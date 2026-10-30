@@ -946,6 +946,17 @@ EXECUTABLE_AFTER_APPROVAL = frozenset({"request_review", "propose_branch", "requ
                                        "create_email_draft", "create_calendar_event"})
 
 
+def _validate_google_write(tool_id: str, payload: Any) -> None:
+    """Every route that can raise an approval card refuses invalid draft/event content first (no card, no approval)."""
+    if tool_id in GOOGLE_WRITE_TOOLS:
+        from .google_workspace import GoogleError, validate_write
+        try:
+            validate_write(tool_id, payload)
+        except GoogleError:
+            raise AssistantError("the draft or event details are invalid (check addresses, times with an offset, "
+                                 "lengths and special characters)") from None
+
+
 def canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -967,10 +978,12 @@ def describe_action(tool_id: str, scope: str, payload: dict[str, Any] | None) ->
     hashed, redacted and bounded. It never executes anything."""
     p = payload if isinstance(payload, dict) else {}
 
+    exact = tool_id in GOOGLE_WRITE_TOOLS      # the card must show exactly what will be written: no redaction rewrite
+
     def v(key: str, limit: int = 200) -> str:
         val = p.get(key)
         text = val if isinstance(val, str) else canonical_json(val)
-        return (redact_secrets(text) or "")[:limit]
+        return (text if exact else (redact_secrets(text) or ""))[:limit]
 
     if tool_id == "run_shell":
         text = f"Run this shell command on an authorized host: {v('command')}"
@@ -1890,6 +1903,7 @@ _GOOGLE_MESSAGES = {
     "not_connected": "Google is not connected for this person: ask them to connect it in the Connectors tab.",
     "needs_attention": "Google needs this person to sign in again in the Connectors tab.",
     "calendar_blocked": "That calendar is not available to the assistant.",
+    "reconnect_needed": "Reconnect Google to allow drafts and events (the saved connection lacks write permission).",
 }
 
 
@@ -2259,6 +2273,7 @@ class AssistantService:
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         if not isinstance(tool_id, str) or tool_id not in TOOL_CATALOG:
             raise AssistantError("unknown tool")
+        _validate_google_write(tool_id, request_payload)
         grant = self._active_grant(assistant_id=assistant_id, tool_id=tool_id, scope=scope,
                                    tenant_id=tenant_id, user_id=user_id)
         preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
@@ -2319,6 +2334,7 @@ class AssistantService:
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         if not isinstance(tool_id, str) or tool_id not in TOOL_CATALOG:
             raise AssistantError("unknown tool")
+        _validate_google_write(tool_id, request_payload)
 
         request_hash = request_digest(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                                       tool_id=tool_id, scope=scope, payload=request_payload)

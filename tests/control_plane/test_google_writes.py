@@ -3,6 +3,7 @@ import base64
 import email
 import json
 import os
+import urllib.error
 import urllib.parse
 
 import pytest
@@ -38,6 +39,11 @@ class WritableGoogle(Google):
     def __call__(self, req, timeout):
         url, method = req.full_url, req.get_method()
         path = urllib.parse.urlparse(url).path
+        if url != gw.TOKEN_URL:
+            for needle, code in self.fail.items():
+                if needle in url:
+                    self.requests.append((method, url, req.get_header("Authorization"), req.data))
+                    raise urllib.error.HTTPError(url, code, "x", {}, None)
         if url != gw.TOKEN_URL and path.endswith("/drafts") and method == "POST":
             self.requests.append((method, url, req.get_header("Authorization"), req.data))
             return Resp({"id": "r-new", "message": {"id": "m1"}})
@@ -328,3 +334,78 @@ def test_drafts_api_guards_origin_role_and_method(connected):
     assert call(connected, BASE + "/google/drafts/r-1", {}, "PUT")[0] in (404, 501)
     assert call(connected, BASE + "/google/drafts", None, "DELETE")[0] == 404
     assert connected.google_fake.writes == [] or all(w[0] == "DELETE" for w in connected.google_fake.writes)
+
+
+# ---- review follow-ups -------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("ch", [" ", " ", "\u0085", "‮", "‏", "⁦", "\x00"])
+def test_unicode_line_separators_and_bidi_controls_are_refused_everywhere(store, ch):
+    w, g = make(store)
+    for field in ("subject",):
+        with pytest.raises(gw.GoogleError):
+            w.create_draft("t", "key:u1", **{**DRAFT, field: f"hi{ch}there"})
+    with pytest.raises(gw.GoogleError):
+        w.create_draft("t", "key:u1", **{**DRAFT, "to": f"bob{ch}@example.com"})
+    for field in ("summary", "location"):
+        with pytest.raises(gw.GoogleError):
+            w.create_event("t", "key:u1", **{**EVENT, field: f"a{ch}b"})
+    for tool, args in (("create_email_draft", {**DRAFT, "subject": f"a{ch}b"}), ("create_calendar_event", {**EVENT, "summary": f"a{ch}b"})):
+        with pytest.raises(gw.GoogleError):
+            gw.validate_write(tool, args)
+    assert g.requests == []
+
+
+def test_ordinary_unicode_text_is_still_accepted(store):
+    w, g = make(store)
+    assert w.create_draft("t", "key:u1", **{**DRAFT, "subject": "Café – 日本語"}) == {"id": "r-new"}
+
+
+def test_no_card_for_invalid_content_on_the_direct_tool_route_or_dry_run(store):
+    from herdr_engineering.control_plane.assistant import AssistantError
+    svc, r1, _, w, g = wired(store)
+    grant(svc, r1, "create_email_draft")
+    bad = {**DRAFT, "subject": "a b"}
+    kw = dict(tenant_id=r1.tenant_id, user_id=r1.user_id, assistant_id=r1.assistant_id, tool_id="create_email_draft",
+              scope="create_email_draft")
+    with pytest.raises(AssistantError):
+        svc.request_tool_action(run_id=r1.run_id, idempotency_key="k1", request_payload=bad, actor=r1.user_id, **kw)
+    with pytest.raises(AssistantError):
+        svc.dry_run_tool_action(request_payload=bad, **kw)
+    assert not svc.store.approvals and not svc.store.actions and g.requests == []
+
+
+def test_a_connection_without_write_scopes_maps_403_to_reconnect_needed(store):
+    w, g = make(store)
+    g.fail["/drafts"] = 403
+    with pytest.raises(gw.GoogleError) as exc:
+        w.create_draft("t", "key:u1", **DRAFT)
+    assert exc.value.reason == "reconnect_needed"
+    g.fail = {"/events": 403}
+    with pytest.raises(gw.GoogleError) as exc:
+        w.create_event("t", "key:u1", **EVENT)
+    assert exc.value.reason == "reconnect_needed"
+    svc, r1, _ = build()
+    svc.google_write = w.write
+    grant(svc, r1, "create_calendar_event")
+    run_tool(svc, r1, "create_calendar_event", EVENT)
+    approve_pending(svc, r1)
+    assert "Reconnect Google" in run_tool(svc, r1, "create_calendar_event", EVENT)
+
+
+def test_drafts_api_reports_reconnect_needed_as_409(connected):
+    connected.google_fake.fail["/drafts/"] = 403
+    assert call(connected, BASE + "/google/drafts/r-1", None, "DELETE") == (409, {"error": "reconnect_needed"})
+
+
+def test_drafts_api_does_not_double_decode_the_id(connected):
+    for path in ("/google/drafts/%252F", "/google/drafts/bad%2Fid", "/google/drafts/%2E%2E"):
+        assert call(connected, BASE + path, None, "DELETE")[0] in (400, 404)
+    assert not [w for w in connected.google_fake.writes if w[0] == "DELETE"]
+
+
+def test_the_approval_card_does_not_redact_what_will_be_written():
+    body = "token is password=hunter2hunter2 and key AKIAABCDEFGHIJKLMNOP"
+    d = describe_action("create_email_draft", "x", {**DRAFT, "body": body})
+    assert body in d
+    assert describe_action("create_calendar_event", "x", {**EVENT, "summary": body})
+    assert body in describe_action("create_calendar_event", "x", {**EVENT, "summary": body})
+    assert body not in describe_action("draft_email", "x", {**DRAFT, "body": body, "subject": body})

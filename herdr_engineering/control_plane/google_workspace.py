@@ -16,6 +16,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +46,7 @@ MAX_CAL_PAGES, FREEBUSY_BATCH = 10, 50
 FREEBUSY_URL = CALENDAR_API + "/freeBusy"
 _ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 PRIMARY = "primary"
+_BAD_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})    # controls, bidi/format, line/paragraph separators
 DRAFT_ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 MAX_ADDRESSES, MAX_TO, MAX_SUBJECT, MAX_DRAFT_BODY = 10, 300, 200, 800
 MAX_SUMMARY, MAX_LOCATION, MAX_REMINDER = 200, 200, 40320
@@ -489,7 +491,7 @@ class GoogleWorkspace:
             if required:
                 raise GoogleError("bad_request")
             return ""
-        if not isinstance(value, str) or len(value) > limit or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        if not isinstance(value, str) or len(value) > limit or any(unicodedata.category(c) in _BAD_CATEGORIES for c in value):
             raise GoogleError("bad_request")
         return value.strip()
 
@@ -537,16 +539,24 @@ class GoogleWorkspace:
         if body is not None:
             data, headers["content-type"] = json.dumps(body).encode(), "application/json"
         req = urllib.request.Request(url, method=method, data=data, headers=headers)     # noqa: S310
-        return self._request(tenant, user, req, allow_empty=method == "DELETE")
+        try:
+            return self._request(tenant, user, req, allow_empty=method == "DELETE")
+        except GoogleError as exc:
+            if exc.reason == "forbidden":       # a connection made before the write scopes were requested
+                raise GoogleError("reconnect_needed") from None
+            raise
 
     def create_draft(self, tenant: str, user: str, to: Any, subject: Any, body: Any) -> dict:
         """Save a Gmail DRAFT in the person's own account. It is never delivered; the person reviews it in Gmail."""
         from email.message import EmailMessage
         addrs, subj, text = self.validate_draft(to, subject, body)
-        msg = EmailMessage()
-        msg["To"], msg["Subject"] = ", ".join(addrs), subj
-        msg.set_content(text)
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        try:
+            msg = EmailMessage()
+            msg["To"], msg["Subject"] = ", ".join(addrs), subj
+            msg.set_content(text)
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        except (ValueError, TypeError, UnicodeError):
+            raise GoogleError("bad_request") from None
         data = self._write(tenant, user, "POST", f"{GMAIL}/drafts", {"message": {"raw": raw}})
         did = data.get("id")
         if not isinstance(did, str) or not DRAFT_ID.fullmatch(did):

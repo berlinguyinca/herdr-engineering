@@ -4131,16 +4131,16 @@ def _make_handler(server, public=False, operator=False):
             try:
                 if self.command == "GET":
                     return self._json({"drafts": gw.list_drafts(tenant, user)})
-                if not DRAFT_ID.fullmatch(unquote(tail[2])):
+                if not DRAFT_ID.fullmatch(tail[2]):
                     return self._json({"error": "bad_id"}, 400)
-                out = gw.delete_draft(tenant, user, unquote(tail[2]))
+                out = gw.delete_draft(tenant, user, tail[2])
                 server.assistant.store.audit_record(tenant_id=tenant, user_id=user, actor=user,
                                                     action="assistant.google.draft.discarded", subject_id=out["id"], detail="gmail draft")
                 return self._json({"ok": True, "id": out["id"]})
             except GoogleError as exc:
-                status = {"not_connected": 409, "needs_attention": 409, "bad_request": 400, "not_found": 404,
+                status = {"not_connected": 409, "needs_attention": 409, "reconnect_needed": 409, "bad_request": 400, "not_found": 404,
                           "rate_limited": 429}.get(exc.reason, 502)
-                return self._json({"error": exc.reason if exc.reason in self._APPS_REASONS | {"not_connected", "needs_attention", "bad_request", "not_found", "rate_limited"} else "unavailable"}, status)
+                return self._json({"error": exc.reason if exc.reason in self._APPS_REASONS | {"not_connected", "needs_attention", "reconnect_needed", "bad_request", "not_found", "rate_limited"} else "unavailable"}, status)
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
