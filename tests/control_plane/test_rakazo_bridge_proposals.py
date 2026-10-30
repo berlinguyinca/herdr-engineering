@@ -91,6 +91,28 @@ def make_server_p():
 
 
 # --------------------------------------------------------------------------------------------- appearing
+def test_a_family_account_never_sees_or_decides_board_proposals_even_with_a_scope(make_server_p):
+    from tests.control_plane.test_rakazo_bridge import ACCOUNTS
+    svr, api = make_server_p(bridge_section(accounts=[{**ACCOUNTS[0], "role": "family"}]))
+    token = api.login()
+    bot = new_bot(api, token)
+    user = svr.rakazo.accounts[0].principal_id
+    tenant = svr.assistant.tenant_for(user)
+    section = {"enabled": True, "suggest": True, "execute": True,
+               "assistant_viewers": {f"{tenant}/{user}": {"org_id": "org1", "projects": "*"}}}
+    calls: list[tuple] = []
+    svr.intelligence._section = lambda: section
+    svr.intelligence._store = pi.IntelligenceStore()
+    svr.intelligence.single_operator_fn = lambda: True
+    svr.intelligence.ci_rerun_fn = lambda repo, run: calls.append((repo, run))
+    p = svr.intelligence.board.request(org_id="org1", requester="x", action="ci_rerun", payload=dict(RERUN), resource_version=1)
+    snap = api.ok("threads/get", {"botId": bot["id"]}, token)
+    assert not [m for m in snap["messages"] if m["id"].startswith(ev.PROPOSAL_PREFIX)]
+    body = {"botId": bot["id"], "runId": "x", "messageId": ev.PROPOSAL_PREFIX + p.id, "answer": "allow"}
+    assert api.rpc("threads/answer", body, token)[0] >= 400
+    assert calls == [] and svr.intelligence.board.get(p.id, "org1").state == "awaiting_approval"
+
+
 def test_a_pending_proposal_is_one_ask_card_with_a_waiting_run_and_one_note(make_rig):
     rig = make_rig()
     p = rig.file()
