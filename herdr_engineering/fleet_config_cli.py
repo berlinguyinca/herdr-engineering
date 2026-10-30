@@ -244,23 +244,11 @@ def collab_values(cfg: FleetConfig) -> dict:
     return dict(collab)
 
 
-def _rakazo_slice(cfg: FleetConfig) -> dict:
-    """The Rakazo Cognito group collab-sync should mirror (only when it reads membership from files)."""
-    try:
-        bridge = cfg.section(CONTROL_PLANE_SECTION).get("rakazo_bridge")
-    except FleetConfigError:
-        return {}
-    cog = bridge.get("cognito") if isinstance(bridge, dict) else None
-    if isinstance(cog, dict) and cog.get("sync_dir") and cog.get("required_group"):
-        return {"rakazo_cognito_group": cog["required_group"]}
-    return {}
-
-
 def render_collab(cfg: FleetConfig, out: Path) -> None:
     """Write a minimal fleet file (JSON, valid YAML, 0600) holding only control_plane.collab."""
     data = {"version": SCHEMA_VERSION,
             "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
-                                                 "values": {"collab": collab_values(cfg), **_rakazo_slice(cfg)}}},
+                                                 "values": {"collab": collab_values(cfg)}}},
             "hosts": {}}
     _parse(data)
     write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")
