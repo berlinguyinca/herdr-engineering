@@ -541,10 +541,12 @@ control_plane:
     enabled: true
     token_ttl_days: 30        # default
     max_tokens: 5             # live sessions per account, default
+    trusted_proxies: []       # addresses/CIDRs whose X-Forwarded-For is believed (loopback always is); see below
     accounts:                 # reserved shape for a later multi-user mode; only role: operator exists today
       - email: you@example.com
         password_scrypt: "scrypt$32768$8$1$...$..."
         role: operator
+        # tokens_valid_after: "2026-11-02T09:30:00Z"   # optional revocation cut-off, see "Revoking a lost phone"
 ```
 
 `enabled: true` with no account, a malformed hash, an unknown key or any role but `operator` (`family` is reserved, not
@@ -561,8 +563,20 @@ herdr-eng bridge hash-password          # prints scrypt$32768$8$1$<salt>$<hash>;
 deploy). With `control_plane.pg_dsn` set the bridge stores only `sha256(token)` plus expiry, creation, last use and last
 address, so a restart does not sign the phone out; without a DSN, or if the table is unreadable at boot, restarting the
 control plane signs everyone out. If the table cannot be written, sign-in fails (no token is issued that would not
-survive). Revoking a session is `sign out` in the app or `DELETE FROM rakazo_bridge_tokens WHERE account_id = ...`
-followed by a restart.
+survive). Database calls never run under the token lock and carry a 3 s connect, statement and lock timeout whatever the
+DSN says, so a stuck database costs a request seconds, not a hang.
+
+**Revoking a lost phone.** A token that is signed out, evicted, expired or cut off is dead in memory at once; the database
+delete follows, and one that fails is remembered and retried with backoff (5 s doubling to 5 min) on later token operations
+(sign-out then answers an error saying so). That memory is lost on a restart, so **deleting rows and restarting is a safe
+revocation only if the deletes succeeded** (check the control-plane log for `could not delete a revoked token row`). The safe
+procedure does not depend on the database:
+
+1. Set `accounts[].tokens_valid_after` to the current time (ISO-8601 with a zone, not in the future) and restart the control
+   plane. Every token created before that moment is rejected, loaded or not, and its row is deleted at the next boot.
+   Signing in again afterwards works (new tokens are newer than the cut-off).
+2. Change the password: generate a new hash with `herdr-eng bridge hash-password`, replace `password_scrypt`, restart.
+3. For a lockout of the whole account instead, remove the account from `accounts` and restart.
 
 **Register in the app**: the sign-in screen opens a Server page (it shows the current server; **Save** probes it): enter `https://local.metabolomics.us`. The app stores only scheme://host:port and
 calls `/rpc/*` and `/api/auth/*` at the origin root, so whatever fronts that name must forward those two prefixes to this
@@ -572,25 +586,44 @@ private/Tailscale addresses. Then sign in with the email and password above and 
 already made in the dashboard for the same account appears by itself.
 
 **Security model.** Sign-in checks the email (case-insensitive) and a scrypt hash in constant time and always spends one
-KDF, whether or not the email exists; the same `Invalid credentials` answer covers both. Each source address locks out for
-30 s after 5 failures and then doubles up to an hour, and the bridge as a whole locks after 40 failures from anywhere
-(`429` with `Retry-After`; the lock is checked before any password work). A token is 32 random bytes shown once. The
-password, tokens, hashes and request bodies are never logged or written to the audit trail; sign-in and sign-out are audited
-under the account's id, and everything the app does is audited as the account's own assistant user.
+KDF, whether or not the email exists; the same `Invalid credentials` answer covers both (a body that is not a sign-in
+attempt gets a generic 400 and costs nothing). Each **source address** locks out after 5 failures for 30 s, doubling up to
+an hour (`429` with `Retry-After`, checked before any password work), and at most two KDFs run at once. There is
+**deliberately no lockout across all addresses**: it would let any device on the tailnet keep the owner out of sign-in. The
+cost of that choice is that guessing is limited per address, not globally, so use a long unique password (a scrypt hash only
+slows an offline attack on the YAML, not a stolen password). A global count of recent failures is logged
+(`failed sign-in from <address> (N from all addresses in 10 minutes)`) for monitoring. A token is 32 random bytes shown
+once. The password, tokens, hashes and request bodies are never logged or written to the audit trail; sign-in and sign-out
+are audited under the account's id, and everything the app does is audited as the account's own assistant user.
+
+**Which address is locked out.** The lockout keys on the address the control plane attributes to the request: the TCP peer,
+or the last `X-Forwarded-For` entry when the peer is loopback or inside `trusted_proxies` and the entry is an IP address.
+The fabric gateway terminates TLS and forwards to the apex upstream through `rewriting_pipe(..., forwarded_for=peer)`
+(`devfabric.py`, called from `fabric.py _proxy_one`), which **replaces** any client-supplied `X-Forwarded-For` with the real
+client address; but it connects to the control plane from the host or Docker bridge, not from loopback. So with the default
+`trusted_proxies: []` the control plane sees that connection's source (a non-loopback host/bridge address) and ignores the
+header: **every client then shares one lockout key**, one device's five bad guesses lock all sign-in for 30 s and the owner
+could be held out by repeating that. To key on the real client, list the address the control plane logs for a failed sign-in from the gateway
+(`failed sign-in from ...` shows the key; a bridge address such as `172.18.0.1` or the host's tailnet address) in
+`trusted_proxies`. I have not observed what the production gateway presents, so check the first failed sign-in after enabling
+and set it. Only list proxies that overwrite the header, as the gateway does; a device that reaches the listener directly can
+never choose its own key. Under `tailscale serve` the peer is loopback and the header is trusted without configuration.
 
 Each account is its own assistant user (`rakazo:<hash of the normalised email>`), so a second account gets separate bots,
 threads, memory, grants, approvals, audit identity and rate limit; the tenant still comes from
 `personal_assistant.tenancy`. Approvals answered in the app go through the same `decide_approval` path as the dashboard,
 with the same rules: the approver must differ from the requester for a sensitive tool unless
-`personal_assistant.actions.allow_self_approval` (or `control_plane.single_operator`) already allows it.
+`personal_assistant.actions.allow_self_approval` (or `control_plane.single_operator`) already allows it. **With
+`control_plane.single_operator` on, the bridge password alone is enough to approve that account's own sensitive tool
+requests** (send_message, run_shell and the like); there is no second person in the loop. Use a long, unique password.
 
 **Residual risk.** A token grants that account's full assistant access (its tools, grants and approvals) from anywhere that
-can reach the listener, i.e. the tailnet; there is no second factor and no device binding. Keep the password long, keep
-`max_tokens` low, and shorten `token_ttl_days` if a phone is lost; nothing else is exposed (no control-plane API key route
+can reach the listener, i.e. the tailnet; there is no second factor and no device binding. Keep the password long and
+unique, keep `max_tokens` low, and see "Revoking a lost phone" if a phone is lost; nothing else is exposed (no control-plane API key route
 accepts a bridge token, and no bridge route accepts an API key).
 
 **Supported:** health probe, email/password sign-in and sign-out, `me`, `spaces/list` (one fixed space, "Herdr"),
-`bots/list|get|create`, `threads/get|head|messages|send|stop|markRead|subscribe` (live events: new messages, run
+`bots/list|get|create` (at most 20 bots per account), `threads/get|head|messages|send|stop|markRead|subscribe` (live events: new messages, run
 started/waiting/completed/failed/cancelled, approval cards and their answers), `threads/answer` for approvals,
 `runs/list`, `aiConsent/*` (no recipients, so no prompt), `notifications/registerPush|unregisterPush` and
 `analytics/screen` (accepted and discarded). Sending runs on in the background so a slow model does not hit the app's 8 s

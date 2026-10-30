@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import re
@@ -51,6 +52,9 @@ MAX_BODY = 1_000_000
 MAX_AUTH_BODY = 8_192
 MAX_STREAMS = 8
 MAX_SENDS = 4
+MAX_BOTS = 20                        # assistants per account
+MAX_RUN_ROWS = 20
+MAX_ACTIVE_ROWS = 50
 
 
 # --------------------------------------------------------------------------------------------- password hashing
@@ -106,13 +110,34 @@ class Account:
     principal_id: str        # the assistant user id for everything this account does
     role: str
     params: ScryptParams = field(repr=False)
+    tokens_valid_after: float = 0.0     # epoch seconds: a token created before this is dead, whatever the database says
 
 
 def normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
-def rakazo_bridge_config(raw: Any) -> dict[str, Any]:
+def _cutoff(value: Any, where: str, now: float) -> float:
+    """``tokens_valid_after``: an ISO-8601 time with a zone (e.g. 2026-11-02T09:30:00Z). Not in the future."""
+    if value is None:
+        return 0.0
+    bad = ValueError(f"{where} must be an ISO-8601 timestamp with a time zone, not in the future "
+                     "(e.g. 2026-11-02T09:30:00Z)")
+    if isinstance(value, datetime):
+        stamp = value
+    elif isinstance(value, str):
+        try:
+            stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            raise bad from None
+    else:
+        raise bad
+    if stamp.tzinfo is None or stamp.timestamp() > now + 300:
+        raise bad
+    return stamp.timestamp()
+
+
+def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     """Validate ``control_plane.rakazo_bridge``. Disabled (and unchecked beyond its type) unless ``enabled`` is true;
     when enabled, anything missing or malformed raises ValueError so the control plane refuses to start."""
     if raw is None:
@@ -121,7 +146,8 @@ def rakazo_bridge_config(raw: Any) -> dict[str, Any]:
         raise ValueError("control_plane.rakazo_bridge must be a mapping")
     if raw.get("enabled") is not True:
         return {"enabled": False}
-    unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens"})
+    now = time.time() if now is None else now
+    unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -134,14 +160,23 @@ def rakazo_bridge_config(raw: Any) -> dict[str, Any]:
 
     ttl_days = bounded("token_ttl_days", 30, 1, 365)
     max_tokens = bounded("max_tokens", 5, 1, 50)
+    proxies = raw.get("trusted_proxies", [])
+    if not isinstance(proxies, list):
+        raise ValueError("control_plane.rakazo_bridge.trusted_proxies must be a list of addresses or CIDR ranges")
+    nets = []
+    for i, item in enumerate(proxies):
+        try:
+            nets.append(ipaddress.ip_network(str(item).strip(), strict=False))
+        except ValueError:
+            raise ValueError(f"control_plane.rakazo_bridge.trusted_proxies[{i}] is not an address or CIDR range") from None
     rows = raw.get("accounts")
     if not isinstance(rows, list) or not rows:
         raise ValueError("control_plane.rakazo_bridge.accounts must list at least one {email, password_scrypt, role}")
     accounts: list[Account] = []
     for i, row in enumerate(rows):
         where = f"control_plane.rakazo_bridge.accounts[{i}]"
-        if not isinstance(row, dict) or set(row) - {"email", "password_scrypt", "role"}:
-            raise ValueError(f"{where} must be a mapping with only email, password_scrypt and role")
+        if not isinstance(row, dict) or set(row) - {"email", "password_scrypt", "role", "tokens_valid_after"}:
+            raise ValueError(f"{where} must be a mapping with only email, password_scrypt, role and tokens_valid_after")
         email = row.get("email")
         if not isinstance(email, str) or not _EMAIL.match(normalize_email(email)) or len(email) > 254:
             raise ValueError(f"{where}.email must be an email address")
@@ -150,12 +185,14 @@ def rakazo_bridge_config(raw: Any) -> dict[str, Any]:
             raise ValueError(f"{where}.role {role!r} is not supported: only 'operator' is implemented "
                              "('family' is reserved for a later multi-user mode)")
         params = parse_scrypt(row.get("password_scrypt"), f"{where}.password_scrypt")
+        cutoff = _cutoff(row.get("tokens_valid_after"), f"{where}.tokens_valid_after", now)
         email_n = normalize_email(email)
         account_id = hashlib.sha256(b"rakazo-bridge-account:" + email_n.encode()).hexdigest()[:16]
         if any(a.account_id == account_id for a in accounts):
             raise ValueError(f"{where}.email repeats an earlier account")
-        accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params))
-    return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts}
+        accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff))
+    return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
+            "trusted_proxies": tuple(nets)}
 
 
 # --------------------------------------------------------------------------------------------- tokens
@@ -163,11 +200,15 @@ class TokenStoreError(Exception):
     """The persistent token table could not be written. Sign-in fails closed rather than issue an unrecorded token."""
 
 
+DB_TIMEOUT_SECONDS = 3
+
+
 class PostgresTokenPersistence:
     """``rakazo_bridge_tokens`` (migration 0036): the SHA-256 of each live token, never the token itself.
 
     Sync psycopg2 like the assistant's store; a connection factory is injectable for tests. Credentials come from the DSN
-    and are never logged."""
+    and are never logged. Every connection gets a connect timeout and a statement/lock timeout whatever the DSN says, so a
+    stuck database costs a request a few seconds, never a hang."""
 
     def __init__(self, dsn: str, connect: Callable | None = None):
         self._dsn = dsn
@@ -178,7 +219,9 @@ class PostgresTokenPersistence:
             conn = self._connect()
         else:
             import psycopg2
-            conn = psycopg2.connect(self._dsn)
+            ms = DB_TIMEOUT_SECONDS * 1000
+            conn = psycopg2.connect(self._dsn, connect_timeout=DB_TIMEOUT_SECONDS,
+                                    options=f"-c statement_timeout={ms} -c lock_timeout={ms}")
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
@@ -216,92 +259,156 @@ class PostgresTokenPersistence:
 class TokenStore:
     """Bearer tokens: 32 random bytes handed out once; only ``sha256(token)`` is kept, with expiry, creation, last use and
     last address. At most ``max_tokens`` live per account (the oldest is evicted). Memory is authoritative; the optional
-    persistence lets tokens survive a restart."""
+    persistence lets tokens survive a restart.
+
+    Revocation never depends on the database. A token that is dropped (sign-out, eviction, expiry, cut-off) is dead in
+    memory at once; its row is deleted afterwards, outside the lock, and a delete that fails is remembered (a tombstone)
+    and retried with backoff on later operations. A tombstone lives only in memory, so if the process restarts before the
+    delete succeeded the row is loaded again: ``tokens_valid_after`` (per account, in the YAML) is the cut-off that kills
+    such tokens whatever the database holds. No database call happens while the lock is held."""
 
     TOUCH_EVERY = 300.0
+    RETRY_MIN, RETRY_MAX = 5.0, 300.0
 
-    def __init__(self, ttl_seconds: float, max_tokens: int, persistence=None, clock: Callable[[], float] = time.time):
+    def __init__(self, ttl_seconds: float, max_tokens: int, persistence=None, clock: Callable[[], float] = time.time,
+                 cutoffs: dict[str, float] | None = None):
         self.ttl, self.max_tokens, self._p, self._clock = ttl_seconds, max_tokens, persistence, clock
+        self._cutoffs = dict(cutoffs or {})
         self._tokens: dict[str, dict[str, Any]] = {}
+        self._tomb: set[str] = set()          # rows whose durable delete is still owed
+        self._retry_at, self._backoff = 0.0, 0.0
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self._serial = 0                      # breaks ties between tokens minted in the same instant
         if persistence is not None:
             try:
                 for rec in persistence.load():
-                    self._tokens[rec.pop("hash")] = {**rec, "persisted": rec["last_used"]}
+                    digest = rec.pop("hash")
+                    if rec["created"] < self._cutoffs.get(rec["account_id"], 0.0):
+                        self._tomb.add(digest)            # revoked by the YAML cut-off: never live, delete the row
+                    elif digest not in self._tomb:
+                        self._tokens[digest] = {**rec, "persisted": rec["last_used"]}
             except Exception as exc:  # noqa: BLE001 - fail closed: nobody is signed in until they sign in again
                 log.error("rakazo bridge: could not load persisted tokens (%s); all sessions are signed out",
                           type(exc).__name__)
+        self._flush()
 
     @staticmethod
     def digest(token: str) -> str:
         return hashlib.sha256(token.encode()).hexdigest()
 
-    def _drop(self, digest: str) -> None:
-        self._tokens.pop(digest, None)
-        if self._p is not None:
-            try:
-                self._p.delete(digest)
-            except Exception as exc:  # noqa: BLE001 - the in-memory copy is gone; a stale row expires by itself
-                log.warning("rakazo bridge: could not delete a token row (%s)", type(exc).__name__)
+    @property
+    def pending_deletes(self) -> int:
+        with self._lock:
+            return len(self._tomb)
+
+    def _drop_locked(self, digest: str) -> None:
+        """Dead in memory now; the row's delete is owed (settled by ``_flush`` after the lock is released)."""
+        if self._tokens.pop(digest, None) is not None and self._p is not None:
+            self._tomb.add(digest)
+
+    def _flush(self, force: bool = False) -> bool:
+        """Settle owed deletes; True when none remain. A failure keeps the tombstones and backs off (5 s, doubling to 5 min)
+        before the next attempt, which any later token operation makes. Never called with the lock held."""
+        if self._p is None:
+            return True
+        now = self._clock()
+        with self._lock:
+            if not self._tomb:
+                return True
+            if not force and now < self._retry_at:
+                return False
+            batch = list(self._tomb)
+        if not self._flush_lock.acquire(blocking=False):
+            return False
+        try:
+            for digest in batch:
+                try:
+                    self._p.delete(digest)
+                except Exception as exc:  # noqa: BLE001 - the database is likely down: stop and back off
+                    log.warning("rakazo bridge: could not delete a revoked token row (%s); will retry",
+                                type(exc).__name__)
+                    with self._lock:
+                        self._backoff = min(self.RETRY_MAX, max(self.RETRY_MIN, self._backoff * 2))
+                        self._retry_at = now + self._backoff
+                    return False
+                with self._lock:
+                    self._tomb.discard(digest)
+            with self._lock:
+                self._backoff = 0.0
+            return True
+        finally:
+            self._flush_lock.release()
 
     def mint(self, account_id: str, ip: str) -> str:
         token = secrets.token_urlsafe(32)
         now = self._clock()
+        digest = self.digest(token)
         rec = {"account_id": account_id, "created": now, "expires": now + self.ttl, "last_used": now,
                "last_ip": ip[:64], "persisted": now}
         with self._lock:
             self._serial += 1
             rec["serial"] = self._serial
             for d in [d for d, r in self._tokens.items() if r["expires"] <= now]:
-                self._drop(d)
-            digest = self.digest(token)
-            if self._p is not None:
-                try:
-                    self._p.upsert(digest, rec)
-                except Exception as exc:  # noqa: BLE001
-                    log.error("rakazo bridge: token table write failed (%s)", type(exc).__name__)
-                    raise TokenStoreError from None
+                self._drop_locked(d)
             self._tokens[digest] = rec
+        if self._p is not None:
+            try:
+                self._p.upsert(digest, rec)
+            except Exception as exc:  # noqa: BLE001
+                log.error("rakazo bridge: token table write failed (%s)", type(exc).__name__)
+                with self._lock:
+                    self._tokens.pop(digest, None)
+                self._flush()
+                raise TokenStoreError from None
+        with self._lock:
             # only after the new one is recorded: a failed write must not cost the account a working session
             mine = sorted((r["created"], r.get("serial", 0), d) for d, r in self._tokens.items()
                           if r["account_id"] == account_id)
             for *_, d in mine[:max(0, len(mine) - self.max_tokens)]:
-                self._drop(d)
+                self._drop_locked(d)
+        self._flush()
         return token
 
     def lookup(self, token: str, ip: str = "") -> str | None:
         """The account a live token belongs to, or None. Records last use and address."""
         digest = self.digest(token)
         now = self._clock()
+        touch = False
         with self._lock:
             rec = self._tokens.get(digest)
             if rec is None:
-                return None
-            if rec["expires"] <= now:
-                self._drop(digest)
-                return None
-            rec["last_used"], rec["last_ip"] = now, ip[:64]
-            if self._p is not None and now - rec["persisted"] >= self.TOUCH_EVERY:
-                rec["persisted"] = now
-                try:
-                    self._p.touch(digest, now, rec["last_ip"])
-                except Exception as exc:  # noqa: BLE001 - bookkeeping only
-                    log.warning("rakazo bridge: could not record token use (%s)", type(exc).__name__)
-            return rec["account_id"]
+                account = None
+            elif rec["expires"] <= now or rec["created"] < self._cutoffs.get(rec["account_id"], 0.0):
+                self._drop_locked(digest)
+                account = None
+            else:
+                account = rec["account_id"]
+                rec["last_used"], rec["last_ip"] = now, ip[:64]
+                if self._p is not None and now - rec["persisted"] >= self.TOUCH_EVERY:
+                    rec["persisted"] = touch = now
+        if touch:
+            try:
+                self._p.touch(digest, touch, ip[:64])
+            except Exception as exc:  # noqa: BLE001 - bookkeeping only
+                log.warning("rakazo bridge: could not record token use (%s)", type(exc).__name__)
+        self._flush()
+        return account
 
     def valid(self, token: str) -> bool:
         with self._lock:
             rec = self._tokens.get(self.digest(token))
-            return rec is not None and rec["expires"] > self._clock()
+            return (rec is not None and rec["expires"] > self._clock()
+                    and rec["created"] >= self._cutoffs.get(rec["account_id"], 0.0))
 
-    def revoke(self, token: str) -> bool:
+    def revoke(self, token: str) -> tuple[bool, bool]:
+        """(was it live, is its row gone). The token is dead in memory either way."""
         digest = self.digest(token)
         with self._lock:
             known = digest in self._tokens
             if known:
-                self._drop(digest)
-            return known
+                self._drop_locked(digest)
+        return known, self._flush(force=True)
 
     def count(self, account_id: str | None = None) -> int:
         with self._lock:
@@ -310,15 +417,18 @@ class TokenStore:
 
 # --------------------------------------------------------------------------------------------- sign-in limiter
 class SignInLimiter:
-    """Failed sign-ins lock a source address, and the whole bridge, out for exponentially longer: from the ``free``-th failure
-    on the lock is ``base * 2**(failures beyond that)`` seconds, up to ``cap``. A success clears that address; quiet time clears
-    both. The lock is checked BEFORE any password work, so a locked-out caller costs nothing."""
+    """Failed sign-ins lock a SOURCE ADDRESS out for exponentially longer: from the ``free``-th failure on the lock is
+    ``base * 2**(failures beyond that)`` seconds, up to ``cap``. A success clears that address; quiet time forgets it.
+    The lock is checked BEFORE any password work. There is deliberately no lock across all addresses: anyone on the
+    tailnet could then keep the owner out. The all-address failure count is for logging only."""
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic, *, free_ip: int = 5, free_global: int = 40,
-                 base_ip: float = 30.0, base_global: float = 60.0, cap: float = 3600.0, forget_after: float = 3600.0):
-        self._clock, self._cap, self._forget = clock, cap, forget_after
-        self._rules = {"ip": (free_ip, base_ip), "*": (free_global, base_global)}
+    WINDOW = 600.0
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, *, free_ip: int = 5, base_ip: float = 30.0,
+                 cap: float = 3600.0, forget_after: float = 3600.0):
+        self._clock, self._cap, self._forget, self._free, self._base = clock, cap, forget_after, free_ip, base_ip
         self._state: dict[str, dict[str, float]] = {}
+        self._recent: list[float] = []
         self._lock = threading.Lock()
 
     def _entry(self, key: str, now: float) -> dict[str, float]:
@@ -329,30 +439,30 @@ class SignInLimiter:
             entry = self._state[key] = {"fails": 0, "until": 0.0, "last": now}
             if len(self._state) > 2048:
                 for stale in sorted(self._state, key=lambda k: self._state[k]["last"])[:512]:
-                    if stale != "*":
-                        del self._state[stale]
+                    del self._state[stale]
         return entry
 
     def retry_after(self, ip: str) -> int:
         now = self._clock()
         with self._lock:
-            wait = max(self._entry(k, now)["until"] - now for k in ("*", "ip:" + ip))
+            wait = self._entry(ip, now)["until"] - now
         return int(wait) + 1 if wait > 0 else 0
 
-    def failure(self, ip: str) -> None:
+    def failure(self, ip: str) -> int:
+        """Record a failure; returns how many failures (from any address) the last ten minutes saw, for logging."""
         now = self._clock()
         with self._lock:
-            for key, rule in (("*", "*"), ("ip:" + ip, "ip")):
-                entry = self._entry(key, now)
-                free, base = self._rules[rule]
-                entry["fails"] += 1
-                entry["last"] = now
-                if entry["fails"] >= free:
-                    entry["until"] = now + min(self._cap, base * 2 ** (entry["fails"] - free))
+            entry = self._entry(ip, now)
+            entry["fails"] += 1
+            entry["last"] = now
+            if entry["fails"] >= self._free:
+                entry["until"] = now + min(self._cap, self._base * 2 ** (entry["fails"] - self._free))
+            self._recent = [t for t in self._recent if now - t < self.WINDOW] + [now]
+            return len(self._recent)
 
     def success(self, ip: str) -> None:
         with self._lock:
-            self._state.pop("ip:" + ip, None)
+            self._state.pop(ip, None)
 
 
 # --------------------------------------------------------------------------------------------- responses and errors
@@ -416,13 +526,16 @@ class RakazoBridge:
         self.accounts: list[Account] = list(config["accounts"])
         self._by_principal = {a.principal_id: a for a in self.accounts}
         self._by_id = {a.account_id: a for a in self.accounts}
-        self.tokens = TokenStore(config["token_ttl_days"] * 86400, config["max_tokens"], persistence, clock)
+        self.tokens = TokenStore(config["token_ttl_days"] * 86400, config["max_tokens"], persistence, clock,
+                                 cutoffs={a.account_id: a.tokens_valid_after for a in self.accounts})
+        self.trusted_proxies = tuple(config.get("trusted_proxies", ()))
         self.limiter = SignInLimiter(monotonic)
         self.journals = ev.JournalRegistry(clock)
         self._kdf_slots = threading.BoundedSemaphore(2)
         self._streams = threading.BoundedSemaphore(MAX_STREAMS)
         self._sends = threading.BoundedSemaphore(MAX_SENDS)
         self._thread_lock = threading.Lock()
+        self._create_lock = threading.Lock()
         self._closed = threading.Event()
         self._monotonic = monotonic
         self.stream_options: dict[str, Any] = {}      # tests shorten the poll/heartbeat/lifetime
@@ -448,11 +561,27 @@ class RakazoBridge:
     def close(self) -> None:
         self._closed.set()
 
-    def handle(self, method: str, path: str, headers: dict[str, str], body: bytes, ip: str) -> BridgeResponse | None:
-        """``headers`` has lower-case names. Never raises."""
+    def client_address(self, peer: str, forwarded_for: str = "") -> str:
+        """The address a request is attributed to (lockout key, token bookkeeping). The last X-Forwarded-For entry is
+        believed only when the TCP peer is loopback or inside ``trusted_proxies``; anything else, or an entry that is not
+        an IP address, leaves the peer itself, so a caller cannot choose its own key."""
+        try:
+            addr = ipaddress.ip_address(peer)
+        except ValueError:
+            return peer[:64]
+        if addr.is_loopback or any(addr in net for net in self.trusted_proxies):
+            try:
+                return str(ipaddress.ip_address(forwarded_for.split(",")[-1].strip()))
+            except ValueError:
+                pass
+        return str(addr)
+
+    def handle(self, method: str, path: str, headers: dict[str, str], body: bytes, peer: str) -> BridgeResponse | None:
+        """``headers`` has lower-case names; ``peer`` is the TCP peer address. Never raises."""
         path = path.split("?", 1)[0]
         if not self.handles(path):
             return None
+        ip = self.client_address(peer, headers.get("x-forwarded-for", ""))
         try:
             if path.startswith("/api/auth/"):
                 return self._auth(method, path[len("/api/auth/"):], headers, body, ip)
@@ -477,8 +606,14 @@ class RakazoBridge:
         if method == "POST" and name == "sign-out":
             token = self._bearer(headers)
             account = self._by_id.get(self.tokens.lookup(token, ip) or "") if token else None
-            if token and self.tokens.revoke(token) and account is not None:
+            known, durable = self.tokens.revoke(token) if token else (False, True)
+            if known and account is not None:
                 self._audit(account, "rakazo.bridge.sign_out")
+            if not durable:
+                # dead in memory, but its database row is still owed a delete (retried; see tokens_valid_after)
+                log.warning("rakazo bridge: a sign-out could not delete its token row yet")
+                raise BridgeError(500, "INTERNAL_SERVER_ERROR",
+                                  "Signed out, but the server could not remove the session record yet.")
             return _json_response(200, {"success": True})        # the same answer for any token: no oracle
         raise BridgeError(404, "NOT_FOUND", "Not found")
 
@@ -494,14 +629,15 @@ class RakazoBridge:
                               {"Retry-After": str(wait)})
         email = password = ""
         try:
-            data = json.loads(body[:MAX_AUTH_BODY]) if len(body) <= MAX_AUTH_BODY else {}
-            if isinstance(data, dict):
-                if isinstance(data.get("email"), str) and len(data["email"]) <= 254:
-                    email = normalize_email(data["email"])
-                if isinstance(data.get("password"), str) and len(data["password"]) <= 1024:
-                    password = data["password"]
-        except ValueError:
-            pass
+            data = json.loads(body) if len(body) <= MAX_AUTH_BODY else None
+        except (ValueError, RecursionError):
+            data = None
+        if not isinstance(data, dict):               # not a sign-in attempt at all: no KDF, no failure counted
+            raise BridgeError(400, "BAD_REQUEST", "That request could not be read.")
+        if isinstance(data.get("email"), str) and len(data["email"]) <= 254:
+            email = normalize_email(data["email"])
+        if isinstance(data.get("password"), str) and len(data["password"]) <= 1024:
+            password = data["password"]
         # Compare against EVERY account (no early exit) and ALWAYS run one KDF, against the matched account's salt or
         # a configured account's when nothing matched, so neither timing nor the response tells a wrong email from a
         # wrong password.
@@ -520,8 +656,8 @@ class RakazoBridge:
             self._kdf_slots.release()
         good = hmac.compare_digest(derived, params.digest) & (matched is not None)
         if not good or matched is None:
-            self.limiter.failure(ip)
-            log.warning("rakazo bridge: failed sign-in from %s", ip[:64])
+            recent = self.limiter.failure(ip)
+            log.warning("rakazo bridge: failed sign-in from %s (%d from all addresses in 10 minutes)", ip[:64], recent)
             raise BridgeError(401, "INVALID_EMAIL_OR_PASSWORD", "Invalid credentials")
         self.limiter.success(ip)
         try:
@@ -558,7 +694,7 @@ class RakazoBridge:
             raise BridgeError(404, "NOT_FOUND", "This server does not support that feature.")
         try:
             data = json.loads(body) if body.strip() else {}
-        except ValueError:
+        except (ValueError, RecursionError):
             raise BridgeError(400, "BAD_REQUEST", "The request body is not valid JSON.") from None
         inp = data.get("json", {}) if isinstance(data, dict) else {}
         if inp is None:
@@ -661,8 +797,11 @@ class RakazoBridge:
         text = inp.get("instructions") or inp.get("description") or ""
         if not isinstance(text, str) or len(text) > 20_000:
             raise BridgeError(400, "BAD_REQUEST", "The instructions are too long.")
-        assistant = self.svc.create_assistant(tenant_id=ctx.tenant, user_id=ctx.user, name=name.strip(),
-                                              instructions=text, enabled=True)
+        with self._create_lock:
+            if len(self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)) >= MAX_BOTS:
+                raise BridgeError(400, "BAD_REQUEST", f"This server allows at most {MAX_BOTS} bots per account.")
+            assistant = self.svc.create_assistant(tenant_id=ctx.tenant, user_id=ctx.user, name=name.strip(),
+                                                  instructions=text, enabled=True)
         return self._bot(ctx, assistant)
 
     def _threads_head(self, ctx, inp):
@@ -796,21 +935,25 @@ class RakazoBridge:
         if mode not in ("active", "recent"):
             raise BridgeError(400, "BAD_REQUEST", "filter must be active or recent.")
         store = self.svc.store
+        limit = MAX_RUN_ROWS if mode == "recent" else MAX_ACTIVE_ROWS
+        with store._lock:                  # the shared dicts change under concurrent runs: read them only while held
+            runs = [r for r in store.list_runs(tenant_id=ctx.tenant, user_id=ctx.user)
+                    if mode == "recent" or ev.run_status(r.state) in ev.ACTIVE][:limit]
+            threads = {r.thread_id for r in runs}
+            prompts: dict[str, list] = {}
+            for m in store.messages.values():            # one pass, only for the threads shown
+                if m.role == "user" and m.thread_id in threads:
+                    prompts.setdefault(m.thread_id, []).append(m)
+            names = {r.assistant_id: a.name for r in runs if (a := store.assistants.get(r.assistant_id))}
         rows = []
-        for run in store.list_runs(tenant_id=ctx.tenant, user_id=ctx.user):
-            status = ev.run_status(run.state)
-            if mode == "active" and status not in ev.ACTIVE:
-                continue
-            assistant = store.assistants.get(run.assistant_id)
-            thread_messages = [m for m in store.messages.values() if m.thread_id == run.thread_id and m.role == "user"
-                               and m.created_at <= run.created_at]
-            prompt = max(thread_messages, key=lambda m: m.created_at).content if thread_messages else ""
-            rows.append({"runId": run.run_id, "botId": run.assistant_id, "botName": assistant.name if assistant else "",
-                         "groupId": None, "groupName": None, "threadId": run.thread_id, "status": status,
-                         "trigger": "user", "notificationsEnabled": False, "promptSnippet": ev.snippet(prompt, 120),
-                         "agentMessage": None, "updatedAt": ev.iso(run.updated_at)})
-            if mode == "recent" and len(rows) >= 20:
-                break
+        for run in runs:
+            before = [m for m in prompts.get(run.thread_id, []) if m.created_at <= run.created_at]
+            prompt = max(before, key=lambda m: m.created_at).content if before else ""
+            rows.append({"runId": run.run_id, "botId": run.assistant_id, "botName": names.get(run.assistant_id, ""),
+                         "groupId": None, "groupName": None, "threadId": run.thread_id,
+                         "status": ev.run_status(run.state), "trigger": "user", "notificationsEnabled": False,
+                         "promptSnippet": ev.snippet(prompt, 120), "agentMessage": None,
+                         "updatedAt": ev.iso(run.updated_at)})
         return {"runs": rows}
 
     def _consent(self, ctx, inp):

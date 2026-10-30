@@ -2160,7 +2160,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(413, "body too large")
             body = self.rfile.read(length) if length else b""
             response = server.rakazo.handle(self.command, self.path, {k.lower(): v for k, v in self.headers.items()},
-                                            body, self._proxied_client())
+                                            body, self.client_address[0])
             if response is None:
                 return self._send_json(404, {"error": "not found"})
             try:

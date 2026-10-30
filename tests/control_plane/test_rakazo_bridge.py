@@ -239,9 +239,11 @@ def test_the_kdf_runs_for_every_attempt_that_is_not_locked_out(srv, monkeypatch)
     api.raw("POST", "/api/auth/sign-in/email", b"not json")
     api.raw("POST", "/api/auth/sign-in/email", {"email": 5, "password": ["x"]})
     api.raw("POST", "/api/auth/sign-in/email", {"email": "alice@example.com", "password": "x" * 5000})
-    assert len(calls) == 4
+    assert len(calls) == 3
     api.sign_in("nobody@example.com", PW_A)                  # a wrong email costs the same KDF as a wrong password
-    assert len(calls) == 5
+    assert len(calls) == 4
+    status, body, _ = api.raw("POST", "/api/auth/sign-in/email", b"not json")       # not an attempt: no KDF, no strike
+    assert status == 400 and body and len(calls) == 4
 
 
 def test_repeated_failures_lock_the_source_out_before_any_password_work(srv, monkeypatch):
@@ -255,9 +257,9 @@ def test_repeated_failures_lock_the_source_out_before_any_password_work(srv, mon
     assert calls == []
 
 
-def test_limiter_backs_off_exponentially_clears_on_success_and_has_a_global_cap():
+def test_limiter_backs_off_exponentially_and_clears_on_success_with_no_global_lock():
     now = [0.0]
-    lim = rb.SignInLimiter(lambda: now[0], free_ip=2, free_global=6, base_ip=10, base_global=60, cap=100)
+    lim = rb.SignInLimiter(lambda: now[0], free_ip=2, base_ip=10, cap=100)
     lim.failure("1.1.1.1")
     assert lim.retry_after("1.1.1.1") == 0
     lim.failure("1.1.1.1")                                    # the 2nd failure locks for 10 s
@@ -266,14 +268,47 @@ def test_limiter_backs_off_exponentially_clears_on_success_and_has_a_global_cap(
     assert lim.retry_after("1.1.1.1") == 0
     lim.failure("1.1.1.1")                                    # the 3rd: 20 s
     assert 20 <= lim.retry_after("1.1.1.1") <= 21
-    assert lim.retry_after("2.2.2.2") == 0                    # another source is untouched (global still under cap)
     lim.success("1.1.1.1")
     assert lim.retry_after("1.1.1.1") == 0
-    for ip in ("3.3.3.3", "4.4.4.4", "5.5.5.5"):              # the global budget runs out across many sources
-        lim.failure(ip)
-    assert lim.retry_after("9.9.9.9") >= 60
-    now[0] = 10_000                                           # quiet time forgets everything
+    for i in range(300):                                      # many failures from elsewhere never lock anybody else
+        lim.failure(f"10.0.{i // 250}.{i % 250}")
     assert lim.retry_after("9.9.9.9") == 0
+    assert lim.failure("9.9.9.8") >= 300                      # ...but they are counted, for logging
+    now[0] = 10_000                                           # quiet time forgets everything
+    assert lim.retry_after("10.0.0.1") == 0 and lim.failure("1.2.3.4") == 1
+
+
+def test_100_failures_from_one_address_do_not_block_a_correct_sign_in_from_another(srv):
+    svr, api = srv
+    hdr = lambda ip: {"X-Forwarded-For": ip}                  # noqa: E731 - loopback is a trusted proxy in the harness
+    codes = []
+    for _ in range(100):
+        body = json.dumps({"email": "alice@example.com", "password": "wrong"}).encode()
+        codes.append(api.raw("POST", "/api/auth/sign-in/email", body, hdr("10.1.1.1"))[0])
+    assert codes[:5] == [401] * 5 and set(codes[5:]) == {429}              # A is locked after 5, before any KDF
+    good = json.dumps({"email": "alice@example.com", "password": PW_A}).encode()
+    status, body, headers = api.raw("POST", "/api/auth/sign-in/email", good, hdr("10.2.2.2"))
+    assert status == 200 and json.loads(body)["token"]
+    assert api.raw("POST", "/api/auth/sign-in/email", good, hdr("10.1.1.1"))[0] == 429      # A stays locked, B was never
+
+
+def test_client_address_trusts_forwarded_for_only_from_loopback_or_configured_proxies():
+    cfg = rb.rakazo_bridge_config(bridge_section(trusted_proxies=["172.18.0.0/16", "100.104.39.6"]))
+    bridge = rb.RakazoBridge(cfg, assistant=None, version="x")
+    assert bridge.client_address("127.0.0.1", "100.64.0.9") == "100.64.0.9"
+    assert bridge.client_address("172.18.0.1", "9.9.9.9, 100.64.0.9") == "100.64.0.9"      # the last (the gateway's) entry
+    assert bridge.client_address("100.104.39.6", "100.64.0.9") == "100.64.0.9"
+    assert bridge.client_address("100.64.0.77", "1.2.3.4") == "100.64.0.77"              # an ordinary device cannot choose
+    assert bridge.client_address("172.19.0.1", "1.2.3.4") == "172.19.0.1"
+    assert bridge.client_address("127.0.0.1", "not-an-ip") == "127.0.0.1"                # junk never becomes a key
+    assert bridge.client_address("127.0.0.1", "") == "127.0.0.1"
+    plain = rb.RakazoBridge(rb.rakazo_bridge_config(bridge_section()), assistant=None, version="x")
+    assert plain.client_address("172.18.0.1", "100.64.0.9") == "172.18.0.1"              # default: loopback only
+    for bad in ("nope", 5, ["10.0.0.0/99"]):
+        with pytest.raises(ValueError, match="trusted_proxies"):
+            rb.rakazo_bridge_config(bridge_section(trusted_proxies=bad if isinstance(bad, list) else [bad]))
+    with pytest.raises(ValueError, match="trusted_proxies"):
+        rb.rakazo_bridge_config(bridge_section(trusted_proxies="10.0.0.1"))
 
 
 # --------------------------------------------------------------------------------------------- tokens
@@ -286,7 +321,7 @@ def test_tokens_expire_are_revoked_and_capped_per_account():
     t3 = store.mint("a", "1.1.1.1")                           # evicts the oldest of account a only
     assert store.lookup(t1) is None and store.lookup(t2) == "a" and store.lookup(t3) == "a"
     assert store.lookup(other) == "b" and store.count("a") == 2 and store.count("b") == 1
-    assert store.revoke(t2) is True and store.lookup(t2) is None and store.revoke(t2) is False
+    assert store.revoke(t2) == (True, True) and store.lookup(t2) is None and store.revoke(t2) == (False, True)
     now[0] += 200
     assert store.lookup(t3) is None and store.valid(other) is False
 
@@ -420,8 +455,11 @@ def test_other_paths_and_verbs_still_behave_as_before(srv):
 def test_bad_framing_and_oversize_bodies_are_refused(srv):
     _, api = srv
     conn = http.client.HTTPConnection("127.0.0.1", api.port, timeout=5)
-    conn.request("POST", "/rpc/me", b"x" * (rb.MAX_BODY + 1), {"content-type": "application/json"})
-    assert conn.getresponse().status == 413
+    try:
+        conn.request("POST", "/rpc/me", b"x" * (rb.MAX_BODY + 1), {"content-type": "application/json"})
+        assert conn.getresponse().status == 413
+    except (BrokenPipeError, ConnectionResetError):
+        pass                                         # refused before the body was read: the socket closed on the sender
 
 
 # --------------------------------------------------------------------------------------------- procedures
@@ -931,3 +969,231 @@ def test_the_cli_validates_the_section_before_serving():
     from herdr_engineering import cli
     src = open(cli.__file__).read()
     assert "rakazo_bridge_config(cp.get(\"rakazo_bridge\"))" in src and "rakazo_bridge_dsn=dsn" in src
+
+
+# --------------------------------------------------------------------------------------------- revocation and the database
+class FlakyTable(FakeTokenTable):
+    def __init__(self):
+        super().__init__()
+        self.fail_delete, self.deletes = False, 0
+
+    def delete(self, digest):
+        self.deletes += 1
+        if self.fail_delete:
+            raise RuntimeError("db down")
+        super().delete(digest)
+
+
+def test_a_failed_database_delete_leaves_the_token_dead_and_is_retried_with_backoff():
+    now = [1000.0]
+    table = FlakyTable()
+    store = rb.TokenStore(10_000, 5, table, clock=lambda: now[0])
+    token = store.mint("a", "ip")
+    other = store.mint("a", "ip")
+    table.fail_delete = True
+    assert store.revoke(token) == (True, False)               # dead at once, but the row is still owed a delete
+    assert store.lookup(token) is None and store.valid(token) is False and store.pending_deletes == 1
+    assert rb.TokenStore.digest(token) in table.rows
+    calls = table.deletes
+    store.lookup(other)                                       # inside the backoff window: no new attempt
+    assert table.deletes == calls
+    now[0] += 6
+    store.lookup(other)                                       # the window passed: retried, fails, backs off longer
+    assert table.deletes == calls + 1 and store.pending_deletes == 1
+    now[0] += 6
+    store.lookup(other)
+    assert table.deletes == calls + 1                         # the doubled window (10 s) has not passed
+    table.fail_delete = False
+    now[0] += 6
+    store.lookup(other)
+    assert store.pending_deletes == 0 and rb.TokenStore.digest(token) not in table.rows
+    assert store.lookup(other) == "a"
+
+
+def test_evicted_and_expired_tokens_also_keep_a_tombstone_when_the_delete_fails():
+    now = [0.0]
+    table = FlakyTable()
+    store = rb.TokenStore(100, 1, table, clock=lambda: now[0])
+    first = store.mint("a", "ip")
+    table.fail_delete = True
+    second = store.mint("a", "ip")                            # evicts the first; its delete fails
+    assert store.lookup(first) is None and store.lookup(second) == "a" and store.pending_deletes == 1
+    now[0] = 500
+    assert store.lookup(second) is None and store.pending_deletes == 2      # expiry: same
+    table.fail_delete = False
+    now[0] = 1000
+    store.lookup("anything")
+    assert store.pending_deletes == 0 and table.rows == {}
+
+
+def test_sign_out_reports_a_failed_durable_delete_without_reviving_the_token(srv):
+    svr, api = srv
+    table = FlakyTable()
+    svr.rakazo.tokens._p = table
+    token = api.login()
+    table.fail_delete = True
+    status, body, _ = api.raw("POST", "/api/auth/sign-out", {}, {"authorization": f"Bearer {token}"})
+    assert status == 500 and "session record" in json.loads(body)["message"]
+    assert api.rpc("me", token=token)[0] == 401              # dead regardless
+    table.fail_delete = False
+    svr.rakazo.tokens._retry_at = 0
+    assert svr.rakazo.tokens._flush(force=True) and svr.rakazo.tokens.pending_deletes == 0
+
+
+def _stamp(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_tokens_valid_after_kills_older_tokens_whatever_the_database_holds():
+    from datetime import UTC, datetime, timedelta
+    table = FlakyTable()
+    old = rb.TokenStore(10_000, 5, table, clock=lambda: 1000.0)
+    stale, kept = old.mint("a", "ip"), old.mint("b", "ip")
+    table.fail_delete = True                                   # the revoking delete never reached the database
+    old.revoke(stale)
+    assert rb.TokenStore.digest(stale) in table.rows
+    # the process restarts: the tombstone is gone, the row is back, the YAML cut-off still kills it
+    table.fail_delete = False
+    reborn = rb.TokenStore(10_000, 5, table, clock=lambda: 2000.0, cutoffs={"a": 1500.0})
+    assert reborn.lookup(stale) is None and rb.TokenStore.digest(stale) not in table.rows
+    assert reborn.lookup(kept) == "b"                          # another account has no cut-off
+    fresh = reborn.mint("a", "ip")                             # signing in again after the cut-off works
+    assert reborn.lookup(fresh) == "a"
+    live = rb.TokenStore(10_000, 5, clock=lambda: 1000.0, cutoffs={"a": 900.0})
+    t = live.mint("a", "ip")
+    assert live.lookup(t) == "a"
+    live._cutoffs["a"] = 1100.0
+    live._clock = lambda: 1200.0
+    assert live.lookup(t) is None                             # created at 1000 < 1100: dead without any database
+    now = datetime.now(UTC)
+    cfg = rb.rakazo_bridge_config(bridge_section(accounts=[{**ACCOUNTS[0], "tokens_valid_after": _stamp(now - timedelta(days=1))}]))
+    assert abs(cfg["accounts"][0].tokens_valid_after - (now - timedelta(days=1)).timestamp()) < 2
+    for bad in ("yesterday", "2026-01-01T00:00:00", 5, _stamp(now + timedelta(days=2))):
+        with pytest.raises(ValueError, match="tokens_valid_after"):
+            rb.rakazo_bridge_config(bridge_section(accounts=[{**ACCOUNTS[0], "tokens_valid_after": bad}]))
+
+
+def test_the_cut_off_applies_through_the_server(make_server):
+    from datetime import UTC, datetime, timedelta
+    svr, api = make_server(bridge_section())
+    token = api.login()
+    assert api.rpc("me", token=token)[0] == 200
+    cutoff = datetime.now(UTC) + timedelta(seconds=1)          # the YAML says: nothing issued before this counts
+    svr.rakazo.tokens._cutoffs[svr.rakazo.accounts[0].account_id] = cutoff.timestamp()
+    time.sleep(1.2)
+    assert api.rpc("me", token=token)[0] == 401
+    assert api.rpc("me", token=api.login())[0] == 200          # a new sign-in is after the cut-off
+
+
+def test_database_calls_run_outside_the_lock_so_a_stuck_database_blocks_nobody_else():
+    gate, entered = threading.Event(), threading.Event()
+
+    class Blocking(FakeTokenTable):
+        block = False
+
+        def upsert(self, digest, rec):
+            if self.block:
+                entered.set()
+                gate.wait(10)
+                raise RuntimeError("timed out")
+            super().upsert(digest, rec)
+
+        def touch(self, digest, when, ip):
+            raise RuntimeError("db down")
+
+    table = Blocking()
+    store = rb.TokenStore(10_000, 5, table)
+    existing = store.mint("a", "ip")
+    table.block = True
+    outcome = []
+    worker = threading.Thread(target=lambda: outcome.append(_try(lambda: store.mint("a", "ip"))), daemon=True)
+    worker.start()
+    assert entered.wait(5)
+    t0 = time.time()
+    assert store.lookup(existing) == "a" and store.valid(existing) and store.count() >= 1       # not blocked
+    store.revoke("nothing")
+    assert time.time() - t0 < 1.0
+    gate.set()
+    worker.join(5)
+    assert isinstance(outcome[0], rb.TokenStoreError)
+    assert store.count("a") == 1                              # the failed mint left no usable token behind
+    store._tokens[rb.TokenStore.digest(existing)]["persisted"] = 0           # a failing touch is ignored
+    assert store.lookup(existing) == "a"
+
+
+def _try(fn):
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        return exc
+
+
+def test_postgres_connections_always_carry_timeouts_even_if_the_dsn_says_otherwise(monkeypatch):
+    import sys
+    import types
+    seen = {}
+
+    class Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, args=()): pass
+        def fetchall(self): return []
+
+    class Conn:
+        def cursor(self): return Cur()
+        def commit(self): pass
+        def close(self): pass
+
+    def connect(dsn, **kw):
+        seen["dsn"], seen["kw"] = dsn, kw
+        return Conn()
+    monkeypatch.setitem(sys.modules, "psycopg2", types.SimpleNamespace(connect=connect))
+    rb.PostgresTokenPersistence("postgresql://u:p@h/db?connect_timeout=999").delete("0" * 64)
+    assert seen["kw"]["connect_timeout"] == 3
+    assert "statement_timeout=3000" in seen["kw"]["options"] and "lock_timeout=3000" in seen["kw"]["options"]
+
+
+# --------------------------------------------------------------------------------------------- hostile input, bounds
+def test_hostile_bodies_get_a_generic_400_without_error_logs(srv, alice, caplog):
+    _, api = srv
+    caplog.set_level(logging.DEBUG)
+    deep = b"[" * 200_000
+    assert api.raw("POST", "/api/auth/sign-in/email", deep)[0] == 400
+    status, body, _ = api.raw("POST", "/rpc/me", deep, {"authorization": f"Bearer {alice}"})
+    assert status == 400 and json.loads(body)["json"]["code"] == "BAD_REQUEST"
+    assert api.raw("POST", "/rpc/me", b"\xff\xfe", {"authorization": f"Bearer {alice}"})[0] == 400
+    assert api.raw("POST", "/api/auth/sign-in/email", b"[1,2]")[0] == 400
+    assert api.raw("POST", "/api/auth/sign-in/email", b"9" * 5000)[0] == 400
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_runs_list_reads_the_store_under_its_lock_and_is_bounded(srv, alice):
+    svr, api = srv
+    bot = new_bot(api, alice)
+    store = svr.assistant.store
+    from herdr_engineering.control_plane.assistant import AssistantRun
+    user = svr.rakazo.accounts[0].principal_id
+    for i in range(40):
+        store.put_run(AssistantRun(run_id=f"run_x{i}", thread_id=bot["threadId"], assistant_id=bot["id"],
+                                   tenant_id="default", user_id=user, task_id=f"t{i}", state="completed"))
+    for i in range(60):
+        store.put_run(AssistantRun(run_id=f"run_a{i}", thread_id=bot["threadId"], assistant_id=bot["id"],
+                                   tenant_id="default", user_id=user, task_id=f"ta{i}", state="running"))
+    held = []
+    real = store.list_runs
+    store.list_runs = lambda **kw: (held.append(store._lock._is_owned()), real(**kw))[1]
+    assert len(api.ok("runs/list", {"filter": "recent"}, alice)["runs"]) == rb.MAX_RUN_ROWS
+    assert len(api.ok("runs/list", {"filter": "active"}, alice)["runs"]) == rb.MAX_ACTIVE_ROWS
+    assert held == [True, True]
+
+
+def test_bots_per_account_are_capped_with_a_rakazo_shaped_error(srv):
+    svr, api = srv
+    alice, bob = api.login(), api.login("bob@example.com", PW_B)
+    for i in range(rb.MAX_BOTS):
+        new_bot(api, alice, f"bot {i}")
+    status, body, _ = api.rpc("bots/create", {"name": "one too many"}, alice)
+    err = body["json"]
+    assert status == 400 and err["code"] == "BAD_REQUEST" and err["status"] == 400 and str(rb.MAX_BOTS) in err["message"]
+    assert len(api.ok("bots/list", token=alice)) == rb.MAX_BOTS
+    new_bot(api, bob)                                         # the cap is per account
