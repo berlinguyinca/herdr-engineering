@@ -42,8 +42,8 @@ def test_reads_answer_with_nothing_configured(srv, alice):
 
 def test_other_changes_are_refused_with_a_reason_and_lookups_are_404(srv, alice):
     _, api = srv
-    status, body = rpc(api, "vault/put", {"name": "k", "value": "v"}, alice)
-    assert status == 400 and "vault" in body["json"]["message"].lower()
+    status, body = rpc(api, "voice/connect", {"provider": "x"}, alice)
+    assert status == 400 and "voice" in body["json"]["message"].lower()
     assert rpc(api, "models/connect", {}, alice)[0] == 400
     assert rpc(api, "tickets/get", {"ticketId": "t"}, alice)[0] == 404
     assert rpc(api, "threads/clear", {"botId": "b"}, alice)[0] == 400

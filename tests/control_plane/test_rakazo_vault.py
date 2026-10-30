@@ -49,7 +49,9 @@ def test_put_list_reveal_remove_with_encryption_at_rest(keyed, alice, caplog):
     assert [m["name"] for m in listing] == ["netbird-key"] and "s3cret-value" not in json.dumps(listing)
     stored = json.dumps(svr.rakazo.prefs.items(svr.rakazo.accounts[0].account_id, "herdr", "vault"))
     assert "s3cret-value" not in stored and '"ct"' in stored                    # only ciphertext is stored
-    assert api.ok("vault/reveal", {"scope": "space", "name": "netbird-key"}, alice) == {"value": "s3cret-value"}
+    revealed = api.ok("vault/reveal", {"scope": "space", "name": "netbird-key"}, alice)
+    validate("vault/reveal", revealed)
+    assert revealed == {"value": "s3cret-value"}
     assert "s3cret-value" not in caplog.text
     assert api.ok("vault/list", {"scope": "account"}, alice) == []              # scopes are separate namespaces
     validate("vault/remove", api.ok("vault/remove", {"name": "netbird-key"}, alice))
