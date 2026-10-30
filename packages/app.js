@@ -861,9 +861,11 @@ async function viewSession(parts, revision) {
       <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>`;
     // The story shows how the agent began and any handoff in or out; without handoff data it is the start and the last report.
     const storyHost = document.getElementById('session-story');
-    const drawStory = tree => { if (storyHost.isConnected) storyHost.innerHTML = renderStory(agentStory(s, tree)); };
-    drawStory({});
-    client.getHandoffTree?.({signal: controller.signal}).then(drawStory).catch(() => { /* the story keeps start and last report */ });
+    let storyTree = {}, storyLinks = null;
+    const drawStory = () => { if (storyHost.isConnected) storyHost.innerHTML = renderStory(agentStory(s, storyTree, Date.now(), storyLinks)); };
+    drawStory();
+    client.getHandoffTree?.({signal: controller.signal}).then(tree => { storyTree = tree; drawStory(); }).catch(() => { /* the story keeps start and last report */ });
+    client.getSessionCommits?.(s.session_id, {signal: controller.signal}).then(links => { storyLinks = links; drawStory(); }).catch(() => { /* no link is shown rather than a guessed one */ });
     const relatedDispose = showRelated('session', s.session_id, null, relatedIntegrationLinks(s,'session',s.session_id), { sessionId: s.session_id });
     const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});
     let disposeAdvanced = null;
@@ -1015,7 +1017,7 @@ async function viewLlm(_parts, revision) {
   const f = { window: window_, ...filters };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet, previous, missions, queue, handoffs] = await Promise.all([
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet, previous, missions, queue, handoffs, spend] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }),
     client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
     client.llm('stats', { ...f, group: 'session' }),
@@ -1028,6 +1030,7 @@ async function viewLlm(_parts, revision) {
     client.llm('stats', { window: window_, project: filters.project, group: 'mission' }).catch(() => null),
     series('queue_p95').catch(() => null),
     client.listHandoffs().catch(() => null),
+    client.llm('spend', f).catch(() => null),
   ]);
   if (revision !== renderRevision) return NO_REFRESH;
   const names = {};
@@ -1037,7 +1040,7 @@ async function viewLlm(_parts, revision) {
     projects: projects.groups.map((g) => g.key),
     modelNames: [...new Set(models.groups.map((g) => g.key))],
     missionNames: (missions?.groups || []).map((g) => g.key),
-  }, { total, models, agents, problems, previous, missions, handoffs: handoffs?.handoffs, series: { requests, errors, ttft, speed, queue } });
+  }, { total, models, agents, problems, previous, missions, spend, handoffs: handoffs?.handoffs, series: { requests, errors, ttft, speed, queue } });
   if (fleet) root.insertAdjacentHTML('beforeend', usageStrip(fleet));
   addSnapshotChip();
   root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {

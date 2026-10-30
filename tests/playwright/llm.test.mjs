@@ -105,3 +105,34 @@ test('an empty install shows placeholders, not zeros', async () => {
     assert.ok(await page.getByText('No requests recorded in this window.').count() >= 1);
   }, { LLM_SEED: '0', INSPECTOR_SEED: '0' });
 });
+
+test('the Spend tab explains how to enable estimates when no price table is configured', async () => {
+  await withApp(async ({ page, base }) => {
+    await page.goto(`${base}/#/llm`);
+    await page.locator('.llm-tile').first().waitFor({ timeout: 8000 });
+    await page.locator('[data-llm-switch="llm-tab"] .llm-tabs label', { hasText: 'Spend' }).click();
+    const off = page.locator('[data-llm-spend="off"]');
+    await off.waitFor();
+    assert.match(await off.innerText(), /no price table is configured/);
+    assert.match(await page.locator('.llm-code').innerText(), /control_plane:/);
+  });
+});
+
+test('with a price table the Spend tab shows a labelled estimate per model and day, and lists unpriced models', async () => {
+  await withApp(async ({ page, base }) => {
+    await page.goto(`${base}/#/llm`);
+    await page.locator('.llm-tile').first().waitFor({ timeout: 8000 });
+    await page.locator('[data-llm-switch="llm-tab"] .llm-tabs label', { hasText: 'Spend' }).click();
+    const on = page.locator('[data-llm-spend="on"]');
+    await on.waitFor();
+    const text = await on.innerText();
+    assert.match(text, /Estimate, not a bill/);
+    assert.match(text, /Estimated total: \$1\.35/);      // 1501 input x $100/M + 6010 output x $200/M
+    const panel = page.locator('.llm-section:has([data-llm-spend="on"])');
+    assert.match(await panel.innerText(), /By day/);
+    assert.equal(await panel.locator('h3.llm-sub').count(), 2);
+    assert.match(await panel.locator('[data-llm-unpriced]').innerText(), /legacy-model/);
+    await page.setViewportSize({ width: 390, height: 800 });
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'the spend tab fits a phone');
+  }, { USAGE_PRICES_SEED: '1' });
+});

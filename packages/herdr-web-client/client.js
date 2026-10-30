@@ -303,6 +303,11 @@ export class HerdrClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
   }
 
+  // Commits and pull requests the server can attribute to this agent without guessing (state: linked | ambiguous | none).
+  getSessionCommits(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/commits`, { signal });
+  }
+
   getAgentSummary(id, { signal } = {}) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { signal });
   }
@@ -597,9 +602,9 @@ export class HerdrClient {
     });
   }
 
-  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode } = {}) {
+  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode, test } = {}) {
     return this.request('/api/v1/ci/debug', {
-      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'?{mode}:{}) }, signal,
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'||mode==='test'?{mode}:{}), ...(mode==='test'&&test?{test}:{}) }, signal,
     });
   }
 

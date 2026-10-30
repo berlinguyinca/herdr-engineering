@@ -5,6 +5,13 @@ import {createServer} from 'node:http';
 import { HerdrClient, ApiError } from './client.js';
 import { connectEvents } from './events.js';
 
+test('getSessionCommits asks for the encoded session commit links', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async url => { calls.push(url); return { ok: true, status: 200, text: async () => '{}' }; } });
+  await client.getSessionCommits('a:b');
+  assert.deepEqual(calls, ['/api/v1/sessions/a%3Ab/commits']);
+});
+
 test('agent summary and rename requests preserve encoded identity and version', async () => {
   const calls = [];
   const client = new HerdrClient('', { fetchImpl: async (url, opts) => {

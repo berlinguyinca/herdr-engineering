@@ -3165,6 +3165,11 @@ def _cmd_cp_web(args) -> int:
         usage_retention = usage_retention_config(cp.get("llm_proxy"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.usage_spend import usage_prices_config
+    try:
+        usage_prices = usage_prices_config(cp.get("usage"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.attention_inbox import attention_config
     try:
         attention = attention_config(cp.get("attention"))
@@ -3338,7 +3343,7 @@ def _cmd_cp_web(args) -> int:
                              assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
                              single_operator=cp.get("single_operator") is True,
-                             usage_retention=usage_retention, attention=attention,
+                             usage_retention=usage_retention, usage_prices=usage_prices, attention=attention,
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
@@ -3692,7 +3697,8 @@ def _fabric_compaction_settings(cp):
         enabled=raw.get("enabled") is True, dry_run=raw.get("dry_run") is not False,
         interval_seconds=number("interval_seconds", 3600, 60), min_age_days=number("min_age_days", 2, 1),
         batch_rows=int(number("batch_rows", 250_000, 1000)), archive_retention_days=retention,
-        rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False)
+        rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
+        keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
 
 
 def _worker_fabric_compactor(fleet_config_path):
