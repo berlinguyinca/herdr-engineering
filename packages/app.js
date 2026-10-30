@@ -861,9 +861,11 @@ async function viewSession(parts, revision) {
       <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>`;
     // The story shows how the agent began and any handoff in or out; without handoff data it is the start and the last report.
     const storyHost = document.getElementById('session-story');
-    const drawStory = tree => { if (storyHost.isConnected) storyHost.innerHTML = renderStory(agentStory(s, tree)); };
-    drawStory({});
-    client.getHandoffTree?.({signal: controller.signal}).then(drawStory).catch(() => { /* the story keeps start and last report */ });
+    let storyTree = {}, storyLinks = null;
+    const drawStory = () => { if (storyHost.isConnected) storyHost.innerHTML = renderStory(agentStory(s, storyTree, Date.now(), storyLinks)); };
+    drawStory();
+    client.getHandoffTree?.({signal: controller.signal}).then(tree => { storyTree = tree; drawStory(); }).catch(() => { /* the story keeps start and last report */ });
+    client.getSessionCommits?.(s.session_id, {signal: controller.signal}).then(links => { storyLinks = links; drawStory(); }).catch(() => { /* no link is shown rather than a guessed one */ });
     const relatedDispose = showRelated('session', s.session_id, null, relatedIntegrationLinks(s,'session',s.session_id), { sessionId: s.session_id });
     const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});
     let disposeAdvanced = null;

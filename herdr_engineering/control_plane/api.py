@@ -2976,6 +2976,13 @@ def _make_handler(server, public=False, operator=False):
                 return self._inspector_global_get(parts)
             if resource == "sessions" and len(parts) > 5 and parts[5] == "inspector":
                 return self._inspector_get(parts)
+            if resource == "sessions" and len(parts) == 6 and parts[5] == "commits":
+                from .session_commits import session_commits
+                session = r.get_session(parts[4])
+                if session is None:
+                    return self._json({"error": "agent not found"}, 404)
+                view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
+                return self._json(session_commits(session, r.list_sessions(), view, pull_requests=r.list_pull_requests()))
             if resource == "sessions" and len(parts) == 6 and parts[5] == "summary":
                 if r.get_session(parts[4]) is None:
                     return self._json({"error": "agent not found"}, 404)
