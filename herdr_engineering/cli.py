@@ -3177,6 +3177,11 @@ def _cmd_cp_web(args) -> int:
         usage_prices = usage_prices_config(cp.get("usage"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.agent_evolution import evolution_config
+    try:
+        evolution = evolution_config(cp.get("evolution"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.attention_inbox import attention_config
     try:
         attention = attention_config(cp.get("attention"))
@@ -3356,7 +3361,7 @@ def _cmd_cp_web(args) -> int:
                              assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
                              single_operator=cp.get("single_operator") is True,
-                             usage_retention=usage_retention, usage_prices=usage_prices, attention=attention,
+                             usage_retention=usage_retention, usage_prices=usage_prices, evolution=evolution, attention=attention,
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
@@ -3706,7 +3711,8 @@ def _assistant_config(cp):
     if not isinstance(pa, dict):
         return None
     if cp.get("single_operator") is True:
-        pa = {**pa, "actions": {**(pa.get("actions") or {}), "allow_self_approval": True}}
+        actions = pa.get("actions")
+        pa = {**pa, "actions": {**(actions if isinstance(actions, dict) else {}), "allow_self_approval": True}}
     return {"personal_assistant": pa}
 
 
