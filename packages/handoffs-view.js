@@ -29,6 +29,8 @@ const ago = (iso) => {
   const m = Math.max(0, Math.round((Date.now() - t) / 60000));
   return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`;
 };
+const agentName = (side) => (side?.agent_id ? `@${side.agent_id}` : side?.session_id || side?.harness || 'unknown');
+const clip = (t, n) => { const x = String(t || '').replace(/\s+/g, ' ').trim(); return x.length > n ? `${x.slice(0, n - 1)}…` : x; };
 const who = (side) => `${side?.harness || 'unknown'}${side?.agent_id ? ` @${side.agent_id}` : side?.session_id ? ` ${side.session_id}` : ''}`;
 
 export function workspaceCard(w, open) {
@@ -48,15 +50,17 @@ export function handoffCard(h) {
 const list = (items) => (items && items.length ? `<ul>${items.map((i) => `<li>${esc(typeof i === 'string' ? i : JSON.stringify(i))}</li>`).join('')}</ul>` : '<p class="hd-muted">Nothing recorded.</p>');
 
 export function detailHtml(row, chain) {
-  const hops = (chain?.more_before ? '<span class="hd-muted" title="Earlier handoffs not shown">…</span><span aria-hidden="true">›</span>' : '') + (chain?.chain || []).map((h, i) => `<button type="button" class="hd-hop${i === chain.position ? ' hd-hop--here' : ''}" data-handoff="${esc(h.handoff_id)}"
-    ${i === chain.position ? 'aria-current="true"' : ''}>${esc(h.source?.harness || '?')} → ${esc(h.target?.harness || '?')}<small>${esc(h.state)}</small></button>`).join('<span aria-hidden="true">›</span>') + (chain?.more_after ? '<span aria-hidden="true">›</span><span class="hd-muted" title="Later handoffs not shown">…</span>' : '');
+  const hopItem = (h, i) => `<li${i === chain.position ? ' aria-current="step"' : ''}><button type="button" class="hd-hop${i === chain.position ? ' hd-hop--here' : ''}" data-handoff="${esc(h.handoff_id)}"
+    ${i === chain.position ? 'aria-current="true"' : ''}><span class="hd-hop__who">${esc(agentName(h.source))} → ${esc(agentName(h.target))}</span><span class="hd-hop__state">${esc(String(h.state).replace('_', ' '))}</span>
+    <small>${esc(clip(h.goal, 70))}${h.updated_at ? ` · ${esc(ago(h.updated_at))}` : ''}</small></button></li>`;
+  const hops = chain?.chain?.length > 1 ? (chain.more_before ? '<li class="hd-muted hd-hop-more">… earlier handoffs not shown</li>' : '') + chain.chain.map(hopItem).join('') + (chain.more_after ? '<li class="hd-muted hd-hop-more">… later handoffs not shown</li>' : '') : '';
   const history = (row.history || []).map((s) => `<li>${esc(s.state)} <small>${esc(ago(s.at))}${s.actor?.id ? ` · ${esc(s.actor.id)}` : ''}</small></li>`).join('');
   const hint = row.target?.model_hint;
   return `<section class="hd-detail" data-handoff-detail-body aria-label="Handoff ${esc(row.handoff_id)}">
     <header><h2>${esc(who(row.source))} → ${esc(who(row.target))}</h2>
     <p><span class="hd-badge">${esc(String(row.state).replace('_', ' '))}</span> ${esc(SENTENCE[row.state] || '')} · updated ${esc(ago(row.updated_at))}${hint ? ` · model hint <code>${esc(hint)}</code>` : ''}</p>
     ${row.mission_id ? `<p class="hd-muted">Mission <a href="#/missions/${encodeURIComponent(row.mission_id)}">${esc(row.mission_id)}</a></p>` : ''}</header>
-    ${hops ? `<nav class="hd-chain" aria-label="Handoff chain">${hops}</nav>` : ''}
+    ${hops ? `<h3>Where this sits in the work</h3><ol class="hd-chain" aria-label="Handoff chain, oldest first">${hops}</ol>` : ''}
     <h3>Goal</h3><p class="hd-goal">${esc(row.goal || '')}</p>
     <div class="hd-cols"><div><h3>Accomplished</h3>${list(row.completed)}</div><div><h3>Missing / what happens next</h3>${list(row.remaining)}</div></div>
     ${(row.decisions || []).length ? `<h3>Decisions</h3>${list(row.decisions)}` : ''}
@@ -83,6 +87,27 @@ export function flowFromPage(rows) {
     if (!latest.has(key)) latest.set(key, h.handoff_id);          // rows arrive newest first
   }
   return { flow: { nodes: [...nodes.values()], edges: [...edges.values()], spawns: [] }, latest };
+}
+
+const routeKey = (h) => `${agentName(h.source)} → ${agentName(h.target)}`;
+
+// One row per from → to pair: how many handoffs, in which states, and the newest one. Readable at any size, unlike a drawn graph.
+export function routeTable(rows) {
+  const routes = new Map();
+  for (const h of rows) {
+    const key = routeKey(h);
+    const r = routes.get(key) || { key, from: agentName(h.source), to: agentName(h.target), total: 0, states: {}, newest: h.handoff_id, attention: 0 };
+    r.total += 1; r.states[h.state] = (r.states[h.state] || 0) + 1; if (h.attention) r.attention += 1;
+    routes.set(key, r);
+  }
+  return [...routes.values()].sort((a, b) => b.attention - a.attention || b.total - a.total || a.key.localeCompare(b.key));
+}
+
+export function routesHtml(routes, active, limit = 12) {
+  const rows = routes.slice(0, limit).map((r) => `<li><button type="button" class="hd-route${r.key === active ? ' hd-route--on' : ''}" data-route="${esc(r.key)}" aria-pressed="${r.key === active}">
+    <span class="hd-route__who">${esc(r.from)} → ${esc(r.to)}</span><span class="hd-route__n">${r.total}</span>
+    <span class="hd-route__states">${Object.entries(r.states).map(([s, n]) => `<span class="hd-chip hd-chip--${esc(s)}">${esc(s.replace('_', ' '))} ${n}</span>`).join(' ')}</span></button></li>`).join('');
+  return `<h3 class="hd-routes__title">Who hands work to whom <small>(${routes.length} route${routes.length === 1 ? '' : 's'}${routes.length > limit ? `, top ${limit}` : ''}; pick one to filter)</small></h3><ul class="hd-routes" data-handoff-routes>${rows}</ul>`;
 }
 
 export function mountHandoffs(container, client, { freshness = () => null, open = '' } = {}) {
@@ -118,10 +143,32 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
     if (hit && container.contains(hit)) { void openHandoff(hit.dataset.handoff); return; }
     const head = ev.target.closest?.('.hd-ws__head');
     if (head) void toggleWorkspace(head.closest('[data-workspace]'));
+    const route = ev.target.closest?.('[data-route]');
+    if (route) { const card = route.closest('[data-workspace]'); card.__route = card.__route === route.dataset.route ? null : route.dataset.route; paint(card); return; }
+    if (ev.target.closest?.('[data-route-clear]')) { const card = ev.target.closest('[data-workspace]'); card.__route = null; paint(card); return; }
     const more = ev.target.closest?.('[data-handoff-more]');
     if (more) void loadPage(more.closest('[data-workspace]'), more.dataset.cursor);
   });
 
+  const SMALL_GRAPH = 6;       // routes a drawn graph can still show legibly
+  const paint = (card) => {
+    const body = card.querySelector('.hd-ws__body');
+    const all = card.__rows || [], active = card.__route || null;
+    const routes = routeTable(all);
+    const shown = active ? all.filter((h) => routeKey(h) === active) : all;
+    const small = routes.length <= SMALL_GRAPH;
+    const overview = small ? '<div class="cx-flow-box" data-handoff-graph></div>' : routesHtml(routes, active);
+    const bar = active ? `<p class="hd-filter" data-handoff-filter>Showing <strong>${esc(active)}</strong> · ${shown.length} loaded handoff${shown.length === 1 ? '' : 's'} <button type="button" data-route-clear>Show all</button></p>` : '';
+    body.innerHTML = `${overview}${bar}<div class="hd-rows">${shown.map(handoffCard).join('') || '<p class="hd-muted">No handoffs.</p>'}</div>
+      ${card.__next ? `<button type="button" data-handoff-more data-cursor="${esc(card.__next)}">Load more</button>${active ? '<small class="hd-muted"> Filter applies to handoffs loaded so far.</small>' : ''}` : ''}`;
+    if (small) {
+      const { flow, latest } = flowFromPage(all);
+      renderFlow(body.querySelector('[data-handoff-graph]'), flow, {
+        onEdge: (e) => e && latest.get(e.key) && openHandoff(latest.get(e.key)),
+        onNode: (n) => { const h = all.find((r) => [r.source, r.target].some((x) => (x?.agent_id || x?.session_id) === n?.id)); if (h) void openHandoff(h.handoff_id); },
+      });
+    }
+  };
   const loadPage = async (card, cursor) => {
     const body = card.querySelector('.hd-ws__body');
     const ws = card.dataset.workspace;
@@ -131,13 +178,8 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
       if (disposed) return;
       const rows = Array.isArray(page.handoffs) ? page.handoffs : [];
       card.__rows = (cursor ? card.__rows || [] : []).concat(rows);
-      const { flow, latest } = flowFromPage(card.__rows);
-      body.innerHTML = `<div class="cx-flow-box" data-handoff-graph></div><div class="hd-rows">${card.__rows.map(handoffCard).join('') || '<p class="hd-muted">No handoffs.</p>'}</div>
-        ${page.next_cursor ? `<button type="button" data-handoff-more data-cursor="${esc(page.next_cursor)}">Load more</button>` : ''}`;
-      renderFlow(body.querySelector('[data-handoff-graph]'), flow, {
-        onEdge: (e) => e && latest.get(e.key) && openHandoff(latest.get(e.key)),
-        onNode: (n) => { const h = card.__rows.find((r) => [r.source, r.target].some((s) => (s?.agent_id || s?.session_id) === n?.id)); if (h) void openHandoff(h.handoff_id); },
-      });
+      card.__next = page.next_cursor || null;
+      paint(card);
     } catch (error) {
       if (!disposed) body.innerHTML = `<p class="hd-muted">Unable to load this workspace: ${esc(error.message)}</p>`;
     }

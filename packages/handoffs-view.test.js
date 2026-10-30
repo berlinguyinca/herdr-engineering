@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage } from './handoffs-view.js';
+import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml } from './handoffs-view.js';
 
 test('summarizes handoff lineage without trusting goal text as markup', () => {
   const summary = handoffGraphSummary({
@@ -60,4 +60,22 @@ test('a cut chain says so on both ends, and the state badge reads as words', () 
     { position: 1, more_before: true, more_after: true, chain: [hop('a'), hop('b'), hop('c')] });
   assert.equal((html.match(/…/g) || []).length, 2);
   assert.match(html, /<span class="hd-badge">in progress<\/span>/);
+});
+
+const row = (id, a, b, state = 'completed', extra = {}) => ({ handoff_id: id, state, source: { harness: 'pi', agent_id: a }, target: { harness: 'pi', agent_id: b }, ...extra });
+
+test('routes are one row per from-to pair, attention first, then busiest', () => {
+  const routes = routeTable([row('1', 'a', 'b'), row('2', 'a', 'b', 'queued'), row('3', 'c', 'd'), row('4', 'c', 'd'), row('5', 'c', 'd'), row('6', 'x', 'y', 'failed', { attention: true })]);
+  assert.deepEqual(routes.map((r) => [r.key, r.total]), [['@x → @y', 1], ['@c → @d', 3], ['@a → @b', 2]]);
+  assert.deepEqual(routes[2].states, { completed: 1, queued: 1 });
+  const html = routesHtml(routes, '@c → @d', 2);
+  assert.match(html, /3 routes, top 2/); assert.match(html, /aria-pressed="true"/); assert.ok(!html.includes('@a → @b'));
+});
+
+test('a chain reads as a labelled path with agents, goals and the current step marked', () => {
+  const hop = (id, a, b, goal) => ({ ...row(id, a, b), goal, updated_at: '2026-01-01T00:00:00Z' });
+  const html = detailHtml({ handoff_id: 'b', state: 'completed', goal: 'g', source: {}, target: {}, completed: [], remaining: [], history: [] },
+    { position: 1, chain: [hop('a', 'one', 'two', 'first leg'), hop('b', 'two', 'three', 'second leg'), hop('c', 'three', 'four', HOSTILE)] });
+  assert.match(html, /<ol class="hd-chain"/); assert.match(html, /@one → @two/); assert.match(html, /first leg/);
+  assert.equal((html.match(/aria-current="step"/g) || []).length, 1); assert.ok(!html.includes('<img'));
 });

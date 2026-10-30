@@ -75,3 +75,22 @@ test('a deep link opens that handoff straight away, so a PR trail or an agent st
     assert.equal(await page.locator('.hd-chain .hd-hop').count(), 3);
   });
 });
+
+test('a workspace with many routes lists who hands to whom, and picking one filters the handoffs', async () => {
+  await withPage(async (page, base) => {
+    const pairs = Array.from({ length: 9 }, (_, i) => [`a${i}`, `b${i}`]);
+    const rows = pairs.flatMap(([a, b], i) => [sum(`w${i}x`, { workspace: 'wide', source: { harness: 'pi', agent_id: a }, target: { harness: 'pi', agent_id: b } }),
+      ...(i === 0 ? [sum('w0y', { workspace: 'wide', source: { harness: 'pi', agent_id: a }, target: { harness: 'pi', agent_id: b } })] : [])]);
+    await boot(page, base, '/handoffs', (p, url) => p === '/api/v1/handoffs/overview' ? { ...OVERVIEW, workspaces: [{ workspace: 'wide', total: rows.length, states: { queued: rows.length }, attention: 0, stalled: 0, latest_at: '2026-01-01T00:00:00Z' }], attention: [] }
+      : p === '/api/v1/handoffs' ? { handoffs: rows, next_cursor: null } : api([])(p, url));
+    await page.locator('[data-workspace="wide"] .hd-ws__head').click();
+    await until(() => page.locator('[data-handoff-routes] .hd-route').count().then((n) => n === 9), 'one row per route');
+    assert.equal(await page.locator('[data-workspace="wide"] [data-handoff-graph]').count(), 0, 'no unreadable graph at this size');
+    assert.equal(await page.locator('[data-workspace="wide"] .hd-row').count(), 10);
+    await page.locator('[data-route="@a0 → @b0"]').click();
+    await until(() => page.locator('[data-workspace="wide"] .hd-row').count().then((n) => n === 2), 'filtered to the route');
+    assert.match(await page.locator('[data-handoff-filter]').innerText(), /@a0 → @b0/);
+    await page.locator('[data-route-clear]').click();
+    await until(() => page.locator('[data-workspace="wide"] .hd-row').count().then((n) => n === 10), 'show all');
+  });
+});
