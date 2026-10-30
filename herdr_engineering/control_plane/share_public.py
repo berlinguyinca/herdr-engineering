@@ -45,7 +45,7 @@ CHUNK_BYTES = 1024 * 1024
 WRITE_SLICE_BYTES = 64 * 1024
 EVENTS_MAX_BYTES = 8 * 1024 * 1024
 STATE_MAX_BYTES = 64 * 1024 * 1024
-DENIED_PER_MINUTE = 20          # denied events per reason per minute (a scanner cannot fill the events file)
+DENIED_PER_MINUTE = 20          # denied events per (share, reason) per minute (a scanner cannot fill the events file)
 OPENED_PER_MINUTE = 60          # opened events per share per minute
 LOG_PER_MINUTE = 20             # log lines per reason per minute
 MAX_CONNECTIONS = 128
@@ -144,7 +144,7 @@ class EventLog:
             self.append(share_id, "opened", actor, detail)
 
     def denied(self, share_id: str, actor: str, reason: str) -> None:
-        if self._denied.allow(reason):
+        if self._denied.allow("%s\x00%s" % (share_id, reason)):   # per share: one link cannot silence the others
             self.append(share_id, "denied", actor, {"reason": reason})
 
     def append(self, share_id: str, kind: str, actor: str, detail: dict) -> None:
@@ -153,11 +153,12 @@ class EventLog:
                            sort_keys=True, ensure_ascii=True) + "\n").encode("ascii")
         with self._lock:
             try:
-                fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o640)
+                fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644)
             except OSError:
                 self._drop("events file unavailable")
                 return
             try:
+                self._readable(fd)
                 if os.fstat(fd).st_size + len(line) > EVENTS_MAX_BYTES:
                     self._drop("events file is full")
                     return
@@ -167,6 +168,16 @@ class EventLog:
                 self._drop("events file write failed")
             finally:
                 os.close(fd)
+
+    @staticmethod
+    def _readable(fd: int) -> None:
+        """The ingesting worker runs as another uid: make the file 0644 whatever the umask or an older mode was."""
+        try:
+            st = os.fstat(fd)
+            if st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) != 0o644:
+                os.fchmod(fd, 0o644)
+        except PermissionError:
+            pass
 
     def _drop(self, why: str) -> None:
         self.dropped += 1
@@ -471,8 +482,16 @@ def _content_headers(name: str, etag: str) -> list[tuple[str, str]]:
 
 
 def _announces_body(handler) -> bool:
-    length = handler.headers.get("Content-Length")
-    return bool(handler.headers.get("Transfer-Encoding")) or (length is not None and length.strip() != "0")
+    """True unless the request provably has no body: no Transfer-Encoding header at all (even empty), and either no
+    Content-Length or exactly one whose value is exactly ``0``. Every occurrence is checked (``get_all``), so a
+    duplicate or conflicting header cannot smuggle a second request past the close-on-body rule."""
+    headers = handler.headers
+    if headers is None:
+        return True
+    if headers.get_all("Transfer-Encoding"):
+        return True
+    lengths = headers.get_all("Content-Length") or []
+    return bool(lengths) and lengths != ["0"]
 
 
 def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True, actor: str = "public") -> bool:

@@ -574,3 +574,66 @@ def test_state_index_is_built_once_per_state_file(env, monkeypatch):
     state = load_state(env.root, TOKEN, env.clock[0])
     state["entry"] = "mutated"
     assert load_state(env.root, TOKEN, env.clock[0])["entry"] == "index.html"
+
+
+# ----------------------------------------------------------------------------- fix round 1
+
+SMUGGLE_SECOND = b"GET /s/%s/f/index.html HTTP/1.1\r\nHost: x\r\n\r\n" % TOKEN.encode()
+
+
+@pytest.mark.parametrize("framing", [
+    b"Content-Length: 0\r\nContent-Length: %d\r\n\r\n" % len(SMUGGLE_SECOND),
+    b"Transfer-Encoding:\r\nTransfer-Encoding: chunked\r\n\r\n",
+    b"Transfer-Encoding: chunked\r\n\r\n",
+    b"Content-Length: 5\r\n\r\nhello",
+    b"Content-Length: %d\r\nExpect: 100-continue\r\n\r\n" % len(SMUGGLE_SECOND),
+    b"Content-Length: 00\r\n\r\n",
+    b"Content-Length:  0 \r\nContent-Length: 0\r\n\r\n",
+])
+def test_body_framing_never_yields_a_second_request(env, framing):
+    first = b"GET " + f("index.html").encode() + b" HTTP/1.1\r\nHost: x\r\n" + framing
+    out = env.raw(first + SMUGGLE_SECOND)   # raw() reads until the server closes
+    assert out.count(b"HTTP/1.1 ") == 1, out[:300]
+    assert out.startswith(b"HTTP/1.1 200 ")
+    assert b"\r\nConnection: close\r\n" in out.split(b"\r\n\r\n", 1)[0] + b"\r\n"
+    assert b"100 Continue" not in out
+
+
+def test_single_zero_content_length_keeps_alive(env):
+    out = env.raw(b"GET " + f("index.html").encode() + b" HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+                  + SMUGGLE_SECOND.replace(b"\r\n\r\n", b"\r\nConnection: close\r\n\r\n"))
+    assert out.count(b"HTTP/1.1 200 ") == 2
+
+
+def test_events_file_is_world_readable_despite_umask(env):
+    old = os.umask(0o027)
+    try:
+        env.request("GET", f("index.html"))
+    finally:
+        os.umask(old)
+    assert env.events.exists()
+    assert env.events.stat().st_mode & 0o777 == 0o644
+
+
+def test_existing_0640_events_file_is_made_0644(env):
+    env.events.write_bytes(b"")
+    os.chmod(env.events, 0o640)
+    env.request("GET", f("index.html"))
+    assert env.events.stat().st_mode & 0o777 == 0o644
+    assert env.event_lines()
+
+
+def test_denied_budget_is_per_share(env):
+    other = {"index.html": b"<p>b</p>"}
+    build_bundle(env.root / "shr-2", [(n, _sha(b), len(b), [b]) for n, b in other.items()],
+                 entry=None, limits=BundleLimits(1 << 20, 10))
+    write_state(env.root, _sha(OTHER_TOKEN.encode()), dict(
+        env.state, share_id="shr-2", entry="index.html",
+        files=[{"name": "index.html", "sha256": _sha(other["index.html"]), "size": len(other["index.html"]),
+                "content_type": "text/html; charset=utf-8"}]))
+    for _ in range(share_public.DENIED_PER_MINUTE + 10):
+        env.request("GET", f("%2e%2e"))            # share A floods bad_path
+    env.request("GET", "/s/%s/f/%%2e%%2e" % OTHER_TOKEN)
+    denied = [json.loads(raw) for raw in env.event_lines() if json.loads(raw)["kind"] == "denied"]
+    assert sum(1 for d in denied if d["share_id"] == "shr-1") == share_public.DENIED_PER_MINUTE
+    assert [d["detail"]["reason"] for d in denied if d["share_id"] == "shr-2"] == ["bad_path"]
