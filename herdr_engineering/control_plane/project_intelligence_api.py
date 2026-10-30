@@ -50,6 +50,8 @@ class IntelligenceRoutes:
         self.ci_watch_status_fn = None            # set by the server: the scheduled CI watch's last-run summary
         self.last_reconcile: dict | None = None   # counters of the latest pass; a reason when it could not run
         self._executor = None
+        from .intel_ledger import Ledger
+        self.ledger = Ledger()
         self._decide_lock = threading.Lock()    # one decision at a time: approve/reject cannot interleave
         from .intel_webhook import ReplayGuard
         self._replay = ReplayGuard()
@@ -207,8 +209,29 @@ class IntelligenceRoutes:
             raise pi.NotFound("the repository is outside this user's project scope")
         p = self.board.request(org_id=viewer.org_id, requester=user_id, action=action,
                                payload=dict(payload), resource_version=1, idempotency_key=idempotency_key[:64])
+        if action == "ci_rerun" and repo and self._auto_ok(raw, cfg, action, repo):
+            self._auto_run(p, viewer)
         return {"id": p.id, "expires_at": p.expires_at.isoformat(), "state": p.state,
                 "payload_sha256": p.payload_sha256}
+
+    def _auto_ok(self, raw: dict, cfg: dict, action: str, repo: str) -> bool:
+        return (cfg["execute"] and cfg["suggest"] and not cfg["kill_switch"]
+                and self.ledger.effective(raw, action, repo) == "auto" and self.ledger.may_auto_now(action, repo))
+
+    def _auto_run(self, p, viewer) -> None:
+        """Approve and run one proposal under the operator's standing YAML policy. Same exact-payload approval and
+        executor as a human decision; the approver is recorded as ``ledger:auto`` and the outcome feeds the ledger."""
+        if p.state != "awaiting_approval":
+            return
+        try:
+            with self._decide_lock:
+                self.board.approve(p.id, approver="ledger:auto", org_id=viewer.org_id, payload_sha256=p.payload_sha256,
+                                   resource_version=p.resource_version, allow_self=True)
+                self.store.record_audit({"action": "proposal_approved", "id": p.id, "actor": "ledger:auto"})
+            done = self.executor.execute(p.id, viewer.org_id)
+        except (pi.IntelligenceError, pi.Conflict, pi.NotFound):
+            return                       # stays a proposal for a human; nothing ran
+        self.ledger.record(done.action, str(done.payload.get("repo")), done.state, auto=True)
 
     def assistant_viewer(self, tenant_id: str, user_id: str) -> pi.Viewer | None:
         """The scope of an assistant user: only YAML ``assistant_viewers: {"<tenant>/<user>": {...}}``. None when the
@@ -251,8 +274,12 @@ class IntelligenceRoutes:
                 p = self.board.approve(proposal_id, approver=actor, org_id=viewer.org_id, payload_sha256=payload_sha256,
                                        resource_version=resource_version, allow_self=single)
             self.store.record_audit({"action": f"proposal_{p.state}", "id": p.id, "actor": actor})
+        if p.state == "refused":
+            self.ledger.record(p.action, str(p.payload.get("repo")), "rejected")
         if p.state == "approved" and execute:
             p = self.executor.execute(p.id, viewer.org_id)     # no-op unless the execute flag is on
+            if p.state in ("executed", "failed"):
+                self.ledger.record(p.action, str(p.payload.get("repo")), p.state)
         return p
 
     def mark_failed(self, proposal_id: str, org_id: str, reason: str, *, only: tuple[str, ...]) -> bool:
@@ -305,6 +332,7 @@ class IntelligenceRoutes:
                     if self.poll_status_fn is not None:
                         poller.update(self.poll_status_fn())  # fixed reason strings (permission, not_configured ...)
                     out["poller"] = poller
+                    out["ledger"] = self.ledger.status(raw)
                     if self.ci_watch_status_fn is not None:
                         out["ci_watch"] = self.ci_watch_status_fn()   # counts and fixed reasons only
                 return 200, out
