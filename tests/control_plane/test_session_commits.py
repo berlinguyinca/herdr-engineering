@@ -101,7 +101,7 @@ def test_an_exact_reported_commit_links_even_on_a_shared_branch():
 
 
 def test_an_active_session_window_runs_to_now():
-    out = link(session(status="active", end=10), [], view(run(1, 200)))
+    out = link(session(status="active", start=200, end=290), [], view(run(1, 295)))
     assert [c["run_number"] for c in out["commits"]] == [1]
 
 
@@ -119,3 +119,53 @@ def test_unparseable_times_and_empty_views_do_not_raise():
     bad = view({"run_number": 1, "provider_repo_id": 7, "branch": "feat/x", "created_at": "junk"})
     assert link(session(), [], bad)["commits"] == []
 
+
+
+def test_an_active_status_that_stopped_reporting_does_not_extend_to_now():
+    stale = session(status="idle", end=10)                       # last report 290 minutes before NOW
+    assert link(stale, [], view(run(1, 200)))["commits"] == []
+    newer = session("s2", start=300 - 40, end=290)
+    assert link(newer, [stale], view(run(2, 280)))["state"] == "linked"      # the idle old session is not a rival
+
+
+def test_an_exact_commit_must_still_be_inside_the_window():
+    base = "b" * 40
+    old, shared = run(1, -600, revision=base), run(2, 20, revision=base)
+    out = link(session(commit=base), [], view(old, shared))
+    assert [(c["run_number"], c["match"]) for c in out["commits"]] == [(2, "commit")]   # the old run at the base commit is not credited
+    assert link(session(commit=base, branch="main"), [], view(old))["state"] == "ambiguous"
+
+
+def test_sequential_agents_on_one_branch_are_not_ambiguous_but_the_grace_stops_at_the_next_agent():
+    first, second = session("a", start=0, end=60), session("b", start=70, end=120)
+    out = link(first, [second], view(run(1, 50), run(2, 75)))
+    assert out["state"] == "linked" and [c["run_number"] for c in out["commits"]] == [1]
+    assert [c["run_number"] for c in link(second, [first], view(run(1, 50), run(2, 75)))["commits"]] == [2]
+
+
+def test_unavailable_ci_data_is_unknown_not_a_claim_of_absence():
+    out = link(session(), [], {"available": False, "repos": [], "pipelines": {}})
+    assert out["state"] == "unknown" and "not a finding" in out["reason"]
+    assert link(session(), [], {"available": True, "repos": [], "pipelines": {}})["state"] == "none"
+
+
+def test_same_run_number_in_two_provider_repositories_keeps_both():
+    other = run(1, 20, repo_id=8)
+    v = {"repos": [{"id": 7, "forge_url": "https://github.com/org/app"}, {"id": 8, "forge_url": "https://github.com/org/app"}],
+         "pipelines": {"a": [run(1, 10), other]}}
+    assert len(link(session(), [], v)["commits"]) == 2
+
+
+def test_pull_request_event_runs_report_the_target_branch_and_are_not_attributed_by_branch():
+    target = dict(run(1, 10, branch="release-1.2"), event="pull_request", ref="refs/pull/9/head")
+    assert link(session(branch="release-1.2"), [], view(target))["commits"] == []
+
+
+def test_refs_heads_prefix_is_ignored_and_a_prefixed_shared_branch_stays_shared():
+    assert link(session(branch="refs/heads/feat/x"), [], view(run(1, 10)))["state"] == "linked"
+    assert link(session(branch="refs/heads/main"), [], view(run(1, 10)))["state"] == "ambiguous"
+
+
+def test_more_than_the_cap_says_how_many_were_left_out():
+    out = link(session(), [], view(*[run(n, n % 50) for n in range(1, 61)]))
+    assert len(out["commits"]) == 50 and out["omitted"] == 10

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { lineageModel } from '../agents-lineage.js';
+import { lineageModel, commitSteps } from '../agents-lineage.js';
 
 const entry = (id, mission, created, updated, tab = 'current') => ({ id, host: 'h', role: id, tab, mission: mission ? { key: mission, title: mission } : null,
   record: { created_at: created, updated_at: updated, mission_id: mission } });
@@ -63,4 +63,15 @@ test('the story lists the commits the server linked, or says plainly that none i
   const prOnly = agentStory(s, {}, Date.now(), { state: 'linked', commits: [], pull_requests: [{ number: 7, status: 'open', url: 'https://github.com/o/r/pull/7', at: '2026-10-28T10:40:00Z' }] });
   assert.deepEqual(prOnly.steps.map(x => x.text).slice(1, 2), ['PR #7 open']);
   assert.deepEqual(agentStory(s, {}, Date.now(), null).steps.map(x => x.kind), ['start', 'now']);
+});
+
+test('commit lines say when they are loading or failed, and untimed lines sit before the last report',()=>{
+ const session={session_id:'s',created_at:'2026-10-29T12:00:00Z',updated_at:'2026-10-29T13:00:00Z',status:'finished'};
+ assert.match(agentStory(session,{},Date.now(),'loading').steps.map(x=>x.text).join('|'),/Checking which commits/);
+ assert.match(agentStory(session,{},Date.now(),'error').steps.map(x=>x.text).join('|'),/could not be loaded/);
+ const steps=agentStory(session,{},Date.now(),{state:'none',reason:'nothing in the window'}).steps;
+ assert.equal(steps.at(-1).kind,'now');
+ assert.match(steps.at(-2).text,/No commit link recorded: nothing in the window/);
+ const many=commitSteps({state:'linked',commits:[{sha:'a'.repeat(40),run_number:1,state:'success',at:'2026-10-29T12:10:00Z'}],omitted:10,pull_requests:[]});
+ assert.match(many.map(x=>x.text).join('|'),/10 more commits not listed/);
 });
