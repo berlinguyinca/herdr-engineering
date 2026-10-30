@@ -83,3 +83,14 @@ proposals as approval cards in groups with group `threads/answer` (tested with s
 Still not implemented (answered with "nothing configured" or a reasoned refusal): skills, MCP servers, connectors, messaging,
 vault, tickets/boards, voice, computer hosts; auto-sync of running agents into rooms; steering cards. Each needs its own
 design (what existing Herdr service backs it) before code; none is blocked by the bridge itself.
+
+### Update 3
+
+#466: optional Hindsight link through the existing `herdr-memory` client (`control_plane.rakazo_bridge.hindsight`). App memory
+edits and removals follow into the shared fact bank; `search/query` adds semantic recall. Tested with a fake client only.
+
+Decision needed before more code (each would otherwise be a stored-but-inert feature, which this bridge refuses to fake):
+- **Agent skills** (`agentSkills/*`): the assistant does not load skills today; storing them without it reading them would mislead.
+- **MCP servers / connectors / messaging**: need an owner for the credentials the app would enter (the operator's vault policy).
+- **Vault**: allowed on the trusted network, but needs an encryption-at-rest choice (key source) first.
+- **Auto-sync of running agents into rooms**: needs the host-registry proofs reviewed, since it grants room membership.
