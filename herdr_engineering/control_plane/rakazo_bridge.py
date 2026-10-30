@@ -1444,7 +1444,8 @@ class RakazoBridge:
 
     def _all_accounts(self) -> list[Any]:
         """Every known account: the configured ones plus any added later (those live only in ``_by_id``)."""
-        return list(self._by_id.values())
+        with self._accounts_lock:
+            return list(self._by_id.values())
 
     def _operator_accounts(self) -> list[Any]:
         """The accounts a board proposal (and, for the open-listener operator, a reminder) is pushed to."""
