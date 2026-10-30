@@ -379,9 +379,12 @@ class TokenStore:
             if not force and now < self._retry_at:
                 return False
             batch = list(self._tomb)
-        if not self._flush_lock.acquire(blocking=False):
+        if not self._flush_lock.acquire(timeout=5.0 if force else 0):
             return False
         try:
+            if force:                          # another flush may have settled (or added) tombstones while we waited
+                with self._lock:
+                    batch = list(self._tomb)
             for digest in batch:
                 try:
                     self._p.delete(digest)
@@ -879,16 +882,21 @@ class RakazoBridge:
                                           title=assistant.name)
 
     def _gather(self, ctx: _Ctx, assistant, thread):
+        """Messages, runs and approvals of one thread. The shared store lock is held only to copy the record tables
+        (a C-speed shallow copy); filtering and sorting happen outside it, so a polling stream never stalls writers."""
         store = self.svc.store
+        store.get_thread(thread.thread_id, tenant_id=ctx.tenant, user_id=ctx.user)       # the ownership check
         with store._lock:
-            messages = store.list_messages(thread.thread_id, tenant_id=ctx.tenant, user_id=ctx.user)
-            runs = [r for r in store.list_runs(tenant_id=ctx.tenant, user_id=ctx.user,
-                                               assistant_id=assistant.assistant_id)
-                    if r.thread_id == thread.thread_id]
-            run_ids = {r.run_id for r in runs}
-            approvals = [(a, store.actions[a.action_id]) for a in list(store.approvals.values())
-                         if a.tenant_id == ctx.tenant and a.user_id == ctx.user and a.action_id in store.actions
-                         and store.actions[a.action_id].run_id in run_ids]
+            all_messages, all_runs = list(store.messages.values()), list(store.runs.values())
+            all_approvals, actions = list(store.approvals.values()), dict(store.actions)
+        messages = sorted((m for m in all_messages if m.thread_id == thread.thread_id), key=lambda m: m.created_at)
+        runs = sorted((r for r in all_runs if r.tenant_id == ctx.tenant and r.user_id == ctx.user
+                       and r.assistant_id == assistant.assistant_id and r.thread_id == thread.thread_id),
+                      key=lambda r: r.created_at, reverse=True)
+        run_ids = {r.run_id for r in runs}
+        approvals = [(a, actions[a.action_id]) for a in all_approvals
+                     if a.tenant_id == ctx.tenant and a.user_id == ctx.user and a.action_id in actions
+                     and actions[a.action_id].run_id in run_ids]
         return messages, runs, approvals
 
     def _journal(self, ctx: _Ctx, assistant, thread):

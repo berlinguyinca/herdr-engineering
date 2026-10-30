@@ -1321,3 +1321,35 @@ def test_an_unexpected_key_error_is_a_404_but_leaves_a_trace_without_the_key(srv
     assert status == 404 and body["json"]["code"] == "NOT_FOUND"
     logged = " ".join(r.getMessage() for r in caplog.records)
     assert "KeyError" in logged and "bots/list" in logged and "sekrit-identifier" not in logged
+
+
+def test_two_boots_in_the_same_second_do_not_share_sequence_numbers():
+    first = ev.JournalRegistry(clock=lambda: 1_000_000.001)
+    second = ev.JournalRegistry(clock=lambda: 1_000_000.250)
+    assert second.get("t", "a").head > first.get("t", "a").head
+
+
+def test_a_sign_out_waits_for_a_concurrent_flush_instead_of_reporting_a_false_failure():
+    gate, deleted = threading.Event(), []
+
+    class Slow:
+        def load(self):
+            return []
+
+        def upsert(self, digest, record):
+            pass
+
+        def delete(self, digest):
+            gate.wait(2)
+            deleted.append(digest)
+
+    store = rb.TokenStore(3600, 5, Slow(), cutoffs={})
+    token = store.mint("acct", "1.2.3.4")
+    first = threading.Thread(target=lambda: store.revoke(token))
+    first.start()
+    time.sleep(0.1)
+    other = store.mint("acct", "1.2.3.4")
+    threading.Timer(0.2, gate.set).start()
+    known, durable = store.revoke(other)               # the first flush is still running: wait for it, do not give up
+    first.join()
+    assert known and durable and len(deleted) == 2

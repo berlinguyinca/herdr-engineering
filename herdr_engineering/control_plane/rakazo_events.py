@@ -259,7 +259,7 @@ class JournalRegistry:
     """One :class:`ThreadJournal` per thread, created on first use."""
 
     def __init__(self, clock: Callable[[], float] = time.time):
-        self._base = int(clock()) * 1000
+        self._base = int(clock() * 1000)          # millisecond resolution: two boots in one second must not share a base
         self._journals: dict[str, ThreadJournal] = {}
         self.lock = threading.RLock()
 
