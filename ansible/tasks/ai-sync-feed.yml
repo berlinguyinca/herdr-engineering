@@ -1,0 +1,40 @@
+---
+# Package provisioning precedes this include. The reporter is read-only (ai-sync status/--version/env list, git reads), so
+# it is enabled wherever ai-sync is installed; hosts without ai-sync keep it stopped rather than reporting noise.
+- name: "Deploy the ai-sync status reporter"
+  become: false
+  when: ansible_facts['system'] == 'Linux'
+  environment:
+    HOME: "{{ fleet_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+  block:
+    - name: "Detect whether ai-sync is installed for the fleet user"
+      ansible.builtin.shell: |
+        PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.volta/bin:$HOME/bin:$PATH"
+        command -v ai-sync >/dev/null 2>&1 && echo true || echo false
+      args:
+        executable: /bin/bash
+      register: ai_sync_present
+      changed_when: false
+      check_mode: false
+
+    - name: "Create the user unit directory"
+      ansible.builtin.file:
+        path: "{{ fleet_home }}/.config/systemd/user"
+        state: directory
+        mode: "0755"
+
+    - name: "Install the ai-sync status reporter unit"
+      ansible.builtin.copy:
+        content: "{{ lookup('file', herdr_engineering_repo_root ~ '/scripts/herdr-eng-ai-sync-feed.service') }}"
+        dest: "{{ fleet_home }}/.config/systemd/user/herdr-eng-ai-sync-feed.service"
+        mode: "0644"
+
+    # Restart after package updates even when the unit text is unchanged.
+    - name: "Apply ai-sync presence and reload updated code"
+      ansible.builtin.systemd_service:
+        name: herdr-eng-ai-sync-feed.service
+        scope: user
+        daemon_reload: true
+        enabled: "{{ ai_sync_present.stdout | trim == 'true' }}"
+        state: "{{ 'restarted' if ai_sync_present.stdout | trim == 'true' else 'stopped' }}"

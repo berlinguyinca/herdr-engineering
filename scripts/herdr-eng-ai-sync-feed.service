@@ -1,0 +1,16 @@
+[Unit]
+Description=HerdR read-only ai-sync status reporter
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.venvs/herdr-engineering/bin/python -m herdr_engineering.ai_sync_feed --loop 300
+Restart=on-failure
+RestartSec=30
+Nice=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
