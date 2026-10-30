@@ -26,6 +26,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Control plane: service-observation compaction (opt-in, dry run by default)
 - `control_plane.fabric_compaction` (YAML; `enabled: false`, `dry_run: true`, `interval_seconds`, `min_age_days`, `batch_rows`, `archive_retention_days`, `rebuild_checkpoint`) lets the worker move interior service observation rows out of `fabric_events` into the new `fabric_events_archive` table (migration 0035), one atomic statement per batch. Rule checked on the production journal: 1,762,189 service rows -> 349,664 with all 6,544 reconstructed services identical. Rows with a v2 envelope and rows younger than `min_age_days` are never touched. After a drain the job rebuilds the recovery checkpoint; the archive is purged after `archive_retention_days`. See docs/operations/recovery-checkpoints.md.
 
+### GitHub App: write capabilities and the review gate on the shared App (opt-in)
+- `github.app.write: [review_gate, escalations]` (YAML, default none) enables fixed, repo-scoped write permission sets on the shared GitHub App; unlisted capabilities are refused before any call to GitHub, reads stay read-only, and a grant wider than the request is refused.
+- `review_gate.app: shared` makes the review gate use that App instead of its own JWT/installation-token code: reads get a read-only token, statuses/merge/update-branch the `review_gate` capability. The old per-gate `app:` block still works.
+
 ### Project intelligence: shared-credential PR poller and single-operator mode (opt-in)
 - The outbound PR poller now works without the review gate: it reads open PRs through `github_auth.credentials()` (the GitHub App, `pull_requests: read` only, repo-scoped tokens). `github_auth` allows `pull_requests` at `read`; nothing writable. `/api/v1/intelligence/status` gains `poller` (counters and a fixed `last_error`).
 - `control_plane.single_operator: true` (YAML, default false; refused with `api_keys`) lets the open listener's caller preauthorize assistant tools and approve proposals, including their own. See the project-intelligence runbook for the residual risk.

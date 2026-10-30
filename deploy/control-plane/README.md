@@ -403,8 +403,8 @@ github:
   permissions. The evidence token is further limited to the one repository it reads (`repositories: [<name>]`).
 - **Precedence.** With `app` set the App wins for every read and one warning is logged when `token` is also set.
   An invalid `app` block means *no* credential (fail closed), never a silent fallback to `token`. Without `app`,
-  `github.token` works exactly as before. `deployment_escalation.issues` (an issue **write**) always uses
-  `github.token`; the App is never given write access.
+  `github.token` works exactly as before. `deployment_escalation.issues` (an issue **write**) uses
+  `github.token` unless the `escalations` write capability is enabled (below); reads never get write access.
 - **Owners.** A request uses the installation of the repository's owner. Only owners listed under
   `installations` get a token (`auto` resolves an id, it never adds an owner); any other owner reads as unknown.
   **Keep the App private** (installable only by its owning account): `auto` matches installations by account
@@ -427,6 +427,28 @@ github:
   the deploying user), so it can read it; never loosen the mode. Needs `PyJWT[crypto]` (the image's `review-gate`/`collab` extras
   already install it; without it every token fails as `jwt_library_missing`). The loader validates the block's structure (`herdr-eng fleet config validate`), not the
   key file, which only the control-plane container can see.
+- **Write capabilities (`write: [...]`, off by default).** Reads stay read-only. A deployment may list, under
+  `github.app.write`, the write capabilities it allows; each has a fixed permission set that no caller can widen, and a
+  capability that is not listed is refused (`write_disabled`) before any call to GitHub:
+
+  | Capability | Used by | App permissions needed |
+  |---|---|---|
+  | `review_gate` | the review gate (`review_gate.app: shared`): commit statuses, merge, update-branch | Commit statuses: write, Contents: write, Pull requests: write (reads: Pull requests: read, Contents: read) |
+  | `escalations` | deployment escalation issues | Issues: write |
+
+  ```yaml
+  github:
+    values:
+      app:
+        app_id: 123456
+        private_key_file: "/etc/herdr/github-app/github-app.pem"
+        installations: {berlinguyinca: auto}
+        write: [review_gate]          # absent or [] = read-only App
+  ```
+
+  Tokens for a capability are repo-scoped, cached per permission set, and GitHub's answer is refused when it grants
+  more than was asked (`metadata: read` may ride along). The PR poller of project intelligence and the review gate's
+  reads need **Pull requests: read** on the App. A static `github.token` has no write capability.
 - **The cache under the App** lists each configured owner's repositories (`repositoryOwner`, not `viewer`), and
   its catalog identity is the App's (not the hourly token), so token rotation does not purge it. Switching
   between `token` and `app` re-syncs the catalog once.

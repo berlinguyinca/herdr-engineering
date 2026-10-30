@@ -1173,7 +1173,15 @@ class ControlPlaneServer:
             ci_fix_caps={e.repo: e.ci_fix_cap for e in config.repos})
         # The queue's real lease and the lease a Claim reports must be one value.
         self.gate_queue = ReviewQueue(repo, lease_seconds=config.reviewer.lease_seconds)
-        app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
+        if config.shared_app:
+            from .. import github_auth
+            app = github_app.GitHubAppClient(None, credentials=github_auth.credentials)   # the fleet's github.app
+            granted = getattr(getattr(github_auth.credentials(), "config", None), "write", ())
+            if config.enabled and "review_gate" not in granted:
+                log.warning("review_gate.app is 'shared' but github.app.write does not list review_gate: "
+                            "statuses, merges and branch updates will be refused (permission)")
+        else:
+            app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
         self.gate_app = app
         registry = AuthorRegistry(repo)
         notifier = AuthorNotifier(repo, config=config.notify, registry=registry,
