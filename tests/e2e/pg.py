@@ -48,12 +48,19 @@ class ThrowawayPostgres:
     def dsn(self) -> str:
         return f"postgresql://postgres@/{self.db}?host={self.sock}"
 
+    def _options(self) -> str:
+        # dynamic_shared_memory_type=mmap keeps parallel-query segments as files under the data dir, not in /dev/shm: in a CI
+        # container /dev/shm is small, shared or cleaned under the cluster, and "could not open shared memory segment
+        # /PostgreSQL.N" then fails whichever test was running (8 errors in test_postgres_recovery.py, CI runs 414 and 415).
+        return (f"-c listen_addresses='' -c unix_socket_directories='{self.sock}' -c fsync=off "
+                "-c dynamic_shared_memory_type=mmap")
+
     def start(self) -> ThrowawayPostgres:
         self.root.mkdir(parents=True, exist_ok=True)
         subprocess.run([str(self.bins / "initdb"), "-D", str(self.data), "-U", "postgres", "--auth=trust", "-E", "UTF8"],
                        check=True, capture_output=True)
         subprocess.run([str(self.bins / "pg_ctl"), "-D", str(self.data), "-w", "-l", str(self.root / "pg.log"),
-                        "-o", f"-c listen_addresses='' -c unix_socket_directories='{self.sock}' -c fsync=off",
+                        "-o", self._options(),
                         "start"], check=True, capture_output=True)
         self.started = True
         subprocess.run([str(self.bins / "createdb"), "-h", str(self.sock), "-U", "postgres", self.db],
@@ -64,7 +71,7 @@ class ThrowawayPostgres:
     def start_existing(self) -> ThrowawayPostgres:
         """Bring the same cluster (same data dir, same socket) back after `stop()`."""
         subprocess.run([str(self.bins / "pg_ctl"), "-D", str(self.data), "-w", "-l", str(self.root / "pg.log"),
-                        "-o", f"-c listen_addresses='' -c unix_socket_directories='{self.sock}' -c fsync=off",
+                        "-o", self._options(),
                         "start"], check=True, capture_output=True)
         self.started = True
         return self
