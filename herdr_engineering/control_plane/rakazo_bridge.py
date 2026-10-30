@@ -44,6 +44,7 @@ from .rakazo_proposals import Busy, ProposalDesk
 from .rakazo_push import ExpoSender, PushNotifier, PushRegistry
 
 log = logging.getLogger(__name__)
+OPEN_LISTENER_USER = "open-listener"     # the user id an unauthenticated (open) dashboard listener acts as
 SLOW_CALL_MS = 300           # a call slower than this is logged (name + duration only)
 VERY_SLOW_CALL_MS = 2000      # ... as a warning
 
@@ -1096,6 +1097,14 @@ class RakazoBridge:
             return None
         return {"botId": bot_id, "spaceId": ev.SPACE_ID}
 
+    def _all_accounts(self) -> list[Any]:
+        """Every known account: the configured ones plus any added later (those live only in ``_by_id``)."""
+        return list(self._by_id.values())
+
+    def _operator_accounts(self) -> list[Any]:
+        """The accounts a board proposal (and, for the open-listener operator, a reminder) is pushed to."""
+        return [a for a in self._all_accounts() if a.role == "operator"]
+
     def notify_proposal(self, proposal) -> None:
         """A new board proposal: push it to each operator phone that may see it. Never raises (it runs on the request that
         filed the proposal)."""
@@ -1103,9 +1112,7 @@ class RakazoBridge:
             return
         try:
             from .rakazo_proposals import proposal_title
-            for account in self.accounts:
-                if account.role != "operator":
-                    continue
+            for account in self._operator_accounts():
                 access = self.desk.access(self.svc.tenant_for(account.principal_id), account.principal_id)
                 if access is None or access[0].org_id != proposal.org_id or not self.desk._visible(access[0], proposal):
                     continue
@@ -1117,17 +1124,22 @@ class RakazoBridge:
                       key: str | None = None) -> int:
         """Push to every account of one person (assistant tenant + user id). ``urgent`` bypasses quiet hours; ``key`` is the
         once-only dedupe key (a fresh one per call when omitted). Returns how many accounts were queued, 0 when push is
-        off or no phone is registered. Never raises."""
+        off or no phone is registered. The dashboard operator (``open-listener``, who has no account of their own) is
+        reached on exactly the operator phones a proposal goes to. Never raises."""
         if not self.push.enabled:
             return 0
         key = key or f"person:{secrets.token_hex(8)}"
         queued = 0
         try:
-            for account in self.accounts:
-                if account.principal_id == user and self.svc.tenant_for(account.principal_id) == tenant:
-                    if self.push.notify(account.account_id, f"{key}:{account.account_id}", title, body, kind="reminder",
-                                        priority=priority, collapse_id=key):
-                        queued += 1
+            if user == OPEN_LISTENER_USER:
+                targets = self._operator_accounts()      # same phones as a proposal; the dashboard operator has no tenant of their own
+            else:
+                targets = [a for a in self._all_accounts()
+                           if a.principal_id == user and self.svc.tenant_for(a.principal_id) == tenant]
+            for account in targets:
+                if self.push.notify(account.account_id, f"{key}:{account.account_id}", title, body, kind="reminder",
+                                    priority=priority, collapse_id=key):
+                    queued += 1
         except Exception:  # noqa: BLE001
             log.warning("rakazo push: a person notification could not be queued")
         return queued
