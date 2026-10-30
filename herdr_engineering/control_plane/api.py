@@ -482,11 +482,13 @@ class ControlPlaneServer:
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
         from .rakazo_bridge import PostgresTokenPersistence, RakazoBridge, rakazo_bridge_config
+        from .rakazo_push import PostgresPushPersistence
         _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
         if _bridge_cfg["enabled"]:       # the assistant user ids the bridge accounts act as (hashes, no email), for ci_watch.users
             log.info("rakazo bridge assistant users: %s", ", ".join(a.principal_id for a in _bridge_cfg["accounts"]))
         self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
-                                    persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
+                                    persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
                        if _bridge_cfg["enabled"] else None)
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
@@ -640,6 +642,8 @@ class ControlPlaneServer:
         self.intelligence.single_operator_fn = lambda: self.single_operator
         if self.rakazo is not None:
             self.rakazo.desk.routes = self.intelligence      # board proposals as phone cards (scope: assistant_viewers)
+            self.intelligence.board.on_new = self.rakazo.notify_proposal      # and as push notifications
+            self.intelligence.push_status_fn = lambda: dict(self.rakazo.push.counters, enabled=self.rakazo.push.enabled)
         self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None) or self._pr_lister
         self.intelligence.poll_status_fn = lambda: {"client": "review_gate" if getattr(self, "gate_app", None) else "shared",
                                                     "last_error": self._pr_lister.last_error}
