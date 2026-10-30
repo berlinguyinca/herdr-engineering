@@ -30,6 +30,7 @@ SPACE_KIND, ARCHIVED_KIND, PINNED_KIND, NAME_KIND, READ_KIND, REMOVED_KIND = (
     "group_space", "group_archived", "group_pinned", "group_name", "group_read", "group_removed")
 PROJECT_KIND = "rooms_project"
 PROPOSAL_PREFIX = "proposal:"
+STEER_PREFIX = "steer:"
 
 
 def person_bot_id(user_id: str) -> str:
@@ -306,6 +307,7 @@ class Rooms:
         page = msgs[-MAX_PAGE:]
         older = page[0]["seq"] if page and len(msgs) > len(page) else None
         page += self.proposal_cards(pr, rid, tid, max(events["next_cursor"], 0))
+        page += self.steering_cards(pr, rid, tid, max(events["next_cursor"], 0))
         return {"threadId": tid, "cursor": events["next_cursor"], "messages": page, "olderCursor": older,
                 "groupId": rid, "groupName": self._pref(ctx, NAME_KIND, rid, room["name"]),
                 "members": self.members(ctx, pr, rid), "run": None, "activeRuns": []}
@@ -331,12 +333,50 @@ class Rooms:
                           "createdAt": p.get("created_at") or ""})
         return cards
 
+    # steering requests as approval cards ----------------------------------------------------------------------
+    def steering_cards(self, pr, room_id: str, tid: str, seq: int) -> list[dict[str, Any]]:
+        """Pending steering requests (an instruction aimed at a running node) as ask cards a room owner can confirm or
+        decline. The instruction is untrusted text, shown as a snippet. Confirming only releases it to the node's owner
+        process through the existing fenced, single-use confirmation; nothing runs here."""
+        try:
+            listed = self.collab.list_steering(pr, room_id, {})["steering"]
+        except CollabError:
+            return []
+        cards = []
+        for r in listed:
+            if r.get("status") != "pending":
+                continue
+            what = ev.snippet(str(r.get("instruction") or r.get("action") or ""), 80)
+            block = {"kind": "ask", "text": f"Confirm steering \"{r['action']}\": {what}?",
+                     "approvalEffectId": r["steering_id"], "actions": [{"id": "allow", "label": "Confirm"},
+                                                                       {"id": "deny", "label": "Decline"}],
+                     "status": "pending", "detail": "Untrusted instruction. Confirming releases it once to the target's owner."}
+            cards.append({"id": STEER_PREFIX + r["steering_id"], "threadId": tid, "seq": seq, "role": "bot", "blocks": [block],
+                          "createdAt": r.get("proposed_at") or ""})
+        return cards
+
+    def _answer_steering(self, pr, room_id: str, steer_id: str, answer: Any):
+        if answer not in ("allow", "deny"):
+            raise self.Error(400, "BAD_REQUEST", "Answer allow or deny.")
+        if answer == "deny":
+            self.call(self.collab.reject_steering, pr, room_id, steer_id, {"reason": "declined from the app"})
+            return {"ok": True}
+        shown = next((r for r in self.call(self.collab.list_steering, pr, room_id, {})["steering"]
+                      if r["steering_id"] == steer_id), None)
+        if shown is None:
+            raise self.Error(404, "NOT_FOUND", "Not found.")
+        self.call(self.collab.confirm_steering, pr, room_id, steer_id,
+                  {"digest": shown["digest"], "expected_fence": shown["target"]["fence"]})
+        return {"ok": True}
+
     def answer(self, ctx, inp):
         pr = self.principal(ctx)
         room = self.room(ctx, pr, inp.get("groupId"))
         message_id, answer = inp.get("messageId"), inp.get("answer")
+        if isinstance(message_id, str) and message_id.startswith(STEER_PREFIX) and not (inp.get("dismiss") or inp.get("fields")):
+            return self._answer_steering(pr, room["room_id"], message_id[len(STEER_PREFIX):], answer)
         if not (isinstance(message_id, str) and message_id.startswith(PROPOSAL_PREFIX)) or inp.get("dismiss") or inp.get("fields"):
-            raise self.Error(400, "BAD_REQUEST", "Only proposal answers are supported in groups.")
+            raise self.Error(400, "BAD_REQUEST", "Only proposal and steering answers are supported in groups.")
         decision = {"allow": "accept", "deny": "reject"}.get(answer)
         if decision is None:
             raise self.Error(400, "BAD_REQUEST", "Answer allow or deny.")

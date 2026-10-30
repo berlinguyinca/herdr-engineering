@@ -116,7 +116,7 @@ steering cards. Impossible without other infrastructure: push (APNs), voice/desk
 What remains, and why it is left alone rather than guessed at. These are the ones where acting autonomously would mean a
 security decision on the owner's behalf:
 - **Approval rules / auto review**: built in Update 6 below, in the one direction that cannot widen authority.
-- **Auto-sync of running agents into rooms / steering cards**: grants room membership from host-registry proofs.
+- **Auto-sync of running agents into rooms**: grants room membership; left to an explicit `groups/create`/`update`. (Steering cards: Update 7.)
 - **Messaging channels, marketplace, computer/voice hosts, push**: need external accounts or infrastructure (Slack/Telegram
   apps, a registry, donbot/nibbler hosts, APNs) that do not exist yet.
 
@@ -131,3 +131,12 @@ consulted by `AssistantService.rule_policy` inside `request_tool_action`:
 - A failing rule lookup means no rule. Removing a rule tombstones it. `approvalRules/preview` reports before/after for a sample tool.
 - `autoReview/get,set` store mode and enabled; `checkerAvailable` is false (no checker model runs here) and `skipApprovals` is
   refused with a pointer to per-tool rules.
+
+### Update 7
+
+Steering cards in groups. Pending steering requests of a room appear in the group thread as `steer:<id>` ask cards next to the
+proposal cards. Confirm calls the existing `confirm_steering` with the request's own digest and fence (single use, fenced, a
+different owner than the proposer unless the operator allows self-confirm); Decline calls `reject_steering`. A person who may
+not read or confirm steering sees no cards or gets the collaboration service's refusal. The instruction is untrusted text and is
+only shown as a snippet. Auto-sync of running agents into rooms stays an explicit action by design: your own agents already
+appear live as bots, but adding one to a room is a permission grant.

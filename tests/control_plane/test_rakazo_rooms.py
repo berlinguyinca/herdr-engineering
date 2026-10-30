@@ -277,3 +277,25 @@ def test_a_reviewer_without_rights_sees_no_proposal_cards(world, monkeypatch):
     monkeypatch.setattr(world.s, "list_proposals", refuse)
     snap = ok(world.api, "threads/get", {"groupId": world.room}, world.bob_t)
     assert all(not m["id"].startswith("proposal:") for m in snap["messages"])
+
+
+def test_steering_requests_are_cards_that_an_owner_can_confirm_or_decline(world, monkeypatch):
+    seen = []
+    req = {"steering_id": "st1", "status": "pending", "action": "pause", "instruction": "Stop and wait", "digest": "dg",
+           "target": {"fence": "fn1"}, "proposed_at": "2026-10-30T10:00:00+00:00"}
+    done = {**req, "steering_id": "st2", "status": "confirmed"}
+    monkeypatch.setattr(world.s, "list_steering", lambda pr, room, q: {"steering": [req, done]})
+    monkeypatch.setattr(world.s, "confirm_steering", lambda pr, room, sid, body: seen.append(("c", sid, body)) or {})
+    monkeypatch.setattr(world.s, "reject_steering", lambda pr, room, sid, body: seen.append(("r", sid, body)) or {})
+    snap = ok(world.api, "threads/get", {"groupId": world.room}, world.alice_t)
+    validate("threads/get", snap)
+    [card] = [m for m in snap["messages"] if m["id"].startswith("steer:")]
+    assert card["id"] == "steer:st1" and card["blocks"][0]["status"] == "pending"
+    for answer in ("allow", "deny"):
+        validate("threads/answer", ok(world.api, "threads/answer",
+                                      {"groupId": world.room, "messageId": "steer:st1", "answer": answer}, world.alice_t))
+    assert seen[0] == ("c", "st1", {"digest": "dg", "expected_fence": "fn1"}) and seen[1][:2] == ("r", "st1")
+    assert world.api.rpc("threads/answer", {"groupId": world.room, "messageId": "steer:st1", "answer": "maybe"},
+                         world.alice_t)[0] == 400
+    assert world.api.rpc("threads/answer", {"groupId": world.room, "messageId": "steer:nope", "answer": "allow"},
+                         world.alice_t)[0] == 404
