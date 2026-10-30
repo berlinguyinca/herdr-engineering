@@ -218,3 +218,21 @@ def test_real_session_ingest_rows_carry_room_workspace_and_agent_instance_ids_in
     q = core.Projection()
     q.apply_all(list(reversed(rows)))
     assert q.digest() == p.digest()
+
+
+def test_a_review_task_depends_on_the_work_it_reviews_and_says_so_in_its_attrs():
+    s = scenario()
+    s.collab(400, "task_created", project_id="p1", room_id="p1-r0", task_id="rev-1", target_agent_id="p1-agent",
+             text="Independent review", actor_user_id="alice", created_by_kind="user", created_by_id="alice", depth=0,
+             reviews_task_id="p1-r0-t0")
+    s.collab(401, "task_created", project_id="p1", room_id="p1-r0", task_id="plain-1", target_agent_id="p1-agent",
+             text="No review", actor_user_id="alice", created_by_kind="user", created_by_id="alice", depth=0)
+    d = build(s.events).dump()
+    work, rev, plain = (wc.urn_for("task", x) for x in ("p1-r0-t0", "rev-1", "plain-1"))
+    dep = [e for e in d["edges"].values() if e["live"] and e["from_id"] == rev and e["to_id"] == work]
+    assert len(dep) == 1 and dep[0]["edge_type"] in ("depends_on", "dependency")     # dependent -> prerequisite
+    assert d["entities"][rev]["attrs"]["reviews_task_id"] == "p1-r0-t0"
+    assert not [e for e in d["edges"].values() if e["from_id"] == plain and e["to_id"] == work]    # positive control
+    assert not d["entities"][plain]["attrs"].get("reviews_task_id")
+    want = build(s.events).digest()
+    assert build(list(reversed(s.events))).digest() == want                           # order-independent like the rest
