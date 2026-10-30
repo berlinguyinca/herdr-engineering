@@ -50,10 +50,10 @@ def share_postgres():
             async def initialize():
                 conn = await asyncpg.connect(dsn)
                 try:
-                    for name in (*PREREQ, "0037_artifact_shares.sql"):
+                    for name in (*PREREQ, "0041_artifact_shares.sql"):
                         await conn.execute((MIGRATIONS / name).read_text())
                     # re-running must be a no-op (idempotent)
-                    await conn.execute((MIGRATIONS / "0037_artifact_shares.sql").read_text())
+                    await conn.execute((MIGRATIONS / "0041_artifact_shares.sql").read_text())
                 finally:
                     await conn.close()
 
@@ -323,8 +323,8 @@ def test_ingest_poison_forged_oversize_and_replaced_files(share_postgres, tmp_pa
 
 def test_migration_up_and_down_names():
     files = sorted(p.name for p in MIGRATIONS.glob("*.sql"))
-    assert [n for n in files if n.startswith("0037")] == ["0037_artifact_shares.sql"]
-    text = (MIGRATIONS / "0037_artifact_shares.sql").read_text()
+    assert [n for n in files if n.startswith("0041")] == ["0041_artifact_shares.sql"]
+    text = (MIGRATIONS / "0041_artifact_shares.sql").read_text()
     assert "-- DOWN:" in text
     down = text.split("-- DOWN:")[1].split("\n\n")[0]
     for table in ("artifact_share_events", "artifact_shares"):
