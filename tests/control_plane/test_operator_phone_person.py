@@ -37,7 +37,7 @@ def srv(tmp_path):
         "enabled": True, "apps": {"key_file": str(key), "redirect_base": "https://x.example"}}})
     svc = AssistantService(config=cfg, now=lambda: NOW)
     bridge = {"enabled": True, "accounts": [_acct("op", "operator"), _acct("fam", "family")]}
-    server = ControlPlaneServer(ControlPlaneRepo(), assistant_service=svc, rakazo_bridge=bridge)
+    server = ControlPlaneServer(ControlPlaneRepo(), assistant_service=svc, rakazo_bridge=bridge, single_operator=True)
     google = Google()
     server.google._open = google
     server.apps.credentials.put_client("google", "cid.apps.googleusercontent.com", "secret")
@@ -60,20 +60,40 @@ def read(server, user):
 def test_canonical_person_maps_only_operator_phone_accounts(srv):
     b = srv.rakazo
     assert b.canonical_person(T, srv.p["op"]) == (T, OP)
-    assert b.canonical_person("other", srv.p["op"]) == ("other", OP)
     for user in (srv.p["fam"], srv.p["view"], "rakazo:unknown", OP, "key:u1", ""):
         assert b.canonical_person(T, user) == (T, user)
 
 
-def test_cognito_style_accounts_follow_their_role(srv):
+def test_cognito_accounts_never_map_even_with_operator_role(srv):
     b = srv.rakazo
     for aid, role in (("cogop", "operator"), ("cogfam", "family")):
         acct = rb.Account(aid, f"{aid}@x.org", f"rakazo:{aid}", role, b._dummy, 0.0, "cog-user")
         assert acct not in b.accounts
         b._by_id[aid] = acct
         b._by_principal[acct.principal_id] = acct
-    assert b.canonical_person(T, "rakazo:cogop") == (T, OP)
-    assert b.canonical_person(T, "rakazo:cogfam") == (T, "rakazo:cogfam")
+        b._cognito_users[aid] = "cog-user"
+        assert b.canonical_person(T, acct.principal_id) == (T, acct.principal_id)
+    # a YAML account that also signed in through Cognito is Cognito-derived: not mapped
+    b._cognito_users[b.accounts[0].account_id] = "x"
+    assert b.canonical_person(T, srv.p["op"]) == (T, srv.p["op"])
+
+
+def test_removed_member_does_not_map(srv):
+    b = srv.rakazo
+    del b._by_principal[srv.p["op"]]
+    assert b.canonical_person(T, srv.p["op"]) == (T, srv.p["op"])
+
+
+def test_not_in_single_operator_mode_nothing_maps(srv):
+    srv.single_operator = False
+    assert srv.rakazo.canonical_person(T, srv.p["op"]) == (T, srv.p["op"])
+    with pytest.raises(gw.GoogleError):
+        read(srv, srv.p["op"])
+    assert srv.g.requests == []
+
+
+def test_other_tenants_never_map(srv):
+    assert srv.rakazo.canonical_person("elsewhere", srv.p["op"]) == ("elsewhere", srv.p["op"])
 
 
 def test_phone_operator_uses_the_dashboard_google_connection(srv):
@@ -142,7 +162,7 @@ def test_family_reminders_stay_private(srv):
 def test_without_a_bridge_the_person_is_unchanged():
     svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}))
     assert svc.canonical_person(T, "rakazo:x") == (T, "rakazo:x")
-    server = ControlPlaneServer(ControlPlaneRepo(), assistant_service=svc)
+    server = ControlPlaneServer(ControlPlaneRepo(), assistant_service=svc, single_operator=True)
     assert server._canonical_person(T, "rakazo:x") == (T, "rakazo:x")
 
 

@@ -501,6 +501,8 @@ class ControlPlaneServer:
                                     collab=collab, artifacts_fn=lambda: RegistryBackend(self))
                        if _bridge_cfg["enabled"] else None)
         self._build_assistant_apps(assistant_apps_dsn)
+        if self.rakazo is not None:
+            self.rakazo.single_operator_fn = lambda: self.single_operator
         self._build_reminders(assistant_apps_dsn)
         self.assistant.canonical_person = self._canonical_person
         from .ingest import IngestService
