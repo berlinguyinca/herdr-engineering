@@ -166,7 +166,8 @@ export const DASHBOARD_SURFACES = [
     regions: [{ name: 'panel', selector: '#pa-notifications' }] },
   { slug: 'dashboard-assistant-approvals', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/personal-assistant', proof: '[data-config]', steps: assistantTab('Approvals', 'Approving allows'),
     regions: [{ name: 'panel', selector: '#pa-approvals' }] },
-  { slug: 'dashboard-assistant-connectors', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/personal-assistant', proof: '[data-config]', steps: connectorsTab },
+  { slug: 'dashboard-assistant-connectors', app: 'dashboard', fullPage: true, skip: [...SKIP, 'mobile-light'],   // no mobile baseline: the 6144 KB cap; phone reflow is gated by ui-gates-dashboard-a11y and assistant-connectors.test.mjs
+     hash: '/personal-assistant', proof: '[data-config]', steps: connectorsTab },
 ];
 
 async function connectorsTab(page) {
