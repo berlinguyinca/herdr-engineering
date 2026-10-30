@@ -144,6 +144,19 @@ export class HerdrClient {
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
   }
 
+  // Artifacts bound to a project, issue, task or room (P03). The server filters by what the caller may read.
+  artifactsForContext(kind, ref, { q, mediaType, limit, cursor, signal } = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries({ q, media_type: mediaType, limit, cursor })) {
+      if (value != null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/artifacts/for/${encodeURIComponent(kind)}/${encodeURIComponent(ref)}${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  artifactLinks(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/links`, { signal });
+  }
+
   getArtifact(id, { signal } = {}) {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}`, { signal });
   }
