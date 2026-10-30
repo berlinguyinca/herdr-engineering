@@ -651,6 +651,10 @@ class ControlPlaneServer:
         self.intelligence.ci_rerun_fn = self._intelligence_ci_rerun
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
+            _google = (self.assistant.config or {}).get("google") or {}
+            if _google.get("enabled"):      # read-only Gmail + Calendar for the listed users (personal_assistant.google)
+                from .google_workspace import GoogleWorkspace
+                self.assistant.google_read = GoogleWorkspace(_google).run
             from .assistant_lineage import LineageReader, principal_resolver
             self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
             from .assistant_adapters import comment_hook, draft_writer_hook, rereview_hook
