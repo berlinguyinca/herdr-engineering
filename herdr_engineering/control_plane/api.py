@@ -657,6 +657,8 @@ class ControlPlaneServer:
                 _gw = GoogleWorkspace(apps=self.apps)
                 self.apps.on_change = _gw.invalidate
                 self.assistant.google_read = _gw.run
+                self.assistant.google_write = _gw.write
+                self.google = _gw
             from .assistant_lineage import LineageReader, principal_resolver
             self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
             from .assistant_adapters import comment_hook, draft_writer_hook, rereview_hook
@@ -4089,6 +4091,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"ready": True, "redirect_uri": server.apps_redirect_uri,
                                    "providers": apps.providers(tenant, user),
                                    "blocked_calendars": apps.blocked_calendars(tenant, user)})
+            if tail[:2] == ["google", "drafts"] and len(tail) <= 3 and command in ("GET", "DELETE") and (len(tail) == 2) == (command == "GET"):
+                return self._google_drafts(tenant, user, tail)
             known = {("PUT", ("google", "client")), ("POST", ("google", "connect")), ("DELETE", ("google",)),
                      ("GET", ("google", "blocked-calendars")), ("PUT", ("google", "blocked-calendars"))}
             if (command, tuple(tail)) not in known:
@@ -4117,6 +4121,26 @@ def _make_handler(server, public=False, operator=False):
             except AppsError as exc:
                 status = {"not_set_up": 409, "no_client": 409, "unknown_provider": 404}.get(exc.reason, 400)
                 return self._json({"error": exc.reason if exc.reason in self._APPS_REASONS | {"bad_client"} else "failed"}, status)
+
+        def _google_drafts(self, tenant, user, tail):
+            """GET lists the calling person's Gmail drafts; DELETE discards one. Both use only that person's connection."""
+            from .google_workspace import DRAFT_ID, GoogleError
+            gw = getattr(server, "google", None)
+            if gw is None:
+                return self._json({"error": "not_set_up"}, 409)
+            try:
+                if self.command == "GET":
+                    return self._json({"drafts": gw.list_drafts(tenant, user)})
+                if not DRAFT_ID.fullmatch(unquote(tail[2])):
+                    return self._json({"error": "bad_id"}, 400)
+                out = gw.delete_draft(tenant, user, unquote(tail[2]))
+                server.assistant.store.audit_record(tenant_id=tenant, user_id=user, actor=user,
+                                                    action="assistant.google.draft.discarded", subject_id=out["id"], detail="gmail draft")
+                return self._json({"ok": True, "id": out["id"]})
+            except GoogleError as exc:
+                status = {"not_connected": 409, "needs_attention": 409, "bad_request": 400, "not_found": 404,
+                          "rate_limited": 429}.get(exc.reason, 502)
+                return self._json({"error": exc.reason if exc.reason in self._APPS_REASONS | {"not_connected", "needs_attention", "bad_request", "not_found", "rate_limited"} else "unavailable"}, status)
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited

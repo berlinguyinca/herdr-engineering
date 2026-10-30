@@ -863,6 +863,26 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
             "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"},
             "artifact_id": {"type": "string", "description": "Existing draft artifact to add a version to (optional)"}},
             "required": ["to", "subject", "body"]}},
+    "create_email_draft": {
+        "sensitive": True,
+        "description": "Save a DRAFT in the user's Gmail drafts. A person must approve the exact recipient, subject and "
+                       "body first. It never delivers anything; the person reviews and sends it themselves in Gmail.",
+        "parameters": {"type": "object", "properties": {
+            "to": {"type": "string", "description": "One or more plain addresses, comma separated (at most 10)."},
+            "subject": {"type": "string"}, "body": {"type": "string", "description": "Plain text, at most 800 characters."}},
+            "required": ["to", "subject", "body"]}},
+    "create_calendar_event": {
+        "sensitive": True,
+        "description": "Create a Google Calendar event (no attendees, no invitations) after a person approves its exact "
+                       "details. Defaults to the user's primary calendar; blocked calendars are refused.",
+        "parameters": {"type": "object", "properties": {
+            "summary": {"type": "string"},
+            "start": {"type": "string", "description": "RFC3339 with offset, e.g. 2026-11-02T09:00:00-08:00."},
+            "end": {"type": "string", "description": "RFC3339 with offset, after start."},
+            "calendar_id": {"type": "string", "description": "Optional; the primary calendar when omitted."},
+            "location": {"type": "string"},
+            "reminder_minutes": {"type": "integer", "description": "Optional single popup reminder, 0 to 40320."}},
+            "required": ["summary", "start", "end"]}},
     "watch_ci": {
         "sensitive": False,
         "description": "Look for failed CI runs the user can see and surface each new one once as a repair proposal "
@@ -912,13 +932,18 @@ def tool_sensitive(tool_id: str) -> bool:
 
 
 # Tools whose every use needs an explicit approval: a grant may never carry ``preauthorized`` for them.
-NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell"})
+NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell", "create_email_draft", "create_calendar_event"})
+
+# Google writes: run through ``google_write`` only after approval. They are requested by the assistant (not the person), so
+# the person whose mailbox or calendar it is can approve them; ``send_message``/``run_shell`` still need a distinct approver.
+GOOGLE_WRITE_TOOLS = frozenset({"create_email_draft", "create_calendar_event"})
 
 # Tools the post-approval executor can run. Everything else (send_message, run_shell, edit_shared) is NOT here: an
 # approval for those stays a record, and ``execute_approved_action`` refuses them (fail closed). ``draft_email`` only
 # ever saves a draft; nothing in this set sends.
 EXECUTABLE_AFTER_APPROVAL = frozenset({"request_review", "propose_branch", "request_mission", "comment_on_node",
-                                       "draft_email", "delegate", "connector_request"})
+                                       "draft_email", "delegate", "connector_request",
+                                       "create_email_draft", "create_calendar_event"})
 
 
 def canonical_json(obj: Any) -> str:
@@ -934,6 +959,7 @@ def request_digest(*, tenant_id: str, user_id: str, assistant_id: str, tool_id: 
 
 
 _DRY_RUN_MAX = 1200
+_DRY_RUN_MAX_GOOGLE = 3000      # the approval card for a Google write shows the FULL content a person is approving
 
 
 def describe_action(tool_id: str, scope: str, payload: dict[str, Any] | None) -> str:
@@ -968,6 +994,16 @@ def describe_action(tool_id: str, scope: str, payload: dict[str, Any] | None) ->
     elif tool_id == "draft_email":
         text = (f"Save an email DRAFT to {v('to')} with subject {v('subject', 120)} as a private artifact. "
                 "Nothing is sent")
+    elif tool_id == "create_email_draft":
+        return (f"Save a Gmail DRAFT (nothing is delivered) to {v('to', 300)} with subject {v('subject', 200)} and this "
+                f"body: {v('body', 800)}")[:_DRY_RUN_MAX_GOOGLE]
+    elif tool_id == "create_calendar_event":
+        return (f"Create a calendar event \"{v('summary', 200)}\" from {v('start', 40)} to {v('end', 40)} on calendar "
+                f"{v('calendar_id', 256) if p.get('calendar_id') else 'primary'}"
+                + (f", location {v('location', 200)}" if p.get("location") else "")
+                + (f", popup reminder {v('reminder_minutes', 10)} minutes before" if p.get("reminder_minutes") is not None
+                   else ", default reminders")
+                + ". No attendees are invited")[:_DRY_RUN_MAX_GOOGLE]
     else:
         text = f"Use tool {tool_id} on {scope or 'default scope'} with fields {sorted(p)}"
     return text[:_DRY_RUN_MAX]
@@ -1921,6 +1957,7 @@ class AssistantService:
             if (repo is not None and fc.get("enabled")) else None)
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
+        self.google_write = None      # (tenant, user, tool_id, payload) -> dict; runs ONLY an approved Google draft/event
         self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.google is enabled
         self.lineage_read = None
         # Thin adapters over EXISTING endpoints, all wired by the control-plane API and all optional. Absent = the
@@ -3705,6 +3742,13 @@ class AssistantService:
                      if target_field else tool_id)
             if not isinstance(scope, str):
                 return "[denied: tool target must be a string]"
+        if tool_id in GOOGLE_WRITE_TOOLS:
+            from .google_workspace import GoogleError, validate_write
+            try:
+                validate_write(tool_id, args)       # a person must never be asked to approve content that cannot run
+            except GoogleError:
+                return "[denied: the draft or event details are invalid (check addresses, times with an offset, lengths)]"
+            scope = tool_id
         idem = hashlib.sha256(
             f"{run.run_id}|{tool_id}|{sorted(args.items())!r}".encode()).hexdigest()[:24]
         try:
@@ -3714,7 +3758,7 @@ class AssistantService:
                 request_payload=args,
                 # the two tools that must always be approved are requested BY the person who instructed the run, so
                 # "approver differs from requester" binds them; for the rest the assistant asks and the owner decides
-                actor=run.user_id if tool_id in NEVER_PREAUTHORIZED else f"assistant:{run.assistant_id}")
+                actor=run.user_id if tool_id in NEVER_PREAUTHORIZED - GOOGLE_WRITE_TOOLS else f"assistant:{run.assistant_id}")
         except ApprovalRequired as ar:
             return f"[operator approval required: {ar.approval_id}: {ar.dry_run}]"
         except AssistantError as exc:
@@ -3848,6 +3892,17 @@ class AssistantService:
             from .google_workspace import GoogleError
             try:
                 return self.google_read(tenant_id, user_id, tool_id, payload)
+            except GoogleError as exc:
+                raise AssistantError(_GOOGLE_MESSAGES.get(exc.reason) or
+                                     f"Google {tool_id.replace('_', ' ')} failed: {exc.reason}") from None
+        if tool_id in GOOGLE_WRITE_TOOLS:
+            # Reached only through the gate: request_tool_action raised ApprovalRequired until a person approved this
+            # exact payload, and execute_approved_action re-checks the approval and the payload hash before this runs.
+            if self.google_write is None:
+                raise AssistantError("Google mail and calendar are not enabled")
+            from .google_workspace import GoogleError
+            try:
+                return self.google_write(tenant_id, user_id, tool_id, payload)
             except GoogleError as exc:
                 raise AssistantError(_GOOGLE_MESSAGES.get(exc.reason) or
                                      f"Google {tool_id.replace('_', ' ')} failed: {exc.reason}") from None

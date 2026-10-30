@@ -26,9 +26,11 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 # Why there is no scope guard here (the old one refused any token wider than read-only): the stored connection's scopes
-# legitimately include compose and event-writing now. Safety instead comes from the request surface: every method here
-# issues only GET requests to read URLs. The two POSTs are the token endpoint and Calendar freeBusy, which only READS busy
-# intervals (a test allows exactly those two URLs as POST).
+# legitimately include compose and event-writing now. Safety instead comes from the request surface. READ methods issue
+# only GET requests to read URLs; the two POSTs they use are the token endpoint and Calendar freeBusy, which only READS busy
+# intervals (a test allows exactly those two URLs as POST). WRITES (a Gmail DRAFT, a Calendar event, discarding a draft) live
+# behind ``write`` / ``create_*`` / ``delete_draft`` and the allow-listed ``_write``; nothing here can deliver mail, and
+# the module has no function for it. The assistant reaches ``write`` only after a person approved the exact content.
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/calendar.readonly")
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -43,6 +45,12 @@ MAX_CAL_PAGES, FREEBUSY_BATCH = 10, 50
 FREEBUSY_URL = CALENDAR_API + "/freeBusy"
 _ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 PRIMARY = "primary"
+DRAFT_ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
+MAX_ADDRESSES, MAX_TO, MAX_SUBJECT, MAX_DRAFT_BODY = 10, 300, 200, 800
+MAX_SUMMARY, MAX_LOCATION, MAX_REMINDER = 200, 200, 40320
+_ADDRESS = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~\-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,253}[A-Za-z0-9])?\Z")
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})\Z")
+_EVENTS_URL = re.compile(re.escape(CALENDAR_API) + r"/calendars/[^/?#]{1,300}/events\Z")
 _TIME = re.compile(r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})?)?")
 
 
@@ -142,6 +150,20 @@ def write_token_file(path: str, record: dict) -> None:
     os.chmod(path, 0o600)
 
 
+def validate_write(tool_id: str, payload: Any) -> None:
+    """Refuse a malformed write BEFORE an approval is requested, so a person never approves content that cannot run.
+    Pure: it makes no request."""
+    p = payload if isinstance(payload, dict) else {}
+    if tool_id == "create_email_draft":
+        GoogleWorkspace.validate_draft(p.get("to"), p.get("subject"), p.get("body"))
+    elif tool_id == "create_calendar_event":
+        GoogleWorkspace.validate_event(p.get("summary"), p.get("start"), p.get("end"), p.get("location"), p.get("reminder_minutes"))
+        if p.get("calendar_id") is not None:
+            GoogleWorkspace._calendar_id(p.get("calendar_id"))
+    else:
+        raise GoogleError("bad_request")
+
+
 def _urlopen(req, timeout):
     return urllib.request.urlopen(req, timeout=timeout)     # noqa: S310 - fixed https endpoints
 
@@ -224,7 +246,7 @@ class GoogleWorkspace:
     def _get(self, tenant: str, user: str, url: str, params: dict[str, Any]) -> dict:
         req = urllib.request.Request(url + "?" + urllib.parse.urlencode(params, doseq=True), method="GET",     # noqa: S310
                                      headers={"authorization": f"Bearer {self._access_token(tenant, user)}", "accept": "application/json"})
-        return self._send(tenant, user, req)
+        return self._request(tenant, user, req)
 
     def _read_post(self, tenant: str, user: str, url: str, body: dict) -> dict:
         """A POST that only READS (freeBusy takes its query as a body). Nothing else may use it."""
@@ -233,9 +255,9 @@ class GoogleWorkspace:
         req = urllib.request.Request(url, method="POST", data=json.dumps(body).encode(),     # noqa: S310
                                      headers={"authorization": f"Bearer {self._access_token(tenant, user)}", "accept": "application/json",
                                               "content-type": "application/json"})
-        return self._send(tenant, user, req)
+        return self._request(tenant, user, req)
 
-    def _send(self, tenant: str, user: str, req: urllib.request.Request) -> dict:
+    def _request(self, tenant: str, user: str, req: urllib.request.Request, allow_empty: bool = False) -> dict:
         try:
             with self._open(req, TIMEOUT) as resp:
                 raw = resp.read(MAX_RESPONSE + 1)
@@ -250,6 +272,8 @@ class GoogleWorkspace:
             raise GoogleError("unavailable") from None
         if len(raw) > MAX_RESPONSE:
             raise GoogleError("unavailable")
+        if allow_empty and not raw.strip():
+            return {}
         try:
             data = json.loads(raw)
         except ValueError:
@@ -455,6 +479,128 @@ class GoogleWorkspace:
                     break
             cursor = max(cursor, end)
         return {"slots": slots}
+
+
+    # ---- writes: only after a person approved the exact content ---------------------------------------------
+    @staticmethod
+    def _plain(value: Any, limit: int, name: str, *, required: bool = True) -> str:
+        """Text with no control characters at all (so no header or line injection through a single-line field)."""
+        if value is None or value == "":
+            if required:
+                raise GoogleError("bad_request")
+            return ""
+        if not isinstance(value, str) or len(value) > limit or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise GoogleError("bad_request")
+        return value.strip()
+
+    @classmethod
+    def validate_draft(cls, to: Any, subject: Any, body: Any) -> tuple[list[str], str, str]:
+        addrs = [a.strip() for a in cls._plain(to, MAX_TO, "to").split(",")]
+        if not 1 <= len(addrs) <= MAX_ADDRESSES or not all(_ADDRESS.match(a) for a in addrs):
+            raise GoogleError("bad_request")
+        subj = cls._plain(subject, MAX_SUBJECT, "subject")
+        if not isinstance(body, str) or not body.strip() or len(body) > MAX_DRAFT_BODY or "\x00" in body:
+            raise GoogleError("bad_request")
+        return addrs, subj, body
+
+    @classmethod
+    def validate_event(cls, summary: Any, start: Any, end: Any, location: Any = None, reminder_minutes: Any = None) -> dict:
+        title = cls._plain(summary, MAX_SUMMARY, "summary")
+        times = []
+        for value in (start, end):
+            if not isinstance(value, str) or not _RFC3339.match(value):
+                raise GoogleError("bad_request")
+            try:
+                times.append(datetime.fromisoformat(value.replace("Z", "+00:00")))
+            except ValueError:
+                raise GoogleError("bad_request") from None
+        if times[1] <= times[0]:
+            raise GoogleError("bad_request")
+        event: dict[str, Any] = {"summary": title, "start": {"dateTime": start}, "end": {"dateTime": end}}
+        where = cls._plain(location, MAX_LOCATION, "location", required=False)
+        if where:
+            event["location"] = where
+        if reminder_minutes is not None:
+            if isinstance(reminder_minutes, bool) or not isinstance(reminder_minutes, int) or not 0 <= reminder_minutes <= MAX_REMINDER:
+                raise GoogleError("bad_request")
+            event["reminders"] = {"useDefault": False, "overrides": [{"method": "popup", "minutes": reminder_minutes}]}
+        return event
+
+    def _write(self, tenant: str, user: str, method: str, url: str, body: dict | None = None) -> dict:
+        """The ONLY non-read request path. Allow-listed: create a draft, create an event, discard a draft."""
+        ok = ((method == "POST" and (url == f"{GMAIL}/drafts" or _EVENTS_URL.match(url)))
+              or (method == "DELETE" and url.startswith(f"{GMAIL}/drafts/") and DRAFT_ID.fullmatch(url[len(f"{GMAIL}/drafts/"):])))
+        if not ok:
+            raise GoogleError("bad_request")
+        headers = {"authorization": f"Bearer {self._access_token(tenant, user)}", "accept": "application/json"}
+        data = None
+        if body is not None:
+            data, headers["content-type"] = json.dumps(body).encode(), "application/json"
+        req = urllib.request.Request(url, method=method, data=data, headers=headers)     # noqa: S310
+        return self._request(tenant, user, req, allow_empty=method == "DELETE")
+
+    def create_draft(self, tenant: str, user: str, to: Any, subject: Any, body: Any) -> dict:
+        """Save a Gmail DRAFT in the person's own account. It is never delivered; the person reviews it in Gmail."""
+        from email.message import EmailMessage
+        addrs, subj, text = self.validate_draft(to, subject, body)
+        msg = EmailMessage()
+        msg["To"], msg["Subject"] = ", ".join(addrs), subj
+        msg.set_content(text)
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        data = self._write(tenant, user, "POST", f"{GMAIL}/drafts", {"message": {"raw": raw}})
+        did = data.get("id")
+        if not isinstance(did, str) or not DRAFT_ID.fullmatch(did):
+            raise GoogleError("unavailable")
+        return {"id": did}
+
+    def list_drafts(self, tenant: str, user: str, max_results: int = 20) -> list[dict]:
+        n = max(1, min(int(max_results), 25))
+        listing = self._get(tenant, user, f"{GMAIL}/drafts", {"maxResults": n})
+        out = []
+        for ref in (listing.get("drafts") or [])[:n]:
+            did = ref.get("id") if isinstance(ref, dict) else None
+            if not isinstance(did, str) or not DRAFT_ID.fullmatch(did):
+                continue
+            draft = self._get(tenant, user, f"{GMAIL}/drafts/{did}", {"format": "metadata", "metadataHeaders": ["To", "Subject"]})
+            msg = draft.get("message") if isinstance(draft.get("message"), dict) else {}
+            h = self._headers(msg)
+            mid = msg.get("id") if isinstance(msg.get("id"), str) and DRAFT_ID.fullmatch(msg.get("id")) else ""
+            out.append({"id": did, "to": h.get("to", ""), "subject": h.get("subject", ""), "snippet": str(msg.get("snippet", ""))[:200],
+                        "gmail_url": f"https://mail.google.com/mail/u/0/#drafts/{mid}" if mid else "https://mail.google.com/mail/u/0/#drafts"})
+        return out
+
+    def delete_draft(self, tenant: str, user: str, draft_id: Any) -> dict:
+        if not isinstance(draft_id, str) or not DRAFT_ID.fullmatch(draft_id):
+            raise GoogleError("bad_request")
+        self._write(tenant, user, "DELETE", f"{GMAIL}/drafts/{draft_id}")
+        return {"id": draft_id, "discarded": True}
+
+    def create_event(self, tenant: str, user: str, summary: Any, start: Any, end: Any, calendar_id: Any = None,
+                     location: Any = None, reminder_minutes: Any = None) -> dict:
+        """Create an event with no attendees. Defaults to the person's primary calendar; a blocked calendar is refused
+        through the policy BEFORE any request is made."""
+        event = self.validate_event(summary, start, end, location, reminder_minutes)
+        cid = PRIMARY if calendar_id is None else self._calendar_id(calendar_id)
+        self._calendars_allowed(tenant, user, [cid])
+        data = self._write(tenant, user, "POST", f"{CALENDAR_API}/calendars/{urllib.parse.quote(cid, safe='')}/events", event)
+        eid, link = data.get("id"), data.get("htmlLink")
+        if not isinstance(eid, str) or not eid:
+            raise GoogleError("unavailable")
+        return {"id": eid[:100], "html_link": link[:500] if isinstance(link, str) and link.startswith("https://") else ""}
+
+    def write(self, tenant_id: str, user_id: str, tool_id: str, payload: dict) -> dict:
+        """One approved write for the calling person. Only the assistant's executor-after-approval calls this."""
+        t, u = tenant_id, user_id
+        if not isinstance(payload, dict):
+            raise GoogleError("bad_request")
+        if tool_id == "create_email_draft":
+            return {"ok": True, "draft": self.create_draft(t, u, payload.get("to"), payload.get("subject"), payload.get("body")),
+                    "note": "Saved as a draft in Gmail. Nothing was delivered."}
+        if tool_id == "create_calendar_event":
+            return {"ok": True, "event": self.create_event(t, u, payload.get("summary"), payload.get("start"), payload.get("end"),
+                                                           payload.get("calendar_id"), payload.get("location"),
+                                                           payload.get("reminder_minutes"))}
+        raise GoogleError("bad_request")
 
     # ---- the assistant's entry point --------------------------------------------------------------------
     def run(self, tenant_id: str, user_id: str, tool_id: str, payload: dict) -> dict:
