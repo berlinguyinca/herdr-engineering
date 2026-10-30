@@ -35,6 +35,7 @@ from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_events as ev
 from . import rakazo_hindsight as hs
+from . import rakazo_mcp as mcp
 from . import rakazo_memory as memory
 from . import rakazo_models as models
 from . import rakazo_prefs as pf
@@ -651,6 +652,7 @@ class RakazoBridge:
         self.artifacts = artifacts.Artifacts(self, BridgeError, artifacts_fn)
         self.models = models.Models(self, BridgeError)
         self.skills = skills.Skills(self, BridgeError)
+        self.mcp = mcp.Mcp(self, BridgeError)
         self.vault = vault.Vault(self, BridgeError, vault.load_cipher(config.get("vault_key_file")))
         runner = getattr(self.svc, "runner", None)
         if hasattr(runner, "prompt_extras"):
@@ -658,7 +660,7 @@ class RakazoBridge:
         self.hindsight = hs.build(config.get("hindsight"))
         for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs(),
                          **self.artifacts.procs(), **self.models.procs(), **self.skills.procs(),
-                         **self.vault.procs()}.items():
+                         **self.vault.procs(), **self.mcp.procs()}.items():
             self._procs[name] = fn
         self.rest = rest.Rest(self, BridgeError, set(self._procs))
         self._procs.update(self.rest.procs())
