@@ -3686,7 +3686,8 @@ def _fabric_compaction_settings(cp):
         enabled=raw.get("enabled") is True, dry_run=raw.get("dry_run") is not False,
         interval_seconds=number("interval_seconds", 3600, 60), min_age_days=number("min_age_days", 2, 1),
         batch_rows=int(number("batch_rows", 250_000, 1000)), archive_retention_days=retention,
-        rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False)
+        rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
+        keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
 
 
 def _worker_fabric_compactor(fleet_config_path):

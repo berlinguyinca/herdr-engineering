@@ -216,6 +216,27 @@ async def build_checkpoint(conn) -> dict:
     }
 
 
+async def prune_checkpoints(conn, keep: int = 2) -> int:
+    """Delete all but the ``keep`` newest ready generations (the active one is always among them). Returns how many
+    generations went. Takes the builder's lock, so it never races a publication; a reader on an older MVCC snapshot
+    keeps seeing the generation it started with. ``keep`` is at least 1 for the active pointer and 2 by default so the
+    previous generation stays for rollback."""
+    keep = max(int(keep), 1)
+    async with conn.transaction():
+        if not await _available(conn):
+            return 0
+        if not await conn.fetchval("SELECT pg_try_advisory_xact_lock($1)", _BUILD_LOCK):
+            raise CheckpointBuildInProgress("a recovery checkpoint build is already running")
+        status = await conn.execute("""
+            DELETE FROM recovery_checkpoint_manifests m
+            WHERE m.checkpoint_id NOT IN (SELECT checkpoint_id FROM recovery_checkpoint_active)
+              AND m.checkpoint_id NOT IN (
+                  SELECT checkpoint_id FROM recovery_checkpoint_manifests
+                  WHERE ready ORDER BY created_at DESC, checkpoint_id DESC LIMIT $1)
+        """, keep)
+    return int(status.split()[-1])
+
+
 def main(argv=None) -> int:
     """Explicit offline builder; credentials stay in memory and errors are bounded."""
     import argparse

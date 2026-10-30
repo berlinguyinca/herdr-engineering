@@ -131,3 +131,37 @@ def test_waiting_between_intervals_and_missing_table_are_harmless():
         return first, await compactor.tick(Conn())
     first, second = asyncio.run(go())
     assert first.startswith("skipped: apply migration 0035") and second == "waiting"
+
+
+def test_pruning_keeps_the_newest_generations_and_the_active_one_and_boot_still_works(db):
+    from herdr_engineering.control_plane.recovery_checkpoint import prune_checkpoints
+
+    _seed(db)
+    ids = [checkpoint_tests._build(db)["checkpoint_id"] for _ in range(4)]
+    expected, _ = _reference(db)
+
+    async def prune(keep):
+        conn = await asyncpg.connect(db.dsn)
+        try:
+            return await prune_checkpoints(conn, keep)
+        finally:
+            await conn.close()
+    assert asyncio.run(prune(2)) == 2
+    left = {r["checkpoint_id"] for r in db.query("SELECT checkpoint_id FROM recovery_checkpoint_manifests")}
+    assert left == set(ids[2:])
+    for table in ("recovery_checkpoint_rows", "recovery_checkpoint_covered"):
+        assert {r["checkpoint_id"] for r in db.query(f"SELECT DISTINCT checkpoint_id FROM {table}")} == left
+    assert db.query("SELECT checkpoint_id FROM recovery_checkpoint_active")[0]["checkpoint_id"] == ids[3]
+    assert asyncio.run(prune(2)) == 0 and asyncio.run(prune(0)) == 1            # keep is clamped to the active one
+    recovered, _, metrics = _checkpoint_source(db)
+    assert metrics["mode"] == "checkpoint" and metrics["checkpoint_id"] == ids[3]
+    assert _projections(recovered) == _projections(expected)
+
+
+def test_a_drain_prunes_after_it_rebuilds(db):
+    _seed(db)
+    for _ in range(3):
+        _build(db)
+    [outcome] = _run(db, CompactionSettings(enabled=True, dry_run=False, keep_checkpoints=2))
+    assert "checkpoint rebuilt" in outcome and "pruned 2 old generations" in outcome
+    assert db.query("SELECT count(*) AS n FROM recovery_checkpoint_manifests")[0]["n"] == 2
