@@ -107,7 +107,7 @@ always refused to agents without one).** All validated by hand with `additionalP
 * *Writes:* `artifact_commit` appends an **intent** (agent id, artifact, base version, changes with inline text,
   message, idempotency key) to an append-only intents directory that is mounted read-write into `collab-public` and
   read by the worker. A dedicated fast loop in the worker (about 1 s) validates the intent against
-  `artifact_collaborators` (the control-plane side is the authority, not the MCP process), applies the merge/commit
+  the artifact ACL grants (the control-plane side is the authority, not the MCP process), applies the merge/commit
   as principal `collab:<agent_id>`, and writes a **result** file the MCP tool reads. `artifact_commit_result` waits
   briefly (long-poll like `tasks_wait`, bounded) so a simple client sees the outcome in one or two calls.
 
