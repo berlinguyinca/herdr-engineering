@@ -36,6 +36,7 @@ from . import rakazo_events as ev
 from . import rakazo_memory as memory
 from . import rakazo_prefs as pf
 from . import rakazo_rooms as rooms
+from . import rakazo_routines as routines
 from . import rakazo_spaces as sp
 from .assistant import (
     ApprovalRequired,
@@ -157,7 +158,8 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     if raw.get("enabled") is not True:
         return {"enabled": False}
     now = time.time() if now is None else now
-    unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies"})
+    unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
+                                 "routine_runner_seconds"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -168,6 +170,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
             raise ValueError(f"control_plane.rakazo_bridge.{key} must be an integer from {low} to {high}")
         return value
 
+    runner = bounded("routine_runner_seconds", 0, 0, 3600)          # 0 = routines run only when tested from the app
     ttl_days = bounded("token_ttl_days", 30, 1, 365)
     max_tokens = bounded("max_tokens", 5, 1, 50)
     proxies = raw.get("trusted_proxies", [])
@@ -205,7 +208,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
             raise ValueError(f"{where}.collab_user must be a collaboration user id (letters, digits and . _ @ + : -)")
         accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff, link))
     return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
-            "trusted_proxies": tuple(nets)}
+            "trusted_proxies": tuple(nets), "routine_runner_seconds": runner}
 
 
 # --------------------------------------------------------------------------------------------- tokens
@@ -625,8 +628,12 @@ class RakazoBridge:
         self.max_bots = MAX_BOTS
         self.bots = bots.Bots(self, BridgeError)
         self.memory = memory.Memory(self, BridgeError)
-        for name, fn in {**self.bots.procs(), **self.memory.procs()}.items():
+        self.routines = routines.Routines(self, BridgeError)
+        for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs()}.items():
             self._procs[name] = fn
+        self.routine_runner_seconds = int(config.get("routine_runner_seconds", 0))
+        if self.routine_runner_seconds:
+            threading.Thread(target=self._routine_loop, name="rakazo-routines", daemon=True).start()
         for name, group_fn in (("threads/head", self.rooms.head), ("threads/get", self.rooms.thread),
                                ("threads/messages", self.rooms.messages), ("threads/send", self.rooms.send),
                                ("threads/stop", lambda c, i, **kw: {"ok": True}),
@@ -651,6 +658,23 @@ class RakazoBridge:
 
     def close(self) -> None:
         self._closed.set()
+
+    def run_due_routines(self) -> int:
+        """Fire every account's due routines (default space and the account's own spaces); returns how many started."""
+        started = 0
+        for account in self.accounts:
+            base = self.svc.tenant_for(account.principal_id)
+            for space_id in [sp.DEFAULT_SPACE_ID] + [s.space_id for s in self.spaces.list(account.account_id)]:
+                ctx = _Ctx(account, sp.space_tenant(base, space_id), account.principal_id, "", False, space_id, base)
+                try:
+                    started += self.routines.run_due(ctx)
+                except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                    log.warning("rakazo bridge: routine check failed (%s)", type(exc).__name__)
+        return started
+
+    def _routine_loop(self) -> None:
+        while not self._closed.wait(self.routine_runner_seconds):
+            self.run_due_routines()
 
     def client_address(self, peer: str, forwarded_for: str = "") -> str:
         """The address a request is attributed to (lockout key, token bookkeeping). The last X-Forwarded-For entry is
