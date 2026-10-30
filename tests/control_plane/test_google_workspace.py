@@ -3,7 +3,6 @@ import base64
 import io
 import json
 import os
-import stat
 import urllib.error
 import urllib.parse
 
@@ -150,28 +149,10 @@ def test_ids_and_times_are_validated(store):
         w.list_events("default", "u1", time_min="tomorrow; drop")
 
 
-def test_authorization_url_asks_for_read_only_scopes_with_pkce():
-    state, verifier, challenge = gw.new_pkce()
-    q = urllib.parse.parse_qs(urllib.parse.urlparse(gw.authorization_url("cid", "http://127.0.0.1:8765/", state, challenge)).query)
-    assert set(q["scope"][0].split()) == set(gw.SCOPES) and all(s.endswith(".readonly") for s in gw.SCOPES)
-    assert q["code_challenge_method"] == ["S256"] and q["access_type"] == ["offline"] and q["state"] == [state]
-    assert verifier not in json.dumps(q)
-
-
-def test_exchange_stores_a_private_token_and_refuses_wider_scopes(tmp_path):
-    class Tokens:
-        def __init__(self, scope):
-            self.scope = scope
-
-        def __call__(self, req, timeout):
-            return Resp({"refresh_token": REFRESH, "scope": self.scope, "access_token": "a"})
-    rec = gw.exchange_code(("cid", SECRET), "code", "ver", "http://127.0.0.1:8765/", Tokens(" ".join(gw.SCOPES)))
-    path = tmp_path / "t.json"
-    gw.write_token_file(str(path), rec)
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-    with pytest.raises(gw.GoogleError) as exc:
-        gw.exchange_code(("cid", SECRET), "code", "ver", "http://127.0.0.1:8765/", Tokens("https://mail.google.com/"))
-    assert exc.value.reason == "unexpected_scope"
+def test_the_retired_file_based_google_config_is_refused():
+    with pytest.raises(ValueError, match="replaced by personal_assistant.apps"):
+        assistant_config({"personal_assistant": {"enabled": True, "google": {"enabled": False}}})
+    assert "google" not in assistant_config({"personal_assistant": {"enabled": True}})
 
 
 def test_the_assistant_tools_dispatch_and_report_fixed_reasons(store):

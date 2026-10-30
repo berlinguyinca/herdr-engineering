@@ -172,14 +172,6 @@ def _build_parser() -> argparse.ArgumentParser:
                     "for control_plane.rakazo_bridge.accounts[].password_scrypt; the password is never an argument"
                     ).set_defaults(func=_cmd_bridge_hash_password)
 
-    # google ---------------------------------------------------------------
-    p = sub.add_parser("google", help="read-only Gmail + Calendar for the assistant (personal_assistant.google)")
-    gsub = p.add_subparsers(dest="google_command", required=True)
-    g = gsub.add_parser("authorize", help="sign in once with Google and store a read-only refresh token (needs a terminal)")
-    g.add_argument("--client-secret-file", required=True, help="the OAuth client JSON downloaded from Google Cloud (Desktop app)")
-    g.add_argument("--token-file", required=True, help="where the refresh token is written (mode 0600; never commit it)")
-    g.set_defaults(func=_cmd_google_authorize)
-
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
     fsub = p.add_subparsers(dest="fleet_command", required=True)
@@ -3821,42 +3813,6 @@ def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 60:
         interval = 600
     return raw.get("enabled") is True, float(interval)
-
-
-def _cmd_google_authorize(args):
-    """Print Google's consent URL, read back the address the browser ends on, and store the refresh token. Only the two
-    read-only scopes are requested. The code, the token and the client secret are never printed."""
-    from urllib.parse import parse_qs, urlparse
-
-    from .control_plane import google_workspace as gw
-    if not sys.stdin.isatty():
-        print("run this in a terminal: it asks you to paste the address your browser ends on", file=sys.stderr)
-        return 1
-    try:
-        client = gw.load_client(args.client_secret_file)
-    except gw.GoogleError as exc:
-        print(f"cannot use the client file: {exc.reason}", file=sys.stderr)
-        return 1
-    redirect = "http://127.0.0.1:8765/"
-    state, verifier, challenge = gw.new_pkce()
-    print("1. Open this address in a browser and approve read-only access to Gmail and Calendar:\n")
-    print(gw.authorization_url(client[0], redirect, state, challenge))
-    print("\n2. The browser then shows 'this site can't be reached' on 127.0.0.1: that is expected.\n"
-          "   Copy the whole address from the address bar and paste it here.\n")
-    pasted = input("Address: ").strip()
-    query = parse_qs(urlparse(pasted).query)
-    code, got_state = (query.get("code") or [""])[0], (query.get("state") or [""])[0]
-    if not code or got_state != state:
-        print("that address has no matching code; start again", file=sys.stderr)
-        return 1
-    try:
-        record = gw.exchange_code(client, code, verifier, redirect)
-    except gw.GoogleError as exc:
-        print(f"Google refused the sign-in: {exc.reason}", file=sys.stderr)
-        return 1
-    gw.write_token_file(args.token_file, record)
-    print(f"stored a read-only token in {args.token_file} (scopes: {', '.join(s.rsplit('/', 1)[-1] for s in record['scopes'])})")
-    return 0
 
 
 def _cmd_bridge_hash_password(args):

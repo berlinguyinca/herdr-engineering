@@ -11,7 +11,6 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import re
 import secrets
 import threading
@@ -33,7 +32,6 @@ log = logging.getLogger(__name__)
 # behind ``write`` / ``create_*`` / ``delete_draft`` and the allow-listed ``_write``; nothing here can deliver mail, and
 # the module has no function for it. The assistant reaches ``write`` only after a person approved the exact content.
 
-SCOPES = ("https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/calendar.readonly")
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
@@ -64,42 +62,6 @@ class GoogleError(Exception):
         self.reason = reason
 
 
-def google_config(raw: Any) -> dict[str, Any]:
-    """``personal_assistant.google``: ``{enabled, client_secret_file, token_file, users: ["tenant/user", ...]}``."""
-    raw = raw if isinstance(raw, dict) else {}
-    where = "control_plane.personal_assistant.google"
-    unknown = set(raw) - {"enabled", "client_secret_file", "token_file", "users"}
-    if unknown:
-        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
-    out = {"enabled": raw.get("enabled", False) is True, "users": []}
-    for key in ("client_secret_file", "token_file"):
-        value = raw.get(key)
-        if value is not None and (not isinstance(value, str) or not value.strip()):
-            raise ValueError(f"{where}.{key} must be a path")
-        out[key] = value
-    users = raw.get("users") or []
-    if not isinstance(users, list) or len(users) > 20 or not all(isinstance(u, str) and "/" in u and len(u) <= 300 for u in users):
-        raise ValueError(f"{where}.users must list at most 20 'tenant/user' entries")
-    out["users"] = list(users)
-    if out["enabled"] and not (out["client_secret_file"] and out["token_file"]):
-        raise ValueError(f"{where} needs client_secret_file and token_file when enabled")
-    return out
-
-
-def load_client(path: str) -> tuple[str, str]:
-    """Client id and secret from Google's downloaded JSON (``installed`` or ``web``)."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        inner = data.get("installed") or data.get("web") or {}
-        client_id, secret = inner["client_id"], inner["client_secret"]
-    except (OSError, ValueError, KeyError, AttributeError, TypeError):
-        raise GoogleError("client_file_unreadable") from None
-    if not isinstance(client_id, str) or not isinstance(secret, str) or not client_id or not secret:
-        raise GoogleError("client_file_unreadable")
-    return client_id, secret
-
-
 def _b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
@@ -108,13 +70,6 @@ def new_pkce() -> tuple[str, str, str]:
     """``(state, verifier, challenge)`` for one authorization attempt."""
     verifier = _b64(secrets.token_bytes(48))
     return _b64(secrets.token_bytes(16)), verifier, _b64(hashlib.sha256(verifier.encode()).digest())
-
-
-def authorization_url(client_id: str, redirect_uri: str, state: str, challenge: str) -> str:
-    return AUTH_URL + "?" + urllib.parse.urlencode({
-        "client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code", "scope": " ".join(SCOPES),
-        "access_type": "offline", "prompt": "consent", "state": state, "code_challenge": challenge,
-        "code_challenge_method": "S256"})
 
 
 def _post_form(opener: Callable, url: str, form: dict[str, str]) -> dict:
@@ -128,28 +83,6 @@ def _post_form(opener: Callable, url: str, form: dict[str, str]) -> dict:
         raise GoogleError("unauthorized" if exc.code in (400, 401) else "unavailable") from None
     except (urllib.error.URLError, OSError, ValueError):
         raise GoogleError("unavailable") from None
-
-
-def exchange_code(client: tuple[str, str], code: str, verifier: str, redirect_uri: str, opener: Callable | None = None) -> dict:
-    """Trade the pasted authorization code for tokens. Returns the refresh token record to store."""
-    opener = opener or _urlopen
-    data = _post_form(opener, TOKEN_URL, {"client_id": client[0], "client_secret": client[1], "code": code,
-                                          "code_verifier": verifier, "redirect_uri": redirect_uri,
-                                          "grant_type": "authorization_code"})
-    refresh = data.get("refresh_token")
-    scopes = sorted(str(data.get("scope", "")).split())
-    if not isinstance(refresh, str) or not refresh:
-        raise GoogleError("no_refresh_token")
-    if not scopes or set(scopes) - set(SCOPES):
-        raise GoogleError("unexpected_scope")
-    return {"refresh_token": refresh, "scopes": scopes, "created": datetime.now(UTC).isoformat()}
-
-
-def write_token_file(path: str, record: dict) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(record, fh)
-    os.chmod(path, 0o600)
 
 
 def validate_write(tool_id: str, payload: Any) -> None:

@@ -42,7 +42,6 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .google_workspace import google_config
 from .reminders import REMINDER_TOOLS, ReminderError
 from .reminders import run_tool as run_reminder_tool
 
@@ -129,6 +128,9 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """
     section = cfg.get("personal_assistant") if isinstance(cfg, dict) else None
     section = section if isinstance(section, dict) else {}
+    if "google" in section:
+        raise ValueError("control_plane.personal_assistant.google is no longer supported and is replaced by "
+                         "personal_assistant.apps (connect Google per person in the dashboard Connectors tab)")
     computer = section.get("computer") if isinstance(section, dict) else None
     computer = computer if isinstance(computer, dict) else {}
     inference = section.get("inference") if isinstance(section, dict) else None
@@ -231,8 +233,6 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
         # Scheduled CI watch (ci_watch.py): a deterministic server-side loop, off unless enabled; YAML only.
         "ci_watch": ci_watch_config(section.get("ci_watch")),
-        # Read-only Gmail + Calendar (google_workspace.py): off unless enabled; files and the user list are YAML.
-        "google": google_config(section.get("google")),
         # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
         "apps": apps_config(section.get("apps")),
     }
@@ -1991,7 +1991,7 @@ class AssistantService:
         self.intelligence_read = None
         self.google_write = None      # (tenant, user, tool_id, payload) -> dict; runs ONLY an approved Google draft/event
         self.reminders = None         # ReminderStore, set by the server; reminders need no Google account
-        self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.google is enabled
+        self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.apps is set up
         self.lineage_read = None
         # Thin adapters over EXISTING endpoints, all wired by the control-plane API and all optional. Absent = the
         # tool says it is not enabled; nothing falls back to doing the thing some other way.

@@ -1817,53 +1817,61 @@ def test_a_bad_pipelines_dir_is_refused_before_anything_runs(env, fault, needle)
     assert not env["log"].exists()
 
 
-def _google_dir(e):
-    return e["home"] / ".config/herdr-engineering/google"
+def _apps_dir(e):
+    return e["home"] / ".config/herdr-engineering/apps"
 
 
-def test_compose_mounts_the_google_dir_read_only_into_web_only():
+def test_compose_mounts_the_apps_dir_read_only_into_web_only():
     doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
-    mount = "${HERDR_CP_GOOGLE_DIR:?run deploy.sh}:/etc/herdr/google:ro"
+    mount = "${HERDR_CP_APPS_DIR:?run deploy.sh}:/etc/herdr/apps:ro"
     assert mount in doc["services"]["control-plane-web"]["volumes"]
     for name, svc in doc["services"].items():
         if name != "control-plane-web":
-            assert not any("/etc/herdr/google" in str(v) for v in svc.get("volumes") or []), name
+            assert not any("/etc/herdr/apps" in str(v) for v in svc.get("volumes") or []), name
+    text = (ROOT / "deploy/control-plane/compose.yaml").read_text()
+    assert "/etc/herdr/google" not in text and "HERDR_CP_GOOGLE_DIR" not in text
+    assert "GOOGLE_DIR" not in (ROOT / "deploy/control-plane/deploy.sh").read_text()
 
 
-def test_deploy_creates_an_empty_0700_google_dir(env):
+def test_deploy_creates_an_empty_0700_apps_dir_and_never_the_key(env):
     env["env"]["FAIL_COMPOSE"] = "1"
     deploy(env)
-    d = _google_dir(env)
+    d = _apps_dir(env)
     assert d.is_dir() and (d.stat().st_mode & 0o777) == 0o700 and not list(d.iterdir())
 
 
-def test_valid_google_files_are_accepted_and_never_printed(env):
-    d = _google_dir(env)
+def test_a_valid_apps_key_is_accepted_and_never_printed(env):
+    d = _apps_dir(env)
     d.mkdir(parents=True, mode=0o700)
     d.chmod(0o700)
-    for name in ("client_secret.json", "token.json"):
-        (d / name).write_text('{"refresh_token": "PLACEHOLDERGOOGLESECRET"}')
-        (d / name).chmod(0o600)
+    (d / "apps.key").write_bytes(b"PLACEHOLDERAPPSKEYBYTES_32bytes!")
+    (d / "apps.key").chmod(0o600)
     r = deploy(env, "--dry-run")
     assert r.returncode == 0, r.stderr
-    assert "PLACEHOLDERGOOGLESECRET" not in r.stdout + r.stderr
+    assert "PLACEHOLDERAPPSKEYBYTES" not in r.stdout + r.stderr
 
 
 @pytest.mark.parametrize("fault,needle", [
     ("dir_mode", "must be mode 0700"),
-    ("extra_file", "must hold only client_secret.json and token.json"),
-    ("file_mode", "must be mode 0600 or 0400"),
+    ("extra_file", "must hold only apps.key"),
+    ("file_mode", "must be mode 0600"),
+    ("short_key", "must be exactly 32 bytes"),
+    ("long_key", "must be exactly 32 bytes"),
+    ("old_google_file", "must hold only apps.key"),
 ])
-def test_a_bad_google_dir_is_refused_before_anything_runs(env, fault, needle):
-    d = _google_dir(env)
+def test_a_bad_apps_dir_is_refused_before_anything_runs(env, fault, needle):
+    d = _apps_dir(env)
     d.mkdir(parents=True, mode=0o700)
     d.chmod(0o700)
-    token = d / "token.json"
-    token.write_text("{}")
-    token.chmod(0o644 if fault == "file_mode" else 0o600)
+    key = d / "apps.key"
+    key.write_bytes(b"k" * {"short_key": 31, "long_key": 33}.get(fault, 32))
+    key.chmod(0o644 if fault == "file_mode" else 0o600)
     if fault == "dir_mode":
         d.chmod(0o755)
     if fault == "extra_file":
         (d / "notes.txt").write_text("x")
+    if fault == "old_google_file":
+        (d / "token.json").write_text("{}")
     r = deploy(env, "--dry-run")
     assert r.returncode != 0 and needle in r.stderr
+    assert not env["log"].exists()
