@@ -757,16 +757,33 @@ class IssueRefused(Exception):
 
 class GitHubIssueSink:
     """``create_issue(repo, title, body, key, *, timeout)`` over the GitHub REST API with the
-    server-held ``github.token`` (no gh CLI). No redirects, bounded read, the token never in
-    an error. Wired only with ``control_plane.deployment_escalation.issues: true``."""
+    GitHub App's ``escalations`` write capability (``github.app.write``) when enabled, else the
+    server-held ``github.token`` (no gh CLI). An enabled capability that cannot mint a token fails
+    closed: it never falls back to the PAT. No redirects, bounded read, the token never in an error.
+    Wired only with ``control_plane.deployment_escalation.issues: true``."""
 
     MAX_RESPONSE = 256 * 1024
 
-    def __init__(self, *, token=None, opener=None):
+    def __init__(self, *, token=None, opener=None, credentials=None):
         import urllib.request
         self._token = token
+        self._credentials = credentials
         from ..github import _NoRedirect
         self._opener = opener or urllib.request.build_opener(_NoRedirect())
+
+    def _app_token(self, repo):
+        """(token, owner) from the App's ``escalations`` capability, or (None, None) when it is not enabled."""
+        if self._token is not None:
+            return None, None
+        from .. import github_auth
+        provider = self._credentials() if callable(self._credentials) else github_auth.credentials()
+        owner = repo.split("/", 1)[0]
+        try:
+            return provider.capability_token_or_raise(owner, "escalations", [repo.split("/", 1)[1]]), (provider, owner)
+        except github_auth.GitHubAuthError as exc:
+            if exc.reason == "write_disabled":
+                return None, None
+            raise IssueRefused(f"GitHub App credential unavailable ({exc.reason})") from None
 
     def _token_value(self):
         if self._token is not None:
@@ -784,7 +801,9 @@ class GitHubIssueSink:
         import urllib.request
         if not isinstance(repo, str) or not _REPO.fullmatch(repo):
             raise IssueRefused("invalid repository")
-        token = self._token_value()
+        token, app = self._app_token(repo)
+        if token is None:
+            token = self._token_value()
         request = urllib.request.Request(
             f"https://api.github.com/repos/{repo}/issues", method="POST",
             data=json.dumps({"title": title[:256], "body": body}).encode(),
@@ -796,6 +815,8 @@ class GitHubIssueSink:
         except urllib.error.HTTPError as exc:
             code = exc.code
             exc.close()
+            if code == 401 and app is not None:
+                app[0].invalidate(app[1])
             if code in (401, 403, 404, 410, 422):
                 raise IssueRefused(f"GitHub refused the issue (HTTP {code})") from None
             raise RuntimeError("issue request failed") from None
