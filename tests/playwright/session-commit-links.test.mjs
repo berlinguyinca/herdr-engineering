@@ -45,7 +45,7 @@ async function withSession(fn) {
 test('a session with no attributable commit says no link is recorded', () => withSession(async ({ page, base, id }) => {
   await page.goto(`${base}/#/herd/session/${id}`);
   const story = page.locator('#session-story');
-  await story.locator('li[data-kind=unlinked]').waitFor();
+  await story.locator('li[data-kind=unlinked]:has-text("No commit link recorded")').waitFor();
   assert.match(await story.locator('li[data-kind=unlinked]').innerText(), /No commit link recorded: /);
 }));
 
@@ -64,4 +64,10 @@ test('linked commits and pull requests appear in the story, and only https links
   assert.equal(await commits.nth(1).locator('a').getAttribute('href'), 'https://ci.example/repos/7/pipeline/12');
   assert.equal(await commits.nth(0).locator('a').count(), 0, 'a javascript: URL is not made a link');
   assert.equal(await page.locator('#session-story li[data-kind=unlinked]').count(), 0);
+}));
+
+test('the story says the links are loading, then that they could not be loaded when the request fails', () => withSession(async ({ page, base, id }) => {
+  await page.route('**/api/v1/sessions/*/commits', (route) => route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"x"}' }));
+  await page.goto(`${base}/#/herd/session/${id}`);
+  await page.locator('#session-story li[data-kind=unlinked]:has-text("could not be loaded")').waitFor();
 }));

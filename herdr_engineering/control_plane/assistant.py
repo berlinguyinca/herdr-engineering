@@ -1817,6 +1817,7 @@ class AssistantService:
         self.lineage_emit = None       # (user, correlation dict) -> dict   best-effort graph events
         self.delegation_consumer = None  # set by assistant_dispatch.DelegationConsumer; cancel reaches the handoff through it
         self.ci_board_request = None   # (tenant, user, payload, idempotency key) -> dict   ActionBoard.request
+        self.ci_rerun_request = None   # same signature; queues a ci_rerun (restart that CI run) proposal beside the repair
         if runner is not None:
             self.runner = runner
         else:
@@ -3355,12 +3356,18 @@ class AssistantService:
             except Exception as exc:  # noqa: BLE001 - no scope, kill switch, or a refused action
                 res["skipped"].append({"node": n.get("id"), "reason": redact_secrets(str(exc))[:200]})
                 continue
+            rerun_id = ""
+            if self.ci_rerun_request is not None:
+                try:    # a plain restart is the cheap first answer to a flaky run; it is a separate, separately approved proposal
+                    rerun_id = str(self.ci_rerun_request(tenant_id, user_id, payload, f"{fp[:50]}-{len(prior)}-rr").get("id") or "")
+                except Exception:  # noqa: BLE001 - the repair proposal is the primary one; a refused rerun must not hide it
+                    rerun_id = ""
             expires = board.get("expires_at")
             x, _ = self.create_proposal(
                 tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id, kind="ci_repair",
                 title=f"CI failed: {repo} run {run_no}",
                 payload={**payload, "fingerprint": fp, "head": head, "ci_node": n.get("id"),
-                         "auto_merge": False},
+                         "auto_merge": False, **({"rerun_proposal": rerun_id} if rerun_id else {})},
                 requested_by=user_id, dedupe_key=f"ci:{fp[:32]}:{len(prior)}",
                 external_ref=str(board.get("id") or ""),
                 correlation={"assistant_id": assistant_id, "ci_node": str(n.get("id") or "")})
@@ -3368,7 +3375,8 @@ class AssistantService:
                 x.expires_at = datetime.fromisoformat(expires)
                 self.store.put_proposal(x)
             self.notify(tenant_id=tenant_id, user_id=user_id, key=f"ci:{fp[:32]}", priority="urgent",
-                        text=f"CI failed in {repo} (run {run_no}); a repair proposal awaits approval",
+                        text=(f"CI failed in {repo} (run {run_no}); a repair proposal awaits approval"
+                              + ("; so does a plain re-run" if rerun_id else "")),
                         link=x.link)
             res["created"].append(x.proposal_id)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,

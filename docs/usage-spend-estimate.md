@@ -16,11 +16,13 @@ control_plane:
       - {model: "qwen*", input: 0, output: 0}        # self-hosted: say so with an explicit zero
 ```
 
-- The first entry whose `model` glob matches a record's model prices it (`fnmatch`, case-sensitive).
+- The first entry whose `model` glob matches a record's model prices it (`fnmatch`, case-insensitive).
 - `input` and `output` are required; `0` is a valid price. `cached` prices cache-read tokens; without it they are
   charged at the `input` rate, which can only overstate.
 - `cached_in_input: true` says the provider counts cache reads inside `input_tokens` (OpenAI style), so they are
-  not charged twice. The default is the Anthropic style, where cache reads are separate.
+  not charged twice; `false` says they are separate (Anthropic style). Left out, it follows the source: proxy records
+  are OpenAI-shaped, so they default to `true`; transcripts default to `false`.
+- Prices go up to 1,000,000 dollars per million tokens; model matching ignores case.
 - Reasoning tokens are taken to be part of `output_tokens` and are not charged again.
 - A bad table stops the control plane at start-up and names the key.
 

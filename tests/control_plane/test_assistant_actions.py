@@ -676,3 +676,33 @@ def test_unhashable_tool_id_is_a_clean_error_and_a_denied_action_cannot_be_appro
     svc.store.get_action(appr.action_id).status = "denied"                   # e.g. the grant was revoked meanwhile
     with pytest.raises(Exception, match="request it again"):
         svc.decide_approval(appr.approval_id, tenant_id="t", user_id="key:u1", decision="approved", actor="boss")
+
+
+def test_a_ci_failure_also_queues_a_separate_rerun_proposal_when_wired():
+    _, feed, routes, svc, r1, _ = _ci_world()
+    svc.ci_rerun_request = routes.assistant_ci_rerun
+    _fail(feed)
+    kw = dict(tenant_id="t", user_id="key:u1", assistant_id=r1.assistant_id, actor="key:u1")
+    svc.watch_ci(**kw)
+    assert sorted(b.action for b in routes.board.pending("org1")) == ["ci_rerun", "request_ci_repair"]
+    rerun = next(b for b in routes.board.pending("org1") if b.action == "ci_rerun")
+    assert rerun.payload == {"repo": "o/r", "run": 12} and rerun.requester == "key:u1"
+    (p,) = svc.store.proposals.values()
+    assert p.kind == "ci_repair" and p.payload["rerun_proposal"] == rerun.id
+    (n,) = svc.store.notifications.values()
+    assert "re-run" in n.text
+    svc.watch_ci(**kw)      # not re-alerted, not re-queued
+    assert len(routes.board.pending("org1")) == 2
+
+
+def test_a_refused_rerun_never_hides_the_repair_proposal():
+    _, feed, routes, svc, r1, _ = _ci_world()
+
+    def boom(*_a):
+        raise RuntimeError("kill switch")
+    svc.ci_rerun_request = boom
+    _fail(feed)
+    out = svc.watch_ci(tenant_id="t", user_id="key:u1", assistant_id=r1.assistant_id, actor="key:u1")
+    assert len(out["created"]) == 1 and [b.action for b in routes.board.pending("org1")] == ["request_ci_repair"]
+    (p,) = svc.store.proposals.values()
+    assert "rerun_proposal" not in p.payload

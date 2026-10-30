@@ -83,3 +83,38 @@ def test_other_org_cannot_execute():
     p = approved(board, "pause_ingestion", {"project": "p1", "source": "github"})
     with pytest.raises(pi.NotFound):
         ex.execute(p.id, "other")
+
+
+def test_ci_rerun_restarts_exactly_the_approved_run_once():
+    calls = []
+    store, board, _, ex = rig(ci_rerun=lambda *a: calls.append(a))
+    p = approved(board, "ci_rerun", {"project": "p", "repo": "a/b", "run": 7})
+    assert ex.execute(p.id, "o").state == "executed"
+    assert calls == [("a/b", 7)]
+    with pytest.raises(pi.Conflict):
+        ex.execute(p.id, "o")
+    assert calls == [("a/b", 7)]
+
+
+def test_ci_rerun_refuses_bad_payloads_unwired_hooks_and_provider_refusals():
+    calls = []
+    _, board, _, ex = rig(ci_rerun=lambda *a: calls.append(a))
+    for payload in ({"project": "p", "repo": "a/b", "run": True}, {"project": "p", "repo": "a/b", "run": 0},
+                    {"project": "p", "repo": "../x", "run": 3}, {"project": "p", "run": 3}):
+        assert ex.execute(approved(board, "ci_rerun", payload).id, "o").state == "failed", payload
+    assert calls == []
+    _, board2, _, unwired = rig()
+    assert unwired.execute(approved(board2, "ci_rerun", {"project": "p", "repo": "a/b", "run": 3}).id, "o").state == "failed"
+
+    def refuse(*_a):
+        raise PermissionError("Woodpecker does not permit this action for this pipeline")
+    _, board3, _, refusing = rig(ci_rerun=refuse)
+    out = refusing.execute(approved(board3, "ci_rerun", {"project": "p", "repo": "a/b", "run": 3}).id, "o")
+    assert out.state == "failed" and "PermissionError" in out.history[-1]
+
+
+def test_ci_rerun_waits_for_the_execute_flag():
+    calls = []
+    _, board, sect, ex = rig({"enabled": True, "suggest": True}, ci_rerun=lambda *a: calls.append(a))
+    p = approved(board, "ci_rerun", {"project": "p", "repo": "a/b", "run": 7})
+    assert ex.execute(p.id, "o").state == "approved" and calls == []

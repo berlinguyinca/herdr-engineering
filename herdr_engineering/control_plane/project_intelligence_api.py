@@ -33,6 +33,7 @@ class IntelligenceRoutes:
         self.github_app_fn = None   # set by the API glue: () -> review-gate GitHub client or None
         self.metrics_fn = None      # set by the API glue: () -> dict of bridge counters and incident states
         self.ci_repair_fn = None    # set by the API glue: (repository, run, operation_id, actor) -> CI-fix request
+        self.ci_rerun_fn = None     # set by the API glue: (repository, run) -> restarts that CI run
         self.poll_status_fn = None  # set by the API glue: () -> {client, last_error} for the PR poller
         self.single_operator_fn = lambda: False   # set by the API glue: the server runs in single-operator mode
         self.last_reconcile: dict | None = None   # counters of the latest pass; a reason when it could not run
@@ -51,7 +52,8 @@ class IntelligenceRoutes:
         if self._executor is None:
             from .intel_executor import ProposalExecutor
             self._executor = ProposalExecutor(self.board, self.store, section_fn=self._section,
-                                              ci_repair=lambda *a: self.ci_repair_fn(*a) if self.ci_repair_fn else _unwired())
+                                              ci_repair=lambda *a: self.ci_repair_fn(*a) if self.ci_repair_fn else _unwired(),
+                                              ci_rerun=lambda *a: self.ci_rerun_fn(*a) if self.ci_rerun_fn else _unwired())
         return self._executor
 
     def reconcile_now(self) -> dict | None:
@@ -149,7 +151,12 @@ class IntelligenceRoutes:
         viewer = self._viewer_from_entry(entry) if isinstance(entry, dict) else None
         return execute_read(ReadTools(self.store), viewer, payload)
 
-    def assistant_ci_repair(self, tenant_id: str, user_id: str, payload: dict, idempotency_key: str) -> dict:
+    def assistant_ci_rerun(self, tenant_id: str, user_id: str, payload: dict, idempotency_key: str) -> dict:
+        """Same scope rules as ``assistant_ci_repair``, queuing a ``ci_rerun`` proposal (restart that CI run)."""
+        return self.assistant_ci_repair(tenant_id, user_id, payload, idempotency_key, action="ci_rerun")
+
+    def assistant_ci_repair(self, tenant_id: str, user_id: str, payload: dict, idempotency_key: str,
+                            action: str = "request_ci_repair") -> dict:
         """Assistant CI watch entry: queue a ``request_ci_repair`` PROPOSAL on the existing board. Scope comes only
         from YAML ``assistant_viewers`` (as for reads). The requester is the user, so the board's own refusal of
         self-approval applies. Executing an approved proposal stays with the existing executor and its policy."""
@@ -165,7 +172,7 @@ class IntelligenceRoutes:
         if not (isinstance(mapped, list) and mapped) or (
                 viewer.project_ids is not None and not set(mapped) <= viewer.project_ids):
             raise pi.NotFound("the repository is outside this user's project scope")
-        p = self.board.request(org_id=viewer.org_id, requester=user_id, action="request_ci_repair",
+        p = self.board.request(org_id=viewer.org_id, requester=user_id, action=action,
                                payload=dict(payload), resource_version=1, idempotency_key=idempotency_key[:64])
         return {"id": p.id, "expires_at": p.expires_at.isoformat(), "state": p.state,
                 "payload_sha256": p.payload_sha256}

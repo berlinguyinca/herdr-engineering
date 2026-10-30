@@ -3696,7 +3696,9 @@ def _fabric_compaction_settings(cp):
     return CompactionSettings(
         enabled=raw.get("enabled") is True, dry_run=raw.get("dry_run") is not False,
         interval_seconds=number("interval_seconds", 3600, 60), min_age_days=number("min_age_days", 2, 1),
-        batch_rows=int(number("batch_rows", 250_000, 1000)), archive_retention_days=retention,
+        batch_rows=int(number("batch_rows", 1_000_000, 1000)), chunk_rows=int(number("chunk_rows", 5000, 100)),
+        chunk_pause_seconds=number("chunk_pause_seconds", 0.25, 0), max_pass_seconds=number("max_pass_seconds", 300, 10),
+        archive_retention_days=retention,
         rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
         keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
 
