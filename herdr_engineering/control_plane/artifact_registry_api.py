@@ -99,6 +99,12 @@ def route_registry(handler, server, parts, resource):
         else:
             body = _json_body(handler, _LINK_FIELDS)
             result = handler._artifact_call("link_context", artifact_id, created_by=principal, **body)
+            access = getattr(server, "room_artifact_access", None)
+            if access is not None and body.get("room_id") and result["linked"]:
+                try:
+                    access.sync_artifact(artifact_id)          # the room's people can read it now, not at the next change
+                except Exception:                              # noqa: BLE001 - the link stands; the next sync retries
+                    pass
             handler._json({"artifact_id": artifact_id, **result}, 201 if result["linked"] else 200)
         return True
 

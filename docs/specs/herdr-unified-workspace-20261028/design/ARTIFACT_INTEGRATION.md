@@ -196,3 +196,6 @@ access, messages, session logs and their migrations 0022 (non-file parts).
 
 Share-link delivery route and publication persistence (P03b); room-derived read grants (P02/P06); WebUI gallery; CLI
 `/artifact` adapter commands; a scheduled reconcile caller (the route and store method exist; a timer is deployment).
+
+## Room-derived read access (built 2026-10-30)
+Decision (operator, option 1): registry grants may name a collab identity. `collab:user:<id>` gets `read` on every artifact linked to a room it is in, written by `artifact_room_access.py` with `granted_by = room:<id>`. Revocation is a delete of that room's grants; the sync runs on membership events, on a room link and at startup. The one ACL still decides; there is no second evaluation path. Not done: a signed-in room member reading through the internet-facing collab-only listener (it has no registry), and a row-per-source ACL so two rooms' grants for the same person never share a row.

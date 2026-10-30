@@ -13,12 +13,14 @@ class ArtifactAcl:
         self._holders: dict[str, set] = {}      # artifact id -> principals with a stored grant (read-time gate index)
 
     def grant(self, artifact_id: str, principal_id: str, permissions: set[str],
-              *, expires_at: float | None = None) -> dict:
+              *, expires_at: float | None = None, granted_by: str | None = None) -> dict:
         allowed = {"read", "edit", "review", "share", "admin"}
         if not artifact_id or not principal_id or not permissions <= allowed:
             raise ValueError("invalid artifact ACL grant")
         grant = {"artifact_id": artifact_id, "principal_id": principal_id,
                  "permissions": sorted(permissions), "expires_at": expires_at}
+        if granted_by is not None:          # who wrote it; room-derived grants say "room:<id>" so they can be revoked as a set
+            grant["granted_by"] = granted_by
         self._grants[(artifact_id, principal_id)] = grant
         self._holders.setdefault(artifact_id, set()).add(principal_id)
         if self.on_change:
@@ -50,6 +52,10 @@ class ArtifactAcl:
         """Principal ids holding a live ``permission`` on the artifact (expired grants are dropped on the way)."""
         return [pid for pid in sorted(self._holders.get(artifact_id, ())) if self.can(artifact_id, pid, permission)]
 
+    def grants_by(self, granted_by: str) -> list[dict]:
+        """Stored grants written by ``granted_by`` (copies), for revoking a source's grants as a set."""
+        return [dict(g) for g in self._grants.values() if g.get("granted_by") == granted_by]
+
     def has_grants(self, artifact_id: str) -> bool:
         return any(aid == artifact_id for aid, _ in self._grants)
 
@@ -61,5 +67,6 @@ class ArtifactAcl:
                 "principal_id": grant["principal_id"],
                 "permissions": list(grant.get("permissions") or []),
                 "expires_at": grant.get("expires_at"),
+                **({"granted_by": grant["granted_by"]} if grant.get("granted_by") else {}),
             }
 

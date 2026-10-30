@@ -394,6 +394,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         # P05 crash takeover: seconds an accepted task may stay accepted before it goes back to pending for its target
         # agent to pick up again (an ``attempt`` counter fences the old run). None = off (the default).
         self.task_lease_seconds: float | None = None
+        # Called with a room id after its membership changed (member added or removed). Must be cheap and never raise:
+        # the artifact registry uses it to queue a re-sync of that room's read grants (P03 room-derived access).
+        self.on_room_members_changed = None
+        # (collab user id, room id, query) -> the registry's page of artifacts linked to that room that this person may
+        # read. Set by the combined server only when room-derived artifact access is on; None = the route answers 404.
+        self.artifact_room_handle = None
         self.enrollment_ttl = enrollment_ttl
         self.credential_ttl = credential_ttl
         self.remote_credential_ttl = remote_credential_ttl  # agents that connect over HTTP MCP
@@ -632,6 +638,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._outstanding_key = None
             self._apply(ev)
             self._touch_rooms(payload, ev["sequence"], event_type)
+            if event_type in ("member_added", "member_removed") and self.on_room_members_changed is not None:
+                try:
+                    self.on_room_members_changed(payload["room_id"])
+                except Exception:               # noqa: BLE001 - a registry hiccup must not fail a membership change
+                    self.stats["member_hook_failures"] = self.stats.get("member_hook_failures", 0) + 1
             self._cv.notify_all()
             return ev
 
@@ -1211,6 +1222,30 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     def _ok(self, uid: str) -> bool:
         """The person exists and may use the network (signed up, and approved when approval is on)."""
         return self.auth.exists(uid) and self._approved(uid)
+
+    def room_ids(self) -> list[str]:
+        with self._lock:
+            return list(self._rooms)
+
+    def room_artifacts(self, pr: Principal, room_id: str, query: dict) -> dict:
+        """Artifacts linked to a room, for a person who is in it now. The registry decides per artifact (its own grants);
+        this only identifies the person. Agents and non-members get the same 404 as a missing room."""
+        if pr.is_agent or self.artifact_room_handle is None:
+            raise CollabError(404, "not found")
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if not room or self._member(room, pr.id) is None:
+                raise CollabError(404, "not found")
+        return self.artifact_room_handle(pr.id, room_id, query)
+
+    def room_readers(self, room_id: str) -> dict[str, float | None]:
+        """``{user_id: expires_at}`` for the people who can read this room right now (lapsed guests excluded).
+        Agents are not readers here; an agent's access to an artifact is its own grant."""
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if not room:
+                return {}
+            return {uid: m["expires_at"] for uid in list(room["members"]) if (m := self._member(room, uid))}
 
     def _member(self, room: dict, uid: str) -> dict | None:
         m = room["members"].get(uid)
@@ -5521,6 +5556,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
+                    if parts[2:] == ["artifacts"]:
+                        return 200, self.room_artifacts(pr, rid, query)
                     if parts[2:] == ["consultations"]:
                         return 200, self.list_consultations(pr, rid)
                     if parts[2:] == ["xlinks"]:

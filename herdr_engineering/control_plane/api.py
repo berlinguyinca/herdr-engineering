@@ -606,6 +606,7 @@ class ControlPlaneServer:
                 self.ingest.reserved_node = collab.is_external_node
                 self.ingest.service_node = collab.is_hcn_node
                 collab.lineage_sink = self._external_lineage
+                self._wire_room_artifact_access(collab, artifact_store, artifact_acl, unified_workspace_config)
                 collab.quorum_config = review_quorum        # T15: review items and the "reviewed at head" evidence use the T06 policy
         self.host = host
         self.port = port
@@ -1215,6 +1216,36 @@ class ControlPlaneServer:
                 self.architecture.explain_key = Path(cfg["api_key_file"]).expanduser().read_text().strip()
             except OSError as exc:
                 raise ValueError(f"control_plane.architecture.explain.api_key_file is unreadable: {exc.strerror}") from exc
+
+    def _wire_room_artifact_access(self, collab, artifact_store, artifact_acl, config) -> None:
+        """P03 room-derived read access: people in a room read the artifacts linked to it, as ordinary read grants
+        (artifact_room_access.py). Only with control_plane.unified_workspace.room_artifact_access: true (default off)."""
+        self.room_artifact_access = None
+        enabled = (self.unified_workspace_enabled and isinstance(config, dict)
+                   and config.get("room_artifact_access") is True)
+        if not enabled or artifact_store is None or artifact_acl is None:
+            return
+        from .artifact_room_access import RoomArtifactAccess, principal_for
+        from .collab import CollabError
+
+        def call(method, *args, **kwargs):
+            runner = getattr(artifact_store, "sync_call", None) or (artifact_store if callable(artifact_store) else None)
+            if runner is None:
+                raise RuntimeError("versioned artifact registry adapter is unavailable")
+            return runner(method, *args, **kwargs)
+        access = RoomArtifactAccess(artifact_acl, call, collab.room_readers, now=time.time)
+        self.room_artifact_access = access
+        collab.on_room_members_changed = access.notify
+
+        def page(user_id, room_id, query):
+            try:
+                limit = int(query.get("limit", "50"))
+            except ValueError:
+                raise CollabError(400, "limit must be an integer") from None
+            return call("list_by_context", principal_id=principal_for(user_id), kind="room", ref=room_id,
+                        query=query.get("q"), media_type=query.get("media_type"), limit=limit, cursor=query.get("cursor"))
+        collab.artifact_room_handle = page
+        access.start(collab.room_ids)
 
     def _external_lineage(self, envelope, principal, valid=None):
         """Ingest one envelope the HCN service built for an external agent. The principal's allowed room is
