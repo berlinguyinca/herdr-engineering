@@ -3646,7 +3646,7 @@ def _make_handler(server, public=False, operator=False):
                             repository_languages=cached_github_languages(server.github_monitor))
                         return server.ci_monitor.report_redactor()(view)
                     # Several seconds to build, asked for by every open CI page: one build per key per few seconds.
-                    return self._json(server.ci_reports_cache.get(self.path, build_reports))
+                    return self._json(server.ci_reports_cache.get((self.path, r.ci_reports_version()), build_reports))
                 if what == "pipeline":
                     view = server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number"),

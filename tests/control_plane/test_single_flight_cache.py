@@ -63,3 +63,17 @@ def test_a_zero_ttl_disables_caching():
     cache.get("k", lambda: calls.append(1))
     cache.get("k", lambda: calls.append(1))
     assert len(calls) == 2
+
+
+def test_the_ci_reports_version_moves_for_ci_rows_and_not_for_other_telemetry():
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    repo = ControlPlaneRepo()
+    before = repo.ci_reports_version()
+    assert repo.ci_reports_version() == before
+    repo._events[("heartbeat", "host-1")] = [{"sequence": 1}]
+    assert repo.ci_reports_version() == before, "fleet telemetry does not invalidate the CI report"
+    repo._events[("ci_observation", "run-1")] = [{"sequence": 5}]
+    changed = repo.ci_reports_version()
+    assert changed != before
+    repo._events[("ci_observation", "run-1")].append({"sequence": 9})
+    assert repo.ci_reports_version() != changed

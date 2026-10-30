@@ -2232,6 +2232,17 @@ class ControlPlaneRepo:
                              or ((entry[0], entry[1]) in keep and
                                  entry[2] == self._events[(entry[0], entry[1])][-1]["sequence"])]
 
+    def ci_reports_version(self) -> int:
+        """Changes whenever a CI observation, report or log-test row is added or replaced, and for nothing else (fleet
+        telemetry does not move it). Cheap: it walks the CI streams' latest sequence numbers, it builds nothing."""
+        kinds = ("ci_observation", "ci_report", "ci_logtests")
+        acc = 0
+        with self._event_lock:
+            for (etype, entity), stream in self._events.items():
+                if etype in kinds and stream:
+                    acc ^= hash((etype, entity, stream[-1].get("sequence"), len(stream)))
+        return acc
+
     def ci_reports(self, *, compact=False, run=None):
         from .ci_observability import _PIPELINE_FIELDS, _REPORT_FIELDS, bind_report_provider
         from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
