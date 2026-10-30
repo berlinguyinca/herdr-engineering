@@ -22,6 +22,7 @@ set -euo pipefail
 USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME] [--lock-held]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
 CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"
+FLEET="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
 DIR="$HOME/.local/share/herdr-engineering/collab-sync"
 DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
 CERT_DIR="$HOME/.local/share/herdr-engineering/collab-edge-certs"
@@ -33,6 +34,7 @@ LOCK_HELD=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
+    --fleet-config) FLEET="${2:?--fleet-config needs a value}"; shift 2 ;;
     --dir) DIR="${2:?--dir needs a value}"; shift 2 ;;
     --data-dir) DATA_DIR="${2:?--data-dir needs a value}"; shift 2 ;;
     --cert-dir) CERT_DIR="${2:?--cert-dir needs a value}"; shift 2 ;;
@@ -46,15 +48,24 @@ while [ $# -gt 0 ]; do
 done
 CERT_SRC="${CERT_SRC:-$ACME/config/live/$CERT_NAME}"
 CERTBOT="${CERTBOT:-${ACME}-venv/bin/certbot}"
-read -r POOL GROUP OPERATOR RAKAZO_GROUP < <(python3 - "$CONFIG" <<'PY'
+read -r POOL GROUP OPERATOR < <(python3 - "$CONFIG" <<'PY'
 import json, sys
-v = json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]
-c = v["collab"]
-print(c["cognito_pool"], c.get("cognito_group") or "local.dev", c.get("operator_user") or "-", v.get("rakazo_cognito_group") or "-")
+c = json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["collab"]
+print(c["cognito_pool"], c.get("cognito_group") or "local.dev", c.get("operator_user") or "-")
 PY
 ) || { echo "cannot read control_plane.collab from $CONFIG (run deploy.sh)" >&2; exit 1; }
 [ "$OPERATOR" = "-" ] && OPERATOR=""
-[ "$RAKAZO_GROUP" = "-" ] && RAKAZO_GROUP=""
+# The Rakazo bridge's group comes from the CENTRAL file (this job runs on the host that owns it), never from the
+# collab slice: the public container refuses any setting beyond control_plane.collab. Only when sync_dir is set.
+RAKAZO_GROUP="$(python3 - "$FLEET" <<'PY' 2>/dev/null || true
+import sys, yaml
+try:
+    cog = yaml.safe_load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["rakazo_bridge"]["cognito"]
+    print(cog["required_group"] if cog.get("sync_dir") else "")
+except (OSError, KeyError, TypeError):
+    print("")
+PY
+)"
 REGION="${POOL%%_*}"
 
 # People the operator invites are added to the group here, on the host, because the public
