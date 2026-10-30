@@ -1,0 +1,17 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.16, pytest-9.2.0, pluggy-1.7.0
+rootdir: /tmp/woodpecker-local-939129680/workspace
+configfile: pytest.ini
+plugins: timeout-2.4.0, platformdirs-4.14.0, anyio-4.15.1, order-1.5.0
+collected 451 items / 17 errors
+tests/e2e/test_analysis_api.py EEEEE                                     [  1%]
+tests/e2e/test_application.py E                                          [  1%]
+tests/integration/test_db_annotation.py EEEEEEEEEEEEEEEEE                [  5%]
+- generated xml file: /tmp/woodpecker-cache/masswiki-ci/logs/masswiki-gates-2de3aa67036b755a6574742c59469369c828a91f-1793316682.junit.xml -
+=========================== short test summary info ============================
+FAILED tests/unit/test_dagster_pipeline.py::TestReferenceLibraryIngestSensor::test_run_key_contains_partition_and_version - AssertionError: assert '2026-04-01' in 'gnps-unknown'
+ +  where 'gnps-unknown' = RunRequest(run_key='gnps-unknown', run_config={}, tags={}, job_name=None, asset_selection=None, stale_assets_only=False, partition_key='gnps', asset_check_keys=None, asset_g
+============ 1 failed, 411 passed, 14 warnings, 56 errors in 6.05s =============
+pytest exit: 1
+=== report gate ===
+=== pytest report gate ===

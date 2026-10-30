@@ -5,7 +5,8 @@ import {safeServiceUrl} from './services-view.js';
 import {recordOutcome} from './record-state.js';
 import {ciRunKey} from './ci-performance.js';
 import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
-import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
+import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports,ciExplorerTargets} from './ci-insights.js';
+import {renderTestExplorer,testExplorerStyles,explorerTests,testSource} from './ci-test-explorer.js';
 import {renderCiPipeline,renderCiDiagnosis,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
 import {mountCiObservability,ciProjectKey} from './ci-observability-view.js';
 import {ciRunInScope,ciRunInWindow,ciSelectRunWindow} from './ci-health.js';
@@ -173,6 +174,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
   let selectedReports=null,selectedReportsError='';
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
+  // The per-test explorer of the repository chosen in the overview: its latest reports, filters, the selected test and its excerpt.
+  let cx={repo:'',label:'',signature:'',reports:null,error:'',search:'',status:'all',sort:'failures',selected:'',slice:null,sliceError:'',history:null,historyError:''};
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='',fixOperationId='';
   let fixAvailable=true,fix=null,fixMessage='',sandboxOperationId='',fixTerminal=null,fixTerminalError='';
   let healthView=null,observabilityView=null,workspace=WORKSPACES.includes(startWorkspace)?startWorkspace:tab==='current'?'overview':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
@@ -183,7 +186,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
   const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
-  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+commandCenterStyles+'<style>'+ciFixStyles+'</style>':''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro"${isCi?' hidden':''}>${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+testExplorerStyles+ciPipelineStyles+commandCenterStyles+'<style>'+ciFixStyles+'</style>':''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro"${isCi?' hidden':''}>${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
     ${isCi?'<div data-ci-attention></div><div data-ci-observability></div><div data-ci-health></div>':''}
     <div class="ig-tabs hd-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
@@ -314,11 +317,13 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
     // Clock advance can change membership even when every provider payload is unchanged.
     const windowMembership=isCi?all.map(entry=>ciRunInWindow(entry.record,state)):null;
-    const nextSignature=JSON.stringify([state,!!error,data,reportData,performanceData,performanceError,performanceDays,windowMembership,[...reviewCache]]);
+    const nextSignature=JSON.stringify([state,!!error,data,reportData,performanceData,performanceError,performanceDays,windowMembership,[...reviewCache],[cx.repo,cx.signature,cx.search,cx.status,cx.sort,cx.selected,cx.error]]);
     if(isCi) {
       const observations=ciObservations();
       const model=ciInsightsModel(observations,state);
-      const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage,selectedRepo:state.project?ciProjectKey(state.project):el('[data-ci-repository]')?.value||''});
+      const selectedRepo=state.project?ciProjectKey(state.project):el('[data-ci-repository]')?.value||'';
+      syncExplorer(ciExplorerTargets(model,selectedRepo),selectedRepo);
+      const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage,selectedRepo,explorer:renderTestExplorer(cx.repo?cx:null)});
       if(insightsSignature!==html){
         const host=el('[data-ci-insights]');
         const focus=[...host.querySelectorAll('details')].findIndex(d=>d.querySelector('summary')===document.activeElement);
@@ -429,6 +434,65 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     catch(err){if(!disposed && (!controller.signal.aborted || timeout))onError(err);}
     finally {clearTimeout(deadline);if(pending.get(key)===controller)pending.delete(key);draw();}
   }
+  function resetExplorer(repo,label) {
+    for(const key of ['cx-reports','cx-slice','cx-history']){pending.get(key)?.abort();pending.delete(key);}
+    cx={...cx,repo,label,signature:'',reports:null,error:'',selected:'',slice:null,sliceError:'',history:null,historyError:''};
+  }
+  // Fetch the full reports (tests included) of the selected repository's latest runs whenever they change.
+  function syncExplorer(targets,repo) {
+    if(!repo){if(cx.repo)resetExplorer('','');return;}
+    if(cx.repo!==repo)resetExplorer(repo,targets[0]?.repository||repo);
+    const exact=targets.filter(r=>r.provider_url&&r.provider_repo_id!=null&&r.repository&&r.run_number);
+    const signature=JSON.stringify(exact.map(r=>[r.report_id,r.run_number]));
+    if(!exact.length){if(cx.reports===null&&targets.length){cx.reports=[];cx.error='These reports are not linked to a provider run yet, so their tests cannot be listed.';}return;}
+    if(signature===cx.signature||typeof client.getCiReports!=='function')return;
+    const repoAtStart=repo;
+    request('cx-reports',async signal=>Promise.all(exact.map(async r=>({label:r.label,wanted:r.report_id,response:await client.getCiReports({signal,provider_url:r.provider_url,provider_repo_id:r.provider_repo_id,repository:r.repository,run_number:r.run_number})}))),responses=>{
+      if(cx.repo!==repoAtStart)return;
+      cx.reports=responses.map(({label,wanted,response})=>{
+        if(!Array.isArray(response?.reports))throw new Error('Invalid test report response');
+        const list=response.reports;return {label,report:list.find(r=>r.report_id===wanted)||list[list.length-1]||null};
+      });
+      cx.signature=signature;cx.error='';
+    },()=>{if(cx.repo===repoAtStart){cx.error='The tests of the latest runs could not be loaded. Retrying automatically.';cx.signature=signature;}});
+  }
+  function explorerTest() {return explorerTests(cx.reports).find(t=>t.key===cx.selected)||null;}
+  function selectExplorerTest(key) {
+    cx.selected=cx.selected===key?'':key;cx.slice=null;cx.sliceError='';cx.history=null;cx.historyError='';
+    pending.get('cx-slice')?.abort();pending.delete('cx-slice');pending.get('cx-history')?.abort();pending.delete('cx-history');
+    const t=explorerTest();
+    if(t&&t.source==='log'&&t.step_id&&t.provider_url){
+      const key0=cx.selected;
+      request('cx-slice',signal=>client.getCiLogSlice(t.provider_repo_id,t.run_number,t.step_id,{start:t.line_start,end:t.line_end,expect:t.name,signal,providerUrl:t.provider_url}),response=>{
+        if(cx.selected!==key0)return;
+        if(response?.provider_url&&canonicalProvider(response.provider_url)!==canonicalProvider(t.provider_url))throw new Error('Log provider identity mismatch');
+        cx.slice=response;cx.sliceError='';
+      },()=>{if(cx.selected===key0)cx.sliceError='The log excerpt could not be read from CI.';});
+    }
+    draw();
+  }
+  // The same test (name, suite and step) in up to eight of the most recent runs of this repository, whatever the branch.
+  function loadExplorerHistory() {
+    const t=explorerTest();if(!t||pending.has('cx-history'))return;
+    const same=r=>r.provider_url===t.provider_url&&String(r.provider_repo_id)===String(t.provider_repo_id);
+    const runs=[...new Set(records(reportData?.reports).filter(same).map(r=>r.run_number))].sort((a,b)=>b-a).slice(0,8);
+    cx.history='loading';cx.historyError='';const key0=cx.selected;
+    request('cx-history',async signal=>Promise.all(runs.map(async number=>({number,response:await client.getCiReports({signal,provider_url:t.provider_url,provider_repo_id:t.provider_repo_id,repository:t.repository,run_number:number})}))),results=>{
+      if(cx.selected!==key0)return;
+      cx.history=results.map(({number,response})=>{
+        const report=(response.reports||[]).at(-1),match=explorerTests([{label:'',report}]).find(x=>x.name===t.name&&(x.suite||'')===(t.suite||'')&&(x.step||'')===(t.step||''));
+        return {run_number:number,branch:report?.branch||'',status:match?.status||'',source:report?testSource(report):'',unindexed:!!report?.index_dropped};
+      });
+    },()=>{if(cx.selected===key0){cx.history=[];cx.historyError='Earlier runs could not be loaded.';}});
+    draw();
+  }
+  function openExplorerRun(number,{withStep=false}={}) {
+    const t=explorerTest();if(!t)return;
+    const record=records(reportData?.pipelines).find(r=>r.provider_url===t.provider_url&&String(r.provider_repo_id)===String(t.provider_repo_id)&&String(r.run_number)===String(number));
+    if(!record)return;
+    workspace='runs';openCiRun(record);
+    if(withStep&&t.step_id){pending.get('log')?.abort();pending.delete('log');step=String(t.step_id);log=null;logError='';draw();refreshDetail();}
+  }
   function refreshRelated() {
     if(!selected || typeof client.related!=='function')return;
     const key=selected.id,id=`${selected.providerId}:${selected.number}`;
@@ -510,6 +574,11 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(button.hasAttribute('data-collapse-success')){collapseSuccess=!collapseSuccess;draw();return;}
     if(button.hasAttribute('data-pipeline-zoom')){zoom=pipelineZoom(button.dataset.pipelineZoom==='reset'?1:Math.round((zoom+(button.dataset.pipelineZoom==='in'?.25:-.25))*100)/100);draw();return;}
     if(button.dataset.ciTestPage){testPage=Math.max(0,testPage+(button.dataset.ciTestPage==='next'?1:-1));draw();}
+    if(button.hasAttribute('data-cx-test')){selectExplorerTest(button.dataset.cxTest);return;}
+    if(button.hasAttribute('data-cx-close')){selectExplorerTest(cx.selected);return;}
+    if(button.hasAttribute('data-cx-history')){loadExplorerHistory();return;}
+    if(button.hasAttribute('data-cx-open-run')){openExplorerRun(button.dataset.cxOpenRun);return;}
+    if(button.hasAttribute('data-cx-open-step')){const t=explorerTest();if(t)openExplorerRun(t.run_number,{withStep:true});return;}
     if(button.hasAttribute('data-ci-test-repo')){
       const select=el('[data-ci-repository]'),key=button.dataset.ciTestRepo;
       const option=[...select.options].find(o=>o.value===key);
@@ -610,7 +679,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       debugSessions=activePiSessions(response.sessions);debugMessage='';{const onBranch=selected?.branch?debugSessions.filter(x=>x.branch===selected.branch):[];if(!debugSessionId && onBranch.length===1){debugSessionId=onBranch[0].session_id;debugOperationId='';fixOperationId='';}}
     },()=>{if(selected?.id===key){debugSessions=[];debugMessage='Pi agents could not load. Reopen this run to retry.';}});
   },{capture:true,signal:listenerController.signal});
-  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';fixOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
+  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-cx-status')){cx.status=event.target.value;draw();return;}if(event.target.hasAttribute('data-cx-sort')){cx.sort=event.target.value;draw();return;}if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';fixOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
   container.querySelector('.ig-tabs:not(.ci-workspace-tabs)').addEventListener('keydown',event=>{
     if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
     const index=tabs.findIndex(([key])=>key===state.tab);
@@ -625,7 +694,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     }
     state[key]=event.target.value;state.page=0;if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,start:null,end:null,run_number:null,...(key==='days'?{mode:'days'}:{}),...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};state.start=null;state.end=null;state.run_number=null;if(key==='days')state.mode='days';observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
   if(isCi)el('[data-ci-performance-window]').addEventListener('change',event=>{performanceDays=Number(event.target.value);refreshPerformance(true);});
-  container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
+  container.addEventListener('input',event=>{if(event.target.hasAttribute('data-cx-search')){cx.search=event.target.value;draw();return;}if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
   el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});
   el('[data-ig-group]').addEventListener('change',event=>{state.group=event.target.value;draw();});
   function visibility() {

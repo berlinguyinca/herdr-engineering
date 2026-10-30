@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### CI test counts from logs, with no project setup
+- The control plane reads the step logs of recently finished Woodpecker runs and keeps what the test runners printed (pytest, `node --test`/TAP, cargo, `go test -v`, jest/vitest, ScalaTest, surefire, gradle, Karma, `unittest`): counts, runner names and, where the runner prints one line per test, an index of names, statuses and log line ranges. No log text is stored, a JUnit upload for the same run always wins, and no environment variables or pipeline changes are needed. `control_plane.ci_log_tests` (YAML: `enabled`, `runs_per_cycle`, `max_log_mib`, `window_days`) tunes it.
+- `GET /api/v1/ci/log-slice` returns the redacted live log lines around an indexed test, or says why it cannot.
+- The CI Tests tab bars use these counts and say where they come from; selecting a repository lists its tests (search, filter, sort) and opens a log excerpt with ways to keep investigating.
+
 ### Unified workspace P01: contracts, ids and the capability/action broker (library only, flag off)
 - New `schemas/workspace-v1.schema.json` (JSON Schema 2020-12) for project, team, room, mission, issue, task, agent, agent_session, host, artifact, artifact_version, review, decision, external_action, event and the 14 typed edges, with canonical ids `urn:herdr:<kind>:<uuid>` (uuid5 over the native id, so every host agrees), aliases, scope, version/ETag, trace/correlation/causation ids and reference URIs. Contract table and graph.py mapping: `docs/contracts/unified-workspace-v1.md`.
 - New `herdr_engineering/control_plane/workspace_contracts.py`: id/alias canonicalisation, validators, ETag compare-and-swap, idempotency tokens, a discover/authorize/approve/invoke broker (user role, agent delegation, room grant, artifact grant, account grant and risk policy are intersected; room membership never grants shell or external-account access), untrusted-content tainting, ACL re-check hooks for traversal, search, export and subscriptions, and the replay-cursor contract.

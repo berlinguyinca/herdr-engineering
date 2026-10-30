@@ -585,6 +585,12 @@ export class HerdrClient {
     return this.request(`/api/v1/ci/log?${query}`, { signal });
   }
 
+  // Lines of one step's live log around an indexed test; the server says plainly when the range is gone.
+  getCiLogSlice(repository, number, step, { start, end, context = 40, expect = '', signal, providerUrl } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number), step: String(step), start: String(start), end: String(end), context: String(context), ...(expect ? { expect: String(expect).slice(0, 500) } : {}), ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) });
+    return this.request(`/api/v1/ci/log-slice?${query}`, { signal });
+  }
+
   ciAction(repository, number, action, { signal, providerUrl } = {}) {
     return this.request('/api/v1/ci/actions', {
       method: 'POST', body: { repository, number, action, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,

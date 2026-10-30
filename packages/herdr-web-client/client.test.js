@@ -574,3 +574,12 @@ test('getGithubProjects reads the projects list or one project, conditionally', 
   assert.equal(again.notModified, true);
   assert.equal(server.calls[2].url, '/api/v1/github/projects?project=PVT_1&since=2');
 });
+
+test('the log slice request names the step, the line range and the test it expects there',async()=>{
+ const calls=[];
+ const client=new HerdrClient('',{fetchImpl:async url=>{calls.push(url);return {ok:true,status:200,text:async()=>'{}'};}});
+ await client.getCiLogSlice('17',12,'4',{start:10,end:14,expect:'TestBeta',providerUrl:'https://ci.example'});
+ const query=new URL(calls[0],'http://test');
+ assert.equal(query.pathname,'/api/v1/ci/log-slice');
+ assert.deepEqual(Object.fromEntries(query.searchParams),{repository:'17',number:'12',step:'4',start:'10',end:'14',context:'40',expect:'TestBeta',provider_url:'https://ci.example'});
+});
