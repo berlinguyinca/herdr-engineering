@@ -3921,6 +3921,41 @@ def _worker_fabric_compactor(fleet_config_path):
     return FabricCompactor(settings) if settings.enabled else None
 
 
+def _artifact_reconcile_settings(cp) -> dict | None:
+    """``control_plane.artifact_reconcile: {enabled, interval_seconds, grace_seconds, orphan_ttl_hours, limit}``
+    (off unless ``enabled`` is exactly true). Out-of-range numbers fall back to the defaults."""
+    raw = (cp or {}).get("artifact_reconcile") or {}
+    if not isinstance(raw, dict):
+        raise SystemExit("fleet config control_plane.artifact_reconcile must be a mapping")
+    if raw.get("enabled") is not True:
+        return None
+
+    def num(key, default, low):
+        v = raw.get(key, default)
+        return float(v) if not isinstance(v, bool) and isinstance(v, (int, float)) and v >= low else float(default)
+    return {"interval": num("interval_seconds", 300, 60), "grace_seconds": num("grace_seconds", 60, 0),
+            "orphan_ttl_seconds": num("orphan_ttl_hours", 24, 1) * 3600.0, "limit": int(num("limit", 100, 1))}
+
+
+def _worker_artifact_reconciler(fleet_config_path, rustfs):
+    """The scheduled artifact reconciler when the fleet file enables it, else None."""
+    from pathlib import Path
+
+    from .control_plane.artifacts import ArtifactStore
+    from .control_plane.worker import ArtifactReconciler
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    settings = _artifact_reconcile_settings(cp)
+    if settings is None:
+        return None
+    return ArtifactReconciler(lambda conn: ArtifactStore(conn, rustfs), **settings)
+
+
 def _maybe_pg_source(dsn, *, inspector_snapshots=False):
     """Build a PostgresSource from a DSN, or None if not provided."""
     if not dsn:
@@ -4031,13 +4066,16 @@ def _cmd_cp_worker(args) -> int:
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
             share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None))
+            reconciler = _worker_artifact_reconciler(getattr(args, "fleet_config", None), rustfs)
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                                          fabric_compactor=compactor, share_housekeeper=share_hk)
+                                          fabric_compactor=compactor, share_housekeeper=share_hk,
+                                          artifact_reconciler=reconciler)
             await run_worker(conn, interval=args.interval, worker_id=worker_id,
                              artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                             fabric_compactor=compactor, share_housekeeper=share_hk)
+                             fabric_compactor=compactor, share_housekeeper=share_hk,
+                             artifact_reconciler=reconciler)
             return None
         finally:
             await conn.close()

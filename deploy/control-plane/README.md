@@ -98,7 +98,7 @@ file is unusable unless `config_failure_mode: last_good` — see "Deployment act
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
 `sensitive_role`, `store_reasoning`), `inspector_snapshots` (`enabled`, default off;
 `interval_seconds`, default 600, at least 60: the worker keeps a replay snapshot of the inspector so a boot
-replays only newer events instead of every stored one; see "Inspector snapshots" below) and `llm_proxy` (`max_inflight`,
+replays only newer events instead of every stored one; see "Inspector snapshots" below), `artifact_reconcile` (`enabled`, default off; the **worker** runs the artifact registry's idempotent repair pass every `interval_seconds`, default 300, at least 60: orphan blobs are marked after `orphan_ttl_hours` (default 24) and never deleted, expired uploads are closed, tombstones past their hold window are purged; `grace_seconds` default 60, `limit` default 100; it does not re-emit lineage, the worker has no graph emitter) and `llm_proxy` (`max_inflight`,
 `queue_wait_seconds`, `raw_retention_days` (default 14: the web server drops older
 `token_usage` records, in memory and in `fabric_events`), `rollup_retention_days`
 (default 400, reserved for the hourly rollups)). `control_plane.compose` is the mapping `deploy.sh` renders
