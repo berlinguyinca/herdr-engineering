@@ -220,6 +220,17 @@ class ShareStore:
             "AND expires_at <= $1 ORDER BY expires_at, share_id", now)
         return [_row(r, keep_hash=True) for r in records]
 
+    async def live_token_hashes(self) -> set[str]:
+        """Token hashes of every live share (the orphan sweep keeps exactly these ``by-token`` directories)."""
+        records = await self._conn.fetch("SELECT token_hash FROM artifact_shares WHERE state='live' "
+                                         "AND token_hash IS NOT NULL")
+        return {r["token_hash"] for r in records}
+
+    async def known_share_states(self) -> dict[str, str]:
+        """``{share_id: state}`` for every share (the orphan sweep keeps bundles of live and pending shares)."""
+        records = await self._conn.fetch("SELECT share_id, state FROM artifact_shares")
+        return {r["share_id"]: r["state"] for r in records}
+
     async def live_total_bytes(self) -> int:
         return int(await self._conn.fetchval(
             "SELECT COALESCE(SUM(total_bytes), 0) FROM artifact_shares WHERE state='live'"))

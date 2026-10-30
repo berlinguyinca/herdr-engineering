@@ -3732,6 +3732,40 @@ def _fabric_compaction_settings(cp):
         keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
 
 
+def _share_worker_settings(cp):
+    """``control_plane.share`` as the worker needs it.  Off unless ``enabled`` is exactly true; directories default to
+    the share container's mounts, and ``marker_dir`` is worker-private (the public container must not write there)."""
+    raw = (cp or {}).get("share") or {}
+    if not isinstance(raw, dict):
+        raise SystemExit("fleet config control_plane.share must be a mapping")
+    out = {"enabled": raw.get("enabled") is True}
+    for key, default in (("shares_dir", "/shares"), ("events_dir", "/share-events"),
+                         ("marker_dir", "/var/lib/herdr/share-markers")):
+        value = raw.get(key, default)
+        if not isinstance(value, str) or not value:
+            raise SystemExit(f"fleet config control_plane.share.{key} must be a non-empty string")
+        out[key] = value
+    return out
+
+
+def _worker_share_housekeeper(fleet_config_path):
+    """The share housekeeper when the fleet file enables shares, else None."""
+    from pathlib import Path
+
+    from .control_plane.worker import ShareHousekeeper
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    settings = _share_worker_settings(cp)
+    if not settings["enabled"]:
+        return None
+    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"])
+
+
 def _worker_fabric_compactor(fleet_config_path):
     """The fabric compactor when the fleet file enables it, else None."""
     from pathlib import Path
@@ -3857,13 +3891,14 @@ def _cmd_cp_worker(args) -> int:
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
+            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None))
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                                          fabric_compactor=compactor)
+                                          fabric_compactor=compactor, share_housekeeper=share_hk)
             await run_worker(conn, interval=args.interval, worker_id=worker_id,
                              artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                             fabric_compactor=compactor)
+                             fabric_compactor=compactor, share_housekeeper=share_hk)
             return None
         finally:
             await conn.close()

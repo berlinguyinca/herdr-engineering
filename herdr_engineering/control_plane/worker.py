@@ -5,14 +5,134 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import socket
+import stat
+import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+from .share_bundle import remove_bundle, remove_state
 
 log = logging.getLogger(__name__)
 LEASE_TTL = 90.0
 HOST_TTL = 300.0
 ARTIFACT_TTL = 3600.0
+
+
+SHARE_INTERVAL = 60.0
+SHARE_ORPHAN_GRACE = 3600.0  # never touch a share directory modified within this window (in-flight approve)
+_SHARE_INGEST_ROUNDS = 64  # each round reads at most 16 MiB
+_TOKEN_DIR = re.compile(r"[0-9a-f]{64}\Z")
+_SHARE_DIR = re.compile(r"share_[0-9a-f]{24}\Z")
+
+
+def _old_real_dirs(directory: Path, pattern: re.Pattern, now: float):
+    """Real (non-symlink) subdirectories of ``directory`` whose name matches ``pattern`` and that were last modified
+    more than the grace period ago.  Anything else (files, symlinks, odd names) is ignored."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not pattern.match(name):
+            continue
+        try:
+            info = os.lstat(directory / name)
+        except OSError:
+            continue
+        if stat.S_ISDIR(info.st_mode) and now - info.st_mtime > SHARE_ORPHAN_GRACE:
+            yield name
+
+
+async def _sweep_expired(store, shares_root: Path, now: float) -> int:
+    expired = 0
+    for share in await store.live_expired(datetime.fromtimestamp(now, UTC)):
+        share_id = share["share_id"]
+        try:
+            remove_state(shares_root, share["token_hash"])  # first: the link stops working at once
+            await store.mark_revoked(share_id, actor="sweep")
+            await store.add_event(share_id, "expired", "sweep", {})
+            remove_bundle(shares_root, share_id)
+            expired += 1
+        except Exception:  # noqa: BLE001 - one bad share must not stop the rest
+            log.exception("share expiry sweep failed for %s", share_id)
+    return expired
+
+
+async def _sweep_orphans(store, shares_root: Path, now: float) -> int:
+    removed = 0
+    token_dirs = list(_old_real_dirs(shares_root / "by-token", _TOKEN_DIR, now))
+    bundle_dirs = list(_old_real_dirs(shares_root, _SHARE_DIR, now))
+    if not token_dirs and not bundle_dirs:
+        return 0
+    live = await store.live_token_hashes()  # read after listing: a share approved meanwhile is already protected
+    states = await store.known_share_states()
+    for name in token_dirs:
+        if name not in live:
+            try:
+                remove_state(shares_root, name)
+                removed += 1
+            except Exception:  # noqa: BLE001
+                log.exception("share orphan token dir %s not removed", name)
+    for name in bundle_dirs:
+        if states.get(name) not in ("live", "pending"):
+            try:
+                remove_bundle(shares_root, name)
+                removed += 1
+            except Exception:  # noqa: BLE001
+                log.exception("share orphan bundle %s not removed", name)
+    return removed
+
+
+async def share_housekeeping(store, shares_root: Path, events_path: Path, now: float, *,
+                             marker_path: Path | None = None) -> dict:
+    """Expire due shares, ingest the share container's audit events, and remove orphaned projections/bundles."""
+    shares_root, events_path = Path(shares_root), Path(events_path)
+    result = {"expired": 0, "ingested": 0, "orphans_removed": 0}
+    result["expired"] = await _sweep_expired(store, shares_root, now)
+    try:
+        for _ in range(_SHARE_INGEST_ROUNDS):
+            count = await store.ingest_events_file(events_path, marker_path=marker_path)
+            if not count:
+                break
+            result["ingested"] += count
+    except Exception:  # noqa: BLE001
+        log.exception("share events ingest failed")
+    try:
+        result["orphans_removed"] = await _sweep_orphans(store, shares_root, now)
+    except Exception:  # noqa: BLE001
+        log.exception("share orphan sweep failed")
+    return result
+
+
+class ShareHousekeeper:
+    """Runs ``share_housekeeping`` at most once per ``interval`` seconds; never raises out of the worker pass."""
+
+    def __init__(self, shares_root, events_dir, marker_dir, *, interval: float = SHARE_INTERVAL, clock=time.time):
+        self.shares_root, self.events_dir, self.marker_dir = Path(shares_root), Path(events_dir), Path(marker_dir)
+        self.interval, self._clock = interval, clock
+        self._last: float | None = None
+
+    async def tick(self, conn) -> dict | str:
+        from .artifact_shares import ShareStore
+        now = self._clock()
+        if self._last is not None and now - self._last < self.interval:
+            return "skipped"
+        self._last = now
+        try:
+            try:
+                self.marker_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                log.exception("share marker dir %s not creatable", self.marker_dir)
+            store = conn if hasattr(conn, "live_expired") else ShareStore(conn)
+            return await share_housekeeping(store, self.shares_root, self.events_dir / "events.jsonl", now,
+                                            marker_path=self.marker_dir / "events.marker.json")
+        except Exception:  # noqa: BLE001
+            log.exception("share housekeeping failed")
+            return "error"
 
 
 async def _run_artifact_job_pass(conn, *, worker_id: str,
@@ -63,7 +183,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        lease_ttl=LEASE_TTL, host_ttl=HOST_TTL,
                        artifact_ttl=ARTIFACT_TTL, worker_id=None,
                        artifact_job_runner=None, max_artifact_jobs=1,
-                       inspector_snapshotter=None, fabric_compactor=None) -> dict:
+                       inspector_snapshotter=None, fabric_compactor=None,
+                       share_housekeeper=None) -> dict:
     summary: dict[str, Any] = {}
 
     # Stale services -> unavailable (never delete).
@@ -117,6 +238,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
         summary["inspector_snapshot"] = await inspector_snapshotter.tick(conn)
     if conn is not None and fabric_compactor is not None:
         summary["fabric_compaction"] = await fabric_compactor.tick(conn)
+    if conn is not None and share_housekeeper is not None:
+        summary["share_housekeeping"] = await share_housekeeper.tick(conn)
     return summary
 
 
