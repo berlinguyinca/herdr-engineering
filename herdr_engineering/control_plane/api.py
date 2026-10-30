@@ -33,6 +33,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
+from .artifact_acl import COLLAB_PREFIXES
 from .artifacts import ArtifactConflict, ArtifactError
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
@@ -3713,6 +3714,8 @@ def _make_handler(server, public=False, operator=False):
                 if not self._artifact_allowed(parts[4], 'admin'):
                     return self._artifact_forbidden()
                 body = self._read_json() or {}
+                if str(body.get("principal_id") or "").startswith(COLLAB_PREFIXES):
+                    return self._json({"error": "collaborator grants use the collaborators route"}, 400)
                 permissions = set(body.get("permissions") or [])
                 grant = server.artifact_acl.grant(
                     parts[4], str(body.get("principal_id") or ""), permissions,
@@ -3723,6 +3726,8 @@ def _make_handler(server, public=False, operator=False):
                 if not self._artifact_allowed(parts[4], 'admin'):
                     return self._artifact_forbidden()
                 body = self._read_json() or {}
+                if str(body.get("principal_id") or "").startswith(COLLAB_PREFIXES):
+                    return self._json({"error": "collaborator grants use the collaborators route"}, 400)
                 server.artifact_acl.revoke(parts[4], str(body.get("principal_id") or ""))
                 return self._json({"ok": True})
             if resource == "artifacts" and server.artifact_graph_gate is not None and len(parts) == 6 \

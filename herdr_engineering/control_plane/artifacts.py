@@ -1032,7 +1032,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
     async def load_acl(self) -> list[dict]:
         rows = await self._conn.fetch(
             "SELECT artifact_id, principal_id, permissions, expires_at, granted_by "
-            "FROM artifact_acl")
+            "FROM artifact_acl WHERE principal_id NOT LIKE 'collab:%' "
+            "AND principal_id NOT LIKE 'collab-invite:%'")
         return [self._row(row) for row in rows]
 
     async def load_reviews(self) -> list[dict]:
