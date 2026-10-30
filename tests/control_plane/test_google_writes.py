@@ -44,6 +44,9 @@ class WritableGoogle(Google):
                 if needle in url:
                     self.requests.append((method, url, req.get_header("Authorization"), req.data))
                     raise urllib.error.HTTPError(url, code, "x", {}, None)
+        if url != gw.TOKEN_URL and path.endswith("/messages/send") and method == "POST":
+            self.requests.append((method, url, req.get_header("Authorization"), req.data))
+            return Resp({"id": "sent1", "threadId": "t9"})
         if url != gw.TOKEN_URL and path.endswith("/drafts") and method == "POST":
             self.requests.append((method, url, req.get_header("Authorization"), req.data))
             return Resp({"id": "r-new", "message": {"id": "m1"}})
@@ -92,12 +95,12 @@ def body_of(req_data):
     return json.loads(req_data)
 
 
-@pytest.mark.parametrize("tool", ["create_email_draft", "create_calendar_event"])
+@pytest.mark.parametrize("tool", ["create_email_draft", "send_email", "create_calendar_event"])
 def test_draft_and_event_tools_are_sensitive_never_preauthorized_and_run_only_after_approval(store, tool):
     assert tool in TOOL_CATALOG and tool_sensitive(tool)
     assert tool in NEVER_PREAUTHORIZED and tool in EXECUTABLE_AFTER_APPROVAL
     svc, r1, _, w, g = wired(store)
-    args = DRAFT if tool == "create_email_draft" else EVENT
+    args = EVENT if tool == "create_calendar_event" else DRAFT
     grant(svc, r1, tool)
     assert "approval required" in run_tool(svc, r1, tool, args)
     assert g.writes == []
@@ -113,14 +116,14 @@ def test_a_preauthorized_grant_for_the_write_tools_is_refused(store):
     from herdr_engineering.control_plane.assistant import AssistantForbidden
     svc, r1, _, _, _ = wired(store)
     op = {"kind": "operator", "id": "key:op", "authenticated_by": "api_key"}
-    for tool in ("create_email_draft", "create_calendar_event"):
+    for tool in ("create_email_draft", "send_email", "create_calendar_event"):
         with pytest.raises(AssistantForbidden):
             grant(svc, r1, tool, preauthorized=True, principal=op)
 
 
 def test_unapproved_call_creates_nothing(store):
     svc, r1, _, w, g = wired(store)
-    for tool, args in (("create_email_draft", DRAFT), ("create_calendar_event", EVENT)):
+    for tool, args in (("create_email_draft", DRAFT), ("send_email", DRAFT), ("create_calendar_event", EVENT)):
         assert "denied" in run_tool(svc, r1, tool, {**args, "summary" if "summary" in args else "subject": "other"})   # no grant
         grant(svc, r1, tool)
         assert "approval required" in run_tool(svc, r1, tool, args)       # grant, no approval
@@ -189,12 +192,18 @@ def test_blocking_the_primary_blocks_the_default_calendar(store):
     assert exc.value.reason == "calendar_blocked" and g.writes == []
 
 
-def test_module_exposes_no_send_function():
-    names = [n for n in dir(gw) if "send" in n.lower()] + [n for n in dir(gw.GoogleWorkspace) if "send" in n.lower()]
-    assert names == []
-    src = open(gw.__file__, encoding="utf-8").read().lower()
-    assert "send" not in src
-    assert not [t for t in TOOL_CATALOG if t in ("create_email_draft", "create_calendar_event") and "send" in t]
+def test_only_an_approved_write_can_reach_the_one_send_function():
+    names = sorted(n for n in dir(gw) + dir(gw.GoogleWorkspace) if "send" in n.lower())
+    assert set(names) == {"send_message", "validate_send"}
+    src = open(gw.__file__, encoding="utf-8").read()
+    assert src.count("self.send_message(") == 1                              # one caller: write(), the post-approval executor
+    assert src.index("self.send_message(") > src.index("def write(")
+    assert src.index("self.send_message(") < src.index("def run(")           # and never inside the read entry point
+
+
+def test_send_email_card_shows_the_exact_message_and_says_it_is_delivered():
+    d = describe_action("send_email", "send_email", {**DRAFT, "body": "x" * 700, "thread_id": "t9"})
+    assert "SEND" in d and "bob@example.com, carol@example.com" in d and "Lunch" in d and "x" * 700 in d and "reply" in d
 
 
 def test_the_read_path_never_writes(store):
@@ -203,7 +212,7 @@ def test_the_read_path_never_writes(store):
     w.run("t", "key:u1", "list_calendar_events", {})
     w.list_drafts("t", "key:u1")
     assert g.writes == []
-    for tool in ("create_email_draft", "create_calendar_event", "delete_draft"):
+    for tool in ("create_email_draft", "send_email", "create_calendar_event", "delete_draft"):
         with pytest.raises(gw.GoogleError):
             w.run("t", "key:u1", tool, DRAFT)                              # the read entry point refuses write tools
     assert g.writes == []

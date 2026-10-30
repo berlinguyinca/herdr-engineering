@@ -694,6 +694,15 @@ class ControlPlaneServer:
                         log.warning("ci_watch: user %s is in tenant %s per personal_assistant.tenancy, not %s; "
                                     "the watch will find no assistant for it", _u["user_id"],
                                     self.assistant.tenant_for(_u["user_id"]), _u["tenant_id"])
+            from .assistant import inbox_watch_config
+            from .inbox_watch import InboxWatchRunner
+            _iw = self.assistant.config.get("inbox_watch") or inbox_watch_config(None)
+            self.inbox_watch = InboxWatchRunner(self.assistant, lambda: getattr(self, "google", None), _iw)
+            for _u in (_iw["users"] if _iw["enabled"] else []):
+                if _u["tenant_id"] != self.assistant.tenant_for(_u["user_id"]):
+                    log.warning("inbox_watch: user %s is in tenant %s per personal_assistant.tenancy, not %s; "
+                                "the watch will find no assistant for it", _u["user_id"],
+                                self.assistant.tenant_for(_u["user_id"]), _u["tenant_id"])
             from .assistant_dispatch import DelegationConsumer
             self.delegation_consumer = DelegationConsumer(
                 self.assistant, self.handoffs,
@@ -1634,6 +1643,8 @@ class ControlPlaneServer:
         self._start_background_thread(self._deployments_loop)
         if getattr(self, "ci_watch", None) is not None and self.ci_watch.config["enabled"]:
             self._start_background_thread(self.ci_watch.run)
+        if getattr(self, "inbox_watch", None) is not None and self.inbox_watch.config["enabled"]:
+            self._start_background_thread(self.inbox_watch.run)
         if getattr(self, "reminder_scheduler", None) is not None:
             self.reminder_scheduler.start()
         if self.collab is not None and self.collab.lineage_sink is not None:
@@ -1724,6 +1735,8 @@ class ControlPlaneServer:
         self._deployments_stop.set()
         if getattr(self, "ci_watch", None) is not None:
             self.ci_watch.stop()
+        if getattr(self, "inbox_watch", None) is not None:
+            self.inbox_watch.stop()
         if getattr(self, "reminder_scheduler", None) is not None:
             self.reminder_scheduler.stop()
         if self._summary_scanner and self._summary_scanner.ident is not None:

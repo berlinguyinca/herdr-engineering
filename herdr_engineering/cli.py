@@ -182,6 +182,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     "for control_plane.rakazo_bridge.accounts[].password_scrypt; the password is never an argument"
                     ).set_defaults(func=_cmd_bridge_hash_password)
 
+    # google ---------------------------------------------------------------
+    from .google_setup_cli import register as _register_google
+    _register_google(sub)
+
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
     fsub = p.add_subparsers(dest="fleet_command", required=True)
