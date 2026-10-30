@@ -38,6 +38,9 @@ class Event:
     workspace_id: str | None = None
     task_id: str | None = None
     agent_id: str | None = None
+    # Distributed trace id (migration 0033). Optional; the INSERT names the column only when it is set, so a writer
+    # still works against a database that has not applied 0033.
+    trace_id: str | None = None
 
 
 # Envelope v2 columns beyond the legacy set, in INSERT order.
@@ -133,7 +136,7 @@ class EventStore:
             event.session_id, payload, event.source_timestamp,
             event.ingest_timestamp, event.schema_version,
         )
-        v2 = any(getattr(event, name) is not None for name in V2_COLUMNS)
+        v2 = any(getattr(event, name) is not None for name in V2_COLUMNS) or event.trace_id is not None
         if v2:
             # v1 events keep the legacy 11-column INSERT so they still work
             # against a database that has not applied migration 0003.
@@ -166,6 +169,10 @@ class EventStore:
                 "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) "
                 "ON CONFLICT DO NOTHING RETURNING event_id")
             args = legacy_args
+        if v2 and event.trace_id is not None:
+            sql = sql.replace("room_id, workspace_id, task_id, agent_id)", "room_id, workspace_id, task_id, agent_id, trace_id)") \
+                     .replace("$22,$23,$24)", "$22,$23,$24,$25)")
+            args = args + (event.trace_id,)
         try:
             row = await self._conn.fetchrow(sql, *args)
         except Exception as exc:
@@ -232,6 +239,7 @@ def _row_to_event(row: dict[str, Any]) -> Event:
         return value
 
     v2 = {name: row.get(name) for name in V2_TEXT_FIELDS}
+    v2["trace_id"] = row.get("trace_id")
     v2["source_sequence"] = row.get("source_sequence")
     for name in V2_JSON_FIELDS:
         v2[name] = _json(row.get(name))

@@ -38,6 +38,7 @@ from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .federation import kind_for_role
 from .graph import read_graph
+from .work_graph_service import handle as work_graph_handle
 from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_delivery, redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
@@ -424,6 +425,24 @@ class ControlPlaneServer:
         self.attachment_dedupe: dict = {}      # redelivery guard for the email-attachment route; lost on restart
         from .artifact_scope import install_gate
         self.artifact_graph_gate = install_gate(repo.graph, artifact_acl)   # None without an ACL: nodes stay private
+        # Persistent Work Graph (unified workspace P02). Only with control_plane.unified_workspace.enabled; without
+        # Postgres the routes answer 503 (never a crash). Artifact visibility is the registry's own gate, not a second ACL.
+        self.work_graph = None
+        if self.unified_workspace_enabled:
+            from .work_graph_service import WorkGraphService
+            _gate = self.artifact_graph_gate
+
+            class _ArtifactRef:
+                attrs: dict = {}
+
+                def __init__(self, node_id):
+                    self.id = node_id
+
+                def attr_values(self):
+                    return {}
+            self.work_graph = WorkGraphService(
+                github_pg_dsn, artifact_ok=(lambda principal, aid: bool(_gate(principal, _ArtifactRef(f"artifact:{aid}"))))
+                if _gate is not None else (lambda principal, aid: False))
         # control_plane.skill_registry (flag off by default: nothing is constructed and the routes answer 404).
         from .skill_routes import build_skill_registry
         self.skills, self.skill_transfer = build_skill_registry(
@@ -540,6 +559,8 @@ class ControlPlaneServer:
                 # membership-scoped lineage reads (lineage-events.md, "Scope semantics"): the
                 # isolated collab-only process never sees fabric data, so it serves none
                 collab.graph_source = lambda: repo.graph
+                collab.work_graph_handle = lambda principal, method, parts, query, body: work_graph_handle(
+                    self.work_graph, principal, method, parts, query, body, None)
                 # External agents (T10) report lineage about themselves through the HCN route; the service
                 # builds the envelope, this only registers the room that enrollment bound it to.
                 self.ingest.reserved_node = collab.is_external_node
@@ -1510,6 +1531,8 @@ class ControlPlaneServer:
             self.agent_summaries.close()
         self.ci_monitor.close()
         self.github_monitor.close()
+        if getattr(self, "work_graph", None) is not None:
+            self.work_graph.close()
         for attr in ("_operator_httpd", "_public_httpd", "_httpd"):
             listener = getattr(self, attr)
             if listener is not None:
@@ -2073,6 +2096,7 @@ def _make_handler(server, public=False, operator=False):
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler"}
+                    or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
                     or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
                 origin = self.headers.get("Origin")
@@ -3620,6 +3644,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(result)
             if resource == "steering":
                 return self._steering(parts, body)
+            if resource == "graph" and len(parts) >= 6 and parts[4] == "work":
+                return self._work_graph(parts[5:], body)
             if resource == "graph" and len(parts) == 8 and parts[4] == "nodes" and parts[6:] == ["review-quorum", "rereview"]:
                 return self._rereview(parts[5], body)
             if resource == "reviews":
@@ -4283,6 +4309,8 @@ def _make_handler(server, public=False, operator=False):
             """Lineage graph reads (viewer level). Every result is filtered by the
             caller's principal; hidden and missing both answer 404."""
             parts = list(parts)
+            if parts[4:5] == ["work"]:
+                return self._work_graph(parts[5:])
             if len(parts) == 7 and parts[4] == "nodes" and parts[6] == "review-quorum":
                 if server.review_quorum is None:
                     return self._json({"error": "review quorum is not configured"}, 404)
@@ -4302,6 +4330,15 @@ def _make_handler(server, public=False, operator=False):
                 if view is not None:
                     out = {**out, **view}
             return self._json(out)
+
+        def _work_graph(self, sub, body=None):
+            """``/api/v1/graph/work/*`` (unified workspace P02): the persistent Work Graph. Off (default) it is a 404 like any
+            unknown route; on without a database it is a 503. Reads need the viewer role; layout writes and reconcile are
+            POSTs (operator), the HCN door serves members."""
+            query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            status, payload, headers = work_graph_handle(server.work_graph, self._principal(), self.command, sub, query, body,
+                                              self.headers.get("If-Match"))
+            return self._json(payload, status, etag=headers.get("ETag"))
 
         def _agent_capabilities(self, session):
             operator = self._role() == "operator"
