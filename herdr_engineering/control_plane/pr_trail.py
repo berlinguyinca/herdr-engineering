@@ -392,7 +392,7 @@ def build(owner, name, number, *, pull_requests, sessions, view, handoffs, revie
 
     starts = [t for t in [*starts, *(_time(h.get("created_at")) for h in hand_all)] if t]
     if starts and closed and closed >= min(starts):
-        signals["duration_s"] = _signal(round((closed - min(starts)).total_seconds()), "From the first evidence-linked agent or handoff to the recorded merge or close time.")
+        signals["duration_s"] = _signal(round((closed - min(starts)).total_seconds()), ("From the first evidence-linked agent or handoff to the merge or close time" + (" this server first observed, which can be later than the real one." if pr.get("ended_source") == "observed" else " the provider reported.")))
     else:
         signals["duration_s"] = _signal(None, "No merge or close time is recorded for this pull request." if starts else "No agent or handoff start time is known.")
     reviews_known = sources["reviews"] == "ok" or sources["plan_reviews"] == "ok"

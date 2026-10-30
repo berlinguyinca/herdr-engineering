@@ -615,6 +615,8 @@ class IngestService:
             branch=payload.get("branch"),
             base=payload.get("base"),
             created_at=payload.get("created_at"),
+            merged_at=payload.get("merged_at"),
+            closed_at=payload.get("closed_at"),
         )
 
     def _ingest_host(self, entity_id, event_type, payload, source="herdr") -> dict:
