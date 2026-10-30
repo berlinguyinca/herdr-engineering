@@ -172,7 +172,9 @@ def normalize_report(body, stamp, *, redact=None, _identity_version=2):
 LOG_SOURCE = 'log_parse'
 LOG_REPORT_LIMIT = 400          # analysed runs retained, separately from uploaded reports so they never evict a JUnit upload
 LOG_HISTORY_BYTES = 64 * 1024 * 1024
-LOG_INDEX_RUNS = 40             # newest analysed runs that keep their per-test index; older ones keep counts only
+LOG_NEGATIVE_LIMIT = 2000       # runs found to have no tests (a few hundred bytes each), kept apart so they never evict a count
+LOG_INDEX_RUNS = 40             # analysed runs that keep their per-test index in memory; the rest keep counts only
+LOG_PERSISTED_FAILURES = 50     # failing tests named in the durable record, whatever the size of the run
 LOG_OUTCOMES = ('counted', 'no_tests')
 
 
@@ -180,6 +182,35 @@ def log_run_key(provider_url, provider_repo_id, run_number):
     """Stable event id of one run's log analysis; re-analysing a run replaces its record."""
     return hashlib.sha256(json.dumps([provider_url, str(provider_repo_id), int(run_number)],
                                      separators=(',', ':')).encode()).hexdigest()
+
+
+def compact_log_report(report):
+    """The durable form of a log report: counts, runners, steps and a bounded list of the failing tests.
+
+    The full per-test index is thousands of rows (about 0.9 MB per 2,500 tests) and is rebuilt from the live log, so it is
+    kept in memory only. A record restored from storage says so with `index_dropped`.
+    """
+    if not report.get('tests'):
+        return report
+    failing = [t for t in report['tests'] if t.get('status') in ('failed', 'errored')][:LOG_PERSISTED_FAILURES]
+    return {**report, 'tests': failing, 'index_complete': False, 'index_dropped': True}
+
+
+def log_finished_epoch(report, fallback=''):
+    """When the run behind a log report finished (seconds), else when the report arrived; 0 if neither parses."""
+    for value in (report.get('run_finished_at'), fallback):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str) and value:
+            try:
+                return float(value)
+            except ValueError:
+                pass
+            try:
+                return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+            except ValueError:
+                continue
+    return 0.0
 
 
 def normalize_log_report(body, stamp, *, redact=None):

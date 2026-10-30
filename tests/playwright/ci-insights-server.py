@@ -109,6 +109,7 @@ with tempfile.TemporaryDirectory() as tmp:
     logs = dict(on_log_report=repo.ingest_ci_log_report, log_known=repo.ci_log_analysis) if '--log-tests' in sys.argv else {}
     server.ci_monitor = CIMonitor(provider_factory=factory, on_observation=repo.observe_ci_pipeline, **logs)
     server.ci_monitor.refresh()
+    server.ci_monitor._analyse_logs()      # the log reader has its own thread once started; this harness never starts the monitor
     # Opt-in scale fixture: retained observations only, never extra provider I/O.
     if '--117-projects' in sys.argv:
         for project in range(116):

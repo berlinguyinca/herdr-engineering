@@ -2003,12 +2003,24 @@ class ControlPlaneRepo:
         One record per run: analysing the run again replaces it. Records that found no tests are kept too, so a
         collector does not fetch the same logs again; `ci_reports()` never shows them.
         """
-        from .ci_reports import normalize_log_report
+        from .ci_reports import compact_log_report, normalize_log_report
         with self._event_lock:
             report = normalize_log_report(body, self._stamp(), redact=redact)
             if self._junit_shadows(report):
+                # Remembered as a run with nothing to count, so a restart does not fetch its logs again.
+                marker = normalize_log_report({**body, 'outcome': 'no_tests', 'summary': {}, 'tests': [], 'runners': [],
+                                               'steps': [], 'provisional': False,
+                                               'skipped_steps': [{'step': '*', 'reason': 'junit_report_exists'}]},
+                                              self._stamp(), redact=redact)
+                self.record_event("ci_logtests", marker["run_key"], "CILogTestsAnalysed", marker, require_durable=True)
+                self._trim_ci_history("ci_logtests")
                 return {**{k: report[k] for k in ('run_key', 'outcome')}, 'skipped': 'junit_report_exists'}
-            self.record_event("ci_logtests", report["run_key"], "CILogTestsAnalysed", report, require_durable=True)
+            # Only the compact form is persisted; the full per-test index lives in memory for the newest runs.
+            self.record_event("ci_logtests", report["run_key"], "CILogTestsAnalysed", compact_log_report(report),
+                              require_durable=True)
+            stream = self._events.get(("ci_logtests", report["run_key"]))
+            if report.get('tests') and stream:
+                stream[-1]['payload'] = report
             self._trim_ci_history("ci_logtests")
             return {k: report[k] for k in ('run_key', 'outcome', 'summary', 'runners')}
 
@@ -2063,9 +2075,12 @@ class ControlPlaneRepo:
             HISTORY_BYTES,
             LOG_HISTORY_BYTES,
             LOG_INDEX_RUNS,
+            LOG_NEGATIVE_LIMIT,
             LOG_REPORT_LIMIT,
             PIPELINE_LIMIT,
             REPORT_LIMIT,
+            compact_log_report,
+            log_finished_epoch,
         )
         keep = set()
         kinds = {kind} if kind is not None else set(_CI_EVENT_KINDS)
@@ -2079,9 +2094,18 @@ class ControlPlaneRepo:
                 for event in self._events[key]:
                     if isinstance(event.get("payload"), str):
                         event["payload"] = json.loads(event["payload"])
-            keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
-                                      arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
-                      reverse=True)
+            if kind == 'ci_logtests':
+                # Newest run first, by when the run finished and not by when it happened to be read: a backlog analysed
+                # today must not push out the runs that matter most.
+                keys.sort(key=lambda key: (log_finished_epoch(self._events[key][-1]['payload'],
+                                                              self._events[key][-1].get("ingest_timestamp", "")),
+                                           self._events[key][-1].get("ingest_timestamp", ""),
+                                           arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                          reverse=True)
+            else:
+                keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
+                                          arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                          reverse=True)
             if kind == 'ci_observation' and any(not key[1].startswith('[') for key in keys):
                 # Upgrade may retain a legacy "repo_id:run" stream alongside
                 # a new provider-scoped stream. Supersede only exact full
@@ -2097,17 +2121,33 @@ class ControlPlaneRepo:
                         if identity is not None:
                             seen.add(identity)
                 keys = unique
-            size, budget, indexed = 0, HISTORY_BYTES, 0
+            size, budget, ordered, indexed = 0, HISTORY_BYTES, keys[:limit], set()
             if kind == 'ci_logtests':
                 budget = LOG_HISTORY_BYTES
-            for key in keys[:limit]:
+                # Runs with counts and runs with nothing to count are limited separately, so a long tail of the latter
+                # can never evict the former.
+                counted = [key for key in keys if self._events[key][-1]['payload'].get('outcome') == 'counted']
+                empty = [key for key in keys if self._events[key][-1]['payload'].get('outcome') != 'counted']
+                ordered = counted[:limit] + empty[:LOG_NEGATIVE_LIMIT]
+                # The per-test index stays in memory for the newest run of every repository and branch first, then for
+                # the newest of the rest, up to LOG_INDEX_RUNS; older runs keep their counts and failing tests.
+                withindex = [key for key in ordered if self._events[key][-1]['payload'].get('tests')
+                             and not self._events[key][-1]['payload'].get('index_dropped')]
+                seen = set()
+                for key in withindex:
+                    payload = self._events[key][-1]['payload']
+                    lane = (payload.get('provider_url'), str(payload.get('provider_repo_id')), payload.get('branch'))
+                    if lane not in seen and len(indexed) < LOG_INDEX_RUNS:
+                        seen.add(lane)
+                        indexed.add(key)
+                for key in withindex:
+                    if len(indexed) < LOG_INDEX_RUNS:
+                        indexed.add(key)
+            for key in ordered:
                 latest = self._events[key][-1]
-                if kind == 'ci_logtests' and latest['payload'].get('tests'):
-                    # Memory stays bounded by keeping the per-test index only for the newest runs; the counts of older
-                    # runs (and the fact that they were analysed) stay.
-                    indexed += 1
-                    if indexed > LOG_INDEX_RUNS:
-                        latest['payload'] = {**latest['payload'], 'tests': [], 'index_complete': False, 'index_dropped': True}
+                if (kind == 'ci_logtests' and latest['payload'].get('tests') and not latest['payload'].get('index_dropped')
+                        and key not in indexed):
+                    latest['payload'] = compact_log_report(latest['payload'])
                 size += len(json.dumps(latest).encode())
                 if size > budget:
                     break

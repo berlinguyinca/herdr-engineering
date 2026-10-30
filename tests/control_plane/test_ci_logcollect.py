@@ -1,5 +1,6 @@
 """The zero-config collector: finished runs' step logs become counts and a per-test index, kept without any log text."""
 import json
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -233,7 +234,200 @@ def test_only_the_newest_runs_keep_their_test_index_in_memory_but_every_run_keep
     c.run_cycle(Provider({(n, '2'): CARGO for n in range(1, total + 1)}), {'g': [run(n, 1000 - n) for n in range(1, total + 1)]})
     rows = repo.ci_reports()['reports']
     assert len(rows) == total
-    assert sum(1 for r in rows if r['tests']) == LOG_INDEX_RUNS
-    old = [r for r in rows if not r['tests']]
+    assert sum(1 for r in rows if not r.get('index_dropped')) == LOG_INDEX_RUNS
+    old = [r for r in rows if r.get('index_dropped')]
+    assert len(old) == 5
     assert all(r['summary']['total'] == 3 and r['index_complete'] is False for r in old)
+    assert all([t['name'] for t in r['tests']] == ['b'] for r in old)               # the failing test is still named
     assert repo.ci_log_analysis(URL, 7, 1)['outcome'] == 'counted'          # still known, so never read again
+
+
+# --- review follow-ups: what is persisted, what is kept, what is retried ----------------------------------------------------
+def big_cargo(count):
+    body = ''.join(f'test suite::case_{n} ... ok\n' for n in range(count))
+    return f'{body}test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n'
+
+
+class Sink:
+    def __init__(self):
+        self.events = []
+
+    def record_required(self, event):
+        self.events.append(json.loads(json.dumps(event)))
+
+    def record(self, event):
+        self.record_required(event)
+
+
+def test_only_a_compact_record_is_persisted_while_the_full_index_stays_readable():
+    sink = Sink()
+    repo = ControlPlaneRepo(sink=sink)
+    c, _ = collector(repo)
+    cargo = big_cargo(2400).replace('case_5 ... ok', 'case_5 ... FAILED').replace('; 0 failed', '; 1 failed').replace('2400 passed', '2399 passed')
+    c.run_cycle(Provider({(1, '2'): cargo}), {'g': [run(1)]})
+    assert len(repo.ci_reports()['reports'][0]['tests']) == 2400                      # the explorer still has every test
+    persisted = [e for e in sink.events if e['entity_type'] == 'ci_logtests']
+    assert len(persisted) == 1 and len(json.dumps(persisted[0]).encode()) < 20_000
+    stored = persisted[0]['payload']
+    assert stored['summary']['total'] == 2400 and stored['index_dropped'] is True
+    assert [t['name'] for t in stored['tests']] == ['suite::case_5']
+    # after a restart only the compact record exists: counts survive, the list says it is gone, and the run is not re-read
+    restored = ControlPlaneRepo()
+    restored.import_state({'events': {f"ci_logtests|{persisted[0]['entity_id']}": persisted}})
+    (report,) = restored.ci_reports()['reports']
+    assert report['summary']['total'] == 2400 and report['index_dropped'] is True and report['index_complete'] is False
+    again, _ = collector(restored)
+    provider = Provider({(1, '2'): cargo})
+    assert again.run_cycle(provider, {'g': [run(1)]}) == 0 and provider.calls == []
+
+
+def test_the_index_is_kept_for_the_newest_run_of_every_branch_before_the_busiest_branch_gets_more():
+    from herdr_engineering.control_plane.ci_reports import LOG_INDEX_RUNS
+    c, repo = collector(runs_per_cycle=100)
+    rows = [{**run(n, 10_000 - n), 'branch': 'busy'} for n in range(1, LOG_INDEX_RUNS + 20)]
+    rows.append({**run(900, 20_000), 'branch': 'quiet'})                         # by far the oldest run
+    c.run_cycle(Provider({(r['run_number'], '2'): CARGO for r in rows}), {'g': rows})
+    by_run = {r['run_number']: r for r in repo.ci_reports()['reports']}
+    assert by_run[900]['tests'] and 'index_dropped' not in by_run[900]
+    assert sum(1 for r in by_run.values() if not r.get('index_dropped')) == LOG_INDEX_RUNS
+
+
+def test_runs_without_tests_never_evict_runs_with_counts(monkeypatch):
+    from herdr_engineering.control_plane import ci_reports
+    monkeypatch.setattr(ci_reports, 'LOG_REPORT_LIMIT', 3)
+    c, repo = collector(runs_per_cycle=100)
+    counted = [run(n, 5_000 - n) for n in range(1, 4)]
+    empty = [run(n, 100 - n) for n in range(10, 30)]                                # newer, but nothing in them
+    logs = {(r['run_number'], '2'): CARGO for r in counted}
+    c.run_cycle(Provider(logs), {'g': counted + empty})
+    assert sorted(r['run_number'] for r in repo.ci_reports()['reports']) == [1, 2, 3]
+    assert repo.ci_log_analysis(URL, 7, 29)['outcome'] == 'no_tests'
+
+
+def test_eviction_follows_when_the_run_finished_not_when_it_was_read(monkeypatch):
+    from herdr_engineering.control_plane import ci_reports
+    monkeypatch.setattr(ci_reports, 'LOG_REPORT_LIMIT', 2)
+    c, repo = collector()
+    for number, age in ((1, 100), (2, 10)):                                         # run 2 finished later but is read second
+        c.run_cycle(Provider({(number, '2'): CARGO}), {'g': [run(number, age)]})
+    c.run_cycle(Provider({(3, '2'): CARGO}), {'g': [run(3, 5000)]})                 # an old backlog run arrives last
+    assert sorted(r['run_number'] for r in repo.ci_reports()['reports']) == [1, 2]
+
+
+def test_a_run_with_a_junit_report_is_remembered_across_a_restart():
+    sink = Sink()
+    repo = ControlPlaneRepo(sink=sink)
+    repo.ingest_ci_report({'repository': 'org/app', 'provider_repo_id': 7, 'provider_url': URL, 'run_number': 1,
+                           'branch': 'main', 'revision': 'abc', 'xml': JUNIT})
+    c, _ = collector(repo)
+    c.run_cycle(Provider({(1, '2'): CARGO}), {'g': [run(1)]})
+    marker = [e for e in sink.events if e['entity_type'] == 'ci_logtests']
+    assert len(marker) == 1 and marker[0]['payload']['outcome'] == 'no_tests'
+    assert repo.ci_log_analysis(URL, 7, 1)['outcome'] == 'no_tests'
+    assert [r.get('source') for r in repo.ci_reports()['reports']] == [None]
+
+
+def test_one_unreadable_step_does_not_hide_the_others_and_is_named():
+    class Flaky(Provider):
+        def step_log_text(self, repo, number, step, *, max_chars):
+            if step == '3':
+                raise OSError('boom')
+            return super().step_log_text(repo, number, step, max_chars=max_chars)
+    c, repo = collector()
+    assert c.run_cycle(Flaky({(1, '2'): CARGO}), {'g': [run(1)]}) == 1
+    (report,) = repo.ci_reports()['reports']
+    assert report['summary']['total'] == 3
+    assert report['skipped_steps'] == [{'step': 'lint', 'reason': 'read_failed'}]
+    assert repo.ci_log_analysis(URL, 7, 1)['provisional'] is True                  # tried again later
+
+
+def test_a_run_that_keeps_failing_is_given_up_on_and_the_bookkeeping_is_pruned():
+    class Broken(Provider):
+        def pipeline(self, repo, number):
+            self.calls.append(('pipeline', repo, number))
+            raise OSError('down')
+    c, repo = collector()
+    clock = [0.0]
+    c._monotonic = lambda: clock[0]
+    provider = Broken()
+    for _ in range(12):
+        c.run_cycle(provider, {'g': [run(1)]})
+        clock[0] += 3600
+    assert len([call for call in provider.calls if call[0] == 'pipeline']) == 5     # MAX_ATTEMPTS
+    assert c._cooldown == {}                                                        # expired entries are dropped
+    c.run_cycle(provider, {'g': []})
+    assert c._attempts == {}
+
+
+def test_stopping_the_monitor_ends_a_run_between_steps_without_counting_it():
+    import threading
+    c, repo = collector()
+    stop = threading.Event()
+
+    class Stopper(Provider):
+        def step_log_text(self, repo, number, step, *, max_chars):
+            stop.set()
+            return super().step_log_text(repo, number, step, max_chars=max_chars)
+    provider = Stopper({(1, '2'): CARGO})
+    assert c.run_cycle(provider, {'g': [run(1)]}, stop) == 0
+    assert len([call for call in provider.calls if call[0] == 'log']) == 1
+    assert repo.ci_log_analysis(URL, 7, 1) is None and c._attempts[(URL, '7', 1)] == 0
+
+
+def test_reading_logs_runs_off_the_poll_thread():
+    import threading
+    started, release = threading.Event(), threading.Event()
+
+    class Slow(Provider):
+        def repos(self, **kw):
+            return []
+
+        def step_log_text(self, repo, number, step, *, max_chars):
+            started.set()
+            release.wait(10)
+            return super().step_log_text(repo, number, step, max_chars=max_chars)
+    repo = ControlPlaneRepo()
+    provider = Slow({(1, '2'): CARGO})
+    monitor = CIMonitor(provider_factory=lambda: provider, on_log_report=repo.ingest_ci_log_report,
+                        log_known=repo.ci_log_analysis, log_tests={'runs_per_cycle': 3})
+    monitor._view['pipelines'] = {'g': [run(1)]}
+    try:
+        monitor._log_thread = threading.Thread(target=monitor._log_loop, daemon=True)
+        monitor._log_thread.start()
+        monitor._log_wake.set()
+        assert started.wait(10)                               # the reader is busy inside a log...
+        assert monitor._refresh_lock.acquire(blocking=False)   # ...and the poll's lock is free
+        monitor._refresh_lock.release()
+        assert monitor.snapshot(start=False) is not None
+        release.set()
+        deadline = time.monotonic() + 10
+        while repo.ci_log_analysis(URL, 7, 1) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert repo.ci_log_analysis(URL, 7, 1)['outcome'] == 'counted'
+    finally:
+        release.set()
+        monitor.close()
+
+
+def test_slice_masks_a_private_key_whose_begin_line_is_outside_the_excerpt():
+    key = ['-----BEGIN RSA PRIVATE KEY-----', 'MIIEowIBAAKCAQEAsecretbodyline1', 'secretbodyline2', '-----END RSA PRIVATE KEY-----']
+    log = '\n'.join(['intro', 'test_alpha FAILED', *key, 'after']) + '\n'
+    monitor = CIMonitor(provider_factory=lambda: Provider({(1, '2'): log}))
+    out = monitor.log_slice('7', 1, '2', 4, 4, context=3, expect='secretbodyline')       # the excerpt starts mid-key
+    lines = out['slice']['lines']
+    assert not any('secretbody' in text or 'MIIEow' in text for text in lines)
+    assert lines.count('[REDACTED]') >= 2 and lines[-1] == 'after'
+
+
+def test_slice_reads_a_log_once_for_repeated_clicks_and_bounds_concurrent_reads():
+    provider = Provider({(1, '2'): 'a\nb\nc\nd\n'})
+    monitor = CIMonitor(provider_factory=lambda: provider)
+    for _ in range(5):
+        monitor.log_slice('7', 1, '2', 2, 2, context=1)
+    assert len([call for call in provider.calls if call[0] == 'log']) == 1
+    monitor._slice_cache.clear()
+    from herdr_engineering.control_plane import ci_monitor
+    for _ in range(ci_monitor.SLICE_READS):
+        monitor._slice_reads.acquire()
+    monitor._slice_reads.acquire = lambda timeout=None: False                          # nothing frees up in time
+    assert 'try again' in monitor.log_slice('7', 1, '2', 2, 2)['error']
