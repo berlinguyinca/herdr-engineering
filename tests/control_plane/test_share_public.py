@@ -48,7 +48,8 @@ def _iso(ts):
 
 
 class Env:
-    def __init__(self, tmp_path, *, audience="public", expires_in=86400.0, files=FILES, entry=None):
+    def __init__(self, tmp_path, *, audience="public", expires_in=86400.0, files=FILES, entry=None, config_extra=None,
+                 state_extra=None):
         self.root = tmp_path / "shares"
         self.events = tmp_path / "events" / "events.jsonl"
         self.events.parent.mkdir()
@@ -64,8 +65,9 @@ class Env:
             "allow_emails": [], "allow_groups": [], "entry": index.entry, "title": "t",
             "files": [{"name": f.name, "sha256": f.sha256, "size": f.size, "content_type": f.content_type}
                       for f in index.files]}
+        self.state.update(state_extra or {})
         write_state(self.root, self.token_hash, self.state)
-        self.config = ShareConfig(shares_root=self.root, events_path=self.events)
+        self.config = ShareConfig(shares_root=self.root, events_path=self.events, **(config_extra or {}))
         self.server = make_share_server(self.config, host="127.0.0.1", port=0, now=lambda: self.clock[0])
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -75,13 +77,13 @@ class Env:
         self.server.shutdown()
         self.server.server_close()
 
-    def request(self, method, path, headers=None):
+    def request(self, method, path, headers=None, body=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
             conn.putrequest(method, path, skip_accept_encoding=True)
             for k, v in (headers or {}).items():
                 conn.putheader(k, v)
-            conn.endheaders()
+            conn.endheaders(body)
             resp = conn.getresponse()
             body = resp.read()
             return resp.status, {k.lower(): v for k, v in resp.getheaders()}, body
@@ -637,3 +639,14 @@ def test_denied_budget_is_per_share(env):
     denied = [json.loads(raw) for raw in env.event_lines() if json.loads(raw)["kind"] == "denied"]
     assert sum(1 for d in denied if d["share_id"] == "shr-1") == share_public.DENIED_PER_MINUTE
     assert [d["detail"]["reason"] for d in denied if d["share_id"] == "shr-2"] == ["bad_path"]
+
+
+@pytest.mark.parametrize("defect", [b"Broken header line\r\n", b" folded-continuation-first\r\n", b"X:\r\n:no-name\r\n"])
+def test_malformed_header_lines_close_the_connection(env, defect):
+    """A malformed header line makes the stdlib parser stop early, hiding a later Content-Length from the body check:
+    the request still gets one response and the connection closes, so the hidden body is never parsed as a request."""
+    first = (b"GET " + f("index.html").encode() + b" HTTP/1.1\r\nHost: x\r\n" + defect
+             + b"Content-Length: %d\r\n\r\n" % len(SMUGGLE_SECOND))
+    out = env.raw(first + SMUGGLE_SECOND)
+    assert out.count(b"HTTP/1.1 ") == 1, out[:300]
+    assert b"\r\nConnection: close\r\n" in out.split(b"\r\n\r\n", 1)[0] + b"\r\n"

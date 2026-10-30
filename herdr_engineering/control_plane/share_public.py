@@ -18,6 +18,18 @@ Security rules (see the plan's Global Constraints and Review Focus):
   index name component by component with ``openat`` and ``O_NOFOLLOW`` and must be regular files of the indexed size.
 * Tokens, sessions and Authorization values are never written to events or logs (the stdlib request log is disabled).
 * No request body is ever read; a request that announces one gets its response and the connection closed.
+
+Lab shares (``audience: lab``) add, only when the lab settings are complete (else every lab route is the 404):
+
+* ``GET/HEAD /s/<token>/`` and ``/s/callback`` -> the static viewer page; ``/s/static/{share.js,share.css}`` and a
+  generated ``/s/static/config.json`` -- a fixed allow-list read from ``static_dir`` with ``O_NOFOLLOW``, served with
+  the strict ``VIEWER_CSP`` (no inline script or style) and no CORS.
+* ``POST /s/<token>/session`` (body-less; ``Authorization: Bearer <access>`` and ``X-Id-Token``, exactly one each) ->
+  ``share_lab.authorise`` against the share's allow-list, then a ``share_session`` HMAC session capped at the earliest of
+  ``session_seconds``, the share's expiry and the access token's ``exp``. Rate-limited per share and globally. OPTIONS
+  on it is the 404, so a cross-origin page cannot get a preflight for the ``Authorization`` header.
+* ``GET/HEAD/OPTIONS /s/<token>/k/<session>/f/<path>`` -> the session is checked against the share's CURRENT state on
+  every request (a revoke or expiry kills it at once), then the file is served exactly like a public one.
 """
 from __future__ import annotations
 
@@ -35,9 +47,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote_to_bytes
+from urllib.parse import quote, unquote_to_bytes, urlsplit
 
+from .collab_cognito import CognitoAuthenticator, SyncedDirectory
 from .share_bundle import ShareBundleError, content_type_for, normalise_name
+from .share_lab import authorise
+from .share_session import MIN_SECRET_BYTES, check_session, mint_session
 
 log = logging.getLogger("herdr.share_public")
 
@@ -51,6 +66,12 @@ LOG_PER_MINUTE = 20             # log lines per reason per minute
 MAX_CONNECTIONS = 128
 MAX_RAW_PATH = 8192
 STATE_CACHE_SIZE = 256
+SESSION_PER_SHARE_PER_MINUTE = 30   # session attempts per share per minute (blunts token guessing)
+SESSION_GLOBAL_PER_MINUTE = 600     # session attempts across all shares per minute
+STATIC_MAX_BYTES = 1024 * 1024
+DEFAULT_STATIC_DIR = Path(__file__).resolve().parent / "share_static"
+VIEWER_FILE = "viewer.html"
+STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8"}
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 _SHARE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -58,11 +79,16 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _RAW_PATH_OK = re.compile(r"[\x21-\x5b\x5d-\x7e]*")   # printable ASCII without space and backslash
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _RANGE_SPEC = re.compile(r"(\d{0,19})-(\d{0,19})")
+_SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,512}")
+_HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::[0-9]{1,5})?")
+_CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 CSP = ("sandbox allow-scripts allow-downloads; default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; "
        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
        "worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'")
 PDF_CSP = "frame-ancestors 'none'"
+VIEWER_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' {origin}; img-src 'self' data:; "
+              "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 CORS_HEADERS = (("Access-Control-Allow-Origin", "*"),
                 ("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, ETag"))
 PREFLIGHT_HEADERS = (("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"),
@@ -92,6 +118,64 @@ class ShareConfig:
     signing_secret: bytes = field(default=b"", repr=False)
     session_seconds: int = 14400
     static_dir: Path | None = None
+
+
+@dataclass(frozen=True)
+class LabSettings:
+    """Everything the lab routes need, validated once at start-up (None in the server when lab is not configured)."""
+
+    authenticator: CognitoAuthenticator
+    secret: bytes = field(repr=False)
+    session_seconds: int
+    static_dir: Path
+    viewer_csp: str
+    config_json: bytes
+
+
+def _https_origin(value) -> str | None:
+    """``https://host[:port]`` for a bare https origin (a trailing ``/`` allowed), else None."""
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    parts = urlsplit(value.strip())
+    if (parts.scheme != "https" or parts.username or parts.password or parts.query or parts.fragment
+            or parts.path not in ("", "/") or not _HOST.fullmatch(parts.netloc.lower())):
+        return None
+    return "https://" + parts.netloc.lower()
+
+
+def lab_settings(config: ShareConfig) -> LabSettings | None:
+    """The validated lab settings, or None (fail closed) when anything required is missing or malformed."""
+    secret = config.signing_secret
+    if not isinstance(secret, bytes) or len(secret) < MIN_SECRET_BYTES:
+        return None
+    origin = _https_origin(config.cognito_domain)
+    public = config.public_url
+    if (origin is None or not isinstance(public, str) or not config.sync_dir or not isinstance(config.pool_id, str)
+            or not isinstance(config.web_client_id, str) or not _CLIENT_ID.fullmatch(config.web_client_id)):
+        return None
+    public_parts = urlsplit(public.strip())
+    if (public_parts.scheme != "https" or public_parts.query or public_parts.fragment or public_parts.username
+            or not _HOST.fullmatch(public_parts.netloc.lower())):
+        return None
+    try:
+        seconds = int(config.session_seconds)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    client_ids = [c for c in (*config.client_ids, config.web_client_id) if isinstance(c, str) and _CLIENT_ID.fullmatch(c)]
+    directory = SyncedDirectory(str(config.sync_dir), "share-lab")      # only jwks() is used: fail closed if absent
+    try:
+        authenticator = CognitoAuthenticator(pool_id=config.pool_id, client_ids=client_ids, required_group="share-lab",
+                                             jwks_fetch=directory.jwks, open_signup=True)
+    except ValueError:
+        return None
+    config_json = json.dumps({"cognito_domain": origin, "client_id": config.web_client_id,
+                              "redirect_uri": public.strip().rstrip("/") + "/s/callback"},
+                             sort_keys=True, ensure_ascii=True).encode("ascii")
+    return LabSettings(authenticator=authenticator, secret=secret, session_seconds=seconds,
+                       static_dir=Path(config.static_dir) if config.static_dir else DEFAULT_STATIC_DIR,
+                       viewer_csp=VIEWER_CSP.format(origin=origin), config_json=config_json)
 
 
 class ShareState(dict):
@@ -488,6 +572,8 @@ def _announces_body(handler) -> bool:
     headers = handler.headers
     if headers is None:
         return True
+    if getattr(headers, "defects", None):
+        return True      # a malformed header line stops the parser early: later framing headers would be hidden
     if headers.get_all("Transfer-Encoding"):
         return True
     lengths = headers.get_all("Content-Length") or []
@@ -649,6 +735,9 @@ class ShareHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self._dispatch()
 
+    def do_POST(self):
+        self._dispatch()
+
     def _dispatch(self):
         try:
             if _announces_body(self):
@@ -668,31 +757,146 @@ class ShareHandler(BaseHTTPRequestHandler):
         raw_path = raw.split("?", 1)[0]
         if not _RAW_PATH_OK.fullmatch(raw):
             return deny(self, None, "bad_path")
+        parts = raw_path.split("/")
+        if parts[2] in ("static", "callback"):
+            return self._viewer_asset(parts)
+        is_session = len(parts) == 4 and parts[3] == "session"
         if self.command == "OPTIONS":
+            if is_session:
+                return deny(self, None, "method")    # no preflight: a foreign origin cannot send Authorization here
             _send_headers(self, 204, PREFLIGHT_HEADERS)
             return None
-        parts = raw_path.split("/")
         if len(parts) < 4 or not TOKEN_RE.fullmatch(parts[2]):
             return deny(self, None, "bad_token")
         is_link = len(parts) == 4 and parts[3] == ""
         is_file = len(parts) >= 5 and parts[3] == "f"
-        if not (is_link or is_file):
+        is_lab_file = len(parts) >= 7 and parts[3] == "k" and parts[5] == "f"
+        if not (is_link or is_file or is_session or is_lab_file):
             return deny(self, None, "unknown_route")
+        if (self.command == "POST") != is_session:
+            return deny(self, None, "method")
+        if is_session and not self.server.session_global.allow("*"):
+            return deny(self, None, "rate_limited")
         prepared = _read_state(self.server.config.shares_root, parts[2])
         if prepared is None:
             return deny(self, None, "unknown_token")
         state, reason = _check_state(prepared, self.server.now())
         if state is None:
             return deny(self, prepared.raw, reason)
-        if state.get("audience") != "public":
-            return deny(self, state, "audience")    # lab shares get their viewer in the lab routes
-        if is_link:
-            location = "f/" + quote(state["entry"], safe="/")
-            _send_headers(self, 302, [("Location", location), ("Content-Length", "0"), ("Cache-Control", "no-store"),
-                                      ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),
-                                      ("X-Content-Type-Options", "nosniff")])
+        audience = state.get("audience")
+        if audience == "public" and (is_link or is_file):
+            if is_link:
+                location = "f/" + quote(state["entry"], safe="/")
+                _send_headers(self, 302, [("Location", location), ("Content-Length", "0"),
+                                          ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"),
+                                          ("X-Robots-Tag", "noindex"), ("X-Content-Type-Options", "nosniff")])
+                return None
+            serve_bundle_file(self, state, "/".join(parts[4:]))
             return None
-        serve_bundle_file(self, state, "/".join(parts[4:]))
+        if audience != "lab" or is_file:
+            return deny(self, state, "audience")    # lab files only under a session; sessions only for lab shares
+        lab = self.server.lab
+        if lab is None:
+            return deny(self, state, "lab_unconfigured")
+        if is_link:
+            return self._send_static(lab, VIEWER_FILE, "text/html; charset=utf-8")
+        if is_session:
+            return self._session(state, parts[2], lab)
+        session = parts[4]
+        got = check_session(lab.secret, state["share_id"], session, self.server.now()) \
+            if _SESSION_SEGMENT.fullmatch(session) else None
+        if got is None:
+            return deny(self, state, "bad_session")
+        serve_bundle_file(self, state, "/".join(parts[6:]), actor=got["identity"])
+        return None
+
+    # -- lab: viewer page, static assets, session exchange
+
+    def _viewer_asset(self, parts):
+        if self.command not in ("GET", "HEAD"):
+            return deny(self, None, "method")
+        lab = self.server.lab
+        if lab is None:
+            return deny(self, None, "lab_unconfigured")
+        if len(parts) == 3 and parts[2] == "callback":
+            return self._send_static(lab, VIEWER_FILE, "text/html; charset=utf-8")
+        if len(parts) == 4 and parts[2] == "static":
+            name = parts[3]
+            if name == "config.json":
+                return self._send_viewer_bytes(lab, lab.config_json, "application/json")
+            if name in STATIC_FILES:
+                return self._send_static(lab, name, STATIC_FILES[name])
+        return deny(self, None, "unknown_route")
+
+    def _send_static(self, lab: LabSettings, name: str, content_type: str):
+        """One allow-listed file straight from ``static_dir`` (no directory walk, no symlink), or the 404."""
+        opened = _open_beneath(lab.static_dir, [name], max_size=STATIC_MAX_BYTES)
+        if opened is None:
+            return deny(self, None, "static_missing")
+        fd, st = opened
+        try:
+            chunks, remaining = [], st.st_size
+            while remaining > 0:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            os.close(fd)
+        return self._send_viewer_bytes(lab, b"".join(chunks), content_type)
+
+    def _send_viewer_bytes(self, lab: LabSettings, body: bytes, content_type: str):
+        _send_headers(self, 200, [("Content-Type", content_type), ("Content-Length", str(len(body))),
+                                  ("Content-Security-Policy", lab.viewer_csp), ("X-Content-Type-Options", "nosniff"),
+                                  ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"),
+                                  ("X-Robots-Tag", "noindex"), ("X-Frame-Options", "DENY")], cors=False)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _single_header(self, name: str) -> str | None:
+        values = self.headers.get_all(name) or []
+        return values[0] if len(values) == 1 else None
+
+    def _session(self, state: ShareState, token: str, lab: LabSettings):
+        """Exchange verified Cognito tokens for a session path. Never echoes a token; every failure is the 404."""
+        share_id = state["share_id"]
+        if _announces_body(self):
+            return deny(self, state, "body")
+        if not self.server.session_per_share.allow(share_id):
+            return deny(self, state, "rate_limited")
+        authorization, id_token = self._single_header("Authorization"), self._single_header("X-Id-Token")
+        if authorization is None or id_token is None:
+            return deny(self, state, "bad_headers")
+        scheme, _, access_token = authorization.strip().partition(" ")
+        if scheme.lower() != "bearer":
+            return deny(self, state, "bad_headers")
+        grant, reason, identity = authorise(state, access_token.strip(), id_token.strip(), lab.authenticator)
+        if grant is None:
+            return deny(self, state, reason, identity or "public")
+        now = self.server.now()
+        exp = min(now + lab.session_seconds, grant["exp"])
+        try:
+            share_expiry = _expiry(state.get("expires_at"))
+        except (ValueError, TypeError, OverflowError):
+            return deny(self, state, "invalid_state", grant["identity"])
+        if share_expiry is not None:
+            exp = min(exp, share_expiry)
+        exp_int = int(exp // 1)
+        if exp_int <= now:
+            return deny(self, state, "token_expired", grant["identity"])
+        try:
+            session = mint_session(lab.secret, share_id, grant["identity"], exp_int)
+        except ValueError:
+            return deny(self, state, "bad_identity", grant["identity"])
+        body = json.dumps({"base": f"/s/{token}/k/{session}/f/", "entry": state["entry"],
+                           "expires_at": exp_int}, sort_keys=True, ensure_ascii=True).encode("ascii")
+        _send_headers(self, 200, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
+                                  ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
+                                  ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),
+                                  ("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")],
+                      cors=False)
+        self.wfile.write(body)
         return None
 
 
@@ -705,6 +909,9 @@ class ShareServer(ThreadingHTTPServer):
         self.config = config
         self.now = now
         self.events = EventLog(config.events_path, now)
+        self.lab = lab_settings(config)
+        self.session_per_share = RateLimiter(SESSION_PER_SHARE_PER_MINUTE, now)
+        self.session_global = RateLimiter(SESSION_GLOBAL_PER_MINUTE, now, max_keys=1)
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         super().__init__(address, ShareHandler)
 
