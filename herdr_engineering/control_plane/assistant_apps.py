@@ -16,6 +16,7 @@ from herdr_engineering.control_plane.app_credentials import AppsError, Credentia
 from herdr_engineering.control_plane.google_workspace import GoogleError
 
 STATE_TTL = 600
+MAX_PENDING_PER_PERSON = 5
 GOOGLE = "google"
 CALLBACK_PATH = "/api/v1/assistant-apps/google/callback"
 CARDS = (("gmail", "Gmail"), ("calendar", "Google Calendar"))
@@ -29,7 +30,7 @@ class AppsService:
     def __init__(self, store: CredentialStore, *, redirect_base: str, opener: Callable | None = None,
                  clock: Callable[[], float] = time.time, github_status_fn: Callable[[], dict] | None = None):
         self._store, self._clock = store, clock
-        self._open = opener or google_oauth._urlopen
+        self._open = opener or google_oauth.default_opener
         self._redirect = redirect_base.rstrip("/") + CALLBACK_PATH
         self._github = github_status_fn
         self._pending: dict[str, tuple[str, str, str, str, float]] = {}
@@ -77,6 +78,7 @@ class AppsService:
 
     # --- sign-in
     def _purge(self, now: float) -> None:
+        """Drop sign-ins that have expired as of ``now``."""
         for key in [k for k, v in self._pending.items() if v[4] <= now]:
             del self._pending[key]
 
@@ -87,21 +89,29 @@ class AppsService:
         if client is None:
             raise AppsError("no_client")
         state, verifier, challenge = google_oauth.new_pkce()
-        sealed = self._store._box.seal(verifier)
+        sealed = self._store.seal_pending(verifier)
         now = self._clock()
         with self._lock:
             self._purge(now)
+            mine = [k for k, v in self._pending.items() if v[:2] == (tenant, user)]    # insertion order: oldest first
+            for k in mine[:max(0, len(mine) - MAX_PENDING_PER_PERSON + 1)]:
+                del self._pending[k]
             self._pending[_digest(state)] = (tenant, user, provider, sealed, now + STATE_TTL)
         return google_oauth.authorization_url(client[0], self._redirect, state, challenge)
 
     def connect_callback(self, provider: str, params: dict) -> tuple[str, str]:
+        """Finish a sign-in and return ``(tenant, user)`` of the person who STARTED it.
+
+        The HTTP layer must NOT require the caller to be signed in: the callback is unauthenticated and the one-time
+        state is the proof of who is connecting.
+        """
         state = params.get("state")
         if not isinstance(state, str) or not state:
             raise AppsError("bad_state")
         now = self._clock()
         with self._lock:
-            self._purge(now - STATE_TTL)     # keeps a just-expired entry findable so it reports "expired"
-            entry = self._pending.pop(_digest(state), None)
+            entry = self._pending.pop(_digest(state), None)    # first, so an expired one reports "expired"
+            self._purge(now)
         if entry is None or entry[2] != provider or provider != GOOGLE:
             raise AppsError("bad_state")
         tenant, user, _, sealed, expires = entry
@@ -115,9 +125,9 @@ class AppsService:
         client = self._store.get_client(GOOGLE)
         if client is None:
             raise AppsError("no_client")
-        verifier = self._store._box.open(sealed)
+        verifier = self._store.open_pending(sealed)
         try:
-            data = google_oauth.exchange_code(self._open, client, code, verifier, self._redirect)
+            data = google_oauth.exchange_authorization_code(self._open, client, code, verifier, self._redirect)
         except GoogleError:
             raise AppsError("exchange_failed") from None
         granted = set(str(data.get("scope", "")).split())

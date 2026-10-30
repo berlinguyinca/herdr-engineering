@@ -23,7 +23,12 @@ from herdr_engineering.control_plane.google_workspace import (
     new_pkce,
 )
 
-__all__ = ["SCOPES", "REVOKE_URL", "new_pkce", "authorization_url", "exchange_code", "account_address", "revoke", "_urlopen"]
+
+def default_opener(req, timeout):
+    return _urlopen(req, timeout)
+
+
+__all__ = ["SCOPES", "REVOKE_URL", "new_pkce", "authorization_url", "exchange_authorization_code", "account_address", "revoke", "default_opener"]
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose",
           "https://www.googleapis.com/auth/calendar.readonly", "https://www.googleapis.com/auth/calendar.events")
@@ -37,7 +42,7 @@ def authorization_url(client_id: str, redirect_uri: str, state: str, challenge: 
         "code_challenge_method": "S256"})
 
 
-def exchange_code(opener: Callable, client: tuple[str, str], code: str, verifier: str, redirect_uri: str) -> dict:
+def exchange_authorization_code(opener: Callable, client: tuple[str, str], code: str, verifier: str, redirect_uri: str) -> dict:
     """Raw token response (``refresh_token``, ``access_token``, ``scope``); the caller judges scopes."""
     data = _post_form(opener, TOKEN_URL, {"client_id": client[0], "client_secret": client[1], "code": code,
                                           "code_verifier": verifier, "redirect_uri": redirect_uri,

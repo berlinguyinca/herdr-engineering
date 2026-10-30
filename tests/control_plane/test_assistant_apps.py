@@ -97,10 +97,11 @@ def test_callback_with_unknown_reused_expired_or_foreign_state_is_refused_and_st
     svc, store, g, clock = env
     with pytest.raises(AppsError) as e:
         svc.connect_callback("google", {"state": "nope", "code": "c"})
-    assert e.value.reason == "bad_state"
+    assert e.value.reason == "bad_state" and not g.calls
     st = _state(svc.connect_start("t", "u", "google"))
     svc.connect_callback("google", {"state": st, "code": "c"})
     store.delete_connection("t", "u", "google")
+    g.calls.clear()
     with pytest.raises(AppsError) as e:
         svc.connect_callback("google", {"state": st, "code": "c"})
     assert e.value.reason == "bad_state"
@@ -116,7 +117,7 @@ def test_callback_with_unknown_reused_expired_or_foreign_state_is_refused_and_st
     with pytest.raises(AppsError) as e:       # foreign provider
         svc.connect_callback("github", {"state": st, "code": "c"})
     assert e.value.reason == "bad_state"
-    assert store.get_connection("t", "u", "google") is None
+    assert store.get_connection("t", "u", "google") is None and not g.calls
 
 
 def test_callback_refuses_a_token_with_extra_or_missing_scopes(env):
@@ -127,6 +128,10 @@ def test_callback_refuses_a_token_with_extra_or_missing_scopes(env):
         with pytest.raises(AppsError) as e:
             svc.connect_callback("google", {"state": st, "code": "c"})
         assert e.value.reason == "unexpected_scope"
+        n = len(g.calls)
+        with pytest.raises(AppsError) as e:     # the state is spent
+            svc.connect_callback("google", {"state": st, "code": "c"})
+        assert e.value.reason == "bad_state" and len(g.calls) == n
     assert store.get_connection("t", "u", "google") is None
 
 
@@ -202,3 +207,24 @@ def test_blocked_calendars_roundtrip(env):
     svc, *_ = env
     svc.set_blocked_calendars("t", "u", ["a", "b", "a"])
     assert svc.blocked_calendars("t", "u") == ["a", "b"] and svc.blocked_calendars("t", "x") == []
+
+
+def test_pending_sign_ins_are_capped_per_person(env):
+    svc, store, g, _ = env
+    first = _state(svc.connect_start("t", "u", "google"))
+    for _ in range(5):
+        svc.connect_start("t", "u", "google")
+    with pytest.raises(AppsError) as e:
+        svc.connect_callback("google", {"state": first, "code": "c"})
+    assert e.value.reason == "bad_state"
+
+
+def test_store_seal_pending_roundtrip_and_not_set_up(env, tmp_path):
+    _, store, *_ = env
+    assert store.open_pending(store.seal_pending("v")) == "v"
+    with pytest.raises(AppsError) as e:
+        CredentialStore(SecretBox(None)).seal_pending("v")
+    assert e.value.reason == "not_set_up"
+    with pytest.raises(AppsError) as e:
+        store.open_pending("garbage")
+    assert e.value.reason == "unreadable"

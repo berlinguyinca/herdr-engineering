@@ -192,6 +192,12 @@ class CredentialStore:
                     return
                 self._tombstones.discard(key)
 
+    def seal_pending(self, plain: str) -> str:
+        return self._box.seal(plain)
+
+    def open_pending(self, token: str) -> str:
+        return self._box.open(token)
+
     # --- OAuth client (one per provider, shared by the whole deployment)
     @_serialized
     def put_client(self, provider: str, client_id: str, client_secret: str) -> None:
