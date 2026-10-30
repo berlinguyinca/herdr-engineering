@@ -1,4 +1,5 @@
-"""`herdr-eng artifacts show|versions|for`: read-only browsing of the versioned artifact registry (P03 `/artifact` adapter)."""
+"""`herdr-eng artifacts show|versions|for|links|link`: browse the versioned artifact registry and bind an artifact to a
+project, issue, task or room (P03 `/artifact` adapter). Only `link` writes, through the existing links route."""
 import argparse
 import json
 import os
@@ -24,6 +25,16 @@ def run_command(args):
             result = client.request(_show_path(args.artifact_id, args.version_id))
         elif action == "versions":
             result = client.request(_show_path(args.artifact_id) + "/versions?summary=true")
+        elif action == "links":
+            result = client.request(_show_path(args.artifact_id) + "/links")
+        elif action == "link":
+            body = {k: v for k, v in (("project_id", args.project), ("issue_ref", args.issue), ("task_id", args.task),
+                                      ("room_id", args.room), ("version_id", args.version),
+                                      ("link_kind", args.link_kind)) if v is not None}
+            if not any(k in body for k in ("project_id", "issue_ref", "task_id", "room_id")):
+                _err("a link needs --project, --issue, --task or --room")
+                return 2
+            result = client.request(_show_path(args.artifact_id) + "/links", body)
         else:
             query = {k: v for k, v in (("q", args.query), ("media_type", args.media_type),
                                        ("limit", args.limit), ("cursor", args.cursor)) if v is not None}
@@ -38,7 +49,7 @@ def run_command(args):
 
 def add_browse_subparsers(subparsers):
     """Register show/versions/for directly under `artifacts` so they read as `artifacts show <id>`."""
-    for name in ("show", "versions", "for"):
+    for name in ("show", "versions", "for", "links", "link"):
         c = subparsers.add_parser(name)
         configure_parser_single(c, name)
 
@@ -56,6 +67,10 @@ def configure_parser_single(c, action):
         c.add_argument("--cursor")
     else:
         c.add_argument("artifact_id")
+    if action == "link":
+        for flag in ("project", "issue", "task", "room", "version"):
+            c.add_argument("--" + flag)
+        c.add_argument("--link-kind", choices=("origin", "reference", "derived"))
     if action == "show":
         c.add_argument("version_id", nargs="?")
     c.set_defaults(func=run_command, browse_action=action)
