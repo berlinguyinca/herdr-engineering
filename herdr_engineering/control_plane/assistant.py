@@ -1023,6 +1023,27 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         self.context_provider = context_provider
         self.context_gate = context_gate
         self._urlopen = urlopen
+        # callables (run) -> text appended to the bot's own instructions, e.g. the app's agent skills; never raise
+        self.prompt_extras: list[Callable[[AssistantRun], str]] = []
+
+    def _bot_prompt(self, run: AssistantRun | None) -> tuple[dict | None, str]:
+        """The bot's own instructions (plus any registered extras) as a system message, and its model: a bot set to
+        ``manual:<id>`` asks the gateway for that model, otherwise the configured one."""
+        if run is None:
+            return None, self.model
+        assistant = self.store.assistants.get(run.assistant_id)
+        if assistant is None:
+            return None, self.model
+        parts = [assistant.instructions.strip()] if assistant.instructions.strip() else []
+        for extra in self.prompt_extras:
+            try:
+                text = extra(run)
+            except Exception:  # noqa: BLE001 - extras must never break a reply
+                text = ""
+            if text:
+                parts.append(text)
+        model = assistant.model_policy[7:] if assistant.model_policy.startswith("manual:") else self.model
+        return ({"role": "system", "content": "\n\n".join(parts)} if parts else None), model or self.model
 
     def _system_message(self, run: AssistantRun | None = None) -> dict | None:
         if self.context_provider is None:
@@ -1053,8 +1074,11 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         sys = self._system_message(run)
         if sys:
             msgs = [sys] + msgs
+        bot, model = self._bot_prompt(run)
+        if bot:
+            msgs = [bot] + msgs
         return {
-            "model": self.model,
+            "model": model,
             "messages": msgs,
         }
 
@@ -1100,7 +1124,10 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         sys = self._system_message(run)
         if sys:
             msgs = [sys] + msgs
-        payload = {"model": self.model, "messages": msgs, "tools": tools,
+        bot, model = self._bot_prompt(run)
+        if bot:
+            msgs = [bot] + msgs
+        payload = {"model": model, "messages": msgs, "tools": tools,
                    "tool_choice": "auto"}
         try:
             return self._parse_step(self._post(payload))

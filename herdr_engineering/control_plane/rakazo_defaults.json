@@ -1,7 +1,6 @@
 {
  "defaults": {
   "agentSecrets/list": [],
-  "agentSkills/list": [],
   "approvalRules/list": [],
   "autoReview/get": {
    "checkerAvailable": false,

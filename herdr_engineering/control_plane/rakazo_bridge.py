@@ -41,6 +41,7 @@ from . import rakazo_prefs as pf
 from . import rakazo_rest as rest
 from . import rakazo_rooms as rooms
 from . import rakazo_routines as routines
+from . import rakazo_skills as skills
 from . import rakazo_spaces as sp
 from .assistant import (
     ApprovalRequired,
@@ -644,9 +645,13 @@ class RakazoBridge:
         self.routines = routines.Routines(self, BridgeError)
         self.artifacts = artifacts.Artifacts(self, BridgeError, artifacts_fn)
         self.models = models.Models(self, BridgeError)
+        self.skills = skills.Skills(self, BridgeError)
+        runner = getattr(self.svc, "runner", None)
+        if hasattr(runner, "prompt_extras"):
+            runner.prompt_extras.append(self.skills.prompt_for)
         self.hindsight = hs.build(config.get("hindsight"))
         for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs(),
-                         **self.artifacts.procs(), **self.models.procs()}.items():
+                         **self.artifacts.procs(), **self.models.procs(), **self.skills.procs()}.items():
             self._procs[name] = fn
         self.rest = rest.Rest(self, BridgeError, set(self._procs))
         self._procs.update(self.rest.procs())

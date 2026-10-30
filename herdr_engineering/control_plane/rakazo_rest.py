@@ -23,7 +23,6 @@ from . import rakazo_events as ev
 
 READS = frozenset({
     "agentSecrets/list",
-    "agentSkills/list",
     "approvalRules/list",
     "autoReview/get",
     "availability/items",
@@ -75,7 +74,7 @@ _REASONS = {
     "connections": "Connectors are managed by the operator, not from the app.",
     "messaging": "Messaging channels are not set up on this server.",
     "marketplace": "There is no marketplace on this server.", "capabilities": "Capabilities are managed by the operator.",
-    "skills": "Taught skills are not available on this server.", "agentSkills": "Agent skills are not available on this server.",
+    "skills": "Taught skills are not available on this server.",
     "tickets": "The ticket board is not enabled on this server.", "boards": "Boards are not enabled on this server.",
     "approvalRules": "Approval rules are decided by the operator's policy.", "autoReview": "Auto review is decided by the operator.",
     "updater": "Updates are applied by the operator.", "deployment": "The deployment is configured by the operator.",
