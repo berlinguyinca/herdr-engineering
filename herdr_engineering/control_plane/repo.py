@@ -1609,6 +1609,9 @@ class ControlPlaneRepo:
         existing = self._reviews.get(review_id)
         if pull_request_number is not None and not (repository or (existing or {}).get("repository")):
             raise ValueError("pull_request_number needs the repository it belongs to")
+        if existing is not None:   # before anything is written: a stored reference is never changed or moved
+            repository, pull_request_number = review_refs.keep_reference(
+                existing.get("repository"), existing.get("pull_request_number"), repository, pull_request_number)
         if existing is None:
             rec = {
                 "review_id": review_id,

@@ -21,9 +21,40 @@ def pull_request_number(value):
 
 
 def repository(value):
-    """``None`` stays ``None``; otherwise a bounded ``[host/]owner/name`` string or ``ValueError``."""
+    """``None`` stays ``None``; otherwise ``owner/name`` or ``host/owner/name`` or ``ValueError``.
+
+    A value with a forge host must be one ``canonical_repository`` understands (the same reading the PR trail uses), so what is stored
+    compares the same way later. A value without a host is exactly ``owner/name``: no ``:`` and no extra segments.
+    """
     if value is None:
         return None
-    if not isinstance(value, str) or len(value) > 200 or not _REPOSITORY.fullmatch(value) or {".", ".."} & set(value.split("/")):
+    ok = isinstance(value, str) and len(value) <= 200 and _REPOSITORY.fullmatch(value) and not ({".", ".."} & set(value.split("/")))
+    if ok:
+        parts = value.split("/")
+        if len(parts) == 2:
+            ok = ":" not in parts[0] and "." not in parts[0]   # "x.y/z" would be read as host x.y, repository z
+        elif len(parts) == 3:
+            from .project_links import canonical_repository
+            ok = canonical_repository(value) is not None
+        else:
+            ok = False
+    if not ok:
         raise ValueError("repository must be a string like owner/name or host/owner/name")
     return value
+
+
+def same_repository(a, b):
+    """Whether two repository identities name the same repository, compared exactly as the PR trail compares them."""
+    from .pr_trail import same_repository as trail_same
+    return trail_same(a, b)
+
+
+def keep_reference(stored_repository, stored_number, repository_in, number_in):
+    """The reference after an update. A stored value is never changed or moved: only ``None`` -> value is allowed, anything else that
+    differs raises ``ValueError`` (a review that named a pull request keeps naming that one)."""
+    if repository_in is not None and stored_repository is not None and not same_repository(stored_repository, repository_in):
+        raise ValueError("review already names another repository")
+    if number_in is not None and stored_number is not None and number_in != stored_number:
+        raise ValueError("review already names another pull request")
+    return (stored_repository if stored_repository is not None else repository_in,
+            stored_number if stored_number is not None else number_in)

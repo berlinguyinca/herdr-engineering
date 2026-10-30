@@ -134,8 +134,10 @@ class ReviewService:
             record[key] = _text(payload.get(key), key)
         # Optional and never guessed: absent means no pull request is named.
         record["pull_request_number"] = review_refs.pull_request_number(payload.get("pull_request_number"))
-        if record["pull_request_number"] is not None and not record["repository"]:
-            raise ValueError("pull_request_number needs the repository it belongs to")
+        if record["pull_request_number"] is not None:
+            if not record["repository"]:
+                raise ValueError("pull_request_number needs the repository it belongs to")
+            review_refs.repository(payload.get("repository"))   # a number is only kept with a repository the PR trail can read
         with self.repo._event_lock:
             existing = _snapshot(self.repo, rid)
             if existing:
