@@ -1,0 +1,30 @@
+TAP version 13
+# Subtest: only unfinished jobs are cancellable
+ok 1 - only unfinished jobs are cancellable
+  ---
+  duration_ms: 1.46159
+  ...
+# Subtest: the panel renders one labelled Cancel button per open job, disabled while in flight
+ok 2 - the panel renders one labelled Cancel button per open job, disabled while in flight
+  ---
+  duration_ms: 0.447467
+  ...
+# Subtest: error text and job fields are escaped
+ok 3 - error text and job fields are escaped
+  ---
+  duration_ms: 0.244729
+# Subtest: explicit local-only scope wins over conflicting catalog or root scope
+ok 784 - explicit local-only scope wins over conflicting catalog or root scope
+  ---
+  duration_ms: 0.591206
+  ...
+1..784
+# tests 784
+# suites 0
+# pass 784
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 12764.134879
+

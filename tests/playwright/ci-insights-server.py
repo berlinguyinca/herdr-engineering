@@ -39,9 +39,24 @@ if '--old-selection-run' in sys.argv:
                 row[key] -= 60 * 86400
 
 
+# --log-tests: the unit-test step prints go -v output and the browser step only karma totals, like real projects do.
+LOGS = {12: '\n'.join(['go: downloading modules', '=== RUN   TestAlpha', '--- PASS: TestAlpha (0.01s)', '=== RUN   TestBeta',
+                       '    beta_test.go:12: expected 200, got 500', '--- FAIL: TestBeta (0.20s)', 'FAIL',
+                       'FAIL\texample.org/app/pkg\t0.3s', '']),
+        13: 'Chrome Headless 1.0 (Linux): Executed 5 of 5 SUCCESS (0.1 secs / 0.1 secs)\nTOTAL: 5 SUCCESS\n'}
+
+
 class ProviderHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?')[0]
+        if '--log-tests' in sys.argv and path.startswith('/api/repos/17/logs/') and path.endswith('/download'):
+            text = LOGS.get(int(path.split('/')[-2]), 'compiling\n').encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(text)))
+            self.end_headers()
+            self.wfile.write(text)
+            return
         if path == '/api/user/repos':
             body = [dict(id=17, full_name='org/app', owner='org', name='app')]
         elif path == '/api/agents':
@@ -91,7 +106,8 @@ with tempfile.TemporaryDirectory() as tmp:
     repo = ControlPlaneRepo()
     server = ControlPlaneServer(repo, web_root=ROOT/'packages')
     server.ci_monitor.close()
-    server.ci_monitor = CIMonitor(provider_factory=factory, on_observation=repo.observe_ci_pipeline)
+    logs = dict(on_log_report=repo.ingest_ci_log_report, log_known=repo.ci_log_analysis) if '--log-tests' in sys.argv else {}
+    server.ci_monitor = CIMonitor(provider_factory=factory, on_observation=repo.observe_ci_pipeline, **logs)
     server.ci_monitor.refresh()
     # Opt-in scale fixture: retained observations only, never extra provider I/O.
     if '--117-projects' in sys.argv:

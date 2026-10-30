@@ -160,6 +160,24 @@ def test_pipeline_and_log_require_valid_query(server):
     assert request(server, 'ci/pipeline?repository=org%2Fapp&number=2')[1]['pipeline']['repository'] == 'org/app'
 
 
+def test_log_slice_route_validates_and_returns_redacted_lines_around_the_range(server):
+    class Provider:
+        base_url = 'https://ci.example.org'
+        token = 'tok'
+        available = True
+
+        def step_log_text(self, repo, number, step, *, max_chars):
+            return 'a\nb\nTestX failed password=hunter2\nd\n', False
+
+    server.ci_monitor._factory = Provider
+    assert request(server, 'ci/log-slice?repository=17&number=3&step=name&start=1&end=2')[0] == 400
+    assert request(server, 'ci/log-slice?repository=17&number=3&step=4&start=0&end=2')[0] == 400
+    status, view = request(server, 'ci/log-slice?repository=17&number=3&step=4&start=3&end=3&context=1&expect=TestX')
+    assert status == 200 and view['slice']['first'] == 2 and view['slice']['last'] == 4
+    assert view['slice']['lines'][1].startswith('TestX failed') and 'hunter2' not in json.dumps(view)
+    assert request(server, 'ci/log-slice?repository=17&number=3&step=4&start=3&end=3&expect=OtherName')[1]['slice'] is None
+
+
 def test_viewer_cannot_execute_and_operator_needs_deployment_opt_in(server):
     body = {'repository': 'org/app', 'number': 2, 'action': 'cancel'}
     assert request(server, 'ci/actions', body)[0] == 403
