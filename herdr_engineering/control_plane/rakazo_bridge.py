@@ -33,6 +33,7 @@ from typing import Any
 
 from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
+from . import rakazo_cognito as cognito
 from . import rakazo_events as ev
 from . import rakazo_hindsight as hs
 from . import rakazo_mcp as mcp
@@ -168,7 +169,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
-                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms"})
+                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -184,6 +185,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     if (not isinstance(auto_join, list) or len(auto_join) > 50
             or not all(isinstance(r, str) and 0 < len(r) <= 200 for r in auto_join)):
         raise ValueError("control_plane.rakazo_bridge.auto_join_rooms must be a list of up to 50 room ids")
+    cognito_cfg = cognito.cognito_config(raw.get("cognito"))
     vault_key_file = raw.get("vault_key_file")
     if vault_key_file is not None and (not isinstance(vault_key_file, str) or not vault_key_file):
         raise ValueError("control_plane.rakazo_bridge.vault_key_file must be a file path")
@@ -231,7 +233,8 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff, link))
     return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
-            "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join)}
+            "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join),
+            "cognito": cognito_cfg}
 
 
 # --------------------------------------------------------------------------------------------- tokens
@@ -609,7 +612,7 @@ class RakazoBridge:
     not the bridge's (the caller then answers exactly as it did before the bridge existed)."""
 
     def __init__(self, config: dict[str, Any], assistant, *, version: str = "0", persistence=None, space_persistence=None,
-                 prefs_persistence=None, collab=None, artifacts_fn=None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
+                 prefs_persistence=None, collab=None, artifacts_fn=None, cognito_signin=None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
         if not config.get("enabled"):
             raise ValueError("RakazoBridge needs an enabled configuration")
         self.svc = assistant
@@ -617,6 +620,9 @@ class RakazoBridge:
         self.accounts: list[Account] = list(config["accounts"])
         self._by_principal = {a.principal_id: a for a in self.accounts}
         self._by_id = {a.account_id: a for a in self.accounts}
+        self._cognito_users: dict[str, str] = {}      # account id -> Cognito username, for pool members who signed in
+        self._accounts_lock = threading.Lock()
+        self.cognito = cognito_signin or (cognito.CognitoSignIn(config["cognito"]) if config.get("cognito") else None)
         self.tokens = TokenStore(config["token_ttl_days"] * 86400, config["max_tokens"], persistence, clock,
                                  cutoffs={a.account_id: a.tokens_valid_after for a in self.accounts})
         self.trusted_proxies = tuple(config.get("trusted_proxies", ()))
@@ -806,6 +812,11 @@ class RakazoBridge:
         for account in self.accounts:
             if hmac.compare_digest(hashlib.sha256(account.email.encode()).digest(), wanted) and matched is None:
                 matched = account
+        if matched is None and self.cognito is not None and email and password:
+            member = self._cognito_account(email, password)
+            if member is not None:
+                self.limiter.success(ip)
+                return self._finish_sign_in(member, ip)
         params = matched.params if matched is not None else self._dummy
         if not self._kdf_slots.acquire(timeout=15):
             raise BridgeError(429, "TOO_MANY_REQUESTS", "Too many attempts. Try again in a few minutes.",
@@ -820,6 +831,9 @@ class RakazoBridge:
             log.warning("rakazo bridge: failed sign-in from %s (%d from all addresses in 10 minutes)", ip[:64], recent)
             raise BridgeError(401, "INVALID_EMAIL_OR_PASSWORD", "Invalid credentials")
         self.limiter.success(ip)
+        return self._finish_sign_in(matched, ip)
+
+    def _finish_sign_in(self, matched: Account, ip: str) -> BridgeResponse:
         try:
             token = self.tokens.mint(matched.account_id, ip)
         except TokenStoreError:
@@ -829,6 +843,25 @@ class RakazoBridge:
                                     "user": {"id": matched.principal_id, "email": matched.email,
                                              "name": matched.email.split("@", 1)[0]}},
                               {"set-auth-token": token})
+
+    def _cognito_account(self, email: str, password: str) -> Account | None:
+        """An account for a verified member of the configured Cognito group, else None (the caller then fails like any
+        wrong password). Cognito being unreachable is a 503, not a failed password."""
+        if not _EMAIL.match(email):
+            return None
+        try:
+            who = self.cognito.authenticate(email, password)
+        except cognito.CognitoUnavailable:
+            raise BridgeError(503, "SERVICE_UNAVAILABLE", "Sign-in is temporarily unavailable.") from None
+        if who is None or not _COLLAB_USER.match(who["user"]):
+            return None
+        account_id = cognito.CognitoSignIn.account_id(who["email"])
+        account = Account(account_id, who["email"], f"rakazo:{account_id}", "operator", self._dummy, 0.0, who["user"])
+        with self._accounts_lock:
+            self._by_id[account_id] = account
+            self._by_principal[account.principal_id] = account
+            self._cognito_users[account_id] = who["user"]
+        return account
 
     def _audit(self, account: Account, action: str) -> None:
         """Best effort: signing in must not depend on the audit store, but a refusal is logged (never any secret)."""
@@ -848,6 +881,9 @@ class RakazoBridge:
         account_id = self.tokens.lookup(token, ip) if token else None
         account = self._by_id.get(account_id or "")
         if account is None:
+            raise BridgeError(401, "UNAUTHORIZED", "Sign in to continue.")
+        pool_user = self._cognito_users.get(account.account_id)
+        if pool_user is not None and not self.cognito.still_member(pool_user):
             raise BridgeError(401, "UNAUTHORIZED", "Sign in to continue.")
         handler = self._procs.get(proc)
         if handler is None:

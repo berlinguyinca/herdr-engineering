@@ -147,3 +147,25 @@ Auto-join, as an operator opt-in. `control_plane.rakazo_bridge.auto_join_rooms: 
 default, at most 50) makes `groups/list` add the signed-in person's own active agents to those rooms they already belong to,
 with chat rights only (`read`, `post`), through the normal `grant_agent` path (so room roles, the agent ceiling and approvals
 still apply). It is best effort and never breaks the listing. The grant stays a deliberate operator decision rather than a default.
+
+### Update 9
+
+Sign-in with the lab Cognito pool (`rakazo_cognito.py`), optional and YAML-only:
+
+    control_plane.rakazo_bridge.cognito:
+      pool_id: us-west-2_GjtcM0PCp            # the pool BinView / lc-binbase-scheduler and the LLM gateway use
+      client_ids: [<app client id>]           # app client allowlist for the access token
+      required_group: <group>                 # REQUIRED, no default: only members of this group may sign in
+      group_check: true                       # default; re-reads membership while the session lives (needs boto3 + AWS read access)
+
+An email that is not a local account is checked by Cognito (`InitiateAuth`, `USER_PASSWORD_AUTH`); the access token must verify
+against the pool's JWKS and carry the group, and the ID token supplies a verified email. The person then acts as the collaboration
+user named by their Cognito username (the same identity HCN gives them), so they see the rooms and agents they already have there.
+Local accounts never go to Cognito; a wrong pool password or a non-member fails like any wrong password; an outage is a 503.
+Removing someone from the group ends their session within about a minute (`group_check`). Pool sessions are held in memory, so a
+web restart asks them to sign in again.
+
+Two things this does NOT do, because they change the shared pool: it does not create an app client or a group. The BinView web
+client has no `USER_PASSWORD_AUTH` flow listed (its flows are legacy defaults), so a dedicated app client with
+`ALLOW_USER_PASSWORD_AUTH`, and a group such as `rakazo-users`, should be created in the pool by you before enabling this.
+Every member of `required_group` gets the `operator` role (the only role implemented), so keep that group small.
