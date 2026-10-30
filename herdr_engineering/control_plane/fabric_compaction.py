@@ -10,13 +10,17 @@ production journal (1,762,189 service rows -> 349,664, all 6,544 reconstructed s
   is not the last one. Other ``ServiceUpdated`` rows carry state transitions (``unavailable_since``) and stay.
 
 Only rows without a v2 envelope (no source, source sequence or actor) are candidates, and only rows older than
-``min_age_days``. Each batch is ONE statement that deletes the rows and inserts them into ``fabric_events_archive``,
-so a row is never lost half way. Removing rows changes the journal a recovery checkpoint covered; the checkpoint
+``min_age_days``. A pass scans the journal once (read only) into a session temp table of event ids, then moves them
+in small chunks, ``chunk_rows`` per transaction with ``chunk_pause_seconds`` between, so a large backlog never holds the
+WAL or the table for minutes (one 250,000-row statement stalled every ingest write for ~8 minutes). Each chunk is ONE
+statement that deletes the rows and inserts them into ``fabric_events_archive``, so a row is never lost half way, and
+rows already listed stay removable (later rows can only make more of a stream interior). Removing rows changes the journal a recovery checkpoint covered; the checkpoint
 loader then replays the affected streams in full (correct, slower), so after a drain the job rebuilds the checkpoint.
 Off unless ``enabled`` is true; ``dry_run`` (the default) only counts.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -33,7 +37,10 @@ class CompactionSettings:
     dry_run: bool = True
     interval_seconds: float = 3600.0
     min_age_days: float = 2.0
-    batch_rows: int = 250_000
+    batch_rows: int = 1_000_000          # rows listed (one journal scan) per pass
+    chunk_rows: int = 5_000              # rows moved per transaction
+    chunk_pause_seconds: float = 0.25    # breathing room for ingest between chunks
+    max_pass_seconds: float = 300.0      # stop moving after this long; the rest is listed again a minute later
     archive_retention_days: float | None = 30.0
     rebuild_checkpoint: bool = True
     keep_checkpoints: int = 2
@@ -41,8 +48,8 @@ class CompactionSettings:
 
 # The candidate rows. Windows run over the whole stream so "first" and "last" are real, age is applied afterwards.
 _REMOVABLE = """
-    SELECT tid, event_type FROM (
-        SELECT ctid AS tid, event_type, ingest_timestamp, payload,
+    SELECT event_id, event_type FROM (
+        SELECT event_id, event_type, ingest_timestamp, payload,
                schema_version, source, source_sequence, actor,
                row_number() OVER w AS rn, count(*) OVER (PARTITION BY entity_id, event_type) AS cnt,
                lag(payload) OVER w AS prev_payload
@@ -60,9 +67,15 @@ _REMOVABLE = """
 
 _COUNT = f"SELECT event_type, count(*) AS n FROM ({_REMOVABLE}) r GROUP BY event_type"
 
-_MOVE = f"""
-    WITH moved AS (
-        DELETE FROM fabric_events WHERE ctid IN (SELECT tid FROM ({_REMOVABLE}) r LIMIT $2) RETURNING *
+_LIST = f"""
+    CREATE TEMP TABLE compaction_pending AS SELECT event_id FROM ({_REMOVABLE}) r LIMIT $2
+"""
+
+_MOVE_CHUNK = """
+    WITH batch AS (
+        DELETE FROM compaction_pending WHERE ctid IN (SELECT ctid FROM compaction_pending LIMIT $1) RETURNING event_id
+    ), moved AS (
+        DELETE FROM fabric_events f USING batch WHERE f.event_id = batch.event_id RETURNING f.*
     ) INSERT INTO fabric_events_archive SELECT moved.*, now() FROM moved
 """
 
@@ -70,9 +83,10 @@ _MOVE = f"""
 class FabricCompactor:
     """Run :meth:`tick` from the worker loop; it does nothing until ``interval_seconds`` have passed."""
 
-    def __init__(self, settings: CompactionSettings, *, clock=time.monotonic, checkpoint_builder=None):
+    def __init__(self, settings: CompactionSettings, *, clock=time.monotonic, pass_clock=time.monotonic, checkpoint_builder=None):
         self.settings = settings
         self._clock = clock
+        self._pass_clock = pass_clock       # times one pass against max_pass_seconds; the tick clock only paces ticks
         self._last: float | None = None
         self._rebuild_pending = False
         self._checkpoint_builder = checkpoint_builder
@@ -100,25 +114,55 @@ class FabricCompactor:
         if s.dry_run:
             counts = {r["event_type"]: int(r["n"]) for r in await conn.fetch(_COUNT, age)}
             return f"dry run: would archive {sum(counts.values())} rows {dict(sorted(counts.items()))}"
-        moved = 0
-        async with conn.transaction():
-            if not await conn.fetchval("SELECT pg_try_advisory_xact_lock($1)", _LOCK):
-                return "skipped: another compaction is running"
-            status = await conn.execute(_MOVE, age, s.batch_rows)
-            moved = int(status.split()[-1])
-            purged = 0
-            if s.archive_retention_days is not None:
-                purged = int((await conn.execute(
-                    "DELETE FROM fabric_events_archive WHERE archived_at < now() - make_interval(secs => $1)",
-                    s.archive_retention_days * 86400.0)).split()[-1])
+        moved, drained = await self._move(conn, age)
+        if moved is None:
+            return "skipped: another compaction is running"
+        purged = 0
+        if s.archive_retention_days is not None:
+            purged = int((await conn.execute(
+                "DELETE FROM fabric_events_archive WHERE archived_at < now() - make_interval(secs => $1)",
+                s.archive_retention_days * 86400.0)).split()[-1])
         if moved:
             self._rebuild_pending = True
-        if moved >= s.batch_rows:
+        if not drained:
             self._last = self._clock() - s.interval_seconds + 60.0       # more to drain: come back in a minute
         outcome = f"archived {moved} rows, purged {purged} from the archive"
-        if self._rebuild_pending and moved < s.batch_rows and s.rebuild_checkpoint:
+        if self._rebuild_pending and drained and s.rebuild_checkpoint:
             outcome += "; " + await self._rebuild(conn)
         return outcome
+
+    async def _move(self, conn, age):
+        """List the removable rows once, then move them chunk by chunk. Returns (moved, drained); moved is None when
+        another compaction holds the lock. The lock and the temp table belong to this session, so both are released
+        in ``finally`` (a failed chunk leaves its own transaction rolled back, the earlier chunks stay moved)."""
+        s = self.settings
+        if not await conn.fetchval("SELECT pg_try_advisory_lock($1)", _LOCK):
+            return None, True
+        started = self._pass_clock()
+        moved = 0
+        try:
+            await conn.execute("DROP TABLE IF EXISTS compaction_pending")
+            await conn.execute(_LIST, age, s.batch_rows)
+            listed = int(await conn.fetchval("SELECT count(*) FROM compaction_pending"))
+            while moved < listed:
+                async with conn.transaction():
+                    status = await conn.execute(_MOVE_CHUNK, s.chunk_rows)
+                got = int(status.split()[-1])
+                if not got:
+                    break
+                moved += got
+                if self._pass_clock() - started >= s.max_pass_seconds:
+                    break
+                if s.chunk_pause_seconds:
+                    await asyncio.sleep(s.chunk_pause_seconds)
+            # drained: nothing was left behind by the row cap or the time cap
+            return moved, listed < s.batch_rows and moved >= listed
+        finally:
+            try:
+                await conn.execute("DROP TABLE IF EXISTS compaction_pending")
+                await conn.execute("SELECT pg_advisory_unlock($1)", _LOCK)
+            except Exception:  # the connection is gone; the session end releases both
+                log.warning("fabric compaction cleanup failed", exc_info=True)
 
     async def _rebuild(self, conn) -> str:
         from . import recovery_checkpoint as rc
