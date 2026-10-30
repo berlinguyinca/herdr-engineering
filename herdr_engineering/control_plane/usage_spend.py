@@ -11,7 +11,8 @@
 There are no built-in prices: a model no entry matches is listed as unpriced, never guessed, and with no table the
 estimate is simply off. ``cached`` prices cache-read tokens; when it is missing they are charged at the ``input`` rate,
 which can only overstate. ``cached_in_input: true`` says the provider counts cache reads inside ``input_tokens`` (OpenAI
-style) so they are not charged twice; the default is the Anthropic style, where they are separate. Reasoning tokens are
+style) so they are not charged twice. Left out, it follows the source: proxy records are OpenAI-shaped (``prompt_tokens`` includes
+the cached count), so they default to true; transcripts default to the Anthropic style, where cache reads are separate. Reasoning tokens are
 taken to be part of ``output_tokens`` and are not charged again. Pure functions; the repo supplies the records.
 """
 from __future__ import annotations
@@ -21,6 +22,8 @@ import fnmatch
 import math
 
 MAX_PRICES = 500
+MAX_RATE = 1_000_000.0          # dollars per million tokens; far above any real price, keeps sums finite
+MAX_COUNT = 10**15
 _RATE_KEYS = ("input", "output", "cached")
 _ALLOWED = {"model", "cached_in_input", *_RATE_KEYS}
 
@@ -53,8 +56,8 @@ def usage_prices_config(mapping) -> list[dict]:
         for key in ("input", "output"):
             row[key] = _rate(entry.get(key), f"{where}.{key}", required=True)
         row["cached"] = _rate(entry.get("cached"), f"{where}.cached", required=False)
-        flag = entry.get("cached_in_input", False)
-        if not isinstance(flag, bool):
+        flag = entry.get("cached_in_input")           # None = follow the source
+        if flag is not None and not isinstance(flag, bool):
             raise ValueError(f"{where}.cached_in_input must be true or false")
         row["cached_in_input"] = flag
         out.append(row)
@@ -66,24 +69,25 @@ def _rate(value, where, *, required):
         if required:
             raise ValueError(f"{where} is required (dollars per million tokens; 0 is allowed)")
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-        raise ValueError(f"{where} must be a number >= 0 (dollars per million tokens)")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= MAX_RATE:
+        raise ValueError(f"{where} must be a number from 0 to {MAX_RATE:g} (dollars per million tokens)")
     return float(value)
 
 
 def price_for(prices, model):
-    return next((p for p in prices if fnmatch.fnmatchcase(model, p["model"])), None)
+    return next((p for p in prices if fnmatch.fnmatchcase(model.lower(), p["model"].lower())), None)
 
 
 def _count(payload, key):
     value = payload.get(key)
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+    return min(value, MAX_COUNT) if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
-def cost(price, tokens) -> float:
-    """Dollars for one token bucket under one price entry."""
+def cost(price, tokens, cached_in_input=False) -> float:
+    """Dollars for one token bucket under one price entry; ``cached_in_input`` is the source's convention when the entry is silent."""
     cached = tokens["cache_read"]
-    billed_input = max(0, tokens["input"] - cached) if price["cached_in_input"] else tokens["input"]
+    inside = price["cached_in_input"] if price["cached_in_input"] is not None else cached_in_input
+    billed_input = max(0, tokens["input"] - cached) if inside else tokens["input"]
     cached_rate = price["input"] if price["cached"] is None else price["cached"]
     return (billed_input * price["input"] + tokens["output"] * price["output"] + cached * cached_rate) / 1_000_000
 
@@ -92,13 +96,14 @@ def _day(ts):
     return _dt.datetime.fromtimestamp(ts, _dt.UTC).strftime("%Y-%m-%d")
 
 
-def estimate(records, prices) -> dict:
-    """``records`` is ``[(ts, payload)]``. Per model, per UTC day and in total; unpriced models are listed with their tokens."""
+def estimate(records, prices, source="llm-proxy") -> dict:
+    """``records`` is ``[(ts, payload)]`` from ``source``; proxy records count cache reads inside the input. Per model, per UTC day and in total; unpriced models are listed with their tokens."""
     if not prices:
         return {"configured": False}
     cells: dict[tuple[str, str], dict] = {}
     for ts, p in records:
-        model = p.get("model") or "unknown"
+        model = p.get("model")
+        model = model.strip()[:200] if isinstance(model, str) and model.strip() else "unknown"
         cell = cells.setdefault((_day(ts), model), {"input": 0, "output": 0, "cache_read": 0, "requests": 0})
         cell["requests"] += 1
         cell["input"] += _count(p, "input_tokens")
@@ -108,7 +113,7 @@ def estimate(records, prices) -> dict:
     models: dict[str, dict] = {}
     for (day, model), tokens in sorted(cells.items()):
         price = price_for(prices, model)
-        value = None if price is None else cost(price, tokens)
+        value = None if price is None else cost(price, tokens, source == "llm-proxy")
         entry = {"model": model, "tokens": tokens, "cost": value}
         d = days.setdefault(day, {"day": day, "models": [], "cost": 0.0, "unpriced_tokens": 0})
         d["models"].append(entry)

@@ -47,9 +47,9 @@ def test_first_matching_entry_prices_and_zero_is_a_real_price():
 
 
 def test_cache_reads_use_their_own_rate_or_the_input_rate_and_are_not_double_charged():
-    separate = table({"model": "a", "input": 10, "output": 0, "cached": 1})
+    separate = table({"model": "a", "input": 10, "output": 0, "cached": 1, "cached_in_input": False})
     assert u.estimate([(DAY1, rec("a", 1_000_000, 0, 1_000_000))], separate)["total"] == 11.0
-    no_rate = table({"model": "a", "input": 10, "output": 0})
+    no_rate = table({"model": "a", "input": 10, "output": 0, "cached_in_input": False})
     assert u.estimate([(DAY1, rec("a", 1_000_000, 0, 1_000_000))], no_rate)["total"] == 20.0   # never cheaper by guess
     inside = table({"model": "a", "input": 10, "output": 0, "cached": 1, "cached_in_input": True})
     assert u.estimate([(DAY1, rec("a", 1_000_000, 0, 400_000))], inside)["total"] == 6.4        # 600k at 10 + 400k at 1
@@ -80,3 +80,24 @@ def test_repo_spend_reads_the_window_and_is_off_without_a_table():
     assert out["configured"] and out["source"] == "llm-proxy" and out["by_model"][0]["cost"] == 2.0
     with pytest.raises(ValueError):
         repo.llm_spend("nonsense", table({"model": "qwen", "input": 1, "output": 1}))
+
+
+def test_cache_convention_follows_the_source_unless_the_entry_says_otherwise():
+    silent = table({"model": "a", "input": 1, "output": 0, "cached": 0.1})
+    row = [(DAY1, rec("a", 1_000_000, 0, 800_000))]
+    assert u.estimate(row, silent)["total"] == 0.28                                   # proxy: cached tokens are inside prompt_tokens
+    assert u.estimate(row, silent, "transcript")["total"] == 1.08                    # transcript: cache reads are separate
+    forced = table({"model": "a", "input": 1, "output": 0, "cached": 0.1, "cached_in_input": False})
+    assert u.estimate(row, forced)["total"] == 1.08
+
+
+def test_odd_records_and_prices_neither_crash_nor_poison_the_json():
+    prices = table({"model": "GPT-*", "input": 1, "output": 1})
+    out = u.estimate([(DAY1, {"model": 5, "input_tokens": 3}), (DAY1, {"model": ["x"], "input_tokens": 1}),
+                      (DAY1, {"model": "gpt-4", "input_tokens": 10**400, "output_tokens": 1})], prices)
+    assert {m["model"] for m in out["unpriced"]} == {"unknown"} and out["by_model"][0]["model"] == "gpt-4"
+    import json
+    import math
+    assert math.isfinite(out["total"]) and json.loads(json.dumps(out, allow_nan=False))
+    with pytest.raises(ValueError):
+        table({"model": "m", "input": 1e308, "output": 0})
