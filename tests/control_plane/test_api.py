@@ -171,7 +171,7 @@ def test_session_commits_endpoint_reports_a_state_and_404_for_an_unknown_agent(s
     repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x")
     status, _, body = c.get("/api/v1/sessions/sx/commits")
     out = json.loads(body)
-    assert status == 200 and out["state"] == "none" and out["session_id"] == "sx" and out["commits"] == []
+    assert status == 200 and out["state"] == "unknown" and out["session_id"] == "sx" and out["commits"] == []
     assert c.get("/api/v1/sessions/nope/commits")[0] == 404
 
 
