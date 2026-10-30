@@ -74,3 +74,12 @@ PR stack, each branch based on the one before it, none merged and nothing deploy
 Known gaps in earlier work: review findings 8-10 on #445 (journal gaps after a quick restart, polling cost under the store
 lock, a false 500 on sign-out during a concurrent flush); real-Postgres paths and migrations 0037/0038 only exercised with
 fake tables; `threads/clear` and `threads/react` are refused because the store has no equivalent.
+
+### Update (later the same night)
+
+Added on top of the stack: #460 models (read-only gateway catalog, per-bot model = assistant model policy), #461 delegate
+proposals as approval cards in groups with group `threads/answer` (tested with stubbed collab calls), #462 review findings 8-10.
+
+Still not implemented (answered with "nothing configured" or a reasoned refusal): skills, MCP servers, connectors, messaging,
+vault, tickets/boards, voice, computer hosts; auto-sync of running agents into rooms; steering cards. Each needs its own
+design (what existing Herdr service backs it) before code; none is blocked by the bridge itself.
