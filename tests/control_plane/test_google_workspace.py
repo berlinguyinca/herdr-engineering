@@ -42,6 +42,7 @@ class Google:
     def __init__(self):
         self.requests, self.fail, self.revoked, self.primary = [], {}, False, "ann@x.org"
         self.busy = {}      # calendar id -> [(start, end)] reported by freeBusy
+        self.extra, self.page, self.fb_omit, self.fb_errors, self.fb_groups = 0, 0, set(), set(), None
         b64 = base64.urlsafe_b64encode(b"Hello from the body").decode()
         self.msgs = {"m1": {"id": "m1", "snippet": "snip", "payload": {
             "headers": [{"name": "From", "value": "Alice <a@x.org>"}, {"name": "Subject", "value": "Lunch"},
@@ -63,14 +64,23 @@ class Google:
         path = urllib.parse.urlparse(url).path
         if url == gw.FREEBUSY_URL:
             ids = [i["id"] for i in json.loads(req.data)["items"]]
-            return Resp({"calendars": {i: {"busy": [{"start": a, "end": b} for a, b in self.busy.get(i, [])]} for i in ids}})
+            assert len(ids) <= 50
+            out = {i: ({"errors": [{"reason": "notFound"}]} if i in self.fb_errors else
+                       {"busy": [{"start": a, "end": b} for a, b in self.busy.get(i, [])]}) for i in ids if i not in self.fb_omit}
+            return Resp({"calendars": out, **({"groups": self.fb_groups} if self.fb_groups else {})})
         if path.endswith("/messages"):
             return Resp({"messages": [{"id": "m1"}, {"id": "../bad"}]})
         if "/messages/" in path:
             return Resp(self.msgs[path.rsplit("/", 1)[1]])
         if path.endswith("/calendarList"):
-            return Resp({"items": [{"id": "ann@x.org", "summary": "Ann", "primary": True}, {"id": "team@x.org", "summary": "Team"},
-                                   {"id": "secret@x.org", "summary": "Private"}]})
+            items = [{"id": "ann@x.org", "summary": "Ann", "primary": True}, {"id": "team@x.org", "summary": "Team"},
+                     {"id": "secret@x.org", "summary": "Private"}] + [{"id": f"x{i}@x.org"} for i in range(self.extra)]
+            if not self.page:
+                return Resp({"items": items})
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            at = int(q.get("pageToken", ["0"])[0])
+            more = at + self.page < len(items)
+            return Resp({"items": items[at:at + self.page], **({"nextPageToken": str(at + self.page)} if more else {})})
         if path.endswith("/calendars/primary"):
             return Resp({"id": self.primary})
         if "/events/" in path:
@@ -233,10 +243,84 @@ def test_free_time_primary_alias_block_hides_the_real_primary_id(store):
     (30, {"time_min": "2026-11-02T18:00:00Z", "time_max": "2026-11-02T08:00:00Z"}),
     (30, {"time_min": "2026-11-02T08:00:00Z", "time_max": "2026-11-02T08:00:00Z"}),
     (30, {"time_min": "2026-11-01T00:00:00Z", "time_max": "2026-11-15T00:00:01Z"}),
-    (30, {"time_min": "2026-11-01"}), (30, {"time_min": 5, "time_max": 6})])
+    (30, {"time_min": "2026-11-01"}), (30, {"time_min": 5, "time_max": 6}),
+    (30, {"time_min": "0001-01-01T00:00:00+23:59", "time_max": "2026-11-02T18:00:00Z"})])
 def test_free_time_window_and_duration_are_validated(store, minutes, win):
     w, g = ws(store)
     with pytest.raises(gw.GoogleError) as exc:
         w.run("default", "u1", "find_free_time", {"duration_minutes": minutes, **win})
     assert exc.value.reason == "bad_request" and g.requests == []
-    assert free(w, 30, time_min="2026-11-01T00:00:00Z", time_max="2026-11-15T00:00:00Z")["slots"]      # exactly 14 days is fine
+
+
+def test_free_time_accepts_exactly_fourteen_days(store):
+    w, _ = ws(store)
+    assert free(w, 30, time_min="2026-11-01T00:00:00Z", time_max="2026-11-15T00:00:00Z")["slots"]
+
+
+def fails_unavailable(w):
+    with pytest.raises(gw.GoogleError) as exc:
+        free(w)
+    assert exc.value.reason == "unavailable"
+
+
+def test_free_time_fails_safe_when_google_cannot_vouch_for_a_calendar(store):
+    w, g = ws(store)
+    g.fb_errors = {"team@x.org"}
+    fails_unavailable(w)
+    g.fb_errors, g.fb_omit = set(), {"team@x.org"}
+    fails_unavailable(w)                                     # a calendar absent from the answer is not "free"
+    g.fb_omit, g.fb_groups = set(), {"g": {"errors": [{"reason": "x"}]}}
+    fails_unavailable(w)
+    g.fb_groups, g.busy = None, {"ann@x.org": [("garbage", "2026-11-02T10:00:00Z")]}
+    fails_unavailable(w)
+
+
+def test_free_time_pages_the_calendar_list_and_chunks_freebusy(store):
+    w, g = ws(store, blocked={("default", "u1"): ["x7@x.org"]})
+    g.extra, g.page = 120, 40
+    g.busy = {"x119@x.org": [("2026-11-02T09:00:00Z", "2026-11-02T10:00:00Z")]}      # on the last page
+    out = free(w)
+    assert out["slots"][0] == {"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T09:00:00Z"}
+    lists = [r for r in g.requests if r[1].split("?")[0].endswith("/calendarList")]
+    assert len(lists) == 4 and all("showHidden=true" in r[1] for r in lists)
+    sizes = [len(json.loads(r[3])["items"]) for r in g.requests if r[1] == gw.FREEBUSY_URL]
+    assert sizes == [50, 50, 22] and sum(sizes) == 122      # 123 calendars minus the blocked x7
+    assert all(b"x7@x.org" not in (r[3] or b"") for r in g.requests)
+
+
+def test_free_time_refuses_to_truncate_an_endless_calendar_list(store):
+    w, g = ws(store)
+    g.extra, g.page = 5000, 100                                  # 51 pages > the cap
+    fails_unavailable(w)
+    assert not [r for r in g.requests if r[1] == gw.FREEBUSY_URL]
+
+
+def test_free_time_clamps_adjacent_outside_and_offset_intervals(store):
+    w, g = ws(store)
+    g.busy = {"ann@x.org": [("2026-11-02T06:00:00Z", "2026-11-02T08:00:00Z"),       # ends exactly at the window start
+                            ("2026-11-02T18:00:00Z", "2026-11-02T20:00:00Z"),       # starts exactly at the window end
+                            ("2026-11-02T01:00:00Z", "2026-11-02T03:00:00Z"),       # wholly before
+                            ("2026-11-02T09:00:00Z", "2026-11-02T10:00:00Z"),
+                            ("2026-11-02T10:00:00Z", "2026-11-02T11:00:00Z")],      # adjacent: merges, no sliver
+              "team@x.org": [("2026-11-02T07:00:00Z", "2026-11-02T08:30:00Z")]}     # straddles the start
+    assert free(w)["slots"] == [{"start": "2026-11-02T08:30:00Z", "end": "2026-11-02T09:00:00Z"},
+                                {"start": "2026-11-02T11:00:00Z", "end": "2026-11-02T18:00:00Z"}]
+    # the same window written with a -08:00 offset
+    out = free(w, time_min="2026-11-02T00:00:00-08:00", time_max="2026-11-02T10:00:00-08:00")
+    assert out["slots"][-1] == {"start": "2026-11-02T11:00:00Z", "end": "2026-11-02T18:00:00Z"}
+
+
+def test_find_free_time_dispatches_through_the_assistant_service(store):
+    svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}))
+    a = svc.create_assistant(tenant_id="default", user_id="u1", name="A")
+    w, g = ws(store)
+    svc.google_read = w.run
+    payload = {"duration_minutes": 30, **WIN}
+    out = svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="find_free_time", payload=payload)
+    assert out["ok"] is True and out["slots"] == [{"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T18:00:00Z"}]
+    with pytest.raises(AssistantError):
+        svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="find_free_time",
+                         payload={**payload, "duration_minutes": 1})
+    g.fb_errors = {"ann@x.org"}
+    with pytest.raises(AssistantError, match="find free time failed: unavailable"):
+        svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="find_free_time", payload=payload)

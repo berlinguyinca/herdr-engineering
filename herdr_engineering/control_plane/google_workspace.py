@@ -39,6 +39,7 @@ TIMEOUT = 15
 MAX_RESPONSE = 2 * 1024 * 1024
 MAX_SEARCH, MAX_EVENTS, MAX_BODY = 10, 25, 4000
 MAX_SLOTS, MAX_WINDOW_DAYS = 5, 14
+MAX_CAL_PAGES, FREEBUSY_BATCH = 10, 50
 FREEBUSY_URL = CALENDAR_API + "/freeBusy"
 _ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 PRIMARY = "primary"
@@ -396,9 +397,9 @@ class GoogleWorkspace:
             value += "T00:00:00Z"
         try:
             dt = datetime.fromisoformat(value)
-        except ValueError:
+            return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+        except (ValueError, OverflowError):
             raise GoogleError("bad_request") from None
-        return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
 
     def find_free_time(self, tenant: str, user: str, duration_minutes: Any, time_min: Any, time_max: Any) -> dict:
         """Up to 5 earliest free gaps (each >= duration) inside the window, over the person's NON-blocked calendars only."""
@@ -407,21 +408,44 @@ class GoogleWorkspace:
         lo, hi = self._instant(time_min), self._instant(time_max)
         if hi <= lo or hi - lo > timedelta(days=MAX_WINDOW_DAYS):
             raise GoogleError("bad_request")
-        data = self._get(tenant, user, f"{CALENDAR_API}/users/me/calendarList", {"fields": "items(id)", "maxResults": 250})
-        ids = [c["id"] for c in data.get("items") or [] if isinstance(c, dict) and isinstance(c.get("id"), str) and c["id"].strip()]
+        ids: list[str] = []
+        token = None
+        for _ in range(MAX_CAL_PAGES):
+            params: dict[str, Any] = {"fields": "items(id),nextPageToken", "maxResults": 250, "showHidden": "true"}
+            if token:
+                params["pageToken"] = token
+            data = self._get(tenant, user, f"{CALENDAR_API}/users/me/calendarList", params)
+            ids += [c["id"] for c in data.get("items") or [] if isinstance(c, dict) and isinstance(c.get("id"), str) and c["id"].strip()]
+            token = data.get("nextPageToken")
+            if not token:
+                break
+        else:
+            raise GoogleError("unavailable")        # never silently truncate the list of calendars
         allowed = self.exclude_blocked(tenant, user, ids)       # the single choke point: blocked ids never reach freeBusy
         if not allowed:
             return {"slots": []}
         fmt = "%Y-%m-%dT%H:%M:%SZ"
-        resp = self._read_post(tenant, user, FREEBUSY_URL, {"timeMin": lo.strftime(fmt), "timeMax": hi.strftime(fmt),
-                                                            "items": [{"id": c} for c in allowed]})
         busy: list[tuple[datetime, datetime]] = []
-        for cal in (resp.get("calendars") or {}).values():
-            if not isinstance(cal, dict) or cal.get("errors"):
-                raise GoogleError("unavailable")        # an unreadable calendar must not be treated as free
-            for b in cal.get("busy") or []:
-                if isinstance(b, dict):
-                    busy.append((max(self._instant(b.get("start")), lo), min(self._instant(b.get("end")), hi)))
+        for i in range(0, len(allowed), FREEBUSY_BATCH):
+            batch = allowed[i:i + FREEBUSY_BATCH]
+            resp = self._read_post(tenant, user, FREEBUSY_URL, {"timeMin": lo.strftime(fmt), "timeMax": hi.strftime(fmt),
+                                                                "items": [{"id": c} for c in batch]})
+            cals = resp.get("calendars")
+            if resp.get("groups") and any(isinstance(g, dict) and g.get("errors") for g in resp["groups"].values()):
+                raise GoogleError("unavailable")
+            if not isinstance(cals, dict) or any(not isinstance(cals.get(c), dict) or cals[c].get("errors") for c in batch):
+                raise GoogleError("unavailable")        # an unreadable or missing calendar must not be treated as free
+            for c in batch:
+                for b in cals[c].get("busy") or []:
+                    if not isinstance(b, dict):
+                        continue
+                    try:
+                        start, end = self._instant(b.get("start")), self._instant(b.get("end"))
+                    except GoogleError:
+                        raise GoogleError("unavailable") from None
+                    if start >= hi or end <= lo:
+                        continue
+                    busy.append((max(start, lo), min(end, hi)))
         busy.sort()
         need, slots, cursor = timedelta(minutes=duration_minutes), [], lo
         for start, end in busy + [(hi, hi)]:
