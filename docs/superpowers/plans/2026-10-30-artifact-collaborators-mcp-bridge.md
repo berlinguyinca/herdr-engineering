@@ -50,7 +50,8 @@ These decisions are binding and supersede the spec where they differ.
 4. **No tight size caps.** Storage is plentiful (hundreds of TB). Every size, count and rate limit is a configurable sanity or anti-abuse limit with a generous default (see Global Constraints → Configuration). The fixed protocol constants are the chunk size and the chunk body cap, because plan 5 shares them.
 5. **Internal (non-external) agents may receive write grants.**
 6. **Grant lifetime:** the default is 30 days and the maximum is 90.
-7. **Retraction fail-safe.** When a retraction is hidden in the web process but fails to persist (`retract` returns `persisted: false`), the route **also revokes every collaborator write grant on that artifact**, for an artifact or a version retraction alike. Read grants are untouched; see Open questions.
+7. **Retraction fail-safe.** When a retraction is hidden in the web process but fails to persist (`retract` returns `persisted: false`), the route **also revokes every collaborator write grant on that artifact**, for an artifact or a version retraction alike. Read grants are untouched.
+   * **Restrict all access is optional and operator-driven, never automatic.** When the retraction fails to persist, the response offers "restrict all access now?". The operator can accept through `herdr-eng artifacts retract --restrict-all`, the **Restrict all access** button in the Collaborators tab, or `POST /api/v1/artifacts/{id}/collab-restrict`. That action also revokes the read collaborator grants, so the mirror drops the artifact and collaborators no longer see it. Without that action, read collaborators keep seeing the artifact until the operator retries the retraction.
 8. **Hosting.** The MCP endpoint stays on its existing host and path. The member/viewer UI on `artifacts.metabolomics.us` belongs to plans 4 and 5. Nothing in this plan changes for it.
 
 ## Global Constraints
@@ -94,6 +95,7 @@ These decisions are binding and supersede the spec where they differ.
     * a worker-local `ArtifactGraphGate`, loaded with `load_retractions()` at least every 30 s, says the artifact, base or head is retracted.
   * The mirror never contains a retracted artifact or version.
   * When a web-side retraction fails to persist, the retract route revokes every `collab:` write grant on that artifact (Decision 7).
+  * Restricting all access (read grants too, hiding the artifact from collaborators) is a separate operator action, never automatic (Decision 7, Task 10).
   * The residual is that the revoke itself can fail. If it fails because Postgres is unreachable, the worker's `merge_commit` fails too. The route reports a failed revoke and never claims success.
 * **`merge_commit` contract**
   * Always called without an outer transaction, so its `artifact_collab_attempts` row persists. It is called with `max_text_bytes = max_text_merge_bytes`.
@@ -191,6 +193,7 @@ These decisions are binding and supersede the spec where they differ.
     * `grant(artifact_id, agent_id, permission: Literal['read','write'], *, expires_at: datetime, granted_by: str) -> dict` upserts `artifact_acl` for `collab:<agent_id>`. An `expires_at` more than 90 days out raises `ValueError`.
     * `revoke(artifact_id, agent_id) -> bool`.
     * `revoke_write_grants(artifact_id) -> int` deletes every `collab:` row on the artifact whose permissions include `edit` and returns the count. It is used by the retraction fail-safe (Task 10).
+    * `revoke_all_grants(artifact_id) -> int` deletes every `collab:` row on the artifact, read and write, and returns the count. It is used only by the operator's restrict-all action (Task 10), never automatically.
     * `live_grants() -> list[dict]` returns `{artifact_id, agent_id, permission, expires_at}` for unexpired `collab:` rows.
     * `grant_for(artifact_id, agent_id) -> dict | None`.
   * Invite grants:
@@ -220,6 +223,7 @@ These decisions are binding and supersede the spec where they differ.
   * `live_grants` drops expired rows.
   * `revoke` deletes the row.
   * `revoke_write_grants` deletes write rows only and leaves read rows and other artifacts untouched.
+  * `revoke_all_grants` deletes read and write rows of that artifact only and leaves other artifacts untouched.
   * `record_received` twice returns the first row.
   * `bytes_last_24h` sums only the last 24 h and excludes `rejected` ledger rows. A 5 GB verified upload counts once, even when two tickets reference it.
   * `record_verified_upload` twice keeps one row.
@@ -712,7 +716,7 @@ Tests: `tests/control_plane/test_worker.py` (extend), `tests/test_compose_render
 **Files:** Create `herdr_engineering/control_plane/artifact_collab_api.py` (hook `route_collab` into `_route_api` beside `route_share`); Modify:
 * `herdr_engineering/control_plane/artifacts.py`: `list_version_summaries` adds `provenance->>'message' AS message`; add `version_text_diff`;
 * `herdr_engineering/control_plane/artifact_retraction.py`: `retract(..., on_unpersisted=None)`;
-* `herdr_engineering/control_plane/api.py`: `_artifact_retract` passes the fail-safe.
+* `herdr_engineering/control_plane/api.py`: `_artifact_retract` passes the fail-safe and honours the operator's `restrict_all` request.
 
 Tests: `tests/control_plane/test_artifact_collab_api.py`, `tests/control_plane/test_artifact_retraction.py` (extend).
 
@@ -735,6 +739,10 @@ Tests: `tests/control_plane/test_artifact_collab_api.py`, `tests/control_plane/t
   * The result gains `collab_write_grants_revoked: int | None` and `collab_revoke_error: str | None`. A failing callback is caught and reported, and the route still answers 500 with both errors.
   * `_artifact_retract` passes a callback that runs `CollabGrantStore(conn).revoke_write_grants(artifact_id)` through the registry's call path. The worker's next `publish_grants` then drops those grants from `grants.json`.
   * The callback runs for version retractions as well as artifact retractions.
+  * Optional restrict-all (operator action only, never automatic):
+    * When `persist` raised, the 500 body also carries `restrict_all_offered: true`, so clients can ask "restrict all access now?".
+    * `POST /api/v1/artifacts/{id}/collab-restrict` (needs `admin`) runs `CollabGrantStore.revoke_all_grants(artifact_id)` and returns `{revoked: int}`. The worker's next `publish_grants` and mirror sync then drop the grants and remove the artifact from the mirror.
+    * `_artifact_retract` accepts `restrict_all: true` in the body and then runs the same revocation after the write-grant fail-safe. Without that flag, read grants are never touched.
 
 - [ ] **Step 1: Write failing tests:**
   * **Access:**
@@ -754,6 +762,11 @@ Tests: `tests/control_plane/test_artifact_collab_api.py`, `tests/control_plane/t
     * When `persist` raises, the callback runs. The artifact's write grants are gone and its read grants remain, and the result carries `collab_write_grants_revoked: 1`.
     * When `persist` succeeds, the callback never runs.
     * When the callback raises, the result carries both errors and is a 500.
+  * **Restrict all (optional):**
+    * A failed-persist retraction without `restrict_all` leaves read grants and answers `restrict_all_offered: true`.
+    * With `restrict_all: true`, a failed-persist retraction also removes the read grants.
+    * `POST …/collab-restrict` removes read and write grants of that artifact only, needs `admin` (a non-admin gets 404, a cross-origin POST gets 403), and the mirror drops the artifact within one sync.
+    * No code path calls `revoke_all_grants` automatically: a successful retraction, and a failed one without the flag, never do.
 - [ ] **Step 2: Run** and expect FAIL. **Step 3: Implement.** **Step 4: Run** the new tests plus `test_artifact_share_api.py` and the retraction tests, and expect PASS.
 - [ ] **Step 5: Commit** `feat(artifacts): owner routes for collaborators and the retraction fail-safe`.
 
@@ -764,9 +777,11 @@ Tests: `tests/control_plane/test_artifact_collab_api.py`, `tests/control_plane/t
 **Interfaces:** These call Task 10's routes with the CLI's existing API-key client and print JSON:
 * `herdr-eng artifacts collab list <artifact_id>`;
 * `… grant <artifact_id> <agent_id> [--write] [--days N]` (1–90, default 30);
-* `… revoke <artifact_id> <agent_id>`.
+* `… revoke <artifact_id> <agent_id>`;
+* `… restrict <artifact_id>` calls `POST …/collab-restrict`;
+* `herdr-eng artifacts retract <artifact_id> [--restrict-all]` (the existing command gains the flag, which sends `restrict_all: true`).
 
-- [ ] **Step 1: Write failing tests:** each command hits the exact path, method and body, and `--days 0` and `--days 91` are refused locally. **Step 2: Run** and expect FAIL. **Step 3: Implement.** **Step 4: Run** and expect PASS. **Step 5: Commit** `feat(cli): artifacts collab grant/list/revoke`.
+- [ ] **Step 1: Write failing tests:** each command hits the exact path, method and body (`retract` sends `restrict_all` only with `--restrict-all`), and `--days 0` and `--days 91` are refused locally. **Step 2: Run** and expect FAIL. **Step 3: Implement.** **Step 4: Run** and expect PASS. **Step 5: Commit** `feat(cli): artifacts collab grant/list/revoke/restrict`.
 
 ### Task 12: Share panel Collaborators and Activity tabs
 
@@ -778,7 +793,7 @@ Create `packages/artifact-collaborators.js` and `packages/artifact-activity.js`.
 
 **Interfaces:**
 * Client methods (all `{signal} = {}`):
-  * `listArtifactCollaborators(id)`, `grantArtifactCollaborator(id, {agent_id, permission, expires_in_days})`, `revokeArtifactCollaborator(id, agentId)`, `grantArtifactInvite(id, {invite_id, permission, expires_in_days})`, `artifactCollabActivity(id)`, `artifactVersionDiff(id, versionId)`;
+  * `listArtifactCollaborators(id)`, `grantArtifactCollaborator(id, {agent_id, permission, expires_in_days})`, `revokeArtifactCollaborator(id, agentId)`, `grantArtifactInvite(id, {invite_id, permission, expires_in_days})`, `artifactCollabActivity(id)`, `artifactVersionDiff(id, versionId)`, `restrictArtifactCollab(id)`;
   * `listCollabAgents()` → `GET /api/v1/collab/agents`;
   * `createExternalInvite(roomId, body)` → the existing externals invites route.
 * Renderers, pure, returning escaped HTML:
@@ -786,6 +801,7 @@ Create `packages/artifact-collaborators.js` and `packages/artifact-activity.js`.
   * `renderGrantForm(state)` has an agent `<select>`, a Read/Read+write choice disabled with `writable_reason` when not writable, and days 1–90 (default 30).
   * `renderInviteResult(invite)` shows the code once, with the same once-only and clear-on-close rules as the share URL.
   * External invites are room-bound, so the invite form has a room `<select>` filled from the operator's rooms. Reuse the existing collab rooms client call that `collab-app.js` / `collab-view.js` use (`GET /api/v1/collab/rooms` through the dashboard proxy), adding a `listCollabRooms()` client method if none exists.
+  * `renderRestrictAll(state)` shows a **Restrict all access** button with a confirm step. It is offered in the Collaborators tab, and is highlighted when a retraction answered `restrict_all_offered`. It is never triggered automatically.
   * `renderHistoryRow(v)` shows number, author label, message, parents and a merge badge.
   * `renderAttempt(a)` shows outcome, agent, conflict names and kinds, reason and time.
 * Mounting:
@@ -797,6 +813,7 @@ Create `packages/artifact-collaborators.js` and `packages/artifact-activity.js`.
   * The client hits exact paths and bodies, with ids `encodeURIComponent`-ed.
   * A hostile agent name, message, file name or conflict name (`<img onerror>`) is escaped.
   * A non-writable artifact disables Read+write and shows the reason.
+  * The Restrict all access button needs a confirm, then calls `restrictArtifactCollab` once; nothing calls it without a click.
   * A 503 from `listArtifactCollaborators` shows "Collaboration is not enabled" with the form hidden, and the Links tab still works.
   * A failed `listCollabAgents` shows an agent-id text input instead of the picker.
   * The invite code disappears from the DOM on Close.
@@ -841,7 +858,6 @@ Create `packages/artifact-collaborators.js` and `packages/artifact-activity.js`.
   * when inline `text` is enough (small text under the 64 KiB request) and when to stage (anything larger, and binary files);
   * the commit/merge/conflict loop: resolve, then re-commit with `base = head_version_id`. Binary and over-`max_text_merge_bytes` files changed on both sides conflict as `binary`/`oversize` with no merged text;
   * the limits, as configurable defaults: 100 changes per commit, 30 commits/min, 1200 chunks/min, 100 GB/day, 60 s intent age, a 24 h staging TTL, plain-artifact-only writes;
-  * that binary files are writable but not readable through `artifact_read`;
   * the honest promise that revocation takes effect within seconds;
   * that collaborators can never share.
 - [ ] **Step 2: Run** the docs or guide tests (`grep -rl collab-guide tests/`) and expect PASS. **Commit** `docs(collab): artifact collaboration tools`.
@@ -872,10 +888,7 @@ Plan 5 supplies `share_store` and `server` (for `approve_share`) through `Collab
 
 ## Open questions for the operator
 
-The 2026-10-30 questions are resolved under Decisions. These questions remain:
-
-1. **Retraction fail-safe and read grants.** Decision 7 revokes only *write* grants when a retraction fails to persist. Read collaborators keep seeing the artifact in the mirror until the operator retries the retraction. Should read grants also be revoked, or should the mirror be told to hide the artifact?
-2. **Binary read-back.** Binary and large files are now writable, but `artifact_read` still answers 415 for binary files, and the mirror skips files over `mirror_max_file_bytes`. A collaborator therefore cannot read back a binary file another party wrote. Is write-only access to binary content acceptable for this plan, or should `artifact_read` return base64 slices of mirrored binary blobs? The second option is a follow-up task: it mirrors binary blobs and adds an `encoding` field.
+None. The 2026-10-30 questions are resolved under Decisions.
 
 ## Self-review notes
 
@@ -888,7 +901,7 @@ The 2026-10-30 questions are resolved under Decisions. These questions remain:
   * Limits (all configurable, Decisions 3–4): Tasks 3 (`BridgeLimits`), 4 (published), 5 and 7 (enforced) and 9 (YAML).
   * Audit and safety: Tasks 3, 5, 7 and 8. Owner revert: plan 1.
   * Docs: Task 14. CLI: Task 11. `agents.json`: Task 7, consumed in Tasks 5 and 9. The invite+grant step: Tasks 1, 7, 9, 10 and 12.
-  * Retraction fail-safe (Decision 7): Tasks 1 (`revoke_write_grants`) and 10.
+  * Retraction fail-safe and the optional, operator-driven restrict-all (Decision 7): Tasks 1 (`revoke_write_grants`, `revoke_all_grants`), 10, 11 and 12.
   * Section C is covered by Tasks 10, 12 and 13.
   * Out of scope: annotations (plan 4) and member-owned artifacts (plan 5). Hosting is unchanged (Decision 8).
 * **Spec deviations (operator-approved, 2026-10-30):**
@@ -899,13 +912,13 @@ The 2026-10-30 questions are resolved under Decisions. These questions remain:
   * The durable state and the worker-local gate are checked in Task 5. The web's in-memory gate is checked at lineage emission in Task 6.
   * If the web hides an artifact but fails to persist the retraction, the route revokes the artifact's collaborator write grants (Task 10). Commits stop within one publisher tick.
   * The remaining residual is a failed revoke, which is reported and normally coincides with Postgres being unreachable, which also blocks `merge_commit`.
-  * Read access in that window is an open question.
+  * Read access in that window stays until the operator chooses "restrict all access now" (Decision 7); it is never revoked automatically.
 * **Cross-plan contract:**
   * Plan 5's nine "Needed from plan 3" items are mapped in "Contract for plan 5"; eight are provided here with tests.
   * Plan 5 must own `write_secret_result`, and plan 4 should switch `annotation_resolve` to the kind registry. Neither of those plans is edited here.
   * Plan 5 imports `CHUNK_BYTES`/`MCP_UPLOAD_MAX_BODY` from `collab_bridge_files` and extends the Task 8 gate through its registry. Its nginx `/mcp` value is already the same 768k.
 * **Name and type consistency:**
-  * Classes: `CollabGrantStore` (incl. `revoke_write_grants`, `decided_for_key(actor, kind, key, outcomes)`, `verified_upload(owner_key, …)`, `record_verified_upload(…, charged)`), `CollabMirror(root, *, limits)`, `CollabIntentApplier(outbox, mirror, *, rustfs, limits, spool_dir)` (incl. `register`, `register_staging_owner`, `sweep_staging`), `IntentContext` (incl. `assemble(…, charge)`, `extras`), `CollabArtifactBridge` (incl. `stage_chunk`, `stage_chunk_for`, `append_intent`, `read_result`, `limits`), `CollabBridgeLoop`.
+  * Classes: `CollabGrantStore` (incl. `revoke_write_grants`, `revoke_all_grants`, `decided_for_key(actor, kind, key, outcomes)`, `verified_upload(owner_key, …)`, `record_verified_upload(…, charged)`), `CollabMirror(root, *, limits)`, `CollabIntentApplier(outbox, mirror, *, rustfs, limits, spool_dir)` (incl. `register`, `register_staging_owner`, `sweep_staging`), `IntentContext` (incl. `assemble(…, charge)`, `extras`), `CollabArtifactBridge` (incl. `stage_chunk`, `stage_chunk_for`, `append_intent`, `read_result`, `limits`), `CollabBridgeLoop`.
   * Contract: `BridgeLimits`, `validate_intent(…, limits)`, `validate_changes(…, limits)`, `validate_chunk -> Chunk`, `upload_id_for`, `staging_path`, `StagedUpload`, `Actor`, `agent_owner_key`, `register_intent_kind`, `Intent` (`kind, actor, artifact_id, idempotency_key, submitted_at, payload`), `CommitPayload` (`inline_bytes`), `Change` (`name, op, text, upload_id`), `register_large_body_admission`.
   * Ledger columns: `artifact_collab_intents.kind`/`actor_kind`/`actor_id` replace `collaborator_agent_id`, and `artifact_collab_uploads.owner_key`/`charged` replace `agent_id`.
   * Constants and patterns: `CHUNK_BYTES`, `MCP_UPLOAD_MAX_BODY`, `TICKET_RE`, `UPLOAD_RE`, `INTENT_MAX_AGE`, `FEED_MAX_AGE`.
