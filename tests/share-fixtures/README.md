@@ -67,5 +67,7 @@ The share CSP runs every page in an opaque-origin sandbox (`sandbox allow-script
   query. Open the database with
   `db.open({ filesystem: { forceFullHTTPReads: false, allowFullHTTPReads: false, reliableHeadRequests: true } })`;
   without it this build downloaded the whole parquet file with one GET.
-* WebKit/Safari: see the harness report; in Playwright WebKit 27.2 `connect-src 'self'` did not match the share's own
-  URL from the sandboxed page, so every `fetch`/XHR to the bundle was refused (scripts, styles and images loaded).
+* WebKit/Safari matches `'self'` against the sandboxed page's opaque origin, so with `'self'` alone every
+  `fetch`/XHR to the bundle was refused. The server therefore also names the share's own prefix
+  (`<public_url origin>/s/<token>/`) in each fetch directive; relative URLs inside the bundle are covered, anything
+  outside this share is not.

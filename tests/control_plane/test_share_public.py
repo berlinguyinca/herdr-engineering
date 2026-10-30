@@ -410,6 +410,80 @@ def test_headers_exact(env):
     assert status == 404
 
 
+FETCH_DIRECTIVES = ("default-src", "script-src", "style-src", "img-src", "font-src", "connect-src", "worker-src")
+
+
+def _directives(policy):
+    out = {}
+    for part in policy.split(";"):
+        name, *sources = part.split()
+        out[name] = sources
+    return out
+
+
+def _assert_token_scoped(policy, origin, token):
+    """Every fetch directive is the plain one plus exactly ``<origin>/s/<token>/``; no other host anywhere."""
+    plain, scoped = _directives(CSP), _directives(policy)
+    assert set(scoped) == set(plain)
+    source = f"{origin}/s/{token}/"
+    for name, sources in scoped.items():
+        if name in FETCH_DIRECTIVES:
+            assert sources[0] == "'self'" and sources[1] == source and sources[2:] == plain[name][1:], name
+        else:
+            assert sources == plain[name], name
+    hosts = [src for srcs in scoped.values() for src in srcs if "://" in src]
+    assert set(hosts) == {source}
+
+
+def test_csp_names_only_its_own_token_prefix(tmp_path):
+    e = Env(tmp_path, config_extra={"public_url": "https://Share.Example/"})
+    try:
+        write_state(e.root, _sha(OTHER_TOKEN.encode()), e.state)          # a second link to the same bundle
+        for path, headers in ((f("index.html"), None), (f("data/table.parquet"), {"Range": "bytes=-4"}),
+                              (f("pic.svg"), None), (f("empty.txt"), None)):
+            status, h, _ = e.request("GET", path, headers)
+            assert status in (200, 206), path
+            _assert_token_scoped(h["content-security-policy"], "https://share.example", TOKEN)
+            assert OTHER_TOKEN not in h["content-security-policy"]
+        status, h, _ = e.request("GET", f"/s/{OTHER_TOKEN}/f/index.html")
+        assert status == 200
+        _assert_token_scoped(h["content-security-policy"], "https://share.example", OTHER_TOKEN)
+        assert TOKEN not in h["content-security-policy"]
+        status, h, _ = e.request("HEAD", f("index.html"), {"Host": "evil.example"})   # Host is never trusted
+        assert "evil" not in h["content-security-policy"]
+        _assert_token_scoped(h["content-security-policy"], "https://share.example", TOKEN)
+        # PDFs keep their own minimal policy; the redirect, the preflight and every 404 carry no token source
+        status, h, _ = e.request("GET", f("doc.pdf"))
+        assert status == 200 and h["content-security-policy"] == "frame-ancestors 'none'"
+        status, h, _ = e.request("GET", f"/s/{TOKEN}/")
+        assert status == 302 and "content-security-policy" not in h
+        status, h, _ = e.request("OPTIONS", f("index.html"))
+        assert status == 204 and "content-security-policy" not in h
+        status, h, _ = e.request("GET", f("missing"))
+        assert status == 404 and h["content-security-policy"] == "default-src 'none'; frame-ancestors 'none'; sandbox"
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("public_url", [None, "", "http://share.example", "https://share.example/base/",
+                                        "https://share.example/?q", "https://user@share.example", "not a url", 42])
+def test_csp_without_a_bare_https_public_origin_keeps_self_only(tmp_path, public_url):
+    e = Env(tmp_path, config_extra={"public_url": public_url})
+    try:
+        status, h, _ = e.request("GET", f("index.html"), {"Host": "evil.example"})
+        assert status == 200 and h["content-security-policy"] == CSP
+    finally:
+        e.close()
+
+
+def test_sandbox_csp_refuses_a_malformed_token():
+    assert share_public.sandbox_csp("https://share.example", "short") == CSP
+    assert share_public.sandbox_csp("https://share.example", TOKEN[:-1] + ";") == CSP
+    assert share_public.sandbox_csp("https://share.example", None) == CSP
+    assert share_public.sandbox_csp(None, TOKEN) == CSP
+    _assert_token_scoped(share_public.sandbox_csp("https://share.example", TOKEN), "https://share.example", TOKEN)
+
+
 def test_etag_304(env):
     etag = '"%s"' % _sha(BODY)
     p = f("data/table.parquet")
