@@ -216,7 +216,11 @@ class GitHubAppClient:
         provider = self._credentials()
         try:
             if method == "GET":
-                token = provider.token_for(owner, github_auth.GATE_READ_PERMISSIONS, [repo])
+                reader = getattr(provider, "token_or_raise", None)
+                if reader is not None:    # real App: keep the precise reason (rate_limited, unknown_owner, ...)
+                    token = reader(owner, github_auth.GATE_READ_PERMISSIONS, [repo])
+                else:
+                    token = provider.token_for(owner, github_auth.GATE_READ_PERMISSIONS, [repo])
                 if not token:
                     raise GitHubAppError(
                         "permission" if getattr(provider, "reason", None) == "unknown_owner" else "authentication")

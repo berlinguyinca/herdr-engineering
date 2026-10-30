@@ -24,6 +24,12 @@ class Provider:
         self.reads.append((owner, dict(permissions or {}), list(repositories or [])))
         return None if self.error == "no_token" else "ghs_READ" + "r" * 20
 
+    def token_or_raise(self, owner, permissions=None, repositories=None):
+        self.reads.append((owner, dict(permissions or {}), list(repositories or [])))
+        if self.error in ("rate_limited", "unknown_owner"):
+            raise github_auth.GitHubAuthError(self.error, retry_s=30 if self.error == "rate_limited" else None)
+        return None if self.error == "no_token" else "ghs_READ" + "r" * 20
+
     def capability_token_or_raise(self, owner, capability, repositories=None):
         self.writes.append((owner, capability, list(repositories or [])))
         if capability not in self.write:
@@ -106,3 +112,19 @@ def test_the_gate_config_accepts_app_shared_and_still_validates_everything_else(
     with pytest.raises(ValueError):
         gate_config.parse_review_gate_section({"enabled": True, "app": "elsewhere", "repos": []}, check_key_file=False)
     assert gate_config.parse_review_gate_section({"enabled": False, "repos": []}).shared_app is False
+
+
+def test_a_rate_limited_read_keeps_its_reason_and_retry_time():
+    p = Provider(error="rate_limited")
+    c, _ = client(p, {})
+    with pytest.raises(GitHubAppError) as exc:
+        c.open_prs(REPO)
+    assert exc.value.reason == "rate_limited" and exc.value.retry_at == 1030.0
+
+
+def test_an_unknown_owner_read_is_a_permission_error():
+    p = Provider(error="unknown_owner")
+    c, _ = client(p, {})
+    with pytest.raises(GitHubAppError) as exc:
+        c.open_prs(REPO)
+    assert exc.value.reason == "permission"
