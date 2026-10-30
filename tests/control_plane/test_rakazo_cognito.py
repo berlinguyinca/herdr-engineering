@@ -110,3 +110,28 @@ def test_a_pool_sign_in_does_not_erase_failed_guesses_at_a_local_password(make_s
     assert api.sign_in("carol@lab.example", "pw")[0] == 200       # a pool member from the same address
     assert api.sign_in("alice@example.com", "wrong")[0] == 401    # the 5th failure still counts ...
     assert api.sign_in("alice@example.com", PW_A)[0] == 429       # ... so the address is now locked out
+
+
+def test_sync_dir_membership_is_read_from_files_and_fails_closed(tmp_path):
+    cfg = rc.cognito_config({**CFG, "group_check": True, "sync_dir": str(tmp_path)})
+    assert cfg["sync_dir"] == str(tmp_path)
+    for bad in ("relative/dir", 5):
+        with pytest.raises(ValueError, match="sync_dir"):
+            rc.cognito_config({**CFG, "sync_dir": bad})
+    members = tmp_path / "members.json"
+
+    def write(users, age=0):
+        members.write_text(json.dumps({"updated": time.time() - age, "groups": {GROUP: users}}))
+
+    sign = rc.CognitoSignIn(cfg, login=lambda *a: tokens(), jwks_fetch=jwks)
+    write(["carol"])
+    assert sign.authenticate("carol@lab.example", "pw") == {"email": "carol@lab.example", "user": "carol"}
+    write([])                                           # removed from the group: the live re-check sees it
+    sign.auth._checked.clear()
+    assert sign.still_member("carol") is False
+    write(["carol"], age=3600)                          # a stalled sync admits nobody
+    sign.auth._checked.clear()
+    assert sign.still_member("carol") is False
+    members.unlink()                                    # a missing file fails closed too
+    sign.auth._checked.clear()
+    assert sign.still_member("carol") is False

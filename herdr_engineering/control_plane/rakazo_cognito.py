@@ -7,8 +7,9 @@ expiry, app-client allowlist) AND carry the configured ``required_group``. The I
 
 Pool members get the chat-only ``family`` role unless ``role: operator`` is configured. Nothing here widens who may sign in
 beyond that one group, there is no default group, and with ``group_check`` on (the
-default) membership is re-read from Cognito while the session lives, so removing someone from the group ends their
-session within about a minute. The person acts as the collaboration user named by their Cognito username, which is the
+default) membership is re-read while the session lives, so removing someone from the group ends their session within
+about a minute. The re-read goes to Cognito with AWS credentials, or, with ``sync_dir``, to the membership file the
+host's collab-sync job writes (no credentials in the process; the file must be fresh or nobody passes). The person acts as the collaboration user named by their Cognito username, which is the
 same identity HCN gives them, so rooms and agents are exactly the ones they already have there.
 """
 from __future__ import annotations
@@ -22,13 +23,13 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
-from .collab_cognito import CognitoAuthenticator
+from .collab_cognito import CognitoAuthenticator, SyncedDirectory
 
 log = logging.getLogger("herdr.rakazo.cognito")
 _POOL = re.compile(r"^([a-z]{2}-[a-z]+-\d)_[A-Za-z0-9]+$")
 _CLIENT = re.compile(r"^[A-Za-z0-9]{10,64}$")
 _GROUP = re.compile(r"^[A-Za-z0-9_.+=,@-]{1,128}$")
-KEYS = frozenset({"pool_id", "client_ids", "required_group", "group_check", "role"})
+KEYS = frozenset({"pool_id", "client_ids", "required_group", "group_check", "role", "sync_dir"})
 
 
 def cognito_config(raw: Any) -> dict[str, Any] | None:
@@ -52,7 +53,11 @@ def cognito_config(raw: Any) -> dict[str, Any] | None:
     role = raw.get("role", "family")
     if role not in ("family", "operator"):
         raise ValueError(f"{where}.role must be family (chat only, the default) or operator")
-    return {"pool_id": pool, "client_ids": tuple(clients), "required_group": group, "group_check": check, "role": role}
+    sync_dir = raw.get("sync_dir")
+    if sync_dir is not None and (not isinstance(sync_dir, str) or not sync_dir.startswith("/")):
+        raise ValueError(f"{where}.sync_dir must be an absolute directory path")
+    return {"pool_id": pool, "client_ids": tuple(clients), "required_group": group, "group_check": check, "role": role,
+            "sync_dir": sync_dir}
 
 
 def boto_member_lookup(pool_id: str, region: str) -> Callable[[str], list[str] | None]:
@@ -114,7 +119,11 @@ class CognitoSignIn:
         self.cfg = cfg
         self.region = _POOL.match(cfg["pool_id"]).group(1)
         lookup = group_lookup
-        if lookup is None and cfg["group_check"]:
+        if lookup is None and cfg["group_check"] and cfg.get("sync_dir"):
+            # Membership comes from files a host-side job refreshes (collab-sync.sh): no AWS credentials in this process.
+            # A stale or missing file fails closed, so the people it lists are the only ones admitted.
+            lookup = SyncedDirectory(cfg["sync_dir"], cfg["required_group"]).groups
+        elif lookup is None and cfg["group_check"]:
             lookup = boto_member_lookup(cfg["pool_id"], self.region)       # ImportError/credential errors fail at startup
         self.auth = authenticator or CognitoAuthenticator(
             pool_id=cfg["pool_id"], client_ids=list(cfg["client_ids"]), required_group=cfg["required_group"],
