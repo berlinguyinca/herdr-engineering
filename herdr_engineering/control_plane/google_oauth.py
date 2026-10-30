@@ -19,6 +19,7 @@ from herdr_engineering.control_plane.google_workspace import (
     GoogleError,
     _post_form,
     _urlopen,
+    error_detail,
     new_pkce,
 )
 
@@ -67,10 +68,11 @@ def account_address(opener: Callable, access_token: str) -> str:
         with opener(req, TIMEOUT) as resp:
             data = json.loads(resp.read(MAX_RESPONSE))
     except urllib.error.HTTPError as exc:
+        detail = error_detail(exc)
         exc.close()
-        raise GoogleError("unavailable") from None
+        raise GoogleError("unavailable", detail) from None
     except (urllib.error.URLError, OSError, ValueError):
-        raise GoogleError("unavailable") from None
+        raise GoogleError("unavailable", "network") from None
     address = data.get("email") if isinstance(data, dict) and data.get("email_verified") is not False else None
     if not isinstance(address, str) or not address:
         raise GoogleError("unavailable")
