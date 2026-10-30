@@ -248,7 +248,10 @@ for (const [name, size, theme] of [['desktop light', [1280, 900], 'light'], ['de
       await page.waitForSelector('#pi-related li');
       const f = [...await staticAudit(page, '#view'), ...await focusIndicatorAudit(page, '#view')];
       assert.deepEqual(f, [], summarize(f));
-      assert.equal(overflowFailure(await overflowAudit(page)), '', 'overflow');
+      const audit = await overflowAudit(page);
+      // the freshness dot is an 8px box whose text label is moved off-screen on purpose (a text-indent technique): not content that is cut
+      audit.clipped = audit.clipped.filter((c) => !c.startsWith('herdr-freshness '));
+      assert.equal(overflowFailure(audit), '', 'overflow');
     });
   });
 }

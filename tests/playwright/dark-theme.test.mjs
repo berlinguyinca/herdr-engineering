@@ -114,6 +114,7 @@ function audit({min}){
   if(!inSvg&&fill&&fill.a>=0.9&&lum(fill)>0.5)light.push(`${where(el)} ${cs.backgroundColor}`);
   const own=[...el.childNodes].filter(n=>n.nodeType===3).map(n=>n.textContent).join('').trim();
   if(!own||el.matches('option,script,style,title')||el.closest(':disabled,[aria-disabled="true"]'))continue;
+  if(el.matches('herdr-freshness')&&parseFloat(cs.textIndent)<-999)continue;   // the status dot: its label is moved off-screen on purpose, no visible text
   const bg=backdrop(el);if(!bg)continue;
   let fg=parse(inSvg?cs.fill:cs.color);if(!fg)continue;
   if(fg.a<1)fg=over(fg,bg);
