@@ -3,6 +3,9 @@
 Grants live in ``artifact_acl`` under the principal ``collab:<agent_id>``.  ``conn`` is an asyncpg connection (or any
 object with the same ``fetch``/``fetchrow``/``fetchval``/``execute`` coroutines).  An *actor* is any object with
 ``kind`` ('agent' or 'user') and ``id`` attributes.
+
+The database does NOT enforce idempotency-key uniqueness or the per-agent daily quota: the applier (Task 5a) must
+serialize work per key and per agent (for example with a Postgres advisory lock) around the check-then-record steps.
 """
 from __future__ import annotations
 
@@ -19,13 +22,24 @@ def _aware(moment: datetime) -> datetime:
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
 
+_MAX_EPOCH = 32503680000   # 3000-01-01 UTC: larger numbers are epoch milliseconds, which would disable a cap
+
+
 def _moment(value) -> datetime:
-    """A datetime from a datetime, epoch seconds or an ISO-8601 string."""
+    """A datetime from a datetime, epoch seconds or an ISO-8601 string; ValueError for anything implausible."""
+    if isinstance(value, bool):
+        raise ValueError("not a timestamp: bool")
     if isinstance(value, datetime):
-        return _aware(value)
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, UTC)
-    return _aware(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+        moment = _aware(value)
+    elif isinstance(value, (int, float)):
+        if not 0 <= value <= _MAX_EPOCH:
+            raise ValueError(f"epoch seconds out of range: {value!r}")
+        moment = datetime.fromtimestamp(value, UTC)
+    else:
+        moment = _aware(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    if moment.year > 3000:
+        raise ValueError("timestamp beyond year 3000")
+    return moment
 
 
 def _check_grant(permission: str, expires_at: datetime) -> datetime:
@@ -61,12 +75,30 @@ class CollabGrantStore:
     async def grant(self, artifact_id: str, agent_id: str, permission: Literal["read", "write"], *,
                     expires_at: datetime, granted_by: str) -> dict:
         expires_at = _check_grant(permission, expires_at)
-        await self.conn.execute(
-            "INSERT INTO artifact_acl (artifact_id, principal_id, permissions, expires_at, granted_by) "
-            "VALUES ($1, $2, $3::jsonb, $4, $5) ON CONFLICT (artifact_id, principal_id) DO UPDATE SET "
-            "permissions = EXCLUDED.permissions, expires_at = EXCLUDED.expires_at, granted_by = EXCLUDED.granted_by",
-            artifact_id, PREFIX + agent_id, json.dumps(_PERMS[permission]), expires_at, granted_by)
+        await self._upsert_acl(artifact_id, agent_id, permission, expires_at, granted_by, merge=False)
         return {"artifact_id": artifact_id, "agent_id": agent_id, "permission": permission, "expires_at": expires_at}
+
+    async def _upsert_acl(self, artifact_id: str, agent_id: str, permission: str, expires_at: datetime,
+                          granted_by: str, *, merge: bool) -> None:
+        """Write the ``collab:<agent_id>`` row.  ``merge=False`` replaces it (an owner's explicit decision, which may
+        narrow or shorten a grant).  ``merge=True`` never downgrades a live row: the stronger permission set and the
+        later expiry win, the expiry still capped at 90 days from now.  An expired row counts as absent."""
+        perms = json.dumps(_PERMS[permission])
+        if not merge:
+            sql = ("INSERT INTO artifact_acl (artifact_id, principal_id, permissions, expires_at, granted_by) "
+                   "VALUES ($1,$2,$3::jsonb,$4,$5) ON CONFLICT (artifact_id, principal_id) DO UPDATE SET "
+                   "permissions = EXCLUDED.permissions, expires_at = EXCLUDED.expires_at, "
+                   "granted_by = EXCLUDED.granted_by")
+        else:
+            sql = ("INSERT INTO artifact_acl (artifact_id, principal_id, permissions, expires_at, granted_by) "
+                   "VALUES ($1,$2,$3::jsonb,$4,$5) ON CONFLICT (artifact_id, principal_id) DO UPDATE SET "
+                   "permissions = CASE WHEN EXCLUDED.permissions ? 'edit' "
+                   "OR (artifact_acl.expires_at > now() AND artifact_acl.permissions ? 'edit') "
+                   "THEN '[\"read\",\"edit\"]'::jsonb ELSE '[\"read\"]'::jsonb END, "
+                   "expires_at = LEAST(GREATEST(EXCLUDED.expires_at, CASE WHEN artifact_acl.expires_at > now() "
+                   "THEN artifact_acl.expires_at END), now() + interval '2160 hours'), "
+                   "granted_by = EXCLUDED.granted_by")
+        await self.conn.execute(sql, artifact_id, PREFIX + agent_id, perms, expires_at, granted_by)
 
     async def revoke(self, artifact_id: str, agent_id: str) -> bool:
         deleted = await self.conn.fetch(
@@ -121,6 +153,9 @@ class CollabGrantStore:
         """Turn each pending invite grant whose invite joined into a real grant; return how many resolved.
 
         ``join_to_agent`` maps invite id -> ``{agent_id | id, hard_expiry}``.  Already resolved rows are skipped.
+        Each invite is claimed and granted in one transaction, so a failure leaves it unresolved for a retry.  An
+        invite whose own expiry has passed is marked resolved with no grant.  The grant never downgrades one the
+        agent already holds: the stronger permission and the later expiry (capped at 90 days from now) win.
         """
         if not join_to_agent:
             return 0
@@ -136,19 +171,16 @@ class CollabGrantStore:
             expires_at = row["expires_at"]
             if agent.get("hard_expiry") is not None:
                 expires_at = min(expires_at, _moment(agent["hard_expiry"]))
-            claimed = await self.conn.fetchval(
-                "UPDATE artifact_collab_invite_grants SET resolved_agent_id=$2, resolved_at=now() "
-                "WHERE invite_id=$1 AND resolved_at IS NULL RETURNING 1", row["invite_id"], agent_id)
-            if not claimed:
-                continue
-            await self.conn.execute(
-                "INSERT INTO artifact_acl (artifact_id, principal_id, permissions, expires_at, granted_by) "
-                "VALUES ($1,$2,$3::jsonb,$4,$5) ON CONFLICT (artifact_id, principal_id) DO UPDATE SET "
-                "permissions = EXCLUDED.permissions, expires_at = EXCLUDED.expires_at, "
-                "granted_by = EXCLUDED.granted_by",
-                row["artifact_id"], PREFIX + agent_id, json.dumps(_PERMS[row["permission"]]), expires_at,
-                row["granted_by"])
-            resolved += 1
+            async with self.conn.transaction():
+                claimed = await self.conn.fetchval(
+                    "UPDATE artifact_collab_invite_grants SET resolved_agent_id=$2, resolved_at=now() "
+                    "WHERE invite_id=$1 AND resolved_at IS NULL RETURNING 1", row["invite_id"], agent_id)
+                if not claimed or row["expires_at"] <= datetime.now(UTC) or expires_at <= datetime.now(
+                        UTC):
+                    continue        # lost the race, or the invite lapsed: resolved without a grant
+                await self._upsert_acl(row["artifact_id"], agent_id, row["permission"], expires_at,
+                                       row["granted_by"], merge=True)
+                resolved += 1
         return resolved
 
     # -- intent ledger ----------------------------------------------------------------------------------------
@@ -167,10 +199,13 @@ class CollabGrantStore:
         return dict(row) if row else None
 
     async def record_outcome(self, ticket_id: str, outcome: str, *, version_id: str | None = None,
-                             attempt_id: str | None = None, reason: str | None = None) -> None:
-        await self.conn.execute(
+                             attempt_id: str | None = None, reason: str | None = None) -> bool:
+        """Decide a ticket once.  True if this call changed the row; False if it was already decided or is unknown."""
+        decided = await self.conn.fetchval(
             "UPDATE artifact_collab_intents SET outcome=$2, version_id=$3, attempt_id=$4, reason=$5, "
-            "decided_at=now() WHERE ticket_id=$1", ticket_id, outcome, version_id, attempt_id, reason)
+            "decided_at=now() WHERE ticket_id=$1 AND outcome='received' RETURNING 1",
+            ticket_id, outcome, version_id, attempt_id, reason)
+        return bool(decided)
 
     async def decided_for_key(self, actor, kind: str, idempotency_key: str,
                               outcomes: frozenset[str]) -> dict | None:

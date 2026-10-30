@@ -4,6 +4,7 @@
 -- agent that has not joined yet).  Additive and idempotent.  Safe to re-run.
 --
 -- DOWN:
+--   DROP INDEX IF EXISTS artifact_collab_attempts_ticket_idx;
 --   ALTER TABLE artifact_collab_attempts DROP COLUMN IF EXISTS ticket_id;
 --   DROP TABLE IF EXISTS artifact_collab_invite_grants;
 --   DROP TABLE IF EXISTS artifact_collab_uploads;
@@ -65,3 +66,5 @@ CREATE TABLE IF NOT EXISTS artifact_collab_invite_grants (
 );
 
 ALTER TABLE artifact_collab_attempts ADD COLUMN IF NOT EXISTS ticket_id text;
+
+CREATE INDEX IF NOT EXISTS artifact_collab_attempts_ticket_idx ON artifact_collab_attempts (ticket_id);

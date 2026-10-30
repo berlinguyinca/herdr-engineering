@@ -190,12 +190,14 @@ def test_decided_for_key(registry_pg):
     async def body(store, conn):
         ag, other = Actor("agent", uid("ag")), Actor("agent", uid("ag"))
         key = uid("key")
-        t = uid("t")
+        t, t2 = uid("t"), uid("t")
         await received(store, t, ag, idempotency_key=key, request_sha256="digest")
         assert await store.decided_for_key(ag, "commit", key, frozenset({"created"})) is None
         await store.record_outcome(t, "rejected")
         assert await store.decided_for_key(ag, "commit", key, frozenset({"created", "merged"})) is None
-        await store.record_outcome(t, "created")
+        await received(store, t2, ag, idempotency_key=key, request_sha256="digest")
+        await store.record_outcome(t2, "created")
+        t = t2
         row = await store.decided_for_key(ag, "commit", key, frozenset({"created", "merged"}))
         assert row["ticket_id"] == t and row["request_sha256"] == "digest"
         assert await store.decided_for_key(ag, "other", key, frozenset({"created"})) is None
@@ -209,8 +211,10 @@ def test_user_actor_with_custom_kind_and_outcome(registry_pg):
         await received(store, t, Actor("user", "u1"), kind="x.test", artifact_id=None)
         await store.record_outcome(t, "stored")
         assert await conn.fetchval("SELECT outcome FROM artifact_collab_intents WHERE ticket_id=$1", t) == "stored"
+        t2 = uid("t")
+        await received(store, t2, Actor("user", "u1"), kind="x.test", artifact_id=None)
         with pytest.raises(asyncpg.CheckViolationError):
-            await store.record_outcome(t, "Bad Outcome")
+            await store.record_outcome(t2, "Bad Outcome")
     run(registry_pg, body)
 
 
@@ -261,4 +265,99 @@ def test_collaborators_and_attempts(registry_pg):
         by = {r["ticket_id"]: r for r in got}
         assert by[tickets["x"]]["conflict_names"] == ["a.md"] and by[tickets["r"]]["conflict_names"] == []
         assert len(await store.attempts(aid, limit=1)) == 1
+    run(registry_pg, body)
+
+
+def test_record_outcome_decides_once(registry_pg):
+    async def body(store, conn):
+        t = uid("t")
+        await received(store, t, Actor("agent", uid("ag")))
+        assert await store.record_outcome(t, "created", version_id="v1") is True
+        assert await store.record_outcome(t, "rejected", reason="late") is False
+        row = await conn.fetchrow("SELECT outcome, version_id, reason FROM artifact_collab_intents "
+                                  "WHERE ticket_id=$1", t)
+        assert (row["outcome"], row["version_id"], row["reason"]) == ("created", "v1", None)
+        assert await store.record_outcome(uid("nope"), "created") is False
+    run(registry_pg, body)
+
+
+def test_resolve_is_atomic_and_retryable(registry_pg, monkeypatch):
+    async def body(store, conn):
+        aid = await artifact(conn)
+        await store.add_invite_grant("inv-atomic", aid, "write", expires_at=now() + timedelta(days=5), granted_by="o")
+
+        async def boom(*a, **k):
+            raise RuntimeError("injected")
+        monkeypatch.setattr(store, "_upsert_acl", boom)
+        joins = {"inv-atomic": {"agent_id": "agx", "hard_expiry": (now() + timedelta(days=9)).timestamp()}}
+        with pytest.raises(RuntimeError):
+            await store.resolve_invite_grants(joins)
+        assert [g["invite_id"] for g in await store.pending_invite_grants(aid)] == ["inv-atomic"]
+        assert await store.grant_for(aid, "agx") is None
+        monkeypatch.undo()
+        assert await store.resolve_invite_grants(joins) == 1
+        assert (await store.grant_for(aid, "agx"))["permission"] == "write"
+    run(registry_pg, body)
+
+
+def test_resolve_never_downgrades(registry_pg):
+    async def body(store, conn):
+        aid = await artifact(conn)
+        late, soon = now() + timedelta(days=40), now() + timedelta(days=2)
+        await store.grant(aid, "ag", "write", expires_at=late, granted_by="o")
+        await store.add_invite_grant("inv-d1", aid, "read", expires_at=soon, granted_by="o")
+        assert await store.resolve_invite_grants({"inv-d1": {"agent_id": "ag"}}) == 1
+        g = await store.grant_for(aid, "ag")
+        assert g["permission"] == "write" and abs((g["expires_at"] - late).total_seconds()) < 1
+        # a stronger, longer invite upgrades both
+        await store.add_invite_grant("inv-d2", aid, "write", expires_at=now() + timedelta(days=60), granted_by="o")
+        await store.grant(aid, "ag2", "read", expires_at=soon, granted_by="o")
+        await store.add_invite_grant("inv-d3", aid, "write", expires_at=late, granted_by="o")
+        await store.resolve_invite_grants({"inv-d3": {"agent_id": "ag2"}})
+        g2 = await store.grant_for(aid, "ag2")
+        assert g2["permission"] == "write" and abs((g2["expires_at"] - late).total_seconds()) < 1
+        # the later expiry is still capped at 90 days from now
+        await conn.execute("UPDATE artifact_acl SET expires_at = now() + interval '200 days' "
+                           "WHERE artifact_id=$1 AND principal_id='collab:ag2'", aid)
+        await store.add_invite_grant("inv-d4", aid, "read", expires_at=soon, granted_by="o")
+        await store.resolve_invite_grants({"inv-d4": {"agent_id": "ag2"}})
+        g2 = await store.grant_for(aid, "ag2")
+        assert g2["expires_at"] <= now() + timedelta(days=90, minutes=1)
+        # an expired existing write grant does not keep write
+        await conn.execute("UPDATE artifact_acl SET expires_at = now() - interval '1 day' "
+                           "WHERE artifact_id=$1 AND principal_id='collab:ag'", aid)
+        await store.add_invite_grant("inv-d5", aid, "read", expires_at=soon, granted_by="o")
+        await store.resolve_invite_grants({"inv-d5": {"agent_id": "ag"}})
+        assert (await store.grant_for(aid, "ag"))["permission"] == "read"
+    run(registry_pg, body)
+
+
+def test_lapsed_invite_resolves_without_grant(registry_pg):
+    async def body(store, conn):
+        aid = await artifact(conn)
+        await store.add_invite_grant("inv-old", aid, "read", expires_at=now() + timedelta(days=1), granted_by="o")
+        await conn.execute("UPDATE artifact_collab_invite_grants SET expires_at = now() - interval '1 hour' "
+                           "WHERE invite_id='inv-old'")
+        assert await store.resolve_invite_grants({"inv-old": {"agent_id": "agold"}}) == 0
+        assert await store.pending_invite_grants(aid) == []
+        assert await store.grant_for(aid, "agold") is None
+    run(registry_pg, body)
+
+
+def test_hard_expiry_parsing():
+    from herdr_engineering.control_plane.artifact_collab_store import _moment
+    want = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
+    assert _moment("2026-11-01T12:00:00Z") == want
+    assert _moment(datetime(2026, 11, 1, 12, 0)) == want
+    assert _moment(want) == want
+    assert _moment(want.timestamp()) == want
+    for bad in (True, want.timestamp() * 1000, datetime(3001, 1, 1, tzinfo=UTC), "not a date"):
+        with pytest.raises(ValueError):
+            _moment(bad)
+
+
+def test_attempts_ticket_index_exists(registry_pg):
+    async def body(store, conn):
+        assert await conn.fetchval("SELECT count(*) FROM pg_indexes WHERE tablename='artifact_collab_attempts' "
+                                   "AND indexname='artifact_collab_attempts_ticket_idx'") == 1
     run(registry_pg, body)
