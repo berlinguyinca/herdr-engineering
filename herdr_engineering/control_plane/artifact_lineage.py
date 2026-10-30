@@ -7,7 +7,7 @@ gate (``artifact_scope.ArtifactGraphGate``) narrows it again at read time, so a 
 Emission is best effort and never raises: the version is already durable when this runs.
 
 Shape per commit: the logical node ``artifact:<id>`` (head facts), one immutable version node
-``artifact:<id>@<version_id>`` and, when the version has a parent, a ``supersession`` edge new -> old. A correction is
+``artifact:<id>@<version_id>`` and a ``supersession`` edge new -> old for every parent (a merge has two). A correction is
 therefore a new version; a retraction (``emit_retraction``) marks the retracted version node and leaves its facts readable
 by the same audience.
 """
@@ -55,10 +55,22 @@ def _envelope(source: str, n: int, event_type: str, entity_id: str, payload: dic
             "entity_type": "lineage", "entity_id": entity_id, "event_type": event_type, "payload": payload, **scope}
 
 
+def _parents(version: dict) -> list[str]:
+    """Ordered, distinct parent ids: ``parent_version_ids`` when present, else the single ``parent_version_id``."""
+    listed = version.get("parent_version_ids")
+    if not isinstance(listed, (list, tuple)) or not listed:
+        listed = [version.get("parent_version_id")]
+    out: list[str] = []
+    for parent in listed:
+        if parent and str(parent) not in out:
+            out.append(str(parent))
+    return out
+
+
 def emit_version_lineage(ingest, version: dict, principal: dict, *, scope: dict | None = None,
                          source_prefix: str = "art") -> dict:
     """Ingest ``artifact:<id>`` (commons node), the immutable ``artifact:<id>@<version_id>`` node, a ``supersession``
-    edge to the parent version and, when the committing principal may write it, a ``produced`` edge from the producer.
+    edge to each parent version and, when the committing principal may write it, a ``produced`` edge from the producer.
     ``scope`` is the envelope visibility (``artifact_scope.visibility_fields``); if the ingest refuses it (for example
     the key may not address that room) the whole sequence is retried ``private``, never wider.
     ``source_prefix`` names the event sources (see ``source_name``): the default is the commit's own, a different one
@@ -94,12 +106,13 @@ def emit_version_lineage(ingest, version: dict, principal: dict, *, scope: dict 
             send(1, "node.upsert", version_node, {"node_type": "artifact", "node_id": version_node, "label": label,
                                                   "state": "ready", "attrs": attrs})
             result["version_node"] = version_node
-            parent = version.get("parent_version_id")
-            if parent:
+            # one edge per parent (a merge has two). The first parent keeps sequence 2 so replays of versions
+            # recorded before parent lists existed stay duplicates; later parents take 4, 5, ... (3 is `produced`).
+            for index, parent in enumerate(_parents(version)):
                 old = f"artifact:{artifact_id}@{parent}"
                 try:
-                    send(2, "edge.add", version_node, {"edge_type": "supersession", "from_id": version_node,
-                                                       "to_id": old})
+                    send(2 if index == 0 else 3 + index, "edge.add", version_node,
+                         {"edge_type": "supersession", "from_id": version_node, "to_id": old})
                 except Exception:                      # noqa: BLE001 - the parent was never recorded: no edge
                     pass
             for field, kind in _PRODUCERS:

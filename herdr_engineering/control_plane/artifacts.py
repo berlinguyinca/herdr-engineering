@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
@@ -18,7 +19,7 @@ from .artifact_provenance import ProvenanceError, context_links, normalize_origi
 from .artifact_uploads import ArtifactUploadMixin
 from .rustfs import IntegrityError, RustFSClient
 
-__all__ = ["ArtifactStore", "ArtifactError", "ArtifactConflict", "IntegrityError"]
+__all__ = ["ArtifactStore", "ArtifactError", "ArtifactConflict", "ArtifactMergeConflict", "IntegrityError"]
 
 
 class ArtifactError(Exception):
@@ -34,6 +35,21 @@ class ArtifactConflict(ArtifactError):
         super().__init__(
             f"artifact {artifact_id} changed; current version is {current_version_id or 'none'}"
         )
+
+
+class ArtifactMergeConflict(ArtifactError):
+    """A collaborator merge did not apply cleanly; nothing was stored except one ``artifact_collab_attempts`` row.
+
+    ``conflicts`` are ``artifact_merge.FileConflict`` values (``theirs_sha256`` = head side, ``mine_sha256`` =
+    contributor); the contributor resolves and retries with ``base_version_id = head_version_id``."""
+
+    def __init__(self, head_version_id: str | None, conflicts: list, clean_names: list[str]):
+        self.head_version_id = head_version_id
+        self.conflicts = list(conflicts)
+        self.clean_names = list(clean_names)
+        super().__init__(
+            f"merge conflict against head {head_version_id or 'none'}: "
+            + ", ".join(f"{c.name} ({c.kind})" for c in self.conflicts))
 
 
 @asynccontextmanager
@@ -334,6 +350,189 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             "validation": validation,
             **{key: value for key, value in origin_columns.items() if value not in (None, [])},
         }
+
+    async def merge_commit(self, artifact_id: str, *,
+                           base_version_id: str,
+                           changes: list[dict],
+                           read_text=None,
+                           store_text=None,
+                           message: str,
+                           created_by: str,
+                           collaborator_agent_id: str,
+                           idempotency_key: str | None = None,
+                           max_text_bytes: int = 2 * 1024 * 1024) -> dict:
+        """Commit a collaborator's ``changes`` made against ``base_version_id``, merging with the head if it moved.
+
+        *mine* is the base manifest with ``changes`` applied (``{name, op: "put"|"delete", entry?}``; deleting an absent
+        name is a no-op). ``base == head`` fast-forwards (``result: "created"``, parents ``[head]``); otherwise the
+        three-way ``merge_manifests`` result is committed on top of the head (``result: "merged"``, parents
+        ``[head, base]``). A conflict stores nothing but one ``artifact_collab_attempts`` row and raises
+        ``ArtifactMergeConflict``. The artifact row lock (as in ``commit_version``) is held from reading the head to
+        committing, so the head cannot move in between. Idempotent per ``(created_by, idempotency_key)``.
+
+        ``read_text(entry) -> str`` and ``store_text(name, template) -> entry`` default to RustFS; ``store_text`` gets
+        ``{**head_entry, "text": merged}`` and must return a complete entry with a fresh sha256/size_bytes.
+        """
+        from .artifact_merge import merge_manifests
+
+        if not isinstance(collaborator_agent_id, str) or not collaborator_agent_id:
+            raise ArtifactError("merge commits require a collaborator_agent_id")
+        if not isinstance(base_version_id, str) or not base_version_id:
+            raise ArtifactError("merge commits require a base_version_id")
+        if not isinstance(message, str):
+            raise ArtifactError("message must be a string")
+        normalized = self._normalize_changes(changes)
+        request_sha = hashlib.sha256(json.dumps(
+            {"artifact_id": artifact_id, "base_version_id": base_version_id, "changes": normalized,
+             "message": message, "collaborator_agent_id": collaborator_agent_id},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        principal = created_by or "unknown"
+        registrations: list[dict] = []
+        if read_text is None:
+            read_text = self._read_blob_text
+        if store_text is None:
+            def store_text(name: str, template: dict) -> dict:
+                entry = self._store_blob_text(name, template)
+                registrations.append(entry)
+                return entry
+        conflict: ArtifactMergeConflict | None = None
+        async with _transaction(self._conn):
+            replay = await self._merge_replay(principal, idempotency_key, request_sha)
+            if replay is not None:
+                return replay
+            artifact = await self._conn.fetchrow(
+                "SELECT artifact_id, current_version_id, artifact_type, lifecycle FROM artifacts "
+                "WHERE artifact_id=$1 FOR UPDATE", artifact_id)
+            if artifact is None:
+                raise ArtifactError(f"no artifact {artifact_id}")
+            # a concurrent identical call may have committed while this one waited for the lock
+            replay = await self._merge_replay(principal, idempotency_key, request_sha)
+            if replay is not None:
+                return replay
+            if artifact["lifecycle"] == "retracted":
+                raise ArtifactError("artifact is retracted: commit a new artifact instead")
+            head_id = artifact["current_version_id"]
+            base = await self.get_version(base_version_id, artifact_id)
+            if base is None:
+                raise ArtifactError(f"base version does not belong to artifact {artifact_id}: {base_version_id}")
+            if head_id is None:
+                raise ArtifactError(f"artifact {artifact_id} has no head version")
+            head = base if head_id == base_version_id else await self.get_version(head_id, artifact_id)
+            if artifact["artifact_type"] == "report" or any(
+                    version.get("report_descriptor") or version.get("source_manifest_blob")
+                    for version in (base, head)):
+                raise ArtifactError("not writable by collaboration")
+            base_files = self._manifest_by_name(base.get("output_manifest"))
+            head_files = self._manifest_by_name(head.get("output_manifest"))
+            mine = dict(base_files)
+            for change in normalized:
+                if change["op"] == "delete":
+                    mine.pop(change["name"], None)
+                else:
+                    mine[change["name"]] = change["entry"]
+            merge = merge_manifests(list(base_files.values()), list(head_files.values()), list(mine.values()),
+                                    read_text=read_text, store_text=store_text, max_text_bytes=max_text_bytes)
+            if merge.conflicts:
+                await self._conn.execute(
+                    "INSERT INTO artifact_collab_attempts (attempt_id, artifact_id, collaborator_agent_id, "
+                    "base_version_id, head_version_id, conflict_names, message) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)",
+                    str(uuid.uuid4()), artifact_id, collaborator_agent_id, base_version_id, head_id,
+                    json.dumps([{"name": c.name, "kind": c.kind} for c in merge.conflicts]), message)
+                # leave the block normally so the attempt row commits; raise once the transaction is closed
+                conflict = ArtifactMergeConflict(head_id, merge.conflicts, merge.clean_names)
+            else:
+                for entry in registrations:
+                    await self.register_report_blob(
+                        artifact_id, storage_key=entry["storage_key"], sha256=entry["sha256"],
+                        size_bytes=entry["size_bytes"], media_type=entry["media_type"])
+                fast_forward = head_id == base_version_id
+                version = await self.commit_version(
+                    artifact_id, base_version_id=head_id, source_manifest_blob=None, output_manifest=merge.files,
+                    provenance={"message": message, "merged_names": merge.merged_names,
+                                "collab_request_sha256": request_sha},
+                    created_by=created_by, idempotency_key=idempotency_key,
+                    parent_version_ids=[head_id] if fast_forward else [head_id, base_version_id],
+                    created_via="collaborator", collaborator_agent_id=collaborator_agent_id)
+        if conflict is not None:
+            raise conflict
+        return {"result": "created" if fast_forward else "merged", "version": version,
+                "merged_names": list(merge.merged_names)}
+
+    async def _merge_replay(self, principal: str, idempotency_key: str | None, request_sha: str) -> dict | None:
+        if not idempotency_key:
+            return None
+        prior = await self._conn.fetchrow(
+            "SELECT version_id FROM artifact_idempotency WHERE principal_id=$1 AND idempotency_key=$2",
+            principal, idempotency_key)
+        if not prior:
+            return None
+        version = await self.get_version(prior["version_id"])
+        if version is None:
+            return None
+        provenance = version.get("provenance") or {}
+        if provenance.get("collab_request_sha256") != request_sha:
+            raise ArtifactError("idempotency key was reused for a different request")
+        parents = version.get("parent_version_ids") or []
+        return {"result": "merged" if len(parents) > 1 else "created", "version": version,
+                "merged_names": list(provenance.get("merged_names") or [])}
+
+    @staticmethod
+    def _normalize_changes(changes: Any) -> list[dict]:
+        if not isinstance(changes, list):
+            raise ArtifactError("changes must be a list")
+        out: list[dict] = []
+        seen: set[str] = set()
+        for change in changes:
+            if not isinstance(change, dict):
+                raise ArtifactError("each change must be an object")
+            name, op = change.get("name"), change.get("op")
+            if not isinstance(name, str) or not name:
+                raise ArtifactError("each change needs a nonempty name")
+            if name in seen:
+                raise ArtifactError(f"duplicate change for {name}")
+            seen.add(name)
+            if op == "delete":
+                out.append({"name": name, "op": "delete"})
+            elif op == "put":
+                entry = change.get("entry")
+                if not isinstance(entry, dict):
+                    raise ArtifactError(f"put of {name} requires an entry")
+                if entry.get("name", name) != name:
+                    raise ArtifactError(f"put entry name differs from change name {name}")
+                entry = ArtifactStore._with_sha({**entry, "name": name})
+                out.append({"name": name, "op": "put", "entry": entry})
+            else:
+                raise ArtifactError("change op must be 'put' or 'delete'")
+        return out
+
+    @staticmethod
+    def _with_sha(entry: dict) -> dict:
+        digest = entry.get("sha256") or entry.get("blob_sha256")
+        if not isinstance(digest, str) or not digest:
+            raise ArtifactError(f"manifest entry {entry.get('name')} needs a sha256")
+        return {**entry, "sha256": digest}
+
+    @staticmethod
+    def _manifest_by_name(manifest: Any) -> dict[str, dict]:
+        files: dict[str, dict] = {}
+        for entry in manifest if isinstance(manifest, list) else []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"]:
+                raise ArtifactError("manifest entries need a name to merge")
+            files[entry["name"]] = ArtifactStore._with_sha(entry)
+        return files
+
+    def _read_blob_text(self, entry: dict) -> str:
+        reference = entry.get("storage_key") or entry.get("blob_sha256")
+        if isinstance(reference, str) and len(reference) == 64 and "/" not in reference:
+            reference = f"sha256/{reference[:2]}/{reference[2:4]}/{reference}"
+        return self._rf.get(reference, entry["sha256"]).decode("utf-8")
+
+    def _store_blob_text(self, name: str, template: dict) -> dict:
+        data = template["text"].encode("utf-8")
+        key, digest = self._rf.put(data)
+        entry = {k: v for k, v in template.items()
+                 if k not in ("text", "storage_key", "blob_sha256", "sha256", "size_bytes")}
+        return {**entry, "name": name, "storage_key": key, "sha256": digest, "size_bytes": len(data)}
 
     async def report_permission(self, artifact_id: str, principal_id: str, permission: str) -> bool:
         """Private report operations use durable owner/grant authority, not a guessed context."""
