@@ -4505,6 +4505,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             bad = [k for k in body if k not in ("status", "result")]
             status = body.get("status")
             cur = self._task_status(t)
+            if not bad and status == cur and status in ("done", "failed"):
+                # P05: a retry of a completion that already happened (the answer was lost, the agent restarted) gets
+                # the recorded outcome and writes nothing; it cannot change a finished task's result. A repeated
+                # "accepted" stays a 400, as before.
+                if self._task_text(body.get("result"), "result", required=False) == t.get("result"):
+                    return {"task_id": task_id, "status": status, "replayed": True}
             allowed = {"pending": ("accepted", "failed"), "accepted": ("done", "failed")}.get(cur, ())
             if bad or status not in allowed:
                 raise CollabError(400, "invalid status change")

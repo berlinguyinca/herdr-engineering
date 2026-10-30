@@ -100,3 +100,28 @@ def test_a_reviewer_cannot_be_the_agent_that_handed_the_work_out(team):
     assert s == 400 and "handed out the work" in out["error"]
     s, ok = assign(team, team.rev, "independent review of the part", reviews_task_id=sub["task_id"])
     assert s == 201
+
+
+def task_updates(team, task_id):
+    s, out = team.api.call("GET", f"{BASE}/rooms/{team.room}/events", user="alice", headers=H)
+    return [e for e in out["events"] if e["event_type"] == "task_updated" and e.get("task_id") == task_id]
+
+
+def test_a_retry_of_a_completion_gets_the_recorded_outcome_and_writes_nothing(team):
+    s, work = assign(team, team.impl, "build it")
+    tid, url = work["task_id"], f"{BASE}/tasks/{work['task_id']}/update"
+    s, first = as_agent(team, team.impl, "POST", url, {"status": "accepted"})
+    assert s == 200 and "replayed" not in first
+    s, again = as_agent(team, team.impl, "POST", url, {"status": "accepted"})
+    assert s == 400                                                    # unchanged: a repeated accept is still refused
+    s, done = as_agent(team, team.impl, "POST", url, {"status": "done", "result": "merged PR 7"})
+    assert s == 200 and "replayed" not in done
+    n = len(task_updates(team, tid))
+    s, retry = as_agent(team, team.impl, "POST", url, {"status": "done", "result": "merged PR 7"})
+    assert s == 200 and retry["replayed"] is True and len(task_updates(team, tid)) == n      # lost answer: no second event
+    s, other = as_agent(team, team.impl, "POST", url, {"status": "done", "result": "a different result"})
+    assert s == 400                                                    # a finished task's result cannot be rewritten
+    s, back = as_agent(team, team.impl, "POST", url, {"status": "failed"})
+    assert s == 400                                                    # and it cannot change outcome
+    s, stranger = as_agent(team, team.rev, "POST", url, {"status": "done", "result": "merged PR 7"})
+    assert s == 404                                                    # only the agent the task was given to
