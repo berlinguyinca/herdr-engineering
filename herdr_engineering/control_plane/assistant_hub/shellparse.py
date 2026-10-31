@@ -72,6 +72,8 @@ class _Spec:
     long_arg: frozenset[str] = frozenset()
     long_opt: frozenset[str] = frozenset()
     numeric: bool = False
+    reject: str = ""
+    reject_long: frozenset[str] = frozenset()
     bare_dash: bool = False
 
 
@@ -81,7 +83,8 @@ def _fs(*names: str) -> frozenset[str]:
 
 _SPECS: dict[str, _Spec] = {
     "env": _Spec(flags="i0v", argflags="uCa", long_noarg=_fs("ignore-environment", "null", "debug"),
-                 long_arg=_fs("unset", "chdir", "argv0"), bare_dash=True),
+                 long_arg=_fs("unset", "chdir", "argv0"), bare_dash=True,
+                 reject="C", reject_long=_fs("chdir")),
     "command": _Spec(flags="p"),
     "exec": _Spec(flags="cl", argflags="a"),
     "builtin": _Spec(),
@@ -97,7 +100,7 @@ _SPECS: dict[str, _Spec] = {
                                  "preserve-env-all"),
                   long_arg=_fs("user", "group", "close-from", "chdir", "prompt", "role", "type",
                                "command-timeout", "other-user", "chroot"),
-                  long_opt=_fs("preserve-env")),
+                  long_opt=_fs("preserve-env"), reject="DR", reject_long=_fs("chdir", "chroot")),
     "xargs": _Spec(flags="0rtpxo", argflags="nLIPdsEa", optattached="lie",
                    long_noarg=_fs("null", "no-run-if-empty", "verbose", "interactive", "exit", "open-tty"),
                    long_arg=_fs("max-args", "max-lines", "max-procs", "delimiter", "max-chars", "arg-file",
@@ -535,6 +538,8 @@ def _skip_options(args: list[str], spec: _Spec) -> int:
             i += 1
         elif a.startswith("--"):
             name, eq, _ = a[2:].partition("=")
+            if name in spec.reject_long:
+                raise Unparseable(f"option {a} changes the working directory or root")
             if name in spec.long_noarg and not eq:
                 i += 1
             elif name in spec.long_arg:
@@ -559,6 +564,8 @@ def _skip_options(args: list[str], spec: _Spec) -> int:
 def _cluster_args(cluster: str, spec: _Spec, original: str) -> int:
     """Validate a short-option cluster; return 1 if it consumes the next word as its argument."""
     for j, ch in enumerate(cluster):
+        if ch in spec.reject:
+            raise Unparseable(f"option {original} changes the working directory or root")
         if ch in spec.flags:
             continue
         if ch in spec.optattached:
@@ -567,6 +574,19 @@ def _cluster_args(cluster: str, spec: _Spec, original: str) -> int:
             return 0 if j + 1 < len(cluster) else 1
         raise Unparseable(f"unknown option {original}")
     return 0
+
+
+def _sudo_user(args: list[str]) -> str | None:
+    """Target user of ``sudo -u``/``--user`` among already validated option words."""
+    for i, a in enumerate(args):
+        if a.startswith("--"):
+            name, eq, value = a[2:].partition("=")
+            if name == "user":
+                return value if eq else args[i + 1]
+        elif a.startswith("-") and "u" in a[1:]:
+            tail = a[1:].partition("u")[2]
+            return tail or args[i + 1]
+    return None
 
 
 def _std_name(head: str) -> str | None:
@@ -674,6 +694,9 @@ def _unwrap(
         if name == "sudo" and not sudo:
             sudo = True
             env.append(SUDO_MARKER)
+            user = _sudo_user(rest[:idx])
+            if user is not None:
+                env.append(("__sudo_user__", user))
         if name == "xargs":
             xargs = True
         argv = rest[idx:]

@@ -35,7 +35,7 @@ def test_env_assignment_and_wrappers_are_stripped():
 
 def test_sudo_marks_env_and_skips_option_arguments():
     cmds = parse("sudo -u bob -n -- command exec builtin git push")
-    assert cmds == [SimpleCommand(("git", "push"), (("__sudo__", "1"),), False)]
+    assert cmds == [SimpleCommand(("git", "push"), (("__sudo__", "1"), ("__sudo_user__", "bob")), False)]
     assert argvs("sudo -nu bob rm x") == [("rm", "x")]
     assert argvs("/usr/bin/sudo --user=bob rm x") == [("rm", "x")]
 
@@ -435,3 +435,37 @@ def test_tilde_in_assignment_value_is_dynamic():
 def test_empty_results_are_possible():
     assert parse("x=1") == []
     assert parse("()") == []
+
+
+# ---- fix round 3 ----
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env -C / rm -rf tmp",
+        "env -C/ rm -rf tmp",
+        "env -iC / rm tmp",
+        "env --chdir=/ rm tmp",
+        "env --chdir / rm tmp",
+        "sudo -D / rm tmp",
+        "sudo -nD / rm tmp",
+        "sudo -D/ rm tmp",
+        "sudo --chdir=/ rm tmp",
+        "sudo --chdir / rm tmp",
+        "sudo -R /r rm tmp",
+        "sudo --chroot=/r rm tmp",
+    ],
+)
+def test_fix3_chdir_options_raise(command):
+    with pytest.raises(Unparseable):
+        parse(command)
+
+
+@pytest.mark.parametrize(
+    ("command", "user"),
+    [("sudo -u bob rm x", "bob"), ("sudo -ubob rm x", "bob"), ("sudo -nu bob rm x", "bob"),
+     ("sudo --user=bob rm x", "bob"), ("sudo --user bob rm x", "bob")],
+)
+def test_fix3_sudo_user_is_recorded(command, user):
+    assert parse(command)[0].env == (("__sudo__", "1"), ("__sudo_user__", user))
+
