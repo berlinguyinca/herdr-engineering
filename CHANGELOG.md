@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Crash takeover: the lease fence is no longer optional after a requeue
+- Once a lease has requeued a task (`attempt` above 1), `PATCH` task updates that omit `attempt` are refused with 409 `stale attempt`, the same as an old `attempt`; before, only a request that sent a wrong `attempt` was fenced, so an old run that never sent one could still accept or finish the requeued task. Tasks never requeued, and every deployment with `control_plane.collab.task_lease_seconds` unset, behave exactly as before. The MCP `task_update` tool takes an optional integer `attempt`, and `worker.sh` (and the copies the dashboard and host runner hand out) now sends the `attempt` that `tasks_inbox` gave it, so those runners keep working after a requeue. A custom runner has to echo `attempt` from `tasks_inbox`. Threat model R-TL1 is resolved; R-TL2 (no heartbeat) stays open.
+
 ### Unified workspace P09 (docs only): threat model and rollout plan
 - `docs/specs/herdr-unified-workspace-20261028/security/THREAT_MODEL.md` now has an implementation threat model of what is on main: work graph routes, artifact registry and ACL, room-derived read access, share links (lab and public), crash-takeover leases, the collab public listener and the control-plane deploy, each with mitigations, residual risks and a severity, plus a turn-on, watch and turn-off table per flag and an accessibility checklist for screens not yet built. It was written by reading the code; nothing was run or verified. No code, schema or config changed. P09 is marked partial in `evidence/STATUS.md`; `evidence/P09-RESULT.md` lists what is not done and the code risks found.
 

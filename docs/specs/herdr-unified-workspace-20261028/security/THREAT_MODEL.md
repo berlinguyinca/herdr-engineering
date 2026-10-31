@@ -158,10 +158,10 @@ inbox. Replay uses event timestamps, so a restart does not extend a lease (`coll
 absent = off.
 
 Residual risks:
-- **R-TL1 (Medium).** The fence is opt-in: the 409 fires only `if "attempt" in body`. An old run that omits `attempt` is not
-  fenced; after a requeue (`pending`) it may still accept (a second concurrent execution) or mark `failed`. It is the same agent
-  identity, so this is duplicate work or a lost result, not privilege escalation. Fix idea: require `attempt` once a task has
-  been requeued.
+- **R-TL1 (Resolved 2026-10-30).** `update_task` now returns 409 `stale attempt` for a run that omits `attempt` once the task
+  has been requeued (`attempt` > 1), the same as a wrong `attempt`. A task never requeued (lease off, or not yet expired) still
+  accepts updates without `attempt`. The MCP `task_update` tool takes `attempt` and `worker.sh` sends the attempt `tasks_inbox`
+  gave it; a custom runner that ignores `attempt` is refused after a requeue (it must echo `attempt` from `tasks_inbox`).
 - **R-TL2 (Medium).** The lease is a hard deadline from accept with no heartbeat (`evidence/P05-RESULT.md` says so): a long
   legitimate task is requeued and run twice once the lease is shorter than the task.
 - **R-TL3 (Low).** Requeue happens only on inbox poll; a task whose agent never polls again stays `accepted`.
@@ -205,7 +205,7 @@ Residual risks:
 | R-RA4 / R-WG1 | Medium | Member graph door and room artifact access cannot run in the compose.collab topology |
 | R-ART1 | Medium | Legacy artifacts without owner, or without an ACL, are broadly readable |
 | R-ART2 | Medium | ACL is an in-memory index; write-through drift shows at restart |
-| R-TL1 / R-TL2 | Medium | Lease fence is opt-in; no heartbeat means duplicate execution of long tasks |
+| R-TL2 | Medium | No lease heartbeat: a long task is requeued and can run twice (R-TL1, the opt-in fence, is resolved) |
 | R-DP1 | Medium | Image rollback does not roll back the schema |
 | R-SH4, R-RA2, R-CL1, R-DP2 | Low-Medium | See sections |
 | R-WG2-4, R-SH5-7, R-ART3, R-RA3, R-TL3, R-CL2 | Low | See sections |

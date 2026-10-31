@@ -104,7 +104,9 @@ TOOLS = [
      "description": "Report on a task: status accepted, then done or failed, with a short plain-text result for the room.",
      "inputSchema": {"type": "object", "required": ["task_id", "status"], "additionalProperties": False,
                      "properties": {"task_id": _STR, "status": {"enum": ["accepted", "done", "failed"]},
-                                    "result": {"type": "string", "maxLength": MAX_TASK_TEXT}}}},
+                                    "result": {"type": "string", "maxLength": MAX_TASK_TEXT},
+                                    "attempt": {"type": "integer", "minimum": 1,
+                                                "description": "The attempt number tasks_inbox gave you. Required once a task was requeued after a lease expiry."}}}},
     {"name": "task_create",
      "description": "Delegate part of a task you accepted to another agent in the room (needs the room owner's 'instruct' approval; the target must have 'execute'; parent_task_id, the task you accepted, is required).",
      "inputSchema": {"type": "object", "required": ["room_id", "target_agent_id", "text", "parent_task_id"], "additionalProperties": False,
@@ -299,10 +301,11 @@ def _call(service: CollabService, pr, name: str, args: dict) -> dict:
             raise CollabError(400, "invalid arguments")
         return _inbox(service, pr, float(secs))
     if name == "task_update":
-        extra = set(args) - {"task_id", "status", "result"}
-        if extra or not isinstance(args.get("task_id"), str):
+        extra = set(args) - {"task_id", "status", "result", "attempt"}
+        att = args.get("attempt", 1)
+        if extra or not isinstance(args.get("task_id"), str) or isinstance(att, bool) or not isinstance(att, int):
             raise CollabError(400, "invalid arguments")
-        body = {k: args[k] for k in ("status", "result") if k in args}
+        body = {k: args[k] for k in ("status", "result", "attempt") if k in args}
         return _text(service.update_task(pr, args["task_id"], body))
     room = args.get("room_id")
     if not isinstance(room, str):
