@@ -159,6 +159,18 @@ sections:
       # are redacted from prompts, logs and events. Copy only what you need.
       # personal_assistant:
       #   enabled: false                 # master kill-switch (also gates the capability flag)
+      #   # OPTIONAL: tailnet-only MCP hub for coding agents (Claude Code). Off by default; records asks, reports and
+      #   # hook observations only (answers nothing, approves nothing). Bind loopback or the tailnet address, NEVER
+      #   # 0.0.0.0 and never behind the nginx edge. See docs/operations/assistant-hub.md.
+      #   hub:
+      #     enabled: false
+      #     host: "127.0.0.1"            # bind address; use your tailnet address (100.x) to serve other machines
+      #     port: 9483
+      #     allowed_networks: ["127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+      #     allowed_hosts: []            # extra accepted Host names, e.g. ["assistant.tailnet-name.ts.net"]
+      #     enrollment_ttl_seconds: 900  # one-time enrollment code lifetime
+      #     worker_ttl_days: 90          # redeemed worker credential lifetime
+      #     # tenant: default            # defaults to the assistant's default tenant
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)

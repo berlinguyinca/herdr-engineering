@@ -717,6 +717,23 @@ def test_durable_store_survives_restart(tmp_path):
     assert len(store2.runs) == 1  # the run survived
 
 
+def test_persisted_snapshot_is_owner_only_even_over_a_loose_existing_file(tmp_path):
+    path = tmp_path / "pa.json"
+    path.write_text("{}")
+    path.chmod(0o644)
+    store = AssistantStore(persist_path=str(path))
+    store.persist()
+    assert (path.stat().st_mode & 0o777) == 0o600
+    fresh = tmp_path / "fresh.json"
+    old_umask = os.umask(0o000)
+    try:
+        AssistantStore(persist_path=str(fresh)).persist()
+    finally:
+        os.umask(old_umask)
+    assert (fresh.stat().st_mode & 0o777) == 0o600
+    assert not (tmp_path / "fresh.json.tmp").exists()
+
+
 def test_durable_snapshot_roundtrip(tmp_path):
     path = tmp_path / "pa.json"
     store = AssistantStore(persist_path=str(path))

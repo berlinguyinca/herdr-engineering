@@ -302,7 +302,8 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None):
+                 share_store=None, shares_root=None, share_settings=None,
+                 assistant_workers=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -479,6 +480,9 @@ class ControlPlaneServer:
                 config=_build_assistant_config(assistant_config or {}), repo=repo)
         else:
             self.assistant = assistant_service
+        # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
+        # The owner routes /api/v1/assistant-workers read it at request time, so it may be attached after startup.
+        self.assistant_workers = assistant_workers
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
         from .rakazo_artifacts import RegistryBackend
@@ -2344,7 +2348,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps"}
+            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
                     or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
@@ -2450,7 +2454,7 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-routines", "assistant-connectors",
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
-                                        "assistant-reminders"}
+                                        "assistant-reminders", "assistant-workers"}
 
         def _mutate_verb(self):
             if operator:
@@ -2480,7 +2484,7 @@ def _make_handler(server, public=False, operator=False):
             err = self._require("operator")
             if err:
                 return err
-            if resource in ("assistant-apps", "assistant-reminders"):
+            if resource in ("assistant-apps", "assistant-reminders", "assistant-workers"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3724,6 +3728,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_apps(parts, None)
             if resource == "assistant-reminders":
                 return self._assistant_reminders(parts)
+            if resource == "assistant-workers":
+                return self._assistant_workers(parts)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -4188,6 +4194,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_apps(parts, body)
             if resource == "assistant-reminders":
                 return self._assistant_reminders(parts)
+            if resource == "assistant-workers":
+                return self._assistant_workers(parts, body)     # body was read above; never read it twice
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4368,6 +4376,91 @@ def _make_handler(server, public=False, operator=False):
                 status = {"not_connected": 409, "needs_attention": 409, "reconnect_needed": 409, "not_set_up": 409, "bad_request": 400,
                           "not_found": 404, "rate_limited": 429}.get(exc.reason, 502)
                 return self._json({"error": exc.reason if exc.reason in {"not_connected", "needs_attention", "reconnect_needed", "not_set_up", "bad_request", "not_found", "rate_limited"} else "unavailable"}, status)
+
+        _SETUP_SUPPORTED = frozenset({"claude"})        # harnesses with a connection snippet in Phase 1
+
+        @staticmethod
+        def _worker_hub_host(hub):
+            """(host, is_placeholder): a host a worker's device can reach, safe to paste into a shell. Every candidate is
+            normalised like the hub's Host check (port stripped, junk skipped); wildcard/loopback results are unusable,
+            so the first usable ``allowed_hosts`` entry is used, else the literal <HUB_HOST>. IPv6 is bracketed."""
+            import ipaddress
+            import re
+
+            from .assistant_hub.netguard import normalize_host_entry
+
+            def usable(entry):
+                host = normalize_host_entry(entry) if isinstance(entry, str) else None
+                if not host:
+                    return None
+                try:
+                    ip = ipaddress.ip_address(host)
+                except ValueError:
+                    if host == "localhost" or not re.fullmatch(r"[a-z0-9.-]+", host):
+                        return None
+                    return host
+                if ip.is_unspecified or ip.is_loopback:
+                    return None
+                return f"[{ip}]" if ip.version == 6 else str(ip)
+
+            for candidate in [hub.get("host"), *(hub.get("allowed_hosts") or [])]:
+                found = usable(candidate)
+                if found:
+                    return found, False
+            return "<HUB_HOST>", True
+
+        def _worker_setup(self, harness):
+            """The harness-specific connection snippet. Placeholders stay literal; the one-time code is never in it."""
+            if harness not in self._SETUP_SUPPORTED:
+                return {"supported": False, "harness": harness}
+            hub = server.assistant.config.get("hub") or {}
+            host, placeholder = self._worker_hub_host(hub)
+            url = f"http://{host}:{hub.get('port')}/assistant/mcp"
+            return {"supported": True, "harness": "claude", "host_is_placeholder": placeholder,
+                    "redeem": {"method": "POST", "path": "/assistant/enroll",
+                               "body": {"code": "<CODE>", "device_id": "<DEVICE>"}},
+                    "mcp_add": f'claude mcp add --transport http herdr-assistant {url} '
+                               '--header "Authorization: Worker <CREDENTIAL>" --header "X-Herdr-Device: <DEVICE>"'}
+
+        def _assistant_workers(self, parts, body=None):
+            """Owner-only enrollment of hub workers: POST creates a one-time code, GET lists, DELETE/<id> revokes.
+            Operator API key only (a Worker credential is not one); the registry is the hub's own instance."""
+            from .assistant import AssistantNotFound, AssistantUnavailable
+            if self._require("operator"):
+                return None
+            try:
+                registry = server.assistant_workers
+                server.assistant._require_enabled()
+                if registry is None:
+                    raise AssistantUnavailable("the assistant hub is not enabled")
+                tenant_id, user_id = self._assistant_scope()
+                if len(parts) == 4 and self.command == "GET":
+                    return self._json({"workers": [w.as_dict() for w in
+                                                   registry.list_workers(tenant_id=tenant_id, user_id=user_id)]})
+                if len(parts) == 4 and self.command == "POST":
+                    body = body or {}
+                    if not isinstance(body, dict):
+                        return self._json({"error": "body must be a JSON object"}, 400)
+                    name, harness = body.get("name"), body.get("harness")
+                    if not isinstance(name, str) or not isinstance(harness, str):
+                        return self._json({"error": "name and harness are required strings"}, 400)
+                    from .assistant_dispatch import HARNESSES
+                    if harness not in HARNESSES:
+                        return self._json({"error": f"unknown harness: {harness!r}"}, 400)
+                    enrollment, code = registry.create_enrollment(tenant_id=tenant_id, user_id=user_id,
+                                                                  name=name, harness=harness)
+                    return self._json({"enrollment_id": enrollment.enrollment_id, "code": code,
+                                       "expires_at": enrollment.expires_at.isoformat(),
+                                       "setup": self._worker_setup(harness)}, 201)
+                if len(parts) == 5 and self.command == "DELETE":
+                    return self._json(registry.revoke(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited

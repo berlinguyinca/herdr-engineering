@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -42,6 +43,8 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .assistant_hub.events import WorkerEvent, event_size
+from .assistant_hub.workers import Enrollment, Worker
 from .inference_models import RETRY_CODES, ModelResolver
 from .reminders import REMINDER_TOOLS, ReminderError
 from .reminders import run_tool as run_reminder_tool
@@ -245,6 +248,61 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "inbox_watch": inbox_watch_config(section.get("inbox_watch")),
         # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
         "apps": apps_config(section.get("apps")),
+        # Tailnet-only MCP hub: off unless enabled; the tenant defaults to the section's default tenant.
+        "hub": _hub_config(section.get("hub"), default_tenant),
+    }
+
+
+_HUB_KEYS = {"enabled", "host", "port", "allowed_networks", "allowed_hosts", "enrollment_ttl_seconds",
+             "worker_ttl_days", "tenant"}
+_HUB_DEFAULT_NETWORKS = ["127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+
+
+def _hub_str_list(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ValueError(f"{where} must be a list of non-empty strings")
+    return [v.strip() for v in value]
+
+
+def _hub_pos_int(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{where} must be a positive integer")
+    return value
+
+
+def _hub_config(raw: Any, default_tenant: str) -> dict[str, Any]:
+    """``personal_assistant.hub``. Off by default. Unknown keys or malformed values stop startup."""
+    where = "control_plane.personal_assistant.hub"
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - _HUB_KEYS
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{where}.enabled must be true or false (not a string)")
+    host = raw.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError(f"{where}.host must be a non-empty string")
+    port = raw.get("port", 9483)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(f"{where}.port must be an integer between 1 and 65535")
+    networks = _hub_str_list(raw.get("allowed_networks", list(_HUB_DEFAULT_NETWORKS)), f"{where}.allowed_networks")
+    for net in networks:
+        try:
+            ipaddress.ip_network(net, strict=True)
+        except ValueError as exc:
+            raise ValueError(f"{where}.allowed_networks has an invalid CIDR {net!r}: {exc}") from exc
+    return {
+        "enabled": enabled,
+        "host": host.strip(),
+        "port": port,
+        "allowed_networks": networks,
+        "allowed_hosts": _hub_str_list(raw.get("allowed_hosts", []), f"{where}.allowed_hosts"),
+        "enrollment_ttl_seconds": _hub_pos_int(raw.get("enrollment_ttl_seconds", 900), f"{where}.enrollment_ttl_seconds"),
+        "worker_ttl_days": _hub_pos_int(raw.get("worker_ttl_days", 90), f"{where}.worker_ttl_days"),
+        "tenant": _tenant_id(raw.get("tenant", default_tenant), "hub.tenant"),
     }
 
 
@@ -1627,6 +1685,13 @@ class AssistantStore:
         self.delegations: dict[str, DelegationRequest] = {}
         self.proposals: dict[str, AssistantProposal] = {}
         self.notifications: dict[str, AssistantNotification] = {}
+        self.workers: dict[str, Worker] = {}
+        self.enrollments: dict[str, Enrollment] = {}
+        self.worker_events: dict[str, WorkerEvent] = {}   # insertion order == oldest first
+        self.max_events_per_tenant = 1000
+        self.max_event_bytes_per_tenant = 4 * 1024 * 1024
+        self._event_index: dict[str, dict[str, int]] = {}   # tenant -> {event_id: size}, oldest first
+        self._event_bytes: dict[str, int] = {}
         self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
         self._audit: list[dict[str, Any]] = []
         # (entry) -> None. Wired by the control plane to the repo event store so every entry is durable BEFORE it is
@@ -1685,6 +1750,9 @@ class AssistantStore:
                 "delegations": [self._e_to_dict(d) for d in self.delegations.values()],
                 "proposals": [self._e_to_dict(x) for x in self.proposals.values()],
                 "notifications": [self._e_to_dict(x) for x in self.notifications.values()],
+                "workers": [self._e_to_dict(x) for x in self.workers.values()],
+                "enrollments": [self._e_to_dict(x) for x in self.enrollments.values()],
+                "worker_events": [self._e_to_dict(x) for x in self.worker_events.values()],
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
             }
@@ -1718,6 +1786,15 @@ class AssistantStore:
             self.notifications = {x.notification_id: x for x in
                                   (self._e_from_dict(AssistantNotification, d)
                                    for d in snap.get("notifications", []))}
+            self.workers = {x.worker_id: x for x in
+                            (self._e_from_dict(Worker, d) for d in snap.get("workers", []))}
+            self.enrollments = {x.enrollment_id: x for x in
+                                (self._e_from_dict(Enrollment, d) for d in snap.get("enrollments", []))}
+            self.worker_events = {x.event_id: x for x in
+                                  (self._e_from_dict(WorkerEvent, d) for d in snap.get("worker_events", []))}
+            self._event_index, self._event_bytes = {}, {}
+            for x in self.worker_events.values():
+                self._index_event(x)
             self._routine_fired = set(snap.get("routine_fired", []))
             kept = {e.get("event_id") for e in snap.get("audit", [])}
             merged = [dict(e) for e in snap.get("audit", [])]
@@ -1725,14 +1802,42 @@ class AssistantStore:
             merged.sort(key=lambda e: (str(e.get("timestamp", "")), str(e.get("tenant_id", "")), int(e.get("seq", 0))))
             self._audit = merged
 
+    def _index_event(self, event: WorkerEvent) -> None:
+        size = event_size(event.payload)
+        self._event_index.setdefault(event.tenant_id, {})[event.event_id] = size
+        self._event_bytes[event.tenant_id] = self._event_bytes.get(event.tenant_id, 0) + size
+
+    def add_worker_event(self, event: WorkerEvent) -> None:
+        """Insert, then drop the tenant's oldest events until both the count and byte budgets hold."""
+        with self._lock:
+            self.worker_events[event.event_id] = event
+            self._index_event(event)
+            idx = self._event_index[event.tenant_id]
+            while len(idx) > 1 and (len(idx) > self.max_events_per_tenant
+                                    or self._event_bytes[event.tenant_id] > self.max_event_bytes_per_tenant):
+                old = next(iter(idx))
+                self._event_bytes[event.tenant_id] -= idx.pop(old)
+                del self.worker_events[old]
+            self._after_mutation()
+
     def persist(self) -> None:
         if not self._persist_path:
             return
         path = self._persist_path
         tmp = path + ".tmp"
         data = self.snapshot()
-        with open(tmp, "w") as f:
-            json.dump(data, f)
+        # The snapshot holds the owner's private data: create the temp file 0600 (a stale tmp is chmodded too).
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
         os.replace(tmp, path)
 
     def load_persisted(self) -> None:
@@ -2211,6 +2316,9 @@ class AssistantService:
         return user_id in allowed or "*" in allowed
 
     # -- feature flag gate -----------------------------------------------------
+    def is_enabled(self) -> bool:
+        return bool(self.config.get("enabled"))
+
     def _require_enabled(self) -> None:
         if not self.config.get("enabled"):
             raise AssistantUnavailable("personal assistant is disabled")
