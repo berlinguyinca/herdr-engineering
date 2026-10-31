@@ -2113,6 +2113,20 @@ def _make_handler(server, public=False, operator=False):
             from . import collab_mcp
             return self._jsonrpc(collab_mcp.handle, "MCP")
 
+        def handle_expect_100(self):
+            """``Expect: 100-continue`` on POST /mcp is answered only after the large-body gate has decided (see
+            ``_continue_100``); inviting the body first would defeat the pre-authentication gate."""
+            if self.command == "POST" and self.path.split("?")[0] == "/mcp":
+                self._expect_100_pending = True
+                return True
+            return super().handle_expect_100()
+
+        def _continue_100(self):
+            if getattr(self, "_expect_100_pending", False):
+                self._expect_100_pending = False
+                self.send_response_only(100)
+                self.end_headers()
+
         def _jsonrpc(self, handle, label):
             from .collab import MAX_BODY
             if server.collab is None:
@@ -2152,6 +2166,7 @@ def _make_handler(server, public=False, operator=False):
                     big_tools = frozenset()
                 if not big_tools:
                     return self._deny(413, "request body size not allowed")
+            self._continue_100()
             try:
                 message = json.loads(self.rfile.read(length))
             except (ValueError, RecursionError):

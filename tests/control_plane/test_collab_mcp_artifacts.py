@@ -401,3 +401,100 @@ def test_mcp_has_its_own_1800_per_minute_ceiling_and_other_routes_keep_600(edge)
         codes.append(r.status)
     assert 429 not in codes[:600] and codes[600] == 429
     c.close()
+
+
+# ------------------------------------------------------------------------------ Task 8b follow-up
+def test_a_big_batch_array_cannot_smuggle_an_admitted_tool(edge, world):
+    batch = [stage_chunk_message(1), padded("artifact_commit", 20 * KIB, rid=2)]
+    status, _, body = post_msg(edge, world.a_info, batch)
+    assert status == 200 and json.loads(body)["error"]["code"] == -32602
+    assert json.loads(body)["error"]["message"] == "request too large for this tool"
+
+
+@pytest.mark.parametrize("make", [lambda: "a" * (700 * KIB), lambda: 10 ** 3000, lambda: None,
+                                  lambda: [1] * 200000, lambda: True])
+def test_a_big_non_object_body_is_32602_not_a_500(edge, world, make):
+    raw = json.dumps(make()).encode()
+    raw = raw if len(raw) > 65536 + 10 else raw + b" " * (70000 - len(raw))
+    status, _, body = raw_post(edge, world.a_info, len(raw), raw)
+    assert status == 200 and json.loads(body)["error"]["code"] == -32602
+
+
+@pytest.mark.parametrize("bad_name", [123, ["artifact_stage_chunk"], {"a": 1}, None])
+def test_a_big_call_with_a_non_string_tool_name_is_32602(edge, world, bad_name):
+    msg = padded("artifact_stage_chunk", 100 * KIB)
+    msg["params"]["name"] = bad_name
+    status, _, body = post_msg(edge, world.a_info, msg)
+    assert status == 200 and json.loads(body)["error"]["code"] == -32602
+
+
+def test_reset_keeps_baseline_entries_registered_at_import_time(edge, world):
+    collab_mcp.register_large_body_admission(lambda s, pr: True, frozenset({"p5_chunk"}), baseline=True)
+    try:
+        collab_mcp.register_large_body_admission(lambda s, pr: True, frozenset({"x_chunk"}))
+        collab_mcp.reset_large_body_admissions()
+        assert collab_mcp.admitted_tools(world.s, world.b) == {"p5_chunk"}
+        assert collab_mcp.admitted_tools(world.s, world.a) == {"p5_chunk", "artifact_stage_chunk"}
+    finally:
+        with collab_mcp._ADMISSIONS_LOCK:
+            collab_mcp._BASELINE[:] = [e for e in collab_mcp._BASELINE if "p5_chunk" not in e[1]]
+        collab_mcp.reset_large_body_admissions()
+
+
+def test_expect_100_continue_gets_no_100_before_the_decision_for_a_refused_caller(edge, world):
+    # an unauthenticated caller sends Expect: 100-continue with an oversize length: the FIRST response is the
+    # final 413 (never "100 Continue", which would invite the body), with Connection: close, body never read
+    head = ("POST /mcp HTTP/1.1\r\nHost: x\r\nX-Forwarded-Proto: https\r\nContent-Type: application/json\r\n"
+            f"Expect: 100-continue\r\nContent-Length: {700 * KIB}\r\n\r\n").encode()
+    s = socket.create_connection(("127.0.0.1", edge.public_port), timeout=3)
+    try:
+        s.sendall(head)
+        first = s.recv(4096)
+        assert first.startswith(b"HTTP/1.1 413") and b"100 Continue" not in first
+        assert b"Connection: close" in first
+    finally:
+        s.close()
+
+
+def test_expect_100_continue_is_sent_only_after_admission(edge, world):
+    body = json.dumps(stage_chunk_message()).encode()
+    head = ("POST /mcp HTTP/1.1\r\nHost: x\r\nX-Forwarded-Proto: https\r\nContent-Type: application/json\r\n"
+            f"Authorization: Agent {world.a_info['credential']}\r\nX-Herdr-Device: {world.a_info['device_id']}\r\n"
+            f"Expect: 100-continue\r\nContent-Length: {len(body)}\r\n\r\n").encode()
+    s = socket.create_connection(("127.0.0.1", edge.public_port), timeout=5)
+    try:
+        s.sendall(head)
+        assert s.recv(4096).startswith(b"HTTP/1.1 100 Continue")
+        s.sendall(body)
+        buf = b""
+        while b'"result"' not in buf:
+            part = s.recv(65536)
+            assert part
+            buf += part
+        assert b"HTTP/1.1 200" in buf
+    finally:
+        s.close()
+
+
+def test_after_a_413_with_a_real_oversize_body_the_connection_is_closed(edge, world):
+    # the body IS sent; its bytes end with a complete second request. The server must not parse it.
+    smuggled = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+    body = b"a" * (700 * KIB - len(smuggled)) + smuggled
+    head = ("POST /mcp HTTP/1.1\r\nHost: x\r\nX-Forwarded-Proto: https\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n").encode()
+    s = socket.create_connection(("127.0.0.1", edge.public_port), timeout=5)
+    try:
+        s.sendall(head + body)
+        data = b""
+        while True:
+            try:
+                part = s.recv(65536)
+            except (ConnectionResetError, TimeoutError):
+                break
+            if not part:
+                break
+            data += part
+        assert data.startswith(b"HTTP/1.1 413") and data.count(b"HTTP/1.1 ") == 1       # exactly one response
+        assert b"Connection: close" in data
+    finally:
+        s.close()

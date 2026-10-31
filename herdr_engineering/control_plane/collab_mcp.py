@@ -462,9 +462,18 @@ _ADMISSIONS: list[Admission] = []
 _ADMISSIONS_LOCK = threading.Lock()
 
 
-def register_large_body_admission(predicate: Callable[[CollabService, Any], bool], tools: frozenset[str]) -> None:
+_BASELINE: list[Admission] = []
+
+
+def register_large_body_admission(predicate: Callable[[CollabService, Any], bool], tools: frozenset[str],
+                                  baseline: bool = False) -> None:
+    """Add an admission. Registrations made at import time (the built-in one, plan 5's) pass ``baseline=True`` so
+    ``reset_large_body_admissions`` keeps them; anything else (tests) is dropped by a reset."""
+    entry = (predicate, frozenset(tools))
     with _ADMISSIONS_LOCK:
-        _ADMISSIONS.append((predicate, frozenset(tools)))
+        if baseline:
+            _BASELINE.append(entry)
+        _ADMISSIONS.append(entry)
 
 
 def _write_grant_holder(service: CollabService, pr: Any) -> bool:
@@ -473,12 +482,12 @@ def _write_grant_holder(service: CollabService, pr: Any) -> bool:
 
 
 def reset_large_body_admissions() -> None:
-    """Back to the built-in registry (tests register extra entries and must restore it)."""
+    """Back to the baseline registry (tests register extra entries and must restore it)."""
     with _ADMISSIONS_LOCK:
-        _ADMISSIONS[:] = [(_write_grant_holder, frozenset({"artifact_stage_chunk"}))]
+        _ADMISSIONS[:] = _BASELINE
 
 
-reset_large_body_admissions()
+register_large_body_admission(_write_grant_holder, frozenset({"artifact_stage_chunk"}), baseline=True)
 
 
 def admitted_tools(service: CollabService, pr: Any) -> frozenset[str]:
@@ -496,13 +505,15 @@ def admitted_tools(service: CollabService, pr: Any) -> frozenset[str]:
 
 
 def oversize_refusal(message: Any, tools: frozenset[str]):
-    """After parsing a body above MAX_BODY: None when it is a call of an admitted tool, else the -32602 reply."""
-    params = message.get("params") if isinstance(message, dict) else None
+    """After parsing a body above MAX_BODY: None only for ONE tools/call object naming an admitted tool, else the
+    -32602 reply. Anything that is not a JSON object (a batch array, a string, a number) is refused whole."""
+    refusal = (200, _error(message.get("id") if isinstance(message, dict) else None,
+                           -32602, "request too large for this tool"))
+    if not isinstance(message, dict) or message.get("method") != "tools/call":
+        return refusal
+    params = message.get("params")
     name = params.get("name") if isinstance(params, dict) else None
-    if message.get("method") == "tools/call" and isinstance(name, str) and name in tools:
-        return None
-    rid = message.get("id") if isinstance(message, dict) else None
-    return 200, _error(rid, -32602, "request too large for this tool")
+    return None if isinstance(name, str) and name in tools else refusal
 
 
 def handle(service: CollabService, message: Any, authorization: str, device: str | None, principal: Any = None):
