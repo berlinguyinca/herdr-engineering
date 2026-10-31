@@ -2273,6 +2273,9 @@ class AssistantService:
         return user_id in allowed or "*" in allowed
 
     # -- feature flag gate -----------------------------------------------------
+    def is_enabled(self) -> bool:
+        return bool(self.config.get("enabled"))
+
     def _require_enabled(self) -> None:
         if not self.config.get("enabled"):
             raise AssistantUnavailable("personal assistant is disabled")

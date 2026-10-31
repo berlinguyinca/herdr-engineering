@@ -33,6 +33,7 @@ UNTRUSTED = (
 )
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
+MAX_OUTPUT_BYTES = 64 * 1024
 REPORT_KINDS = ("decision", "correction", "rule_stated", "outcome")
 _STR = {"type": "string"}
 _LIMIT = {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT}
@@ -68,7 +69,7 @@ _TOOLS: dict[str, tuple[str, str, dict]] = {
                        "payload": {"type": "object"}, "session_id": _STR}}),
     "memory_search": ("read", "Search the owner's assistant memory. Returns untrusted text.", {
         "type": "object", "required": ["query"], "additionalProperties": False,
-        "properties": {"query": {"type": "string", "maxLength": 500}, "limit": _LIMIT}}),
+        "properties": {"query": {"type": "string", "maxLength": 500}, "limit": _LIMIT, "assistant_id": _STR}}),
     "grants_list": ("read", "List the owner's tool grants.", _list_schema()),
     "approvals_list": ("read", "List the owner's approvals.", _list_schema(state=_STR)),
     "routines_list": ("read", "List the owner's routines.", _list_schema()),
@@ -162,19 +163,42 @@ def _report(hub: Hub, worker: Worker, args: dict) -> dict:
     return _text({"status": "recorded", "event_id": event.event_id})
 
 
+def _rows_result(key: str, rows: list[dict], limit: int) -> dict:
+    """Untrusted list result capped at MAX_OUTPUT_BYTES: rows are dropped from the end and ``truncated`` is set."""
+    rows = rows[:limit]
+    truncated = False
+    while rows and len(json.dumps({key: rows, "truncated": True}, ensure_ascii=False, default=str).encode()) \
+            > MAX_OUTPUT_BYTES:
+        rows.pop()
+        truncated = True
+    out: dict[str, Any] = {key: rows}
+    if truncated:
+        out["truncated"] = True
+    return _text(out, untrusted=True)
+
+
 def _memory_search(hub: Hub, worker: Worker, args: dict) -> dict:
-    _check_args(args, {"query", "limit"})
+    _check_args(args, {"query", "limit", "assistant_id"})
     query, limit = _req_str(args, "query"), _limit(args)
-    owned = hub.service.list_assistants(tenant_id=worker.tenant_id, user_id=worker.user_id)
-    target = next((a for a in owned if a.enabled), None)  # archive_assistant disables, so enabled == not archived
-    if target is None:
+    wanted = _opt_str(args, "assistant_id")
+    owned = sorted((a for a in hub.service.list_assistants(tenant_id=worker.tenant_id, user_id=worker.user_id)
+                    if a.enabled),  # archive_assistant disables, so enabled == not archived
+                   key=lambda a: (a.created_at, a.assistant_id))
+    if wanted is not None:
+        target = next((a for a in owned if a.assistant_id == wanted), None)
+        if target is None:
+            raise _ToolError("assistant not found")
+    elif owned:
+        target = owned[0]
+    else:
         raise _ToolError("no assistant")
     rows = hub.service.search_memory(tenant_id=worker.tenant_id, user_id=worker.user_id,
                                      assistant_id=target.assistant_id, query=query, limit=limit)
-    return _text({"memories": [m.as_dict() for m in rows[:limit]]}, untrusted=True)
+    return _rows_result("memories", [m.as_dict() for m in rows], limit)
 
 
-def _lister(key: str, method: str, filter_arg: str | None = None, *, on_store: bool = False) -> Callable[[Hub, Worker, dict], dict]:
+def _lister(key: str, method: str, filter_arg: str | None = None, *, on_store: bool = False)\
+        -> Callable[[Hub, Worker, dict], dict]:
     def run(hub: Hub, worker: Worker, args: dict) -> dict:
         _check_args(args, {"limit"} | ({filter_arg} if filter_arg else set()))
         limit = _limit(args)
@@ -182,8 +206,10 @@ def _lister(key: str, method: str, filter_arg: str | None = None, *, on_store: b
         if filter_arg and (value := _opt_str(args, filter_arg)) is not None:
             kwargs[filter_arg] = value
         source = hub.store if on_store else hub.service  # the service has no list_grants; the store call is owner-scoped
-        rows = getattr(source, method)(**kwargs)
-        return _text({key: [r.as_dict() for r in rows[:limit]]}, untrusted=True)
+        # list_approvals/list_proposals also return OTHER users' rows to a configured approver; keep only the owner's.
+        # (list_proposals additionally expires overdue proposals as a side effect.)
+        rows = [r for r in getattr(source, method)(**kwargs) if r.user_id == worker.user_id]
+        return _rows_result(key, [r.as_dict() for r in rows], limit)
     return run
 
 
@@ -207,6 +233,8 @@ def _call(hub: Hub, worker: Worker, name: str, args: dict) -> dict:
             raise _ToolError("unknown tool")
         if spec[0] not in worker.scopes:
             raise _ToolError("scope: this worker is not allowed to use that tool")
+        if not hub.service.is_enabled():
+            raise _ToolError("assistant is not enabled")
         return run(hub, worker, args)
     except _ToolError as exc:
         return _text({"error": str(exc)}, is_error=True)
