@@ -3,6 +3,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
 import { requestErrorDetail } from './dashboard-load-state.js';
+import { mountKeys, roveIndex, TABS } from './personal-assistant-keys.js';
 
 function statusClass(status) {
   return { ready: 'pa-status--ready', running: 'pa-status--running', disabled: 'pa-status--disabled',
@@ -87,7 +88,25 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     return { list: sel && !list.includes(sel) ? [sel, ...list] : list, active: active.length, hidden: state.assistants.length - active.length };
   };
 
+  // draw() rebuilds the whole view, which would drop keyboard focus; remember what had it and give it back.
+  const focusKey = () => {
+    const el = container.ownerDocument.activeElement;
+    if (!el || !container.contains(el)) return null;
+    for (const attr of ['data-tab', 'data-select', 'data-config', 'data-keys', 'data-showall', 'data-msg', 'data-new', 'data-newthread']) {
+      if (el.hasAttribute(attr)) return { attr, value: el.getAttribute(attr), draft: el.value };
+    }
+    return null;
+  };
+  const restoreFocus = (k) => {
+    if (!k) return;
+    const el = [...container.querySelectorAll(`[${k.attr}]`)].find(x => x.getAttribute(k.attr) === k.value);
+    if (!el) return;
+    if (k.attr === 'data-msg' && k.draft) el.value = k.draft;
+    el.focus();
+  };
+
   const draw = () => {
+    const keep = focusKey();
     const selected = state.assistants.find(a => a.assistant_id === state.selectedId);
     const { list, active, hidden } = offered();
     const more = Math.max(0, active - list.filter(isActive).length);
@@ -97,7 +116,8 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
           <select data-select aria-label="Assistant">${list.map(a => `<option value="${esc(a.assistant_id)}" ${a.assistant_id === state.selectedId ? 'selected' : ''}>${esc(a.name)} · ${esc(statusLabel(a.status))}</option>`).join('')}</select></label>
         ${more > 0 || showAll && active > 3 ? `<button class="hd-linkbtn" data-showall>${showAll ? 'Show recent only' : `Show all ${active}`}</button>` : ''}
         <span class="pa-grow"></span>
-        <button class="hd-btn hd-btn--ghost" data-config aria-expanded="${configOpen}">Configure</button>
+        <button class="hd-btn hd-btn--ghost" data-keys aria-haspopup="dialog" title="Keyboard shortcuts (?)">Keys <kbd>?</kbd></button>
+        <button class="hd-btn hd-btn--ghost" data-config aria-expanded="${configOpen}" title="Show or hide Configure (,)">Configure</button>
         <button class="hd-btn" data-new>+ New</button>
       </div>
       ${hidden ? `<p class="pa-muted pa-hidden-note">${hidden} inactive assistant${hidden === 1 ? '' : 's'} not listed.</p>` : ''}
@@ -106,16 +126,25 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       ${selected && configOpen ? `<section class="hd-card pa-config" aria-label="Configure ${esc(selected.name)}">
         <div class="pa-row"><div class="pa-status ${statusClass(selected.status)}"><span class="hd-status__dot"></span>${esc(statusLabel(selected.status))}</div>
           <span class="pa-muted">${esc(selected.assistant_id)}</span><span class="pa-badge">${selected.enabled ? 'enabled' : 'disabled'}</span></div>
-        <div class="pa-tabs">${['General', 'Permissions', 'Memory', 'Routines', 'Connectors', 'Delegations', 'Approvals', 'Proposals', 'Notifications', 'Diagnostics'].map(t =>
-          `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" data-tab="${t}">${t}</button>`).join('')}</div>
-        <div id="pa-panel">${renderPanel(selected)}</div></section>` : ''}`;
+        <div class="pa-tabs" role="tablist" aria-label="Configure ${esc(selected.name)}">${TABS.map(t =>
+          `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" role="tab" id="pa-tab-${t}" aria-selected="${state.tab === t}" aria-controls="pa-panel" tabindex="${state.tab === t ? 0 : -1}" data-tab="${t}">${t}</button>`).join('')}</div>
+        <div id="pa-panel" role="tabpanel" aria-labelledby="pa-tab-${state.tab}">${renderPanel(selected)}</div></section>` : ''}`;
     container.querySelector('[data-select]')?.addEventListener('change', e => { state.selectedId = e.target.value; draw(); });
     container.querySelector('[data-showall]')?.addEventListener('click', () => { showAll = !showAll; draw(); });
     container.querySelector('[data-config]')?.addEventListener('click', () => { configOpen = !configOpen; draw(); });
     if (selected) drawApprovalStrip(selected);
-    container.querySelectorAll('[data-tab]').forEach(el => el.addEventListener('click', () => {
-      state.tab = el.dataset.tab; draw();
-    }));
+    container.querySelectorAll('[data-tab]').forEach(el => {
+      el.addEventListener('click', () => { state.tab = el.dataset.tab; draw(); });
+      el.addEventListener('keydown', e => {                      // roving focus: arrows move and open, Home/End jump
+        const tabs = [...container.querySelectorAll('[data-tab]')];
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown') return;      // a horizontal tablist keeps Up/Down for scrolling
+        const next = roveIndex(e.key, tabs.indexOf(el), tabs.length);
+        if (next === null || e.ctrlKey || e.metaKey || e.altKey) return;
+        e.preventDefault(); state.tab = tabs[next].dataset.tab; draw();
+        container.querySelector(`[data-tab="${state.tab}"]`)?.focus();
+      });
+    });
+    container.querySelector('[data-keys]')?.addEventListener('click', () => keys.openHelp());
     container.querySelectorAll('[data-new]').forEach(el => el.addEventListener('click', async () => {
       const name = prompt('Assistant name', 'Personal Assistant');
       if (!name) return;
@@ -125,6 +154,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     const panel = container.querySelector('#pa-panel');
     if (panel) bindPanel(panel, selected);
     bindChat(container, selected);
+    restoreFocus(keep);
   };
 
   // Waiting approvals are the one thing a person must act on here, so they sit above the conversation rather than in a tab.
@@ -136,6 +166,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       const mine = pending.filter(ap => ap.assistant_id === a.assistant_id);
       const strip = container.querySelector('#pa-strip');
       if (!strip) return;
+      const had = strip.contains(container.ownerDocument.activeElement) ? container.ownerDocument.activeElement.dataset : null;
       strip.hidden = !mine.length;
       strip.innerHTML = mine.map(ap => `<div class="pa-row"><span><strong>Approval needed</strong> · ${esc(ap.policy_snapshot)}</span><span class="pa-grow"></span>
         <button class="hd-btn hd-btn--sm" data-strip-approve="${esc(ap.approval_id)}">Approve</button>
@@ -145,6 +176,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
         try { await client.decideApproval(id, b.dataset.stripApprove ? 'approved' : 'denied'); } catch { /* the strip refreshes below */ }
         drawApprovalStrip(a);
       }));
+      if (had) strip.querySelector(had.stripApprove ? `[data-strip-approve="${had.stripApprove}"]` : `[data-strip-deny="${had.stripDeny}"]`)?.focus();
     } catch { /* approvals unavailable: the Approvals tab reports it */ }
   };
 
@@ -722,7 +754,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       <div id="pa-threads">${skeleton('threads')}</div>
       <div id="pa-messages" class="pa-chat" style="min-height:180px;margin-top:10px"></div>
       <div class="pa-row" style="margin-top:10px">
-        <input style="flex:1" placeholder="Message…" data-msg>
+        <input style="flex:1" placeholder="Message…  (press / to focus)" aria-label="Message" data-msg>
         <button class="hd-btn" data-send>Send</button>
         <button class="hd-btn hd-btn--ghost" data-voice title="Voice input">🎤</button>
         <button class="hd-btn hd-btn--ghost" data-speak title="Speak reply">🔊</button>
@@ -743,6 +775,18 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     const threadsEl = container.querySelector('#pa-threads');
     const messagesEl = container.querySelector('#pa-messages');
     const statusEl = container.querySelector('#pa-runstatus');
+    input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click(); } });
+    sendBtn.addEventListener('click', async () => {
+      const content = input.value.trim();
+      if (!content) return;
+      if (!currentThread) { statusEl.textContent = 'Still loading the conversation; your message is kept.'; return; }
+      input.value = ''; statusEl.textContent = 'Running…';
+      try {
+        const { run } = await client.sendAssistantMessage(a.assistant_id, currentThread, content);
+        await loadMessages(client, a, currentThread, messagesEl);
+        statusEl.textContent = `Run ${run.run_id} · ${run.state}`;
+      } catch (error) { statusEl.textContent = 'Error: ' + error.message; }
+    });
     try {
       const { threads = [] } = await client.listAssistantThreads(a.assistant_id);
       if (!currentThread) currentThread = threads[0] ? threads[0].thread_id : null;
@@ -753,19 +797,13 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       }
       threadsEl.innerHTML = `<div class="pa-row">${threads.map(t =>
         `<button class="hd-btn hd-btn--sm ${t.thread_id === currentThread ? 'pa-tab--active' : ''}" data-t="${esc(t.thread_id)}">${esc(t.title)}</button>`).join('')}</div>`;
-      threadsEl.querySelectorAll('[data-t]').forEach(b => b.addEventListener('click', async () => { currentThread = b.dataset.t; await loadMessages(client, a, currentThread, messagesEl); }));
+      threadsEl.querySelectorAll('[data-t]').forEach(b => b.addEventListener('click', async () => {
+        currentThread = b.dataset.t;
+        threadsEl.querySelectorAll('[data-t]').forEach(x => x.classList.toggle('pa-tab--active', x === b));
+        await loadMessages(client, a, currentThread, messagesEl);
+      }));
       await loadMessages(client, a, currentThread, messagesEl);
     } catch (error) { threadsEl.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
-    sendBtn.addEventListener('click', async () => {
-      const content = input.value.trim();
-      if (!content || !currentThread) return;
-      input.value = ''; statusEl.textContent = 'Running…';
-      try {
-        const { run } = await client.sendAssistantMessage(a.assistant_id, currentThread, content);
-        await loadMessages(client, a, currentThread, messagesEl);
-        statusEl.textContent = `Run ${run.run_id} · ${run.state}`;
-      } catch (error) { statusEl.textContent = 'Error: ' + error.message; }
-    });
     const voiceBtn = container.querySelector('[data-voice]');
     const speakBtn = container.querySelector('[data-speak]');
     const voiceMod = await import('./voice.js').catch(() => null);
@@ -794,8 +832,10 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   };
 
   const loadMessages = async (client, a, threadId, el) => {
+    el.dataset.loading = threadId;
     try {
       const { messages = [] } = await client.getThread(a.assistant_id, threadId);
+      if (el.dataset.loading !== threadId) return;             // a newer thread was picked while this was in flight
       el.innerHTML = messages.length ? messages.map(m =>
         `<div class="pa-msg ${m.role === 'user' ? 'pa-msg--user' : ''}">${esc(m.content)}<div class="pa-muted">${esc(m.role)} · ${esc(m.provenance || 'direct')}</div></div>`).join('')
         : '<div class="pa-muted">No messages yet. Say hello.</div>';
@@ -803,6 +843,14 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
   };
 
+  const keys = mountKeys(container, {
+    assistants: () => offered().list.map(a => ({ id: a.assistant_id, name: a.name, selected: a.assistant_id === state.selectedId })),
+    selectId: (id) => { state.selectedId = id; draw(); },      // focus stays put, so [ and ] can be pressed again
+    openTab: (t) => { configOpen = true; state.tab = t; draw(); container.querySelector(`[data-tab="${t}"]`)?.focus(); },
+    toggleConfig: () => { configOpen = !configOpen; draw(); container.querySelector('[data-config]')?.focus(); },
+    newThread: () => container.querySelector('[data-newthread]')?.click(),
+    focusComposer: () => container.querySelector('[data-msg]')?.focus(),
+  });
   void render();
-  return () => { disposed = true; };
+  return () => { disposed = true; keys.dispose(); };
 }

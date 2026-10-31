@@ -115,7 +115,7 @@ const FAKE_BACKEND = async () => {
 };
 
 const openTab = async (page, name) => {
-  await page.getByRole('button', { name, exact: true }).click();
+  await page.getByRole('tab', { name, exact: true }).click();
 };
 
 test('proposals are grouped pending, approved and executed; preview is a dry run; approve hands off', () => withPage(async (page) => {
