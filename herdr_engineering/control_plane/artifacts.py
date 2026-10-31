@@ -44,10 +44,13 @@ class ArtifactMergeConflict(ArtifactError):
     """A collaborator merge did not apply cleanly; nothing was stored except one ``artifact_collab_attempts`` row.
 
     ``conflicts`` are ``artifact_merge.FileConflict`` values (``theirs_sha256`` = head side, ``mine_sha256`` =
-    contributor); the contributor resolves and retries with ``base_version_id = head_version_id``."""
+    contributor); the contributor resolves and retries with ``base_version_id = head_version_id``. ``attempt_id`` is
+    the id of that attempt row when ``merge_commit`` raised it."""
 
-    def __init__(self, head_version_id: str | None, conflicts: list, clean_names: list[str]):
+    def __init__(self, head_version_id: str | None, conflicts: list, clean_names: list[str], *,
+                 attempt_id: str | None = None):
         self.head_version_id = head_version_id
+        self.attempt_id = attempt_id
         self.conflicts = list(conflicts)
         self.clean_names = list(clean_names)
         super().__init__(
@@ -363,6 +366,7 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                            created_by: str,
                            collaborator_agent_id: str,
                            idempotency_key: str | None = None,
+                           ticket_id: str | None = None,
                            max_text_bytes: int = 2 * 1024 * 1024) -> dict:
         """Commit a collaborator's ``changes`` made against ``base_version_id``, merging with the head if it moved.
 
@@ -371,7 +375,11 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         three-way ``merge_manifests`` result is committed on top of the head (``result: "merged"``, parents
         ``[head, base]``). A conflict stores nothing but one ``artifact_collab_attempts`` row and raises
         ``ArtifactMergeConflict``. The artifact row lock (as in ``commit_version``) is held from reading the head to
-        committing, so the head cannot move in between. Idempotent per ``(created_by, idempotency_key)``.
+        committing, so the head cannot move in between. Idempotent per ``(created_by, idempotency_key)``. A retracted
+        artifact, base or head version (``lifecycle`` / ``state``) is refused under that lock.
+
+        ``ticket_id`` (the collab intent that asked for this commit, if any) is stored on the attempt row, and the
+        raised ``ArtifactMergeConflict.attempt_id`` names that row.
 
         If the merged/contributed content fails the manifest and blob checks of ``commit_version`` (or the scoped blob
         registration), that is a conflict of kind ``validation``: the savepoint is rolled back, one attempt row is
@@ -429,6 +437,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             if head_id is None:
                 raise ArtifactError(f"artifact {artifact_id} has no head version")
             head = base if head_id == base_version_id else await self.get_version(head_id, artifact_id)
+            if head is None or any(version.get("state") == "retracted" for version in (base, head)):
+                raise ArtifactError("version is retracted: commit against a live head instead")
             if artifact["artifact_type"] == "report" or any(
                     version.get("report_descriptor") or version.get("source_manifest_blob")
                     for version in (base, head)):
@@ -472,13 +482,15 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                         name, "validation", (base_files.get(name) or {}).get("sha256"),
                         (head_files.get(name) or {}).get("sha256"), (mine.get(name) or {}).get("sha256"), None)]
             if conflicts:
+                attempt_id = str(uuid.uuid4())
                 await self._conn.execute(
                     "INSERT INTO artifact_collab_attempts (attempt_id, artifact_id, collaborator_agent_id, "
-                    "base_version_id, head_version_id, conflict_names, message) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)",
-                    str(uuid.uuid4()), artifact_id, collaborator_agent_id, base_version_id, head_id,
-                    json.dumps([{"name": c.name, "kind": c.kind} for c in conflicts]), message)
+                    "base_version_id, head_version_id, conflict_names, message, ticket_id) "
+                    "VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)",
+                    attempt_id, artifact_id, collaborator_agent_id, base_version_id, head_id,
+                    json.dumps([{"name": c.name, "kind": c.kind} for c in conflicts]), message, ticket_id)
                 # leave the block normally so the attempt row commits; raise once the transaction is closed
-                conflict = ArtifactMergeConflict(head_id, conflicts, merge.clean_names)
+                conflict = ArtifactMergeConflict(head_id, conflicts, merge.clean_names, attempt_id=attempt_id)
         if conflict is not None:
             raise conflict
         return {"result": "created" if fast_forward else "merged", "version": version,

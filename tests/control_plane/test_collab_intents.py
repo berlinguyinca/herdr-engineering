@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import asyncpg
@@ -14,6 +15,7 @@ import pytest
 
 from herdr_engineering.control_plane import collab_bridge_files as cbf
 from herdr_engineering.control_plane.artifact_collab_store import CollabGrantStore
+from herdr_engineering.control_plane.artifacts import ArtifactStore
 from herdr_engineering.control_plane.collab_bridge_files import (
     Actor,
     BridgeLimits,
@@ -64,7 +66,8 @@ class Env:
         self.mirror_root = tmp_path / "mirror"
         self.clock = clock
         self.pool = pool
-        self.applier = CollabIntentApplier(self.outbox, Mirror(self.mirror_root), rustfs=FakeBlobs(),
+        self.mirror = kw.pop("mirror_cls", Mirror)(self.mirror_root)
+        self.applier = CollabIntentApplier(self.outbox, self.mirror, rustfs=FakeBlobs(),
                                            limits=kw.pop("limits", BridgeLimits()), spool_dir=tmp_path / "spool",
                                            clock=clock, **kw)
 
@@ -1466,3 +1469,396 @@ def test_the_received_cap_scales_with_the_number_of_agents_in_the_feed(registry_
             await env.tick()
         assert sorted(n for n, _ in calls) == list(range(1, 11))
     run(registry_pg, tmp_path, body, received_min_cap=3)
+
+
+# ----------------------------------------------------------------------------- the commit handler (Task 5b)
+
+BASE_DOC = "".join(f"line {i}\n" for i in range(1, 11))
+NO_GRANT = "no write grant"
+
+
+class RecMirror(Mirror):
+    """The mirror's ``refresh`` surface (``CollabMirror.refresh(store, artifact_id, *, gate)``), recording calls."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.refreshed = []
+        self.fail = False
+
+    async def refresh(self, store, artifact_id, *, gate):
+        assert gate is not None
+        self.refreshed.append(artifact_id)
+        if self.fail:
+            raise RuntimeError("mirror broke " + SENTINEL)
+        return {}
+
+
+def edit(text, lineno, new):
+    lines = text.splitlines(keepends=True)
+    lines[lineno - 1] = new + "\n"
+    return "".join(lines)
+
+
+def blob_entry(env, name, text, media_type="text/markdown"):
+    key, digest = env.applier.rustfs.put(text.encode())
+    return {"name": name, "media_type": media_type, "sha256": digest, "size_bytes": len(text.encode()),
+            "storage_key": key}
+
+
+async def seed(env, files=None, *, source_manifest_blob=None):
+    async with env.pool.acquire() as conn:
+        store = ArtifactStore(conn, env.applier.rustfs)
+        aid = (await store.register_logical(original_filename="doc.md", created_by="owner"))["artifact_id"]
+        version = await store.commit_version(
+            aid, base_version_id=None, source_manifest_blob=source_manifest_blob,
+            output_manifest=files if files is not None else [blob_entry(env, "doc.md", BASE_DOC)], created_by="owner")
+    return aid, version["version_id"]
+
+
+async def owner_edit(env, aid, base, text, name="doc.md"):
+    async with env.pool.acquire() as conn:
+        version = await ArtifactStore(conn, env.applier.rustfs).commit_version(
+            aid, base_version_id=base, source_manifest_blob=None, output_manifest=[blob_entry(env, name, text)],
+            created_by="owner")
+    return version["version_id"]
+
+
+async def grant(env, aid, agent_id, permission="write", *, days=1.0):
+    async with env.pool.acquire() as conn:
+        await CollabGrantStore(conn).grant(aid, agent_id, permission,
+                                           expires_at=datetime.now(UTC) + timedelta(days=days), granted_by="owner")
+
+
+def put(name, text):
+    return {"name": name, "op": "put", "text": text}
+
+
+def commit(env, agent_id, aid, base, changes, *, key=None, message="collab edit"):
+    return env.intent(agent(agent_id), kind="commit", artifact_id=aid, key=key,
+                      payload={"base_version_id": base, "message": message, "changes": changes})
+
+
+async def settle(env):
+    counts = await env.tick(wait=30)
+    await env.applier.drain(timeout=30)
+    later = await env.tick(wait=30)
+    return {k: counts[k] + later[k] for k in counts}
+
+
+async def sql(env, query, *args):
+    async with env.pool.acquire() as conn:
+        return await conn.fetch(query, *args)
+
+
+async def head_of(env, aid):
+    (row,) = await sql(env, "SELECT current_version_id FROM artifacts WHERE artifact_id=$1", aid)
+    return row["current_version_id"]
+
+
+async def version_of(env, vid):
+    async with env.pool.acquire() as conn:
+        return await ArtifactStore(conn, env.applier.rustfs).get_version(vid)
+
+
+async def text_of(env, vid, name="doc.md"):
+    (entry,) = [e for e in (await version_of(env, vid))["output_manifest"] if e["name"] == name]
+    return env.applier.rustfs.get(entry["storage_key"], entry["sha256"]).decode()
+
+
+def committing(pg, tmp_path, body, **kw):
+    kw.setdefault("mirror_cls", RecMirror)
+
+    async def go(env):
+        env.applier.register_commit()
+        a = uid("agent")
+        env.feed({a: "active"})
+        return await body(env, a)
+    return run(pg, tmp_path, go, **kw)
+
+
+def test_a_fast_forward_commit_is_created_with_the_head_as_its_parent(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        mine = edit(BASE_DOC, 2, "mine")
+        raw = commit(env, a, aid, v1, [put("doc.md", mine)])
+        counts = await settle(env)
+        doc = env.result(raw["ticket"])
+        assert counts["applied"] == 1 and doc["result"] == "created" and not env.pending(raw["ticket"])
+        assert doc["version_id"] == await head_of(env, aid) and doc["version_number"] == 2
+        assert doc["actor"] == {"kind": "agent", "id": a} and doc["artifact_id"] == aid
+        version = await version_of(env, doc["version_id"])
+        assert version["parent_version_ids"] == [v1] and version["created_by"] == f"collab:{a}"
+        assert version["created_via"] == "collaborator" and version["collaborator_agent_id"] == a
+        assert await text_of(env, doc["version_id"]) == mine
+        row = await ledger(env, raw["ticket"])
+        assert row["outcome"] == "created" and row["version_id"] == doc["version_id"]
+        assert row["bytes"] == len(mine.encode())
+        assert env.mirror.refreshed == [aid]
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_stale_base_with_disjoint_edits_is_merged_with_two_parents(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        v2 = await owner_edit(env, aid, v1, edit(BASE_DOC, 2, "owner"))
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [put("doc.md", edit(BASE_DOC, 9, "mine"))])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "merged" and doc["merged_names"] == ["doc.md"]
+        version = await version_of(env, doc["version_id"])
+        assert version["parent_version_ids"] == [v2, v1]
+        merged = await text_of(env, doc["version_id"])
+        assert "owner\n" in merged and "mine\n" in merged
+    committing(registry_pg, tmp_path, body)
+
+
+def test_overlapping_edits_conflict_and_persist_one_attempt_named_by_the_ledger(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        v2 = await owner_edit(env, aid, v1, edit(BASE_DOC, 5, "owner"))
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [put("doc.md", edit(BASE_DOC, 5, "mine"))])
+        counts = await settle(env)
+        doc = env.result(raw["ticket"])
+        assert counts["conflicts"] == 1 and doc["result"] == "conflict" and doc["head_version_id"] == v2
+        (conflict,) = doc["conflicts"]
+        assert conflict["name"] == "doc.md" and conflict["kind"] == "modify_modify_text"
+        assert "<<<<<<<" in conflict["merged_text"] and conflict["truncated"] is False
+        assert await head_of(env, aid) == v2
+        (attempt,) = await sql(env, "SELECT * FROM artifact_collab_attempts WHERE artifact_id=$1", aid)
+        assert attempt["ticket_id"] == raw["ticket"]
+        row = await ledger(env, raw["ticket"])
+        assert row["outcome"] == "conflict" and row["attempt_id"] == attempt["attempt_id"]
+        async with env.pool.acquire() as conn:
+            (listed,) = await CollabGrantStore(conn).attempts(aid)
+        assert listed["ticket_id"] == raw["ticket"]
+        assert listed["conflict_names"] == [{"name": "doc.md", "kind": "modify_modify_text"}]
+        assert env.mirror.refreshed == []
+    committing(registry_pg, tmp_path, body)
+
+
+def test_conflict_text_over_the_cap_is_left_out_and_marked_truncated(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await owner_edit(env, aid, v1, edit(BASE_DOC, 5, "owner"))
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [put("doc.md", edit(BASE_DOC, 5, "mine"))])
+        await settle(env)
+        (conflict,) = env.result(raw["ticket"])["conflicts"]
+        assert conflict["merged_text"] is None and conflict["truncated"] is True
+    committing(registry_pg, tmp_path, body, limits=BridgeLimits(max_conflict_text_bytes=16))
+
+
+@pytest.mark.parametrize("case", ["none", "read", "expired"])
+def test_a_commit_without_a_live_write_grant_is_rejected(registry_pg, tmp_path, case):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        if case == "read":
+            await grant(env, aid, a, "read")
+        elif case == "expired":
+            await grant(env, aid, a, days=-1)
+        raw = commit(env, a, aid, v1, [put("doc.md", SENTINEL)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == NO_GRANT
+        assert await head_of(env, aid) == v1
+        assert SENTINEL not in (env.mirror_root / "results" / f"{raw['ticket']}.json").read_text()
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_grant_revoked_after_the_intent_was_written_is_rejected_before_staging_is_looked_at(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [{"name": "big.bin", "op": "put", "upload_id": "upl_" + "0" * 24}])
+        async with env.pool.acquire() as conn:
+            assert await CollabGrantStore(conn).revoke(aid, a)
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == NO_GRANT
+    committing(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("case", ["artifact", "head_version", "base_version"])
+def test_a_retracted_artifact_or_version_is_rejected(registry_pg, tmp_path, case):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        v2 = await owner_edit(env, aid, v1, edit(BASE_DOC, 2, "owner"))
+        await grant(env, aid, a)
+        warm, w1 = await seed(env)                         # load the gate first: the durable state must decide
+        await grant(env, warm, a)
+        warm_up = commit(env, a, warm, w1, [put("doc.md", "warm\n")])
+        await settle(env)
+        assert env.result(warm_up["ticket"])["result"] == "created"
+        async with env.pool.acquire() as conn:
+            store = ArtifactStore(conn, env.applier.rustfs)
+            if case == "artifact":
+                await store.record_retraction(aid)
+            else:
+                await store.record_retraction(aid, v2 if case == "head_version" else v1)
+        raw = commit(env, a, aid, v1, [put("doc.md", edit(BASE_DOC, 9, "mine"))])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and "retracted" in doc["reason"]
+        assert await head_of(env, aid) == v2
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_retraction_only_the_gate_holds_is_rejected(registry_pg, tmp_path):
+    async def body(env, a):
+        gone, g1 = await seed(env)
+        other, o1 = await seed(env)
+        await grant(env, gone, a)
+        await grant(env, other, a)
+        async with env.pool.acquire() as conn:
+            await ArtifactStore(conn, env.applier.rustfs).record_retraction(gone)
+        first = commit(env, a, other, o1, [put("doc.md", "first\n")])
+        await settle(env)                                  # the gate is loaded with load_retractions here
+        assert env.result(first["ticket"])["result"] == "created"
+        await sql(env, "UPDATE artifacts SET lifecycle='active' WHERE artifact_id=$1", gone)
+        raw = commit(env, a, gone, g1, [put("doc.md", "second\n")])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and "retracted" in doc["reason"]
+        assert await head_of(env, gone) == g1
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_report_artifact_is_not_writable_by_collaboration(registry_pg, tmp_path):
+    async def body(env, a):
+        typed, t1 = await seed(env)
+        await sql(env, "UPDATE artifacts SET artifact_type='report' WHERE artifact_id=$1", typed)
+        rendered, r1 = await seed(env, source_manifest_blob=blob_entry(env, "source.json", "{}")["storage_key"])
+        tickets = []
+        for aid, base in ((typed, t1), (rendered, r1)):
+            await grant(env, aid, a)
+            tickets.append(commit(env, a, aid, base, [put("doc.md", "x\n")])["ticket"])
+        await settle(env)
+        for ticket in tickets:
+            doc = env.result(ticket)
+            assert doc["result"] == "rejected" and doc["reason"] == "not writable by collaboration"
+        assert await head_of(env, typed) == t1 and await head_of(env, rendered) == r1
+    committing(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("name", ["../x", "a/../../b", "a\x00b", "a\rb", "dir", "doc.md/x"])
+def test_hostile_names_are_rejected_without_stopping_the_tick(registry_pg, tmp_path, name):
+    async def body(env, a):
+        aid, v1 = await seed(env, [blob_entry(env, "doc.md", BASE_DOC), blob_entry(env, "dir/a.md", "a\n")])
+        await grant(env, aid, a)
+        hostile = commit(env, a, aid, v1, [put(name, "x\n")])
+        b = uid("agent")
+        env.feed({a: "active", b: "active"})
+        await grant(env, aid, b)
+        fine = commit(env, b, aid, v1, [put("doc.md", edit(BASE_DOC, 3, "fine"))])
+        counts = await settle(env)
+        doc = env.result(hostile["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == "invalid or clashing file names"
+        assert counts["rejected"] == 1 and env.result(fine["ticket"])["result"] == "created"
+        assert not env.pending(hostile["ticket"])
+        manifests = [e["name"] for e in (await version_of(env, await head_of(env, aid)))["output_manifest"]]
+        assert sorted(manifests) == ["dir/a.md", "doc.md"]
+    committing(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("text", ["".join(chr(97 + i % 26) + "\n" for i in range(100_000)), "y" * 60_000])
+def test_hostile_text_shapes_commit_or_conflict_normally(registry_pg, tmp_path, text):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await owner_edit(env, aid, v1, edit(BASE_DOC, 2, "owner"))
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [put("doc.md", text)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] in ("merged", "conflict")
+        if doc["result"] == "conflict":
+            assert doc["conflicts"][0]["kind"] == "modify_modify_text" and doc["conflicts"][0]["merged_text"]
+    committing(registry_pg, tmp_path, body)
+
+
+def test_inline_bytes_over_the_daily_quota_are_rejected_and_a_retry_is_not_counted_twice(registry_pg, tmp_path):
+    first_text = "q" * 40 + "\n"
+
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        first = commit(env, a, aid, v1, [put("doc.md", first_text)])
+        # crash-retry shape: the ticket's own received row (with its inline bytes) already exists
+        async with env.pool.acquire() as conn:
+            await CollabGrantStore(conn).record_received(
+                first["ticket"], "commit", Actor("agent", a), aid, v1, first["ticket"], request_digest(first),
+                len(first_text))
+        await settle(env)
+        assert env.result(first["ticket"])["result"] == "created"
+        over = commit(env, a, aid, await head_of(env, aid), [put("doc.md", "z\n")])
+        await settle(env)
+        doc = env.result(over["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == "daily quota exceeded"
+    committing(registry_pg, tmp_path, body, limits=BridgeLimits(daily_bytes_per_agent=len(first_text)))
+
+
+def test_a_forged_storage_key_is_rejected_by_validation_and_never_referenced(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        other, _ = await seed(env)
+        key, digest = env.applier.rustfs.put(b"other's private bytes\n")
+        async with env.pool.acquire() as conn:
+            await ArtifactStore(conn, env.applier.rustfs).register_report_blob(
+                other, storage_key=key, sha256=digest, size_bytes=22, media_type="text/plain")
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [{"name": "doc.md", "op": "put", "storage_key": key}])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == "a change has an unknown or forbidden key"
+        assert await head_of(env, aid) == v1
+        assert await sql(env, "SELECT 1 FROM artifact_blobs WHERE scope=$1 AND blob_sha256=$2", aid, digest) == []
+        manifests = await sql(env, "SELECT output_manifest::text AS m FROM artifact_versions WHERE artifact_id=$1",
+                              aid)
+        assert all(key not in r["m"] for r in manifests)
+    committing(registry_pg, tmp_path, body)
+
+
+def test_two_tickets_with_one_key_produce_one_version_and_both_name_it(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        changes = [put("doc.md", edit(BASE_DOC, 4, "once"))]
+        one = commit(env, a, aid, v1, changes, key="retry-1")
+        two = commit(env, a, aid, v1, changes, key="retry-1")
+        await settle(env)
+        first, second = env.result(one["ticket"]), env.result(two["ticket"])
+        assert first["result"] == second["result"] == "created"
+        assert first["version_id"] == second["version_id"] == await head_of(env, aid)
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 2
+    committing(registry_pg, tmp_path, body)
+
+
+def test_hooks_run_on_success_and_their_failures_are_logged_not_fatal(registry_pg, tmp_path, caplog):
+    seen = []
+
+    def lineage(version):
+        seen.append(dict(version))
+        raise RuntimeError("lineage broke " + SENTINEL)
+
+    async def body(env, a):
+        env.mirror.fail = True
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [put("doc.md", SENTINEL + "\n")], message="m")
+        counts = await settle(env)
+        doc = env.result(raw["ticket"])
+        assert counts["applied"] == 1 and doc["result"] == "created"
+        assert (await ledger(env, raw["ticket"]))["outcome"] == "created"
+        assert env.mirror.refreshed == [aid]
+        assert aid in env.applier.take_mirror_force() and env.applier.take_mirror_force() == set()
+        assert [(v["artifact_id"], v["version_id"]) for v in seen] == [(aid, doc["version_id"])]
+        refused = commit(env, a, uid("art"), v1, [put("doc.md", SENTINEL + "\n")])
+        await settle(env)
+        assert SENTINEL not in (env.mirror_root / "results" / f"{refused['ticket']}.json").read_text()
+
+    caplog.set_level(logging.DEBUG)
+    committing(registry_pg, tmp_path, body, lineage=lineage)
+    assert "lineage" in caplog.text and "mirror" in caplog.text
+    assert SENTINEL not in caplog.text

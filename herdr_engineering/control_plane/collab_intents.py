@@ -39,6 +39,26 @@ The handler returns ``{result, version_id?, reason?, attempt_id?, …}``; the ap
 Every outbox access is fd-relative and no-follow (``list_beneath``/``read_json_beneath``/``unlink_beneath``); all
 blocking file I/O runs in worker threads. Log lines carry only ticket, kind, actor, artifact and outcome.
 
+The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:<agent_id>``:
+
+6. ``grant_for`` must show ``write``, unexpired, re-read now (a grant revoked after the intent was written is "no write
+   grant", whatever its staging holds).
+7. The artifact must exist and be writable (not a report, no ``report_descriptor`` / ``source_manifest_blob`` on base
+   or head); neither it nor its base or head version may be retracted, by ``lifecycle`` / ``state`` or by the worker's
+   ``ArtifactGraphGate`` (reloaded with ``load_retractions`` at least every ``GATE_RELOAD`` s). Put names must not clash
+   with the base/head files (``check_names``: duplicates and file/directory prefixes).
+9. Daily quota: ``bytes_last_24h(agent, exclude_ticket=ticket) + inline_bytes <= daily_bytes_per_agent`` (the
+   ticket's own ``received`` row is excluded, so a crash-retry is never counted twice).
+10. Inline text is stored with ``rustfs.put`` and ``register_report_blob``; staged puts go through ``ctx.assemble``
+    (Task 5c).
+11. ``merge_commit`` (no outer transaction, so a conflict's attempt row persists) with ``ticket_id`` and
+    ``max_text_bytes = limits.max_text_merge_bytes``; ``ArtifactMergeConflict`` is ``conflict`` (its ``attempt_id``
+    goes on the ledger row; ``merged_text`` capped at ``max_conflict_text_bytes`` per result, measured as encoded
+    JSON), any other ``ArtifactError`` is ``rejected`` with its message.
+12. After the outcome is recorded and published: the artifact id is handed to a background mirror refresher (the lane
+    never waits behind the mirror's lock; a failed refresh is kept for ``take_mirror_force``, which the mirror task
+    passes to ``sync(force=...)``), and ``lineage(version)`` runs. Neither can fail the tick.
+
 Wiring (Task 9): the scan must never wait for a lane's connection, or fresh intents stop being received while every
 lane is busy and then expire. Pass ``tick(..., scan_acquire=...)`` over a dedicated connection, or size the applier's
 pool to at least ``limits.apply_concurrency + 1``.
@@ -46,9 +66,11 @@ pool to at least ``limits.apply_concurrency + 1``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
+import mimetypes
 import os
 import re
 import stat
@@ -60,7 +82,8 @@ from pathlib import Path
 from types import MappingProxyType
 
 from .artifact_collab_store import CollabGrantStore
-from .artifacts import ArtifactStore
+from .artifact_scope import ArtifactGraphGate
+from .artifacts import ArtifactError, ArtifactMergeConflict, ArtifactStore
 from .collab_bridge_files import (
     DIR_MODE,
     FEED_MAX_AGE,
@@ -73,6 +96,7 @@ from .collab_bridge_files import (
     IntentError,
     _validate_actor,
     _walk_dirs,
+    agent_owner_key,
     atomic_write_json,
     ensure_dir,
     file_exists_beneath,
@@ -81,6 +105,7 @@ from .collab_bridge_files import (
     unlink_beneath,
     validate_intent,
 )
+from .share_bundle import ShareBundleError, check_names
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +140,17 @@ REASON_FEED_STALE = "agent feed stale"
 REASON_AGENT = "agent not active"
 REASON_INTERNAL = "internal error"
 REASON_FUTURE = "invalid submitted_at"
+REASON_NO_GRANT = "no write grant"
+REASON_NO_ARTIFACT = "artifact not found"
+REASON_RETRACTED = "artifact or version is retracted"
+REASON_NOT_WRITABLE = "not writable by collaboration"
+REASON_NAMES = "invalid or clashing file names"
+REASON_QUOTA = "daily quota exceeded"
+REASON_BASE = "base version does not belong to the artifact"
+REASON_NO_HEAD = "artifact has no head version"
+REASON_MAX = 300                    # an ArtifactError message on a result is cut to this many characters
+COMMIT_OUTCOMES = frozenset({"created", "merged"})
+GATE_RELOAD = 30.0                  # the worker-local retraction gate is reloaded at least this often (seconds)
 
 _RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason")
 _STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id")
@@ -145,6 +181,7 @@ class _Kind:
     handler: Callable[[IntentContext, Intent], Awaitable[dict]]
     lane_key: Callable[[Intent, dict | None], str] | None
     replay_outcomes: frozenset[str]
+    after: Callable[[IntentContext, Intent, dict, dict], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -193,7 +230,7 @@ class CollabIntentApplier:
     def __init__(self, outbox: Path, mirror, *, rustfs, limits: BridgeLimits, spool_dir: Path,
                  lineage: Callable[[dict], dict] | None = None, context_extras: Mapping[str, object] | None = None,
                  clock: Callable[[], float] = time.time, max_per_tick: int = 20,
-                 received_min_cap: int | None = None):
+                 received_min_cap: int | None = None, gate: ArtifactGraphGate | None = None):
         self.outbox = Path(outbox)
         self.mirror = mirror
         self.rustfs = rustfs
@@ -213,27 +250,48 @@ class CollabIntentApplier:
         self._feed: dict | None = None
         self._sem = asyncio.Semaphore(limits.apply_concurrency)
         self._counts = self._zero()
+        # the worker's retraction gate (shared with the mirror when Task 9 passes one), reloaded every GATE_RELOAD s
+        self.gate = gate if gate is not None else ArtifactGraphGate(None)
+        self._gate_loaded: float | None = None
+        self._acquire = None                               # the latest tick's acquire, for the mirror refresher
+        self._refresh_due: set[str] = set()
+        self._mirror_force: set[str] = set()
+        self._refresher: asyncio.Task | None = None
 
     # -- registry ---------------------------------------------------------------------------------------------
     def register(self, kind: str, handler: Callable[[IntentContext, Intent], Awaitable[dict]], *,
                  lane_key: Callable[[Intent, dict | None], str] | None = None,
-                 replay_outcomes: frozenset[str] = frozenset()) -> None:
+                 replay_outcomes: frozenset[str] = frozenset(),
+                 after: Callable[[IntentContext, Intent, dict, dict], Awaitable[None]] | None = None) -> None:
         """Attach the handler of an intent kind (its validator is registered with ``register_intent_kind``).
 
         A handler must be idempotent on ``(actor, kind, idempotency key)``: a crash between its return and
         ``record_outcome`` leaves the ticket ``received``, and the restarted worker runs the handler again (age-exempt).
         ``commit`` gets that from ``merge_commit``'s own idempotency key.
+
+        Keys of the handler's return value that start with ``_`` are private: they are never recorded or published,
+        and are handed to ``after(ctx, intent, out, private)``, which runs only once this call decided the ticket and
+        its result is written. Errors in ``after`` are logged (type only) and never change the outcome.
         """
         if not isinstance(kind, str) or not _KIND_NAME.match(kind):
             raise ValueError("invalid intent kind name")
         if kind in self._kinds:
             raise ValueError("intent kind already has a handler")
-        if not callable(handler) or (lane_key is not None and not callable(lane_key)):
-            raise ValueError("handler and lane_key must be callable")
+        if not callable(handler) or any(f is not None and not callable(f) for f in (lane_key, after)):
+            raise ValueError("handler, lane_key and after must be callable")
         outcomes = frozenset(replay_outcomes)
         if not all(isinstance(o, str) and _OUTCOME.match(o) for o in outcomes):
             raise ValueError("invalid replay outcome")
-        self._kinds[kind] = _Kind(handler, lane_key, outcomes)
+        self._kinds[kind] = _Kind(handler, lane_key, outcomes, after)
+
+    def register_commit(self) -> None:
+        """Register plan 3's ``commit`` kind (steps 6-12; replays ``created`` / ``merged``)."""
+        self.register("commit", self._commit, replay_outcomes=COMMIT_OUTCOMES, after=self._after_commit)
+
+    def take_mirror_force(self) -> set[str]:
+        """Artifact ids whose post-commit mirror refresh failed; the mirror task passes them to ``sync(force=...)``."""
+        due, self._mirror_force = self._mirror_force, set()
+        return due
 
     # -- the tick ---------------------------------------------------------------------------------------------
     @staticmethod
@@ -269,6 +327,7 @@ class CollabIntentApplier:
         all are rediscovered the order follows mtime. Lanes started here are awaited for at most ``wait`` seconds; a longer one keeps running and its lane is
         skipped by later ticks until it finishes (``drain`` awaits them all).
         """
+        self._acquire = acquire
         feed, listing = await asyncio.to_thread(self._load_outbox)
         self._feed = feed
         if listing is None:
@@ -309,16 +368,21 @@ class CollabIntentApplier:
         return self._take_counts()
 
     async def drain(self, timeout: float | None = None) -> None:
-        """Await every running lane (shutdown and tests)."""
+        """Await every running lane and the mirror refresher (shutdown and tests)."""
         tasks = list(self._busy.values())
         if tasks:
             await asyncio.wait(tasks, timeout=timeout)
+        refresher = self._refresher
+        if refresher is not None and not refresher.done():
+            await asyncio.wait([refresher], timeout=timeout)
 
     async def aclose(self, timeout: float = 5.0) -> None:
         """Let running lanes finish for ``timeout`` seconds, then cancel the rest (their intents stay ``received``
         and are picked up again, age-exempt, after a restart)."""
         await self.drain(timeout)
         tasks = list(self._busy.values())
+        if self._refresher is not None and not self._refresher.done():
+            tasks.append(self._refresher)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -572,15 +636,26 @@ class CollabIntentApplier:
         ctx = IntentContext(actor=intent.actor, agent=agent, conn=conn, store=ArtifactStore(conn, self.rustfs),
                             grants=CollabGrantStore(conn), limits=self.limits, assemble=self.assemble,
                             extras=self.extras)
+        private: dict = {}
         try:
             out = await spec.handler(ctx, intent)
+            if isinstance(out, dict):
+                private = {k: out[k] for k in out if isinstance(k, str) and k.startswith("_")}
+                out = {k: v for k, v in out.items() if k not in private}
             _check_outcome(out)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.error("collab intent %s (%s): handler failed (%s)", intent.ticket, intent.kind, type(exc).__name__)
-            out = {"result": "rejected", "reason": REASON_INTERNAL}
-        await self._finish(conn, name, intent, out)
+            out, private = {"result": "rejected", "reason": REASON_INTERNAL}, {}
+        if await self._finish(conn, name, intent, out) and spec.after is not None:
+            try:
+                await spec.after(ctx, intent, out, private)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # the outcome is durable and published: a hook never changes it
+                log.error("collab intent %s (%s): after-hook failed (%s)", intent.ticket, intent.kind,
+                          type(exc).__name__)
 
     # -- deciding and results ---------------------------------------------------------------------------------
     @staticmethod
@@ -600,8 +675,9 @@ class CollabIntentApplier:
                 return
         await self._finish(conn, name or intent.ticket + ".json", intent, out, zero_bytes=zero_bytes)
 
-    async def _finish(self, conn, name: str, intent: Intent, out: dict, *, zero_bytes: bool = False) -> None:
-        """Record and publish ``out``, which ``_check_outcome`` accepts (the applier's own outcomes always do)."""
+    async def _finish(self, conn, name: str, intent: Intent, out: dict, *, zero_bytes: bool = False) -> bool:
+        """Record and publish ``out``, which ``_check_outcome`` accepts (the applier's own outcomes always do); True
+        when this call decided the ticket."""
         result = out["result"]
         decided = await CollabGrantStore(conn).record_outcome(
             intent.ticket, result, version_id=out.get("version_id"), attempt_id=out.get("attempt_id"),
@@ -610,7 +686,7 @@ class CollabIntentApplier:
             row = await self._ledger(conn, intent.ticket)
             if row is not None and row["outcome"] != "received":
                 await self._settle_from_row(name, row)
-            return
+            return False
         doc = {"ticket": intent.ticket, "kind": intent.kind,
                "actor": {"kind": intent.actor.kind, "id": intent.actor.id}, "artifact_id": intent.artifact_id,
                "result": result}
@@ -618,6 +694,7 @@ class CollabIntentApplier:
         doc["decided_at"] = self.clock()
         await asyncio.to_thread(self._write_and_consume, name, doc)
         self._done(intent.ticket, intent.kind, intent.actor.kind, intent.actor.id, intent.artifact_id, result)
+        return True
 
     async def _reject_unvalidated(self, conn, name: str, row: dict | None, raw, reason: str) -> None:
         """An intent that failed validation: nothing of its content is kept except an independently valid actor."""
@@ -686,6 +763,130 @@ class CollabIntentApplier:
         log.info("collab intent %s kind=%s actor=%s:%s artifact=%s outcome=%s",
                  ticket, kind, actor_kind, actor_id, artifact_id, outcome)
 
+    # -- the commit kind (Task 5b) -----------------------------------------------------------------------------
+    async def _commit(self, ctx: IntentContext, intent: Intent) -> dict:
+        """Steps 6-11. Every refusal before ``merge_commit`` stores nothing (no blob, no scoped row)."""
+        agent_id, aid, payload = intent.actor.id, intent.artifact_id, intent.payload
+        grant = await ctx.grants.grant_for(aid, agent_id)                                           # step 6
+        expires = _epoch(grant["expires_at"]) if grant is not None else None
+        if grant is None or grant["permission"] != "write" or expires is None or expires <= self.clock():
+            return _rejected(REASON_NO_GRANT)
+        store = ctx.store                                                                           # step 7
+        artifact = await store.get(aid)
+        if artifact is None:
+            return _rejected(REASON_NO_ARTIFACT)
+        await self._load_gate(store)
+        if artifact["lifecycle"] == "retracted" or self.gate.artifact_retracted(aid):
+            return _rejected(REASON_RETRACTED)
+        base = await store.get_version(payload.base_version_id, aid)
+        if base is None:
+            return _rejected(REASON_BASE)
+        head_id = artifact["current_version_id"]
+        head = base if head_id == base["version_id"] else (
+            await store.get_version(head_id, aid) if head_id else None)
+        if head is None:
+            return _rejected(REASON_NO_HEAD)
+        if any(v.get("state") == "retracted" or self.gate.version_retracted(aid, v["version_id"]) for v in (base, head)):
+            return _rejected(REASON_RETRACTED)
+        if artifact["artifact_type"] == "report" or any(
+                v.get("report_descriptor") or v.get("source_manifest_blob") for v in (base, head)):
+            return _rejected(REASON_NOT_WRITABLE)
+        head_files = _files_of(head)
+        if not _names_fit(payload.changes, _files_of(base), head_files):
+            return _rejected(REASON_NAMES)
+        used = await ctx.grants.bytes_last_24h(agent_id, exclude_ticket=intent.ticket)               # step 9
+        if used + payload.inline_bytes > ctx.limits.daily_bytes_per_agent:
+            return _rejected(REASON_QUOTA)
+        changes = []                                                                                # step 10
+        for change in payload.changes:
+            if change.op == "delete":
+                changes.append({"name": change.name, "op": "delete"})
+            elif change.text is not None:
+                changes.append({"name": change.name, "op": "put",
+                                "entry": await self._store_inline(ctx, aid, change.name, change.text, head_files)})
+            else:
+                entry = await ctx.assemble(agent_owner_key(agent_id), change.upload_id, artifact_id=aid,
+                                           name=change.name, charge=True)
+                changes.append({"name": change.name, "op": "put", "entry": entry})
+        try:                                                                                        # step 11
+            out = await store.merge_commit(
+                aid, base_version_id=base["version_id"], changes=changes, message=payload.message,
+                created_by=f"collab:{agent_id}", collaborator_agent_id=agent_id, idempotency_key=self._key(intent),
+                ticket_id=intent.ticket, max_text_bytes=ctx.limits.max_text_merge_bytes)
+        except ArtifactMergeConflict as exc:
+            return {"result": "conflict", "head_version_id": exc.head_version_id, "attempt_id": exc.attempt_id,
+                    "conflicts": _conflicts(exc.conflicts, ctx.limits.max_conflict_text_bytes)}
+        except ArtifactError as exc:
+            return _rejected(str(exc)[:REASON_MAX] or "commit refused")
+        version = out["version"]
+        result = {"result": out["result"], "version_id": version["version_id"],
+                  "merged_names": [n for n in out.get("merged_names") or [] if isinstance(n, str)],
+                  "_version": dict(version)}
+        number = version.get("version_number")
+        if isinstance(number, int) and not isinstance(number, bool):
+            result["version_number"] = number
+        return result
+
+    async def _store_inline(self, ctx: IntentContext, aid: str, name: str, text: str, head_files: dict) -> dict:
+        """An inline put's entry: the bytes go to RustFS and are registered as a blob scoped to this artifact."""
+        data = text.encode("utf-8")
+        key, digest = await asyncio.to_thread(self.rustfs.put, data)
+        # the scoped row is immutable per (artifact, digest): reuse its media type so the entry always matches it
+        prior = await ctx.conn.fetchval(
+            "SELECT media_type FROM artifact_blobs WHERE scope=$1 AND blob_sha256=$2", aid, digest)
+        media_type = prior or (head_files.get(name) or {}).get("media_type") or mimetypes.guess_type(name)[0] \
+            or "text/plain"
+        await ctx.store.register_report_blob(aid, storage_key=key, sha256=digest, size_bytes=len(data),
+                                             media_type=media_type)
+        return {"name": name, "media_type": media_type, "sha256": digest, "size_bytes": len(data), "storage_key": key}
+
+    async def _load_gate(self, store: ArtifactStore) -> None:
+        now = self.clock()
+        if self._gate_loaded is None or now - self._gate_loaded >= GATE_RELOAD or now < self._gate_loaded:
+            self.gate.load_retractions(await store.load_retractions())
+            self._gate_loaded = now
+
+    async def _after_commit(self, ctx: IntentContext, intent: Intent, out: dict, private: dict) -> None:
+        """Step 12, once the outcome is durable and published: mirror refresh (handed off) and lineage."""
+        if out.get("result") not in COMMIT_OUTCOMES:
+            return
+        self._schedule_refresh(intent.artifact_id)
+        version = private.get("_version")
+        if self.lineage is None or not isinstance(version, dict):
+            return
+        try:
+            emitted = await asyncio.to_thread(self.lineage, version)
+            if inspect.isawaitable(emitted):
+                await emitted
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("collab intent %s: lineage emission failed artifact=%s (%s)", intent.ticket,
+                        intent.artifact_id, type(exc).__name__)
+
+    def _schedule_refresh(self, artifact_id: str) -> None:
+        self._refresh_due.add(artifact_id)
+        if self._refresher is None or self._refresher.done():
+            self._refresher = asyncio.create_task(self._run_refreshes())
+
+    async def _run_refreshes(self) -> None:
+        """Refresh each due artifact on a connection of its own, off the lanes; a failure is kept for the mirror
+        task's next ``sync(force=...)``."""
+        while self._refresh_due:
+            artifact_id = min(self._refresh_due)
+            self._refresh_due.discard(artifact_id)
+            try:
+                async with self._acquire() as conn:
+                    await self.mirror.refresh(ArtifactStore(conn, self.rustfs), artifact_id, gate=self.gate)
+            except asyncio.CancelledError:
+                self._mirror_force.add(artifact_id)
+                self._mirror_force.update(self._refresh_due)
+                raise
+            except Exception as exc:
+                log.warning("collab mirror refresh after commit failed artifact=%s (%s)", artifact_id,
+                            type(exc).__name__)
+                self._mirror_force.add(artifact_id)
+
     # -- results sweep ----------------------------------------------------------------------------------------
     async def sweep_results(self, max_age: float = 3600) -> int:
         """Delete result files older than ``max_age`` seconds (by mtime), at most ``RESULTS_SWEEP_BATCH`` per call;
@@ -735,6 +936,45 @@ def _check_outcome(out) -> None:
     if conflicts is not None and (not isinstance(conflicts, list) or not all(isinstance(c, dict) for c in conflicts)):
         raise TypeError("invalid outcome field")
     json.dumps(out, ensure_ascii=False, allow_nan=False)   # TypeError/ValueError: not writable as a result
+
+
+def _rejected(reason: str) -> dict:
+    return {"result": "rejected", "reason": reason}
+
+
+def _files_of(version: dict) -> dict[str, dict]:
+    manifest = version.get("output_manifest")
+    return {e["name"]: e for e in manifest if isinstance(e, dict) and isinstance(e.get("name"), str)} \
+        if isinstance(manifest, list) else {}
+
+
+def _names_fit(changes, base_files: dict, head_files: dict) -> bool:
+    """No put name duplicates or file/directory-clashes with a file that stays in base or head."""
+    deleted = {c.name for c in changes if c.op == "delete"}
+    puts = {c.name for c in changes if c.op == "put"}
+    kept = (set(base_files) | set(head_files)) - deleted - puts
+    try:
+        check_names(sorted(kept | puts))
+    except ShareBundleError:
+        return False
+    return True
+
+
+def _conflicts(conflicts, cap: int) -> list[dict]:
+    """``[{name, kind, merged_text, truncated}]``; all merged text of one result fits ``cap`` bytes as written (JSON,
+    so escaping counts), else that file's text is left out and marked ``truncated``."""
+    out, budget = [], cap
+    for c in conflicts:
+        text = c.merged_text if c.kind == "modify_modify_text" and isinstance(c.merged_text, str) else None
+        item = {"name": c.name, "kind": c.kind, "merged_text": None, "truncated": False}
+        if text is not None:
+            size = len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
+            if size <= budget:
+                item["merged_text"], budget = text, budget - size
+            else:
+                item["truncated"] = True
+        out.append(item)
+    return out
 
 
 def _base_of(intent: Intent) -> str | None:
