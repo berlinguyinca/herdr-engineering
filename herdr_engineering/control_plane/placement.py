@@ -60,9 +60,23 @@ def requirements(type_requires: Iterable[str], extra: Iterable[str] | None = Non
 # cluster partition). Both carry the same fields so one resolver ranks them.
 #   id, kind, label, status ("ready"|"stale"|"unavailable"), capabilities, free{cpus,memory_mb,gpus},
 #   attested_at (epoch seconds), profiles[], models[], role_bindings[], queue_wait_s (slurm only, estimate)
+#   nodes[] (optional): per-node free {cpus, memory_mb, gpus}; when present one node must cover the whole request
 
 def _fits(free: Mapping[str, int], need: Mapping[str, int]) -> list[str]:
     return [key for key in RESOURCE_KEYS if need.get(key, 0) > int(free.get(key, 0))]
+
+
+def _shortfall(candidate: Mapping[str, Any], need: Mapping[str, int]) -> list[str]:
+    """What stops the candidate carrying the request. A candidate that lists per-node capacity (a cluster partition)
+    fits only when ONE node covers every resource at once, since a runtime lives on a single node; the others are
+    judged on their aggregate free resources."""
+    nodes = candidate.get("nodes")
+    if nodes is None:
+        return _fits(candidate.get("free", {}), need)
+    if not any(not _fits(node, need) for node in nodes):
+        best = max(nodes, key=lambda n: (int(n.get("cpus", 0)), int(n.get("memory_mb", 0))), default={})
+        return _fits(best, need) or list(RESOURCE_KEYS[:1])      # no single node has it all: report the closest
+    return []
 
 
 def evaluate(candidate: Mapping[str, Any], *, needs: list[str], resources: Mapping[str, int],
@@ -75,7 +89,7 @@ def evaluate(candidate: Mapping[str, Any], *, needs: list[str], resources: Mappi
     missing = [cap for cap in needs if cap not in have]
     if missing:
         why.append("missing " + ", ".join(missing))
-    short = _fits(candidate.get("free", {}), resources)
+    short = _shortfall(candidate, resources)
     if short:
         why.append("not enough " + ", ".join(short))
     if profile and profile not in candidate.get("profiles", ()):

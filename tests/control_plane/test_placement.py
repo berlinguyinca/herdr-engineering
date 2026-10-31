@@ -1,5 +1,7 @@
 """Automatic placement: capabilities and resources decide, Slurm participates only when configured, nothing grants."""
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -76,11 +78,13 @@ def test_a_host_attesting_internet_changes_no_profile_and_grants_nothing():
 
 
 # ------------------------------------------------------------------------------------- slurm
-SINFO = """gpu*|up|idle|2|32|256000|gpu:a100:4(S:0-1)
-gpu*|up|mix|3|32|256000|gpu:a100:4(S:0-1)
-gpu*|up|alloc|5|32|256000|gpu:a100:4(S:0-1)
-low|up|idle|10|64|512000|(null)
-dead|down|idle|4|16|64000|(null)
+SINFO = """gpu*|up|n1|idle|0/32/0/32|250000|256000|gpu:a100:4(S:0-1)
+gpu*|up|n2|mixed|8/24/0/32|100000|256000|gpu:a100:4(S:0-1)
+gpu*|up|n3|allocated|32/0/0/32|1000|256000|gpu:a100:4(S:0-1)
+gpu*|up|n4|drained|0/0/32/32|250000|256000|gpu:a100:4(S:0-1)
+low|up|n5|idle|0/64/0/64|500000|512000|(null)
+low|up|n6|down*|0/0/64/64|500000|512000|(null)
+dead|down|n7|idle|0/16/0/16|60000|64000|(null)
 garbage line
 """
 
@@ -104,21 +108,47 @@ def test_slurm_config_ignores_unconfigured_clusters_and_rejects_bad_input():
         sp.slurm_config([cluster(), cluster()])                      # duplicate id
 
 
-def test_sinfo_counts_only_fully_idle_nodes_and_reads_gpus():
+def test_sinfo_lists_only_usable_nodes_with_their_own_free_capacity():
     info = sp.parse_sinfo(SINFO)
-    assert info["gpu"] == {"up": True, "idle_nodes": 2, "cpus": 32, "memory_mb": 256000, "gpus_per_node": 4}
-    assert info["low"]["idle_nodes"] == 10 and info["dead"]["up"] is False
+    gpu = {n["node"]: n for n in info["gpu"]["nodes"]}
+    assert set(gpu) == {"n1", "n2"}                                   # allocated and drained nodes never count
+    assert gpu["n1"] == {"node": "n1", "cpus": 32, "memory_mb": 250000, "gpus": 4, "gpu_total": 4, "cpus_total": 32}
+    assert gpu["n2"]["cpus"] == 24 and gpu["n2"]["memory_mb"] == 100000
+    assert gpu["n2"]["gpus"] == 0 and gpu["n2"]["gpu_total"] == 4     # GPU use is unknown, so a busy node offers none
+    assert [n["node"] for n in info["low"]["nodes"]] == ["n5"]        # the down node is excluded
+    assert info["dead"]["up"] is False
     assert "garbage line" not in info
 
 
-def test_probe_reports_idle_capacity_caches_and_treats_failure_as_unavailable():
+def test_free_memory_is_capped_at_the_nodes_size():
+    row = sp.parse_sinfo("p|up|n1|idle|0/4/0/4|999999|1000|(null)")["p"]["nodes"][0]
+    assert row["memory_mb"] == 1000
+
+
+def test_real_whiteale_output_parses_to_exactly_the_usable_nodes():
+    text = (Path(__file__).parent.parent / "fixtures" / "slurm" / "whiteale-sinfo-nodes.txt").read_text()
+    info = sp.parse_sinfo(text)
+    assert set(info) == {"bigmem", "compute", "high", "low", "mpi"} and all(p["up"] for p in info.values())
+    for name, part in info.items():                                   # only idle or mixed nodes, never down/drained
+        assert part["nodes"], name
+        assert all(0 < n["cpus"] <= n["cpus_total"] and n["memory_mb"] > 0 for n in part["nodes"])
+    assert {n["node"] for n in info["mpi"]["nodes"]} <= {n["node"] for n in info["compute"]["nodes"]}
+    states = {line.split("|")[3].rstrip("*") for line in text.splitlines() if line.strip()}
+    assert {"down", "drained", "allocated"} <= states                  # the capture really contains the unusable kinds
+    unusable = {line.split("|")[2] for line in text.splitlines() if line.split("|")[3].rstrip("*") in
+                {"down", "drained", "allocated"}}
+    assert not unusable & {n["node"] for p in info.values() for n in p["nodes"]}
+
+
+def test_probe_reports_free_capacity_per_node_caches_and_treats_failure_as_unavailable():
     calls, clock = [], [0.0]
     probe = sp.SlurmProbe(sp.slurm_config([cluster()]), runner=lambda host: calls.append(host) or SINFO,
                           ttl=60, clock=lambda: clock[0])
     rows = {c["id"]: c for c in probe.candidates()}
     low, gpu = rows["slurm:hive:low"], rows["slurm:hive:gpu"]
-    assert low["status"] == "ready" and low["free"] == {"cpus": 640, "memory_mb": 5_120_000, "gpus": 0}
-    assert gpu["free"] == {"cpus": 64, "memory_mb": 512000, "gpus": 8} and "gpu" in gpu["capabilities"]
+    assert low["status"] == "ready" and low["free"] == {"cpus": 64, "memory_mb": 500000, "gpus": 0}
+    assert gpu["free"] == {"cpus": 56, "memory_mb": 350000, "gpus": 4} and "gpu" in gpu["capabilities"]
+    assert gpu["nodes"] == [{"cpus": 32, "memory_mb": 250000, "gpus": 4}, {"cpus": 24, "memory_mb": 100000, "gpus": 0}]
     assert low["kind"] == "slurm" and low["profiles"] == [PROFILE]
     probe.candidates()
     assert calls == ["login1.example"]                               # cached inside the ttl
@@ -130,6 +160,45 @@ def test_probe_reports_idle_capacity_caches_and_treats_failure_as_unavailable():
         raise OSError("ssh failed")
     broken = sp.SlurmProbe(sp.slurm_config([cluster()]), runner=down)
     assert {c["status"] for c in broken.candidates()} == {"unavailable"}   # never raises to the caller
+
+
+def test_a_request_needs_one_node_that_covers_every_resource_at_once():
+    candidate = cand("slurm:c:p", "slurm", nodes=[{"cpus": 20, "memory_mb": 1000, "gpus": 0},
+                                                  {"cpus": 2, "memory_mb": 50000, "gpus": 0}],
+                     free={"cpus": 22, "memory_mb": 51000, "gpus": 0})
+    split = pl.place([candidate], needs=[], resources={"cpus": 10, "memory_mb": 20000})
+    assert split["chosen"] is None                                   # the sums fit, but no single node does
+    assert split["rejected"][0]["reasons"][0].startswith("not enough")
+    assert pl.place([candidate], needs=[], resources={"cpus": 2, "memory_mb": 20000})["chosen"] == "slurm:c:p"
+    assert pl.place([candidate], needs=[], resources={"cpus": 20, "memory_mb": 500})["chosen"] == "slurm:c:p"
+
+
+@pytest.mark.skipif(not os.environ.get("HERDR_LIVE_SLURM_HOST"), reason="set HERDR_LIVE_SLURM_HOST to probe a real cluster")
+def test_live_cluster_probe_returns_well_formed_candidates():
+    """Read-only: one `sinfo` over ssh with the production runner. Never submits or installs anything."""
+    host = os.environ["HERDR_LIVE_SLURM_HOST"]
+    info = sp.parse_sinfo(sp._ssh_runner(host))
+    assert info, "the cluster reported no partitions"
+    config = sp.slurm_config([{"id": "live", "login_host": host, "assistant_use": True,
+                               "partitions": {name: {"capabilities": ["os:linux"]} for name in info}}])
+    rows = sp.SlurmProbe(config).candidates()
+    assert {r["status"] for r in rows} <= {"ready", "unavailable"} and len(rows) == len(info)
+    for row in rows:
+        assert all(isinstance(row["free"][k], int) and row["free"][k] >= 0 for k in pl.RESOURCE_KEYS)
+        assert row["profiles"] == []                                  # nothing is attested, so nothing is placeable
+        assert pl.place([row], needs=[], resources={}, profile=PROFILE)["chosen"] is None
+
+
+def test_the_ssh_command_quotes_the_format_so_the_remote_shell_sees_no_pipe():
+    argv = sp.ssh_argv("login1.example")
+    assert argv[:5] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] and argv[5] == "login1.example"
+    assert len(argv) == 7                                            # one remote command string, not loose arguments
+    assert argv[6] == f"sinfo -N -h -o '{sp.SINFO_FORMAT}'"
+    import shlex
+    assert shlex.split(argv[6]) == ["sinfo", "-N", "-h", "-o", sp.SINFO_FORMAT]
+    for bad in ("-oProxyCommand=x", "a b", "a;b", "$(x)", ""):
+        with pytest.raises(ValueError):
+            sp.ssh_argv(bad)
 
 
 def test_a_cluster_without_a_declared_profile_never_carries_a_specialist():

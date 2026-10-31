@@ -2,12 +2,14 @@
 
 A cluster takes part only when the operator configured it for assistant use and listed the sandbox profiles it has
 attested; ``sinfo`` can report capacity but cannot attest a display, an internet path or a sandbox, so those come from
-configuration and are never inferred. Capacity is conservative: only fully idle nodes count as free. Nothing here
-submits a job. Launching onto a cluster needs a runner installed and attested there, which is a separate change.
+configuration and are never inferred. Capacity is per node, because a runtime lives on one node: a partition lists the
+usable nodes' idle CPUs, free memory and GPUs, and a request fits only when a single node covers all of it. Down,
+drained and draining nodes never count. Nothing here submits a job. Launching onto a cluster needs a runner installed and attested there, which is a separate change.
 """
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -16,7 +18,10 @@ from typing import Any
 
 from . import placement
 
-SINFO_FORMAT = "%R|%a|%T|%D|%c|%m|%G"
+SINFO_FORMAT = "%P|%a|%n|%T|%C|%e|%m|%G"
+SINFO_ARGS = ["-N", "-h", "-o", SINFO_FORMAT]
+_USABLE_STATES = frozenset({"idle", "mixed"})
+MAX_NODES = 256
 _HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}\Z")
 _ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _PARTITION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -68,37 +73,51 @@ def slurm_config(value: Any) -> list[dict[str, Any]]:
 
 
 def parse_sinfo(text: str) -> dict[str, dict[str, Any]]:
-    """Per partition: availability and fully idle capacity from ``sinfo -h -o SINFO_FORMAT`` lines."""
+    """Per partition: availability and the usable nodes, from ``sinfo -N -h -o SINFO_FORMAT`` lines.
+
+    A node is usable when it is ``idle`` or ``mixed``; ``allocated`` has no idle CPU and ``down``, ``drained``,
+    ``draining`` and the like are unavailable. Free memory is the node's reported free memory capped at its size, and
+    GPUs count only on a node with no allocated CPU (``sinfo`` does not report GPU use, so this errs towards none)."""
     parts: dict[str, dict[str, Any]] = {}
     for line in text.splitlines():
         fields = line.strip().split("|")
-        if len(fields) != 7:
+        if len(fields) != 8:
             continue
-        name, avail, state, nodes, cpus, mem, gres = fields
+        name, avail, node, state, cpus, free_mem, mem, gres = fields
         name = name.rstrip("*")
-        if not _PARTITION_RE.fullmatch(name) or not (nodes.isdigit() and cpus.isdigit()):
+        counts = cpus.split("/")
+        if (not _PARTITION_RE.fullmatch(name) or not _HOST_RE.fullmatch(node) or len(counts) != 4
+                or not all(c.isdigit() for c in counts)):
             continue
-        row = parts.setdefault(name, {"up": avail.strip() == "up", "idle_nodes": 0, "cpus": 0,
-                                      "memory_mb": 0, "gpus_per_node": 0})
+        alloc, idle, _other, total = (int(c) for c in counts)
+        row = parts.setdefault(name, {"up": True, "nodes": []})
         row["up"] = row["up"] and avail.strip() == "up"
-        row["cpus"] = max(row["cpus"], int(cpus))
-        digits = re.sub(r"\D", "", mem)
-        row["memory_mb"] = max(row["memory_mb"], int(digits) if digits else 0)
-        match = _GPU_RE.search(gres)
-        if match:
-            row["gpus_per_node"] = max(row["gpus_per_node"], int(match.group(1)))
-        if state.strip().rstrip("*~#!%$@^-") == "idle":
-            row["idle_nodes"] += int(nodes)
+        if state.strip().rstrip("*~#!%$@^-") not in _USABLE_STATES or len(row["nodes"]) >= MAX_NODES:
+            continue
+        size = int(re.sub(r"\D", "", mem) or 0)
+        free = int(re.sub(r"\D", "", free_mem) or 0)
+        gpu = _GPU_RE.search(gres)
+        row["nodes"].append({
+            "node": node, "cpus": idle, "memory_mb": min(free, size) if size else free,
+            "gpus": int(gpu.group(1)) if gpu and alloc == 0 else 0,
+            "gpu_total": int(gpu.group(1)) if gpu else 0, "cpus_total": total})
     return parts
+
+
+def ssh_argv(login_host: str) -> list[str]:
+    """``ssh`` joins its remote arguments with spaces and the remote shell re-parses them, so the constant remote command
+    is quoted as one string; otherwise the ``|`` in the format would be read as a pipe."""
+    if not _HOST_RE.fullmatch(login_host) or login_host.startswith("-"):
+        raise ValueError("invalid login host")
+    remote = " ".join(shlex.quote(a) for a in ["sinfo", *SINFO_ARGS])
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", login_host, remote]
 
 
 def _ssh_runner(login_host: str) -> str:
     """Fixed argv, no user input: the only value interpolated is an operator-validated host name."""
     if not _HOST_RE.fullmatch(login_host) or login_host.startswith("-"):
         raise ValueError("invalid login host")
-    done = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", login_host, "sinfo", "-h", "-o", SINFO_FORMAT],
-        capture_output=True, text=True, timeout=12, check=False)
+    done = subprocess.run(ssh_argv(login_host), capture_output=True, text=True, timeout=12, check=False)
     if done.returncode != 0:
         raise OSError("sinfo failed")
     return done.stdout
@@ -134,18 +153,16 @@ class SlurmProbe:
         for name, spec in cluster["partitions"].items():
             seen = info.get(name)
             usable = reachable and seen is not None and seen["up"]
-            idle = seen["idle_nodes"] if usable else 0
+            nodes = [{k: n[k] for k in ("cpus", "memory_mb", "gpus")} for n in seen["nodes"]] if usable else []
             caps = set(spec["capabilities"])
-            if seen and seen["gpus_per_node"]:
+            if seen and any(n["gpu_total"] for n in seen["nodes"]):
                 caps.add("gpu")
             rows.append({
                 "id": f"slurm:{cluster['id']}:{name}", "kind": "slurm", "backend": "slurm",
                 "label": f"{cluster['label']} / {name}",
                 "status": "ready" if usable else "unavailable",
-                "capabilities": sorted(caps),
-                "free": {"cpus": idle * seen["cpus"] if usable else 0,
-                         "memory_mb": idle * seen["memory_mb"] if usable else 0,
-                         "gpus": idle * seen["gpus_per_node"] if usable else 0},
+                "capabilities": sorted(caps), "nodes": nodes,
+                "free": {key: sum(n[key] for n in nodes) for key in placement.RESOURCE_KEYS},
                 "attested_at": 0.0, "profiles": list(spec["profiles"]),
                 "role_bindings": list(spec["role_bindings"]), "queue_wait_s": 0,
             })

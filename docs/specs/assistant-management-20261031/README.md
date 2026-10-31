@@ -209,10 +209,28 @@ personal_assistant:
               role_bindings: ["procedure:secretary-system@1.0.0:sha256:..."]
 ```
 
-Capacity is read-only (`sinfo`, over `ssh` with a fixed argument list and an operator-validated host, cached 60 s), and
-conservative: **only fully idle nodes count as free**. `sinfo` cannot attest a display, an internet path or a sandbox, so
-those come from configuration and are never inferred; GPUs are read from the partition's GRES. A partition with no
-declared profile never carries a specialist. An unreachable cluster is `unavailable`, never an error to the caller.
+Capacity is read-only: one `sinfo -N -h -o '%P|%a|%n|%T|%C|%e|%m|%G'` over `ssh` (a fixed command, quoted as one remote
+string, with an operator-validated host name), cached 60 s. It is modelled **per node**, because a runtime lives on one
+node: a partition lists its usable nodes' idle CPUs, free memory (capped at the node's size) and GPUs, and a request
+fits only when a single node covers all of it at once. Only `idle` and `mixed` nodes count; `allocated`, `down`,
+`drained` and `draining` never do. `sinfo` does not report GPU use, so GPUs are counted only on a node with no allocated
+CPU. `sinfo` also cannot attest a display, an internet path or a sandbox, so those come from configuration and are never
+inferred. A partition with no declared profile never carries a specialist. An unreachable cluster is `unavailable`,
+never an error to the caller.
+
+#### Validated against `whiteale.fiehnlab.ucdavis.edu`
+
+Read-only, on 2026-10-31 (Slurm 25.11.8; partitions `compute`, `bigmem`, `mpi`, `high`, `low`; 24-core nodes, 57 GB or
+245 GB; no GPUs; not part of the dev fabric). The capture is `tests/fixtures/slurm/whiteale-sinfo-nodes.txt`. It showed
+that real `sinfo` uses full state words (`allocated`, `mixed`), appends `+` to memory, and that a busy cluster can have
+no fully idle node while mixed nodes still have free cores, which is why capacity is per node. A live probe also exposed
+an `ssh` quoting bug (the `|` in the format was read as a pipe by the remote shell) that no unit test caught; it is fixed
+and covered. The live check is opt-in and read-only: `HERDR_LIVE_SLURM_HOST=whiteale.fiehnlab.ucdavis.edu pytest
+tests/control_plane/test_placement.py -k live`.
+
+Configured honestly (no profile attested there), whiteale is correctly *unplaceable*: every partition is rejected with
+`no sandbox profile task-restricted-v1`. Declaring a profile it has not attested would make it plannable, which is
+exactly what must not be done until a runner is attested there.
 
 **Not built:** launching a runtime onto Slurm. That needs the runner installed and attested on the cluster
 (bubblewrap, cgroup and broker enforcement on compute nodes), which cannot be proven without one. Until then a Slurm
