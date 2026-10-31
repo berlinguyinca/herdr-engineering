@@ -384,6 +384,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     assistant = subparsers.add_parser("assistant", help="authenticated personal-agent control tools")
     groups = assistant.add_subparsers(dest="assistant_group", required=True)
 
+    from .assistant_manage_cli import register_management
+    register_management(groups)
+
     agents = groups.add_parser("agents", help="discover visible agents")
     agent_ops = agents.add_subparsers(required=True)
     cmd = agent_ops.add_parser("list")
