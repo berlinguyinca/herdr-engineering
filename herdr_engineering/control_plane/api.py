@@ -254,7 +254,8 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
-                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None):
+                 assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
+                 fabric_resolver=None, fabric_services=None, fabric_names=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -334,7 +335,8 @@ class ControlPlaneServer:
             from .assistant import AssistantService
             from .assistant import assistant_config as _build_assistant_config
             self.assistant = AssistantService(
-                config=_build_assistant_config(assistant_config or {}), repo=repo)
+                config=_build_assistant_config(assistant_config or {}), repo=repo,
+                delegation_adapter=assistant_delegation_adapter)
         else:
             self.assistant = assistant_service
         from .ingest import IngestService
@@ -820,6 +822,11 @@ class ControlPlaneServer:
             sweep_token_usage(self.repo, raw_retention_days=self.usage_retention["raw_retention_days"])
         except Exception as exc:
             log.warning("token_usage retention sweep failed: %s", type(exc).__name__)
+        try:
+            if self.assistant.config.get("enabled"):
+                self.assistant.maintain_delegations()
+        except Exception as exc:
+            log.warning("assistant delegation maintenance failed: %s", type(exc).__name__)
 
     def _link_flush_loop(self, interval=30):
         """T14: tell the lineage graph what it missed about cross-workspace links (a retraction the graph was down
@@ -2984,6 +2991,9 @@ def _make_handler(server, public=False, operator=False):
                                      assistant_id=body.get("assistant_id", ""),
                                      task=body.get("task", ""),
                                      target_system=body.get("target_system", "pi"),
+                                     context=body.get("context"),
+                                     source_refs=body.get("source_refs"),
+                                     idempotency_key=body.get("idempotency_key", ""),
                                      actor=user_id)
                     return self._json(d.as_dict(), 201)
                 if resource == "assistant-delegations" and len(parts) == 6 and parts[5] == "cancel":
