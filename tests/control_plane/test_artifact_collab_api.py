@@ -17,7 +17,10 @@ from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
 from herdr_engineering.control_plane.artifact_adapter import SyncArtifactAdapter
 from herdr_engineering.control_plane.artifact_bundle import ArtifactBundle
 from herdr_engineering.control_plane.artifact_collab_store import CollabGrantStore
+from herdr_engineering.control_plane.artifact_scope import ArtifactGraphGate
 from herdr_engineering.control_plane.artifacts import ArtifactStore
+from herdr_engineering.control_plane.collab_bridge_files import BridgeLimits
+from herdr_engineering.control_plane.collab_mirror import CollabMirror
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane.registry_pg import FakeBlobs, registry_pg, uid  # noqa: F401 - imported fixture
 
@@ -172,6 +175,7 @@ ALL_ROUTES = [
     ("POST", "/collaborators/invite-grant", {"invite_id": "i1", "permission": "read"}),
     ("GET", "/collab-activity", None),
     ("GET", "/versions/v1/diff", None),
+    ("POST", "/collab-restrict", {}),
 ]
 
 
@@ -215,7 +219,8 @@ def test_cross_origin_post_is_403_and_same_origin_is_allowed(env, registry_pg, b
     aid = seed(registry_pg, blobs)
     body = {"agent_id": "a1", "permission": "read"}
     for tail, payload in (("/collaborators", body), ("/collaborators/a1/revoke", {}),
-                          ("/collaborators/invite-grant", {"invite_id": "i1", "permission": "read"})):
+                          ("/collaborators/invite-grant", {"invite_id": "i1", "permission": "read"}),
+                          ("/collab-restrict", {})):
         status, _ = request(base, f"/api/v1/artifacts/{aid}{tail}", body=payload,
                             headers={"Origin": "https://evil.example"})
         assert status == 403, tail
@@ -613,7 +618,8 @@ def test_encoded_resource_segment_cannot_bypass_the_origin_guard(env, registry_p
     evil = {"Origin": "https://evil.example"}
     for tail, body in (("/collaborators", {"agent_id": "a1", "permission": "read"}),
                        ("/collaborators/a1/revoke", {}),
-                       ("/collaborators/invite-grant", {"invite_id": "i1", "permission": "read"})):
+                       ("/collaborators/invite-grant", {"invite_id": "i1", "permission": "read"}),
+                       ("/collab-restrict", {})):
         status, _ = request(base, f"/api/v1/%61rtifacts/{aid}{tail}", body=body, headers=evil)
         assert status == 403, tail
     assert not acl_rows(registry_pg, blobs, aid)
@@ -648,3 +654,150 @@ def test_diff_file_count_and_total_read_budget_bound_cpu(env, registry_pg, blobs
     status, data = diff_of(base, aid, second)
     done = [f for f in data["files"] if f["diff"] is not None]
     assert 1 <= len(done) < 5 and all(f["reason"] == "oversize" for f in data["files"] if f["diff"] is None)
+
+
+# ------------------------------------------------------------------------------------------------ retraction fail-safe
+
+
+@contextmanager
+def failing_persist(pg, blobs):
+    """A REAL database failure: triggers make the retraction UPDATE (artifact or version) raise inside Postgres."""
+    sql(pg, blobs, "CREATE OR REPLACE FUNCTION retraction_boom() RETURNS trigger AS $$ BEGIN "
+                   "RAISE EXCEPTION 'boom secret-dsn'; END $$ LANGUAGE plpgsql")
+    sql(pg, blobs, "CREATE TRIGGER boom_a BEFORE UPDATE ON artifacts FOR EACH ROW "
+                   "WHEN (NEW.lifecycle = 'retracted') EXECUTE FUNCTION retraction_boom()")
+    sql(pg, blobs, "CREATE TRIGGER boom_v BEFORE UPDATE ON artifact_versions FOR EACH ROW "
+                   "WHEN (NEW.state = 'retracted') EXECUTE FUNCTION retraction_boom()")
+    try:
+        yield
+    finally:
+        sql(pg, blobs, "DROP TRIGGER boom_a ON artifacts")
+        sql(pg, blobs, "DROP TRIGGER boom_v ON artifact_versions")
+
+
+def grant_rows(base, aid, agent, permission):
+    return request(base, f"/api/v1/artifacts/{aid}/collaborators", body={"agent_id": agent, "permission": permission})
+
+
+def seeded_grants(base, pg, blobs):
+    aid = seed(pg, blobs)
+    assert grant_rows(base, aid, "r1", "read")[0] == 201
+    assert grant_rows(base, aid, "w1", "write")[0] == 201
+    return aid
+
+
+def principals(pg, blobs, aid):
+    return [r["principal_id"] for r in acl_rows(pg, blobs, aid)]
+
+
+def version_of(pg, blobs, aid):
+    return sql(pg, blobs, "SELECT version_id FROM artifact_versions WHERE artifact_id=$1", aid)[0]["version_id"]
+
+
+@pytest.mark.parametrize("by_version", [False, True])
+def test_failed_persist_revokes_write_grants_only_and_offers_restrict_all(env, registry_pg, blobs, by_version):
+    base, server, _ = env
+    aid = seeded_grants(base, registry_pg, blobs)
+    body = {"version_id": version_of(registry_pg, blobs, aid)} if by_version else {}
+    with failing_persist(registry_pg, blobs):
+        status, data = request(base, f"/api/v1/artifacts/{aid}/retract", body=body)
+    assert status == 500
+    assert data["persisted"] is False and data["hidden"] is True and data["error"]
+    assert data["collab_write_grants_revoked"] == 1 and data["collab_revoke_error"] is None
+    assert data["restrict_all_offered"] is True
+    assert principals(registry_pg, blobs, aid) == ["collab:r1"]          # read stays: nothing automatic restricts it
+
+
+def test_successful_retraction_never_runs_the_callback_or_touches_grants(env, registry_pg, blobs):
+    base, server, _ = env
+    aid = seeded_grants(base, registry_pg, blobs)
+    status, data = request(base, f"/api/v1/artifacts/{aid}/retract", body={"reason": "ok"})
+    assert status == 200 and data["persisted"] is True
+    assert data["collab_write_grants_revoked"] is None and data["collab_revoke_error"] is None
+    assert "restrict_all_offered" not in data
+    assert principals(registry_pg, blobs, aid) == ["collab:r1", "collab:w1"]
+
+
+def test_failing_callback_is_reported_by_type_name_and_never_masks_the_500(env, registry_pg, blobs):
+    base, server, _ = env
+    aid = seeded_grants(base, registry_pg, blobs)
+    server.collab_grant_store.close()                                      # the grant store is now really unusable
+    with failing_persist(registry_pg, blobs):
+        status, data = request(base, f"/api/v1/artifacts/{aid}/retract", body={})
+    assert status == 500 and data["persisted"] is False and data["error"]
+    assert data["collab_write_grants_revoked"] is None
+    assert data["collab_revoke_error"] == "RuntimeError"                   # a type name, no message
+    assert data["restrict_all_offered"] is True
+
+
+def test_restrict_all_in_the_retract_body_is_a_bool_and_unknown_keys_still_400(env, registry_pg, blobs):
+    base, server, _ = env
+    aid = seeded_grants(base, registry_pg, blobs)
+    for bad in ("yes", 1, None, [True]):
+        assert request(base, f"/api/v1/artifacts/{aid}/retract", body={"restrict_all": bad})[0] == 400, bad
+    assert request(base, f"/api/v1/artifacts/{aid}/retract", body={"restrict_all": True, "scope": "x"})[0] == 400
+    assert principals(registry_pg, blobs, aid) == ["collab:r1", "collab:w1"]
+
+
+def test_failed_persist_with_restrict_all_also_removes_read_grants(env, registry_pg, blobs):
+    base, server, _ = env
+    aid = seeded_grants(base, registry_pg, blobs)
+    other = seeded_grants(base, registry_pg, blobs)
+    with failing_persist(registry_pg, blobs):
+        status, data = request(base, f"/api/v1/artifacts/{aid}/retract", body={"restrict_all": True})
+    assert status == 500 and data["collab_write_grants_revoked"] == 1 and data["restrict_all_offered"] is True
+    assert data["collab_all_grants_revoked"] == 1 and data["collab_restrict_error"] is None   # the write one went first
+    assert principals(registry_pg, blobs, aid) == []
+    assert principals(registry_pg, blobs, other) == ["collab:r1", "collab:w1"]      # that artifact only
+
+
+def test_restrict_all_on_a_successful_retraction_touches_no_grants(env, registry_pg, blobs):
+    base, server, _ = env
+    ok = seeded_grants(base, registry_pg, blobs)
+    status, data = request(base, f"/api/v1/artifacts/{ok}/retract", body={"restrict_all": True})
+    assert status == 200 and data.get("collab_all_grants_revoked") is None
+    assert principals(registry_pg, blobs, ok) == ["collab:r1", "collab:w1"]          # success: grants untouched
+
+
+def test_restrict_route_revokes_read_and_write_of_that_artifact_only(env, registry_pg, blobs, tmp_path):
+    base, server, _ = env
+    aid = seeded_grants(base, registry_pg, blobs)
+    other = seeded_grants(base, registry_pg, blobs)
+    sql(registry_pg, blobs, "INSERT INTO artifact_acl (artifact_id, principal_id, permissions, granted_by) "
+                            "VALUES ($1,'api-key:x:operator','[\"read\"]'::jsonb,'o')", aid)   # a web grant stays
+    status, data = request(base, f"/api/v1/artifacts/{aid}/collab-restrict", body={})
+    assert status == 200 and data == {"revoked": 2}
+    assert principals(registry_pg, blobs, aid) == [] and principals(registry_pg, blobs, other) == ["collab:r1", "collab:w1"]
+    assert sql(registry_pg, blobs, "SELECT 1 FROM artifact_acl WHERE artifact_id=$1 AND principal_id='api-key:x:operator'",
+               aid)
+    assert request(base, f"/api/v1/artifacts/{aid}/collab-restrict", body={})[1] == {"revoked": 0}
+    assert request(base, f"/api/v1/artifacts/{aid}/collab-restrict", body={"x": 1})[0] == 400
+    assert request(base, f"/api/v1/artifacts/{aid}/collab-restrict", method="GET")[0] == 404
+
+
+def test_restrict_route_needs_admin_and_changes_nothing_for_others(env, registry_pg, blobs):
+    base, server, _ = env
+    aid = seeded_grants(base, registry_pg, blobs)
+    denied = request(base, f"/api/v1/artifacts/{aid}/collab-restrict", key=OTHER_KEY, body={})
+    assert denied == (404, {"error": "not found"})
+    assert request(base, f"/api/v1/artifacts/{aid}/collab-restrict", body={}, headers={"Origin": "https://evil.example"})[0] == 403
+    assert principals(registry_pg, blobs, aid) == ["collab:r1", "collab:w1"]
+
+
+def test_after_restrict_the_mirror_drops_the_grants_and_the_artifact_in_one_sync(env, registry_pg, blobs, tmp_path):
+    base, server, _ = env
+    aid = seeded_grants(base, registry_pg, blobs)
+    mirror = CollabMirror(tmp_path / "mirror", rustfs=blobs, limits=BridgeLimits())
+
+    async def sync_once(store, conn):
+        gate = ArtifactGraphGate(None)
+        gate.load_retractions(await store.load_retractions())
+        await mirror.publish_grants(CollabGrantStore(conn), store)
+        await mirror.sync(store, gate=gate)
+    run(registry_pg, blobs, sync_once)
+    assert (tmp_path / "mirror" / "artifacts" / aid / "head.json").exists()
+    assert request(base, f"/api/v1/artifacts/{aid}/collab-restrict", body={})[1] == {"revoked": 2}
+    run(registry_pg, blobs, sync_once)
+    agents = json.loads((tmp_path / "mirror" / "grants.json").read_text())["agents"]
+    assert all(aid not in arts for arts in agents.values())
+    assert not (tmp_path / "mirror" / "artifacts" / aid).exists()

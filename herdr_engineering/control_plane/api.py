@@ -5254,13 +5254,20 @@ def _make_handler(server, public=False, operator=False):
 
         # ----------------------------------------------------- artifact <-> lineage graph routes
         def _artifact_retract(self, artifact_id):
-            """POST /api/v1/artifacts/<id>/retract {"version_id"?, "reason"?}: hide the artifact (or one version) from
-            every graph reader, durably. ``admin`` on the artifact, like the ACL routes."""
+            """POST /api/v1/artifacts/<id>/retract {"version_id"?, "reason"?, "restrict_all"?}: hide the artifact (or one
+            version) from every graph reader, durably. ``admin`` on the artifact, like the ACL routes.
+
+            Fail-safe: when the retraction could not be persisted (hidden in memory only) the artifact's collaborator WRITE
+            grants are revoked. ``restrict_all: true`` additionally revokes its read grants, on that failed path only;
+            without the flag read grants are never touched and the 500 offers it (``restrict_all_offered``)."""
             if not self._artifact_allowed(artifact_id, "admin"):
                 return self._artifact_forbidden()
             body = self._read_json() or {}
-            if not isinstance(body, dict) or set(body) - {"version_id", "reason"}:
-                return self._json({"error": "body may only carry version_id and reason"}, 400)
+            if not isinstance(body, dict) or set(body) - {"version_id", "reason", "restrict_all"}:
+                return self._json({"error": "body may only carry version_id, reason and restrict_all"}, 400)
+            restrict_all = body.get("restrict_all", False)
+            if not isinstance(restrict_all, bool):
+                return self._json({"error": "restrict_all must be a boolean"}, 400)
             version_id = body.get("version_id")
             if version_id is not None and (not isinstance(version_id, str) or not version_id):
                 return self._json({"error": "version_id must be a non-empty string"}, 400)
@@ -5274,9 +5281,22 @@ def _make_handler(server, public=False, operator=False):
             if server.artifact_store is not None:
                 def persist(aid, vid, why):
                     self._artifact_call("record_retraction", aid, vid, why)
+            grants = server.collab_grant_store if server.collab_artifacts_enabled else None
+            on_unpersisted = None
+            if grants is not None:
+                def on_unpersisted(aid):
+                    return grants("revoke_write_grants", aid)
             result = retract(gate=server.artifact_graph_gate, ingest=server.ingest, principal=self._principal(),
                              artifact_id=artifact_id, version_id=version_id, reason=body.get("reason"),
-                             persist=persist)
+                             persist=persist, on_unpersisted=on_unpersisted)
+            if result["error"]:
+                result["restrict_all_offered"] = True
+                if restrict_all and grants is not None:       # operator-requested, after the write-grant fail-safe
+                    result["collab_all_grants_revoked"], result["collab_restrict_error"] = None, None
+                    try:
+                        result["collab_all_grants_revoked"] = grants("revoke_all_grants", artifact_id)
+                    except Exception as exc:                  # noqa: BLE001 - type name only; the 500 stands
+                        result["collab_restrict_error"] = type(exc).__name__
             return self._json(result, 500 if result["error"] else 200)
 
         def _artifact_backfill(self, artifact_id):
