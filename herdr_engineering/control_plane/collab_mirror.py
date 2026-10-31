@@ -204,7 +204,7 @@ class CollabMirror:
         doc = {"generated_at": now, **body}
 
         def write() -> None:
-            ensure_dir(self.root, mode=DIR_MODE)
+            ensure_dir(self.root, mode=DIR_MODE, public_mode=True)
             atomic_write_json(self.root, GRANTS_NAME, doc)
         await asyncio.get_running_loop().run_in_executor(self._grants_pool, write)
         self._grants_body, self._grants_written_at = body, now
@@ -246,14 +246,22 @@ class CollabMirror:
             work = asyncio.ensure_future(asyncio.to_thread(self._write, artifact_id, doc, candidates,
                                                            prune_first=shrunk, fetch=fetch))
             cancelled = False
-            while True:
-                try:
-                    complete = await asyncio.shield(work)
-                    break
-                except asyncio.CancelledError:
-                    if work.done():
-                        raise
-                    cancelled = True
+            try:
+                while True:
+                    try:
+                        complete = await asyncio.shield(work)
+                        break
+                    except asyncio.CancelledError:
+                        if work.done():
+                            raise
+                        cancelled = True
+            except Exception as exc:
+                self._forget(artifact_id)                 # head.json state unknown: prune first next time
+                if cancelled:                             # the cancellation wins over the worker's own error
+                    log.warning("collab mirror refresh failed after cancellation artifact=%s error=%s",
+                                artifact_id, type(exc).__name__)
+                    raise asyncio.CancelledError from exc
+                raise
             self._listed[artifact_id] = listed
             if cancelled:
                 self._fingerprints.pop(artifact_id, None)
@@ -413,11 +421,11 @@ class CollabMirror:
         """Blocking. When versions left the listing (or downloads are off), first publish a ``head.json`` marking only
         blobs already present. Then walk the candidates once in priority order (head first, then older versions newest
         first): a present blob that fits the artifact budget is kept, a missing one that fits is downloaded and
-        charged only once in place. Publish again. True when nothing is left to reconsider: no download failed and no
-        blob was skipped for budget while a lower-priority one was kept."""
+        charged only once in place. Publish again. True when no download failed (a budget skip is final for this
+        version set and limits, so it never makes the refresh incomplete)."""
         parts = [ARTIFACTS_DIR, artifact_id, BLOBS_DIR]
-        ensure_dir(self.root, mode=DIR_MODE)
-        make_dirs_beneath(self.root, parts, dir_mode=DIR_MODE)
+        ensure_dir(self.root, mode=DIR_MODE, public_mode=True)
+        make_dirs_beneath(self.root, parts, dir_mode=DIR_MODE, public_mode=True)
         if prune_first or not fetch:
             budget = self.limits.mirror_max_artifact_bytes
             for candidate in candidates:
@@ -431,12 +439,11 @@ class CollabMirror:
                 for ref in candidate["refs"]:
                     ref["mirrored"] = False
         budget = self.limits.mirror_max_artifact_bytes
-        complete, skipped = True, False
+        complete = True
         for candidate in candidates:
             sha, size = candidate["sha256"], candidate["size_bytes"]
             if size > budget:
-                skipped = True
-                continue
+                continue        # deterministic for this version set: settles (a new version changes the fingerprint)
             if file_exists_beneath(self.root, parts, sha):
                 ok = True
             elif self._bad_blob(sha):
@@ -449,7 +456,6 @@ class CollabMirror:
                     continue
             if ok:
                 budget -= size
-                complete = complete and not skipped
             else:
                 for ref in candidate["refs"]:
                     ref["text"] = False

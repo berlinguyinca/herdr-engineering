@@ -37,6 +37,7 @@ import errno
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -48,6 +49,8 @@ from pathlib import Path
 from typing import BinaryIO, Literal
 
 from .share_bundle import ShareBundleError, check_names, normalise_name
+
+_log = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------------- protocol constants (not configuration)
 
@@ -305,18 +308,18 @@ DIR_MODE = 0o755
 
 
 def _fix_dir_mode(dfd: int, mode: int) -> None:
-    """``fchmod`` the directory ``dfd`` to ``mode`` when its mode differs (the umask or an earlier run decided it).
-    A directory this process does not own is left as it is (``EPERM``)."""
+    """``fchmod`` the existing directory ``dfd`` to ``mode`` when its mode differs (opt-in: ``public_mode=True``).
+    A directory this process does not own is left as it is (``EPERM``, logged at debug)."""
     if stat.S_IMODE(os.fstat(dfd).st_mode) != mode:
         try:
             os.fchmod(dfd, mode)
         except PermissionError:
-            pass
+            _log.debug("directory mode left as is: not owned by this process")
 
 
-def _ensure_dir(path: Path, mode: int = DIR_MODE) -> int:
-    """An fd on ``path`` (trusted: the writer's own tree), creating missing directories; every directory created and
-    ``path`` itself end up with ``mode`` whatever the umask."""
+def _ensure_dir(path: Path, mode: int = DIR_MODE, *, public_mode: bool = False) -> int:
+    """An fd on ``path`` (trusted: the writer's own tree), creating missing directories with ``mode`` whatever the
+    umask. An existing ``path`` keeps its mode unless ``public_mode`` asks to repair it to ``mode``."""
     path = Path(path)
     missing = []
     probe = path
@@ -330,17 +333,19 @@ def _ensure_dir(path: Path, mode: int = DIR_MODE) -> int:
             continue
         os.chmod(d, mode)
     dfd = _open_root(path)
-    try:
-        _fix_dir_mode(dfd, mode)
-    except BaseException:
-        os.close(dfd)
-        raise
+    if public_mode:
+        try:
+            _fix_dir_mode(dfd, mode)
+        except BaseException:
+            os.close(dfd)
+            raise
     return dfd
 
 
-def ensure_dir(path: Path, *, mode: int = DIR_MODE) -> None:
-    """Create the trusted directory ``path`` (and missing parents) with ``mode``, repairing ``path``'s own mode."""
-    os.close(_ensure_dir(path, mode))
+def ensure_dir(path: Path, *, mode: int = DIR_MODE, public_mode: bool = False) -> None:
+    """Create the trusted directory ``path`` (and missing parents) with ``mode``; with ``public_mode`` also repair an
+    existing ``path``'s mode to ``mode`` (the mirror's world-readable tree)."""
+    os.close(_ensure_dir(path, mode, public_mode=public_mode))
 
 
 def _create_tmp(dfd: int, data: bytes, mode: int) -> str:
@@ -467,32 +472,38 @@ def file_exists_beneath(root: Path, parts: list[str], name: str) -> bool:
     return True
 
 
-def _make_dirs_beneath(root: Path, parts: list[str], dir_mode: int) -> int:
-    """An fd on ``root/parts...``: every component is created with ``mkdirat`` if missing, ``fchmod``-ed to
-    ``dir_mode`` whenever its mode differs (so the umask never decides), and always opened ``O_DIRECTORY|O_NOFOLLOW`` from the previous fd.
+def _make_dirs_beneath(root: Path, parts: list[str], dir_mode: int, public_mode: bool = False) -> int:
+    """An fd on ``root/parts...``: every component is created with ``mkdirat`` if missing (then ``fchmod``-ed to
+    ``dir_mode``, so the umask never decides; with ``public_mode`` an existing component whose mode differs is
+    repaired too), and always opened ``O_DIRECTORY|O_NOFOLLOW`` from the previous fd.
     ``BridgeError`` for an unsafe component, ``OSError`` for a symlinked or non-directory one."""
     if not _safe_parts(parts):
         raise BridgeError("unsafe path component")
     dfd = _open_root(Path(root))
     try:
         for part in parts:
+            created = True
             try:
                 os.mkdir(part, 0o700, dir_fd=dfd)
             except FileExistsError:
-                pass
+                created = False
             nfd = _open_subdir(part, dfd)
             os.close(dfd)
             dfd = nfd
-            _fix_dir_mode(dfd, dir_mode)
+            if created:
+                os.fchmod(dfd, dir_mode)
+            elif public_mode:
+                _fix_dir_mode(dfd, dir_mode)
     except BaseException:
         os.close(dfd)
         raise
     return dfd
 
 
-def make_dirs_beneath(root: Path, parts: list[str], *, dir_mode: int = 0o755) -> None:
-    """Create ``root/parts...`` as ``_make_dirs_beneath`` does (no-follow, created dirs ``fchmod``-ed)."""
-    os.close(_make_dirs_beneath(root, parts, dir_mode))
+def make_dirs_beneath(root: Path, parts: list[str], *, dir_mode: int = 0o755, public_mode: bool = False) -> None:
+    """Create ``root/parts...`` as ``_make_dirs_beneath`` does (no-follow, created dirs ``fchmod``-ed; existing ones
+    repaired only with ``public_mode``)."""
+    os.close(_make_dirs_beneath(root, parts, dir_mode, public_mode))
 
 
 class _Rejected(Exception):

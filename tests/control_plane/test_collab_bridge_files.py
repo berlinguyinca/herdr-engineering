@@ -1167,7 +1167,10 @@ def test_dir_helpers_repair_the_mode_of_existing_dirs(tmp_path):
     (tmp_path / "a" / "b").mkdir(parents=True)
     os.chmod(tmp_path / "a", 0o700)
     os.chmod(tmp_path / "a" / "b", 0o777)
-    cbf.make_dirs_beneath(tmp_path, ["a", "b"])
+    cbf.make_dirs_beneath(tmp_path, ["a", "b"])                 # default: existing modes are left alone
+    assert stat.S_IMODE(os.stat(tmp_path / "a").st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(tmp_path / "a" / "b").st_mode) == 0o777
+    cbf.make_dirs_beneath(tmp_path, ["a", "b"], public_mode=True)
     assert stat.S_IMODE(os.stat(tmp_path / "a").st_mode) == 0o755
     assert stat.S_IMODE(os.stat(tmp_path / "a" / "b").st_mode) == 0o755
     (tmp_path / "c").mkdir()
@@ -1179,7 +1182,13 @@ def test_dir_helpers_repair_the_mode_of_existing_dirs(tmp_path):
         os.umask(old)
     for d in ("c/d", "c/d/e"):
         assert stat.S_IMODE(os.stat(tmp_path / d).st_mode) == 0o755, d
+    assert stat.S_IMODE(os.stat(tmp_path / "c").st_mode) == 0o700     # an existing parent is never widened
     cbf.ensure_dir(tmp_path / "c")
+    assert stat.S_IMODE(os.stat(tmp_path / "c").st_mode) == 0o700
+    cbf.atomic_write_bytes(tmp_path / "c", "f", b"x")
+    cbf.link_new_bytes(tmp_path / "c", "g", b"x")
+    assert stat.S_IMODE(os.stat(tmp_path / "c").st_mode) == 0o700
+    cbf.ensure_dir(tmp_path / "c", public_mode=True)
     assert stat.S_IMODE(os.stat(tmp_path / "c").st_mode) == 0o755
 
 

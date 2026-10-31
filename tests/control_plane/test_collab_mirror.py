@@ -2,6 +2,7 @@
 """CollabMirror: the read-only collaborator mirror the worker publishes for collab-public (Task 4)."""
 import asyncio
 import concurrent.futures
+import errno
 import hashlib
 import json
 import os
@@ -739,18 +740,27 @@ def test_head_files_have_budget_priority_over_older_present_blobs(registry_pg, t
     run(registry_pg, body, blobs)
 
 
-def test_budget_skip_with_older_blob_kept_is_reconsidered(registry_pg, tmp_path):
+def test_budget_skip_settles_and_is_reconsidered_only_on_change(registry_pg, tmp_path):
     blobs = CountingBlobs()
 
     async def body(store, conn, blobs):
         aid, v1 = await make_artifact(store, blobs, {"old.md": b"o" * 30})
-        await commit(store, blobs, aid, v1["version_id"], {"big.md": b"b" * 90})
+        v2 = await commit(store, blobs, aid, v1["version_id"], {"big.md": b"b" * 90})
         await grant(conn, aid)
         mirror = mirror_for(tmp_path, blobs, mirror_max_artifact_bytes=80, mirror_history_versions=1)
         await mirror.sync(store, gate=await gate_for(store))
+        head = tmp_path / "mirror" / "artifacts" / aid / "head.json"
         doc = head_doc(tmp_path / "mirror", aid)
         assert doc["versions"][0]["files"][0]["mirrored"] is False and doc["versions"][1]["files"][0]["mirrored"]
+        before = os.stat(head)
+        out = await mirror.sync(store, gate=await gate_for(store))   # identical state: settled, nothing rewritten
+        after = os.stat(head)
+        assert aid not in out["refreshed"]
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+        await commit(store, blobs, aid, v2["version_id"], {"small.md": b"s" * 20})
         assert aid in (await mirror.sync(store, gate=await gate_for(store)))["refreshed"]
+        files = {f["name"]: f["mirrored"] for v in head_doc(tmp_path / "mirror", aid)["versions"] for f in v["files"]}
+        assert files == {"small.md": True, "big.md": False, "old.md": False}   # old.md left the window
     run(registry_pg, body, blobs)
 
 
@@ -786,8 +796,9 @@ def test_genuinely_binary_blob_is_cached_and_not_refetched(registry_pg, tmp_path
         mirror = CollabMirror(tmp_path / "mirror", rustfs=blobs, limits=BridgeLimits(), clock=clock)
         await mirror.sync(store, gate=await gate_for(store))
         clock.t += 7200
-        out = await mirror.sync(store, gate=await gate_for(store))
-        assert aid not in out["refreshed"]
+        out = await mirror.sync(store, gate=await gate_for(store), force={aid})   # plans the same sha again
+        assert aid in out["refreshed"]
+        await mirror.refresh(store, aid, gate=await gate_for(store))
         assert blobs.fetches.count(hashlib.sha256(b"\xff" * 20).hexdigest()) == 1
         assert head_doc(tmp_path / "mirror", aid)["versions"][0]["files"][0]["text"] is False
     run(registry_pg, body, blobs)
@@ -923,3 +934,85 @@ def test_present_blob_is_kept_even_when_its_sha_failed_elsewhere(registry_pg, tm
         doc = await mirror.refresh(store, x, gate=await gate_for(store))
         assert {f["name"]: f["mirrored"] for f in doc["versions"][0]["files"]}["doc.md"] is True
     run(registry_pg, body, blobs)
+
+
+# ----------------------------------------------------------------------------- review fixes, round 3
+
+def test_restart_prune_pass_marks_do_not_leak_into_the_budget_walk(registry_pg, tmp_path):
+    async def body(store, conn, blobs):
+        limits = dict(mirror_max_artifact_bytes=100, mirror_history_versions=1)
+        aid, v1 = await make_artifact(store, blobs, {"old.md": b"o" * 60})
+        await mirror_for(tmp_path, blobs, **limits).refresh(store, aid, gate=await gate_for(store))
+        await commit(store, blobs, aid, v1["version_id"], {"new.md": b"n" * 60})
+        doc = await mirror_for(tmp_path, blobs, **limits).refresh(store, aid, gate=await gate_for(store))  # restart
+        files = {f["name"]: f["mirrored"] for v in doc["versions"] for f in v["files"]}
+        assert files == {"new.md": True, "old.md": False}
+        assert blob_names(tmp_path / "mirror", aid) == [hashlib.sha256(b"n" * 60).hexdigest()]
+    run(registry_pg, body)
+
+
+def test_first_head_json_after_restart_respects_the_budget(registry_pg, tmp_path):
+    blobs = CountingBlobs()
+
+    async def body(store, conn, blobs):
+        aid, v1 = await make_artifact(store, blobs, {"a.md": b"a" * 60})
+        v2 = await commit(store, blobs, aid, v1["version_id"], {"b.md": b"b" * 60})
+        await mirror_for(tmp_path, blobs).refresh(store, aid, gate=await gate_for(store))
+        assert len(blob_names(tmp_path / "mirror", aid)) == 2
+        await commit(store, blobs, aid, v2["version_id"], {"c.md": b"c" * 10})
+        seen = []
+        blobs.hooks[hashlib.sha256(b"c" * 10).hexdigest()] = lambda: seen.append(sum(
+            f["size_bytes"] for v in head_doc(tmp_path / "mirror", aid)["versions"] for f in v["files"]
+            if f["mirrored"]))
+        await mirror_for(tmp_path, blobs, mirror_max_artifact_bytes=100, mirror_history_versions=2).refresh(
+            store, aid, gate=await gate_for(store))
+        assert seen and seen[0] <= 100
+    run(registry_pg, body, blobs)
+
+
+def test_sync_reports_failures_before_any_refresh(registry_pg, tmp_path):
+    async def body(store, conn, blobs):
+        aid, _ = await make_artifact(store, blobs, {"doc.md": b"one\n"})
+        await grant(conn, aid)
+        real = store.get
+
+        async def broken(artifact_id):
+            if artifact_id == aid:
+                raise OSError("database went away")
+            return await real(artifact_id)
+        store.get = broken
+        out = await mirror_for(tmp_path, blobs).sync(store, gate=await gate_for(store))
+        assert out["failed"] == [aid]
+    run(registry_pg, body)
+
+
+@pytest.mark.parametrize("how", ["cancel", "timeout"])
+def test_cancellation_survives_a_worker_error(registry_pg, tmp_path, how):
+    async def body(store, conn, blobs):
+        aid, _ = await make_artifact(store, blobs, {"doc.md": b"one\n"})
+        await grant(conn, aid)
+        mirror = mirror_for(tmp_path, blobs)
+        entered, release = threading.Event(), threading.Event()
+
+        def boom(artifact_id, doc):
+            entered.set()
+            release.wait(5)
+            raise OSError(errno.ENOSPC, "no space left")
+        mirror._publish_head = boom
+        gate = await gate_for(store)
+        if how == "cancel":
+            task = asyncio.create_task(mirror.sync(store, gate=gate))
+            await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            await asyncio.sleep(0.05)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+        else:
+            threading.Timer(0.3, release.set).start()
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.1):
+                    await mirror.refresh(store, aid, gate=gate)
+        assert not mirror._lock(aid).locked()
+    run(registry_pg, body)
