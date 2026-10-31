@@ -4142,7 +4142,10 @@ def _start_assistant_hub(service):
 
 def _wire_assistant_hub(svr):
     """Start the hub (when enabled) and hand the owner API the SAME registry the hub authenticates against."""
-    hub_server, registry = _start_assistant_hub(svr.assistant)
+    service = getattr(svr, "assistant", None)
+    if service is None:   # a server built without the assistant has no hub to start
+        return None
+    hub_server, registry = _start_assistant_hub(service)
     svr.assistant_workers = registry
     return hub_server
 
