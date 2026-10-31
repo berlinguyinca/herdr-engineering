@@ -189,6 +189,7 @@ collab-public enforces the same values and has none of its own.
 | `mirror_max_file_bytes` | 1073741824 | larger text files are not mirrored |
 | `mirror_max_artifact_bytes` | 17179869184 | mirrored bytes per artifact |
 | `apply_concurrency` | 4 | applier lanes (one DB connection each, plus two) |
+| `audit_coalesce_seconds` | 60 | at most one `artifact_commit_submitted` / `artifact_upload_staged` audit event per agent and artifact per window; the next event carries `calls` (audit-log exhaustion guard) |
 | `mirror_dir` / `outbox_dir` / `spool_dir` | `/collab-mirror` / `/collab-outbox` / `/collab-spool` | container paths; deploy.sh's mounts are fixed, keep the defaults |
 
 Fixed (not configuration): chunks are 512 KiB, an intent is applied only if under 60 s old when the worker first

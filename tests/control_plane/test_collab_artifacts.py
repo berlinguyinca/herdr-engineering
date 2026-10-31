@@ -1017,6 +1017,7 @@ def test_a_fifth_pending_intent_is_429_until_the_worker_consumes_one(world):
 def test_the_pending_cap_is_per_actor(world):
     world.mirror.grant(world.b.id, X, "write")
     world.mirror.grants()
+    world.mirror.grants()
     for i in range(4):
         world.bridge.commit(world.a, commit_args(str(i)))
     assert world.bridge.commit(world.b, commit_args("b"))["status"] == "pending"
@@ -1217,6 +1218,7 @@ def test_the_ticket_map_is_bounded_and_an_evicted_ticket_is_404(world, registry)
 def test_b_cannot_read_as_ticket_even_after_waiting(world):
     world.mirror.grant(world.b.id, X, "write")
     world.mirror.grants()
+    world.mirror.grants()
     br, waits = waiting_bridge(world)
     ticket = br.commit(world.a, commit_args())["ticket"]
     assert status(br.result, world.b, ticket, wait=5) == (404, "not found")
@@ -1365,3 +1367,61 @@ def test_an_agent_id_that_is_not_a_valid_owner_key_is_a_4xx_not_a_500_when_check
     upl = upload_id_for("x", X, "big.bin", sha(BIG), len(BIG))
     checked = cbf.validate_changes([{"name": "big.bin", "op": "put", "upload_id": upl}], cbf.BridgeLimits())
     assert status(world.bridge._check_uploads, odd, X, checked, cbf.BridgeLimits())[0] == 400
+
+
+# ------------------------------------------------------------------------------ B-H1 audit coalescing (F2)
+def test_commits_are_audited_once_per_window_with_a_calls_count(world):
+    br, a = world.bridge, world.a
+    world.mirror.grants(limits={"commits_per_minute": 1000, "max_pending_intents_per_agent": 1000,
+                                "audit_coalesce_seconds": 60})
+    start = world.clock.t
+    for i in range(10):
+        world.clock.t = start + i
+        br.commit(a, commit_args(str(i)))
+    assert len(world.events("artifact_commit_submitted")) == 1
+    assert world.events("artifact_commit_submitted")[0]["payload"]["calls"] == 1
+    assert len(intent_files(world)) == 10                             # every commit still ran
+    world.clock.t = start + 61
+    world.mirror.grants(limits={"commits_per_minute": 1000, "max_pending_intents_per_agent": 1000,
+                                "audit_coalesce_seconds": 60})
+    br.commit(a, commit_args("late"))
+    evs = world.events("artifact_commit_submitted")
+    assert len(evs) == 2 and evs[1]["payload"]["calls"] == 10
+
+
+def test_commit_audit_coalescing_is_per_agent_and_artifact(world):
+    br = world.bridge
+    world.mirror.grant(world.b.id, X, "write")
+    world.mirror.grants()
+    br.commit(world.a, commit_args("1"))
+    br.commit(world.b, commit_args("2"))
+    assert len(world.events("artifact_commit_submitted")) == 2
+
+
+def test_upload_staged_audits_are_coalesced_per_artifact(world):
+    br, a = world.bridge, world.a
+    other = BIG[::-1]
+    for data, name in ((BIG, "big.bin"), (other, "other.bin")):
+        for i in range(3):
+            br.stage_chunk(a, chunk_args(X, data, i, name=name))
+    assert len(staged_events(world)) == 1
+
+
+# ------------------------------------------------------------------------------ B-M4 parse cache (F2)
+def test_grants_and_head_are_parsed_once_until_rewritten(world, monkeypatch):
+    from herdr_engineering.control_plane import collab_bridge_files as cbf
+    calls = []
+    real = cbf._parse_json_object
+    monkeypatch.setattr(cbf, "_parse_json_object", lambda data: (calls.append(1), real(data))[1])
+    br, a = world.bridge, world.a
+    br.head(a, X)
+    n = len(calls)
+    assert n >= 2                                         # grants.json and head.json, first time
+    br.head(a, X)
+    br.head(a, X)
+    assert len(calls) == n                                # unchanged files are not parsed again
+    world.mirror.head(X, [version("v_x3", 3, [file_entry("a.txt", TEXT)], parents=("v_x2",))], title="renamed.txt")
+    world.mirror.grants()
+    out = br.head(a, X)
+    assert len(calls) > n                                 # an atomic rewrite is picked up
+    assert out["head_version_id"] == "v_x3" or "v_x3" in json.dumps(out)

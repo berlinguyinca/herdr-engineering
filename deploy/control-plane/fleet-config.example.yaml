@@ -143,6 +143,7 @@ sections:
       #   mirror_max_file_bytes: 1073741824          # per mirrored text file
       #   mirror_max_artifact_bytes: 17179869184     # per mirrored artifact
       #   apply_concurrency: 4                       # applier lanes (DB connections)
+      #   audit_coalesce_seconds: 60                 # one commit/upload audit event per agent+artifact per window
       #   # container paths; keep the defaults with deploy.sh (its mounts are fixed):
       #   # mirror_dir: /collab-mirror   outbox_dir: /collab-outbox   spool_dir: /collab-spool
       #   # Host side (deploy.sh creates them beside the share dirs, always): HERDR_COLLAB_MIRROR_DIR and

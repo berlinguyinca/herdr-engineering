@@ -109,6 +109,7 @@ from .collab_bridge_files import (
     open_beneath,
     read_bytes_beneath,
     read_json_beneath,
+    read_json_cached,
     read_staged_meta,
     staging_parts,
     unlink_beneath,
@@ -251,7 +252,7 @@ class CollabArtifactBridge:
     # -- grants.json ------------------------------------------------------------------------------------------
     def _grants(self) -> tuple[dict, BridgeLimits] | None:
         """The fresh ``grants.json`` agents map and its limits, or None (missing, stale, invalid)."""
-        doc = read_json_beneath(self.mirror, [GRANTS_NAME], max_bytes=GRANTS_MAX_BYTES)
+        doc = read_json_cached(self.mirror, [GRANTS_NAME], max_bytes=GRANTS_MAX_BYTES)
         if doc is None:
             return None
         generated, agents = doc.get("generated_at"), doc.get("agents")
@@ -309,7 +310,7 @@ class CollabArtifactBridge:
         return CollabError(404, NOT_FOUND)
 
     def _head_doc(self, artifact_id: str) -> dict | None:
-        doc = read_json_beneath(self.mirror, [ARTIFACTS_DIR, artifact_id, HEAD_NAME], max_bytes=HEAD_MAX_BYTES)
+        doc = read_json_cached(self.mirror, [ARTIFACTS_DIR, artifact_id, HEAD_NAME], max_bytes=HEAD_MAX_BYTES)
         if doc is None:
             return None
         head, versions = doc.get("head"), doc.get("versions")
@@ -366,6 +367,34 @@ class CollabArtifactBridge:
             while len(self._uses) > self.USE_COUNTER_MAX:     # an evicted key's suppressed calls are dropped
                 self._uses.popitem(last=False)
                 self.stats["use_counter_evicted"] += 1
+
+    def _audit_coalesced(self, kind: str, owner: str, artifact_id: str, event_type: str, make_payload,
+                         window: float) -> bool:
+        """Commit ``event_type`` at most once per ``window`` s per (kind, owner, artifact); the others only bump a
+        counter that the next emitted event carries as ``calls``. A write-grant agent therefore cannot exhaust the
+        lifetime audit log by looping. Raises (counter unchanged) when the event cannot be written. True when emitted."""
+        svc = self.service
+        with svc._lock:
+            key = (owner, artifact_id, kind)
+            now = self.clock()
+            state = self._uses.get(key)
+            if state is not None and now - state[0] < window:
+                state[1] += 1
+                self._uses.move_to_end(key)
+                return False
+            payload = make_payload()
+            payload["calls"] = (state[1] if state is not None else 0) + 1
+            svc._commit(event_type, payload)
+            self._uses[key] = [now, 0]
+            self._uses.move_to_end(key)
+            while len(self._uses) > self.USE_COUNTER_MAX:
+                self._uses.popitem(last=False)
+                self.stats["use_counter_evicted"] += 1
+            return True
+
+    def _coalesce_window(self) -> float:
+        got = self._grants()
+        return float(got[1].audit_coalesce_seconds) if got is not None else float(BridgeLimits().audit_coalesce_seconds)
 
     # -- tools ------------------------------------------------------------------------------------------------
     def list(self, pr: Principal) -> dict:
@@ -684,11 +713,13 @@ class CollabArtifactBridge:
         owner = agent.get("owner") if isinstance(agent, dict) else None
         actor = Principal("member" if member else "agent", owner_key, owner)
         actor.external = isinstance(agent, dict) and bool(agent.get("external"))
-        payload = svc._actor(actor, action="artifact.stage_chunk", outcome="allowed", owner_key=owner_key,
-                             upload_id=upload_id, artifact_id=meta.artifact_id, resource_id=meta.artifact_id,
-                             size_bytes=meta.size_bytes, project_ids=[])
         try:
-            svc._commit("artifact_upload_staged", payload)
+            self._audit_coalesced(
+                "stage", owner_key, meta.artifact_id, "artifact_upload_staged",
+                lambda: svc._actor(actor, action="artifact.stage_chunk", outcome="allowed", owner_key=owner_key,
+                                   upload_id=upload_id, artifact_id=meta.artifact_id, resource_id=meta.artifact_id,
+                                   size_bytes=meta.size_bytes, project_ids=[]),
+                self._coalesce_window())
         except BaseException:
             unlink_beneath(self.outbox, parts, AUDITED_MARKER)
             raise
@@ -853,10 +884,13 @@ class CollabArtifactBridge:
             payload["message"] = args["message"]
         inline = sum(len(c.text.encode("utf-8")) for c in checked if c.text is not None)
         ticket = new_ticket()
-        with svc._lock:                      # audited before the intent exists: a refused audit refuses the commit
-            svc._commit("artifact_commit_submitted", svc._actor(
+        # audited before the intent exists (a refused audit refuses the commit), coalesced per (agent, artifact)
+        self._audit_coalesced(
+            "commit", pr.id, artifact_id, "artifact_commit_submitted",
+            lambda: svc._actor(
                 pr, action="artifact.commit", outcome="allowed", ticket=ticket, artifact_id=artifact_id,
-                resource_id=artifact_id, size_bytes=inline + staged_bytes, changes=len(checked), project_ids=[]))
+                resource_id=artifact_id, size_bytes=inline + staged_bytes, changes=len(checked), project_ids=[]),
+            float(limits.audit_coalesce_seconds))
         self.append_intent(actor, "commit", payload, artifact_id=artifact_id,
                            idempotency_key=args.get("idempotency_key"), ticket=ticket)
         return {"ticket": ticket, "status": "pending"}

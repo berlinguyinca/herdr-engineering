@@ -33,6 +33,7 @@ from __future__ import annotations
 import base64
 import binascii
 import codecs
+import collections
 import errno
 import hashlib
 import io
@@ -43,6 +44,7 @@ import os
 import re
 import secrets
 import stat
+import threading
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -121,6 +123,7 @@ class BridgeLimits:
     mirror_max_file_bytes: int = 1_073_741_824
     mirror_max_artifact_bytes: int = 17_179_869_184
     apply_concurrency: int = 4
+    audit_coalesce_seconds: int = 60   # per (agent, artifact): one commit/upload audit event per window, with a count
 
     @classmethod
     def from_mapping(cls, d: dict) -> BridgeLimits:
@@ -240,6 +243,51 @@ def read_json_beneath(root: Path, parts: list[str], *, max_bytes: int) -> dict |
     except (ValueError, RecursionError, UnicodeError):
         return None
     return obj if isinstance(obj, dict) else None
+
+
+_JSON_CACHE_MAX = 64
+_json_cache: collections.OrderedDict = collections.OrderedDict()
+_json_cache_lock = threading.Lock()
+
+
+def _parse_json_object(data: bytes) -> dict | None:
+    try:
+        obj = json.loads(data.decode("utf-8"), parse_constant=_no_constants)
+        json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    except (ValueError, RecursionError, UnicodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def read_json_cached(root: Path, parts: list[str], *, max_bytes: int) -> dict | None:
+    """``read_json_beneath`` that parses a file once while it is unchanged: the parsed object is cached per path under
+    (st_ino, st_mtime_ns, st_size), so the worker's atomic rename (new inode) is picked up at once. The returned object
+    is SHARED: callers must treat it as read-only. The cache is a small bounded LRU; failures are never cached."""
+    fd = _open_single(root, parts, max_bytes)
+    if fd is None:
+        return None
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return None
+    path_key = (str(root), tuple(parts))
+    sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+    with _json_cache_lock:
+        hit = _json_cache.get(path_key)
+        if hit is not None and hit[0] == sig:
+            _json_cache.move_to_end(path_key)
+            os.close(fd)
+            return hit[1]
+    data = _read_capped(fd, max_bytes)
+    obj = None if data is None else _parse_json_object(data)
+    if obj is not None:
+        with _json_cache_lock:
+            _json_cache[path_key] = (sig, obj)
+            _json_cache.move_to_end(path_key)
+            while len(_json_cache) > _JSON_CACHE_MAX:
+                _json_cache.popitem(last=False)
+    return obj
 
 
 class _BoundedReader(io.RawIOBase):
@@ -1352,7 +1400,7 @@ __all__ = [
     "BridgeLimits", "Change", "Chunk", "CHUNK_BYTES", "CommitPayload", "ENTRY_SLACK", "FEED_MAX_AGE", "Intent",
     "INTENT_MAX_AGE", "IntentError", "link_new_beneath", "link_new_bytes", "list_beneath", "list_parts", "MAX_CHUNK_INDEX",
     "MAX_MESSAGE", "max_parts_for", "MEMBER_PREFIX", "STAGING_DIR", "MAX_TREE_DEPTH", "MCP_UPLOAD_MAX_BODY", "META_MAX_BYTES", "META_NAME",
-    "new_ticket", "open_beneath", "read_bytes_beneath", "read_json_beneath", "read_staged_meta",
+    "new_ticket", "open_beneath", "read_bytes_beneath", "read_json_beneath", "read_json_cached", "read_staged_meta",
     "register_intent_kind", "remove_tree_beneath", "request_digest", "SHA_RE", "StagedUpload", "staging_parts",
     "staging_path", "TICKET_RE", "tree_entry_cap", "unlink_beneath", "upload_complete", "upload_id_for",
     "UPLOAD_RE", "validate_changes", "validate_chunk", "validate_commit_payload", "validate_intent",

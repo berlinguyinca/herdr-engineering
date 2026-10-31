@@ -612,6 +612,7 @@ def test_limit_defaults_equal_the_configuration_table():
         "staging_bytes_total": 2_000_000_000_000, "max_text_merge_bytes": 2_097_152,
         "max_conflict_text_bytes": 8_388_608, "mirror_history_versions": 5, "mirror_max_manifests": 100000,
         "mirror_max_file_bytes": 1_073_741_824, "mirror_max_artifact_bytes": 17_179_869_184, "apply_concurrency": 4,
+            "audit_coalesce_seconds": 60,
     }
     assert BridgeLimits.from_mapping({}) == BridgeLimits()
     assert BridgeLimits.from_mapping(BridgeLimits().to_dict()) == BridgeLimits()
