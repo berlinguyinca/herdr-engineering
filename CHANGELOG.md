@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Room-derived artifact access: never overwrite another source, and a way to clean up
+- The room sync no longer replaces a grant that another source holds. A person with a direct grant on an artifact (an explicit write or share grant, any `granted_by` that is not `room:*`) keeps exactly that grant when a room links the artifact, and it is not revoked when they leave the room; before, the room wrote its `read` over it and a later revoke deleted it. Between two rooms the first holder keeps the row unless the second room's grant lasts longer, so a guest-style expiry never shortens a member's grant. One grant row still holds one source (a direct grant that later lapses is not replaced until that room's next sync); no migration.
+- New `herdr-eng control-plane revoke-room-grants [--fleet-config FILE] [--apply]` deletes every `artifact_acl` row with `granted_by` `room:*`, for use after `room_artifact_access` was turned off (turning it off never removed the grants already written). Dry run by default, never touches any other source, safe to repeat; restart the control plane afterwards. See `docs/artifacts/room-access-maintenance.md`. Threat model R-RA2 is resolved apart from the one-row-one-source limit above.
+
 ### Crash takeover: the lease fence is no longer optional after a requeue
 - Once a lease has requeued a task (`attempt` above 1), `PATCH` task updates that omit `attempt` are refused with 409 `stale attempt`, the same as an old `attempt`; before, only a request that sent a wrong `attempt` was fenced, so an old run that never sent one could still accept or finish the requeued task. Tasks never requeued, and every deployment with `control_plane.collab.task_lease_seconds` unset, behave exactly as before. The MCP `task_update` tool takes an optional integer `attempt`, and `worker.sh` (and the copies the dashboard and host runner hand out) now sends the `attempt` that `tasks_inbox` gave it, so those runners keep working after a requeue. A custom runner has to echo `attempt` from `tasks_inbox`. Threat model R-TL1 is resolved; R-TL2 (no heartbeat) stays open.
 

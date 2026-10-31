@@ -102,10 +102,12 @@ Residual risks:
 - **R-RA1 (Medium).** Revocation of a removed (non-guest) member is asynchronous. Removal triggers `notify`, a worker wakes and
   `drain` revokes; a failing sync re-queues the room only for the next wake (the loop waits up to 30 s) or restart. Between
   removal and the sync the person keeps read. Guest expiry is not affected (checked at read).
-- **R-RA2 (Low-Medium).** One grant row holds one source. `_apply` calls `acl.grant(..., {"read"}, ...)` for any wanted
-  (artifact, principal) pair that this source does not already hold, which overwrites a grant of another source; a stronger
-  explicit grant to a `collab:user:` principal would be downgraded, and a later revoke deletes it. Collab principals do not
-  normally hold explicit grants, so this is latent. The changelog already notes the "two rooms flip" limit.
+- **R-RA2 (Resolved 2026-10-30 for direct grants; one narrower limit remains).** `_apply` no longer overwrites a live grant
+  held by another source: a direct grant (any `granted_by` not starting with `room:`) is left as it is and is not revoked
+  when the room lets go; between two rooms the first holder keeps the row unless the second room's grant lasts longer.
+  `herdr-eng control-plane revoke-room-grants [--apply]` removes every `room:*` row after the flag is turned off
+  (`docs/artifacts/room-access-maintenance.md`). Remaining limit: one grant row holds one source, so a direct grant that later
+  expires or is revoked is not replaced by the room's until that room's next sync. No migration was needed.
 - **R-RA3 (Low).** Because linking needs only `edit` (R-ART3), an editor can expose an artifact to a room they are not in.
 - **R-RA4 (Medium, topology).** Same as R-WG1: `collab` and the artifact store are in different processes in the compose
   overlay, so this feature cannot run there as written. Enabling it needs a topology decision first.
@@ -207,7 +209,7 @@ Residual risks:
 | R-ART2 | Medium | ACL is an in-memory index; write-through drift shows at restart |
 | R-TL2 | Medium | No lease heartbeat: a long task is requeued and can run twice (R-TL1, the opt-in fence, is resolved) |
 | R-DP1 | Medium | Image rollback does not roll back the schema |
-| R-SH4, R-RA2, R-CL1, R-DP2 | Low-Medium | See sections |
+| R-SH4, R-CL1, R-DP2 | Low-Medium | See sections |
 | R-WG2-4, R-SH5-7, R-ART3, R-RA3, R-TL3, R-CL2 | Low | See sections |
 
 ## 5. Rollout and rollback by flag
@@ -217,7 +219,7 @@ with the flag off (migrations are additive, so the image can be ahead of the fla
 | Flag | Default | Turn on | Watch | Turn off / rollback |
 |---|---|---|---|---|
 | `control_plane.unified_workspace.enabled` | off | Migration 0034 applies at start; set `true`; restart control-plane-web. Operator calls `POST /api/v1/graph/work/reconcile`, then reads `/api/v1/graph/work/status` | `status` worker `last_error`, gaps, 5xx on `/graph/work/*`; read as a non-operator key to confirm room rows stay hidden | `false` and restart: routes return 404 again; data stays. Drop tables per 0034 `-- DOWN:` only if they must go |
-| `control_plane.unified_workspace.room_artifact_access` (also needs `enabled`) | off | First settle R-RA4 (collab and artifact store in one process); set `true`; restart. Startup syncs every room | grants with `granted_by` `room:*` vs membership; a removed test member's read must fail within one sync interval | `false` and restart stops new grants but does NOT remove written ones. Revoke grants whose `granted_by` starts with `room:` (no repair command exists yet) |
+| `control_plane.unified_workspace.room_artifact_access` (also needs `enabled`) | off | First settle R-RA4 (collab and artifact store in one process); set `true`; restart. Startup syncs every room | grants with `granted_by` `room:*` vs membership; a removed test member's read must fail within one sync interval | `false` and restart stops new grants but does NOT remove written ones. Revoke grants whose `granted_by` starts with `room:` (`herdr-eng control-plane revoke-room-grants --apply`, then restart; see `docs/artifacts/room-access-maintenance.md`) |
 | `control_plane.collab.task_lease_seconds` | absent (off) | Set 60..604800, longer than the longest honest task (R-TL2); restart the process that runs collab | `task.requeue` events, 409 `stale attempt`, duplicate results | Remove the key and restart. Tasks already requeued stay requeued; `attempt` survives replay |
 | Share links `control_plane.share.enabled` (+ `signing_secret`, collab `public_url`) | off | Complete the share block; `deploy.sh` refuses incomplete config, renders the edge with `/s/`, starts `share-public` | share `events` (`opened`, `denied`), 404 rate on `/s/`, live bytes | Revoke individual shares first (`POST .../shares/{sid}/revoke` removes state, then bundle); then `enabled: false` and deploy: the edge stops routing `/s/` and `share-public` is stopped |
 | Per-user rollout | not built | The spec asks for it; every flag today is global | | |
