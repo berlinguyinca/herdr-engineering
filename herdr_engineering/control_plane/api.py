@@ -2348,7 +2348,8 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers"}
+            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
+                                    "assistant-action-requests", "assistant-grants"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
                     or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
@@ -2454,7 +2455,8 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-routines", "assistant-connectors",
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
-                                        "assistant-reminders", "assistant-workers"}
+                                        "assistant-reminders", "assistant-workers",
+                                        "assistant-action-requests", "assistant-grants"}
 
         def _mutate_verb(self):
             if operator:
@@ -2484,7 +2486,8 @@ def _make_handler(server, public=False, operator=False):
             err = self._require("operator")
             if err:
                 return err
-            if resource in ("assistant-apps", "assistant-reminders", "assistant-workers"):
+            if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
+                            "assistant-action-requests", "assistant-grants"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3730,6 +3733,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_reminders(parts)
             if resource == "assistant-workers":
                 return self._assistant_workers(parts)
+            if resource in ("assistant-action-requests", "assistant-grants"):
+                return self._assistant_hub_owner(parts, resource)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -4196,6 +4201,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_reminders(parts)
             if resource == "assistant-workers":
                 return self._assistant_workers(parts, body)     # body was read above; never read it twice
+            if resource in ("assistant-action-requests", "assistant-grants"):
+                return self._assistant_hub_owner(parts, resource, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4448,12 +4455,103 @@ def _make_handler(server, public=False, operator=False):
                     if harness not in HARNESSES:
                         return self._json({"error": f"unknown harness: {harness!r}"}, 400)
                     enrollment, code = registry.create_enrollment(tenant_id=tenant_id, user_id=user_id,
-                                                                  name=name, harness=harness)
+                                                                  name=name, harness=harness,
+                                                                  scopes=body.get("scopes"))
                     return self._json({"enrollment_id": enrollment.enrollment_id, "code": code,
                                        "expires_at": enrollment.expires_at.isoformat(),
+                                       "scopes": list(enrollment.scopes),
                                        "setup": self._worker_setup(harness)}, 201)
+                if len(parts) == 6 and parts[5] == "scopes" and self.command == "POST":
+                    if not isinstance(body, dict) or set(body) != {"scopes"}:
+                        return self._json({"error": 'body must be exactly {"scopes": [...]}'}, 400)
+                    return self._json(registry.set_scopes(tenant_id, user_id, parts[4], body["scopes"]).as_dict())
                 if len(parts) == 5 and self.command == "DELETE":
                     return self._json(registry.revoke(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+
+        @staticmethod
+        def _iso(value):
+            return value.isoformat() if value is not None else None
+
+        def _assistant_hub_owner(self, parts, resource, body=None):
+            """Owner-only views and decisions over the hub's action requests and grants (operator API key only; a
+            Worker credential is not one). ``display`` is returned here and nowhere a worker can read."""
+            from .assistant import AssistantNotFound, AssistantUnavailable
+            from .assistant_hub.policy import (
+                ActivationRefused,
+                activate_grant,
+                record_owner_decision,
+                revoke_action_grant,
+            )
+            if self._require("operator"):
+                return None
+            iso = self._iso
+            try:
+                server.assistant._require_enabled()
+                if server.assistant_workers is None:
+                    raise AssistantUnavailable("the assistant hub is not enabled")
+                tenant_id, user_id = self._assistant_scope()
+                svc, store = server.assistant, server.assistant.store
+                cfg = svc.config["grants"]
+
+                def request_view(r):
+                    return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
+                            "task_id": r.task_id, "verb": r.verb, "risk_class": r.risk_class, "status": r.status,
+                            "reason": r.reason, "display": r.display, "created_at": iso(r.created_at),
+                            "decided_at": iso(r.decided_at), "decided_by": r.decided_by, "key_id": r.key_id}
+
+                def grant_view(g):
+                    return {"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb,
+                            "resource_scope": g.resource_scope, "key_id": g.key_id,
+                            "state": g.effective_state(svc.now(), int(cfg["policy_version"])).value,
+                            "policy_version": g.policy_version, "created_at": iso(g.created_at),
+                            "proposed_at": iso(g.proposed_at), "activated_at": iso(g.activated_at),
+                            "expires_at": iso(g.expires_at), "revoked_at": iso(g.revoked_at),
+                            "confirmed_by": g.confirmed_by}
+
+                def exact(keys):
+                    return isinstance(body, dict) and set(body) == keys
+
+                if resource == "assistant-action-requests":
+                    if len(parts) == 4 and self.command == "GET":
+                        status = _q(self.path, "status")
+                        if status not in (None, "", "pending", "approved", "denied", "vetoed"):
+                            return self._json({"error": "status must be pending, approved, denied or vetoed"}, 400)
+                        rows = store.list_action_requests(tenant_id, user_id, status or None)
+                        return self._json({"requests": [request_view(r) for r in rows]})
+                    if len(parts) == 6 and parts[5] == "decision" and self.command == "POST":
+                        if not exact({"approve"}) or not isinstance(body["approve"], bool):
+                            return self._json({"error": 'body must be exactly {"approve": true|false}'}, 400)
+                        try:
+                            row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
+                                                        body["approve"], decided_by=user_id)
+                        except ValueError as exc:       # already decided, or vetoed (a veto is final)
+                            return self._json({"error": str(exc), "code": "conflict"}, 409)
+                        return self._json(request_view(row))
+                else:
+                    if len(parts) == 4 and self.command == "GET":
+                        return self._json({"grants": [grant_view(g) for g in store.list_action_grants(tenant_id, user_id)]})
+                    if len(parts) == 5 and self.command == "DELETE":
+                        return self._json(grant_view(revoke_action_grant(store, svc.now(), tenant_id, user_id,
+                                                                          parts[4], revoked_by=user_id)))
+                    if len(parts) == 6 and parts[5] == "activate" and self.command == "POST":
+                        if not exact({"confirm"}) or body["confirm"] is not True:
+                            return self._json({"error": 'body must be exactly {"confirm": true}'}, 400)
+                        try:
+                            # The judge gate is hard-coded unsatisfied this phase: Phase 3 wires the real judge gate.
+                            grant = activate_grant(store, cfg, svc.now(), tenant_id, user_id, parts[4],
+                                                   confirmed_by=user_id, judge_gate_satisfied=False)
+                        except ActivationRefused as exc:
+                            if exc.code == "not_found":
+                                return self._json({"error": "not found"}, 404)
+                            return self._json({"error": str(exc), "code": exc.code}, 409)
+                        return self._json(grant_view(grant))
                 return self._json({"error": "not found"}, 404)
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)

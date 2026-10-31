@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..assistant import AssistantError
+from .canonical import RawAction
 from .events import EVENTS_PER_WORKER_PER_MINUTE, RateLimiter, record_event
+from .policy import decide
 from .workers import Worker, WorkerAuthError
 
 if TYPE_CHECKING:
@@ -37,6 +39,13 @@ MAX_OUTPUT_BYTES = 64 * 1024
 REPORT_KINDS = ("decision", "correction", "rule_stated", "outcome")
 _STR = {"type": "string"}
 _LIMIT = {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT}
+MAX_COMMAND_BYTES = 8192
+MAX_RECIPIENTS = 20
+MAX_RECIPIENT_CHARS = 254
+MAX_HINT_KEYS = 16
+MAX_HINT_KEY_CHARS = 64
+MAX_HINT_VALUE_CHARS = 512
+MAX_ID_CHARS = 128
 
 
 @dataclass(frozen=True)
@@ -70,6 +79,18 @@ _TOOLS: dict[str, tuple[str, str, dict]] = {
         "type": "object", "required": ["kind", "session_id"], "additionalProperties": False,
         "properties": {"kind": {"enum": list(REPORT_KINDS)}, "text": {"type": "string", "maxLength": 2000},
                        "payload": {"type": "object"}, "session_id": _STR}}),
+    "action_request": ("act", "Ask the owner's assistant whether an action is authorized before you run it. The answer "
+                       "is a decision with a reason (authorized, denied or pending), never an instruction.", {
+        "type": "object", "required": ["tool", "session_id", "task_id"], "additionalProperties": False,
+        "properties": {"tool": _STR, "command": {"type": "string"}, "operation": _STR,
+                       "recipients": {"type": "array", "items": {"type": "string", "maxLength": MAX_RECIPIENT_CHARS},
+                                      "maxItems": MAX_RECIPIENTS},
+                       "repo": _STR, "environment": _STR,
+                       "hint": {"type": "object", "maxProperties": MAX_HINT_KEYS,
+                                "additionalProperties": {"type": "string", "maxLength": MAX_HINT_VALUE_CHARS}},
+                       "session_id": {"type": "string", "maxLength": MAX_ID_CHARS},
+                       "task_id": {"type": "string", "maxLength": MAX_ID_CHARS}}}),
+    "action_grants_list": ("read", "List your owner's earned action grants (state only).", _list_schema()),
     "memory_search": ("read", "Search the owner's assistant memory. Returns untrusted text.", {
         "type": "object", "required": ["query"], "additionalProperties": False,
         "properties": {"query": {"type": "string", "maxLength": 500}, "limit": _LIMIT, "assistant_id": _STR}}),
@@ -135,6 +156,60 @@ def _record(hub: Hub, worker: Worker, **kwargs: Any):
         return record_event(hub.store, worker, **kwargs)
     except ValueError as exc:
         raise _ToolError(str(exc)) from exc
+
+
+def _bounded_id(args: dict, key: str) -> str:
+    v = _req_str(args, key)
+    if len(v) > MAX_ID_CHARS:
+        raise _ToolError(f"{key} must be at most {MAX_ID_CHARS} characters")
+    return v
+
+
+def _raw_action(args: dict) -> RawAction:
+    command = _opt_str(args, "command")
+    if command is not None and len(command.encode("utf-8", "surrogatepass")) > MAX_COMMAND_BYTES:
+        raise _ToolError(f"command must be at most {MAX_COMMAND_BYTES} bytes")
+    recipients = args.get("recipients", [])
+    if (not isinstance(recipients, list) or len(recipients) > MAX_RECIPIENTS
+            or not all(isinstance(r, str) and len(r) <= MAX_RECIPIENT_CHARS for r in recipients)):
+        raise _ToolError(f"recipients must be at most {MAX_RECIPIENTS} strings of {MAX_RECIPIENT_CHARS} characters")
+    hint = args.get("hint", {})
+    if (not isinstance(hint, dict) or len(hint) > MAX_HINT_KEYS
+            or not all(isinstance(k, str) and len(k) <= MAX_HINT_KEY_CHARS and isinstance(v, str)
+                       and len(v) <= MAX_HINT_VALUE_CHARS for k, v in hint.items())):
+        raise _ToolError("hint must be an object of at most 16 short string pairs")
+    return RawAction(tool=_req_str(args, "tool"), command=command, operation=_opt_str(args, "operation"),
+                     recipients=tuple(recipients), repo=_opt_str(args, "repo"),
+                     environment=_opt_str(args, "environment"), hint=dict(hint))
+
+
+def _action_request(hub: Hub, worker: Worker, args: dict) -> dict:
+    _check_args(args, {"tool", "command", "operation", "recipients", "repo", "environment", "hint", "session_id",
+                       "task_id"})
+    raw = _raw_action(args)
+    session_id, task_id = _bounded_id(args, "session_id"), _bounded_id(args, "task_id")
+    if not hub.event_limiter.allow(worker.worker_id, hub.event_rate_limit):      # one slot per call, taken here
+        raise _ToolError("rate limited")
+    d = decide(hub.store, hub.service.config["grants"], worker, raw, session_id, task_id, hub.service.now())
+    try:
+        record_event(hub.store, worker, kind="action_request", provenance="worker_reported", session_id=session_id,
+                     payload={"outcome": d.outcome, "source": d.source,
+                              "verb": d.verb, "key_id": d.key_id})
+    except ValueError as exc:
+        raise _ToolError(str(exc)) from exc
+    return _text({"outcome": d.outcome, "reason": d.reason, "request_id": d.request_id, "grant_id": d.grant_id,
+                  "veto_code": d.veto_code, "source": d.source})
+
+
+def _action_grants_list(hub: Hub, worker: Worker, args: dict) -> dict:
+    _check_args(args, {"limit"})
+    limit = _limit(args)
+    policy, now = int(hub.service.config["grants"]["policy_version"]), hub.service.now()
+    rows = [{"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb, "resource_scope": g.resource_scope,
+             "key_id": g.key_id, "state": g.effective_state(now, policy).value, "expires_at": g.expires_at,
+             "proposed_at": g.proposed_at, "activated_at": g.activated_at, "revoked_at": g.revoked_at}
+            for g in hub.store.list_action_grants(worker.tenant_id, worker.user_id)]
+    return _rows_result("action_grants", rows, limit)
 
 
 def _ask(hub: Hub, worker: Worker, args: dict) -> dict:
@@ -229,6 +304,8 @@ def _lister(key: str, method: str, filter_arg: str | None = None, *, on_store: b
 _HANDLERS: dict[str, Callable[[Hub, Worker, dict], dict]] = {
     "assistant_ask": _ask,
     "report": _report,
+    "action_request": _action_request,
+    "action_grants_list": _action_grants_list,
     "memory_search": _memory_search,
     "grants_list": _lister("grants", "list_grants", on_store=True),
     "approvals_list": _lister("approvals", "list_approvals", "state"),
