@@ -3860,13 +3860,55 @@ class AssistantService:
             source_refs=list(d.source_refs), role_ref=dict(d.role_ref) if d.role_ref else None)
 
     def _delegation_adapter_for(self, d: DelegationRequest) -> DelegationRuntimeAdapter | None:
+        return self._delegation_adapter_for_scope(d.tenant_id, d.user_id, d.target_system)
+
+    def _delegation_adapter_for_scope(self, tenant_id: str, user_id: str,
+                                      target: str) -> DelegationRuntimeAdapter | None:
         if self.delegation_adapter_resolver is not None:
-            return self.delegation_adapter_resolver(d.tenant_id, d.user_id, d.target_system)
+            return self.delegation_adapter_resolver(tenant_id, user_id, target)
         scope = (self.config.get("delegation") or {}).get("binding_scope")
         if (self.delegation_adapter is not None and scope
-                and scope.get("tenant_id") == d.tenant_id and scope.get("user_id") == d.user_id):
+                and scope.get("tenant_id") == tenant_id and scope.get("user_id") == user_id):
             return self.delegation_adapter
         return None
+
+    def assistant_graph(self, *, tenant_id: str, user_id: str, limit: int = 100) -> dict[str, Any]:
+        """Read-only projection of this person's assistants, their delegations and the specialists those run on.
+
+        It grants nothing and changes nothing: a specialist shows as ``bound`` only when delegation would really
+        resolve an adapter (or the engineering handoff consumer) for this person."""
+        self._require_enabled()
+        nodes: list[dict[str, Any]] = [{"id": "you", "kind": "you", "name": "You"}]
+        edges: list[dict[str, str]] = []
+        grants = self.store.list_grants(tenant_id=tenant_id, user_id=user_id)
+        now = self.now()
+        for a in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id):
+            scopes = sorted({g.scope for g in grants if g.assistant_id == a.assistant_id
+                             and g.tool_id == "delegate" and g.active(now)})
+            nodes.append({"id": a.assistant_id, "kind": "assistant", "name": a.name, "status": a.status,
+                          "enabled": a.enabled, "can_delegate": bool(scopes), "delegate_scopes": scopes})
+            edges.append({"from": "you", "to": a.assistant_id, "kind": "owns"})
+        consumer_on = bool(self.config.get("delegation_consumer", {}).get("enabled"))
+        for target, spec in self.config["delegation"]["targets"].items():
+            if target == "pi":
+                bound = consumer_on
+            else:
+                try:
+                    bound = self._delegation_adapter_for_scope(tenant_id, user_id, target) is not None
+                except Exception:  # noqa: BLE001 - an unreadable binding is simply "not bound"
+                    bound = False
+            role = spec.get("role_ref")
+            nodes.append({"id": f"specialist:{target}", "kind": "specialist", "name": target, "bound": bound,
+                          "role": f"{role['id']}@{role['version']}" if role else None})
+        known = {n["id"] for n in nodes}
+        for d in self.store.list_delegations(tenant_id=tenant_id, user_id=user_id)[:max(1, min(limit, 500))]:
+            nodes.append({"id": d.delegation_id, "kind": "delegation", "status": d.status,
+                          "name": d.task[:80], "created_at": d.created_at.isoformat()})
+            if d.assistant_id in known:
+                edges.append({"from": d.assistant_id, "to": d.delegation_id, "kind": "delegated"})
+            if f"specialist:{d.target_system}" in known:
+                edges.append({"from": d.delegation_id, "to": f"specialist:{d.target_system}", "kind": "runs_on"})
+        return {"nodes": nodes, "edges": edges}
 
     def _delegation_lock(self, delegation_id: str) -> threading.RLock:
         with self._delegation_locks_guard:

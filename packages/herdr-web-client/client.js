@@ -876,6 +876,10 @@ export class HerdrClient {
   connectorRequest(connectorId, body) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/request`, { method: 'POST', body });
   }
+  // Read-only graph of the caller's assistants, delegations and the specialists they run on.
+  assistantGraph({ signal } = {}) {
+    return this.request('/api/v1/assistant-graph', { signal });
+  }
   listDelegations() {
     return this.request('/api/v1/assistant-delegations');
   }

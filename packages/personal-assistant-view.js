@@ -4,6 +4,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
 import { requestErrorDetail } from './dashboard-load-state.js';
 import { mountKeys, roveIndex, TABS } from './personal-assistant-keys.js';
+import { loadAssistantGraph, renderAssistantGraph } from './assistant-graph-view.js';
 
 function statusClass(status) {
   return { ready: 'pa-status--ready', running: 'pa-status--running', disabled: 'pa-status--disabled',
@@ -52,6 +53,7 @@ function takeSignInReturn(win = typeof window === 'undefined' ? null : window) {
 export function mountPersonalAssistant(container, client, { onFreshness = () => {} } = {}) {
   let disposed = false;
   let state = { assistants: [], selectedId: null, tab: 'General' };
+  let graphState = { phase: 'loading' };
 
   const render = async () => {
     container.innerHTML = skeleton('Personal Assistant');
@@ -105,6 +107,19 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     el.focus();
   };
 
+  // The graph is read-only context. It shows the last answer at once and refreshes in place, never redrawing the page.
+  let graphBusy = false;
+  const refreshGraph = async () => {
+    if (graphBusy) return;
+    graphBusy = true;
+    try {
+      const out = await loadAssistantGraph(client);
+      graphState = { phase: out.status === 'ok' ? 'ready' : out.status, nodes: out.nodes, edges: out.edges, message: out.message };
+      const el = container.querySelector('#pa-graph');
+      if (el) el.innerHTML = renderAssistantGraph(graphState);
+    } finally { graphBusy = false; }
+  };
+
   const draw = () => {
     const keep = focusKey();
     const selected = state.assistants.find(a => a.assistant_id === state.selectedId);
@@ -128,10 +143,12 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
           <span class="pa-muted">${esc(selected.assistant_id)}</span><span class="pa-badge">${selected.enabled ? 'enabled' : 'disabled'}</span></div>
         <div class="pa-tabs" role="tablist" aria-label="Configure ${esc(selected.name)}">${TABS.map(t =>
           `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" role="tab" id="pa-tab-${t}" aria-selected="${state.tab === t}" aria-controls="pa-panel" tabindex="${state.tab === t ? 0 : -1}" data-tab="${t}">${t}</button>`).join('')}</div>
-        <div id="pa-panel" role="tabpanel" aria-labelledby="pa-tab-${state.tab}">${renderPanel(selected)}</div></section>` : ''}`;
+        <div id="pa-panel" role="tabpanel" aria-labelledby="pa-tab-${state.tab}">${renderPanel(selected)}</div></section>` : ''}
+      <section class="hd-card pa-graph-card" aria-label="Assistant graph"><h2 class="pa-graph-heading">Assistant graph</h2><div id="pa-graph">${renderAssistantGraph(graphState)}</div></section>`;
     container.querySelector('[data-select]')?.addEventListener('change', e => { state.selectedId = e.target.value; draw(); });
     container.querySelector('[data-showall]')?.addEventListener('click', () => { showAll = !showAll; draw(); });
     container.querySelector('[data-config]')?.addEventListener('click', () => { configOpen = !configOpen; draw(); });
+    refreshGraph();
     if (selected) drawApprovalStrip(selected);
     container.querySelectorAll('[data-tab]').forEach(el => {
       el.addEventListener('click', () => { state.tab = el.dataset.tab; draw(); });

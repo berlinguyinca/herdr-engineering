@@ -3744,7 +3744,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_reminders(parts)
             if resource == "assistant-workers":
                 return self._assistant_workers(parts)
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
@@ -4579,6 +4579,8 @@ def _make_handler(server, public=False, operator=False):
                                                         svc.list_connectors(tenant_id=tenant_id, user_id=user_id)]})
                 if resource == "assistant-connectors" and len(parts) == 5:
                     return self._json(svc.get_connector(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-graph" and len(parts) == 4:
+                    return self._json(svc.assistant_graph(tenant_id=tenant_id, user_id=user_id))
                 if resource == "assistant-delegations" and len(parts) == 4:
                     return self._json({"delegations": [d.as_dict() for d in
                                                          svc.list_delegations(tenant_id=tenant_id, user_id=user_id)]})
