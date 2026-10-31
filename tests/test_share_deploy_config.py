@@ -558,12 +558,13 @@ def test_edge_mcp_location_alone_has_the_chunk_body_cap_and_its_own_rate_zone():
 def test_edge_mcp_body_spool_is_bounded_by_connection_limits_and_an_explicit_tmpfs():
     conf = EDGE.read_text()
     mcp = _brace_block(conf, conf.index("location = /mcp"))
-    assert "limit_conn mcpconn 8;" in mcp and "limit_conn mcptotal 64;" in mcp
+    assert "limit_conn mcpconn 32;" in mcp and "limit_conn mcptotal 128;" in mcp
+    assert "limit_conn_status 429;" in mcp
     assert "limit_conn_zone $remote_addr zone=mcpconn:" in conf
     assert "limit_conn_zone $server_name zone=mcptotal:" in conf
     edge = yaml.safe_load((CP / "compose.collab.yaml").read_text())["services"]["collab-edge"]
     sizes = {t.split(":")[0]: t for t in edge["tmpfs"]}
-    assert "size=64m" in sizes["/var/cache/nginx"] and "size=8m" in sizes["/run"]
-    spool_mib = 64 * 768 / 1024                                # every in-flight /mcp body, worst case
-    assert spool_mib <= 64
-    assert edge["mem_limit"] == "256m"
+    assert "size=96m" in sizes["/var/cache/nginx"] and "size=8m" in sizes["/run"]
+    spool_mib = 128 * 768 / 1024                                # every in-flight /mcp body, worst case
+    assert spool_mib <= 96
+    assert edge["mem_limit"] == "384m"

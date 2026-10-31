@@ -1017,7 +1017,6 @@ def test_a_fifth_pending_intent_is_429_until_the_worker_consumes_one(world):
 def test_the_pending_cap_is_per_actor(world):
     world.mirror.grant(world.b.id, X, "write")
     world.mirror.grants()
-    world.mirror.grants()
     for i in range(4):
         world.bridge.commit(world.a, commit_args(str(i)))
     assert world.bridge.commit(world.b, commit_args("b"))["status"] == "pending"
@@ -1217,7 +1216,6 @@ def test_the_ticket_map_is_bounded_and_an_evicted_ticket_is_404(world, registry)
 # -- result()
 def test_b_cannot_read_as_ticket_even_after_waiting(world):
     world.mirror.grant(world.b.id, X, "write")
-    world.mirror.grants()
     world.mirror.grants()
     br, waits = waiting_bridge(world)
     ticket = br.commit(world.a, commit_args())["ticket"]

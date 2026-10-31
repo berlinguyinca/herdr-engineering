@@ -223,10 +223,12 @@ may hold at most 4096 staged uploads (a module constant; every upload directory 
 - nginx buffers up to 768k of body per `/mcp` request from any client before the control plane decides whether to
   admit it (above 64 KiB only for an authenticated agent with a write grant, and only for `artifact_stage_chunk`).
   That exposure is bounded by `hcn_mcp`, by `client_body_timeout 10s` and by connection limits: `/mcp` allows 8
-  concurrent requests per source address (`mcpconn`) and 64 in all (`mcptotal`), so at most 64 x 768 KiB =
-  48 MiB of bodies are spooled at once. They land in the edge's `/var/cache/nginx` tmpfs, which is sized explicitly
-  (`size=64m`, `/run` 8m) in `compose.collab.yaml`, and the edge's `mem_limit` is 256m because tmpfs pages count
-  against it (64m spool + 8m + nginx buffers/zones). A test pins these directives.
+  concurrent requests per source address (`mcpconn`) and 128 in all (`mcptotal`), refused with 429 like the rate
+  limits (`limit_conn_status 429`). These count long polls too (`artifact_commit_result` waits up to 20 s,
+  `tasks_wait`, `helper_wait`) and many agents share one NAT address, hence 32 per address rather than a handful. At
+  most 128 x 768 KiB = 96 MiB of bodies are spooled at once. They land in the edge's `/var/cache/nginx` tmpfs, which is sized explicitly
+  (`size=96m`, `/run` 8m) in `compose.collab.yaml`, and the edge's `mem_limit` is 384m because tmpfs pages count
+  against it (96m spool + 8m + nginx buffers/zones). A test pins these directives.
 - Credential guessing is bounded by these two rate limits only. Failed agent authentications are counted
   (`auth_failures`) but there is no lockout.
 
@@ -282,6 +284,10 @@ automatic. The 500 reply from a failed retract carries `restrict_all_offered`.
 and `--days 1..90`) and `herdr-eng artifacts retract <artifact_id> [--version-id ...] [--reason ...] [--restrict-all]`.
 They call the control plane with an API key read from the environment variable named by `--api-key-env`
 (default `HERDR_API_KEY`); the key itself is never an argument.
+
+Agent ids starting with `room:` are refused by every collaborator route (grant, revoke, invite). A grant made under such an id
+before that rule cannot be revoked by id any more: use `collab restrict <artifact_id>` (it revokes every collaborator
+grant of the artifact).
 
 ## Verify
 

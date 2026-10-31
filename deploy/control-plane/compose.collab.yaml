@@ -182,8 +182,8 @@ services:
     read_only: true
     tmpfs:
       - /run:uid=${HERDR_COLLAB_CERT_UID:-1000},size=8m
-      # nginx spools request bodies above 16 KiB here: 64 concurrent /mcp bodies of 768 KiB = 48 MiB (nginx.conf)
-      - /var/cache/nginx:uid=${HERDR_COLLAB_CERT_UID:-1000},size=64m
+      # nginx spools request bodies above 16 KiB here: 128 concurrent /mcp requests with a 768 KiB body = 96 MiB (nginx.conf)
+      - /var/cache/nginx:uid=${HERDR_COLLAB_CERT_UID:-1000},size=96m
     volumes:
       # deploy.sh installs this to a stable path (the build worktree is temporary)
       - ${HERDR_COLLAB_EDGE_CONF:?run deploy.sh}:/etc/nginx/nginx.conf:ro
@@ -196,7 +196,7 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 128
-    mem_limit: 256m          # tmpfs pages count here: 64m body spool + 8m /run + nginx's own buffers and zones
+    mem_limit: 384m          # tmpfs pages count here: 96m body spool + 8m /run + nginx's own buffers and zones
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
