@@ -88,6 +88,13 @@ class ArtifactContextMixin:
             ctx_key(link_kind, task_id=task_id, project_id=project_id, issue_ref=issue_ref, room_id=room_id))
         return result == "INSERT 0 1" if isinstance(result, str) else True
 
+    async def unlink_room(self, artifact_id: str, room_id: str) -> int:
+        """Remove every binding between an artifact and a room (all link kinds). Returns how many were removed; none is fine."""
+        _, room_id = validate_context("room", room_id)
+        rows = await self._conn.fetch(
+            "DELETE FROM artifact_bindings WHERE artifact_id=$1 AND room_id=$2 RETURNING 1", artifact_id, room_id)
+        return len(rows)
+
     async def list_links(self, artifact_id: str) -> list[dict]:
         rows = await self._conn.fetch(
             "SELECT task_id, project_id, issue_ref, room_id, link_kind, version_id, created_at "

@@ -1,5 +1,6 @@
-"""`herdr-eng artifacts show|versions|for|links|link`: browse the versioned artifact registry and bind an artifact to a
-project, issue, task or room (P03 `/artifact` adapter). Only `link` writes, through the existing links route."""
+"""`herdr-eng artifacts show|versions|for|links|link|unlink`: browse the versioned artifact registry and bind an artifact
+to a project, issue, task or room (P03 `/artifact` adapter). Only `link` and `unlink` write, through the links routes;
+`unlink --room` removes a room link (it needs `edit`, like `link`)."""
 import argparse
 import json
 import os
@@ -35,6 +36,8 @@ def run_command(args):
                 _err("a link needs --project, --issue, --task or --room")
                 return 2
             result = client.request(_show_path(args.artifact_id) + "/links", body)
+        elif action == "unlink":
+            result = client.request(_show_path(args.artifact_id) + "/links/remove", {"room_id": args.room})
         else:
             query = {k: v for k, v in (("q", args.query), ("media_type", args.media_type),
                                        ("limit", args.limit), ("cursor", args.cursor)) if v is not None}
@@ -49,7 +52,7 @@ def run_command(args):
 
 def add_browse_subparsers(subparsers):
     """Register show/versions/for directly under `artifacts` so they read as `artifacts show <id>`."""
-    for name in ("show", "versions", "for", "links", "link"):
+    for name in ("show", "versions", "for", "links", "link", "unlink"):
         c = subparsers.add_parser(name)
         configure_parser_single(c, name)
 
@@ -71,6 +74,8 @@ def configure_parser_single(c, action):
         for flag in ("project", "issue", "task", "room", "version"):
             c.add_argument("--" + flag)
         c.add_argument("--link-kind", choices=("origin", "reference", "derived"))
+    if action == "unlink":
+        c.add_argument("--room", required=True, help="the room whose link to remove (needs edit on the artifact)")
     if action == "show":
         c.add_argument("version_id", nargs="?")
     c.set_defaults(func=run_command, browse_action=action)

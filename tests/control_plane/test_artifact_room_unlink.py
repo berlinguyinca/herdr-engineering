@@ -55,6 +55,62 @@ def new_artifact(adapter, acl, key="owner"):
     return artifact_id
 
 
+def test_link_needs_a_room_that_exists_and_says_nothing_more_about_one_that_does_not(registry_pg):
+    with running(registry_pg["dsn"]) as (server, adapter, acl, room):
+        aid = new_artifact(adapter, acl)
+        status, body = call(server, "POST", f"/api/v1/artifacts/{aid}/links", {"room_id": room})
+        assert status == 201 and body["linked"] is True
+        for unknown in ("room-does-not-exist", "x" * 40):
+            status, body = call(server, "POST", f"/api/v1/artifacts/{aid}/links", {"room_id": unknown})
+            assert (status, body) == (404, {"error": "not found"})
+        links = call(server, "GET", f"/api/v1/artifacts/{aid}/links")[1]["links"]
+        assert [link["room_id"] for link in links] == [room]
+
+
+def test_unlink_removes_the_link_and_the_rooms_read_grants_and_is_idempotent(registry_pg):
+    with running(registry_pg["dsn"]) as (server, adapter, acl, room):
+        aid = new_artifact(adapter, acl)
+        call(server, "POST", f"/api/v1/artifacts/{aid}/links", {"room_id": room})
+        assert acl.can(aid, principal_for("bob"), "read")                      # the link synced the room's people
+        status, body = call(server, "POST", f"/api/v1/artifacts/{aid}/links/remove", {"room_id": room})
+        assert (status, body) == (200, {"artifact_id": aid, "unlinked": 1})
+        assert call(server, "GET", f"/api/v1/artifacts/{aid}/links")[1]["links"] == []
+        assert not acl.can(aid, principal_for("bob"), "read")
+        assert call(server, "POST", f"/api/v1/artifacts/{aid}/links/remove", {"room_id": room})[1]["unlinked"] == 0
+
+
+def test_unlink_needs_edit_and_answers_a_stranger_like_a_missing_artifact(registry_pg):
+    with running(registry_pg["dsn"]) as (server, adapter, acl, room):
+        aid = new_artifact(adapter, acl)
+        call(server, "POST", f"/api/v1/artifacts/{aid}/links", {"room_id": room})
+        acl.grant(aid, principal("other"), {"read"})                           # can read, cannot edit
+        assert call(server, "POST", f"/api/v1/artifacts/{aid}/links/remove", {"room_id": room}, key="other") == (404, {"error": "not found"})
+        assert call(server, "POST", f"/api/v1/artifacts/{aid}/links/remove", {"room_id": room}, key="agent")[0] == 403   # agent role is read-only
+        assert call(server, "POST", "/api/v1/artifacts/missing/links/remove", {"room_id": room}, key="other") == (404, {"error": "not found"})
+        assert len(call(server, "GET", f"/api/v1/artifacts/{aid}/links")[1]["links"]) == 1
+
+
+def test_unlink_rejects_bodies_that_name_anything_but_a_room(registry_pg):
+    with running(registry_pg["dsn"]) as (server, adapter, acl, room):
+        aid = new_artifact(adapter, acl)
+        for body in ({}, {"room_id": ""}, {"room_id": room, "project_id": "p"}, {"project_id": "p"}):
+            assert call(server, "POST", f"/api/v1/artifacts/{aid}/links/remove", body)[0] == 400
+
+
+def test_cli_unlink_removes_the_link_through_the_real_route(registry_pg, monkeypatch, capsys):
+    from herdr_engineering.cli import main
+    monkeypatch.setenv("HERDR_API_KEY", "owner")
+    with running(registry_pg["dsn"]) as (server, adapter, acl, room):
+        aid = new_artifact(adapter, acl)
+        base = f"http://127.0.0.1:{server.port}"
+        assert main(["artifacts", "link", aid, "--room", room, "--control-plane", base]) == 0
+        capsys.readouterr()
+        assert main(["artifacts", "unlink", aid, "--room", room, "--control-plane", base, "--json"]) == 0
+        assert '"unlinked": 1' in capsys.readouterr().out.replace('":1', '": 1')
+        assert call(server, "GET", f"/api/v1/artifacts/{aid}/links")[1]["links"] == []
+        assert main(["artifacts", "unlink", "missing", "--room", room, "--control-plane", base]) == 1
+
+
 def test_cli_revoke_room_grants_is_a_dry_run_until_apply(registry_pg, tmp_path, capsys):
     import yaml
 
