@@ -2062,3 +2062,381 @@ def test_a_new_ticket_for_a_crashed_tickets_request_replays_its_version_uncharge
         assert (await ledger(env, same["ticket"]))["bytes"] == 0
         assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 2
     committing(registry_pg, tmp_path, body)
+
+
+# ----------------------------------------------------------------------------- staged uploads (Task 5c)
+
+CHUNK = cbf.CHUNK_BYTES
+BLOB = (bytes(range(128, 256)) * (3 * CHUNK // 128 + 1))[:2 * CHUNK + 1000]    # 3 parts, never UTF-8
+NOT_FOUND, INCOMPLETE, FAILED = "upload not found", "upload incomplete", "upload failed verification"
+
+
+def stage(env, owner, aid, name, data, *, skip=(), created_at=None):
+    """Stage ``data`` as collab-public would: ``staging/<owner>/<upload_id>/{meta.json, 0000000..}``."""
+    sha = hashlib.sha256(data).hexdigest()
+    upl = cbf.upload_id_for(owner, aid, name, sha, len(data))
+    total = -(-len(data) // CHUNK)
+    d = env.outbox / "staging" / owner / upl
+    d.mkdir(parents=True, exist_ok=True)
+    meta = cbf.StagedUpload(upload_id=upl, owner_key=owner, artifact_id=aid, name=name, size_bytes=len(data),
+                            file_sha256=sha, total=total, created_at=env.clock() if created_at is None else created_at)
+    (d / "meta.json").write_text(json.dumps(meta.to_dict()))
+    for i in range(total):
+        if i not in skip:
+            (d / f"{i:07d}").write_bytes(data[i * CHUNK:(i + 1) * CHUNK])
+    return upl, d
+
+
+def staged(name, upl):
+    return {"name": name, "op": "put", "upload_id": upl}
+
+
+def entry_of(env, name, data, media_type):
+    key, digest = env.applier.rustfs.put(data)
+    return {"name": name, "media_type": media_type, "sha256": digest, "size_bytes": len(data), "storage_key": key}
+
+
+async def owner_commit(env, aid, base, entries):
+    async with env.pool.acquire() as conn:
+        return (await ArtifactStore(conn, env.applier.rustfs).commit_version(
+            aid, base_version_id=base, source_manifest_blob=None, output_manifest=entries,
+            created_by="owner"))["version_id"]
+
+
+def reset_calls(env):
+    env.applier.rustfs.calls.update(put=0, put_stream=0)
+
+
+def tree(d):
+    return {p.relative_to(d).as_posix(): (p.read_bytes() if p.is_file() else None) for p in sorted(d.rglob("*"))}
+
+
+async def upload_row(env, owner, upl):
+    rows = await sql(env, "SELECT * FROM artifact_collab_uploads WHERE owner_key=$1 AND upload_id=$2", owner, upl)
+    return dict(rows[0]) if rows else None
+
+
+async def used_bytes(env, agent_id):
+    async with env.pool.acquire() as conn:
+        return await CollabGrantStore(conn).bytes_last_24h(agent_id)
+
+
+def test_a_three_chunk_staged_binary_file_is_assembled_verified_and_only_meta_and_markers_remain(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        upl, d = stage(env, a, aid, "blob.bin", BLOB)
+        (d / "audited").write_bytes(b"")                       # collab-public's audit marker stays
+        (d / ".tmp-0123456789abcdef").write_bytes(b"stale")    # a stale fallback tmp goes with the parts
+        reset_calls(env)
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "created", doc
+        (entry,) = [e for e in (await version_of(env, doc["version_id"]))["output_manifest"] if e["name"] == "blob.bin"]
+        assert entry["sha256"] == hashlib.sha256(BLOB).hexdigest() and entry["size_bytes"] == len(BLOB)
+        assert entry["media_type"] == "application/octet-stream"
+        assert env.applier.rustfs.get(entry["storage_key"], entry["sha256"]) == BLOB
+        assert sorted(p.name for p in d.iterdir()) == ["audited", "meta.json", "verified"]
+        assert env.applier.rustfs.calls["put_stream"] == 1
+        assert env.applier.rustfs.spool_dirs == [env.applier.spool_dir]
+        row = await upload_row(env, a, upl)
+        assert row["charged"] and row["size_bytes"] == len(BLOB) and row["artifact_id"] == aid
+        assert (await ledger(env, raw["ticket"]))["bytes"] == 0
+        assert await used_bytes(env, a) == len(BLOB)
+    committing(registry_pg, tmp_path, body)
+
+
+BIG = "".join(f"big line {i}\n" for i in range(40))
+
+
+def test_a_staged_text_file_over_the_merge_cap_merges_on_one_side_and_conflicts_oversize_on_both(registry_pg, tmp_path):
+    async def body(env, a):
+        doc0 = blob_entry(env, "doc.md", BASE_DOC)
+        aid, v1 = await seed(env, [doc0, blob_entry(env, "big.txt", BIG, "text/plain")])
+        await grant(env, aid, a)
+        v2 = await owner_commit(env, aid, v1, [blob_entry(env, "doc.md", edit(BASE_DOC, 1, "owner")),
+                                               blob_entry(env, "big.txt", BIG, "text/plain")])
+        mine = edit(BIG, 30, "mine").encode()
+        upl, _ = stage(env, a, aid, "big.txt", mine)
+        one = commit(env, a, aid, v1, [staged("big.txt", upl)])
+        await settle(env)
+        merged = env.result(one["ticket"])
+        assert merged["result"] == "merged", merged
+        assert await text_of(env, merged["version_id"], "big.txt") == mine.decode()
+        assert await text_of(env, merged["version_id"], "doc.md") == edit(BASE_DOC, 1, "owner")
+        v4 = await owner_commit(env, aid, merged["version_id"], [
+            blob_entry(env, "doc.md", edit(BASE_DOC, 1, "owner")),
+            blob_entry(env, "big.txt", edit(mine.decode(), 2, "owner"), "text/plain")])
+        again = edit(mine.decode(), 2, "contributor").encode()
+        upl2, _ = stage(env, a, aid, "big.txt", again)
+        two = commit(env, a, aid, merged["version_id"], [staged("big.txt", upl2)])
+        await settle(env)
+        doc = env.result(two["ticket"])
+        assert doc["result"] == "conflict" and doc["head_version_id"] == v4
+        assert doc["conflicts"] == [{"name": "big.txt", "kind": "oversize", "merged_text": None, "truncated": False}]
+        assert v2
+    committing(registry_pg, tmp_path, body, limits=BridgeLimits(max_text_merge_bytes=64))
+
+
+def test_a_binary_file_changed_on_both_sides_conflicts_and_a_recommit_reuses_the_verified_upload(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env, [blob_entry(env, "doc.md", BASE_DOC),
+                                   entry_of(env, "blob.bin", b"\x80base", "application/octet-stream")])
+        await grant(env, aid, a)
+        v2 = await owner_commit(env, aid, v1, [blob_entry(env, "doc.md", BASE_DOC),
+                                               entry_of(env, "blob.bin", b"\x80owner", "application/octet-stream")])
+        upl, d = stage(env, a, aid, "blob.bin", BLOB)
+        reset_calls(env)
+        first = commit(env, a, aid, v1, [staged("blob.bin", upl)])
+        await settle(env)
+        doc = env.result(first["ticket"])
+        assert doc["result"] == "conflict" and doc["head_version_id"] == v2
+        assert doc["conflicts"] == [{"name": "blob.bin", "kind": "binary", "merged_text": None, "truncated": False}]
+        assert await used_bytes(env, a) == len(BLOB)
+        assert sorted(p.name for p in d.iterdir()) == ["meta.json", "verified"]
+        second = commit(env, a, aid, doc["head_version_id"], [staged("blob.bin", upl)])
+        await settle(env)
+        done = env.result(second["ticket"])
+        assert done["result"] == "created", done
+        assert env.applier.rustfs.calls["put_stream"] == 1          # never re-assembled
+        assert await used_bytes(env, a) == len(BLOB)                # never charged twice (the quota is exactly one)
+        (entry,) = [e for e in (await version_of(env, done["version_id"]))["output_manifest"] if e["name"] == "blob.bin"]
+        assert entry["sha256"] == hashlib.sha256(BLOB).hexdigest()
+    committing(registry_pg, tmp_path, body, limits=BridgeLimits(daily_bytes_per_agent=len(BLOB)))
+
+
+@pytest.mark.parametrize("case", ["other_agent", "other_artifact", "other_name"])
+def test_an_upload_that_is_not_the_callers_own_for_this_artifact_and_name_is_not_found(registry_pg, tmp_path, case):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        other_aid, _ = await seed(env)
+        await grant(env, aid, a)
+        if case == "other_agent":
+            upl, d = stage(env, uid("agent"), aid, "blob.bin", BLOB)
+        elif case == "other_artifact":
+            upl, d = stage(env, a, other_aid, "blob.bin", BLOB)
+        else:
+            upl, d = stage(env, a, aid, "other.bin", BLOB)
+        before = tree(d)
+        reset_calls(env)
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == NOT_FOUND
+        assert env.applier.rustfs.calls == {"put": 0, "put_stream": 0}
+        assert tree(d) == before and await head_of(env, aid) == v1
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_missing_part_is_incomplete_and_nothing_is_stored(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        upl, d = stage(env, a, aid, "blob.bin", BLOB, skip={1})
+        before = tree(d)
+        reset_calls(env)
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl), put("doc.md", "inline\n")])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == INCOMPLETE
+        assert env.applier.rustfs.calls == {"put": 0, "put_stream": 0}
+        assert tree(d) == before and await upload_row(env, a, upl) is None
+    committing(registry_pg, tmp_path, body)
+
+
+def _growing_part(monkeypatch):
+    """Part 1 raises BridgeError mid-read, as a part that grew past its cap after the open does."""
+    from herdr_engineering.control_plane import collab_intents
+    real = collab_intents.open_beneath
+
+    class Grows:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def read(self, n=-1):
+            raise cbf.BridgeError("file grew past its size cap")
+
+        def close(self):
+            self.inner.close()
+
+    def opener(root, parts, *, max_bytes=None):
+        reader = real(root, parts, max_bytes=max_bytes)
+        return Grows(reader) if reader is not None and parts[-1] == "0000001" else reader
+    monkeypatch.setattr(collab_intents, "open_beneath", opener)
+
+
+@pytest.mark.parametrize("case", ["overwritten", "oversized_part", "grew_mid_stream"])
+def test_a_part_changed_after_staging_fails_verification_and_the_upload_is_deleted(registry_pg, tmp_path, case,
+                                                                                    monkeypatch):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        upl, d = stage(env, a, aid, "blob.bin", BLOB)
+        if case == "overwritten":
+            (d / "0000001").write_bytes(b"\x00" * CHUNK)
+        elif case == "oversized_part":
+            (d / "0000001").write_bytes(b"\x00" * (CHUNK + 1))
+        else:
+            _growing_part(monkeypatch)
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == FAILED
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 1
+        assert await sql(env, "SELECT 1 FROM artifact_blobs WHERE scope=$1 AND blob_sha256=$2", aid,
+                         hashlib.sha256(BLOB).hexdigest()) == []
+        assert await upload_row(env, a, upl) is None
+        assert not d.exists() and (env.outbox / "staging" / a).is_dir()
+    committing(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_a_forged_verified_marker_without_a_row_is_ignored(registry_pg, tmp_path, complete):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        upl, d = stage(env, a, aid, "blob.bin", BLOB, skip=() if complete else {2})
+        (d / "verified").write_bytes(b"")
+        reset_calls(env)
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        if complete:
+            assert doc["result"] == "created" and env.applier.rustfs.calls["put_stream"] == 1
+            assert (await upload_row(env, a, upl))["sha256"] == hashlib.sha256(BLOB).hexdigest()
+        else:
+            assert doc["result"] == "rejected" and doc["reason"] == INCOMPLETE
+            assert env.applier.rustfs.calls["put_stream"] == 0 and await upload_row(env, a, upl) is None
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_symlinked_part_is_rejected_and_its_target_is_untouched(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        upl, d = stage(env, a, aid, "blob.bin", BLOB, skip={1})
+        outside = tmp_path / "outside-part"
+        outside.write_bytes(BLOB[CHUNK:2 * CHUNK])
+        (d / "0000001").symlink_to(outside)
+        reset_calls(env)
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == INCOMPLETE
+        assert env.applier.rustfs.calls["put_stream"] == 0
+        assert outside.read_bytes() == BLOB[CHUNK:2 * CHUNK] and (d / "0000001").is_symlink()
+    committing(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("level", ["agent_dir", "upload_dir"])
+def test_a_staging_dir_swapped_for_a_symlink_is_rejected_and_nothing_outside_is_touched(registry_pg, tmp_path, level):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        upl, d = stage(env, a, aid, "blob.bin", BLOB)       # complete and valid: following the link would assemble it
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        moved = d.parent if level == "agent_dir" else d
+        target = outside / moved.name
+        moved.rename(target)
+        moved.symlink_to(target, target_is_directory=True)
+        before = tree(outside)
+        reset_calls(env)
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == NOT_FOUND
+        assert env.applier.rustfs.calls == {"put": 0, "put_stream": 0}
+        assert tree(outside) == before and not any(p.name == "verified" for p in outside.rglob("*"))
+        assert await upload_row(env, a, upl) is None
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_declared_size_over_the_daily_quota_is_rejected_before_any_rustfs_call(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        upl, d = stage(env, a, aid, "blob.bin", BLOB)
+        before = tree(d)
+        reset_calls(env)
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl), put("doc.md", "x\n")])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == "daily quota exceeded"
+        assert env.applier.rustfs.calls == {"put": 0, "put_stream": 0}
+        assert tree(d) == before and await upload_row(env, a, upl) is None
+    # the upload alone fits; with the commit's 2 inline bytes it does not
+    committing(registry_pg, tmp_path, body, limits=BridgeLimits(daily_bytes_per_agent=len(BLOB) + 1))
+
+
+def test_a_crash_retry_of_a_consumed_staged_put_reports_the_same_version(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        upl, d = stage(env, a, aid, "blob.bin", BLOB)
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl)], key="k-staged")
+        await settle(env)
+        first = env.result(raw["ticket"])
+        assert first["result"] == "created"
+        assert not (d / "0000000").exists()
+        await crash_before_outcome(env, raw)
+        await settle(env)
+        again = env.result(raw["ticket"])
+        assert again["result"] == "created" and again["version_id"] == first["version_id"]
+        same = commit(env, a, aid, v1, [staged("blob.bin", upl)], key="k-staged")
+        await settle(env)
+        replay = env.result(same["ticket"])
+        assert replay["result"] == "created" and replay["version_id"] == first["version_id"]
+        assert env.applier.rustfs.calls["put_stream"] == 1
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 2
+        assert await used_bytes(env, a) == len(BLOB)
+    committing(registry_pg, tmp_path, body)
+
+
+def test_an_owner_key_assembles_uncharged_through_ctx_assemble(registry_pg, tmp_path, registry):
+    register_x()
+    seen = {}
+
+    async def handler(ctx, intent):
+        seen["entry"] = await ctx.assemble("m_test", seen["upl"], artifact_id=seen["aid"], name="blob.bin",
+                                           charge=False)
+        return {"result": "done"}
+
+    async def body(env):
+        env.applier.register("x.test", handler)
+        a = uid("agent")
+        aid, _ = await seed(env)
+        seen["aid"] = aid
+        seen["upl"], d = stage(env, "m_test", aid, "blob.bin", BLOB)
+        used = await used_bytes(env, a)
+        raw = env.intent({"kind": "user", "id": "u_owner"})
+        await settle(env)
+        assert env.result(raw["ticket"])["result"] == "done"
+        assert seen["entry"]["sha256"] == hashlib.sha256(BLOB).hexdigest()
+        assert seen["entry"]["size_bytes"] == len(BLOB) and seen["entry"]["name"] == "blob.bin"
+        row = await upload_row(env, "m_test", seen["upl"])
+        assert row is not None and row["charged"] is False
+        assert await used_bytes(env, "m_test") == 0 and await used_bytes(env, a) == used
+        assert sorted(p.name for p in d.iterdir()) == ["meta.json", "verified"]
+    run(registry_pg, tmp_path, body)
+
+
+def test_staged_bytes_never_reach_the_logs(registry_pg, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    secret = (SENTINEL.encode() * (CHUNK // len(SENTINEL) + 2))[:CHUNK + 10]
+
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        good, _ = stage(env, a, aid, "secret.txt", secret)
+        bad, d = stage(env, a, aid, "bad.txt", secret[::-1])
+        (d / "0000001").write_bytes(SENTINEL.encode())
+        one = commit(env, a, aid, v1, [staged("secret.txt", good)])
+        await settle(env)
+        two = commit(env, a, aid, env.result(one["ticket"])["version_id"], [staged("bad.txt", bad)])
+        await settle(env)
+        assert env.result(one["ticket"])["result"] == "created"
+        assert env.result(two["ticket"])["reason"] == FAILED
+    committing(registry_pg, tmp_path, body)
+    assert SENTINEL not in caplog.text and SENTINEL[::-1] not in caplog.text

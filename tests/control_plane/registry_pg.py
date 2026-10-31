@@ -24,12 +24,15 @@ class FakeBlobs:
     def __init__(self):
         self.objects = {}
         self.deleted = []
+        self.calls = {"put": 0, "put_stream": 0}   # every write call, verified or not
+        self.spool_dirs = []
 
     @staticmethod
     def key(digest):
         return f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
 
     def put(self, data):
+        self.calls["put"] += 1
         digest = hashlib.sha256(data).hexdigest()
         self.objects[self.key(digest)] = bytes(data)
         return self.key(digest), digest
@@ -39,7 +42,10 @@ class FakeBlobs:
         self.objects[key] = bytes(data)
         return key
 
-    def put_stream(self, stream, *, expected_sha256=None, expected_size=None, media_type=None, chunk_size=1 << 20):
+    def put_stream(self, stream, *, expected_sha256=None, expected_size=None, media_type=None, chunk_size=1 << 20,
+                   spool_dir=None):
+        self.calls["put_stream"] += 1
+        self.spool_dirs.append(spool_dir)
         data = io.BytesIO()
         while chunk := stream.read(chunk_size):
             data.write(chunk)

@@ -57,10 +57,16 @@ The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:
    clash (``check_names``: duplicates and file/directory prefixes) within the contributor's tree (base with the
    changes applied) nor with the head's remaining files; base and head are not checked against each other, so a
    head that replaced ``a`` with ``a/b`` does not refuse a clean stale-base commit.
-9. Daily quota: ``bytes_last_24h(agent, exclude_ticket=ticket) + inline_bytes <= daily_bytes_per_agent`` (the
-   ticket's own ``received`` row is excluded, so a crash-retry is never counted twice).
-10. Inline text is stored with ``rustfs.put`` and ``register_report_blob``; staged puts go through ``ctx.assemble``
-    (Task 5c).
+8. Each staged put is resolved (Task 5c): a ``verified_upload(agent, upload_id)`` row of the same artifact and name
+   is reused as is (no staging read, no charge); otherwise the upload's ``meta.json`` is read no-follow from
+   ``staging/<agent>/<upload_id>/`` (derived from the intent's agent, so another agent's upload id is never found) and
+   must name this artifact and file, else ``rejected`` "upload not found".
+9. Daily quota: ``bytes_last_24h(agent, exclude_ticket=ticket) + inline_bytes + declared size_bytes of the
+   unverified uploads <= daily_bytes_per_agent``, before any RustFS call (the ticket's own ``received`` row is
+   excluded and a verified upload is already counted once, so a crash-retry or re-commit is never counted twice).
+10. Staged puts go through ``ctx.assemble(..., charge=True)`` first (``UploadRefused`` gives "upload incomplete" /
+    "upload failed verification"; see ``_assemble``), then inline text is stored with ``rustfs.put`` and
+    ``register_report_blob``, so a refused upload leaves no inline bytes behind.
 11. ``merge_commit`` (no outer transaction, so a conflict's attempt row persists) with ``ticket_id`` and
     ``max_text_bytes = limits.max_text_merge_bytes``; ``ArtifactMergeConflict`` is ``conflict`` (its ``attempt_id``
     goes on the ledger row; ``merged_text`` capped at ``max_conflict_text_bytes`` per result, measured as encoded
@@ -82,6 +88,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import functools
 import inspect
 import json
 import logging
@@ -101,10 +108,12 @@ from .artifact_collab_store import CollabGrantStore
 from .artifact_scope import ArtifactGraphGate
 from .artifacts import ArtifactError, ArtifactMergeConflict, ArtifactStore
 from .collab_bridge_files import (
+    CHUNK_BYTES,
     DIR_MODE,
     FEED_MAX_AGE,
     INTENT_MAX_AGE,
     TICKET_RE,
+    VERIFIED_MARKER,
     Actor,
     BridgeError,
     BridgeLimits,
@@ -117,10 +126,18 @@ from .collab_bridge_files import (
     ensure_dir,
     file_exists_beneath,
     list_beneath,
+    list_parts,
+    open_beneath,
     read_json_beneath,
+    read_staged_meta,
+    remove_tree_beneath,
+    staging_parts,
+    tree_entry_cap,
     unlink_beneath,
     validate_intent,
+    write_marker_beneath,
 )
+from .rustfs import IntegrityError
 from .share_bundle import ShareBundleError, check_names
 
 log = logging.getLogger(__name__)
@@ -162,6 +179,9 @@ REASON_RETRACTED = "artifact or version is retracted"
 REASON_NOT_WRITABLE = "not writable by collaboration"
 REASON_NAMES = "invalid or clashing file names"
 REASON_QUOTA = "daily quota exceeded"
+REASON_UPLOAD_NOT_FOUND = "upload not found"
+REASON_UPLOAD_INCOMPLETE = "upload incomplete"
+REASON_UPLOAD_FAILED = "upload failed verification"
 REASON_BASE = "base version does not belong to the artifact"
 REASON_NO_HEAD = "artifact has no head version"
 REASON_MAX = 300                    # an ArtifactError message on a result is cut to this many characters
@@ -177,8 +197,12 @@ _KIND_NAME = re.compile(r"[a-z][a-z0-9_.]{0,47}\Z")
 _LOCK_SALT = "herdr.collab-intents:"
 
 
-async def _assemble_unavailable(*_args, **_kwargs):
-    raise NotImplementedError("staged-upload assembly arrives with Task 5c")
+class UploadRefused(Exception):
+    """``IntentContext.assemble`` refused a staged upload; ``reason`` is a fixed text fit for a result."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass
@@ -258,7 +282,6 @@ class CollabIntentApplier:
         self.extras = MappingProxyType(dict(context_extras or {}))
         self.clock = clock
         self.max_per_tick = max_per_tick
-        self.assemble: Callable[..., Awaitable[dict]] = _assemble_unavailable
         self._kinds: dict[str, _Kind] = {}
         self._busy: dict[str, asyncio.Task] = {}
         self._inflight: set[str] = set()
@@ -679,8 +702,8 @@ class CollabIntentApplier:
 
     def _context(self, conn, intent: Intent, agent: dict | None) -> IntentContext:
         return IntentContext(actor=intent.actor, agent=agent, conn=conn, store=ArtifactStore(conn, self.rustfs),
-                             grants=CollabGrantStore(conn), limits=self.limits, assemble=self.assemble,
-                             extras=self.extras)
+                             grants=CollabGrantStore(conn), limits=self.limits,
+                             assemble=functools.partial(self._assemble, conn), extras=self.extras)
 
     async def _early_replayed(self, conn, name: str, intent: Intent, spec: _Kind) -> bool:
         """The kind's ``early_replay``, before the agent check; True when it decided the ticket. A failure is logged
@@ -853,10 +876,29 @@ class CollabIntentApplier:
         head_files = _files_of(head)
         if not _names_fit(payload.changes, _files_of(base), head_files):
             return _rejected(REASON_NAMES)
+        owner = agent_owner_key(agent_id)
+        uploads = [c for c in payload.changes if c.op == "put" and c.upload_id is not None]
+        unverified = 0
+        for change in uploads:                                                                      # step 8
+            try:
+                row, meta = await self._resolve_upload(ctx.grants, owner, change.upload_id, artifact_id=aid,
+                                                       name=change.name)
+            except UploadRefused as exc:
+                return _rejected(exc.reason)
+            if row is None:
+                unverified += meta.size_bytes
         used = await ctx.grants.bytes_last_24h(agent_id, exclude_ticket=intent.ticket)               # step 9
-        if used + payload.inline_bytes > ctx.limits.daily_bytes_per_agent:
+        if used + payload.inline_bytes + unverified > ctx.limits.daily_bytes_per_agent:
             return _rejected(REASON_QUOTA)
-        changes = []                                                                                # step 10
+        entries: dict[str, dict] = {}                                                               # step 10
+        for change in uploads:             # staged first: a refused upload leaves no inline bytes behind either
+            try:
+                entries[change.name] = await ctx.assemble(
+                    owner, change.upload_id, artifact_id=aid, name=change.name, charge=True,
+                    media_type=(head_files.get(change.name) or {}).get("media_type"))
+            except UploadRefused as exc:
+                return _rejected(exc.reason)
+        changes = []
         for change in payload.changes:
             if change.op == "delete":
                 changes.append({"name": change.name, "op": "delete"})
@@ -864,9 +906,7 @@ class CollabIntentApplier:
                 changes.append({"name": change.name, "op": "put",
                                 "entry": await self._store_inline(ctx, aid, change.name, change.text, head_files)})
             else:
-                entry = await ctx.assemble(agent_owner_key(agent_id), change.upload_id, artifact_id=aid,
-                                           name=change.name, charge=True)
-                changes.append({"name": change.name, "op": "put", "entry": entry})
+                changes.append({"name": change.name, "op": "put", "entry": entries[change.name]})
         try:                                                                                        # step 11
             out = await store.merge_commit(
                 aid, base_version_id=base["version_id"], changes=changes, message=payload.message,
@@ -911,6 +951,87 @@ class CollabIntentApplier:
         await ctx.store.register_report_blob(aid, storage_key=key, sha256=digest, size_bytes=len(data),
                                              media_type=media_type)
         return {"name": name, "media_type": media_type, "sha256": digest, "size_bytes": len(data), "storage_key": key}
+
+    # -- staged uploads (Task 5c) ------------------------------------------------------------------------------
+    async def _resolve_upload(self, grants: CollabGrantStore, owner_key: str, upload_id: str, *, artifact_id: str,
+                              name: str):
+        """Step 8: ``(verified row, None)`` for an upload the worker already verified for this artifact and name,
+        else ``(None, meta)`` from the upload's own ``meta.json`` under ``staging/<owner_key>/`` (the path is derived
+        from the caller, so another owner's upload is never found); ``UploadRefused`` "upload not found" otherwise."""
+        row = await grants.verified_upload(owner_key, upload_id)
+        if row is not None:
+            if row["artifact_id"] != artifact_id or row["name"] != name:
+                raise UploadRefused(REASON_UPLOAD_NOT_FOUND)
+            return row, None
+        meta = await asyncio.to_thread(read_staged_meta, self.outbox, owner_key, upload_id, self.limits)
+        if meta is None or meta.artifact_id != artifact_id or meta.name != name:
+            raise UploadRefused(REASON_UPLOAD_NOT_FOUND)
+        return None, meta
+
+    async def _assemble(self, conn, owner_key: str, upload_id: str, *, artifact_id: str, name: str, charge: bool,
+                        media_type: str | None = None) -> dict:
+        """``IntentContext.assemble``: the entry of a staged upload, verified by the worker itself.
+
+        A verified upload (``artifact_collab_uploads`` row) of this artifact and name is reused as is: no staging
+        read, no RustFS call, no charge. Otherwise every part ``0..total-1`` must be a regular single-linked file
+        (else "upload incomplete"; the ``verified`` marker is never trusted). The parts are streamed in order
+        through ``open_beneath`` into ``rustfs.put_stream`` (in a thread, spooled into ``spool_dir``), which checks
+        the declared sha256 and size; a mismatch, or a part that vanished or grew, is "upload failed verification"
+        and the whole upload dir is deleted. Then ``register_report_blob``, ``record_verified_upload(charged=charge)``,
+        the ``verified`` marker, and the parts (and stale ``.tmp-*``) are deleted, leaving ``meta.json``, ``audited``
+        and ``verified``. ``media_type`` is the preferred type (the head entry's) when this artifact has no scoped
+        blob for these bytes yet. Raises ``UploadRefused``; the caller does the quota check before calling."""
+        grants, store = CollabGrantStore(conn), ArtifactStore(conn, self.rustfs)
+        row, meta = await self._resolve_upload(grants, owner_key, upload_id, artifact_id=artifact_id, name=name)
+        if row is not None:
+            return _entry_of_upload(row)
+        parts = staging_parts(owner_key, upload_id)
+        try:
+            present = await asyncio.to_thread(list_parts, self.outbox, owner_key, upload_id, max_parts=meta.total)
+        except BridgeError:
+            present = []
+        if present != list(range(meta.total)):
+            raise UploadRefused(REASON_UPLOAD_INCOMPLETE)
+        media = await store.scoped_blob_media_type(artifact_id, meta.file_sha256) or media_type \
+            or mimetypes.guess_type(name)[0] or "application/octet-stream"
+        try:
+            stored = await asyncio.to_thread(self._stream_upload, parts, meta, media)
+        except (IntegrityError, BridgeError):
+            log.warning("collab upload %s owner=%s artifact=%s: failed verification, deleted", upload_id, owner_key,
+                        artifact_id)
+            await asyncio.to_thread(remove_tree_beneath, self.outbox, parts, max_entries=tree_entry_cap(self.limits))
+            raise UploadRefused(REASON_UPLOAD_FAILED) from None
+        await store.register_report_blob(artifact_id, storage_key=stored["key"], sha256=stored["sha256"],
+                                         size_bytes=stored["size"], media_type=media)
+        row = await grants.record_verified_upload(owner_key, upload_id, artifact_id=artifact_id, name=name,
+                                                  sha256=stored["sha256"], size_bytes=stored["size"],
+                                                  storage_key=stored["key"], media_type=media, charged=charge)
+        await asyncio.to_thread(self._settle_staging, parts, meta.total)
+        log.info("collab upload %s owner=%s artifact=%s: verified charged=%s", upload_id, owner_key, artifact_id,
+                 bool(row["charged"]))
+        return _entry_of_upload(row)
+
+    def _stream_upload(self, parts: list[str], meta, media_type: str) -> dict:
+        os.makedirs(self.spool_dir, mode=0o700, exist_ok=True)
+        reader = _PartsReader(self.outbox, parts, meta.total)
+        try:
+            return self.rustfs.put_stream(reader, expected_sha256=meta.file_sha256, expected_size=meta.size_bytes,
+                                          media_type=media_type, spool_dir=self.spool_dir)
+        finally:
+            reader.close()
+
+    def _settle_staging(self, parts: list[str], total: int) -> None:
+        """After the row is durable: the ``verified`` marker, then the parts and stale ``.tmp-*`` go (no-follow)."""
+        write_marker_beneath(self.outbox, parts, VERIFIED_MARKER)
+        for index in range(total):
+            unlink_beneath(self.outbox, parts, _part_name(index))
+        try:
+            listing = list_beneath(self.outbox, parts, max_entries=tree_entry_cap(self.limits)) or []
+        except BridgeError:
+            listing = []
+        for entry, st in listing:
+            if entry.startswith(".tmp-") and stat.S_ISREG(st.st_mode):
+                unlink_beneath(self.outbox, parts, entry)
 
     async def _load_gate(self, store: ArtifactStore) -> None:
         now = self.clock()
@@ -1021,6 +1142,45 @@ def _check_outcome(out) -> None:
     json.dumps(out, ensure_ascii=False, allow_nan=False)   # TypeError/ValueError: not writable as a result
 
 
+def _part_name(index: int) -> str:
+    return f"{index:07d}"
+
+
+class _PartsReader:
+    """A file-like reader over an upload's parts in index order, each opened only when reached with ``open_beneath``
+    (no-follow, single-linked, at most ``CHUNK_BYTES``). A part that is missing or unsafe at that point raises
+    ``BridgeError``, as one that grows past its cap does; never an empty read before the last part is done."""
+
+    def __init__(self, root: Path, parts: list[str], total: int):
+        self._root, self._parts, self._total = root, parts, total
+        self._index, self._current = 0, None
+
+    def read(self, size: int = -1) -> bytes:
+        want = size if size is not None and size > 0 else CHUNK_BYTES
+        while self._index < self._total:
+            if self._current is None:
+                self._current = open_beneath(self._root, [*self._parts, _part_name(self._index)],
+                                             max_bytes=CHUNK_BYTES)
+                if self._current is None:
+                    raise BridgeError("upload part missing or unsafe")
+            data = self._current.read(want)
+            if data:
+                return data
+            self._current.close()
+            self._current, self._index = None, self._index + 1
+        return b""
+
+    def close(self) -> None:
+        if self._current is not None:
+            self._current.close()
+            self._current = None
+
+
+def _entry_of_upload(row: dict) -> dict:
+    return {"name": row["name"], "media_type": row["media_type"], "sha256": row["sha256"],
+            "size_bytes": int(row["size_bytes"]), "storage_key": row["storage_key"]}
+
+
 def _rejected(reason: str) -> dict:
     return {"result": "rejected", "reason": reason}
 
@@ -1096,4 +1256,4 @@ def _inline_bytes(intent: Intent) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-__all__ = ["CollabIntentApplier", "IntentContext", "INTENT_MAX_BYTES", "RESULTS_DIR", "INTENTS_DIR", "AGENTS_FEED"]
+__all__ = ["CollabIntentApplier", "IntentContext", "UploadRefused", "INTENT_MAX_BYTES", "RESULTS_DIR", "INTENTS_DIR", "AGENTS_FEED"]
