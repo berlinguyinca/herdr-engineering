@@ -48,7 +48,8 @@ These proof URLs are no longer live. No production service was installed, restar
 
 This is an isolated development activation contract, not a deployed secretary integration.
 The runner currently supports a fixed no-tools Pi command; browser, calendar, email,
-location-history, booking and persona bindings are not registered by this slice. Docker and
+location-history and booking bindings are not registered by this slice. The immutable
+Secretary role is digest-bound, but it supplies instructions only. Docker and
 Apptainer remain definition-only. A host supervisor/service deployment and the later
 tab-supervision operator integration remain separate work. Runtime staging is currently
 expensive on cold controller startup; it does not imply a model or task has started.

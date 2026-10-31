@@ -38,7 +38,8 @@ agent credentials cannot call them.
 - `POST /fleet/assistant-runtime-hosts` records a strict, maximum-five-minute attestation.
   The exact document contains the host, `task-restricted-v1` profile and digest, fixed Pi
   entrypoint/artifact digest, all five required enforcement booleans, exact resource
-  limits, approved model IDs, issued/expiry times and a one-use nonce.
+  limits, approved model IDs, configured immutable role bindings, issued/expiry times
+  and a one-use nonce. Role bindings contain only ID, semantic version and SHA-256.
 - `GET /fleet/assistant-runtimes` returns the claimable queue.
 - `POST /fleet/assistant-runtimes/{id}/claim` accepts exactly `host_id` and
   `attestation_nonce`. It rechecks current owner, room, package, digest, profile, limits,
@@ -69,5 +70,23 @@ exactly once: if the one-time credential response is
 lost, the runner must not start a second process and the owner must request a new activation.
 Actual collaboration tasks use the minted agent credential and the existing task API;
 the activation API does not introduce another task scheduler.
+
+## Immutable role binding
+
+For Pi activation v1, every entry in `manifest.references.procedures` is a required
+instruction-role artifact. The server derives that list from the immutable package;
+the owner cannot submit or override it during activation. Claim responses give the
+runner `required_role_bindings` as ID/version/digest records only. No prompt text,
+host path or role file content crosses the control-plane API.
+
+A host may attest a registry of at most 32 bindings. One package activation may require
+at most eight; bindings are sorted deterministically before claim and receipt comparison.
+
+The host attestation must advertise every required reference. A `ready` receipt must
+return `launch_attestation.role_bindings` exactly equal to the package requirement;
+missing, changed or additional roles are refused and the runtime remains non-ready.
+The verified references are visible in the owner's launch receipt. An empty procedure
+list binds an empty role list and preserves existing package compatibility. Role binding
+does not change the fixed no-tools sandbox or grant any additional room authority.
 
 Docker and Apptainer definitions remain unlaunchable in v1.

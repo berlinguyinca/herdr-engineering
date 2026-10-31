@@ -44,7 +44,8 @@ def package(env, room, *, runtime="pi", name="venue-coordinator"):
 
 
 def attestation(env, record, *, host_id="local-linux", nonce="nonce-0123456789abcdef",
-                models=("family:fast", "family:planner"), expires_delta=240):
+                models=("family:fast", "family:planner"), expires_delta=240,
+                role_bindings=None):
     return {
         "schema_version": 1, "host_id": host_id, "profile": "task-restricted-v1",
         "profile_digest": "sha256:" + "a" * 64,
@@ -55,6 +56,8 @@ def attestation(env, record, *, host_id="local-linux", nonce="nonce-0123456789ab
                         "limits": record["manifest"]["sandbox"]["limits"]},
         "approved_models": list(models), "issued_at": env.clock.t,
         "expires_at": env.clock.t + expires_delta, "nonce": nonce,
+        "role_bindings": (record["manifest"]["references"]["procedures"]
+                          if role_bindings is None else role_bindings),
     }
 
 
@@ -96,7 +99,8 @@ def test_operator_attestation_is_strict_fresh_and_publicly_summarized(env):
     assert hosts == {"hosts": [{"host_id": "local-linux", "label": "local-linux", "status": "ready",
         "attested_at": env.clock.t, "expires_at": env.clock.t + 240,
         "supported_runtime_kinds": ["pi"], "sandbox_profiles": ["task-restricted-v1"],
-        "models": ["family:fast", "family:planner"]}]}
+        "models": ["family:fast", "family:planner"],
+        "role_bindings": record["manifest"]["references"]["procedures"]}]}
     assert invite(env.api, room, "bob", role="contributor")[0] == 201
     assert env.api.call("GET", f"{BASE}/rooms/{room}/assistant-hosts", user="bob")[0] in (403, 404)
     for bad in [{**body, "command": "pi --dangerous"}, {**body, "expires_at": env.clock.t + 301},
@@ -165,6 +169,8 @@ def test_claim_mints_one_private_credential_and_revalidates_host_policy(env):
     assert status == 200 and claimed["runtime"]["status"] == "claimed"
     assert claimed["credential"].startswith("hca_") and claimed["claim_token"] and claimed["device_id"]
     assert claimed["actions"] == ["execute", "read"] and claim(env, runtime_id)[0] == 409
+    assert claimed["package"]["required_role_bindings"] == \
+        record["manifest"]["references"]["procedures"]
     status, public = env.api.call("GET", f"{BASE}/rooms/{room}/assistant-runtimes/{runtime_id}", user="alice")
     assert status == 200 and public["runtime"]["agent_id"] == claimed["runtime"]["agent_id"]
     assert "credential" not in str(public) and "claim_token" not in str(public)
@@ -254,7 +260,8 @@ def test_runner_receipts_make_ready_and_checkpoints_are_monotonic(env):
         "checkpoint": checkpoint(2, "duplicate")})[0] == 409
     launch = {"profile_digest": attested["profile_digest"],
               "runtime_artifact_digest": attested["runtime"]["artifact_digest"],
-              "enforcement": attested["enforcement"]}
+              "enforcement": attested["enforcement"],
+              "role_bindings": record["manifest"]["references"]["procedures"]}
     ready = {"claim_token": token, "attestation_nonce": attested["nonce"], "status": "ready",
              "checkpoint": checkpoint(3, "ready"), "launch_attestation": launch,
              "instance_id": "pi-instance-1"}
@@ -263,6 +270,70 @@ def test_runner_receipts_make_ready_and_checkpoints_are_monotonic(env):
     assert out["runtime"]["launch_attestation"] == launch and out["runtime"]["checkpoint"] == ready["checkpoint"]
     wrong = {**ready, "claim_token": "wrong-token", "checkpoint": checkpoint(4, "ready")}
     assert operator(env, "POST", ["fleet", "assistant-runtimes", runtime_id, "report"], wrong)[0] == 404
+
+
+def test_secretary_role_must_be_host_configured_and_exactly_bound_at_ready(env):
+    _, room = make_room(env.api)
+    secretary = manifest(name="secretary")
+    role = {"id": "procedure:secretary-system", "version": "1.0.0",
+            "digest": "sha256:942e5b1002d74a9d52ae2fb7c2f8ef07f4f6b08aa1b9e08a36b8e0504ffab120"}
+    secretary["references"]["procedures"] = [role]
+    status, made = env.api.call("POST", f"{BASE}/rooms/{room}/assistant-packages",
+                                {"manifest": secretary}, user="alice")
+    assert status == 201
+    record = made["package"]
+    attest(env, record, role_bindings=[], nonce="nonce-no-role-01234567")
+    assert request_runtime(env, room, record)[0] == 409
+
+    attested, _ = attest(env, record, role_bindings=[role], nonce="nonce-secretary-012345")
+    status, requested = request_runtime(env, room, record)
+    assert status == 202
+    runtime_id = requested["runtime"]["runtime_id"]
+    claimed = claim(env, runtime_id, nonce=attested["nonce"])[1]
+    assert claimed["package"]["required_role_bindings"] == [role]
+    assert operator(env, "POST", ["fleet", "assistant-runtimes", runtime_id, "report"], {
+        "claim_token": claimed["claim_token"], "attestation_nonce": attested["nonce"],
+        "status": "starting", "checkpoint": checkpoint(1, "starting")})[0] == 200
+    base_launch = {"profile_digest": attested["profile_digest"],
+                   "runtime_artifact_digest": attested["runtime"]["artifact_digest"],
+                   "enforcement": attested["enforcement"]}
+    for roles in ([], [{**role, "digest": "sha256:" + "0" * 64}],
+                  [role, {"id": "procedure:extra-system", "version": "1.0.0",
+                          "digest": "sha256:" + "1" * 64}]):
+        body = {"claim_token": claimed["claim_token"], "attestation_nonce": attested["nonce"],
+                "status": "ready", "checkpoint": checkpoint(2, "ready"),
+                "launch_attestation": {**base_launch, "role_bindings": roles},
+                "instance_id": "secretary-instance"}
+        assert operator(env, "POST", ["fleet", "assistant-runtimes", runtime_id, "report"], body)[0] == 409
+    ready = {"claim_token": claimed["claim_token"], "attestation_nonce": attested["nonce"],
+             "status": "ready", "checkpoint": checkpoint(2, "ready"),
+             "launch_attestation": {**base_launch, "role_bindings": [role]},
+             "instance_id": "secretary-instance"}
+    status, result = operator(env, "POST", ["fleet", "assistant-runtimes", runtime_id, "report"], ready)
+    assert status == 200 and result["runtime"]["launch_attestation"]["role_bindings"] == [role]
+    status, public = env.api.call("GET", f"{BASE}/rooms/{room}/assistant-runtimes/{runtime_id}", user="alice")
+    assert status == 200 and public["runtime"]["launch_attestation"]["role_bindings"] == [role]
+
+
+def test_empty_role_package_remains_compatible(env):
+    _, room = make_room(env.api)
+    value = manifest(name="roleless")
+    value["references"]["procedures"] = []
+    status, made = env.api.call("POST", f"{BASE}/rooms/{room}/assistant-packages",
+                                {"manifest": value}, user="alice")
+    assert status == 201
+    record = made["package"]
+    attested, _ = attest(env, record, role_bindings=[])
+    runtime_id = request_runtime(env, room, record)[1]["runtime"]["runtime_id"]
+    claimed = claim(env, runtime_id)[1]
+    assert claimed["package"]["required_role_bindings"] == []
+    assert operator(env, "POST", ["fleet", "assistant-runtimes", runtime_id, "report"], {
+        "claim_token": claimed["claim_token"], "attestation_nonce": attested["nonce"],
+        "status": "ready", "checkpoint": checkpoint(1, "ready"),
+        "launch_attestation": {"profile_digest": attested["profile_digest"],
+            "runtime_artifact_digest": attested["runtime"]["artifact_digest"],
+            "enforcement": attested["enforcement"], "role_bindings": []},
+        "instance_id": "roleless-instance"})[0] == 200
 
 
 def test_cancellation_revokes_execution_before_runner_receipt(env):
@@ -286,7 +357,8 @@ def test_cancellation_revokes_execution_before_runner_receipt(env):
         "checkpoint": checkpoint(1, "starting_after_cancel")})[0] == 409
     launch = {"profile_digest": attested["profile_digest"],
               "runtime_artifact_digest": attested["runtime"]["artifact_digest"],
-              "enforcement": attested["enforcement"]}
+              "enforcement": attested["enforcement"],
+              "role_bindings": record["manifest"]["references"]["procedures"]}
     assert operator(env, "POST", ["fleet", "assistant-runtimes", runtime_id, "report"], {
         "claim_token": token, "attestation_nonce": attested["nonce"], "status": "ready",
         "checkpoint": checkpoint(1, "ready_after_cancel"), "launch_attestation": launch,

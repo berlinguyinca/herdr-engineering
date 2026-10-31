@@ -103,7 +103,8 @@ def validate_claim(value, host_id, nonce):
     if not _exact(value, required) or value.get("actions") != ["execute", "read"]:
         raise RunnerError("invalid claim")
     package = value["package"]
-    if not _exact(package, {"package_id", "digest", "runtime_artifact_digest", "profile", "limits"}):
+    if not _exact(package, {"package_id", "digest", "runtime_artifact_digest", "profile", "limits",
+                            "required_role_bindings"}):
         raise RunnerError("invalid claim package")
     if package["profile"] != "task-restricted-v1" or not SHA256.fullmatch(package["digest"] or ""):
         raise RunnerError("claim profile mismatch")
@@ -189,13 +190,18 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def fixed_pi_command(model: str) -> str:
+def fixed_pi_command(model: str, role_count: int = 0) -> str:
     if not SAFE.fullmatch(model):
         raise RunnerError("invalid model")
+    if not 0 <= role_count <= 8:
+        raise RunnerError("invalid role count")
+    role = "".join(
+        f' --append-system-prompt "$PI_CODING_AGENT_DIR/role-{index:02d}.md"'
+        for index in range(role_count))
     return ("/usr/bin/node /opt/herdr-pi/dist/bundle/cli.js --print --no-tools "
             "--no-extensions --no-mcp --no-skills --no-prompt-templates --no-themes "
             "--no-context-files --no-session --provider herdr --model " + model
-            + " --api-key broker-bound")
+            + " --api-key broker-bound" + role)
 
 
 def write_private(path: Path, value: str):
@@ -204,8 +210,59 @@ def write_private(path: Path, value: str):
         stream.write(value)
 
 
+def load_role_registry(path: Path | None) -> dict[tuple[str, str, str], Path]:
+    if path is None:
+        return {}
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                or info.st_mode & 0o077 or info.st_size > 65536):
+            raise RunnerError("role registry must be a private regular file")
+        value = json.loads(stream.read().decode())
+    if not _exact(value, {"roles"}) or not isinstance(value["roles"], list) or len(value["roles"]) > 32:
+        raise RunnerError("invalid role registry")
+    result = {}
+    for row in value["roles"]:
+        if not _exact(row, {"id", "version", "digest", "path"}):
+            raise RunnerError("invalid role registry")
+        key = (row["id"], row["version"], row["digest"])
+        if not all(isinstance(x, str) and x for x in key) or not SHA256.fullmatch(row["digest"]):
+            raise RunnerError("invalid role registry")
+        role_path = Path(row["path"])
+        if not role_path.is_absolute() or key in result:
+            raise RunnerError("invalid role registry")
+        result[key] = role_path
+    return result
+
+
+def read_verified_role(path: Path, expected_digest: str) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                or info.st_mode & 0o077 or info.st_size < 1 or info.st_size > 65536):
+            raise RunnerError("role artifact must be a private regular file")
+        data = stream.read()
+    if "sha256:" + hashlib.sha256(data).hexdigest() != expected_digest:
+        raise RunnerError("role artifact digest mismatch")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise RunnerError("role artifact must be UTF-8") from None
+
+
+def verified_role_refs(registry: dict[tuple[str, str, str], Path]) -> list[dict]:
+    refs = []
+    for role_id, version, digest in sorted(registry):
+        read_verified_role(registry[(role_id, version, digest)], digest)
+        refs.append({"id": role_id, "version": version, "digest": digest})
+    return refs
+
+
 def prepare_activation(root: Path, claim: dict, runtime_dir: Path, sandbox: Path,
-                       worker_template: Path, collab_base: str, egress_sock: Path):
+                       worker_template: Path, collab_base: str, egress_sock: Path,
+                       role_registry=None):
     package = claim["package"]
     collab = urllib.parse.urlsplit(collab_base)
     loopback_http = collab.scheme == "http" and collab.hostname == "127.0.0.1"
@@ -229,6 +286,26 @@ def prepare_activation(root: Path, claim: dict, runtime_dir: Path, sandbox: Path
               "api": "openai-completions", "apiKey": "broker-bound",
               "models": [{"id": claim["selected_model"]}]}}}
     write_private(harness / "models.json", json.dumps(models, separators=(",", ":")))
+    required_roles = package.get("required_role_bindings", [])
+    if not isinstance(required_roles, list) or len(required_roles) > 8:
+        raise RunnerError("invalid required role bindings")
+    verified_roles = []
+    if required_roles:
+        ordered = sorted(required_roles, key=lambda row: (
+            row.get("id", ""), row.get("version", ""), row.get("digest", "")))
+        if len({json.dumps(row, sort_keys=True) for row in ordered}) != len(ordered):
+            raise RunnerError("duplicate required role binding")
+        for index, row in enumerate(ordered):
+            if not _exact(row, {"id", "version", "digest"}):
+                raise RunnerError("invalid required role binding")
+            key = (row["id"], row["version"], row["digest"])
+            role_path = (role_registry or {}).get(key)
+            if role_path is None:
+                raise RunnerError("required role is not configured")
+            role_text = read_verified_role(role_path, row["digest"])
+            target = harness / f"role-{index:02d}.md"
+            write_private(target, role_text); target.chmod(0o400)
+            verified_roles.append(dict(row))
     write_private(activation / "agent.json", json.dumps({
         "credential": claim["credential"], "device_id": claim["device_id"], "name": "agent",
     }, separators=(",", ":")))
@@ -241,7 +318,8 @@ def prepare_activation(root: Path, claim: dict, runtime_dir: Path, sandbox: Path
     (activation / "worker.sh").chmod(0o700)
     limits = validate_limits(package["limits"])
     env = {
-        "HOME": str(home), "HERDR_AGENT_CMD": fixed_pi_command(claim["selected_model"]),
+        "HOME": str(home), "HERDR_AGENT_CMD": fixed_pi_command(
+            claim["selected_model"], len(verified_roles)),
         "HERDR_SANDBOX": str(sandbox), "HERDR_SANDBOX_PROFILE": "task-restricted-v1",
         "HERDR_SANDBOX_RUNTIME_DIR": str(runtime_dir),
         "HERDR_SANDBOX_HARNESS_DIR": str(activation / "harness"),
@@ -255,7 +333,7 @@ def prepare_activation(root: Path, claim: dict, runtime_dir: Path, sandbox: Path
         "HERDR_READY_FILE": str(activation / "ready"),
         "HERDR_SANDBOX_UNIT": "herdr-" + activation.name.replace("activation-", "")[:20],
     }
-    return activation, env
+    return activation, env, verified_roles
 
 
 def strict_preflight(sandbox: Path, runtime_dir: Path, egress_sock: Path, limits: dict,
@@ -331,7 +409,8 @@ def profile_digest(sandbox: Path, limits: dict) -> str:
     return "sha256:" + hashlib.sha256(body).hexdigest()
 
 
-def attestation(host_id, artifact_digest, sandbox, limits, models, nonce, enforcement):
+def attestation(host_id, artifact_digest, sandbox, limits, models, nonce, enforcement,
+                role_bindings=None):
     now = time.time()
     return {
         "schema_version": 1, "host_id": host_id, "profile": "task-restricted-v1",
@@ -341,22 +420,24 @@ def attestation(host_id, artifact_digest, sandbox, limits, models, nonce, enforc
         "enforcement": enforcement,
         "approved_models": list(models), "issued_at": now,
         "expires_at": now + 240, "nonce": nonce,
+        "role_bindings": list(role_bindings or []),
     }
 
 
 def run_activation(client, runtime_id, host_id, nonce, claim_value, root, runtime_dir,
-                   sandbox, worker, collab_base, egress_sock, enforcement, profile_hash):
+                   sandbox, worker, collab_base, egress_sock, enforcement, profile_hash,
+                   role_registry=None):
     claim_value = validate_claim(claim_value, host_id, nonce)
     if time.time() >= claim_value["lease_expires_at"]:
         raise RunnerError("claim lease expired")
-    activation, env = prepare_activation(root, claim_value, runtime_dir, sandbox, worker,
-                                         collab_base, egress_sock)
+    activation, env, verified_roles = prepare_activation(
+        root, claim_value, runtime_dir, sandbox, worker, collab_base, egress_sock, role_registry)
     if profile_digest(sandbox, claim_value["package"]["limits"]) != profile_hash:
         raise RunnerError("sandbox profile changed after attestation")
     token = claim_value["claim_token"]
     runtime_digest = claim_value["package"]["runtime_artifact_digest"]
     launch = {"profile_digest": profile_hash, "runtime_artifact_digest": runtime_digest,
-              "enforcement": enforcement}
+              "enforcement": enforcement, "role_bindings": verified_roles}
     process = None
     sequence = 1
     terminal_reported = False
@@ -445,6 +526,7 @@ def main(argv=None):
     parser.add_argument("--collab-base", required=True)
     parser.add_argument("--egress-sock", required=True)
     parser.add_argument("--models", required=True)
+    parser.add_argument("--role-registry")
     parser.add_argument("--memory-bytes", type=int, default=536870912)
     parser.add_argument("--process-count", type=int, default=64)
     parser.add_argument("--cpu-quota-percent", type=int, default=100)
@@ -464,13 +546,15 @@ def main(argv=None):
     if Path(args.pi_source).resolve(strict=True) != trusted_source:
         raise RunnerError("Pi source does not match the trusted installed SDK")
     runtime_dir, digest = stage_runtime(trusted_source, Path(args.runtime_root))
+    role_registry = load_role_registry(Path(args.role_registry)) if args.role_registry else {}
     sandbox = Path(args.sandbox).resolve(strict=True)
     client = OperatorClient(args.operator_origin)
     while True:
         nonce = secrets.token_urlsafe(24)
         enforcement = strict_preflight(sandbox, runtime_dir, Path(args.egress_sock), limits,
                                        Path(args.activation_root))
-        proof = attestation(args.host_id, digest, sandbox, limits, models, nonce, enforcement)
+        proof = attestation(args.host_id, digest, sandbox, limits, models, nonce, enforcement,
+                            verified_role_refs(role_registry))
         client.attest(proof)
         refresh_at = proof["expires_at"] - 15
         while time.time() < refresh_at:
@@ -483,7 +567,7 @@ def main(argv=None):
                     run_activation(client, runtime_id, args.host_id, nonce, claimed,
                                    Path(args.activation_root), runtime_dir, sandbox,
                                    Path(args.worker), args.collab_base, Path(args.egress_sock),
-                                   proof["enforcement"], proof["profile_digest"])
+                                   proof["enforcement"], proof["profile_digest"], role_registry)
                 except RunnerError:
                     if args.once:
                         return 1

@@ -112,6 +112,7 @@ def attest(service, package, *, expires_in=240, models=("qwen3-32b", "llama-4-sc
                         "limits": package["manifest"]["sandbox"]["limits"]},
         "approved_models": list(models), "issued_at": now, "expires_at": now + expires_in,
         "nonce": "nonce-runtime-cli-01234567",
+        "role_bindings": package["manifest"]["references"]["procedures"],
     }
     status, result = service.dispatch(
         "POST", ["fleet", "assistant-runtime-hosts"], {}, body, "", None, operator="alice")
@@ -247,6 +248,7 @@ def test_ready_runtime_agent_accepts_existing_task_contract(collab_server):
         "profile_digest": attestation["profile_digest"],
         "runtime_artifact_digest": attestation["runtime"]["artifact_digest"],
         "enforcement": attestation["enforcement"],
+        "role_bindings": package["manifest"]["references"]["procedures"],
     }
     report = {
         "claim_token": claimed["claim_token"], "attestation_nonce": attestation["nonce"],

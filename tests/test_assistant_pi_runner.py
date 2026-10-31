@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 
 import pytest
@@ -10,12 +12,14 @@ from herdr_engineering.assistant_pi_runner import (
     cancel_process,
     fixed_pi_command,
     launch_worker,
+    load_role_registry,
     prepare_activation,
     profile_digest,
     run_activation,
     stage_runtime,
     tree_digest,
     validate_claim,
+    verified_role_refs,
 )
 
 LIMITS = {
@@ -43,7 +47,7 @@ def claim(digest):
         "package": {
             "package_id": "package_1", "digest": "sha256:" + "1" * 64,
             "runtime_artifact_digest": digest, "profile": "task-restricted-v1",
-            "limits": LIMITS,
+            "limits": LIMITS, "required_role_bindings": [],
         },
     }
 
@@ -107,7 +111,7 @@ def test_activation_uses_fixed_pi_argv_and_private_files(tmp_path):
         "  call tasks_wait '{\"seconds\":20}' > \"$TMP/r.json\" || { sleep 5; continue; }\n"
     )
     sock = tmp_path / "egress.sock"; sock.write_text("")
-    activation, env = prepare_activation(
+    activation, env, roles = prepare_activation(
         tmp_path / "runs", value, staged, sandbox, worker,
         "https://collab.example", sock,
     )
@@ -121,6 +125,7 @@ def test_activation_uses_fixed_pi_argv_and_private_files(tmp_path):
     models = json.loads((activation / "harness/pi/models.json").read_text())
     assert models["providers"]["herdr"]["apiKey"] == "broker-bound"
     assert models["providers"]["herdr"]["models"] == [{"id": "approved-model"}]
+    assert roles == []
 
 
 def test_model_cannot_become_shell_arguments():
@@ -136,6 +141,80 @@ def test_operator_origin_is_exact_loopback(origin):
     from herdr_engineering.assistant_pi_runner import OperatorClient
     with pytest.raises(RunnerError, match="loopback"):
         OperatorClient(origin)
+
+
+def test_secretary_role_is_digest_bound_and_uses_static_prompt_path(tmp_path):
+    source = fake_runtime(tmp_path)
+    staged, digest = stage_runtime(source, tmp_path / "artifacts")
+    role = tmp_path / "secretary.md"; role.write_text("Secretary role\n"); role.chmod(0o600)
+    role_digest = "sha256:" + hashlib.sha256(role.read_bytes()).hexdigest()
+    registry_file = tmp_path / "roles.json"
+    registry_file.write_text(json.dumps({"roles": [{
+        "id": "procedure:secretary-system", "version": "1.0.0",
+        "digest": role_digest, "path": str(role),
+    }]})); registry_file.chmod(0o600)
+    registry = load_role_registry(registry_file)
+    assert verified_role_refs(registry) == [{
+        "id": "procedure:secretary-system", "version": "1.0.0", "digest": role_digest,
+    }]
+    value = claim(digest)
+    value["package"]["required_role_bindings"] = [{
+        "id": "procedure:secretary-system", "version": "1.0.0", "digest": role_digest,
+    }]
+    sandbox = tmp_path / "sandbox"; sandbox.write_text("x")
+    worker = tmp_path / "worker"; worker.write_text(
+        "BASE='__HERDR_BASE__'\n"
+        "  call tasks_wait '{\"seconds\":20}' > \"$TMP/r.json\" || { sleep 5; continue; }\n")
+    activation, env, verified = prepare_activation(
+        tmp_path / "runs", value, staged, sandbox, worker,
+        "https://collab.example", tmp_path / "sock", registry)
+    assert verified == value["package"]["required_role_bindings"]
+    assert (activation / "harness/pi/role-00.md").read_text() == "Secretary role\n"
+    assert (activation / "harness/pi/role-00.md").stat().st_mode & 0o777 == 0o400
+    assert '--append-system-prompt "$PI_CODING_AGENT_DIR/role-00.md"' in env["HERDR_AGENT_CMD"]
+    assert "Secretary role" not in env["HERDR_AGENT_CMD"]
+    role.write_text("tampered"); role.chmod(0o600)
+    with pytest.raises(RunnerError, match="digest"):
+        verified_role_refs(registry)
+
+
+def test_role_registry_rejects_tamper_links_and_hardlinks(tmp_path):
+    role = tmp_path / "role"; role.write_text("role"); role.chmod(0o600)
+    digest = "sha256:" + hashlib.sha256(role.read_bytes()).hexdigest()
+    from herdr_engineering.assistant_pi_runner import read_verified_role
+    assert read_verified_role(role, digest) == "role"
+    role.write_text("tampered")
+    with pytest.raises(RunnerError, match="digest"):
+        read_verified_role(role, digest)
+    link = tmp_path / "link"; link.symlink_to(role)
+    with pytest.raises(OSError):
+        read_verified_role(link, digest)
+    hard = tmp_path / "hard"; os.link(role, hard)
+    with pytest.raises(RunnerError, match="private regular"):
+        read_verified_role(role, "sha256:" + hashlib.sha256(role.read_bytes()).hexdigest())
+
+
+def test_multiple_roles_are_sorted_and_appended_in_fixed_order(tmp_path):
+    source = fake_runtime(tmp_path); staged, digest = stage_runtime(source, tmp_path / "artifacts")
+    registry = {}; required = []
+    for role_id, text in (("procedure:z-role", "z"), ("procedure:a-role", "a")):
+        path = tmp_path / (role_id.split(":")[1] + ".md"); path.write_text(text); path.chmod(0o600)
+        role_digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        key = (role_id, "1.0.0", role_digest); registry[key] = path
+        required.append({"id": role_id, "version": "1.0.0", "digest": role_digest})
+    value = claim(digest); value["package"]["required_role_bindings"] = required
+    sandbox = tmp_path / "sandbox"; sandbox.write_text("x")
+    worker = tmp_path / "worker"; worker.write_text(
+        "BASE='__HERDR_BASE__'\n"
+        "  call tasks_wait '{\"seconds\":20}' > \"$TMP/r.json\" || { sleep 5; continue; }\n")
+    activation, env, verified = prepare_activation(
+        tmp_path / "runs", value, staged, sandbox, worker,
+        "https://collab.example", tmp_path / "sock", registry)
+    assert [row["id"] for row in verified] == ["procedure:a-role", "procedure:z-role"]
+    assert (activation / "harness/pi/role-00.md").read_text() == "a"
+    assert (activation / "harness/pi/role-01.md").read_text() == "z"
+    command = env["HERDR_AGENT_CMD"]
+    assert command.index("role-00.md") < command.index("role-01.md")
 
 
 def test_cancel_terminates_the_process_group():
@@ -187,7 +266,7 @@ def test_pre_ready_failure_reports_terminal_receipt_and_cleans_up(tmp_path, monk
         def poll(self): return 1
 
     monkeypatch.setattr(runner, "prepare_activation", lambda *args: (
-        activation, {"HERDR_SANDBOX_UNIT": "herdr-test"}))
+        activation, {"HERDR_SANDBOX_UNIT": "herdr-test"}, []))
     monkeypatch.setattr(runner, "launch_worker", lambda *args: Process())
     monkeypatch.setattr(runner, "cancel_process", lambda process: None)
     monkeypatch.setattr(runner, "stop_sandbox_unit", lambda unit: None)
@@ -220,7 +299,7 @@ def test_unverifiable_scope_stop_emits_no_terminal_receipt(tmp_path, monkeypatch
         def poll(self): return 1
 
     monkeypatch.setattr(runner, "prepare_activation", lambda *args: (
-        activation, {"HERDR_SANDBOX_UNIT": "herdr-test"}))
+        activation, {"HERDR_SANDBOX_UNIT": "herdr-test"}, []))
     monkeypatch.setattr(runner, "launch_worker", lambda *args: Process())
     monkeypatch.setattr(runner, "cancel_process", lambda process: None)
     monkeypatch.setattr(runner, "stop_sandbox_unit", lambda unit: (_ for _ in ()).throw(

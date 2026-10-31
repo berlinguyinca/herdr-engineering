@@ -97,6 +97,7 @@ MAX_ASSISTANT_RUNTIME_HOSTS = 50
 MAX_ASSISTANT_RUNTIMES_PER_OWNER = 20
 ASSISTANT_RUNTIME_RATE = 12       # activation requests per owner per hour
 _RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_RUNTIME_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
 _RUNTIME_LIVE = frozenset({"claimed", "starting", "ready"})
 _RUNTIME_TERMINAL = frozenset({"failed", "cancelled"})
 MAX_PENDING_REQUESTS = 120       # open access requests per room (one family of agents fits)
@@ -3170,9 +3171,32 @@ class CollabService:
             out[key] = got
         return out
 
+    @staticmethod
+    def _assistant_role_bindings(value: Any, limit: int = 32) -> list[dict]:
+        if not isinstance(value, list) or len(value) > limit:
+            raise CollabError(400, "invalid role bindings")
+        out, seen = [], set()
+        for item in value:
+            if (not isinstance(item, dict) or set(item) != {"id", "version", "digest"}
+                    or not isinstance(item.get("id"), str) or not item["id"].startswith("procedure:")
+                    or not _KEY_RE.fullmatch(item["id"])
+                    or not isinstance(item.get("version"), str)
+                    or not _RUNTIME_VERSION.fullmatch(item["version"])
+                    or not isinstance(item.get("digest"), str)
+                    or not _RUNTIME_DIGEST.fullmatch(item["digest"])):
+                raise CollabError(400, "invalid role binding")
+            key = (item["id"], item["version"])
+            if key in seen:
+                raise CollabError(400, "role bindings must be unique")
+            seen.add(key)
+            out.append({"id": item["id"], "version": item["version"], "digest": item["digest"]})
+        out.sort(key=lambda item: (item["id"], item["version"], item["digest"]))
+        return out
+
     def _normalize_assistant_runtime_attestation(self, body: Any) -> dict:
         fields = {"schema_version", "host_id", "profile", "profile_digest", "runtime",
-                  "enforcement", "approved_models", "issued_at", "expires_at", "nonce"}
+                  "enforcement", "approved_models", "issued_at", "expires_at", "nonce",
+                  "role_bindings"}
         if not isinstance(body, dict) or set(body) != fields or body.get("schema_version") != 1:
             raise CollabError(400, "invalid runtime host attestation")
         host_id = self._require_host(body.get("host_id"))
@@ -3212,6 +3236,7 @@ class CollabService:
                             "limits": limits},
             "approved_models": sorted(models), "issued_at": float(issued),
             "expires_at": float(expires), "nonce": nonce,
+            "role_bindings": self._assistant_role_bindings(body.get("role_bindings")),
         }
 
     @staticmethod
@@ -3223,6 +3248,7 @@ class CollabService:
             "attested_at": record["issued_at"], "expires_at": record["expires_at"],
             "supported_runtime_kinds": ["pi"], "sandbox_profiles": [record["profile"]],
             "models": list(record["approved_models"]),
+            "role_bindings": copy.deepcopy(record["role_bindings"]),
         }
 
     def attest_assistant_runtime_host(self, pr: Principal, body: dict) -> tuple[int, dict]:
@@ -3300,11 +3326,13 @@ class CollabService:
         artifact_digest = manifest["runtime"]["artifact"]["digest"]
         profile = manifest["sandbox"]["profile"]
         limits = manifest["sandbox"]["limits"]
+        required_roles = self._assistant_role_bindings(manifest["references"]["procedures"], 8)
         room_models = self._profile(runtime["room_id"])["allowed_models"]
         if (host["runtime"]["artifact_digest"] != artifact_digest or host["profile"] != profile
                 or host["enforcement"]["limits"] != limits
                 or runtime["selected_model"] not in host["approved_models"]
                 or runtime["selected_model"] not in manifest["model_policy"]["allowed"]
+                or any(role not in host["role_bindings"] for role in required_roles)
                 or (room_models is not None and runtime["selected_model"] not in room_models)):
             raise CollabError(409, "runtime package is not supported by this host")
         return package, host
@@ -3508,7 +3536,9 @@ class CollabService:
                 "package": {"package_id": package["package_id"], "digest": package["digest"],
                             "runtime_artifact_digest": manifest["runtime"]["artifact"]["digest"],
                             "profile": manifest["sandbox"]["profile"],
-                            "limits": copy.deepcopy(manifest["sandbox"]["limits"])},
+                            "limits": copy.deepcopy(manifest["sandbox"]["limits"]),
+                            "required_role_bindings": self._assistant_role_bindings(
+                                manifest["references"]["procedures"], 8)},
                 "selected_model": runtime["selected_model"], "actions": ["execute", "read"],
             }
 
@@ -3564,13 +3594,16 @@ class CollabService:
     @staticmethod
     def _assistant_runtime_launch_attestation(value: Any) -> dict:
         if (not isinstance(value, dict)
-                or set(value) != {"profile_digest", "runtime_artifact_digest", "enforcement"}
+                or set(value) != {"profile_digest", "runtime_artifact_digest", "enforcement",
+                                  "role_bindings"}
                 or not isinstance(value.get("profile_digest"), str)
                 or not _RUNTIME_DIGEST.fullmatch(value["profile_digest"])
                 or not isinstance(value.get("runtime_artifact_digest"), str)
                 or not _RUNTIME_DIGEST.fullmatch(value["runtime_artifact_digest"])):
             raise CollabError(400, "invalid launch attestation")
-        return copy.deepcopy(value)
+        out = copy.deepcopy(value)
+        out["role_bindings"] = CollabService._assistant_role_bindings(value["role_bindings"], 8)
+        return out
 
     def report_assistant_runtime(self, pr: Principal, runtime_id: str, body: dict) -> dict:
         self._require_operator(pr)
@@ -3608,6 +3641,8 @@ class CollabService:
                     "profile_digest": runtime["attestation"]["profile_digest"],
                     "runtime_artifact_digest": runtime["attestation"]["runtime"]["artifact_digest"],
                     "enforcement": runtime["attestation"]["enforcement"],
+                    "role_bindings": self._assistant_role_bindings(
+                        self._assistant_runtime_package(runtime)["manifest"]["references"]["procedures"], 8),
                 }:
                     raise CollabError(409, "launch attestation does not match the claim")
                 instance_id = body.get("instance_id")
