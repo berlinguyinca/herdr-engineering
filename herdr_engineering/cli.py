@@ -337,6 +337,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_browse_subparsers(asub)
     from .teams_client import add_teams_subparser
     add_teams_subparser(sub)
+    from .rooms_client import add_rooms_subparser
+    add_rooms_subparser(sub)
     # system-graph artifact (P5): deterministic sanitized snapshot renderer.
     ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
     gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
@@ -3758,6 +3760,8 @@ def _cmd_cp_web(args) -> int:
         collab.steering = normalize_steering(getattr(args, "collab_steering", None))
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
+        from .control_plane.collab_team_rooms import normalize_team_rooms
+        collab.team_rooms = normalize_team_rooms(getattr(args, "collab_team_rooms", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
     from .control_plane.rakazo_bridge import rakazo_bridge_config
     try:
@@ -3979,6 +3983,8 @@ COLLAB_CONFIG_KEYS = {
     "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
     "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
     "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
+    # team collaboration slice 1: attach a team to a room, per-room guest level, the Suggest queue; YAML only, off by default
+    "team_rooms": ("collab_team_rooms", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
@@ -4014,9 +4020,11 @@ def _apply_collab_config(args, cp) -> None:
         elif kind is dict:
             from .control_plane.collab_attention import normalize_insights
             from .control_plane.collab_context import normalize_contextual
+            from .control_plane.collab_team_rooms import normalize_team_rooms
             from .control_plane.collab_workbench import normalize_steering
             try:
-                {"contextual": normalize_contextual, "insights": normalize_insights}.get(key, normalize_steering)(value)
+                {"contextual": normalize_contextual, "insights": normalize_insights,
+                 "team_rooms": normalize_team_rooms}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
@@ -4041,6 +4049,7 @@ HOT_COLLAB_SWITCHES = {
     "steering": ("steering_source", "dict"),
     "contextual": ("contextual_source", "dict"),
     "insights": ("insights_source", "dict"),
+    "team_rooms": ("team_rooms_source", "dict"),
     "delegation_enabled": ("delegation_source", "bool"),
     "replay_history": ("replay_history_source", "str"),
 }
@@ -4067,7 +4076,9 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
     from .control_plane.collab_attention import normalize_insights
     from .control_plane.collab_context import normalize_contextual
     from .control_plane.collab_workbench import normalize_steering
-    normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights}
+    from .control_plane.collab_team_rooms import normalize_team_rooms
+    normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights,
+                   "team_rooms": normalize_team_rooms}
 
     def check(key, value):
         return normalizers[key](value) if key in normalizers else value

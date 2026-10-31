@@ -269,7 +269,8 @@ def test_non_safety_writes_stop_before_safety_writes_and_the_tiers_are_ordered()
     assert SAFETY_EVENTS == {"member_removed", "agent_revoked", "user_decided", "join_token_revoked", "xlink_revoked",
                              "workspace_unlinked", "mission_unlinked", "agent_grant_revoked",
                              "helpers_paused", "helper_cancelled", "egress_removed",
-                             "federation_share_revoked", "federation_peer_disabled"}      # ADR-0008 P2
+                             "federation_share_revoked", "federation_peer_disabled",      # ADR-0008 P2
+                             "team_detached"}                                              # team rooms slice 1
     svc._log.extend([{}] * (ordinary - len(svc._log)))        # exactly at the ordinary limit
     with pytest.raises(CollabError):
         svc._commit("room_created", {})
@@ -327,8 +328,17 @@ def _flow_mission(w):
     return lambda: w.s.unlink_mission(w.alice, w.room, "m-1")
 
 
+def _flow_team(w):
+    from herdr_engineering.control_plane.collab_team_rooms import normalize_team_rooms
+    w.s.team_rooms = normalize_team_rooms({"enabled": True})
+    info = w.s.connect_agent(w.alice, {"harness_type": "claude-code"})        # not yet granted in the room
+    team = "team-" + "a" * 20
+    w.s.attach_team(w.alice, w.room, team, {"roles": {"implementer": [info["agent_id"]]}})
+    return lambda: w.s.detach_team(w.alice, w.room, team)
+
+
 @pytest.mark.parametrize("flow", [_flow_member, _flow_agent, _flow_external, _flow_join_token, _flow_workspace,
-                                  _flow_mission])
+                                  _flow_mission, _flow_team])
 def test_every_revoke_flow_completes_on_a_log_that_refuses_ordinary_writes(w, flow):
     revoke = flow(w)
     _at_the_ordinary_limit(w.s)
@@ -420,14 +430,15 @@ def _switch_values(svc):
         "steering": bool(svc.steer_cfg()["enabled"] and not svc.steer_cfg()["kill_switch"]),
         "contextual": bool(svc.ctx_cfg()["enabled"] and not svc.ctx_cfg()["kill_switch"]),
         "insights": bool(svc.insights_cfg()["enabled"] and not svc.insights_cfg()["kill_switch"]),
+        "team_rooms": svc.team_rooms_active(),
         "delegation_enabled": svc.delegation_enabled,
         "replay_history": svc.replay_history,
     }
 
 
 FEATURES = {"steering": {"enabled": True}, "contextual": {"enabled": True}, "insights": {"enabled": True},
-            "delegation_enabled": True, "replay_history": "full"}
-OFF = {"steering": False, "contextual": False, "insights": False, "delegation_enabled": False,
+            "team_rooms": {"enabled": True}, "delegation_enabled": True, "replay_history": "full"}
+OFF = {"steering": False, "contextual": False, "insights": False, "team_rooms": False, "delegation_enabled": False,
        "replay_history": "since_join"}
 
 
@@ -444,7 +455,7 @@ def test_every_feature_switch_fails_closed_identically_when_the_fleet_file_break
     store = FleetConfigStore(path)
     svc = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
     cli._wire_collab_switches(svc, store)
-    assert _switch_values(svc) == {"steering": True, "contextual": True, "insights": True,
+    assert _switch_values(svc) == {"steering": True, "contextual": True, "insights": True, "team_rooms": True,
                                    "delegation_enabled": True, "replay_history": "full"}
     if breakage == "delete":
         path.unlink()
@@ -458,7 +469,7 @@ def test_every_feature_switch_fails_closed_identically_when_the_fleet_file_break
     else:
         data = yaml.safe_load(path.read_text())
         coll = data["sections"]["control_plane"]["values"]["collab"]
-        for key in ("steering", "contextual", "insights"):
+        for key in ("steering", "contextual", "insights", "team_rooms"):
             coll[key] = {"kill_switch": "yes"}
         coll["delegation_enabled"] = "yes"
         coll["replay_history"] = "everything"

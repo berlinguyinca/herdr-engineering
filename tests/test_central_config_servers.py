@@ -702,6 +702,27 @@ def test_insights_settings_are_yaml_only_validated_and_off_by_default(tmp_path, 
         cli._apply_collab_config(argparse.Namespace(), {"collab": {"insights": {"kill_switch": "no"}}})
 
 
+def test_team_rooms_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    import pytest as _pytest
+
+    from herdr_engineering.control_plane.collab_team_rooms import normalize_team_rooms
+    assert "team_rooms" in fcc.COLLAB_KEYS and "team_rooms" in cli.COLLAB_CONFIG_KEYS
+    assert "team_rooms" in cli.HOT_COLLAB_SWITCHES                                  # read per request, fail closed
+    assert normalize_team_rooms(None)["enabled"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, team_rooms={"enabled": True, "default_guest_level": "read_only"}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["team_rooms"]["default_guest_level"] == "read_only"
+    args = argparse.Namespace(collab_team_rooms=None)
+    cli._apply_collab_config(args, {"collab": {"team_rooms": {"enabled": True}}})
+    assert args.collab_team_rooms == {"enabled": True}
+    for bad in ({"default_guest_level": "direct"}, {"kill_switch": "no"}, {"unknown": 1}):
+        with _pytest.raises(SystemExit):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"team_rooms": bad}})
+        with _pytest.raises(fcc.FleetConfigError):
+            fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, team_rooms=bad))))
+
+
 def test_collab_skills_slice_is_accepted_and_forwarded(tmp_path):
     central = make_file(tmp_path, collab=dict(COLLAB, skills={"enabled": True}))
     values = fcc.collab_values(fcc.load_fleet_config(central))
