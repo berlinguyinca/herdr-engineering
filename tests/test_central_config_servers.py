@@ -944,4 +944,4 @@ def test_render_collab_slice_never_carries_rakazo_settings(tmp_path):
         "sync_dir": "/etc/herdr/collab-sync"}})
     out = tmp_path / "s" / "collab-config.json"
     fcc.render_collab(fcc.load_fleet_config(central), out)
-    assert yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"] == {"collab": COLLAB}
+    assert yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"] == {"collab": COLLAB, "collab_artifacts": {"enabled": False}}
