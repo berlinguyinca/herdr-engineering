@@ -1,6 +1,6 @@
 """The scheduled inbox watch: new mail goes to the assistant once, as one triage turn, with untrusted text quoted."""
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -135,3 +135,112 @@ def test_config_defaults_limits_and_refusals():
                 {"users": [{"user_id": "u", "extra": 1}]}, {"users": [{"user_id": "u"}] * 21}):
         with pytest.raises(ValueError, match="inbox_watch"):
             inbox_watch_config(bad)
+
+
+DAY = 24 * 3600
+
+
+def grant_world(**iw):
+    w = World(FakeGoogle([]), **iw)
+    a = w.svc.store.list_assistants(tenant_id="t", user_id="key:u1")[0]
+    w.aid = a.assistant_id
+    return w
+
+
+def grant(w, tool, days, **kw):
+    g = w.svc.grant_tool(tenant_id="t", user_id="key:u1", assistant_id=w.aid, tool_id=tool, scope="*",
+                         ttl_seconds=days * DAY, **kw)
+    return g
+
+
+def expiry(w, g):
+    return next(x for x in w.svc.store.list_grants(tenant_id="t", user_id="key:u1") if x.grant_id == g.grant_id).expires_at
+
+
+def test_renewal_is_off_by_default():
+    w = grant_world()
+    g = grant(w, "search_email", 2)
+    before = expiry(w, g)
+    w.runner.tick()
+    assert expiry(w, g) == before
+
+
+def test_read_grants_close_to_expiry_are_renewed_and_audited():
+    w = grant_world(renew_grants=True)
+    near, far = grant(w, "search_email", 3), grant(w, "read_email", 25)
+    far_before = expiry(w, far)
+    w.runner.tick()
+    assert (expiry(w, near) - NOW).days >= 29              # back to the full cap
+    assert expiry(w, far) == far_before                     # not due yet: left alone
+    events = [e for e in w.svc.store.audit if e["action"] == "assistant.grant.renewed"]
+    assert len(events) == 1 and events[0]["actor"] == ACTOR and events[0]["subject_id"] == near.grant_id
+
+
+def test_write_tools_revoked_and_expired_grants_are_never_renewed():
+    w = grant_world(renew_grants=True)
+    send, draft = grant(w, "send_email", 2), grant(w, "create_email_draft", 2)
+    revoked, lapsed = grant(w, "find_free_time", 2), grant(w, "list_calendar_events", 2)
+    w.svc.revoke_grant(revoked.grant_id, tenant_id="t", user_id="key:u1")
+    w.svc.store.grants[lapsed.grant_id].expires_at = NOW - timedelta(days=1)       # already lapsed
+    before = {g.grant_id: expiry(w, g) for g in (send, draft, revoked, lapsed)}
+    w.runner.tick()
+    assert {g.grant_id: expiry(w, g) for g in (send, draft, revoked, lapsed)} == before
+
+
+def test_only_the_watched_assistants_grants_are_renewed():
+    w = grant_world(renew_grants=True)
+    other = w.svc.create_assistant(tenant_id="t", user_id="key:u1", name="B")
+    g = w.svc.grant_tool(tenant_id="t", user_id="key:u1", assistant_id=other.assistant_id, tool_id="search_email",
+                         scope="*", ttl_seconds=2 * DAY)
+    w.runner.config["users"][0]["assistant_id"] = w.aid
+    before = expiry(w, g)
+    w.runner.tick()
+    assert expiry(w, g) == before
+
+
+def test_renewal_config_validation():
+    for bad in (0, 30, "7", True, 2.5, None):
+        with pytest.raises(ValueError, match="renew_within_days"):
+            inbox_watch_config({"renew_within_days": bad})
+    cfg = inbox_watch_config({"renew_grants": True, "renew_within_days": 3})
+    assert cfg["renew_grants"] is True and cfg["renew_within_seconds"] == 3 * DAY
+    assert inbox_watch_config({})["renew_within_seconds"] == 7 * DAY
+    with pytest.raises(ValueError, match="renew_grants"):
+        inbox_watch_config({"renew_grants": "yes"})
+
+
+def test_a_failing_renewal_never_stops_triage(monkeypatch):
+    w = grant_world(renew_grants=True)
+    w.google.mails = [mail(1)]
+    monkeypatch.setattr(w.svc, "renew_read_grants", lambda **k: (_ for _ in ()).throw(RuntimeError("store down")))
+    st = w.runner.tick()
+    assert st["triaged"] == 1 and st["last_error"] is None
+
+
+def test_grants_are_not_renewed_while_the_mailbox_is_not_connected():
+    w = grant_world(renew_grants=True)
+    w.google.error = "not_connected"
+    g = grant(w, "search_email", 2)
+    before = expiry(w, g)
+    w.runner.tick()
+    assert expiry(w, g) == before
+
+
+def test_the_window_is_inclusive_and_a_huge_window_is_capped_below_the_lifetime():
+    w = grant_world(renew_grants=True)
+    edge = grant(w, "search_email", 7)                         # exactly 7 days left: due
+    w.runner.tick()
+    assert (expiry(w, edge) - NOW).days >= 29
+    w2 = grant_world(renew_grants=True)
+    fresh = grant(w2, "read_email", 29)
+    w2.runner.config["renew_within_seconds"] = 100 * DAY       # cannot make a 29-day grant look due every tick
+    before = expiry(w2, fresh)
+    w2.runner.tick()
+    assert expiry(w2, fresh) == before
+
+
+def test_a_revoked_grant_is_not_brought_back_by_a_racing_renewal():
+    w = grant_world(renew_grants=True)
+    g = grant(w, "search_email", 2)
+    w.svc.revoke_grant(g.grant_id, tenant_id="t", user_id="key:u1")
+    assert w.svc.store.extend_grant(g.grant_id, NOW + timedelta(days=30)) is False

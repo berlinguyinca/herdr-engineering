@@ -7,6 +7,9 @@ hands the NEW messages to the user's assistant as one triage turn. The assistant
 summarizes, proposes replies (``send_email`` / ``create_email_draft``) and calendar entries. Every write is an approval card
 a person must approve; nothing here sends, drafts or schedules anything itself.
 
+With ``renew_grants`` on it also keeps the watched assistant's read-only mail and calendar grants from lapsing
+(``AssistantService.renew_read_grants``); write grants are never renewed here.
+
 Mail text is written by other people. It enters the prompt only as JSON-quoted, length-bounded fields under an explicit
 "untrusted data" instruction, and the loop never gives the assistant a grant it did not already have.
 
@@ -122,6 +125,7 @@ class InboxWatchRunner:
         except GoogleError as exc:
             return ("not_connected" if exc.reason in ("not_connected", "needs_attention", "forbidden", "reconnect_needed")
                     else "google_unavailable"), 0, False
+        self._renew(tenant, user, assistant_id)      # only while the mailbox is connected and answering
         fresh = []
         for mail in found:
             _, verdict = svc.notify(tenant_id=tenant, user_id=user, key=f"inbox:{mail['id']}", priority="normal",
@@ -137,6 +141,19 @@ class InboxWatchRunner:
         svc.send_message(tenant_id=tenant, user_id=user, assistant_id=assistant_id, thread_id=thread.thread_id,
                          content=self.prompt(fresh))
         return "ok", len(fresh), True
+
+    def _renew(self, tenant: str, user: str, assistant_id: str) -> None:
+        if not self.config.get("renew_grants"):
+            return
+        try:
+            n = self.assistant.renew_read_grants(tenant_id=tenant, user_id=user, assistant_id=assistant_id,
+                                                 within_seconds=self.config["renew_within_seconds"], actor=ACTOR)
+        except Exception as exc:  # noqa: BLE001 - a renewal problem must never stop triage
+            log.warning("inbox_watch: grant renewal for %s/%s failed (%s)", tenant, user, type(exc).__name__)
+            return
+        if n:
+            with self._lock:
+                self._status["renewed"] = self._status.get("renewed", 0) + n
 
     @staticmethod
     def prompt(mails: list[dict[str, Any]]) -> str:
