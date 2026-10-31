@@ -1803,8 +1803,18 @@ class AssistantStore:
         path = self._persist_path
         tmp = path + ".tmp"
         data = self.snapshot()
-        with open(tmp, "w") as f:
-            json.dump(data, f)
+        # The snapshot holds the owner's private data: create the temp file 0600 (a stale tmp is chmodded too).
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
         os.replace(tmp, path)
 
     def load_persisted(self) -> None:
