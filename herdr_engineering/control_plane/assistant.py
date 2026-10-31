@@ -44,6 +44,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
+from . import placement
 from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_hub.workers import Enrollment, Worker
 from .inference_models import RETRY_CODES, ModelResolver
@@ -112,8 +113,8 @@ def _delegation_targets(value: Any) -> dict[str, dict[str, Any]]:
     for target, raw in value.items():
         if not isinstance(target, str) or not _DELEGATION_REF.fullmatch(target):
             raise ValueError("invalid delegation target")
-        if not isinstance(raw, dict) or set(raw) != {"role_ref"}:
-            raise ValueError("delegation target needs exactly role_ref")
+        if not isinstance(raw, dict) or "role_ref" not in raw or set(raw) - {"role_ref", "requires", "resources"}:
+            raise ValueError("delegation target takes role_ref, and optionally requires and resources")
         role = raw["role_ref"]
         if role is not None:
             if (not isinstance(role, dict) or set(role) != {"id", "version", "digest"}
@@ -130,6 +131,13 @@ def _delegation_targets(value: Any) -> dict[str, dict[str, Any]]:
         if target == "pi-secretary" and role != _SECRETARY_ROLE:
             raise ValueError("pi-secretary requires the reviewed Secretary role")
         out[target] = {"role_ref": role}
+        try:
+            if raw.get("requires") is not None:
+                out[target]["requires"] = placement.normalize_capabilities(raw["requires"], what="requires")
+            if raw.get("resources") is not None:
+                out[target]["resources"] = placement.normalize_resources(raw["resources"])
+        except placement.PlacementError as exc:
+            raise ValueError(f"delegation target {target}: {exc}") from None
     return out
 
 
@@ -533,6 +541,9 @@ class Assistant:
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
     version: int = 1
+    type: str = "rakazo"              # rakazo, or a configured specialist type (delegation.targets)
+    parent_id: str | None = None      # explicit association; management only, confers no authority
+    idempotency_key: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -540,6 +551,8 @@ class Assistant:
             "tenant_id": self.tenant_id,
             "user_id": self.user_id,
             "name": self.name,
+            "type": self.type,
+            "parent_id": self.parent_id,
             "persona": self.persona,
             "status": self.status,
             "instructions": self.instructions,
@@ -2562,22 +2575,128 @@ class AssistantService:
             raise AssistantUnavailable("personal assistant is disabled")
 
     # -- assistants ------------------------------------------------------------
+    MAX_LINK_DEPTH = 3
+
+    def assistant_types(self) -> list[dict[str, Any]]:
+        """The types a person may create: the built-in ``rakazo`` plus every configured specialist target.
+        Never free text, so a type always names something the control plane knows how to treat."""
+        out = [{"type": "rakazo", "kind": "assistant", "can_be_parent": True, "requires": [], "resources": {},
+                "role": None}]
+        for name, spec in sorted(self.config["delegation"]["targets"].items()):
+            role = spec.get("role_ref")
+            out.append({"type": name, "kind": "specialist", "can_be_parent": False,
+                        "requires": list(spec.get("requires", [])), "resources": dict(spec.get("resources", {})),
+                        "role": f"{role['id']}@{role['version']}" if role else None})
+        return out
+
+    @staticmethod
+    def _assistant_status(a: Assistant) -> str:
+        if not a.enabled:
+            return "disabled"
+        return "ready" if a.type == "rakazo" else "needs_setup"
+
     def create_assistant(self, *, tenant_id: str, user_id: str,
                          name: str, persona: str = "helpful",
                          instructions: str = "",
                          model_policy: str = "auto",
-                         enabled: bool = True) -> Assistant:
+                         enabled: bool = True, type: str = "rakazo",
+                         parent_id: str | None = None, idempotency_key: str = "") -> Assistant:
         self._require_enabled()
+        if type not in {t["type"] for t in self.assistant_types()}:
+            raise AssistantError("unknown assistant type")
+        if idempotency_key and not _DELEGATION_REF.fullmatch(str(idempotency_key)):
+            raise AssistantError("invalid idempotency_key")
+        name = name or "Personal Assistant"
+        if idempotency_key:
+            for prior in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id):
+                if prior.idempotency_key == idempotency_key:
+                    if (prior.name, prior.type, prior.parent_id) != (name, type, parent_id or None):
+                        raise AssistantError("idempotency_key already used differently")
+                    return prior
+        if parent_id:
+            parent = self.store.get_assistant(parent_id, tenant_id=tenant_id, user_id=user_id)
+            self._check_link(parent, None, type)
         a = Assistant(
             assistant_id=_new_id("asst"),
             tenant_id=tenant_id, user_id=user_id,
-            name=name or "Personal Assistant", persona=persona,
+            name=name, persona=persona,
             instructions=instructions, model_policy=model_policy,
-            enabled=enabled, status="ready" if enabled else "disabled")
+            enabled=enabled, type=type, parent_id=parent_id or None,
+            idempotency_key=idempotency_key or "")
+        a.status = self._assistant_status(a)
         self.store.put_assistant(a)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
-                                action="assistant.created", subject_id=a.assistant_id)
+                                action="assistant.created", subject_id=a.assistant_id,
+                                detail=f"type={type}" + (f" parent={parent_id}" if parent_id else ""))
         return a
+
+    def _depth_above(self, a: Assistant, tenant_id: str, user_id: str) -> int:
+        depth, seen, cur = 1, {a.assistant_id}, a
+        while cur.parent_id:
+            if cur.parent_id in seen:
+                raise AssistantError("assistant links form a cycle")
+            seen.add(cur.parent_id)
+            cur = self.store.get_assistant(cur.parent_id, tenant_id=tenant_id, user_id=user_id)
+            depth += 1
+        return depth
+
+    def _height_below(self, a: Assistant, tenant_id: str, user_id: str) -> int:
+        kids = [c for c in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id)
+                if c.parent_id == a.assistant_id]
+        return 1 + max((self._height_below(c, tenant_id, user_id) for c in kids), default=0)
+
+    def _check_link(self, parent: Assistant, child: Assistant | None, child_type: str) -> None:
+        """Management rules only; none of them confers a capability."""
+        if parent.type != "rakazo":
+            raise AssistantError("only a rakazo assistant can be a parent")
+        if not parent.enabled:
+            raise AssistantError("an archived or disabled assistant cannot be linked")
+        tenant, user = parent.tenant_id, parent.user_id
+        if child is not None:
+            if child.assistant_id == parent.assistant_id:
+                raise AssistantError("an assistant cannot be its own parent")
+            if not child.enabled:
+                raise AssistantError("an archived or disabled assistant cannot be linked")
+            walk, seen = parent, {child.assistant_id}
+            while walk is not None:
+                if walk.assistant_id in seen:
+                    raise AssistantError("link would create a cycle")
+                seen.add(walk.assistant_id)
+                walk = (self.store.get_assistant(walk.parent_id, tenant_id=tenant, user_id=user)
+                        if walk.parent_id else None)
+            below = self._height_below(child, tenant, user)
+        else:
+            below = 1
+        if self._depth_above(parent, tenant, user) + below > self.MAX_LINK_DEPTH:
+            raise AssistantError(f"links may be at most {self.MAX_LINK_DEPTH} deep")
+
+    def link_assistant(self, child_id: str, *, tenant_id: str, user_id: str, parent_id: str) -> Assistant:
+        self._require_enabled()
+        child = self.store.get_assistant(child_id, tenant_id=tenant_id, user_id=user_id)
+        parent = self.store.get_assistant(parent_id, tenant_id=tenant_id, user_id=user_id)
+        self._check_link(parent, child, child.type)
+        if child.parent_id == parent.assistant_id:
+            return child                                            # replay: the recorded link
+        child.parent_id = parent.assistant_id
+        child.updated_at = self.now()
+        child.version += 1
+        self.store.put_assistant(child)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.linked", subject_id=child_id, detail=f"parent={parent_id}")
+        return child
+
+    def unlink_assistant(self, child_id: str, *, tenant_id: str, user_id: str) -> Assistant:
+        self._require_enabled()
+        child = self.store.get_assistant(child_id, tenant_id=tenant_id, user_id=user_id)
+        if child.parent_id is None:
+            return child
+        former, child.parent_id = child.parent_id, None
+        child.updated_at = self.now()
+        child.version += 1
+        self.store.put_assistant(child)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.unlinked", subject_id=child_id, detail=f"parent={former}")
+        return child
 
     def get_assistant(self, assistant_id: str, *, tenant_id: str, user_id: str) -> Assistant:
         self._require_enabled()
@@ -2595,7 +2714,7 @@ class AssistantService:
         for key in allowed:
             if key in patch:
                 setattr(a, key, patch[key])
-        a.status = "ready" if a.enabled else "disabled"
+        a.status = self._assistant_status(a)
         a.updated_at = self.now()
         a.version += 1
         self.store.put_assistant(a)
@@ -2615,6 +2734,11 @@ class AssistantService:
         for grant in self.store.list_grants(tenant_id=tenant_id, user_id=user_id,
                                             assistant_id=assistant_id):
             grant.revoked_at = self.now()
+        for child in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id):
+            if child.parent_id == assistant_id:                      # an archived parent leaves no dangling links
+                self.unlink_assistant(child.assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if a.parent_id:
+            self.unlink_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.archived", subject_id=assistant_id)
 
@@ -3886,8 +4010,11 @@ class AssistantService:
             scopes = sorted({g.scope for g in grants if g.assistant_id == a.assistant_id
                              and g.tool_id == "delegate" and g.active(now)})
             nodes.append({"id": a.assistant_id, "kind": "assistant", "name": a.name, "status": a.status,
+                          "type": a.type, "parent_id": a.parent_id,
                           "enabled": a.enabled, "can_delegate": bool(scopes), "delegate_scopes": scopes})
             edges.append({"from": "you", "to": a.assistant_id, "kind": "owns"})
+            if a.parent_id:
+                edges.append({"from": a.parent_id, "to": a.assistant_id, "kind": "linked"})
         consumer_on = bool(self.config.get("delegation_consumer", {}).get("enabled"))
         for target, spec in self.config["delegation"]["targets"].items():
             if target == "pi":

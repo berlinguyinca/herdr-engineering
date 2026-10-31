@@ -3744,7 +3744,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_reminders(parts)
             if resource == "assistant-workers":
                 return self._assistant_workers(parts)
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph",
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
@@ -4579,6 +4579,9 @@ def _make_handler(server, public=False, operator=False):
                                                         svc.list_connectors(tenant_id=tenant_id, user_id=user_id)]})
                 if resource == "assistant-connectors" and len(parts) == 5:
                     return self._json(svc.get_connector(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-types" and len(parts) == 4:
+                    svc._require_enabled()
+                    return self._json({"types": svc.assistant_types()})
                 if resource == "assistant-graph" and len(parts) == 4:
                     return self._json(svc.assistant_graph(tenant_id=tenant_id, user_id=user_id))
                 if resource == "assistant-delegations" and len(parts) == 4:
@@ -4618,8 +4621,17 @@ def _make_handler(server, public=False, operator=False):
                             persona=body.get("persona", "helpful"),
                             instructions=body.get("instructions", ""),
                             model_policy=body.get("model_policy", "auto"),
-                            enabled=bool(body.get("enabled", True)))
+                            enabled=bool(body.get("enabled", True)),
+                            type=body.get("type", "rakazo"), parent_id=body.get("parent_id"),
+                            idempotency_key=body.get("idempotency_key", ""))
                         return self._json(created.as_dict(), 201)
+                    if len(parts) == 6 and parts[5] == "link" and self.command == "POST":
+                        return self._json(svc.link_assistant(
+                            parts[4], tenant_id=tenant_id, user_id=user_id,
+                            parent_id=str(body.get("parent_id", ""))).as_dict())
+                    if len(parts) == 6 and parts[5] == "unlink" and self.command == "POST":
+                        return self._json(svc.unlink_assistant(
+                            parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
                     if len(parts) == 5 and self.command in ("PATCH", "POST"):
                         if body.get("archive"):
                             svc.archive_assistant(parts[4], tenant_id=tenant_id, user_id=user_id)
