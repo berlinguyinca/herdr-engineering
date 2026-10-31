@@ -119,3 +119,39 @@ def test_the_service_builds_a_resolver_from_the_inference_section():
     assert svc.runner.resolver is not None
     with pytest.raises(ValueError, match="preferred_models"):
         assistant_config({"personal_assistant": {"inference": {"preferred_models": "laya"}}})
+
+
+def test_a_bots_own_model_choice_is_never_substituted():
+    r, seen = runner("laya", [Busy(404), OK], preferred=["qwen3.8-text"])
+    with pytest.raises(Busy):
+        r._post({"model": "some-manual-model", "messages": []})
+    assert seen == ["some-manual-model"]
+
+
+def test_auto_with_no_catalog_fails_clearly_instead_of_sending_auto():
+    r, seen = runner("auto", [OK], served=None)
+    with pytest.raises(RuntimeError, match="no model"):
+        r._post({"model": "auto", "messages": []})
+    assert seen == []
+
+
+def test_a_failed_catalog_fetch_is_retried_soon():
+    now, calls = [0.0], []
+    r = resolver(served=None, clock=lambda: now[0], calls=calls)
+    r.candidates("auto"); r.candidates("auto")
+    assert len(calls) == 1
+    now[0] = 6.0
+    r.candidates("auto")
+    assert len(calls) == 2
+
+
+def test_an_empty_preferred_models_key_means_no_preferences():
+    cfg = assistant_config({"personal_assistant": {"inference": {"endpoint": URL, "preferred_models": None}}})
+    assert cfg["inference"]["preferred_models"] == []
+
+
+@pytest.mark.parametrize("code", [500, 504])
+def test_server_errors_move_on_to_the_next_model(code):
+    r, seen = runner("auto", [Busy(code), OK], preferred=["laya", "qwen3.8-text"])
+    assert r._post({"model": "auto", "messages": []}) == OK
+    assert seen == ["laya", "qwen3.8-text"]

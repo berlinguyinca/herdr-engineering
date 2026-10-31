@@ -20,7 +20,8 @@ TIMEOUT = 3.0
 MAX_BODY = 2_000_000
 MAX_MODELS = 500
 MAX_CANDIDATES = 4
-RETRY_CODES = frozenset({404, 429, 502, 503})
+FAILED_TTL = 5.0
+RETRY_CODES = frozenset({404, 429, 500, 502, 503, 504})
 NON_TEXT = re.compile(r"modality-(?!text)|embed|rerank|whisper", re.I)
 
 
@@ -37,12 +38,12 @@ class ModelResolver:
         self.api_key, self.preferred = api_key, list(preferred)
         self._fetch, self._clock = fetch, clock
         self._lock = threading.Lock()
-        self._cache: tuple[float, list[str]] | None = None
+        self._cache: tuple[float, list[str], float] | None = None
 
     def served(self) -> list[str]:
         with self._lock:
-            if self._cache and self._clock() - self._cache[0] < TTL:
-                return self._cache[1]
+            if self._cache and self._clock() - self._cache[0] < self._cache[2]:
+                return list(self._cache[1])
         ids: list[str] = []
         try:
             raw = self._fetch(self.url, self.api_key, TIMEOUT)
@@ -52,7 +53,7 @@ class ModelResolver:
         except Exception:  # noqa: BLE001 - an unreachable or odd gateway is an empty catalog, never an error
             ids = []
         with self._lock:
-            self._cache = (self._clock(), ids)
+            self._cache = (self._clock(), ids, TTL if ids else FAILED_TTL)
         return ids
 
     def candidates(self, wanted: str) -> list[str]:

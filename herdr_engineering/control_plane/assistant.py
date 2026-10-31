@@ -181,7 +181,7 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "endpoint": str(inference.get("endpoint", "")),
             "timeout": int(inference.get("timeout", 60)),
             "model": str(inference.get("model", "")),
-            "preferred_models": _model_preferences(inference.get("preferred_models", [])),
+            "preferred_models": _model_preferences(inference.get("preferred_models") or []),
             "api_key": str(inference.get("api_key", "")),  # never logged
         },
         # optional durable Postgres persistence (herdr_pa). When ``dsn`` is set,
@@ -1296,15 +1296,23 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         """Send one chat-completions request and return the parsed body. A gateway that has no capacity for (or no longer
         serves) the model sends the request on to the next candidate. Raises on transport failure; callers degrade to a safe
         reply."""
-        if self.resolver is None:
+        wanted = str(payload.get("model", ""))
+        # a bot's own ``manual:`` model is the person's choice and is sent as it is; only the configured default is resolved
+        if self.resolver is None or (wanted not in ("", "auto") and wanted != self.model):
             return self._post_one(payload)
+        candidates = self.resolver.candidates(wanted)
+        if not candidates:
+            raise RuntimeError("no model available: the gateway lists none and none is pinned")
         last: Exception | None = None
-        for model in self.resolver.candidates(str(payload.get("model", ""))) or [payload.get("model", "")]:
+        for model in candidates:
             try:
+                if model != wanted:
+                    _log.warning("assistant model %r not used; asking %r", wanted or "auto", model)
                 return self._post_one({**payload, "model": model})
             except Exception as exc:  # noqa: BLE001
                 if getattr(exc, "code", None) not in RETRY_CODES:
                     raise
+                _log.warning("assistant model %r answered %s; trying the next", model, exc.code)
                 last = exc
         raise last  # type: ignore[misc]
 
