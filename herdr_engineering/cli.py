@@ -3162,7 +3162,7 @@ def _cmd_cp_assistant_worker(args) -> int:
                       f"{w['device_id']:<16} {w['expires_at']}")
         elif args.action == "scopes":
             out = call("POST", f"/api/v1/assistant-workers/{quote(args.worker_id, safe='')}/scopes", {"scopes": scopes})
-            print(f"{out['worker_id']}: scopes {','.join(out['scopes'])}")
+            print(_tty_safe(f"{out['worker_id']}: scopes {','.join(out['scopes'])}"))
         else:
             out = call("DELETE", f"/api/v1/assistant-workers/{quote(args.worker_id, safe='')}")
             print(f"{out['worker_id']}: {out['status']}")
@@ -3172,6 +3172,11 @@ def _cmd_cp_assistant_worker(args) -> int:
     except (OSError, ValueError, KeyError) as exc:
         print(f"assistant-worker {args.action} failed: {type(exc).__name__}", file=sys.stderr)
     return 1
+
+
+def _tty_safe(value) -> str:
+    """Server-provided text with every ESC/C0/C1 control character removed (space kept), safe to print to a terminal."""
+    return "".join(c for c in str(value) if c == " " or not (ord(c) < 32 or 0x7F <= ord(c) <= 0x9F))
 
 
 def _cmd_cp_assistant_hub_owner(args) -> int:
@@ -3219,23 +3224,25 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
                 rows = call("GET", f"/api/v1/assistant-action-requests{query}")["requests"]
                 print(f"{'REQUEST_ID':<20} {'STATUS':<9} {'VERB':<14} {'WORKER':<22} DISPLAY")
                 for r in rows:
-                    display = " ".join(r["display"].split())[:120]
-                    print(f"{r['request_id']:<20} {r['status']:<9} {r['verb']:<14} {r['worker_id']:<22} {display}")
+                    display = _tty_safe(r["display"])[:120]
+                    print(_tty_safe(f"{r['request_id']:<20} {r['status']:<9} {r['verb']:<14} {r['worker_id']:<22} ")
+                          + display)
             else:
                 out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision",
                            {"approve": args.action == "approve"})
-                print(f"{out['request_id']}: {out['status']}")
+                print(_tty_safe(f"{out['request_id']}: {out['status']}"))
         elif args.action == "list":
             rows = call("GET", "/api/v1/assistant-grants")["grants"]
             print(f"{'GRANT_ID':<24} {'STATE':<9} {'VERB':<14} {'WORKER':<22} EXPIRES")
             for g in rows:
-                print(f"{g['grant_id']:<24} {g['state']:<9} {g['verb']:<14} {g['worker_id']:<22} {g['expires_at'] or '-'}")
+                print(_tty_safe(f"{g['grant_id']:<24} {g['state']:<9} {g['verb']:<14} {g['worker_id']:<22} "
+                                f"{g['expires_at'] or '-'}"))
         elif args.action == "revoke":
             out = call("DELETE", f"/api/v1/assistant-grants/{quoted}")
-            print(f"{out['grant_id']}: {out['state']}")
+            print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
         else:
             out = call("POST", f"/api/v1/assistant-grants/{quoted}/activate", {"confirm": True})
-            print(f"{out['grant_id']}: {out['state']}")
+            print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
         return 0
     except urllib.error.HTTPError as exc:
         code = ""

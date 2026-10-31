@@ -25,8 +25,9 @@ from herdr_engineering.control_plane.assistant_hub.server import HubServer
 from herdr_engineering.control_plane.assistant_hub.workers import WorkerRegistry
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
-KEYS = {"alice": "p2-route-alice-key", "bea": "p2-route-bea-key", "viewer": "p2-route-viewer-key"}
-ROLES = {KEYS["alice"]: "operator", KEYS["bea"]: "operator", KEYS["viewer"]: "viewer"}
+KEYS = {"alice": "p2-route-alice-key", "bea": "p2-route-bea-key", "viewer": "p2-route-viewer-key",
+        "carol": "p2-route-carol-key"}
+ROLES = {KEYS["alice"]: "operator", KEYS["bea"]: "operator", KEYS["viewer"]: "viewer", KEYS["carol"]: "operator"}
 PUSH = "git push origin main"
 SECRET_CMD = "frobnicate --all --token=hunter2-CANARY"
 ACT = ["ask", "report", "read", "act"]
@@ -58,7 +59,7 @@ def owner(base, method, path, body=None, who="alice", raw=None):
 @pytest.fixture()
 def world(acknowledged_sink):
     long_ago = (datetime.now(UTC) - timedelta(days=60)).isoformat()
-    section = {"enabled": True, "tenancy": {"principals": {pid("alice"): "acme", pid("bea"): "globex"}},
+    section = {"enabled": True, "tenancy": {"principals": {pid("alice"): "acme", pid("bea"): "globex", pid("carol"): "acme"}},
                "grants": {"shadow_started_at": long_ago},
                "hub": {"enabled": True, "host": "100.64.0.9", "port": 9483, "allowed_networks": ["127.0.0.0/8"]}}
     svc = AssistantService(config=assistant_config({"personal_assistant": section}))
@@ -230,7 +231,8 @@ def test_vetoed_request_cannot_be_decided(world):
     assert owner(base, "GET", "/api/v1/assistant-action-requests?status=vetoed")[1]["requests"][0]["status"] == "vetoed"
 
 
-@pytest.mark.parametrize("body", [{}, {"approve": "yes"}, {"approve": 1}, {"approve": None},
+@pytest.mark.parametrize("body", [{}, {"approve": "yes"}, {"approve": "true"}, {"approve": 1}, {"approve": 0},
+                                  {"approve": None},
                                   {"approve": True, "decided_by": "mallory"}, [True], "x"])
 def test_decision_body_validation_400(world, body):
     base, hub_base, _, _ = world
@@ -299,7 +301,8 @@ def test_activate_not_proposed_and_not_found(world):
     assert owner(base, "POST", f"/api/v1/assistant-grants/{gid}/activate", {"confirm": True}, who="bea")[0] == 404
 
 
-@pytest.mark.parametrize("body", [{}, {"confirm": False}, {"confirm": "true"}, {"confirm": True, "x": 1}, [True]])
+@pytest.mark.parametrize("body", [{}, {"confirm": False}, {"confirm": "true"}, {"confirm": 1}, {"confirm": 0},
+                                  {"confirm": "yes"}, {"confirm": None}, {"confirm": True, "x": 1}, [True]])
 def test_activate_body_validation_400(world, body):
     base, hub_base, svc, _ = world
     gid = put_grant(svc, new_worker(base, hub_base, scopes=ACT)[0])
@@ -468,3 +471,70 @@ def test_cli_subprocess_approve_in_throwaway_home(world, tmp_path):
     assert done.returncode == 0, done.stderr
     assert KEYS["alice"] not in done.stdout + done.stderr
     assert svc.store.get_action_request(rid, tenant_id="acme", user_id=pid("alice")).status == "approved"
+
+
+# ------------------------------------------------------------------- same tenant, different user (carol vs alice)
+
+def test_same_tenant_other_user_isolated_on_every_route(world):
+    base, hub_base, svc, _ = world
+    worker = new_worker(base, hub_base, scopes=ACT)                  # alice's
+    rid = action_request(hub_base, worker, "frobnicate --all")["request_id"]
+    gid = put_grant(svc, worker[0])
+    active = put_grant(svc, worker[0], cmd="git push origin dev", activate=True)
+    assert owner(base, "GET", "/api/v1/assistant-action-requests", who="carol")[1] == {"requests": []}
+    assert owner(base, "GET", "/api/v1/assistant-grants", who="carol")[1] == {"grants": []}
+    assert owner(base, "POST", f"/api/v1/assistant-action-requests/{rid}/decision", {"approve": True},
+                 who="carol")[0] == 404
+    assert owner(base, "POST", f"/api/v1/assistant-grants/{gid}/activate", {"confirm": True}, who="carol")[0] == 404
+    assert owner(base, "DELETE", f"/api/v1/assistant-grants/{active}", who="carol")[0] == 404
+    assert owner(base, "POST", f"/api/v1/assistant-workers/{worker[0]}/scopes", {"scopes": ["ask"]},
+                 who="carol")[0] == 404
+    # nothing of alice's changed
+    assert owner(base, "GET", "/api/v1/assistant-action-requests")[1]["requests"][0]["status"] == "pending"
+    states = {g["grant_id"]: g["state"] for g in owner(base, "GET", "/api/v1/assistant-grants")[1]["grants"]}
+    assert states == {gid: "proposed", active: "active"}
+    assert owner(base, "GET", "/api/v1/assistant-workers")[1]["workers"][0]["scopes"] == ACT
+    assert owner(base, "GET", "/api/v1/assistant-workers", who="carol")[1] == {"workers": []}
+
+
+# ------------------------------------------------------------------------------------- activation refusal audit
+
+def test_refused_activation_is_audited_and_chain_verifies(world):
+    base, hub_base, svc, _ = world
+    worker = new_worker(base, hub_base, scopes=ACT)
+    gate = put_grant(svc, worker[0])
+    shadow = put_grant(svc, worker[0], cmd="git push origin dev", state=GrantState.SHADOW)
+    for gid, code in ((gate, "judge_gate_not_satisfied"), (shadow, "not_proposed")):
+        assert owner(base, "POST", f"/api/v1/assistant-grants/{gid}/activate", {"confirm": True})[0] == 409
+        entries = [e for e in svc.store.audit if e["action"] == "assistant.grant.activate_refused"
+                   and e["subject_id"] == gid]
+        assert len(entries) == 1 and code in entries[0]["detail"] and gid in entries[0]["detail"]
+        assert entries[0]["actor"] == pid("alice") and entries[0]["tenant_id"] == "acme"
+    before = len(svc.store.audit)
+    assert owner(base, "POST", "/api/v1/assistant-grants/nope/activate", {"confirm": True})[0] == 404
+    assert len(svc.store.audit) == before                           # not_found is not audited
+    assert svc.store.verify_audit("acme") is True
+
+
+# ------------------------------------------------------------------------------------------- terminal injection
+
+ANSI = "\x1b[31mRED\x1b]0;pwn\x07\x9b2J\r\tend"
+
+
+def test_scrub_display_strips_control_characters():
+    from herdr_engineering.control_plane.assistant_hub.policy import scrub_display
+    out = scrub_display("echo \x1b[31mhi\x00\x07\x9b\x7f there\nline2\ttab\r")
+    assert not any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F for c in out)
+    assert "hi" in out and "line2" in out and "tab" in out
+
+
+def test_cli_action_list_strips_terminal_escapes(world, keyfile, capsys):
+    base, hub_base, svc, _ = world
+    worker = new_worker(base, hub_base, scopes=ACT)
+    rid = action_request(hub_base, worker, "frobnicate " + ANSI)["request_id"]
+    row = svc.store.get_action_request(rid, tenant_id="acme", user_id=pid("alice"))
+    row.display = "frobnicate " + ANSI                                # even a dirty stored value must not reach the tty
+    svc.store.put_action_request(row)
+    rc, out, _ = run_cli(capsys, base, keyfile, "assistant-action", "list")
+    assert rc == 0 and "RED" in out
+    assert not any(ord(c) < 32 and c != "\n" or 0x7F <= ord(c) <= 0x9F for c in out)

@@ -58,6 +58,7 @@ _SSHPASS_RE = re.compile(r"(?i)\b(sshpass\s+-p\s*)[^\s\"']+")
 _LOGIN_RE = re.compile(r"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--password)(?:=|\s+))[^\s\"']+")
 _DB_ATTACHED_RE = re.compile(r"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p)[^\s\"']+")
 _MASK = "***"
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 
 
 def display_text(raw: RawAction) -> str:
@@ -74,7 +75,8 @@ def scrub_display(text: str) -> str:
     scrubber. A secret that has no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why
     this text lives only on the request row and key_canonical holds a digest instead of command text.
     """
-    out = _USERINFO_RE.sub(r"\1" + _MASK + "@", text)
+    out = _CONTROL_RE.sub(" ", text)                    # no ESC/C0/C1 (or newline/tab) in anything a terminal may print
+    out = _USERINFO_RE.sub(r"\1" + _MASK + "@", out)
     out = _HEADER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
     out = _SSHPASS_RE.sub(lambda m: m.group(1) + _MASK, out)
     out = _LOGIN_RE.sub(lambda m: m.group(1) + _MASK, out)
@@ -205,6 +207,18 @@ def _refuse(code: str, message: str) -> ActivationRefused:
 
 def activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str, grant_id: str,
                    confirmed_by: str, judge_gate_satisfied: bool) -> ActionGrant:
+    try:
+        return _activate_grant(store, cfg, now, tenant_id, user_id, grant_id, confirmed_by, judge_gate_satisfied)
+    except ActivationRefused as exc:
+        if exc.code != "not_found":                     # an unknown id has no grant to attach the entry to
+            store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=confirmed_by.strip() or "unknown",
+                               action="assistant.grant.activate_refused", subject_id=grant_id,
+                               detail=f"{exc.code} grant={grant_id}")
+        raise
+
+
+def _activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str, grant_id: str,
+                    confirmed_by: str, judge_gate_satisfied: bool) -> ActionGrant:
     with store._lock:
         grant = store.get_action_grant(grant_id, tenant_id=tenant_id, user_id=user_id)
         if grant is None:
