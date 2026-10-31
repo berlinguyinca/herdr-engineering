@@ -1,0 +1,136 @@
+{
+  "source": {
+    "title": "Example milestone birthday venue shortlist",
+    "uri": "fixture:venue-shortlist",
+    "kind": "redacted_user_supplied_summary",
+    "live_verified": false
+  },
+  "requirements": {
+    "date_time": null,
+    "timezone": null,
+    "adults": null,
+    "children": null,
+    "budget": null,
+    "currency": null
+  },
+  "venues": [
+    {
+      "id": "yaquis",
+      "name": "Yaquis Cantina",
+      "city": "Woodland",
+      "priority": 1,
+      "identity": "unverified",
+      "contact": "orders@yaquiscantina.com",
+      "source": "https://www.yaquiscantina.com/contact82a5d229"
+    },
+    {
+      "id": "obo",
+      "name": "OBO Italian",
+      "city": "Sacramento",
+      "priority": 1,
+      "identity": "unverified",
+      "contact": null,
+      "source": "https://oboitalian.com/contact-us/"
+    },
+    {
+      "id": "revolution",
+      "name": "Revolution Winery",
+      "city": "Sacramento",
+      "priority": 2,
+      "identity": "unverified",
+      "contact": "events@rev.wine",
+      "source": null
+    },
+    {
+      "id": "franquette",
+      "name": "Franquette",
+      "city": "West Sacramento",
+      "priority": 2,
+      "identity": "unverified"
+    },
+    {
+      "id": "preserve",
+      "name": "Preserve",
+      "city": "Winters",
+      "priority": 2,
+      "identity": "unverified"
+    },
+    {
+      "id": "paesanos",
+      "name": "Paesanos",
+      "city": "Davis",
+      "priority": 2,
+      "identity": "unverified"
+    },
+    {
+      "id": "carbonis",
+      "name": "Carbonis Hotel",
+      "city": "Winters",
+      "priority": 2,
+      "identity": "unverified"
+    },
+    {
+      "id": "58-degrees",
+      "name": "58 Degrees",
+      "city": null,
+      "priority": 3,
+      "identity": "closed"
+    },
+    {
+      "id": "hoobys-downtown",
+      "name": "Hoobys downtown",
+      "city": null,
+      "priority": 3,
+      "identity": "unverified"
+    },
+    {
+      "id": "hoobys-farm",
+      "name": "Hoobys farm",
+      "city": null,
+      "priority": 3,
+      "identity": "unverified"
+    },
+    {
+      "id": "green-river",
+      "name": "Green River",
+      "city": null,
+      "priority": 3,
+      "identity": "unverified"
+    },
+    {
+      "id": "sudwerk",
+      "name": "Sudwerk",
+      "city": null,
+      "priority": 3,
+      "identity": "unverified"
+    },
+    {
+      "id": "tommy-js",
+      "name": "Tommy Js",
+      "city": null,
+      "priority": 3,
+      "identity": "unverified"
+    },
+    {
+      "id": "burger-saloon",
+      "name": "Burger Saloon",
+      "city": null,
+      "priority": 3,
+      "identity": "unverified"
+    },
+    {
+      "id": "blue-note",
+      "name": "Blue Note",
+      "city": null,
+      "priority": 3,
+      "identity": "ambiguous"
+    },
+    {
+      "id": "twist",
+      "name": "Twist Food Hall",
+      "city": null,
+      "priority": 3,
+      "identity": "ambiguous"
+    }
+  ]
+}
