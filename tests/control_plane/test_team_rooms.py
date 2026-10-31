@@ -246,6 +246,18 @@ def test_attach_refuses_bad_input_for_the_stated_reason(plane):
     assert len(p.svc._log) == n
 
 
+def test_detach_leaves_a_grant_the_owner_made_by_hand_after_the_team_one_ended(plane):
+    p = plane
+    impl, rev, roles = two_agents(p)
+    team = p.team()
+    p.attach(team, roles)
+    assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/agents/{impl['agent_id']}/remove", {})[0] == 200
+    assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/agents", {"agent_id": impl["agent_id"], "actions": ["read"]})[0] == 201
+    assert p.detach(team)[0] == 200
+    assert actions_of(p, impl) == {p.room: ["read"]}                               # the hand-made grant is not the team's to remove
+    assert actions_of(p, rev) == {}
+
+
 def test_an_agent_that_already_holds_a_grant_is_refused_not_merged(plane):
     p = plane
     impl, rev, roles = two_agents(p)
@@ -610,6 +622,23 @@ def test_a_crash_between_the_decision_and_the_task_finishes_exactly_once(plane, 
     assert len([e for e in crashed._log if e["event_type"] == "task_created"]) == 1
     again = crashed.decide_suggestion(owner, p.room, sid, {"decision": "approve", "expected_digest": digest})
     assert again["replayed"] is True and len([e for e in crashed._log if e["event_type"] == "task_created"]) == 1
+
+
+def test_a_crash_after_the_task_but_before_the_materialized_record_reuses_that_task(plane, tmp_path):
+    p = plane
+    impl = worker(p)
+    sug = p.suggest("dave")[1]
+    sid, digest = sug["suggestion_id"], sug["digest"]
+    assert p.decide(sid, decision="approve", expected_digest=digest, target_agent_id=impl["agent_id"])[0] == 200
+    log = p.svc._log
+    cut = next(i for i, e in enumerate(log) if e["event_type"] == "task_created" and e["payload"].get("suggestion_id") == sid)
+    crashed = _new_service(tmp_path, p.clock, name="crashed2")
+    crashed.hydrate(log[:cut + 1])
+    assert crashed._sg[sid]["state"] == "approved" and len([e for e in crashed._log if e["event_type"] == "task_created"]) == 1
+    owner = crashed.authenticate(f"Bearer {USERS['alice']}", None)
+    out = crashed.decide_suggestion(owner, p.room, sid, {"decision": "approve", "expected_digest": digest})
+    assert out["state"] == "materialized" and len([e for e in crashed._log if e["event_type"] == "task_created"]) == 1
+    assert out["task_id"] == log[cut]["payload"]["task_id"]
 
 
 def test_level_attachment_and_the_pending_queue_are_identical_after_a_restart(plane, tmp_path):
