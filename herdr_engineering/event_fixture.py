@@ -14,8 +14,10 @@ from .artifacts import ArtifactWorkspaceProvider, FilesystemArtifactWorkspace, P
 from .event_coordinator import Coordinator, Requirements, Venue
 
 
-def prepare_fixture(data: dict, workspace: ArtifactWorkspaceProvider) -> PublishResult:
-    coordinator = Coordinator("user:fixture", "task:event-draft-001", Requirements(**data["requirements"]),
+def prepare_fixture(data: dict, workspace: ArtifactWorkspaceProvider, *,
+                    user_id: str = "user:fixture",
+                    task_id: str = "task:event-draft-001") -> PublishResult:
+    coordinator = Coordinator(user_id, task_id, Requirements(**data["requirements"]),
                               tuple(v["id"] for v in data["venues"]), ("resource:event-fixture",))
     request, result = coordinator.browser_proposal("request:event-fixture-001", ("resource:event-fixture",))
     rows = []
@@ -34,6 +36,8 @@ def prepare_fixture(data: dict, workspace: ArtifactWorkspaceProvider) -> Publish
         })
     report = {
         "version": 1, "mode": "offline_fixture", "source": data["source"],
+        "requirements": asdict(coordinator.requirements),
+        "missing_requirements": coordinator.requirements.missing(),
         "completion": "drafts_prepared_outreach_blocked", "venues": rows,
         "browser": {"request": request, "result": result}, "checkpoint": coordinator.dumps(),
     }
@@ -49,9 +53,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--user-id", default="user:fixture")
+    parser.add_argument("--task-id", default="task:event-draft-001")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True, mode=0o700)
-    result = prepare_fixture(json.loads(args.fixture.read_text()), FilesystemArtifactWorkspace(root=args.output))
+    result = prepare_fixture(json.loads(args.fixture.read_text()), FilesystemArtifactWorkspace(root=args.output),
+                             user_id=args.user_id, task_id=args.task_id)
     print(json.dumps({"status": result.status, "artifact": result.artifact.to_dict() if result.artifact else None,
                       "error": result.error}))
     return 0 if result.ok else 1

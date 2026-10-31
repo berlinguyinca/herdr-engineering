@@ -76,3 +76,11 @@ wrapped by urllib as URLError, before the test receives the expected HTTP 400.
 Unread-body rejection while the client is still uploading is the source-grounded
 explanation for the reset on this macOS/Python 3.14 environment; no packet trace was
 collected. This concerns baseline HTTP rejection behavior, not event fixture code.
+
+Delegation-scope extension: optional keyword user_id/task_id and matching CLI flags
+preserve legacy defaults. Two API/CLI regression tests failed before implementation;
+52 focused tests passed afterward, including explicit scope propagation through
+drafts/checkpoint/browser envelopes/artifact mission and legacy defaults. Report
+schema now exposes requirements and missing_requirements, preserving source provenance
+and unknown venue cost status. Ruff, compilation and diff checks passed. No browser
+imports, grants, runtime orchestration or dependencies were added.

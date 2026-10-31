@@ -12,7 +12,9 @@
     "completion",
     "venues",
     "browser",
-    "checkpoint"
+    "checkpoint",
+    "requirements",
+    "missing_requirements"
   ],
   "properties": {
     "version": {
@@ -52,6 +54,73 @@
     "checkpoint": {
       "type": "string",
       "contentMediaType": "application/json"
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "date_time",
+        "timezone",
+        "adults",
+        "children",
+        "budget",
+        "currency"
+      ],
+      "properties": {
+        "date_time": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timezone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "adults": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "children": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "budget": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "currency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "missing_requirements": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "date_time",
+          "timezone",
+          "adults",
+          "children",
+          "budget",
+          "currency"
+        ]
+      }
     }
   },
   "$defs": {

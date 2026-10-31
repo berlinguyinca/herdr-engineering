@@ -202,7 +202,9 @@ def test_fixture_workflow_publishes_hash_verified_local_drafts(tmp_path):
     assert len(report["venues"]) == 16
     assert report["browser"]["result"]["status"] == "unbound"
     assert all(v["blockers"] and v["draft"]["recipient"] is None for v in report["venues"])
-    assert Coordinator.loads(report["checkpoint"]).requirements.missing()
+    restored = Coordinator.loads(report["checkpoint"])
+    assert restored.requirements.missing()
+    assert (restored.user_id, restored.task_id) == ("user:fixture", "task:event-draft-001")
     assert report["source"]["live_verified"] is False
     assert report["completion"] == "drafts_prepared_outreach_blocked"
 
@@ -263,3 +265,40 @@ def test_dinner_eight_400_fixture_and_report_schema(tmp_path):
     assert all("400 USD" in v["draft"]["body"] for v in report["venues"])
     assert report["browser"]["result"]["status"] == "unbound"
     assert all(v["comparison"]["costs"]["status"] == "unknown" for v in report["venues"])
+
+
+def test_fixture_preserves_explicit_delegation_scope_and_requirements(tmp_path):
+    from herdr_engineering.artifacts import FilesystemArtifactWorkspace
+    from herdr_engineering.event_fixture import prepare_fixture
+
+    fixture = Path(__file__).parent / "fixtures/event_coordinator/dinner-eight-under-400.json"
+    data = json.loads(fixture.read_text())
+    ws = FilesystemArtifactWorkspace(root=tmp_path)
+    result = prepare_fixture(data, ws, user_id="user:main", task_id="task:main-dinner")
+    report = json.loads(ws.read(result.artifact))
+    restored = Coordinator.loads(report["checkpoint"])
+    assert (restored.user_id, restored.task_id) == ("user:main", "task:main-dinner")
+    assert report["requirements"] == data["requirements"]
+    assert set(report["missing_requirements"]) == {"date_time", "timezone"}
+    assert report["source"] == data["source"]
+    for envelope in report["browser"].values():
+        assert envelope["scope"] == {"user_ref":"user:main", "account_ref":None, "task_ref":"task:main-dinner"}
+    assert all(v["draft"]["user_id"] == "user:main" and v["draft"]["task_id"] == "task:main-dinner" for v in report["venues"])
+    assert "/task-main-dinner/" in result.artifact.uri
+
+
+def test_fixture_cli_preserves_explicit_scope(tmp_path):
+    import subprocess
+    import sys
+
+    fixture = Path(__file__).parent / "fixtures/event_coordinator/dinner-eight-under-400.json"
+    completed = subprocess.run([
+        sys.executable, "-m", "herdr_engineering.event_fixture", "--fixture", str(fixture),
+        "--output", str(tmp_path), "--user-id", "user:cli", "--task-id", "task:cli-dinner",
+    ], capture_output=True, text=True, check=True)
+    metadata = json.loads(completed.stdout)
+    assert metadata["status"] == "published"
+    assert "/task-cli-dinner/" in metadata["artifact"]["uri"]
+    report = json.loads(next(tmp_path.rglob("report.json")).read_text())
+    assert report["browser"]["request"]["scope"]["user_ref"] == "user:cli"
+    assert Coordinator.loads(report["checkpoint"]).task_id == "task:cli-dinner"

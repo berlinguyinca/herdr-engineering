@@ -62,13 +62,18 @@ PYTHONPATH=. python3 -m herdr_engineering.event_fixture \
   --output /tmp/herdr-dinner-fixture-artifacts
 ```
 
-Public fixture API: `prepare_fixture(data: dict, workspace: ArtifactWorkspaceProvider)
--> PublishResult` in `herdr_engineering/event_fixture.py`. `data` has `source`,
+Public fixture API: `prepare_fixture(data: dict, workspace: ArtifactWorkspaceProvider,
+*, user_id="user:fixture", task_id="task:event-draft-001") -> PublishResult` in `herdr_engineering/event_fixture.py`. `data` has `source`,
 `requirements` and `venues`, as illustrated by either JSON fixture. Venue keys are
 `id/name/city/identity/priority`, optional historical `contact/source`. Requirements
 keys are `date_time/timezone/adults/children/budget/currency`; unknown values are null.
 Output is an immutable artifact reference; `workspace.read(result.artifact)` returns
-report JSON. Fixture IDs/sender are deliberately synthetic and fixed in this wrapper.
+report JSON. Fixture sender is deliberately synthetic. User/task IDs default to the legacy fixture
+values but accept explicit trusted delegation scope through keyword arguments or
+CLI `--user-id` / `--task-id`. Scope is preserved in drafts, checkpoint, browser
+envelopes and artifact mission. Reports include `requirements` (nulls preserved),
+`missing_requirements`, original `source` provenance and per-venue cost evidence;
+unknown costs remain `comparison.costs.status == "unknown"`.
 
 General domain API for main orchestration: construct
 `Coordinator(user_id, task_id, Requirements(...), venue_ids=(...), resource_refs=(...))`.
@@ -77,3 +82,12 @@ Then use `draft(venue, sender)`, `observe(Evidence(...))`, `comparison(venue_id)
 scope through your authenticated orchestration; never infer it from model/page content.
 Main can supply its own input dictionaries or use the domain directly without editing
 these files. Review UI/delegation/task-scope orchestration remain main-lane ownership.
+
+Example explicit delegation (run from the pinned event worktree):
+
+```sh
+PYTHONPATH=. python3 -m herdr_engineering.event_fixture \
+  --fixture tests/fixtures/event_coordinator/dinner-eight-under-400.json \
+  --output /tmp/herdr-dinner-fixture-artifacts \
+  --user-id user:main-fixture --task-id task:main-dinner
+```
