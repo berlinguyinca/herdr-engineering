@@ -2337,20 +2337,20 @@ def _make_handler(server, public=False, operator=False):
             path = self.path.split("?")[0]
             # Decide on the DECODED resource: routing unquotes each segment, so a raw
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
-            segs = path.split("/")
-            res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
+            segs = [unquote(seg) for seg in path.split("/")]
+            dpath = "/".join(segs)          # what the router matches: every guard below tests THIS, never the raw path
+            res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
-                    or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
-                    or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
+                    or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
+                    or _TERMINAL_ATTACH.match(dpath) or _STEER_ACK.match(dpath) or _is_rereview(dpath)):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
-            if path.split("/")[3:4] and path.split("/")[3] in {
-                    "artifacts", "artifact-reports", "artifact-jobs", "artifact-reviews", "publications"}:
+            if res in {"artifacts", "artifact-reports", "artifact-jobs", "artifact-reviews", "publications"}:
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
