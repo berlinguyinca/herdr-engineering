@@ -222,7 +222,11 @@ may hold at most 4096 staged uploads (a module constant; every upload directory 
   edge ceiling, so the edge is the effective limit. Other routes keep their 600/min.
 - nginx buffers up to 768k of body per `/mcp` request from any client before the control plane decides whether to
   admit it (above 64 KiB only for an authenticated agent with a write grant, and only for `artifact_stage_chunk`).
-  That exposure is bounded by `hcn_mcp`, by `client_body_timeout 10s` and by the per-address connection limit.
+  That exposure is bounded by `hcn_mcp`, by `client_body_timeout 10s` and by connection limits: `/mcp` allows 8
+  concurrent requests per source address (`mcpconn`) and 64 in all (`mcptotal`), so at most 64 x 768 KiB =
+  48 MiB of bodies are spooled at once. They land in the edge's `/var/cache/nginx` tmpfs, which is sized explicitly
+  (`size=64m`, `/run` 8m) in `compose.collab.yaml`, and the edge's `mem_limit` is 256m because tmpfs pages count
+  against it (64m spool + 8m + nginx buffers/zones). A test pins these directives.
 - Credential guessing is bounded by these two rate limits only. Failed agent authentications are counted
   (`auth_failures`) but there is no lockout.
 
