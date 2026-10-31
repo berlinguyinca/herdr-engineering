@@ -121,7 +121,23 @@ def test_action_request_response_and_event_never_leak_command_display_or_canary(
     events = list_events(hub.store, tenant_id="t1", user_id="u1", kind="action_request")
     assert len(events) == 1 and events[0].provenance == "worker_reported"
     assert set(events[0].payload) == {"outcome", "source", "verb", "key_id"}
+    key = derive(RawAction(tool="Bash", command=cmd, repo="acme/repo")).key
+    expect_verb, expect_id = (key.verb.value, key.key_id()) if key else ("unknown", "")
+    body = body_of(out)
+    assert events[0].payload == {"outcome": body["outcome"], "source": body["source"], "verb": expect_verb,
+                                 "key_id": expect_id}
     assert CANARY not in json.dumps(events[0].payload) and "deploy-tool" not in json.dumps(events[0].payload)
+
+
+def test_event_payload_for_a_known_action_carries_its_verb_and_key_id():
+    hub = make_hub()
+    auth = enrol(hub, scopes=ACT)
+    body = body_of(act(hub, auth))
+    key = derive(RawAction(tool="Bash", command=PUSH, repo="acme/repo")).key
+    ev = list_events(hub.store, tenant_id="t1", user_id="u1", kind="action_request")[0]
+    assert ev.payload == {"outcome": body["outcome"], "source": body["source"], "verb": key.verb.value,
+                          "key_id": key.key_id()}
+    assert key.verb.value == "git.push"
 
 
 def test_hint_over_cap_rejected():

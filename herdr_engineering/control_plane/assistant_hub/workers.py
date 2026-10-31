@@ -233,12 +233,16 @@ class WorkerRegistry:
             return w
 
     def set_scopes(self, tenant_id: str, user_id: str, worker_id: str, scopes: Sequence[str]) -> Worker:
+        from ..assistant import AssistantNotFound
+
         granted = _normalize_scopes(scopes)
         with self._store._lock:
             try:
                 w = self._owned(worker_id, tenant_id, user_id)
-            except Exception as exc:
+            except AssistantNotFound as exc:
                 raise KeyError(worker_id) from exc
+            if w.status != "active":
+                raise ValueError("a revoked worker's scopes cannot be changed")
             old = list(w.scopes)
             w.scopes = granted
             self._store._after_mutation()

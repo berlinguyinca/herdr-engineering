@@ -285,11 +285,32 @@ def test_enrollment_scopes_are_validated_deduped_sorted_and_applied():
             reg.create_enrollment(tenant_id="t1", user_id="u1", name="b", harness="pi", scopes=bad)
 
 
-def test_existing_worker_keeps_its_stored_read_scope():
+def test_existing_worker_keeps_its_stored_read_scope_and_old_rows_load_with_defaults():
     store, reg, _ = make()
     worker, _ = enroll(reg)
     worker.scopes = ["ask", "report", "read"]                     # a Phase 1 worker
-    assert store.workers[worker.worker_id].scopes == ["ask", "report", "read"]
+    pending, _ = reg.create_enrollment(tenant_id="t1", user_id="u1", name="p", harness="pi")
+    snap = json.loads(json.dumps(store.snapshot(), default=str))
+    old_worker = dict(snap["workers"][0])
+    old_worker.update(worker_id="wrk_old")
+    old_worker.pop("scopes")
+    snap["workers"].append(old_worker)
+    for e in snap["enrollments"]:
+        e.pop("scopes", None)                                     # enrollments written before scopes existed
+    fresh = AssistantStore()
+    fresh.restore(snap)
+    assert fresh.workers[worker.worker_id].scopes == ["ask", "report", "read"]
+    assert fresh.workers["wrk_old"].scopes == ["ask", "report"]
+    assert fresh.enrollments[pending.enrollment_id].scopes == ["ask", "report"]
+
+
+def test_set_scopes_refuses_a_revoked_worker():
+    _, reg, _ = make()
+    worker, _ = enroll(reg)
+    reg.revoke(worker.worker_id, tenant_id="t1", user_id="u1")
+    with pytest.raises(ValueError):
+        reg.set_scopes("t1", "u1", worker.worker_id, ["ask", "act"])
+    assert worker.scopes == ["ask", "report"]
 
 
 def test_set_scopes_updates_persists_and_audits():

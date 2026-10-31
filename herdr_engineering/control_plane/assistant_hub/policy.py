@@ -36,6 +36,8 @@ class Decision:
     grant_id: str | None
     veto_code: str | None
     source: Source
+    verb: str = ""          # derived key facts for the caller's event; empty when no key could be derived
+    key_id: str = ""
 
 
 class ActivationRefused(ValueError):
@@ -144,6 +146,13 @@ def _pending(store: AssistantStore, worker: Worker, raw: RawAction, derived: Der
 def decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, session_id: str, task_id: str,
            now: datetime) -> Decision:
     derived = derive(raw)
+    key = derived.key
+    return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now),
+                   verb=key.verb.value if key else Verb.UNKNOWN.value, key_id=key.key_id() if key else "")
+
+
+def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
+            task_id: str, now: datetime) -> Decision:
     veto = check_vetoes(derived, _extra_rules(cfg))
     if veto is not None:
         return _deny(store, worker, raw, derived, veto, session_id, task_id, now)

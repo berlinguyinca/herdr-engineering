@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..assistant import AssistantError
-from .canonical import RawAction, derive
+from .canonical import RawAction
 from .events import EVENTS_PER_WORKER_PER_MINUTE, RateLimiter, record_event
 from .policy import decide
 from .workers import Worker, WorkerAuthError
@@ -191,11 +191,10 @@ def _action_request(hub: Hub, worker: Worker, args: dict) -> dict:
     if not hub.event_limiter.allow(worker.worker_id, hub.event_rate_limit):      # one slot per call, taken here
         raise _ToolError("rate limited")
     d = decide(hub.store, hub.service.config["grants"], worker, raw, session_id, task_id, hub.service.now())
-    key = derive(raw).key
     try:
         record_event(hub.store, worker, kind="action_request", provenance="worker_reported", session_id=session_id,
                      payload={"outcome": d.outcome, "source": d.source,
-                              "verb": key.verb.value if key else "unknown", "key_id": key.key_id() if key else ""})
+                              "verb": d.verb, "key_id": d.key_id})
     except ValueError as exc:
         raise _ToolError(str(exc)) from exc
     return _text({"outcome": d.outcome, "reason": d.reason, "request_id": d.request_id, "grant_id": d.grant_id,
