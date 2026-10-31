@@ -5,6 +5,7 @@ Real sockets, real frozen bundles, the real isolated sanitiser child. Helpers co
 import json
 import re
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -12,6 +13,7 @@ from herdr_engineering.control_plane import share_public, share_render
 from herdr_engineering.control_plane.share_session import csrf_token
 from tests.control_plane.test_share_annotate import (
     FRAME_RE,
+    ORIGIN,
     SECRET,
     TOKEN,
     base,
@@ -106,15 +108,18 @@ def test_csp_header_by_header(lab):
     csp = parse_csp(a(lab, "notes.txt")[1]["content-security-policy"])
     script = csp["script-src"]
     assert len(script) == 2 and script[0].startswith("'nonce-") and script[1] == "'strict-dynamic'"
-    expected = {"default-src": ["'none'"], "style-src": ["'self'"], "style-src-elem": ["'self'", "'unsafe-inline'"],
-                "style-src-attr": ["'unsafe-inline'"], "img-src": ["'self'", "data:"], "font-src": ["'self'"],
-                "connect-src": ["'self'"], "worker-src": ["'self'"], "frame-src": ["'none'"], "child-src": ["'none'"],
+    share = f"{ORIGIN}/s/{TOKEN}/"
+    expected = {"default-src": ["'none'"], "style-src-elem": [f"{ORIGIN}/s/static/", share, "'unsafe-inline'"],
+                "style-src-attr": ["'unsafe-inline'"], "img-src": [share, "data:"],
+                "font-src": [share, f"{ORIGIN}/s/static/", "data:"], "connect-src": [share],
+                "worker-src": [f"{ORIGIN}/s/static/vendor/pdfjs/"], "frame-src": ["'none'"], "child-src": ["'none'"],
                 "object-src": ["'none'"], "base-uri": ["'none'"], "form-action": ["'none'"],
                 "frame-ancestors": ["'none'"]}
     for name, value in expected.items():
         assert csp[name] == value, name
     assert set(csp) == set(expected) | {"script-src"}
-    assert not any(t.startswith(("http", "*")) for ds in csp.values() for t in ds)
+    assert not any(t in ("'self'", "blob:", "*") for ds in csp.values() for t in ds)
+    assert not any(t.startswith("http") and not t.startswith(ORIGIN) for ds in csp.values() for t in ds)
 
 
 def test_csrf_is_delivered_only_in_our_markup(lab):
@@ -241,22 +246,48 @@ def test_a_view_records_an_annotate_opened_event_for_the_entry(lab):
     assert {"file": "index.html", "mode": "annotate"} in [e["detail"] for e in events if e["kind"] == "opened"]
 
 
-def test_render_errors_map_to_uniform_responses(lab, monkeypatch):
-    ref = lab.request("GET", "/nothing-here")[2]
-    # the error mapping is the unit under test; the real child is covered by the rest of this module
-    for exc, status in ((share_render.RenderBusy(), 503), (share_render.RenderFailed("x /secret/path"), 404),
-                        (share_render.RenderTimeout("slow"), 404)):
-        def boom(*_args, _exc=exc, **_kw):
-            raise _exc
-        monkeypatch.setattr(share_public, "sanitize_html", boom)
-        got, h, body = a(lab, "page2.html")
-        assert got == status and b"secret" not in body and b"slow" not in body
-        if status == 404:
-            assert body == ref
-        else:
+def test_render_failures_map_to_uniform_responses(tmp_path, monkeypatch):
+    """Every case is provoked through the real isolated child; nothing is stubbed."""
+    files = {"index.html": b"<p>i</p>",
+             "tripwire.html": b'<p title="' + CLOSE_TEMPLATE.encode() + b'<img src=x onerror=1>">x</p>',
+             "huge.html": b"< " * 1_000_000, "slowish.html": b"<div>" * 9000 + b"slow-one"}
+    for k in range(8):
+        files[f"busy{k}.html"] = b"<div>" * 9000 + b"distinct-%d" % k
+    env = make_env(tmp_path, files=files)
+    try:
+        share_render.clear_sanitize_caches()
+        ref = env.request("GET", "/nothing-here")[2]
+        # RenderFailed: the output tripwire refuses the page, uniformly and without detail
+        status, _, body = a(env, "tripwire.html")
+        assert (status, body) == (404, ref)
+        # RenderTooLarge: the 2 MiB input is within the cap but parses to more than the output cap
+        status, _, body = a(env, "huge.html")
+        assert status == 200 and b"too large to show" in body
+        # RenderTimeout: a legitimate module constant, then a payload that cannot finish in time
+        monkeypatch.setattr(share_render, "SANITIZE_DEADLINE_SECONDS", 0.05)
+        status, _, body = a(env, "slowish.html")
+        assert (status, body) == (404, ref)
+        # RenderBusy: more concurrent renders than the pending cap
+        with ThreadPoolExecutor(8) as pool:
+            results = list(pool.map(lambda k: a(env, f"busy{k}.html"), range(8)))
+        busy = [r for r in results if r[0] == 503]
+        assert busy, [r[0] for r in results]
+        for _, h, body in busy:
             assert body == share_public.UNAVAILABLE_BODY and h["retry-after"] == "5"
-    monkeypatch.setattr(share_public, "sanitize_html", lambda *_a, **_k: (_ for _ in ()).throw(share_render.RenderTooLarge()))
-    assert b"too large to show" in a(lab, "page2.html")[2]
+        assert all(r[0] in (200, 404, 503) for r in results)
+    finally:
+        env.close()
+
+
+def test_back_to_back_renders_from_short_lived_threads_all_succeed(tmp_path):
+    files = {f"p{k}.html": b"<p>page %d</p>" % k for k in range(12)} | {"index.html": b"<p>i</p>"}
+    env = make_env(tmp_path, files=files)
+    try:
+        share_render.clear_sanitize_caches()
+        statuses = [a(env, f"p{k}.html")[0] for k in range(12)]       # each on a fresh server thread, no gaps
+        assert statuses == [200] * 12
+    finally:
+        env.close()
 
 
 def test_sanitised_output_is_cached_per_share_file_hash_and_resolver(lab, monkeypatch):

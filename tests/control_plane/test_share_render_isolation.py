@@ -373,3 +373,30 @@ print('ok')
 """
     done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60, check=False)
     assert done.stdout.strip() == "ok", done.stderr[-800:]
+
+
+# -------------------------------------------------------------------------------------- the real child's lifetime
+
+def test_child_survives_the_thread_that_spawned_it() -> None:
+    """The child must not be tied to its spawning thread (request threads are short-lived)."""
+    sr._WORKER._kill()
+    box: list[str] = []
+    worker = threading.Thread(target=lambda: box.append(sr.sanitize_html(b"<p>a</p>", resolve=keep)))
+    worker.start()
+    worker.join()
+    assert box
+    proc = sr._WORKER._proc
+    assert proc is not None
+    time.sleep(0.3)
+    assert proc.poll() is None
+    assert "<p>b</p>" in sr.sanitize_html(b"<p>b</p>", resolve=keep)
+
+
+def test_real_child_exits_when_the_parent_pipe_closes() -> None:
+    sr._WORKER._kill()
+    sr.sanitize_html(b"<p>a</p>", resolve=keep)
+    proc = sr._WORKER._proc
+    assert proc is not None and proc.stdin is not None
+    proc.stdin.close()
+    assert proc.wait(timeout=10) == 0
+    sr._WORKER._proc = None

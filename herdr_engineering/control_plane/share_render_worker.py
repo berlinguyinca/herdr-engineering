@@ -11,8 +11,8 @@ checked strictly. Child to parent: ``{"t": "ready"}`` once at start, then per jo
 library failed, including a Rust panic). Parent to child: ``{"t": "job", "id", "text"}``.
 
 Hardening applied before any data is read (best effort, NOT a sandbox: there is no seccomp filter and no network
-namespace, so a compromised child can still use the network and read what its uid can read): parent-death signal, no
-new privileges, address-space, open-file and process-count limits, and a CPU limit re-armed per job. The parent's
+namespace, so a compromised child can still use the network and read what its uid can read): no
+new privileges (parent death is handled by stdin EOF, not a death signal, which is tied to the spawning thread), address-space, open-file and process-count limits, and a CPU limit re-armed per job. The parent's
 wall-clock deadline and SIGKILL are the guarantee; these only stop a runaway child the parent has not killed yet.
 """
 
@@ -23,7 +23,6 @@ import json
 import os
 import re
 import resource
-import signal
 import struct
 import sys
 import time
@@ -245,7 +244,8 @@ def _harden() -> None:
     """Best-effort self-restriction before any data is read. Each step is skipped, not fatal, where unsupported."""
     try:
         libc = ctypes.CDLL(None, use_errno=True)
-        libc.prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+        # No PR_SET_PDEATHSIG: it fires when the SPAWNING THREAD exits, and the parent spawns from request threads.
+        # Parent death is covered by stdin EOF (``serve`` returns) and the parent's atexit kill.
         libc.prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS
     except (OSError, AttributeError):
         pass

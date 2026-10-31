@@ -175,14 +175,15 @@ VIEW_CSP = ("default-src 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; st
             "font-src {origin}/s/{token}/ {origin}/s/static/ data:; connect-src {origin}/s/{token}/; "
             "worker-src {origin}/s/static/vendor/pdfjs/; frame-src 'none'; child-src 'none'; object-src 'none'; "
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-# The annotation view. Sanitised content lives in a shadow root of THIS document, so its <style> elements and style
-# attributes are governed by the page policy: 'unsafe-inline' is allowed for those two directives and nowhere else
-# (script-src has neither it nor 'self'; a style cannot run code). Every remote origin stays out of style-src-elem, so an
-# @import of a remote sheet cannot load. Fetches (images, fonts, XHR, the pdf.js worker) are same-origin only.
-ANNOTATE_CSP = ("default-src 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; style-src 'self'; "
-                "style-src-elem 'self' 'unsafe-inline'; style-src-attr 'unsafe-inline'; img-src 'self' data:; "
-                "font-src 'self'; connect-src 'self'; worker-src 'self'; frame-src 'none'; child-src 'none'; "
-                "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+# The annotation view: the plan's view policy (``VIEW_CSP``), path-scoped to this share, with these deviations.
+#   * img-src has NO ``blob:`` (the plan's ``data: blob:``): sanitised content images are same-share ``f/`` URLs or
+#     ``data:`` images, and pdf.js draws on canvases, so nothing needs a blob URL.
+#   * ``style-src-elem`` and ``style-src-attr`` keep ``'unsafe-inline'`` (as the plan does): the sanitiser keeps content
+#     <style> elements and style attributes inside the shadow root and they cannot carry our nonce. A style cannot run
+#     code, and no remote origin is allowed in either directive (an @import of a remote sheet cannot load).
+#   * font-src keeps ``data:`` (plan); there is no ``style-src`` (the two split directives cover every style use).
+# Verified in a real browser by tests/playwright/annotate-view.test.mjs.
+ANNOTATE_CSP = VIEW_CSP.replace("img-src {origin}/s/{token}/ data: blob:;", "img-src {origin}/s/{token}/ data:;")
 PDFJS_CONFIG = {"module": "/s/static/vendor/pdfjs/pdf.min.mjs", "worker": "/s/static/vendor/pdfjs/pdf.worker.min.mjs",
                 "options": {"isEvalSupported": False, "enableXfa": False}}
 MODE_SWITCH_TEMPLATE = (
@@ -1189,7 +1190,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         finally:
             os.close(fd)
         nonce, body = self._render_view(state, parts, got, name, shown, content, mode, lab)
-        csp = (ANNOTATE_CSP.format(nonce=nonce) if mode == "annotate"
+        csp = (ANNOTATE_CSP.format(origin=origin, token=token, nonce=nonce) if mode == "annotate"
                else VIEW_CSP.format(origin=origin, token=token, nonce=nonce))
         headers = [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
                    ("Content-Security-Policy", csp),
