@@ -299,7 +299,8 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, evolution=None, learning=None, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256, single_operator=False,
-                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
+                 assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
+                 fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None,
@@ -477,7 +478,8 @@ class ControlPlaneServer:
             from .assistant import AssistantService
             from .assistant import assistant_config as _build_assistant_config
             self.assistant = AssistantService(
-                config=_build_assistant_config(assistant_config or {}), repo=repo)
+                config=_build_assistant_config(assistant_config or {}), repo=repo,
+                delegation_adapter=assistant_delegation_adapter)
         else:
             self.assistant = assistant_service
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
@@ -1695,6 +1697,11 @@ class ControlPlaneServer:
             self.learning_trails.sweep()
         except Exception as exc:
             log.warning("learning trail sweep failed: %s", type(exc).__name__)
+        try:
+            if self.assistant.config.get("enabled"):
+                self.assistant.maintain_delegations()
+        except Exception as exc:
+            log.warning("assistant delegation maintenance failed: %s", type(exc).__name__)
 
     def _link_flush_loop(self, interval=30):
         """T14: tell the lineage graph what it missed about cross-workspace links (a retraction the graph was down
@@ -4814,6 +4821,9 @@ def _make_handler(server, public=False, operator=False):
                                      assistant_id=body.get("assistant_id", ""),
                                      task=body.get("task", ""),
                                      target_system=body.get("target_system", "pi"),
+                                     context=body.get("context"),
+                                     source_refs=body.get("source_refs"),
+                                     idempotency_key=body.get("idempotency_key", ""),
                                      actor=user_id)
                     return self._json(d.as_dict(), 201)
                 if resource == "assistant-delegations" and len(parts) == 6 and parts[5] == "cancel":
