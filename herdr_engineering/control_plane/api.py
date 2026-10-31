@@ -3742,6 +3742,10 @@ def _make_handler(server, public=False, operator=False):
             if resource == "artifact-jobs" and server.artifact_graph_gate is not None \
                     and server.artifact_store is not None and len(parts) == 6 and parts[5] == "lineage":
                 return self._artifact_job_lineage(parts[4])
+            if resource == "artifacts" and server.artifact_graph_gate is not None \
+                    and server.artifact_store is not None and len(parts) == 8 and parts[5] == "versions" \
+                    and parts[7] == "collab-lineage":
+                return self._artifact_collab_lineage(parts[4], parts[6])
             if resource == "artifacts" and server.artifact_store is not None and len(parts) == 6 and parts[5] == "versions":
                 if not self._artifact_allowed(parts[4], 'edit'):
                     return self._artifact_forbidden()
@@ -5251,6 +5255,28 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             if version.get("job_id") != job_id:
                 return self._json({"error": "that version was not committed by this job"}, 409)
+            if server.artifact_graph_gate.version_retracted(artifact_id, version_id):
+                return self._json({"error": "artifact or version is retracted"}, 409)
+            from .artifact_lineage import emit_version_lineage
+            from .artifact_scope import visibility_fields
+            result = emit_version_lineage(server.ingest, {**version, "artifact_id": artifact_id}, self._principal(),
+                                          scope=visibility_fields(gated=True))
+            return self._json(result, 502 if result["error"] else 200)
+
+        def _artifact_collab_lineage(self, artifact_id, version_id):
+            """POST /api/v1/artifacts/<id>/versions/<vid>/collab-lineage {}: the collaborator applier reports a merge
+            version. The body carries nothing; the server reads the version from the registry. A caller without ``edit``
+            and an unknown version are both 404, so existence is not leaked."""
+            body = self._read_json() or {}
+            if not isinstance(body, dict) or body:
+                return self._json({"error": "body must be exactly {}"}, 400)
+            if not self._artifact_allowed(artifact_id, "edit"):
+                return self._deny(404, "not found")
+            version = self._artifact_call("get_version", version_id, artifact_id)
+            if version is None:
+                return self._deny(404, "not found")
+            if version.get("created_via") != "collaborator":
+                return self._json({"error": "that version was not committed by a collaborator"}, 409)
             if server.artifact_graph_gate.version_retracted(artifact_id, version_id):
                 return self._json({"error": "artifact or version is retracted"}, 409)
             from .artifact_lineage import emit_version_lineage
