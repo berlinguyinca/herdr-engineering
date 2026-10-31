@@ -19,13 +19,22 @@ the same mount (``rename`` cannot cross mounts), so the worst a hostile writer a
 place inside its own volume. Every component is checked first (non-empty, no ``/``, no NUL, not ``.``/``..``), because
 ``O_NOFOLLOW`` guards only the last component of a single open and ``..`` would climb out.
 
-``root`` itself is opened following symlinks: it is trusted deployment configuration, not attacker input.
+``root`` itself is opened following symlinks: it is trusted deployment configuration, not attacker input. Callers must
+pass the trusted mount point (the outbox or mirror volume as mounted) as ``root``, never a subdirectory path under
+``collab-public``'s control.
+
+The containment guarantee for a directory renamed away while its fd is held rests on the kernel refusing ``renameat`` /
+``linkat`` across mounts (``EXDEV``). It therefore requires the outbox to be a bind mount rooted at the outbox itself,
+with no overlapping read-write mount of ``collab-public`` in either direction (no mount of a parent of the outbox and no
+mount of a directory inside it). Under that deployment a hostile writer can only move things within its own volume.
 """
 from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import hashlib
+import io
 import json
 import math
 import os
@@ -58,7 +67,8 @@ META_NAME = "meta.json"
 VERIFIED_MARKER = "verified"
 AUDITED_MARKER = "audited"
 META_MAX_BYTES = 65_536
-MAX_TREE_DEPTH = 4  # remove_tree_beneath: an upload dir is flat; anything deeper is hostile
+MAX_TREE_DEPTH = 4  # remove_tree_beneath: an upload dir is flat; anything deeper is hostile (and cannot be swept)
+MAX_DIR_ENTRIES = MAX_CHUNK_INDEX + 1 + 64  # every part index plus meta, markers and a little slack
 
 _TICKET = re.compile(TICKET_RE)
 _UPLOAD = re.compile(UPLOAD_RE)
@@ -226,14 +236,54 @@ def read_json_beneath(root: Path, parts: list[str], *, max_bytes: int) -> dict |
     return obj if isinstance(obj, dict) else None
 
 
+class _BoundedReader(io.RawIOBase):
+    """A raw reader on ``fd`` that raises ``BridgeError`` as soon as more than ``limit`` bytes come out of the file,
+    so a file that grows after the open (or whose fstat under-reports) is never consumed past its cap."""
+
+    def __init__(self, fd: int, limit: int):
+        super().__init__()
+        self._fd, self._limit, self._count = fd, limit, 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        view = memoryview(buffer).cast("B")
+        if not len(view):
+            return 0
+        want = max(1, min(len(view), self._limit + 1 - self._count))
+        data = os.read(self._fd, want)
+        self._count += len(data)
+        if self._count > self._limit:
+            raise BridgeError("file grew past its size cap")
+        view[:len(data)] = data
+        return len(data)
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                os.close(self._fd)
+            finally:
+                super().close()
+
+
 def open_beneath(root: Path, parts: list[str], *, max_bytes: int | None = None) -> BinaryIO | None:
-    """A streaming reader on ``root/parts...`` with the same checks as ``read_bytes_beneath``; the caller closes it."""
+    """A streaming reader on ``root/parts...`` with the same checks as ``read_bytes_beneath``; the caller closes it.
+
+    With ``max_bytes`` the file must be at most that size at open, and reading raises ``BridgeError`` once more than
+    ``max_bytes`` bytes have come out (the file grew after the open), so the cap holds for the whole read.
+    """
     fd = _open_single(root, parts, max_bytes)
     if fd is None:
         return None
     try:
+        if max_bytes is not None:
+            return _BoundedReader(fd, max_bytes)
         return os.fdopen(fd, "rb")
-    except OSError:
+    except (OSError, ValueError):
         os.close(fd)
         return None
 
@@ -313,13 +363,58 @@ def atomic_write_json(dir: Path, name: str, obj: dict, *, mode: int = 0o644) -> 
     atomic_write_bytes(dir, name, data, mode=mode)
 
 
+_TMPFILE_FALLBACK = (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL)
+
+
+def _open_tmpfile(dfd: int) -> int:
+    """An unnamed ``O_TMPFILE`` in the directory ``dfd`` (raises ``OSError`` where unsupported)."""
+    return os.open(".", os.O_TMPFILE | os.O_WRONLY | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+
+
+def _link_tmpfile(dfd: int, name: str, data: bytes, mode: int) -> bool | None:
+    """The ``O_TMPFILE`` path of ``link_new_bytes``: True/False as it returns, or None when unsupported (fall back).
+
+    The file has no name until ``linkat`` gives it its final one, so there is never a ``.tmp-*`` leftover and never an
+    ``nlink == 2`` moment; a crash at any point leaves either nothing or the complete file.
+    """
+    try:
+        fd = _open_tmpfile(dfd)
+    except OSError as exc:
+        if exc.errno in _TMPFILE_FALLBACK:
+            return None
+        raise
+    try:
+        _write_all(fd, data)
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+        try:
+            os.link(f"/proc/self/fd/{fd}", name, dst_dir_fd=dfd, follow_symlinks=True)
+        except FileExistsError:
+            return False
+        except FileNotFoundError:  # no /proc: the unnamed file is discarded on close
+            return None
+    finally:
+        os.close(fd)
+    os.fsync(dfd)
+    return True
+
+
 def link_new_bytes(dir: Path, name: str, data: bytes, *, mode: int = 0o600) -> bool:
-    """Create ``dir/name`` with ``data`` unless it exists (False then; never replaced, never partial)."""
+    """Create ``dir/name`` with ``data`` unless it exists (False then; never replaced, never partial).
+
+    Uses ``O_TMPFILE`` + ``linkat`` where available. The fallback (no ``O_TMPFILE`` or no ``/proc``) writes a
+    ``.tmp-<rand>`` and links it: a crash there can leave a stale ``.tmp-*`` (ignored by ``list_parts`` and the read
+    helpers, removed by the staging sweep) and the final name briefly has ``nlink == 2``.
+    """
     if not _safe_part(name) or name.startswith(".tmp-"):
         raise BridgeError("unsafe file name")
+    data = bytes(data)
     dfd = _ensure_dir(dir)
     try:
-        tmp = _create_tmp(dfd, bytes(data), mode)
+        linked = _link_tmpfile(dfd, name, data, mode)
+        if linked is not None:
+            return linked
+        tmp = _create_tmp(dfd, data, mode)
         try:
             os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
         except FileExistsError:
@@ -351,6 +446,41 @@ def _walk_dirs(root: Path, parts: list[str]) -> int | None:
         os.close(dfd)
         return None
     return dfd
+
+
+def _scan_names(dfd: int, cap: int) -> list[str]:
+    """The entry names of the directory ``dfd``; ``BridgeError`` if there are more than ``cap``."""
+    names = []
+    with os.scandir(dfd) as it:
+        for entry in it:
+            names.append(entry.name)
+            if len(names) > cap:
+                raise BridgeError("too many entries")
+    return names
+
+
+def list_beneath(root: Path, parts: list[str], *, max_entries: int) -> list[tuple[str, os.stat_result]] | None:
+    """The entries of the real directory ``root/parts...`` with their no-follow ``lstat`` (sorted by name).
+
+    Symlinks, FIFOs and the like are reported as such (``S_ISLNK``/``S_ISFIFO``) so callers can skip them; an entry that
+    vanishes while listing is left out. None if any component is unsafe, a symlink or not a directory;
+    ``BridgeError("too many entries")`` past ``max_entries``.
+    """
+    dfd = _walk_dirs(root, parts)
+    if dfd is None:
+        return None
+    try:
+        out = []
+        for name in _scan_names(dfd, max_entries):
+            try:
+                out.append((name, os.stat(name, dir_fd=dfd, follow_symlinks=False)))
+            except FileNotFoundError:
+                continue
+        return sorted(out, key=lambda item: item[0])
+    except OSError:
+        return None
+    finally:
+        os.close(dfd)
 
 
 def write_marker_beneath(root: Path, parts: list[str], name: str, data: bytes = b"", *, mode: int = 0o644) -> bool:
@@ -408,11 +538,13 @@ def unlink_beneath(root: Path, parts: list[str], name: str) -> bool:
 
 def _empty_dir(dfd: int, depth: int) -> bool:
     """Remove everything inside the directory ``dfd``; recursion goes only through fds opened no-follow."""
-    if depth > MAX_TREE_DEPTH:
+    if depth > MAX_TREE_DEPTH:  # an over-deep tree is never swept; it stays (inside the volume) and returns False
         return False
     ok = True
-    with os.scandir(dfd) as it:
-        names = [entry.name for entry in it]
+    try:
+        names = _scan_names(dfd, MAX_DIR_ENTRIES)
+    except BridgeError:  # too many entries: treated as not emptied
+        return False
     for child in names:
         try:
             st = os.stat(child, dir_fd=dfd, follow_symlinks=False)
@@ -599,30 +731,17 @@ def read_staged_meta(root: Path, owner_key: str, upload_id: str) -> StagedUpload
 
 
 def list_parts(root: Path, owner_key: str, upload_id: str) -> list[int]:
-    """The sorted indices of the regular part files present in an upload dir (no symlink, dir or FIFO counts)."""
+    """The sorted indices of the regular, single-linked part files in an upload dir (no symlink, dir, FIFO or stale
+    ``.tmp-*`` counts). ``BridgeError("too many entries")`` past ``MAX_DIR_ENTRIES``."""
     try:
         parts = staging_parts(owner_key, upload_id)
     except BridgeError:
         return []
-    dfd = _walk_dirs(root, parts)
-    if dfd is None:
+    entries = list_beneath(root, parts, max_entries=MAX_DIR_ENTRIES)
+    if entries is None:
         return []
-    try:
-        with os.scandir(dfd) as it:
-            names = [e.name for e in it if _PART.match(e.name)]
-        out = []
-        for name in names:
-            try:
-                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
-            except OSError:
-                continue
-            if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
-                out.append(int(name))
-        return sorted(out)
-    except OSError:
-        return []
-    finally:
-        os.close(dfd)
+    return sorted(int(name) for name, st in entries
+                  if _PART.match(name) and stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
 
 
 def upload_complete(root: Path, owner_key: str, upload_id: str) -> bool:
@@ -641,7 +760,10 @@ def upload_complete(root: Path, owner_key: str, upload_id: str) -> bool:
     meta = read_staged_meta(root, owner_key, upload_id)
     if meta is None:
         return False
-    present = set(list_parts(root, owner_key, upload_id))
+    try:
+        present = set(list_parts(root, owner_key, upload_id))
+    except BridgeError:
+        return False
     return all(i in present for i in range(meta.total))
 
 
@@ -915,7 +1037,7 @@ __all__ = [
     "MCP_UPLOAD_MAX_BODY", "META_MAX_BYTES", "META_NAME", "SHA_RE", "StagedUpload", "TICKET_RE", "UPLOAD_RE",
     "VERIFIED_MARKER", "agent_owner_key", "atomic_write_bytes", "atomic_write_json", "link_new_bytes", "list_parts",
     "new_ticket", "open_beneath", "read_bytes_beneath", "read_json_beneath", "read_staged_meta",
-    "register_intent_kind", "remove_tree_beneath", "request_digest", "staging_parts", "staging_path",
+    "register_intent_kind", "list_beneath", "MAX_DIR_ENTRIES", "remove_tree_beneath", "request_digest", "staging_parts", "staging_path",
     "unlink_beneath", "upload_complete", "upload_id_for", "validate_changes", "validate_chunk",
     "validate_commit_payload", "validate_intent", "write_marker_beneath",
 ]

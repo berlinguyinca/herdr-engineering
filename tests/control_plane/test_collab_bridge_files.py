@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import math
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -51,6 +53,21 @@ def tree(tmp_path):
 
 
 @pytest.fixture
+def no_hang():
+    """Fail fast (instead of hanging the suite) if a FIFO open ever blocks."""
+    class Hung(BaseException):  # not an OSError, so no helper's ``except OSError`` can swallow it
+        pass
+
+    def boom(signum, frame):
+        raise Hung("blocked on a FIFO")
+    old = signal.signal(signal.SIGALRM, boom)
+    signal.alarm(5)
+    yield
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, old)
+
+
+@pytest.fixture
 def registry():
     saved = dict(cbf._INTENT_KINDS)
     yield
@@ -82,7 +99,7 @@ def test_read_json_beneath_refuses_a_symlinked_parent(tree):
     assert cbf.read_json_beneath(root, ["intents", "a.json"], max_bytes=100) is None
 
 
-def test_read_json_beneath_refuses_a_fifo_without_blocking(tree):
+def test_read_json_beneath_refuses_a_fifo_without_blocking(tree, no_hang):
     root, _ = tree
     os.mkfifo(root / "a.json")
     assert cbf.read_json_beneath(root, ["a.json"], max_bytes=100) is None
@@ -298,7 +315,7 @@ def test_unlink_beneath_refuses_a_symlinked_intent(tree):
     assert (outside / "sentinel").read_bytes() == SENTINEL
 
 
-def test_unlink_beneath_refuses_dirs_and_fifos_and_removes_files(tree):
+def test_unlink_beneath_refuses_dirs_and_fifos_and_removes_files(tree, no_hang):
     root, _ = tree
     (root / "intents" / "d").mkdir(parents=True)
     os.mkfifo(root / "intents" / "f")
@@ -736,3 +753,152 @@ def test_error_reasons_never_echo_names_or_text():
         with pytest.raises(IntentError) as err:
             cbf.validate_changes(changes, LIMITS)
         assert secret not in str(err.value)
+
+
+# ----------------------------------------------------------------------------- review fixes
+
+def test_read_cap_holds_when_fstat_under_reports(tree, monkeypatch):
+    root, _ = tree
+    (root / "p").write_bytes(b"x" * 11)
+    real_fstat = os.fstat
+
+    class Small:
+        def __init__(self, st):
+            self._st = st
+
+        def __getattr__(self, name):
+            return 5 if name == "st_size" else getattr(self._st, name)
+    monkeypatch.setattr(cbf.os, "fstat", lambda fd: Small(real_fstat(fd)))
+    assert cbf.read_bytes_beneath(root, ["p"], max_bytes=10) is None
+    assert cbf.read_bytes_beneath(root, ["p"], max_bytes=11) == b"x" * 11
+
+
+def test_open_beneath_cap_holds_when_the_file_grows(tree):
+    root, _ = tree
+    (root / "p").write_bytes(b"y" * 10)
+    fh = cbf.open_beneath(root, ["p"], max_bytes=10)
+    with open(root / "p", "ab") as grow:
+        grow.write(b"z" * 100)
+    with fh, pytest.raises(BridgeError):
+        fh.read()
+    with cbf.open_beneath(root, ["p"], max_bytes=110) as ok:
+        assert ok.read() == b"y" * 10 + b"z" * 100
+    assert cbf.open_beneath(root, ["p"], max_bytes=10) is None
+
+
+def test_open_beneath_bounded_reads_in_pieces(tree):
+    root, _ = tree
+    (root / "p").write_bytes(b"0123456789")
+    with cbf.open_beneath(root, ["p"], max_bytes=10) as fh:
+        assert fh.read(4) == b"0123"
+        assert fh.read() == b"456789"
+        assert fh.read() == b""
+
+
+def test_list_parts_leaves_out_a_hardlinked_part(tree):
+    root, outside = tree
+    upl, d = _stage(root, size=2 * CHUNK_BYTES, parts=[0])
+    os.link(outside / "sentinel", d / "0000001")
+    assert cbf.list_parts(root, AGENT, upl) == [0]
+    assert cbf.upload_complete(root, AGENT, upl) is False
+
+
+def test_remove_tree_removes_a_dangling_link_without_following(tree):
+    root, outside = tree
+    d = _upload_dir(root)
+    (d / "0000000").symlink_to(outside / "new")
+    (d / "dirlink").symlink_to(outside)
+    before = _snapshot(outside)
+    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL]) is True
+    assert not os.path.lexists(d)
+    assert not os.path.lexists(outside / "new")
+    assert _snapshot(outside) == before
+
+
+def test_link_new_bytes_uses_o_tmpfile_and_never_leaves_a_tmp(tree, monkeypatch):
+    root, _ = tree
+    calls = []
+    real_link = os.link
+
+    def crash_after_link(src, dst, **kw):
+        calls.append(src)
+        real_link(src, dst, **kw)
+        raise KeyboardInterrupt("simulated crash right after the link")
+    monkeypatch.setattr(cbf.os, "link", crash_after_link)
+    with pytest.raises(KeyboardInterrupt):
+        cbf.link_new_bytes(root, "0000000", b"part")
+    monkeypatch.undo()
+    assert calls and calls[0].startswith("/proc/self/fd/")
+    assert sorted(p.name for p in root.iterdir()) == ["0000000"]
+    assert os.stat(root / "0000000").st_nlink == 1
+    assert stat.S_IMODE(os.stat(root / "0000000").st_mode) == 0o600
+    assert cbf.read_bytes_beneath(root, ["0000000"], max_bytes=10) == b"part"
+    assert cbf.link_new_bytes(root, "0000000", b"other") is False
+    assert (root / "0000000").read_bytes() == b"part"
+
+
+@pytest.mark.parametrize("how", ["no_tmpfile", "no_proc"])
+def test_link_new_bytes_falls_back(tree, monkeypatch, how):
+    root, _ = tree
+    if how == "no_tmpfile":
+        def unsupported(dfd):
+            raise OSError(errno.EOPNOTSUPP, "no O_TMPFILE")
+        monkeypatch.setattr(cbf, "_open_tmpfile", unsupported)
+    else:
+        real_link = os.link
+
+        def no_proc(src, dst, **kw):
+            if str(src).startswith("/proc/"):
+                raise FileNotFoundError(errno.ENOENT, "no /proc")
+            return real_link(src, dst, **kw)
+        monkeypatch.setattr(cbf.os, "link", no_proc)
+    assert cbf.link_new_bytes(root, "0000000", b"part") is True
+    assert cbf.link_new_bytes(root, "0000000", b"other") is False
+    monkeypatch.undo()
+    assert sorted(p.name for p in root.iterdir()) == ["0000000"]
+    assert (root / "0000000").read_bytes() == b"part"
+    assert os.stat(root / "0000000").st_nlink == 1
+
+
+def test_stale_fallback_tmp_is_ignored_and_swept(tree):
+    root, _ = tree
+    upl, d = _stage(root, size=CHUNK_BYTES + 1, parts=[0])
+    (d / ".tmp-deadbeef00000000").write_bytes(b"partial")
+    assert cbf.list_parts(root, AGENT, upl) == [0]
+    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl)) is True
+    assert not os.path.lexists(d)
+
+
+def test_list_beneath(tree, no_hang):
+    root, outside = tree
+    d = root / "intents"
+    d.mkdir()
+    (d / "b.json").write_text("{}")
+    (d / "a.json").symlink_to(outside / "sentinel")
+    os.mkfifo(d / "f")
+    (d / "sub").mkdir()
+    entries = cbf.list_beneath(root, ["intents"], max_entries=10)
+    assert [name for name, _ in entries] == ["a.json", "b.json", "f", "sub"]
+    kinds = {name: stat.S_IFMT(st.st_mode) for name, st in entries}
+    assert kinds == {"a.json": stat.S_IFLNK, "b.json": stat.S_IFREG, "f": stat.S_IFIFO, "sub": stat.S_IFDIR}
+    with pytest.raises(BridgeError):
+        cbf.list_beneath(root, ["intents"], max_entries=3)
+    (root / "linked").symlink_to(d)
+    assert cbf.list_beneath(root, ["linked"], max_entries=10) is None
+    assert cbf.list_beneath(root, ["missing"], max_entries=10) is None
+    assert cbf.list_beneath(root, [".."], max_entries=10) is None
+    assert cbf.list_beneath(root, ["intents", "b.json"], max_entries=10) is None
+
+
+def test_directory_entry_caps(tree, monkeypatch):
+    root, _ = tree
+    upl, d = _stage(root, size=3 * CHUNK_BYTES, parts=[0, 1, 2])
+    monkeypatch.setattr(cbf, "MAX_DIR_ENTRIES", 3)  # meta.json + three parts = 4 entries
+    with pytest.raises(BridgeError):
+        cbf.list_parts(root, AGENT, upl)
+    assert cbf.upload_complete(root, AGENT, upl) is False
+    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl)) is False
+    assert d.is_dir()
+    monkeypatch.setattr(cbf, "MAX_DIR_ENTRIES", 4)
+    assert cbf.list_parts(root, AGENT, upl) == [0, 1, 2]
+    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl)) is True
