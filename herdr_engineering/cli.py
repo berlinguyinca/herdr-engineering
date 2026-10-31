@@ -3932,6 +3932,7 @@ def _share_lab_problems(collab: dict, share: dict) -> list[str]:
 
 def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host, port):
     """Build (not start) the share server from the render-share slice; logs once when lab links are off."""
+    from .control_plane.annotation_anchor import annotation_settings
     from .control_plane.share_public import ShareConfig, make_share_server
     from .fleet_config import FleetConfigError, load_fleet_config
     from .fleet_config_cli import check_share_slice
@@ -3954,7 +3955,8 @@ def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host
         web_client_id=collab.get("cognito_web_client"), cognito_domain=collab.get("cognito_domain"),
         public_url=share.get("public_url"),
         signing_secret=secret.encode("utf-8") if isinstance(secret, str) else b"",
-        session_seconds=share.get("session_seconds", 14400))
+        session_seconds=share.get("session_seconds", 14400), annotations=annotation_settings(share.get("annotations")),
+        annotations_path=Path(events_dir) / "annotations.jsonl")
     server = make_share_server(config, host=host, port=port)
     if server.lab is None:
         problems = _share_lab_problems(collab, share)

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>Shared file</title>
+{{CSRF_META}}
+<link rel="stylesheet" href="/s/static/annotate.css">
+<script type="module" src="/s/static/annotate.js" nonce="{{NONCE}}"></script>
+</head>
+<body data-mode="{{MODE}}">
+{{SWITCH}}
+{{DATA_JSON}}
+<main id="herdr-stage">
+{{CONTENT}}
+<div id="herdr-native"></div>
+</main>
+</body>
+</html>

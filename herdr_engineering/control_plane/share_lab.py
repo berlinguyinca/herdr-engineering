@@ -47,6 +47,28 @@ def authorise(state, access_token, id_token, authenticator) -> tuple[dict | None
         return None, "auth_error", None
 
 
+def still_admitted(state: object, email: object) -> bool:
+    """Whether a session already minted for ``email`` may still WRITE against the share's CURRENT allow-list.
+
+    A session holds the verified email but no group claims, so group admission cannot be re-evaluated without the
+    tokens. Rule (fail closed where it can be evaluated): admitted when the lower-cased email is on ``allow_emails``,
+    or when the share has a non-empty ``allow_groups`` (those members are only bounded by the session expiry, which is
+    capped at the access token's ``exp``). A share with neither, a malformed list or a non-lab state refuses.
+    Never raises."""
+    try:
+        if not isinstance(state, dict) or state.get("audience") != "lab" or not isinstance(email, str) or not email:
+            return False
+        emails, groups = state.get("allow_emails") or [], state.get("allow_groups") or []
+        if not isinstance(emails, list) or not isinstance(groups, list):
+            return False
+        allowed = {e.strip().lower() for e in emails if isinstance(e, str) and e.strip() and e.isascii()}
+        if email.strip().lower() in allowed:
+            return True
+        return any(isinstance(g, str) and g for g in groups)
+    except Exception:
+        return False
+
+
 def authorise_lab(state: dict, access_token: str, id_token: str, authenticator) -> dict | None:
     """``{identity, email, exp}`` when the verified tokens may open this lab share, else None (never raises)."""
     return authorise(state, access_token, id_token, authenticator)[0]
