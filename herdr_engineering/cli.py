@@ -330,6 +330,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_report_subparser(asub)
     from .artifact_shares_client import add_share_subparser
     add_share_subparser(asub)
+    from .artifact_collab_client import add_collab_subparser
+    add_collab_subparser(asub)
     from .artifact_browse_client import add_browse_subparsers
     add_browse_subparsers(asub)
     # system-graph artifact (P5): deterministic sanitized snapshot renderer.
