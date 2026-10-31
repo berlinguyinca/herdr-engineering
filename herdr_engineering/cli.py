@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import socket
 import sys
@@ -680,13 +681,21 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="PATH to a file holding the API key of a principal in the tenant to anchor (never the key itself)")
     p2.set_defaults(func=_cmd_cp_assistant_audit)
     p2 = csub.add_parser("assistant-worker", help="enroll, list or revoke tailnet-hub workers (owner API)")
-    p2.add_argument("action", choices=["enroll", "list", "revoke"])
+    p2.add_argument("action", choices=["enroll", "list", "revoke", "redeem", "install-hooks"])
     p2.add_argument("worker_id", nargs="?", default=None, help="the worker to revoke (revoke only)")
     p2.add_argument("--name", default=None, help="a label for the worker (enroll)")
     p2.add_argument("--harness", default=None, help="claude | pi | codex | opencode (enroll)")
     p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
-    p2.add_argument("--api-key-file", required=True,
-                    help="PATH to a file holding an operator API key (never the key itself)")
+    p2.add_argument("--api-key-file", default=None,
+                    help="PATH to a file holding an operator API key (never the key itself); enroll|list|revoke")
+    p2.add_argument("--url", default=None, help="hub base URL, e.g. http://100.x.y.z:8765 (redeem)")
+    p2.add_argument("--code", default=None, help="the single-use enrollment code (redeem)")
+    p2.add_argument("--device-id", default=None, help="a stable id for this device (redeem)")
+    p2.add_argument("--out", default=None,
+                    help="where redeem stores the 0600 worker file (default ~/.config/herdr/assistant-worker.json)")
+    p2.add_argument("--force", action="store_true", help="redeem: overwrite an existing worker file")
+    p2.add_argument("--settings", default=None, help="install-hooks: the Claude Code settings.json to edit")
+    p2.add_argument("--yes", action="store_true", help="install-hooks: apply without the confirmation prompt")
     p2.set_defaults(func=_cmd_cp_assistant_worker)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
@@ -3072,6 +3081,13 @@ def _cmd_cp_assistant_worker(args) -> int:
 
     from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
 
+    if args.action == "redeem":
+        return _assistant_worker_redeem(args)
+    if args.action == "install-hooks":
+        return _assistant_worker_install_hooks(args)
+    if not args.api_key_file:
+        print(f"{args.action} needs --api-key-file", file=sys.stderr)
+        return 2
     if args.action == "enroll" and not (args.name and args.harness):
         print("enroll needs --name and --harness", file=sys.stderr)
         return 2
@@ -3124,6 +3140,118 @@ def _cmd_cp_assistant_worker(args) -> int:
     except (OSError, ValueError, KeyError) as exc:
         print(f"assistant-worker {args.action} failed: {type(exc).__name__}", file=sys.stderr)
     return 1
+
+
+_REDEEM_SAFE = re.compile(r"[A-Za-z0-9._~:/\-]+")
+
+
+def _assistant_worker_redeem(args) -> int:
+    """Redeem an enrollment code: store the 0600 worker file, print the ``claude mcp add`` line exactly once."""
+    import urllib.error
+    import urllib.request
+
+    from .control_plane.assistant_hub.hook_relay import (
+        DEFAULT_FILE,
+        RelayConfigError,
+        validate_hub_url,
+    )
+
+    if not (args.url and args.code and args.device_id):
+        print("redeem needs --url, --code and --device-id", file=sys.stderr)
+        return 2
+    try:
+        base = validate_hub_url(args.url)
+    except RelayConfigError as exc:
+        print(f"assistant-worker redeem failed: {exc}", file=sys.stderr)
+        return 2
+    if not _REDEEM_SAFE.fullmatch(base) or not _REDEEM_SAFE.fullmatch(args.device_id):
+        print("assistant-worker redeem failed: url/device-id contain unsupported characters", file=sys.stderr)
+        return 2
+    dest = Path(args.out or DEFAULT_FILE).expanduser()
+    if os.path.lexists(dest) and not args.force:
+        print(f"assistant-worker redeem failed: {dest} exists (use --force to replace it)", file=sys.stderr)
+        return 1
+    try:
+        req = urllib.request.Request(f"{base}/assistant/enroll", method="POST",
+                                     headers={"Content-Type": "application/json"},
+                                     data=json.dumps({"code": args.code, "device_id": args.device_id}).encode())
+        with urllib.request.urlopen(req, timeout=15) as response:
+            out = json.loads(response.read(1024 * 1024))
+        cred, device = out["credential"], out["device_id"]
+        if not (isinstance(cred, str) and isinstance(device, str)
+                and _REDEEM_SAFE.fullmatch(cred) and _REDEEM_SAFE.fullmatch(device)):
+            raise ValueError("unexpected enrollment response")
+    except urllib.error.HTTPError as exc:
+        print(f"assistant-worker redeem failed: HTTP {exc.code}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"assistant-worker redeem failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    payload = json.dumps({"url": base, "credential": cred, "device_id": device}).encode()
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if args.force:
+            tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(payload)
+                os.replace(tmp, dest)
+            except BaseException:
+                if os.path.lexists(tmp):
+                    os.unlink(tmp)
+                raise
+        else:
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+    except OSError as exc:
+        print(f"assistant-worker redeem failed: cannot write {dest}: {exc.strerror}", file=sys.stderr)
+        return 1
+    print(f"worker credential stored in {dest} (mode 0600). It will not be shown again except in the line below.")
+    print("Run this once to give Claude Code the hub (the credential is shown only now):")
+    print(f'claude mcp add --transport http herdr-assistant {base}/assistant/mcp '
+          f'--header "Authorization: Worker {cred}" --header "X-Herdr-Device: {device}"')
+    return 0
+
+
+def _assistant_worker_install_hooks(args) -> int:
+    """Install the observe-only Claude Code hooks into an explicit settings file (diff + confirmation)."""
+    from .control_plane.assistant_hub import hook_relay
+
+    if args.harness != "claude":
+        print("install-hooks supports only --harness claude", file=sys.stderr)
+        return 1
+    if not args.settings:
+        print("install-hooks needs --settings PATH", file=sys.stderr)
+        return 2
+    command = f"{shlex.quote(sys.executable)} -I {shlex.quote(hook_relay.__file__)}"
+    applied: list[bool] = []
+
+    def confirm(diff: str) -> bool:
+        print(diff, end="")
+        if args.yes:
+            ok = True
+        elif not sys.stdin.isatty():
+            print("not a terminal: re-run with --yes to apply", file=sys.stderr)
+            ok = False
+        else:
+            ok = input("Apply this change? [y/N] ").strip().lower() in ("y", "yes")
+        applied.append(ok)
+        return ok
+    try:
+        diff = hook_relay.install_hooks(Path(args.settings).expanduser(), command=command, confirm=confirm)
+    except (OSError, ValueError) as exc:
+        print(f"install-hooks failed: {exc}", file=sys.stderr)
+        return 1
+    if not diff:
+        print("hooks already installed")
+    elif applied and applied[0]:
+        print("hooks installed")
+    else:
+        print("no changes written", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_cp_collab_repair(args) -> int:
