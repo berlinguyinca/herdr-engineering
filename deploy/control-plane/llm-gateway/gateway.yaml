@@ -1,0 +1,10 @@
+# Prototype: the InferWeave gateway that replaces the python llm-proxy at the fabric edge.
+# Project keys are not written here. `control-plane llm-gateway-sync` renders them as
+# sha256-only principals into /var/lib/herdr-llm-gateway/principals.json.
+gateway_id: node_herdr-eng-edge
+secrets:
+  kek_file: /var/lib/herdr-llm-gateway/secrets/kek
+  admin_secret_file: /var/lib/herdr-llm-gateway/secrets/admin
+auth:
+  client_principals_file: /var/lib/herdr-llm-gateway/principals.json
+  client_token_file: /var/lib/herdr-llm-gateway/secrets/client-token

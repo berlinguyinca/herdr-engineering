@@ -212,6 +212,54 @@ services:
       timeout: 3s
       retries: 3
 
+  # ---- PROTOTYPE: InferWeave gateway at the fabric edge (replaces llm-proxy) -----
+  # Opt-in: `docker compose --profile llm-gateway up`. The sync supervisor renders the
+  # control plane's project keys as sha256-only principals and restarts the gateway
+  # (debounced) when the key set changes. Needs `deploy/control-plane/llm-gateway` built
+  # with a reviewed Linux inferweave binary; see docs/llm-gateway-prototype.md. HERDR_LLM_GATEWAY_DIR
+  # must be a 0700 directory holding secrets/kek, secrets/admin and secrets/client-token.
+  # Defaults, not `:?` guards: compose interpolates every service, enabled or not.
+  llm-gateway:
+    profiles: ["llm-gateway"]
+    image: herdr-llm-gateway:${HERDR_CP_IMAGE_TAG:-unset}
+    container_name: herdr-llm-gateway
+    restart: unless-stopped
+    depends_on:
+      - control-plane-web
+    volumes:
+      - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+      - ./llm-gateway/gateway.yaml:/etc/herdr/llm-gateway/gateway.yaml:ro
+    ports:
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_GATEWAY_PORT:-8089}:8089"
+    command:
+      - "control-plane"
+      - "llm-gateway-sync"
+      - "--control-plane"
+      - "http://control-plane-web:8080"
+      - "--principals-file"
+      - "/var/lib/herdr-llm-gateway/principals.json"
+      - "--"
+      - "inferweave"
+      - "gateway"
+      - "serve"
+      - "--config"
+      - "/etc/herdr/llm-gateway/gateway.yaml"
+      - "--listen"
+      - "0.0.0.0:8089"
+      - "--outbox"
+      - "/var/lib/herdr-llm-gateway/outbox"
+      - "--name"
+      - "herdr-eng-edge"
+      - "--nodes"
+      - "/var/lib/herdr-llm-gateway/nodes.json"
+      - "--adaptive"
+      - "--no-builtin-models"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8089/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
   # ---- dev.lan front door (host network; was deploy/fabric-stack) -------------
   # The worker mounts ./config.yaml (control plane); the fabric services mount
   # the fabric config from ../fabric-stack. Same project, same rendered substitution file.
