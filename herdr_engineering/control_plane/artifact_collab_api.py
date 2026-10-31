@@ -26,7 +26,7 @@ from .artifact_collab_store import InviteGrantConflict
 from .artifact_report_api import _access
 from .artifacts import ArtifactError
 
-AGENT_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
+AGENT_ID = re.compile(r"(?!room:)[A-Za-z0-9_.:-]{1,80}")  # reserved namespace
 INVITE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 DEFAULT_DAYS, MAX_DAYS = 30, 90
 PERMISSIONS = ("read", "write")

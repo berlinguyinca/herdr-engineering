@@ -171,7 +171,8 @@ class CollabGrantStore:
     async def pending_invite_grants(self, artifact_id: str) -> list[dict]:
         rows = await self.conn.fetch(
             "SELECT invite_id, artifact_id, permission, expires_at, granted_by, created_at "
-            "FROM artifact_collab_invite_grants WHERE artifact_id=$1 AND resolved_at IS NULL ORDER BY created_at, "
+            "FROM artifact_collab_invite_grants WHERE artifact_id=$1 AND resolved_at IS NULL AND expires_at > now() "
+            "ORDER BY created_at, "
             "invite_id", artifact_id)
         return [dict(r) for r in rows]
 
@@ -285,7 +286,7 @@ class CollabGrantStore:
     async def collaborators(self, artifact_id: str) -> list[dict]:
         grants = await self.conn.fetch(
             "SELECT artifact_id, principal_id, permissions, expires_at FROM artifact_acl "
-            "WHERE artifact_id=$1 AND left(principal_id, $2) = $3 ORDER BY principal_id",
+            "WHERE artifact_id=$1 AND left(principal_id, $2) = $3 AND expires_at > now() ORDER BY principal_id",
             artifact_id, len(PREFIX), PREFIX)
         stats = {r["actor_id"]: r for r in await self.conn.fetch(
             "SELECT actor_id, max(received_at) AS last_used_at, "

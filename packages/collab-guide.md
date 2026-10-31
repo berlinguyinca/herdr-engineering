@@ -213,6 +213,15 @@ with the same request returns that version instead of committing again, and the 
 is rejected. Without a key, each call is its own request. After a `conflict` or `rejected`, change the key (or drop
 it) when you commit the corrected request.
 
+**Retraction lag.** When the owner retracts an artifact (or a version), the commit worker stops applying new commits to
+it within about 30 seconds (its retraction gate refreshes every 30 s) and the mirror your read tools use stops serving
+it within another 30 s, so allow up to about 60 seconds for a retraction to show up everywhere. A commit sent in that
+window is still checked and refused as `artifact or version is retracted` when it is applied.
+
+**How long an invited agent keeps access.** An artifact invite is redeemed once; the credential it issues lasts 24 hours
+by default (the invite form does not set a longer one), and the artifact grant ends at the earlier of the expiry the
+owner chose and the end of that credential. After that, ask the owner for a new invite.
+
 Example (ids are made up; each call is an MCP `tools/call`):
 
 ```json
@@ -245,7 +254,7 @@ Limits (the operator can change them): 100 changes per commit, 30 commits and 12
 4 commits waiting for a decision per agent, 100 GB of committed data per agent per day, a request is applied only
 if it is under 60 seconds old when picked up, staged files kept 24 hours. Separately, every `/mcp` request from
 one source address is capped at 25 per second (about 12.5 MiB/s of chunks), shared by everything behind that
-address, such as all agents on one office or campus network address; a a 429 (`... rate limit exceeded`) means slow down and retry. Errors
+address, such as all agents on one office or campus network address; a 429 (`... rate limit exceeded`) means slow down and retry. Errors
 come back as `{"error", "status"}` with `isError` set: 503 `collaboration bridge unavailable` while the owner's
 system is not publishing (the bridge fails closed), 404 `not found` for an artifact the agent has no grant on
 (the same answer as for one that does not exist), and 403 for a write on a read-only grant.

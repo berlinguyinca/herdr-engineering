@@ -132,13 +132,15 @@ def add_collab_subparser(asub):
     r.add_argument("agent_id")
     _common(actions.add_parser("restrict", help="operator action: revoke ALL collaborator grants of the artifact, "
                                                  "READ access included"))
-    t = asub.add_parser("retract", help="hide an artifact (or one version) and revoke collaborator write access")
+    t = asub.add_parser("retract", help="hide an artifact (or one version); collaborator write grants are revoked only if the "
+                                              "retraction could not be saved (the failed-persist path)")
     t.set_defaults(artifacts_command="retract")
     _common(t)
     t.add_argument("--version-id", help="retract only this version")
     t.add_argument("--reason")
     t.add_argument("--restrict-all", action="store_true",
-                   help="operator action: also revoke ALL collaborator grants, READ access included")
+                   help="operator action: on that same failed-persist path also revoke ALL collaborator grants, READ "
+                        "access included (a successful retraction touches no grants)")
     return collab
 
 

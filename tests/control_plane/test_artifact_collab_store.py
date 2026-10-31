@@ -427,3 +427,20 @@ def test_bytes_last_24h_can_leave_queued_received_tickets_out(registry_pg):
         assert await store.bytes_last_24h(ag) == 107
         assert await store.bytes_last_24h(ag, count_received=False) == 100
     run(registry_pg, body)
+
+
+def test_expired_grants_and_lapsed_invites_are_not_listed(registry_pg):
+    async def body(store, conn):
+        aid = await artifact(conn)
+        live_inv, old_inv = uid("inv"), uid("inv")
+        await store.grant(aid, "live", "read", expires_at=now() + timedelta(days=1), granted_by="o")
+        await store.grant(aid, "gone", "read", expires_at=now() + timedelta(days=1), granted_by="o")
+        await conn.execute("UPDATE artifact_acl SET expires_at = now() - interval '1 minute' "
+                           "WHERE artifact_id=$1 AND principal_id='collab:gone'", aid)
+        await store.add_invite_grant(live_inv, aid, "read", expires_at=now() + timedelta(days=1), granted_by="o")
+        await store.add_invite_grant(old_inv, aid, "read", expires_at=now() + timedelta(days=1), granted_by="o")
+        await conn.execute("UPDATE artifact_collab_invite_grants SET expires_at = now() - interval '1 minute' "
+                           "WHERE invite_id=$1", old_inv)
+        assert [r["agent_id"] for r in await store.collaborators(aid)] == ["live"]
+        assert [g["invite_id"] for g in await store.pending_invite_grants(aid)] == [live_inv]
+    run(registry_pg, body)

@@ -437,7 +437,8 @@ class CollabFixture:
         gone = [k for k, v in self.grants.items() if k[0] == artifact_id and (not write_only or v["permission"] == "write")]
         for key in gone:
             del self.grants[key]
-        pend = [k for k, v in self.invites.items() if v["artifact_id"] == artifact_id]
+        pend = [k for k, v in self.invites.items()
+                if v["artifact_id"] == artifact_id and (not write_only or v["permission"] == "write")]
         for key in pend:
             del self.invites[key]
         return {"grants": len(gone), "pending_invites": len(pend)}

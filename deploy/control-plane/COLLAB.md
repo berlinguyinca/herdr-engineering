@@ -239,6 +239,18 @@ queued is checked against the live grant again before it is applied. If the work
 revocation can be published and `grants.json` goes stale; after 120 s every artifact tool fails closed. The mirror
 (content) follows every 30 s and is not part of the access decision.
 
+**Retraction lag (about 60 s).** A retraction reaches the commit path in two steps: the worker's retraction gate
+refreshes every 30 s (commits already queued are refused as `artifact or version is retracted` once it has), and the
+mirror sync that drops the retracted content from `head.json` runs every 30 s. Plan for up to about 60 s between the
+retract call and the last read or commit being refused. Grants are not touched by a successful retraction (only by the
+failed-persist fail-safe below).
+
+**Invite lifetime.** The Collaborators panel creates the remote-agent invite with a 1 h code lifetime and no
+`credential_ttl_seconds`, so the server default of 24 h applies to the credential that redeeming it issues. When the
+invite resolves, the grant expiry is `min(expires_at chosen by the owner, the agent's hard_expiry)`; an invited agent
+therefore loses access after 24 h even for a 90-day grant, and the owner issues a new invite (or grants the agent
+directly by id once it has a longer-lived credential).
+
 ### Trust model
 
 - The applier trusts the outbox file layout for who an intent is from: `intents/<ticket>.json` carries the actor,
