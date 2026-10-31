@@ -31,6 +31,10 @@ MAX_LAYOUT_NODES = 5000
 CENTRIC_EDGES = ("contains", "implements", "produced", "assigned_to", "spawned", "derived_from", "supersedes",
                  "discussed_in", "references", "depends_on", "delegated_to")
 
+TEAM_NAME_MAX = 120
+TEAM_SOURCE = "workgraph.team"
+TEAM_STATUSES = ("active", "archived")
+
 ArtifactOk = Callable[[Mapping[str, Any], str], bool]
 
 
@@ -708,6 +712,101 @@ class WorkGraphStore:
                 out.add(h["entity_id"])
         return out
 
+    # ---- explicit teams (unified workspace P05/P06: the producer of the ``team`` kind) ---------------------------------
+    async def list_teams(self, principal, *, status: str | None = None, limit: Any = None, cursor: str | None = None) -> dict:
+        """Teams the caller may see (the visibility predicate of every other kind: a hidden team is never named).
+        ``status`` is active (default), archived or all."""
+        status = status or "active"
+        if status not in (*TEAM_STATUSES, "all"):
+            raise ValueError("status must be active, archived or all")
+        return await self.list_entities(principal, kinds=["team"], status=None if status == "all" else status,
+                                        limit=limit, cursor=cursor)
+
+    async def team_command(self, principal, action: str, body: Mapping[str, Any] | None, team: str | None = None) -> dict:
+        """Create, rename or archive an EXPLICIT team.  Operator only (collab roles are not in the graph principal, so
+        nobody else can be shown to be an editor); everyone else gets the usual 404.
+
+        The command is appended to ``fabric_events`` (entity_type ``team``) -- the same source of truth every other kind
+        projects from, so a replay from clean rebuilds the team -- and is then projected at once.  Event ids are
+        deterministic, so a repeated command is a no-op; a crash between the append and the projection is repaired by the
+        worker, which reads the same row."""
+        if not isinstance(principal, Mapping) or principal.get("kind") != "operator" or principal.get("authenticated_by") in (None, "none"):
+            raise wc.NotFoundOrForbidden
+        body = body if isinstance(body, Mapping) else {}
+        actor = str(principal.get("id") or "operator")[:120]
+        if action == "create":
+            return await self._team_create(principal, actor, body)
+        if action in ("rename", "archive") and team:
+            return await self._team_change(principal, actor, action, team, body)
+        raise ValueError("unknown team command")
+
+    async def _team_create(self, principal, actor: str, body: Mapping[str, Any]) -> dict:
+        name = _team_name(body.get("name"))
+        pid, rid = _team_ref(body, "project_id"), _team_ref(body, "room_id")
+        key = _team_ref(body, "idempotency_key")
+        async with self._pool.acquire() as c:
+            if rid:
+                room = await self._visible_root(c, principal, f"room:{rid}")
+                if room["kind"] != "room":
+                    raise wc.NotFoundOrForbidden
+                if pid and room["project_id"] and room["project_id"] != pid:
+                    raise ValueError("that room does not belong to that project")
+                pid = pid or room["project_id"]
+            if pid:
+                project = await self._visible_root(c, principal, f"project:{pid}")
+                if project["kind"] != "project":
+                    raise wc.NotFoundOrForbidden
+        ident = f"k:{key}" if key else f"n:{name.casefold()}|{pid or ''}|{rid or ''}"
+        native = "team-" + hashlib.sha256(ident.encode()).hexdigest()[:20]
+        created = await self._team_append(actor, native, "team_created", f"team.created.{native}",
+                                          {"name": name, "project_id": pid, "room_id": rid}, pid, rid)
+        return {"team": await self._team_doc(principal, native), "created": created}
+
+    async def _team_change(self, principal, actor: str, action: str, native: str, body: Mapping[str, Any]) -> dict:
+        async with self._pool.acquire() as c:
+            head = await self._visible_root(c, principal, f"team:{native}")
+        if head["kind"] != "team" or (head["attrs"] or {}).get("origin") != core.TEAM_ORIGIN:
+            raise ValueError("only a team created with 'teams create' can be changed")
+        changed = False
+        if action == "rename":
+            name = _team_name(body.get("name"))
+            if head["status"] == "archived":
+                raise ValueError("an archived team cannot be renamed")
+            if name != head["display_name"]:
+                tag = hashlib.sha256(name.encode()).hexdigest()[:10]
+                changed = await self._team_append(actor, native, "team_renamed", f"team.renamed.{native}.{head['version']}.{tag}",
+                                                  {"name": name}, head["project_id"], None)
+        elif head["status"] != "archived":
+            changed = await self._team_append(actor, native, "team_archived", f"team.archived.{native}", {}, head["project_id"], None)
+        return {"team": await self._team_doc(principal, native), "changed": changed}
+
+    async def _team_doc(self, principal, native: str) -> dict:
+        async with self._pool.acquire() as c:
+            return entity_doc(await self._visible_root(c, principal, f"team:{native}"))
+
+    async def _team_append(self, actor: str, native: str, event_type: str, event_id: str, payload: dict,
+                           project_id: str | None, room_id: str | None) -> bool:
+        """Append one team event to the source log and project it.  False when this exact event was already stored."""
+        now = datetime.now(UTC)
+        who = {"kind": "operator", "id": actor}
+        async with self._pool.acquire() as c, c.transaction():
+            await c.execute("SELECT pg_advisory_xact_lock(hashtext($1))", "team|" + native)
+            seq = await c.fetchval("SELECT COALESCE(max(sequence), -1) + 1 FROM fabric_events WHERE entity_type = 'team' "
+                                   "AND entity_id = $1", native)
+            row = await c.fetchrow(
+                "INSERT INTO fabric_events (event_id, sequence, event_type, entity_type, entity_id, payload, source_timestamp, "
+                "source, actor, visibility_scope, project_id, room_id) VALUES ($1,$2,$3,'team',$4,$5,$6,$7,$8,'room',$9,$10) "
+                "ON CONFLICT DO NOTHING RETURNING event_id",
+                event_id, seq, event_type, native, payload, now, TEAM_SOURCE, who, project_id, room_id)
+        raw = {"event_id": event_id, "entity_type": "team", "entity_id": native, "event_type": event_type, "sequence": seq,
+               "source_timestamp": now, "payload": payload, "source": TEAM_SOURCE, "actor": who,
+               "visibility_scope": "room", "project_id": project_id, "room_id": room_id}
+        if row is not None:
+            res = await self.apply_events([raw])
+            if res["poison"]:
+                raise ValueError("the team could not be recorded")
+        return row is not None
+
     @staticmethod
     def _layout_doc(row: Mapping[str, Any] | None, scope_id: str, owner: str) -> dict:
         if row is None:
@@ -775,6 +874,24 @@ class WorkGraphStore:
                 "etag = EXCLUDED.etag, updated_by = EXCLUDED.updated_by, updated_at = now()",
                 root["entity_id"], owner, clean, body["version"], etag, principal.get("id"))
             return {**body, "etag": etag}
+
+
+def _team_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("name is required")
+    name = " ".join(value.split())
+    if not name or len(name) > TEAM_NAME_MAX or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise ValueError(f"name must be 1 to {TEAM_NAME_MAX} printable characters")
+    return name
+
+
+def _team_ref(body: Mapping[str, Any], key: str) -> str | None:
+    value = body.get(key)
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or len(value) > 200 or value != value.strip():
+        raise ValueError(f"{key} must be a plain id")
+    return value
 
 
 def layout_owner(principal: Mapping[str, Any] | None) -> str | None:

@@ -195,6 +195,16 @@ export class HerdrClient {
     });
   }
 
+  // The teams the caller may see (explicit teams plus each project's own). status: active (default), archived or all.
+  workGraphTeams({ status, limit, cursor, signal } = {}) {
+    const query = new URLSearchParams();
+    if (status) query.set('status', status);
+    if (limit) query.set('limit', String(limit));
+    if (cursor) query.set('cursor', cursor);
+    const qs = query.toString();
+    return this.request(`/api/v1/graph/work/teams${qs ? `?${qs}` : ''}`, { signal });
+  }
+
   getArtifact(id, { signal } = {}) {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}`, { signal });
   }

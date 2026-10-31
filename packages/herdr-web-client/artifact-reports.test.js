@@ -127,3 +127,11 @@ test('work graph reads and layout saves use the graph routes and send only what 
   assert.equal(calls[2].options.method, 'PUT');
   assert.deepEqual(JSON.parse(calls[2].options.body), { ref: 'project:p', document: { nodes: {} }, shared: true, if_match: '"e1"' });
 });
+
+test('the teams list asks only for what was named', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url) => { calls.push(url); return response({ items: [] }); } });
+  await client.workGraphTeams();
+  await client.workGraphTeams({ status: 'all', limit: 20, cursor: 'c 1' });
+  assert.deepEqual(calls, ['/api/v1/graph/work/teams', '/api/v1/graph/work/teams?status=all&limit=20&cursor=c+1']);
+});

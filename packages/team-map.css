@@ -47,3 +47,19 @@
 .tm-line[data-depth="1"] { padding-left: 16px; } .tm-line[data-depth="2"] { padding-left: 32px; } .tm-line[data-depth="3"] { padding-left: 48px; } .tm-line[data-depth="4"] { padding-left: 64px; }
 .tm-relations li { padding: 4px 0; font-size: 0.875rem; } .tm-relations li[data-live="false"] { color: var(--text-secondary); font-style: italic; }
 @media (prefers-reduced-motion: no-preference) { .tm-node rect { transition: fill 0.15s; } }
+
+/* Your teams (unified workspace P06): same tokens, no literal colours or fonts. */
+.teams { color: var(--text); min-width: 0; }
+.teams-bar { margin: 0 0 12px; }
+.teams-check { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; font-size: 0.875rem; color: var(--text-secondary); }
+.teams-check input { width: 20px; height: 20px; }
+.teams-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); }
+.teams-card { margin: 0; }
+.teams-link { display: flex; flex-direction: column; gap: 4px; min-height: 44px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); text-decoration: none; }
+.teams-link:hover { background: var(--surface-hover); }
+.teams-link:focus-visible, .teams-check input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.teams-name { font-weight: 600; overflow-wrap: anywhere; }
+.teams-meta { font-size: 0.8125rem; color: var(--text-secondary); overflow-wrap: anywhere; }
+.teams-chip { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border-subtle); background: var(--surface); }
+.teams-state { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 16px; color: var(--text-secondary); }
+.teams-note { font-size: 0.8125rem; color: var(--text-secondary); margin: 8px 0; }
