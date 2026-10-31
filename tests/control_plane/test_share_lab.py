@@ -257,6 +257,11 @@ def reference(env):
     return body
 
 
+def base_of(got):
+    """The session's ``/s/<token>/k/<session>/f/`` prefix, taken from the response's landing."""
+    return re.match(r"(/s/[^/]+/k/[^/]+/)[fv]/", got["landing"]).group(1) + "f/"
+
+
 def open_session(env, a=None, i=None, token=TOKEN, extra=None):
     headers = {"Authorization": "Bearer " + (access("alice") if a is None else a),
                "X-Id-Token": ident("alice") if i is None else i, "Content-Length": "0"}
@@ -337,26 +342,25 @@ def test_session_flow_serves_files_under_the_session_base(lab, capfd):
     assert h["x-content-type-options"] == "nosniff"
     assert "access-control-allow-origin" not in h
     got = json.loads(body)
-    assert set(got) == {"base", "entry", "landing", "expires_at"}
-    assert got["landing"] == got["base"] + "index.html"
-    sess = got["base"].split("/")[4]
+    assert set(got) == {"landing", "expires_at"}        # no csrf, no base/entry: the viewer reads only the landing
+    assert got["landing"] == base_of(got) + "index.html"
+    sess = base_of(got).split("/")[4]
     assert check_session(SECRET, "shr-1", sess, NOW0)["email"] == "alice@lab.example"
-    assert got["entry"] == "index.html"
     assert got["expires_at"] == NOW0 + 3600          # capped at the access token's exp (< session_seconds)
-    assert re.fullmatch(rf"/s/{re.escape(TOKEN)}/k/[A-Za-z0-9_.-]+/f/", got["base"])
+    assert re.fullmatch(rf"/s/{re.escape(TOKEN)}/k/[A-Za-z0-9_.-]+/f/", base_of(got))
     assert a.encode() not in body and i.encode() not in body
-    status, h, body = lab.request("GET", got["base"] + "index.html")
+    status, h, body = lab.request("GET", base_of(got) + "index.html")
     assert status == 200 and body == FILES["index.html"]
     # public_url is https://share.example/: the sandbox CSP also names this share's prefix, which covers k/<session>/f/
     assert h["content-security-policy"] == share_public.sandbox_csp("https://share.example", TOKEN)
     assert f"https://share.example/s/{TOKEN}/ " in h["content-security-policy"]
     assert OTHER_TOKEN not in h["content-security-policy"] and "/k/" not in h["content-security-policy"]
     assert h["access-control-allow-origin"] == "*" and h["access-control-expose-headers"] == EXPOSE
-    status, h, body = lab.request("GET", got["base"] + "data/table.parquet", {"Range": "bytes=-10"})
+    status, h, body = lab.request("GET", base_of(got) + "data/table.parquet", {"Range": "bytes=-10"})
     assert status == 206 and len(body) == 10
-    status, h, body = lab.request("GET", got["base"] + "my%20file%20%C3%A9.txt")
+    status, h, body = lab.request("GET", base_of(got) + "my%20file%20%C3%A9.txt")
     assert status == 200 and body == b"spaced"
-    status, h, _ = lab.request("OPTIONS", got["base"] + "data/table.parquet",
+    status, h, _ = lab.request("OPTIONS", base_of(got) + "data/table.parquet",
                                {"Origin": "null", "Access-Control-Request-Method": "GET"})
     assert status == 204
     assert all(ShareStore._parse_line(x) is not None for x in lab.event_lines())   # the worker ingests them
@@ -365,7 +369,7 @@ def test_session_flow_serves_files_under_the_session_base(lab, capfd):
     assert opened and opened[0]["actor"] == "alice" and opened[0]["share_id"] == "shr-1"
     text = lab.events.read_text()
     captured = capfd.readouterr()
-    session = got["base"].split("/")[4]
+    session = base_of(got).split("/")[4]
     for secret in (a, i, TOKEN, session):
         assert secret not in text and secret not in captured.out and secret not in captured.err
 
@@ -374,7 +378,7 @@ def test_group_member_gets_a_session(lab):
     status, _, body = open_session(lab, access("dave", groups=("Readers",)),
                                    ident("dave", email="dave@elsewhere.example"))
     assert status == 200
-    status, _, _ = lab.request("GET", json.loads(body)["base"] + "index.html")
+    status, _, _ = lab.request("GET", base_of(json.loads(body)) + "index.html")
     assert status == 200
 
 
@@ -476,9 +480,9 @@ def test_session_lifetime_is_capped(tmp_path):
             assert status == 200, body
             got = json.loads(body)
             # the session dies at exactly that instant
-            assert e.request("GET", got["base"] + "index.html")[0] == 200
+            assert e.request("GET", base_of(got) + "index.html")[0] == 200
             e.clock[0] = got["expires_at"]
-            assert e.request("GET", got["base"] + "index.html")[0] == 404
+            assert e.request("GET", base_of(got) + "index.html")[0] == 404
             return got["expires_at"]
         finally:
             e.close()
@@ -491,7 +495,7 @@ def test_session_lifetime_is_capped(tmp_path):
 
 def test_revoke_kills_a_live_session(lab):
     status, _, body = open_session(lab)
-    base = json.loads(body)["base"]
+    base = base_of(json.loads(body))
     assert lab.request("GET", base + "index.html")[0] == 200
     write_state(lab.root, lab.token_hash, dict(lab.state, state="revoked"))
     assert lab.request("GET", base + "index.html")[0] == 404
@@ -617,10 +621,65 @@ def test_landing_route_follows_the_entry_type(tmp_path, entry, kind):
         status, _, body = open_session(e)
         assert status == 200, body
         got = json.loads(body)
-        session = got["base"].split("/")[4]
+        session = base_of(got).split("/")[4]
         assert check_session(SECRET, "shr-1", session, NOW0)["email"] == "alice@lab.example"
         from urllib.parse import quote
         assert got["landing"] == f"/s/{TOKEN}/k/{session}/{kind}/{quote(entry, safe='/')}"
         assert got["landing"].isascii()
     finally:
         e.close()
+
+
+def test_email_part_must_be_canonical_base64():
+    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
+    a_id, a_mail, a_exp, a_mac = s.split(".")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    assert len(a_mail) % 4 != 0                       # the last char carries unused low bits
+    unused = {2: 0b1111, 3: 0b11}[len(a_mail) % 4]
+    last = alphabet.index(a_mail[-1])
+    assert last & unused == 0                         # canonical encodings have them zeroed
+    twin = a_mail[:-1] + alphabet[last | 1]            # same decoded bytes, non-canonical text
+    import base64
+    pad = lambda t: t + "=" * (-len(t) % 4)           # noqa: E731
+    assert base64.urlsafe_b64decode(pad(twin)) == base64.urlsafe_b64decode(pad(a_mail))
+    assert check_session(SECRET, "shr-1", s, NOW0) is not None
+    assert check_session(SECRET, "shr-1", ".".join((a_id, twin, a_exp, a_mac)), NOW0) is None
+
+
+def test_csrf_domain_is_separated_from_the_session_mac():
+    from herdr_engineering.control_plane import share_session as ss
+    assert ss._CSRF_DOMAIN != ss._DOMAIN
+    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
+    t = csrf_token(SECRET, "shr-1", s)
+    mac = s.split(".")[3]
+    assert t != mac and t not in s                    # nothing in the session equals the token
+    # the same message under the session domain would give a different value: the tags really separate the two
+    import hashlib
+    import hmac as hm
+    ln = lambda v: len(v).to_bytes(4, "big") + v      # noqa: E731
+    swapped = hm.new(SECRET, ss._DOMAIN + b"\x00" + ln(b"shr-1") + ln(s.encode()), hashlib.sha256).digest()
+    assert t != ss._b64(swapped)
+    # a session MAC is never accepted as a token for any share, and a token is never a session
+    assert not check_csrf(SECRET, "shr-1", s, mac)
+    assert check_session(SECRET, "shr-1", t, NOW0) is None
+
+
+def test_v1_session_and_bad_sessions_are_the_uniform_404_over_http(lab):
+    import base64
+    import hashlib
+    import hmac as hm
+    ref = reference(lab)
+    ln = lambda v: len(v).to_bytes(4, "big") + v      # noqa: E731
+    exp = NOW0 + 100
+    v1_mac = hm.new(SECRET, b"herdr-share-session-v1\x00" + ln(b"shr-1") + ln(b"alice") + ln(str(exp).encode()),
+                    hashlib.sha256).digest()
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()   # noqa: E731
+    v1 = f"{b64(b'alice')}.{exp}.{b64(v1_mac)}"
+    good = mint_session(SECRET, "shr-1", "alice", exp, email="alice@lab.example")
+    assert lab.request("GET", f"/s/{TOKEN}/k/{good}/f/index.html")[0] == 200
+    for bad in (v1, good[:-1] + ("A" if good[-1] != "A" else "B"), "x" * 769):
+        status, _, body = lab.request("GET", f"/s/{TOKEN}/k/{bad}/f/index.html")
+        assert status == 404 and body == ref
+    remove_state(lab.root, lab.token_hash)             # revoked share: the same bytes as a bad session
+    status, _, body = lab.request("GET", f"/s/{TOKEN}/k/{good}/f/index.html")
+    assert status == 404 and body == ref

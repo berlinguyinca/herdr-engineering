@@ -883,10 +883,9 @@ class ShareHandler(BaseHTTPRequestHandler):
         except ValueError:
             return deny(self, state, "bad_identity", grant["identity"])
         entry = state["entry"]
-        base = f"/s/{token}/k/{session}/f/"
         kind = "f" if content_type_for(entry).split(";")[0].strip() == "text/html" else "v"
         landing = f"/s/{token}/k/{session}/{kind}/{quote(entry, safe='/')}"
-        body = json.dumps({"base": base, "entry": entry, "landing": landing, "expires_at": exp_int},
+        body = json.dumps({"landing": landing, "expires_at": exp_int},
                           sort_keys=True, ensure_ascii=True).encode("ascii")
         _send_headers(self, 200, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
                                   ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),

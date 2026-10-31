@@ -10,7 +10,16 @@
   "use strict";
 
   var SHARE_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/$/;
-  var LANDING_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/k\/[A-Za-z0-9_.-]{1,768}\/[fv]\//;
+  // /s/<token>/k/<session>/<f|v>/<entry>: the entry is one or more plain path segments (no backslash, query, fragment,
+  // control or space character, no empty segment) so the browser cannot resolve it anywhere but under the share.
+  var LANDING_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/k\/[A-Za-z0-9_.-]{1,768}\/[fv]\/[^\/\\?#\x00-\x20\x7f]+(?:\/[^\/\\?#\x00-\x20\x7f]+)*$/;
+  var DOT_SEGMENT = /(?:^|\/)(?:\.|\.\.|%2e|\.%2e|%2e\.|%2e%2e)(?:\/|$)/i;
+  var ENCODED_SEPARATOR = /%(?:2f|5c|00|3f|23)/i;
+
+  function safeLanding(landing, sharePath) {
+    return typeof landing === "string" && LANDING_PATH.test(landing) && landing.indexOf(sharePath) === 0
+      && !DOT_SEGMENT.test(landing) && !ENCODED_SEPARATOR.test(landing);
+  }
   var ORIGIN = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?$/;
   var PENDING_KEY = "herdr-share-pkce";
   var TOKENS_KEY = "herdr-share-tokens";
@@ -113,8 +122,7 @@
     forget(); // the session path replaces the tokens; nothing is kept either way
     if (!r.ok) throw new Error("session");
     var got = await r.json();
-    if (!got || typeof got.landing !== "string" || !LANDING_PATH.test(got.landing)
-        || got.landing.indexOf(sharePath) !== 0) {
+    if (!got || !safeLanding(got.landing, sharePath)) {
       throw new Error("session");
     }
     location.replace(got.landing);
