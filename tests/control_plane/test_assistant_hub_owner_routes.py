@@ -87,7 +87,7 @@ def test_create_enrollment_requires_operator_key(world):
     assert enroll(base, who="viewer")[0] == 403
     status, body = enroll(base)
     assert status == 201
-    assert set(body) == {"enrollment_id", "code", "expires_at", "setup"}
+    assert set(body) == {"enrollment_id", "code", "expires_at", "scopes", "setup"}
     assert body["code"] and body["enrollment_id"]
     assert body["setup"] == {
         "supported": True, "harness": "claude", "host_is_placeholder": False,

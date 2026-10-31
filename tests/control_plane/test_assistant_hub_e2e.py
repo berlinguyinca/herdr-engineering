@@ -102,7 +102,8 @@ def events(world, **kw):
 
 def test_full_flow_enroll_use_revoke_audit(world):
     # 1. owner creates an enrollment
-    status, created = owner(world, "POST", "/api/v1/assistant-workers", {"name": "laptop", "harness": "claude"})
+    status, created = owner(world, "POST", "/api/v1/assistant-workers", {"name": "laptop", "harness": "claude",
+                                                                      "scopes": ["ask", "report", "read"]})
     assert status == 201, created
     code = created["code"]
     assert created["setup"]["supported"] is True and "claude mcp add --transport http" in created["setup"]["mcp_add"]
@@ -113,8 +114,7 @@ def test_full_flow_enroll_use_revoke_audit(world):
     cred, wid = redeemed["credential"], redeemed["worker_id"]
     assert http("POST", world.hub + "/assistant/enroll", {"code": code, "device_id": "dev1"})[0] == 401
 
-    # 3. MCP (a new worker has only ask+report; the owner opts it into read)
-    world.registry.set_scopes(TENANT, OWNER, wid, ["ask", "report", "read"])
+    # 3. MCP (the owner enrolled it with read scope)
     status, body = mcp(world, cred, "dev1", "initialize")
     assert status == 200 and body["result"]["serverInfo"]["name"] == "herdr-assistant"
     status, body = mcp(world, cred, "dev1", "tools/list")
@@ -241,3 +241,14 @@ def test_real_claude_mcp_add_writes_server_entry_in_throwaway_home(world, tmp_pa
     got = subprocess.run([argv[0], "mcp", "get", "herdr-assistant"], cwd=home, env=env, capture_output=True,
                          text=True, timeout=60)
     assert "herdr-assistant" in got.stdout + got.stderr
+
+
+def test_owner_scope_route_changes_a_redeemed_worker(world):
+    _, created = owner(world, "POST", "/api/v1/assistant-workers", {"name": "late", "harness": "claude"})
+    _, redeemed = http("POST", world.hub + "/assistant/enroll", {"code": created["code"], "device_id": "dev9"})
+    cred, wid = redeemed["credential"], redeemed["worker_id"]
+    names = lambda: {t["name"] for t in mcp(world, cred, "dev9", "tools/list")[1]["result"]["tools"]}  # noqa: E731
+    before = names()
+    status, out = owner(world, "POST", f"/api/v1/assistant-workers/{wid}/scopes", {"scopes": ["ask", "report", "read"]})
+    assert status == 200 and out["scopes"] == ["ask", "report", "read"]
+    assert names() > before

@@ -687,8 +687,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="PATH to a file holding the API key of a principal in the tenant to anchor (never the key itself)")
     p2.set_defaults(func=_cmd_cp_assistant_audit)
     p2 = csub.add_parser("assistant-worker", help="enroll, list or revoke tailnet-hub workers (owner API)")
-    p2.add_argument("action", choices=["enroll", "list", "revoke", "redeem", "install-hooks"])
-    p2.add_argument("worker_id", nargs="?", default=None, help="the worker to revoke (revoke only)")
+    p2.add_argument("action", choices=["enroll", "list", "revoke", "scopes", "redeem", "install-hooks"])
+    p2.add_argument("worker_id", nargs="?", default=None, help="the worker to revoke or change scopes of (revoke|scopes)")
+    p2.add_argument("--scopes", default=None, help="comma-separated scopes from ask,report,read,act (enroll|scopes)")
     p2.add_argument("--name", default=None, help="a label for the worker (enroll)")
     p2.add_argument("--harness", default=None, help="claude | pi | codex | opencode (enroll)")
     p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
@@ -704,6 +705,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--settings", default=None, help="install-hooks: the Claude Code settings.json to edit")
     p2.add_argument("--yes", action="store_true", help="install-hooks: apply without the confirmation prompt")
     p2.set_defaults(func=_cmd_cp_assistant_worker)
+    p2 = csub.add_parser("assistant-action", help="list, approve or deny hub workers' action requests (owner API)")
+    p2.add_argument("action", choices=["list", "approve", "deny"])
+    p2.add_argument("request_id", nargs="?", default=None, help="the request to decide (approve|deny)")
+    p2.add_argument("--status", default=None, choices=["pending", "approved", "denied", "vetoed"], help="list filter")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
+    p2.set_defaults(func=_cmd_cp_assistant_hub_owner, command_group_kind="action")
+    p2 = csub.add_parser("assistant-grant", help="list, revoke or activate hub action grants (owner API)")
+    p2.add_argument("action", choices=["list", "revoke", "activate"])
+    p2.add_argument("grant_id", nargs="?", default=None, help="the grant (revoke|activate)")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
+    p2.set_defaults(func=_cmd_cp_assistant_hub_owner, command_group_kind="grant")
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -3098,9 +3112,13 @@ def _cmd_cp_assistant_worker(args) -> int:
     if args.action == "enroll" and not (args.name and args.harness):
         print("enroll needs --name and --harness", file=sys.stderr)
         return 2
-    if args.action == "revoke" and not args.worker_id:
-        print("revoke needs a WORKER_ID", file=sys.stderr)
+    if args.action in ("revoke", "scopes") and not args.worker_id:
+        print(f"{args.action} needs a WORKER_ID", file=sys.stderr)
         return 2
+    if args.action == "scopes" and not args.scopes:
+        print("scopes needs --scopes a,b", file=sys.stderr)
+        return 2
+    scopes = [x.strip() for x in args.scopes.split(",")] if args.scopes else None
     try:
         key = Path(args.api_key_file).expanduser().read_text().strip()
         base = resolve_control_plane(args.control_plane)
@@ -3121,8 +3139,12 @@ def _cmd_cp_assistant_worker(args) -> int:
             return json.loads(response.read(1024 * 1024))
     try:
         if args.action == "enroll":
-            out = call("POST", "/api/v1/assistant-workers", {"name": args.name, "harness": args.harness})
+            payload = {"name": args.name, "harness": args.harness}
+            if scopes is not None:
+                payload["scopes"] = scopes
+            out = call("POST", "/api/v1/assistant-workers", payload)
             print(f"enrollment: {out['enrollment_id']}\ncode: {out['code']}\nexpires_at: {out['expires_at']}")
+            print(f"scopes: {','.join(out.get('scopes', []))}")
             print("This code will not be shown again; it is single-use. Redeem it on the worker's device.")
             setup = out.get("setup") or {}
             if not setup.get("supported"):
@@ -3138,6 +3160,9 @@ def _cmd_cp_assistant_worker(args) -> int:
             for w in rows:
                 print(f"{w['worker_id']:<34} {w['name']:<20} {w['harness']:<9} {w['status']:<8} "
                       f"{w['device_id']:<16} {w['expires_at']}")
+        elif args.action == "scopes":
+            out = call("POST", f"/api/v1/assistant-workers/{quote(args.worker_id, safe='')}/scopes", {"scopes": scopes})
+            print(f"{out['worker_id']}: scopes {','.join(out['scopes'])}")
         else:
             out = call("DELETE", f"/api/v1/assistant-workers/{quote(args.worker_id, safe='')}")
             print(f"{out['worker_id']}: {out['status']}")
@@ -3146,6 +3171,82 @@ def _cmd_cp_assistant_worker(args) -> int:
         print(f"assistant-worker {args.action} failed: HTTP {exc.code}", file=sys.stderr)
     except (OSError, ValueError, KeyError) as exc:
         print(f"assistant-worker {args.action} failed: {type(exc).__name__}", file=sys.stderr)
+    return 1
+
+
+def _cmd_cp_assistant_hub_owner(args) -> int:
+    """``control-plane assistant-action list|approve|deny`` and ``assistant-grant list|revoke|activate``.
+
+    0 on success, 1 on a refusal or failure (one stderr line; an activation refusal prints its code), 2 on usage."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import quote
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    kind = "assistant-action" if args.command_group_kind == "action" else "assistant-grant"
+    target = getattr(args, "request_id", None) or getattr(args, "grant_id", None)
+    if not args.api_key_file:
+        print(f"{kind} {args.action} needs --api-key-file", file=sys.stderr)
+        return 2
+    if args.action != "list" and not target:
+        print(f"{kind} {args.action} needs an ID", file=sys.stderr)
+        return 2
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+    except ValueError:
+        print("cannot read --api-key-file: not a text file", file=sys.stderr)
+        return 2
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(f"{base}{path}", method=method, headers={
+            "X-API-Key": key, "Content-Type": "application/json"},
+            data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read(1024 * 1024))
+    quoted = quote(target, safe="") if target else ""
+    try:
+        if kind == "assistant-action":
+            if args.action == "list":
+                query = f"?status={quote(args.status, safe='')}" if args.status else ""
+                rows = call("GET", f"/api/v1/assistant-action-requests{query}")["requests"]
+                print(f"{'REQUEST_ID':<20} {'STATUS':<9} {'VERB':<14} {'WORKER':<22} DISPLAY")
+                for r in rows:
+                    display = " ".join(r["display"].split())[:120]
+                    print(f"{r['request_id']:<20} {r['status']:<9} {r['verb']:<14} {r['worker_id']:<22} {display}")
+            else:
+                out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision",
+                           {"approve": args.action == "approve"})
+                print(f"{out['request_id']}: {out['status']}")
+        elif args.action == "list":
+            rows = call("GET", "/api/v1/assistant-grants")["grants"]
+            print(f"{'GRANT_ID':<24} {'STATE':<9} {'VERB':<14} {'WORKER':<22} EXPIRES")
+            for g in rows:
+                print(f"{g['grant_id']:<24} {g['state']:<9} {g['verb']:<14} {g['worker_id']:<22} {g['expires_at'] or '-'}")
+        elif args.action == "revoke":
+            out = call("DELETE", f"/api/v1/assistant-grants/{quoted}")
+            print(f"{out['grant_id']}: {out['state']}")
+        else:
+            out = call("POST", f"/api/v1/assistant-grants/{quoted}/activate", {"confirm": True})
+            print(f"{out['grant_id']}: {out['state']}")
+        return 0
+    except urllib.error.HTTPError as exc:
+        code = ""
+        try:
+            code = str(json.loads(exc.read(65536)).get("code") or "")
+        except (OSError, ValueError, AttributeError):
+            pass
+        suffix = f" ({code})" if code and code.replace("_", "").isalnum() else ""
+        print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}", file=sys.stderr)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"{kind} {args.action} failed: {type(exc).__name__}", file=sys.stderr)
     return 1
 
 
