@@ -8,6 +8,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### CI page: the history report is built once per few seconds
 - `GET /api/v1/ci/reports` took about 5 s per call and 6, 12 and 17 s for three at once, because every open CI page rebuilt it on every refresh. Pages that gave up showed "CI history: Failed to fetch" and left broken-pipe tracebacks in the log (106 in 40 minutes). The first caller now builds it and concurrent callers wait for that one result; a result is reused for up to 15 s (the page refreshes every 20 s) and only while no CI observation, report or log-test row has been added or replaced, so an upload shows at once. A failed build is not cached. What the endpoint reads from the CI monitor and GitHub language cache can be up to 15 s old.
 
+### Artifact share links: share with a room
+- `herdr-eng artifacts share create ... --audience lab --room ROOM` (API field `room_id`) adds the sign-in emails of the people in that room, as they are when you create the share, to the lab allow-list. The link is still the lab link: Cognito sign-in, exactly those people, a frozen bundle on the share volume, no path to the registry or the tailnet. People who join the room later are not added (create a new share); lapsed guests and people with no known email are left out; a room with none is refused. Public shares refuse `room_id`.
+
 ### CI page: one attention item per repository
 - "Needs attention" on the CI page no longer lists the same repository once per pull request and branch. Unfixed failures of one repository are one row: the newest failure leads (its failing step and log load when the row is opened), and the other failing branches and pull requests are listed inside it, with a "N branches or PRs failing" chip. Each ref is still judged on its own, so a green main does not clear a red pull request, and a ref that gets a green run drops out of the row. The Overview badge counts repositories.
 

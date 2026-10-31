@@ -1223,6 +1223,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         """The person exists and may use the network (signed up, and approved when approval is on)."""
         return self.auth.exists(uid) and self._approved(uid)
 
+    def room_member_emails(self, room_id: str) -> list[str]:
+        """Sign-in emails of the people in this room now (lapsed guests and people with no known email left out)."""
+        with self._lock:
+            return sorted({self._user_email[u] for u in self.room_readers(room_id) if self._user_email.get(u)})
+
     def room_ids(self) -> list[str]:
         with self._lock:
             return list(self._rooms)
