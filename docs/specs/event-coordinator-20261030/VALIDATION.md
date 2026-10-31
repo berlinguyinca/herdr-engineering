@@ -150,3 +150,19 @@ Local evidence (outside source):
 and `latest-request-fixed.png` in the same directory. The fixed PNG was visually
 inspected. This proves the two tested requests; it does not establish general
 conversational interpretation or live research capabilities.
+
+## LLM interpretation contract handoff
+
+Main and event lanes agreed on event-intent v1. Canonical JSON Schema and seven
+positive/ten negative examples were added, without modifying event runtime/fixture
+interfaces or duplicating main's JavaScript validator. Three fixture conformance
+checks failed before the files existed and now the focused suite passes 81 tests.
+Ruff on the new test and diff checks pass. These checks validate fixture grounding,
+closed schema shape and semantic bounds; they do not claim a general JSON Schema
+validator ran or that any live gateway call occurred. Main owns live model-client,
+usage/model evidence, runtime validation and UI integration. Runtime must test all
+negative fixtures, including the semantic cases JSON Schema cannot reject alone.
+Independent contract review found no important code/spec/security blocker and requested
+no changes. Reviewer independently reran 81 tests, Ruff, JSON parsing, diff and fixture
+consistency checks. Formal LSP evidence remained unavailable due the closed diagnostics
+transport; no general JSON Schema validator result or live gateway call is claimed here.

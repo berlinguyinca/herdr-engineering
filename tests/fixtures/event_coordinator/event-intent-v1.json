@@ -1,0 +1,528 @@
+{
+  "contract": "urn:herdr:event-intent:v1",
+  "positive": [
+    {
+      "id": "screenshot-age-range",
+      "request": "Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "eight adults",
+          "children": "10 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      }
+    },
+    {
+      "id": "freeform-alternative",
+      "request": "Could you help arrange dinner? There will be 8 adults and 10 children, ages 6 to 14. Each adult needs their own tab.",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "8 adults",
+          "children": "10 children",
+          "childrenAgeRange": "ages 6 to 14",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": "Each adult needs their own tab",
+          "separateBillPayers": "Each adult needs their own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      }
+    },
+    {
+      "id": "explicit-usd-zero-children",
+      "request": "Dinner for 8 adults, no children, with a USD400 ceiling. Everyone pays separately.",
+      "result": {
+        "adults": 8,
+        "children": 0,
+        "childrenAgeRange": null,
+        "budgetMinor": 40000,
+        "currency": "USD",
+        "separateBills": true,
+        "separateBillPayers": "everyone",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "8 adults",
+          "children": "no children",
+          "childrenAgeRange": null,
+          "budgetMinor": "USD400",
+          "currency": "USD400",
+          "separateBills": "Everyone pays separately",
+          "separateBillPayers": "Everyone pays separately",
+          "dateTime": null,
+          "timezone": null
+        }
+      }
+    },
+    {
+      "id": "dollar-symbol-is-not-currency",
+      "request": "Dinner for eight adults with a $400 ceiling.",
+      "result": {
+        "adults": 8,
+        "children": null,
+        "childrenAgeRange": null,
+        "budgetMinor": 40000,
+        "currency": null,
+        "separateBills": null,
+        "separateBillPayers": null,
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [
+          {
+            "field": "currency",
+            "reason": "ambiguous"
+          }
+        ],
+        "evidence": {
+          "adults": "eight adults",
+          "children": null,
+          "childrenAgeRange": null,
+          "budgetMinor": "$400",
+          "currency": null,
+          "separateBills": null,
+          "separateBillPayers": null,
+          "dateTime": null,
+          "timezone": null
+        }
+      }
+    },
+    {
+      "id": "relative-date-preserved",
+      "request": "Please find dinner options for 12 adults next Friday evening in America/Los_Angeles.",
+      "result": {
+        "adults": 12,
+        "children": null,
+        "childrenAgeRange": null,
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": null,
+        "separateBillPayers": null,
+        "dateTime": "next Friday evening",
+        "timezone": "America/Los_Angeles",
+        "clarifications": [],
+        "evidence": {
+          "adults": "12 adults",
+          "children": null,
+          "childrenAgeRange": null,
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": null,
+          "separateBillPayers": null,
+          "dateTime": "next Friday evening",
+          "timezone": "America/Los_Angeles"
+        }
+      }
+    },
+    {
+      "id": "conflicting-counts",
+      "request": "Dinner for 8 adults, actually 12 adults; 3 kids.",
+      "result": {
+        "adults": null,
+        "children": 3,
+        "childrenAgeRange": null,
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": null,
+        "separateBillPayers": null,
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [
+          {
+            "field": "adults",
+            "reason": "conflicting"
+          }
+        ],
+        "evidence": {
+          "adults": null,
+          "children": "3 kids",
+          "childrenAgeRange": null,
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": null,
+          "separateBillPayers": null,
+          "dateTime": null,
+          "timezone": null
+        }
+      }
+    },
+    {
+      "id": "no-billing-assumption",
+      "request": "Dinner with 4 adults and 2 kids.",
+      "result": {
+        "adults": 4,
+        "children": 2,
+        "childrenAgeRange": null,
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": null,
+        "separateBillPayers": null,
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "4 adults",
+          "children": "2 kids",
+          "childrenAgeRange": null,
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": null,
+          "separateBillPayers": null,
+          "dateTime": null,
+          "timezone": null
+        }
+      }
+    }
+  ],
+  "negative": [
+    {
+      "id": "invented-grant",
+      "request": "Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "eight adults",
+          "children": "10 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        },
+        "grants": [
+          "send-email"
+        ]
+      },
+      "validation_layer": "schema"
+    },
+    {
+      "id": "ungrounded-quote",
+      "request": "Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "99 adults",
+          "children": "10 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      },
+      "validation_layer": "semantic"
+    },
+    {
+      "id": "non-null-without-evidence",
+      "request": "Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": null,
+          "children": "10 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      },
+      "validation_layer": "schema"
+    },
+    {
+      "id": "combined-count-overflow",
+      "request": "Dinner for 80 adults and 30 kids between 6-14 where every adult pays there own tab",
+      "result": {
+        "adults": 80,
+        "children": 30,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "80 adults",
+          "children": "30 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      },
+      "validation_layer": "semantic"
+    },
+    {
+      "id": "reversed-age-range",
+      "request": "Dinner for eight adults and 10 kids between 14-6 where every adult pays there own tab",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 14,
+          "maximum": 6
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "eight adults",
+          "children": "10 kids",
+          "childrenAgeRange": "between 14-6",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      },
+      "validation_layer": "semantic"
+    },
+    {
+      "id": "unknown-billing-payers",
+      "request": "Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": null,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "eight adults",
+          "children": "10 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": null,
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      },
+      "validation_layer": "schema"
+    },
+    {
+      "id": "invented-scope",
+      "request": "Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "eight adults",
+          "children": "10 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        },
+        "user_id": "user:attacker",
+        "task_id": "task:expanded"
+      },
+      "validation_layer": "schema"
+    },
+    {
+      "id": "null-with-fabricated-evidence",
+      "request": "Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "eight adults",
+          "children": "10 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": "$400",
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      },
+      "validation_layer": "schema"
+    },
+    {
+      "id": "nested-extra-field",
+      "request": "Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14,
+          "authority": "book-now"
+        },
+        "budgetMinor": null,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "eight adults",
+          "children": "10 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": null,
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      },
+      "validation_layer": "schema"
+    },
+    {
+      "id": "unsafe-budget-integer",
+      "request": "Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab budget 9007199254740992",
+      "result": {
+        "adults": 8,
+        "children": 10,
+        "childrenAgeRange": {
+          "minimum": 6,
+          "maximum": 14
+        },
+        "budgetMinor": 9007199254740992,
+        "currency": null,
+        "separateBills": true,
+        "separateBillPayers": "adults",
+        "dateTime": null,
+        "timezone": null,
+        "clarifications": [],
+        "evidence": {
+          "adults": "eight adults",
+          "children": "10 kids",
+          "childrenAgeRange": "between 6-14",
+          "budgetMinor": "9007199254740992",
+          "currency": null,
+          "separateBills": "every adult pays there own tab",
+          "separateBillPayers": "every adult pays there own tab",
+          "dateTime": null,
+          "timezone": null
+        }
+      },
+      "validation_layer": "schema"
+    }
+  ]
+}

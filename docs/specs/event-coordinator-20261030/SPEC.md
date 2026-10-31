@@ -166,3 +166,20 @@ small immutable records and pure functions; verify regression suite and request 
 independent review. Preserve existing fixture CLI/report schema so main can continue
 its pinned integration. Live adapters, submissions and task-level follow-up authority
 remain outside this extension.
+
+## LLM event interpretation boundary
+
+Main and event lanes agreed on a closed flat extraction shape: adults, children,
+childrenAgeRange, budgetMinor, currency, separateBills, separateBillPayers, dateTime,
+timezone, clarifications and evidence. Unknowns stay null. Evidence has exactly the
+nine extracted-field keys, with verbatim user-request quotes for known values and
+null for unknowns. Clarifications carry field/reason enums, never model-written UI
+instructions. The model cannot supply task/user/scope IDs, total guests, credentials,
+model policy, authority or actions.
+
+Event lane publishes canonical JSON Schema and grounded positive/negative examples.
+Main owns the single JavaScript runtime validator, gateway call and UI wiring. The
+schema captures closed shape, primitive bounds and evidence presence; runtime checks
+sum/order relationships, exact quote grounding, supported currencies and invalid or
+conflicting extraction. Quotes support review, not proof that interpretation is
+semantically correct. Existing Requirements/report/CLI schemas remain unchanged.
