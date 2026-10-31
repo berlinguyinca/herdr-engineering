@@ -85,6 +85,8 @@ _TEXT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _MAX_B64 = 4 * math.ceil(CHUNK_BYTES / 3)
 _ACTOR_KINDS = frozenset({"agent", "user"})
 _MEMBER_PREFIX = "m_"
+MEMBER_PREFIX = _MEMBER_PREFIX  # plan 5's member owner keys
+STAGING_DIR = "staging"
 
 
 class BridgeError(ValueError):
@@ -944,7 +946,7 @@ def staging_parts(owner_key: str, upload_id: str) -> list[str]:
     _check_id(owner_key, "owner key")
     if not isinstance(upload_id, str) or not _UPLOAD.match(upload_id):
         raise BridgeError("invalid upload id")
-    return ["staging", owner_key, upload_id]
+    return [STAGING_DIR, owner_key, upload_id]
 
 
 def staging_path(root: Path, owner_key: str, upload_id: str) -> Path:
@@ -1349,7 +1351,7 @@ __all__ = [
     "Actor", "agent_owner_key", "DIR_MODE", "ensure_dir", "file_exists_beneath", "make_dirs_beneath", "stream_new_beneath", "utf8_accept", "atomic_write_bytes", "atomic_write_json", "AUDITED_MARKER", "BridgeError",
     "BridgeLimits", "Change", "Chunk", "CHUNK_BYTES", "CommitPayload", "ENTRY_SLACK", "FEED_MAX_AGE", "Intent",
     "INTENT_MAX_AGE", "IntentError", "link_new_beneath", "link_new_bytes", "list_beneath", "list_parts", "MAX_CHUNK_INDEX",
-    "MAX_MESSAGE", "max_parts_for", "MAX_TREE_DEPTH", "MCP_UPLOAD_MAX_BODY", "META_MAX_BYTES", "META_NAME",
+    "MAX_MESSAGE", "max_parts_for", "MEMBER_PREFIX", "STAGING_DIR", "MAX_TREE_DEPTH", "MCP_UPLOAD_MAX_BODY", "META_MAX_BYTES", "META_NAME",
     "new_ticket", "open_beneath", "read_bytes_beneath", "read_json_beneath", "read_staged_meta",
     "register_intent_kind", "remove_tree_beneath", "request_digest", "SHA_RE", "StagedUpload", "staging_parts",
     "staging_path", "TICKET_RE", "tree_entry_cap", "unlink_beneath", "upload_complete", "upload_id_for",

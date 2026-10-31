@@ -28,11 +28,14 @@ from herdr_engineering.control_plane.collab_artifacts import (
     AGENTS_FEED,
     AUDIT_EVERY,
     MAX_READ_BYTES,
+    STAGING_INDEX_TTL,
+    STAGING_UPLOADS_PER_OWNER,
     UNAVAILABLE,
     CollabArtifactBridge,
 )
 from herdr_engineering.control_plane.collab_bridge_files import (
     CHUNK_BYTES,
+    ENTRY_SLACK,
     FEED_MAX_AGE,
     BridgeLimits,
     atomic_write_bytes,
@@ -657,6 +660,9 @@ def test_a_first_chunk_over_the_per_agent_staging_cap_is_429(world):
     assert not upload_dir(world, a.id, X, small, "two.bin").exists()
     assert br.stage_chunk(a, chunk_args(X, small, 0, name="one.bin"))["stored"] is False   # a replay is no new reservation
     (upload_dir(world, a.id, X, small, "one.bin") / "verified").write_bytes(b"")          # the worker consumed it
+    assert status(br.stage_chunk, a, chunk_args(X, small, 0, name="two.bin"))[0] == 429  # cached usage: conservative
+    world.clock.t += STAGING_INDEX_TTL
+    world.mirror.grants(limits={"staging_bytes_per_agent": 1000})
     assert br.stage_chunk(a, chunk_args(X, small, 0, name="two.bin"))["stored"] is True
 
 
@@ -732,7 +738,7 @@ def test_a_symlinked_owner_dir_is_never_followed(world, tmp_path):
     outside.mkdir()
     (world.outbox / "staging").mkdir()
     (world.outbox / "staging" / world.a.id).symlink_to(outside)
-    assert status(world.bridge.stage_chunk, world.a, chunk_args(X, BIG, 0))[0] in (409, 503)
+    assert status(world.bridge.stage_chunk, world.a, chunk_args(X, BIG, 0)) == (503, "staging unavailable")
     assert list(outside.iterdir()) == []
 
 
@@ -825,3 +831,63 @@ def test_stage_chunk_for_refuses_a_hand_built_chunk_that_breaks_the_reservation_
         assert status(world.bridge.stage_chunk_for, "m_hand", bad, limits=BridgeLimits(),
                       staging_cap=10 ** 9)[0] == 400
     assert not (world.outbox / "staging").exists()
+
+
+# ------------------------------------------------------------------------------ per-owner upload bounds
+def small_bridge(world, *, uploads=3):
+    return CollabArtifactBridge(world.s, world.mirror.root, world.outbox, clock=world.clock, feed_interval=3600.0,
+                                max_uploads_per_owner=uploads)
+
+
+def test_the_default_upload_count_cap_is_well_under_the_listing_cap():
+    assert STAGING_UPLOADS_PER_OWNER == 4096
+
+
+def test_an_owner_at_the_upload_count_cap_is_429_while_others_stage_and_its_uploads_continue(world):
+    br, a = small_bridge(world), world.a
+    tiny = [bytes([i]) * 10 for i in range(5)]
+    for i in range(2):
+        assert br.stage_chunk(a, chunk_args(X, tiny[i], 0, name=f"t{i}.bin"))["complete"] is True
+    assert br.stage_chunk(a, chunk_args(X, BIG, 0))["stored"] is True                   # the 3rd: in-cap, partial
+    assert status(br.stage_chunk, a, chunk_args(X, tiny[3], 0, name="t3.bin")) == (
+        429, "staging space full; commit or wait")
+    assert not upload_dir(world, a.id, X, tiny[3], "t3.bin").exists()
+    assert br.stage_chunk(a, chunk_args(X, tiny[0], 0, name="t0.bin"))["stored"] is False   # replay at the cap
+    assert br.stage_chunk(a, chunk_args(X, BIG, 1))["stored"] is True                   # continuation at the cap
+    assert br.stage_chunk(a, chunk_args(X, BIG, 2))["complete"] is True
+    other = br.stage_chunk_for("m_b", as_chunk(X, tiny[4], 0, name="b.bin"), limits=BridgeLimits(),
+                               staging_cap=10 ** 9)
+    assert other["stored"] is True                                                       # another owner still stages
+
+
+def test_an_unlistable_owner_dir_is_full_for_that_owner_only_and_counted_conservatively(world):
+    br = small_bridge(world)
+    flood = world.outbox / "staging" / "m_flood"
+    for i in range(3 + ENTRY_SLACK + 1):                                                 # past its listing bound
+        (flood / f"upl_{i:024x}").mkdir(parents=True)
+    lim = BridgeLimits(staging_bytes_per_agent=1000, staging_bytes_total=1500)
+    tiny = b"f" * 10
+    assert status(br.stage_chunk_for, "m_flood", as_chunk(X, tiny, 0, name="f.bin"), limits=lim,
+                  staging_cap=10 ** 9) == (429, "staging space full; commit or wait")
+    assert br.stage_chunk_for("m_b", as_chunk(X, tiny, 0, name="b.bin"), limits=lim,
+                              staging_cap=10 ** 9)["stored"] is True
+    # the unlistable owner counts as a full per-agent allowance (1000) against the whole-volume cap (1500)
+    assert status(br.stage_chunk_for, "m_c", as_chunk(X, b"c" * 600, 0, name="c.bin"), limits=lim,
+                  staging_cap=10 ** 9) == (429, "staging space full; commit or wait")
+    assert br.stage_chunk_for("m_c", as_chunk(X, b"c" * 400, 0, name="c.bin"), limits=lim,
+                              staging_cap=10 ** 9)["stored"] is True
+
+
+def test_owner_usage_is_cached_and_rescanned_only_after_its_ttl(world):
+    br = world.bridge
+    for owner in ("m_one", "m_two"):
+        br.stage_chunk_for(owner, as_chunk(X, b"x" * 10, 0, name="x.bin"), limits=BridgeLimits(),
+                           staging_cap=10 ** 9)
+    scans = br.stats["owner_scans"]
+    for i in range(5):
+        br.stage_chunk_for("m_one", as_chunk(X, bytes([i]) * 10, 0, name=f"y{i}.bin"), limits=BridgeLimits(),
+                           staging_cap=10 ** 9)
+    assert br.stats["owner_scans"] == scans                                              # no rescan within the TTL
+    world.clock.t += STAGING_INDEX_TTL
+    br.stage_chunk_for("m_one", as_chunk(X, b"z" * 10, 0, name="z.bin"), limits=BridgeLimits(), staging_cap=10 ** 9)
+    assert br.stats["owner_scans"] == scans + 2                                          # each owner once again

@@ -26,14 +26,22 @@ never taken from the caller, and every staging write is a no-follow ``link_new_b
 so a part or ``meta.json`` is never partial and never replaced.
 
 * The first chunk of an upload reserves its declared ``size_bytes`` against ``staging_cap`` (that owner) and
-  ``limits.staging_bytes_total`` (all owners). The sum is the declared size of every upload dir with a valid
-  ``meta.json`` and no ``verified`` marker (a verified upload's parts are gone). Reservation, the scan and the
-  ``meta.json`` link run under one per-bridge lock, so concurrent first chunks in this process can never exceed a cap.
-  Residuals: the lock is per process (a second ``collab-public`` process on the same outbox could over-reserve by its
-  own in-flight first chunks), a meta-less dir (a crash between ``mkdirat`` and the ``meta.json`` link) is not counted
-  until the worker's sweep removes it after 60 s, and a part written in the instant between the worker's ``verified``
-  marker and its part unlinks stays until the TTL sweep. Each part is bounded by its validated length, so the bytes on
-  disk never exceed the declared sizes.
+  ``limits.staging_bytes_total`` (all owners), and counts against the owner's upload-count cap
+  (``max_uploads_per_owner``, default ``STAGING_UPLOADS_PER_OWNER``; every upload dir counts, verified or not, because
+  that is what bounds a listing). An owner's usage is the declared size of its upload dirs with a valid ``meta.json``
+  and no ``verified`` marker (a verified upload's parts are gone). Usage is kept per owner in memory, rescanned at most
+  once per ``staging_index_ttl`` s and bumped by this bridge's own reservations; only this process creates uploads and
+  the worker only removes them, so a stale entry over-counts (conservative), never under-counts. An owner dir that
+  cannot be listed (over ``max_uploads_per_owner + ENTRY_SLACK`` entries, or unsafe) is full for that owner and counts
+  as ``max(last known, staging_bytes_per_agent)`` bytes towards the whole-volume sum, so it never blocks other owners.
+  ``staging/`` itself past ``STAGING_OWNERS_MAX`` owners refuses every reservation (owners are bounded by agents).
+  Reservation and the ``meta.json`` link run under one per-bridge lock, so concurrent first chunks in this process can
+  never exceed a cap. Residuals: the lock and the usage index are per process (a second ``collab-public`` process on
+  the same outbox could over-reserve by its own in-flight first chunks), a meta-less dir (a crash between ``mkdirat``
+  and the ``meta.json`` link) is counted only after a rescan, and a part written in the instant between the worker's
+  ``verified`` marker and its part unlinks stays until the TTL sweep. Each part is bounded by its validated length, so
+  the bytes on disk never exceed the declared sizes. A first chunk costs one listing of ``staging/`` plus, per owner
+  whose entry is older than the TTL, one bounded scan (at most ``max_uploads_per_owner + ENTRY_SLACK`` metas).
 * A plain chunk costs a ``meta.json`` read, a ``verified`` stat and the part write; only the last index or a replay
   scans the upload dir (``list_parts``) for ``complete``/``received``/``missing`` (at most ``MAX_MISSING``).
 * A scan that sees the upload complete links the ``audited`` marker and only then commits ``artifact_upload_staged``
@@ -47,6 +55,7 @@ The methods are synchronous and do blocking file I/O and hashing: an async calle
 from __future__ import annotations
 
 import collections
+import dataclasses
 import errno
 import hashlib
 import json
@@ -64,9 +73,12 @@ from .collab import CollabError, Principal
 from .collab_bridge_files import (
     AUDITED_MARKER,
     CHUNK_BYTES,
+    ENTRY_SLACK,
     FEED_MAX_AGE,
+    MEMBER_PREFIX,
     META_NAME,
     SHA_RE,
+    STAGING_DIR,
     VERIFIED_MARKER,
     BridgeError,
     BridgeLimits,
@@ -113,7 +125,6 @@ _GRANT_PERMISSIONS = frozenset({"read", "write"})
 _TOOL_ACTIONS = {"artifacts_list": "artifact.list", "artifact_head": "artifact.head",
                  "artifact_read": "artifact.read", "artifact_history": "artifact.history"}
 
-STAGING_DIR = "staging"
 READ_ONLY = "read-only grant"
 NOT_WRITABLE = "artifact is not writable through collaboration"
 STAGING_FULL = "staging space full; commit or wait"
@@ -124,9 +135,17 @@ STAGING_INVALID = "staged upload directory is invalid"
 STAGING_UNAVAILABLE = "staging unavailable"
 BAD_CHUNK_ARGS = "chunk arguments are missing or unknown"
 MAX_MISSING = 100
-STAGING_OWNERS_MAX = 100_000        # entries of staging/ one reservation scan reads (fail closed past it)
-STAGING_UPLOADS_MAX = 100_000       # entries of one staging/<owner>/ (fail closed past it)
-_MEMBER_PREFIX = "m_"
+STAGING_OWNERS_MAX = 100_000        # entries of staging/ one reservation reads (fail closed past it, for everyone)
+STAGING_UPLOADS_PER_OWNER = 4096    # upload dirs one owner may hold (the TTL sweep frees them)
+STAGING_INDEX_TTL = 30.0            # seconds an owner's cached staging usage is trusted before a rescan
+
+
+@dataclasses.dataclass(frozen=True)
+class _OwnerUsage:
+    size_bytes: int       # declared bytes of its unverified uploads
+    uploads: int          # upload dirs, verified or not
+    at: float             # when scanned (a bump keeps the scan time)
+    full: bool = False    # the dir could not be listed: no new upload for this owner
 
 
 def _finite(value) -> bool:
@@ -157,7 +176,8 @@ class CollabArtifactBridge:
     USE_COUNTER_MAX = 50_000
 
     def __init__(self, service, mirror: Path, outbox: Path, *, clock: Callable[[], float] = time.time,
-                 feed_interval: float = FEED_INTERVAL):
+                 feed_interval: float = FEED_INTERVAL, max_uploads_per_owner: int = STAGING_UPLOADS_PER_OWNER,
+                 staging_index_ttl: float = STAGING_INDEX_TTL):
         self.service = service
         self.mirror = Path(mirror)
         self.outbox = Path(outbox)
@@ -170,6 +190,12 @@ class CollabArtifactBridge:
         self._uses: collections.OrderedDict = collections.OrderedDict()
         self._feed_lock = threading.Lock()
         self._staging_lock = threading.Lock()
+        if isinstance(max_uploads_per_owner, bool) or not isinstance(max_uploads_per_owner, int) \
+                or max_uploads_per_owner < 1:
+            raise ValueError("max_uploads_per_owner must be a positive integer")
+        self.max_uploads_per_owner = max_uploads_per_owner
+        self.staging_index_ttl = float(staging_index_ttl)
+        self._owner_usage: dict[str, _OwnerUsage] = {}            # guarded by _staging_lock
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -478,7 +504,9 @@ class CollabArtifactBridge:
             if file_exists_beneath(self.outbox, parts, META_NAME):
                 raise CollabError(409, META_MISMATCH)                # present but invalid: never relinked
             own, everyone = self._reserved(owner_key, limits)
-            if own + chunk.size_bytes > staging_cap or everyone + chunk.size_bytes > limits.staging_bytes_total:
+            if own.full or own.uploads >= self.max_uploads_per_owner \
+                    or own.size_bytes + chunk.size_bytes > staging_cap \
+                    or everyone + chunk.size_bytes > limits.staging_bytes_total:
                 self.stats["staging_full"] += 1
                 raise CollabError(429, STAGING_FULL)
             meta = StagedUpload(upload_id=upload_id, owner_key=owner_key, artifact_id=chunk.artifact_id,
@@ -487,37 +515,67 @@ class CollabArtifactBridge:
             body = json.dumps(meta.to_dict(), ensure_ascii=False, allow_nan=False).encode("utf-8")
             if link_new_beneath(self.outbox, parts, META_NAME, body, create_dirs=True):
                 self.stats["uploads_started"] += 1
+                self._owner_usage[owner_key] = dataclasses.replace(
+                    own, size_bytes=own.size_bytes + chunk.size_bytes, uploads=own.uploads + 1)
                 return meta
             again = read_staged_meta(self.outbox, owner_key, upload_id, limits)   # another process linked it
             if again is None:
                 raise CollabError(409, META_MISMATCH)
             return again
 
-    def _reserved(self, owner_key: str, limits: BridgeLimits) -> tuple[int, int]:
-        """(declared bytes staged by ``owner_key``, by every owner): uploads with a valid ``meta.json`` and no
-        ``verified`` marker. Fails closed (429) when a listing is over its cap."""
+    def _reserved(self, owner_key: str, limits: BridgeLimits) -> tuple[_OwnerUsage, int]:
+        """(``owner_key``'s usage, declared bytes staged by every owner); call under ``_staging_lock``. Fails closed
+        (429, for everyone) only when ``staging/`` itself is over ``STAGING_OWNERS_MAX`` entries."""
         self.stats["reservation_scans"] += 1
+        now = self.clock()
         try:
             owners = list_beneath(self.outbox, [STAGING_DIR], max_entries=STAGING_OWNERS_MAX) or []
-            own = everyone = 0
-            for owner, st in owners:
-                if not stat.S_ISDIR(st.st_mode):
-                    continue                                         # never follow a symlinked owner entry
-                uploads = list_beneath(self.outbox, [STAGING_DIR, owner], max_entries=STAGING_UPLOADS_MAX) or []
-                for upload_id, ust in uploads:
-                    if not stat.S_ISDIR(ust.st_mode):
-                        continue
-                    meta = read_staged_meta(self.outbox, owner, upload_id, limits)
-                    if meta is None or file_exists_beneath(self.outbox, [STAGING_DIR, owner, upload_id],
-                                                           VERIFIED_MARKER):
-                        continue
-                    everyone += meta.size_bytes
-                    if owner == owner_key:
-                        own += meta.size_bytes
         except BridgeError:
             self.stats["staging_full"] += 1
             raise CollabError(429, STAGING_FULL) from None
+        own, everyone, seen = _OwnerUsage(0, 0, now), 0, set()
+        for owner, st in owners:
+            if not stat.S_ISDIR(st.st_mode):
+                continue                                             # never follow a symlinked owner entry
+            seen.add(owner)
+            usage = self._usage(owner, limits, now)
+            everyone += usage.size_bytes
+            if owner == owner_key:
+                own = usage
+        for gone in [k for k in self._owner_usage if k not in seen]:
+            del self._owner_usage[gone]                              # removed by the worker's sweep
         return own, everyone
+
+    def _usage(self, owner: str, limits: BridgeLimits, now: float) -> _OwnerUsage:
+        """One owner's cached usage, rescanned when older than ``staging_index_ttl``. An owner dir that cannot be
+        listed is ``full`` and counted as ``max(last known, staging_bytes_per_agent)`` bytes."""
+        cached = self._owner_usage.get(owner)
+        if cached is not None and now - cached.at < self.staging_index_ttl:
+            return cached
+        self.stats["owner_scans"] += 1
+        try:
+            uploads = list_beneath(self.outbox, [STAGING_DIR, owner],
+                                   max_entries=self.max_uploads_per_owner + ENTRY_SLACK)
+        except BridgeError:
+            uploads = None
+        if uploads is None:
+            self.stats["owner_unlistable"] += 1
+            log.warning("collab staging owner=%s: cannot be listed; counted full", owner)
+            usage = _OwnerUsage(max(cached.size_bytes if cached else 0, limits.staging_bytes_per_agent),
+                                self.max_uploads_per_owner, now, full=True)
+        else:
+            size = count = 0
+            for upload_id, ust in uploads:
+                if not stat.S_ISDIR(ust.st_mode):
+                    continue
+                count += 1
+                meta = read_staged_meta(self.outbox, owner, upload_id, limits)
+                if meta is not None and not file_exists_beneath(self.outbox, [STAGING_DIR, owner, upload_id],
+                                                                VERIFIED_MARKER):
+                    size += meta.size_bytes
+            usage = _OwnerUsage(size, count, now)
+        self._owner_usage[owner] = usage
+        return usage
 
     def _write_part(self, parts: list[str], name: str, data: bytes) -> bool:
         """True when the part was linked now, False for a replay of the same bytes; 409 for different bytes."""
@@ -533,7 +591,7 @@ class CollabArtifactBridge:
                 if existing is not None:
                     break
                 time.sleep(0.01)
-        if existing is not None and hashlib.sha256(existing).digest() == hashlib.sha256(data).digest():
+        if existing is not None and existing == data:
             self.stats["chunk_replays"] += 1
             return False
         raise CollabError(409, CHUNK_CONFLICT)
@@ -564,23 +622,23 @@ class CollabArtifactBridge:
         If the event cannot be written the marker is removed again and the 503 propagates, so a retry audits it.
         Task 7c's ``commit()`` precheck calls this too. True when the event was emitted now."""
         parts = staging_parts(owner_key, upload_id)
+        if file_exists_beneath(self.outbox, parts, AUDITED_MARKER):
+            return False                                             # the common replay: no tmpfile, no fsync
         try:
             if not link_new_beneath(self.outbox, parts, AUDITED_MARKER, b""):
                 return False
         except BridgeError:
             return False                                             # swept meanwhile: nothing to audit here
         svc = self.service
-        member = owner_key.startswith(_MEMBER_PREFIX)
+        member = owner_key.startswith(MEMBER_PREFIX)
         with svc._lock:
             agent = None if member else svc._agents.get(owner_key)
-        payload = {
-            "actor_user_id": agent.get("owner") if isinstance(agent, dict) else None,
-            "actor_agent_id": None if member else owner_key,
-            "actor_kind": "member" if member else ("external" if isinstance(agent, dict) and agent.get("external")
-                                                   else "agent"),
-            "action": "artifact.stage_chunk", "outcome": "allowed", "owner_key": owner_key, "upload_id": upload_id,
-            "artifact_id": meta.artifact_id, "resource_id": meta.artifact_id, "size_bytes": meta.size_bytes,
-            "project_ids": []}
+        owner = agent.get("owner") if isinstance(agent, dict) else None
+        actor = Principal("member" if member else "agent", owner_key, owner)
+        actor.external = isinstance(agent, dict) and bool(agent.get("external"))
+        payload = svc._actor(actor, action="artifact.stage_chunk", outcome="allowed", owner_key=owner_key,
+                             upload_id=upload_id, artifact_id=meta.artifact_id, resource_id=meta.artifact_id,
+                             size_bytes=meta.size_bytes, project_ids=[])
         try:
             svc._commit("artifact_upload_staged", payload)
         except BaseException:
@@ -710,4 +768,4 @@ class CollabArtifactBridge:
 
 __all__ = ["AGENTS_FEED", "AUDIT_EVERY", "BINARY", "CHUNK_CONFLICT", "CollabArtifactBridge", "INTEGRITY",
            "MAX_MISSING", "MAX_READ_BYTES", "META_MISMATCH", "NOT_FOUND", "NOT_MIRRORED", "NOT_WRITABLE", "READ_ONLY",
-           "STAGING_FULL", "UNAVAILABLE"]
+           "STAGING_FULL", "STAGING_INDEX_TTL", "STAGING_UPLOADS_PER_OWNER", "UNAVAILABLE"]
