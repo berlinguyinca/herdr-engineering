@@ -2,8 +2,11 @@
 (tmp_path) and explicit paths. Nothing here reads or writes the real ~/.claude, ~/.codex, ~/.config/herdr, ..."""
 import json
 import os
+import socket
 import subprocess
 import sys
+import threading
+import time
 from argparse import Namespace
 from pathlib import Path
 
@@ -14,6 +17,7 @@ from herdr_engineering.control_plane.assistant_hub.events import list_events
 from herdr_engineering.control_plane.assistant_hub.hook_relay import (
     RelayConfig,
     RelayConfigError,
+    build_hook_command,
     install_hooks,
     relay,
 )
@@ -71,8 +75,8 @@ def test_relay_posts_observation_to_real_hub(started, tmp_path):
 
 def test_relay_marks_failed_outcome_and_summarises_other_tools_by_keys(started, tmp_path):
     hub, _, _, cfg = setup(started, tmp_path)
-    relay({"session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "WebFetch",
-           "tool_input": {"url": "http://x", "prompt": "p"}, "tool_response": {"is_error": True, "error": "boom"}}, cfg)
+    relay({"session_id": "s", "hook_event_name": "PostToolUseFailure", "tool_name": "WebFetch",
+           "tool_input": {"url": "http://x", "prompt": "p"}, "error": "boom"}, cfg)
     (e,) = events(hub)
     assert e.payload["outcome"] == "failed"
     assert e.payload["tool_input_summary"] == "keys: prompt, url"
@@ -151,12 +155,12 @@ def test_relay_writes_no_decision_files(started, tmp_path):
 def test_relay_truncates_and_scrubs_bash_command(started, tmp_path):
     hub, _, _, cfg = setup(started, tmp_path)
     relay({**PERM, "tool_input": {"command": "curl -H 'x: sk-abcdefghijklmnopqrstuvwxyz0123' http://h"}}, cfg)
-    relay({**PERM, "tool_input": {"command": "echo " + "a" * 1000}}, cfg)
+    relay({**PERM, "tool_input": {"command": "echo " + "ab " * 400}}, cfg)
     long_e, tok_e = events(hub)
     assert "sk-abcdefghijklmnop" not in json.dumps(tok_e.payload)
     assert "curl" in tok_e.payload["tool_input_summary"]
     assert len(long_e.payload["tool_input_summary"]) <= 300
-    assert long_e.payload["tool_input_summary"].startswith("echo aaa")
+    assert long_e.payload["tool_input_summary"].startswith("echo ab ab")
 
 
 def test_hook_main_reads_stdin_exits_zero(started, tmp_path):
@@ -182,7 +186,7 @@ def test_install_hooks_diff_confirm_and_idempotent(tmp_path):
     diff = install_hooks(s, command=CMD, confirm=lambda d: seen.append(d) or True)
     assert seen == [diff] and "PermissionRequest" in diff and "PostToolUse" in diff and diff.startswith("---")
     data = json.loads(s.read_text())
-    for ev in ("PermissionRequest", "PostToolUse"):
+    for ev in ("PermissionRequest", "PostToolUse", "PostToolUseFailure"):
         (entry,) = data["hooks"][ev]
         assert entry["matcher"] == "*"
         assert entry["hooks"] == [{"type": "command", "command": CMD, "timeout": 5}]
@@ -303,8 +307,161 @@ def test_cli_install_hooks_command_and_non_claude(tmp_path, capsys):
     ns = Namespace(action="install-hooks", harness="claude", settings=str(s), yes=True)
     assert _cmd_cp_assistant_worker(ns) == 0
     cmd = json.loads(s.read_text())["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
-    assert cmd.startswith(sys.executable) and " -I " in cmd and cmd.endswith("hook_relay.py")
+    assert sys.executable in cmd and " -I " in cmd and "hook_relay.py" in cmd and cmd.startswith("/bin/sh -c ")
     capsys.readouterr()
     ns = Namespace(action="install-hooks", harness="pi", settings=str(tmp_path / "t.json"), yes=True)
     assert _cmd_cp_assistant_worker(ns) == 1
     assert "claude" in capsys.readouterr().err and not (tmp_path / "t.json").exists()
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def installed_command(tmp_path, exe, script):
+    s = tmp_path / "inst-settings.json"
+    s.unlink(missing_ok=True)
+    install_hooks(s, command=build_hook_command(exe, script), confirm=lambda d: True)
+    return json.loads(s.read_text())["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+
+
+def run_cmd(cmd, tmp_path):
+    return subprocess.run(cmd, shell=True, input=json.dumps(PERM), capture_output=True, text=True, timeout=30,
+                          env={"HOME": str(tmp_path), "HERDR_ASSISTANT_WORKER_FILE": str(tmp_path / "none.json")})
+
+
+def test_installed_command_never_blocks_or_prints(tmp_path):
+    loud_dir = tmp_path / "loud dir"
+    loud_dir.mkdir()
+    loud = loud_dir / "hook_relay.py"
+    loud.write_text("import sys\nprint('out'); print('err', file=sys.stderr); sys.exit(2)\n")
+    cases = {
+        "real": (sys.executable, hook_relay.__file__),
+        "missing script": (sys.executable, str(tmp_path / "gone" / "hook_relay.py")),
+        "missing interpreter": (str(tmp_path / "no-python"), hook_relay.__file__),
+        "loud exit 2": (sys.executable, str(loud)),
+    }
+    for name, (exe, script) in cases.items():
+        r = run_cmd(installed_command(tmp_path, exe, script), tmp_path)
+        assert r.returncode == 0 and r.stdout == "" and r.stderr == "", (name, r)
+
+
+def test_installed_command_still_delivers_stdin(started, tmp_path):
+    hub, srv, _, _ = setup(started, tmp_path)
+    cmd = installed_command(tmp_path, sys.executable, hook_relay.__file__)
+    r = subprocess.run(cmd, shell=True, input=json.dumps(PERM), capture_output=True, text=True, timeout=30,
+                       env={"HOME": str(tmp_path), "HERDR_ASSISTANT_WORKER_FILE": str(tmp_path / "w.json")})
+    assert r.returncode == 0 and r.stdout == "" and len(events(hub)) == 1
+
+
+def test_install_hooks_replaces_stale_relay_entries(tmp_path):
+    s = tmp_path / "settings.json"
+    other = {"matcher": "Edit", "hooks": [{"type": "command", "command": "fmt"}]}
+    s.write_text(json.dumps({"hooks": {"PostToolUse": [other]}}))
+    a = build_hook_command("/old/python3", "/old/path/hook_relay.py")
+    b = build_hook_command("/new/python3", "/new/path/hook_relay.py")
+    install_hooks(s, command=a, confirm=lambda d: True)
+    diff = install_hooks(s, command=b, confirm=lambda d: True)
+    assert "/old/path" in diff and "/new/path" in diff
+    data = json.loads(s.read_text())
+    for ev in ("PermissionRequest", "PostToolUse", "PostToolUseFailure"):
+        cmds = [h["command"] for e in data["hooks"][ev] for h in e["hooks"] if "hook_relay.py" in h["command"]]
+        assert cmds == [b], ev
+    assert data["hooks"]["PostToolUse"][0] == other
+    assert install_hooks(s, command=b, confirm=lambda d: pytest.fail("idempotent")) == ""
+
+
+def test_relay_post_tool_use_failure_is_failed_and_post_tool_use_is_ran(started, tmp_path):
+    hub, _, _, cfg = setup(started, tmp_path)
+    relay({"session_id": "s", "hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+           "tool_input": {"command": "false"}, "tool_use_id": "t1", "error": "exit 1 SECRET"}, cfg)
+    relay({"session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Bash",
+           "tool_input": {"command": "true"}, "tool_use_id": "t2", "tool_response": {"is_error": True}}, cfg)
+    ran, failed = events(hub)
+    assert failed.payload["outcome"] == "failed" and ran.payload["outcome"] == "ran"
+    assert "SECRET" not in json.dumps(failed.payload)
+
+
+def test_relay_total_deadline_against_silent_listener(tmp_path, capsys):
+    lst = socket.socket()
+    lst.bind(("127.0.0.1", 0))
+    lst.listen(5)
+    held = []
+    threading.Thread(target=lambda: held.append(lst.accept()), daemon=True).start()
+    cfg = RelayConfig(url=f"http://127.0.0.1:{lst.getsockname()[1]}", credential="c" * 20, device_id="d")
+    t0 = time.monotonic()
+    assert relay(dict(PERM), cfg) is None
+    took = time.monotonic() - t0
+    lst.close()
+    assert took < 3.0, took
+    out = capsys.readouterr()
+    assert out.out == "" and out.err == ""
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()
+    t0 = time.monotonic()
+    relay(dict(PERM), RelayConfig(url=f"http://127.0.0.1:{port}", credential="c" * 20, device_id="d"))
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_summary_masks_token_straddling_the_300_char_cut(started, tmp_path):
+    hub, _, _, cfg = setup(started, tmp_path)
+    token = "sk-" + "QwErTyUiOpAsDfGhJkLzXcVbNm0123456789"
+    cmd = "echo " + "ab " * 95 + token + " tail"
+    assert cmd.index(token) < 300 < cmd.index(token) + len(token)
+    relay({**PERM, "tool_input": {"command": cmd}}, cfg)
+    blob = json.dumps(events(hub)[0].payload)
+    for i in range(len(token) - 7):
+        assert token[i:i + 8] not in blob
+
+
+class _Redirector(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        import http.server
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:1/elsewhere")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+        self.srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+
+    def run(self):
+        self.srv.serve_forever()
+
+
+def test_redeem_does_not_follow_redirects_and_makes_private_dir(tmp_path, capsys):
+    from herdr_engineering.cli import _cmd_cp_assistant_worker
+    r = _Redirector()
+    r.start()
+    args = Namespace(action="redeem", url=f"http://127.0.0.1:{r.srv.server_port}", code="C", device_id="d",
+                     out=str(tmp_path / "newdir" / "w.json"), force=False)
+    assert _cmd_cp_assistant_worker(args) == 1
+    r.srv.shutdown()
+    err = capsys.readouterr().err
+    assert "HTTP 302" in err and len(err.strip().splitlines()) == 1
+
+
+def test_redeem_creates_parent_0700(started, tmp_path):
+    from herdr_engineering.cli import _cmd_cp_assistant_worker
+    hub, srv = started()
+    _, code = hub.registry.create_enrollment(tenant_id="default", user_id="u1", name="b", harness="claude")
+    args = redeem_args(srv, code, tmp_path)
+    assert _cmd_cp_assistant_worker(args) == 0
+    assert (Path(args.out).parent.stat().st_mode & 0o777) == 0o700
+
+
+def test_redeem_warns_on_plain_http_to_public_host(tmp_path, capsys):
+    from herdr_engineering.cli import _cmd_cp_assistant_worker
+    args = Namespace(action="redeem", url="http://hub.example.invalid:9", code="C", device_id="d",
+                     out=str(tmp_path / "w.json"), force=False)
+    _cmd_cp_assistant_worker(args)
+    assert "plain http" in capsys.readouterr().err
+    for url in ("http://127.0.0.1:1", "http://100.64.1.2:1", "http://10.0.0.1:1", "http://[fd7a:115c:a1e0::1]:1",
+                "https://hub.example.invalid"):
+        assert hook_relay.plain_http_warning(url) is None, url
+    assert hook_relay.plain_http_warning("http://8.8.8.8:1")

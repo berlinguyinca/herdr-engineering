@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import signal
 import socket
 import sys
@@ -3153,6 +3152,8 @@ def _assistant_worker_redeem(args) -> int:
     from .control_plane.assistant_hub.hook_relay import (
         DEFAULT_FILE,
         RelayConfigError,
+        make_opener,
+        plain_http_warning,
         validate_hub_url,
     )
 
@@ -3171,11 +3172,14 @@ def _assistant_worker_redeem(args) -> int:
     if os.path.lexists(dest) and not args.force:
         print(f"assistant-worker redeem failed: {dest} exists (use --force to replace it)", file=sys.stderr)
         return 1
+    warning = plain_http_warning(base)
+    if warning:
+        print(warning, file=sys.stderr)
     try:
         req = urllib.request.Request(f"{base}/assistant/enroll", method="POST",
                                      headers={"Content-Type": "application/json"},
                                      data=json.dumps({"code": args.code, "device_id": args.device_id}).encode())
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with make_opener().open(req, timeout=15) as response:
             out = json.loads(response.read(1024 * 1024))
         cred, device = out["credential"], out["device_id"]
         if not (isinstance(cred, str) and isinstance(device, str)
@@ -3189,7 +3193,9 @@ def _assistant_worker_redeem(args) -> int:
         return 1
     payload = json.dumps({"url": base, "credential": cred, "device_id": device}).encode()
     try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.parent.exists():
+            dest.parent.mkdir(parents=True, mode=0o700)
+            os.chmod(dest.parent, 0o700)
         if args.force:
             tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -3225,7 +3231,7 @@ def _assistant_worker_install_hooks(args) -> int:
     if not args.settings:
         print("install-hooks needs --settings PATH", file=sys.stderr)
         return 2
-    command = f"{shlex.quote(sys.executable)} -I {shlex.quote(hook_relay.__file__)}"
+    command = hook_relay.build_hook_command(sys.executable, hook_relay.__file__)
     applied: list[bool] = []
 
     def confirm(diff: str) -> bool:

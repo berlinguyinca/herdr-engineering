@@ -8,11 +8,15 @@ a file, never caches a decision. The assistant learns; the harness does not. Eve
 from __future__ import annotations
 
 import difflib
+import ipaddress
 import json
 import os
+import re
+import shlex
 import stat
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,9 +28,12 @@ from urllib.parse import urlsplit
 
 ENV_FILE = "HERDR_ASSISTANT_WORKER_FILE"
 DEFAULT_FILE = "~/.config/herdr/assistant-worker.json"
-TIMEOUT_S = 3
 MAX_COMMAND = 300
-HOOK_EVENTS = ("PermissionRequest", "PostToolUse")
+HOOK_EVENTS = ("PermissionRequest", "PostToolUse", "PostToolUseFailure")
+MARKER = "hook_relay.py"
+DEADLINE_S = 2.5
+SOCKET_TIMEOUT_S = 2.0
+_TOKENISH = re.compile(r"[A-Za-z0-9_.=/+\-]{24,}")
 _FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit")
 _PATH_KEYS = ("file_path", "path", "notebook_path")
 
@@ -96,7 +103,8 @@ def _summary(tool_name: str, tool_input: Any) -> str:
         return ""
     if tool_name == "Bash":
         cmd = tool_input.get("command")
-        return cmd[:MAX_COMMAND] if isinstance(cmd, str) else ""
+        # mask token-looking runs BEFORE truncating so a secret cut at the boundary cannot leak a prefix
+        return _TOKENISH.sub("[masked]", cmd)[:MAX_COMMAND] if isinstance(cmd, str) else ""
     if tool_name in _FILE_TOOLS:
         for key in _PATH_KEYS:
             value = tool_input.get(key)
@@ -104,12 +112,6 @@ def _summary(tool_name: str, tool_input: Any) -> str:
                 return value[:MAX_COMMAND]
         return ""
     return ("keys: " + ", ".join(sorted(str(k) for k in tool_input)))[:MAX_COMMAND]
-
-
-def _failed(response: Any) -> bool:
-    if isinstance(response, dict):
-        return bool(response.get("is_error") or response.get("error") or response.get("success") is False)
-    return False
 
 
 def observation(event: dict) -> dict:
@@ -121,7 +123,9 @@ def observation(event: dict) -> dict:
                                "tool_input_summary": _summary(name, event.get("tool_input")),
                                "cwd": str(event.get("cwd") or ""), "harness": "claude"}
     if hook == "PostToolUse":
-        payload["outcome"] = "failed" if _failed(event.get("tool_response")) else "ran"
+        payload["outcome"] = "ran"
+    elif hook == "PostToolUseFailure":
+        payload["outcome"] = "failed"
     return payload
 
 
@@ -130,8 +134,41 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def make_opener() -> urllib.request.OpenerDirector:
+    """An opener that ignores proxy environment variables and never follows redirects."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def plain_http_warning(url: str) -> str | None:
+    """A warning when ``url`` is plain http to a host that is not loopback, private, CGNAT or tailnet; else None."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.scheme != "http" or host == "localhost":
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return f"warning: plain http to {host}, which is not a recognised private address; use the tailnet address"
+    if ip.is_loopback or ip.is_private or ip in _TAILNET_V6 or (ip.version == 4 and ip in _CGNAT):
+        return None
+    return f"warning: plain http to public address {host}; the credential would cross the network unencrypted"
+
+
 def relay(event: dict, config: RelayConfig) -> str | None:
     """POST the observation; Phase 1 ALWAYS returns None (no decision), whatever happens."""
+    def send() -> None:
+        _post(event, config)
+    worker = threading.Thread(target=send, daemon=True)
+    worker.start()
+    worker.join(DEADLINE_S)  # total deadline; the daemon thread dies with the process
+    return None
+
+
+def _post(event: dict, config: RelayConfig) -> None:
     try:
         sid = event.get("session_id")
         body = json.dumps({"session_id": sid if isinstance(sid, str) and sid else "unknown",
@@ -140,12 +177,10 @@ def relay(event: dict, config: RelayConfig) -> str | None:
             f"{config.url}/assistant/hook-events", data=body, method="POST",
             headers={"Content-Type": "application/json", "Authorization": f"Worker {config.credential}",
                      "X-Herdr-Device": config.device_id})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
-        with opener.open(request, timeout=TIMEOUT_S) as response:
+        with make_opener().open(request, timeout=SOCKET_TIMEOUT_S) as response:
             response.read(4096)
     except Exception:  # noqa: BLE001 - observation must never disturb the harness
         pass
-    return None
 
 
 def main() -> int:
@@ -171,21 +206,42 @@ def _backup_path(settings: Path, *, stamp: str | None = None) -> Path:
     return candidate
 
 
+def build_hook_command(exe: str, script: str) -> str:
+    """One shell command that runs the relay and can never block the harness: no output, always exit 0."""
+    inner = f"{shlex.quote(exe)} -I {shlex.quote(script)} >/dev/null 2>&1; exit 0"
+    return f"/bin/sh -c {shlex.quote(inner)}"
+
+
+def _is_ours(hook: Any) -> bool:
+    return isinstance(hook, dict) and MARKER in str(hook.get("command", ""))
+
+
 def _with_hooks(data: dict, command: str) -> dict:
     hooks = data.get("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError("settings 'hooks' must be an object")
     new = dict(data)
     new_hooks = dict(hooks)
+    ours = {"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 5}]}
     for event in HOOK_EVENTS:
         entries = new_hooks.get(event, [])
         if not isinstance(entries, list):
             raise ValueError(f"settings hooks.{event} must be a list")
-        if any(isinstance(e, dict) and isinstance(e.get("hooks"), list)
-               and any(isinstance(h, dict) and h.get("command") == command for h in e["hooks"]) for e in entries):
+        for e in entries:
+            if isinstance(e, dict) and "hooks" in e and not isinstance(e["hooks"], list):
+                raise ValueError(f"settings hooks.{event} entry has a non-list 'hooks'")
+        mine = [e for e in entries if isinstance(e, dict) and any(_is_ours(h) for h in e.get("hooks", []))]
+        if mine == [ours]:
             continue
-        new_hooks[event] = [*entries, {"matcher": "*",
-                                       "hooks": [{"type": "command", "command": command, "timeout": 5}]}]
+        kept: list[Any] = []
+        for e in entries:
+            if e in mine:
+                rest = [h for h in e["hooks"] if not _is_ours(h)]
+                if rest:
+                    kept.append({**e, "hooks": rest})
+            else:
+                kept.append(e)
+        new_hooks[event] = [*kept, ours]
     new["hooks"] = new_hooks
     return new
 
