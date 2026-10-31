@@ -148,6 +148,7 @@ class TeamRoomsMixin:
             att = self._tr_attach.get((rid, p["team_id"]))
             if att is not None:
                 att["state"] = "detached"
+            self._tr2_forget_team(rid, p["team_id"])
             for aid in p["agents"]:
                 g = room["grants"].get(aid)
                 if g is not None and g.get("team_id") == p["team_id"]:       # only what the attach made
@@ -636,6 +637,8 @@ class TeamRoomsMixin:
         not task events (design section 8 and contradiction 8). Off, nothing changes."""
         if pr.is_agent or not self.team_rooms_active():
             return False
+        if self._tr2_visible.get(room["id"]) and self.team_roles_active():
+            return False                  # slice 2: the owner chose member_visibility for this room
         m = self._member(room, pr.id)
         return bool(m and m["role"] == "guest")
 

@@ -3793,6 +3793,8 @@ def _cmd_cp_web(args) -> int:
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
         from .control_plane.collab_team_rooms import normalize_team_rooms
         collab.team_rooms = normalize_team_rooms(getattr(args, "collab_team_rooms", None))
+        from .control_plane.collab_team_roles import normalize_team_roles
+        collab.team_roles = normalize_team_roles(getattr(args, "collab_team_roles", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
     from .control_plane.rakazo_bridge import rakazo_bridge_config
     try:
@@ -4021,6 +4023,8 @@ COLLAB_CONFIG_KEYS = {
     "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
     # team collaboration slice 1: attach a team to a room, per-room guest level, the Suggest queue; YAML only, off by default
     "team_rooms": ("collab_team_rooms", dict),
+    # team collaboration slice 2: roles, routing by role, people as role holders, leases; YAML only, off by default
+    "team_roles": ("collab_team_roles", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
@@ -4056,11 +4060,12 @@ def _apply_collab_config(args, cp) -> None:
         elif kind is dict:
             from .control_plane.collab_attention import normalize_insights
             from .control_plane.collab_context import normalize_contextual
+            from .control_plane.collab_team_roles import normalize_team_roles
             from .control_plane.collab_team_rooms import normalize_team_rooms
             from .control_plane.collab_workbench import normalize_steering
             try:
                 {"contextual": normalize_contextual, "insights": normalize_insights,
-                 "team_rooms": normalize_team_rooms}.get(key, normalize_steering)(value)
+                 "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
@@ -4086,6 +4091,7 @@ HOT_COLLAB_SWITCHES = {
     "contextual": ("contextual_source", "dict"),
     "insights": ("insights_source", "dict"),
     "team_rooms": ("team_rooms_source", "dict"),
+    "team_roles": ("team_roles_source", "dict"),
     "delegation_enabled": ("delegation_source", "bool"),
     "replay_history": ("replay_history_source", "str"),
 }
@@ -4111,10 +4117,11 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
         return source
     from .control_plane.collab_attention import normalize_insights
     from .control_plane.collab_context import normalize_contextual
-    from .control_plane.collab_workbench import normalize_steering
+    from .control_plane.collab_team_roles import normalize_team_roles
     from .control_plane.collab_team_rooms import normalize_team_rooms
+    from .control_plane.collab_workbench import normalize_steering
     normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights,
-                   "team_rooms": normalize_team_rooms}
+                   "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}
 
     def check(key, value):
         return normalizers[key](value) if key in normalizers else value

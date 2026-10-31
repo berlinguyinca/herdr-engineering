@@ -780,6 +780,27 @@ def test_team_rooms_settings_are_yaml_only_validated_and_off_by_default(tmp_path
             fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, team_rooms=bad))))
 
 
+def test_team_roles_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    import pytest as _pytest
+
+    from herdr_engineering.control_plane.collab_team_roles import normalize_team_roles
+    assert "team_roles" in fcc.COLLAB_KEYS and "team_roles" in cli.COLLAB_CONFIG_KEYS
+    assert "team_roles" in cli.HOT_COLLAB_SWITCHES                                  # read per request, fail closed
+    assert normalize_team_roles(None)["enabled"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, team_roles={"enabled": True, "default_no_response_policy": "wait"}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["team_roles"]["default_no_response_policy"] == "wait"
+    args = argparse.Namespace(collab_team_roles=None)
+    cli._apply_collab_config(args, {"collab": {"team_roles": {"enabled": True}}})
+    assert args.collab_team_roles == {"enabled": True}
+    for bad in ({"default_no_response_policy": "drop"}, {"kill_switch": "no"}, {"unknown": 1}, {"person_lease_seconds": 5}):
+        with _pytest.raises(SystemExit):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"team_roles": bad}})
+        with _pytest.raises(fcc.FleetConfigError):
+            fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, team_roles=bad))))
+
+
 def test_collab_skills_slice_is_accepted_and_forwarded(tmp_path):
     central = make_file(tmp_path, collab=dict(COLLAB, skills={"enabled": True}))
     values = fcc.collab_values(fcc.load_fleet_config(central))

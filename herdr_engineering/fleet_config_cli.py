@@ -190,7 +190,7 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
-                         "contextual", "insights", "team_rooms",
+                         "contextual", "insights", "team_rooms", "team_roles",
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled",
@@ -239,6 +239,11 @@ def collab_values(cfg: FleetConfig) -> dict:
     from .control_plane.collab_team_rooms import normalize_team_rooms
     try:
         normalize_team_rooms(collab.get("team_rooms"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_team_roles import normalize_team_roles
+    try:
+        normalize_team_roles(collab.get("team_roles"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
     from .control_plane.collab import summary_fix_config
