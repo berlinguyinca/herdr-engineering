@@ -616,6 +616,26 @@ def test_an_agent_delegates_by_role_only_from_a_task_it_accepted_and_never_to_a_
     assert p.svc._tasks[kid["task_id"]]["depth"] == 1 and p.svc._tasks[kid["task_id"]]["parent"] == root
 
 
+def test_a_task_is_only_as_good_as_its_requesters_current_authority(rp):
+    """Like an agent's inbox: once whoever asked may no longer ask, the person neither sees the task nor can finish it, and the
+    sweep never hands that request to a new holder."""
+    p = rp
+    team, _ = crew(p)
+    p.assign(team, "tester", "user:dave")
+    p.assign(team, "tester", "user:erin")
+    p.assign(team, "implementer", "user:bob")
+    p.policy(team, "reassign")
+    tid = p.make("bob", target_role="tester", text="bob asks")[1]["task_id"]
+    holder = p.events("task_created")[0]["payload"]["routed_to"][5:]
+    assert [t["task_id"] for t in p.mine(holder)[1]["tasks"]] == [tid]
+    assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/members/bob/remove", {})[0] == 200
+    assert p.mine(holder)[1]["tasks"] == []
+    assert p.respond(holder, tid, "accepted")[0] == 404
+    out = p.sweep()
+    assert out["reassigned"] == 0 and out["escalated"] == 1 and not p.events("task_reassigned")
+    assert p.events("task_escalated")[0]["payload"]["reason"] == "creator_gone"
+
+
 def test_the_operator_sees_an_overdue_person_task_in_attention_and_the_assignee_sees_theirs(rp):
     p = rp
     from herdr_engineering.control_plane.collab_attention import normalize_insights

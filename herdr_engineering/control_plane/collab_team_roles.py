@@ -421,8 +421,8 @@ class TeamRolesMixin:
                 if not t or t["room_id"] != room_id or t.get("target_user") != pr.id:
                     continue
                 status = self._task_status(t)
-                if status not in ("pending", "accepted", "blocked"):
-                    continue
+                if status not in ("pending", "accepted", "blocked") or not self._creator_valid(t, self._rooms[room_id]):
+                    continue                      # a task is only as good as its requester's CURRENT authority
                 lease = t["lease"]
                 out.append({"task_id": tid, "room_id": room_id, "text": t["text"], "status": status, "role": t.get("role"),
                             "team_id": t.get("team_id"), "created_at": t["created_at"],
@@ -439,7 +439,8 @@ class TeamRolesMixin:
             self._tr2_person(pr, room_id, "task.respond")
             room = self._rooms[room_id]
             t = self._tasks.get(task_id) if isinstance(task_id, str) else None
-            if not t or t["room_id"] != room_id or t.get("target_user") != pr.id or not self._ok(pr.id):
+            if (not t or t["room_id"] != room_id or t.get("target_user") != pr.id or not self._ok(pr.id)
+                    or not self._creator_valid(t, room)):
                 raise _err(404, "not found")
             if set(body) - {"status", "result"}:
                 raise _err(400, "unknown field")
@@ -682,6 +683,9 @@ class TeamRolesMixin:
         base = dict(room_id=t["room_id"], project_id=room["project_id"], task_id=tid, visibility_scope="room",
                     outcome="allowed", project_ids=[room["project_id"]], resource_id=tid, actor_user_id=None,
                     actor_agent_id=None, actor_kind="system", target_user_id=t["target_user"])
+        if not self._creator_valid(t, room):              # whoever asked no longer may: never hand it to anyone new
+            self._tr2_escalate(base, "creator_gone", lease["policy"], out)
+            return
         if status == "accepted":                          # the lease ended on accept; only a holder who vanished matters
             if gone:
                 self._tr2_escalate(base, "holder_gone", lease["policy"], out)
@@ -728,7 +732,7 @@ class TeamRolesMixin:
             if not t or t["room_id"] != room_id or t.get("target_user") != pr.id:
                 continue
             st = self._task_status(t)
-            if st in ("pending", "accepted"):
+            if st in ("pending", "accepted") and self._creator_valid(t, self._rooms[room_id]):
                 lease = t["lease"]
                 out.append({"id": tid, "kind": "task_overdue" if st == "pending" and now >= lease["expires"] else "task_assigned",
                             "at": t["created_at"], "expires_epoch": lease["expires"], "role": t.get("role")})

@@ -228,9 +228,14 @@ herdr-eng rooms respond ROOM TASK accepted|done|declined [--result TEXT]
 - Fast: `team_roles.enabled: false` (or `kill_switch: true`). New fields are unknown again, the routes are 404, the sweep stops.
   Nothing is deleted. Person tasks already created stay in the log: they are still visible only to the assignee, owner and creator, and
   nobody chases them (no reminder, no escalation) while the flag is off. Cancel the ones you no longer want (`POST .../tasks/{id}/cancel`).
+  A task is also only as good as its requester's current authority: once whoever asked is removed from the room (or loses the `task`
+  right), the assignee no longer sees it, cannot answer it (404), and the sweep escalates it (`creator_gone`) instead of re-routing it.
 - `roles clear` works with the flag off. `detach` also takes the team's people out of their roles.
-- An image without this code ignores the new event types, but it has no rule hiding a person's task: it would list the task (text
-  included) to everyone who can read the room's task list. **Cancel or finish every task for a person before rolling the image back.**
+- **Do not roll the image back while the log holds a task for a person newer than about 8 days, whatever its status.** An image
+  without this code replays such a task with no agent target, lists its text to everyone who can read the room's task list, and
+  `room_state` and `room_flow` fail with a `TypeError` for every owner and contributor of that room (checked by replaying a log that
+  holds one such task into the code of `origin/main`). Cancelling does not help, because finished tasks stay in memory until the old
+  image prunes them (a task expires after 24 hours, then is dropped after 7 days). Roll back the FLAG, not the image.
 - No migration, no table, no environment variable.
 
 ## Choices made where the design left room
