@@ -19,7 +19,9 @@ from .artifact_shares_client import ShareClient, ShareError, _safe
 
 BASE = "/api/v1/collab"
 TOKEN_ENV = "HERDR_COLLAB_TOKEN"
-ACTIONS = ("attach", "detach", "teams", "guest-level", "queue", "approve", "reject", "suggest", "withdraw")
+ACTIONS = ("attach", "detach", "teams", "guest-level", "queue", "approve", "reject", "suggest", "withdraw",
+           # slice 2: roles and people as role holders (every route is 404 until team_roles.enabled is true)
+           "roles", "assign-role", "clear-role", "role-policy", "member-visibility", "assign", "my-tasks", "respond")
 
 
 def _err(message):
@@ -146,9 +148,11 @@ def run_command(args):
             result = client.request(f"{room}/suggestions", body)
             _show(args, result, lambda r: print(f"{'Already filed' if r.get('replayed') else 'Filed'}: {_safe(r['suggestion_id'])} "
                                                 f"[{_safe(r['state'])}], waiting for the room owner"))
-        else:
+        elif action == "withdraw":
             result = client.request(f"{room}/suggestions/{_q(args.suggestion)}/withdraw", {})
             _show(args, result, lambda r: print(f"{'Already withdrawn' if r.get('replayed') else 'Withdrawn'}: {_safe(r['suggestion_id'])}"))
+        else:
+            _run_roles(client, room, action, args)
         return 0
     except ShareError as error:
         message = _message(error)
@@ -158,6 +162,68 @@ def run_command(args):
         message = str(error)
         _err(message.replace(token, "[redacted]") if token else message)
         return 1
+
+
+def _holder(value):
+    return value if value.startswith("user:") else "user:" + value
+
+
+def _run_roles(client, room, action, args):
+    """Slice 2: who holds which role, tasks for a role or a person, and a person's own queue."""
+    team = f"{room}/teams/{_q(getattr(args, 'team', '') or '')}"
+    if action == "roles":
+        result = client.request(f"{team}/roles")
+
+        def human(r):
+            print(f"Team {_safe(r['team_id'])}  no-response policy: {_safe(r['no_response_policy'])}")
+            for role in r["roles"]:
+                held = ", ".join(f"{_safe(h['holder'])}{'' if h['can_take_tasks'] else ' (cannot take tasks)'}" for h in role["holders"])
+                print(f"  {_safe(role['role'])} ({_safe(role['kind'])}): {held or 'nobody'}")
+        _show(args, result, human)
+    elif action in ("assign-role", "clear-role"):
+        path = f"{team}/roles" + ("/clear" if action == "clear-role" else "")
+        result = client.request(path, {"role": args.role_name, "holder": _holder(args.holder)})
+        verb = "Cleared" if action == "clear-role" else "Assigned"
+        _show(args, result, lambda r: print(f"{'Already so: ' if r.get('replayed') else verb + ' '}{_safe(r['holder'])} as {_safe(r['role'])}"))
+    elif action == "role-policy":
+        if args.policy is None:
+            current = client.request(f"{team}/roles")
+            result = {"no_response_policy": current["no_response_policy"], "team_id": args.team}
+        else:
+            result = client.request(f"{team}/policy", {"no_response_policy": args.policy})
+        _show(args, result, lambda r: print(f"No-response policy for {_safe(r['team_id'])}: {_safe(r['no_response_policy'])}"))
+    elif action == "member-visibility":
+        if args.state is None:
+            result = client.request(f"{room}/member-visibility")
+        else:
+            result = client.request(f"{room}/member-visibility", {"enabled": args.state == "on"})
+        _show(args, result, lambda r: print("Members see the task list: " + ("on" if r["enabled"] else "off")))
+    elif action == "assign":
+        body = {"text": args.text}
+        for field, key in (("role", "target_role"), ("team", "team_id"), ("user", "target_user_id"), ("lease", "lease_seconds"),
+                           ("policy", "no_response_policy"), ("reviews", "reviews_task_id"), ("key", "idempotency_key")):
+            if getattr(args, field, None) is not None:
+                body[key] = getattr(args, field)
+        result = client.request(f"{room}/tasks", body)
+        _show(args, result, lambda r: print(f"{'Already created' if r.get('replayed') else 'Created'}: task {_safe(r['task_id'])} "
+                                            f"for {_safe(r.get('routed_to'))}"))
+    elif action == "my-tasks":
+        result = client.request(f"{room}/my-tasks")
+
+        def human(r):
+            for t in r["tasks"]:
+                print(f"{_safe(t['task_id'], 80)}  [{_safe(t['status'], 20)}]  role {_safe(t.get('role') or '-', 30)}  "
+                      f"answer by {_safe(t['lease']['expires_at'], 40)}")
+                print("  task text (untrusted data):")
+                for line in str(t["text"]).splitlines() or [""]:
+                    print(f"    > {_safe(line, 400)}")
+            if not r["tasks"]:
+                print("Nothing is assigned to you.")
+        _show(args, result, human)
+    else:
+        body = {"status": args.status, **({"result": args.result} if args.result else {})}
+        result = client.request(f"{room}/tasks/{_q(args.task)}/respond", body)
+        _show(args, result, lambda r: print(f"{'Already ' if r.get('replayed') else ''}{_safe(r['status'])}: task {_safe(r['task_id'])}"))
 
 
 def _show(args, result, human):
@@ -175,8 +241,28 @@ def configure_parser(parser):
         c.add_argument("--token-env", default=TOKEN_ENV, help="Environment variable NAME holding your collaboration bearer token, never the token")
         c.add_argument("--json", action="store_true", help="print the server's JSON only")
         c.add_argument("room")
-        if action in ("attach", "detach"):
+        if action in ("attach", "detach", "roles", "assign-role", "clear-role", "role-policy"):
             c.add_argument("team", help="the team id (herdr-eng teams list)")
+        if action in ("assign-role", "clear-role"):
+            c.add_argument("role_name", metavar="role", choices=("issue_writer", "implementer", "tester", "reviewer"))
+            c.add_argument("holder", help="the person: user:ID (or just the ID). Agents join a role through attach")
+        if action == "role-policy":
+            c.add_argument("policy", nargs="?", choices=("reassign", "escalate", "wait"), help="omit to show the current policy")
+        if action == "member-visibility":
+            c.add_argument("state", nargs="?", choices=("on", "off"), help="omit to show; on lets members see the room's task list")
+        if action == "assign":
+            c.add_argument("text")
+            c.add_argument("--role", choices=("issue_writer", "implementer", "tester", "reviewer"), help="route to the role's holder")
+            c.add_argument("--team", help="the team, when more than one attached team holds the role")
+            c.add_argument("--user", help="name a person directly (a room member) instead of a role")
+            c.add_argument("--lease", type=int, help="seconds the person has to answer (room owner only)")
+            c.add_argument("--policy", choices=("reassign", "escalate", "wait"), help="what happens with no answer (room owner only)")
+            c.add_argument("--reviews", help="the task this one reviews (a reviewer must be independent of it)")
+            c.add_argument("--key", help="idempotency key")
+        if action == "respond":
+            c.add_argument("task")
+            c.add_argument("status", choices=("accepted", "done", "declined"))
+            c.add_argument("--result")
         if action == "attach":
             c.add_argument("--role", action="append", metavar="ROLE=AGENT_ID[,AGENT_ID]",
                            help="issue_writer, implementer, tester or reviewer; repeat for each role. Only your own agents")

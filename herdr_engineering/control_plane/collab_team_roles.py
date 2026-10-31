@@ -136,7 +136,7 @@ class TeamRolesMixin:
 
     # ----------------------------------------------------------------- the fold
     def _apply_team_roles(self, ev: dict) -> bool:
-        t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
+        t, p = ev["event_type"], ev["payload"]
         if t not in TR2_EVENTS:
             return False
         if t == "team_role_assigned":

@@ -4117,9 +4117,9 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
         return source
     from .control_plane.collab_attention import normalize_insights
     from .control_plane.collab_context import normalize_contextual
-    from .control_plane.collab_workbench import normalize_steering
     from .control_plane.collab_team_roles import normalize_team_roles
     from .control_plane.collab_team_rooms import normalize_team_rooms
+    from .control_plane.collab_workbench import normalize_steering
     normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights,
                    "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}
 

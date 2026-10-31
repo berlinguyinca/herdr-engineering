@@ -7,7 +7,6 @@ Nothing is mocked. The only thing a test moves is the service's clock, and the s
 from __future__ import annotations
 
 import json
-import threading
 
 import pytest
 
@@ -443,14 +442,15 @@ def test_reassign_moves_the_role_once_then_escalates(rp):
     team, _ = crew(p)
     p.assign(team, "tester", "user:dave")
     p.assign(team, "tester", "user:erin")
+    p.assign(team, "tester", "user:bob")                                                # a third holder: "once" is a rule, not luck
     assert p.policy(team, "reassign")[1]["no_response_policy"] == "reassign"
     s, out = p.make("alice", target_role="tester", text="verify")
     first, tid = out["routed_to"], out["task_id"]
-    other = "user:erin" if first == "user:dave" else "user:dave"
     p.clock.t += 1000
     assert p.sweep()["reassigned"] == 1 and p.sweep()["reassigned"] == 0
     moved = p.events("task_reassigned")[0]["payload"]
-    assert moved["from"] == first and moved["to"] == other and moved["task_id"] == tid
+    other = moved["to"]
+    assert moved["from"] == first and other != first and moved["task_id"] == tid
     assert [t["task_id"] for t in p.mine(other[5:])[1]["tasks"]] == [tid] and p.mine(first[5:])[1]["tasks"] == []
     assert p.respond(first[5:], tid, "accepted")[0] == 404                              # the old holder is out
     p.clock.t += 1000

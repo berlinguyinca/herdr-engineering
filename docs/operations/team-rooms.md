@@ -124,3 +124,132 @@ Web UI (no Rooms, queue or approval screen; only the API, CLI and the attention 
 (`attention_inbox.py`), role routing and people as role holders (slice 2), coordinators (slice 3), assistant briefs and the
 email path (slice 4), approval-gated external actions (slice 5), `member_visibility`, `my-tasks`, the Direct level's behaviour
 and `role`/`team_id` on a suggestion.
+
+---
+
+# Slice 2: roles, routing by role, people as role holders, leases
+
+Slice 2 of the same design (`TEAM_COLLABORATION.md` sections 4.2-4.5, 7, 8, 14, 15). It sits behind its own sibling flag
+`control_plane.collab.team_roles.enabled` and ALSO needs `team_rooms` on (roles resolve through attachments). With either off,
+`create_task` rejects the new fields as unknown (400, exactly as today), every new route answers 404 (except `roles clear`, which is a
+revocation and stays reachable), the sweep does nothing, and the review rule is the old agent-only one. A test pins that.
+
+## What it does
+
+1. **Role holders, agents and people.** A team's roles are `issue_writer` (kind planner), `implementer`, `tester` (kind implementer)
+   and `reviewer` (kind reviewer); `coordinator` is refused (slice 3). They are kept **per room and team**: an agent holds a role by
+   being attached (slice 1, unchanged), a person holds it by `team_role_assigned`, written by the room **owner user** only (an agent
+   gets 403 and an `audit_denied`, anyone else the usual 404). The person must be a current member of the room (an external guest
+   with a sign-in qualifies). Assigning a role never changes the person's room role and a member is never implicitly a holder. A
+   detach takes the team's people out of their roles. At most 20 people in roles per room and team.
+2. **Routing by role.** `POST /rooms/{room}/tasks` takes `target_role` (and `team_id` when more than one attached team holds the role:
+   400 `team_required` otherwise) instead of `target_agent_id`. The rule, in order: take the holders that can take a task now (a person
+   who is still a member, an agent that is active and holds `execute` in the room), drop any that are not independent when the task
+   is a review, drop full ones (agents `MAX_OPEN_TASKS_PER_AGENT`, people 20), pick the **fewest open tasks**, break a tie by the
+   **smallest principal key** (`agent:<id>` sorts before `user:<id>`). The holder is written into the `task_created` event as
+   `routed_to`, so a replay or restart never re-routes; the same idempotency key returns the same task, also after a restart. **Nobody
+   eligible is a 409 `no_role_holder` and nothing is written**: it never falls through to an agent outside the role. A `reviewer` task
+   must name `reviews_task_id`.
+3. **Tasks for a person.** `target_user_id` names a room member directly; a person holder is reached through the role. Such a task has
+   no agent target (it is in no `tasks_inbox`) and lands in the person's queue: `GET /rooms/{room}/my-tasks` (any non-agent member,
+   guests included; their own tasks only, text marked untrusted) and, for members the attention inbox already serves, the categories
+   `task_assigned` and `task_overdue` (ids, role and dates only, never the words; needs `insights.enabled`). They answer with
+   `POST /rooms/{room}/tasks/{id}/respond {"status": "accepted"|"done"|"declined", "result": ...}`; only the assignee can.
+4. **The clock.** A person never polls, so a server-side sweep (a daemon thread of the control plane every `sweep_interval_seconds`,
+   default 30) evaluates every open person task from the replayed state and `now`. Per task: a lease (`person_lease_seconds`,
+   default 3 days, ceiling 14 days; the room owner may set `lease_seconds` per task) with reminders at 50% and 90% (`task_reminded`,
+   each once, before expiry only), then the **no-response policy**, one per team (`herdr-eng rooms role-policy`, default `escalate`,
+   the task may carry its own if the owner creates it): `reassign` (move the role to another eligible holder **once**, new lease, then
+   escalate; a direct assignment has no role so it escalates), `escalate` (`task_escalated`: status `blocked`, a `task_overdue` row in
+   the owner's attention; the owner cancels or re-issues it), `wait` (`task_lease_extended` by another lease, at most
+   `max_lease_extensions` times and never past the hard expiry, then escalate). The hard expiry (`hard_expiry_seconds`, default 30
+   days) replaces the 24 hour `TASK_TTL` for these tasks. Accepting ends the lease. A holder who left the room or lost the role while
+   holding an open task goes into the same policy at the next sweep, without waiting for the lease.
+   Crash safety: no in-memory deadline and no table. The deadline, the reminders sent, the extension count and the policy are in the
+   `task_created` / `task_reminded` / `task_lease_extended` / `task_reassigned` / `task_escalated` events and rebuilt on replay; every
+   outcome changes the state the next sweep reads, so a repeated or concurrent sweep commits nothing. The sweep skips while the
+   service is degraded and stops quietly on a full or unavailable log.
+5. **Independent review across agents and people.** With the flag on a review (`reviews_task_id`, to an agent, a person or a role) is
+   refused when the reviewer is the implementer, anyone who held the work before a reassignment, the creator of the work, a creator
+   anywhere up its parent chain, or anyone in the same configured `reviewer_groups` as one of those. Principals are compared as
+   `agent:<id>` / `user:<id>` keys. Agents owned by the same person still count as different reviewers, as before; a person and their
+   own agents are different principals too unless you put them in a group.
+6. **What an external person sees.** Their own assigned tasks (`my-tasks`) and the artifacts shared into the room. Not the roster,
+   agents, flow, team attachment or roles, other people's tasks, or task events: slice 1 already hid the task list and task events from
+   guests, and a person's task is hidden from everyone but the assignee, the room owner and the task's creator in the list, the feed
+   and the state view. `member_visibility` (owner, per room, default off, `herdr-eng rooms member-visibility ROOM on`) gives members
+   back exactly the room's task list and task events of agent tasks; person tasks of others, the roster, agents and flow stay hidden.
+
+## Turn it on
+
+```yaml
+control_plane:
+  collab:
+    team_rooms: {enabled: true}          # required
+    team_roles:
+      enabled: true                      # absent = off
+      person_lease_seconds: 259200       # 60 .. 1209600
+      hard_expiry_seconds: 2592000
+      max_lease_extensions: 3
+      reminder_fractions: [0.5, 0.9]
+      default_no_response_policy: escalate   # reassign | escalate | wait
+      reviewer_groups: []                # e.g. [["user:alice", "agent:AGENT_ID"]] counts as one reviewer
+      sweep_interval_seconds: 30
+      kill_switch: false
+```
+
+Read per request through the fleet config store (a missing, unreadable or invalid file turns it OFF); the sweep thread re-reads the
+interval each pass. No migration, no table, no environment variable.
+
+## Operate it
+
+```bash
+herdr-eng rooms assign-role ROOM TEAM tester dave        # a person (user:ID or just the ID); agents join a role by attach
+herdr-eng rooms clear-role ROOM TEAM tester dave
+herdr-eng rooms roles ROOM TEAM                          # holders, kinds, who can take tasks, the policy
+herdr-eng rooms role-policy ROOM TEAM [reassign|escalate|wait]
+herdr-eng rooms assign ROOM "verify the fix" --role tester [--team TEAM] [--lease 3600 --policy wait] [--reviews TASK]
+herdr-eng rooms assign ROOM "look at this" --user bob
+herdr-eng rooms member-visibility ROOM [on|off]
+herdr-eng rooms my-tasks ROOM                             # any member, with their own token
+herdr-eng rooms respond ROOM TASK accepted|done|declined [--result TEXT]
+```
+
+| Route (`/api/v1/collab`) | Who |
+|---|---|
+| `POST /rooms/{room}/teams/{team}/roles` `{"role", "holder": "user:ID"}`, `.../roles/clear`, `.../policy` `{"no_response_policy"}` | owner |
+| `GET /rooms/{room}/teams/{team}/roles` | owner |
+| `GET` / `POST /rooms/{room}/member-visibility` `{"enabled": bool}` | any member reads; owner sets |
+| `POST /rooms/{room}/tasks` `{"target_role" \| "target_user_id", "team_id", "lease_seconds", "no_response_policy", ...}` | as for any task (`task` right; an agent only by role and with an accepted parent) |
+| `GET /rooms/{room}/my-tasks`, `POST /rooms/{room}/tasks/{id}/respond` | the assignee (a person, any room role) |
+
+## Roll back
+
+- Fast: `team_roles.enabled: false` (or `kill_switch: true`). New fields are unknown again, the routes are 404, the sweep stops.
+  Nothing is deleted. Person tasks already created stay in the log: they are still visible only to the assignee, owner and creator, and
+  nobody chases them (no reminder, no escalation) while the flag is off. Cancel the ones you no longer want (`POST .../tasks/{id}/cancel`).
+- `roles clear` works with the flag off. `detach` also takes the team's people out of their roles.
+- An image without this code ignores the new event types, but it has no rule hiding a person's task: it would list the task (text
+  included) to everyone who can read the room's task list. **Cancel or finish every task for a person before rolling the image back.**
+- No migration, no table, no environment variable.
+
+## Choices made where the design left room
+
+- Role holders are per (room, team), not per team: authority is decided against a room, an external person only exists as a room
+  member, and the slice-1 attach already binds agents that way. The route is `.../rooms/{room}/teams/{team}/roles`, not the sketch's
+  `/teams/{team}/roles`.
+- Agents become holders only by attach (their grants and actions are fixed there). `assign-role` takes people only.
+- Agents whose role lacks `execute` (`issue_writer`, `reviewer`) cannot be routed a task (`create_task` and `tasks_inbox` need
+  `execute`); the request fails closed (409) rather than widening their rights. A person can hold those roles.
+- A person task is a task with `target_agent_id: null` and `target_user_id`; no new Work Graph entity kind (design 6.2 left it open).
+  The projection carries the task with no words and no assignee.
+- The hard expiry is its own field, not `bounds.expires_at`, because `bounds` marks a bounded delegation all over `collab.py`.
+- A decline is terminal; it is not re-routed. The no-response policy is for silence.
+- Only the room owner sets a per-task lease or policy.
+
+## Not built in this slice
+
+Web UI (no role, my-tasks or overdue screen), a way for the owner to re-issue a blocked task in one step (cancel and create again),
+re-routing on a decline, `task_assigned` for guests in the attention inbox (a guest reads `my-tasks`; the attention inbox stays 404 for
+guests), email or push notification of a reminder (the reminder is an event and the queue entry), the fleet-wide `attention_inbox.py`,
+coordinators (slice 3), assistant briefs (slice 4), approval-gated external actions (slice 5), Direct behaviour.
