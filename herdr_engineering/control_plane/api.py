@@ -1423,7 +1423,9 @@ def _make_handler(server, public=False, operator=False):
                         cache_read_tokens=row.get("cache_read_tokens"),
                         duration_ms=row.get("duration_ms"), success=row.get("success", True),
                         request_id=row.get("request_id"), session_id=row.get("session_id"),
-                        mission_id=row.get("mission_id"), key_id=row.get("key_id"))
+                        mission_id=row.get("mission_id"), key_id=row.get("key_id"),
+                        source=row.get("source") if row.get("source") in ("llm-proxy", "llm-gateway")
+                        else "llm-proxy")
                 return self._json({"ok": True, "recorded": min(len(rows), 500)})
             if resource == "llm" and len(parts) >= 5:
                 what = parts[4]

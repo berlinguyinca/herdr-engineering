@@ -276,9 +276,32 @@ services:
       timeout: 3s
       retries: 3
 
+  llm-gateway-usage:
+    profiles: ["llm-gateway"]
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-unset}
+    container_name: herdr-llm-gateway-usage
+    restart: unless-stopped
+    depends_on:
+      llm-gateway:
+        condition: service_healthy
+    volumes:
+      - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+    command:
+      - "control-plane"
+      - "llm-gateway-usage"
+      - "--control-plane"
+      - "http://control-plane-web:8080"
+      - "--gateway"
+      - "http://llm-gateway:8089"
+      - "--admin-secret-file"
+      - "/var/lib/herdr-llm-gateway/secrets/admin"
+      - "--state-file"
+      - "/var/lib/herdr-llm-gateway/usage-state.json"
+
   # ---- dev.lan front door (host network; was deploy/fabric-stack) -------------
   # The worker mounts ./config.yaml (control plane); the fabric services mount
   # the fabric config from ../fabric-stack. Same project, same rendered substitution file.
+
   coredns:
     image: coredns/coredns:1.11.4
     container_name: herdr-coredns
