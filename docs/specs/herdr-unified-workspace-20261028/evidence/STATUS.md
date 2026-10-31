@@ -18,6 +18,8 @@ Deploys are the operator's step.
 
 Team, room and assistant collaboration (design only, approved 2026-10-31, nothing built): `design/TEAM_COLLABORATION.md` (attach a team to a room, guest levels, coordinators, assistant briefs; build order, flags and the operator's three decisions of 2026-10-31; no phase state changes).
 
+Team rooms slice 1 (built on branch `feat/uw-slice1-team-room-guest-levels`, PR open, NOT deployed, flag `control_plane.collab.team_rooms.enabled` off by default, nothing run live): attach/detach a team to a room (owner only, agents with fixed roles), per-room guest level with `direct` stored but acting as suggest, the Suggest queue (approve makes a new owner-origin task with the request as tainted quoted data), guests see only their own requests and shared artifacts, API routes and `herdr-eng rooms`. Tested against real Postgres and HTTP. NOT built: web UI, fleet-wide attention inbox, role routing and people as role holders (slice 2), coordinators (slice 3), assistant briefs/email (slice 4), approval-gated external actions (slice 5), Direct behaviour. See `docs/operations/team-rooms.md` and threat model section 3.8.
+
 ## Decisions
 - One artifact registry. The registry owns ids, versions, ACLs and sharing; RustFS owns bytes. #366's separate storage, archive and previews are re-expressed as registry features and #366 is not merged. See `design/ARTIFACT_INTEGRATION.md`.
 - `project`, `team`, `artifact_version`, `external_action` are owned graph kinds (P02). Only the account owner approves `send_email`.
