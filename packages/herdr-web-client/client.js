@@ -223,6 +223,39 @@ export class HerdrClient {
     return this.request(`${this.artifactSharesPath(id, shareId)}/events`, { signal });
   }
 
+  // Artifact collaborators (owner view): grants for agents, one-time invite grants, activity, version diffs.
+  artifactCollabPath(id, tail = '') {
+    return `/api/v1/artifacts/${encodeURIComponent(id)}${tail}`;
+  }
+
+  listArtifactCollaborators(id, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collaborators'), { signal });
+  }
+
+  grantArtifactCollaborator(id, body, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collaborators'), { method: 'POST', body, signal });
+  }
+
+  revokeArtifactCollaborator(id, agentId, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, `/collaborators/${encodeURIComponent(agentId)}/revoke`), { method: 'POST', body: {}, signal });
+  }
+
+  grantArtifactInvite(id, body, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collaborators/invite-grant'), { method: 'POST', body, signal });
+  }
+
+  artifactCollabActivity(id, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collab-activity'), { signal });
+  }
+
+  artifactVersionDiff(id, versionId, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, `/versions/${encodeURIComponent(versionId)}/diff`), { signal });
+  }
+
+  restrictArtifactCollab(id, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collab-restrict'), { method: 'POST', body: {}, signal });
+  }
+
   async restoreArtifactVersion(id, versionId, { signal } = {}) {
     const unsupported = () => Object.assign(new Error('Restore is not supported for report artifacts'), { code: 'restore_unsupported' });
     const artifact = await this.getArtifact(id, { signal });

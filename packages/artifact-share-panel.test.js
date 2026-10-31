@@ -689,3 +689,58 @@ test('setVersions does not clobber a pending review or a shown link', async () =
   assert.match(container.regions.review.html, /Review before generating/);
   panel.dispose();
 });
+
+// ------------------------------------------------------------------ tabs
+
+function withPanes(container) {
+  const panes = {};
+  const tabs = {};
+  const base = container.querySelector;
+  const pane = name => (panes[name] ||= (() => {
+    const node = { hidden: name !== 'links', html: '', listeners: {}, isConnected: true,
+      get innerHTML() { return node.html; }, set innerHTML(v) { node.html = String(v); },
+      replaceChildren() { node.html = ''; }, querySelector: () => null, contains: () => true,
+      addEventListener(type, fn) { (node.listeners[type] ||= new Set()).add(fn); },
+      removeEventListener(type, fn) { node.listeners[type]?.delete(fn); } };
+    return node;
+  })());
+  container.panes = panes;
+  const add = container.addEventListener;
+  container.addEventListener = (type, fn) => { (container.listeners ||= {})[type] ||= new Set(); container.listeners[type].add(fn); add(type, fn); };
+  container.querySelector = selector => {
+    const paneName = selector.match(/^\[data-panel-pane="(\w+)"\]$/)?.[1];
+    if (paneName) return pane(paneName);
+    const tabName = selector.match(/^\[data-panel-tab="(\w+)"\]$/)?.[1];
+    if (tabName) return (tabs[tabName] ||= { setAttribute(k, v) { this[k] = v; } });
+    return base(selector);
+  };
+  container.tabClick = name => { for (const fn of container.listeners?.click || []) fn({ target: { closest: s => (s === '[data-panel-tab]' ? { dataset: { panelTab: name } } : null) } }); };
+  return container;
+}
+
+test('the panel offers Links, Collaborators and Activity tabs with the Links content untouched', async () => {
+  const container = withPanes(fakeContainer());
+  const panel = mountSharePanel(container, fakeClient(), 'art1', { versions, headVersionId: 'v2' });
+  await tick();
+  for (const label of ['Links', 'Collaborators', 'Activity']) assert.match(container.innerHTML, new RegExp(`data-panel-tab="${label.toLowerCase()}"[^>]*>${label}<`));
+  assert.match(container.innerHTML, /data-share-action="review"/);
+  assert.doesNotMatch(container.innerHTML, /<(iframe|frame|object|embed)/i);
+  panel.dispose();
+});
+
+test('a 503 on the Collaborators tab shows the notice and the Links tab keeps working', async () => {
+  const container = withPanes(fakeContainer());
+  const client = { ...fakeClient(), listArtifactCollaborators: async () => { throw Object.assign(new Error('off'), { status: 503 }); } };
+  const collabApi = { agents: async () => ({ agents: [] }), rooms: async () => ({ rooms: [] }), inviteExternal: async () => ({}) };
+  const panel = mountSharePanel(container, client, 'art1', { versions, headVersionId: 'v2', collabApi });
+  await tick();
+  container.tabClick('collaborators');
+  await tick(); await tick();
+  assert.match(container.panes.collaborators.html, /Collaboration is not enabled/);
+  assert.doesNotMatch(container.panes.collaborators.html, /data-collab-field/);
+  assert.equal(container.panes.links?.hidden, true);
+  container.tabClick('links');
+  assert.equal(container.panes.links.hidden, false);
+  assert.match(container.innerHTML, /data-share-action="review"/);
+  panel.dispose();
+});
