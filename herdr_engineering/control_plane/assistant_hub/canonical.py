@@ -80,7 +80,11 @@ class _Cls:
 
 def argv_digest(argv: Iterable[str]) -> str:
     """Key target for shell commands: binds every token without storing any free-form command text."""
-    return "argv:" + hashlib.sha256("\0".join(argv).encode("utf-8", "surrogatepass")).hexdigest()
+    digest = hashlib.sha256()
+    for token in argv:                                     # length-prefixed, so token boundaries are unambiguous
+        raw = token.encode("utf-8", "surrogatepass")
+        digest.update(b"%d:" % len(raw) + raw)
+    return "argv:" + digest.hexdigest()
 
 
 def raw_digest(text: str) -> str:
@@ -941,6 +945,7 @@ def _shell(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
     else:
         owner = True
         notes.append("a grant covers only one plain command")
+        best = replace(best, target=raw_digest(_normalized_text(text)))
     reasons = [*dict.fromkeys(st.reasons), *notes]
     if hint_cwd and cwd is None:
         owner = True
@@ -961,7 +966,22 @@ def _single_simple(text: str, cmds: list, out: list[Element]) -> bool:
     if len(cmds) != 1 or not is_single_simple_text(text) or XARGS_MARKER in cmds[0].argv:
         return False
     cmd = cmds[0]
+    argv = [a for a in cmd.argv if a != XARGS_MARKER]
+    if _tokens(text) != argv:                  # a wrapper, comment or expansion was peeled: not the plain command
+        return False
     return not (cmd.env or cmd.redirects or cmd.wrapped or any(el.env or el.redirects or el.xargs for el in out))
+
+
+def _tokens(text: str) -> list[str] | None:
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return None
+
+
+def _normalized_text(text: str) -> str:
+    tokens = _tokens(text)
+    return " ".join(tokens) if tokens is not None else " ".join(text.split())
 
 
 def _mentions_cluster(text: str) -> bool:

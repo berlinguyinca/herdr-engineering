@@ -47,9 +47,14 @@ class ActivationRefused(ValueError):
 _MAX_DISPLAY = 300
 _SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w*|cookie)"
 _USERINFO_RE = re.compile(r"(://)[^/\s@]*@")
-_OPTION_RE = re.compile(rf"(?i)(--?[\w-]*{_SECRET_WORDS}[\w-]*)(=|\s+)(\S+)")
-_ASSIGN_RE = re.compile(rf"(?i)\b([\w]*{_SECRET_WORDS}[\w]*)=(\S+)")
-_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)(\s+)\S+")
+_OPTION_RE = re.compile(rf"(?i)(--?[\w-]*{_SECRET_WORDS}[\w-]*)(=|\s+)([^\s\"']+)")
+_ASSIGN_RE = re.compile(rf"(?i)\b([\w]*(?:{_SECRET_WORDS}|pwd|pass|key)|[\w]*{_SECRET_WORDS}[\w]*)=([^\s\"']+)")
+_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)(\s+)[^\s\"']+")
+_USER_OPT_RE = re.compile(r"(?i)(\s(?:-u|--user|--proxy-user)(?:=|\s+))[^\s\"']+")
+_HEADER_RE = re.compile(r"(?i)\b(x-api-key|api-key|cookie|set-cookie|proxy-authorization|authorization)(\s*:\s*)[^\"'\n]*")
+_SSHPASS_RE = re.compile(r"(?i)\b(sshpass\s+-p\s*)[^\s\"']+")
+_LOGIN_RE = re.compile(r"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--password)(?:=|\s+))[^\s\"']+")
+_DB_ATTACHED_RE = re.compile(r"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p)[^\s\"']+")
 _MASK = "***"
 
 
@@ -68,6 +73,11 @@ def scrub_display(text: str) -> str:
     this text lives only on the request row and key_canonical holds a digest instead of command text.
     """
     out = _USERINFO_RE.sub(r"\1" + _MASK + "@", text)
+    out = _HEADER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
+    out = _SSHPASS_RE.sub(lambda m: m.group(1) + _MASK, out)
+    out = _LOGIN_RE.sub(lambda m: m.group(1) + _MASK, out)
+    out = _DB_ATTACHED_RE.sub(lambda m: m.group(1) + _MASK, out)
+    out = _USER_OPT_RE.sub(lambda m: m.group(1) + _MASK, out)
     out = _OPTION_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
     out = _ASSIGN_RE.sub(lambda m: f"{m.group(1)}={_MASK}", out)
     out = _BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)

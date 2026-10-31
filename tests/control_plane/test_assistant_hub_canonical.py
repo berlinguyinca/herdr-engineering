@@ -51,10 +51,10 @@ ROWS = [
     ("ls | xargs git push", V.GIT_PUSH, F.NONE, True),
     ("xargs git push -f", V.GIT_FORCE_PUSH, F.FORCE, True),
     ("env X=1 git push -f", V.GIT_FORCE_PUSH, F.FORCE,True),
-    ("command git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
-    ("exec git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
-    ("time git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
-    ("nohup git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
+    ("command git push -f", V.GIT_FORCE_PUSH, F.FORCE, True),
+    ("exec git push -f", V.GIT_FORCE_PUSH, F.FORCE, True),
+    ("time git push -f", V.GIT_FORCE_PUSH, F.FORCE, True),
+    ("nohup git push -f", V.GIT_FORCE_PUSH, F.FORCE, True),
     ("cat <<< 'x' | git push -f", V.UNKNOWN, F.NONE, True),
     # unparseable / empty
     ("echo 'unterminated", V.UNKNOWN, F.NONE, True),
@@ -265,7 +265,8 @@ def test_single_plain_command_is_not_owner_decides_and_target_binds_argv():
     import hashlib
     d = derive(sh("git push origin 'feature'", repo="acme/r"))
     assert not d.owner_decides
-    assert d.key.target == "argv:" + hashlib.sha256(b"git\0push\0origin\0feature").hexdigest()
+    expect = hashlib.sha256(b"3:git4:push6:origin7:feature").hexdigest()
+    assert d.key.target == "argv:" + expect
     assert derive(sh("git  push origin feature", repo="acme/r")).key == d.key
 
 
@@ -281,3 +282,28 @@ def test_unknown_and_unparseable_targets_are_digests_not_text():
     for cmd in ("frobnicate --secret hunter2-canary", "echo $(((("):
         k = derive(sh(cmd)).key
         assert k.target.startswith(("argv:", "raw:")) and "hunter2" not in k.canonical()
+
+
+def test_argv_digest_is_unambiguous():
+    from herdr_engineering.control_plane.assistant_hub.canonical import argv_digest
+    assert argv_digest(["a\0b"]) != argv_digest(["a", "b"])
+    assert argv_digest(["ab", "c"]) != argv_digest(["a", "bc"])
+
+
+PEELED = ["exec git push origin feature", "command git push origin feature", "nohup git push origin feature",
+          "timeout 5 git push origin feature", "nice -n 19 git push origin feature", "env git push origin feature",
+          "stdbuf -o0 git push origin feature", "sh -c 'git push origin feature'", "time git push origin feature",
+          "git push origin feature # note", "builtin command git push origin feature"]
+
+
+@pytest.mark.parametrize("command", PEELED)
+def test_peeled_wrappers_never_share_the_plain_commands_key(command):
+    plain = derive(sh("git push origin feature", repo="acme/r"))
+    d = derive(sh(command, repo="acme/r"))
+    assert d.owner_decides and d.key.key_id() != plain.key.key_id()
+    assert d.key.target.startswith("raw:")
+
+
+def test_ssh_wrapper_stays_grantable_by_full_argv():
+    d = derive(sh("ssh hive squeue -u me"))
+    assert not d.owner_decides and d.key.target.startswith("argv:")

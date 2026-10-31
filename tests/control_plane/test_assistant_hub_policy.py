@@ -228,7 +228,7 @@ def test_persisted_state_holds_no_command_text_and_display_is_masked():
     rows = store.list_action_requests(T, U)
     assert any("https://***@example.com" in r.display and "--token=***" in r.display for r in rows)
     assert any("GITHUB_TOKEN=***" in r.display for r in rows)
-    assert any("Bearer ***" in r.display for r in rows)
+    assert any("Authorization: ***" in r.display for r in rows)
     approvable = next(r for r in rows if r.status == "pending" and r.verb == "git.push")
     record_owner_decision(store, cfg, NOW, T, U, approvable.request_id, True, "owner")
     store.put_action_grant(ActionGrant(grant_id="ag_s", tenant_id=T, user_id=U, worker_id=W, key_id="k",
@@ -421,3 +421,36 @@ def test_decision_is_a_frozen_dataclass():
     d = Decision("pending", "r", None, None, None, "owner")
     with pytest.raises(AttributeError):
         replace(d).outcome = "authorized"            # type: ignore[misc]
+
+
+@pytest.mark.parametrize("cmd", ["exec git push origin feature", "command git push origin feature",
+                                 "nohup git push origin feature", "timeout 5 git push origin feature",
+                                 "nice -n 19 git push origin feature", "env git push origin feature",
+                                 "stdbuf -o0 git push origin feature", "sh -c 'git push origin feature'",
+                                 "git push origin feature # note"])
+def test_wrapped_command_is_not_covered_by_the_plain_commands_grant(cmd):
+    store, cfg = AssistantStore(), _cfg()
+    _active_grant(store, cfg, _push(GRANT_CMD))
+    assert _decide(store, cfg, _push(cmd)).outcome == "pending"
+    assert derive(_push(cmd)).key.key_id() != derive(_push(GRANT_CMD)).key.key_id()
+
+
+@pytest.mark.parametrize("raw,masked,leaked", [
+    ("curl -u bob:pw1 https://x", "-u ***", "pw1"),
+    ("curl --user bob:pw2 https://x", "--user ***", "pw2"),
+    ("mysql -h db -pSECRET3 app", "-p***", "SECRET3"),
+    ("sshpass -p PW4 ssh host ls", "sshpass -p ***", "PW4"),
+    ('curl -H "X-Api-Key: key5" https://x', 'X-Api-Key: ***"', "key5"),
+    ('curl -H "Cookie: sid=cook6" https://x', "Cookie: ***", "cook6"),
+    ('curl -H "Set-Cookie: sid=cook7" https://x', "Set-Cookie: ***", "cook7"),
+    ('curl -H "Proxy-Authorization: Basic abc8" https://x', "Proxy-Authorization: ***", "abc8"),
+    ("DB_PWD=pw9 AWS_SECRET=s10 MY_KEY=k11 X_PASS=p12 run", "DB_PWD=***", "pw9"),
+    ("docker login -p pw13 reg", "-p ***", "pw13"),
+    ("podman login --password pw14 reg", "--password ***", "pw14"),
+    ('curl -H "Authorization: Bearer tok15" https://x', 'Authorization: ***"', "tok15"),
+])
+def test_display_masks_each_secret_shape(raw, masked, leaked):
+    from herdr_engineering.control_plane.assistant_hub.policy import scrub_display
+    out = scrub_display(raw)
+    assert masked in out and leaked not in out
+    assert "ls -pfoo" not in raw and scrub_display("ls -pfoo") == "ls -pfoo"    # -p is only a secret for db clients
