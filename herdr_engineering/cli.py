@@ -4163,6 +4163,13 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, rustfs, conn
     clock = time.time
     gate = ArtifactGraphGate(None)
     mirror = CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=clock)
+    if lineage is not None:
+        post = lineage
+
+        def lineage(version):                      # noqa: F811 - a version retracted by now is never posted
+            if gate.version_retracted(str(version.get("artifact_id")), str(version.get("version_id"))):
+                return {"skipped": "retracted"}
+            return post(version)
     applier = CollabIntentApplier(settings.outbox_dir, mirror, rustfs=rustfs, limits=settings.limits,
                                   spool_dir=settings.spool_dir, lineage=lineage, context_extras={}, clock=clock,
                                   gate=gate)
@@ -4180,7 +4187,12 @@ def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):
     from .control_plane.collab_artifacts import CollabArtifactBridge
     bridge = CollabArtifactBridge(service, Path(mirror_dir), Path(outbox_dir))
     service.artifact_bridge = bridge
-    bridge.start()
+    try:
+        bridge.start()
+    except BaseException:
+        service.artifact_bridge = None
+        bridge.stop()
+        raise
     return bridge
 
 
@@ -4255,7 +4267,10 @@ def _cmd_cp_worker(args) -> int:
             finally:
                 stop.set()
                 if bridge_task is not None:
-                    await asyncio.wait_for(bridge_task, 60)    # applier.aclose / mirror.close run in its teardown
+                    try:
+                        await asyncio.wait_for(bridge_task, 60)    # applier.aclose / mirror.close run in its teardown
+                    except Exception as exc:  # noqa: BLE001 - never mask the exception run_worker is raising
+                        logging.getLogger(__name__).warning("collab bridge teardown failed (%s)", type(exc).__name__)
             return None
         finally:
             await conn.close()

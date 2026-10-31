@@ -648,3 +648,59 @@ def test_a_failed_post_commit_refresh_and_a_grant_change_force_the_next_sync(reg
             await until(lambda: len(forced) > n and aid in forced[-1], timeout=5)
             assert not rig.applier._mirror_force
     loop_run(go())
+
+
+def test_grants_are_not_published_until_the_first_retraction_load_succeeds(registry_pg, svc, tmp_path, monkeypatch,
+                                                                         caplog):
+    async def go():
+        real = ArtifactStore.load_retractions
+        state = {"fail": True, "calls": 0}
+
+        async def flaky(self):
+            state["calls"] += 1
+            if state["fail"]:
+                raise RuntimeError("retractions boom SECRET")
+            return await real(self)
+        monkeypatch.setattr(ArtifactStore, "load_retractions", flaky)
+        async with LoopRig(svc, tmp_path, registry_pg["dsn"], FakeBlobs()) as rig:
+            aid, _ = await rig.artifact()
+            pr = rig.agent("agent-a")
+            await rig.grant(aid, pr)
+            rig.start()
+            await until(lambda: state["calls"] >= 4)                   # retried every pass, not every 30 s
+            assert rig.grants() is None                                # fail closed: nothing published
+            assert any("RuntimeError" in r.getMessage() for r in caplog.records)
+            assert not any("SECRET" in r.getMessage() for r in caplog.records)
+            state["fail"] = False
+            await until(lambda: rig.grants() and aid in rig.grants()["agents"].get(pr.id, {}))
+    loop_run(go())
+
+
+def test_a_failed_later_retraction_refresh_keeps_the_last_good_gate(registry_pg, svc, tmp_path, monkeypatch):
+    async def go():
+        real = ArtifactStore.load_retractions
+        state = {"fail": False}
+
+        async def flaky(self):
+            if state["fail"]:
+                raise RuntimeError("boom")
+            return await real(self)
+        monkeypatch.setattr(ArtifactStore, "load_retractions", flaky)
+        async with LoopRig(svc, tmp_path, registry_pg["dsn"], FakeBlobs()) as rig:
+            aid, _ = await rig.artifact()
+            other, _ = await rig.artifact()
+            pr = rig.agent("agent-a")
+            await rig.grant(aid, pr)
+            await rig.grant(other, pr)
+            rig.start()
+            await until(lambda: rig.grants() and aid in rig.grants()["agents"].get(pr.id, {}))
+            async with rig.pool.acquire() as conn:
+                await ArtifactStore(conn, rig.blobs).record_retraction(aid, None)
+            await until(lambda: rig.gate.artifact_retracted(aid))
+            state["fail"] = True
+            before = rig.grants()["generated_at"]
+            await asyncio.sleep(1.0)                                   # several failing refreshes (every 0.3 s)
+            assert rig.gate.artifact_retracted(aid)                    # the last good gate is kept
+            assert aid not in rig.grants()["agents"].get(pr.id, {})
+            await until(lambda: rig.grants()["generated_at"] > before)  # and publishing continues
+    loop_run(go())

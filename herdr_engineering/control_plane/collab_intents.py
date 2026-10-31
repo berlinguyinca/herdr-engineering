@@ -1147,7 +1147,7 @@ class CollabIntentApplier:
         """
         n_agents = len(agents) if isinstance(agents, Mapping) else 0
         rules = (isinstance(agents, Mapping) and isinstance(grants, list)
-                 and await asyncio.to_thread(self._fresh_feed_agents) is not None)
+                 and await asyncio.to_thread(self.fresh_feed_agents) is not None)
         if not rules:
             log.warning("collab staging sweep: no fresh agent feed or bad arguments; agent and grant rules skipped")
         live = self._live_write_grants(grants) if rules else set()
@@ -1201,7 +1201,7 @@ class CollabIntentApplier:
         row = agents.get(owner) if isinstance(agents, Mapping) else None
         return isinstance(row, Mapping) and row.get("status") == "active"
 
-    def _fresh_feed_agents(self) -> dict | None:
+    def fresh_feed_agents(self) -> dict | None:
         """The ``agents`` of ``agents.json`` if it is fresh (the ``_agent_for`` check), else None; blocking."""
         feed = read_json_beneath(self.outbox, [AGENTS_FEED], max_bytes=AGENTS_FEED_MAX_BYTES)
         generated = feed.get("generated_at") if isinstance(feed, dict) else None
@@ -1212,7 +1212,7 @@ class CollabIntentApplier:
 
     def _agent_inactive_now(self, owner: str) -> bool:
         """True only when a fresh ``agents.json`` read now shows the agent not active; blocking."""
-        agents = self._fresh_feed_agents()
+        agents = self.fresh_feed_agents()
         return agents is not None and not self._agent_active(agents, owner)
 
     async def _still_doomed(self, conn, owner: str, reason: str, meta: StagedUpload | None) -> bool:

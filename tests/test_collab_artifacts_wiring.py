@@ -103,7 +103,7 @@ def test_lineage_hook_is_passed_through_and_none_when_absent(tmp_path):
         def hook(version):
             return {}
         _, _, loop = build(tmp_path, lineage=hook)
-        assert loop.applier.lineage is hook
+        assert loop.applier.lineage({"artifact_id": "a", "version_id": "v"}) == {}      # wrapped, calls through
         loop.mirror.close()
     asyncio.run(go())
 
@@ -260,3 +260,50 @@ def test_the_new_code_reads_no_environment_variable():
                cli._wire_collab_artifacts_bridge, cli._worker_control_plane_section, cli._cmd_cp_worker):
         src = inspect.getsource(fn)
         assert "environ" not in src and "getenv" not in src, fn.__name__
+
+
+def test_the_lineage_hook_skips_a_version_the_shared_gate_marks_retracted(tmp_path):
+    async def go():
+        posted = []
+
+        def poster(version):
+            posted.append(version["version_id"])
+            return {"ok": True}
+        _, _, loop = build(tmp_path, lineage=poster)
+        hook = loop.applier.lineage
+        assert hook({"artifact_id": "a1", "version_id": "v1"}) == {"ok": True}
+        loop.gate.retract("a1", "v2")
+        assert hook({"artifact_id": "a1", "version_id": "v2"}) == {"skipped": "retracted"}
+        loop.gate.retract("a2", None)
+        assert hook({"artifact_id": "a2", "version_id": "v9"}) == {"skipped": "retracted"}
+        assert hook({"artifact_id": "a1", "version_id": "v3"}) == {"ok": True}
+        assert posted == ["v1", "v3"]
+        loop.mirror.close()
+    asyncio.run(go())
+
+
+def test_a_failing_bridge_start_stops_what_was_started():
+    from herdr_engineering.control_plane import collab_artifacts as ca
+
+    class Svc:
+        artifact_bridge = None
+    stopped = []
+
+    class Bridge:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise OSError("no disk")
+
+        def stop(self):
+            stopped.append(1)
+    original = ca.CollabArtifactBridge
+    ca.CollabArtifactBridge = Bridge
+    try:
+        svc = Svc()
+        with pytest.raises(OSError):
+            cli._wire_collab_artifacts_bridge(svc, {"collab_artifacts": {"enabled": True}}, "/m", "/o")
+    finally:
+        ca.CollabArtifactBridge = original
+    assert stopped == [1] and svc.artifact_bridge is None

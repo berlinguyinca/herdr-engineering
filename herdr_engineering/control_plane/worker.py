@@ -312,6 +312,7 @@ class _ConnPool:
         try:
             if slot is None or slot.is_closed():
                 slot = await self._connect()
+                self._open = [c for c in self._open if not c.is_closed()]
                 self._open.append(slot)
             return slot
         except BaseException:
@@ -447,9 +448,11 @@ class CollabBridgeLoop:
                 try:
                     self.gate.load_retractions(await store.load_retractions())
                     loaded = now
-                except Exception as exc:  # noqa: BLE001 - keep publishing with the gate as it is
+                except Exception as exc:  # noqa: BLE001 - keep the last good gate; retry on the next pass
                     log.warning("collab bridge: retraction refresh failed (%s)", type(exc).__name__)
-                    loaded = now
+            if loaded is None:                      # fail closed: never publish with a gate that never loaded
+                await self._wait(stop, self.interval)
+                continue
             try:
                 joins = await asyncio.to_thread(self._invite_joins)
                 if joins:
@@ -463,7 +466,7 @@ class CollabBridgeLoop:
 
     def _invite_joins(self) -> dict[str, dict]:
         """invite id -> {agent_id, hard_expiry} for the active agents of a fresh ``agents.json``; blocking."""
-        agents = self.applier._fresh_feed_agents()
+        agents = self.applier.fresh_feed_agents()
         joins: dict[str, dict] = {}
         for agent_id, row in (agents or {}).items():
             if isinstance(row, dict) and row.get("status") == "active" and isinstance(row.get("join_id"), str):
@@ -494,7 +497,7 @@ class CollabBridgeLoop:
     async def _sweeps(self, conn, grants: CollabGrantStore) -> None:
         """Staging sweep (only with a fresh ``agents.json``) and result sweep. ANY exception is logged by type."""
         try:
-            agents = await asyncio.to_thread(self.applier._fresh_feed_agents)
+            agents = await asyncio.to_thread(self.applier.fresh_feed_agents)
             if agents is not None:
                 await self.applier.sweep_staging(conn, agents=agents, grants=await grants.live_grants())
         except Exception as exc:  # noqa: BLE001 - e.g. RecursionError: a sweep never kills the task
