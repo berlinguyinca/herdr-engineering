@@ -228,6 +228,37 @@ an `ssh` quoting bug (the `|` in the format was read as a pipe by the remote she
 and covered. The live check is opt-in and read-only: `HERDR_LIVE_SLURM_HOST=whiteale.fiehnlab.ucdavis.edu pytest
 tests/control_plane/test_placement.py -k live`.
 
+#### Sandbox smoke test on whiteale (2026-10-31)
+
+One 3-minute, 1-CPU, 512 MB `sbatch` job on `low` ran a read-only preflight on compute node `kvm-node-9`. It installed
+nothing. `sbatch --test-only` and the job were accepted without any account setup. Result on the compute node:
+
+| Check | Result |
+|---|---|
+| `bwrap` (bubblewrap) | **missing** on the compute node (present on the login node) |
+| `node` | **missing** on the compute node |
+| `systemd-run --user --scope` | **fails** inside a job |
+| cgroup v2 | present, but `cgroup.subtree_control` is **not writable**: Slurm's `task/cgroup` and `proctrack/cgroup` own the hierarchy |
+| `python3` | present |
+
+So `task-restricted-v1` (which attests bubblewrap, cgroup v2 limits, broker-only egress and task-only access) **cannot
+be attested on whiteale as it stands**, and whiteale stays unplaceable, which is what placement already reports. This
+confirms the placement gate against a real cluster. Slurm does contain the job with its own cgroup limits, but that is a
+different mechanism and not the attested profile; treating it as equivalent would be a security decision of its own.
+
+Two further facts: the login node (`kvm-node-12`) has a **local** `/home`, while compute nodes mount BeeGFS at `/home`
+(the login node sees it at `/mnt/beegfs`), so a runner cannot assume the login node and the job share files and must
+report back over the network; and `--cpus-per-task=1` was allocated as two logical processors.
+
+Caveats on the evidence: the preflight's `bwrap_no_network` and `bwrap_hides_home` lines are meaningless here, because
+they treated any failure as "enforced" and bubblewrap was missing; only the missing `bwrap`, the failed systemd scope and
+the non-delegated cgroup are real findings. A follow-up job meant to read results interactively was malformed (`srun -q`
+takes an argument, so `-p` was read as the QoS and `low` as the command); it never ran and is not evidence of anything.
+
+What a Slurm profile would need, none of it built: bubblewrap (or an equivalent such as Apptainer, to be checked) on the
+compute nodes, with a reviewed profile that states what Slurm's cgroup containment does and does not guarantee. The same
+question applies to the planned GPU cluster, which will be inside the fabric and so can be provisioned for it.
+
 Configured honestly (no profile attested there), whiteale is correctly *unplaceable*: every partition is rejected with
 `no sandbox profile task-restricted-v1`. Declaring a profile it has not attested would make it plannable, which is
 exactly what must not be done until a runner is attested there.
