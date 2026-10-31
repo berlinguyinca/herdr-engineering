@@ -39,6 +39,12 @@ herdr-eng assistant packages validate --file package.json --json
 herdr-eng assistant packages register --room ROOM_ID --file package.json --json
 herdr-eng assistant packages list --room ROOM_ID --json
 herdr-eng assistant packages inspect PACKAGE_ID --room ROOM_ID --json
+herdr-eng assistant hosts list --room ROOM_ID --json
+herdr-eng assistant agents create --package PACKAGE_ID --room ROOM_ID --host HOST_ID \
+  --name NAME --idempotency-key KEY --json
+herdr-eng assistant agents runtime-status RUNTIME_ID --room ROOM_ID --json
+herdr-eng assistant agents runtime-inspect RUNTIME_ID --room ROOM_ID --json
+herdr-eng assistant agents runtime-cancel RUNTIME_ID --room ROOM_ID --json
 ```
 
 `task.json` contains exactly:
@@ -88,3 +94,5 @@ successful envelope.
 - This CLI does not launch Pi, containers, browsers, email, purchases, or external writes.
 - Package validation is local and credential-free. Package registration is owner-only and
   definition-only; every runtime reports `runtime_launch_supported: false`.
+- Pi activation is asynchronous and only available for a fresh operator-attested strict
+  host. The CLI never accepts or forwards shell, path, environment, credential, or grant data.

@@ -56,7 +56,9 @@ STRICT=0
 if [ "$PROFILE" = task-restricted-v1 ]; then
   STRICT=1
   [ -n "${HERDR_SANDBOX_HARNESS_DIR:-}" ] || deny "task-restricted-v1 requires a private harness directory"
+  [ -n "${HERDR_SANDBOX_RUNTIME_DIR:-}" ] || deny "task-restricted-v1 requires a pinned runtime directory"
   [ -n "${HERDR_EGRESS_SOCK:-}" ] || deny "task-restricted-v1 requires broker-only network egress"
+  [[ "${HERDR_SANDBOX_UNIT:-}" =~ ^herdr-[a-z0-9-]{1,48}$ ]] || deny "task-restricted-v1 requires a safe sandbox unit"
   if [ -n "${HERDR_SANDBOX_RO_BINDS+x}" ] || [ -n "${HERDR_SANDBOX_SSH_DIR+x}" ]; then
     deny "task-restricted-v1 does not permit SSH or extra host mounts"
   fi
@@ -66,6 +68,11 @@ if [ "$PROFILE" = task-restricted-v1 ]; then
   bounded_decimal HERDR_SANDBOX_CPU_PERCENT "${HERDR_SANDBOX_CPU_PERCENT:-}" 10 800 3
   [ -d "$HERDR_SANDBOX_HARNESS_DIR" ] && [ ! -L "$HERDR_SANDBOX_HARNESS_DIR" ] || deny "the harness directory must be a directory, not a link"
   [ "$(owner_mode "$HERDR_SANDBOX_HARNESS_DIR")" = "$(id -u) 700" ] || deny "the harness directory must be yours with mode 0700"
+  [ -d "$HERDR_SANDBOX_RUNTIME_DIR" ] && [ ! -L "$HERDR_SANDBOX_RUNTIME_DIR" ] || deny "the runtime directory must be a directory, not a link"
+  read -r runtime_uid runtime_mode <<< "$(owner_mode "$HERDR_SANDBOX_RUNTIME_DIR")"
+  [ "$runtime_uid" = "$(id -u)" ] && (( (8#$runtime_mode & 022) == 0 )) || deny "the runtime directory must be yours and not group/other writable"
+  runtime_real="$(cd "$HERDR_SANDBOX_RUNTIME_DIR" && pwd -P)"
+  if find "$runtime_real" -xdev \( ! -type d ! -type f -o -type f -links +1 \) -print -quit | grep -q .; then deny "the runtime directory must contain only private regular files and directories"; fi
   [ -S "$HERDR_EGRESS_SOCK" ] && [ ! -L "$HERDR_EGRESS_SOCK" ] || deny "task-restricted-v1 requires a private broker egress socket"
   sock_parent="$(dirname "$HERDR_EGRESS_SOCK")"
   [ ! -L "$sock_parent" ] && [ "$(owner_mode "$sock_parent")" = "$(id -u) 700" ] || deny "the egress socket directory must be yours with mode 0700"
@@ -115,6 +122,7 @@ args+=(
       --ro-bind-try /etc/alternatives /etc/alternatives
       --proc /proc --dev /dev --size 268435456 --tmpfs /tmp --size 67108864 --tmpfs /var/tmp
       --tmpfs "$HOME")
+if [ "$STRICT" = 1 ]; then args+=(--ro-bind "$runtime_real" /opt/herdr-pi); fi
 
 # The harness and its login, read-only. Resolve where the executables really live (symlinks into ~/.local/share,
 # node under a version manager...) and expose just those directories.
@@ -251,7 +259,7 @@ BWRAP="$(command -v bwrap)" || { echo "collab-sandbox: bubblewrap (bwrap) is not
 run=("$BWRAP" "${args[@]}" -- "${inner[@]}")
 if [ "$STRICT" = 1 ]; then
   command -v systemd-run >/dev/null || deny "cannot enforce the strict resource limits on this host"
-  exec systemd-run --user --scope -q -p TasksMax="$HERDR_SANDBOX_TASKS" -p MemoryMax="$HERDR_SANDBOX_MEM_BYTES" -p CPUQuota="$HERDR_SANDBOX_CPU_PERCENT%" -- "$0" --run-strict "$HERDR_SANDBOX_TASKS" "$HERDR_SANDBOX_MEM_BYTES" "$HERDR_SANDBOX_CPU_PERCENT" "$HERDR_SANDBOX_TIMEOUT_SECONDS" "$TIMEOUT_BIN" "${run[@]}"
+  exec systemd-run --user --scope -q --collect --unit="$HERDR_SANDBOX_UNIT" -p TasksMax="$HERDR_SANDBOX_TASKS" -p MemoryMax="$HERDR_SANDBOX_MEM_BYTES" -p CPUQuota="$HERDR_SANDBOX_CPU_PERCENT%" -- "$0" --run-strict "$HERDR_SANDBOX_TASKS" "$HERDR_SANDBOX_MEM_BYTES" "$HERDR_SANDBOX_CPU_PERCENT" "$HERDR_SANDBOX_TIMEOUT_SECONDS" "$TIMEOUT_BIN" "${run[@]}"
 fi
 if systemd-run --user --scope -q -p TasksMax=1000 true 2>/dev/null; then
   exec systemd-run --user --scope -q -p TasksMax="${HERDR_SANDBOX_TASKS:-512}" -p MemoryMax="${HERDR_SANDBOX_MEM:-8G}" -- "${run[@]}"

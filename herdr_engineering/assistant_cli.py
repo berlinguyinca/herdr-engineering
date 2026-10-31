@@ -208,6 +208,43 @@ class AssistantClient:
             raise AssistantAPIError(502, "assistant API returned an invalid package response")
         return package
 
+    def hosts_list(self, room_id: str) -> dict:
+        return self._request("GET", f"/api/v1/collab/rooms/{_segment(room_id)}/assistant-hosts")
+
+    def runtime_create(self, room_id: str, package_id: str, host_id: str, name: str,
+                       idempotency_key: str, *, selected_model: str | None = None) -> dict:
+        body = {"package_id": package_id, "host_id": host_id, "name": name,
+                "idempotency_key": idempotency_key}
+        if selected_model is not None:
+            body["selected_model"] = selected_model
+        return self._request(
+            "POST", f"/api/v1/collab/rooms/{_segment(room_id)}/assistant-runtimes", body)
+
+    def runtimes_list(self, room_id: str) -> dict:
+        return self._request("GET", f"/api/v1/collab/rooms/{_segment(room_id)}/assistant-runtimes")
+
+    def runtime_get(self, room_id: str, runtime_id: str) -> dict:
+        payload = self._request(
+            "GET", f"/api/v1/collab/rooms/{_segment(room_id)}/assistant-runtimes/"
+            f"{_segment(runtime_id)}")
+        runtime = payload.get("runtime")
+        if not isinstance(runtime, dict):
+            raise AssistantAPIError(502, "assistant API returned an invalid runtime response")
+        return runtime
+
+    def runtime_status(self, room_id: str, runtime_id: str) -> dict:
+        runtime = self.runtime_get(room_id, runtime_id)
+        fields = (
+            "runtime_id", "status", "package_id", "package_digest", "host_id", "agent_id",
+            "cancel_requested", "checkpoint", "error_code", "lease_expires_at", "updated_at",
+        )
+        return {field: runtime.get(field) for field in fields}
+
+    def runtime_cancel(self, room_id: str, runtime_id: str) -> dict:
+        return self._request(
+            "POST", f"/api/v1/collab/rooms/{_segment(room_id)}/assistant-runtimes/"
+            f"{_segment(runtime_id)}/cancel", {})
+
 
 def _segment(value: str | None) -> str:
     if not isinstance(value, str) or not value or "/" in value or value in {".", ".."}:
@@ -317,6 +354,19 @@ def _run(args: argparse.Namespace) -> int:
             result = client.packages_list(args.room)
         elif op == "packages-inspect":
             result = client.package_get(args.room, args.package_id)
+        elif op == "hosts-list":
+            result = client.hosts_list(args.room)
+        elif op == "agents-create":
+            result = client.runtime_create(
+                args.room, args.package_id, args.host_id, args.name, args.idempotency_key,
+                selected_model=args.selected_model,
+            )
+        elif op == "agents-runtime-inspect":
+            result = client.runtime_get(args.room, args.runtime_id)
+        elif op == "agents-runtime-status":
+            result = client.runtime_status(args.room, args.runtime_id)
+        elif op == "agents-runtime-cancel":
+            result = client.runtime_cancel(args.room, args.runtime_id)
         else:  # pragma: no cover - argparse constrains this
             raise ConfigError("unknown assistant operation")
         print(json.dumps(_success(result), indent=2, sort_keys=True))
@@ -339,6 +389,29 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     cmd.add_argument("agent_id")
     cmd.add_argument("--room")
     _finish(cmd, "agents-inspect")
+    cmd = agent_ops.add_parser("create", help="queue one strict Pi package activation")
+    cmd.add_argument("--package", dest="package_id", required=True)
+    cmd.add_argument("--room", required=True)
+    cmd.add_argument("--host", dest="host_id", required=True)
+    cmd.add_argument("--name", required=True)
+    cmd.add_argument("--idempotency-key", required=True)
+    cmd.add_argument("--model", dest="selected_model")
+    _finish(cmd, "agents-create")
+    for command, operation in (
+        ("runtime-inspect", "agents-runtime-inspect"),
+        ("runtime-status", "agents-runtime-status"),
+        ("runtime-cancel", "agents-runtime-cancel"),
+    ):
+        cmd = agent_ops.add_parser(command)
+        cmd.add_argument("runtime_id")
+        cmd.add_argument("--room", required=True)
+        _finish(cmd, operation)
+
+    hosts = groups.add_parser("hosts", help="list owner-visible attested runtime hosts")
+    host_ops = hosts.add_subparsers(required=True)
+    cmd = host_ops.add_parser("list")
+    cmd.add_argument("--room", required=True)
+    _finish(cmd, "hosts-list")
 
     capabilities = groups.add_parser("capabilities", help="show current room grant capabilities")
     capability_ops = capabilities.add_subparsers(required=True)

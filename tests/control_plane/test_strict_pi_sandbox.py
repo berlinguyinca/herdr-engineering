@@ -23,7 +23,8 @@ def strict_env(tmp_path):
     work = home / "herdr-agents/work/a1"
     harness = short_root / "harness"
     broker = short_root / "broker"
-    for directory in (work, harness, broker):
+    runtime = short_root / "runtime"
+    for directory in (work, harness, broker, runtime):
         directory.mkdir(parents=True, mode=0o700)
         directory.chmod(0o700)
     work.parent.chmod(0o700)
@@ -35,11 +36,13 @@ def strict_env(tmp_path):
         "HOME": str(home),
         "HERDR_SANDBOX_PROFILE": PROFILE,
         "HERDR_SANDBOX_HARNESS_DIR": str(harness),
+        "HERDR_SANDBOX_RUNTIME_DIR": str(runtime),
         "HERDR_EGRESS_SOCK": str(sock_path),
         "HERDR_SANDBOX_MEM_BYTES": "1073741824",
         "HERDR_SANDBOX_TASKS": "128",
         "HERDR_SANDBOX_TIMEOUT_SECONDS": "900",
         "HERDR_SANDBOX_CPU_PERCENT": "100",
+        "HERDR_SANDBOX_UNIT": "herdr-test-agent",
     }
     try:
         yield env, work, harness, sock_path
@@ -73,11 +76,13 @@ def test_unknown_profile_refuses_before_running(strict_env):
     ("missing", "message"),
     [
         ("HERDR_SANDBOX_HARNESS_DIR", "requires a private harness directory"),
+        ("HERDR_SANDBOX_RUNTIME_DIR", "requires a pinned runtime directory"),
         ("HERDR_EGRESS_SOCK", "requires broker-only network egress"),
         ("HERDR_SANDBOX_MEM_BYTES", "HERDR_SANDBOX_MEM_BYTES"),
         ("HERDR_SANDBOX_TASKS", "HERDR_SANDBOX_TASKS"),
         ("HERDR_SANDBOX_TIMEOUT_SECONDS", "HERDR_SANDBOX_TIMEOUT_SECONDS"),
         ("HERDR_SANDBOX_CPU_PERCENT", "HERDR_SANDBOX_CPU_PERCENT"),
+        ("HERDR_SANDBOX_UNIT", "safe sandbox unit"),
     ],
 )
 def test_strict_profile_requires_every_control(strict_env, missing, message):
