@@ -11,6 +11,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Artifact share links: share with a room
 - `herdr-eng artifacts share create ... --audience lab --room ROOM` (API field `room_id`) adds the sign-in emails of the people in that room, as they are when you create the share, to the lab allow-list. The link is still the lab link: Cognito sign-in, exactly those people, a frozen bundle on the share volume, no path to the registry or the tailnet. People who join the room later are not added (create a new share); lapsed guests and people with no known email are left out; a room with none is refused. Public shares refuse `room_id`.
 
+### Team Map logic (unified workspace P06, not yet on a page)
+- `packages/team-map-model.js` groups a Work Graph snapshot project -> issue -> task -> deliverables, folds noisy execution nodes into a count, filters, names what each line means (five meanings), describes the map as text, counts milestones instead of inventing percentages, and lays nodes out deterministically without moving placed ones. `HerdrClient` gains `workGraphSnapshot`, `workGraphLayout`, `saveWorkGraphLayout`. Nothing renders it yet.
+
 ### CI page: one attention item per repository
 - "Needs attention" on the CI page no longer lists the same repository once per pull request and branch. Unfixed failures of one repository are one row: the newest failure leads (its failing step and log load when the row is opened), and the other failing branches and pull requests are listed inside it, with a "N branches or PRs failing" chip. Each ref is still judged on its own, so a green main does not clear a red pull request, and a ref that gets a green run drops out of the row. The Overview badge counts repositories.
 
