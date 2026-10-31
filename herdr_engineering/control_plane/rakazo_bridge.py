@@ -83,6 +83,8 @@ MAX_NONCES = 512
 # send_email is deliberately absent. Override with control_plane.rakazo_bridge.default_tools; [] disables.
 DEFAULT_TOOLS = ("set_reminder", "list_reminders", "cancel_reminder", "search_email", "read_email", "list_calendar_events",
                  "find_free_time", "create_email_draft", "create_calendar_event")
+# default_tools may only name these: tools that stay behind an approval card or touch only the person's own data.
+ALLOWED_DEFAULT_TOOLS = DEFAULT_TOOLS + ("draft_email",)
 MAX_BOTS = 20                        # assistants per account
 MAX_RUN_ROWS = 20
 MAX_ACTIVE_ROWS = 50
@@ -208,9 +210,9 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
                              "(the herdr-memory service; the token stays in its file)")
     tools = raw.get("default_tools", list(DEFAULT_TOOLS))
     if (not isinstance(tools, list) or len(tools) > 50 or not all(isinstance(t, str) for t in tools)
-            or any(t not in TOOL_CATALOG for t in tools) or "send_email" in tools):
-        raise ValueError("control_plane.rakazo_bridge.default_tools must be a list of known assistant tool ids "
-                         "(never send_email)")
+            or any(t not in ALLOWED_DEFAULT_TOOLS for t in tools)):
+        raise ValueError("control_plane.rakazo_bridge.default_tools must be a list drawn from: "
+                         + ", ".join(ALLOWED_DEFAULT_TOOLS))
     ttl_days = bounded("token_ttl_days", 30, 1, 365)
     max_tokens = bounded("max_tokens", 5, 1, 50)
     proxies = raw.get("trusted_proxies", [])
@@ -689,6 +691,7 @@ class RakazoBridge:
         self._nonce_lock = threading.Lock()
         self._nonces: OrderedDict[tuple, dict[str, Any]] = OrderedDict()      # recent sends, by clientNonce
         self._create_lock = threading.Lock()
+        self._grant_lock = threading.Lock()
         self._closed = threading.Event()
         self._monotonic = monotonic
         self.thread_factory = threading.Thread      # tests swap it to make a thread start fail
@@ -1024,16 +1027,17 @@ class RakazoBridge:
             if self.canonical_person(ctx.tenant, ctx.user) != (ctx.tenant, OPEN_LISTENER_USER):
                 return
             bot_id = assistant.assistant_id
-            if self.bots.meta(ctx, bot_id).get("default_tools_applied"):
-                return
-            have = {g.tool_id for g in self.svc.store.list_grants(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id)}
-            for tool in self.default_tools:
-                if tool in TOOL_CATALOG and tool != "send_email" and tool not in have:
-                    self.svc.grant_tool(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id, tool_id=tool,
-                                        scope="*", preauthorized=False)
-            self.bots._put_meta(ctx, bot_id, {"default_tools_applied": True})
-        except Exception:  # noqa: BLE001 - a grant failure must never break chat
-            log.warning("rakazo bridge: default tool grants failed")
+            with self._grant_lock:      # concurrent first requests must not each grant every tool
+                if self.bots.meta(ctx, bot_id).get("default_tools_applied"):
+                    return
+                have = {g.tool_id for g in self.svc.store.list_grants(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id)}
+                for tool in self.default_tools:
+                    if tool in ALLOWED_DEFAULT_TOOLS and tool not in have:
+                        self.svc.grant_tool(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id, tool_id=tool,
+                                            scope="*", preauthorized=False)
+                self.bots._put_meta(ctx, bot_id, {"default_tools_applied": True})
+        except Exception as exc:  # noqa: BLE001 - a grant failure must never break chat
+            log.warning("rakazo bridge: default tool grants failed (%s)", type(exc).__name__)
 
     def _target(self, ctx: _Ctx, inp: dict[str, Any]):
         if inp.get("groupId"):

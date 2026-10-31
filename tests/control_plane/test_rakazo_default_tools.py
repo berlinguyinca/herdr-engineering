@@ -100,7 +100,7 @@ def test_config_override_is_respected_and_empty_disables():
     assert tools(b2, ctx2, bot2) == set()
 
 
-@pytest.mark.parametrize("bad", [["nope"], "set_reminder", ["send_email"], [1]])
+@pytest.mark.parametrize("bad", [["nope"], "set_reminder", ["send_email"], ["browse"], ["run_shell"], ["edit_shared"], [1]])
 def test_bad_default_tools_are_refused_at_config_parse(bad):
     section = {"enabled": True, "accounts": [_acct("op", "operator")], "default_tools": bad}
     with pytest.raises(ValueError, match="default_tools"):
@@ -120,3 +120,21 @@ def test_grant_failure_never_breaks_chat(monkeypatch):
     bot = b.svc.create_assistant(tenant_id=ctx.tenant, user_id=ctx.user, name="x", instructions="", enabled=True)
     monkeypatch.setattr(b.svc, "grant_tool", lambda **k: (_ for _ in ()).throw(RuntimeError("boom")))
     assert b._assistant(ctx, bot.assistant_id).assistant_id == bot.assistant_id
+
+
+def test_concurrent_first_requests_grant_each_tool_once():
+    import threading
+    _, b = build()
+    ctx = ctx_for(b, "op")
+    bot = b.svc.create_assistant(tenant_id=ctx.tenant, user_id=ctx.user, name="x", instructions="", enabled=True)
+    start = threading.Barrier(8)
+
+    def hit():
+        start.wait()
+        b._assistant(ctx, bot.assistant_id)
+
+    threads = [threading.Thread(target=hit) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    ids = [g.tool_id for g in grants(b, ctx, bot.assistant_id)]
+    assert sorted(ids) == sorted(rb.DEFAULT_TOOLS)
