@@ -224,7 +224,7 @@ async def scenario(rig: Rig, pool) -> None:
                                    changes=[{"name": "big.bin", "op": "put", "upload_id": upl}])
     assert is_error and incomplete["status"] == 409 and incomplete["missing"] == [2]
     resumed = rig.ok("artifact_stage_chunk", **chunk(incomplete["missing"][0]))      # resume from `missing`
-    assert resumed["index"] == 2 and resumed.get("complete", True)
+    assert resumed["index"] == 2 and resumed["complete"] is True
     ticket = rig.commit(r1, [{"name": "big.bin", "op": "put", "upload_id": upl}], message="big")
     await rig.cycle()
     big = rig.result(ticket)
