@@ -44,7 +44,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from . import placement
+from . import placement, slurm_placement
 from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_hub.workers import Enrollment, Worker
 from .inference_models import RETRY_CODES, ModelResolver
@@ -342,6 +342,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "binding_scope": _delegation_binding_scope(delegation.get("binding_scope")),
             "pi_bindings": _delegation_pi_bindings(delegation.get("pi_bindings")),
         },
+        "placement": {"slurm": slurm_placement.slurm_config(
+            ((section.get("placement") or {}).get("slurm") or {}).get("clusters"))},
     }
 
 
@@ -2525,6 +2527,11 @@ class AssistantService:
         self._transport = None  # injected in tests; default uses urllib
         self.delegation_adapter = delegation_adapter
         self.delegation_adapter_resolver = delegation_adapter_resolver
+        # Placement sources: attested fabric hosts (set by the control plane) and Slurm clusters configured for
+        # assistant use. Both are read-only; neither can start anything from here.
+        self.host_candidates: Callable[[], list[dict[str, Any]]] | None = None
+        self.slurm_probe = (slurm_placement.SlurmProbe(self.config["placement"]["slurm"])
+                            if self.config["placement"]["slurm"] else None)
         if delegation_adapter is not None and delegation_adapter_resolver is not None:
             raise ValueError("configure a delegation adapter or resolver, not both")
         if delegation_adapter is not None and not self.config["delegation"].get("binding_scope"):
@@ -3996,6 +4003,63 @@ class AssistantService:
             return self.delegation_adapter
         return None
 
+    @staticmethod
+    def _role_key(role: dict[str, Any] | None) -> str | None:
+        return f"{role['id']}@{role['version']}:{role['digest']}" if role else None
+
+    def placement_candidates(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for source in (self.host_candidates, self.slurm_probe.candidates if self.slurm_probe else None):
+            if source is None:
+                continue
+            try:
+                out.extend(source())
+            except Exception:  # noqa: BLE001 - one unreachable source never hides the others
+                _log.warning("assistant placement source failed", exc_info=True)
+        return out
+
+    def resolve_placement(self, type_name: str, *, require: list[str] | None = None) -> dict[str, Any]:
+        """Where a specialist of this type would run now. Automatic: resources and capabilities decide, a caller can
+        only add requirements, and nothing here grants a tool, a network path or a display."""
+        spec = next((t for t in self.assistant_types() if t["type"] == type_name), None)
+        if spec is None or spec["kind"] != "specialist":
+            raise AssistantError("only specialist types are placed")
+        try:
+            needs = placement.requirements(spec["requires"], require)
+        except placement.PlacementError as exc:
+            raise AssistantError(str(exc)) from None
+        target = self.config["delegation"]["targets"][type_name]
+        decision = placement.place(
+            self.placement_candidates(), needs=needs, resources=spec["resources"],
+            profile="task-restricted-v1", role=self._role_key(target.get("role_ref")))
+        decision["type"] = type_name
+        return decision
+
+    def _graph_placement(self, nodes: list[dict[str, Any]], edges: list[dict[str, str]],
+                         node: dict[str, Any], a: Assistant) -> None:
+        """Current plan for a specialist: ``planned`` is where the resolver would run it now, never a claim that it
+        runs there. ``unplaceable`` carries the reason each candidate was rejected."""
+        try:
+            decision = self.resolve_placement(a.type)
+        except AssistantError as exc:
+            node["placement"] = {"state": "unplaceable", "reasons": [str(exc)]}
+            return
+        chosen = decision["chosen"]
+        known = {n["id"] for n in nodes}
+        if chosen is None:
+            node["placement"] = {"state": "unplaceable", "needs": decision["needs"],
+                                 "reasons": [f"{r['id']}: {'; '.join(r['reasons'])}" for r in decision["rejected"]]
+                                 or ["no host or cluster is configured"]}
+            return
+        cand = next((c for c in self.placement_candidates() if c["id"] == chosen), {"id": chosen})
+        host_node_id = chosen
+        if host_node_id not in known:
+            nodes.append({"id": host_node_id, "kind": "host", "name": cand.get("label", chosen),
+                          "backend": cand.get("backend", cand.get("kind", "host")), "status": cand.get("status"),
+                          "capabilities": list(cand.get("capabilities", [])), "free": dict(cand.get("free", {}))})
+        node["placement"] = {"state": "planned", "host": host_node_id}
+        edges.append({"from": a.assistant_id, "to": host_node_id, "kind": "placed_on", "state": "planned"})
+
     def assistant_graph(self, *, tenant_id: str, user_id: str, limit: int = 100) -> dict[str, Any]:
         """Read-only projection of this person's assistants, their delegations and the specialists those run on.
 
@@ -4015,6 +4079,8 @@ class AssistantService:
             edges.append({"from": "you", "to": a.assistant_id, "kind": "owns"})
             if a.parent_id:
                 edges.append({"from": a.parent_id, "to": a.assistant_id, "kind": "linked"})
+            if a.type != "rakazo" and a.enabled:
+                self._graph_placement(nodes, edges, nodes[-1], a)
         consumer_on = bool(self.config.get("delegation_consumer", {}).get("enabled"))
         for target, spec in self.config["delegation"]["targets"].items():
             if target == "pi":

@@ -578,6 +578,9 @@ class ControlPlaneServer:
         from .single_flight_cache import SingleFlightCache
         self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
+        if self.assistant.host_candidates is None:       # looked up per call: `collab` may be swapped after startup
+            self.assistant.host_candidates = lambda: (
+                self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
         self.collab_require_https = collab_require_https
         # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
         # `control_plane.federation` on; the gateway is rebuilt if `collab` is swapped (tests do).
@@ -3744,7 +3747,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_reminders(parts)
             if resource == "assistant-workers":
                 return self._assistant_workers(parts)
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types",
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
@@ -4477,7 +4480,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):
-            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant
@@ -4582,6 +4585,12 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "assistant-types" and len(parts) == 4:
                     svc._require_enabled()
                     return self._json({"types": svc.assistant_types()})
+                if resource == "assistant-placement" and len(parts) == 4:
+                    query = parse_qs(urlsplit(self.path).query)
+                    extra = [c for raw in query.get("require", []) for c in raw.split(",") if c]
+                    kind = (query.get("type") or [""])[0]
+                    svc._require_enabled()
+                    return self._json(svc.resolve_placement(kind, require=extra))
                 if resource == "assistant-graph" and len(parts) == 4:
                     return self._json(svc.assistant_graph(tenant_id=tenant_id, user_id=user_id))
                 if resource == "assistant-delegations" and len(parts) == 4:
@@ -4596,7 +4605,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc), "code": "rate_limited"}, 429)
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
-            except ValueError as exc:
+            except (AssistantError, ValueError) as exc:         # a refused request (for example an unknown capability)
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_post(self, parts, resource, body):

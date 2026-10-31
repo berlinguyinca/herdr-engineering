@@ -75,3 +75,57 @@ test('loading, off, error and empty states render without a graph', () => {
   assert.match(renderAssistantGraph({ phase: 'ready', nodes: [], edges: [] }), /No assistants yet/);
   assert.ok(renderAssistantGraph({ phase: 'loading' }).length > 0);
 });
+
+
+const PLACED = {
+  nodes: [
+    { id: 'you', kind: 'you', name: 'You' },
+    { id: 'asst_p', kind: 'assistant', name: 'Fleet PA', type: 'rakazo', status: 'ready', can_delegate: false, delegate_scopes: [] },
+    { id: 'asst_s', kind: 'assistant', name: 'Secretary', type: 'pi-secretary', parent_id: 'asst_p', status: 'needs_setup',
+      can_delegate: false, delegate_scopes: [], placement: { state: 'planned', host: 'host:bender' } },
+    { id: 'asst_w', kind: 'assistant', name: 'Web <scout>', type: 'scout', parent_id: 'asst_p', status: 'needs_setup',
+      can_delegate: false, delegate_scopes: [], placement: { state: 'unplaceable', needs: ['display'], reasons: ['host:bender: missing display', '<b>x</b>'] } },
+    { id: 'asst_c', kind: 'assistant', name: 'Cluster job', type: 'pi-secretary', status: 'needs_setup',
+      can_delegate: false, delegate_scopes: [], placement: { state: 'planned', host: 'slurm:hive:low' } },
+    { id: 'host:bender', kind: 'host', name: 'bender', backend: 'host', status: 'ready', capabilities: ['display', 'internet'], free: { cpus: 8, memory_mb: 16384, gpus: 0 } },
+    { id: 'slurm:hive:low', kind: 'host', name: 'Hive / low', backend: 'slurm', status: 'ready', capabilities: ['os:linux'], free: { cpus: 640, memory_mb: 5120000, gpus: 0 } },
+  ],
+  edges: [
+    { from: 'you', to: 'asst_p', kind: 'owns' }, { from: 'asst_p', to: 'asst_s', kind: 'linked' }, { from: 'asst_p', to: 'asst_w', kind: 'linked' },
+    { from: 'asst_s', to: 'host:bender', kind: 'placed_on', state: 'planned' },
+  ],
+};
+
+test('linked children nest under their parent and unlinked assistants stay at the top', () => {
+  const html = renderAssistantGraph({ phase: 'ready', ...PLACED });
+  const parent = html.indexOf('data-graph-id="asst_p"');
+  const child = html.indexOf('data-graph-id="asst_s"');
+  const other = html.indexOf('data-graph-id="asst_c"');
+  assert.ok(parent < child && child < other, 'the child sits under its parent; the unlinked assistant follows');
+  assert.equal((html.match(/data-graph-id="asst_s"/g) || []).length, 1, 'a linked child is drawn once');
+  assert.match(html, /data-graph-id="asst_s"[\s\S]*pi-secretary/);
+});
+
+test('where an agent would run is labelled planned, with the backend, and never claims it is running', () => {
+  const html = renderAssistantGraph({ phase: 'ready', ...PLACED });
+  assert.match(html, /planned: bender/);
+  assert.match(html, /planned: Hive \/ low[\s\S]*slurm/);
+  assert.ok(!/running on|runs on bender/.test(html));
+});
+
+test('an unplaceable specialist says why, escaped', () => {
+  const html = renderAssistantGraph({ phase: 'ready', ...PLACED });
+  assert.match(html, /can&#39;t be placed|can't be placed/);
+  assert.match(html, /host:bender: missing display/);
+  assert.ok(!html.includes('<b>x</b>') && !html.includes('Web <scout>'));
+  assert.match(html, /Web &lt;scout&gt;/);
+});
+
+test('hosts are listed with status, backend, capabilities and free resources', () => {
+  const html = renderAssistantGraph({ phase: 'ready', ...PLACED });
+  assert.match(html, /Where agents run/);
+  assert.match(html, /data-graph-id="host:bender"[\s\S]*display[\s\S]*internet/);
+  assert.match(html, /free: 8 cpu, 16 GiB/);
+  assert.match(html, /data-graph-id="slurm:hive:low"[\s\S]*slurm/);
+  assert.ok(!renderAssistantGraph({ phase: 'ready', nodes: [{ id: 'you', kind: 'you' }], edges: [] }).includes('Where agents run'));
+});

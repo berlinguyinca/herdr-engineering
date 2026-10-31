@@ -100,7 +100,8 @@ def test_operator_attestation_is_strict_fresh_and_publicly_summarized(env):
         "attested_at": env.clock.t, "expires_at": env.clock.t + 240,
         "supported_runtime_kinds": ["pi"], "sandbox_profiles": ["task-restricted-v1"],
         "models": ["family:fast", "family:planner"],
-        "role_bindings": record["manifest"]["references"]["procedures"]}]}
+        "role_bindings": record["manifest"]["references"]["procedures"],
+        "capabilities": [], "resources": {}}]}                    # a runner that reports none is shown as none
     assert invite(env.api, room, "bob", role="contributor")[0] == 201
     assert env.api.call("GET", f"{BASE}/rooms/{room}/assistant-hosts", user="bob")[0] in (403, 404)
     for bad in [{**body, "command": "pi --dangerous"}, {**body, "expires_at": env.clock.t + 301},

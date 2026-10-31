@@ -34,7 +34,7 @@ from ..assistant_packages import ManifestError, agent_package_record
 from . import collab_delegation as dlg
 from . import collab_external as ext
 from . import collab_mentions as mentions
-from . import collab_models, ids, logfile_lock
+from . import collab_models, ids, logfile_lock, placement
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_federation import FederationMixin
@@ -4793,8 +4793,15 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         fields = {"schema_version", "host_id", "profile", "profile_digest", "runtime",
                   "enforcement", "approved_models", "issued_at", "expires_at", "nonce",
                   "role_bindings"}
-        if not isinstance(body, dict) or set(body) != fields or body.get("schema_version") != 1:
+        optional = {"capabilities", "resources"}          # older runners that do not report them keep attesting
+        if (not isinstance(body, dict) or not fields <= set(body) or set(body) - fields - optional
+                or body.get("schema_version") != 1):
             raise CollabError(400, "invalid runtime host attestation")
+        try:
+            capabilities = placement.normalize_capabilities(body.get("capabilities"))
+            resources = placement.normalize_resources(body.get("resources"))
+        except placement.PlacementError:
+            raise CollabError(400, "invalid runtime host capabilities") from None
         host_id = self._require_host(body.get("host_id"))
         profile, profile_digest = body.get("profile"), body.get("profile_digest")
         runtime, enforcement = body.get("runtime"), body.get("enforcement")
@@ -4833,6 +4840,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             "approved_models": sorted(models), "issued_at": float(issued),
             "expires_at": float(expires), "nonce": nonce,
             "role_bindings": self._assistant_role_bindings(body.get("role_bindings")),
+            "capabilities": capabilities, "resources": resources,
         }
 
     @staticmethod
@@ -4845,7 +4853,25 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             "supported_runtime_kinds": ["pi"], "sandbox_profiles": [record["profile"]],
             "models": list(record["approved_models"]),
             "role_bindings": copy.deepcopy(record["role_bindings"]),
+            "capabilities": list(record.get("capabilities", [])),
+            "resources": dict(record.get("resources", {})),
         }
+
+    def assistant_runtime_host_candidates(self) -> list[dict]:
+        """Placement candidates for every attested host: only fields the runner attested, no owner or room data."""
+        with self._lock:
+            now = self._now()
+            rows = []
+            for host_id in sorted(self._assistant_runtime_hosts):
+                record = self._assistant_runtime_hosts[host_id]
+                host = self._assistant_runtime_host_json(record, now, self._fleet_flags.get(host_id, True))
+                rows.append({
+                    "id": f"host:{host_id}", "kind": "host", "backend": "host", "label": host["label"],
+                    "status": host["status"], "capabilities": host["capabilities"], "free": host["resources"],
+                    "attested_at": host["attested_at"], "profiles": host["sandbox_profiles"],
+                    "role_bindings": [f"{r['id']}@{r['version']}:{r['digest']}" for r in host["role_bindings"]],
+                    "models": host["models"], "queue_wait_s": 0})
+            return rows
 
     def attest_assistant_runtime_host(self, pr: Principal, body: dict) -> tuple[int, dict]:
         self._require_operator(pr)

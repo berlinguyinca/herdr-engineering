@@ -1,7 +1,6 @@
 # Assistant management CLI and graph contract
 
-Status: proposed. Extends `docs/specs/assistant-cli-20261030/README.md`; nothing here is implemented yet except the
-read-only graph route (`GET /api/v1/assistant-graph`, commit `979d7189`).
+Status: implemented except where marked **not built**. Extends `docs/specs/assistant-cli-20261030/README.md`.
 
 ## Goal
 
@@ -28,8 +27,8 @@ Audit of the conventions already in `herdr-eng`, and what this contract does wit
 | `herdr-eng assistant <noun> <verb>`; nouns are plural: `agents`, `tasks`, `packages`, `approvals`, `hosts` | Keep the nouns for what is attached. Add **verbs directly on `assistant`** for the assistant itself: `create list inspect link unlink archive graph types`. `assistant agents create` (queue a Pi runtime) is unchanged and stays the low-level verb |
 | Words as flags, not prose: `--room`, `--package`, `--host`, `--name` | `--type`, `--parent`, not `type <t>` / `to <p>`. Subject is a positional, as in `teams create "Name"` |
 | `assistant` group prints a versioned envelope `{"schema_version":1,"ok":...}`; `--json` is accepted and is the default | Same envelope, same `--json` no-op. Exit `0` on success, `1` on any operational error (envelope on stdout) |
-| Identity from the credential only; no `--user`, `--owner`, `--approved` (`HERDR_ASSISTANT_URL`, `_TOKEN_FILE`, HTTPS or loopback, no redirects) | Unchanged. New verbs use `AssistantClient` and the same `AssistantConfig` |
-| Mutations are sent once and never retried; `--idempotency-key` makes an uncertain result replay-safe (`agents create`, `tasks create`) | Same. `create` and `link` take an optional `--idempotency-key`; when omitted the CLI derives `sha256(verb, name, type, parent)`, so a repeat of the same command replays instead of duplicating |
+| Identity from the credential only; no `--user`, `--owner`, `--approved` | Kept. **Transport differs, on purpose:** `assistant agents/tasks/...` use `HERDR_ASSISTANT_*` Bearer tokens against `/api/v1/collab`, but the Personal Assistant API authenticates by API key mapped to a principal and tenant. The new verbs therefore use the `herdr-eng teams` transport (`--control-plane`, `--api-key-env HERDR_API_KEY`, no redirects) and the `assistant` group's envelope |
+| Mutations are sent once and never retried; `--idempotency-key` makes an uncertain result replay-safe (`agents create`, `tasks create`) | Same. `create` takes an optional `--idempotency-key`; when omitted the CLI derives one from `(verb, name, type, parent)`, so a repeat replays instead of duplicating. `link`/`unlink` are idempotent by nature (a repeat is a no-op) and take none |
 | A proposal is only a pending request; no CLI operation turns it into authority (`approvals request`) | `link` and `create` never create grants. See Authority |
 | `teams` is human-readable by default, with `--json` | Not followed: the `assistant` group is JSON by default. One addition, `graph --tree`, prints text for humans |
 | IDs are the addressable thing (`AGENT_ID`, `TASK_ID`) | An assistant is addressed by `asst_...` id, or by exact name when that name is unique among the caller's assistants. An ambiguous name fails and lists the ids |
@@ -40,10 +39,9 @@ Audit of the conventions already in `herdr-eng`, and what this contract does wit
 herdr-eng assistant types
 herdr-eng assistant list [--type TYPE] [--parent REF] [--json]
 herdr-eng assistant inspect REF [--json]
-herdr-eng assistant create NAME --type TYPE [--parent REF] [--require CAPS] [--host HOST_ID] [--dry-run] [--idempotency-key KEY]
-herdr-eng assistant place --type TYPE [--require CAPS] [--json]
-herdr-eng assistant hosts list [--require CAPS] [--room ROOM_ID]
-herdr-eng assistant link CHILD --parent PARENT [--idempotency-key KEY]
+herdr-eng assistant create NAME --type TYPE [--parent REF] [--idempotency-key KEY]
+herdr-eng assistant place --type TYPE [--require CAPS]
+herdr-eng assistant link CHILD --parent PARENT
 herdr-eng assistant unlink CHILD
 herdr-eng assistant archive REF
 herdr-eng assistant graph [--tree] [--json]
@@ -55,6 +53,7 @@ herdr-eng assistant graph [--tree] [--json]
 herdr-eng assistant create "Fleet PA" --type rakazo
 herdr-eng assistant create "Secretary" --type pi-secretary --parent "Fleet PA"
 herdr-eng assistant link "Mail assistant" --parent "Fleet PA"      # existing assistant, explicit association
+herdr-eng assistant place --type scout --require desktop
 herdr-eng assistant graph --tree
 ```
 
@@ -115,9 +114,9 @@ Additive; existing assistants and clients are unaffected.
 - `POST /api/v1/assistants/{id}/link` with `{"parent_id": ...}`, and `POST /api/v1/assistants/{id}/unlink` with `{}`.
 - The host attestation gains `capabilities` (closed vocabulary above); `_assistant_runtime_host_json` returns it.
 - Specialist type definitions in `personal_assistant.delegation.targets` gain an optional `requires` list.
-- `POST` runtime creation keeps taking an explicit `host_id`; the resolver runs in the CLI and in a server-side
-  `GET /api/v1/assistant-placement?type=...&require=...`, so the dashboard and CLI choose identically. The server
-  re-checks the pinned host when the runtime is created and does not trust the client's choice.
+- `GET /api/v1/assistant-placement?type=...&require=a,b` runs the one resolver for the CLI and the dashboard, so they
+  always agree. Runtime creation (`assistant agents create`) is unchanged and still names a host; connecting that to
+  the resolver belongs to self-provisioning and is **not built**.
 - Every mutation writes the existing audit entries: `assistant.created`, `assistant.linked`, `assistant.unlinked`.
 - The graph gains an edge `{"from": parent, "to": child, "kind": "linked"}` and each assistant node gains `type` and
   `parent_id`. Edge kinds are then: `owns` (derived), `linked` (explicit), `delegated`, `runs_on` (runtime facts).
@@ -134,8 +133,8 @@ The dashboard stays a projection of the same API and adds no state of its own.
 ## Placement
 
 Some specialists run remotely inside the fabric on hosts that differ in what they can offer: a browsing agent needs a
-display, a desktop agent a desktop session, others an internet path or a VM boundary. Creating an assistant locates a
-host from what it needs; nobody types a host id unless they want to pin one.
+display, a desktop agent a desktop session, others an internet path or a VM boundary. Placement is **always automatic**: resources and
+capabilities decide, and nobody types a host, so there is no `--host` flag. Where an agent runs is shown, not chosen.
 
 ### Capabilities
 
@@ -171,42 +170,72 @@ runner attests counts for placement.
 
 ### Resolution
 
-`create` computes requirements as `type.requires` plus any `--require`. `--require` can only add to a type's minimum,
-never relax it, so a browser specialist cannot be placed on a host without a display.
+Requirements are `type.requires` plus any `--require`/`require=`; a caller can only add to a type's minimum, never relax
+it. Resources come from the type's `resources` (`cpus`, `memory_mb`, `gpus`).
 
-A host is a candidate when all of these hold:
+A candidate (a fabric host or a Slurm partition) qualifies when all of these hold:
 
-1. Its attestation is fresh and unused (`status: ready`), and the operator has not disabled it.
-2. It supports the runtime kind and a sandbox profile the type permits.
-3. Its attested capabilities contain every requirement.
-4. It carries the type's role binding and approved model, where the type has them.
+1. It is `ready`: a fresh, unused attestation that the operator has not disabled (hosts), or a partition that is up (Slurm).
+2. Its attested or configured capabilities contain every requirement.
+3. Its free resources cover the type's resources.
+4. It lists the sandbox profile the type uses (`task-restricted-v1`) and the type's role binding.
 
-Candidates are ordered by freshest attestation, then `host_id`, so the same inputs choose the same host. With
-`--host HOST_ID` the host is pinned, and it must still pass the checks above; pinning is never a way around a
-requirement. If no host qualifies, `create` fails before anything is created and says which requirement eliminated
-which host.
+Qualifying candidates are ordered: **fabric hosts before Slurm** (a host can start now), then freshest attestation, then
+most free capacity, then id, so the same inputs choose the same place. If nothing qualifies, `chosen` is null and every
+rejected candidate carries its reasons (`missing display`, `not enough cpus`, `no sandbox profile ...`, `role not bound`).
 
-The chosen `host_id` is recorded on the runtime and returned in the result. It is not re-chosen silently: a running
-runtime stays where it is, and if its host goes stale the existing lease logic fails it. Creating again places again,
-with the requirements part of the idempotency fingerprint. The assistant's identity does not depend on the host.
+Creating a specialist **never fails because nothing qualifies**. The assistant exists with status `needs_setup`, and
+the graph shows `unplaceable` with those reasons. Placement is computed from current state each time it is read, so it
+cannot go stale: the dashboard shows where an agent *would run now* (`planned`), and will show where it actually runs once
+a runtime exists.
+
+### Slurm
+
+A cluster takes part only when the operator has configured it for assistant use:
+
+```yaml
+personal_assistant:
+  placement:
+    slurm:
+      clusters:
+        - id: hive
+          label: Hive
+          login_host: login1.example
+          assistant_use: true            # without this the cluster is invisible to placement
+          partitions:
+            low:
+              capabilities: [os:linux]
+              profiles: [task-restricted-v1]     # only what the operator has attested on that partition
+              role_bindings: ["procedure:secretary-system@1.0.0:sha256:..."]
+```
+
+Capacity is read-only (`sinfo`, over `ssh` with a fixed argument list and an operator-validated host, cached 60 s), and
+conservative: **only fully idle nodes count as free**. `sinfo` cannot attest a display, an internet path or a sandbox, so
+those come from configuration and are never inferred; GPUs are read from the partition's GRES. A partition with no
+declared profile never carries a specialist. An unreachable cluster is `unavailable`, never an error to the caller.
+
+**Not built:** launching a runtime onto Slurm. That needs the runner installed and attested on the cluster
+(bubblewrap, cgroup and broker enforcement on compute nodes), which cannot be proven without one. Until then a Slurm
+partition can be *planned* onto and is visible in the graph, but nothing is submitted. The existing no-touch rule for
+compute nodes still applies.
 
 ### CLI
 
 ```sh
-herdr-eng assistant hosts list --require display,internet
-herdr-eng assistant place --type browser                 # ranked candidates, and why each rejected host was rejected
-herdr-eng assistant create "Web scout" --type browser --parent "Fleet PA" --dry-run
-herdr-eng assistant create "Web scout" --type browser --parent "Fleet PA" --require vm
+herdr-eng assistant place --type scout                    # chosen place, ranked candidates, and why others were rejected
+herdr-eng assistant place --type scout --require desktop  # can only tighten
+herdr-eng assistant graph --tree                          # shows "on <host>" per specialist and a "Where agents run" section
 ```
 
-`place` and `--dry-run` change nothing. `hosts list` stays the existing room-scoped owner view, with capabilities added
-to each host and `--require` as a filter. Output follows the existing envelope.
+`place` and `graph` change nothing. There is no `hosts list --require`: `hosts` is the collab-token, room-scoped owner view,
+a different credential world, and `place` answers the same question.
 
 ### Graph and dashboard
 
-The graph gains `host` nodes (status, capabilities) and a `placed_on` edge from a specialist to its host. A specialist
-with unmet requirements shows what is missing, for example "needs display and internet: no host qualifies", rather than
-a bare "not set up". The dashboard shows capability chips on hosts and the same reason text.
+The graph gains `host` nodes (status, backend `host` or `slurm`, capabilities, free resources) and a `placed_on` edge with
+`state: planned` from a specialist to its host. A specialist that cannot be placed carries `placement.state: unplaceable`
+with the per-candidate reasons. The dashboard labels a placement **planned**, shows the backend and capability chips on hosts, and
+lists the reasons for an unplaceable specialist.
 
 ## Specialist setup
 
@@ -225,9 +254,10 @@ for that person. Two stages, deliberately separate:
 - Parity test: whatever `create`/`link` do through the CLI appears in `GET /api/v1/assistant-graph` and in
   `renderAssistantGraph` output.
 - Negative tests: no grant, approval or connection is created or changed by any verb; a second user sees nothing.
-- Placement tests: capability superset match, unknown capability rejected, `--require` cannot relax a type minimum,
-  stale/used/disabled hosts excluded, deterministic tie-break, pinned host that fails a requirement is refused, no
-  candidate reports the eliminating requirement per host, and a host attesting `internet` never changes a profile.
+- Placement tests (`tests/control_plane/test_placement.py`): capability superset match, unknown capability rejected,
+  `--require` cannot relax a type minimum, stale hosts excluded, deterministic ordering, per-candidate rejection reasons,
+  a host attesting `internet` never changes a profile, a runner that reports no capabilities matches nothing, Slurm config
+  validation, `sinfo` parsing, probe caching and failure, and a cluster without a declared profile never carrying a specialist.
 - Replay test: repeating a command with the same (or derived) key creates one assistant and one audit entry.
 
 ## Open decisions (defaults chosen)
@@ -238,6 +268,7 @@ for that person. Two stages, deliberately separate:
 - **Parent type:** only `rakazo`. Rakazo-to-Rakazo links are allowed (for example `Mail assistant` under `Fleet PA`).
 - **Output:** JSON default, as the `assistant` group does today.
 - **Capability source:** runner attestation only; fleet inventory is a hint.
+- **Placement is never user-chosen:** no `--host`, no `--dry-run` (every `place` is a dry run).
 - **Browsing precondition:** no `browser` specialist can be created until a sandbox profile that permits `display` and
   brokered `internet` is designed and reviewed. Until then `place --type browser` reports no host qualifies, which is
   the correct answer.

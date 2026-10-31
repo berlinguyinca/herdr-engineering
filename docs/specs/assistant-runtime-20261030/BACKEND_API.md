@@ -90,3 +90,12 @@ list binds an empty role list and preserves existing package compatibility. Role
 does not change the fixed no-tools sandbox or grant any additional room authority.
 
 Docker and Apptainer definitions remain unlaunchable in v1.
+
+## Host capabilities and resources (placement)
+
+A host attestation may additionally carry `capabilities` (a closed vocabulary: `display`, `desktop`, `internet`, `vm`,
+`gpu`, `os:linux`, `os:macos`, `arch:x86_64`, `arch:arm64`; `desktop` implies `display`) and `resources`
+(`cpus`, `memory_mb`, `gpus` currently free). Both are optional, so runners that predate them keep attesting, and an
+unknown name rejects the whole attestation. Owner-visible host summaries return both, as `[]` and `{}` when the runner
+reports none. They constrain where an agent may be placed and grant nothing: the sandbox profile alone decides what a
+runtime can reach.

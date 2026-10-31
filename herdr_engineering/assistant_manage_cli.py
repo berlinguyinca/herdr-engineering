@@ -13,7 +13,7 @@ import json
 import os
 import sys
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from .artifact_shares_client import ShareClient, ShareError, _safe
 
@@ -155,6 +155,9 @@ def run_command(args: argparse.Namespace) -> int:
             target = resolve_ref(_list(client), args.ref)
             client.request(f"{BASE}/{quote(target['assistant_id'], safe='')}", {"archive": True})
             result = {"archived": target["assistant_id"]}
+        elif op == "place":
+            query = urlencode({"type": args.type, **({"require": args.require} if args.require else {})})
+            result = client.request(f"/api/v1/assistant-placement?{query}")
         elif op == "graph":
             result = client.request("/api/v1/assistant-graph")
             if args.tree:
@@ -208,6 +211,10 @@ def register_management(groups: argparse._SubParsersAction) -> None:
     c = groups.add_parser("archive", help="archive an assistant (disables it and revokes its grants)")
     c.add_argument("ref")
     _common(c, "archive")
+    c = groups.add_parser("place", help="show where a specialist type would run now, and why other places were rejected")
+    c.add_argument("--type", required=True)
+    c.add_argument("--require", help="extra capabilities, comma separated; can only add to the type's own")
+    _common(c, "place")
     c = groups.add_parser("graph", help="your assistants, delegations and where they run")
     c.add_argument("--tree", action="store_true", help="indented text instead of JSON")
     _common(c, "graph")
