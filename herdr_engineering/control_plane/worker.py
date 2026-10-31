@@ -16,7 +16,7 @@ from typing import Any
 
 from .artifact_collab_store import CollabGrantStore
 from .artifacts import ArtifactStore
-from .share_bundle import remove_bundle, remove_state
+from .share_bundle import remove_bundle, remove_state, write_own_projection
 
 log = logging.getLogger(__name__)
 LEASE_TTL = 90.0
@@ -134,6 +134,101 @@ class ShareHousekeeper:
             return "error"
 
 
+ANNOTATION_INTERVAL = 15.0
+ANNOTATION_OVERLAP = timedelta(minutes=1)    # ``updated_at`` is the START of the writing transaction: read with margin
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_APPLIED = frozenset({"inserted", "edited", "withdrawn"})
+
+
+class AnnotationHousekeeper:
+    """Ingests the share container's ``annotations.jsonl``, rewrites the viewers' projections of the touched shares and
+    hands the touched artifacts' open annotations to the (one, shared) collaborator mirror; never raises out of the
+    worker pass.
+
+    * ``mirror`` is the worker's single ``CollabMirror`` (a second instance would have its own per-artifact locks and
+      could race ``remove``/``sync``); without one the mirror step is skipped.
+    * The first tick after start treats every annotation as touched; later ticks read ``touched_since`` with an overlap
+      margin (a superset is harmless: projections and publishes are idempotent).
+    * A projection that failed keeps the window open for the next tick; a failed mirror publish is logged and
+      repaired by the artifact's next change or a restart."""
+
+    def __init__(self, shares_root, events_dir, marker_dir, settings: dict, *, owner_emails, mirror=None,
+                 interval: float = ANNOTATION_INTERVAL, clock=time.time):
+        self.shares_root, self.events_dir, self.marker_dir = Path(shares_root), Path(events_dir), Path(marker_dir)
+        self.settings, self.owner_emails = settings, frozenset(owner_emails)
+        self.mirror, self.interval, self._clock = mirror, interval, clock
+        self._last: float | None = None
+        self._since: datetime | None = None
+
+    async def tick(self, conn) -> dict | str:
+        if not self.settings["enabled"]:
+            return "disabled"
+        now = self._clock()
+        if self._last is not None and now - self._last < self.interval:
+            return "skipped"
+        self._last = now
+        try:
+            return await self._tick(conn, now)
+        except Exception:  # noqa: BLE001
+            log.exception("annotation housekeeping failed")
+            return "error"
+
+    async def _tick(self, conn, now: float) -> dict:
+        from .artifact_annotations import AnnotationStore
+        from .artifact_shares import EVENTS_ROTATE_BYTES, ROTATED_GRACE_SECONDS
+        from .jsonl_ingest import JsonlIngestor
+        store = AnnotationStore(conn)
+        started = await conn.fetchval("SELECT now()")
+        try:
+            self.marker_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.exception("annotation marker dir %s not creatable", self.marker_dir)
+        settings = self.settings
+
+        async def put(c, record, key) -> bool:
+            outcome = await store.ingest(
+                c, record, key, owner_emails=self.owner_emails, per_user_per_day=settings["per_user_per_day"],
+                max_per_share=settings["max_per_share"], max_comment_chars=settings["max_comment_chars"])
+            return outcome in _APPLIED
+
+        ingested = 0
+        try:
+            ingested = await JsonlIngestor(conn, parse_line=store.parse_line, store=put, max_line_bytes=65536
+                                           ).ingest_and_rotate(
+                self.events_dir / "annotations.jsonl", self.marker_dir / "annotation.marker.json",
+                rotate_bytes=EVENTS_ROTATE_BYTES, now=now, grace=ROTATED_GRACE_SECONDS)
+        except Exception:  # noqa: BLE001
+            log.exception("annotation ingest failed")
+        since = _EPOCH if self._since is None else self._since - ANNOTATION_OVERLAP
+        shares, artifacts = await store.touched_since(since)
+        projected, failed = 0, False
+        for share_id in sorted(shares):
+            try:
+                await self._project(conn, store, share_id)
+                projected += 1
+            except Exception:  # noqa: BLE001
+                failed = True
+                log.exception("annotation projection of %s failed", share_id)
+        published = 0
+        if self.mirror is not None:
+            for artifact_id in sorted(artifacts):
+                try:
+                    await self.mirror.publish_annotations(artifact_id, await store.open_for_agents(artifact_id))
+                    published += 1
+                except Exception:  # noqa: BLE001
+                    log.exception("annotation mirror publish of %s failed", artifact_id)
+        if not failed:
+            self._since = started
+        return {"ingested": ingested, "projected": projected, "published": published}
+
+    async def _project(self, conn, store, share_id: str) -> None:
+        own = await store.own_rows(share_id)
+        authors = {r["author_identity"] for r in await conn.fetch(
+            "SELECT DISTINCT author_identity FROM artifact_annotations WHERE share_id = $1", share_id)}
+        for identity in sorted(authors | set(own)):          # an author whose rows are all withdrawn gets an empty file
+            write_own_projection(self.shares_root, share_id, identity, own.get(identity, []))
+
+
 class ArtifactReconciler:
     """Runs the artifact registry's idempotent repair pass (``reconcile``: orphan blobs marked, expired uploads closed,
     held tombstones purged) at most once per ``interval`` seconds; never raises out of the worker pass.
@@ -208,7 +303,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        artifact_ttl=ARTIFACT_TTL, worker_id=None,
                        artifact_job_runner=None, max_artifact_jobs=1,
                        inspector_snapshotter=None, fabric_compactor=None,
-                       share_housekeeper=None, artifact_reconciler=None) -> dict:
+                       share_housekeeper=None, artifact_reconciler=None,
+                       annotation_housekeeper=None) -> dict:
     summary: dict[str, Any] = {}
 
     # Stale services -> unavailable (never delete).
@@ -264,6 +360,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
         summary["fabric_compaction"] = await fabric_compactor.tick(conn)
     if conn is not None and share_housekeeper is not None:
         summary["share_housekeeping"] = await share_housekeeper.tick(conn)
+    if conn is not None and annotation_housekeeper is not None:
+        summary["annotation_housekeeping"] = await annotation_housekeeper.tick(conn)
     if conn is not None and artifact_reconciler is not None:
         summary["artifact_reconcile"] = await artifact_reconciler.tick(conn)
     return summary

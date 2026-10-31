@@ -19,6 +19,15 @@ MAX_CONTEXT_CHARS: Final = 64
 MAX_PAGE: Final = 100000
 ANCHOR_KINDS: Final = ("document", "text_quote", "pdf_page", "image_region")
 ANNOTATION_ID_RE: Final = re.compile(r"ann_[A-Za-z0-9_-]{22}")
+ANNOTATION_DEFAULTS: Final[dict[str, bool | int]] = {
+    "enabled": True,
+    "per_user_per_minute": 60,
+    "per_share_per_minute": 600,
+    "global_per_minute": 3000,
+    "per_user_per_day": 2000,
+    "max_per_share": 20000,
+    "max_comment_chars": 4000,
+}
 
 _CODES: Final = frozenset({"bad_anchor", "bad_file", "empty", "too_long", "bad_chars", "bad_id"})
 _BOX = ("x", "y", "w", "h")
@@ -38,6 +47,52 @@ class AnnotationInputError(ValueError):
             raise ValueError(f"unknown annotation error code: {code}")
         super().__init__(message or code)
         self.code = code
+
+
+_OWNER_EMAIL: Final = re.compile(
+    r"[!-?A-~]+@[!-?A-~]+\Z", re.ASCII
+)  # the share store's rule: printable ASCII
+
+
+def clean_owner_emails(raw: object) -> list[str]:
+    """``control_plane.share.owner_emails`` as a sorted, de-duplicated list of lowercase ASCII emails; ``ValueError``
+    when it is not a list of valid emails (None means none)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("control_plane.share.owner_emails must be a list of emails")
+    out: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str) or len(item) > 254 or not _OWNER_EMAIL.match(item):
+            raise ValueError("control_plane.share.owner_emails must be a list of ASCII emails")
+        out.add(item.lower())
+    return sorted(out)
+
+
+def annotation_settings(raw: dict[str, object] | None) -> dict[str, bool | int]:
+    """``control_plane.share.annotations`` merged over ``ANNOTATION_DEFAULTS``; raises ``ValueError`` when refused.
+
+    Plain ``ValueError`` on purpose: this module imports no ``fleet_config``; the fleet-config layer wraps it."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("control_plane.share.annotations must be a mapping")
+    unknown = sorted(str(k) for k in set(raw) - set(ANNOTATION_DEFAULTS))
+    if unknown:
+        raise ValueError("control_plane.share.annotations: unknown keys: " + ", ".join(unknown))
+    out: dict[str, bool | int] = {**ANNOTATION_DEFAULTS, **raw}  # type: ignore[arg-type]
+    if not isinstance(out["enabled"], bool):
+        raise ValueError("control_plane.share.annotations.enabled must be true or false")
+    for key, value in out.items():
+        if key == "enabled":
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"control_plane.share.annotations.{key} must be a positive integer")
+    if not 1 <= out["max_comment_chars"] <= MAX_COMMENT_CHARS:
+        raise ValueError(
+            f"control_plane.share.annotations.max_comment_chars must be 1-{MAX_COMMENT_CHARS}"
+        )
+    return out
 
 
 def _bad_chars(text: str, *, allow_whitespace: bool) -> bool:

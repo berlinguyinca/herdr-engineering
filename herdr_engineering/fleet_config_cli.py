@@ -279,10 +279,11 @@ def render_collab(cfg: FleetConfig, out: Path) -> None:
 SHARE_SECTION_KEY = "share"
 # control_plane.share as authored; an unknown key (which could be a secret meant elsewhere) is refused.
 SHARE_KEYS = frozenset({"enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
-                        "session_seconds", "signing_secret", "shares_dir", "events_dir", "marker_dir"})
+                        "session_seconds", "signing_secret", "shares_dir", "events_dir", "marker_dir",
+                        "annotations", "owner_emails"})
 # What share-public gets: no directories (its mounts are fixed), nothing else from the central file.
 SHARE_SLICE_KEYS = ("enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
-                    "session_seconds", "signing_secret")
+                    "session_seconds", "signing_secret", "annotations")
 # Cognito identifiers share-public needs for lab sign-in (public values; no group, no operator).
 SHARE_COLLAB_KEYS = ("cognito_pool", "cognito_clients", "cognito_web_client", "cognito_domain", "public_url")
 SHARE_FIXED_DIRS = {"shares_dir": "/shares", "events_dir": "/share-events",
@@ -327,6 +328,12 @@ def share_values(cfg: FleetConfig) -> dict:
         if key in share and share[key] != fixed:
             raise FleetConfigError(f"control_plane.share.{key} must be {fixed} (or left out): it is a container "
                                    f"path and deploy.sh's mounts are fixed")
+    from .control_plane.annotation_anchor import annotation_settings, clean_owner_emails
+    try:
+        annotation_settings(share.get("annotations"))
+        clean_owner_emails(share.get("owner_emails"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
     if share.get("enabled") is not True:
         return {"share": {"enabled": False}}
     from .control_plane.share_session import MIN_SECRET_BYTES

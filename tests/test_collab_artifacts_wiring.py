@@ -74,7 +74,8 @@ def build(tmp_path, lineage=None, **cfg):
 
     async def connect():
         raise AssertionError("not connected in this test")
-    return s, blobs, cli._build_collab_bridge_loop(s, rustfs=blobs, connect=connect, lineage=lineage)
+    return s, blobs, cli._build_collab_bridge_loop(
+        s, mirror=cli._build_collab_mirror(s, rustfs=blobs), rustfs=blobs, connect=connect, lineage=lineage)
 
 
 def test_commit_is_registered_and_the_pieces_share_one_gate_one_limits_one_clock(tmp_path):
@@ -152,7 +153,9 @@ def test_yaml_limits_reach_the_applier_and_grants_json(registry_pg, tmp_path):
 
         async def connect():
             return await asyncpg.connect(registry_pg["dsn"])
-        loop = cli._build_collab_bridge_loop(s, rustfs=FakeBlobs(), connect=connect, lineage=None)
+        blobs = FakeBlobs()
+        loop = cli._build_collab_bridge_loop(s, mirror=cli._build_collab_mirror(s, rustfs=blobs), rustfs=blobs,
+                                             connect=connect, lineage=None)
         loop.interval, loop.reconnect_delay = 0.05, 0.05
         assert loop.applier.limits.daily_bytes_per_agent == 123
         stop = asyncio.Event()
@@ -174,9 +177,11 @@ def test_yaml_limits_reach_the_applier_and_grants_json(registry_pg, tmp_path):
 class SpyLoop:
     """Stands in for the loop only to count starts; everything it would touch is real."""
     started = 0
+    last_mirror = None
 
     def __init__(self, *a, **k):
         self.mirror = k.get("mirror") or (a[1] if len(a) > 1 else None)
+        type(self).last_mirror = self.mirror
         self.applier = a[2] if len(a) > 2 else None
 
     async def run(self, stop):
@@ -195,6 +200,8 @@ def run_worker_cmd(monkeypatch, registry_pg, tmp_path, *, cp_extra):
 
     async def fake_run_worker(conn, *, stop=None, **kw):       # the long-running worker pass, ended after 0.2 s
         seen["passes"] += 1
+        seen["kw"] = kw
+        seen["loop_mirror"] = SpyLoop.last_mirror
         await asyncio.sleep(0.2)
         seen["started_beside"] = SpyLoop.started                # the loop is already running next to the worker
     monkeypatch.setattr(worker, "CollabBridgeLoop", SpyLoop)
@@ -215,6 +222,23 @@ def test_worker_starts_the_loop_beside_run_worker_when_enabled(monkeypatch, regi
                                                               "outbox_dir": str(tmp_path / "o"),
                                                               "spool_dir": str(tmp_path / "s")}})
     assert rc == 0 and seen["passes"] == 1 and seen["started_beside"] == 1 and SpyLoop.started == 1
+
+
+def test_the_bridge_loop_and_the_annotation_housekeeper_share_one_mirror(monkeypatch, registry_pg, tmp_path):
+    rc, seen = run_worker_cmd(
+        monkeypatch, registry_pg, tmp_path,
+        cp_extra={"collab_artifacts": {"enabled": True, "mirror_dir": str(tmp_path / "m"),
+                                       "outbox_dir": str(tmp_path / "o"), "spool_dir": str(tmp_path / "s")},
+                  "share": {"enabled": True, "owner_emails": ["Owner@Lab.test"],
+                            "annotations": {"max_per_share": 9}}})
+    housekeeper = seen["kw"]["annotation_housekeeper"]
+    assert rc == 0 and housekeeper.mirror is not None and housekeeper.mirror is seen["loop_mirror"]
+    assert housekeeper.owner_emails == frozenset({"owner@lab.test"}) and housekeeper.settings["max_per_share"] == 9
+
+
+def test_without_collab_artifacts_the_housekeeper_has_no_mirror(monkeypatch, registry_pg, tmp_path):
+    rc, seen = run_worker_cmd(monkeypatch, registry_pg, tmp_path, cp_extra={"share": {"enabled": True}})
+    assert rc == 0 and seen["kw"]["annotation_housekeeper"].mirror is None
 
 
 @pytest.mark.parametrize("cp_extra", [{}, {"collab_artifacts": {"enabled": False}},
@@ -256,7 +280,8 @@ def test_enabled_without_rustfs_fails_clearly(monkeypatch, registry_pg, tmp_path
 # ------------------------------------------------------------------------------------------------ no environment
 
 def test_the_new_code_reads_no_environment_variable():
-    for fn in (cli._collab_artifacts_settings, cli._build_collab_bridge_loop, cli._collab_lineage_hook,
+    for fn in (cli._collab_artifacts_settings, cli._build_collab_mirror, cli._build_collab_bridge_loop,
+               cli._worker_annotation_housekeeper, cli._collab_lineage_hook,
                cli._wire_collab_artifacts_bridge, cli._worker_control_plane_section, cli._cmd_cp_worker):
         src = inspect.getsource(fn)
         assert "environ" not in src and "getenv" not in src, fn.__name__

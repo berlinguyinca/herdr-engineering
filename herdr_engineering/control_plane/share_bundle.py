@@ -369,3 +369,72 @@ def remove_bundle(root: Path, share_id: str) -> None:
         target.unlink()
     else:
         shutil.rmtree(target, ignore_errors=True)
+
+
+MAX_PROJECTION_BYTES = 2 * 1024 * 1024
+ANNOTATIONS_DIR = "annotations"
+
+
+def _jsonable(value: object) -> object:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _projection_bytes(rows: list[dict]) -> bytes:
+    """``{"annotations": rows}`` as JSON; rows are newest first and the oldest are dropped to fit the cap."""
+    encoded = [json.dumps(row, sort_keys=True, default=_jsonable) for row in rows]
+    kept, size = 0, len('{"annotations":[],"truncated":true}')
+    for text in encoded:
+        size += len(text.encode("utf-8")) + 2
+        if size > MAX_PROJECTION_BYTES:
+            break
+        kept += 1
+    tail = ',"truncated":true' if kept < len(rows) else ""
+    return ('{"annotations":[' + ",".join(encoded[:kept]) + "]" + tail + "}").encode("utf-8")
+
+
+def write_own_projection(root: Path, share_id: str, identity: str, rows: list[dict]) -> None:
+    """Atomically publish ``rows`` as ``<root>/<share_id>/annotations/<sha256(identity)>.json`` (mode 0644, at most
+    2 MiB, newest rows kept first; a cut file carries ``"truncated": true``).
+
+    Skipped when ``<root>/<share_id>`` is missing (a revoked share is never recreated) and never follows a symlink:
+    every step goes through a directory descriptor opened with ``O_NOFOLLOW``."""
+    if not isinstance(share_id, str) or not _SHARE_ID.match(share_id) or share_id in _RESERVED_IDS:
+        raise ShareBundleError("invalid share id")
+    data = _projection_bytes(rows)
+    name = hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".json"
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        share_fd = os.open(Path(root) / share_id, flags)
+    except OSError:
+        return
+    try:
+        try:
+            os.mkdir(ANNOTATIONS_DIR, 0o755, dir_fd=share_fd)
+        except FileExistsError:
+            pass
+        try:
+            dir_fd = os.open(ANNOTATIONS_DIR, flags, dir_fd=share_fd)
+        except OSError:
+            return                                               # a planted symlink or file: left alone
+        try:
+            os.fchmod(dir_fd, 0o755)
+            tmp = f".{name}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644,
+                         dir_fd=dir_fd)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    os.fchmod(handle.fileno(), 0o644)
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except BaseException:
+                try:
+                    os.unlink(tmp, dir_fd=dir_fd)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(share_fd)

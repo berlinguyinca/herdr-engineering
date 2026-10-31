@@ -593,8 +593,10 @@ def test_sharing_disabled_answers_503(tmp_path):
 def test_share_settings_defaults_and_validation():
     from herdr_engineering.control_plane.artifact_share_api import share_settings_config
     settings = share_settings_config({}, public_url="https://x.example/")
+    from herdr_engineering.control_plane.annotation_anchor import ANNOTATION_DEFAULTS
     assert settings == {"public_url": "https://x.example/", "max_share_bytes": 512 * MIB, "max_files": 20000,
-                        "max_total_bytes": 2048 * MIB, "default_public_days": 30}
+                        "max_total_bytes": 2048 * MIB, "default_public_days": 30,
+                        "annotations": ANNOTATION_DEFAULTS, "owner_emails": []}
     assert share_settings_config({"max_files": 5}, public_url="https://x.example/")["max_files"] == 5
     for bad in ({"max_files": 0}, {"max_files": True}, {"max_share_bytes": "1"}, {"default_public_days": 91}):
         with pytest.raises(ValueError):
@@ -777,3 +779,32 @@ def test_a_room_share_is_refused_for_public_unknown_rooms_and_bad_ids(tmp_path):
 def test_a_room_share_without_collaboration_is_refused(env):
     base, *_ = env
     assert create(base, audience="lab", room_id="r1")[0] == 400
+
+
+def test_share_settings_carry_the_annotation_block_and_lowercased_owner_emails():
+    from herdr_engineering.control_plane.annotation_anchor import ANNOTATION_DEFAULTS
+    from herdr_engineering.control_plane.artifact_share_api import share_settings_config
+    settings = share_settings_config({}, public_url="https://x.example/")
+    assert settings["annotations"] == ANNOTATION_DEFAULTS and settings["owner_emails"] == []
+    custom = share_settings_config({"annotations": {"max_per_share": 3}, "owner_emails": ["Boss@Lab.test", "boss@lab.test"]},
+                                   public_url="https://x.example/")
+    assert custom["annotations"]["max_per_share"] == 3 and custom["owner_emails"] == ["boss@lab.test"]
+    for bad in ({"annotations": {"nope": 1}}, {"owner_emails": "a@b.test"}, {"owner_emails": ["bad"]},
+                {"owner_emails": ["K@b.test"]}):
+        with pytest.raises(ValueError):
+            share_settings_config(bad, public_url="https://x.example/")
+
+
+def test_a_lab_share_lists_the_owner_emails_deduplicated_and_lowercased(tmp_path):
+    with share_server(tmp_path, owner_emails=["owner@lab.test", "bob@x.org"]) as (base, _, shares, _b, _r):
+        status, body = create(base, audience="lab", allow_emails=["Bob@x.org", "carol@x.org"])
+        assert status == 201, body
+        assert body["share"]["allow_emails"] == ["bob@x.org", "carol@x.org", "owner@lab.test"]
+        status, body = create(base, audience="lab")
+        assert status == 201 and body["share"]["allow_emails"] == ["bob@x.org", "owner@lab.test"]
+
+
+def test_a_public_share_ignores_the_owner_emails(tmp_path):
+    with share_server(tmp_path, owner_emails=["owner@lab.test"]) as (base, *_):
+        status, body = create(base, audience="public")
+        assert status == 201 and not body["share"].get("allow_emails")

@@ -4404,6 +4404,32 @@ def _worker_share_housekeeper(fleet_config_path):
     return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"])
 
 
+def _worker_annotation_housekeeper(fleet_config_path, mirror=None):
+    """The annotation housekeeper when the fleet file enables shares, else None. ``mirror`` is the worker's one shared
+    ``CollabMirror`` (None: the mirror step is skipped)."""
+    from pathlib import Path
+
+    from .control_plane.annotation_anchor import annotation_settings, clean_owner_emails
+    from .control_plane.worker import AnnotationHousekeeper
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    settings = _share_worker_settings(cp)
+    if not settings["enabled"]:
+        return None
+    share = cp.get("share") or {}
+    try:
+        annotations, owners = annotation_settings(share.get("annotations")), clean_owner_emails(share.get("owner_emails"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    return AnnotationHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"], annotations,
+                                 owner_emails=owners, mirror=mirror)
+
+
 def _worker_fabric_compactor(fleet_config_path):
     """The fabric compactor when the fleet file enables it, else None."""
     from pathlib import Path
@@ -4577,19 +4603,24 @@ def _collab_lineage_hook(worker_cfg):
         raise SystemExit(f"control_plane.artifact_worker.lineage: {exc}") from None
 
 
-def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, rustfs, connect, lineage):
-    """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
-    applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
-    and staging owner here)."""
+def _build_collab_mirror(settings: CollabArtifactsSettings, *, rustfs):
+    """The worker's ONE ``CollabMirror``: the bridge loop and the annotation housekeeper share it (a second instance
+    would have its own per-artifact locks and could race ``remove``/``sync``)."""
     import time
 
+    from .control_plane.collab_mirror import CollabMirror
+    return CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=time.time)
+
+
+def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rustfs, connect, lineage):
+    """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
+    applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
+    and staging owner here). ``mirror`` comes from ``_build_collab_mirror``."""
     from .control_plane import worker as cp_worker
     from .control_plane.artifact_scope import ArtifactGraphGate
     from .control_plane.collab_intents import CollabIntentApplier
-    from .control_plane.collab_mirror import CollabMirror
-    clock = time.time
+    clock = mirror.clock
     gate = ArtifactGraphGate(None)
-    mirror = CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=clock)
     if lineage is not None:
         post = lineage
 
@@ -4675,21 +4706,27 @@ def _cmd_cp_worker(args) -> int:
                 return await run_one_pass(conn, worker_id=worker_id,
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                           fabric_compactor=compactor, share_housekeeper=share_hk,
+                                          annotation_housekeeper=_worker_annotation_housekeeper(
+                                              getattr(args, "fleet_config", None)),
                                           artifact_reconciler=reconciler)
             stop = asyncio.Event()
             bridge_task = None
+            mirror = None
             if collab_settings.enabled:     # a long-running loop on its own connections; --once never starts it
                 if rustfs is None:
                     raise SystemExit("control_plane.collab_artifacts needs RustFS (control_plane.rustfs_endpoint)")
                 dsn = cp["postgres_dsn"]
+                mirror = _build_collab_mirror(collab_settings, rustfs=rustfs)
                 bridge_loop = _build_collab_bridge_loop(
-                    collab_settings, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
+                    collab_settings, mirror=mirror, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
                     lineage=_collab_lineage_hook(worker_cfg))
                 bridge_task = asyncio.create_task(bridge_loop.run(stop), name="collab-bridge-loop")
+            annotation_hk = _worker_annotation_housekeeper(getattr(args, "fleet_config", None), mirror)
             try:
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                  fabric_compactor=compactor, share_housekeeper=share_hk,
+                                 annotation_housekeeper=annotation_hk,
                                  artifact_reconciler=reconciler)
             finally:
                 stop.set()

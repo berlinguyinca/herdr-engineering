@@ -568,3 +568,36 @@ def test_edge_mcp_body_spool_is_bounded_by_connection_limits_and_an_explicit_tmp
     spool_mib = 128 * 768 / 1024                                # every in-flight /mcp body, worst case
     assert spool_mib <= 96
     assert edge["mem_limit"] == "384m"
+
+
+# ------------------------------------------------------------------ annotations and owner emails
+
+def test_share_values_accept_annotations_and_owner_emails_and_the_slice_drops_the_owners(tmp_path):
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET,
+                                        "annotations": {"max_per_share": 7, "per_user_per_minute": 5},
+                                        "owner_emails": ["Owner@Lab.test"]})
+    cfg = load_fleet_config(central)
+    values = fcc.share_values(cfg)
+    assert values["share"]["annotations"] == {"max_per_share": 7, "per_user_per_minute": 5}
+    assert "owner_emails" not in values["share"]
+    out = tmp_path / "share" / "share-config.json"
+    fcc.render_share(cfg, out)
+    assert "owner@lab.test" not in out.read_text().lower()
+    fcc.check_share_slice(load_fleet_config(out))
+    assert "owner_emails" in fcc.SHARE_KEYS and "owner_emails" not in fcc.SHARE_SLICE_KEYS
+    assert "annotations" in fcc.SHARE_SLICE_KEYS
+
+
+@pytest.mark.parametrize("annotations", [{"enabled": "yes"}, {"per_user_per_minute": 0}, {"max_comment_chars": 4001},
+                                         {"nope": 1}, "on"])
+def test_a_bad_annotations_block_is_a_fleet_config_error_not_a_value_error(tmp_path, annotations):
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "annotations": annotations})
+    with pytest.raises(FleetConfigError, match="annotations"):
+        fcc.share_values(load_fleet_config(central))
+
+
+@pytest.mark.parametrize("owners", ["a@b.test", ["not-an-email"], ["a@b.test", 5], ["é@b.test"], [""]])
+def test_invalid_owner_emails_are_refused(tmp_path, owners):
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "owner_emails": owners})
+    with pytest.raises(FleetConfigError, match="owner_emails"):
+        fcc.share_values(load_fleet_config(central))
