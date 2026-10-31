@@ -69,9 +69,9 @@ def test_sudo_and_env_propagate_into_shell_c():
 
 
 def test_command_substitution_and_backticks_are_extracted():
-    cmds = parse('echo "$(date)" `whoami` \'$(no)\' $(a $(b))')
+    cmds = parse('echo "$(date)" `whoami` $(a $(b))')
     assert [(c.argv, c.wrapped) for c in cmds] == [
-        (("echo", "$(date)", "`whoami`", "$(no)", "$(a $(b))"), False),
+        (("echo", "$(date)", "`whoami`", "$(a $(b))"), False),
         (("date",), True), (("whoami",), True), (("a", "$(b)"), True), (("b",), True),
     ]
     assert argvs("A=$(rm x)") == [("rm", "x")]
@@ -237,4 +237,134 @@ def test_exactly_8192_chars_is_allowed():
 
 
 def test_substitution_text_inside_single_quotes_is_literal_even_with_parens():
-    assert argvs("echo '(' ')' '`' \"(\" \")\"") == [("echo", "(", ")", "`", "(", ")")]
+    assert argvs("echo '(' ')' \"(\" \")\"") == [("echo", "(", ")", "(", ")")]
+
+
+# ---- fix round 1 ----
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "x='$(touch P)'; echo ${x@P}",
+        "echo ${x@P}",
+        "echo ${x@Q}",
+        "echo $[1+1]",
+        "echo ${a[$(touch P)]}",
+        "echo ${a[0]}",
+        "echo ${!x}",
+        "a[$(touch P)]=1",
+        "PS4='$(touch P)' set -x",
+        "PS4='$(touch P)' bash -xc true",
+        "PS4=x bash -xc true",
+        "[ -v 'a[$(touch P)]' ]",
+        "[ -f x ]",
+        "[[ -f x ]]",
+        "printf -v x %s y",
+        "declare -n r=x",
+        "typeset x",
+        "local x",
+        "read x",
+        "unset x",
+        "test -v x",
+        "set -x",
+        "shopt -s x",
+        "alias a=b",
+        "export A=1",
+        "readonly A=1",
+        "mapfile a",
+        "readarray a",
+        "getopts a b",
+        "hash -p x y",
+        "enable -n x",
+        "let 'x=1'",
+        "builtin printf -v x y",
+        "command declare x",
+        "echo '$(touch P)'",
+        "echo '`touch P`'",
+        "echo \\`x\\`",
+        "echo $\\(x)",
+        "echo '$'\"(\"x",
+        "A='$(x)' git status",
+        "A=1 env BASH_ENV=/tmp/x ls",
+        "env LD_PRELOAD=/x ls",
+        "sudo PATH=/x ls",
+        "LD_LIBRARY_PATH=/x ls",
+        "PROMPT_COMMAND=x ls",
+        "IFS=x ls",
+        "SHELLOPTS=xtrace ls",
+        "BASHOPTS=x ls",
+        "ENV=x ls",
+        "PATH=/x ls",
+        "bash -c 'echo hi' '$(x)'",
+        "cat > '$(x)'",
+        "x\"" + "$(" * 2700,
+        "'\"$(" * 2700,
+    ],
+)
+def test_fix1_late_evaluation_is_unparseable(command):
+    with pytest.raises(Unparseable):
+        parse(command)
+
+
+def test_sh_dash_c_string_with_substitution_still_recursed():
+    assert argvs("bash -c 'echo $(date)'") == [("echo", "$(date)"), ("date",)]
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["g{i,}t push -f", "git push {,--force}", "git $X", "git ${X}", "rm *", "rm -rf $HOME/..", "~/x",
+     "ls a?", "ls [ab]", "echo \"$X\"", "git $(echo push)", "git {1..3}", "echo $1", "echo $@",
+     "echo hi > $F"],
+)
+def test_dynamic_commands_are_flagged(command):
+    cmds = parse(command)
+    assert cmds[0].dynamic is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["git push 'a*'", "git push \"a*\"", "echo '$X'", "echo \\* \\~", "echo a~b", "echo {a}", "echo $ x",
+     "git push origin main", "echo \"{a,b}\""],
+)
+def test_static_commands_are_not_dynamic(command):
+    assert parse(command)[0].dynamic is False
+
+
+def test_dynamic_does_not_leak_between_commands():
+    cmds = parse("echo $X; ls")
+    assert [c.dynamic for c in cmds] == [True, False]
+
+
+def test_length_cap_counts_utf8_bytes():
+    with pytest.raises(Unparseable):
+        parse("\u00e9" * 5000)
+    assert len(parse("\u00e9" * 4096)) == 1
+
+
+def test_quoted_assignment_lookalike_is_a_command_head():
+    assert parse('"A=1" git push -f')[0].argv == ("A=1", "git", "push", "-f")
+    assert parse("\\cmdD=1 x")[0].argv == ("cmdD=1", "x")
+    assert parse("'A'=1 x")[0].argv == ("A=1", "x")
+    assert parse("A=1 x")[0].env == (("A", "1"),)
+    assert parse('A="b c" x')[0].env == (("A", "b c"),)
+    assert parse('env "A=1" x')[0].argv == ("A=1", "x")
+
+
+def test_fuzz_only_parses_or_raises_unparseable():
+    import random
+
+    rng = random.Random(1234)
+    alphabet = ["$(", ")", "(", "`", "'", '"', "\\", "$", "{", "}", "${", ";", "&", "|", ">", "<", "\n", " ",
+                "a", "bash -c ", "sudo ", "env ", "=", "#", "$((", "<<", "x", "[", "*"]
+    for _ in range(2000):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 60)))
+        try:
+            result = parse(text)
+        except Unparseable:
+            continue
+        assert isinstance(result, list)
+    for text in ("$(" * 3000, '"$(' * 2700, "`" * 5000, "(" * 4000, "{ " * 4000, "'" * 8000):
+        try:
+            parse(text)
+        except Unparseable:
+            pass

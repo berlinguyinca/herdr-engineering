@@ -24,7 +24,16 @@ _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 _NAMED_FD = re.compile(r"^\{[A-Za-z_][A-Za-z0-9_]*\}$")
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 _STD_DIRS = ("/usr/bin/", "/bin/", "/usr/local/bin/", "/usr/sbin/", "/sbin/")
-_FORBIDDEN = frozenset({"eval", "source", ".", "trap"})
+_FORBIDDEN = frozenset({
+    "eval", "source", ".", "trap", "[[", "[", "test", "let", "declare", "typeset", "local", "printf", "read",
+    "unset", "set", "shopt", "alias", "export", "readonly", "mapfile", "readarray", "getopts", "hash", "enable",
+})
+_FORBIDDEN_ENV = frozenset({
+    "PS4", "BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "PROMPT_COMMAND", "IFS", "SHELLOPTS",
+    "BASHOPTS",
+})
+_BRACE_EXPANSION = re.compile(r"\{[^{}]*(?:,|\.\.)[^{}]*\}")
+_DYNAMIC_DOLLAR = frozenset("{@*?#$!-_")
 _RESERVED = frozenset({
     "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "select", "case", "esac",
     "function", "coproc", "in", "!",
@@ -43,6 +52,7 @@ class SimpleCommand:
     env: tuple[tuple[str, str], ...]
     wrapped: bool
     redirects: tuple[str, ...] = ()
+    dynamic: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,11 +102,14 @@ def parse(command: str) -> list[SimpleCommand]:
     """Return every simple command in ``command`` or raise ``Unparseable``."""
     if not isinstance(command, str):
         raise Unparseable("command is not text")
-    if len(command) > MAX_LENGTH:
+    if len(command.encode("utf-8", errors="surrogatepass")) > MAX_LENGTH:
         raise Unparseable("command too long")
     if not command.strip():
         raise Unparseable("empty command")
-    return _parse(command, 0, (), False)
+    try:
+        return _parse(command, 0, (), False)
+    except RecursionError as exc:
+        raise Unparseable("nesting too deep") from exc
 
 
 def _parse(text: str, depth: int, inherited: tuple[tuple[str, str], ...], wrapped: bool) -> list[SimpleCommand]:
@@ -112,15 +125,27 @@ def _parse(text: str, depth: int, inherited: tuple[tuple[str, str], ...], wrappe
     return out
 
 
-@dataclass
-class _Word:
-    text: str
-    quoted: bool
+class _Text(str):
+    """A word's text plus facts the resolver needs: assignable (name part unquoted), danger (literal ``$(``)."""
+
+    assignable: bool
+    danger: bool
+
+    def __new__(cls, text: str, assignable: bool, danger: bool) -> _Text:
+        obj = super().__new__(cls, text)
+        obj.assignable = assignable
+        obj.danger = danger
+        return obj
+
+
+def _is_assignment(word: str) -> bool:
+    return bool(_ASSIGN.match(word)) and getattr(word, "assignable", True)
 
 
 @dataclass
 class _Segment:
-    words: list[_Word] = field(default_factory=list)
+    words: list[_Text] = field(default_factory=list)
+    dynamic: bool = False
     redirects: list[str] = field(default_factory=list)
     subs: list[SimpleCommand] = field(default_factory=list)
 
@@ -137,6 +162,11 @@ class _Scanner:
         self.buf: list[str] = []
         self.in_word = False
         self.quoted = False
+        self.lit: list[str] = []
+        self.uq: list[str] = []
+        self.dyn = False
+        self.eq_seen = False
+        self.pre_eq_quoted = False
         self.pending: str | None = None
         self.parens = 0
         self.braces = 0
@@ -185,30 +215,54 @@ class _Scanner:
                 self.parens -= 1
                 i += 1
             else:
-                self._add(c)
+                self._plain(c)
                 i += 1
         self._end()
         if self.parens or self.braces:
             raise Unparseable("unbalanced group")
         return self.segments
 
-    def _add(self, text: str, quoted: bool = False) -> None:
+    def _add(self, text: str, quoted: bool = False, literal: bool = True) -> None:
         self.buf.append(text)
+        self.lit.append(text if literal else "\x01")
         self.in_word = True
         if quoted:
             self.quoted = True
+            if not self.eq_seen:
+                self.pre_eq_quoted = True
+
+    def _plain(self, c: str) -> None:
+        if not self.in_word and c == "~":
+            self.dyn = True
+        if c == "=":
+            self.eq_seen = True
+        self.uq.append(c)
+        self._add(c)
 
     def _reset_word(self) -> None:
         self.buf = []
         self.in_word = False
         self.quoted = False
+        self.lit = []
+        self.uq = []
+        self.dyn = False
+        self.eq_seen = False
+        self.pre_eq_quoted = False
 
     def _flush(self) -> None:
         if not self.in_word:
             return
         text, quoted = "".join(self.buf), self.quoted
+        literal = "".join(self.lit)
+        danger = "$(" in literal or "`" in literal
+        uq = "".join(self.uq)
+        if self.dyn or any(ch in uq for ch in "*?[") or _BRACE_EXPANSION.search(uq):
+            self.cur.dynamic = True
+        assignable = not self.pre_eq_quoted
         self._reset_word()
         if self.pending is not None:
+            if danger:
+                raise Unparseable("literal command substitution text in redirect target")
             kind, self.pending = self.pending, None
             if kind == "dup" and (text.isdigit() or text == "-"):
                 return
@@ -223,7 +277,7 @@ class _Scanner:
                     raise Unparseable("unbalanced brace")
                 self.braces -= 1
                 return
-        self.cur.words.append(_Word(text, quoted))
+        self.cur.words.append(_Text(text, assignable, danger))
 
     def _end(self) -> None:
         self._flush()
@@ -261,7 +315,7 @@ class _Scanner:
                 if not nxt:
                     break
                 if nxt in '$`"\\':
-                    self._add(nxt)
+                    self._add(nxt, quoted=True)
                     i += 2
                 elif nxt == "\n":
                     i += 2
@@ -283,21 +337,27 @@ class _Scanner:
         if nxt == "(":
             if s[i + 2:i + 3] == "(":
                 raise Unparseable("arithmetic expansion")
-            j = _find_close_paren(s, i + 2)
+            j = _find_close_paren(s, i + 2, self.depth + 1)
             self._substitute(s[i + 2:j])
-            self._add(s[i:j + 1])
+            self._add(s[i:j + 1], literal=False)
+            self.dyn = True
             return j + 1
         if nxt == "{":
             j = s.find("}", i + 2)
             if j == -1:
                 raise Unparseable("unbalanced parameter expansion")
-            if any(ch in s[i + 2:j] for ch in "()`$\"'\\{"):
+            if any(ch in s[i + 2:j] for ch in "()`$\"'\\{@[!"):
                 raise Unparseable("complex parameter expansion")
-            self._add(s[i:j + 1])
+            self._add(s[i:j + 1], literal=False)
+            self.dyn = True
             return j + 1
+        if nxt == "[":
+            raise Unparseable("legacy arithmetic expansion")
         if nxt in ("'", '"') and not in_dq:
             raise Unparseable("ANSI-C or locale quoting")
         self._add("$")
+        if nxt.isalnum() or nxt in _DYNAMIC_DOLLAR:
+            self.dyn = True
         return i + 1
 
     def _backtick(self, i: int) -> int:
@@ -316,7 +376,8 @@ class _Scanner:
         if j >= n:
             raise Unparseable("unbalanced backtick")
         self._substitute("".join(inner))
-        self._add(s[i:j + 1])
+        self._add(s[i:j + 1], literal=False)
+        self.dyn = True
         return j + 1
 
     def _substitute(self, inner: str) -> None:
@@ -374,7 +435,9 @@ class _Scanner:
         return i + 1
 
 
-def _find_close_paren(s: str, start: int) -> int:
+def _find_close_paren(s: str, start: int, level: int) -> int:
+    if level > MAX_DEPTH:
+        raise Unparseable("nesting too deep")
     depth, i, n = 1, start, len(s)
     while i < n:
         c = s[i]
@@ -386,7 +449,7 @@ def _find_close_paren(s: str, start: int) -> int:
                 raise Unparseable("unbalanced single quote")
             i = j + 1
         elif c == '"':
-            i = _skip_dquote(s, i)
+            i = _skip_dquote(s, i, level)
         elif c == "`":
             i = _skip_backtick(s, i)
         elif c == "(":
@@ -402,7 +465,7 @@ def _find_close_paren(s: str, start: int) -> int:
     raise Unparseable("unbalanced command substitution")
 
 
-def _skip_dquote(s: str, i: int) -> int:
+def _skip_dquote(s: str, i: int, level: int) -> int:
     n = len(s)
     i += 1
     while i < n:
@@ -412,7 +475,7 @@ def _skip_dquote(s: str, i: int) -> int:
         elif c == '"':
             return i + 1
         elif c == "$" and s[i + 1:i + 2] == "(":
-            i = _find_close_paren(s, i + 2) + 1
+            i = _find_close_paren(s, i + 2, level + 1) + 1
         elif c == "`":
             i = _skip_backtick(s, i)
         else:
@@ -516,22 +579,31 @@ def _shell_c_string(args: list[str]) -> str | None:
     return args[i]
 
 
-def _null_command(redirects: tuple[str, ...], env: tuple[tuple[str, str], ...], wrapped: bool) -> list[SimpleCommand]:
-    return [SimpleCommand((":",), env, wrapped, redirects)] if redirects else []
+def _null_command(
+    seg: _Segment, env: tuple[tuple[str, str], ...], wrapped: bool
+) -> list[SimpleCommand]:
+    if not seg.redirects:
+        return []
+    return [SimpleCommand((":",), env, wrapped, tuple(seg.redirects), seg.dynamic)]
+
+
+def _add_env(env: list[tuple[str, str]], word: str) -> None:
+    key, _, value = word.partition("=")
+    if key.rstrip("+") in _FORBIDDEN_ENV:
+        raise Unparseable(f"assignment to {key} is not allowed")
+    env.append((key, value))
 
 
 def _resolve(
     segment: _Segment, depth: int, inherited: tuple[tuple[str, str], ...], wrapped: bool
 ) -> list[SimpleCommand]:
-    words = [w.text for w in segment.words]
+    words = list(segment.words)
     env = list(inherited)
     k = 0
-    while k < len(words) and _ASSIGN.match(words[k]):
-        name, _, value = words[k].partition("=")
-        env.append((name, value))
+    while k < len(words) and _is_assignment(words[k]):
+        _add_env(env, words[k])
         k += 1
-    redirects = tuple(segment.redirects)
-    main = _unwrap(words[k:], env, redirects, depth, wrapped)
+    main = _unwrap(words[k:], env, segment, depth, wrapped)
     return main + segment.subs
 
 
@@ -541,14 +613,15 @@ def _check_head(head: str) -> None:
 
 
 def _unwrap(
-    argv: list[str], env: list[tuple[str, str]], redirects: tuple[str, ...], depth: int, wrapped: bool
+    argv: list[str], env: list[tuple[str, str]], seg: _Segment, depth: int, wrapped: bool
 ) -> list[SimpleCommand]:
     xargs = sudo = False
     for _ in range(_MAX_WRAPPERS):
         if not argv and xargs:
             argv = ["echo"]
         if not argv:
-            return _null_command(redirects, tuple(env), wrapped)
+            _reject_danger(seg, None)
+            return _null_command(seg, tuple(env), wrapped)
         head = argv[0]
         _check_head(head)
         name = _std_name(head)
@@ -559,9 +632,8 @@ def _unwrap(
             break
         idx = _skip_options(rest, _SPECS[name])
         if name in ("env", "sudo"):
-            while idx < len(rest) and _ASSIGN.match(rest[idx]):
-                key, _, value = rest[idx].partition("=")
-                env.append((key, value))
+            while idx < len(rest) and _is_assignment(rest[idx]):
+                _add_env(env, rest[idx])
                 idx += 1
         if name == "timeout":
             if idx >= len(rest):
@@ -575,11 +647,18 @@ def _unwrap(
         argv = rest[idx:]
     else:
         raise Unparseable("too many wrappers")
-    return _finish(argv, env, redirects, depth, wrapped, xargs)
+    return _finish(argv, env, seg, depth, wrapped, xargs)
+
+
+def _reject_danger(seg: _Segment, allowed: str | None) -> None:
+    """Literal ``$(``/backtick text can be evaluated later (``${x@P}``, ``declare``...), except in a ``-c`` string."""
+    for word in seg.words:
+        if word.danger and word is not allowed:
+            raise Unparseable("literal command substitution text")
 
 
 def _finish(
-    argv: list[str], env: list[tuple[str, str]], redirects: tuple[str, ...], depth: int, wrapped: bool, xargs: bool
+    argv: list[str], env: list[tuple[str, str]], seg: _Segment, depth: int, wrapped: bool, xargs: bool
 ) -> list[SimpleCommand]:
     head = argv[0]
     if not head or "$" in head or "`" in head:
@@ -587,8 +666,10 @@ def _finish(
     if _std_name(head) in _SHELLS:
         string = _shell_c_string(argv[1:])
         if string is not None:
+            _reject_danger(seg, string)
             inner = _parse(string, depth + 1, tuple(env), True)
-            return inner + _null_command(redirects, tuple(env), wrapped)
+            return inner + _null_command(seg, tuple(env), wrapped)
+    _reject_danger(seg, None)
     if xargs:
         argv = [*argv, XARGS_MARKER]
-    return [SimpleCommand(tuple(argv), tuple(env), wrapped, redirects)]
+    return [SimpleCommand(tuple(argv), tuple(env), wrapped, tuple(seg.redirects), seg.dynamic)]
