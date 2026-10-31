@@ -77,3 +77,8 @@ def test_agent_ids_in_the_room_namespace_are_refused():
     from herdr_engineering.control_plane.artifact_collab_api import AGENT_ID
     assert AGENT_ID.fullmatch("agent_1.x:y") and AGENT_ID.fullmatch("roomy:1")
     assert not AGENT_ID.fullmatch("room:abc") and not AGENT_ID.fullmatch("room:")
+
+
+def test_user_prefixed_agent_ids_are_refused():
+    from herdr_engineering.control_plane.artifact_collab_api import AGENT_ID
+    assert not AGENT_ID.fullmatch("user:x") and AGENT_ID.fullmatch("users:x")

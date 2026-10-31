@@ -67,3 +67,20 @@ def test_acl_routes_reject_collab_principals_with_400():
                 assert call(server, 'POST', path, {'principal_id': pid, 'permissions': ['read']})[0] == 400
         assert server.artifact_acl.has_grants('private') is True
         assert server.artifact_acl.principals_with('private', 'read') == [principal('owner')]
+
+
+def test_room_user_principals_are_web_grants_but_agent_collaborators_stay_reserved():
+    import pytest
+
+    from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+    acl = ArtifactAcl()
+    acl.grant("a1", "collab:user:bob", {"read"}, granted_by="room:r1")
+    for reserved in ("collab:agent1", "collab-invite:i1"):
+        with pytest.raises(ValueError):
+            acl.grant("a1", reserved, {"read"})
+    fresh = ArtifactAcl()
+    fresh.load([{"artifact_id": "a1", "principal_id": "collab:user:bob", "permissions": ["read"], "granted_by": "room:r1"},
+                {"artifact_id": "a1", "principal_id": "collab:agent1", "permissions": ["edit"]}])
+    assert fresh.has_grants("a1")
+    assert [g["principal_id"] for g in fresh.grants_with_source_prefix("room:")] == ["collab:user:bob"]
+    assert not any(g.get("principal_id") == "collab:agent1" for g in fresh._grants.values())

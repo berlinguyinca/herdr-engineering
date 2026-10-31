@@ -841,3 +841,11 @@ def test_restrict_all_applied_is_false_when_ignored_on_success_or_with_the_bridg
     with collab_server(registry_pg, blobs, enabled=False) as (base, server, _):
         status, data = request(base, f"/api/v1/artifacts/{aid}/retract", body={"restrict_all": True})
         assert status == 200 and data["restrict_all_applied"] is False
+
+
+def test_a_user_prefixed_agent_id_is_a_400_on_grant_and_revoke(env, registry_pg, blobs):
+    base, server, _ = env
+    aid = seed(registry_pg, blobs)
+    assert request(base, f"/api/v1/artifacts/{aid}/collaborators",
+                   body={"agent_id": "user:x", "permission": "read"})[0] == 400
+    assert request(base, f"/api/v1/artifacts/{aid}/collaborators/user:x/revoke", body={})[0] == 400

@@ -14,6 +14,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 PREFIX = "collab:"
+# ``collab:user:<id>`` rows are web room-member grants (artifact_room_access): never an agent collaborator.
+NOT_ROOM_USER = " AND principal_id NOT LIKE 'collab:user:%'"
+RESERVED_AGENT_PREFIXES = ("user:", "room:")
 MAX_GRANT_DAYS = 90
 _PERMS = {"read": ["read"], "write": ["read", "edit"]}
 
@@ -40,6 +43,11 @@ def _moment(value) -> datetime:
     if moment.year > 3000:
         raise ValueError("timestamp beyond year 3000")
     return moment
+
+
+def _check_agent_id(agent_id: str) -> None:
+    if agent_id.startswith(RESERVED_AGENT_PREFIXES):
+        raise ValueError("agent id uses a reserved prefix")
 
 
 def _check_grant(permission: str, expires_at: datetime) -> datetime:
@@ -79,6 +87,7 @@ class CollabGrantStore:
     async def grant(self, artifact_id: str, agent_id: str, permission: Literal["read", "write"], *,
                     expires_at: datetime, granted_by: str) -> dict:
         expires_at = _check_grant(permission, expires_at)
+        _check_agent_id(agent_id)
         await self._upsert_acl(artifact_id, agent_id, permission, expires_at, granted_by, merge=False)
         return {"artifact_id": artifact_id, "agent_id": agent_id, "permission": permission, "expires_at": expires_at}
 
@@ -105,6 +114,7 @@ class CollabGrantStore:
         await self.conn.execute(sql, artifact_id, PREFIX + agent_id, perms, expires_at, granted_by)
 
     async def revoke(self, artifact_id: str, agent_id: str) -> bool:
+        _check_agent_id(agent_id)
         deleted = await self.conn.fetch(
             "DELETE FROM artifact_acl WHERE artifact_id=$1 AND principal_id=$2 RETURNING 1",
             artifact_id, PREFIX + agent_id)
@@ -120,7 +130,8 @@ class CollabGrantStore:
         write = " AND permission = 'write'" if write_only else ""
         async with self.conn.transaction():
             rows = await self.conn.fetch(
-                "DELETE FROM artifact_acl WHERE artifact_id=$1 AND left(principal_id, $2) = $3" + edit + " RETURNING 1",
+                "DELETE FROM artifact_acl WHERE artifact_id=$1 AND left(principal_id, $2) = $3" + NOT_ROOM_USER + edit
+                + " RETURNING 1",
                 artifact_id, len(PREFIX), PREFIX)
             pending = await self.conn.fetch(
                 "UPDATE artifact_collab_invite_grants SET resolved_at=now() "
@@ -138,11 +149,14 @@ class CollabGrantStore:
     async def live_grants(self) -> list[dict]:
         rows = await self.conn.fetch(
             "SELECT artifact_id, principal_id, permissions, expires_at FROM artifact_acl "
-            "WHERE left(principal_id, $1) = $2 AND expires_at > now() ORDER BY artifact_id, principal_id",
+            "WHERE left(principal_id, $1) = $2 AND principal_id NOT LIKE 'collab:user:%' AND expires_at > now() "
+            "ORDER BY artifact_id, principal_id",
             len(PREFIX), PREFIX)
         return [_grant_row(r) for r in rows]
 
     async def grant_for(self, artifact_id: str, agent_id: str) -> dict | None:
+        if agent_id.startswith(RESERVED_AGENT_PREFIXES):
+            return None
         row = await self.conn.fetchrow(
             "SELECT artifact_id, principal_id, permissions, expires_at FROM artifact_acl "
             "WHERE artifact_id=$1 AND principal_id=$2", artifact_id, PREFIX + agent_id)
@@ -195,7 +209,7 @@ class CollabGrantStore:
         for row in rows:
             agent = join_to_agent[row["invite_id"]]
             agent_id = agent.get("agent_id") or agent.get("id")
-            if not agent_id:
+            if not agent_id or str(agent_id).startswith(RESERVED_AGENT_PREFIXES):
                 continue
             expires_at = row["expires_at"]
             if agent.get("hard_expiry") is not None:
@@ -286,7 +300,8 @@ class CollabGrantStore:
     async def collaborators(self, artifact_id: str) -> list[dict]:
         grants = await self.conn.fetch(
             "SELECT artifact_id, principal_id, permissions, expires_at FROM artifact_acl "
-            "WHERE artifact_id=$1 AND left(principal_id, $2) = $3 AND expires_at > now() ORDER BY principal_id",
+            "WHERE artifact_id=$1 AND left(principal_id, $2) = $3 AND principal_id NOT LIKE 'collab:user:%' "
+            "AND expires_at > now() ORDER BY principal_id",
             artifact_id, len(PREFIX), PREFIX)
         stats = {r["actor_id"]: r for r in await self.conn.fetch(
             "SELECT actor_id, max(received_at) AS last_used_at, "

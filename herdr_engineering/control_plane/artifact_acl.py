@@ -5,6 +5,13 @@ import time
 from collections.abc import Callable
 
 COLLAB_PREFIXES = ("collab:", "collab-invite:")
+# ``collab:user:<id>`` are WEB room-member grants (artifact_room_access), not fleet-agent collaborators.
+ROOM_USER_PREFIX = "collab:user:"
+
+
+def is_agent_collaborator(principal_id: str) -> bool:
+    """True for the principals only the collaborators route may write (agent grants and their invites)."""
+    return principal_id.startswith(COLLAB_PREFIXES) and not principal_id.startswith(ROOM_USER_PREFIX)
 
 
 class ArtifactAcl:
@@ -16,7 +23,7 @@ class ArtifactAcl:
 
     def grant(self, artifact_id: str, principal_id: str, permissions: set[str],
               *, expires_at: float | None = None, granted_by: str | None = None) -> dict:
-        if principal_id.startswith(COLLAB_PREFIXES):
+        if is_agent_collaborator(principal_id):
             raise ValueError("collaborator grants use the collaborators route")
         allowed = {"read", "edit", "review", "share", "admin"}
         if not artifact_id or not principal_id or not permissions <= allowed:
@@ -76,7 +83,7 @@ class ArtifactAcl:
 
     def load(self, grants: list[dict]) -> None:
         for grant in grants:
-            if str(grant.get("principal_id") or "").startswith(COLLAB_PREFIXES):
+            if is_agent_collaborator(str(grant.get("principal_id") or "")):
                 continue
             self._holders.setdefault(grant["artifact_id"], set()).add(grant["principal_id"])
             self._grants[(grant["artifact_id"], grant["principal_id"])] = {

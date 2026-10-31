@@ -444,3 +444,35 @@ def test_expired_grants_and_lapsed_invites_are_not_listed(registry_pg):
         assert [r["agent_id"] for r in await store.collaborators(aid)] == ["live"]
         assert [g["invite_id"] for g in await store.pending_invite_grants(aid)] == [live_inv]
     run(registry_pg, body)
+
+
+def test_room_member_grants_are_not_agent_collaborators_and_survive_agent_revokes(registry_pg):
+    async def body(store, conn):
+        aid = await artifact(conn)
+        await store.grant(aid, "ag1", "write", expires_at=now() + timedelta(days=1), granted_by="o")
+        await conn.execute("INSERT INTO artifact_acl (artifact_id, principal_id, permissions, expires_at, granted_by) "
+                           "VALUES ($1,'collab:user:bob','[\"read\"]'::jsonb, now() + interval '1 day', 'room:r1')", aid)
+        assert [r["agent_id"] for r in await store.collaborators(aid)] == ["ag1"]
+        assert all(g["agent_id"] != "user:bob" for g in await store.live_grants())
+        await store.revoke_grants(aid, write_only=False)
+        await store.revoke_grants(aid, write_only=True)
+        assert await conn.fetchval("SELECT count(*) FROM artifact_acl WHERE principal_id='collab:user:bob'") == 1
+        assert await store.grant_for(aid, "user:bob") is None
+        with pytest.raises(ValueError):
+            await store.revoke(aid, "user:bob")
+        with pytest.raises(ValueError):
+            await store.grant(aid, "user:bob", "read", expires_at=now() + timedelta(days=1), granted_by="o")
+    run(registry_pg, body)
+
+
+def test_a_room_revoke_leaves_agent_grants(registry_pg):
+    from herdr_engineering.control_plane.artifact_room_access import revoke_room_grants_pg
+
+    async def body(store, conn):
+        aid = await artifact(conn)
+        await store.grant(aid, "ag1", "read", expires_at=now() + timedelta(days=1), granted_by="o")
+        await conn.execute("INSERT INTO artifact_acl (artifact_id, principal_id, permissions, expires_at, granted_by) "
+                           "VALUES ($1,'collab:user:bob','[\"read\"]'::jsonb, now() + interval '1 day', 'room:r1')", aid)
+        await revoke_room_grants_pg(conn, apply=True)
+        assert [r["agent_id"] for r in await store.collaborators(aid)] == ["ag1"]
+    run(registry_pg, body)
