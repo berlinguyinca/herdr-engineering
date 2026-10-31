@@ -41,12 +41,19 @@ blocking file I/O runs in worker threads. Log lines carry only ticket, kind, act
 
 The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:<agent_id>``:
 
+5b. A version already committed for ``(collab:<agent_id>, key)`` (``merge_commit_for_key``) decides the ticket before
+   any check below: a crash between ``merge_commit`` and ``record_outcome`` must report that one version, even if
+   the grant was revoked, the head moved or the quota filled since. It is replayed (``created`` / ``merged``) when the
+   ledger row of the ticket it was committed for has this ticket's ``request_sha256``, else ``rejected`` "idempotency
+   key was reused for a different request".
 6. ``grant_for`` must show ``write``, unexpired, re-read now (a grant revoked after the intent was written is "no write
    grant", whatever its staging holds).
 7. The artifact must exist and be writable (not a report, no ``report_descriptor`` / ``source_manifest_blob`` on base
    or head); neither it nor its base or head version may be retracted, by ``lifecycle`` / ``state`` or by the worker's
    ``ArtifactGraphGate`` (reloaded with ``load_retractions`` at least every ``GATE_RELOAD`` s). Put names must not clash
-   with the base/head files (``check_names``: duplicates and file/directory prefixes).
+   clash (``check_names``: duplicates and file/directory prefixes) within the contributor's tree (base with the
+   changes applied) nor with the head's remaining files; base and head are not checked against each other, so a
+   head that replaced ``a`` with ``a/b`` does not refuse a clean stale-base commit.
 9. Daily quota: ``bytes_last_24h(agent, exclude_ticket=ticket) + inline_bytes <= daily_bytes_per_agent`` (the
    ticket's own ``received`` row is excluded, so a crash-retry is never counted twice).
 10. Inline text is stored with ``rustfs.put`` and ``register_report_blob``; staged puts go through ``ctx.assemble``
@@ -55,17 +62,22 @@ The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:
     ``max_text_bytes = limits.max_text_merge_bytes``; ``ArtifactMergeConflict`` is ``conflict`` (its ``attempt_id``
     goes on the ledger row; ``merged_text`` capped at ``max_conflict_text_bytes`` per result, measured as encoded
     JSON), any other ``ArtifactError`` is ``rejected`` with its message.
-12. After the outcome is recorded and published: the artifact id is handed to a background mirror refresher (the lane
-    never waits behind the mirror's lock; a failed refresh is kept for ``take_mirror_force``, which the mirror task
-    passes to ``sync(force=...)``), and ``lineage(version)`` runs. Neither can fail the tick.
+12. After the outcome is recorded and published, the lane only hands off: the artifact id to a background mirror
+    refresher (the lane never waits behind the mirror's lock; a failed refresh is kept for ``take_mirror_force``,
+    which the mirror task passes to ``sync(force=...)``) and the version to a background lineage task (its poster may
+    take minutes; the queue keeps at most ``LINEAGE_QUEUE_MAX`` versions, dropping the oldest). Neither can fail the
+    tick, and neither holds the lane's semaphore slot, connection or advisory locks.
 
 Wiring (Task 9): the scan must never wait for a lane's connection, or fresh intents stop being received while every
-lane is busy and then expire. Pass ``tick(..., scan_acquire=...)`` over a dedicated connection, or size the applier's
-pool to at least ``limits.apply_concurrency + 1``.
+lane is busy and then expire. The mirror refresher takes one connection from the lanes' ``acquire`` (the latest
+tick's) while it runs; lineage takes none. So with ``tick(..., scan_acquire=...)`` over a dedicated connection the
+lanes' pool needs at least ``limits.apply_concurrency + 1`` connections, and with one shared pool at least
+``limits.apply_concurrency + 2``.
 """
 from __future__ import annotations
 
 import asyncio
+import collections
 import inspect
 import json
 import logging
@@ -151,6 +163,8 @@ REASON_NO_HEAD = "artifact has no head version"
 REASON_MAX = 300                    # an ArtifactError message on a result is cut to this many characters
 COMMIT_OUTCOMES = frozenset({"created", "merged"})
 GATE_RELOAD = 30.0                  # the worker-local retraction gate is reloaded at least this often (seconds)
+LINEAGE_QUEUE_MAX = 1000            # versions waiting for lineage emission; the oldest is dropped beyond this
+REASON_KEY_REUSED = "idempotency key was reused for a different request"
 
 _RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason")
 _STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id")
@@ -257,6 +271,8 @@ class CollabIntentApplier:
         self._refresh_due: set[str] = set()
         self._mirror_force: set[str] = set()
         self._refresher: asyncio.Task | None = None
+        self._lineage_due: collections.deque[tuple[str, str, dict]] = collections.deque()
+        self._lineage_task: asyncio.Task | None = None
 
     # -- registry ---------------------------------------------------------------------------------------------
     def register(self, kind: str, handler: Callable[[IntentContext, Intent], Awaitable[dict]], *,
@@ -269,8 +285,9 @@ class CollabIntentApplier:
         ``record_outcome`` leaves the ticket ``received``, and the restarted worker runs the handler again (age-exempt).
         ``commit`` gets that from ``merge_commit``'s own idempotency key.
 
-        Keys of the handler's return value that start with ``_`` are private: they are never recorded or published,
-        and are handed to ``after(ctx, intent, out, private)``, which runs only once this call decided the ticket and
+        Keys of the handler's return value that start with ``_`` are private: they are never recorded or published
+        (``_zero_bytes: True`` records the ticket with 0 inline bytes), and are handed to
+        ``after(ctx, intent, out, private)``, which runs only once this call decided the ticket and
         its result is written. Errors in ``after`` are logged (type only) and never change the outcome.
         """
         if not isinstance(kind, str) or not _KIND_NAME.match(kind):
@@ -368,21 +385,20 @@ class CollabIntentApplier:
         return self._take_counts()
 
     async def drain(self, timeout: float | None = None) -> None:
-        """Await every running lane and the mirror refresher (shutdown and tests)."""
+        """Await every running lane, then the mirror refresher and the lineage task (shutdown and tests)."""
         tasks = list(self._busy.values())
         if tasks:
             await asyncio.wait(tasks, timeout=timeout)
-        refresher = self._refresher
-        if refresher is not None and not refresher.done():
-            await asyncio.wait([refresher], timeout=timeout)
+        background = [t for t in (self._refresher, self._lineage_task) if t is not None and not t.done()]
+        if background:
+            await asyncio.wait(background, timeout=timeout)
 
     async def aclose(self, timeout: float = 5.0) -> None:
         """Let running lanes finish for ``timeout`` seconds, then cancel the rest (their intents stay ``received``
         and are picked up again, age-exempt, after a restart)."""
         await self.drain(timeout)
         tasks = list(self._busy.values())
-        if self._refresher is not None and not self._refresher.done():
-            tasks.append(self._refresher)
+        tasks += [t for t in (self._refresher, self._lineage_task) if t is not None and not t.done()]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -648,7 +664,8 @@ class CollabIntentApplier:
         except Exception as exc:
             log.error("collab intent %s (%s): handler failed (%s)", intent.ticket, intent.kind, type(exc).__name__)
             out, private = {"result": "rejected", "reason": REASON_INTERNAL}, {}
-        if await self._finish(conn, name, intent, out) and spec.after is not None:
+        if await self._finish(conn, name, intent, out, zero_bytes=private.get("_zero_bytes") is True) \
+                and spec.after is not None:
             try:
                 await spec.after(ctx, intent, out, private)
             except asyncio.CancelledError:
@@ -765,14 +782,17 @@ class CollabIntentApplier:
 
     # -- the commit kind (Task 5b) -----------------------------------------------------------------------------
     async def _commit(self, ctx: IntentContext, intent: Intent) -> dict:
-        """Steps 6-11. Every refusal before ``merge_commit`` stores nothing (no blob, no scoped row)."""
+        """Steps 5b-11. Every refusal before ``merge_commit`` stores nothing (no blob, no scoped row)."""
         agent_id, aid, payload = intent.actor.id, intent.artifact_id, intent.payload
+        store = ctx.store
+        prior = await store.merge_commit_for_key(f"collab:{agent_id}", self._key(intent))           # step 5b
+        if prior is not None and prior["ticket_id"] is not None:   # one with no ticket: merge_commit replays it
+            return await self._replay_commit(ctx, intent, prior)
         grant = await ctx.grants.grant_for(aid, agent_id)                                           # step 6
         expires = _epoch(grant["expires_at"]) if grant is not None else None
         if grant is None or grant["permission"] != "write" or expires is None or expires <= self.clock():
             return _rejected(REASON_NO_GRANT)
-        store = ctx.store                                                                           # step 7
-        artifact = await store.get(aid)
+        artifact = await store.get(aid)                                                             # step 7
         if artifact is None:
             return _rejected(REASON_NO_ARTIFACT)
         await self._load_gate(store)
@@ -818,24 +838,29 @@ class CollabIntentApplier:
                     "conflicts": _conflicts(exc.conflicts, ctx.limits.max_conflict_text_bytes)}
         except ArtifactError as exc:
             return _rejected(str(exc)[:REASON_MAX] or "commit refused")
-        version = out["version"]
-        result = {"result": out["result"], "version_id": version["version_id"],
-                  "merged_names": [n for n in out.get("merged_names") or [] if isinstance(n, str)],
-                  "_version": dict(version)}
-        number = version.get("version_number")
-        if isinstance(number, int) and not isinstance(number, bool):
-            result["version_number"] = number
-        return result
+        return _committed(out)
+
+    async def _replay_commit(self, ctx: IntentContext, intent: Intent, prior: dict) -> dict:
+        """Step 5b: the version this key already committed, if it was committed for this same request. Another
+        ticket's version stored nothing for this one, so this ticket is recorded with 0 bytes (as in step 3)."""
+        ticket = prior["ticket_id"]
+        own = await self._ledger(ctx.conn, intent.ticket)
+        origin = own if ticket == intent.ticket else await self._ledger(ctx.conn, ticket)
+        if (own is None or origin is None or origin["request_sha256"] != own["request_sha256"]
+                or prior["version"].get("artifact_id") != intent.artifact_id):
+            return _rejected(REASON_KEY_REUSED)
+        out = _committed(prior)
+        if ticket != intent.ticket:
+            out["_zero_bytes"] = True
+        return out
 
     async def _store_inline(self, ctx: IntentContext, aid: str, name: str, text: str, head_files: dict) -> dict:
         """An inline put's entry: the bytes go to RustFS and are registered as a blob scoped to this artifact."""
         data = text.encode("utf-8")
         key, digest = await asyncio.to_thread(self.rustfs.put, data)
         # the scoped row is immutable per (artifact, digest): reuse its media type so the entry always matches it
-        prior = await ctx.conn.fetchval(
-            "SELECT media_type FROM artifact_blobs WHERE scope=$1 AND blob_sha256=$2", aid, digest)
-        media_type = prior or (head_files.get(name) or {}).get("media_type") or mimetypes.guess_type(name)[0] \
-            or "text/plain"
+        media_type = await ctx.store.scoped_blob_media_type(aid, digest) \
+            or (head_files.get(name) or {}).get("media_type") or mimetypes.guess_type(name)[0] or "text/plain"
         await ctx.store.register_report_blob(aid, storage_key=key, sha256=digest, size_bytes=len(data),
                                              media_type=media_type)
         return {"name": name, "media_type": media_type, "sha256": digest, "size_bytes": len(data), "storage_key": key}
@@ -847,22 +872,33 @@ class CollabIntentApplier:
             self._gate_loaded = now
 
     async def _after_commit(self, ctx: IntentContext, intent: Intent, out: dict, private: dict) -> None:
-        """Step 12, once the outcome is durable and published: mirror refresh (handed off) and lineage."""
+        """Step 12, once the outcome is durable and published: mirror refresh and lineage, both handed off."""
         if out.get("result") not in COMMIT_OUTCOMES:
             return
         self._schedule_refresh(intent.artifact_id)
         version = private.get("_version")
         if self.lineage is None or not isinstance(version, dict):
             return
-        try:
-            emitted = await asyncio.to_thread(self.lineage, version)
-            if inspect.isawaitable(emitted):
-                await emitted
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning("collab intent %s: lineage emission failed artifact=%s (%s)", intent.ticket,
-                        intent.artifact_id, type(exc).__name__)
+        if len(self._lineage_due) >= LINEAGE_QUEUE_MAX:
+            dropped, artifact_id, _ = self._lineage_due.popleft()
+            log.warning("collab intent %s: lineage queue full, emission dropped artifact=%s", dropped, artifact_id)
+        self._lineage_due.append((intent.ticket, intent.artifact_id, version))
+        if self._lineage_task is None or self._lineage_task.done():
+            self._lineage_task = asyncio.create_task(self._run_lineage())
+
+    async def _run_lineage(self) -> None:
+        """Emit lineage for each queued version, oldest first, off the lanes (no connection, no lock)."""
+        while self._lineage_due:
+            ticket, artifact_id, version = self._lineage_due.popleft()
+            try:
+                emitted = await asyncio.to_thread(self.lineage, version)
+                if inspect.isawaitable(emitted):
+                    await emitted
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("collab intent %s: lineage emission failed artifact=%s (%s)", ticket, artifact_id,
+                            type(exc).__name__)
 
     def _schedule_refresh(self, artifact_id: str) -> None:
         self._refresh_due.add(artifact_id)
@@ -949,15 +985,30 @@ def _files_of(version: dict) -> dict[str, dict]:
 
 
 def _names_fit(changes, base_files: dict, head_files: dict) -> bool:
-    """No put name duplicates or file/directory-clashes with a file that stays in base or head."""
+    """The contributor's tree (base with the changes applied) and the puts over the head's remaining files are each
+    free of duplicates and file/directory clashes. Base and head are never checked against each other: the head may
+    have replaced a base file ``a`` with ``a/b``, and the merge decides what that means."""
     deleted = {c.name for c in changes if c.op == "delete"}
     puts = {c.name for c in changes if c.op == "put"}
-    kept = (set(base_files) | set(head_files)) - deleted - puts
     try:
-        check_names(sorted(kept | puts))
+        for side in (base_files, head_files):
+            check_names(sorted((set(side) - deleted - puts) | puts))
     except ShareBundleError:
         return False
     return True
+
+
+def _committed(out: dict) -> dict:
+    """A ``merge_commit`` (or ``merge_commit_for_key``) result as the commit kind's outcome; the version itself goes
+    to the after-hook as private ``_version``."""
+    version = out["version"]
+    result = {"result": out["result"], "version_id": version["version_id"],
+              "merged_names": [n for n in out.get("merged_names") or [] if isinstance(n, str)],
+              "_version": dict(version)}
+    number = version.get("version_number")
+    if isinstance(number, int) and not isinstance(number, bool):
+        result["version_number"] = number
+    return result
 
 
 def _conflicts(conflicts, cap: int) -> list[dict]:

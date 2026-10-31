@@ -378,8 +378,9 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         committing, so the head cannot move in between. Idempotent per ``(created_by, idempotency_key)``. A retracted
         artifact, base or head version (``lifecycle`` / ``state``) is refused under that lock.
 
-        ``ticket_id`` (the collab intent that asked for this commit, if any) is stored on the attempt row, and the
-        raised ``ArtifactMergeConflict.attempt_id`` names that row.
+        ``ticket_id`` (the collab intent that asked for this commit, if any) is stored on the attempt row (the
+        raised ``ArtifactMergeConflict.attempt_id`` names that row) and as ``collab_ticket_id`` in a committed
+        version's provenance, which ``merge_commit_for_key`` returns.
 
         If the merged/contributed content fails the manifest and blob checks of ``commit_version`` (or the scoped blob
         registration), that is a conflict of kind ``validation``: the savepoint is rolled back, one attempt row is
@@ -470,7 +471,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                             artifact_id, base_version_id=head_id, source_manifest_blob=None,
                             output_manifest=merge.files,
                             provenance={"message": message, "merged_names": merge.merged_names,
-                                        "collab_request_sha256": request_sha},
+                                        "collab_request_sha256": request_sha,
+                                        **({"collab_ticket_id": ticket_id} if ticket_id else {})},
                             created_by=created_by, idempotency_key=idempotency_key,
                             parent_version_ids=[head_id] if fast_forward else [head_id, base_version_id],
                             created_via="collaborator", collaborator_agent_id=collaborator_agent_id)
@@ -507,23 +509,33 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         candidates = list(merge.merged_names) + [c["name"] for c in normalized if c["op"] == "put"]
         return candidates[0] if candidates else (normalized[0]["name"] if normalized else "*")
 
-    async def _merge_replay(self, principal: str, idempotency_key: str | None, request_sha: str) -> dict | None:
+    async def merge_commit_for_key(self, created_by: str, idempotency_key: str | None) -> dict | None:
+        """The ``merge_commit`` already committed for ``(created_by, idempotency_key)``, as ``merge_commit`` returns
+        it plus ``ticket_id`` (the ``ticket_id`` it was committed for, or None), else None. Nothing is compared: the
+        caller decides whether its request is the same one."""
         if not idempotency_key:
             return None
         prior = await self._conn.fetchrow(
             "SELECT version_id FROM artifact_idempotency WHERE principal_id=$1 AND idempotency_key=$2",
-            principal, idempotency_key)
-        if not prior:
-            return None
-        version = await self.get_version(prior["version_id"])
+            created_by or "unknown", idempotency_key)
+        version = await self.get_version(prior["version_id"]) if prior else None
         if version is None:
             return None
         provenance = version.get("provenance") or {}
-        if provenance.get("collab_request_sha256") != request_sha:
-            raise ArtifactError("idempotency key was reused for a different request")
         parents = version.get("parent_version_ids") or []
+        ticket = provenance.get("collab_ticket_id")
         return {"result": "merged" if len(parents) > 1 else "created", "version": version,
-                "merged_names": list(provenance.get("merged_names") or [])}
+                "merged_names": list(provenance.get("merged_names") or []),
+                "ticket_id": ticket if isinstance(ticket, str) else None}
+
+    async def _merge_replay(self, principal: str, idempotency_key: str | None, request_sha: str) -> dict | None:
+        prior = await self.merge_commit_for_key(principal, idempotency_key)
+        if prior is None:
+            return None
+        if (prior["version"].get("provenance") or {}).get("collab_request_sha256") != request_sha:
+            raise ArtifactError("idempotency key was reused for a different request")
+        prior.pop("ticket_id")
+        return prior
 
     @staticmethod
     def _normalize_changes(changes: Any) -> list[dict]:
@@ -659,6 +671,12 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                         sha256=output.get("sha256") or output.get("blob_sha256"),
                         size_bytes=output.get("size_bytes"), media_type=output.get("media_type"))
         return len(outputs)
+
+    async def scoped_blob_media_type(self, artifact_id: str, sha256: str) -> str | None:
+        """The media type of the blob registered for ``(artifact_id, sha256)``, or None (scoped rows are immutable,
+        so a new entry for the same bytes must reuse it)."""
+        return await self._conn.fetchval(
+            "SELECT media_type FROM artifact_blobs WHERE scope=$1 AND blob_sha256=$2", artifact_id, sha256)
 
     async def register_report_blob(self, artifact_id: str, *, storage_key: str, sha256: str,
                                    size_bytes: int, media_type: str) -> dict:

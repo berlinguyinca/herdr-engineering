@@ -1,11 +1,13 @@
 # ruff: noqa: F811  (pytest fixtures are imported by name from registry_pg)
 """CollabIntentApplier core: registry, lanes, ledger replay and the generic steps 1-5 (Task 5a)."""
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1796,6 +1798,11 @@ def test_inline_bytes_over_the_daily_quota_are_rejected_and_a_retry_is_not_count
         await settle(env)
         doc = env.result(over["ticket"])
         assert doc["result"] == "rejected" and doc["reason"] == "daily quota exceeded"
+        # nothing of the refused commit is stored: no bytes, no scoped blob row, no version
+        key, digest = FakeBlobs.key(hashlib.sha256(b"z\n").hexdigest()), hashlib.sha256(b"z\n").hexdigest()
+        assert key not in env.applier.rustfs.objects
+        assert await sql(env, "SELECT 1 FROM artifact_blobs WHERE scope=$1 AND blob_sha256=$2", aid, digest) == []
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 2
     committing(registry_pg, tmp_path, body, limits=BridgeLimits(daily_bytes_per_agent=len(first_text)))
 
 
@@ -1862,3 +1869,157 @@ def test_hooks_run_on_success_and_their_failures_are_logged_not_fatal(registry_p
     committing(registry_pg, tmp_path, body, lineage=lineage)
     assert "lineage" in caplog.text and "mirror" in caplog.text
     assert SENTINEL not in caplog.text
+
+
+def test_hooks_run_on_the_merged_path(registry_pg, tmp_path):
+    seen = []
+
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await owner_edit(env, aid, v1, edit(BASE_DOC, 2, "owner"))
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [put("doc.md", edit(BASE_DOC, 9, "mine"))])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "merged"
+        assert env.mirror.refreshed == [aid]
+        assert [(v["artifact_id"], v["version_id"]) for v in seen] == [(aid, doc["version_id"])]
+    committing(registry_pg, tmp_path, body, lineage=seen.append)
+
+
+async def poll_result(env, ticket, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        await env.tick(wait=1)
+        doc = env.result(ticket)
+        if doc is not None:
+            return doc
+        await asyncio.sleep(0.05)
+    return None
+
+
+def test_a_blocked_lineage_does_not_hold_the_lane(registry_pg, tmp_path):
+    release, entered, seen = threading.Event(), threading.Event(), []
+
+    def lineage(version):
+        entered.set()
+        release.wait(30)
+        seen.append(version["version_id"])
+
+    async def body(env, a):
+        try:
+            aid, v1 = await seed(env)
+            await grant(env, aid, a)
+            first = commit(env, a, aid, v1, [put("doc.md", edit(BASE_DOC, 2, "one"))])
+            doc = await poll_result(env, first["ticket"])
+            assert doc is not None and doc["result"] == "created"
+            assert await asyncio.to_thread(entered.wait, 10)
+            second = commit(env, a, aid, doc["version_id"], [put("doc.md", edit(BASE_DOC, 3, "two"))])
+            later = await poll_result(env, second["ticket"])
+            assert later is not None and later["result"] == "created"   # decided while lineage is still blocked
+            assert seen == []
+        finally:
+            release.set()
+        await env.applier.drain(timeout=30)
+        assert seen == [doc["version_id"], later["version_id"]]
+    committing(registry_pg, tmp_path, body, lineage=lineage)
+
+
+async def crash_before_outcome(env, raw):
+    """The worker died after merge_commit and before record_outcome: the row is ``received`` again, the intent
+    file is back and no result was written."""
+    await sql(env, "UPDATE artifact_collab_intents SET outcome='received', version_id=NULL, attempt_id=NULL, "
+                   "reason=NULL, decided_at=NULL WHERE ticket_id=$1", raw["ticket"])
+    (env.mirror_root / "results" / f"{raw['ticket']}.json").unlink()
+    (env.outbox / "intents" / f"{raw['ticket']}.json").write_text(json.dumps(raw))
+
+
+@pytest.mark.parametrize("case", ["revoked", "names", "quota", "retracted"])
+def test_a_crash_retry_reports_the_existing_version_whatever_would_now_refuse_it(registry_pg, tmp_path, case):
+    text = edit(BASE_DOC, 4, "once")
+    limits = BridgeLimits(daily_bytes_per_agent=len(text.encode()) + 10)
+
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [put("doc.md", text)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "created"
+        env.mirror.refreshed.clear()
+        await crash_before_outcome(env, raw)
+        if case == "revoked":
+            async with env.pool.acquire() as conn:
+                assert await CollabGrantStore(conn).revoke(aid, a)
+        elif case == "names":                              # head now has doc.md/x: a put of doc.md clashes
+            await owner_edit(env, aid, doc["version_id"], "x\n", name="doc.md/x")
+        elif case == "quota":                              # another commit used up the day's bytes
+            async with env.pool.acquire() as conn:
+                await CollabGrantStore(conn).record_received(
+                    new_ticket(), "commit", Actor("agent", a), aid, v1, None, "0" * 64, 1000)
+        else:
+            async with env.pool.acquire() as conn:
+                await ArtifactStore(conn, env.applier.rustfs).record_retraction(aid, doc["version_id"])
+        await settle(env)
+        again = env.result(raw["ticket"])
+        assert again["result"] == "created" and again["version_id"] == doc["version_id"]
+        assert (await ledger(env, raw["ticket"]))["version_id"] == doc["version_id"]
+        versions = await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)
+        assert len(versions) == (3 if case == "names" else 2)
+        assert env.mirror.refreshed == [aid]            # the after-hook the crash skipped runs now
+    committing(registry_pg, tmp_path, body, limits=limits)
+
+
+def test_a_new_ticket_reusing_a_crashed_tickets_key_for_another_request_is_rejected(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [put("doc.md", edit(BASE_DOC, 4, "once"))], key="k-crash")
+        await settle(env)
+        assert env.result(raw["ticket"])["result"] == "created"
+        await crash_before_outcome(env, raw)
+        (env.outbox / "intents" / f"{raw['ticket']}.json").unlink()      # withdrawn: only the new ticket runs
+        other = commit(env, a, aid, v1, [put("doc.md", edit(BASE_DOC, 5, "other"))], key="k-crash")
+        await settle(env)
+        refused = env.result(other["ticket"])
+        assert refused["result"] == "rejected"
+        assert refused["reason"] == "idempotency key was reused for a different request"
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 2
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_clean_stale_base_commit_merges_when_head_replaced_a_file_with_a_directory(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env, [blob_entry(env, "doc.md", BASE_DOC), blob_entry(env, "a", "file\n")])
+        async with env.pool.acquire() as conn:
+            v2 = (await ArtifactStore(conn, env.applier.rustfs).commit_version(
+                aid, base_version_id=v1, source_manifest_blob=None, created_by="owner",
+                output_manifest=[blob_entry(env, "doc.md", BASE_DOC), blob_entry(env, "a/b", "nested\n")]))["version_id"]
+        await grant(env, aid, a)
+        raw = commit(env, a, aid, v1, [put("doc.md", edit(BASE_DOC, 9, "mine"))])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "merged", doc
+        version = await version_of(env, doc["version_id"])
+        assert version["parent_version_ids"] == [v2, v1]
+        assert sorted(e["name"] for e in version["output_manifest"]) == ["a/b", "doc.md"]
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_new_ticket_for_a_crashed_tickets_request_replays_its_version_uncharged(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        changes = [put("doc.md", edit(BASE_DOC, 4, "once"))]
+        raw = commit(env, a, aid, v1, changes, key="k-crash")
+        await settle(env)
+        first = env.result(raw["ticket"])
+        await crash_before_outcome(env, raw)
+        (env.outbox / "intents" / f"{raw['ticket']}.json").unlink()
+        same = commit(env, a, aid, v1, changes, key="k-crash")
+        await settle(env)
+        doc = env.result(same["ticket"])
+        assert doc["result"] == "created" and doc["version_id"] == first["version_id"]
+        assert (await ledger(env, same["ticket"]))["bytes"] == 0
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 2
+    committing(registry_pg, tmp_path, body)
