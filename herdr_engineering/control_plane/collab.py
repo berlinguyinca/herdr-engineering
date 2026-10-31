@@ -84,6 +84,10 @@ TASK_TTL = 24 * 3600.0           # a task nobody finished in a day is expired
 MAX_TASK_DEPTH = 3               # human -> agent -> agent -> agent
 TASK_RATE = 20                   # new tasks per creator per 10 minutes
 MAX_OPEN_TASKS_PER_AGENT = 10
+MAX_APPROVAL_PROPOSALS_PER_OWNER = 100
+APPROVAL_PROPOSAL_RATE = 20       # per requester per 10 minutes
+MAX_APPROVAL_SUMMARY = 500
+MAX_APPROVAL_DETAILS = 8 * 1024
 MAX_PENDING_REQUESTS = 120       # open access requests per room (one family of agents fits)
 SPAWN_FAMILIES = ("claude-code", "codex", "pi", "agent")   # what the host runner knows how to start
 PROFILE_LIMIT_DEFAULTS = {"live_per_agent": 3, "depth": 2, "per_hour": 20}   # a room profile may only lower these
@@ -337,6 +341,8 @@ class CollabService:
         self._invites: dict[str, dict] = {}
         self._tasks: dict[str, dict] = {}
         self._tasks_by_target: dict[str, list[str]] = defaultdict(list)
+        self._approval_proposals: dict[str, dict] = {}
+        self._approval_proposal_idem: dict[tuple[str, str, str], tuple[str, str]] = {}
         self._requests: dict[str, dict] = {}                 # open agent-access requests
         # Indexes kept only by _apply (so hydrate rebuilds them): they replace whole-state scans.
         self._agents_by_owner: dict[str, set] = defaultdict(set)
@@ -401,6 +407,8 @@ class CollabService:
 
     def _touch_rooms(self, p: dict, seq: int) -> None:
         """Remember which rooms an event changed, so a room's long-poll wakes only for its own news."""
+        if p.get("room_notify") is False:
+            return
         rooms = set()
         if isinstance(p.get("room_id"), str):
             rooms.add(p["room_id"])
@@ -570,10 +578,25 @@ class CollabService:
                 "created_at": p["created_at"], "created_epoch": p["created_epoch"],
                 "updated_at": p["created_at"], "seq": seq}
             self._tasks_by_target[p["target_agent_id"]].append(p["task_id"])
+            if p.get("idempotency_key") and p.get("fingerprint") and p.get("requester_key"):
+                self._idem[(p["requester_key"], p["room_id"],
+                            "task:" + p["idempotency_key"])] = (
+                    p["fingerprint"], p["task_id"])
         elif t == "task_updated":
             tk = self._tasks.get(p["task_id"])
             if tk:
                 tk.update(status=p["status"], result=p.get("result"), updated_at=p["created_at"])
+        elif t == "approval_proposal_created":
+            requester_key = f"{p['requester_kind']}:{p['requester_id']}"
+            self._approval_proposals[p["proposal_id"]] = {
+                "proposal_id": p["proposal_id"], "room_id": p["room_id"],
+                "task_id": p["task_id"], "kind": p["kind"], "summary": p["summary"],
+                "details": p["details"], "state": "pending", "owner": p["actor_user_id"],
+                "requester_kind": p["requester_kind"], "requester_id": p["requester_id"],
+                "created_at": p["created_at"], "sequence": ev["sequence"],
+            }
+            self._approval_proposal_idem[(requester_key, p["room_id"], p["idempotency_key"])] = (
+                p["fingerprint"], p["proposal_id"])
         elif t == "agent_granted":
             self._rooms[p["room_id"]]["grants"][p["agent_id"]] = {
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
@@ -2768,7 +2791,7 @@ class CollabService:
         """A person with the room's "task" right, or an agent the owner approved with "instruct",
         gives work to ONE agent that the owner approved with "execute"."""
         with self._lock:
-            room, _ = self._authorize(pr, room_id, "instruct" if pr.is_agent else "task", "task.create")
+            room, first = self._authorize(pr, room_id, "instruct" if pr.is_agent else "task", "task.create")
             bad = [k for k in body if k not in ("target_agent_id", "text", "parent_task_id", "idempotency_key")]
             if bad:
                 raise CollabError(400, "unknown field")
@@ -2783,17 +2806,14 @@ class CollabService:
             ikey = body.get("idempotency_key")
             if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
                 raise CollabError(400, "invalid idempotency_key")
-            if ikey is not None and (prior := self._idem.get((pr.key, room_id, "task:" + ikey))):
-                if prior[0] != _digest(json.dumps([room_id, tid_, text])):
-                    raise CollabError(409, "idempotency_key already used for a different task")
-                return {"task_id": prior[1], "status": "pending", "replayed": True}
             depth, parent, root = 0, body.get("parent_task_id"), pr.owner
             if pr.is_agent:
                 # Agents only delegate: every agent-made task traces to a task that someone gave
                 # this agent and it accepted, so a chain always starts with a person.
                 pt = self._tasks.get(parent) if isinstance(parent, str) else None
                 if (not pt or pt["room_id"] != room_id or pt["target"] != pr.id
-                        or self._task_status(pt) != "accepted"):
+                        or pt["seq"] < first or self._task_status(pt) != "accepted"
+                        or not self._creator_valid(pt, room)):
                     raise CollabError(400, "agents delegate: parent_task_id must be a task you accepted in this room")
                 if pt["by_kind"] == "agent" and pt["by_id"] == tid_:
                     raise CollabError(400, "cannot hand a task straight back to the agent that gave it")
@@ -2802,6 +2822,11 @@ class CollabService:
                     raise CollabError(400, "task chain is too deep")
             elif parent is not None:
                 raise CollabError(400, "parent_task_id is for agents delegating a task")
+            fingerprint = _digest(json.dumps([room_id, tid_, text, parent]))
+            if ikey is not None and (prior := self._idem.get((pr.key, room_id, "task:" + ikey))):
+                if prior[0] != fingerprint:
+                    raise CollabError(409, "idempotency_key already used for a different task")
+                return {"task_id": prior[1], "status": "pending", "replayed": True}
             self._prune()
             now = self._now()
             open_for_target = sum(1 for tid2 in self._tasks_by_target.get(tid_, ())
@@ -2815,11 +2840,135 @@ class CollabService:
                 pr, project_id=room["project_id"], room_id=room_id, task_id=task_id,
                 target_agent_id=tid_, text=text, depth=depth, parent_task_id=parent,
                 created_by_kind=pr.kind, created_by_id=pr.id, created_epoch=now, root_user_id=root,
+                idempotency_key=ikey, fingerprint=fingerprint, requester_key=pr.key,
                 visibility_scope="room", action="task.create", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=task_id))
-            if ikey is not None:
-                self._idem[(pr.key, room_id, "task:" + ikey)] = (_digest(json.dumps([room_id, tid_, text])), task_id)
         return {"task_id": task_id, "status": "pending", "event": self._view(ev)}
+
+    # -- task-scoped requests for human approval (requests only; never grants)
+    @staticmethod
+    def _approval_proposal_json(proposal: dict) -> dict:
+        return {
+            "proposal_id": proposal["proposal_id"], "room_id": proposal["room_id"],
+            "task_id": proposal["task_id"], "kind": proposal["kind"],
+            "summary": proposal["summary"],
+            "details": json.loads(json.dumps(proposal["details"], ensure_ascii=False)),
+            "state": "pending", "created_at": proposal["created_at"],
+            "requester": {"type": proposal["requester_kind"], "id": proposal["requester_id"],
+                          "owner_user_id": proposal["owner"]},
+        }
+
+    def _approval_relationship(self, pr: Principal, room: dict, task: dict) -> bool:
+        """A proposal stays inside the user who owns the task's assigned agent."""
+        target = self._agents.get(task["target"])
+        if not target or target["owner"] != pr.owner:
+            return False
+        effective = self._effective(Principal("agent", task["target"], target["owner"]), room)
+        if not effective or "execute" not in effective[0] or task["seq"] < effective[1]:
+            return False
+        if pr.is_agent:
+            return task["target"] == pr.id
+        return self._member(room, pr.id) is not None
+
+    def create_approval_proposal(self, pr: Principal, room_id: str, body: dict) -> tuple[int, dict]:
+        """Record a pending request for approval without creating executable authority."""
+        with self._lock:
+            room, first = self._authorize(pr, room_id, "read", "approval_proposal.create")
+            allowed = {"task_id", "kind", "summary", "details", "idempotency_key"}
+            if not isinstance(body, dict) or set(body) - allowed:
+                raise CollabError(400, "unknown field")
+            task_id = body.get("task_id")
+            task = self._tasks.get(task_id) if isinstance(task_id, str) else None
+            if (not task or task["room_id"] != room_id or task["seq"] < first
+                    or self._task_status(task) not in ("pending", "accepted")
+                    or not self._approval_relationship(pr, room, task)):
+                raise CollabError(404, "not found")
+            if pr.is_agent:
+                effective = self._effective(pr, room)
+                if not effective or "execute" not in effective[0] or task["seq"] < effective[1]:
+                    raise CollabError(404, "not found")
+            else:
+                member = self._member(room, pr.id)
+                if not member or not (member["role"] == "owner" or task["root"] == pr.id
+                                      or task["by_owner"] == pr.id):
+                    raise CollabError(404, "not found")
+
+            kind, summary = body.get("kind"), body.get("summary")
+            if not isinstance(kind, str) or not _KEY_RE.fullmatch(kind) or len(kind) > 64:
+                raise CollabError(400, "invalid kind")
+            if not isinstance(summary, str):
+                raise CollabError(400, "summary must be a string")
+            summary = redact_text(_CONTROL.sub("", summary)).strip()
+            if not summary or len(summary) > MAX_APPROVAL_SUMMARY:
+                raise CollabError(400, f"summary must be 1-{MAX_APPROVAL_SUMMARY} characters")
+            details = body.get("details")
+            if not isinstance(details, dict):
+                raise CollabError(400, "details must be an object")
+            try:
+                details_json = json.dumps(details, ensure_ascii=False, sort_keys=True,
+                                          separators=(",", ":"), allow_nan=False)
+            except (TypeError, ValueError):
+                raise CollabError(400, "details must be a JSON object") from None
+            if len(details_json.encode()) > MAX_APPROVAL_DETAILS:
+                raise CollabError(400, "details are too large")
+            details = json.loads(details_json)
+
+            ikey = body.get("idempotency_key")
+            if not isinstance(ikey, str) or not _KEY_RE.fullmatch(ikey):
+                raise CollabError(400, "invalid idempotency_key")
+            requester_key = pr.key
+            fingerprint = _digest(json.dumps(
+                [room_id, task_id, kind, summary, details], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":")))
+            prior = self._approval_proposal_idem.get((requester_key, room_id, ikey))
+            if prior:
+                if prior[0] != fingerprint:
+                    raise CollabError(409, "idempotency_key already used for a different proposal")
+                proposal = self._approval_proposals[prior[1]]
+                # Replay never bypasses current room, task or agent authority.
+                if not self._approval_relationship(pr, room, task):
+                    raise CollabError(404, "not found")
+                return 200, {"proposal": self._approval_proposal_json(proposal), "replayed": True}
+
+            count = sum(1 for p in self._approval_proposals.values()
+                        if p["room_id"] == room_id and p["owner"] == pr.owner)
+            if count >= MAX_APPROVAL_PROPOSALS_PER_OWNER:
+                raise CollabError(429, "approval proposal limit reached")
+            self._throttle("approval-proposal:" + requester_key,
+                           APPROVAL_PROPOSAL_RATE, 600.0, "approval proposal")
+            proposal_id = ids.new_id("proposal")
+            ev = self._commit("approval_proposal_created", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id,
+                proposal_id=proposal_id, task_id=task_id, kind=kind, summary=summary,
+                details=details, requester_kind=pr.kind, requester_id=pr.id,
+                idempotency_key=ikey, fingerprint=fingerprint, visibility_scope="owner",
+                room_notify=False,
+                action="approval_proposal.create", outcome="allowed",
+                project_ids=[room["project_id"]], resource_id=proposal_id))
+            proposal = self._approval_proposals[proposal_id]
+        return 201, {"proposal": self._approval_proposal_json(proposal),
+                     "event_id": ev["event_id"]}
+
+    def list_approval_proposals(self, pr: Principal, room_id: str) -> dict:
+        with self._lock:
+            room, first = self._authorize(pr, room_id, "read", "approval_proposal.list")
+            if pr.is_agent:
+                effective = self._effective(pr, room)
+                if not effective or "execute" not in effective[0]:
+                    raise CollabError(404, "not found")
+            rows = []
+            for proposal in self._approval_proposals.values():
+                if (proposal["room_id"] != room_id or proposal["owner"] != pr.owner
+                        or proposal["sequence"] < first):
+                    continue
+                task = self._tasks.get(proposal["task_id"])
+                if not task or not self._approval_relationship(pr, room, task):
+                    continue
+                if pr.is_agent and proposal["requester_id"] != pr.id:
+                    continue
+                rows.append(proposal)
+            rows.sort(key=lambda p: p["sequence"], reverse=True)
+        return {"proposals": [self._approval_proposal_json(p) for p in rows]}
 
     def _grant_expiry(self, body: dict) -> float:
         """Every agent grant lapses: the owner may pick a date (up to a year), else the default."""
@@ -2910,6 +3059,15 @@ class CollabService:
             rows.sort(key=lambda r: r[0], reverse=True)
             out = [dict(self._task_json(tid, t), untrusted=True) for _, tid, t in rows[:limit]]
         return {"tasks": out}
+
+    def get_task(self, pr: Principal, room_id: str, task_id: str) -> dict:
+        with self._lock:
+            _, first = self._authorize(pr, room_id, "read", "task.get")
+            task = self._tasks.get(task_id) if isinstance(task_id, str) else None
+            if not task or task["room_id"] != room_id or task["seq"] < first:
+                raise CollabError(404, "not found")
+            out = dict(self._task_json(task_id, task), untrusted=True)
+        return {"task": out}
 
     def cancel_task(self, pr: Principal, room_id: str, task_id: str) -> dict:
         self._require_user(pr)
@@ -3258,6 +3416,10 @@ class CollabService:
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
+                    if n == 4 and parts[2] == "tasks":
+                        return 200, self.get_task(pr, rid, parts[3])
+                    if parts[2:] == ["approval-proposals"]:
+                        return 200, self.list_approval_proposals(pr, rid)
                     if parts[2:] == ["flow"]:
                         return 200, self.room_flow(pr, rid)
                     if parts[2:] == ["state"]:
@@ -3362,6 +3524,8 @@ class CollabService:
                         return 200, self.decide_agent_request(pr, rid, parts[3], body)
                     if parts[2:] == ["tasks"]:
                         return 201, self.create_task(pr, rid, body)
+                    if parts[2:] == ["approval-proposals"]:
+                        return self.create_approval_proposal(pr, rid, body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
                         return 200, self.cancel_task(pr, rid, parts[3])
                     if parts[2:] == ["messages"]:
