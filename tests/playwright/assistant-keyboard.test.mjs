@@ -56,7 +56,7 @@ const FAKE_BACKEND = async () => {
     let m;
     if (method === 'GET' && path === '/api/v1/assistants') return reply(200, { assistants: db.assistants });
     if (method === 'GET' && path === '/api/v1/assistant-approvals') return reply(200, { approvals: db.approvals });
-    if (method === 'GET' && /\/threads$/.test(path)) return reply(200, { threads: db.threads });
+    if (method === 'GET' && /\/threads$/.test(path)) { if (window.__delay) await new Promise((r) => setTimeout(r, window.__delay)); return reply(200, { threads: db.threads }); }
     if (method === 'GET' && (m = /\/threads\/([^/]+)$/.exec(path))) return reply(200, { thread: { thread_id: m[1] }, messages: [{ role: 'assistant', content: `hello from ${m[1]}`, provenance: 'direct' }] });
     if (method === 'POST' && /\/messages$/.test(path)) return reply(202, { run: { run_id: 'run_1', state: 'completed' } });
     if (method === 'POST' && /\/decision$/.test(path)) return reply(200, { decision: 'approved' });
@@ -153,4 +153,19 @@ test('typing in the assistant picker does not trigger shortcuts', () => withPage
   await page.keyboard.press('n'); await page.keyboard.press('?');
   assert.equal(await page.getByRole('dialog').count(), 0);
   assert.equal((await mutations(page)).length, 0);
+}));
+
+test('Enter during a slow redraw still sends (the handler no longer waits for the network)', () => withPage(async (page) => {
+  await page.evaluate(() => { window.__delay = 700; });
+  await page.keyboard.press('2');                                           // redraws the view; the chat reloads slowly
+  await page.keyboard.press('/');
+  await page.keyboard.type('early words');
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => window.__calls.some((c) => c.path.endsWith('/messages')));
+  assert.equal((await mutations(page)).find((c) => c.path.endsWith('/messages')).body.content, 'early words');
+}));
+
+test('AltGr-produced brackets still switch assistant (AltGr reports ctrl+alt)', () => withPage(async (page) => {
+  await page.evaluate(() => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: ']', ctrlKey: true, altKey: true, modifierAltGraph: true, bubbles: true })));
+  assert.equal(await page.locator('[data-select]').inputValue(), 'asst_2');
 }));

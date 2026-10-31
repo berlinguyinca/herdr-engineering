@@ -92,7 +92,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   const focusKey = () => {
     const el = container.ownerDocument.activeElement;
     if (!el || !container.contains(el)) return null;
-    for (const attr of ['data-tab', 'data-select', 'data-config', 'data-keys', 'data-showall', 'data-msg']) {
+    for (const attr of ['data-tab', 'data-select', 'data-config', 'data-keys', 'data-showall', 'data-msg', 'data-new', 'data-newthread']) {
       if (el.hasAttribute(attr)) return { attr, value: el.getAttribute(attr), draft: el.value };
     }
     return null;
@@ -137,6 +137,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       el.addEventListener('click', () => { state.tab = el.dataset.tab; draw(); });
       el.addEventListener('keydown', e => {                      // roving focus: arrows move and open, Home/End jump
         const tabs = [...container.querySelectorAll('[data-tab]')];
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown') return;      // a horizontal tablist keeps Up/Down for scrolling
         const next = roveIndex(e.key, tabs.indexOf(el), tabs.length);
         if (next === null || e.ctrlKey || e.metaKey || e.altKey) return;
         e.preventDefault(); state.tab = tabs[next].dataset.tab; draw();
@@ -165,6 +166,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       const mine = pending.filter(ap => ap.assistant_id === a.assistant_id);
       const strip = container.querySelector('#pa-strip');
       if (!strip) return;
+      const had = strip.contains(container.ownerDocument.activeElement) ? container.ownerDocument.activeElement.dataset : null;
       strip.hidden = !mine.length;
       strip.innerHTML = mine.map(ap => `<div class="pa-row"><span><strong>Approval needed</strong> · ${esc(ap.policy_snapshot)}</span><span class="pa-grow"></span>
         <button class="hd-btn hd-btn--sm" data-strip-approve="${esc(ap.approval_id)}">Approve</button>
@@ -174,6 +176,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
         try { await client.decideApproval(id, b.dataset.stripApprove ? 'approved' : 'denied'); } catch { /* the strip refreshes below */ }
         drawApprovalStrip(a);
       }));
+      if (had) strip.querySelector(had.stripApprove ? `[data-strip-approve="${had.stripApprove}"]` : `[data-strip-deny="${had.stripDeny}"]`)?.focus();
     } catch { /* approvals unavailable: the Approvals tab reports it */ }
   };
 
@@ -772,6 +775,18 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     const threadsEl = container.querySelector('#pa-threads');
     const messagesEl = container.querySelector('#pa-messages');
     const statusEl = container.querySelector('#pa-runstatus');
+    input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click(); } });
+    sendBtn.addEventListener('click', async () => {
+      const content = input.value.trim();
+      if (!content) return;
+      if (!currentThread) { statusEl.textContent = 'Still loading the conversation; your message is kept.'; return; }
+      input.value = ''; statusEl.textContent = 'Running…';
+      try {
+        const { run } = await client.sendAssistantMessage(a.assistant_id, currentThread, content);
+        await loadMessages(client, a, currentThread, messagesEl);
+        statusEl.textContent = `Run ${run.run_id} · ${run.state}`;
+      } catch (error) { statusEl.textContent = 'Error: ' + error.message; }
+    });
     try {
       const { threads = [] } = await client.listAssistantThreads(a.assistant_id);
       if (!currentThread) currentThread = threads[0] ? threads[0].thread_id : null;
@@ -789,17 +804,6 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       }));
       await loadMessages(client, a, currentThread, messagesEl);
     } catch (error) { threadsEl.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
-    input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click(); } });
-    sendBtn.addEventListener('click', async () => {
-      const content = input.value.trim();
-      if (!content || !currentThread) return;
-      input.value = ''; statusEl.textContent = 'Running…';
-      try {
-        const { run } = await client.sendAssistantMessage(a.assistant_id, currentThread, content);
-        await loadMessages(client, a, currentThread, messagesEl);
-        statusEl.textContent = `Run ${run.run_id} · ${run.state}`;
-      } catch (error) { statusEl.textContent = 'Error: ' + error.message; }
-    });
     const voiceBtn = container.querySelector('[data-voice]');
     const speakBtn = container.querySelector('[data-speak]');
     const voiceMod = await import('./voice.js').catch(() => null);
@@ -828,8 +832,10 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   };
 
   const loadMessages = async (client, a, threadId, el) => {
+    el.dataset.loading = threadId;
     try {
       const { messages = [] } = await client.getThread(a.assistant_id, threadId);
+      if (el.dataset.loading !== threadId) return;             // a newer thread was picked while this was in flight
       el.innerHTML = messages.length ? messages.map(m =>
         `<div class="pa-msg ${m.role === 'user' ? 'pa-msg--user' : ''}">${esc(m.content)}<div class="pa-muted">${esc(m.role)} · ${esc(m.provenance || 'direct')}</div></div>`).join('')
         : '<div class="pa-muted">No messages yet. Say hello.</div>';

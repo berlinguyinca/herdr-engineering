@@ -50,7 +50,7 @@ export function mountKeys(container, api) {
       { id: 'approvals', keys: 'a', label: 'Go to waiting approvals', run: () => focusApprovals() },
       { id: 'assistant', keys: '[ / ]', label: 'Previous / next assistant', run: () => stepAssistant(1), palette: false },
       { id: 'config', keys: ',', label: 'Show or hide Configure', run: () => api.toggleConfig() },
-      { id: 'tabs', keys: '1 – 0', label: 'Open a Configure tab (1 General … 0 Diagnostics)', run: () => {}, palette: false },
+      { id: 'tabs', keys: '1 – 0', label: `Open a Configure tab (1 ${TABS[0]} … 0 ${TABS[9]})`, run: () => {}, palette: false },
       { id: 'help', keys: '?', label: 'Show keyboard shortcuts', run: () => openHelp() },
       { id: 'palette', keys: 'Ctrl/⌘ K', label: 'Command palette', run: () => openPalette(), palette: false },
     ];
@@ -61,7 +61,7 @@ export function mountKeys(container, api) {
 
   const stepThread = (d) => {
     const btns = [...container.querySelectorAll('#pa-threads [data-t]')];
-    const cur = btns.find(b => b.classList.contains('pa-tab--active'));
+    const cur = btns.includes(doc.activeElement) ? doc.activeElement : btns.find(b => b.classList.contains('pa-tab--active'));
     const next = step(btns, cur, d);
     if (next) { next.click(); next.focus(); }
   };
@@ -141,8 +141,10 @@ export function mountKeys(container, api) {
   // ---- the keys themselves
   const onKey = (e) => {
     if (!visible()) return;
+    if (!e.key) return;
+    const altGr = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');   // AltGr reports ctrl+alt
     if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'k') { e.preventDefault(); overlay ? closeOverlay() : openPalette(); return; }
-    if (overlay || e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (overlay || e.defaultPrevented || ((e.ctrlKey || e.metaKey || e.altKey) && !altGr)) return;
     const t = e.target;
     if (t && t.closest && t.closest(TYPING)) {
       if (e.key === 'Escape' && t.matches('[data-msg]')) { t.blur(); }       // leave the message box, back to single-key mode
