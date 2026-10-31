@@ -1,6 +1,7 @@
 # Tab supervision: base requirement
 
-Each managed Herdr tab represents exactly one durable job with exactly one root agent.
+Each managed Herdr workspace explicitly corresponds to one collaboration room.
+Each managed tab in that workspace represents exactly one durable job with exactly one root agent.
 A supervisor that requests a child becomes its immutable supervisor, recursively.
 Human ownership remains authoritative. Layout, focus, pane closure, runtime readiness,
 and an agent saying done do not establish ancestry or a verified outcome.
@@ -142,3 +143,32 @@ Each binding explicitly repeats the owning tab key and cannot migrate to another
 job's tab. Binding server/session/instance/pane facts must be attested by the trusted
 operator. Public read views here are internal operator views, not authorized HTTP
 responses; existing API authorization must gate any later exposure.
+
+
+## Approved dashboard integration (2026-10-31)
+
+One identity registry applies to collaboration agents, engineering agents and
+personal assistants/subagents. The authorized room projection joins exact agent IDs;
+no second assistant agent registry or runtime-based identity reconstruction is added.
+Durable human/operator room/workspace links group job tabs, and a shared component
+renders collapsible trees in the existing Flow view and dashboard agent/assistant
+views. Task and review links are distinct from immutable supervisor relationships.
+Unknown legacy ancestry remains unknown. Root p2 is confirmed spawner of p3, p6 and
+p7; p5 has unknown original spawner despite authorized root monitoring.
+
+The first UI integration is observation only. It must not infer live process health
+from persisted state, confer grants through package registration or room membership,
+or add launch/cancel buttons. Operational freshness and verified outcomes remain
+explicit. Deferred runtime launch/lease control remains with the root lane.
+
+
+## Dashboard persistence and delivery details
+
+The standalone module still speaks its `tab_supervision` event contract. Inside
+CollabService, `_CollabSupervisionSink` wraps those records in existing private
+`collab`/`supervision_recorded` events, so they do not enter generic activity/SSE
+feeds. Existing file/Postgres replay is reused without a new database or task store.
+The same authorized projection feeds Flow, Agents and Personal Assistants. Native
+runtime observations only enrich an exact instance match; recorded bindings remain
+unconfirmed. See `../plans/2026-10-31-supervision-integration-boundary.md` for root
+transaction, scope/model and runtime integration responsibilities.

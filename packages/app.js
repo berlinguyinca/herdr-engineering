@@ -17,6 +17,7 @@ import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
+import { mountSupervisionCatalog } from './supervision-catalog.js';
 import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
@@ -51,6 +52,7 @@ const NAV = [
   { path: '/topology', label: 'Topology' },
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Agents' },
+  { path: '/assistants', label: 'Personal Assistants' },
   { path: '/services', label: 'Services' },
   { path: '/local-services', label: 'Local services' },
   { path: '/system-services', label: 'System services' },
@@ -84,6 +86,7 @@ const ROUTES = {
   '/missions': viewMissions,
   '/missions/:id': viewMission,
   '/herd': viewSessions,
+  '/assistants': viewAssistants,
   '/herd/session/:id': viewSession,
   '/services': viewServices,
   '/system-services': viewServices,
@@ -245,7 +248,19 @@ async function missionSessions(m) {
 }
 
 async function viewSessions() {
-  dashboardView = mountSessionsView(root, client, {tab: route().query.get('tab') || 'current'});
+  root.innerHTML = '<div id="agent-session-reports"></div><section id="agent-job-trees" aria-label="Shared job trees"></section>';
+  const sessions = mountSessionsView(document.getElementById('agent-session-reports'), client, {tab: route().query.get('tab') || 'current'});
+  const trees = mountSupervisionCatalog(document.getElementById('agent-job-trees'), client, {
+    roomId: route().query.get('room') || '', title: 'Job trees',
+  });
+  dashboardView = {dispose() { sessions.dispose(); trees.dispose(); }};
+}
+
+async function viewAssistants() {
+  root.innerHTML = '<h1>Personal Assistants</h1><p>Assistants and their subagents use the same collaboration identities and job trees.</p><div id="assistant-job-trees"></div>';
+  dashboardView = mountSupervisionCatalog(document.getElementById('assistant-job-trees'), client, {
+    roomId: route().query.get('room') || '', title: 'Job trees',
+  });
 }
 
 async function viewSession(parts, revision) {

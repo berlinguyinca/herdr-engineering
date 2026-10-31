@@ -41,3 +41,24 @@ VanillaJS/Web Components, existing CSS tokens, no new dependencies. Preserve rou
 
 ## Open questions
 - [ ] Designer/implementer: evaluate container-query splits after the viewport-bounded Projects panes have production evidence.
+
+## Shared collaboration and supervision model (2026-10-31)
+
+Collaboration, Agents and Personal Assistants use the same collaboration agent
+identities and authorized supervision projection. A Herdr workspace is explicitly
+linked to one collaboration room; tabs represent jobs with one root agent each;
+panes represent bound child agents. Runtime sessions and pane positions are not
+agent identities or evidence of parentage. Legacy parentage remains unknown until
+an explicit human/operator adoption event. In particular, monitoring permission
+does not establish an original spawn relationship.
+
+Reuse the room Flow view and a shared collapsible tree component. Show room/workspace
+context, then one collapsed job/tab group per root, with expandable child branches.
+Search names, responsibilities and roles; reveal ancestors of matching descendants.
+Retain selected detail and expanded IDs across refresh. Label supervisor, task,
+legacy-helper and runtime-binding relationships distinctly. Reviewer roles and
+result evidence remain visible without implying that an agent's status verifies work.
+Show unknown/unadopted agents separately rather than inventing a root. Missing,
+unavailable, stale and empty projections remain distinguishable. No new lifecycle
+controls are introduced by the visualization. Use semantic disclosures, bounded
+large-tree rendering, keyboard focus, existing tokens and mobile containment.

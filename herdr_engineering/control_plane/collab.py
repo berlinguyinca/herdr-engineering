@@ -26,6 +26,7 @@ import secrets
 import threading
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -284,6 +285,86 @@ class FileEventLog:
     record = record_required
 
 
+class _CollabSupervisionSink:
+    """Keep supervision records inside the existing private collaboration log."""
+
+    def __init__(self, service):
+        self.service = service
+
+    def record_required(self, event):
+        service = self.service
+        # Refuse before acquiring the service lock: a module-first caller would
+        # invert room-read lock order and could deadlock the operator.
+        if not getattr(service._lock, "_is_owned", lambda: False)():
+            raise RuntimeError("supervision writes require the serialized operator boundary")
+        with service._lock:
+            if not service.durable:
+                raise RuntimeError("durable collaboration storage is required")
+            provider = service.supervision_provider
+            payload = event["payload"]
+            affected = set(payload.get("targets", []))
+            if payload.get("agent_id"):
+                affected.add(payload["agent_id"])
+            new_agent = payload.get("agent", {})
+            if new_agent.get("supervisor_id"):
+                affected.add(new_agent["supervisor_id"])
+            rooms = {link["room_id"] for link in provider.links()
+                     if link["job_id"] == payload.get("job_id")
+                     or affected.intersection(link["agent_ids"])} if provider else set()
+            if payload.get("room_id"):
+                rooms.add(payload["room_id"])
+            if (event["event_type"] in {"created", "delegated", "bound", "checkpoint", "linked"}
+                    or event["event_type"] == "concluded" and payload.get("outcome") == "verified"):
+                self._validate_live_identity(event, rooms)
+            service._commit("supervision_recorded", {
+                "event": copy.deepcopy(event), "room_ids": sorted(rooms),
+                "actor_user_id": payload["actor"]["owner_id"],
+                "actor_agent_id": payload["actor"]["agent_id"]})
+
+    def _validate_live_identity(self, event, room_ids):
+        service = self.service
+        payload, actor = event["payload"], event["payload"]["actor"]
+        proposed = payload.get("agent")
+        records = {n["agent_id"]: n for n in service.supervision_provider.supervision.agents()}
+        if proposed:
+            records[proposed["agent_id"]] = proposed
+        affected = [payload.get("agent_id"), actor["agent_id"]]
+        if proposed:
+            affected.append(proposed["agent_id"])
+        if event["event_type"] == "linked":
+            affected.extend(n["agent_id"] for n in records.values()
+                            if n["job_id"] == payload["job_id"])
+            room = service._rooms.get(payload["room_id"])
+            if not room or (service._member(room, actor["owner_id"]) or {}).get("role") != "owner":
+                raise RuntimeError("current room owner grant required for supervision link")
+        checked = set()
+        while affected:
+            aid = affected.pop()
+            if aid is None or aid in checked:
+                continue
+            checked.add(aid)
+            node, agent = records.get(aid), service._agents.get(aid)
+            if (not node or not agent or agent["owner"] != node["owner_id"]
+                    or agent["owner"] != actor["owner_id"] or agent["status"] != "active"
+                    or service._now() >= agent["expires_at"] or not service._ok(agent["owner"])):
+                raise RuntimeError("current owned collaboration identity required")
+            affected.append(node["supervisor_id"])
+            for rid in room_ids:
+                room = service._rooms.get(rid)
+                grant = service._effective(Principal("agent", aid, agent["owner"]), room) if room else None
+                if grant is None or "read" not in grant[0] or not set(node["policy"]["scopes"]) <= grant[0]:
+                    raise RuntimeError("current inherited collaboration room grant required")
+                profile = service._profile(rid)
+                allowed_models = profile["allowed_models"]
+                if allowed_models is None:
+                    allowed_models = [model["id"] for model in service._catalogue]
+                for key in node["policy"]["models"]:
+                    family, separator, model = key.partition("/")
+                    if (not separator or family not in profile["allowed_families"]
+                            or model not in allowed_models):
+                        raise RuntimeError("current approved family/model policy required")
+
+
 class CollabService:
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
@@ -294,7 +375,8 @@ class CollabService:
                  max_rooms_per_project: int = 50, max_members_per_room: int = 100,
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
-                 approval: ApprovalPolicy | None = None, summary_fix: dict | None = None):
+                 approval: ApprovalPolicy | None = None, summary_fix: dict | None = None,
+                 supervision_provider=None):
         self.auth = authenticator
         try:
             self.summary_fix = summary_fix_config(summary_fix)
@@ -363,6 +445,13 @@ class CollabService:
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
+        self._supervision_records: list[dict] = []
+        if supervision_provider is None:
+            from .supervision_dashboard import SupervisionDashboardProvider
+            from .tab_supervision import Supervision
+            supervision_provider = SupervisionDashboardProvider(
+                Supervision(_CollabSupervisionSink(self), now=self._now))
+        self.supervision_provider = supervision_provider
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -463,11 +552,15 @@ class CollabService:
                     if isinstance(u, str) and u not in self._users:
                         self._users[u] = {"status": "approved", "since": None, "decided_by": "grandfathered",
                                           "decided_at": None, "reason": None}
+            if any(e["event_type"] == "supervision_recorded" for e in parsed):
+                self.supervision_provider.supervision.hydrate(self._supervision_records)
             return len(parsed)
 
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
+        if t == "supervision_recorded":
+            self._supervision_records.append(copy.deepcopy(p["event"]))
         if t == "project_created":
             self._projects[p["project_id"]] = {"name": p["name"], "members": {p["actor_user_id"]: "manager"}}
         elif t == "project_member_added":
@@ -2633,6 +2726,7 @@ class CollabService:
                         "status": "active" if g and a.get("status") == "active" else "removed",
                         "instance_id": a.get("instance_id") if a.get("owner") == pr.id else None,
                         "parent_agent_id": a.get("parent") if a.get("parent") in room["grants"] else None,
+                        "helper_role": (self._helper_by_agent.get(aid) or {}).get("role"),
                         "group": _herd_group(a.get("name", ""))}
                 return nodes[key]
 
@@ -2661,9 +2755,58 @@ class CollabService:
                       for _, tid, t in rows[:self.FLOW_TASKS]]
             spawns = [{"from": "a:" + n["parent_agent_id"], "to": n["id"]} for n in nodes.values()
                       if n["kind"] == "agent" and n.get("parent_agent_id") and "a:" + n["parent_agent_id"] in nodes]
-        return {"room_id": room_id, "seq": self._seq, "nodes": list(nodes.values()),
-                "edges": [{**e, "counts": dict(e["counts"])} for e in edges.values()],
-                "spawns": spawns, "tasks": recent, "untrusted_text": True}
+            flow = {"room_id": room_id, "seq": self._seq, "nodes": list(nodes.values()),
+                    "edges": [{**e, "counts": dict(e["counts"])} for e in edges.values()],
+                    "spawns": spawns, "tasks": recent, "untrusted_text": True}
+            # Current effective grants, not historical task participation, establish visibility.
+            visible = {aid for aid in room["grants"] if (record := self._agents.get(aid))
+                       and record["status"] == "active" and self._effective(
+                           Principal("agent", aid, record["owner"]), room) is not None}
+            scoped_flow = {**flow, "nodes": [n for n in flow["nodes"]
+                                           if n.get("agent_id") in visible]}
+            flow["supervision"] = self.supervision_provider.project(
+                room_id, scoped_flow, pr.id if not pr.is_agent else None)
+            return flow
+
+    @contextmanager
+    def supervision_transaction(self):
+        """Trusted in-process operator only; resolves credentials/grants before entry.
+
+        This grants no authority by itself. Never expose a client-supplied Actor
+        or callable through HTTP. One authoritative process writer is required.
+        """
+        with self._lock:
+            yield self.supervision_provider.supervision
+
+    def room_supervision(self, pr: Principal, room_id: str) -> dict:
+        """Same room authorization and exact collaboration agent IDs as the Flow view."""
+        return self.room_flow(pr, room_id)["supervision"]
+
+    def link_supervision_job(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """Owner-only explicit grouping. This grants no launch or task authority."""
+        self._require_user(pr)
+        if not isinstance(body, dict) or set(body) != {"job_id", "workspace_id"}:
+            raise CollabError(400, "job_id and workspace_id required")
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "supervision.link")
+            if (self._member(room, pr.id) or {}).get("role") != "owner":
+                raise CollabError(403, "only the room owner links a job")
+            records = [n for n in self.supervision_provider.supervision.agents()
+                       if n["job_id"] == body["job_id"]]
+            if not records or any(n["owner_id"] != pr.id for n in records):
+                raise CollabError(404, "job not found")
+            for node in records:
+                agent = self._agents.get(node["agent_id"])
+                if (not agent or agent["owner"] != pr.id or agent["status"] != "active"
+                        or self._effective(Principal("agent", node["agent_id"], pr.id), room) is None):
+                    raise CollabError(409, "job agents require current collaboration room grants")
+            from .tab_supervision import Actor
+            try:
+                return self.supervision_provider.link(
+                    Actor(pr.id, None, frozenset(), frozenset()), body["job_id"],
+                    room_id, body["workspace_id"])
+            except (ValueError, RuntimeError) as exc:
+                raise CollabError(409, "job link conflicts with current grants, model policy or workspace ownership") from exc
 
     def rename_agent(self, pr: Principal, agent_id: str, body: dict) -> dict:
         """Give an agent a new @name. The owner (or the dashboard operator) may; the name must stay unique
@@ -3258,6 +3401,8 @@ class CollabService:
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
+                    if parts[2:] == ["supervision"]:
+                        return 200, self.room_supervision(pr, rid)
                     if parts[2:] == ["flow"]:
                         return 200, self.room_flow(pr, rid)
                     if parts[2:] == ["state"]:
@@ -3272,6 +3417,8 @@ class CollabService:
             elif method in ("PUT", "POST") and n == 3 and parts[0] == "rooms" and parts[2] == "profile":
                 return 200, self.set_room_profile(pr, parts[1], body)
             elif method == "POST":
+                if n == 4 and parts[0] == "rooms" and parts[2:] == ["supervision", "link"]:
+                    return 200, self.link_supervision_job(pr, parts[1], body)
                 if parts == ["me"]:
                     return 200, self.link_identity(pr, body)
                 if parts == ["agents", "connect"]:

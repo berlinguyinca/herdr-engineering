@@ -155,6 +155,7 @@ test('Collaboration uses shared Markdown and composer while preserving authentic
   assert.equal(requests.length, 2);
   assert.equal(await input.inputValue(), '@missing do work');
   await page.getByRole('tab', { name: 'Flow', exact: true }).click();
+  await page.getByText('Task handoffs and legacy helper relationships', { exact: true }).click();
   await page.locator('[data-node="coder-id"]').click();
   assert.equal(await page.getByRole('link', { name: 'Open agent conversation' }).getAttribute('href'), '/#/herd/session/session%3Aone');
   await page.evaluate(() => window.collab.dispose());

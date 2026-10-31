@@ -110,6 +110,11 @@ export class CollabApi {
     return this.call('GET', `/rooms/${encodeURIComponent(room)}/state?since=${since}&cursor=${cursor}&wait=${wait}`, undefined, signal);
   }
   flow(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/flow`); }
+  supervision(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/supervision`); }
+  linkSupervisionJob(room, jobId, workspaceId) {
+    return this.call('POST', `/rooms/${encodeURIComponent(room)}/supervision/link`,
+      {job_id: jobId, workspace_id: workspaceId});
+  }
   linkAgent(agentId, instanceId) { return this.call('POST', `/agents/${encodeURIComponent(agentId)}/link`, { instance_id: instanceId || null }); }
   createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
   joinTokens() { return this.call('GET', '/agents/join-tokens'); }

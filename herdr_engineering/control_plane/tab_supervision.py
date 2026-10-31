@@ -164,7 +164,9 @@ class Supervision:
                 "agent_id": agent_id, "supervisor_id": parent["agent_id"] if parent else None,
                 "task_id": task_id, "policy": p, "binding": None, "status": "queued",
                 "used_tokens": 0, "progress": 0, "heartbeat_at": when,
-                "progress_at": when, "evidence_ref": None}
+                "progress_at": when, "evidence_ref": None,
+                "room_id": parent["room_id"] if parent else None,
+                "workspace_id": parent["workspace_id"] if parent else None}
 
     def create_job(self, actor, job_id, tab_id, agent_id, task_id, policy):
         with self._lock:
@@ -183,6 +185,61 @@ class Supervision:
             node = self._new_agent(actor, parent["job_id"], parent["tab_id"],
                                    child_id, task_id, policy, parent)
             self._commit(actor, "delegated", {"agent": node}, at=node["heartbeat_at"])
+
+    def link_job(self, actor, job_id, room_id, workspace_id):
+        """Associate an existing job with its collaboration room/workspace.
+
+        The trusted operator constructs ``actor`` after authenticating the human.
+        Links are immutable in this checkpoint; adoption or migration requires a
+        separate explicit contract rather than layout inference.
+        """
+        with self._lock:
+            if actor.agent_id is not None:
+                raise ValueError("only authenticated human links jobs")
+            for value in (actor.owner_id, job_id, room_id, workspace_id):
+                _text(value)
+            rows = [node for node in self._agents.values() if node["job_id"] == job_id]
+            if not rows:
+                raise ValueError("unknown job")
+            root = next((node for node in rows if node["supervisor_id"] is None), None)
+            if root is None or root["owner_id"] != actor.owner_id:
+                raise ValueError("owner mismatch")
+            current = (root["room_id"], root["workspace_id"])
+            requested = (room_id, workspace_id)
+            if current == requested:
+                return
+            if current != (None, None):
+                raise ValueError("job collaboration link is immutable")
+            for node in self._agents.values():
+                if node["job_id"] == job_id or node.get("room_id") is None:
+                    continue
+                if ((node["room_id"] == room_id) != (node["workspace_id"] == workspace_id)):
+                    raise ValueError("one collaboration room maps to one workspace")
+            self._commit(actor, "linked", {"job_id": job_id, "room_id": room_id,
+                                            "workspace_id": workspace_id})
+
+    def job_links(self):
+        """Return detached authoritative room/workspace links for integration validation."""
+        with self._lock:
+            roots = [node for node in self._agents.values()
+                     if node["supervisor_id"] is None and node.get("room_id")]
+            return deepcopy([{
+                "job_id": root["job_id"], "room_id": root["room_id"],
+                "workspace_id": root["workspace_id"], "root_agent_id": root["agent_id"],
+                "owner_id": root["owner_id"],
+                "agent_ids": sorted(node["agent_id"] for node in self._agents.values()
+                                    if node["job_id"] == root["job_id"]),
+            } for root in sorted(roots, key=lambda node: node["job_id"])])
+
+    def job_agent_ids(self, job_id):
+        """Return detached stable identities for pre-link collaboration validation."""
+        _text(job_id)
+        with self._lock:
+            rows = sorted(node["agent_id"] for node in self._agents.values()
+                          if node["job_id"] == job_id)
+            if not rows:
+                raise ValueError("unknown job")
+            return rows
 
     def bind(self, actor, agent_id, binding):
         with self._lock:
@@ -304,6 +361,10 @@ class Supervision:
         if kind in {"created", "delegated"}:
             n = deepcopy(p["agent"])
             self._agents[n["agent_id"]] = n
+        elif kind == "linked":
+            for node in self._agents.values():
+                if node["job_id"] == p["job_id"]:
+                    node.update(room_id=p["room_id"], workspace_id=p["workspace_id"])
         elif kind == "stopping":
             for aid in p["targets"]:
                 self._get(aid).update(status="stop_requested", stop_reason=p["reason"])
@@ -351,7 +412,7 @@ class Supervision:
                         or event.get("sequence") != candidate._seq + 1):
                     raise ValueError("invalid supervision history version/sequence/identity")
                 try:
-                    candidate._replay(event)
+                    candidate._replay(deepcopy(event))
                 except (KeyError, TypeError, OverflowError) as exc:
                     raise ValueError("malformed supervision history") from exc
             self._agents, self._receipts, self._binding_owners, self._seq = (
@@ -366,6 +427,10 @@ class Supervision:
         self._now = lambda: timestamp
         if kind in {"created", "delegated"}:
             n = p["agent"]
+            # Version 1 histories written before room/workspace linking did not
+            # carry these additive fields. Their absence means explicitly unlinked.
+            n.setdefault("room_id", None)
+            n.setdefault("workspace_id", None)
             q = n["policy"]
             policy = Policy(frozenset(q["scopes"]), frozenset(q["models"]),
                             q["token_limit"], q["deadline"])
@@ -379,6 +444,8 @@ class Supervision:
                 self.delegate(actor, n["agent_id"], n["task_id"], policy)
             if self._get(n["agent_id"]) != n:
                 raise ValueError("creation history mismatch")
+        elif kind == "linked":
+            self.link_job(actor, p["job_id"], p["room_id"], p["workspace_id"])
         elif kind == "stopping":
             if not p["targets"]:
                 raise ValueError("empty stop history")

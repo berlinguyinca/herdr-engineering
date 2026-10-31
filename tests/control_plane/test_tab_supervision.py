@@ -320,3 +320,68 @@ def test_rebinding_does_not_release_historical_workload_identity(tree):
     restored.hydrate(sink.events)
     with pytest.raises(ValueError):
         restored.bind(human(), "r2", Binding("server", "s", "i", "pi", "tab2", "wD:p7"))
+
+
+def test_human_links_existing_job_to_room_and_workspace_durably(tree):
+    s, sink = tree
+    s.link_job(human(), "job", "room-1", "workspace-1")
+    assert s.view("root")["room_id"] == "room-1"
+    assert s.view("root")["workspace_id"] == "workspace-1"
+    restored = Supervision(sink, now=lambda: 10)
+    restored.hydrate(sink.events)
+    assert restored.view("root")["room_id"] == "room-1"
+    assert restored.view("root")["workspace_id"] == "workspace-1"
+
+
+def test_job_link_is_owner_authorized_immutable_and_shared_by_descendants(tree):
+    s, sink = tree
+    child(s)
+    with pytest.raises(ValueError):
+        s.link_job(agent(), "job", "room-1", "workspace-1")
+    with pytest.raises(ValueError):
+        s.link_job(human("other"), "job", "room-1", "workspace-1")
+    s.link_job(human(), "job", "room-1", "workspace-1")
+    assert s.view("child")["room_id"] == "room-1"
+    with pytest.raises(ValueError):
+        s.link_job(human(), "job", "room-2", "workspace-2")
+    assert len(sink.events) == 3
+
+
+def test_duplicate_identical_job_link_is_idempotent(tree):
+    s, sink = tree
+    s.link_job(human(), "job", "room-1", "workspace-1")
+    count = len(sink.events)
+    s.link_job(human(), "job", "room-1", "workspace-1")
+    assert len(sink.events) == count
+
+
+def test_job_link_sink_failure_does_not_publish_partial_association(tree):
+    s, sink = tree
+    sink.fail = True
+    with pytest.raises(OSError):
+        s.link_job(human(), "job", "room-1", "workspace-1")
+    assert s.view("root")["room_id"] is None
+    assert s.job_links() == []
+
+
+def test_pre_link_history_without_room_fields_still_replays(tree):
+    _, sink = tree
+    legacy = deepcopy(sink.events)
+    legacy[0]["payload"]["agent"].pop("room_id")
+    legacy[0]["payload"]["agent"].pop("workspace_id")
+    restored = Supervision(sink, now=lambda: 10)
+    restored.hydrate(legacy)
+    assert restored.view("root")["room_id"] is None
+    assert restored.view("root")["workspace_id"] is None
+
+
+def test_room_and_workspace_form_one_explicit_group(tree):
+    s, _ = tree
+    s.link_job(human(), "job", "room-1", "workspace-1")
+    s.create_job(human(), "job-2", "server/tab-2", "root-2", "task-2", policy())
+    with pytest.raises(ValueError):
+        s.link_job(human(), "job-2", "room-1", "workspace-2")
+    with pytest.raises(ValueError):
+        s.link_job(human(), "job-2", "room-2", "workspace-1")
+    s.link_job(human(), "job-2", "room-1", "workspace-1")
+    assert s.view("root-2")["workspace_id"] == "workspace-1"
