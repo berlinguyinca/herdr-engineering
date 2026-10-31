@@ -274,3 +274,26 @@ The Pi side is built in **berlinguyinca/pi-engineering**, not herdr-engineering.
 - **Extension responsibilities:** register assistant tools (`assistant_ask`, `action_request`, `assignments_next`, `report`, read tools); gate `pi.on("tool_call")` through the hub using the same canonical action format and the same rule (allow only on active grant, deny only on veto, else fall through); post-tool observation for evidence (Pi has no approval prompt, so "owner answered" does not exist in Pi: **Pi workers produce no approval evidence**, only outcomes; learning for Pi actions comes from the other harnesses' answers to the same action keys **(my call, owner to confirm)**); an enrollment command that stores the worker credential in pi-engineering's own config location, never in files in the repo.
 - **Fall-through for Pi when the hub is unreachable (open, section 14 question):** with no prompt to fall back to, default **block only fixed vetoes and allow the rest**, configurable per worker.
 - **Delivery:** its own phase 1d with its own PRs in pi-engineering; pi-engineering has its own CI (Woodpecker was only just activated and no required checks yet), review and merge rules apply per repo; no merge without the owner's word.
+
+## 16. Approval and direction of travel (owner, 2026-10-30)
+
+Quoted: *"yes i'm happy with this and remember we want the assistant to learn, not the harness. Eventually the assistant is supposed to drive all of our harnesses based on specs and emails it receives, with tasks assigned to it."* Sections 1-15 are approved.
+
+### 16.1 The assistant learns; harnesses stay thin
+
+- All learned state (evidence, counts, grants, judge scores, calibration, memory of owner preferences) lives **only in the hub's store**. Harness-side code (hooks, the Pi extension, the OpenCode plugin) is a stateless relay: it observes, forwards, and applies a decision the hub returned. It keeps no grants, no counters, no cached "allow" lists, and no local learning files.
+- Consequently a new harness or a freshly installed worker inherits everything already learned, and removing a harness loses nothing. A hook that cannot reach the hub never "remembers" an earlier allow; it falls through to the owner's prompt (or the Pi rule in 15.2).
+- Testable invariant: the harness adapters contain no persistence of decisions; tests assert the hook relay writes nothing but its own log/diagnostics.
+
+### 16.2 Direction: the assistant drives the harnesses
+
+Target end state (not in the first phases, but the design must not paint it into a corner):
+
+- **Inputs the assistant receives:** specs (documents/repos), emails, and tasks assigned to it (by the owner, routines, or other systems).
+- **Outputs:** assignments dispatched to workers of any harness (`assignments_next`, plus later push via `claude -p`/`codex exec`/`opencode serve`/Pi extension timer), progress and results flowing back through `assignment_update` and `report`, drafts for the owner, and owner-visible digests.
+- **Constraints carried forward now so phase 1-4 do not block it:**
+  - Every assignment has a **source and provenance** (`owner`, `routine`, `email`, `spec`, `task`) and a trust level. Email and spec content is **untrusted data**; it can describe work, but only an owner-originated or owner-confirmed assignment can carry authority, and the fixed vetoes and grants apply to whatever the worker then does.
+  - Assignments name the **worker/harness class** they suit (by capability, e.g. needs hive access, needs GPU, needs Pi), so a dispatcher can choose without the harness learning anything.
+  - The dispatch loop reuses the existing delegation/proposal machinery (`assistant_dispatch.DelegationConsumer`, `source_harness`) where it fits instead of a second queue.
+  - Outbound email follows the same verb split as everything else (`email.draft` free, `email.send` earned, scoped by recipient).
+- **Not in scope of this plan:** the email/spec ingestion connectors and the autonomous dispatcher. They get their own design after phase 4, building on the assignment model above.
