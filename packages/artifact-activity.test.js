@@ -151,3 +151,9 @@ test('dispose removes listeners and content', async () => {
   assert.equal(container.innerHTML, '');
   assert.equal(container.listenerCount(), 0);
 });
+
+test('sparse attempts, history rows and files render without the text "undefined"', () => {
+  const html = renderAttempt({ conflict_names: [{}, null] }) + renderHistoryRow({}, {}) + renderDiffFiles({ files: [{}] });
+  assert.doesNotMatch(html, /undefined|null/);
+  assert.match(html, /—/);
+});

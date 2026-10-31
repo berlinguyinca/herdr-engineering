@@ -396,10 +396,16 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
 
   // Collaborators and Activity mount on first use; each owns its pane, listeners and one-time values.
   const mounted = {};
-  let activityHandle = null;
+  let activityHandle = null, currentTab = 'links';
   const showTab = key => {
     const pane = name => container.querySelector?.(`[data-panel-pane="${name}"]`);
     if (!pane(key)) return;
+    // Leaving Collaborators drops the one-time invite code and disarms the Restrict all confirm.
+    if (currentTab === 'collaborators' && key !== 'collaborators') {
+      mounted.collaborators?.controller.closeInvite();
+      mounted.collaborators?.controller.cancelRestrict();
+    }
+    currentTab = key;
     if (key === 'collaborators' && !mounted.collaborators) mounted.collaborators = mountCollaborators(pane(key), client, collabApi, artifactId, { signal });
     if (key === 'activity' && !mounted.activity) mounted.activity = activityHandle = mountActivity(pane(key), client, artifactId, { versions: ctrl.state.versions, signal });
     for (const [name] of TABS) {

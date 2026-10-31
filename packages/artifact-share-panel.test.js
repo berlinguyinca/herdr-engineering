@@ -699,7 +699,7 @@ function withPanes(container) {
   const pane = name => (panes[name] ||= (() => {
     const node = { hidden: name !== 'links', html: '', listeners: {}, isConnected: true,
       get innerHTML() { return node.html; }, set innerHTML(v) { node.html = String(v); },
-      replaceChildren() { node.html = ''; }, querySelector: () => null, contains: () => true,
+      replaceChildren() { node.html = ''; node.input = null; }, querySelector: sel => (sel === '[data-invite-code]' && node.html.includes('data-invite-code') ? (node.input ||= { value: '' }) : null), contains: () => true,
       addEventListener(type, fn) { (node.listeners[type] ||= new Set()).add(fn); },
       removeEventListener(type, fn) { node.listeners[type]?.delete(fn); } };
     return node;
@@ -742,5 +742,36 @@ test('a 503 on the Collaborators tab shows the notice and the Links tab keeps wo
   container.tabClick('links');
   assert.equal(container.panes.links.hidden, false);
   assert.match(container.innerHTML, /data-share-action="review"/);
+  panel.dispose();
+});
+
+test('leaving the Collaborators tab drops the one-time invite code and disarms Restrict all', async () => {
+  const container = withPanes(fakeContainer());
+  const restricted = [];
+  const client = { ...fakeClient(), listArtifactCollaborators: async () => ({ writable: true, collaborators: [], pending_invites: [] }),
+    grantArtifactInvite: async () => ({}), restrictArtifactCollab: async () => { restricted.push(1); return {}; } };
+  const collabApi = { agents: async () => ({ agents: [] }), rooms: async () => ({ rooms: [{ room_id: 'r1', name: 'R' }] }), inviteExternal: async () => ({ invite_id: 'i1', code: 'SECRET-CODE', expires_at: 1900000000 }) };
+  const panel = mountSharePanel(container, client, 'art1', { versions, headVersionId: 'v2', collabApi });
+  container.tabClick('collaborators');
+  await tick(); await tick();
+  const pane = container.panes.collaborators;
+  const paneClick = data => { for (const fn of pane.listeners.click) fn({ target: { closest: s => { const k = s.match(/^\[data-([a-z-]+)\]$/)[1].replace(/-([a-z])/g, (_, c) => c.toUpperCase()); return k in data ? { dataset: data, disabled: false } : null; } } }); };
+  for (const fn of pane.listeners.change) fn({ target: { closest: s => (s === '[data-collab-field]' ? { dataset: { collabField: 'room' }, value: 'r1' } : null) } });
+  paneClick({ collabAction: 'invite' });
+  await tick(); await tick(); await tick();
+  assert.equal(pane.querySelector('[data-invite-code]').value, 'SECRET-CODE');
+  paneClick({ collabAction: 'restrict' });
+  assert.match(pane.html, /restrict-confirm/);
+  for (const away of ['links', 'activity']) {
+    container.tabClick('collaborators');
+    paneClick({ collabAction: 'invite' }); await tick(); await tick(); await tick();
+    assert.ok(pane.querySelector('[data-invite-code]'));
+    container.tabClick(away);
+    assert.equal(pane.querySelector('[data-invite-code]'), null);
+    assert.doesNotMatch(pane.html, /SECRET-CODE/);
+  }
+  container.tabClick('collaborators');
+  assert.doesNotMatch(pane.html, /restrict-confirm/);
+  assert.equal(restricted.length, 0);
   panel.dispose();
 });

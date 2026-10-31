@@ -19,17 +19,19 @@ export function formatWhen(value) {
   return text.replace('T', ' ').slice(0, 19);
 }
 
+// Missing fields show an em dash instead of the text "undefined".
+export const show = value => (value === null || value === undefined || value === '' ? '—' : esc(value));
 const agentLabel = agent => agent.name || agent.display_name || agent.agent_id;
 const disabledAttr = on => (on ? ' disabled' : '');
 
 export function renderCollaboratorRow(c, { busy = false } = {}) {
-  return `<tr data-collab-row><td>${esc(c.display_name || c.agent_id)}<br><code>${esc(c.agent_id)}</code></td>`
-    + `<td>${esc(c.permission)}</td><td><time>${esc(formatWhen(c.expires_at))}</time></td>`
+  return `<tr data-collab-row><td>${show(c.display_name || c.agent_id)}<br><code>${show(c.agent_id)}</code></td>`
+    + `<td>${show(c.permission)}</td><td><time>${show(formatWhen(c.expires_at))}</time></td>`
     + `<td><time>${esc(formatWhen(c.last_used_at) || 'never')}</time></td><td>${esc(c.commits ?? 0)}</td><td>${esc(c.conflicts ?? 0)}</td>`
-    + `<td><button type="button" class="hd-btn" data-collab-action="revoke" data-agent-id="${esc(c.agent_id)}"${disabledAttr(busy)}>Revoke</button></td></tr>`;
+    + `<td><button type="button" class="hd-btn" data-collab-action="revoke" data-agent-id="${esc(c.agent_id ?? '')}"${disabledAttr(busy)}>Revoke</button></td></tr>`;
 }
 
-const renderPending = invite => `<li data-collab-pending><code>${esc(invite.invite_id)}</code> · ${esc(invite.permission)} · expires <time>${esc(formatWhen(invite.expires_at))}</time></li>`;
+const renderPending = invite => `<li data-collab-pending><code>${show(invite.invite_id)}</code> · ${show(invite.permission)} · expires <time>${show(formatWhen(invite.expires_at))}</time></li>`;
 
 export function renderCollaboratorList(state) {
   const rows = state.collaborators || [];
@@ -48,7 +50,7 @@ const permissionSelect = (field, value, { writable, writableReason }) => `<selec
 export function renderGrantForm(state) {
   const form = state.form || {};
   const picker = Array.isArray(state.agents)
-    ? `<select class="hd-input" data-collab-field="agent_id" aria-label="Agent"><option value="">Select an agent</option>${state.agents.map(a => `<option value="${esc(a.agent_id)}"${form.agent_id === a.agent_id ? ' selected' : ''}>${esc(agentLabel(a))}</option>`).join('')}</select>`
+    ? `<select class="hd-input" data-collab-field="agent_id" aria-label="Agent"><option value="">Select an agent</option>${state.agents.map(a => `<option value="${esc(a.agent_id ?? '')}"${form.agent_id === a.agent_id ? ' selected' : ''}>${show(agentLabel(a))}</option>`).join('')}</select>`
     : `<input class="hd-input" type="text" data-collab-field="agent_id" value="${esc(form.agent_id ?? '')}" placeholder="Agent id" aria-label="Agent id" autocomplete="off">`;
   return `<fieldset class="hd-card" data-collab-grant><legend>Give an agent access</legend>${picker}`
     + `${permissionSelect('permission', form.permission, state)}${daysInput('days', form.days)}`
@@ -58,11 +60,11 @@ export function renderGrantForm(state) {
 export function renderInviteForm(state) {
   const form = state.form || {};
   const room = Array.isArray(state.rooms)
-    ? `<select class="hd-input" data-collab-field="room" aria-label="Room"><option value="">Select a room</option>${state.rooms.map(r => `<option value="${esc(r.room_id)}"${form.room === r.room_id ? ' selected' : ''}>${esc(r.name || r.room_id)}</option>`).join('')}</select>`
+    ? `<select class="hd-input" data-collab-field="room" aria-label="Room"><option value="">Select a room</option>${state.rooms.map(r => `<option value="${esc(r.room_id ?? '')}"${form.room === r.room_id ? ' selected' : ''}>${show(r.name || r.room_id)}</option>`).join('')}</select>`
     : `<input class="hd-input" type="text" data-collab-field="room" value="${esc(form.room ?? '')}" placeholder="Room id" aria-label="Room id" autocomplete="off">`;
   return `<fieldset class="hd-card" data-collab-invite-form><legend>Invite a remote agent</legend>`
     + `<p class="hd-note">An invite is bound to one room. The remote agent redeems the code once.</p>${room}`
-    + `<input class="hd-input" type="text" data-collab-field="label" value="${esc(form.label ?? '')}" placeholder="Label" aria-label="Label" autocomplete="off">`
+    + `<input class="hd-input" type="text" data-collab-field="label" maxlength="40" value="${esc(form.label ?? '')}" placeholder="Label" aria-label="Label" autocomplete="off">`
     + `${permissionSelect('invite_permission', form.permission, state)}${daysInput('invite_days', form.days)}`
     + `<button type="button" class="hd-btn" data-collab-action="invite"${disabledAttr(state.busy)}>Create invite</button></fieldset>`;
 }

@@ -319,3 +319,10 @@ test('dispose removes listeners and the content', async () => {
   assert.equal(container.innerHTML, '');
   assert.equal(container.listenerCount(), 0);
 });
+
+test('sparse objects render an em dash, never the text "undefined"', () => {
+  const html = renderCollaboratorRow({}, {}) + renderInviteForm({ rooms: [{}], form: {} });
+  assert.doesNotMatch(html, /undefined|null/);
+  assert.match(html, /—/);
+  assert.match(renderInviteForm({ rooms: [], form: {} }), /data-collab-field="label"[^>]*maxlength="40"/);
+});
