@@ -8,6 +8,7 @@ attestation is just data). Payloads are redacted and size-capped; the log is cap
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,9 +20,14 @@ if TYPE_CHECKING:  # assistant.py imports this module, so avoid a runtime cycle
 
 EVENT_KINDS: tuple[str, ...] = ("ask", "report", "observation")
 PROVENANCES: tuple[str, ...] = ("worker_reported", "harness_attested")
-MAX_PAYLOAD_BYTES = 16 * 1024
+MAX_PAYLOAD_BYTES = 4 * 1024
 MAX_LIST_LIMIT = 500
 _MAX_SESSION_ID = 128
+_MASK = "***REDACTED***"
+_SECRET_NAME_RE = re.compile(r"(?i)(token|secret|passw(or)?d|api[_-]?key|authorization|credential|cookie)")
+_TOKEN_RE = re.compile(
+    r"sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|hcw_[A-Za-z0-9_-]{10,}|hce_[A-Za-z0-9_-]{10,}"
+    r"|hca_[A-Za-z0-9_-]{10,}|Bearer\s+\S{8,}|Worker\s+\S{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
 
 
 @dataclass
@@ -37,10 +43,50 @@ class WorkerEvent:
     created_at: datetime
 
 
-def record_event(store: AssistantStore, worker: Worker, *, kind: str, provenance: str, session_id: str,
-                 payload: dict[str, Any]) -> WorkerEvent:
+def _scrub(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ValueError("payload keys must be strings")
+            masked = _SECRET_NAME_RE.search(k) is not None and v not in (None, "")
+            key = _TOKEN_RE.sub(_MASK, k)
+            while key in out:
+                key += "_"
+            out[key] = _MASK if masked else _scrub(v)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_scrub(v) for v in value]
+    if isinstance(value, str):
+        return _TOKEN_RE.sub(_MASK, value)
+    return value
+
+
+def scrub_payload(obj: Any) -> Any:
+    """Shared redaction first, then mask token-shaped substrings and secret-looking keys/sub-trees. Returns a copy."""
     from ..assistant import redact_obj
 
+    _scrub_keys_check(obj)
+    return _scrub(redact_obj(obj))
+
+
+def _scrub_keys_check(value: Any) -> None:
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ValueError("payload keys must be strings")
+            _scrub_keys_check(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _scrub_keys_check(v)
+
+
+def event_size(payload: Any) -> int:
+    return len(json.dumps(payload, default=str).encode("utf-8"))
+
+
+def record_event(store: AssistantStore, worker: Worker, *, kind: str, provenance: str, session_id: str,
+                 payload: dict[str, Any]) -> WorkerEvent:
     if kind not in EVENT_KINDS:
         raise ValueError(f"unknown event kind: {kind!r}")
     if provenance not in PROVENANCES:
@@ -49,9 +95,9 @@ def record_event(store: AssistantStore, worker: Worker, *, kind: str, provenance
         raise ValueError(f"session_id must be 1-{_MAX_SESSION_ID} characters")
     if not isinstance(payload, dict):
         raise ValueError("payload must be an object")
-    safe = redact_obj(payload)
+    safe = scrub_payload(payload)
     try:
-        size = len(json.dumps(safe, ensure_ascii=False, default=str).encode("utf-8"))
+        size = event_size(safe)
     except (TypeError, ValueError) as exc:
         raise ValueError("payload is not serializable") from exc
     if size > MAX_PAYLOAD_BYTES:
@@ -60,12 +106,7 @@ def record_event(store: AssistantStore, worker: Worker, *, kind: str, provenance
         event_id="evt_" + secrets.token_hex(8), tenant_id=worker.tenant_id, user_id=worker.user_id,
         worker_id=worker.worker_id, session_id=session_id, kind=kind, provenance=provenance, payload=safe,
         created_at=datetime.now(UTC))
-    with store._lock:
-        store.worker_events[event.event_id] = event
-        own = [e.event_id for e in store.worker_events.values() if e.tenant_id == worker.tenant_id]
-        for old in own[:max(0, len(own) - store.max_events_per_tenant)]:
-            del store.worker_events[old]
-        store._after_mutation()
+    store.add_worker_event(event)
     return event
 
 

@@ -4,7 +4,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from herdr_engineering.control_plane.assistant import AssistantStore
-from herdr_engineering.control_plane.assistant_hub.events import list_events, record_event
+from herdr_engineering.control_plane.assistant_hub.events import (
+    list_events,
+    record_event,
+    scrub_payload,
+)
 from herdr_engineering.control_plane.assistant_hub.workers import WorkerRegistry
 
 
@@ -59,7 +63,7 @@ def test_oversize_payload_rejected():
     store, reg = make()
     w = worker(reg)
     with pytest.raises(ValueError):
-        rec(store, w, payload={"x": "a" * (16 * 1024)})
+        rec(store, w, payload={"x": "a" * 4096})
     assert list_events(store, tenant_id="t1", user_id="u1") == []
     rec(store, w, payload={"x": "a" * 1000})
 
@@ -93,7 +97,7 @@ def test_events_survive_snapshot_restore():
 
 def test_retention_cap_per_tenant():
     store, reg = make()
-    assert store.max_events_per_tenant == 10_000
+    assert store.max_events_per_tenant == 1000
     store.max_events_per_tenant = 5
     w, other = worker(reg), worker(reg, tenant="t2", device="d2")
     keep = rec(store, other)
@@ -102,3 +106,65 @@ def test_retention_cap_per_tenant():
     assert got == ids[::-1][:5]
     assert [e.event_id for e in list_events(store, tenant_id="t2", user_id="u1")] == [keep.event_id]
     assert sum(1 for e in store.worker_events.values() if e.tenant_id == "t1") == 5
+
+
+def test_scrub_masks_token_shaped_values_with_innocuous_keys():
+    out = scrub_payload({
+        "a": "sk-abcdefghijklmnop123456", "b": "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        "f": "Bearer abcdefghijklmnop12345", "w": "Worker hcw_abcdefghij12",
+        "j": "eyJabcdefghijk.eyJabcdefghijk.sig", "m": "see hca_abcdefghij12 and hce_abcdefghij12 ok"})
+    blob = json.dumps(out)
+    for leak in ("sk-abc", "ghp_abc", "Bearer abc", "hcw_abc", "eyJabc", "hca_abc", "hce_abc"):
+        assert leak not in blob
+    assert out["m"] == "see ***REDACTED*** and ***REDACTED*** ok"
+
+
+def test_scrub_recurses_lists_and_tuples():
+    out = scrub_payload({"x": [{"y": ("sk-abcdefghijklmnop123456", "fine")}], "t": ("ghp_" + "a" * 30,)})
+    assert out == {"x": [{"y": ["***REDACTED***", "fine"]}], "t": ["***REDACTED***"]}
+
+
+def test_scrub_masks_secret_looking_keys_and_secret_named_subtrees():
+    out = scrub_payload({"sk-abcdefghijklmnop123456": 1, "Cookie": {"a": ["x", {"b": "c"}]},
+                         "API_KEY": ["one", "two"], "password": {"deep": "v"}})
+    assert out == {"***REDACTED***": 1, "Cookie": "***REDACTED***", "API_KEY": "***REDACTED***",
+                   "password": "***REDACTED***"}
+
+
+def test_scrub_leaves_harmless_values_and_rejects_non_string_keys():
+    harmless = {"n": 3, "ok": True, "none": None, "s": "hello world", "l": [1, "two", {"k": "v"}]}
+    assert scrub_payload(harmless) == harmless
+    with pytest.raises(ValueError):
+        scrub_payload({1: "x"})
+    with pytest.raises(ValueError):
+        scrub_payload({"a": [{2: "x"}]})
+
+
+def test_record_event_scrubs_stored_payload():
+    store, reg = make()
+    e = rec(store, worker(reg), payload={"a": "sk-abcdefghijklmnop123456"})
+    assert e.payload == {"a": "***REDACTED***"}
+
+
+def test_byte_budget_drops_oldest_and_spares_other_tenants():
+    store, reg = make()
+    w, other = worker(reg), worker(reg, tenant="t2", device="d2")
+    keep = rec(store, other, payload={"x": "z" * 100})
+    store.max_event_bytes_per_tenant = 450
+    ids = [rec(store, w, payload={"x": "y" * 100}).event_id for _ in range(6)]
+    got = [e.event_id for e in list_events(store, tenant_id="t1", user_id="u1", limit=500)]
+    assert 0 < len(got) < 6 and got == ids[::-1][:len(got)]
+    assert store._event_bytes["t1"] <= 450
+    assert [e.event_id for e in list_events(store, tenant_id="t2", user_id="u1")] == [keep.event_id]
+
+
+def test_index_rebuilt_after_restore_so_caps_still_apply():
+    store, reg = make()
+    w = worker(reg)
+    for i in range(4):
+        rec(store, w, payload={"i": i})
+    fresh = AssistantStore()
+    fresh.restore(store.snapshot())
+    fresh.max_events_per_tenant = 3
+    rec(fresh, w)
+    assert len(list_events(fresh, tenant_id="t1", user_id="u1", limit=500)) == 3

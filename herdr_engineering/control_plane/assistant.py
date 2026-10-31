@@ -43,7 +43,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .assistant_hub.events import WorkerEvent
+from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_hub.workers import Enrollment, Worker
 from .inference_models import RETRY_CODES, ModelResolver
 from .reminders import REMINDER_TOOLS, ReminderError
@@ -1665,7 +1665,10 @@ class AssistantStore:
         self.workers: dict[str, Worker] = {}
         self.enrollments: dict[str, Enrollment] = {}
         self.worker_events: dict[str, WorkerEvent] = {}   # insertion order == oldest first
-        self.max_events_per_tenant = 10_000
+        self.max_events_per_tenant = 1000
+        self.max_event_bytes_per_tenant = 4 * 1024 * 1024
+        self._event_index: dict[str, dict[str, int]] = {}   # tenant -> {event_id: size}, oldest first
+        self._event_bytes: dict[str, int] = {}
         self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
         self._audit: list[dict[str, Any]] = []
         # (entry) -> None. Wired by the control plane to the repo event store so every entry is durable BEFORE it is
@@ -1766,12 +1769,33 @@ class AssistantStore:
                                 (self._e_from_dict(Enrollment, d) for d in snap.get("enrollments", []))}
             self.worker_events = {x.event_id: x for x in
                                   (self._e_from_dict(WorkerEvent, d) for d in snap.get("worker_events", []))}
+            self._event_index, self._event_bytes = {}, {}
+            for x in self.worker_events.values():
+                self._index_event(x)
             self._routine_fired = set(snap.get("routine_fired", []))
             kept = {e.get("event_id") for e in snap.get("audit", [])}
             merged = [dict(e) for e in snap.get("audit", [])]
             merged += [e for e in self._audit if e.get("event_id") not in kept]   # restore never drops a live entry
             merged.sort(key=lambda e: (str(e.get("timestamp", "")), str(e.get("tenant_id", "")), int(e.get("seq", 0))))
             self._audit = merged
+
+    def _index_event(self, event: WorkerEvent) -> None:
+        size = event_size(event.payload)
+        self._event_index.setdefault(event.tenant_id, {})[event.event_id] = size
+        self._event_bytes[event.tenant_id] = self._event_bytes.get(event.tenant_id, 0) + size
+
+    def add_worker_event(self, event: WorkerEvent) -> None:
+        """Insert, then drop the tenant's oldest events until both the count and byte budgets hold."""
+        with self._lock:
+            self.worker_events[event.event_id] = event
+            self._index_event(event)
+            idx = self._event_index[event.tenant_id]
+            while len(idx) > 1 and (len(idx) > self.max_events_per_tenant
+                                    or self._event_bytes[event.tenant_id] > self.max_event_bytes_per_tenant):
+                old = next(iter(idx))
+                self._event_bytes[event.tenant_id] -= idx.pop(old)
+                del self.worker_events[old]
+            self._after_mutation()
 
     def persist(self) -> None:
         if not self._persist_path:
