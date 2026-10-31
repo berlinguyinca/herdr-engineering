@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -245,6 +246,61 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "inbox_watch": inbox_watch_config(section.get("inbox_watch")),
         # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
         "apps": apps_config(section.get("apps")),
+        # Tailnet-only MCP hub: off unless enabled; the tenant defaults to the section's default tenant.
+        "hub": _hub_config(section.get("hub"), default_tenant),
+    }
+
+
+_HUB_KEYS = {"enabled", "host", "port", "allowed_networks", "allowed_hosts", "enrollment_ttl_seconds",
+             "worker_ttl_days", "tenant"}
+_HUB_DEFAULT_NETWORKS = ["127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+
+
+def _hub_str_list(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ValueError(f"{where} must be a list of non-empty strings")
+    return [v.strip() for v in value]
+
+
+def _hub_pos_int(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{where} must be a positive integer")
+    return value
+
+
+def _hub_config(raw: Any, default_tenant: str) -> dict[str, Any]:
+    """``personal_assistant.hub``. Off by default. Unknown keys or malformed values stop startup."""
+    where = "control_plane.personal_assistant.hub"
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - _HUB_KEYS
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{where}.enabled must be true or false (not a string)")
+    host = raw.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError(f"{where}.host must be a non-empty string")
+    port = raw.get("port", 9483)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(f"{where}.port must be an integer between 1 and 65535")
+    networks = _hub_str_list(raw.get("allowed_networks", list(_HUB_DEFAULT_NETWORKS)), f"{where}.allowed_networks")
+    for net in networks:
+        try:
+            ipaddress.ip_network(net, strict=True)
+        except ValueError as exc:
+            raise ValueError(f"{where}.allowed_networks has an invalid CIDR {net!r}: {exc}") from exc
+    return {
+        "enabled": enabled,
+        "host": host.strip(),
+        "port": port,
+        "allowed_networks": networks,
+        "allowed_hosts": _hub_str_list(raw.get("allowed_hosts", []), f"{where}.allowed_hosts"),
+        "enrollment_ttl_seconds": _hub_pos_int(raw.get("enrollment_ttl_seconds", 900), f"{where}.enrollment_ttl_seconds"),
+        "worker_ttl_days": _hub_pos_int(raw.get("worker_ttl_days", 90), f"{where}.worker_ttl_days"),
+        "tenant": _tenant_id(raw.get("tenant", default_tenant), "hub.tenant"),
     }
 
 
