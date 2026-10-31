@@ -1,0 +1,23 @@
+{
+  "validation_only": true,
+  "business_ready": false,
+  "existing_root_integration": "pending AssistantService delegation adapter",
+  "role_source_commit": "0ea67580c6926057b41d11b498533219e7adbb61",
+  "task": {
+    "task_id": "grant_01m68dqn040000098t4xb4tdv5",
+    "status": "done",
+    "result": "My assigned role is coordination secretary. No external tools are registered for this task.\n"
+  },
+  "runtime": {
+    "runtime_id": "collab_01m68dmh050000038620fgxc94",
+    "status": "cancelled",
+    "lease_expires_at": null,
+    "checkpoint": {
+      "sequence": 18,
+      "phase": "finished",
+      "output_sha256": null
+    },
+    "launch_attestation": null
+  },
+  "private_context_received": false
+}

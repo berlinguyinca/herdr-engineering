@@ -8,6 +8,8 @@ here re-implements Herdr or another owner system.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import logging
 import os
@@ -37,6 +39,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version",
                         version=f"herdr-eng {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    from .assistant_cli import register as register_assistant_cli
+    register_assistant_cli(sub)
 
     p = sub.add_parser("build-cleanup", help="reclaim stale Rust build caches")
     cleanup_sub = p.add_subparsers(dest="cleanup_command", required=True)
@@ -4435,7 +4440,22 @@ def _cmd_cp_worker(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if effective_argv and effective_argv[0] == "assistant":
+        parse_errors = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(parse_errors):
+                args = parser.parse_args(effective_argv)
+        except SystemExit as exc:
+            if not exc.code:
+                raise
+            lines = [line.strip() for line in parse_errors.getvalue().splitlines() if line.strip()]
+            reason = lines[-1].split("error:", 1)[-1].strip() if lines else "invalid arguments"
+            _print_json({"schema_version": 1, "ok": False,
+                         "error": {"code": "argument_error", "message": reason}})
+            return int(exc.code)
+    else:
+        args = parser.parse_args(effective_argv)
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:
