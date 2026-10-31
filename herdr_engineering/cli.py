@@ -3086,6 +3086,9 @@ def _cmd_cp_assistant_worker(args) -> int:
     except OSError as exc:
         print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
         return 2
+    except ValueError:
+        print("cannot read --api-key-file: not a text file", file=sys.stderr)
+        return 2
 
     def call(method, path, body=None):
         req = urllib.request.Request(f"{base}{path}", method=method, headers={
@@ -3102,6 +3105,8 @@ def _cmd_cp_assistant_worker(args) -> int:
             if not setup.get("supported"):
                 print(f"setup: the {setup.get('harness', args.harness)} harness is not supported yet")
             else:
+                if setup.get("host_is_placeholder"):
+                    print("warning: replace <HUB_HOST> with this machine's tailnet name or address")
                 print(f"redeem: {json.dumps(setup['redeem'])}")
                 print(f"then run: {setup['mcp_add']}")
         elif args.action == "list":
@@ -3535,8 +3540,7 @@ def _cmd_cp_web(args) -> int:
             )
     except Exception:
         logging.exception("self-report of stack services failed")
-    hub_server, hub_registry = _start_assistant_hub(svr.assistant)
-    svr.assistant_workers = hub_registry     # the SAME registry the hub authenticates against; None while the hub is off
+    hub_server = _wire_assistant_hub(svr)
     if hub_server is not None:
         logging.info("assistant hub listening on %s:%s", hub_server.host, hub_server.port)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
@@ -3992,6 +3996,13 @@ def _start_assistant_hub(service):
         raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
     server.start()
     return server, registry
+
+
+def _wire_assistant_hub(svr):
+    """Start the hub (when enabled) and hand the owner API the SAME registry the hub authenticates against."""
+    hub_server, registry = _start_assistant_hub(svr.assistant)
+    svr.assistant_workers = registry
+    return hub_server
 
 
 def _assistant_config(cp):

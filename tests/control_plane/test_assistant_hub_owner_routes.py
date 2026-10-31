@@ -89,7 +89,7 @@ def test_create_enrollment_requires_operator_key(world):
     assert set(body) == {"enrollment_id", "code", "expires_at", "setup"}
     assert body["code"] and body["enrollment_id"]
     assert body["setup"] == {
-        "supported": True, "harness": "claude",
+        "supported": True, "harness": "claude", "host_is_placeholder": False,
         "redeem": {"method": "POST", "path": "/assistant/enroll",
                    "body": {"code": "<CODE>", "device_id": "<DEVICE>"}},
         "mcp_add": 'claude mcp add --transport http herdr-assistant http://100.64.0.9:9483/assistant/mcp '
@@ -248,3 +248,125 @@ def test_hub_listener_404_for_owner_paths(world):
 def test_server_uses_the_shared_registry(world):
     _, _, registry, svr = world
     assert svr.assistant_workers is registry
+
+
+# ---------------------------------------------------------------- fix round 1
+def _server_with_hub(sink, hub_cfg):
+    section = {"enabled": True, "hub": {"enabled": True, "port": 9483, **hub_cfg}}
+    svc = AssistantService(config=assistant_config({"personal_assistant": section}))
+    registry = WorkerRegistry(svc.store, enrollment_ttl=timedelta(minutes=10), worker_ttl=timedelta(days=30))
+    svr = ControlPlaneServer(ControlPlaneRepo(sink=sink), assistant_service=svc, api_keys=ROLES,
+                             assistant_workers=registry)
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    return svr
+
+
+def _setup_for(sink, hub_cfg):
+    svr = _server_with_hub(sink, hub_cfg)
+    try:
+        return enroll(f"http://127.0.0.1:{svr.port}")[1]["setup"]
+    finally:
+        svr.shutdown()
+
+
+@pytest.mark.parametrize("hub_cfg,host,placeholder", [
+    ({"host": "0.0.0.0"}, "<HUB_HOST>", True),
+    ({"host": "::"}, "<HUB_HOST>", True),
+    ({"host": "127.0.0.1"}, "<HUB_HOST>", True),
+    ({"host": "::1"}, "<HUB_HOST>", True),
+    ({"host": "100.64.0.9"}, "100.64.0.9", False),
+    ({"host": "fd7a:115c:a1e0::1"}, "[fd7a:115c:a1e0::1]", False),
+    ({"host": "0.0.0.0", "allowed_hosts": ["localhost", "box.tail1234.ts.net"]}, "box.tail1234.ts.net", False),
+])
+def test_setup_url_host(acknowledged_sink, hub_cfg, host, placeholder):
+    setup = _setup_for(acknowledged_sink, hub_cfg)
+    assert setup["mcp_add"].split()[6] == f"http://{host}:9483/assistant/mcp"
+    assert setup["host_is_placeholder"] is placeholder
+
+
+def test_cli_warns_when_host_is_placeholder(acknowledged_sink, tmp_path, capsys):
+    svr = _server_with_hub(acknowledged_sink, {"host": "0.0.0.0"})
+    try:
+        keyfile = tmp_path / "k"
+        keyfile.write_text(KEYS["alice"])
+        capsys.readouterr()
+        assert cli.main(["control-plane", "assistant-worker", "enroll", "--name", "n", "--harness", "claude",
+                         "--control-plane", f"http://127.0.0.1:{svr.port}", "--api-key-file", str(keyfile)]) == 0
+        assert "replace <HUB_HOST> with this machine's tailnet name or address" in capsys.readouterr().out
+    finally:
+        svr.shutdown()
+
+
+def test_delete_with_hostile_origin_refused(world):
+    base, _, _, _ = world
+    status, _ = call(base, "DELETE", "/api/v1/assistant-workers/x", None,
+                     {"X-API-Key": KEYS["alice"], "Origin": "http://evil.example"})
+    assert status == 403
+
+
+def test_control_character_name_400(world):
+    base, _, _, _ = world
+    assert enroll(base, name="bad\x1b[31mname")[0] == 400
+    assert enroll(base, name="line\nbreak")[0] == 400
+
+
+def test_cli_non_utf8_key_file(world, tmp_path, capsys):
+    base, _, _, _ = world
+    keyfile = tmp_path / "k"
+    keyfile.write_bytes(b"\xff\xfe\x80secret")
+    capsys.readouterr()
+    assert cli.main(["control-plane", "assistant-worker", "list", "--control-plane", base,
+                     "--api-key-file", str(keyfile)]) != 0
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1 and "secret" not in err
+
+
+def test_cli_enroll_unsupported_harness(world, tmp_path, capsys):
+    base, _, _, _ = world
+    keyfile = tmp_path / "k"
+    keyfile.write_text(KEYS["alice"])
+    capsys.readouterr()
+    rc = cli.main(["control-plane", "assistant-worker", "enroll", "--name", "n", "--harness", "emacs",
+                   "--control-plane", base, "--api-key-file", str(keyfile)])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1 and "400" in err
+    rc = cli.main(["control-plane", "assistant-worker", "enroll", "--name", "n", "--harness", "codex",
+                   "--control-plane", base, "--api-key-file", str(keyfile)])
+    out = capsys.readouterr().out
+    assert rc == 0 and "not supported yet" in out and "will not be shown again" in out
+
+
+def test_cli_connection_refused(tmp_path, capsys):
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    keyfile = tmp_path / "k"
+    keyfile.write_text("sekrit-key")
+    capsys.readouterr()
+    assert cli.main(["control-plane", "assistant-worker", "list", "--control-plane", f"http://127.0.0.1:{port}",
+                     "--api-key-file", str(keyfile)]) != 0
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1 and "sekrit-key" not in err and "Traceback" not in err
+
+
+def test_cp_web_wiring_shares_the_hub_registry(acknowledged_sink):
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    svc = AssistantService(config=assistant_config({"personal_assistant": {
+        "enabled": True, "hub": {"enabled": True, "host": "127.0.0.1", "port": port,
+                                 "allowed_networks": ["127.0.0.0/8"]}}}))
+    svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), assistant_service=svc, api_keys=ROLES)
+    hub = cli._wire_assistant_hub(svr)
+    try:
+        assert hub is not None and svr.assistant_workers is hub.hub.registry
+    finally:
+        hub.shutdown()
+        svr.shutdown()
+    off = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), api_keys=ROLES)
+    assert cli._wire_assistant_hub(off) is None and off.assistant_workers is None
+    off.shutdown()

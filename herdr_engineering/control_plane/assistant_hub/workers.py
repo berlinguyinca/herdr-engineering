@@ -106,6 +106,8 @@ class WorkerRegistry:
             raise ValueError("user_id must be non-empty")
         if not isinstance(name, str) or not name.strip() or len(name) > _MAX_NAME:
             raise ValueError(f"name must be 1-{_MAX_NAME} characters")
+        if not name.isprintable():
+            raise ValueError("name must not contain control characters")
         code = _CODE_PREFIX + secrets.token_urlsafe(24)
         enrollment = Enrollment(
             enrollment_id="enr_" + secrets.token_hex(8), tenant_id=tenant_id, user_id=user_id, name=name,

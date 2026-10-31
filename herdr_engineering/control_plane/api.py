@@ -2484,7 +2484,7 @@ def _make_handler(server, public=False, operator=False):
             err = self._require("operator")
             if err:
                 return err
-            if resource in ("assistant-apps", "assistant-reminders"):
+            if resource in ("assistant-apps", "assistant-reminders", "assistant-workers"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -4377,15 +4377,42 @@ def _make_handler(server, public=False, operator=False):
                           "not_found": 404, "rate_limited": 429}.get(exc.reason, 502)
                 return self._json({"error": exc.reason if exc.reason in {"not_connected", "needs_attention", "reconnect_needed", "not_set_up", "bad_request", "not_found", "rate_limited"} else "unavailable"}, status)
 
-        _WORKER_SETUP_HARNESSES = frozenset({"claude", "pi", "codex", "opencode"})
+        _SETUP_SUPPORTED = frozenset({"claude"})        # harnesses with a connection snippet in Phase 1
+
+        @staticmethod
+        def _worker_hub_host(hub):
+            """(host, is_placeholder): a host a worker's device can reach. Wildcard/loopback binds are useless there, so
+            use the first non-loopback allowed host, else the literal <HUB_HOST> placeholder. IPv6 is bracketed."""
+            import ipaddress
+
+            def unusable(h):
+                h = (h or "").strip().strip("[]")
+                if not h or h.lower() == "localhost":
+                    return True
+                try:
+                    a = ipaddress.ip_address(h)
+                except ValueError:
+                    return False
+                return a.is_unspecified or a.is_loopback
+
+            def fmt(h):
+                h = h.strip().strip("[]")
+                return f"[{h}]" if ":" in h else h
+            if not unusable(hub.get("host")):
+                return fmt(hub["host"]), False
+            for h in hub.get("allowed_hosts") or []:
+                if isinstance(h, str) and not unusable(h):
+                    return fmt(h), False
+            return "<HUB_HOST>", True
 
         def _worker_setup(self, harness):
             """The harness-specific connection snippet. Placeholders stay literal; the one-time code is never in it."""
-            if harness != "claude":
+            if harness not in self._SETUP_SUPPORTED:
                 return {"supported": False, "harness": harness}
             hub = server.assistant.config.get("hub") or {}
-            url = f"http://{hub.get('host')}:{hub.get('port')}/assistant/mcp"
-            return {"supported": True, "harness": "claude",
+            host, placeholder = self._worker_hub_host(hub)
+            url = f"http://{host}:{hub.get('port')}/assistant/mcp"
+            return {"supported": True, "harness": "claude", "host_is_placeholder": placeholder,
                     "redeem": {"method": "POST", "path": "/assistant/enroll",
                                "body": {"code": "<CODE>", "device_id": "<DEVICE>"}},
                     "mcp_add": f'claude mcp add --transport http herdr-assistant {url} '
@@ -4413,7 +4440,8 @@ def _make_handler(server, public=False, operator=False):
                     name, harness = body.get("name"), body.get("harness")
                     if not isinstance(name, str) or not isinstance(harness, str):
                         return self._json({"error": "name and harness are required strings"}, 400)
-                    if harness not in self._WORKER_SETUP_HARNESSES:
+                    from .assistant_dispatch import HARNESSES
+                    if harness not in HARNESSES:
                         return self._json({"error": f"unknown harness: {harness!r}"}, 400)
                     enrollment, code = registry.create_enrollment(tenant_id=tenant_id, user_id=user_id,
                                                                   name=name, harness=harness)
