@@ -1026,3 +1026,110 @@ def test_remove_tree_requires_a_valid_entry_bound(tree):
     for bad in (True, -1, "5", None):
         assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=bad) is False
     assert cbf.staging_path(root, AGENT, UPL).is_dir()
+
+
+# ----------------------------------------------------------------------------- stream_new_beneath (mirror blobs)
+
+def _chunks(*parts):
+    yield from parts
+
+
+def test_stream_new_beneath_writes_creates_dirs_with_modes(tmp_path):
+    root = tmp_path / "m"
+    root.mkdir()
+    old = os.umask(0o077)
+    try:
+        assert cbf.stream_new_beneath(root, ["a", "b"], "f", _chunks(b"he", b"llo"), max_bytes=10,
+                                      accept=cbf.utf8_accept()) is True
+    finally:
+        os.umask(old)
+    assert (root / "a" / "b" / "f").read_bytes() == b"hello"
+    assert stat.S_IMODE(os.stat(root / "a").st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(root / "a" / "b").st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(root / "a" / "b" / "f").st_mode) == 0o644
+    assert os.listdir(root / "a" / "b") == ["f"]
+    assert cbf.file_exists_beneath(root, ["a", "b"], "f")
+    assert not cbf.file_exists_beneath(root, ["a", "b"], "g")
+
+
+def test_stream_new_beneath_never_replaces_and_does_not_consume(tmp_path):
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "f").write_bytes(b"old")
+    consumed = []
+
+    def gen():
+        consumed.append(1)
+        yield b"new"
+    assert cbf.stream_new_beneath(tmp_path, ["d"], "f", gen(), max_bytes=10) is True
+    assert (tmp_path / "d" / "f").read_bytes() == b"old" and consumed == []
+
+
+def test_stream_new_beneath_lost_race_keeps_existing(tmp_path, monkeypatch):
+    (tmp_path / "d").mkdir()
+
+    def gen():
+        (tmp_path / "d" / "f").write_bytes(b"winner")      # another writer lands first
+        yield b"loser"
+    assert cbf.stream_new_beneath(tmp_path, ["d"], "f", gen(), max_bytes=10) is True
+    assert (tmp_path / "d" / "f").read_bytes() == b"winner"
+    assert os.listdir(tmp_path / "d") == ["f"]
+
+
+@pytest.mark.parametrize("tmpfile", [True, False])
+def test_stream_new_beneath_rejects_leave_nothing(tmp_path, monkeypatch, tmpfile):
+    if not tmpfile:
+        monkeypatch.setattr(cbf, "_open_tmpfile", lambda dfd: (_ for _ in ()).throw(
+            OSError(errno.EOPNOTSUPP, "no")))
+    (tmp_path / "d").mkdir()
+    assert cbf.stream_new_beneath(tmp_path, ["d"], "bad", _chunks(b"caf\xe9"), max_bytes=10,
+                                  accept=cbf.utf8_accept()) is False
+    assert cbf.stream_new_beneath(tmp_path, ["d"], "cut", _chunks(b"\xc3"), max_bytes=10,
+                                  accept=cbf.utf8_accept()) is False   # truncated multibyte at the end
+    assert cbf.stream_new_beneath(tmp_path, ["d"], "big", _chunks(b"12345", b"67"), max_bytes=6) is False
+
+    def crash():
+        yield b"part"
+        raise RuntimeError("transport died")
+    with pytest.raises(RuntimeError):
+        cbf.stream_new_beneath(tmp_path, ["d"], "crash", crash(), max_bytes=10)
+    assert os.listdir(tmp_path / "d") == []
+
+
+def test_stream_new_beneath_fallback_tmp_is_private(tmp_path, monkeypatch):
+    monkeypatch.setattr(cbf, "_open_tmpfile", lambda dfd: (_ for _ in ()).throw(OSError(errno.EOPNOTSUPP, "no")))
+    (tmp_path / "d").mkdir()
+    modes = []
+
+    def gen():
+        for name in os.listdir(tmp_path / "d"):
+            modes.append(stat.S_IMODE(os.lstat(tmp_path / "d" / name).st_mode))
+        yield b"x"
+    old = os.umask(0)
+    try:
+        assert cbf.stream_new_beneath(tmp_path, ["d"], "f", gen(), max_bytes=10) is True
+    finally:
+        os.umask(old)
+    assert modes == [0o600]
+    assert os.listdir(tmp_path / "d") == ["f"]
+    assert stat.S_IMODE(os.stat(tmp_path / "d" / "f").st_mode) == 0o644
+
+
+def test_stream_new_beneath_never_follows_a_planted_symlink(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "m"
+    root.mkdir()
+    (root / "d").symlink_to(outside)
+    with pytest.raises(OSError):
+        cbf.stream_new_beneath(root, ["d"], "f", _chunks(b"x"), max_bytes=10)
+    (root / "e").mkdir()
+    (root / "e" / "f").symlink_to(outside / "target")
+    assert not cbf.file_exists_beneath(root, ["e"], "f")
+    with pytest.raises(OSError):
+        cbf.stream_new_beneath(root, ["e"], "f", _chunks(b"x"), max_bytes=10)
+    assert list(outside.iterdir()) == []
+    for bad in (["..", "x"], ["a/b"], [""]):
+        with pytest.raises(BridgeError):
+            cbf.stream_new_beneath(root, bad, "f", _chunks(b"x"), max_bytes=10)
+    with pytest.raises(BridgeError):
+        cbf.stream_new_beneath(root, ["e"], "../f", _chunks(b"x"), max_bytes=10)

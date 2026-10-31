@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import codecs
 import errno
 import hashlib
 import io
@@ -428,6 +429,186 @@ def link_new_bytes(dir: Path, name: str, data: bytes, *, mode: int = 0o600) -> b
         return True
     finally:
         os.close(dfd)
+
+
+def file_exists_beneath(root: Path, parts: list[str], name: str) -> bool:
+    """A regular file (never a symlink, at any component) at ``root/parts.../name``; any unsafe component is False."""
+    if not _safe_part(name):
+        return False
+    opened = _open_beneath(Path(root), [*parts, name])
+    if opened is None:
+        return False
+    os.close(opened[0])
+    return True
+
+
+def _make_dirs_beneath(root: Path, parts: list[str], dir_mode: int) -> int:
+    """An fd on ``root/parts...``: every component is created with ``mkdirat`` if missing (then ``fchmod``-ed to
+    ``dir_mode``, so the umask never decides) and always opened ``O_DIRECTORY|O_NOFOLLOW`` from the previous fd.
+    ``BridgeError`` for an unsafe component, ``OSError`` for a symlinked or non-directory one."""
+    if not _safe_parts(parts):
+        raise BridgeError("unsafe path component")
+    dfd = _open_root(Path(root))
+    try:
+        for part in parts:
+            created = True
+            try:
+                os.mkdir(part, 0o700, dir_fd=dfd)
+            except FileExistsError:
+                created = False
+            nfd = _open_subdir(part, dfd)
+            os.close(dfd)
+            dfd = nfd
+            if created:
+                os.fchmod(dfd, dir_mode)
+    except BaseException:
+        os.close(dfd)
+        raise
+    return dfd
+
+
+def make_dirs_beneath(root: Path, parts: list[str], *, dir_mode: int = 0o755) -> None:
+    """Create ``root/parts...`` as ``_make_dirs_beneath`` does (no-follow, created dirs ``fchmod``-ed)."""
+    os.close(_make_dirs_beneath(root, parts, dir_mode))
+
+
+class _Rejected(Exception):
+    """A stream refused by its validator or its size cap: nothing is left behind."""
+
+
+def utf8_accept() -> Callable[[bytes, bool], bool]:
+    """A fresh validator for ``stream_new_beneath``: True while the bytes so far are (a prefix of) valid UTF-8."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+
+    def accept(chunk: bytes, final: bool) -> bool:
+        try:
+            decoder.decode(chunk, final=final)
+        except UnicodeDecodeError:
+            return False
+        return True
+    return accept
+
+
+def _fill(fd: int, chunks, max_bytes: int, accept) -> None:
+    size = 0
+    iterator = iter(chunks)
+    try:
+        for chunk in iterator:
+            chunk = bytes(chunk)
+            size += len(chunk)
+            if size > max_bytes or (accept is not None and not accept(chunk, False)):
+                raise _Rejected
+            _write_all(fd, chunk)
+        if accept is not None and not accept(b"", True):
+            raise _Rejected
+    finally:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            close()
+
+
+def _copy_fd(src: int, dst: int) -> None:
+    offset = 0
+    while block := os.pread(src, 1 << 20, offset):
+        _write_all(dst, block)
+        offset += len(block)
+
+
+def stream_new_beneath(root: Path, parts: list[str], name: str, chunks, *, max_bytes: int,
+                       accept: Callable[[bytes, bool], bool] | None = None, mode: int = 0o644,
+                       dir_mode: int = 0o755) -> bool:
+    """Create ``root/parts.../name`` from the byte iterable ``chunks`` unless it exists; never replaced, never partial.
+
+    Missing directories are created no-follow with ``dir_mode``. True when the file is present afterwards (written now,
+    already there, or written first by a racing writer: ``chunks`` is not consumed when it already exists). False,
+    leaving nothing behind, when more than ``max_bytes`` arrive or ``accept(chunk, final)`` (e.g. ``utf8_accept()``)
+    refuses the bytes. Any error raised by ``chunks`` propagates, again leaving nothing behind. An existing entry
+    that is not a regular file (a planted symlink) raises ``FileExistsError``.
+
+    The data goes into an unnamed ``O_TMPFILE`` that ``linkat`` names only once complete; without ``O_TMPFILE`` a
+    ``.tmp-<rand>`` (mode 0600 until complete) is linked and unlinked instead. Blocking: run it off the event loop.
+    """
+    if not _safe_part(name) or name.startswith(".tmp-"):
+        raise BridgeError("unsafe file name")
+    dfd = _make_dirs_beneath(root, parts, dir_mode)
+    try:
+        if _file_exists_at(dfd, name):
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                close()
+            return True
+        try:
+            linked = _stream_tmpfile(dfd, name, chunks, max_bytes, accept, mode)
+            if linked is None:
+                linked = _stream_named_tmp(dfd, name, chunks, max_bytes, accept, mode)
+        except _Rejected:
+            return False
+        if not linked:
+            if not _file_exists_at(dfd, name):
+                raise FileExistsError(errno.EEXIST, "an entry that is not a regular file holds the name")
+            return True
+        os.fsync(dfd)
+        return True
+    finally:
+        os.close(dfd)
+
+
+def _file_exists_at(dfd: int, name: str) -> bool:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError:
+        return False
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+
+
+def _stream_tmpfile(dfd: int, name: str, chunks, max_bytes: int, accept, mode: int) -> bool | None:
+    """The ``O_TMPFILE`` path: True linked, False the name exists, None when ``O_TMPFILE`` is unsupported."""
+    try:
+        fd = _open_tmpfile(dfd)
+    except OSError as exc:
+        if exc.errno in _TMPFILE_FALLBACK:
+            return None
+        raise
+    try:
+        _fill(fd, chunks, max_bytes, accept)
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+        try:
+            os.link(f"/proc/self/fd/{fd}", name, dst_dir_fd=dfd, follow_symlinks=True)
+        except FileExistsError:
+            return False
+        except FileNotFoundError:          # no /proc: the stream is consumed, so copy into a named tmp instead
+            return _link_named(dfd, name, lambda tfd: _copy_fd(fd, tfd), mode)
+        return True
+    finally:
+        os.close(fd)
+
+
+def _stream_named_tmp(dfd: int, name: str, chunks, max_bytes: int, accept, mode: int) -> bool:
+    return _link_named(dfd, name, lambda tfd: _fill(tfd, chunks, max_bytes, accept), mode)
+
+
+def _link_named(dfd: int, name: str, fill: Callable[[int], None], mode: int) -> bool:
+    tmp = _tmp_name()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            fill(fd)
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        _unlink_quiet(tmp, dfd)
 
 
 # ----------------------------------------------------------------------------- root-safe mutation in a hostile tree
@@ -1104,7 +1285,7 @@ def validate_commit_payload(payload: dict, limits: BridgeLimits) -> CommitPayloa
 register_intent_kind("commit", validate_commit_payload, actors=frozenset({"agent"}), requires_artifact=True)
 
 __all__ = [
-    "Actor", "agent_owner_key", "atomic_write_bytes", "atomic_write_json", "AUDITED_MARKER", "BridgeError",
+    "Actor", "agent_owner_key", "file_exists_beneath", "make_dirs_beneath", "stream_new_beneath", "utf8_accept", "atomic_write_bytes", "atomic_write_json", "AUDITED_MARKER", "BridgeError",
     "BridgeLimits", "Change", "Chunk", "CHUNK_BYTES", "CommitPayload", "ENTRY_SLACK", "FEED_MAX_AGE", "Intent",
     "INTENT_MAX_AGE", "IntentError", "link_new_bytes", "list_beneath", "list_parts", "MAX_CHUNK_INDEX",
     "MAX_MESSAGE", "max_parts_for", "MAX_TREE_DEPTH", "MCP_UPLOAD_MAX_BODY", "META_MAX_BYTES", "META_NAME",

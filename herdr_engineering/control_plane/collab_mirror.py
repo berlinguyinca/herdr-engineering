@@ -6,28 +6,39 @@ Layout under the mirror root (worker-owned; mounted read-only into ``collab-publ
     artifacts/<artifact_id>/head.json   manifests of the non-retracted versions, newest first
     artifacts/<artifact_id>/blobs/<sha256>   text files of the head and the previous ``mirror_history_versions``
 
-``head.json`` is written last and atomically, so a reader never sees a manifest whose mirrored blobs are missing, and a
-crash mid-refresh leaves the previous ``head.json`` (and its blobs) in place. Blobs a new ``head.json`` no longer
-references are collected only after the swap, under the artifact's lock. Nothing else in an artifact dir is touched by a
-refresh (plan 4 keeps ``annotations.json`` there); ``remove`` deletes the whole dir.
+Contract for consumers:
 
-Timestamps in ``grants.json`` (``generated_at``, ``expires_at``) are epoch seconds (float). No owner identity
-(``created_by``), storage key or provenance beyond the capped commit message is ever written.
+* ``grants.json`` timestamps (``generated_at``, ``expires_at``) are epoch seconds (float); ``head.json``'s
+  ``created_at`` is an ISO-8601 string.
+* A missing ``head.json`` means the artifact is not listed.
+* A file's ``text`` flag is authoritative only when ``mirrored`` is true (its bytes were checked as UTF-8). For a file
+  that was never downloaded (outside the history window, over a cap, or whose fetch failed) it is a media-type /
+  extension guess.
+* No owner identity (``created_by``), storage key or provenance beyond the capped commit message is ever written.
 
-Every blocking step (RustFS streaming, fsync, directory sweeps) runs in a worker thread. Every write goes through
-fd-relative, no-follow operations or ``atomic_write_json``; every listing and delete goes through
+Refresh order: a ``head.json`` that drops a version (retraction) is written, and its blobs collected, BEFORE any
+download, so a slow or failing RustFS never keeps a retracted version readable. Downloads come next; a blob whose fetch
+fails is listed ``mirrored: false`` (and not retried for ``BAD_BLOB_TTL`` seconds), ``head.json`` is still written and
+the artifact is retried on the next ``sync``. ``head.json`` is always swapped atomically and after the blobs it marks
+mirrored are in place; blobs it no longer references are collected after each swap, under the artifact's lock. Nothing
+else in an artifact dir is touched by a refresh (plan 4 keeps ``annotations.json`` there); ``remove`` deletes the dir.
+
+Every blocking step runs off the event loop: mirror refreshes on the default executor, the small ``grants.json`` write
+on a dedicated single thread so its heartbeat never queues behind a long download or sweep. Blobs are written through
+``stream_new_beneath`` (no-follow, never replaced, never partial); listings and deletes go through
 ``list_beneath``/``unlink_beneath``/``remove_tree_beneath``.
 """
 from __future__ import annotations
 
 import asyncio
-import codecs
+import concurrent.futures
 import logging
 import os
 import re
 import stat
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -39,9 +50,13 @@ from .collab_bridge_files import (
     BridgeError,
     BridgeLimits,
     atomic_write_json,
+    file_exists_beneath,
     list_beneath,
+    make_dirs_beneath,
     remove_tree_beneath,
+    stream_new_beneath,
     unlink_beneath,
+    utf8_accept,
 )
 
 log = logging.getLogger(__name__)
@@ -52,17 +67,26 @@ ARTIFACTS_DIR = "artifacts"
 BLOBS_DIR = "blobs"
 REPORT_READ_ONLY = "report artifacts are read-only for collaborators"
 RENDERED_READ_ONLY = "renderer-built artifacts are read-only for collaborators"
+BAD_BLOB_TTL = 600.0
+DIR_MODE = 0o755
 # The mirror is the worker's own tree (collab-public mounts it read-only), so these are fail-safe bounds on listings
 # and sweeps, not anti-abuse limits: no other writer can flood it.
 MIRROR_ENTRY_SLACK = 4096
 MIRROR_MAX_ENTRIES = 1_000_000
-_BINARY_CACHE_MAX = 100_000
+_CACHE_MAX = 100_000
 _SHA = re.compile(SHA_RE)
 _ARTIFACT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")
 
 
-class _NotText(Exception):
-    """Raised inside a blob stream that turned out not to be UTF-8 (or grew past its cap): discard the temp file."""
+@dataclass(frozen=True)
+class GrantsPublish:
+    """What ``publish_grants`` did: truthy when ``grants.json`` was written; ``changed`` holds the artifact ids whose
+    grant entries differ from the previous write (all of them on the first write), for an immediate mirror sync."""
+    written: bool
+    changed: frozenset[str]
+
+    def __bool__(self) -> bool:
+        return self.written
 
 
 def _epoch(value) -> float | None:
@@ -75,102 +99,27 @@ def _epoch(value) -> float | None:
     return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
 
 
-def _walk_create(root: Path, parts: list[str]) -> int:
-    """An fd on ``root/parts...``; each component is created if missing and always opened ``O_NOFOLLOW``."""
-    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        for part in parts:
-            if not part or part in (".", "..") or "/" in part or "\0" in part:
-                raise BridgeError("unsafe path component")
-            try:
-                os.mkdir(part, 0o755, dir_fd=dfd)
-            except FileExistsError:
-                pass
-            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
-            os.close(dfd)
-            dfd = nfd
-    except BaseException:
-        os.close(dfd)
-        raise
-    return dfd
-
-
-def _write_all(fd: int, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        view = view[os.write(fd, view):]
-
-
-def _stream_blob(root: Path, parts: list[str], name: str, chunks: Iterable[bytes], *, max_bytes: int) -> bool:
-    """Stream ``chunks`` into ``root/parts.../name`` (tmp, fsync, rename in the dir fd) if they are UTF-8 text of at
-    most ``max_bytes``; False (nothing left behind) otherwise. Any other error propagates, also leaving nothing."""
-    dfd = _walk_create(root, parts)
-    try:
-        tmp = ".tmp-" + os.urandom(8).hex()
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+def _ensure_root(root: Path) -> None:
+    """Create the (trusted) mirror root and missing parents with mode 0755 whatever the umask."""
+    missing = []
+    probe = root
+    while not probe.exists():
+        missing.append(probe)
+        probe = probe.parent
+    for d in reversed(missing):
         try:
-            try:
-                decoder = codecs.getincrementaldecoder("utf-8")()
-                size = 0
-                iterator = iter(chunks)
-                try:
-                    for chunk in iterator:
-                        size += len(chunk)
-                        if size > max_bytes:
-                            raise _NotText
-                        try:
-                            decoder.decode(chunk)
-                        except UnicodeDecodeError:
-                            raise _NotText from None
-                        _write_all(fd, chunk)
-                    try:
-                        decoder.decode(b"", final=True)
-                    except UnicodeDecodeError:
-                        raise _NotText from None
-                finally:
-                    close = getattr(iterator, "close", None)
-                    if close is not None:
-                        close()
-                os.fchmod(fd, 0o644)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
-        except _NotText:
-            _unlink_quiet(tmp, dfd)
-            return False
-        except BaseException:
-            _unlink_quiet(tmp, dfd)
-            raise
-        os.fsync(dfd)
-        return True
-    finally:
-        os.close(dfd)
+            d.mkdir()
+        except FileExistsError:
+            continue
+        os.chmod(d, DIR_MODE)
 
 
-def _unlink_quiet(name: str, dfd: int) -> None:
-    try:
-        os.unlink(name, dir_fd=dfd)
-    except OSError:
-        pass
-
-
-def _is_blob(root: Path, parts: list[str], name: str) -> bool:
-    """A regular file (never a link) at ``root/parts.../name``; any unsafe component is "no"."""
-    try:
-        dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    except OSError:
-        return False
-    try:
-        for part in parts:
-            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
-            os.close(dfd)
-            dfd = nfd
-        return stat.S_ISREG(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode)
-    except OSError:
-        return False
-    finally:
-        os.close(dfd)
+def _by_artifact(agents: dict) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for agent_id, arts in agents.items():
+        for artifact_id, grant in arts.items():
+            out.setdefault(artifact_id, {})[agent_id] = grant
+    return out
 
 
 class CollabMirror:
@@ -180,41 +129,61 @@ class CollabMirror:
         self.limits = limits
         self.clock = clock
         self._locks: dict[str, asyncio.Lock] = {}      # never popped: a waiter and a newcomer must share one lock
-        self._fingerprints: dict[str, tuple] = {}
-        self._binary: set[str] = set()
+        self._fingerprints: dict[str, tuple] = {}      # set only after a refresh with every download done
+        self._listed: dict[str, frozenset[str]] = {}   # version ids the last head.json written listed
+        self._binary: set[str] = set()                 # content-addressed, so "not UTF-8" never expires
+        self._bad: dict[str, float] = {}               # sha -> retry-after (epoch) for failed fetches
         self._grants_body: dict | None = None
         self._grants_written_at: float | None = None
+        self._grants_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="collab-grants")
+
+    def close(self) -> None:
+        self._grants_pool.shutdown(wait=False)
 
     # -- grants.json ------------------------------------------------------------------------------------------
-    async def publish_grants(self, grants, store, *, heartbeat: float = 30.0) -> bool:
-        """Write ``grants.json`` when its content changed, else at least every ``heartbeat`` s; True if written.
+    async def publish_grants(self, grants, store, *, heartbeat: float = 30.0, gate=None,
+                             retracted: set[str] | frozenset[str] | None = None) -> GrantsPublish:
+        """Write ``grants.json`` when its content changed, else at least every ``heartbeat`` s.
 
-        ``grants`` is a ``CollabGrantStore`` (or the list ``live_grants`` returns). ``store`` (an ``ArtifactStore`` or
-        None) drops artifacts retracted as a whole, so ``artifacts_list`` stops showing them with the next write.
-        Never takes an artifact lock.
+        ``grants`` is a ``CollabGrantStore`` (or the list ``live_grants`` returns). Artifacts retracted as a whole are
+        left out, so ``artifacts_list`` stops showing them with the next write; they come from ``retracted`` (a set of
+        artifact ids), else ``gate.artifact_retracted`` (the worker's pre-loaded ``ArtifactGraphGate``), else
+        ``store.load_retractions()`` (``store`` may be None). Never takes an artifact lock; the file write runs on a
+        dedicated thread, never on the default executor the mirror's downloads use.
         """
         rows = await grants.live_grants() if hasattr(grants, "live_grants") else list(grants)
-        retracted = set()
-        if store is not None:
-            retracted = {r["artifact_id"] for r in await store.load_retractions() if not r.get("version_id")}
+        if retracted is not None:
+            is_retracted = set(retracted).__contains__
+        elif gate is not None:
+            is_retracted = gate.artifact_retracted
+        elif store is not None:
+            is_retracted = {r["artifact_id"] for r in await store.load_retractions()
+                            if not r.get("version_id")}.__contains__
+        else:
+            def is_retracted(_artifact_id: str) -> bool:
+                return False
         agents: dict[str, dict] = {}
         for row in rows:
-            if row["artifact_id"] in retracted:
+            if is_retracted(row["artifact_id"]):
                 continue
             agents.setdefault(row["agent_id"], {})[row["artifact_id"]] = {
                 "permission": row["permission"], "expires_at": _epoch(row["expires_at"])}
         body = {"limits": self.limits.to_dict(), "agents": agents}
+        before = _by_artifact(self._grants_body["agents"]) if self._grants_body is not None else {}
+        after = _by_artifact(agents)
+        changed = frozenset(a for a in before.keys() | after.keys() if before.get(a) != after.get(a))
         now = self.clock()
         if body == self._grants_body and self._grants_written_at is not None \
                 and now - self._grants_written_at < heartbeat:
-            return False
-        await asyncio.to_thread(self._ensure_root)
-        await asyncio.to_thread(atomic_write_json, self.root, GRANTS_NAME, {"generated_at": now, **body})
-        self._grants_body, self._grants_written_at = body, now
-        return True
+            return GrantsPublish(False, frozenset())
+        doc = {"generated_at": now, **body}
 
-    def _ensure_root(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        def write() -> None:
+            _ensure_root(self.root)
+            atomic_write_json(self.root, GRANTS_NAME, doc)
+        await asyncio.get_running_loop().run_in_executor(self._grants_pool, write)
+        self._grants_body, self._grants_written_at = body, now
+        return GrantsPublish(True, changed)
 
     # -- per-artifact mirror ----------------------------------------------------------------------------------
     def _lock(self, artifact_id: str) -> asyncio.Lock:
@@ -227,33 +196,54 @@ class CollabMirror:
         """Rewrite ``artifacts/<artifact_id>`` from Postgres; the ``head.json`` written, or ``{}`` if it was removed.
 
         An artifact that is missing, retracted (durably or by ``gate``) or whose head version is retracted is removed
-        from the mirror instead (fail closed). Errors while streaming a blob propagate and leave the previous
-        ``head.json`` untouched.
+        from the mirror instead (fail closed). A failed blob fetch leaves that file ``mirrored: false`` and the
+        artifact due for a retry on the next ``sync``; an exception that is not an ``Exception`` (a crash) propagates
+        and leaves the previous ``head.json`` untouched.
         """
+        return await self._refresh(store, artifact_id, gate=gate, fetch=True)
+
+    async def _refresh(self, store, artifact_id: str, *, gate, fetch: bool) -> dict:
         if not _ARTIFACT_ID.match(artifact_id or ""):
             raise BridgeError("invalid artifact id")
         async with self._lock(artifact_id):
             artifact = await store.get(artifact_id)
             versions = await store.list_versions(artifact_id) if artifact is not None else []
-            doc, fetch = self._plan(artifact, versions, gate)
+            doc, candidates = self._plan(artifact, versions, gate)
             if doc is None:
                 await self._remove_dir(artifact_id)
-                self._fingerprints.pop(artifact_id, None)
+                self._forget(artifact_id)
                 return {}
-            await asyncio.to_thread(self._write, artifact_id, doc, fetch)
-            self._fingerprints[artifact_id] = self._fingerprint(artifact, versions, gate)
-            log.info("collab mirror refreshed artifact=%s head=%s", artifact_id, doc["head"]["version_id"])
+            listed = frozenset(v["version_id"] for v in doc["versions"])
+            previous = self._listed.get(artifact_id)
+            shrunk = previous is None or bool(previous - listed)
+            complete = await asyncio.to_thread(self._write, artifact_id, doc, candidates, prune_first=shrunk,
+                                               fetch=fetch)
+            self._listed[artifact_id] = listed
+            if fetch and complete:
+                self._fingerprints[artifact_id] = self._fingerprint(artifact, versions, gate)
+            else:
+                self._fingerprints.pop(artifact_id, None)
+            log.info("collab mirror %s artifact=%s head=%s", "refreshed" if fetch else "pruned", artifact_id,
+                     doc["head"]["version_id"])
             return doc
 
+    def _forget(self, artifact_id: str) -> None:
+        self._fingerprints.pop(artifact_id, None)
+        self._listed.pop(artifact_id, None)
+
+    def _live(self, artifact_id: str, versions: list[dict], gate) -> list[dict]:
+        return [v for v in versions
+                if v.get("state") != "retracted" and not gate.version_retracted(artifact_id, v["version_id"])]
+
     def _plan(self, artifact, versions: list[dict], gate) -> tuple[dict | None, list[dict]]:
-        """The ``head.json`` to write (``mirrored`` flags provisional) and the files to fetch; (None, []) to remove."""
+        """The ``head.json`` to write (every file ``mirrored: false`` for now) and the blob candidates in priority
+        order (head first, deduplicated by sha); (None, []) when the artifact must leave the mirror."""
         if artifact is None:
             return None, []
         artifact_id = artifact["artifact_id"]
         if artifact["lifecycle"] == "retracted" or gate.artifact_retracted(artifact_id):
             return None, []
-        live = [v for v in versions
-                if v.get("state") != "retracted" and not gate.version_retracted(artifact_id, v["version_id"])]
+        live = self._live(artifact_id, versions, gate)
         head_id = artifact["current_version_id"]
         head = next((v for v in live if v["version_id"] == head_id), None)
         if head is None:                                    # no head, or the head itself is retracted
@@ -266,7 +256,7 @@ class CollabMirror:
             writable_reason = REPORT_READ_ONLY
         elif head.get("report_descriptor") or head.get("source_manifest_blob"):
             writable_reason = RENDERED_READ_ONLY
-        out_versions, fetch, budget, chosen = [], [], self.limits.mirror_max_artifact_bytes, {}
+        out_versions, candidates, chosen = [], [], {}
         for index, version in enumerate(live):
             in_window = index < window
             files = []
@@ -285,12 +275,11 @@ class CollabMirror:
                 if sha in chosen:
                     chosen[sha]["refs"].append(f)
                     continue
-                if size is None or size > self.limits.mirror_max_file_bytes or size > budget:
+                if size is None or size > self.limits.mirror_max_file_bytes:
                     continue
-                budget -= size
                 chosen[sha] = {"sha256": sha, "size_bytes": size, "refs": [f],
                                "storage_key": item.get("storage_key") or item.get("blob_sha256")}
-                fetch.append(chosen[sha])
+                candidates.append(chosen[sha])
             prov = version.get("provenance") if isinstance(version.get("provenance"), dict) else {}
             message = prov.get("message") if isinstance(prov.get("message"), str) else ""
             parents = list(version.get("parent_version_ids") or [])
@@ -308,30 +297,18 @@ class CollabMirror:
                "writable_reason": writable_reason,
                "head": {"version_id": head["version_id"], "version_number": head["version_number"]},
                "versions": out_versions}
-        return doc, fetch
+        return doc, candidates
 
-    def _write(self, artifact_id: str, doc: dict, fetch: list[dict]) -> None:
-        """Blocking: stream missing blobs, swap ``head.json``, then collect unreferenced blobs."""
+    @staticmethod
+    def _mark(candidate: dict, ok: bool) -> None:
+        for ref in candidate["refs"]:
+            ref["mirrored"] = ok
+            if ok:
+                ref["text"] = True
+
+    def _publish_head(self, artifact_id: str, doc: dict) -> None:
+        """Swap ``head.json``, then collect every blob it does not mark mirrored (stale ``.tmp-*`` included)."""
         parts = [ARTIFACTS_DIR, artifact_id, BLOBS_DIR]
-        self._ensure_root()
-        os.close(_walk_create(self.root, parts))
-        for item in fetch:
-            sha = item["sha256"]
-            if _is_blob(self.root, parts, sha):
-                ok = True
-            else:
-                key = item["storage_key"]
-                if isinstance(key, str) and _SHA.match(key):
-                    key = f"sha256/{key[:2]}/{key[2:4]}/{key}"
-                ok = _stream_blob(self.root, parts, sha, self.rustfs.iter_get(key, sha),
-                                  max_bytes=min(item["size_bytes"], self.limits.mirror_max_file_bytes))
-                if not ok:
-                    if len(self._binary) >= _BINARY_CACHE_MAX:
-                        self._binary.clear()
-                    self._binary.add(sha)
-            for ref in item["refs"]:
-                ref["mirrored"] = ok
-                ref["text"] = ok or ref["text"] and sha not in self._binary
         atomic_write_json(self.root / ARTIFACTS_DIR / artifact_id, HEAD_NAME, doc)
         keep = {f["sha256"] for v in doc["versions"] for f in v["files"] if f["mirrored"]}
         try:
@@ -343,18 +320,80 @@ class CollabMirror:
             if name not in keep:
                 unlink_beneath(self.root, parts, name)
 
+    def _bad_blob(self, sha: str) -> bool:
+        return self._bad.get(sha, 0.0) > self.clock()
+
+    def _remember_bad(self, sha: str) -> None:
+        now = self.clock()
+        if len(self._bad) >= _CACHE_MAX:
+            self._bad = {k: v for k, v in self._bad.items() if v > now}
+            if len(self._bad) >= _CACHE_MAX:
+                self._bad.clear()
+        self._bad[sha] = now + BAD_BLOB_TTL
+
+    def _write(self, artifact_id: str, doc: dict, candidates: list[dict], *, prune_first: bool,
+               fetch: bool) -> bool:
+        """Blocking. Mark blobs already present, publish a pruned ``head.json`` first when versions left the listing
+        (or downloads are off), then download the rest within the artifact budget and publish again. True when no
+        download failed."""
+        parts = [ARTIFACTS_DIR, artifact_id, BLOBS_DIR]
+        _ensure_root(self.root)
+        make_dirs_beneath(self.root, parts, dir_mode=DIR_MODE)
+        budget = self.limits.mirror_max_artifact_bytes
+        pending = []
+        for candidate in candidates:
+            if file_exists_beneath(self.root, parts, candidate["sha256"]) and candidate["size_bytes"] <= budget:
+                budget -= candidate["size_bytes"]
+                self._mark(candidate, True)
+            else:
+                pending.append(candidate)
+        if prune_first or not fetch:
+            self._publish_head(artifact_id, doc)
+            if not fetch:
+                return True
+        complete = True
+        for candidate in pending:
+            sha, size = candidate["sha256"], candidate["size_bytes"]
+            if size > budget:
+                continue
+            if self._bad_blob(sha):
+                complete = False
+                continue
+            key = candidate["storage_key"]
+            if isinstance(key, str) and _SHA.match(key):
+                key = f"sha256/{key[:2]}/{key[2:4]}/{key}"
+            try:
+                ok = stream_new_beneath(self.root, parts, sha, self.rustfs.iter_get(key, sha), max_bytes=size,
+                                        accept=utf8_accept())
+            except Exception as exc:                        # noqa: BLE001 - RustFS/IntegrityError/OS: per blob
+                log.warning("collab mirror blob fetch failed artifact=%s sha256=%s error=%s", artifact_id, sha,
+                            type(exc).__name__)
+                self._remember_bad(sha)
+                complete = False
+                continue
+            if ok:
+                budget -= size                              # charged only once the bytes are in place
+            else:
+                if len(self._binary) >= _CACHE_MAX:
+                    self._binary.clear()
+                self._binary.add(sha)
+                for ref in candidate["refs"]:
+                    ref["text"] = False
+            self._mark(candidate, ok)
+        self._publish_head(artifact_id, doc)
+        return complete
+
     def _fingerprint(self, artifact, versions: list[dict], gate) -> tuple:
         artifact_id = artifact["artifact_id"]
         return (artifact["current_version_id"], artifact["lifecycle"], artifact["artifact_type"],
-                tuple(sorted(v["version_id"] for v in versions if v.get("state") != "retracted"
-                             and not gate.version_retracted(artifact_id, v["version_id"]))))
+                tuple(sorted(v["version_id"] for v in self._live(artifact_id, versions, gate))))
 
     async def remove(self, artifact_id: str) -> bool:
         """Delete ``artifacts/<artifact_id>`` entirely (annotations included), under the artifact's lock."""
         if not _ARTIFACT_ID.match(artifact_id or ""):
             raise BridgeError("invalid artifact id")
         async with self._lock(artifact_id):
-            self._fingerprints.pop(artifact_id, None)
+            self._forget(artifact_id)
             return await self._remove_dir(artifact_id)
 
     async def _remove_dir(self, artifact_id: str) -> bool:
@@ -372,31 +411,42 @@ class CollabMirror:
     # -- sync -------------------------------------------------------------------------------------------------
     async def sync(self, store, *, gate, force: set[str] | frozenset[str] = frozenset(),
                    grants: CollabGrantStore | None = None) -> dict:
-        """Refresh every granted artifact whose head or version set changed (or that is in ``force``) and remove
-        mirrored artifacts with no live grant or that are retracted. Does not publish ``grants.json``.
+        """Bring the mirror in line with Postgres; does not publish ``grants.json``.
+
+        Pass 1 (no downloads): remove mirrored artifacts that are retracted or have no live grant, and publish a pruned
+        ``head.json`` for every artifact whose listed versions shrank. Pass 2: refresh every granted artifact whose
+        head or version set changed, whose last refresh left a download undone, or that is in ``force``.
 
         ``grants`` defaults to a ``CollabGrantStore`` over ``store``'s connection. Per-artifact failures are logged
         and reported, never raised, so one broken artifact cannot stall the rest.
+
+        Known race (accepted): an artifact granted after ``live_grants`` ran and refreshed meanwhile by the applier can
+        be swept as "not granted" in pass 1; the next ``sync`` (or applier refresh) mirrors it again.
         """
         grants = grants if grants is not None else CollabGrantStore(store._conn)
         granted = sorted({g["artifact_id"] for g in await grants.live_grants()})
         out = {"refreshed": [], "removed": [], "failed": []}
+        due = []
         for artifact_id in granted:
             try:
                 artifact = await store.get(artifact_id)
                 if artifact is None or artifact["lifecycle"] == "retracted" or gate.artifact_retracted(artifact_id):
                     if await self._known(artifact_id):
-                        await self.remove(artifact_id)
-                        out["removed"].append(artifact_id)
+                        await self._remove_into(artifact_id, out)
                     continue
-                if artifact_id not in force and artifact_id in self._fingerprints:
-                    versions = await store.list_versions(artifact_id)
-                    if self._fingerprint(artifact, versions, gate) == self._fingerprints[artifact_id]:
-                        continue
-                doc = await self.refresh(store, artifact_id, gate=gate)
-                out["refreshed" if doc else "removed"].append(artifact_id)
+                versions = await store.list_versions(artifact_id)
+                if artifact_id not in force and \
+                        self._fingerprints.get(artifact_id) == self._fingerprint(artifact, versions, gate):
+                    continue
+                due.append(artifact_id)
+                listed = self._listed.get(artifact_id)
+                live = {v["version_id"] for v in self._live(artifact_id, versions, gate)}
+                if listed is None or listed - live:
+                    if not await self._refresh(store, artifact_id, gate=gate, fetch=False):
+                        due.remove(artifact_id)
+                        out["removed"].append(artifact_id)
             except Exception:                                  # noqa: BLE001 - one artifact never stops the sync
-                log.exception("collab mirror refresh failed artifact=%s", artifact_id)
+                log.exception("collab mirror prune failed artifact=%s", artifact_id)
                 out["failed"].append(artifact_id)
         wanted = set(granted)
         try:
@@ -408,13 +458,26 @@ class CollabMirror:
         for name, st in entries or []:
             if name in wanted or not _ARTIFACT_ID.match(name) or not stat.S_ISDIR(st.st_mode):
                 continue
-            await self.remove(name)
-            out["removed"].append(name)
+            await self._remove_into(name, out)
+        for artifact_id in due:
+            try:
+                doc = await self.refresh(store, artifact_id, gate=gate)
+                out["refreshed" if doc else "removed"].append(artifact_id)
+            except Exception:                                  # noqa: BLE001 - one artifact never stops the sync
+                log.exception("collab mirror refresh failed artifact=%s", artifact_id)
+                out["failed"].append(artifact_id)
         return out
+
+    async def _remove_into(self, artifact_id: str, out: dict) -> None:
+        if await self.remove(artifact_id):
+            out["removed"].append(artifact_id)
+        else:
+            out["failed"].append(artifact_id)
 
     async def _known(self, artifact_id: str) -> bool:
         return artifact_id in self._fingerprints or await asyncio.to_thread(
             os.path.lexists, self.root / ARTIFACTS_DIR / artifact_id)
 
 
-__all__ = ["CollabMirror", "GRANTS_NAME", "HEAD_NAME", "REPORT_READ_ONLY", "RENDERED_READ_ONLY"]
+__all__ = ["BAD_BLOB_TTL", "CollabMirror", "GRANTS_NAME", "GrantsPublish", "HEAD_NAME", "REPORT_READ_ONLY",
+           "RENDERED_READ_ONLY"]
