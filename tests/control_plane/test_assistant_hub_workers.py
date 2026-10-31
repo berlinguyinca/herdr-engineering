@@ -182,14 +182,26 @@ def test_unknown_credential_failures_are_coalesced_per_window():
     assert "hcw_" not in json.dumps(store.audit)
 
 
-def test_known_worker_failures_audited_individually_under_its_tenant():
-    store, reg, _ = make()
+def test_known_worker_failures_are_coalesced_per_worker_and_reason():
+    store, reg, clock = make()
     w, cred = enroll(reg, tenant="tX", user="uX")
-    for _ in range(3):
+    for _ in range(50):
         with pytest.raises(WorkerAuthError):
             reg.authenticate(f"Worker {cred}", "wrong")
     fails = [a for a in store.audit if a["action"] == "worker.auth_failed"]
-    assert len(fails) == 3 and all(a["tenant_id"] == "tX" for a in fails)
+    assert len(fails) == 1 and fails[0]["tenant_id"] == "tX"   # the first still audits, under its tenant
+    # a different reason for the same worker is its own key
+    store.workers[w.worker_id].status = "revoked"
+    for _ in range(50):
+        with pytest.raises(WorkerAuthError):
+            reg.authenticate(f"Worker {cred}", "dev-1")
+    fails = [a for a in store.audit if a["action"] == "worker.auth_failed"]
+    assert len(fails) == 2 and "revoked" in fails[1]["detail"]
+    clock.advance(seconds=61)
+    with pytest.raises(WorkerAuthError):
+        reg.authenticate(f"Worker {cred}", "dev-1")
+    fails = [a for a in store.audit if a["action"] == "worker.auth_failed"]
+    assert len(fails) == 3 and "suppressed=49" in fails[2]["detail"]
 
 
 def failing_sink(entry) -> None:

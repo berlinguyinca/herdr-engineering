@@ -24,6 +24,7 @@ _CRED_PREFIX = "hcw_"
 _CODE_PREFIX = "hce_"
 _HUB_TENANT = "hub"
 _FAIL_WINDOW = timedelta(seconds=60)
+_MAX_FAIL_KEYS = 1024
 _SEEN_PERSIST_INTERVAL = timedelta(seconds=60)
 _MAX_NAME = 64
 
@@ -92,8 +93,7 @@ class WorkerRegistry:
         self._enrollment_ttl = enrollment_ttl
         self._worker_ttl = worker_ttl
         self._now = now
-        self._fail_window_start: datetime | None = None
-        self._fail_suppressed = 0
+        self._fail_windows: dict[tuple[str, str], tuple[datetime, int]] = {}
 
     def create_enrollment(self, *, tenant_id: str, user_id: str, name: str, harness: str) -> tuple[Enrollment, str]:
         from ..assistant_dispatch import HARNESSES  # lazy: assistant_dispatch imports assistant
@@ -124,15 +124,17 @@ class WorkerRegistry:
         """Audit a failure and return the uniform error. Failures matching no known worker/enrollment (tenant_id
         None) are coalesced to one entry per window; an audit-write failure never changes the 401."""
         with self._store._lock:
-            detail = reason
-            if tenant_id is None:
-                now = self._now()
-                start = self._fail_window_start
-                if start is not None and now - start < _FAIL_WINDOW:
-                    self._fail_suppressed += 1
-                    return WorkerAuthError()
-                detail = f"{reason}; suppressed={self._fail_suppressed}"
-                self._fail_window_start, self._fail_suppressed = now, 0
+            # Coalesce per (subject, reason): unknown credentials share one key, known workers/enrollments get their own.
+            key = (subject_id, reason) if tenant_id is not None else ("-", "-")
+            now = self._now()
+            window = self._fail_windows.get(key)
+            if window is not None and now - window[0] < _FAIL_WINDOW:
+                self._fail_windows[key] = (window[0], window[1] + 1)
+                return WorkerAuthError()
+            detail = f"{reason}; suppressed={window[1] if window else 0}" if window or tenant_id is None else reason
+            if len(self._fail_windows) >= _MAX_FAIL_KEYS:
+                self._fail_windows = {k: v for k, v in self._fail_windows.items() if now - v[0] < _FAIL_WINDOW}
+            self._fail_windows[key] = (now, 0)
             try:
                 self._store.audit_record(tenant_id=tenant_id or _HUB_TENANT, user_id=user_id, actor="worker",
                                          action="worker.auth_failed", subject_id=subject_id, detail=detail)
