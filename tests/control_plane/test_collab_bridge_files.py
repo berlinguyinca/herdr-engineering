@@ -27,6 +27,7 @@ ART = "artifact_00000000000000000000000001"
 VER = "version_000000000000000000000000001"
 SENTINEL = b"do not touch"
 LIMITS = BridgeLimits()
+TREE_CAP = 1000
 
 
 def _snapshot(path: Path) -> dict:
@@ -245,7 +246,7 @@ def test_symlinked_owner_dir_is_never_followed(tree):
     (root / "staging" / AGENT).symlink_to(outside)
     before = _snapshot(outside)
     assert cbf.write_marker_beneath(root, ["staging", AGENT, UPL], "verified") is False
-    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL]) is False
+    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=TREE_CAP) is False
     assert cbf.unlink_beneath(root, ["staging", AGENT], "sentinel") is False
     assert _snapshot(outside) == before
     assert (outside / "sentinel").read_bytes() == SENTINEL
@@ -257,7 +258,7 @@ def test_symlinked_upload_dir_is_never_followed(tree):
     (root / "staging" / AGENT / UPL).symlink_to(outside)
     before = _snapshot(outside)
     assert cbf.write_marker_beneath(root, ["staging", AGENT, UPL], "verified") is False
-    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL]) is False
+    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=TREE_CAP) is False
     assert cbf.unlink_beneath(root, ["staging", AGENT, UPL], "sentinel") is False
     assert _snapshot(outside) == before
 
@@ -273,7 +274,7 @@ def test_remove_tree_removes_links_not_their_targets(tree):
     (d / "nested" / "f").write_bytes(b"y")
     os.link(outside / "sentinel", d / "hard")
     before = _snapshot(outside)
-    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL]) is True
+    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=TREE_CAP) is True
     assert not os.path.lexists(d)
     assert (root / "staging" / AGENT).is_dir()
     assert _snapshot(outside) == before
@@ -284,7 +285,7 @@ def test_remove_tree_of_the_owner_dir_sweeps_symlinked_children(tree):
     (root / "staging" / AGENT).mkdir(parents=True)
     (root / "staging" / AGENT / UPL).symlink_to(outside)
     before = _snapshot(outside)
-    assert cbf.remove_tree_beneath(root, ["staging", AGENT]) is True
+    assert cbf.remove_tree_beneath(root, ["staging", AGENT], max_entries=TREE_CAP) is True
     assert not os.path.lexists(root / "staging" / AGENT)
     assert _snapshot(outside) == before
 
@@ -296,13 +297,13 @@ def test_remove_tree_refuses_a_deep_nest(tree):
     for _ in range(cbf.MAX_TREE_DEPTH + 2):
         p = p / "n"
         p.mkdir()
-    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL]) is False
+    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=TREE_CAP) is False
 
 
 def test_remove_tree_refuses_root_itself_and_missing(tree):
     root, _ = tree
-    assert cbf.remove_tree_beneath(root, []) is False
-    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL]) is False
+    assert cbf.remove_tree_beneath(root, [], max_entries=TREE_CAP) is False
+    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=TREE_CAP) is False
     assert root.is_dir()
 
 
@@ -343,7 +344,7 @@ def test_mutators_refuse_unsafe_components(tree, parts, name):
     before = _snapshot(outside)
     assert cbf.write_marker_beneath(root, parts, name) is False
     assert cbf.unlink_beneath(root, parts, name) is False
-    assert cbf.remove_tree_beneath(root, [*parts, name]) is False
+    assert cbf.remove_tree_beneath(root, [*parts, name], max_entries=TREE_CAP) is False
     assert _snapshot(outside) == before
 
 
@@ -398,7 +399,7 @@ def test_remove_tree_survives_a_dir_swapped_for_a_symlink(tree, monkeypatch, whe
     (outside / UPL / "0000000").write_bytes(b"keep")
     before = _snapshot(outside)
     state = _swap_after_open(monkeypatch, root, outside, AGENT, when)
-    cbf.remove_tree_beneath(root, ["staging", AGENT, UPL])
+    cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=TREE_CAP)
     monkeypatch.undo()
     assert state["done"]
     assert _snapshot(outside) == before
@@ -418,7 +419,7 @@ def test_remove_tree_survives_a_child_dir_swapped_for_a_symlink(tree, monkeypatc
             real_symlink(outside, d / "nested")
         return real_open(path, flags, mode, dir_fd=dir_fd)
     monkeypatch.setattr(cbf.os, "open", shim)
-    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL]) is True
+    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=TREE_CAP) is True
     monkeypatch.undo()
     assert not os.path.lexists(d)
     assert _snapshot(outside) == before
@@ -458,14 +459,14 @@ def test_staged_upload_meta_round_trip_and_binding():
     upl = cbf.upload_id_for(AGENT, ART, "d/x.bin", sha, CHUNK_BYTES + 1)
     meta = cbf.StagedUpload(upload_id=upl, owner_key=AGENT, artifact_id=ART, name="d/x.bin",
                             size_bytes=CHUNK_BYTES + 1, file_sha256=sha, total=2, created_at=1.5)
-    assert cbf.StagedUpload.from_dict(meta.to_dict()) == meta
+    assert cbf.StagedUpload.from_dict(meta.to_dict(), limits=LIMITS) == meta
     forged = {**meta.to_dict(), "artifact_id": "artifact_other"}
     with pytest.raises(BridgeError):
-        cbf.StagedUpload.from_dict(forged)
+        cbf.StagedUpload.from_dict(forged, limits=LIMITS)
     with pytest.raises(BridgeError):
-        cbf.StagedUpload.from_dict({**meta.to_dict(), "total": 3})
+        cbf.StagedUpload.from_dict({**meta.to_dict(), "total": 3}, limits=LIMITS)
     with pytest.raises(BridgeError):
-        cbf.StagedUpload.from_dict({**meta.to_dict(), "extra": 1})
+        cbf.StagedUpload.from_dict({**meta.to_dict(), "extra": 1}, limits=LIMITS)
 
 
 def _stage(root: Path, *, size: int, parts: list[int], verified: bool = False):
@@ -487,24 +488,24 @@ def test_upload_complete_and_list_parts(tree):
     root, outside = tree
     upl, d = _stage(root, size=3 * CHUNK_BYTES, parts=[0, 2])
     assert cbf.list_parts(root, AGENT, upl, max_parts=3) == [0, 2]
-    assert cbf.upload_complete(root, AGENT, upl) is False
+    assert cbf.upload_complete(root, AGENT, upl, LIMITS) is False
     (d / "0000001").symlink_to(outside / "sentinel")
     assert cbf.list_parts(root, AGENT, upl, max_parts=3) == [0, 2]
-    assert cbf.upload_complete(root, AGENT, upl) is False
+    assert cbf.upload_complete(root, AGENT, upl, LIMITS) is False
     os.unlink(d / "0000001")
     cbf.link_new_bytes(d, "0000001", b"x")
     (d / "junk").write_bytes(b"")
     (d / "0000009").write_bytes(b"")  # beyond total: listed but irrelevant
-    assert cbf.upload_complete(root, AGENT, upl) is True
+    assert cbf.upload_complete(root, AGENT, upl, LIMITS) is True
 
 
 def test_upload_complete_by_verified_marker_and_symlinked_dirs(tree):
     root, outside = tree
     upl, d = _stage(root, size=2 * CHUNK_BYTES, parts=[], verified=True)
-    assert cbf.upload_complete(root, AGENT, upl) is True
+    assert cbf.upload_complete(root, AGENT, upl, LIMITS) is True
     other = cbf.upload_id_for(AGENT, ART, "y.bin", "d" * 64, 1)
     (root / "staging" / AGENT / other).symlink_to(d)
-    assert cbf.upload_complete(root, AGENT, other) is False
+    assert cbf.upload_complete(root, AGENT, other, LIMITS) is False
     assert cbf.list_parts(root, AGENT, other, max_parts=3) == []
 
 
@@ -800,7 +801,7 @@ def test_list_parts_leaves_out_a_hardlinked_part(tree):
     upl, d = _stage(root, size=2 * CHUNK_BYTES, parts=[0])
     os.link(outside / "sentinel", d / "0000001")
     assert cbf.list_parts(root, AGENT, upl, max_parts=2) == [0]
-    assert cbf.upload_complete(root, AGENT, upl) is False
+    assert cbf.upload_complete(root, AGENT, upl, LIMITS) is False
 
 
 def test_remove_tree_removes_a_dangling_link_without_following(tree):
@@ -809,7 +810,7 @@ def test_remove_tree_removes_a_dangling_link_without_following(tree):
     (d / "0000000").symlink_to(outside / "new")
     (d / "dirlink").symlink_to(outside)
     before = _snapshot(outside)
-    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL]) is True
+    assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=TREE_CAP) is True
     assert not os.path.lexists(d)
     assert not os.path.lexists(outside / "new")
     assert _snapshot(outside) == before
@@ -865,7 +866,7 @@ def test_stale_fallback_tmp_is_ignored_and_swept(tree):
     upl, d = _stage(root, size=CHUNK_BYTES + 1, parts=[0])
     (d / ".tmp-deadbeef00000000").write_bytes(b"partial")
     assert cbf.list_parts(root, AGENT, upl, max_parts=2) == [0]
-    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl)) is True
+    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl), max_entries=TREE_CAP) is True
     assert not os.path.lexists(d)
 
 
@@ -897,7 +898,7 @@ def test_list_parts_fails_closed_past_its_bound(tree):
         (d / f"junk{i}").write_bytes(b"")
     with pytest.raises(BridgeError):
         cbf.list_parts(root, AGENT, upl, max_parts=3)
-    assert cbf.upload_complete(root, AGENT, upl) is False
+    assert cbf.upload_complete(root, AGENT, upl, LIMITS) is False
     os.unlink(d / "junk0")  # exactly at the bound: still listed
     assert cbf.list_parts(root, AGENT, upl, max_parts=3) == [0, 1, 2]
     os.unlink(d / "junk1")
@@ -975,3 +976,53 @@ def test_link_new_bytes_falls_back_without_o_tmpfile_constant(tree, monkeypatch)
     assert cbf.link_new_bytes(root, "p", b"x") is True
     monkeypatch.undo()
     assert sorted(p.name for p in root.iterdir()) == ["p"]
+
+
+def _hostile_meta(root: Path, size: int) -> str:
+    """A self-consistent meta.json (upload id and total derive from its fields) declaring ``size`` bytes."""
+    sha = "9" * 64
+    upl = cbf.upload_id_for(AGENT, ART, "big.bin", sha, size)
+    d = cbf.staging_path(root, AGENT, upl)
+    d.mkdir(parents=True)
+    cbf.atomic_write_json(d, cbf.META_NAME, {"upload_id": upl, "owner_key": AGENT, "artifact_id": ART,
+                                             "name": "big.bin", "size_bytes": size, "file_sha256": sha,
+                                             "total": math.ceil(size / CHUNK_BYTES), "created_at": 1.0})
+    return upl
+
+
+def test_hostile_meta_never_sizes_the_part_scan(tree, monkeypatch):
+    root, _ = tree
+    upl = _hostile_meta(root, 10**18)  # total ~1.9e12: would scan without bound if trusted
+    monkeypatch.setattr(cbf, "list_parts", lambda *a, **k: pytest.fail("scanned a hostile upload dir"))
+    assert cbf.read_staged_meta(root, AGENT, upl, LIMITS) is None
+    assert cbf.upload_complete(root, AGENT, upl, LIMITS) is False
+    raw = cbf.read_json_beneath(root, [*cbf.staging_parts(AGENT, upl), cbf.META_NAME], max_bytes=4096)
+    with pytest.raises(BridgeError):
+        cbf.StagedUpload.from_dict(raw, limits=LIMITS)
+
+
+def test_meta_just_over_max_file_bytes_is_refused(tree):
+    root, _ = tree
+    limits = BridgeLimits.from_mapping({"max_file_bytes": 2 * CHUNK_BYTES - 1})  # same part count as 2 * CHUNK_BYTES
+    upl = _hostile_meta(root, 2 * CHUNK_BYTES)
+    assert cbf.read_staged_meta(root, AGENT, upl, limits) is None
+    assert cbf.read_staged_meta(root, AGENT, upl, BridgeLimits.from_mapping({"max_file_bytes": 2 * CHUNK_BYTES}))
+
+
+def test_a_max_size_upload_completes(tree):
+    root, _ = tree
+    limits = BridgeLimits.from_mapping({"max_file_bytes": 3 * CHUNK_BYTES})
+    upl, _ = _stage(root, size=3 * CHUNK_BYTES, parts=[0, 1, 2])
+    assert cbf.upload_complete(root, AGENT, upl, limits) is True
+    assert cbf.upload_complete(root, AGENT, upl, BridgeLimits.from_mapping({"max_file_bytes": 3 * CHUNK_BYTES - 1}))\
+        is False
+
+
+def test_remove_tree_requires_a_valid_entry_bound(tree):
+    root, _ = tree
+    _upload_dir(root)
+    with pytest.raises(TypeError):
+        cbf.remove_tree_beneath(root, ["staging", AGENT, UPL])
+    for bad in (True, -1, "5", None):
+        assert cbf.remove_tree_beneath(root, ["staging", AGENT, UPL], max_entries=bad) is False
+    assert cbf.staging_path(root, AGENT, UPL).is_dir()

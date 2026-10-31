@@ -609,15 +609,20 @@ def tree_entry_cap(limits: BridgeLimits) -> int:
     return max_parts_for(limits) + ENTRY_SLACK
 
 
-def remove_tree_beneath(root: Path, parts: list[str], *, max_entries: int | None = None) -> bool:
+def remove_tree_beneath(root: Path, parts: list[str], *, max_entries: int) -> bool:
     """Delete the real directory ``root/parts...`` and everything in it, never following a link.
 
     False (with whatever could be removed safely removed) if any component is unsafe, a symlink or not a directory,
-    the tree is deeper than ``MAX_TREE_DEPTH``, holds more than ``max_entries`` entries in all (default:
-    ``tree_entry_cap`` of the default limits; callers pass ``tree_entry_cap(limits)`` or a bound of their own), or
-    something could not be removed. Links inside are removed as links.
+    the tree is deeper than ``MAX_TREE_DEPTH``, holds more than ``max_entries`` entries in all (callers pass
+    ``tree_entry_cap(limits)`` for an upload dir, or a bound of their own), or something could not be removed. Links
+    inside are removed as links.
+
+    Blocking: sweeping a max-size upload (~190k parts at the default limits) takes on the order of 40 s, so async
+    callers must run it off the event loop (``asyncio.to_thread`` / a worker thread).
     """
-    budget = [tree_entry_cap(BridgeLimits()) if max_entries is None else max_entries]
+    if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 0:
+        return False
+    budget = [max_entries]
     if not _safe_parts(parts) or not parts:
         return False
     parent = _walk_dirs(root, parts[:-1])
@@ -723,16 +728,20 @@ class StagedUpload:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> StagedUpload:
-        """A ``meta.json`` checked against its own identity: ``upload_id`` must be the one its fields derive."""
+    def from_dict(cls, d: dict, *, limits: BridgeLimits) -> StagedUpload:
+        """A ``meta.json`` checked against its own identity (``upload_id`` must be the one its fields derive) and
+        against ``limits``: ``size_bytes`` within ``max_file_bytes``, so ``total`` within ``max_parts_for(limits)``.
+        ``meta.json`` is written by the other side, so its ``total`` must never size a scan on its own."""
         if not isinstance(d, dict) or set(d) != {f.name for f in fields(cls)}:
             raise BridgeError("invalid upload metadata")
         size = _check_size(d["size_bytes"])
+        if size > limits.max_file_bytes:
+            raise BridgeError("upload is over max_file_bytes")
         upload_id = upload_id_for(d["owner_key"], d["artifact_id"], d["name"], d["file_sha256"], size)
         if d["upload_id"] != upload_id or d["name"] != normalise_name(d["name"]):
             raise BridgeError("invalid upload metadata")
         total = d["total"]
-        if isinstance(total, bool) or total != _total_for(size):
+        if isinstance(total, bool) or total != _total_for(size) or total > max_parts_for(limits):
             raise BridgeError("invalid upload metadata")
         created = d["created_at"]
         if isinstance(created, bool) or not isinstance(created, (int, float)) or not math.isfinite(created):
@@ -741,8 +750,9 @@ class StagedUpload:
                    size_bytes=size, file_sha256=d["file_sha256"], total=total, created_at=float(created))
 
 
-def read_staged_meta(root: Path, owner_key: str, upload_id: str) -> StagedUpload | None:
-    """The validated ``meta.json`` of an upload, bound to the ``owner_key``/``upload_id`` it was looked up by."""
+def read_staged_meta(root: Path, owner_key: str, upload_id: str, limits: BridgeLimits) -> StagedUpload | None:
+    """The validated ``meta.json`` of an upload, bound to the ``owner_key``/``upload_id`` it was looked up by and
+    within ``limits`` (see ``StagedUpload.from_dict``); None otherwise."""
     try:
         parts = staging_parts(owner_key, upload_id)
     except BridgeError:
@@ -751,7 +761,7 @@ def read_staged_meta(root: Path, owner_key: str, upload_id: str) -> StagedUpload
     if raw is None:
         return None
     try:
-        meta = StagedUpload.from_dict(raw)
+        meta = StagedUpload.from_dict(raw, limits=limits)
     except (BridgeError, ShareBundleError):
         return None
     if meta.owner_key != owner_key or meta.upload_id != upload_id:
@@ -766,6 +776,9 @@ def list_parts(root: Path, owner_key: str, upload_id: str, *, max_parts: int) ->
     ``max_parts`` is the upload's validated ``meta.total`` (or ``max_parts_for(limits)``). The scan stops with
     ``BridgeError("too many entries")`` once the dir holds more than ``max_parts + ENTRY_SLACK`` entries; only names
     shaped like a part are stat'ed and only their integer indices are kept.
+
+    Blocking: a max-size upload (~190k parts at the default limits) takes tens of seconds to list, so async callers
+    must run it off the event loop (``asyncio.to_thread`` / a worker thread).
     """
     try:
         parts = staging_parts(owner_key, upload_id)
@@ -801,10 +814,12 @@ def list_parts(root: Path, owner_key: str, upload_id: str, *, max_parts: int) ->
         os.close(dfd)
 
 
-def upload_complete(root: Path, owner_key: str, upload_id: str) -> bool:
+def upload_complete(root: Path, owner_key: str, upload_id: str, limits: BridgeLimits) -> bool:
     """Every index ``0..total-1`` is present, or the worker's ``verified`` marker is.
 
-    The marker is a hint for ``collab-public`` only; the worker never trusts it and re-verifies the bytes.
+    The marker is a hint for ``collab-public`` only; the worker never trusts it and re-verifies the bytes. The scan is
+    bounded by ``limits`` (``meta.json`` is untrusted), never by the meta's own ``total`` alone. Blocking, like
+    ``list_parts``.
     """
     try:
         parts = staging_parts(owner_key, upload_id)
@@ -814,11 +829,11 @@ def upload_complete(root: Path, owner_key: str, upload_id: str) -> bool:
     if marker is not None:
         os.close(marker[0])
         return True
-    meta = read_staged_meta(root, owner_key, upload_id)
+    meta = read_staged_meta(root, owner_key, upload_id, limits)
     if meta is None:
         return False
     try:
-        present = set(list_parts(root, owner_key, upload_id, max_parts=meta.total))
+        present = set(list_parts(root, owner_key, upload_id, max_parts=min(meta.total, max_parts_for(limits))))
     except BridgeError:
         return False
     return all(i in present for i in range(meta.total))
