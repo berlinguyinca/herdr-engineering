@@ -5,7 +5,6 @@ nothing here may read or write the real ~/.claude, ~/.claude.json, ~/.codex, ~/.
 Note: /api/v1 routes need asyncpg importable (pre-existing sandbox gap, see docs/operations/assistant-hub.md)."""
 import hashlib
 import json
-import os
 import shlex
 import shutil
 import subprocess
@@ -66,10 +65,14 @@ def world(acknowledged_sink):
                              api_keys={OWNER_KEY: "operator"}, assistant_workers=registry)
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
-    yield Namespace(api=f"http://127.0.0.1:{svr.port}", hub=f"http://127.0.0.1:{hub.port}", hub_port=hub.port,
-                    svc=svc, registry=registry)
-    svr.shutdown()
-    hub.shutdown()
+    try:
+        yield Namespace(api=f"http://127.0.0.1:{svr.port}", hub=f"http://127.0.0.1:{hub.port}", hub_port=hub.port,
+                        svc=svc, registry=registry)
+    finally:
+        try:
+            svr.shutdown()
+        finally:
+            hub.shutdown()
 
 
 def owner(world, method, path, body=None):
@@ -158,6 +161,9 @@ def test_full_flow_enroll_use_revoke_audit(world):
                                                               "payload": {"hook_event": "PostToolUse"}},
                 {"Authorization": f"Worker {cred}", "X-Herdr-Device": "dev1"})[0] == 401
     assert len(events(world)) == 3     # the refused calls recorded nothing
+    revoked = [a for a in world.svc.store.audit
+               if a["action"] == "worker.revoked" and a["subject_id"] == wid and a["tenant_id"] == TENANT]
+    assert len(revoked) == 1 and revoked[0]["actor"] == OWNER
 
     # 6. the audit chain verifies and neither secret appears anywhere durable
     assert world.svc.store.verify_audit(TENANT) is True
@@ -194,8 +200,7 @@ def test_cli_redeem_install_hooks_and_installed_command_delivers_observation(wor
     event = {"session_id": "cli-s1", "hook_event_name": "PostToolUse", "tool_name": "Bash",
              "tool_input": {"command": "echo hi"}, "tool_use_id": "tu1", "tool_response": {"stdout": "hi"}}
     run = subprocess.run(command, shell=True, input=json.dumps(event), capture_output=True, text=True, timeout=30,
-                         env=clean_env(home, HERDR_ASSISTANT_WORKER_FILE=str(worker_file),
-                                       PATH=os.environ.get("PATH", "/usr/bin:/bin")))
+                         env=clean_env(home, HERDR_ASSISTANT_WORKER_FILE=str(worker_file)))
     assert (run.returncode, run.stdout, run.stderr) == (0, "", "")
     (obs,) = events(world, kind="observation")
     assert obs.provenance == "harness_attested" and obs.payload["tool_name"] == "Bash"

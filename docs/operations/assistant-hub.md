@@ -58,6 +58,8 @@ tailnet interface.
    `herdr-eng control-plane assistant-worker redeem --url http://HUB_HOST:9483 --code CODE --device-id my-laptop`
    writes `~/.config/herdr/assistant-worker.json` (mode 0600; the parent directory is created 0700) and prints the
    `claude mcp add` line once. Plain `http://` to a non-private host prints a warning. The code is single use.
+   A `--code` value is visible to other local users in `ps`. Prefer `--code -` (reads the code from stdin) or set
+   `HERDR_ASSISTANT_ENROLL_CODE` and omit `--code`; an explicit `--code` still works and wins over the env var.
 3. **Register the server with Claude Code.** Run the printed line:
    `claude mcp add --transport http herdr-assistant http://HUB_HOST:9483/assistant/mcp --header "Authorization: Worker <credential>" --header "X-Herdr-Device: my-laptop"`
 4. **Install the observe-only hooks (optional).**
@@ -68,6 +70,14 @@ tailnet interface.
    changes a permission decision. It is idempotent and only ever replaces its own entries.
 
 `assistant-worker list` shows workers (no secrets). Only the `claude` harness has setup support in Phase 1.
+
+## Scopes and what an enrolled worker can read
+
+A redeemed worker gets the default scopes `ask`, `report` and `read`. The `read` scope gives it read access to the
+owner's assistant memory (`memory_search`) and to the owner's grants, approvals, routines, connector metadata (never
+credentials), delegations and proposals. That is a lot of private context for one credential, so **enroll only
+harnesses you trust, and consider narrowing a worker's scopes** (a worker without `read` cannot use the list or search
+tools). Scope opt-in at enrollment time (default no `read`) is planned for Phase 2.
 
 ## Provenance
 
@@ -101,6 +111,13 @@ credential or the enrollment code.
 
 - Event payload: 4 KiB after scrubbing (secret-looking values are masked before storage).
 - Retention: 1,000 events and 4 MiB per tenant (oldest dropped first).
+- Per-worker event limit: 30 events/min per worker across the event-writing paths (`assistant_ask`, `report` and
+  `/assistant/hook-events`), in addition to the per-peer limit. Beyond it the hook endpoint returns 429 and the MCP
+  tools return the tool error `rate limited`. Every event persists a snapshot, so this keeps a runaway worker from
+  stalling the store.
+- Repeated authentication failures for the same worker and reason (revoked, expired, device mismatch) are audited once
+  per 60 s window, like unknown credentials; later windows record how many were suppressed.
+- The persisted store snapshot file is written with mode 0600.
 - Rate limits per peer address: 120 requests/min for `/assistant/mcp` and `/assistant/hook-events` combined, 10/min for `/assistant/enroll` (429 beyond).
 - At most 8 concurrent connections per peer; a request must finish within 15 s (slow clients are cut off).
 - Request bodies over 64 KiB are refused (413).
