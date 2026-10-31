@@ -3499,16 +3499,15 @@ def _require_durable_review_gate(cp: dict, dsn) -> None:
 def _share_wiring(cp: dict, dsn: str | None):
     """(share store adapter, shares root, settings) when control_plane.share.enabled is true, else three Nones.
 
-    Needs the registry database (shares live beside artifacts). Links are issued under control_plane.collab.public_url;
+    Needs the registry database (shares live beside artifacts). Links are issued under control_plane.share.public_url;
     the bundle volume is control_plane.share.shares_dir (default /shares, the container mount). Caps come from the YAML.
     """
     share = cp.get("share") or {}
     if not isinstance(share, dict) or share.get("enabled") is not True or not dsn:
         return None, None, None
     from .control_plane.artifact_share_api import share_settings_config
-    collab = cp.get("collab") if isinstance(cp.get("collab"), dict) else {}
     try:
-        settings = share_settings_config(share, public_url=collab.get("public_url"))
+        settings = share_settings_config(share, public_url=share.get("public_url"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     from .control_plane import artifact_adapter
@@ -3922,9 +3921,11 @@ def _share_lab_problems(collab: dict, share: dict) -> list[str]:
     secret = share.get("signing_secret")
     if not isinstance(secret, str) or len(secret.encode("utf-8")) < MIN_SECRET_BYTES:
         problems.append(f"control_plane.share.signing_secret (at least {MIN_SECRET_BYTES} bytes)")
-    for key in ("cognito_web_client", "cognito_domain", "cognito_pool", "public_url"):
+    for key in ("cognito_web_client", "cognito_domain", "cognito_pool"):
         if not isinstance(collab.get(key), str) or not collab.get(key):
             problems.append(f"control_plane.collab.{key}")
+    if not isinstance(share.get("public_url"), str) or not share.get("public_url"):
+        problems.append("control_plane.share.public_url")
     return problems
 
 
@@ -3950,7 +3951,7 @@ def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host
         pool_id=collab.get("cognito_pool"),
         client_ids=tuple(c for c in clients if isinstance(c, str)) if isinstance(clients, list) else (),
         web_client_id=collab.get("cognito_web_client"), cognito_domain=collab.get("cognito_domain"),
-        public_url=collab.get("public_url"),
+        public_url=share.get("public_url"),
         signing_secret=secret.encode("utf-8") if isinstance(secret, str) else b"",
         session_seconds=share.get("session_seconds", 14400))
     server = make_share_server(config, host=host, port=port)
@@ -3959,7 +3960,7 @@ def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host
         log.warning("share-public: lab links are OFF (every lab link answers 404) because these settings are "
                     "missing or invalid: %s; public links are served",
                     ", ".join(problems) or "control_plane.collab Cognito identifiers (pool, web client, https "
-                                           "domain, https public_url)")
+                                           "domain; https control_plane.share.public_url)")
     return server
 
 

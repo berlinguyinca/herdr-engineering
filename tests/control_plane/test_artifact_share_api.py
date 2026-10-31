@@ -361,12 +361,12 @@ def test_approve_requires_confirm_true_and_returns_url_once(env):
     assert [e["kind"] for e in json.loads(events)["events"]] == ["created", "approved"]
 
 
-@pytest.mark.parametrize("public_url", ["https://share.example", "https://share.example/"])
+@pytest.mark.parametrize("public_url", ["https://artifacts.example.test", "https://artifacts.example.test/"])
 def test_approve_url_joins_public_url_without_double_slash(tmp_path, public_url):
     with share_server(tmp_path, public_url=public_url) as (base, *_):
         share_id = create(base)[1]["share"]["share_id"]
         status, body = approve(base, share_id)
-        assert status == 200 and body["url"].startswith("https://share.example/s/") and "//s/" not in body["url"]
+        assert status == 200 and body["url"].startswith("https://artifacts.example.test/s/") and "//s/" not in body["url"]
 
 
 def test_approve_copies_nested_outputs_and_pins_content(env):
@@ -611,8 +611,9 @@ def test_cli_share_wiring_is_off_unless_enabled(monkeypatch, tmp_path):
     from herdr_engineering import cli
     assert cli._share_wiring({}, "postgresql:///x") == (None, None, None)
     assert cli._share_wiring({"share": {"enabled": False}}, "postgresql:///x") == (None, None, None)
-    cp = {"share": {"enabled": True, "max_files": 7, "shares_dir": str(tmp_path)},
-          "collab": {"public_url": "https://share.example/"}}
+    cp = {"share": {"enabled": True, "max_files": 7, "shares_dir": str(tmp_path),
+                    "public_url": "https://artifacts.example.test/"},
+          "collab": {"public_url": "https://mcp.example.test/"}}
     assert cli._share_wiring(cp, None) == (None, None, None)              # no registry database: no sharing
     made = []
 
@@ -623,9 +624,9 @@ def test_cli_share_wiring_is_off_unless_enabled(monkeypatch, tmp_path):
     monkeypatch.setattr("herdr_engineering.control_plane.artifact_adapter.SyncArtifactAdapter", FakeAdapter)
     adapter, root, settings = cli._share_wiring(cp, "postgresql:///x")
     assert isinstance(adapter, FakeAdapter) and len(made) == 1
-    assert root == tmp_path and settings["max_files"] == 7 and settings["public_url"] == "https://share.example/"
-    with pytest.raises(SystemExit, match="public_url"):
-        cli._share_wiring({"share": {"enabled": True}}, "postgresql:///x")
+    assert root == tmp_path and settings["max_files"] == 7 and settings["public_url"] == "https://artifacts.example.test/"
+    with pytest.raises(SystemExit, match=r"control_plane\.share\.public_url"):
+        cli._share_wiring({"share": {"enabled": True}, "collab": cp["collab"]}, "postgresql:///x")
 
 
 def test_revoke_racing_an_approve_removes_the_state_it_did_not_see(env):

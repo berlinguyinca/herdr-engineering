@@ -68,7 +68,7 @@ def share_settings_config(raw: dict | None, *, public_url: str | None) -> dict:
     if settings["default_public_days"] > 90:
         raise ValueError("control_plane.share.default_public_days must be 1-90")
     if not isinstance(public_url, str) or not public_url.startswith("https://") or not urlsplit(public_url).netloc:
-        raise ValueError("share links need an https:// control_plane.collab.public_url")
+        raise ValueError("share links need an https:// control_plane.share.public_url")
     from .annotation_anchor import annotation_settings, clean_owner_emails
     return {"public_url": public_url, **settings, "annotations": annotation_settings(raw.get("annotations")),
             "owner_emails": clean_owner_emails(raw.get("owner_emails"))}

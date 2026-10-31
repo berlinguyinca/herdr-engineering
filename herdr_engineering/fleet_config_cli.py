@@ -280,10 +280,10 @@ SHARE_SECTION_KEY = "share"
 # control_plane.share as authored; an unknown key (which could be a secret meant elsewhere) is refused.
 SHARE_KEYS = frozenset({"enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
                         "session_seconds", "signing_secret", "shares_dir", "events_dir", "marker_dir",
-                        "annotations", "owner_emails"})
+                        "annotations", "owner_emails", "public_url"})
 # What share-public gets: no directories (its mounts are fixed), nothing else from the central file.
 SHARE_SLICE_KEYS = ("enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
-                    "session_seconds", "signing_secret", "annotations")
+                    "session_seconds", "signing_secret", "annotations", "public_url")
 # Cognito identifiers share-public needs for lab sign-in (public values; no group, no operator).
 SHARE_COLLAB_KEYS = ("cognito_pool", "cognito_clients", "cognito_web_client", "cognito_domain", "public_url")
 SHARE_FIXED_DIRS = {"shares_dir": "/shares", "events_dir": "/share-events",
@@ -318,8 +318,8 @@ def share_values(cfg: FleetConfig) -> dict:
     """The validated share slice values ``{collab: {...}, share: {...}}``.
 
     Disabled (the default): only ``share.enabled: false`` is rendered and nothing else is required. Enabled: needs a
-    signing secret of at least 32 bytes, an https ``control_plane.collab.public_url`` with no path (the viewer's
-    redirect is fixed at ``/s/callback``), the Cognito pool, and caps that the control plane itself accepts."""
+    signing secret of at least 32 bytes, an https ``control_plane.share.public_url`` origin of its own (not the
+    MCP host's; the viewer's redirect is fixed at ``/s/callback`` at its root), the Cognito pool, and caps that the control plane itself accepts."""
     share, collab = _share_mapping(cfg)
     unknown = sorted(str(k) for k in set(share) - SHARE_KEYS)
     if unknown:
@@ -341,13 +341,16 @@ def share_values(cfg: FleetConfig) -> dict:
     if not isinstance(secret, str) or len(secret.encode("utf-8")) < MIN_SECRET_BYTES:
         raise FleetConfigError(f"control_plane.share.enabled is true but control_plane.share.signing_secret is "
                                f"missing or shorter than {MIN_SECRET_BYTES} bytes: {_SECRET_HINT}")
-    public_url = collab.get("public_url")
+    public_url = share.get("public_url")
     parts = urllib.parse.urlsplit(public_url.strip()) if isinstance(public_url, str) else None
+    mcp_url = collab.get("public_url")
+    mcp_netloc = urllib.parse.urlsplit(mcp_url.strip()).netloc.lower() if isinstance(mcp_url, str) else None
     if (parts is None or parts.scheme != "https" or not parts.netloc or parts.path not in ("", "/")
-            or parts.query or parts.fragment):
-        raise FleetConfigError("control_plane.share needs control_plane.collab.public_url to be an https origin "
-                               "with an empty path or '/' (share links and the lab sign-in callback /s/callback "
-                               "live at its root)")
+            or parts.query or parts.fragment or parts.netloc.lower() == mcp_netloc):
+        raise FleetConfigError("control_plane.share.public_url must be an https origin (empty path or '/', no query "
+                               "or fragment) on a host other than control_plane.collab.public_url: share links and "
+                               "the lab sign-in callback /s/callback live at the root of the share host; MCP stays "
+                               "on control_plane.collab.public_url")
     if not isinstance(collab.get("cognito_pool"), str) or not collab.get("cognito_pool"):
         raise FleetConfigError("control_plane.share needs control_plane.collab.cognito_pool")
     # The caps the control plane enforces (artifact_share_api.DEFAULTS; a test keeps the two in step). Not imported:

@@ -33,7 +33,8 @@ SECRET = secrets.token_hex(32)   # generated per run, 64 hex chars
 COLLAB = {"cognito_pool": "us-west-2_TESTPOOL", "cognito_clients": ["client-a"],
           "cognito_group": "team.test", "cognito_web_client": "webclient1",
           "cognito_domain": "https://pool.auth.us-west-2.amazoncognito.com",
-          "public_url": "https://share.example.test/", "operator_user": "owner-test"}
+          "public_url": "https://mcp.example.test/", "operator_user": "owner-test"}
+SHARE_URL = "https://artifacts.example.test/"
 
 
 def _central(tmp_path, share=None, collab=COLLAB):
@@ -55,7 +56,7 @@ def _central(tmp_path, share=None, collab=COLLAB):
 # ------------------------------------------------------------------------------------ (b) the share slice
 
 def test_slice_holds_only_the_share_and_cognito_keys(tmp_path):
-    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "max_files": 50,
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL, "max_files": 50,
                                         "session_seconds": 3600, "shares_dir": "/shares"})
     out = tmp_path / "share" / "share-config.json"
     fcc.render_share(load_fleet_config(central), out)
@@ -68,7 +69,8 @@ def test_slice_holds_only_the_share_and_cognito_keys(tmp_path):
     assert set(values["collab"]) == {"cognito_pool", "cognito_clients", "cognito_web_client",
                                      "cognito_domain", "public_url"}
     assert set(values["share"]) <= {"enabled", "max_share_bytes", "max_total_bytes", "max_files",
-                                    "default_public_days", "session_seconds", "signing_secret"}
+                                    "default_public_days", "session_seconds", "signing_secret", "public_url"}
+    assert values["share"]["public_url"] == SHARE_URL
     assert values["share"]["signing_secret"] == SECRET and values["share"]["max_files"] == 50
     text = out.read_text()
     full = yaml.safe_load(central.read_text())
@@ -106,20 +108,46 @@ def test_enabled_share_needs_a_long_signing_secret_and_says_how(tmp_path, secret
     assert not (tmp_path / "out.json").exists()
 
 
-@pytest.mark.parametrize("url", ["https://share.example.test/collab/", "https://share.example.test/x",
-                                 "http://share.example.test/"])
-def test_enabled_share_refuses_a_public_url_with_a_path(tmp_path, url):
-    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET},
-                       collab={**COLLAB, "public_url": url})
-    with pytest.raises(FleetConfigError, match="public_url"):
+@pytest.mark.parametrize("url", ["https://artifacts.example.test/x/", "https://artifacts.example.test/x",
+                                 "http://artifacts.example.test/", "https://artifacts.example.test/?a=1",
+                                 "https://artifacts.example.test/#f", "https://mcp.example.test/", "", None])
+def test_enabled_share_refuses_a_bad_share_public_url(tmp_path, url):
+    share = {"enabled": True, "signing_secret": SECRET}
+    if url is not None:
+        share["public_url"] = url
+    central = _central(tmp_path, share=share)
+    with pytest.raises(FleetConfigError, match=r"control_plane\.share\.public_url") as info:
         fcc.render_share(load_fleet_config(central), tmp_path / "out.json")
+    assert "/s/callback" in str(info.value) and "control_plane.collab.public_url" in str(info.value)
+    assert not (tmp_path / "out.json").exists()
+
+
+def test_disabled_share_needs_no_share_public_url(tmp_path):
+    central = _central(tmp_path, share={"enabled": False})
+    fcc.render_share(load_fleet_config(central), tmp_path / "out.json")
+
+
+def test_share_public_builds_lab_and_origin_from_the_share_host(tmp_path):
+    from herdr_engineering.cli import _share_public_server
+    out = _slice(tmp_path, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
+    server = _share_public_server(out, shares_dir=tmp_path / "shares", events_dir=tmp_path / "events",
+                                  sync_dir=tmp_path / "sync", host="127.0.0.1", port=0)
+    try:
+        assert server.config.public_url == SHARE_URL
+        assert server.lab is not None
+        assert json.loads(server.lab.config_json)["redirect_uri"] == "https://artifacts.example.test/s/callback"
+        assert server.public_origin == "https://artifacts.example.test"
+        from herdr_engineering.control_plane.share_public import sandbox_csp
+        assert "https://artifacts.example.test/s/" + "a" * 43 + "/" in sandbox_csp(server.public_origin, "a" * 43)
+    finally:
+        server.server_close()
 
 
 def test_enabled_share_refuses_unknown_keys_and_bad_caps(tmp_path):
-    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "api_key": "x"})
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL, "api_key": "x"})
     with pytest.raises(FleetConfigError, match="unknown keys: api_key"):
         fcc.render_share(load_fleet_config(central), tmp_path / "out.json")
-    central = _central(tmp_path / "b", share={"enabled": True, "signing_secret": SECRET, "max_files": 0})
+    central = _central(tmp_path / "b", share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL, "max_files": 0})
     with pytest.raises(FleetConfigError, match="max_files"):
         fcc.render_share(load_fleet_config(central), tmp_path / "out.json")
 
@@ -130,7 +158,7 @@ def test_slice_cap_defaults_match_the_control_plane():
 
 
 def test_share_public_refuses_a_file_carrying_more_than_the_slice(tmp_path):
-    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET})
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
     with pytest.raises(FleetConfigError, match="render-share"):
         fcc.check_share_slice(load_fleet_config(central))
 
@@ -147,7 +175,7 @@ def _slice(tmp_path, share, collab=COLLAB):
 def test_share_public_logs_once_when_lab_settings_are_incomplete(tmp_path, caplog):
     from herdr_engineering.cli import _share_public_server
     collab = {k: v for k, v in COLLAB.items() if k != "cognito_web_client"}
-    out = _slice(tmp_path, {"enabled": True, "signing_secret": SECRET}, collab=collab)
+    out = _slice(tmp_path, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL}, collab=collab)
     caplog.set_level(logging.WARNING)
     server = _share_public_server(out, shares_dir=tmp_path / "shares", events_dir=tmp_path / "events",
                                   sync_dir=tmp_path / "sync", host="127.0.0.1", port=0)
@@ -162,7 +190,7 @@ def test_share_public_logs_once_when_lab_settings_are_incomplete(tmp_path, caplo
 
 def test_share_public_with_complete_lab_settings_logs_nothing(tmp_path, caplog):
     from herdr_engineering.cli import _share_public_server
-    out = _slice(tmp_path, {"enabled": True, "signing_secret": SECRET})
+    out = _slice(tmp_path, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
     caplog.set_level(logging.WARNING)
     server = _share_public_server(out, shares_dir=tmp_path / "shares", events_dir=tmp_path / "events",
                                   sync_dir=tmp_path / "sync", host="127.0.0.1", port=0)
@@ -279,7 +307,7 @@ def test_share_dirs_are_fixed_container_paths(tmp_path):
         central = _central(tmp_path / key, share={"enabled": False, key: bad})
         with pytest.raises(FleetConfigError, match=f"control_plane.share.{key} must be"):
             fcc.render_share(load_fleet_config(central), tmp_path / "out.json")
-    central = _central(tmp_path / "ok", share={"enabled": True, "signing_secret": SECRET, "shares_dir": "/shares",
+    central = _central(tmp_path / "ok", share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL, "shares_dir": "/shares",
                                               "events_dir": "/share-events",
                                               "marker_dir": "/var/lib/herdr/share-markers"})
     fcc.render_share(load_fleet_config(central), tmp_path / "ok.json")
@@ -418,7 +446,7 @@ def test_dry_run_refuses_enabled_share_without_a_signing_secret(env):
 
 
 def test_dry_run_refuses_enabled_share_without_the_collab_marker(env):
-    _set_share(env, {"enabled": True, "signing_secret": SECRET}, collab=False)
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL}, collab=False)
     data = yaml.safe_load(env["central"].read_text())
     data["sections"]["control_plane"]["values"]["collab"] = dict(COLLAB)
     env["central"].unlink()
@@ -429,7 +457,7 @@ def test_dry_run_refuses_enabled_share_without_the_collab_marker(env):
 
 
 def test_dry_run_with_share_enabled_validates_and_never_prints_the_secret(env):
-    _set_share(env, {"enabled": True, "signing_secret": SECRET})
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
     before = _ds._home_files(env)
     r = _ds.deploy(env, "--dry-run")
     assert r.returncode == 0, r.stderr
@@ -441,7 +469,7 @@ def test_dry_run_with_share_enabled_validates_and_never_prints_the_secret(env):
 
 
 def test_real_deploy_with_share_enabled_installs_the_slice_and_edge_and_recreates_share_public(env):
-    _set_share(env, {"enabled": True, "signing_secret": SECRET})
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
     r = _ds.deploy(env)
     assert r.returncode == 0, r.stdout + r.stderr
     assert SECRET not in r.stdout + r.stderr
@@ -500,7 +528,7 @@ def _log_pairs(e):
 
 
 def test_rollback_recreates_share_public_from_the_previous_commit_when_its_edge_routes_s(env):
-    _set_share(env, {"enabled": True, "signing_secret": SECRET})
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
     full, prev_tag = _ds._seed_previous(env, _rollback_target_with_share_public())
     _seed_share_edge(env, with_s=True)
     env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
@@ -514,7 +542,7 @@ def test_rollback_recreates_share_public_from_the_previous_commit_when_its_edge_
 
 
 def test_rollback_stops_share_public_when_the_restored_edge_does_not_route_s(env):
-    _set_share(env, {"enabled": True, "signing_secret": SECRET})
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
     _, prev_tag = _ds._seed_previous(env, _rollback_target_with_share_public())
     _seed_share_edge(env, with_s=False)
     env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
@@ -573,7 +601,7 @@ def test_edge_mcp_body_spool_is_bounded_by_connection_limits_and_an_explicit_tmp
 # ------------------------------------------------------------------ annotations and owner emails
 
 def test_share_values_accept_annotations_and_owner_emails_and_the_slice_drops_the_owners(tmp_path):
-    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET,
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL,
                                         "annotations": {"max_per_share": 7, "per_user_per_minute": 5},
                                         "owner_emails": ["Owner@Lab.test"]})
     cfg = load_fleet_config(central)
@@ -591,13 +619,13 @@ def test_share_values_accept_annotations_and_owner_emails_and_the_slice_drops_th
 @pytest.mark.parametrize("annotations", [{"enabled": "yes"}, {"per_user_per_minute": 0}, {"max_comment_chars": 4001},
                                          {"nope": 1}, "on"])
 def test_a_bad_annotations_block_is_a_fleet_config_error_not_a_value_error(tmp_path, annotations):
-    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "annotations": annotations})
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL, "annotations": annotations})
     with pytest.raises(FleetConfigError, match="annotations"):
         fcc.share_values(load_fleet_config(central))
 
 
 @pytest.mark.parametrize("owners", ["a@b.test", ["not-an-email"], ["a@b.test", 5], ["é@b.test"], [""]])
 def test_invalid_owner_emails_are_refused(tmp_path, owners):
-    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "owner_emails": owners})
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL, "owner_emails": owners})
     with pytest.raises(FleetConfigError, match="owner_emails"):
         fcc.share_values(load_fleet_config(central))
