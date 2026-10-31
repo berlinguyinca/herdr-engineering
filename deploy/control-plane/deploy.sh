@@ -334,12 +334,20 @@ fi
 if [ "$DRY" = 1 ]; then
   SHARE_DIR="$ENV_DIR/new/share"
   export HERDR_SHARES_DIR="$ENV_DIR/shares" HERDR_SHARE_EVENTS_DIR="$ENV_DIR/share-events"
+  export HERDR_COLLAB_MIRROR_DIR="$ENV_DIR/collab-mirror"
+  export HERDR_COLLAB_OUTBOX_DIR="$ENV_DIR/collab-outbox"
+  export HERDR_COLLAB_SPOOL_DIR="$ENV_DIR/collab-spool"
 else
   SHARE_DIR="$HOME/.config/herdr-engineering/share"
   if [ "$SHARE" = 1 ]; then only_file "$SHARE_DIR" share-config.json || exit 1; fi
   # bundles (web writes, worker sweeps, share-public reads) and share-public's events file (worker reads)
   export HERDR_SHARES_DIR="$HOME/.local/share/herdr-engineering/shares"
   export HERDR_SHARE_EVENTS_DIR="$HOME/.local/share/herdr-engineering/share-events"
+  # collaborator bridge, beside them on the same large storage: the worker's mirror (collab-public reads it) and
+  # spool (assembled uploads, worker-private), and the outbox collab-public writes. Pairwise disjoint siblings.
+  export HERDR_COLLAB_MIRROR_DIR="$HOME/.local/share/herdr-engineering/collab-mirror"
+  export HERDR_COLLAB_OUTBOX_DIR="$HOME/.local/share/herdr-engineering/collab-outbox"
+  export HERDR_COLLAB_SPOOL_DIR="$HOME/.local/share/herdr-engineering/collab-spool"
 fi
 export HERDR_SHARE_CONFIG_DIR="$SHARE_DIR"
 SHARE_CONFIG="$SHARE_DIR/share-config.json"
@@ -516,6 +524,11 @@ if [ "$COLLAB" = 1 ]; then
   if [ "$SHARE" = 1 ] && [ "$(id -u)" != "$WANT_UID" ]; then
     echo "WARNING: share-public runs as uid $WANT_UID (control_plane.compose.HERDR_COLLAB_CERT_UID) but this deploy" \
          "creates $SHARE_DIR and $HERDR_SHARE_EVENTS_DIR as uid $(id -u); it will not be able to read or write them." >&2
+  fi
+  # collab-public runs as the same uid: it writes the outbox and reads the mirror (both created below as the deploying uid)
+  if [ "$(id -u)" != "$WANT_UID" ]; then
+    echo "WARNING: collab-public runs as uid $WANT_UID (control_plane.compose.HERDR_COLLAB_CERT_UID) but this deploy" \
+         "creates $HERDR_COLLAB_MIRROR_DIR and $HERDR_COLLAB_OUTBOX_DIR as uid $(id -u); it will not be able to write the outbox." >&2
   fi
 fi
 
@@ -735,6 +748,11 @@ forward() {
   install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
   # mount sources of web/worker (and share-public): created here, after the build, never before
   mkdir -p "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" && chmod 755 "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" \
+    || return 1
+  # collaborator bridge directories: ALWAYS (the worker mounts them whether or not the bridge is enabled). Mirror and
+  # outbox are the deploying uid's, 0755 (the root worker writes them regardless); the spool is worker-private, 0700.
+  mkdir -p "$HERDR_COLLAB_MIRROR_DIR" "$HERDR_COLLAB_OUTBOX_DIR" "$HERDR_COLLAB_SPOOL_DIR" \
+    && chmod 755 "$HERDR_COLLAB_MIRROR_DIR" "$HERDR_COLLAB_OUTBOX_DIR" && chmod 700 "$HERDR_COLLAB_SPOOL_DIR" \
     || return 1
   if [ "$SHARE" = 1 ]; then install_private "$NEW_SHARE" "$SHARE_CONFIG" || return 1; fi
   # the deploy/pipelines refresh timer; its first run is the timer's (a fetch never fails a deploy)

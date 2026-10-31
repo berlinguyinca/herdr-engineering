@@ -68,7 +68,14 @@ SAFETY_EVENTS = frozenset({
     "team_detached"})
 BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_denied", "task_progress",
                          "steer_proposed", "consult_asked", "proposal_submitted", "external_status_changed",
+                         # plan 3: the artifact bridge's audit trail (collab_artifacts); _apply ignores them
+                         "artifact_tool_used", "artifact_commit_submitted", "artifact_upload_staged",
                          "suggestion_submitted"})        # a guest can file one at will, so it stops early like chat
+# audit records only: committed, never wake a room's long-poll
+SILENT_EVENTS = frozenset({"workspace_terminal_authorized", "artifact_tool_used", "artifact_commit_submitted",
+                           "artifact_upload_staged"})
+# events after which the artifact bridge's agents.json may be out of date
+AGENT_FEED_EVENTS = frozenset({"agent_revoked", "user_decided", "agent_enrolled"})
 # creation event -> kind (what is outstanding is recomputed from state, see _recount)
 REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
                     "join_token_created": "join", "xlink_created": "xlink", "workspace_linked": "workspace",
@@ -491,6 +498,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self.redeem_failures: dict[str, int] = {}      # failed invite redemptions per client address (bounded)
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
+        # plan 3: the collab-public artifact bridge (collab_artifacts.CollabArtifactBridge), wired by the server
+        # when control_plane.collab_artifacts is enabled; None = no artifact tools
+        self.artifact_bridge = None
         self.stats = defaultdict(int)
         self._init_workbench()
         self._init_context()
@@ -647,6 +657,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._outstanding_key = None
             self._apply(ev)
             self._touch_rooms(payload, ev["sequence"], event_type)
+            if event_type in AGENT_FEED_EVENTS and self.artifact_bridge is not None:
+                self.artifact_bridge.agents_changed()      # wakes its feed thread; no I/O under the lock
             if event_type in ("member_added", "member_removed") and self.on_room_members_changed is not None:
                 try:
                     self.on_room_members_changed(payload["room_id"])
@@ -667,7 +679,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         rooms.update(r for r in (p.get("room_ids") or ()) if isinstance(r, str))
         if isinstance(p.get("agent_id"), str):
             rooms |= self._rooms_by_agent.get(p["agent_id"], set())
-        if event_type == "workspace_terminal_authorized":
+        if event_type in SILENT_EVENTS:
             return                                  # an audit record only: wakes nobody
         # Link changes are shown to people only (never guests or agents), so they wake only people's polls.
         target = self._room_link_seq if event_type in self._LINK_EVENTS else self._room_seq
@@ -1359,6 +1371,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         except CollabError:
             pass
 
+    def _refresh_agent_feed(self) -> None:
+        """Rewrite the artifact bridge's agents.json now (outside the service lock); never raises."""
+        bridge = self.artifact_bridge
+        if bridge is not None:
+            bridge.write_agents_feed()
+
     @staticmethod
     def _actor(pr: Principal, **extra) -> dict:
         return {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None,
@@ -1605,7 +1623,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._expire_helpers()                # a disabled person's helpers end now
             elif action in ("approve", "enable") and self._user_email.get(uid):
                 self._deliver_pending(uid, self._user_email[uid])
-            return self._user_row(uid, self._users[uid])
+            row = self._user_row(uid, self._users[uid])
+        self._refresh_agent_feed()          # disable / kick / enable change which agents may act
+        return row
 
     # -- people: link email at sign-in, invite by email
     def me(self, pr: Principal) -> dict:
@@ -2161,6 +2181,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     pr, agent_id=agent_id, room_id=room_id, room_ids=[room_id], project_id=room["project_id"],
                     action="external.revoke", outcome="allowed",
                     project_ids=[room["project_id"]], resource_id=agent_id))
+        self._refresh_agent_feed()
         return {"ok": True, "state": "revoked"}
 
     def external_me(self, pr: Principal) -> dict:
@@ -2183,6 +2204,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             self._commit("agent_revoked", self._actor(
                 pr, agent_id=pr.id, room_id=x["room_id"], room_ids=[x["room_id"]], project_id=x["project_id"],
                 action="external.leave", outcome="allowed", project_ids=[x["project_id"]], resource_id=pr.id))
+        self._refresh_agent_feed()
         return {"ok": True}
 
     def external_heartbeat(self, pr: Principal, body: dict) -> dict:
@@ -2704,6 +2726,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 pr, agent_id=agent_id, room_ids=rooms, action="agent.revoke", outcome="allowed",
                 project_ids=[], resource_id=agent_id))
             self._end_agent(self._actor(pr), agent_id, "revoked", set())      # and every helper under it
+        self._refresh_agent_feed()
         return {"ok": True}
 
     # ------------------------------------------------------- room profile

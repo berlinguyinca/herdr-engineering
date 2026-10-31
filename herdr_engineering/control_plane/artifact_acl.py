@@ -4,6 +4,8 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
+COLLAB_PREFIXES = ("collab:", "collab-invite:")
+
 
 class ArtifactAcl:
     def __init__(self, *, now: Callable[[], float] = time.time, on_change=None):
@@ -14,6 +16,8 @@ class ArtifactAcl:
 
     def grant(self, artifact_id: str, principal_id: str, permissions: set[str],
               *, expires_at: float | None = None, granted_by: str | None = None) -> dict:
+        if principal_id.startswith(COLLAB_PREFIXES):
+            raise ValueError("collaborator grants use the collaborators route")
         allowed = {"read", "edit", "review", "share", "admin"}
         if not artifact_id or not principal_id or not permissions <= allowed:
             raise ValueError("invalid artifact ACL grant")
@@ -72,6 +76,8 @@ class ArtifactAcl:
 
     def load(self, grants: list[dict]) -> None:
         for grant in grants:
+            if str(grant.get("principal_id") or "").startswith(COLLAB_PREFIXES):
+                continue
             self._holders.setdefault(grant["artifact_id"], set()).add(grant["principal_id"])
             self._grants[(grant["artifact_id"], grant["principal_id"])] = {
                 "artifact_id": grant["artifact_id"],
