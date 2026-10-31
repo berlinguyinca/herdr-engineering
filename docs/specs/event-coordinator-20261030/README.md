@@ -91,3 +91,11 @@ PYTHONPATH=. python3 -m herdr_engineering.event_fixture \
   --output /tmp/herdr-dinner-fixture-artifacts \
   --user-id user:main-fixture --task-id task:main-dinner
 ```
+
+## Optional contact preparation extension
+
+`event_contacts.py` adds structured scoped research observations, unique email-first
+contact selection and local semantic form proposals. See
+`docs/contracts/event-contact-preparation-v1.md` for the public interface and trusted
+adapter requirements. It adds no browser binding, imports or submission capability.
+The earlier fixture CLI/report schema remain intact for pinned main-lane integration.

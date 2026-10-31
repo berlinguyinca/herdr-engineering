@@ -84,3 +84,30 @@ drafts/checkpoint/browser envelopes/artifact mission and legacy defaults. Report
 schema now exposes requirements and missing_requirements, preserving source provenance
 and unknown venue cost status. Ruff, compilation and diff checks passed. No browser
 imports, grants, runtime orchestration or dependencies were added.
+
+## Contact research and local form preparation extension
+
+New `event_contacts.py` consumes scoped trusted structured observations only; it does
+not fetch pages or execute browser operations. Tests first failed because the module
+was absent. Four additional duplicate-contact regressions failed before history checks
+were added. The focused suite including `tests/test_event_contacts.py` now passes
+77 tests (25 contact-preparation scenarios plus the prior 52). Ruff on the new module
+and tests, Python compilation and diff checks pass. The previously documented full
+suite baseline failure is unchanged; no broad rerun was needed for this pure additive
+module. Existing fixture CLI and report schema remain unchanged.
+
+Coverage: scoped identity/resource boundaries, future/expired observations, verified
+origin, email-first route deduplication/ambiguity, cross-origin forms, explicit requester
+fields, hidden/unsupported required controls, missing date/message values, proposal
+hashes, immutable inputs and cross-channel duplicate/opt-out/reply history. All network
+addresses are synthetic example.test routes. No live research or external action occurs.
+
+Independent contact-preparation review found query-bearing URLs could retain tokens
+in durable provenance/proposals. Source and target regressions failed before the fix;
+all URL queries are now rejected at construction, alongside userinfo/fragments.
+Operational token-bearing destinations require a future opaque authorized binding.
+After the fix, 77 focused tests, Ruff, compilation and diff checks pass. Reviewer
+LSP/AST diagnostic transports remain unavailable; no such analysis result is claimed.
+Final independent re-review confirmed query source/target rejection and reported no
+remaining code/spec/security blocker in the reviewed contact-extension slice. The
+reviewer independently reran all 77 focused tests, Ruff, compilation and diff checks.

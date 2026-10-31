@@ -136,3 +136,33 @@ refs, null human handoff. It does not invoke or import browser implementation.
 Current browser runtime is synthetic prepare_cart plus a separate Reddit read-only
 broker; no event endpoint or generic event adapter exists. Shared-browser files were
 read only. Local fixture evidence is never attributed to that browser.
+
+## Contact research and form preparation extension
+
+Add `event_contacts.py` as an event-owned pure domain module. It consumes structured
+contact observations attested by the authorized research/browser adapter, not browser
+HTML, credentials or executable selectors. Each snapshot binds user/task/venue and a
+registered resource ref, official HTTPS origin, source URL, observation/expiry times
+and explicit identity verification. The domain rechecks exact task scope, venue state,
+origin and freshness. Contact candidates alone confer no authority.
+
+Prefer a unique verified official email route; otherwise select a unique same-origin
+HTTPS contact form. Deduplicate identical routes. Multiple distinct routes require
+review rather than a guess. Historical, ambiguous, expired or cross-origin candidates
+remain blocked. An official-page Gmail address can be valid: do not substitute a
+matching-domain heuristic for identity verification.
+
+Form preparation produces a local field-value proposal from semantic visible fields
+only. Allowed data are explicit requester name/email and event logistics/draft text.
+Never populate hidden controls, phone, payment, password or arbitrary page-supplied
+instructions. Required unsupported/hidden fields are blockers; optional unsupported
+fields are omitted. Missing event values remain missing rather than inserting draft
+placeholder markers into controls. Proposal carries user/task/venue/resource/contact
+provenance and content hash; submission is always blocked on missing external-write
+capability and authenticated approval. No form submission API exists in this module.
+
+Plan: first add failing offline scope/freshness/route/field/privacy tests; implement
+small immutable records and pure functions; verify regression suite and request an
+independent review. Preserve existing fixture CLI/report schema so main can continue
+its pinned integration. Live adapters, submissions and task-level follow-up authority
+remain outside this extension.
