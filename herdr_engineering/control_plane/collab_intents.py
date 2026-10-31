@@ -21,9 +21,11 @@ Per intent file, at scan time (before any lane wait), for every kind (Task 5a):
 
 The intent then waits for its lane (``lane_key``; default one lane per actor). Lanes run concurrently up to
 ``limits.apply_concurrency``; within a lane intents run oldest first, never two at once; a lane still busy from an
-earlier tick is skipped (its files are rescanned next tick), never awaited. In the lane, under session advisory locks on
-the lane and on the idempotency key (Postgres, so a second worker process cannot interleave), steps 1, 3 and 5 are
-checked again just before the handler runs: the store does not enforce key uniqueness or quota itself.
+earlier tick is skipped, never awaited. Only a small record of a received ticket is kept in memory (no payload; the
+set is capped). In the lane, under session advisory locks on the lane and on the idempotency key (Postgres, so a second
+worker process cannot interleave), the file is re-read and re-validated, a digest that differs from the ledger row is
+``rejected`` "intent changed after it was received", a withdrawn file is forgotten, and steps 1, 3 and 5 are checked
+again just before the handler runs: the store does not enforce key uniqueness or quota itself.
 
 The handler returns ``{result, version_id?, reason?, attempt_id?, …}``; the applier records it with ``record_outcome``
 (which decides once: if another path decided first, the decided row is what gets written), writes
@@ -67,6 +69,7 @@ from .collab_bridge_files import (
     _walk_dirs,
     atomic_write_json,
     ensure_dir,
+    file_exists_beneath,
     list_beneath,
     read_json_beneath,
     unlink_beneath,
@@ -91,6 +94,11 @@ STRAY_SCAN_ENTRIES = 50_000     # entries one stray pass looks at (it streams; n
 # sweep_results deletes at most this many files per call (the results dir is the worker's own tree: no cap, no
 # fail-closed listing; an oversized backlog drains over successive calls).
 RESULTS_SWEEP_BATCH = 10_000
+# Received-but-unfinished tickets are remembered as small records (no payload), at most
+# max(RECEIVED_MIN_CAP, agents x RECEIVED_PER_AGENT); past that, new tickets stay on disk un-received (fail closed) and
+# are retried once there is room.
+RECEIVED_MIN_CAP = 4096
+RECEIVED_PER_AGENT = 8
 
 REASON_UNREADABLE = "intent is not readable"
 REASON_UNKNOWN_KIND = "unknown intent kind"
@@ -133,16 +141,22 @@ class _Kind:
     replay_outcomes: frozenset[str]
 
 
-@dataclass
-class _Job:
+@dataclass(frozen=True)
+class _Received:
+    """What the applier remembers of a received ticket: identifiers and order only, never the payload. The lane
+    re-reads and re-validates the file, and checks its digest against the ledger row, before applying it."""
+    ticket: str
     name: str
-    intent: Intent
-    spec: _Kind
+    kind: str
+    actor: Actor
+    key: str
     lane: str
-    mtime: float = 0.0
+    submitted_at: float
+    mtime: float
+    request_sha256: str
 
     def order(self) -> tuple:
-        return (self.intent.submitted_at, self.mtime, self.intent.ticket)
+        return (self.submitted_at, self.mtime, self.ticket)
 
 
 def _default_lane(intent: Intent, _agent: dict | None) -> str:
@@ -185,7 +199,8 @@ class CollabIntentApplier:
         self._kinds: dict[str, _Kind] = {}
         self._busy: dict[str, asyncio.Task] = {}
         self._inflight: set[str] = set()
-        self._received: dict[str, _Job] = {}     # received (ledger row written) but not yet finished
+        self._received: dict[str, _Received] = {}   # received (ledger row written) but not yet finished
+        self._received_cap = RECEIVED_MIN_CAP
         self._feed: dict | None = None
         self._sem = asyncio.Semaphore(limits.apply_concurrency)
         self._counts = self._zero()
@@ -238,9 +253,11 @@ class CollabIntentApplier:
         size ``acquire``'s pool to at least ``apply_concurrency + 1``.
 
         The per-tick scan budget (``max_per_tick``) goes only to files with no known ``received`` row (only they are on
-        the age clock). A received ticket is kept in memory and never rescanned: when its lane is free, the lane starts
-        with ALL of its received tickets, strictly oldest first (``submitted_at``, then mtime, then ticket), so a fresh
-        ticket always runs behind its lane's older ones. Lanes started here are awaited for at most ``wait`` seconds; a longer one keeps running and its lane is
+        the age clock). A received ticket is remembered as a small record (capped; see ``RECEIVED_MIN_CAP``) and not
+        rescanned: when its lane is free, the lane starts with ALL of its received tickets, oldest first
+        (``submitted_at``, then mtime, then ticket), so in steady state a fresh ticket always runs behind its lane's
+        older ones. After a restart the received rows are rediscovered in mtime order under the scan budget, so until
+        all are rediscovered the order follows mtime. Lanes started here are awaited for at most ``wait`` seconds; a longer one keeps running and its lane is
         skipped by later ticks until it finishes (``drain`` awaits them all).
         """
         feed, listing = await asyncio.to_thread(self._load_outbox)
@@ -250,7 +267,7 @@ class CollabIntentApplier:
         mtimes = {name: st.st_mtime for name, st in listing
                   if stat.S_ISREG(st.st_mode) and _INTENT_FILE.match(name) and name[:-5] not in self._inflight}
         present = {name[:-5] for name in mtimes}
-        self._received = {t: job for t, job in self._received.items() if t in present or t in self._inflight}
+        self._received = {t: rec for t, rec in self._received.items() if t in present or t in self._inflight}
         fresh = sorted((n for n in mtimes if n[:-5] not in self._received), key=lambda n: (mtimes[n], n))
         names = fresh[:self.max_per_tick]
         raws = await asyncio.to_thread(self._read_intents, names) if names else {}
@@ -264,17 +281,17 @@ class CollabIntentApplier:
                     log.error("collab intent %s: scan failed (%s)", name[:-5], type(exc).__name__)
                     continue
                 if job is not None:
-                    job.mtime = mtimes[name]
-                    if job.lane in self._busy:
+                    rec = self._remember(job, mtimes[name])
+                    if rec.lane in self._busy:
                         self._counts["skipped"] += 1
-        lanes: dict[str, list[_Job]] = {}
-        for ticket, job in self._received.items():
-            if ticket not in self._inflight and job.lane not in self._busy:
-                lanes.setdefault(job.lane, []).append(job)
+        lanes: dict[str, list[_Received]] = {}
+        for ticket, rec in self._received.items():
+            if ticket not in self._inflight and rec.lane not in self._busy:
+                lanes.setdefault(rec.lane, []).append(rec)
         started = []
         for lane, jobs in lanes.items():
-            jobs.sort(key=_Job.order)
-            self._inflight.update(j.intent.ticket for j in jobs)
+            jobs.sort(key=_Received.order)
+            self._inflight.update(j.ticket for j in jobs)
             task = asyncio.create_task(self._run_lane(lane, jobs, acquire))
             self._busy[lane] = task
             started.append(task)
@@ -302,6 +319,7 @@ class CollabIntentApplier:
         self._sweep_strays()
         feed = read_json_beneath(self.outbox, [AGENTS_FEED], max_bytes=AGENTS_FEED_MAX_BYTES)
         agents = feed.get("agents") if isinstance(feed, dict) else None
+        self._received_cap = max(RECEIVED_MIN_CAP, (len(agents) if isinstance(agents, dict) else 0) * RECEIVED_PER_AGENT)
         cap = max(INTENTS_MIN_ENTRIES,
                   (len(agents) if isinstance(agents, dict) else 0) * self.limits.max_pending_intents_per_agent * 2)
         try:
@@ -344,11 +362,16 @@ class CollabIntentApplier:
             os.close(dfd)
         return removed
 
+    def _reread(self, name: str) -> tuple[bool, dict | None]:
+        if not file_exists_beneath(self.outbox, [INTENTS_DIR], name):
+            return False, None
+        return True, read_json_beneath(self.outbox, [INTENTS_DIR, name], max_bytes=INTENT_MAX_BYTES)
+
     def _read_intents(self, names: list[str]) -> dict[str, dict | None]:
         return {n: read_json_beneath(self.outbox, [INTENTS_DIR, n], max_bytes=INTENT_MAX_BYTES) for n in names}
 
     # -- generic steps 1-5 (scan time) ------------------------------------------------------------------------
-    async def _scan(self, conn, name: str, raw: dict | None) -> _Job | None:
+    async def _scan(self, conn, name: str, raw: dict | None) -> tuple[str, Intent, str] | None:
         ticket = name[:-5]
         grants = CollabGrantStore(conn)
         row = await self._ledger(conn, ticket)
@@ -373,6 +396,8 @@ class CollabIntentApplier:
             return None
         if await self._replayed(conn, name, intent, spec, row):                                       # step 3
             return None
+        if ticket not in self._received and len(self._received) >= self._received_cap:
+            return None                                    # full: stays on disk un-received, retried with room
         if row is None:                                                                             # step 4
             if intent.submitted_at > self.clock() + INTENT_FUTURE_SKEW:
                 await self._decide(conn, intent, None, {"result": "rejected", "reason": REASON_FUTURE}, charge=False)
@@ -397,9 +422,15 @@ class CollabIntentApplier:
             log.error("collab intent %s: lane key failed (%s)", ticket, type(exc).__name__)
             await self._finish(conn, name, intent, {"result": "rejected", "reason": REASON_INTERNAL})
             return None
-        job = _Job(name, intent, spec, lane)
-        self._received[intent.ticket] = job
-        return job
+        return name, intent, lane
+
+    def _remember(self, job: tuple[str, Intent, str], mtime: float) -> _Received:
+        name, intent, lane = job
+        rec = _Received(ticket=intent.ticket, name=name, kind=intent.kind, actor=intent.actor, key=self._key(intent),
+                        lane=lane, submitted_at=intent.submitted_at, mtime=mtime,
+                        request_sha256=intent.request_sha256)
+        self._received[intent.ticket] = rec
+        return rec
 
     @staticmethod
     def _key(intent: Intent) -> str:
@@ -442,12 +473,12 @@ class CollabIntentApplier:
         return True
 
     # -- lanes ------------------------------------------------------------------------------------------------
-    async def _run_lane(self, lane: str, jobs: list[_Job], acquire) -> None:
+    async def _run_lane(self, lane: str, jobs: list[_Received], acquire) -> None:
         try:
             for index, job in enumerate(jobs):
                 async with self._sem:
                     ran = await self._apply(job, acquire)
-                self._inflight.discard(job.intent.ticket)
+                self._inflight.discard(job.ticket)
                 if not ran:                                # locked elsewhere: keep the lane's order, retry next tick
                     self._counts["skipped"] += len(jobs) - index
                     break
@@ -457,15 +488,14 @@ class CollabIntentApplier:
             log.error("collab intents: lane failed (%s)", type(exc).__name__)
         finally:
             for job in jobs:
-                self._inflight.discard(job.intent.ticket)
+                self._inflight.discard(job.ticket)
             if self._busy.get(lane) is asyncio.current_task():
                 del self._busy[lane]
 
-    async def _apply(self, job: _Job, acquire) -> bool:
-        intent = job.intent
+    async def _apply(self, job: _Received, acquire) -> bool:
         async with acquire() as conn:
             locks = [_LOCK_SALT + "lane:" + job.lane,
-                     _LOCK_SALT + f"key:{intent.actor.kind}:{intent.actor.id}:{intent.kind}:{self._key(intent)}"]
+                     _LOCK_SALT + f"key:{job.actor.kind}:{job.actor.id}:{job.kind}:{job.key}"]
             held = []
             try:
                 for lock in locks:
@@ -481,15 +511,28 @@ class CollabIntentApplier:
                     except Exception as exc:  # a broken connection drops its session locks anyway
                         log.warning("collab intents: advisory unlock failed (%s)", type(exc).__name__)
 
-    async def _apply_locked(self, conn, job: _Job) -> None:
-        intent, name = job.intent, job.name
-        row = await self._ledger(conn, intent.ticket)
-        if row is None:
-            return                                         # the received row vanished: rescanned next tick
+    async def _apply_locked(self, conn, job: _Received) -> None:
+        name = job.name
+        row = await self._ledger(conn, job.ticket)
+        if row is None:                                    # the received row vanished: forget it; a later scan
+            self._received.pop(job.ticket, None)           # treats the file as fresh (age clock and all)
+            return
         if row["outcome"] != "received":
             await self._settle_from_row(name, row)
             return
-        if await self._replayed(conn, name, intent, job.spec, row):
+        present, raw = await asyncio.to_thread(self._reread, name)
+        if not present:                                    # withdrawn (or replaced by a non-file): forgotten
+            self._received.pop(job.ticket, None)
+            return
+        try:
+            intent = validate_intent(raw, filename=name, limits=self.limits) if raw is not None else None
+        except IntentError:
+            intent = None
+        spec = self._kinds.get(intent.kind) if intent is not None else None
+        if intent is None or spec is None or intent.request_sha256 != row["request_sha256"]:
+            await self._reject_unvalidated(conn, name, row, None, REASON_CHANGED)
+            return
+        if await self._replayed(conn, name, intent, spec, row):
             return
         agent, reason = self._agent_for(intent)            # the newest feed: revoked while queued is still refused
         if reason is not None:
@@ -499,7 +542,7 @@ class CollabIntentApplier:
                             grants=CollabGrantStore(conn), limits=self.limits, assemble=self.assemble,
                             extras=self.extras)
         try:
-            out = await job.spec.handler(ctx, intent)
+            out = await spec.handler(ctx, intent)
             _check_outcome(out)
         except asyncio.CancelledError:
             raise

@@ -1128,3 +1128,153 @@ def test_a_received_intent_whose_file_vanished_is_forgotten(registry_pg, tmp_pat
         await env.tick()
         assert calls == [1] and gone["ticket"] not in env.applier._received
     run(registry_pg, tmp_path, body)
+
+
+# ----------------------------------------------------------------------------- review round 3
+
+def _blocked_lane(release_holder, calls):
+    async def handler(ctx, intent):
+        calls.append(intent.payload.get("n"))
+        if intent.payload.get("n") == 1:
+            await release_holder["event"].wait()
+        return {"result": "done"}
+    return handler
+
+
+def test_a_received_ticket_is_remembered_without_its_payload_and_the_set_is_capped(
+        registry_pg, tmp_path, registry, monkeypatch):
+    from herdr_engineering.control_plane import collab_intents as ci
+    monkeypatch.setattr(ci, "RECEIVED_MIN_CAP", 3)
+    monkeypatch.setattr(ci, "RECEIVED_PER_AGENT", 1)
+    register_x()
+    hold, calls = {}, []
+
+    async def body(env):
+        hold["event"] = asyncio.Event()
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", _blocked_lane(hold, calls))
+        env.intent(agent(a), payload={"n": 1}, age=10)
+        await env.tick(wait=0.05)
+        big = "y" * 200_000
+        queued = [env.intent(agent(a), payload={"n": 2 + i, "text": big}, age=9 - i) for i in range(4)]
+        await env.tick(wait=0.05)
+        assert len(env.applier._received) == 3                             # cap: A1 + two queued
+        received = [r for r in queued if await ledger(env, r["ticket"]) is not None]
+        assert len(received) == 2
+        for rec in env.applier._received.values():
+            assert not hasattr(rec, "payload") and not hasattr(rec, "intent")
+            assert all(len(v) < 300 for v in vars(rec).values() if isinstance(v, str))
+        hold["event"].set()
+        await env.applier.drain(timeout=5)
+        for _ in range(4):
+            await env.tick()
+        assert sorted(calls) == [1, 2, 3, 4, 5]
+    run(registry_pg, tmp_path, body)
+
+
+def test_an_intent_rewritten_after_it_was_received_is_rejected_in_the_lane(registry_pg, tmp_path, registry):
+    register_x()
+    hold, calls = {}, []
+
+    async def body(env):
+        hold["event"] = asyncio.Event()
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", _blocked_lane(hold, calls))
+        env.intent(agent(a), payload={"n": 1}, age=1)
+        queued = env.intent(agent(a), payload={"n": 2})
+        await env.tick(wait=0.05)
+        env.intent(agent(a), payload={"n": 7}, ticket=queued["ticket"])     # rewritten while queued
+        hold["event"].set()
+        await env.applier.drain(timeout=5)
+        doc = env.result(queued["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == "intent changed after it was received"
+        assert calls == [1]
+    run(registry_pg, tmp_path, body)
+
+
+def test_a_restart_picks_up_received_rows(registry_pg, tmp_path, registry):
+    register_x()
+    calls = []
+
+    async def handler(ctx, intent):
+        calls.append(intent.payload["n"])
+        return {"result": "done"}
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        raw = env.intent(agent(a), age=300)
+        await _record(env, raw)                            # received by the previous process
+        fresh = CollabIntentApplier(env.outbox, Mirror(env.mirror_root), rustfs=FakeBlobs(), limits=BridgeLimits(),
+                                    spool_dir=tmp_path / "spool", clock=env.clock)
+        fresh.register("x.test", handler)
+        await fresh.tick(env.pool.acquire, wait=5)
+        await fresh.drain(timeout=5)
+        assert calls == [1] and env.result(raw["ticket"])["result"] == "done"
+    run(registry_pg, tmp_path, body)
+
+
+def test_a_stale_received_ticket_file_is_applied_not_swept(registry_pg, tmp_path, registry):
+    register_x()
+    calls = []
+
+    async def handler(ctx, intent):
+        calls.append(intent.ticket)
+        return {"result": "done"}
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        raw = env.intent(agent(a), age=300)
+        await _record(env, raw)
+        old = env.clock() - 7200
+        os.utime(env.outbox / "intents" / f"{raw['ticket']}.json", (old, old))
+        await env.tick()
+        assert calls == [raw["ticket"]] and env.result(raw["ticket"])["result"] == "done"
+    run(registry_pg, tmp_path, body)
+
+
+def test_a_received_row_that_vanished_is_forgotten_and_rescanned_once(registry_pg, tmp_path, registry):
+    register_x()
+    hold, calls = {}, []
+
+    async def body(env):
+        hold["event"] = asyncio.Event()
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", _blocked_lane(hold, calls))
+        env.intent(agent(a), payload={"n": 1}, age=1)
+        queued = env.intent(agent(a), payload={"n": 2})
+        await env.tick(wait=0.05)
+        async with env.pool.acquire() as conn:
+            await conn.execute("DELETE FROM artifact_collab_intents WHERE ticket_id=$1", queued["ticket"])
+        hold["event"].set()
+        await env.applier.drain(timeout=5)
+        for _ in range(3):
+            await env.tick()
+        assert calls == [1, 2] and env.result(queued["ticket"])["result"] == "done"
+    run(registry_pg, tmp_path, body)
+
+
+def test_an_intent_withdrawn_after_its_lane_started_is_forgotten(registry_pg, tmp_path, registry):
+    register_x()
+    hold, calls = {}, []
+
+    async def body(env):
+        hold["event"] = asyncio.Event()
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", _blocked_lane(hold, calls))
+        env.intent(agent(a), payload={"n": 1}, age=1)
+        queued = env.intent(agent(a), payload={"n": 2})
+        await env.tick(wait=0.05)                          # both in one running lane
+        (env.outbox / "intents" / f"{queued['ticket']}.json").unlink()
+        hold["event"].set()
+        await env.applier.drain(timeout=5)
+        assert calls == [1] and env.result(queued["ticket"]) is None
+        assert queued["ticket"] not in env.applier._received
+        assert (await ledger(env, queued["ticket"]))["outcome"] == "received"
+    run(registry_pg, tmp_path, body)
