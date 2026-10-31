@@ -7,6 +7,7 @@ caller exactly once. Every authentication failure raises the same ``WorkerAuthEr
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -22,6 +23,11 @@ _AUTH_MESSAGE = "worker authentication failed"
 _CRED_PREFIX = "hcw_"
 _CODE_PREFIX = "hce_"
 _HUB_TENANT = "hub"
+_FAIL_WINDOW = timedelta(seconds=60)
+_SEEN_PERSIST_INTERVAL = timedelta(seconds=60)
+_MAX_NAME = 64
+
+log = logging.getLogger(__name__)
 
 
 class WorkerAuthError(Exception):
@@ -86,12 +92,20 @@ class WorkerRegistry:
         self._enrollment_ttl = enrollment_ttl
         self._worker_ttl = worker_ttl
         self._now = now
+        self._fail_window_start: datetime | None = None
+        self._fail_suppressed = 0
 
     def create_enrollment(self, *, tenant_id: str, user_id: str, name: str, harness: str) -> tuple[Enrollment, str]:
         from ..assistant_dispatch import HARNESSES  # lazy: assistant_dispatch imports assistant
 
         if harness not in HARNESSES:
             raise ValueError(f"unknown harness: {harness!r}")
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValueError("tenant_id must be non-empty")
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("user_id must be non-empty")
+        if not isinstance(name, str) or not name.strip() or len(name) > _MAX_NAME:
+            raise ValueError(f"name must be 1-{_MAX_NAME} characters")
         code = _CODE_PREFIX + secrets.token_urlsafe(24)
         enrollment = Enrollment(
             enrollment_id="enr_" + secrets.token_hex(8), tenant_id=tenant_id, user_id=user_id, name=name,
@@ -103,10 +117,25 @@ class WorkerRegistry:
                                      subject_id=enrollment.enrollment_id, detail=f"harness={harness}")
         return enrollment, code
 
-    def _fail(self, reason: str, *, tenant_id: str = _HUB_TENANT, user_id: str = "-",
+    def _fail(self, reason: str, *, tenant_id: str | None = None, user_id: str = "-",
               subject_id: str = "-") -> WorkerAuthError:
-        self._store.audit_record(tenant_id=tenant_id, user_id=user_id, actor="worker", action="worker.auth_failed",
-                                 subject_id=subject_id, detail=reason)
+        """Audit a failure and return the uniform error. Failures matching no known worker/enrollment (tenant_id
+        None) are coalesced to one entry per window; an audit-write failure never changes the 401."""
+        with self._store._lock:
+            detail = reason
+            if tenant_id is None:
+                now = self._now()
+                start = self._fail_window_start
+                if start is not None and now - start < _FAIL_WINDOW:
+                    self._fail_suppressed += 1
+                    return WorkerAuthError()
+                detail = f"{reason}; suppressed={self._fail_suppressed}"
+                self._fail_window_start, self._fail_suppressed = now, 0
+            try:
+                self._store.audit_record(tenant_id=tenant_id or _HUB_TENANT, user_id=user_id, actor="worker",
+                                         action="worker.auth_failed", subject_id=subject_id, detail=detail)
+            except Exception as exc:  # noqa: BLE001 - fail closed on the caller side, never turn a 401 into a 500
+                log.warning("worker auth-failure audit write failed (%s)", type(exc).__name__)
         return WorkerAuthError()
 
     def redeem(self, code: str, *, device_id: str) -> tuple[Worker, str]:
@@ -125,17 +154,19 @@ class WorkerRegistry:
             if now >= found.expires_at:
                 raise self._fail("redeem: code expired", tenant_id=found.tenant_id, user_id=found.user_id,
                                  subject_id=found.enrollment_id)
-            found.redeemed_at = now
             cred = _CRED_PREFIX + secrets.token_urlsafe(32)
+            worker_id = "wrk_" + secrets.token_hex(8)
+            # Audit first: if the durable sink fails, nothing is consumed and the code stays redeemable.
+            self._store.audit_record(tenant_id=found.tenant_id, user_id=found.user_id, actor=worker_id,
+                                     action="worker.redeemed", subject_id=worker_id,
+                                     detail=f"harness={found.harness}")
+            found.redeemed_at = now
             worker = Worker(
-                worker_id="wrk_" + secrets.token_hex(8), tenant_id=found.tenant_id, user_id=found.user_id,
+                worker_id=worker_id, tenant_id=found.tenant_id, user_id=found.user_id,
                 name=found.name, harness=found.harness, device_id=device_id, secret_digest=_digest(cred),
                 status="active", created_at=now, expires_at=now + self._worker_ttl, scopes=list(DEFAULT_SCOPES))
             self._store.workers[worker.worker_id] = worker
             self._store._after_mutation()
-            self._store.audit_record(tenant_id=worker.tenant_id, user_id=worker.user_id, actor=worker.worker_id,
-                                     action="worker.redeemed", subject_id=worker.worker_id,
-                                     detail=f"harness={worker.harness}")
         return worker, cred
 
     def authenticate(self, authorization: str, device: str | None) -> Worker:
@@ -158,8 +189,10 @@ class WorkerRegistry:
                 raise self._fail("authenticate: expired", **ctx)
             if not isinstance(device, str) or not _eq(found.device_id, device):
                 raise self._fail("authenticate: device mismatch", **ctx)
+            prev = found.last_seen_at
             found.last_seen_at = now
-            self._store._after_mutation()
+            if prev is None or now - prev >= _SEEN_PERSIST_INTERVAL:
+                self._store._after_mutation()
             return found
 
     def _owned(self, worker_id: str, tenant_id: str, user_id: str) -> Worker:
