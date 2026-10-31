@@ -19,7 +19,7 @@ import logging
 import socket
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -46,19 +46,25 @@ _ERRORS = {400: "bad request", 401: "unauthorized", 403: "forbidden", 404: "not 
 
 
 class _RateLimiter:
-    """Sliding-window counter per key (thread-safe, bounded memory)."""
+    """Sliding-window counter per key (thread-safe). Memory is bounded: keys are kept in least-recently-used order, and
+    at the cap the oldest key is dropped (O(1)); an evicted peer simply starts a fresh window."""
 
-    def __init__(self, window: float = _RATE_WINDOW) -> None:
+    def __init__(self, window: float = _RATE_WINDOW, max_keys: int = _MAX_TRACKED_PEERS) -> None:
         self._window = window
-        self._hits: dict[Any, deque[float]] = {}
+        self._max = max(1, max_keys)
+        self._hits: OrderedDict[Any, deque[float]] = OrderedDict()
         self._lock = threading.Lock()
 
     def allow(self, key: Any, limit: int) -> bool:
         now = time.monotonic()
         with self._lock:
-            if len(self._hits) >= _MAX_TRACKED_PEERS:
-                self._hits = {k: q for k, q in self._hits.items() if q and now - q[-1] < self._window}
-            q = self._hits.setdefault(key, deque())
+            q = self._hits.get(key)
+            if q is None:
+                while len(self._hits) >= self._max:
+                    self._hits.popitem(last=False)
+                q = self._hits[key] = deque()
+            else:
+                self._hits.move_to_end(key)
             while q and now - q[0] >= self._window:
                 q.popleft()
             if len(q) >= limit:
@@ -71,29 +77,93 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
 
-    def __init__(self, address, handler, family) -> None:
+    def __init__(self, address, handler, family, max_per_peer: int) -> None:
         self.address_family = family
         self._slots = threading.BoundedSemaphore(_MAX_CONNECTIONS)
+        self._max_per_peer = max(1, max_per_peer)
+        self._peer_counts: dict[str, int] = {}
+        self._peer_lock = threading.Lock()
         super().__init__(address, handler)
 
+    def peer_connections(self, peer: str) -> int:
+        with self._peer_lock:
+            return self._peer_counts.get(peer, 0)
+
+    def _take(self, peer: str) -> bool:
+        with self._peer_lock:
+            if self._peer_counts.get(peer, 0) >= self._max_per_peer:
+                return False
+            self._peer_counts[peer] = self._peer_counts.get(peer, 0) + 1
+            return True
+
+    def _give(self, peer: str) -> None:
+        with self._peer_lock:
+            n = self._peer_counts.get(peer, 0) - 1
+            if n > 0:
+                self._peer_counts[peer] = n
+            else:
+                self._peer_counts.pop(peer, None)
+
     def process_request(self, request, client_address) -> None:
+        peer = client_address[0]
         if not self._slots.acquire(blocking=False):
-            try:
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            except OSError:
-                pass
-            self.shutdown_request(request)
+            self._refuse(request)
             return
-        super().process_request(request, client_address)
+        if not self._take(peer):
+            self._slots.release()
+            self._refuse(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:           # thread could not start: nothing else will release the slot
+            self._give(peer)
+            self._slots.release()
+            raise
+
+    def _refuse(self, request) -> None:
+        try:
+            request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+        except OSError:
+            pass
+        self.shutdown_request(request)
 
     def process_request_thread(self, request, client_address) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
+            self._give(client_address[0])
             self._slots.release()
 
     def handle_error(self, request, client_address) -> None:  # never print request details
         log.warning("hub connection error")
+
+
+class _HeaderTee:
+    """Records the raw header lines the stdlib parser reads, so framing smuggling forms can be rejected."""
+
+    def __init__(self, fp) -> None:
+        self._fp = fp
+        self.lines: list[bytes] = []
+
+    def readline(self, *args):
+        line = self._fp.readline(*args)
+        self.lines.append(line)
+        return line
+
+    def __getattr__(self, name):
+        return getattr(self._fp, name)
+
+
+def _bad_header_lines(lines: list[bytes]) -> bool:
+    for line in lines:
+        if line in (b"\r\n", b"\n", b""):
+            continue
+        if line[:1] in (b" ", b"\t"):                       # obs-fold continuation
+            return True
+        name, sep, _ = line.partition(b":")
+        if not sep or not name or name != name.strip() or b" " in name or b"\t" in name:
+            return True
+    return False
 
 
 def _content_length(raw: str | None) -> int | None:
@@ -106,24 +176,37 @@ def _content_length(raw: str | None) -> int | None:
 class HubServer:
     def __init__(self, hub: Hub, *, host: str, port: int, allowed_networks, allowed_hosts,
                  max_body: int = 65536, peer_networks=None, rate_limit: int = 120,
-                 enroll_rate_limit: int = 10) -> None:
+                 enroll_rate_limit: int = 10, request_deadline: float = 15.0, max_connections_per_peer: int = 8,
+                 max_tracked_peers: int = _MAX_TRACKED_PEERS) -> None:
         networks = parse_networks(allowed_networks)
         if not bind_allowed(host, networks):
             raise ValueError("hub bind address is not inside allowed_networks")
         self.hub = hub
         self.host = host
         self.max_body = max_body
-        self.peer_networks = parse_networks(peer_networks) if peer_networks is not None else networks
+        # ``peer_networks`` may only NARROW the accepted peers (every entry must lie inside allowed_networks), so no
+        # caller can widen who may connect. Production wiring does not pass it; tests use it to reject a loopback client.
+        self.peer_networks = networks
+        if peer_networks is not None:
+            narrowed = parse_networks(peer_networks)
+            if not all(any(p.version == a.version and p.subnet_of(a) for a in networks) for p in narrowed):
+                raise ValueError("peer_networks must be a subset of allowed_networks")
+            self.peer_networks = narrowed
+        self.request_deadline = request_deadline
         self.allowed_hosts = [*allowed_hosts, host]
         self.rate_limit, self.enroll_rate_limit = rate_limit, enroll_rate_limit
-        self._limiter = _RateLimiter()
+        self._limiter = _RateLimiter(max_keys=max_tracked_peers)
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self._serving = False
         self._closed = False
         self._lock = threading.Lock()
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
-        self._httpd = _Server((host, port), _make_handler(self), family)
+        self._httpd = _Server((host, port), _make_handler(self), family, max_connections_per_peer)
+
+    def peer_permitted(self, peer: str) -> bool:
+        """The single peer check: IPv4-mapped IPv6 is classified by its IPv4 form; scope ids/garbage are refused."""
+        return peer_allowed(peer, self.peer_networks)
 
     @property
     def port(self) -> int:
@@ -168,10 +251,36 @@ def _make_handler(owner: HubServer) -> type[BaseHTTPRequestHandler]:
 
         def handle(self) -> None:
             # Peer check first: nothing from a disallowed peer is parsed.
-            if not peer_allowed(self.client_address[0], owner.peer_networks):
+            if not owner.peer_permitted(self.client_address[0]):
                 self._reply(403)
                 return
-            super().handle()
+            # Overall deadline from accept to a fully read request (per-recv timeouts alone allow slow trickling):
+            # when it fires the socket is shut down, which unblocks the pending read and ends the handler.
+            self._deadline = threading.Timer(owner.request_deadline, self._expire)
+            self._deadline.daemon = True
+            self._deadline.start()
+            try:
+                super().handle()
+            finally:
+                self._deadline.cancel()
+
+        def _expire(self) -> None:
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        def parse_request(self) -> bool:
+            real = self.rfile
+            tee = self.rfile = _HeaderTee(real)
+            try:
+                ok = super().parse_request()
+            finally:
+                self.rfile = real
+            if ok and _bad_header_lines(tee.lines):
+                self._reply(400)
+                return False
+            return ok
 
         def send_error(self, code, message=None, explain=None) -> None:
             self._reply(code if code in _ERRORS else 400)
@@ -240,6 +349,7 @@ def _make_handler(owner: HubServer) -> type[BaseHTTPRequestHandler]:
             if length is None or length <= 0 or length > owner.max_body:
                 return self._reply(413)
             raw = self.rfile.read(length)
+            self._deadline.cancel()
             if len(raw) != length:
                 return self._reply(400)
             try:

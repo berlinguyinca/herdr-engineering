@@ -1,6 +1,7 @@
 """Hub listener over REAL loopback sockets. No mocks: a real HubServer, a real WorkerRegistry and AssistantService."""
 import json
 import socket
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -132,7 +133,7 @@ def test_notification_returns_202_empty(started):
 
 
 def test_peer_outside_allowed_networks_rejected(started):
-    hub, srv = started(peer_networks=["100.64.0.0/10"])
+    hub, srv = started(peer_networks=["127.0.0.2/32"])
     # invalid JSON body: if the body were parsed we would see 400, never 403
     st, headers, body = req(srv.port, body=b"{not json")
     assert st == 403
@@ -143,8 +144,8 @@ def test_peer_outside_allowed_networks_rejected(started):
 
 
 def test_x_forwarded_for_ignored(started):
-    _, srv = started(peer_networks=["100.64.0.0/10"])
-    for h in ({"X-Forwarded-For": "100.64.1.2"}, {"Forwarded": "for=100.64.1.2"}, {"X-Real-IP": "100.64.1.2"}):
+    _, srv = started(peer_networks=["127.0.0.2/32"])
+    for h in ({"X-Forwarded-For": "127.0.0.2"}, {"Forwarded": "for=127.0.0.2"}, {"X-Real-IP": "127.0.0.2"}):
         st, _, _ = req(srv.port, body=b"{}", headers=h)
         assert st == 403
 
@@ -366,3 +367,148 @@ def test_cli_refuses_wildcard_hub_bind():
     svc = _service({"enabled": True, "hub": {"enabled": True, "host": "0.0.0.0"}})
     with pytest.raises(SystemExit, match="assistant hub cannot start"):
         _start_assistant_hub(svc)
+
+
+# ---- fix round 1 -----------------------------------------------------------------------------------------------
+
+def _wait_for(cond, timeout=5.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return cond()
+
+
+def test_slowloris_trickle_closed_at_deadline_and_slot_released(started):
+    hub, srv = started(request_deadline=0.5, max_connections_per_peer=2)
+    for _ in range(3):                      # 3 > cap of 2: a leaked slot would starve the normal request below
+        s = socket.create_connection(("127.0.0.1", srv.port), timeout=5)
+        t0 = time.monotonic()
+        closed = False
+        s.sendall(b"POST /assistant/mcp HTTP/1.1\r\n")
+        while time.monotonic() - t0 < 4:
+            try:
+                s.sendall(b"X")             # one byte every 0.2 s keeps every per-recv timeout alive
+                s.settimeout(0.2)
+                if s.recv(1) == b"":
+                    closed = True
+                    break
+            except TimeoutError:
+                continue
+            except OSError:
+                closed = True
+                break
+        elapsed = time.monotonic() - t0
+        s.close()
+        assert closed and elapsed < 2.0, elapsed
+    creds, _ = enrol(hub, srv.port)
+    assert mcp(srv.port, creds["credential"], "dev1", "tools/list")[0] == 200
+
+
+def test_slow_body_also_hits_deadline(started):
+    _, srv = started(request_deadline=0.5, max_connections_per_peer=2)
+    with socket.create_connection(("127.0.0.1", srv.port), timeout=5) as s:
+        s.sendall(b"POST /assistant/mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: 50\r\n\r\n{")
+        t0 = time.monotonic()
+        s.settimeout(3)
+        data = s.recv(100)
+        assert time.monotonic() - t0 < 2.0
+        assert b"200" not in data[:15]
+
+
+def test_per_peer_connection_cap(started):
+    hub, srv = started(max_connections_per_peer=3)
+    idle = [socket.create_connection(("127.0.0.1", srv.port), timeout=5) for _ in range(3)]
+    try:
+        assert _wait_for(lambda: srv._httpd.peer_connections("127.0.0.1") == 3)
+        st, _, _ = raw(srv.port, b"")        # cap+1: refused at accept with 503 and no request parsing
+        assert st == 503
+    finally:
+        for c in idle:
+            c.close()
+    assert _wait_for(lambda: srv._httpd.peer_connections("127.0.0.1") == 0)    # counter never leaks
+    creds, _ = enrol(hub, srv.port)
+    assert mcp(srv.port, creds["credential"], "dev1", "tools/list")[0] == 200
+
+
+def test_rate_limiter_is_bounded():
+    from herdr_engineering.control_plane.assistant_hub.server import _RateLimiter
+
+    lim = _RateLimiter(max_keys=3)
+    for i in range(50):
+        assert lim.allow((f"10.0.0.{i}", "g"), 5)
+        assert len(lim._hits) <= 3
+    # a busy key is not evicted while it is the most recently used
+    for _ in range(5):
+        assert lim.allow(("hot", "g"), 5)
+    assert not lim.allow(("hot", "g"), 5)
+
+
+def test_server_passes_tracking_cap():
+    srv = HubServer(make_hub(), host="127.0.0.1", port=0, allowed_networks=LOOP, allowed_hosts=[],
+                    max_tracked_peers=3)
+    try:
+        assert srv._limiter._max == 3
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize("line", [b"Transfer-Encoding : chunked", b"Content-Length : 2", b"Content-Length\t: 2",
+                                  b"X-Folded: a\r\n b", b"X-Folded: a\r\n\tb", b"NoColonHere"])
+def test_header_whitespace_and_obs_fold_rejected(started, line):
+    _, srv = started()
+    head = (b"POST /assistant/mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+            + line + b"\r\n")
+    if b"Content-Length" not in line:
+        head += b"Content-Length: 2\r\n"
+    st, _, _ = raw(srv.port, head + b"\r\n{}")
+    assert st == 400
+
+
+def test_peer_networks_must_be_subset_of_allowed():
+    hub = make_hub()
+    with pytest.raises(ValueError):
+        HubServer(hub, host="127.0.0.1", port=0, allowed_networks=LOOP, allowed_hosts=[],
+                  peer_networks=["100.64.0.0/10"])
+    with pytest.raises(ValueError):
+        HubServer(hub, host="127.0.0.1", port=0, allowed_networks=LOOP, allowed_hosts=[],
+                  peer_networks=["127.0.0.0/8", "0.0.0.0/0"])
+    HubServer(hub, host="127.0.0.1", port=0, allowed_networks=LOOP, allowed_hosts=[],
+              peer_networks=["127.0.0.2/32"]).shutdown()
+
+
+def test_ipv6_loopback_bind_serves():
+    try:
+        with socket.socket(socket.AF_INET6) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        pytest.skip("host has no IPv6 loopback (::1 cannot be bound)")
+    hub = make_hub()
+    srv = HubServer(hub, host="::1", port=0, allowed_networks=["::1/128"], allowed_hosts=[])
+    srv.start()
+    assert srv.wait_until_ready()
+    try:
+        _, code = hub.registry.create_enrollment(tenant_id="default", user_id="u1", name="b", harness="pi")
+        body = json.dumps({"code": code, "device_id": "d"}).encode()
+        head = (f"POST /assistant/enroll HTTP/1.1\r\nHost: [::1]:{srv.port}\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n").encode()
+        with socket.create_connection(("::1", srv.port), timeout=5) as s:
+            s.sendall(head + body)
+            assert s.recv(65536).startswith(b"HTTP/1.1 200")
+    finally:
+        srv.shutdown()
+
+
+def test_mapped_ipv4_peer_classified_by_ipv4_form():
+    srv = HubServer(make_hub(), host="127.0.0.1", port=0, allowed_networks=LOOP + ["100.64.0.0/10"],
+                    allowed_hosts=[])
+    try:
+        assert srv.peer_permitted("::ffff:100.64.1.2") is True
+        assert srv.peer_permitted("::ffff:8.8.8.8") is False
+        assert srv.peer_permitted("100.64.1.2") is True
+        assert srv.peer_permitted("8.8.8.8") is False
+        assert srv.peer_permitted("fe80::1%eth0") is False
+    finally:
+        srv.shutdown()
