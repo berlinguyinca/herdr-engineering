@@ -43,6 +43,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .assistant_hub.workers import Enrollment, Worker
 from .inference_models import RETRY_CODES, ModelResolver
 from .reminders import REMINDER_TOOLS, ReminderError
 from .reminders import run_tool as run_reminder_tool
@@ -1660,6 +1661,8 @@ class AssistantStore:
         self.delegations: dict[str, DelegationRequest] = {}
         self.proposals: dict[str, AssistantProposal] = {}
         self.notifications: dict[str, AssistantNotification] = {}
+        self.workers: dict[str, Worker] = {}
+        self.enrollments: dict[str, Enrollment] = {}
         self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
         self._audit: list[dict[str, Any]] = []
         # (entry) -> None. Wired by the control plane to the repo event store so every entry is durable BEFORE it is
@@ -1718,6 +1721,8 @@ class AssistantStore:
                 "delegations": [self._e_to_dict(d) for d in self.delegations.values()],
                 "proposals": [self._e_to_dict(x) for x in self.proposals.values()],
                 "notifications": [self._e_to_dict(x) for x in self.notifications.values()],
+                "workers": [self._e_to_dict(x) for x in self.workers.values()],
+                "enrollments": [self._e_to_dict(x) for x in self.enrollments.values()],
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
             }
@@ -1751,6 +1756,10 @@ class AssistantStore:
             self.notifications = {x.notification_id: x for x in
                                   (self._e_from_dict(AssistantNotification, d)
                                    for d in snap.get("notifications", []))}
+            self.workers = {x.worker_id: x for x in
+                            (self._e_from_dict(Worker, d) for d in snap.get("workers", []))}
+            self.enrollments = {x.enrollment_id: x for x in
+                                (self._e_from_dict(Enrollment, d) for d in snap.get("enrollments", []))}
             self._routine_fired = set(snap.get("routine_fired", []))
             kept = {e.get("event_id") for e in snap.get("audit", [])}
             merged = [dict(e) for e in snap.get("audit", [])]

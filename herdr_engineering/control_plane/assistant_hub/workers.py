@@ -1,0 +1,185 @@
+"""Worker registry for the assistant hub: one-time enrollment codes and digest-only worker credentials.
+
+Only sha256 hex digests are ever stored or audited; the plaintext credential and enrollment code are returned to the
+caller exactly once. Every authentication failure raises the same ``WorkerAuthError`` (uniform 401).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import secrets
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # assistant.py imports this module, so avoid a runtime cycle
+    from ..assistant import AssistantStore
+
+DEFAULT_SCOPES: tuple[str, ...] = ("ask", "report", "read")
+AUTH_SCHEME = "Worker"
+_AUTH_MESSAGE = "worker authentication failed"
+_CRED_PREFIX = "hcw_"
+_CODE_PREFIX = "hce_"
+_HUB_TENANT = "hub"
+
+
+class WorkerAuthError(Exception):
+    """Uniform authentication failure; callers map it to HTTP 401 without distinguishing causes."""
+
+    def __init__(self) -> None:
+        super().__init__(_AUTH_MESSAGE)
+
+
+@dataclass
+class Worker:
+    worker_id: str
+    tenant_id: str
+    user_id: str
+    name: str
+    harness: str
+    device_id: str
+    secret_digest: str
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    last_seen_at: datetime | None = None
+    scopes: list[str] = field(default_factory=lambda: list(DEFAULT_SCOPES))
+
+    def as_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d.pop("secret_digest", None)
+        for k in ("created_at", "expires_at", "last_seen_at"):
+            if d[k] is not None:
+                d[k] = d[k].isoformat()
+        return d
+
+
+@dataclass
+class Enrollment:
+    enrollment_id: str
+    tenant_id: str
+    user_id: str
+    name: str
+    harness: str
+    code_digest: str
+    expires_at: datetime
+    redeemed_at: datetime | None = None
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _eq(a: str, b: str) -> bool:
+    return secrets.compare_digest(a.encode(), b.encode())
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+class WorkerRegistry:
+    def __init__(self, store: AssistantStore, *, enrollment_ttl: timedelta, worker_ttl: timedelta,
+                 now: Callable[[], datetime] = _utcnow) -> None:
+        self._store = store
+        self._enrollment_ttl = enrollment_ttl
+        self._worker_ttl = worker_ttl
+        self._now = now
+
+    def create_enrollment(self, *, tenant_id: str, user_id: str, name: str, harness: str) -> tuple[Enrollment, str]:
+        from ..assistant_dispatch import HARNESSES  # lazy: assistant_dispatch imports assistant
+
+        if harness not in HARNESSES:
+            raise ValueError(f"unknown harness: {harness!r}")
+        code = _CODE_PREFIX + secrets.token_urlsafe(24)
+        enrollment = Enrollment(
+            enrollment_id="enr_" + secrets.token_hex(8), tenant_id=tenant_id, user_id=user_id, name=name,
+            harness=harness, code_digest=_digest(code), expires_at=self._now() + self._enrollment_ttl)
+        with self._store._lock:
+            self._store.enrollments[enrollment.enrollment_id] = enrollment
+            self._store._after_mutation()
+            self._store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="worker.enrolled",
+                                     subject_id=enrollment.enrollment_id, detail=f"harness={harness}")
+        return enrollment, code
+
+    def _fail(self, reason: str, *, tenant_id: str = _HUB_TENANT, user_id: str = "-",
+              subject_id: str = "-") -> WorkerAuthError:
+        self._store.audit_record(tenant_id=tenant_id, user_id=user_id, actor="worker", action="worker.auth_failed",
+                                 subject_id=subject_id, detail=reason)
+        return WorkerAuthError()
+
+    def redeem(self, code: str, *, device_id: str) -> tuple[Worker, str]:
+        digest = _digest(code) if isinstance(code, str) else ""
+        with self._store._lock:
+            found = None
+            for e in self._store.enrollments.values():
+                if _eq(e.code_digest, digest):
+                    found = e
+            if found is None or not device_id:
+                raise self._fail("redeem: unknown code")
+            if found.redeemed_at is not None:
+                raise self._fail("redeem: code already used", tenant_id=found.tenant_id, user_id=found.user_id,
+                                 subject_id=found.enrollment_id)
+            now = self._now()
+            if now >= found.expires_at:
+                raise self._fail("redeem: code expired", tenant_id=found.tenant_id, user_id=found.user_id,
+                                 subject_id=found.enrollment_id)
+            found.redeemed_at = now
+            cred = _CRED_PREFIX + secrets.token_urlsafe(32)
+            worker = Worker(
+                worker_id="wrk_" + secrets.token_hex(8), tenant_id=found.tenant_id, user_id=found.user_id,
+                name=found.name, harness=found.harness, device_id=device_id, secret_digest=_digest(cred),
+                status="active", created_at=now, expires_at=now + self._worker_ttl, scopes=list(DEFAULT_SCOPES))
+            self._store.workers[worker.worker_id] = worker
+            self._store._after_mutation()
+            self._store.audit_record(tenant_id=worker.tenant_id, user_id=worker.user_id, actor=worker.worker_id,
+                                     action="worker.redeemed", subject_id=worker.worker_id,
+                                     detail=f"harness={worker.harness}")
+        return worker, cred
+
+    def authenticate(self, authorization: str, device: str | None) -> Worker:
+        parts = authorization.split(" ") if isinstance(authorization, str) else []
+        if len(parts) != 2 or parts[0] != AUTH_SCHEME or not parts[1].startswith(_CRED_PREFIX):
+            raise self._fail("authenticate: malformed authorization")
+        digest = _digest(parts[1])
+        with self._store._lock:
+            found = None
+            for w in self._store.workers.values():
+                if _eq(w.secret_digest, digest):
+                    found = w
+            if found is None:
+                raise self._fail("authenticate: unknown credential")
+            ctx = {"tenant_id": found.tenant_id, "user_id": found.user_id, "subject_id": found.worker_id}
+            if found.status != "active":
+                raise self._fail("authenticate: revoked", **ctx)
+            now = self._now()
+            if now >= found.expires_at:
+                raise self._fail("authenticate: expired", **ctx)
+            if not isinstance(device, str) or not _eq(found.device_id, device):
+                raise self._fail("authenticate: device mismatch", **ctx)
+            found.last_seen_at = now
+            self._store._after_mutation()
+            return found
+
+    def _owned(self, worker_id: str, tenant_id: str, user_id: str) -> Worker:
+        from ..assistant import AssistantNotFound
+
+        w = self._store.workers.get(worker_id)
+        if w is None or w.tenant_id != tenant_id or w.user_id != user_id:
+            raise AssistantNotFound("worker not found")
+        return w
+
+    def revoke(self, worker_id: str, *, tenant_id: str, user_id: str) -> Worker:
+        with self._store._lock:
+            w = self._owned(worker_id, tenant_id, user_id)
+            w.status = "revoked"
+            self._store._after_mutation()
+            self._store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="worker.revoked",
+                                     subject_id=w.worker_id)
+            return w
+
+    def list_workers(self, *, tenant_id: str, user_id: str) -> list[Worker]:
+        with self._store._lock:
+            return [w for w in self._store.workers.values()
+                    if w.tenant_id == tenant_id and w.user_id == user_id]
