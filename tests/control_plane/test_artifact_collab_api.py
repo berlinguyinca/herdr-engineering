@@ -591,3 +591,60 @@ def test_version_summaries_include_the_commit_message(registry_pg, blobs):
         assert rows[second["version_id"]]["message"] is None
         assert "provenance" not in rows[first["version_id"]]
     run(registry_pg, blobs, body)
+
+
+def test_invite_grant_reuse_is_idempotent_for_the_same_grant_and_409_otherwise(env, registry_pg, blobs):
+    base, server, _ = env
+    a, b = seed(registry_pg, blobs), seed(registry_pg, blobs)
+    path = lambda aid: f"/api/v1/artifacts/{aid}/collaborators/invite-grant"  # noqa: E731
+    assert request(base, path(a), body={"invite_id": "inv-r", "permission": "read"})[0] == 201
+    assert request(base, path(a), body={"invite_id": "inv-r", "permission": "read"})[0] == 201      # idempotent
+    status, data = request(base, path(a), body={"invite_id": "inv-r", "permission": "write"})
+    assert status == 409 and data == {"error": "invite already registered"}
+    status, data = request(base, path(b), body={"invite_id": "inv-r", "permission": "read"})
+    assert status == 409 and data == {"error": "invite already registered"}      # no word of artifact a
+    assert request(base, f"/api/v1/artifacts/{b}/collaborators")[1]["pending_invites"] == []
+    assert len(request(base, f"/api/v1/artifacts/{a}/collaborators")[1]["pending_invites"]) == 1
+
+
+def test_encoded_resource_segment_cannot_bypass_the_origin_guard(env, registry_pg, blobs):
+    base, server, _ = env
+    aid = seed(registry_pg, blobs)
+    evil = {"Origin": "https://evil.example"}
+    for tail, body in (("/collaborators", {"agent_id": "a1", "permission": "read"}),
+                       ("/collaborators/a1/revoke", {}),
+                       ("/collaborators/invite-grant", {"invite_id": "i1", "permission": "read"})):
+        status, _ = request(base, f"/api/v1/%61rtifacts/{aid}{tail}", body=body, headers=evil)
+        assert status == 403, tail
+    assert not acl_rows(registry_pg, blobs, aid)
+    assert sql(registry_pg, blobs, "SELECT 1 FROM artifact_collab_invite_grants WHERE artifact_id=$1", aid) == []
+
+
+def test_diff_with_a_missing_first_parent_is_an_error_not_an_all_added_diff(env, registry_pg, blobs):
+    base, server, _ = env
+    aid, first, second = two_versions(registry_pg, blobs, [entry(blobs, "a.md", b"a\n")],
+                                      [entry(blobs, "a.md", b"b\n")])
+    async def body(store, conn):
+        await conn.execute("SET session_replication_role = replica")
+        await conn.execute("UPDATE artifact_versions SET parent_version_ids = ARRAY['ghost'], "
+                           "parent_version_id='ghost' WHERE version_id=$1", second)
+    run(registry_pg, blobs, body)
+    status, data = diff_of(base, aid, second)
+    assert status == 409 and data["reason"] == "parent version missing" and "files" not in data
+
+
+def test_diff_file_count_and_total_read_budget_bound_cpu(env, registry_pg, blobs, monkeypatch):
+    base, server, _ = env
+    monkeypatch.setattr(artifacts_module, "MAX_DIFF_FILES", 3)
+    olds = [entry(blobs, f"f{i}.md", b"old\n") for i in range(5)]
+    news = [entry(blobs, f"f{i}.md", f"new {i}\n".encode()) for i in range(5)]
+    aid, _, second = two_versions(registry_pg, blobs, olds, news)
+    status, data = diff_of(base, aid, second)
+    done = [f for f in data["files"] if f["diff"] is not None]
+    assert [f["name"] for f in done] == ["f0.md", "f1.md", "f2.md"]
+    assert [f.get("reason") for f in data["files"][3:]] == ["oversize", "oversize"]
+    monkeypatch.setattr(artifacts_module, "MAX_DIFF_FILES", 200)
+    monkeypatch.setattr(artifacts_module, "MAX_DIFF_READ_BYTES", 20)      # old 4 + new ~6 bytes per file
+    status, data = diff_of(base, aid, second)
+    done = [f for f in data["files"] if f["diff"] is not None]
+    assert 1 <= len(done) < 5 and all(f["reason"] == "oversize" for f in data["files"] if f["diff"] is None)

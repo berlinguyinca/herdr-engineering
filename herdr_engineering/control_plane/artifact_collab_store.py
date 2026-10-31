@@ -67,6 +67,10 @@ def _names(raw) -> list:
     return json.loads(raw) if isinstance(raw, str) else list(raw)
 
 
+class InviteGrantConflict(Exception):
+    """The invite id is already registered for a different artifact, permission or grantor (nothing is disclosed)."""
+
+
 class CollabGrantStore:
     def __init__(self, conn):
         self.conn = conn
@@ -135,12 +139,21 @@ class CollabGrantStore:
     async def add_invite_grant(self, invite_id: str, artifact_id: str, permission: Literal["read", "write"], *,
                                expires_at: datetime, granted_by: str) -> dict:
         expires_at = _check_grant(permission, expires_at)
-        await self.conn.execute(
+        inserted = await self.conn.fetchval(
             "INSERT INTO artifact_collab_invite_grants (invite_id, artifact_id, permission, expires_at, granted_by) "
-            "VALUES ($1,$2,$3,$4,$5) ON CONFLICT (invite_id) DO NOTHING",
+            "VALUES ($1,$2,$3,$4,$5) ON CONFLICT (invite_id) DO NOTHING RETURNING 1",
             invite_id, artifact_id, permission, expires_at, granted_by)
-        return {"invite_id": invite_id, "artifact_id": artifact_id, "permission": permission,
-                "expires_at": expires_at, "granted_by": granted_by}
+        if inserted:
+            return {"invite_id": invite_id, "artifact_id": artifact_id, "permission": permission,
+                    "expires_at": expires_at, "granted_by": granted_by}
+        # invite_id is a global key: a repeat is fine only when it is exactly the grant already stored
+        row = await self.conn.fetchrow(
+            "SELECT invite_id, artifact_id, permission, expires_at, granted_by FROM artifact_collab_invite_grants "
+            "WHERE invite_id=$1", invite_id)
+        if row is None or (row["artifact_id"], row["permission"], row["granted_by"]) != (
+                artifact_id, permission, granted_by):
+            raise InviteGrantConflict("invite already registered")
+        return dict(row)
 
     async def pending_invite_grants(self, artifact_id: str) -> list[dict]:
         rows = await self.conn.fetch(

@@ -6,7 +6,10 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 import pytest
 
-from herdr_engineering.control_plane.artifact_collab_store import CollabGrantStore
+from herdr_engineering.control_plane.artifact_collab_store import (
+    CollabGrantStore,
+    InviteGrantConflict,
+)
 from tests.control_plane.registry_pg import ROOT, registry_pg, uid  # noqa: F401 - imported fixture
 
 GB5 = 5 * 1024 ** 3
@@ -360,4 +363,21 @@ def test_attempts_ticket_index_exists(registry_pg):
     async def body(store, conn):
         assert await conn.fetchval("SELECT count(*) FROM pg_indexes WHERE tablename='artifact_collab_attempts' "
                                    "AND indexname='artifact_collab_attempts_ticket_idx'") == 1
+    run(registry_pg, body)
+
+
+def test_add_invite_grant_is_idempotent_for_the_same_grant_and_refuses_any_other(registry_pg):
+    async def body(store, conn):
+        a, b = await artifact(conn), await artifact(conn)
+        far = now() + timedelta(days=30)
+        first = await store.add_invite_grant("inv-x", a, "read", expires_at=far, granted_by="o")
+        again = await store.add_invite_grant("inv-x", a, "read", expires_at=now() + timedelta(days=5), granted_by="o")
+        assert again["invite_id"] == "inv-x" and abs((again["expires_at"] - first["expires_at"]).total_seconds()) < 1
+        for other in ((b, "read", "o"), (a, "write", "o"), (a, "read", "someone-else")):
+            with pytest.raises(InviteGrantConflict):
+                await store.add_invite_grant("inv-x", other[0], other[1], expires_at=far, granted_by=other[2])
+        rows = await conn.fetch("SELECT artifact_id, permission FROM artifact_collab_invite_grants "
+                                "WHERE invite_id='inv-x'")
+        assert [(r["artifact_id"], r["permission"]) for r in rows] == [(a, "read")]
+        assert await store.pending_invite_grants(b) == []
     run(registry_pg, body)

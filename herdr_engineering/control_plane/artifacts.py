@@ -70,7 +70,9 @@ async def _transaction(conn: Any):
 
 # Display-only caps for ``version_text_diff``: they bound diff cost, they are not storage limits.
 MAX_DIFF_FILE_BYTES = 2 * 1024 * 1024
-MAX_DIFF_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_DIFF_RESPONSE_BYTES = 4 * 1024 * 1024   # diff text in one response
+MAX_DIFF_FILES = 200                         # changed files diffed per response; the rest are 'oversize'
+MAX_DIFF_READ_BYTES = 16 * 1024 * 1024       # blob bytes read (both sides, all files) per response
 
 
 class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycleMixin):
@@ -820,9 +822,11 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                                                           if version.get("parent_version_id") else [])
         against = parents[0] if parents else None
         parent = await self.get_version(against, artifact_id) if against else None
+        if against and parent is None:
+            raise ArtifactError("parent version missing")
         new_files = self._manifest_by_name(version.get("output_manifest"))
         old_files = self._manifest_by_name(parent.get("output_manifest")) if parent else {}
-        spent, out = 0, []
+        spent, read_total, diffed, out = 0, 0, 0, []
         for name in sorted(set(new_files) | set(old_files)):
             old, new = old_files.get(name), new_files.get(name)
             change = ("added" if old is None else "deleted" if new is None
@@ -836,12 +840,15 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                 item["reason"] = "binary"
                 continue
             sides = [side for side in (old, new) if side is not None]
-            if (spent >= MAX_DIFF_RESPONSE_BYTES
+            if (spent >= MAX_DIFF_RESPONSE_BYTES or diffed >= MAX_DIFF_FILES
+                    or read_total >= MAX_DIFF_READ_BYTES
                     or any(isinstance(s.get("size_bytes"), int) and s["size_bytes"] > MAX_DIFF_FILE_BYTES
                            for s in sides)):
                 item["reason"] = "oversize"
                 continue
+            diffed += 1
             data = [self._read_limited(side, MAX_DIFF_FILE_BYTES) for side in sides]
+            read_total += sum(len(d) for d in data if d is not None)
             if any(d is None for d in data):
                 item["reason"] = "oversize"
                 continue

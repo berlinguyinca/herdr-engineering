@@ -19,12 +19,15 @@ import re
 from datetime import UTC, date, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
+from .artifact_collab_store import InviteGrantConflict
 from .artifact_report_api import _access
+from .artifacts import ArtifactError
 
 AGENT_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
 INVITE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 DEFAULT_DAYS, MAX_DAYS = 30, 90
 PERMISSIONS = ("read", "write")
+PARENT_MISSING = "parent version missing"
 LEGACY = "legacy artifact: set an owner first"
 
 
@@ -146,13 +149,23 @@ def route_collab(handler, server, parts, resource) -> bool:
         invite_id = _text(body.get("invite_id"), INVITE_ID, "invite_id")
         permission, expires_at = _permission(body), _expiry(body)
         if _owned_writable(handler, server, artifact_id, permission):
-            row = grants("add_invite_grant", invite_id, artifact_id, permission, expires_at=expires_at,
-                         granted_by=handler._resource_principal())
-            handler._json(_plain(row), 201)
+            try:
+                row = grants("add_invite_grant", invite_id, artifact_id, permission, expires_at=expires_at,
+                             granted_by=handler._resource_principal())
+            except InviteGrantConflict:
+                handler._json({"error": "invite already registered"}, 409)
+            else:
+                handler._json(_plain(row), 201)
     elif kind == "activity":
         handler._json(_plain({"attempts": grants("attempts", artifact_id)}))
     else:
-        result = handler._artifact_call("version_text_diff", artifact_id, tail[1])
+        try:
+            result = handler._artifact_call("version_text_diff", artifact_id, tail[1])
+        except ArtifactError as exc:
+            if str(exc) != PARENT_MISSING:
+                raise
+            handler._json({"error": PARENT_MISSING, "reason": PARENT_MISSING}, 409)
+            return True
         if result is None:
             handler._deny(404, "not found")
         else:
