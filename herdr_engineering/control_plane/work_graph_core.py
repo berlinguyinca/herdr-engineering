@@ -394,10 +394,41 @@ def _artifact_ops(ev: dict) -> list[dict]:
     return artifact_ops(art, ver, bindings, parent_version_id=_text(p.get("parent_version_id")))
 
 
+TEAM_ORIGIN = "explicit"          # attrs.origin of a team somebody created on purpose (the per-project team says "project")
+
+
+def _team_ops(ev: dict) -> list[dict]:
+    """Explicit teams (operator action; see ``WorkGraphStore.team_command``).  A team linked to a room is visible to that
+    room's non-guest members -- the room's members ARE the team's members; one with no room is visible to operators only
+    (``room`` visibility with no rooms), so a team is never named to people it does not list."""
+    t, p, native = ev["event_type"], ev["payload"], ev["entity_id"]
+    if not native:
+        return []
+    if t == "team_created":
+        name, pid, rid = _text(p.get("name"), 120), _text(p.get("project_id")), _text(p.get("room_id"))
+        if not name:
+            return []
+        sc = _scope("room", rooms=[rid] if rid else (), project=pid)
+        ops = [ent("team", native, display_name=name, status="active", **sc,
+                   attrs={"origin": TEAM_ORIGIN}, aliases=[("team_explicit", native)])]
+        if pid:
+            ops.append(edge("references", ("project", pid), ("team", native), **sc))
+        if rid:
+            ops.append(edge("contains", ("team", native), ("room", rid), **sc))
+        return ops
+    if t == "team_renamed" and _text(p.get("name"), 120):
+        return [ent("team", native, display_name=_text(p.get("name"), 120))]
+    if t == "team_archived":
+        return [ent("team", native, status="archived")]
+    return []
+
+
 def ops_for_event(ev: dict) -> list[dict]:
     et = ev["entity_type"]
     if et == "collab":
         return _collab_ops(ev)
+    if et == "team":
+        return _team_ops(ev)
     if et == "session":
         return _session_ops(ev)
     if et == "artifact":
@@ -405,7 +436,7 @@ def ops_for_event(ev: dict) -> list[dict]:
     return []
 
 
-HANDLED_ENTITY_TYPES = ("collab", "session", "artifact")
+HANDLED_ENTITY_TYPES = ("collab", "session", "artifact", "team")
 
 
 def assertions_for_event(ev: dict, ops: list[dict] | None = None) -> list[dict]:

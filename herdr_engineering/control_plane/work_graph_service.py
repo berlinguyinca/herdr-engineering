@@ -154,6 +154,8 @@ def handle(service: WorkGraphService | None, principal: Mapping[str, Any] | None
             if parts == ["layout"]:
                 doc = s.call("get_layout", principal, q("ref") or "", which=q("which") or "effective")
                 return 200, doc, {"ETag": doc["etag"]}
+            if parts == ["teams"]:
+                return 200, s.call("list_teams", principal, status=q("status") or None, limit=q("limit"), cursor=q("cursor")), {}
             if parts == ["status"]:
                 if (principal or {}).get("kind") != "operator":
                     return 404, {"error": "not found"}, {}
@@ -164,6 +166,10 @@ def handle(service: WorkGraphService | None, principal: Mapping[str, Any] | None
                 doc = s.call("put_layout", principal, str(body.get("ref") or q("ref") or ""), body.get("document"),
                              shared=body.get("shared") is True, if_match=if_match or body.get("if_match"))
                 return 200, doc, {"ETag": doc["etag"]}
+            if parts == ["teams"] and method == "POST":
+                return 200, s.call("team_command", principal, "create", body), {}
+            if len(parts) == 3 and parts[0] == "teams" and parts[2] in ("rename", "archive") and method == "POST":
+                return 200, s.call("team_command", principal, parts[2], body, parts[1]), {}
             if parts == ["reconcile"] and method == "POST":
                 if (principal or {}).get("kind") != "operator":
                     return 404, {"error": "not found"}, {}
