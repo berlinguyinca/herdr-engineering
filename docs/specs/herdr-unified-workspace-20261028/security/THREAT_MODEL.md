@@ -86,9 +86,10 @@ Residual risks:
   (`_artifact_acl_allows`). Production must run with an ACL; legacy rows should be audited and given an owner.
 - **R-ART2 (Medium).** The grant model is in memory and rebuilt from rows (`ArtifactAcl.load`); a missed `on_change`
   write-through would make a revoke or a room grant disappear or reappear only at restart. Not tested for this document.
-- **R-ART3 (Low).** `artifact_context.py` `link_context` needs only `edit` (`artifact_registry_api.py`) and takes any `room_id`;
-  no unlink route exists (none found by search). Under room-derived access (3.3) a link is exposure to that room until the
-  artifact is archived.
+- **R-ART3 (Low; unlink added 2026-10-30, partly open).** `link_context` still needs only `edit`. The missing unlink now
+  exists (`herdr-eng artifacts unlink ARTIFACT --room ROOM`, `POST /api/v1/artifacts/<id>/links/remove`, needs `edit`, removes
+  that room's read grants at once), and a link to a room that does not exist is refused with the generic 404. Still open: an
+  API key has no room membership, so an editor can link to any room that exists (existence is all that can be checked).
 
 ### 3.3 Room-derived read access (`unified_workspace.room_artifact_access`)
 Mechanism (`artifact_room_access.py`, wired in `api.py` `_wire_room_artifact_access`): ordinary `read` grants for
@@ -102,11 +103,14 @@ Residual risks:
 - **R-RA1 (Medium).** Revocation of a removed (non-guest) member is asynchronous. Removal triggers `notify`, a worker wakes and
   `drain` revokes; a failing sync re-queues the room only for the next wake (the loop waits up to 30 s) or restart. Between
   removal and the sync the person keeps read. Guest expiry is not affected (checked at read).
-- **R-RA2 (Low-Medium).** One grant row holds one source. `_apply` calls `acl.grant(..., {"read"}, ...)` for any wanted
-  (artifact, principal) pair that this source does not already hold, which overwrites a grant of another source; a stronger
-  explicit grant to a `collab:user:` principal would be downgraded, and a later revoke deletes it. Collab principals do not
-  normally hold explicit grants, so this is latent. The changelog already notes the "two rooms flip" limit.
-- **R-RA3 (Low).** Because linking needs only `edit` (R-ART3), an editor can expose an artifact to a room they are not in.
+- **R-RA2 (Resolved 2026-10-30 for direct grants; one narrower limit remains).** `_apply` no longer overwrites a live grant
+  held by another source: a direct grant (any `granted_by` not starting with `room:`) is left as it is and is not revoked
+  when the room lets go; between two rooms the first holder keeps the row unless the second room's grant lasts longer.
+  `herdr-eng control-plane revoke-room-grants [--apply]` removes every `room:*` row after the flag is turned off
+  (`docs/artifacts/room-access-maintenance.md`). Remaining limit: one grant row holds one source, so a direct grant that later
+  expires or is revoked is not replaced by the room's until that room's next sync. No migration was needed.
+- **R-RA3 (Low; mitigated).** Because linking needs only `edit` (R-ART3), an editor can expose an artifact to an existing
+  room they are not in. The exposure can now be undone with `artifacts unlink`; it is not prevented.
 - **R-RA4 (Medium, topology).** Same as R-WG1: `collab` and the artifact store are in different processes in the compose
   overlay, so this feature cannot run there as written. Enabling it needs a topology decision first.
 
@@ -158,10 +162,10 @@ inbox. Replay uses event timestamps, so a restart does not extend a lease (`coll
 absent = off.
 
 Residual risks:
-- **R-TL1 (Medium).** The fence is opt-in: the 409 fires only `if "attempt" in body`. An old run that omits `attempt` is not
-  fenced; after a requeue (`pending`) it may still accept (a second concurrent execution) or mark `failed`. It is the same agent
-  identity, so this is duplicate work or a lost result, not privilege escalation. Fix idea: require `attempt` once a task has
-  been requeued.
+- **R-TL1 (Resolved 2026-10-30).** `update_task` now returns 409 `stale attempt` for a run that omits `attempt` once the task
+  has been requeued (`attempt` > 1), the same as a wrong `attempt`. A task never requeued (lease off, or not yet expired) still
+  accepts updates without `attempt`. The MCP `task_update` tool takes `attempt` and `worker.sh` sends the attempt `tasks_inbox`
+  gave it; a custom runner that ignores `attempt` is refused after a requeue (it must echo `attempt` from `tasks_inbox`).
 - **R-TL2 (Medium).** The lease is a hard deadline from accept with no heartbeat (`evidence/P05-RESULT.md` says so): a long
   legitimate task is requeued and run twice once the lease is shorter than the task.
 - **R-TL3 (Low).** Requeue happens only on inbox poll; a task whose agent never polls again stays `accepted`.
@@ -205,9 +209,9 @@ Residual risks:
 | R-RA4 / R-WG1 | Medium | Member graph door and room artifact access cannot run in the compose.collab topology |
 | R-ART1 | Medium | Legacy artifacts without owner, or without an ACL, are broadly readable |
 | R-ART2 | Medium | ACL is an in-memory index; write-through drift shows at restart |
-| R-TL1 / R-TL2 | Medium | Lease fence is opt-in; no heartbeat means duplicate execution of long tasks |
+| R-TL2 | Medium | No lease heartbeat: a long task is requeued and can run twice (R-TL1, the opt-in fence, is resolved) |
 | R-DP1 | Medium | Image rollback does not roll back the schema |
-| R-SH4, R-RA2, R-CL1, R-DP2 | Low-Medium | See sections |
+| R-SH4, R-CL1, R-DP2 | Low-Medium | See sections |
 | R-WG2-4, R-SH5-7, R-ART3, R-RA3, R-TL3, R-CL2 | Low | See sections |
 
 ## 5. Rollout and rollback by flag
@@ -217,7 +221,7 @@ with the flag off (migrations are additive, so the image can be ahead of the fla
 | Flag | Default | Turn on | Watch | Turn off / rollback |
 |---|---|---|---|---|
 | `control_plane.unified_workspace.enabled` | off | Migration 0034 applies at start; set `true`; restart control-plane-web. Operator calls `POST /api/v1/graph/work/reconcile`, then reads `/api/v1/graph/work/status` | `status` worker `last_error`, gaps, 5xx on `/graph/work/*`; read as a non-operator key to confirm room rows stay hidden | `false` and restart: routes return 404 again; data stays. Drop tables per 0034 `-- DOWN:` only if they must go |
-| `control_plane.unified_workspace.room_artifact_access` (also needs `enabled`) | off | First settle R-RA4 (collab and artifact store in one process); set `true`; restart. Startup syncs every room | grants with `granted_by` `room:*` vs membership; a removed test member's read must fail within one sync interval | `false` and restart stops new grants but does NOT remove written ones. Revoke grants whose `granted_by` starts with `room:` (no repair command exists yet) |
+| `control_plane.unified_workspace.room_artifact_access` (also needs `enabled`) | off | First settle R-RA4 (collab and artifact store in one process); set `true`; restart. Startup syncs every room | grants with `granted_by` `room:*` vs membership; a removed test member's read must fail within one sync interval | `false` and restart stops new grants but does NOT remove written ones. Revoke grants whose `granted_by` starts with `room:` (`herdr-eng control-plane revoke-room-grants --apply`, then restart; see `docs/artifacts/room-access-maintenance.md`) |
 | `control_plane.collab.task_lease_seconds` | absent (off) | Set 60..604800, longer than the longest honest task (R-TL2); restart the process that runs collab | `task.requeue` events, 409 `stale attempt`, duplicate results | Remove the key and restart. Tasks already requeued stay requeued; `attempt` survives replay |
 | Share links `control_plane.share.enabled` (+ `signing_secret`, collab `public_url`) | off | Complete the share block; `deploy.sh` refuses incomplete config, renders the edge with `/s/`, starts `share-public` | share `events` (`opened`, `denied`), 404 rate on `/s/`, live bytes | Revoke individual shares first (`POST .../shares/{sid}/revoke` removes state, then bundle); then `enabled: false` and deploy: the edge stops routing `/s/` and `share-public` is stopped |
 | Per-user rollout | not built | The spec asks for it; every flag today is global | | |

@@ -670,6 +670,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--include-gap-tail", action="store_true",
                     help="also set aside every row after the first missing sequence (may drop genuine events)")
     p2.set_defaults(func=_cmd_cp_collab_repair)
+    p2 = csub.add_parser("revoke-room-grants", help="remove every room-derived artifact read grant (granted_by room:*) "
+                         "after unified_workspace.room_artifact_access was turned off; dry run by default, "
+                         "grants of any other source are never touched, safe to repeat")
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file; control_plane.pg_dsn names the database")
+    p2.add_argument("--apply", action="store_true", help="really delete the rows (default: only count them)")
+    p2.set_defaults(func=_cmd_cp_revoke_room_grants)
     p2 = csub.add_parser("assistant-audit", help="anchor the assistant audit head off the event store, or "
                          "verify the stored chain against the last anchor (detects truncation/rollback)")
     p2.add_argument("action", choices=["anchor", "verify"])
@@ -3073,6 +3080,24 @@ def _cmd_cp_collab_repair(args) -> int:
             report = asyncio.run(_run())
     except (PermissionError, collab_repair.LogInUseError, collab_repair.SchemaTooOldError) as exc:
         raise SystemExit(str(exc)) from None
+    _print_json({"ok": True, **report})
+    return 0
+
+
+def _cmd_cp_revoke_room_grants(args) -> int:
+    import asyncio
+
+    from .control_plane.artifact_room_access import revoke_room_grants_pg
+
+    async def _run():
+        conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
+        try:
+            return await revoke_room_grants_pg(conn, apply=args.apply)
+        finally:
+            await conn.close()
+    report = asyncio.run(_run())
+    if report["found"] and not args.apply:
+        print("dry run: nothing deleted; repeat with --apply, then restart the control plane", file=sys.stderr)
     _print_json({"ok": True, **report})
     return 0
 

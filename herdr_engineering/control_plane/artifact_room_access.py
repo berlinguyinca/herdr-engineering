@@ -28,6 +28,19 @@ def source_for(room_id: str) -> str:
     return "room:" + room_id
 
 
+_FOREVER = float("inf")
+
+
+def _room_may_replace(other: dict, expires_at: float | None) -> bool:
+    """May a room write over the live grant ``other`` (held by a different source)? Only another room's grant, and only
+    to lengthen it: a direct grant (any other ``granted_by``) is never overwritten, and a room never shortens or narrows
+    what another source gave (one grant row holds one source, so the first holder keeps it)."""
+    if not str(other.get("granted_by") or "").startswith("room:"):
+        return False
+    return (expires_at if expires_at is not None else _FOREVER) > (
+        other["expires_at"] if other["expires_at"] is not None else _FOREVER)
+
+
 class RoomArtifactAccess:
     """Keep ``artifact_acl`` in step with room membership.
 
@@ -67,6 +80,10 @@ class RoomArtifactAccess:
         granted = revoked = 0
         for key, expires_at in want.items():
             current = have.get(key)
+            if current is None:
+                other = self.acl.held(*key)
+                if other is not None and not _room_may_replace(other, expires_at):
+                    continue                    # a grant of another source stays as it is (R-RA2); it is not ours to revoke
             if current is None or current.get("expires_at") != expires_at or current["permissions"] != ["read"]:
                 self.acl.grant(key[0], key[1], {"read"}, expires_at=expires_at, granted_by=source)
                 granted += 1
@@ -80,6 +97,19 @@ class RoomArtifactAccess:
             for artifact_id in {a for a, _ in gone}:
                 self.sync_artifact(artifact_id, resync=True)
         return {"granted": granted, "revoked": revoked}
+
+    def unlink(self, artifact_id: str, room_id: str) -> int:
+        """After the room's link to an artifact was removed: revoke that room's grants on it. A person another room still
+        links the artifact to gets the grant back from that room (``_apply`` re-syncs on any revoke)."""
+        return self._apply(room_id, set(), self.readers(room_id), only={artifact_id})["revoked"]
+
+    def revoke_all_room_grants(self) -> int:
+        """Remove every ``room:*``-sourced grant (after ``room_artifact_access`` was turned off). Grants of any other
+        source are never touched. Idempotent: a second call finds nothing. Returns how many were removed."""
+        grants = self.acl.grants_with_source_prefix("room:")
+        for g in grants:
+            self.acl.revoke(g["artifact_id"], g["principal_id"])
+        return len(grants)
 
     # ---- triggers
     def notify(self, room_id: str) -> None:
@@ -118,3 +148,15 @@ class RoomArtifactAccess:
     def stop(self) -> None:
         self._stop = True
         self._wake.set()
+
+
+async def revoke_room_grants_pg(conn, *, apply: bool) -> dict:
+    """Remove every ``room:*``-sourced row of ``artifact_acl`` (the maintenance step after ``room_artifact_access`` was
+    turned off; the grants it wrote stay until removed). Counts first and deletes nothing unless ``apply``. Rows of any
+    other ``granted_by`` are never matched. Idempotent. A running control plane keeps its in-memory ACL until restart, so
+    run it with the feature off and restart afterwards (docs/artifacts/room-access-maintenance.md)."""
+    found = int(await conn.fetchval("SELECT count(*) FROM artifact_acl WHERE granted_by LIKE 'room:%'"))
+    removed = 0
+    if apply and found:
+        removed = len(await conn.fetch("DELETE FROM artifact_acl WHERE granted_by LIKE 'room:%' RETURNING 1"))
+    return {"found": found, "removed": removed, "applied": bool(apply)}

@@ -1243,6 +1243,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 raise CollabError(404, "not found")
         return self.artifact_room_handle(pr.id, room_id, query)
 
+    def room_exists(self, room_id: str) -> bool:
+        """Whether a room by this id exists. For callers (API keys) that have no room membership of their own."""
+        with self._lock:
+            return isinstance(room_id, str) and room_id in self._rooms
+
     def room_readers(self, room_id: str) -> dict[str, float | None]:
         """``{user_id: expires_at}`` for the people who can read this room right now (lapsed guests excluded).
         Agents are not readers here; an agent's access to an artifact is its own grant."""
@@ -4580,8 +4585,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             bad = [k for k in body if k not in ("status", "result", "attempt")]
             status = body.get("status")
             cur = self._task_status(t)
+            # R-TL1: once a lease has requeued the task (attempt > 1) the fence is mandatory, so an old run that never
+            # learned of ``attempt`` cannot finish it. A task never requeued (lease off, or not yet expired) is unchanged.
             if "attempt" in body and body["attempt"] != t.get("attempt", 1):
                 raise CollabError(409, "stale attempt: this task was requeued")
+            if "attempt" not in body and t.get("attempt", 1) > 1:
+                raise CollabError(409, "stale attempt: this task was requeued; send the attempt from tasks_inbox")
             if not bad and status == cur and status in ("done", "failed"):
                 # P05: a retry of a completion that already happened (the answer was lost, the agent restarted) gets
                 # the recorded outcome and writes nothing; it cannot change a finished task's result. A repeated
