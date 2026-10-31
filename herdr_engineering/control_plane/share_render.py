@@ -205,111 +205,124 @@ def _make_filter(resolve: Resolver) -> Callable[[str, str, str], str | None]:
     return attribute_filter
 
 
-# ammonia's cost grows with the square of the retained nesting depth (about 3 s at 40 000 levels, 30 s at 100 000), so
-# hostile depth is cut off before the library sees it. The scan below builds no tree and emits nothing: it follows the
-# tokenizer closely enough (comments, bogus comments, CDATA, quoted attribute values, raw-text elements) that markup
-# inside those cannot desync it, and it keeps a stack of open element names. A closing tag with no matching open
-# element is ignored (so stray closers cannot hide depth); otherwise it pops back to its match. Formatting elements
-# are removed alone (the parser's adoption step can re-open them), and void and optional-end-tag elements never push.
-# Over-estimating only truncates earlier; under-estimating would let depth through.
+# ammonia's cost is roughly (retained depth x number of end tags and formatting/table reconstructions), so hostile
+# markup is cut off before the library sees it. The scan is conservative BY CONSTRUCTION rather than faithful to HTML5:
+#   * It only TRUSTS syntax whose extent is provable with a strict grammar: a tag whose attribute values hold no angle
+#     bracket and no stray quote, a comment with no inner double hyphen, a bogus comment (to the first greater-than), a
+#     raw-text element body (to its closing tag name). Inside those the real parser sees exactly what this scan sees.
+#   * The first construct it cannot prove (a loose tag, a loose comment, a CDATA marker, a script body with a comment
+#     opener) TAINTS the rest of the scan: from then on every "<name" anywhere still pushes, but nothing pops, because
+#     a closer could be hidden from the real parser (an attribute value, a comment). Depth only grows, so it hits
+#     MAX_NESTING and the text is cut.
+#   * While trusted, depth only FALLS when the parser certainly pops: a closer that names the top of the stack, a scoped
+#     block closer (list, table, division and similar) that reaches its match through optional-end-tag elements only,
+#     or a repeated p, li, dt, dd or option (and td, th, tr) whose previous sibling is on top. Any other closer, stray or
+#     crossing, is ignored for depth, because the parser may ignore it too.
+#   * Raw text is not skipped inside svg or math (foreign content parses it as markup): tags there are counted.
+# It meters WORK: depth for every end tag and for every formatting or table-ish start tag, 1 for any other tag, plus
+# the length of any optional-element run it scans. The text is cut on a tag boundary as soon as depth passes
+# MAX_NESTING or work passes WORK_BUDGET.
+#
+# WORK_BUDGET calibration (this host, nh3 0.3.7): the worst 1 MB shapes under this budget clean in about 1 s (see the
+# task report table); legitimate documents (depth <= 60, 1 MB) use about 6e6 work.
 MAX_NESTING = 10_000
-MAX_INPUT_BYTES = 4 * 1024 * 1024
-_TAG_START = re.compile(r"<(/?)([A-Za-z][^\s/>]*)")
-_NOT_NESTING = frozenset(
-    "area base br col embed hr img input link meta source track wbr p li dt dd tr td th tbody thead tfoot option optgroup "
-    "colgroup rp rt".split()
+WORK_BUDGET = 20_000_000
+_PLAIN_TAG = re.compile(
+    r"""<(/?)([A-Za-z][A-Za-z0-9:-]*+)(?:\s++[^\s"'<>/=`\x00]++(?:\s*+=\s*+(?:"[^"<>]*+"|'[^'<>]*+'|[^\s"'<>=`\x00]++))?+)*+\s*+/?+>"""
 )
-_FORMATTING = frozenset("a b big code em font i nobr s small strike strong tt u".split())
-_RAW_TEXT = frozenset("style script textarea title xmp iframe noembed noframes".split())
-_RAW_END: dict[str, re.Pattern[str]] = {n: re.compile(r"</" + n + r"(?=[\s/>]|\Z)", re.I) for n in _RAW_TEXT}
-
-
-def _tag_end(text: str, pos: int) -> int:
-    """The index just past the ``>`` that ends the tag whose name ends at ``pos``, or -1 (an open quote swallows the rest)."""
-    n = len(text)
-    while pos < n:
-        c = text[pos]
-        if c == ">":
-            return pos + 1
-        if c in "\"'":
-            back = pos - 1
-            while back >= 0 and text[back] in " \t\r\n\x0c":
-                back -= 1
-            if back >= 0 and text[back] == "=":
-                close = text.find(c, pos + 1)
-                if close < 0:
-                    return -1
-                pos = close
-        pos += 1
-    return -1
+_PLAIN_COMMENT = re.compile(r"<!--(?!-?>)(?:(?!--)[\s\S])*+-->")
+_ANY_TAG = re.compile(r"<(/?)([A-Za-z][^\s/>]*)")
+_VOID = frozenset(
+    "area base basefont bgsound br col embed frame hr img input keygen link meta param source track wbr".split()
+)
+_METERED_START = frozenset(
+    "a b big code em font i nobr s small strike strong tt u table tr td th tbody thead tfoot caption colgroup col".split()
+)
+_OPTIONAL_END = frozenset("p li dt dd tr td th tbody thead tfoot option optgroup rt rp colgroup caption".split())
+_SCOPED_CLOSERS = frozenset(
+    "ul ol dl table tbody thead tfoot tr td th div section article aside nav main header footer blockquote details "
+    "figure select body html".split()
+)
+_SELF_SIBLING = frozenset("p li dt dd option".split())
+_RAW_TEXT = frozenset("style script xmp iframe noembed noframes textarea title".split())
+_RAW_END = {n: re.compile(r"</" + n + r"(?=[\s/>])", re.I) for n in _RAW_TEXT}
 
 
 def _bound_nesting(text: str) -> str:
-    """The text cut where estimated nesting would pass ``MAX_NESTING`` (the library closes what is still open)."""
-    if len(text) > MAX_INPUT_BYTES:
-        cut = text.rfind("<", 0, MAX_INPUT_BYTES)
-        text = text[: cut if cut > 0 else MAX_INPUT_BYTES]
+    """The text cut where estimated depth passes ``MAX_NESTING`` or metered work passes ``WORK_BUDGET``."""
     stack: list[str] = []
-    live: dict[str, int] = {}
-    dead: dict[str, int] = {}
-    depth = 0
-    n = len(text)
-    i = text.find("<")
-    while 0 <= i < n:
-        if text.startswith("<!--", i):
-            end = text.find("-->", i + 4)
+    work = 0
+    tainted = False
+    pos = text.find("<")
+    while pos >= 0:
+        nxt = text[pos + 1 : pos + 2]
+        if nxt == "!":
+            m = _PLAIN_COMMENT.match(text, pos)
+            if m is not None:
+                pos = text.find("<", m.end())
+                continue
+            if text.startswith(("<!--", "<![CDATA["), pos):
+                tainted = True
+                pos = text.find("<", pos + 1)
+                continue
+        if nxt in ("!", "?") or (nxt == "/" and not text[pos + 2 : pos + 3].isalpha()):
+            if nxt == "/" and text[pos + 2 : pos + 3] == "":
+                return text
+            end = text.find(">", pos + 1)
             if end < 0:
                 return text
-            i = text.find("<", end + 3)
+            pos = text.find("<", end + 1)
             continue
-        if text.startswith(("<!", "<?"), i) or text.startswith("</", i) and not text[i + 2 : i + 3].isalpha():
-            end = text.find(">", i + 2)
-            if end < 0:
-                return text
-            i = text.find("<", end + 1)
-            continue
-        m = _TAG_START.match(text, i)
+        m = _PLAIN_TAG.match(text, pos)
         if m is None:
-            i = text.find("<", i + 1)
-            continue
+            m = _ANY_TAG.match(text, pos)
+            if m is None:
+                pos = text.find("<", pos + 1)
+                continue
+            tainted = True
         name = m.group(2).lower()
-        end = _tag_end(text, m.end())
-        if end < 0:
-            return text[:i]
+        depth = len(stack)
         if m.group(1):
-            if live.get(name, 0) > 0:
-                if name in _FORMATTING:
-                    live[name] -= 1
-                    depth -= 1
-                    if stack[-1] == name:
+            work += depth
+            if not tainted:
+                if stack and stack[-1] == name:
+                    stack.pop()
+                elif name in _SCOPED_CLOSERS and stack:
+                    j = depth - 1
+                    while j >= 0 and stack[j] in _OPTIONAL_END:
+                        j -= 1
+                    work += depth - 1 - j
+                    if j >= 0 and stack[j] == name:
+                        del stack[j:]
+        else:
+            work += depth if name in _METERED_START else 1
+            if name == "plaintext" and not tainted:
+                return text
+            if name not in _VOID:
+                top = stack[-1] if stack else ""
+                if not tainted:
+                    if top == name and name in _SELF_SIBLING:
                         stack.pop()
-                    else:
-                        dead[name] = dead.get(name, 0) + 1
-                else:
-                    while stack:
-                        top = stack.pop()
-                        if dead.get(top, 0) > 0:
-                            dead[top] -= 1
-                            continue
-                        live[top] -= 1
-                        depth -= 1
-                        if top == name:
-                            break
-        elif name == "plaintext":
-            return text
-        elif name not in _NOT_NESTING:
-            if name in _RAW_TEXT:
-                found = _RAW_END[name].search(text, end)
-                if found is None:
-                    return text
-                end = found.start()
-            else:
+                    elif name in ("td", "th") and top in ("td", "th"):
+                        stack.pop()
+                    elif name == "tr" and top in ("td", "th"):
+                        stack.pop()
+                        if stack and stack[-1] == "tr":
+                            stack.pop()
+                if name in _RAW_TEXT and not tainted:
+                    work += depth
+                    if "svg" not in stack and "math" not in stack:
+                        found = _RAW_END[name].search(text, m.end())
+                        if found is None:
+                            return text
+                        if name == "script" and "<!--" in text[m.end() : found.start()]:
+                            tainted = True
+                        pos = found.start()
+                        continue
                 stack.append(name)
-                live[name] = live.get(name, 0) + 1
-                depth += 1
-                if depth > MAX_NESTING:
-                    return text[:i]
-        i = text.find("<", end)
+        if len(stack) > MAX_NESTING or work > WORK_BUDGET:
+            return text[: m.start()]
+        pos = text.find("<", m.end() if m.end() > pos else pos + 1)
     return text
 
 
