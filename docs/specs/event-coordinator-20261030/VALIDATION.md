@@ -128,3 +128,25 @@ unknown costs, separate-tabs question still open, and no recipient/outreach. The
 focused event/artifact/contracts suite passes 78 tests; Ruff and diff check pass.
 This test does not claim the request parser preserves billing preference: that
 request interpretation and clarification work remains main-lane ownership.
+
+## Independent UI verification after main-lane fixes
+
+At refreshed http://127.0.0.1:62731, real Chromium in a fresh private context tested:
+- `Plan a dinner for eight adults and 10 kids between 6-14 where every adult pays there own tab`
+- `Plan dinner for 8 adults and 10 children ages 6 to 14, separate bills please.`
+
+Both reached draft_ready and rendered two venue drafts. Verified adults 8, children
+10, guests 18, ages minimum 6/maximum 14, separateBills true and adult bill payers.
+Budget/currency remained null; date/timezone/budget/currency stayed missing. The UI
+visibly showed children ages 6–14, separate adult tabs, 8 adults + 10 kids and budget
+Not specified. Browser stayed unbound, recipients null and quoted costs unknown.
+The page explicitly described deterministic extraction and no LLM interpretation.
+No page JavaScript errors occurred. Test routing allowed only that loopback origin;
+no approval/review button was clicked and no outreach occurred. Prototype source
+remained main-owned and was not modified by this lane.
+
+Local evidence (outside source):
+`/Users/wohlgemuth/IdeaProjects/.worktrees/herdr-event-artifacts/ui-debug/after-fix.json`
+and `latest-request-fixed.png` in the same directory. The fixed PNG was visually
+inspected. This proves the two tested requests; it does not establish general
+conversational interpretation or live research capabilities.
