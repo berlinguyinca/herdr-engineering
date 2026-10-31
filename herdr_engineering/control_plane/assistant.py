@@ -304,7 +304,9 @@ def inbox_watch_config(raw: Any) -> dict[str, Any]:
     raw = raw if isinstance(raw, dict) else {}
     where = "control_plane.personal_assistant.inbox_watch"
     unknown = set(raw) - {"enabled", "interval_seconds", "users", "query", "lookback_minutes", "tick_budget_seconds",
-                          "max_new_per_tick"}
+                          "max_new_per_tick", "renew_grants", "renew_within_days"}
+    if not isinstance(raw.get("renew_grants", False), bool):
+        raise ValueError(f"{where}.renew_grants must be true or false")
     if unknown:
         raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
     query = raw.get("query", "in:inbox -category:promotions -category:social -category:forums")
@@ -330,6 +332,9 @@ def inbox_watch_config(raw: Any) -> dict[str, Any]:
         "max_new_per_tick": min(10, max(1, int(raw.get("max_new_per_tick", 10)))),       # Gmail search returns at most 10
         "lookback_minutes": min(2880, max(30, int(raw.get("lookback_minutes", 360)))),
         "tick_budget_seconds": max(5, int(raw.get("tick_budget_seconds", 120))),
+        # keep the watched assistant's read-only mail/calendar grants from lapsing (see AssistantService.renew_read_grants)
+        "renew_grants": raw.get("renew_grants", False),
+        "renew_within_seconds": min(30, max(1, int(raw.get("renew_within_days", 7)))) * 24 * 3600,
         "query": query.strip(),
         "users": users,
     }
@@ -1006,6 +1011,10 @@ NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell", "create_email_draf
 # Google writes: run through ``google_write`` only after approval. They are requested by the assistant (not the person), so
 # the person whose mailbox or calendar it is can approve them; ``send_message``/``run_shell`` still need a distinct approver.
 GOOGLE_WRITE_TOOLS = frozenset({"create_email_draft", "send_email", "create_calendar_event"})
+
+# The only grants a scheduled job may extend: reads of the person's own mail and calendar. A write grant is never renewed
+# automatically, and neither is one that was revoked or has already lapsed (a person grants those again).
+RENEWABLE_READ_TOOLS = frozenset({"search_email", "read_email", "list_calendar_events", "find_free_time"})
 
 # Tools the post-approval executor can run. Everything else (send_message, run_shell, edit_shared) is NOT here: an
 # approval for those stays a record, and ``execute_approved_action`` refuses them (fail closed). ``draft_email`` only
@@ -2362,6 +2371,26 @@ class AssistantService:
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.grant.created", subject_id=g.grant_id)
         return g
+
+    def renew_read_grants(self, *, tenant_id: str, user_id: str, assistant_id: str, within_seconds: int,
+                          actor: str) -> int:
+        """Extend this assistant's still-active read-only Google grants that expire within ``within_seconds`` to the full
+        grant lifetime. Skips write tools, preauthorized grants, revoked grants and grants that already lapsed. Each
+        renewal is audited. Returns how many were renewed."""
+        self._require_enabled()
+        now = self.now()
+        renewed = 0
+        for g in self.store.list_grants(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id):
+            if (g.tool_id not in RENEWABLE_READ_TOOLS or not g.active(now) or g.constraints.get("preauthorized")
+                    or g.expires_at - now > timedelta(seconds=within_seconds)):
+                continue
+            g.expires_at = now + timedelta(seconds=self.config["grant_max_ttl_seconds"])
+            self.store.put_grant(g)
+            self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,
+                                    action="assistant.grant.renewed", subject_id=g.grant_id,
+                                    detail=f"{g.tool_id} until {g.expires_at.isoformat(timespec='seconds')}")
+            renewed += 1
+        return renewed
 
     def revoke_grant(self, grant_id: str, *, tenant_id: str, user_id: str) -> None:
         self._require_enabled()

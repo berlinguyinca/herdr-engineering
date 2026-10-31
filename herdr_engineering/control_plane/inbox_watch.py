@@ -7,6 +7,9 @@ hands the NEW messages to the user's assistant as one triage turn. The assistant
 summarizes, proposes replies (``send_email`` / ``create_email_draft``) and calendar entries. Every write is an approval card
 a person must approve; nothing here sends, drafts or schedules anything itself.
 
+With ``renew_grants`` on it also keeps the watched assistant's read-only mail and calendar grants from lapsing
+(``AssistantService.renew_read_grants``); write grants are never renewed here.
+
 Mail text is written by other people. It enters the prompt only as JSON-quoted, length-bounded fields under an explicit
 "untrusted data" instruction, and the loop never gives the assistant a grant it did not already have.
 
@@ -115,6 +118,9 @@ class InboxWatchRunner:
         assistant_id = self._assistant_id(u)
         if assistant_id is None:
             return "no_assistant", 0, False
+        if self.config.get("renew_grants"):
+            svc.renew_read_grants(tenant_id=tenant, user_id=user, assistant_id=assistant_id,
+                                  within_seconds=self.config["renew_within_seconds"], actor=ACTOR)
         from .google_workspace import GoogleError
         after = int(self._now() - self.config["lookback_minutes"] * 60)
         try:
