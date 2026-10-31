@@ -18,33 +18,33 @@ after(async () => { await browser?.close(); });
 const FLOOR = { 'dashboard-missions': { controls: 10, text: 40 }, 'dashboard-assistant-proposals': { controls: 25, text: 60 },
   'dashboard-assistant-notifications': { controls: 20, text: 45 }, 'dashboard-assistant-approvals': { controls: 20, text: 45 },
   'dashboard-assistant-connectors': { controls: 40, text: 83 } };
-const KNOWN = {   // slug -> run label -> rule -> recorded count (measured 2026-10-29; color-contrast lowered by 1 on every state after the shared button style, #406, 2026-10-30)
+const KNOWN = {   // slug -> run label -> rule -> recorded count (measured 2026-10-29; color-contrast lowered by 1 on every state after the shared button style, #406, 2026-10-30; the chat input got a label and the Configure tabs became a real tablist, which removed name-role-value, label and one focus-visible on every assistant tab, 2026-10-31)
   'dashboard-missions': {
     'desktop light': {'color-contrast': 2, 'focus-indicator-contrast': 12},
     'desktop dark': {'color-contrast': 1},
     'phone (375px) light': {'color-contrast': 2, 'focus-indicator-contrast': 12},
   },
   'dashboard-assistant-proposals': {
-    'desktop light': {'name-role-value': 1, 'heading-order': 1, 'label': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 17},
-    'desktop dark': {'name-role-value': 1, 'heading-order': 1, 'label': 1, 'color-contrast': 1, 'focus-visible': 17},
-    'phone (375px) light': {'name-role-value': 1, 'heading-order': 1, 'label': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 17},
+    'desktop light': {'heading-order': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 16},
+    'desktop dark': {'heading-order': 1, 'color-contrast': 1, 'focus-visible': 16},
+    'phone (375px) light': {'heading-order': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 16},
   },
   'dashboard-assistant-notifications': {
-    'desktop light': {'name-role-value': 1, 'label': 1, 'color-contrast': 5, 'focus-indicator-contrast': 1, 'focus-visible': 10},
-    'desktop dark': {'name-role-value': 1, 'label': 1, 'color-contrast': 1, 'focus-visible': 10},
-    'phone (375px) light': {'name-role-value': 1, 'label': 1, 'color-contrast': 5, 'focus-indicator-contrast': 1, 'focus-visible': 10},
+    'desktop light': {'color-contrast': 5, 'focus-indicator-contrast': 1, 'focus-visible': 9},
+    'desktop dark': {'color-contrast': 1, 'focus-visible': 9},
+    'phone (375px) light': {'color-contrast': 5, 'focus-indicator-contrast': 1, 'focus-visible': 9},
   },
   'dashboard-assistant-approvals': {
-    'desktop light': {'name-role-value': 1, 'label': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 10},
-    'desktop dark': {'name-role-value': 1, 'label': 1, 'color-contrast': 1, 'focus-visible': 10},
-    'phone (375px) light': {'name-role-value': 1, 'label': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 10},
+    'desktop light': {'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 9},
+    'desktop dark': {'color-contrast': 1, 'focus-visible': 9},
+    'phone (375px) light': {'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 9},
   },
   // Apps, blocked calendars, Drafts, Reminders and the generic connector list (measured 2026-10-30). Same page-level findings as the other
   // assistant tabs (the unlabelled chat input, h1 then h3, the shared button focus ring and muted-text contrast); nothing of its own.
   'dashboard-assistant-connectors': {
-    'desktop light': {'name-role-value': 1, 'heading-order': 1, 'label': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 20},
-    'desktop dark': {'name-role-value': 1, 'heading-order': 1, 'label': 1, 'color-contrast': 1, 'focus-visible': 20},
-    'phone (375px) light': {'name-role-value': 1, 'heading-order': 1, 'label': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 20},
+    'desktop light': {'heading-order': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 19},
+    'desktop dark': {'heading-order': 1, 'color-contrast': 1, 'focus-visible': 19},
+    'phone (375px) light': {'heading-order': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 19},
   },
 };
 const RUNS = [['desktop light', 'desktop', 'light'], ['desktop dark', 'desktop', 'dark'], ['phone (375px) light', 'mobile', 'light']];

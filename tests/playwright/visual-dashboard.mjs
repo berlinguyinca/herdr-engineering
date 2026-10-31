@@ -179,7 +179,7 @@ async function connectorsTab(page) {
 function assistantTab(name, text) {
   return async (page) => {
     await page.locator('[data-config]').click();
-    await page.getByRole('button', { name, exact: true }).click();
+    await page.getByRole('tab', { name, exact: true }).click();
     await page.locator('#pa-panel').getByText(text).first().waitFor();
     // The voice buttons are colour emoji (U+1F3A4, U+1F50A). No bundled font has them, so each host would paint them with its own
     // emoji font (or a box): the one thing in these pages that is not reproducible. They are swapped for ASCII stand-ins here, and
