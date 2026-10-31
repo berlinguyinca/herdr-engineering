@@ -247,10 +247,18 @@ class CollabGrantStore:
             actor.kind, actor.id, kind, idempotency_key, sorted(outcomes))
         return dict(row) if row else None
 
-    async def bytes_last_24h(self, agent_id: str, *, exclude_ticket: str | None = None) -> int:
+    async def bytes_last_24h(self, agent_id: str, *, exclude_ticket: str | None = None,
+                             count_received: bool = True) -> int:
+        """Inline commit bytes of the agent's non-rejected tickets plus its charged verified uploads, last 24 hours.
+
+        ``count_received=False`` leaves out tickets still ``received``: their inline bytes were recorded at scan time
+        and nothing is stored yet, so a queued burst must not push an older ticket over the quota (the applier adds
+        the ticket being applied itself; a lane applies one agent's tickets one at a time, so the decided rows are
+        exactly what was stored before it). Verified uploads are counted once, whichever ticket names them."""
+        states = "outcome <> 'rejected'" + ("" if count_received else " AND outcome <> 'received'")
         inline = await self.conn.fetchval(
             "SELECT COALESCE(sum(bytes), 0) FROM artifact_collab_intents WHERE kind='commit' AND actor_kind='agent' "
-            "AND actor_id=$1 AND outcome <> 'rejected' AND received_at > now() - interval '24 hours' "
+            f"AND actor_id=$1 AND {states} AND received_at > now() - interval '24 hours' "
             "AND ticket_id IS DISTINCT FROM $2", agent_id, exclude_ticket)
         staged = await self.conn.fetchval(
             "SELECT COALESCE(sum(size_bytes), 0) FROM artifact_collab_uploads WHERE owner_key=$1 AND charged "

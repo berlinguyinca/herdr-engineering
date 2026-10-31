@@ -412,3 +412,18 @@ def test_resolve_skips_invites_of_a_retracted_artifact(registry_pg):
         assert await store.resolve_invite_grants({"inv-ret": {"agent_id": "ag"}}) == 0
         assert await store.grant_for(aid, "ag") is None
     run(registry_pg, body)
+
+
+def test_bytes_last_24h_can_leave_queued_received_tickets_out(registry_pg):
+    async def body(store, conn):
+        ag = uid("ag")
+        actor = Actor("agent", ag)
+        t1, t2, t3 = (uid("t") for _ in range(3))
+        await received(store, t1, actor, bytes=100)
+        await store.record_outcome(t1, "created")
+        await received(store, t2, actor, bytes=7)             # queued, nothing stored yet
+        await received(store, t3, actor, bytes=9)
+        await store.record_outcome(t3, "rejected", reason="no")
+        assert await store.bytes_last_24h(ag) == 107
+        assert await store.bytes_last_24h(ag, count_received=False) == 100
+    run(registry_pg, body)

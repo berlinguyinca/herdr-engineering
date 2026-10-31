@@ -2938,3 +2938,176 @@ def test_an_intent_written_by_the_bridge_commit_is_applied_and_read_back_through
         other = await asyncio.to_thread(world.bridge.commit, world.a, commit_args("again"))   # the pending slot is free
         assert other["status"] == "pending"
     run(registry_pg, tmp_path, body, clock=world.clock)
+
+
+# ----------------------------------------------------------------------------------------------------- F1 fixes
+@pytest.mark.parametrize("what", ["grant", "agent"])
+def test_a_grant_or_agent_lost_during_assembly_is_rejected_and_no_version_is_created(registry_pg, tmp_path, what):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        upl, _ = stage(env, a, aid, "blob.bin", BLOB)
+        entered, release = threading.Event(), threading.Event()
+        real = env.applier.rustfs.put_stream
+
+        def slow(stream, **kw):
+            entered.set()
+            release.wait(20)
+            return real(stream, **kw)
+        env.applier.rustfs.put_stream = slow
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl)])
+        await env.tick(wait=0.05)
+        assert await asyncio.to_thread(entered.wait, 10)
+        if what == "grant":
+            async with env.pool.acquire() as conn:
+                assert await CollabGrantStore(conn).revoke(aid, a)
+        else:
+            env.feed({a: "revoked"})
+            await env.tick(wait=0.05)                      # loads the new feed; the lane is still busy
+        release.set()
+        await env.applier.drain(timeout=30)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected"
+        assert doc["reason"] == ("no write grant" if what == "grant" else "agent not active")
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 1
+    committing(registry_pg, tmp_path, body)
+
+
+def fail_once(obj, name, exc):
+    """Replace ``obj.name`` with a wrapper that raises ``exc`` on its first call only (injected infrastructure blip)."""
+    real, state = getattr(obj, name), {"calls": 0}
+
+    def wrapper(*a, **kw):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise exc
+        return real(*a, **kw)
+    setattr(obj, name, wrapper)
+    return state
+
+
+def test_a_transient_storage_error_leaves_the_ticket_received_and_the_next_tick_commits_it(registry_pg, tmp_path,
+                                                                                         caplog):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        state = fail_once(env.applier.rustfs, "put", OSError(SENTINEL))
+        raw = commit(env, a, aid, v1, [put("doc.md", "retry me\n")])
+        await env.tick(wait=30)
+        await env.applier.drain(timeout=30)
+        assert state["calls"] == 1                                      # not hot-looped inside one tick
+        assert (await ledger(env, raw["ticket"]))["outcome"] == "received"
+        assert env.result(raw["ticket"]) is None and env.pending(raw["ticket"])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "created"
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 2
+    caplog.set_level(logging.DEBUG)
+    committing(registry_pg, tmp_path, body)
+    assert SENTINEL not in caplog.text and "OSError" in caplog.text
+
+
+def test_a_transient_error_that_never_clears_is_rejected_after_the_intent_max_age(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+
+        def boom(data):
+            raise OSError("down")
+        env.applier.rustfs.put = boom
+        raw = commit(env, a, aid, v1, [put("doc.md", "x\n")])
+        await settle(env)
+        assert (await ledger(env, raw["ticket"]))["outcome"] == "received"
+        env.clock.t += cbf.INTENT_MAX_AGE + 1
+        env.feed({a: "active"})
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == "internal error"
+    committing(registry_pg, tmp_path, body, clock=Clock())
+
+
+def test_a_lane_keeps_its_order_while_its_first_ticket_waits_for_a_transient_retry(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        fail_once(env.applier.rustfs, "put", OSError("blip"))
+        first = commit(env, a, aid, v1, [put("one.md", "1\n")])
+        env.clock.t += 1
+        second = commit(env, a, aid, v1, [put("two.md", "2\n")])
+        await env.tick(wait=30)
+        await env.applier.drain(timeout=30)
+        assert env.result(second["ticket"]) is None             # the later ticket did not overtake the waiting one
+        await settle(env)
+        await settle(env)
+        assert env.result(first["ticket"])["result"] == "created"
+        assert env.result(second["ticket"])["result"] in ("created", "merged")
+    committing(registry_pg, tmp_path, body, clock=Clock())
+
+
+def test_a_failure_recording_the_outcome_after_merge_commit_settles_from_the_committed_version(
+        registry_pg, tmp_path, monkeypatch):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        real, state = CollabGrantStore.record_outcome, {"calls": 0}
+
+        async def flaky(self, *args, **kw):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise asyncpg.InterfaceError("connection is closed")
+            return await real(self, *args, **kw)
+        monkeypatch.setattr(CollabGrantStore, "record_outcome", flaky)
+        raw = commit(env, a, aid, v1, [put("doc.md", "post commit\n")])
+        await settle(env)
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "created"
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 2
+        assert doc["version_id"] == await head_of(env, aid)
+    committing(registry_pg, tmp_path, body)
+
+
+def test_a_deterministic_handler_failure_still_rejects_at_once(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+
+        def boom(data):
+            raise ValueError("deterministic")
+        env.applier.rustfs.put = boom
+        raw = commit(env, a, aid, v1, [put("doc.md", "x\n")])
+        await env.tick(wait=30)
+        await env.applier.drain(timeout=30)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == "internal error"
+    committing(registry_pg, tmp_path, body)
+
+
+def test_queued_received_tickets_do_not_count_against_the_daily_quota_of_the_one_being_applied(registry_pg, tmp_path):
+    texts = [f"{i}" * 59 + "\n" for i in range(4)]                   # 60 bytes each; the quota is 100
+
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        raws = [commit(env, a, aid, v1, [put(f"f{i}.md", texts[i])]) for i in range(4)]
+        for i, raw in enumerate(raws):                               # lane order = submitted_at
+            path = env.outbox / "intents" / f"{raw['ticket']}.json"
+            doc = json.loads(path.read_text())
+            doc["submitted_at"] = env.clock() - (10 - i)
+            path.write_text(json.dumps(doc))
+        await settle(env)
+        await settle(env)
+        results = [env.result(r["ticket"]) for r in raws]
+        assert results[0]["result"] in ("created", "merged")         # the first in lane order fits
+        assert [r["result"] for r in results[1:]] == ["rejected"] * 3
+        assert {r["reason"] for r in results[1:]} == {"daily quota exceeded"}
+        assert len(await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 2
+    committing(registry_pg, tmp_path, body, limits=BridgeLimits(daily_bytes_per_agent=100))
+
+
+def test_an_empty_agent_feed_makes_the_agent_and_grant_rules_unprovable_for_the_staging_sweep(registry_pg, tmp_path):
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "a.bin", BLOB[:50])
+        assert await swept(env, {}, []) == 0 and d.is_dir()          # fresh but EMPTY feed: only TTL/grace apply
+        assert await swept(env, active(uid("other")), []) == 1 and not d.exists()    # a populated feed proves it
+    sweeping(registry_pg, tmp_path, body)

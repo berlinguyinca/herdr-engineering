@@ -50,7 +50,8 @@ The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:
    ledger row of the ticket it was committed for has this ticket's ``request_sha256``, else ``rejected`` "idempotency
    key was reused for a different request".
 6. ``grant_for`` must show ``write``, unexpired, re-read now (a grant revoked after the intent was written is "no write
-   grant", whatever its staging holds).
+   grant", whatever its staging holds). It, and the agent's feed status, are checked once more right before
+   ``merge_commit`` (after assembly and inline storing), so a revocation during a long assembly stops the commit.
 7. The artifact must exist and be writable (not a report, no ``report_descriptor`` / ``source_manifest_blob`` on base
    or head); neither it nor its base or head version may be retracted, by ``lifecycle`` / ``state`` or by the worker's
    ``ArtifactGraphGate`` (reloaded with ``load_retractions`` at least every ``GATE_RELOAD`` s). Put names must not clash
@@ -61,9 +62,12 @@ The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:
    is reused as is (no staging read, no charge); otherwise the upload's ``meta.json`` is read no-follow from
    ``staging/<agent>/<upload_id>/`` (derived from the intent's agent, so another agent's upload id is never found) and
    must name this artifact and file, else ``rejected`` "upload not found".
-9. Daily quota: ``bytes_last_24h(agent, exclude_ticket=ticket) + inline_bytes + declared size_bytes of the
-   unverified uploads <= daily_bytes_per_agent``, before any RustFS call (the ticket's own ``received`` row is
-   excluded and a verified upload is already counted once, so a crash-retry or re-commit is never counted twice).
+9. Daily quota: ``bytes_last_24h(agent, exclude_ticket=ticket, count_received=False) + inline_bytes + declared
+   size_bytes of the unverified uploads <= daily_bytes_per_agent``, before any RustFS call. Only DECIDED non-rejected
+   tickets (and charged verified uploads) are counted: queued ``received`` tickets stored nothing yet, so a burst of
+   large tickets cannot reject an older one, and each ticket is judged against what was stored before it in its
+   lane (an agent's tickets run one at a time). The ticket's own bytes are added once (its ``received`` row is
+   excluded) and a verified upload is already counted once, so a crash-retry or re-commit is never counted twice.
 10. Staged puts go through ``ctx.assemble(..., charge=True)`` first (``UploadRefused`` gives "upload incomplete" /
     "upload failed verification"; see ``_assemble``), then inline text is stored with ``rustfs.put`` and
     ``register_report_blob``, so a refused upload leaves no inline bytes behind.
@@ -71,6 +75,11 @@ The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:
     ``max_text_bytes = limits.max_text_merge_bytes``; ``ArtifactMergeConflict`` is ``conflict`` (its ``attempt_id``
     goes on the ledger row; ``merged_text`` capped at ``max_conflict_text_bytes`` per result, measured as encoded
     JSON), any other ``ArtifactError`` is ``rejected`` with its message.
+    A handler exception from infrastructure (asyncpg, OSError, S3 transport, TimeoutError) does not decide the ticket:
+    it stays ``received`` and its lane stops there, so the next tick retries it in order (at most once per tick), until
+    ``INTENT_MAX_AGE`` after its first such failure; then it is ``rejected`` "internal error" like any other error. A
+    failure after ``merge_commit`` (recording the outcome, writing the result) leaves the ticket ``received`` too, and
+    the retry settles it from the committed version through the kind's ``early_replay``.
 12. After the outcome is recorded and published, the lane only hands off: the artifact id to a background mirror
     refresher (the lane never waits behind the mirror's lock; a failed refresh is kept for ``take_mirror_force``,
     which the mirror task passes to ``sync(force=...)``) and the version to a background lineage task (its poster may
@@ -107,6 +116,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
+
+import asyncpg
 
 from .artifact_collab_store import CollabGrantStore
 from .artifact_scope import ArtifactGraphGate
@@ -147,6 +158,24 @@ from .rustfs import IntegrityError
 from .share_bundle import ShareBundleError, check_names
 
 log = logging.getLogger(__name__)
+
+try:                                                  # S3 transport errors (boto3 is optional in tests)
+    from botocore.exceptions import BotoCoreError, ClientError
+    _STORAGE_ERRORS: tuple[type[BaseException], ...] = (BotoCoreError, ClientError)
+except ImportError:  # pragma: no cover
+    _STORAGE_ERRORS = ()
+# The scan connection is gone (restart, idle kill, reset): it is replaced, never reused.
+_CONN_LOST: tuple[type[BaseException], ...] = (asyncpg.PostgresConnectionError, asyncpg.InterfaceError,
+                                               ConnectionError)
+# Infrastructure errors in a lane: the ticket is left ``received`` and retried on a later tick (for at most
+# ``INTENT_MAX_AGE`` after the first failure), never decided "internal error" at once. Everything else is deterministic.
+_TRANSIENT: tuple[type[BaseException], ...] = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError,
+                                               *_STORAGE_ERRORS)
+
+
+class _ScanConnectionLost(Exception):
+    """Internal: carries a connection-level scan error out of the scan lease so the connection is replaced."""
+
 
 INTENTS_DIR = "intents"
 AGENTS_FEED = "agents.json"
@@ -298,6 +327,7 @@ class CollabIntentApplier:
         self._busy: dict[str, asyncio.Task] = {}
         self._inflight: set[str] = set()
         self._received: dict[str, _Received] = {}   # received (ledger row written) but not yet finished
+        self._transient_since: dict[str, float] = {}   # ticket -> clock() of its first transient lane failure
         self._received_min_cap = received_min_cap
         self._received_cap = self._min_cap()
         self._feed: dict | None = None
@@ -415,19 +445,27 @@ class CollabIntentApplier:
         fresh = sorted((n for n in mtimes if n[:-5] not in self._received), key=lambda n: (mtimes[n], n))
         names = fresh[:self.max_per_tick]
         raws = await asyncio.to_thread(self._read_intents, names) if names else {}
-        async with (scan_acquire or acquire)() as conn:
-            for name in names:
-                try:
-                    job = await self._scan(conn, name, raws.get(name))
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # one bad intent never stops the scan; retried next tick
-                    log.error("collab intent %s: scan failed (%s)", name[:-5], type(exc).__name__)
-                    continue
-                if job is not None:
-                    rec = self._remember(job, mtimes[name])
-                    if rec.lane in self._busy:
-                        self._counts["skipped"] += 1
+        try:
+            async with (scan_acquire or acquire)() as conn:
+                for name in names:
+                    try:
+                        job = await self._scan(conn, name, raws.get(name))
+                    except asyncio.CancelledError:
+                        raise
+                    except _CONN_LOST as exc:
+                        raise _ScanConnectionLost from exc     # leaves the lease with the error: it is replaced
+                    except Exception as exc:  # one bad intent never stops the scan; retried next tick
+                        log.error("collab intent %s: scan failed (%s)", name[:-5], type(exc).__name__)
+                        continue
+                    if job is not None:
+                        rec = self._remember(job, mtimes[name])
+                        if rec.lane in self._busy:
+                            self._counts["skipped"] += 1
+        except _ScanConnectionLost as lost:
+            # a connection-level failure (or storage blip): the rest of the scan is retried next tick on a fresh
+            # connection; lanes already waiting still start below
+            log.error("collab intents: scan connection failed (%s); retrying next tick",
+                      type(lost.__cause__).__name__)
         lanes: dict[str, list[_Received]] = {}
         for ticket, rec in self._received.items():
             if ticket not in self._inflight and rec.lane not in self._busy:
@@ -672,8 +710,7 @@ class CollabIntentApplier:
                     if not await conn.fetchval("SELECT pg_try_advisory_lock(hashtextextended($1, 0))", lock):
                         return False
                     held.append(lock)
-                await self._apply_locked(conn, job)
-                return True
+                return await self._apply_locked(conn, job) is not False
             finally:
                 for lock in reversed(held):
                     try:
@@ -681,7 +718,9 @@ class CollabIntentApplier:
                     except Exception as exc:  # a broken connection drops its session locks anyway
                         log.warning("collab intents: advisory unlock failed (%s)", type(exc).__name__)
 
-    async def _apply_locked(self, conn, job: _Received) -> None:
+    async def _apply_locked(self, conn, job: _Received) -> bool | None:
+        """Apply one ticket under its locks. False: leave it ``received`` for a later tick (a transient failure), and
+        the lane stops there so its order holds; anything else: done with it for now."""
         name = job.name
         row = await self._ledger(conn, job.ticket)
         if row is None:                                    # the received row vanished: forget it; a later scan
@@ -722,8 +761,17 @@ class CollabIntentApplier:
             raise
         except Exception as exc:
             log.error("collab intent %s (%s): handler failed (%s)", intent.ticket, intent.kind, type(exc).__name__)
+            if isinstance(exc, _TRANSIENT) and self._may_retry(intent.ticket):
+                return False                   # undecided: the lane stops, the next tick runs it again
             out, private = {"result": "rejected", "reason": REASON_INTERNAL}, {}
         await self._conclude(conn, name, intent, spec, ctx, out, private)
+        return None
+
+    def _may_retry(self, ticket: str) -> bool:
+        """True while a ticket whose handler hit a transient error is within ``INTENT_MAX_AGE`` of its first such
+        failure; past that it is decided like any other failure (no ticket holds its lane forever)."""
+        first = self._transient_since.setdefault(ticket, self.clock())
+        return self.clock() - first <= INTENT_MAX_AGE
 
     def _context(self, conn, intent: Intent, agent: dict | None) -> IntentContext:
         return IntentContext(actor=intent.actor, agent=agent, conn=conn, store=ArtifactStore(conn, self.rustfs),
@@ -864,6 +912,7 @@ class CollabIntentApplier:
         self._consume(name)
 
     def _done(self, ticket, kind, actor_kind, actor_id, artifact_id, outcome: str) -> None:
+        self._transient_since.pop(ticket, None)
         self._received.pop(ticket, None)
         self._count(outcome)
         log.info("collab intent %s kind=%s actor=%s:%s artifact=%s outcome=%s",
@@ -875,9 +924,7 @@ class CollabIntentApplier:
         stores nothing (no blob, no scoped row)."""
         agent_id, aid, payload = intent.actor.id, intent.artifact_id, intent.payload
         store = ctx.store
-        grant = await ctx.grants.grant_for(aid, agent_id)                                           # step 6
-        expires = _epoch(grant["expires_at"]) if grant is not None else None
-        if grant is None or grant["permission"] != "write" or expires is None or expires <= self.clock():
+        if not await self._has_write_grant(ctx, aid, agent_id):                                     # step 6
             return _rejected(REASON_NO_GRANT)
         artifact = await store.get(aid)                                                             # step 7
         if artifact is None:
@@ -912,7 +959,7 @@ class CollabIntentApplier:
                 return _rejected(exc.reason)
             if row is None:
                 unverified += meta.size_bytes
-        used = await ctx.grants.bytes_last_24h(agent_id, exclude_ticket=intent.ticket)               # step 9
+        used = await ctx.grants.bytes_last_24h(agent_id, exclude_ticket=intent.ticket, count_received=False)  # step 9
         if used + payload.inline_bytes + unverified > ctx.limits.daily_bytes_per_agent:
             return _rejected(REASON_QUOTA)
         entries: dict[str, dict] = {}                                                               # step 10
@@ -932,6 +979,14 @@ class CollabIntentApplier:
                                 "entry": await self._store_inline(ctx, aid, change.name, change.text, head_files)})
             else:
                 changes.append({"name": change.name, "op": "put", "entry": entries[change.name]})
+        # Assembly can take a minute and inline storing is I/O: the write grant and the agent are checked once more,
+        # right before the commit, so a revocation during the assembly stops it (the early replay already ran, so a
+        # commit that did land is still reported).
+        _, reason = self._agent_for(intent)
+        if reason is not None:
+            return _rejected(reason)
+        if not await self._has_write_grant(ctx, aid, agent_id):
+            return _rejected(REASON_NO_GRANT)
         try:                                                                                        # step 11
             out = await store.merge_commit(
                 aid, base_version_id=base["version_id"], changes=changes, message=payload.message,
@@ -943,6 +998,12 @@ class CollabIntentApplier:
         except ArtifactError as exc:
             return _rejected(str(exc)[:REASON_MAX] or "commit refused")
         return _committed(out)
+
+    async def _has_write_grant(self, ctx: IntentContext, aid: str, agent_id: str) -> bool:
+        """``grant_for`` re-read now: a ``write`` grant that has not expired."""
+        grant = await ctx.grants.grant_for(aid, agent_id)
+        expires = _epoch(grant["expires_at"]) if grant is not None else None
+        return grant is not None and grant["permission"] == "write" and expires is not None and expires > self.clock()
 
     async def _commit_replay(self, ctx: IntentContext, intent: Intent) -> dict | None:
         """Step 5b: the version already committed for ``(collab:<actor>, key)``, or None. Only the actor's own
@@ -1132,7 +1193,8 @@ class CollabIntentApplier:
 
         **The agent and grant rules apply only when they are proven current**: ``agents.json`` is read here and must
         be fresh (``FEED_MAX_AGE``, the check ``_agent_for`` makes), ``agents`` a mapping and ``grants`` a list;
-        otherwise (stale or missing feed, a bad argument) only the TTL and grace rules run, so a forgotten or failed
+        otherwise (stale or missing feed, a feed listing NO agents at all (a degraded control-plane feed), a bad
+        argument) only the TTL and grace rules run, so a forgotten or failed
         feed refresh can never make every agent's staging look revoked. Before an owner's deletions, the pending
         intents are read again (an upload one names is kept, whatever rule matched), a "no grant" verdict is
         re-confirmed with ``grant_for`` on ``conn`` and an "agent not active" verdict with a fresh read of
@@ -1146,8 +1208,8 @@ class CollabIntentApplier:
         ``_sweep_strays``). Logs carry owner keys, upload ids and counts only.
         """
         n_agents = len(agents) if isinstance(agents, Mapping) else 0
-        rules = (isinstance(agents, Mapping) and isinstance(grants, list)
-                 and await asyncio.to_thread(self.fresh_feed_agents) is not None)
+        rules = (isinstance(agents, Mapping) and bool(agents) and isinstance(grants, list)
+                 and bool(await asyncio.to_thread(self.fresh_feed_agents)))
         if not rules:
             log.warning("collab staging sweep: no fresh agent feed or bad arguments; agent and grant rules skipped")
         live = self._live_write_grants(grants) if rules else set()
