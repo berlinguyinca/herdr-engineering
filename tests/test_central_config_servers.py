@@ -268,11 +268,68 @@ def test_render_collab_slice_holds_only_the_collab_mapping(tmp_path):
     assert oct(out.stat().st_mode & 0o777) == "0o600"
     text = out.read_text()
     data = yaml.safe_load(text)
-    assert data["sections"]["control_plane"]["values"] == {"collab": COLLAB}
+    assert data["sections"]["control_plane"]["values"] == {"collab": COLLAB, "collab_artifacts": {"enabled": False}}
     assert data["hosts"] == {}
     cp = yaml.safe_load(central.read_text())["sections"]["control_plane"]["values"]
     for secret in (cp["pg_dsn"], cp["minio_password"], *cp["api_keys"]):
         assert secret not in text
+
+
+def _artifacts_slice(tmp_path, **cp_extra):
+    central = make_file(tmp_path, collab=dict(COLLAB), **cp_extra)
+    out = tmp_path / "slice" / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(central), out)
+    return out, yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"]
+
+
+@pytest.mark.parametrize("section, expected", [
+    (None, False), ({}, False), ({"enabled": False}, False), ({"enabled": True}, True),
+    ({"enabled": "true"}, False), ({"enabled": 1}, False), ({"enabled": None}, False), ("enabled", False)])
+def test_render_collab_renders_collab_artifacts_enabled_only_for_exactly_true(tmp_path, section, expected):
+    extra = {} if section is None else {"collab_artifacts": section}
+    _, values = _artifacts_slice(tmp_path, **extra)
+    assert values["collab_artifacts"] == {"enabled": expected}
+    assert set(values) == {"collab", "collab_artifacts"}
+
+
+def test_render_collab_carries_no_collab_artifacts_limit_or_path(tmp_path):
+    _, values = _artifacts_slice(tmp_path, collab_artifacts={"enabled": True, "daily_bytes_per_agent": 7,
+                                                             "mirror_dir": "/secret-path"})
+    assert values["collab_artifacts"] == {"enabled": True}
+
+
+def _bridge_run(tmp_path, monkeypatch, old_env, *, enabled, mirror=True, outbox=True, slice_values=None):
+    import herdr_engineering.control_plane.collab_cognito as cc
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    extra = {} if enabled is None else {"collab_artifacts": {"enabled": enabled}}
+    out, _ = _artifacts_slice(tmp_path, **extra)
+    (tmp_path / "mirror").mkdir()
+    (tmp_path / "outbox").mkdir()
+    seen = _run_web(monkeypatch, out, **_collab_only_args(tmp_path),
+                    collab_artifacts_mirror=str(tmp_path / "mirror") if mirror else None,
+                    collab_artifacts_outbox=str(tmp_path / "outbox") if outbox else None)
+    return seen["server_kw"]["collab"]
+
+
+def test_collab_public_builds_the_bridge_only_with_the_slice_enabled_and_both_flags(tmp_path, monkeypatch, old_env, capsys):
+    from herdr_engineering.control_plane.collab_artifacts import CollabArtifactBridge
+    service = _bridge_run(tmp_path, monkeypatch, old_env, enabled=True)
+    assert isinstance(service.artifact_bridge, CollabArtifactBridge)
+    assert (tmp_path / "outbox" / "agents.json").exists()          # started: the feed is written
+
+
+@pytest.mark.parametrize("enabled, mirror, outbox", [(False, True, True), (None, True, True),
+                                                      (True, False, True), (True, True, False),
+                                                      (True, False, False)])
+def test_collab_public_builds_no_bridge_otherwise(tmp_path, monkeypatch, old_env, capsys, enabled, mirror, outbox):
+    service = _bridge_run(tmp_path, monkeypatch, old_env, enabled=enabled, mirror=mirror, outbox=outbox)
+    assert service.artifact_bridge is None
+    assert not (tmp_path / "outbox" / "agents.json").exists()
+
+
+def test_collab_public_stops_the_bridge_feed_thread_at_shutdown(tmp_path, monkeypatch, old_env, capsys):
+    service = _bridge_run(tmp_path, monkeypatch, old_env, enabled=True)
+    assert service.artifact_bridge.feed_thread_alive() is False
 
 
 def test_render_collab_refuses_missing_or_unknown_keys(tmp_path):
@@ -887,4 +944,4 @@ def test_render_collab_slice_never_carries_rakazo_settings(tmp_path):
         "sync_dir": "/etc/herdr/collab-sync"}})
     out = tmp_path / "s" / "collab-config.json"
     fcc.render_collab(fcc.load_fleet_config(central), out)
-    assert yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"] == {"collab": COLLAB}
+    assert yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"] == {"collab": COLLAB, "collab_artifacts": {"enabled": False}}

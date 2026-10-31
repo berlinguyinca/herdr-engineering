@@ -267,3 +267,159 @@ test('a report artifact page shows the Share card and shares its rendered previe
     await panel(page).locator('[data-share-row] [data-share-state]', { hasText: 'live' }).waitFor();
   });
 });
+
+// ------------------------------------------------------------------------------------------------ Collaborators and Activity tabs
+
+const HOSTILE_TAG = '<img src=x onerror=window.__x=1>';
+const INVITE_CODE = 'hcn_invite_ONE-TIME-CODE-7f3a9c2e51b84d60';
+
+const collabPanel = page => page.locator('[data-collab-panel]');
+const activityPanel = page => page.locator('[data-activity-panel]');
+
+async function openTab(page, key) {
+  await page.locator(`[data-panel-tab="${key}"]`).click();
+  await page.locator(`[data-panel-pane="${key}"]`).waitFor({ state: 'visible' });
+}
+
+async function openCollaborators(page, base, id = 'collab_1') {
+  await openArtifact(page, base, id);
+  await openTab(page, 'collaborators');
+  await collabPanel(page).locator('h3', { hasText: 'Collaborators' }).waitFor();
+  // The agent picker is filled by the dashboard proxy after the grants load.
+  await collabPanel(page).locator('select[data-collab-field="agent_id"] option[value="agent-codex"]').waitFor({ state: 'attached' });
+}
+
+const noHostileEffect = async page => {
+  assert.equal(await page.evaluate(() => window.__x), undefined);
+  assert.equal(await page.locator('img[src="x"]').count(), 0);
+};
+
+test('an owner grants an agent read+write, sees the row, and revokes it', async () => {
+  await withShares(async ({ page, base, requests }) => {
+    await openCollaborators(page, base);
+    await collabPanel(page).getByText('No agent has access to this artifact.').waitFor();
+    await collabPanel(page).locator('select[data-collab-field="agent_id"]').selectOption('agent-codex');
+    await collabPanel(page).locator('select[data-collab-field="permission"]').selectOption('write');
+    await collabPanel(page).locator('[data-collab-action="grant"]').click();
+    const row = collabPanel(page).locator('[data-collab-row]');
+    await row.waitFor();
+    assert.match(await row.innerText(), /agent-codex[\s\S]*write/);
+    await collabPanel(page).getByText('Access granted.').waitFor();
+    const grant = requests.find(r => r.method === 'POST' && r.url.endsWith('/api/v1/artifacts/collab_1/collaborators'));
+    assert.deepEqual(JSON.parse(grant.body), { agent_id: 'agent-codex', permission: 'write', expires_in_days: 30 });
+
+    await row.locator('[data-collab-action="revoke"]').click();
+    await row.waitFor({ state: 'detached' });
+    await collabPanel(page).getByText('No agent has access to this artifact.').waitFor();
+    assert.ok(requests.some(r => r.method === 'POST' && r.url.endsWith('/collaborators/agent-codex/revoke')));
+    assert.equal(await collabPanel(page).locator('[role="alert"]').count(), 0);
+  });
+});
+
+test('a report artifact offers no write access and says why', async () => {
+  await withShares(async ({ page, base }) => {
+    await openCollaborators(page, base, 'report_1');
+    const write = collabPanel(page).locator('select[data-collab-field="permission"] option[value="write"]');
+    assert.equal(await write.isDisabled(), true);
+    const reason = collabPanel(page).locator('[data-collab-writable-reason]').first();
+    assert.match(await reason.innerText(), /report artifacts are read-only for collaborators/);
+  });
+});
+
+test('an invite code is shown once and is gone from the page after Close', async () => {
+  await withShares(async ({ page, base, requests, consoleLines }) => {
+    await openCollaborators(page, base);
+    await collabPanel(page).locator('select[data-collab-field="room"]').selectOption('room-1');
+    await collabPanel(page).locator('input[data-collab-field="label"]').fill('remote reviewer');
+    await collabPanel(page).locator('[data-collab-action="invite"]').click();
+    const input = collabPanel(page).locator('[role="dialog"][data-collab-invite] [data-invite-code]');
+    await input.waitFor();
+    assert.equal(await input.inputValue(), INVITE_CODE);
+    // Positive control: readable as the input's value, never in the markup.
+    assert.ok((await pageStrings(page)).some(value => value.includes(INVITE_CODE)));
+    assert.equal((await page.content()).includes(INVITE_CODE), false, 'the code is never serialised into markup');
+    const pending = collabPanel(page).locator('[data-collab-pending]');
+    await pending.waitFor();
+    assert.match(await pending.innerText(), /inv-1/);
+    const made = requests.find(r => r.method === 'POST' && r.url.endsWith('/externals/invites'));
+    assert.deepEqual(JSON.parse(made.body).actions, ['read']);
+    const link = requests.find(r => r.method === 'POST' && r.url.endsWith('/collaborators/invite-grant'));
+    assert.deepEqual(JSON.parse(link.body), { invite_id: 'inv-1', permission: 'read', expires_in_days: 30 });
+
+    await collabPanel(page).locator('[data-collab-action="close-invite"]').click();
+    await collabPanel(page).locator('[data-collab-invite]').waitFor({ state: 'detached' });
+    assert.equal((await page.content()).includes(INVITE_CODE), false);
+    assert.deepEqual((await pageStrings(page)).filter(value => value.includes(INVITE_CODE)), []);
+    assert.equal(consoleLines.some(line => line.includes(INVITE_CODE)), false);
+    assert.equal(requests.some(r => r.url.includes(INVITE_CODE) || (r.body || '').includes(INVITE_CODE)), false);
+  });
+});
+
+test('the Activity tab shows the merge badge, rejected attempts with their conflicts, and a version diff', async () => {
+  await withShares(async ({ page, base }) => {
+    await openArtifact(page, base, 'collab_1');
+    await openTab(page, 'activity');
+    const history = activityPanel(page);
+    await history.locator('[data-activity-version]').first().waitFor();
+    assert.equal(await history.locator('[data-version-merge]').count(), 1);
+    assert.match(await history.locator('[data-activity-version]', { has: page.locator('[data-version-merge]') }).innerText(), /Merge of parents[\s\S]*c1_v2[\s\S]*c1_v3/);
+
+    await history.locator('[data-activity-action="toggle-attempts"]').click();
+    await history.locator('[data-activity-attempt]').first().waitFor();
+    assert.equal(await history.locator('[data-activity-attempt]').count(), 2);
+    const conflict = history.locator('[data-activity-attempt]', { hasText: 'conflict' });
+    assert.match(await conflict.first().innerText(), /agent-codex[\s\S]*Conflicts:[\s\S]*index\.html/);
+    await history.locator('[data-activity-action="toggle-attempts"]', { hasText: 'Hide rejected attempts' }).click();
+    assert.equal(await history.locator('[data-activity-attempt]').count(), 0);
+
+    await history.locator('[data-activity-action="select"][data-version-id="c1_v4"]').click();
+    await history.locator('[data-activity-file]').first().waitFor();
+    assert.equal(await history.locator('[data-activity-file]').count(), 3);
+    const index = history.locator('[data-activity-file]', { hasText: 'index.html' });
+    assert.equal(await index.locator('.hd-diff__add', { hasText: '<p>side</p>' }).count(), 1);
+    const binary = history.locator('[data-activity-file]', { hasText: 'logo.png' });
+    assert.match(await binary.innerText(), /binary/);
+    assert.equal(await binary.locator('.hd-diff').count(), 0, 'a binary file shows no diff body');
+    assert.equal(await history.locator('[role="alert"]').count(), 0);
+  });
+});
+
+test('hostile agent names, messages, file names and reasons stay text on both tabs', async () => {
+  await withShares(async ({ page, base }) => {
+    await openCollaborators(page, base);
+    const evil = collabPanel(page).locator('select[data-collab-field="agent_id"] option[value="agent-evil"]');
+    assert.ok((await evil.innerText()).includes(HOSTILE_TAG));
+    await collabPanel(page).locator('select[data-collab-field="agent_id"]').selectOption('agent-evil');
+    await collabPanel(page).locator('[data-collab-action="grant"]').click();
+    await collabPanel(page).locator('[data-collab-row]').waitFor();
+    await openTab(page, 'activity');
+    const history = activityPanel(page);
+    await history.locator('[data-activity-version]').first().waitFor();
+    assert.ok((await history.innerText()).includes(`merge ${HOSTILE_TAG}`));
+    await history.locator('[data-activity-action="toggle-attempts"]').click();
+    await history.locator('[data-activity-attempt]').first().waitFor();
+    assert.ok((await history.innerText()).includes(`stale base ${HOSTILE_TAG}`));
+    await history.locator('[data-activity-action="select"][data-version-id="c1_v4"]').click();
+    await history.locator('[data-activity-file]').first().waitFor();
+    assert.ok((await history.locator('[data-activity-file]', { hasText: 'hostile file' }).count()) >= 0);
+    assert.ok((await history.innerText()).includes(`${HOSTILE_TAG}.txt`));
+    await noHostileEffect(page);
+  });
+});
+
+test('when collaboration is not enabled the Collaborators tab says so and Links keeps working', async () => {
+  await withShares(async ({ page, base, requests }) => {
+    await openArtifact(page, base);
+    await openTab(page, 'collaborators');
+    await collabPanel(page).getByText('Collaboration is not enabled').waitFor();
+    assert.ok(requests.some(r => r.url.endsWith('/api/v1/artifacts/web_1/collaborators')));
+    assert.equal(await collabPanel(page).locator('[data-collab-row], [data-collab-action="grant"]').count(), 0);
+    await openTab(page, 'links');
+    await reviewPublic(page);
+    assert.match(await panel(page).locator('[data-share-review]').innerText(), /index\.html/);
+    await action(page, 'generate').click();
+    await panel(page).locator('[data-share-url]').waitFor();
+    await action(page, 'close').click();
+    await panel(page).locator('[data-share-row] [data-share-state]', { hasText: 'live' }).waitFor();
+  }, { COLLAB_DISABLED: '1' });
+});

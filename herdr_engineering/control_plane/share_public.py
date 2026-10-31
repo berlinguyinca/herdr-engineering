@@ -49,6 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote_to_bytes, urlsplit
 
+from .collab_bridge_files import _open_beneath
 from .collab_cognito import CognitoAuthenticator, SyncedDirectory
 from .share_bundle import ShareBundleError, content_type_for, normalise_name
 from .share_lab import authorise
@@ -297,34 +298,7 @@ def _log(reason: str, extra: str = "") -> None:
         log.warning("share-public: %s %s", reason, extra)
 
 
-# ----------------------------------------------------------------------------- safe filesystem access
-
-def _open_beneath(root: Path, parts: list[str], *, max_size: int | None = None) -> tuple[int, os.stat_result] | None:
-    """Open ``root/parts...`` without following a symlink at ANY component; a regular file, or None."""
-    try:
-        dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    except OSError:
-        return None
-    try:
-        for part in parts[:-1]:
-            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
-            os.close(dfd)
-            dfd = nfd
-        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dfd)
-    except OSError:
-        return None
-    finally:
-        os.close(dfd)
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or (max_size is not None and st.st_size > max_size):
-            os.close(fd)
-            return None
-    except OSError:
-        os.close(fd)
-        return None
-    return fd, st
-
+# safe filesystem access: ``_open_beneath`` lives in ``collab_bridge_files`` (shared with the collab artifact bridge)
 
 @dataclass(frozen=True)
 class _Prepared:

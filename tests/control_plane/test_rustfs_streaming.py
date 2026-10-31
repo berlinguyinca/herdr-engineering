@@ -1,5 +1,7 @@
 import hashlib
 import io
+import os
+import tempfile
 
 import pytest
 
@@ -155,3 +157,24 @@ def test_streaming_rejects_nonpositive_chunks(size):
     with pytest.raises(ValueError, match="chunk_size"):
         list(client.iter_get("key", "digest", chunk_size=size))
     assert s3.objects == {}
+
+
+class _SpoolRecordingS3(_StreamingS3):
+    def __init__(self):
+        super().__init__()
+        self.spool_dirs = []
+
+    def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None):
+        self.spool_dirs.append(os.path.dirname(fileobj.name))
+        super().upload_fileobj(fileobj, bucket, key, ExtraArgs=ExtraArgs)
+
+
+def test_put_stream_spools_into_the_given_dir_and_defaults_to_the_temp_dir(tmp_path):
+    s3 = _SpoolRecordingS3()
+    client = RustFSClient(endpoint="http://x", bucket="b", s3=s3)
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    client.put_stream(io.BytesIO(b"in the spool dir"), spool_dir=spool)
+    client.put_stream(io.BytesIO(b"in the default dir"))
+    assert s3.spool_dirs == [str(spool), tempfile.gettempdir()]
+    assert list(spool.iterdir()) == []

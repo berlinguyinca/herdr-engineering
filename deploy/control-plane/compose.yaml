@@ -188,6 +188,13 @@ services:
       - ${HERDR_SHARES_DIR:?run deploy.sh}:/shares
       - ${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events
       - herdr-cp-share-markers:/var/lib/herdr/share-markers
+      # Collaborator bridge (control_plane.collab_artifacts; container paths are its defaults, keep them). The worker runs
+      # as root (no user:), so it writes the mirror (files 0644, dirs 0755), reads staged parts (0600) and unlinks in
+      # the outbox even though deploy.sh creates both as the deploying uid. The spool (assembled uploads, large
+      # storage) is the worker's alone: collab-public never mounts it. deploy.sh creates all three, always.
+      - ${HERDR_COLLAB_MIRROR_DIR:?run deploy.sh}:/collab-mirror
+      - ${HERDR_COLLAB_OUTBOX_DIR:?run deploy.sh}:/collab-outbox
+      - ${HERDR_COLLAB_SPOOL_DIR:?run deploy.sh}:/collab-spool
     environment:
       HERDR_ENGINEERING_CONFIG: /app/control-plane/config.yaml
     command:
