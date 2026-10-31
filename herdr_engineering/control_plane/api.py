@@ -517,6 +517,9 @@ class ControlPlaneServer:
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
         self._ingest_limiter = _RateLimiter(max_requests=6000)
+        # POST /mcp: chunked artifact staging legitimately sends many requests; the edge (25 r/s per IP) is the
+        # binding per-client ceiling, this one is a sanity backstop above it.
+        self._mcp_limiter = _RateLimiter(max_requests=1800)
         self._stream_limiter = _RateLimiter(max_requests=120)
         # Fail-closed (Spec §104): never default a blank/missing role to
         # "operator". Keep roles verbatim after strip; empty/None/unknown
@@ -2126,17 +2129,44 @@ def _make_handler(server, public=False, operator=False):
             if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                 return self._deny(415, "application/json required")
             length = _content_length(self.headers.get("Content-Length"))
-            if length is None or length <= 0 or length > MAX_BODY:
+            principal, big_tools = None, None
+            if length is None or length <= 0:
                 return self._deny(413, "request body size not allowed")
+            if length > MAX_BODY:
+                if label != "MCP":
+                    return self._deny(413, "request body size not allowed")
+                from . import collab_mcp
+                from .collab_bridge_files import MCP_UPLOAD_MAX_BODY
+                if length > MCP_UPLOAD_MAX_BODY:
+                    return self._deny(413, "request body size not allowed")
+                # Pre-authentication large-body gate: nothing above MAX_BODY is read for a caller who is not an
+                # authenticated agent admitted by a registered predicate (every refusal closes the connection).
+                if (len(self.headers.get_all("Content-Length") or []) != 1
+                        or "Transfer-Encoding" in self.headers):
+                    return self._deny(400, "ambiguous request framing")
+                try:
+                    principal = server.collab.authenticate(
+                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"))
+                    big_tools = collab_mcp.admitted_tools(server.collab, principal) if principal.is_agent else frozenset()
+                except Exception:
+                    big_tools = frozenset()
+                if not big_tools:
+                    return self._deny(413, "request body size not allowed")
             try:
                 message = json.loads(self.rfile.read(length))
             except (ValueError, RecursionError):
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32700, "message": "parse error"}}, 400)
             try:
+                if big_tools is not None:
+                    from . import collab_mcp
+                    refusal = collab_mcp.oversize_refusal(message, big_tools)
+                    if refusal is not None:
+                        return self._json(refusal[1], refusal[0])
+                extra = {} if principal is None else {"principal": principal}
                 status, payload = handle(
                     server.collab, message, self.headers.get("Authorization", ""),
-                    self.headers.get("X-Herdr-Device"))
+                    self.headers.get("X-Herdr-Device"), **extra)
             except Exception:
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32603, "message": "internal error"}}, 500)
@@ -2851,6 +2881,8 @@ def _make_handler(server, public=False, operator=False):
                 limiter = server._stream_limiter
             elif self.command == "POST" and path == "/api/v1/ingest":
                 limiter = server._ingest_limiter
+            elif self.command == "POST" and path == "/mcp":
+                limiter = server._mcp_limiter
             else:
                 limiter = server._limiter
             if limiter.allow(who):

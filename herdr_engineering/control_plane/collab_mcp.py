@@ -10,7 +10,9 @@ wrapped as untrusted data."""
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from . import collab_waiters
@@ -451,17 +453,73 @@ def _call(service: CollabService, pr, name: str, args: dict) -> dict:
     raise CollabError(404, "unknown tool")
 
 
-def handle(service: CollabService, message: Any, authorization: str, device: str | None):
-    """One JSON-RPC message in, (HTTP status, JSON or None) out."""
+# ---------------------------------------------------------------- large-body admission (Task 8b)
+# A body above MAX_BODY (and up to MCP_UPLOAD_MAX_BODY) is only read for an authenticated agent for whom at least one
+# registered predicate holds, and then only for the tools those predicates name. This is the ONE gate: later plans
+# add entries here instead of adding a second check.
+Admission = tuple[Callable[[CollabService, Any], bool], frozenset[str]]
+_ADMISSIONS: list[Admission] = []
+_ADMISSIONS_LOCK = threading.Lock()
+
+
+def register_large_body_admission(predicate: Callable[[CollabService, Any], bool], tools: frozenset[str]) -> None:
+    with _ADMISSIONS_LOCK:
+        _ADMISSIONS.append((predicate, frozenset(tools)))
+
+
+def _write_grant_holder(service: CollabService, pr: Any) -> bool:
+    bridge = service.artifact_bridge
+    return bridge is not None and bridge.has_write_grant(pr)
+
+
+def reset_large_body_admissions() -> None:
+    """Back to the built-in registry (tests register extra entries and must restore it)."""
+    with _ADMISSIONS_LOCK:
+        _ADMISSIONS[:] = [(_write_grant_holder, frozenset({"artifact_stage_chunk"}))]
+
+
+reset_large_body_admissions()
+
+
+def admitted_tools(service: CollabService, pr: Any) -> frozenset[str]:
+    """Union of the tools of every admission that holds for ``pr``. A predicate that raises admits nothing."""
+    with _ADMISSIONS_LOCK:
+        entries = list(_ADMISSIONS)
+    union: set[str] = set()
+    for predicate, tools in entries:
+        try:
+            if predicate(service, pr):
+                union |= tools
+        except Exception:
+            continue
+    return frozenset(union)
+
+
+def oversize_refusal(message: Any, tools: frozenset[str]):
+    """After parsing a body above MAX_BODY: None when it is a call of an admitted tool, else the -32602 reply."""
+    params = message.get("params") if isinstance(message, dict) else None
+    name = params.get("name") if isinstance(params, dict) else None
+    if message.get("method") == "tools/call" and isinstance(name, str) and name in tools:
+        return None
+    rid = message.get("id") if isinstance(message, dict) else None
+    return 200, _error(rid, -32602, "request too large for this tool")
+
+
+def handle(service: CollabService, message: Any, authorization: str, device: str | None, principal: Any = None):
+    """One JSON-RPC message in, (HTTP status, JSON or None) out. ``principal`` is a caller the HTTP layer already
+    authenticated (the large-body gate); it is not authenticated a second, so failures are counted once."""
     if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
         return 400, _error(None, -32600, "invalid request")
     rid, method = message.get("id"), message.get("method")
     if rid is None:                          # notification: nothing to return
         return 202, None
-    try:
-        pr = service.authenticate(authorization, device)
-    except CollabError:
-        return 401, _error(rid, -32001, "unauthorized")
+    if principal is not None:
+        pr = principal
+    else:
+        try:
+            pr = service.authenticate(authorization, device)
+        except CollabError:
+            return 401, _error(rid, -32001, "unauthorized")
     if not pr.is_agent:
         return 403, _error(rid, -32002, "connect with an agent credential, not a user token")
     if method == "initialize":
