@@ -1,8 +1,9 @@
 """Verb catalog and canonical action identity for the assistant hub policy core.
 
-An ``ActionKey`` is the normalized description of one proposed action. Its canonical JSON (NFKC-normalized, lowercased
-tool and scope, sorted keys, no whitespace) is hashed into a stable ``key_id`` so grants and vetoes match on identity
-rather than on whatever spelling a worker happened to use. ``unknown`` verbs are always OUTWARD (fail closed).
+An ``ActionKey`` is the normalized description of one proposed action. Its canonical JSON (sorted keys, no whitespace)
+is hashed into a stable ``key_id`` so grants and vetoes match on identity rather than on spelling. Canonicalization
+never merges distinct strings: target is NFC and case-sensitive, scope is NFC and case-folded, only the tool name gets
+NFKC + lowercase. ``unknown`` verbs are always OUTWARD (fail closed), and a key's risk class must match its verb.
 """
 
 from __future__ import annotations
@@ -61,8 +62,19 @@ _FLAG_ORDER = (FlagClass.NONE, FlagClass.MULTIPLE, FlagClass.NO_VERIFY, FlagClas
                FlagClass.HARD)
 
 
-def _norm(value: str) -> str:
-    return unicodedata.normalize("NFKC", value)
+def _nfc(value: str) -> str:
+    return unicodedata.normalize("NFC", value)
+
+
+def _tool_name(value: str) -> str:
+    # Tool names are identifiers; compatibility folding is safe here. Re-normalize after lower() for idempotence.
+    return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", value).lower())
+
+
+def _scope(value: str) -> str:
+    # Scopes (repos, recipients, hosts) are case-insensitive. NFC only: compatibility folding could merge distinct
+    # strings and make a grant broader than what the owner approved.
+    return _nfc(_nfc(value).casefold())
 
 
 @dataclass(frozen=True)
@@ -74,14 +86,18 @@ class ActionKey:
     flag_class: FlagClass
     risk_class: RiskClass
 
+    def __post_init__(self) -> None:
+        if self.risk_class is not VERB_RISK[self.verb]:
+            raise ValueError(f"risk_class {self.risk_class.value} does not match verb {self.verb.value}")
+
     def canonical(self) -> str:
         return json.dumps({
-            "tool": _norm(self.tool).lower(),
-            "verb": _norm(str(self.verb.value)),
-            "resource_scope": _norm(self.resource_scope).lower(),
-            "target": _norm(self.target).strip(),
-            "flag_class": _norm(str(self.flag_class.value)),
-            "risk_class": _norm(str(self.risk_class.value)),
+            "tool": _tool_name(self.tool),
+            "verb": self.verb.value,
+            "resource_scope": _scope(self.resource_scope),
+            "target": _nfc(self.target).strip(),
+            "flag_class": self.flag_class.value,
+            "risk_class": self.risk_class.value,
         }, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
     def key_id(self) -> str:
