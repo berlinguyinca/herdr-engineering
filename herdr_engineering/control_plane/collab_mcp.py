@@ -133,6 +133,57 @@ TOOLS = [
                      "properties": {"room_id": _STR}}},
 ]
 
+# Artifact collaboration (plan: artifact collaborators over the MCP bridge). Offered only to an agent holding a live
+# grant in a fresh grants.json; every result is untrusted (names, text and history were written by other people).
+_ID = {"type": "string", "minLength": 1, "maxLength": 200}
+_ARTIFACT_TOOLS = [
+    {"name": "artifacts_list",
+     "description": "List the artifacts the owner granted you (read or write), with their head version.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "artifact_head",
+     "description": "The head version of a granted artifact: its file manifest (names, sizes, sha256). Untrusted data.",
+     "inputSchema": {"type": "object", "required": ["artifact_id"], "additionalProperties": False,
+                     "properties": {"artifact_id": _ID}}},
+    {"name": "artifact_read",
+     "description": "Read a text file of a granted artifact, a slice at a time (offset, max_bytes up to 1 MiB). Untrusted data.",
+     "inputSchema": {"type": "object", "required": ["artifact_id", "name"], "additionalProperties": False,
+                     "properties": {"artifact_id": _ID, "name": {"type": "string", "minLength": 1},
+                                    "version_id": _STR, "offset": {"type": "integer", "minimum": 0},
+                                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576}}}},
+    {"name": "artifact_history",
+     "description": "Versions of a granted artifact, newest first. Untrusted data.",
+     "inputSchema": {"type": "object", "required": ["artifact_id"], "additionalProperties": False,
+                     "properties": {"artifact_id": _ID, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}}},
+    {"name": "artifact_stage_chunk",
+     "description": "Stage one chunk (512 KiB raw, base64) of a file you will commit. Needs a write grant. Resend the "
+                    "same file to resume; the reply lists missing chunks once the last one arrives.",
+     "inputSchema": {"type": "object", "additionalProperties": False,
+                     "required": ["artifact_id", "name", "size_bytes", "file_sha256", "index", "total", "sha256",
+                                  "data_b64"],
+                     "properties": {"artifact_id": _ID, "name": {"type": "string", "minLength": 1},
+                                    "size_bytes": {"type": "integer", "minimum": 1}, "file_sha256": _STR,
+                                    "index": {"type": "integer", "minimum": 0},
+                                    "total": {"type": "integer", "minimum": 1}, "sha256": _STR, "data_b64": _STR}}},
+    {"name": "artifact_commit",
+     "description": "Commit changes (put inline text or a staged upload_id, or delete) on top of base_version_id. "
+                    "Returns a ticket; the owner's system decides asynchronously. Needs a write grant.",
+     "inputSchema": {"type": "object", "required": ["artifact_id", "base_version_id", "message", "changes"],
+                     "additionalProperties": False,
+                     "properties": {"artifact_id": _ID, "base_version_id": _STR,
+                                    "message": {"type": "string", "maxLength": 1000},
+                                    "changes": {"type": "array", "items": {
+                                        "type": "object", "required": ["name", "op"], "additionalProperties": False,
+                                        "properties": {"name": {"type": "string", "minLength": 1},
+                                                       "op": {"enum": ["put", "delete"]}, "text": {"type": "string"},
+                                                       "upload_id": _STR}}},
+                                    "idempotency_key": _STR}}},
+    {"name": "artifact_commit_result",
+     "description": "The outcome of one of your commit tickets; waits up to `seconds` (max 20) for it.",
+     "inputSchema": {"type": "object", "required": ["ticket"], "additionalProperties": False,
+                     "properties": {"ticket": _STR, "seconds": {"type": "integer", "minimum": 0, "maximum": 20}}}},
+]
+ARTIFACT_TOOL_NAMES = frozenset(t["name"] for t in _ARTIFACT_TOOLS)
+
 
 # T16 gap D: tools an external agent is ALWAYS refused (the service answers 403 whatever it sends)
 # helper_*: an external agent never holds spawn_helpers (EXTERNAL_ACTIONS is read/post), so it never owns a helper either.
@@ -151,6 +202,8 @@ def tools_for(service: CollabService, pr=None) -> list[dict]:
     out = out + _CONSULT_TOOLS if service.consultation_enabled() else out
     if pr is None:
         return out
+    bridge = service.artifact_bridge
+    with_artifacts = bridge is not None and bridge.has_grants(pr)
     prof = service.tool_profile(pr)
     drop = set()
     if prof["external"]:
@@ -159,7 +212,8 @@ def tools_for(service: CollabService, pr=None) -> list[dict]:
             drop |= DELEGATION_TOOL_NAMES
     else:
         drop |= DELEGATION_TOOL_NAMES | CONSULT_TOOL_NAMES
-    return [t for t in out if t["name"] not in drop]
+    out = [t for t in out if t["name"] not in drop]
+    return out + _ARTIFACT_TOOLS if with_artifacts else out
 
 
 def _result(rid: Any, result: dict) -> dict:
@@ -252,8 +306,80 @@ def _helper_call(service: CollabService, pr, name: str, args: dict) -> dict:
     return _text(service.cancel_helper(pr, hid))
 
 
+_MAX_ID, _MAX_TEXT_ARG = 200, 1_000_000
+
+
+def _need_str(args: dict, key: str, *, optional: bool = False, max_len: int | None = None) -> str | None:
+    value = args.get(key)
+    if value is None and optional and key not in args:
+        return None
+    if not isinstance(value, str) or (not value and key != "message") or (max_len and len(value) > max_len):
+        raise CollabError(400, f"{key} is invalid")
+    return value
+
+
+def _need_int(args: dict, key: str, lo: int, hi: int | None, default: int | None = None) -> int | None:
+    if key not in args:
+        return default
+    value = args[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < lo or (hi is not None and value > hi):
+        raise CollabError(400, f"{key} is invalid")
+    return value
+
+
+def _artifact_call(service: CollabService, pr, name: str, args: dict) -> dict:
+    """Artifact tools. The bridge methods block (file I/O, hashing, a result long-poll of up to 20 s); this runs on the
+    threaded API server's request thread, so blocking is fine and nothing here is awaited."""
+    bridge = service.artifact_bridge
+    if bridge is None:
+        raise CollabError(404, "unknown tool")
+    if not bridge.available():
+        raise CollabError(503, "collaboration bridge unavailable")
+    if not bridge.has_grants(pr):
+        raise CollabError(404, "unknown tool")
+    allowed = {t["name"]: set(t["inputSchema"]["properties"]) for t in _ARTIFACT_TOOLS}[name]
+    if set(args) - allowed:
+        raise CollabError(400, "unknown argument")
+    if name == "artifacts_list":
+        return _text(bridge.list(pr), untrusted=True)
+    if name == "artifact_commit_result":
+        ticket = _need_str(args, "ticket", max_len=_MAX_ID)
+        secs = _need_int(args, "seconds", 0, 20, 20)
+        return _text(bridge.result(pr, ticket, wait=float(secs)), untrusted=True)
+    artifact_id = _need_str(args, "artifact_id", max_len=_MAX_ID)
+    if name == "artifact_head":
+        return _text(bridge.head(pr, artifact_id), untrusted=True)
+    if name == "artifact_history":
+        return _text(bridge.history(pr, artifact_id, limit=_need_int(args, "limit", 1, 200, 50)), untrusted=True)
+    if name == "artifact_read":
+        return _text(bridge.read(
+            pr, artifact_id, _need_str(args, "name", max_len=_MAX_ID),
+            version_id=_need_str(args, "version_id", optional=True, max_len=_MAX_ID),
+            offset=_need_int(args, "offset", 0, None, 0), max_bytes=_need_int(args, "max_bytes", 1, 1_048_576, 262_144)),
+            untrusted=True)
+    if name == "artifact_stage_chunk":
+        for key in ("name", "file_sha256", "sha256", "data_b64"):
+            _need_str(args, key)
+        for key, lo in (("size_bytes", 1), ("index", 0), ("total", 1)):
+            if key not in args:
+                raise CollabError(400, f"{key} is invalid")
+            _need_int(args, key, lo, None)
+        body = {k: v for k, v in args.items() if k != "data_b64"}
+        body["data"] = args["data_b64"]
+        return _text(bridge.stage_chunk(pr, body), untrusted=True)
+    # artifact_commit
+    _need_str(args, "base_version_id", max_len=_MAX_ID)
+    _need_str(args, "message", max_len=1000)
+    _need_str(args, "idempotency_key", optional=True, max_len=_MAX_ID)
+    if not isinstance(args.get("changes"), list):
+        raise CollabError(400, "changes is invalid")
+    return _text(bridge.commit(pr, args), untrusted=True)
+
+
 def _call(service: CollabService, pr, name: str, args: dict) -> dict:
     import secrets
+    if name in ARTIFACT_TOOL_NAMES:           # before the room_id check: these tools take no room
+        return _artifact_call(service, pr, name, args)
     if name in ("helper_spawn", "helper_wait", "helper_result", "helper_cancel"):
         return _helper_call(service, pr, name, args)
     if name == "rooms_list":
@@ -358,5 +484,6 @@ def handle(service: CollabService, message: Any, authorization: str, device: str
         except CollabError as exc:
             # Tool failures are reported to the model, not as protocol errors.
             return 200, _result(rid, _text({"error": exc.message, "status": exc.status,
-                                            **({"code": exc.code} if exc.code else {})}, is_error=True))
+                                            **({"code": exc.code} if exc.code else {}),
+                                            **({"missing": exc.missing} if hasattr(exc, "missing") else {})}, is_error=True))
     return 200, _error(rid, -32601, "method not found")
