@@ -562,6 +562,8 @@ class ControlPlaneServer:
         from .review_quorum import RereviewLedger
         self.rereview = RereviewLedger(repo)
         self._refusal_logged: dict = {}    # T16 gap C: durable re-review requests (the route 404s when the quorum is off)
+        from .single_flight_cache import SingleFlightCache
+        self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
         self.collab_require_https = collab_require_https
         # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
@@ -3659,10 +3661,14 @@ def _make_handler(server, public=False, operator=False):
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
                     filters = _ci_reports_query(self.path)
-                    view = {**r.ci_reports(**filters), "repos": server.ci_monitor.snapshot().get("repos", [])}
-                    view = annotate_ci_history(view, r,
-                        repository_languages=cached_github_languages(server.github_monitor))
-                    return self._json(server.ci_monitor.report_redactor()(view))
+
+                    def build_reports():
+                        view = {**r.ci_reports(**filters), "repos": server.ci_monitor.snapshot().get("repos", [])}
+                        view = annotate_ci_history(view, r,
+                            repository_languages=cached_github_languages(server.github_monitor))
+                        return server.ci_monitor.report_redactor()(view)
+                    # Several seconds to build, asked for by every open CI page: one build per key per few seconds.
+                    return self._json(server.ci_reports_cache.get((self.path, r.ci_reports_version()), build_reports))
                 if what == "pipeline":
                     view = server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number"),
