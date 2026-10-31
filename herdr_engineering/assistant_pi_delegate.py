@@ -114,3 +114,95 @@ class PiSecretaryDelegationAdapter:
             raise PiDelegationError("Pi task cancellation failed")
         return {"external_id": external_id, "status": "cancellation_requested",
                 "cancel_requested": True}
+
+
+_RUNTIME_LIVE = frozenset({"queued", "claimed", "starting", "ready"})
+_RUNTIME_STOPPED = frozenset({"failed", "cancelled"})
+_TASK_OPEN = frozenset({"pending", "accepted"})
+
+
+class HcnPiTaskTransport:
+    """``PiTaskTransport`` over the owner's own authenticated client; it adds no authority.
+
+    Cancelling a task only withdraws the logical task. ``execution_stopped`` is reported only after the host has
+    reported every runtime of the bound agent failed/cancelled, which the runner does after verified process and
+    scope teardown. A missing or still-live runtime is never read as stopped."""
+
+    def __init__(self, client, agent_id: str):
+        if not REF.fullmatch(agent_id or ""):
+            raise PiDelegationError("invalid Pi Secretary binding")
+        self.client, self.agent_id = client, agent_id
+
+    def create_task(self, *, room_id: str, agent_id: str, text: str, idempotency_key: str) -> dict:
+        if agent_id != self.agent_id:
+            raise PiDelegationError("transport is bound to a different agent")
+        return self.client.task_create(room_id, agent_id, text, idempotency_key)
+
+    def get_task(self, *, room_id: str, task_id: str) -> dict:
+        task = dict(self.client.task_get(room_id, task_id))
+        if task.get("target_agent_id") not in (None, self.agent_id):
+            raise PiDelegationError("invalid Pi task response")
+        if task.get("status") == "cancelled":
+            task["execution_stopped"] = self._execution_stopped(room_id)
+        return task
+
+    def cancel_task(self, *, room_id: str, task_id: str) -> dict:
+        value = self.client.task_cancel(room_id, task_id)
+        if value.get("ok") is not True:
+            return value
+        # Withdrawing the task does not stop Pi. Ask the host to stop the bound runtime, but only when no other
+        # open task of this agent would be failed by it; otherwise leave execution_stopped false (fail closed).
+        if not self._other_open_tasks(room_id, task_id):
+            for runtime in self._runtimes(room_id):
+                if runtime.get("status") in _RUNTIME_LIVE and not runtime.get("cancel_requested"):
+                    self.client.runtime_cancel(room_id, runtime["runtime_id"])
+        return value
+
+    def _runtimes(self, room_id: str) -> list[dict]:
+        rows = self.client.runtimes_list(room_id).get("runtimes")
+        if not isinstance(rows, list):
+            raise PiDelegationError("invalid runtime listing")
+        return [r for r in rows if isinstance(r, dict) and r.get("agent_id") == self.agent_id]
+
+    def _other_open_tasks(self, room_id: str, task_id: str) -> bool:
+        rows = self.client.tasks_list(room_id).get("tasks")
+        if not isinstance(rows, list):
+            raise PiDelegationError("invalid task listing")
+        return any(t.get("target_agent_id") == self.agent_id and t.get("task_id") != task_id
+                   and t.get("status") in _TASK_OPEN for t in rows if isinstance(t, dict))
+
+    def _execution_stopped(self, room_id: str) -> bool:
+        runtimes = self._runtimes(room_id)
+        return bool(runtimes) and all(r.get("status") in _RUNTIME_STOPPED for r in runtimes)
+
+
+def build_pi_delegation_resolver(bindings: list[dict[str, str]]):
+    """Resolver for ``AssistantService`` from operator-owned ``delegation.pi_bindings``.
+
+    Exact (tenant, user, "pi-secretary") match only; any other scope, target or an unreadable credential resolves
+    to None, so delegation stays unavailable instead of falling back to another user's binding. The credential file
+    is read when the adapter is first needed, never kept in configuration."""
+    from .assistant_cli import AssistantClient, AssistantConfig, ConfigError, _read_token_file
+    from pathlib import Path
+
+    by_scope = {(b["tenant_id"], b["user_id"]): b for b in bindings}
+    cache: dict[tuple[str, str], PiSecretaryDelegationAdapter] = {}
+
+    def resolve(tenant_id: str, user_id: str, target: str):
+        entry = by_scope.get((tenant_id, user_id))
+        if entry is None or target != "pi-secretary":
+            return None
+        key = (tenant_id, user_id)
+        if key not in cache:
+            try:
+                config = AssistantConfig(
+                    base_url=entry["api_url"], auth_kind="user",
+                    token=_read_token_file(Path(entry["credential_file"]).expanduser()))
+                binding = PiSecretaryBinding(room_id=entry["room_id"], agent_id=entry["agent_id"])
+            except (ConfigError, PiDelegationError):
+                return None
+            cache[key] = PiSecretaryDelegationAdapter(
+                binding, HcnPiTaskTransport(AssistantClient(config), entry["agent_id"]))
+        return cache[key]
+
+    return resolve

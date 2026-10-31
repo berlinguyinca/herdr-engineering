@@ -173,6 +173,10 @@ class AssistantClient:
             body["parent_task_id"] = parent_task_id
         return self._request("POST", f"/api/v1/collab/rooms/{_segment(room_id)}/tasks", body)
 
+    def task_cancel(self, room_id: str, task_id: str) -> dict:
+        return self._request(
+            "POST", f"/api/v1/collab/rooms/{_segment(room_id)}/tasks/{_segment(task_id)}/cancel", {})
+
     def task_inbox(self) -> dict:
         return self._request("GET", "/api/v1/collab/tasks/inbox")
 

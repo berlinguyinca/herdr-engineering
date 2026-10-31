@@ -411,3 +411,176 @@ def test_cancel_recovers_lost_submit_receipt_before_requesting_stop():
     assert recovered.external_id == "grant_task1" and recovered.status == "queued"
     stopped = svc.get_delegation(delegation.delegation_id, tenant_id="t1", user_id="u1")
     assert stopped.status == "cancelled"
+
+
+class HcnClient:
+    """Models the owner's API surface: task cancel is logical; only a host report makes a runtime terminal."""
+
+    def __init__(self, agent_id="agent_pi"):
+        self.agent_id = agent_id
+        self.task = {"task_id": "grant_t1", "target_agent_id": agent_id, "status": "accepted", "result": None}
+        self.other_tasks = []
+        self.runtimes = [{"runtime_id": "rt1", "agent_id": agent_id, "status": "ready", "cancel_requested": False}]
+        self.runtime_cancels = []
+
+    def task_create(self, room_id, agent_id, text, key):
+        return {"task_id": "grant_t1", "status": "pending"}
+
+    def task_get(self, room_id, task_id):
+        return dict(self.task)
+
+    def task_cancel(self, room_id, task_id):
+        self.task["status"] = "cancelled"
+        return {"ok": True}
+
+    def tasks_list(self, room_id):
+        return {"tasks": [self.task, *self.other_tasks]}
+
+    def runtimes_list(self, room_id):
+        return {"runtimes": [dict(r) for r in self.runtimes]}
+
+    def runtime_cancel(self, room_id, runtime_id):
+        self.runtime_cancels.append(runtime_id)
+        for r in self.runtimes:
+            if r["runtime_id"] == runtime_id:
+                r["cancel_requested"] = True
+        return {"runtime": {}}
+
+
+def hcn_adapter(client):
+    from herdr_engineering.assistant_pi_delegate import HcnPiTaskTransport
+    binding = PiSecretaryBinding(room_id="room_1", agent_id=client.agent_id)
+    return PiSecretaryDelegationAdapter(binding, HcnPiTaskTransport(client, client.agent_id))
+
+
+def test_hcn_transport_cancel_is_not_terminal_until_the_host_reports_the_runtime_stopped():
+    client = HcnClient()
+    adapter = hcn_adapter(client)
+    assert adapter.cancel("grant_t1")["status"] == "cancellation_requested"
+    assert client.runtime_cancels == ["rt1"]
+    polled = adapter.poll("grant_t1")
+    assert polled["status"] == "running" and polled["cancel_requested"] is True      # logical cancel is not a stop
+    client.runtimes[0]["status"] = "cancelled"                                       # host reports verified teardown
+    assert adapter.poll("grant_t1")["status"] == "cancelled"
+
+
+def test_hcn_transport_never_infers_a_stop_from_a_missing_or_live_runtime():
+    client = HcnClient()
+    adapter = hcn_adapter(client)
+    adapter.cancel("grant_t1")
+    client.runtimes = []
+    assert adapter.poll("grant_t1")["status"] == "running"                           # no runtime evidence: not stopped
+    client.runtimes = [{"runtime_id": "rt1", "agent_id": client.agent_id, "status": "ready"},
+                       {"runtime_id": "rt2", "agent_id": client.agent_id, "status": "cancelled"}]
+    assert adapter.poll("grant_t1")["status"] == "running"                           # one still live
+    client.runtimes = [{"runtime_id": "rt9", "agent_id": "agent_other", "status": "cancelled"}]
+    assert adapter.poll("grant_t1")["status"] == "running"                           # another agent's runtime is ignored
+
+
+def test_hcn_transport_does_not_stop_a_runtime_that_serves_other_open_tasks():
+    client = HcnClient()
+    client.other_tasks = [{"task_id": "grant_t2", "target_agent_id": client.agent_id, "status": "pending"}]
+    adapter = hcn_adapter(client)
+    adapter.cancel("grant_t1")
+    assert client.runtime_cancels == []                                              # would fail the other delegation
+    assert adapter.poll("grant_t1")["status"] == "running"
+
+
+def test_hcn_transport_rejects_a_foreign_agent_or_task_response():
+    from herdr_engineering.assistant_pi_delegate import HcnPiTaskTransport, PiDelegationError
+    client = HcnClient()
+    transport = HcnPiTaskTransport(client, client.agent_id)
+    with pytest.raises(PiDelegationError):
+        transport.create_task(room_id="room_1", agent_id="agent_other", text="x", idempotency_key="k")
+    client.task["target_agent_id"] = "agent_other"
+    with pytest.raises(PiDelegationError):
+        transport.get_task(room_id="room_1", task_id="grant_t1")
+
+
+def _binding(tmp_path, **over):
+    cred = tmp_path / "cred"
+    cred.write_text("hcu_token\n")
+    cred.chmod(0o600)
+    row = {"tenant_id": "t1", "user_id": "u1", "room_id": "room_1", "agent_id": "agent_pi",
+           "api_url": "http://127.0.0.1:8080", "credential_file": str(cred)}
+    return {**row, **over}
+
+
+def test_pi_bindings_config_is_strict_and_unique(tmp_path):
+    cfg = lambda rows: assistant_config({"personal_assistant": {"enabled": True, "delegation": {"pi_bindings": rows}}})
+    assert cfg(None)["delegation"]["pi_bindings"] == []
+    assert len(cfg([_binding(tmp_path)])["delegation"]["pi_bindings"]) == 1
+    with pytest.raises(ValueError):
+        cfg([_binding(tmp_path), _binding(tmp_path, room_id="room_2")])         # one binding per tenant+user
+    with pytest.raises(ValueError):
+        cfg([{**_binding(tmp_path), "token": "inline-secret"}])                 # no inline credentials
+    bad = _binding(tmp_path)
+    del bad["agent_id"]
+    with pytest.raises(ValueError):
+        cfg([bad])
+
+
+def test_resolver_matches_exact_scope_target_and_fails_closed_on_a_bad_credential(tmp_path):
+    from herdr_engineering.assistant_pi_delegate import build_pi_delegation_resolver
+    row = _binding(tmp_path)
+    resolve = build_pi_delegation_resolver([row])
+    adapter = resolve("t1", "u1", "pi-secretary")
+    assert adapter is not None and adapter.binding.agent_id == "agent_pi" and adapter.binding.room_id == "room_1"
+    assert resolve("t1", "u1", "pi-secretary") is adapter
+    assert resolve("t1", "u2", "pi-secretary") is None                          # another user never inherits it
+    assert resolve("t2", "u1", "pi-secretary") is None
+    assert resolve("t1", "u1", "pi") is None
+    cred = tmp_path / "cred"
+    cred.chmod(0o644)                                                           # group/world readable: refused
+    assert build_pi_delegation_resolver([row])("t1", "u1", "pi-secretary") is None
+    missing = build_pi_delegation_resolver([{**row, "credential_file": str(tmp_path / "absent")}])
+    assert missing("t1", "u1", "pi-secretary") is None
+
+
+def _bound_section(tmp_path):
+    return {"enabled": True, "delegation": {
+        "targets": {"pi": {"role_ref": None}, "pi-secretary": {"role_ref": ROLE}},
+        "pi_bindings": [_binding(tmp_path)]}}
+
+
+def test_normal_startup_with_bindings_requires_acknowledged_persistence(tmp_path, acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)                             # no personal_assistant.persistence.dsn
+    with pytest.raises(ValueError, match="acknowledged assistant persistence"):
+        ControlPlaneServer(repo, assistant_config={"personal_assistant": _bound_section(tmp_path)}, api_keys={})
+    with pytest.raises(ValueError, match="not both"):
+        ControlPlaneServer(repo, assistant_config={"personal_assistant": _bound_section(tmp_path)}, api_keys={},
+                           assistant_delegation_adapter=Adapter())
+
+
+def test_service_accepts_the_operator_resolver_with_durable_persistence(tmp_path):
+    from herdr_engineering.assistant_pi_delegate import build_pi_delegation_resolver
+    cfg = assistant_config({"personal_assistant": _bound_section(tmp_path)})
+    resolver = build_pi_delegation_resolver(cfg["delegation"]["pi_bindings"])
+    svc = AssistantService(config=cfg, store=AssistantStore(persist_backend=DurableBackend()),
+                           delegation_adapter_resolver=resolver)
+    assert svc.delegation_adapter_resolver("t1", "u1", "pi-secretary").binding.agent_id == "agent_pi"
+    assert svc.delegation_adapter_resolver("t1", "someone-else", "pi-secretary") is None
+
+
+@pytest.mark.parametrize("with_adapter", [True, False])
+def test_a_failing_created_audit_leaves_no_orphan_and_submits_nothing(with_adapter):
+    adapter = Adapter() if with_adapter else None
+    svc = service(adapter); assistant = root(svc)
+    real = svc.store.audit_record
+
+    def audit(**kw):
+        if kw.get("action") == "assistant.delegation.created":
+            raise OSError("audit unavailable")
+        return real(**kw)
+    svc.store.audit_record = audit
+    with pytest.raises(OSError):
+        svc.delegate(tenant_id="t1", user_id="u1", assistant_id=assistant.assistant_id, task="Find a time.",
+                     target_system="pi-secretary", context={}, source_refs=[], run_id="",
+                     idempotency_key="audit-fail-1", actor="u1")
+    assert not svc.store.delegations and not svc.store._delegation_idempotency
+    assert adapter is None or adapter.submitted == []
+    svc.store.audit_record = real
+    again = svc.delegate(tenant_id="t1", user_id="u1", assistant_id=assistant.assistant_id, task="Find a time.",
+                         target_system="pi-secretary", context={}, source_refs=[], run_id="",
+                         idempotency_key="audit-fail-1", actor="u1")
+    assert again.status == "queued" and (adapter is None or len(adapter.submitted) == 1)

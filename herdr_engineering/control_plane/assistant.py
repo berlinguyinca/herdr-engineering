@@ -144,6 +144,29 @@ def _delegation_binding_scope(value: Any) -> dict[str, str] | None:
     return {"tenant_id": value["tenant_id"], "user_id": value["user_id"]}
 
 
+_PI_BINDING_KEYS = {"tenant_id", "user_id", "room_id", "agent_id", "api_url", "credential_file"}
+
+
+def _delegation_pi_bindings(value: Any) -> list[dict[str, str]]:
+    """Operator-owned Pi Secretary bindings, one per (tenant, user). Nothing is inferred or defaulted."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 64:
+        raise ValueError("personal_assistant.delegation.pi_bindings must be a list")
+    out, seen = [], set()
+    for raw in value:
+        if (not isinstance(raw, dict) or set(raw) != _PI_BINDING_KEYS
+                or not all(isinstance(raw[key], str) and raw[key] and len(raw[key]) <= 400
+                           and raw[key].isprintable() for key in _PI_BINDING_KEYS)):
+            raise ValueError("each pi_binding needs exactly " + ", ".join(sorted(_PI_BINDING_KEYS)))
+        scope = (raw["tenant_id"], raw["user_id"])
+        if scope in seen:
+            raise ValueError("duplicate pi_binding for one tenant and user")
+        seen.add(scope)
+        out.append({key: raw[key] for key in sorted(_PI_BINDING_KEYS)})
+    return out
+
+
 _TENANT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}\Z")
 
 
@@ -309,6 +332,7 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "delegation": {
             "targets": _delegation_targets(delegation.get("targets")),
             "binding_scope": _delegation_binding_scope(delegation.get("binding_scope")),
+            "pi_bindings": _delegation_pi_bindings(delegation.get("pi_bindings")),
         },
     }
 
@@ -2298,6 +2322,22 @@ class AssistantStore:
             self._after_mutation()
         return d, True
 
+    def release_delegation(self, d: DelegationRequest, *, require_durable: bool = False) -> None:
+        """Undo a reservation nothing external has seen yet (its audit entry failed)."""
+        with self._lock:
+            self.delegations.pop(d.delegation_id, None)
+            if d.idempotency_key:
+                self._delegation_idempotency.pop(
+                    (d.tenant_id, d.user_id, d.assistant_id, d.idempotency_key), None)
+            self._durable_delegations.pop(d.delegation_id, None)
+            if require_durable:
+                try:
+                    self._persist_required()
+                except Exception:  # noqa: BLE001 - the caller re-raises the audit failure that got us here
+                    pass
+        if not require_durable:
+            self._after_mutation()
+
     def put_delegation_required(self, d: DelegationRequest) -> None:
         with self._lock:
             previous = self._durable_delegations.get(d.delegation_id)
@@ -4028,8 +4068,13 @@ class AssistantService:
             raise DelegationPersistenceError("delegation persistence unavailable") from exc
         if not created:
             return self._submit_delegation(d)
-        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor or user_id,
-                                action="assistant.delegation.created", subject_id=d.delegation_id)
+        try:
+            self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor or user_id,
+                                    action="assistant.delegation.created", subject_id=d.delegation_id)
+        except Exception:
+            self.store.release_delegation(d, require_durable=(
+                self.delegation_adapter is not None or self.delegation_adapter_resolver is not None))
+            raise                                                   # audit first: a refusal leaves no orphan
         return self._submit_delegation(d)
 
     def list_delegations(self, *, tenant_id: str, user_id: str) -> list[DelegationRequest]:

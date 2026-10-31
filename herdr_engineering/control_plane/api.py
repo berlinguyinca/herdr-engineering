@@ -477,9 +477,16 @@ class ControlPlaneServer:
         if assistant_service is None:
             from .assistant import AssistantService
             from .assistant import assistant_config as _build_assistant_config
+            _cfg = _build_assistant_config(assistant_config or {})
+            _resolver = None
+            if _cfg["delegation"]["pi_bindings"]:
+                if assistant_delegation_adapter is not None:
+                    raise ValueError("configure a delegation adapter or pi_bindings, not both")
+                from ..assistant_pi_delegate import build_pi_delegation_resolver
+                _resolver = build_pi_delegation_resolver(_cfg["delegation"]["pi_bindings"])
             self.assistant = AssistantService(
-                config=_build_assistant_config(assistant_config or {}), repo=repo,
-                delegation_adapter=assistant_delegation_adapter)
+                config=_cfg, repo=repo, delegation_adapter=assistant_delegation_adapter,
+                delegation_adapter_resolver=_resolver)
         else:
             self.assistant = assistant_service
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.

@@ -51,6 +51,12 @@ def handoff_id_for(delegation_id: str) -> str:
     return f"assistant.{delegation_id}"
 
 
+def adapter_owned(d: DelegationRequest) -> bool:
+    """Records the scoped runtime adapter owns (a role binding or an external task) never enter the engineering
+    handoff queue: that path is for approved mission/branch proposals only."""
+    return bool(d.role_ref or d.external_id)
+
+
 class DelegationConsumer:
     def __init__(self, service, handoffs, *, source_harness: str = "pi"):
         self.svc, self.handoffs = service, handoffs
@@ -128,7 +134,7 @@ class DelegationConsumer:
         return ((d.correlation or {}).get("dispatch") or {}).get("state") == "handed_off"
 
     def _dispatch(self, d: DelegationRequest, actor: str) -> DelegationRequest:
-        if d.kind not in KINDS:
+        if d.kind not in KINDS or adapter_owned(d):
             raise AssistantError(f"{d.kind} delegations are not dispatched here")
         if self._handed_off(d):
             return d                                            # replay: the recorded result, whatever it became since
@@ -228,7 +234,7 @@ class DelegationConsumer:
     def on_cancel(self, d: DelegationRequest, actor: str) -> None:
         """Called by ``cancel_delegation`` after the delegation is ``cancelled``. A queued/claimed/accepted handoff is
         cancelled too. If a hand-off is in flight, the dispatcher sees ``cancelled`` and cancels it itself."""
-        if d.kind in KINDS and (d.correlation or {}).get("dispatch"):
+        if d.kind in KINDS and not adapter_owned(d) and (d.correlation or {}).get("dispatch"):
             self._cancel_handoff(handoff_id_for(d.delegation_id), actor)
 
     # -- background ----------------------------------------------------------------------------------------
@@ -241,7 +247,7 @@ class DelegationConsumer:
             return out
         now = self.svc.now()
         pending = sorted((d for d in list(self._store.delegations.values())
-                          if d.kind in KINDS and d.status == "queued"),
+                          if d.kind in KINDS and d.status == "queued" and not adapter_owned(d)),
                          key=lambda d: (d.created_at, d.delegation_id))
         if pending:
             k = self._offset % len(pending)
@@ -271,7 +277,7 @@ class DelegationConsumer:
         n = 0
         for d in list(self._store.delegations.values()):
             disp = (d.correlation or {}).get("dispatch") or {}
-            if d.status != "running" or disp.get("state") != "handed_off":
+            if adapter_owned(d) or d.status != "running" or disp.get("state") != "handed_off":
                 continue
             row = self.handoffs.get(disp.get("handoff_id", ""))
             if row is None:                                     # the queue lost it: say so rather than stay "running"
