@@ -14,18 +14,24 @@ Per intent file, at scan time (before any lane wait), for every kind (Task 5a):
    ``replay_outcomes`` is replayed when its ``request_sha256`` matches, else this ticket is ``rejected`` "idempotency
    key was reused for a different request". This runs before any upload lookup.
 4. With no ledger row, an intent older than ``INTENT_MAX_AGE`` is ``expired`` (recorded with 0 bytes, so it is never
-   charged against the quota); otherwise its ``received`` row is written, and from then on no age check applies, so an
-   intent queued behind its own lane's multi-GB assembly never expires. A ``received`` row whose ``request_sha256``,
-   actor or kind differ from the re-validated file is ``rejected``: a rewritten file never inherits the exemption.
+   charged against the quota) and one with a ``submitted_at`` too far ahead is ``rejected``, both even while the
+   received set is full (deciding them needs no memory); otherwise its ``received`` row is written, and from then on
+   no age check applies, so an intent queued behind its own lane's multi-GB assembly never expires. A ``received`` row
+   whose ``request_sha256``, actor, kind or idempotency key differ from the re-validated file is ``rejected``: a
+   rewritten file never inherits the exemption. ``request_sha256`` (``request_digest``) covers kind, actor,
+   artifact_id and payload only; the key and ``submitted_at`` are compared separately, the key against the row and
+   ``submitted_at`` against the received record (the row does not store it; see the lane below).
 5. An agent actor must be ``active`` and unexpired in a fresh ``agents.json`` (``FEED_MAX_AGE``).
 
 The intent then waits for its lane (``lane_key``; default one lane per actor). Lanes run concurrently up to
 ``limits.apply_concurrency``; within a lane intents run oldest first, never two at once; a lane still busy from an
 earlier tick is skipped, never awaited. Only a small record of a received ticket is kept in memory (no payload; the
 set is capped). In the lane, under session advisory locks on the lane and on the idempotency key (Postgres, so a second
-worker process cannot interleave), the file is re-read and re-validated, a digest that differs from the ledger row is
-``rejected`` "intent changed after it was received", a withdrawn file is forgotten, and steps 1, 3 and 5 are checked
-again just before the handler runs: the store does not enforce key uniqueness or quota itself.
+worker process cannot interleave), the file is re-read and re-validated; it is ``rejected`` "intent changed after it
+was received" unless its digest, kind, actor and key equal the ledger row's and the record's (the key is what the
+advisory lock and the replay lookup are keyed on, so a moved key would be applied twice) and its ``submitted_at``
+equals the record's (it decided the lane order and the age check); a withdrawn file is forgotten, and steps 1, 3 and 5
+are checked again just before the handler runs: the store does not enforce key uniqueness or quota itself.
 
 The handler returns ``{result, version_id?, reason?, attempt_id?, …}``; the applier records it with ``record_outcome``
 (which decides once: if another path decided first, the decided row is what gets written), writes
@@ -96,7 +102,7 @@ STRAY_SCAN_ENTRIES = 50_000     # entries one stray pass looks at (it streams; n
 RESULTS_SWEEP_BATCH = 10_000
 # Received-but-unfinished tickets are remembered as small records (no payload), at most
 # max(RECEIVED_MIN_CAP, agents x RECEIVED_PER_AGENT); past that, new tickets stay on disk un-received (fail closed) and
-# are retried once there is room.
+# are retried once there is room. The base is injectable (``received_min_cap``) so tests can fill the set cheaply.
 RECEIVED_MIN_CAP = 4096
 RECEIVED_PER_AGENT = 8
 
@@ -144,7 +150,8 @@ class _Kind:
 @dataclass(frozen=True)
 class _Received:
     """What the applier remembers of a received ticket: identifiers and order only, never the payload. The lane
-    re-reads and re-validates the file, and checks its digest against the ledger row, before applying it."""
+    re-reads and re-validates the file and checks its digest, kind, actor and key against the ledger row and this
+    record, and its ``submitted_at`` against this record, before applying it."""
     ticket: str
     name: str
     kind: str
@@ -185,7 +192,8 @@ def _safe_actor(raw) -> dict | None:
 class CollabIntentApplier:
     def __init__(self, outbox: Path, mirror, *, rustfs, limits: BridgeLimits, spool_dir: Path,
                  lineage: Callable[[dict], dict] | None = None, context_extras: Mapping[str, object] | None = None,
-                 clock: Callable[[], float] = time.time, max_per_tick: int = 20):
+                 clock: Callable[[], float] = time.time, max_per_tick: int = 20,
+                 received_min_cap: int | None = None):
         self.outbox = Path(outbox)
         self.mirror = mirror
         self.rustfs = rustfs
@@ -200,7 +208,8 @@ class CollabIntentApplier:
         self._busy: dict[str, asyncio.Task] = {}
         self._inflight: set[str] = set()
         self._received: dict[str, _Received] = {}   # received (ledger row written) but not yet finished
-        self._received_cap = RECEIVED_MIN_CAP
+        self._received_min_cap = received_min_cap
+        self._received_cap = self._min_cap()
         self._feed: dict | None = None
         self._sem = asyncio.Semaphore(limits.apply_concurrency)
         self._counts = self._zero()
@@ -315,11 +324,14 @@ class CollabIntentApplier:
         if tasks:
             await asyncio.wait(tasks)
 
+    def _min_cap(self) -> int:
+        return RECEIVED_MIN_CAP if self._received_min_cap is None else self._received_min_cap
+
     def _load_outbox(self):
         self._sweep_strays()
         feed = read_json_beneath(self.outbox, [AGENTS_FEED], max_bytes=AGENTS_FEED_MAX_BYTES)
         agents = feed.get("agents") if isinstance(feed, dict) else None
-        self._received_cap = max(RECEIVED_MIN_CAP, (len(agents) if isinstance(agents, dict) else 0) * RECEIVED_PER_AGENT)
+        self._received_cap = max(self._min_cap(), (len(agents) if isinstance(agents, dict) else 0) * RECEIVED_PER_AGENT)
         cap = max(INTENTS_MIN_ENTRIES,
                   (len(agents) if isinstance(agents, dict) else 0) * self.limits.max_pending_intents_per_agent * 2)
         try:
@@ -363,9 +375,14 @@ class CollabIntentApplier:
         return removed
 
     def _reread(self, name: str) -> tuple[bool, dict | None]:
+        """``(present, raw)``: a file unlinked between the existence check and the read counts as absent (forgotten),
+        never as a rewritten one; a present file that does not parse is ``(True, None)``."""
         if not file_exists_beneath(self.outbox, [INTENTS_DIR], name):
             return False, None
-        return True, read_json_beneath(self.outbox, [INTENTS_DIR, name], max_bytes=INTENT_MAX_BYTES)
+        raw = read_json_beneath(self.outbox, [INTENTS_DIR, name], max_bytes=INTENT_MAX_BYTES)
+        if raw is None and not file_exists_beneath(self.outbox, [INTENTS_DIR], name):
+            return False, None
+        return True, raw
 
     def _read_intents(self, names: list[str]) -> dict[str, dict | None]:
         return {n: read_json_beneath(self.outbox, [INTENTS_DIR, n], max_bytes=INTENT_MAX_BYTES) for n in names}
@@ -390,14 +407,11 @@ class CollabIntentApplier:
         if spec is None:
             await self._decide(conn, intent, row, {"result": "rejected", "reason": REASON_UNKNOWN_KIND})
             return None
-        if row is not None and (row["request_sha256"] != intent.request_sha256 or row["kind"] != intent.kind
-                                or (row["actor_kind"], row["actor_id"]) != (intent.actor.kind, intent.actor.id)):
+        if row is not None and not self._row_matches(row, intent):
             await self._decide(conn, intent, row, {"result": "rejected", "reason": REASON_CHANGED})
             return None
         if await self._replayed(conn, name, intent, spec, row):                                       # step 3
             return None
-        if ticket not in self._received and len(self._received) >= self._received_cap:
-            return None                                    # full: stays on disk un-received, retried with room
         if row is None:                                                                             # step 4
             if intent.submitted_at > self.clock() + INTENT_FUTURE_SKEW:
                 await self._decide(conn, intent, None, {"result": "rejected", "reason": REASON_FUTURE}, charge=False)
@@ -405,6 +419,9 @@ class CollabIntentApplier:
             if self.clock() - intent.submitted_at > INTENT_MAX_AGE:
                 await self._decide(conn, intent, None, {"result": "expired", "reason": REASON_EXPIRED}, charge=False)
                 return None
+        if ticket not in self._received and len(self._received) >= self._received_cap:
+            return None                                    # full: stays on disk un-received, retried with room
+        if row is None:
             existing = await grants.record_received(
                 intent.ticket, intent.kind, intent.actor, intent.artifact_id, _base_of(intent), self._key(intent),
                 intent.request_sha256, _inline_bytes(intent))
@@ -435,6 +452,15 @@ class CollabIntentApplier:
     @staticmethod
     def _key(intent: Intent) -> str:
         return intent.idempotency_key or intent.ticket
+
+    @classmethod
+    def _row_matches(cls, row: dict, intent: Intent) -> bool:
+        """The re-validated file is the request its ``received`` row was written for: same digest (kind, actor,
+        artifact, payload), kind and actor (named in the row on their own) and idempotency key (not in the digest; it
+        keys the advisory lock and the replay lookup, so a moved key would run the handler twice)."""
+        return (row["request_sha256"] == intent.request_sha256 and row["kind"] == intent.kind
+                and (row["actor_kind"], row["actor_id"]) == (intent.actor.kind, intent.actor.id)
+                and row["idempotency_key"] == cls._key(intent))
 
     def _agent_for(self, intent: Intent) -> tuple[dict | None, str | None]:
         """Step 5: the actor's ``agents.json`` row, or the rejection reason. User actors skip it (their handler
@@ -521,7 +547,7 @@ class CollabIntentApplier:
             await self._settle_from_row(name, row)
             return
         present, raw = await asyncio.to_thread(self._reread, name)
-        if not present:                                    # withdrawn (or replaced by a non-file): forgotten
+        if not present:                                    # withdrawn (even mid-reread) or now a non-file: forgotten
             self._received.pop(job.ticket, None)
             return
         try:
@@ -529,7 +555,12 @@ class CollabIntentApplier:
         except IntentError:
             intent = None
         spec = self._kinds.get(intent.kind) if intent is not None else None
-        if intent is None or spec is None or intent.request_sha256 != row["request_sha256"]:
+        # The file must still be the request the row and the record were made for: digest, kind, actor and key
+        # against both (the lock just taken is on the record's key), submitted_at against the record (it set the
+        # lane order and passed the age check; the row does not store it).
+        if (intent is None or spec is None or not self._row_matches(row, intent)
+                or (job.kind, job.actor, job.key, job.submitted_at)
+                != (intent.kind, intent.actor, self._key(intent), intent.submitted_at)):
             await self._reject_unvalidated(conn, name, row, None, REASON_CHANGED)
             return
         if await self._replayed(conn, name, intent, spec, row):
