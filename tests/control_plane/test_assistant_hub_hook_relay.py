@@ -287,6 +287,38 @@ def test_redeem_writes_0600_and_prints_mcp_add_once(started, tmp_path, capsys):
     assert (dest.stat().st_mode & 0o777) == 0o600
 
 
+@pytest.mark.parametrize("via", ["env", "stdin", "env_overridden_by_flag"])
+def test_redeem_accepts_code_from_env_or_stdin(started, tmp_path, capsys, monkeypatch, via):
+    import io
+
+    from herdr_engineering.cli import _cmd_cp_assistant_worker
+    hub, srv = started()
+    _, code = hub.registry.create_enrollment(tenant_id="default", user_id="u1", name="box", harness="claude")
+    monkeypatch.delenv("HERDR_ASSISTANT_ENROLL_CODE", raising=False)
+    if via == "env":
+        monkeypatch.setenv("HERDR_ASSISTANT_ENROLL_CODE", code)
+        args = redeem_args(srv, None, tmp_path)
+    elif via == "stdin":
+        monkeypatch.setattr(sys, "stdin", io.StringIO(code + "\n"))
+        args = redeem_args(srv, "-", tmp_path)
+    else:
+        monkeypatch.setenv("HERDR_ASSISTANT_ENROLL_CODE", "hce_not-the-right-one")
+        args = redeem_args(srv, code, tmp_path)
+    assert _cmd_cp_assistant_worker(args) == 0
+    assert RelayConfig.load(Path(args.out)).credential in capsys.readouterr().out
+
+
+def test_redeem_without_any_code_source_fails_fast(started, tmp_path, capsys, monkeypatch):
+    import io
+
+    from herdr_engineering.cli import _cmd_cp_assistant_worker
+    _, srv = started()
+    monkeypatch.delenv("HERDR_ASSISTANT_ENROLL_CODE", raising=False)
+    assert _cmd_cp_assistant_worker(redeem_args(srv, None, tmp_path)) == 2
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert _cmd_cp_assistant_worker(redeem_args(srv, "-", tmp_path)) == 2
+
+
 def test_redeem_failure_is_one_line_no_secret(started, tmp_path, capsys):
     from herdr_engineering.cli import _cmd_cp_assistant_worker
     _, srv = started()

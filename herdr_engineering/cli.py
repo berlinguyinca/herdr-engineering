@@ -688,7 +688,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--api-key-file", default=None,
                     help="PATH to a file holding an operator API key (never the key itself); enroll|list|revoke")
     p2.add_argument("--url", default=None, help="hub base URL, e.g. http://100.x.y.z:8765 (redeem)")
-    p2.add_argument("--code", default=None, help="the single-use enrollment code (redeem)")
+    p2.add_argument("--code", default=None, help="the single-use enrollment code (redeem); visible in `ps` - prefer `--code -` to read stdin "
+                    "or the HERDR_ASSISTANT_ENROLL_CODE env var")
     p2.add_argument("--device-id", default=None, help="a stable id for this device (redeem)")
     p2.add_argument("--out", default=None,
                     help="where redeem stores the 0600 worker file (default ~/.config/herdr/assistant-worker.json)")
@@ -3157,8 +3158,15 @@ def _assistant_worker_redeem(args) -> int:
         validate_hub_url,
     )
 
-    if not (args.url and args.code and args.device_id):
-        print("redeem needs --url, --code and --device-id", file=sys.stderr)
+    # A --code value is visible to other local users in `ps`; prefer `--code -` (stdin) or the env var.
+    code = args.code
+    if code == "-":
+        code = sys.stdin.read().strip()
+    elif not code:
+        code = os.environ.get("HERDR_ASSISTANT_ENROLL_CODE", "").strip()
+    if not (args.url and code and args.device_id):
+        print("redeem needs --url, a code (HERDR_ASSISTANT_ENROLL_CODE, --code - for stdin, or --code) "
+              "and --device-id", file=sys.stderr)
         return 2
     try:
         base = validate_hub_url(args.url)
@@ -3178,7 +3186,7 @@ def _assistant_worker_redeem(args) -> int:
     try:
         req = urllib.request.Request(f"{base}/assistant/enroll", method="POST",
                                      headers={"Content-Type": "application/json"},
-                                     data=json.dumps({"code": args.code, "device_id": args.device_id}).encode())
+                                     data=json.dumps({"code": code, "device_id": args.device_id}).encode())
         with make_opener().open(req, timeout=15) as response:
             out = json.loads(response.read(1024 * 1024))
         cred, device = out["credential"], out["device_id"]
