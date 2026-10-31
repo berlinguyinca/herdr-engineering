@@ -86,9 +86,10 @@ Residual risks:
   (`_artifact_acl_allows`). Production must run with an ACL; legacy rows should be audited and given an owner.
 - **R-ART2 (Medium).** The grant model is in memory and rebuilt from rows (`ArtifactAcl.load`); a missed `on_change`
   write-through would make a revoke or a room grant disappear or reappear only at restart. Not tested for this document.
-- **R-ART3 (Low).** `artifact_context.py` `link_context` needs only `edit` (`artifact_registry_api.py`) and takes any `room_id`;
-  no unlink route exists (none found by search). Under room-derived access (3.3) a link is exposure to that room until the
-  artifact is archived.
+- **R-ART3 (Low; unlink added 2026-10-30, partly open).** `link_context` still needs only `edit`. The missing unlink now
+  exists (`herdr-eng artifacts unlink ARTIFACT --room ROOM`, `POST /api/v1/artifacts/<id>/links/remove`, needs `edit`, removes
+  that room's read grants at once), and a link to a room that does not exist is refused with the generic 404. Still open: an
+  API key has no room membership, so an editor can link to any room that exists (existence is all that can be checked).
 
 ### 3.3 Room-derived read access (`unified_workspace.room_artifact_access`)
 Mechanism (`artifact_room_access.py`, wired in `api.py` `_wire_room_artifact_access`): ordinary `read` grants for
@@ -108,7 +109,8 @@ Residual risks:
   `herdr-eng control-plane revoke-room-grants [--apply]` removes every `room:*` row after the flag is turned off
   (`docs/artifacts/room-access-maintenance.md`). Remaining limit: one grant row holds one source, so a direct grant that later
   expires or is revoked is not replaced by the room's until that room's next sync. No migration was needed.
-- **R-RA3 (Low).** Because linking needs only `edit` (R-ART3), an editor can expose an artifact to a room they are not in.
+- **R-RA3 (Low; mitigated).** Because linking needs only `edit` (R-ART3), an editor can expose an artifact to an existing
+  room they are not in. The exposure can now be undone with `artifacts unlink`; it is not prevented.
 - **R-RA4 (Medium, topology).** Same as R-WG1: `collab` and the artifact store are in different processes in the compose
   overlay, so this feature cannot run there as written. Enabling it needs a topology decision first.
 

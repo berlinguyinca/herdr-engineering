@@ -98,6 +98,11 @@ class RoomArtifactAccess:
                 self.sync_artifact(artifact_id, resync=True)
         return {"granted": granted, "revoked": revoked}
 
+    def unlink(self, artifact_id: str, room_id: str) -> int:
+        """After the room's link to an artifact was removed: revoke that room's grants on it. A person another room still
+        links the artifact to gets the grant back from that room (``_apply`` re-syncs on any revoke)."""
+        return self._apply(room_id, set(), self.readers(room_id), only={artifact_id})["revoked"]
+
     def revoke_all_room_grants(self) -> int:
         """Remove every ``room:*``-sourced grant (after ``room_artifact_access`` was turned off). Grants of any other
         source are never touched. Idempotent: a second call finds nothing. Returns how many were removed."""

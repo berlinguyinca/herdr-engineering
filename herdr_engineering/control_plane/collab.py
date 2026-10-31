@@ -1243,6 +1243,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 raise CollabError(404, "not found")
         return self.artifact_room_handle(pr.id, room_id, query)
 
+    def room_exists(self, room_id: str) -> bool:
+        """Whether a room by this id exists. For callers (API keys) that have no room membership of their own."""
+        with self._lock:
+            return isinstance(room_id, str) and room_id in self._rooms
+
     def room_readers(self, room_id: str) -> dict[str, float | None]:
         """``{user_id: expires_at}`` for the people who can read this room right now (lapsed guests excluded).
         Agents are not readers here; an agent's access to an artifact is its own grant."""
