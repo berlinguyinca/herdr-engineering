@@ -5,20 +5,25 @@ the service. The parent (``share_render``) starts it with ``python -m`` style is
 request and answers the child's URL-resolution callbacks, because the resolver stays in the parent. A frame is an
 8-byte big-endian length followed by UTF-8 JSON.
 
-Child to parent: ``{"t": "resolve", "c": context, "u": url}`` (the parent answers ``{"r": url-or-null}``),
-``{"t": "done", "out": html}``, ``{"t": "failed"}`` (the library failed, including a Rust panic).
-Parent to child: ``{"t": "job", "text": html}``.
+The child is treated as COMPROMISED by the parent: every frame after the first carries the job's random id and is
+checked strictly. Child to parent: ``{"t": "ready"}`` once at start, then per job ``{"t": "resolve", "id", "c", "u"}``
+(the parent answers ``{"t": "reply", "id", "r"}``), ``{"t": "done", "id", "out"}`` or ``{"t": "failed", "id"}`` (the
+library failed, including a Rust panic). Parent to child: ``{"t": "job", "id", "text"}``.
 
-Backstops set in the child: a CPU limit re-armed before every job and an address-space limit. The parent's wall-clock
-deadline and SIGKILL are the guarantee; these only stop a runaway child that the parent has not killed yet.
+Hardening applied before any data is read (best effort, NOT a sandbox: there is no seccomp filter and no network
+namespace, so a compromised child can still use the network and read what its uid can read): parent-death signal, no
+new privileges, address-space, open-file and process-count limits, and a CPU limit re-armed per job. The parent's
+wall-clock deadline and SIGKILL are the guarantee; these only stop a runaway child the parent has not killed yet.
 """
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
 import resource
+import signal
 import struct
 import sys
 import time
@@ -31,6 +36,7 @@ import nh3
 Resolver = Callable[[str, str], str | None]
 
 MAX_FRAME = 16 * 1024 * 1024
+MAX_RESOLVE_URL = 8 * 1024
 CHILD_ADDRESS_SPACE = 1 << 30
 
 
@@ -185,41 +191,73 @@ def read_frame(inp: BinaryIO) -> dict[str, object] | None:
     body = inp.read(size)
     if len(body) < size:
         return None
-    value = json.loads(body.decode("utf-8"))
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
     return value if isinstance(value, dict) else None
 
 
+def _local_policy(context: str, url: str) -> str | None:
+    """URLs too long to send to the parent: only an embedded raster image is kept, everything else is dropped."""
+    return url if context == "img" and _DATA_IMAGE.fullmatch(url) else None
+
+
 def serve(inp: BinaryIO, out: BinaryIO) -> None:
-    """The child loop: read a job, sanitize it asking the parent to resolve URLs, answer, repeat until EOF."""
-    cache: dict[tuple[str, str], str | None] = {}
-
-    def resolve(context: str, url: str) -> str | None:
-        key = (context, url)
-        if key in cache:
-            return cache[key]
-        write_frame(out, {"t": "resolve", "c": context, "u": url})
-        reply = read_frame(inp)
-        if reply is None:
-            os._exit(3)  # the parent went away mid-job
-        value = reply.get("r")
-        cache[key] = value if isinstance(value, str) else None
-        return cache[key]
-
+    """The child loop: announce readiness, then per job sanitize while asking the parent to resolve URLs."""
+    write_frame(out, {"t": "ready"})
     while True:
         job = read_frame(inp)
-        if job is None or job.get("t") != "job" or not isinstance(job.get("text"), str):
+        if job is None or set(job) != {"t", "id", "text"} or job["t"] != "job":
             return
-        cache.clear()
-        used = int(time.process_time())
-        soft = used + int(SAFETY_CPU_SECONDS)
+        job_id, text = job["id"], job["text"]
+        if not isinstance(job_id, str) or not isinstance(text, str):
+            return
+        cache: dict[tuple[str, str], str | None] = {}
+
+        def resolve(context: str, url: str, job_id: str = job_id, cache: dict[tuple[str, str], str | None] = cache) -> str | None:
+            if len(url) > MAX_RESOLVE_URL:
+                return _local_policy(context, url)
+            key = (context, url)
+            if key in cache:
+                return cache[key]
+            write_frame(out, {"t": "resolve", "id": job_id, "c": context, "u": url})
+            reply = read_frame(inp)
+            if reply is None or set(reply) != {"t", "id", "r"} or reply["t"] != "reply" or reply["id"] != job_id:
+                os._exit(3)  # the parent went away or is out of step
+            value = reply["r"]
+            cache[key] = value if isinstance(value, str) else None
+            return cache[key]
+
+        soft = int(time.process_time()) + int(SAFETY_CPU_SECONDS)
         resource.setrlimit(resource.RLIMIT_CPU, (soft, resource.RLIM_INFINITY))
         try:
-            write_frame(out, {"t": "done", "out": sanitize_text(job["text"], resolve)})  # type: ignore[arg-type]
+            write_frame(out, {"t": "done", "id": job_id, "out": sanitize_text(text, resolve)})
         except SanitizerFailed:
-            write_frame(out, {"t": "failed"})
+            write_frame(out, {"t": "failed", "id": job_id})
 
 
 SAFETY_CPU_SECONDS = 5.0
+CHILD_OPEN_FILES = 32
+
+
+def _harden() -> None:
+    """Best-effort self-restriction before any data is read. Each step is skipped, not fatal, where unsupported."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+        libc.prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS
+    except (OSError, AttributeError):
+        pass
+    for which, value in (
+        (resource.RLIMIT_AS, CHILD_ADDRESS_SPACE),
+        (resource.RLIMIT_NOFILE, CHILD_OPEN_FILES),
+        (resource.RLIMIT_NPROC, 0),
+    ):
+        try:
+            resource.setrlimit(which, (value, value))
+        except (ValueError, OSError):
+            pass
 
 
 def main() -> None:
@@ -227,9 +265,6 @@ def main() -> None:
     inp = os.fdopen(os.dup(0), "rb", buffering=1 << 20)
     out = os.fdopen(os.dup(1), "wb", buffering=1 << 20)
     os.dup2(2, 1)
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (CHILD_ADDRESS_SPACE, CHILD_ADDRESS_SPACE))
-    except (ValueError, OSError):
-        pass
+    _harden()
     serve(inp, out)
     sys.exit(0)

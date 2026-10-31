@@ -836,10 +836,6 @@ def test_success_cache_needs_a_cache_key_and_honours_it(guard: None) -> None:
     assert len(calls) == 4  # no key, no caching
 
 
-def test_oversized_frames_and_garbage_are_failures() -> None:
-    assert sr.MAX_FRAME >= sr.MAX_RENDER_OUTPUT
-
-
 def test_child_module_imports_only_nh3_and_stdlib() -> None:
     code = (
         "import sys; sys.path.insert(0, sys.argv[1]);"

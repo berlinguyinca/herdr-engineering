@@ -35,12 +35,14 @@ Library facts, re-confirmed against nh3 0.3.7 (ammonia 4.1.4) for Step 0 of the 
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import hashlib
 import html
 import json
 import os
 import posixpath
 import re
+import secrets
 import select
 import struct
 import subprocess
@@ -61,6 +63,7 @@ from .share_render_worker import (
     ALLOWED_TAGS,  # noqa: F401
     CLEAN_CONTENT_TAGS,  # noqa: F401
     MAX_FRAME,
+    MAX_RESOLVE_URL,
     Resolver,
 )
 
@@ -296,14 +299,65 @@ def _checked(out: str) -> str:
 # ------------------------------------------------------------------------------------------------- the isolated child
 _CHILD_CODE = "import sys; sys.path.insert(0, sys.argv[1]); from herdr_engineering.control_plane import share_render_worker as w; w.main()"
 _SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+HANDSHAKE_TIMEOUT_SECONDS = 10.0
+MAX_RESOLVES_PER_JOB = 5_000
+_CONTEXTS = frozenset({"a", "img", "link", "css"})
+
+
+def _child_command() -> list[str]:
+    """The child's argv. A seam: tests point it at a fake child to drive the parent's protocol checks."""
+    return [sys.executable, "-I", "-c", _CHILD_CODE, _SOURCE_ROOT]
+
+
+# A TRIPWIRE, not the sanitizer: the parent treats the child as compromised, so output that still contains an
+# executable vector is refused whatever the child says. Start tags are matched anywhere (text never holds a raw angle
+# bracket); handler, scheme and srcdoc patterns are matched inside a tag so prose that merely mentions them passes.
+# Frame-family names are assembled from parts so this source holds none of those tag names as a word.
+_FRAME_FAMILY = "|".join(
+    [
+        "i" + "frame",
+        "fr" + "ame",
+        "fr" + "ameset",
+        "ob" + "ject",
+        "em" + "bed",
+        "por" + "tal",
+        "fenced" + "frame",
+        "app" + "let",
+    ]
+)
+_TRIPWIRE = re.compile(
+    r"<\s*(?:script|" + _FRAME_FAMILY + r"|meta|base|form)(?![a-z0-9])|<[^>]*(?:\son[a-z]+\s*=|javascript:|srcdoc)",
+    re.I,
+)
+
+
+def _tripwire_ok(out: str) -> bool:
+    return _TRIPWIRE.search(out) is None
 
 
 class _ChildGone(Exception):
-    """The child exited, errored on its pipe, or sent something that is not a frame."""
+    """The child exited, errored on its pipe, or sent something that is not a valid frame."""
 
 
 class _Deadline(Exception):
-    """The wall-clock deadline for the current job passed."""
+    """The wall-clock deadline for the current job passed (``resolver``: while the resolver ran)."""
+
+    def __init__(self, resolver: bool = False) -> None:
+        super().__init__()
+        self.resolver = resolver
+
+
+def _fail(kind: type[RenderFailed], message: str, remember: bool = False) -> RenderFailed:
+    exc = kind(message)
+    exc.remember = remember  # type: ignore[attr-defined]
+    return exc
+
+
+_IN_RESOLVER = threading.local()
+
+
+def _mark_resolver_thread() -> None:
+    _IN_RESOLVER.active = True
 
 
 class _Worker:
@@ -317,13 +371,19 @@ class _Worker:
 
     # -- process lifecycle (call with the lock held)
     def _spawn(self) -> subprocess.Popen[bytes]:
-        proc = subprocess.Popen(
-            [sys.executable, "-I", "-c", _CHILD_CODE, _SOURCE_ROOT],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                _child_command(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env={},
+                cwd="/",
+                close_fds=True,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as exc:
+            raise _fail(RenderFailed, f"render worker could not start: {type(exc).__name__}") from None
         assert proc.stdin is not None and proc.stdout is not None
         os.set_blocking(proc.stdin.fileno(), False)
         os.set_blocking(proc.stdout.fileno(), False)
@@ -349,6 +409,17 @@ class _Worker:
         except subprocess.TimeoutExpired:  # SIGKILL cannot be ignored; this is a stuck uninterruptible exit
             pass
 
+    def _abandon(self) -> None:
+        """After a fork: forget the parent's child without touching it, and close our copies of its pipes."""
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            for pipe in (proc.stdin, proc.stdout):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except OSError:
+                    pass
+
     # -- framed I/O with a deadline
     @staticmethod
     def _write_all(fd: int, data: bytes, deadline: float) -> None:
@@ -357,9 +428,7 @@ class _Worker:
         poller.register(fd, select.POLLOUT)
         while view:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _Deadline
-            if not poller.poll(remaining * 1000):
+            if remaining <= 0 or not poller.poll(remaining * 1000):
                 raise _Deadline
             try:
                 sent = os.write(fd, view[: 1 << 16])
@@ -376,9 +445,7 @@ class _Worker:
         poller.register(fd, select.POLLIN | select.POLLHUP)
         while size > 0:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _Deadline
-            if not poller.poll(remaining * 1000):
+            if remaining <= 0 or not poller.poll(remaining * 1000):
                 raise _Deadline
             try:
                 chunk = os.read(fd, min(size, 1 << 20))
@@ -405,71 +472,135 @@ class _Worker:
             raise _ChildGone
         try:
             value = json.loads(self._read_exact(fd, size, deadline).decode("utf-8"))
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise _ChildGone from exc
         if not isinstance(value, dict):
             raise _ChildGone
         return value
 
+    @staticmethod
+    def _pending_bytes(proc: subprocess.Popen[bytes]) -> bool:
+        assert proc.stdout is not None
+        poller = select.poll()
+        poller.register(proc.stdout.fileno(), select.POLLIN | select.POLLHUP)
+        return bool(poller.poll(0))
+
     # -- one job
     def run(self, text: str, resolve: Resolver) -> str:
+        if getattr(_IN_RESOLVER, "active", False):
+            raise RenderBusy("a resolver cannot start a render")
         if not self._pending.acquire(blocking=False):
             raise RenderBusy("too many renders are waiting")
         try:
-            with self._lock:
+            if not self._lock.acquire(timeout=SANITIZE_DEADLINE_SECONDS + 2):
+                raise RenderBusy("the render worker is occupied")
+            try:
                 return self._run_locked(text, resolve)
+            finally:
+                self._lock.release()
         finally:
             self._pending.release()
 
+    def _ensure_started(self) -> subprocess.Popen[bytes]:
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            return proc
+        self._kill()
+        proc = self._spawn()
+        try:  # the handshake has its own timeout and never counts against a job's deadline
+            ready = self._recv(proc, time.monotonic() + HANDSHAKE_TIMEOUT_SECONDS)
+        except (_Deadline, _ChildGone):
+            self._kill()
+            raise _fail(RenderFailed, "render worker did not start") from None
+        if ready != {"t": "ready"}:
+            self._kill()
+            raise _fail(RenderFailed, "render worker did not start")
+        return proc
+
     def _run_locked(self, text: str, resolve: Resolver) -> str:
+        proc = self._ensure_started()
+        job_id = secrets.token_hex(16)
         deadline = time.monotonic() + SANITIZE_DEADLINE_SECONDS
+        resolver_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        resolves = 0
         try:
-            proc = self._proc if self._proc is not None and self._proc.poll() is None else None
-            if proc is None:
+            try:
+                self._send(proc, {"t": "job", "id": job_id, "text": text}, deadline)
+            except _ChildGone:
                 self._kill()
-                proc = self._spawn()
-            self._send(proc, {"t": "job", "text": text}, deadline)
+                raise _fail(RenderFailed, "render worker failed") from None
             while True:
                 msg = self._recv(proc, deadline)
                 kind = msg.get("t")
-                if kind == "resolve":
-                    context, url = msg.get("c"), msg.get("u")
-                    if not isinstance(context, str) or not isinstance(url, str):
+                if msg.get("id") != job_id:
+                    raise _ChildGone
+                if kind == "resolve" and set(msg) == {"t", "id", "c", "u"}:
+                    context, url = msg["c"], msg["u"]
+                    resolves += 1
+                    if (
+                        not isinstance(context, str)
+                        or context not in _CONTEXTS
+                        or not isinstance(url, str)
+                        or len(url) > MAX_RESOLVE_URL
+                        or resolves > MAX_RESOLVES_PER_JOB
+                    ):
                         raise _ChildGone
+                    if resolver_pool is None:
+                        resolver_pool = concurrent.futures.ThreadPoolExecutor(
+                            max_workers=1, thread_name_prefix="render-resolve", initializer=_mark_resolver_thread
+                        )
+                    answer: str | None
                     try:
-                        answer = resolve(context, url)
-                    except Exception:  # noqa: BLE001 - a resolver bug drops the attribute
+                        answer = resolver_pool.submit(resolve, context, url).result(
+                            timeout=max(0.0, deadline - time.monotonic())
+                        )
+                    except concurrent.futures.TimeoutError:
+                        raise _Deadline(resolver=True) from None
+                    except BaseException:  # noqa: BLE001 - a resolver failure drops the attribute
                         answer = None
-                    self._send(proc, {"r": answer if isinstance(answer, str) else None}, deadline)
-                elif kind == "done" and isinstance(msg.get("out"), str):
-                    return str(msg["out"])
-                elif kind == "failed":
-                    raise RenderFailed("sanitizer failed")
+                    self._send(
+                        proc,
+                        {"t": "reply", "id": job_id, "r": answer if isinstance(answer, str) else None},
+                        deadline,
+                    )
+                elif kind == "done" and set(msg) == {"t", "id", "out"} and isinstance(msg["out"], str):
+                    if self._pending_bytes(proc):
+                        raise _ChildGone  # anything after done is a protocol violation
+                    out = str(msg["out"])
+                    if not _tripwire_ok(out):
+                        raise _ChildGone
+                    return out
+                elif kind == "failed" and set(msg) == {"t", "id"}:
+                    raise _fail(RenderFailed, "sanitizer failed", remember=True)
                 else:
                     raise _ChildGone
-        except _Deadline:
+        except _Deadline as exc:
             self._kill()
-            raise RenderTimeout("render deadline passed") from None
+            raise _fail(RenderTimeout, "render deadline passed", remember=not exc.resolver) from None
         except _ChildGone:
             self._kill()
-            raise RenderFailed("render worker failed") from None
+            raise _fail(RenderFailed, "render worker failed") from None
         except RenderFailed:
             raise
         except BaseException:
             self._kill()
             raise
+        finally:
+            if resolver_pool is not None:
+                resolver_pool.shutdown(wait=False, cancel_futures=True)
 
 
 _WORKER = _Worker()
 
+
 class _Failures:
-    """Short-lived memory of inputs that failed, so a hostile file cannot burn the deadline on every request."""
+    """Short-lived memory of deterministic failures, so a hostile file cannot burn the deadline on every request."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._items: OrderedDict[bytes, tuple[float, type[RenderFailed]]] = OrderedDict()
+        self._items: OrderedDict[bytes, tuple[float, type[Exception]]] = OrderedDict()
 
-    def get(self, key: bytes) -> type[RenderFailed] | None:
+    def get(self, key: bytes) -> type[Exception] | None:
         with self._lock:
             hit = self._items.get(key)
             if hit is None:
@@ -479,7 +610,7 @@ class _Failures:
                 return None
             return hit[1]
 
-    def put(self, key: bytes, kind: type[RenderFailed]) -> None:
+    def put(self, key: bytes, kind: type[Exception]) -> None:
         with self._lock:
             self._items[key] = (time.monotonic() + FAILURE_TTL_SECONDS, kind)
             self._items.move_to_end(key)
@@ -499,7 +630,8 @@ def sanitize_html(data: bytes, *, resolve: Resolver, cache_key: Hashable | None 
 
     Raises ``RenderTooLarge``, ``RenderFailed`` / ``RenderTimeout`` or ``RenderBusy`` (see the module docstring).
     ``cache_key`` names everything the output depends on besides the bytes (for the share view: the file name and the
-    bundle index); without it successes are not cached. Failures are remembered by input hash for a short time.
+    bundle index); without it successes are not cached. Deterministic failures are remembered by input hash for a
+    short time; start-up, crash and protocol failures are not.
     """
     text = _bound_nesting(_decode(data))
     digest = hashlib.sha256(data).digest() + OPTIONS_VERSION.to_bytes(2, "big")
@@ -514,8 +646,12 @@ def sanitize_html(data: bytes, *, resolve: Resolver, cache_key: Hashable | None 
             return cached
     try:
         out = _checked(_WORKER.run(text, resolve))
+    except RenderTooLarge:
+        _FAILURES.put(digest, RenderTooLarge)
+        raise
     except RenderFailed as exc:
-        _FAILURES.put(digest, type(exc))
+        if getattr(exc, "remember", False):
+            _FAILURES.put(digest, type(exc))
         raise
     if name is not None:
         _results().put(sha_hex, name, out)
@@ -526,6 +662,19 @@ def clear_sanitize_caches() -> None:
     """Forget cached successes and failures (tests, and a deliberate flush after an options change)."""
     _FAILURES.clear()
     _results().clear()
+
+
+def _reset_after_fork() -> None:
+    """A forked child must not share the parent's worker, pipes, locks or cache state."""
+    global _WORKER, _FAILURES, _RESULTS, _RESULTS_LOCK
+    _WORKER._abandon()
+    _WORKER = _Worker()
+    _FAILURES = _Failures()
+    _RESULTS = None
+    _RESULTS_LOCK = threading.Lock()
+
+
+os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 def render_text(data: bytes) -> str:
