@@ -196,3 +196,57 @@ def test_wiring_is_off_unless_both_flags_are_exactly_true():
 def test_wiring_hooks_membership_and_the_route_when_on():
     me, collab = _wiring({"room_artifact_access": True})
     assert collab.on_room_members_changed == me.room_artifact_access.notify and callable(collab.artifact_room_handle)
+
+
+# ---- R-RA2: room sync never overwrites or weakens a grant another source holds
+def test_a_direct_write_grant_survives_room_sync_and_room_removal():
+    readers = {"r1": {"bob": None}}
+    store, acl, ra = make(readers)
+    acl.grant("a1", principal_for("bob"), {"read", "edit"}, granted_by="control-plane")
+    assert ra.sync_room("r1") == {"granted": 1, "revoked": 0}                 # only a2 is new
+    held = acl.held("a1", principal_for("bob"))
+    assert held["permissions"] == ["edit", "read"] and held["granted_by"] == "control-plane"
+    del readers["r1"]["bob"]
+    ra.sync_room("r1")                                                        # room removal revokes its own part only
+    assert acl.can("a1", principal_for("bob"), "edit")
+    assert not acl.can("a2", principal_for("bob"), "read")
+
+
+def test_a_direct_read_grant_is_not_taken_over_by_a_room_and_so_not_revoked_with_it():
+    readers = {"r1": {"bob": None}}
+    store, acl, ra = make(readers)
+    acl.grant("a1", principal_for("bob"), {"read"}, expires_at=500.0, granted_by="someone")
+    ra.sync_room("r1")
+    assert acl.held("a1", principal_for("bob"))["granted_by"] == "someone"
+    readers["r1"].clear()
+    ra.sync_room("r1")
+    assert acl.can("a1", principal_for("bob"), "read")
+
+
+def test_a_room_does_not_weaken_another_rooms_longer_grant():
+    store, acl, ra = make({"r1": {"bob": None}, "r2": {"bob": 150.0}}, now=100.0)
+    ra.sync_room("r1")
+    ra.sync_room("r2")                                                        # a guest-style expiry must not shorten r1's
+    assert acl.held("a2", principal_for("bob"))["expires_at"] is None
+    acl.now = lambda: 200.0
+    assert acl.can("a2", principal_for("bob"), "read")
+
+
+def test_a_longer_room_grant_replaces_a_shorter_one_from_another_room():
+    store, acl, ra = make({"r1": {"bob": 150.0}, "r2": {"bob": None}}, now=100.0)
+    ra.sync_room("r1")
+    ra.sync_room("r2")
+    assert acl.held("a2", principal_for("bob"))["expires_at"] is None
+
+
+# ---- turning the flag off leaves written grants behind; this is the explicit way to remove them
+def test_revoke_all_room_grants_removes_only_room_sourced_grants_and_is_idempotent():
+    store, acl, ra = make({"r1": {"bob": None}, "r2": {"bob": None}})
+    ra.sync_room("r1")
+    ra.sync_room("r2")
+    acl.grant("a9", principal_for("bob"), {"read", "edit"}, granted_by="control-plane")
+    acl.grant("a9", "api-key:abc:operator", {"read"})
+    assert ra.revoke_all_room_grants() == 2                                   # a1 (r1) and a2
+    assert acl.held("a1", principal_for("bob")) is None and acl.held("a2", principal_for("bob")) is None
+    assert acl.can("a9", principal_for("bob"), "edit") and acl.can("a9", "api-key:abc:operator", "read")
+    assert ra.revoke_all_room_grants() == 0
