@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -27,7 +28,9 @@ _MASK = "***REDACTED***"
 _SECRET_NAME_RE = re.compile(r"(?i)(token|secret|passw(or)?d|api[_-]?key|authorization|credential|cookie)")
 _TOKEN_RE = re.compile(
     r"sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|hcw_[A-Za-z0-9_-]{10,}|hce_[A-Za-z0-9_-]{10,}"
-    r"|hca_[A-Za-z0-9_-]{10,}|Bearer\s+\S{8,}|Worker\s+\S{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+    r"|hca_[A-Za-z0-9_-]{10,}|Bearer\s+\S{8,}|Worker\s+\S{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", re.IGNORECASE)
+_ZERO_WIDTH_RE = re.compile("[\u200b-\u200d\u2060\ufeff]")
+MAX_DEPTH = 32
 
 
 @dataclass
@@ -43,14 +46,18 @@ class WorkerEvent:
     created_at: datetime
 
 
+def _mask_tokens(text: str) -> str:
+    """Mask token shapes, matching on the NFKC-normalised, zero-width-stripped text; harmless text is unchanged."""
+    norm = _ZERO_WIDTH_RE.sub("", unicodedata.normalize("NFKC", text))
+    return _TOKEN_RE.sub(_MASK, norm) if _TOKEN_RE.search(norm) else text
+
+
 def _scrub(value: Any) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for k, v in value.items():
-            if not isinstance(k, str):
-                raise ValueError("payload keys must be strings")
             masked = _SECRET_NAME_RE.search(k) is not None and v not in (None, "")
-            key = _TOKEN_RE.sub(_MASK, k)
+            key = _mask_tokens(k)
             while key in out:
                 key += "_"
             out[key] = _MASK if masked else _scrub(v)
@@ -58,27 +65,33 @@ def _scrub(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_scrub(v) for v in value]
     if isinstance(value, str):
-        return _TOKEN_RE.sub(_MASK, value)
+        return _mask_tokens(value)
     return value
+
+
+def _check(value: Any, depth: int = 1) -> None:
+    """Reject non-string keys and over-deep nesting before any recursive pass runs."""
+    if isinstance(value, (dict, list, tuple)) and depth > MAX_DEPTH:
+        raise ValueError("payload nested too deeply")
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ValueError("payload keys must be strings")
+            _check(v, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _check(v, depth + 1)
 
 
 def scrub_payload(obj: Any) -> Any:
     """Shared redaction first, then mask token-shaped substrings and secret-looking keys/sub-trees. Returns a copy."""
     from ..assistant import redact_obj
 
-    _scrub_keys_check(obj)
-    return _scrub(redact_obj(obj))
-
-
-def _scrub_keys_check(value: Any) -> None:
-    if isinstance(value, dict):
-        for k, v in value.items():
-            if not isinstance(k, str):
-                raise ValueError("payload keys must be strings")
-            _scrub_keys_check(v)
-    elif isinstance(value, (list, tuple)):
-        for v in value:
-            _scrub_keys_check(v)
+    try:
+        _check(obj)
+        return _scrub(redact_obj(obj))
+    except RecursionError as exc:  # backstop; _check normally rejects deep payloads first
+        raise ValueError("payload nested too deeply") from exc
 
 
 def event_size(payload: Any) -> int:

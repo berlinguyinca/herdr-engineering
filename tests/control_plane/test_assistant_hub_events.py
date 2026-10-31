@@ -168,3 +168,55 @@ def test_index_rebuilt_after_restore_so_caps_still_apply():
     fresh.max_events_per_tenant = 3
     rec(fresh, w)
     assert len(list_events(fresh, tenant_id="t1", user_id="u1", limit=500)) == 3
+
+
+def _nest(kind, depth, leaf="x"):
+    v = leaf
+    for i in range(depth):
+        v = {"k": v} if kind == "dict" or (kind == "mixed" and i % 2) else [v]
+    return v
+
+
+@pytest.mark.parametrize("kind", ["dict", "list", "mixed"])
+def test_deep_nesting_raises_value_error_not_recursion_error(kind):
+    store, reg = make()
+    for depth in (33, 5000):
+        with pytest.raises(ValueError):
+            scrub_payload(_nest(kind, depth))
+    with pytest.raises(ValueError):
+        rec(store, worker(reg), payload={"a": _nest(kind, 5000)})
+
+
+def test_nesting_at_exact_limit_works():
+    out = scrub_payload(_nest("dict", 32, leaf="sk-abcdefghijklmnop123456"))
+    for _ in range(32):
+        out = out["k"]
+    assert out == "***REDACTED***"
+    with pytest.raises(ValueError):
+        scrub_payload(_nest("dict", 33))
+
+
+def test_token_matching_is_case_insensitive():
+    out = scrub_payload({"a": "bearer abcdefghijkl", "b": "Sk-abcdefghijklmnop123456", "Sk-abcdefghijklmnop123456": 1})
+    assert out == {"a": "***REDACTED***", "b": "***REDACTED***", "***REDACTED***": 1}
+
+
+def test_unicode_tricks_do_not_evade_scrubbing():
+    out = scrub_payload({
+        "a": "ｓｋ-abcdefghijklmnop123456",
+        "b": "s​k-abcdefghijklmnop123456",
+        "c": "gh⁠p_" + "a" * 30,
+        "d": "Bea﻿rer abcdefghijkl",
+        "s‍k-abcdefghijklmnop123456": 1})
+    assert out == {"a": "***REDACTED***", "b": "***REDACTED***", "c": "***REDACTED***",
+                   "d": "***REDACTED***", "***REDACTED***": 1}
+    assert scrub_payload({"h": "café Ａ"}) == {"h": "café Ａ"}
+
+
+def test_size_cap_measured_after_scrubbing():
+    store, reg = make()
+    w = worker(reg)
+    e = rec(store, w, payload={"a": "sk-" + "a" * 5000})
+    assert e.payload == {"a": "***REDACTED***"}
+    with pytest.raises(ValueError):
+        rec(store, w, payload={"a": "b" * 5000})
