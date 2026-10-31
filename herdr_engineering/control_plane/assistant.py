@@ -43,6 +43,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .assistant_hub.events import WorkerEvent
 from .assistant_hub.workers import Enrollment, Worker
 from .inference_models import RETRY_CODES, ModelResolver
 from .reminders import REMINDER_TOOLS, ReminderError
@@ -1663,6 +1664,8 @@ class AssistantStore:
         self.notifications: dict[str, AssistantNotification] = {}
         self.workers: dict[str, Worker] = {}
         self.enrollments: dict[str, Enrollment] = {}
+        self.worker_events: dict[str, WorkerEvent] = {}   # insertion order == oldest first
+        self.max_events_per_tenant = 10_000
         self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
         self._audit: list[dict[str, Any]] = []
         # (entry) -> None. Wired by the control plane to the repo event store so every entry is durable BEFORE it is
@@ -1723,6 +1726,7 @@ class AssistantStore:
                 "notifications": [self._e_to_dict(x) for x in self.notifications.values()],
                 "workers": [self._e_to_dict(x) for x in self.workers.values()],
                 "enrollments": [self._e_to_dict(x) for x in self.enrollments.values()],
+                "worker_events": [self._e_to_dict(x) for x in self.worker_events.values()],
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
             }
@@ -1760,6 +1764,8 @@ class AssistantStore:
                             (self._e_from_dict(Worker, d) for d in snap.get("workers", []))}
             self.enrollments = {x.enrollment_id: x for x in
                                 (self._e_from_dict(Enrollment, d) for d in snap.get("enrollments", []))}
+            self.worker_events = {x.event_id: x for x in
+                                  (self._e_from_dict(WorkerEvent, d) for d in snap.get("worker_events", []))}
             self._routine_fired = set(snap.get("routine_fired", []))
             kept = {e.get("event_id") for e in snap.get("audit", [])}
             merged = [dict(e) for e in snap.get("audit", [])]
