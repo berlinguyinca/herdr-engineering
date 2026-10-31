@@ -245,3 +245,21 @@ def test_committable_fixture_contains_no_personal_sheet_identifier():
 def test_grant_requires_immutable_unique_sha256_approvals(hashes):
     with pytest.raises(ValueError):
         replace(grant(draft()), draft_hashes=hashes)
+
+
+def test_dinner_eight_400_fixture_and_report_schema(tmp_path):
+    from herdr_engineering.artifacts import FilesystemArtifactWorkspace
+    from herdr_engineering.event_fixture import prepare_fixture
+
+    fixtures = Path(__file__).parent / "fixtures/event_coordinator"
+    data = json.loads((fixtures / "dinner-eight-under-400.json").read_text())
+    assert data["requirements"]["adults"] + data["requirements"]["children"] == 8
+    assert data["requirements"]["budget"] == 400 and data["requirements"]["currency"] == "USD"
+    ws = FilesystemArtifactWorkspace(root=tmp_path)
+    report = json.loads(ws.read(prepare_fixture(data, ws).artifact))
+    schema = json.loads((Path(__file__).parents[1] / "docs/contracts/event-fixture-report-v1.schema.json").read_text())
+    assert set(report) == set(schema["required"]) == set(schema["properties"])
+    assert all("8 adults and 0 children" in v["draft"]["body"] for v in report["venues"])
+    assert all("400 USD" in v["draft"]["body"] for v in report["venues"])
+    assert report["browser"]["result"]["status"] == "unbound"
+    assert all(v["comparison"]["costs"]["status"] == "unknown" for v in report["venues"])

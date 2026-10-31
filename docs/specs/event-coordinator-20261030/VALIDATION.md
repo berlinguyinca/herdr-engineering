@@ -60,3 +60,19 @@ focused tests, Ruff and compilation successfully; no further code changes reques
 The reviewer's Python LSP backend was unavailable (transport closed), so no LSP/type
 analysis result or formal tool approval is claimed. Static validation here is Ruff
 plus Python compilation; there is no configured new dependency or typecheck setup.
+
+Dinner handoff extension: one fixture/schema regression test failed before the new
+files existed, then the focused suite passed 50 tests. Ruff passed. Synthetic dinner
+runner published report art_af1501cc03ca4eb0a211 (6468 bytes), SHA256
+ce9a19e78f1760ee8543d142aafb2bb19e10926deeb478a9a3c4b47ce2b007ea.
+Eight synthetic adults, no children, USD400 ceiling; date/time/timezone and venue costs
+remain unknown, so no under-budget success or live availability is asserted.
+
+Baseline source diagnosis for main: `control_plane/api.py` telemetry POST branch
+(lines 1305-1310 at fabc61c) rejects oversized Content-Length before `_read_json()`.
+The failing test's 1,048,576-character padding produces a 1,048,627-byte JSON body.
+Observed client failure is ConnectionResetError errno 54 in `HTTPConnection.sendall`,
+wrapped by urllib as URLError, before the test receives the expected HTTP 400.
+Unread-body rejection while the client is still uploading is the source-grounded
+explanation for the reset on this macOS/Python 3.14 environment; no packet trace was
+collected. This concerns baseline HTTP rejection behavior, not event fixture code.

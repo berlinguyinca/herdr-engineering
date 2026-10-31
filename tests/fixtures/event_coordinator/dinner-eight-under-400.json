@@ -1,0 +1,8 @@
+{
+  "source": {"title":"Synthetic dinner for eight with USD400 ceiling", "uri":"fixture:dinner-eight-under-400", "kind":"synthetic", "live_verified":false},
+  "requirements": {"date_time":null, "timezone":null, "adults":8, "children":0, "budget":400, "currency":"USD"},
+  "venues": [
+    {"id":"fixture-bistro", "name":"Example Bistro", "city":"Fixture City", "priority":1, "identity":"unverified"},
+    {"id":"fixture-patio", "name":"Example Patio", "city":"Fixture City", "priority":2, "identity":"unverified"}
+  ]
+}

@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:herdr:event-fixture-report:v1",
+  "title": "Offline event fixture report v1",
+  "description": "Fixture projection only. Budget is a request ceiling, not proof of venue total. Checkpoint is private serialized state, never authority. Browser external reference is owned by browser-system at e47b9f0.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "mode",
+    "source",
+    "completion",
+    "venues",
+    "browser",
+    "checkpoint"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "mode": {
+      "const": "offline_fixture"
+    },
+    "source": {
+      "type": "object"
+    },
+    "completion": {
+      "const": "drafts_prepared_outreach_blocked"
+    },
+    "venues": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/venue"
+      }
+    },
+    "browser": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "result"
+      ],
+      "properties": {
+        "request": {
+          "$ref": "urn:herdr:browser-capability:v1"
+        },
+        "result": {
+          "$ref": "urn:herdr:browser-capability:v1"
+        }
+      }
+    },
+    "checkpoint": {
+      "type": "string",
+      "contentMediaType": "application/json"
+    }
+  },
+  "$defs": {
+    "draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "user_id",
+        "task_id",
+        "venue_id",
+        "sender",
+        "subject",
+        "body",
+        "recipient",
+        "followup"
+      ],
+      "properties": {
+        "user_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "venue_id": {
+          "type": "string"
+        },
+        "sender": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "recipient": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "followup": {
+          "type": "boolean"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "venue_id",
+        "question",
+        "value",
+        "source",
+        "kind",
+        "observed_at"
+      ],
+      "properties": {
+        "venue_id": {
+          "type": "string"
+        },
+        "question": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "official_fact",
+            "estimate",
+            "explicit_reply"
+          ]
+        },
+        "observed_at": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "question": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "evidence"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "unknown",
+            "researched",
+            "answered",
+            "conflict"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        }
+      }
+    },
+    "venue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "priority",
+        "identity",
+        "historical_lead",
+        "lead_source",
+        "provenance",
+        "draft",
+        "draft_hash",
+        "blockers",
+        "unanswered",
+        "comparison"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer"
+        },
+        "identity": {
+          "enum": [
+            "verified",
+            "unverified",
+            "ambiguous",
+            "closed"
+          ]
+        },
+        "historical_lead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lead_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provenance": {
+          "const": "local_user_summary_fixture"
+        },
+        "draft": {
+          "$ref": "#/$defs/draft"
+        },
+        "draft_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unanswered": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "comparison": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "capacity",
+            "patio",
+            "children",
+            "mingling",
+            "service",
+            "tabs",
+            "wine",
+            "costs"
+          ],
+          "properties": {
+            "capacity": {
+              "$ref": "#/$defs/question"
+            },
+            "patio": {
+              "$ref": "#/$defs/question"
+            },
+            "children": {
+              "$ref": "#/$defs/question"
+            },
+            "mingling": {
+              "$ref": "#/$defs/question"
+            },
+            "service": {
+              "$ref": "#/$defs/question"
+            },
+            "tabs": {
+              "$ref": "#/$defs/question"
+            },
+            "wine": {
+              "$ref": "#/$defs/question"
+            },
+            "costs": {
+              "$ref": "#/$defs/question"
+            }
+          }
+        }
+      }
+    }
+  }
+}
