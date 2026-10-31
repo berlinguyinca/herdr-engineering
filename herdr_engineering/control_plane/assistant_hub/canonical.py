@@ -13,8 +13,9 @@ normalized with ``os.path.normpath``; symlinks are not followed, so any ``hint``
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+import shlex
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
 
 from .shellparse import XARGS_MARKER, SimpleCommand, Unparseable, parse
 from .verbs import STRICTER, VERB_RISK, ActionKey, FlagClass, Verb
@@ -62,6 +63,8 @@ class Derived:
     details: tuple[Element, ...] = ()
     raw_text: str = ""
     hint_host: str = ""
+    unparsed: bool = False
+    hint_cwd: str = ""
 
 
 @dataclass(frozen=True)
@@ -176,6 +179,82 @@ def repo_from_url(text: str) -> str:
     return "/".join(parts[-2:]) if len(parts) >= 2 else ""
 
 
+def expand_braces(token: str, limit: int = 64) -> list[str]:
+    """Expand ``{a,b}`` lists (bounded); unexpandable text is left as is."""
+    out = [token]
+    for _ in range(8):
+        nxt: list[str] = []
+        changed = False
+        for t in out:
+            opened = t.find("{")
+            if opened == -1:
+                nxt.append(t)
+                continue
+            depth, parts, start, end = 0, [], opened + 1, -1
+            for i in range(opened, len(t)):
+                c = t[i]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+                elif c == "," and depth == 1:
+                    parts.append(t[start:i])
+                    start = i + 1
+            if end == -1 or not parts:
+                nxt.append(t)
+                continue
+            parts.append(t[start:end])
+            changed = True
+            nxt.extend(t[:opened] + p + t[end + 1:] for p in parts)
+        out = nxt[:limit]
+        if not changed:
+            break
+    return out[:limit]
+
+
+SCAN_HEADS = frozenset({
+    "git", "gh", "curl", "wget", "http", "https", "rm", "rmdir", "mv", "cp", "truncate", "dd", "shred", "unlink",
+    "find", "rsync", "tee", "sed", "apt", "apt-get", "aptitude", "dnf", "yum", "zypper", "conda", "mamba",
+    "micromamba", "cargo", "npm", "crontab", "systemctl", "apptainer", "singularity", "make", "gem", "go", "spack",
+    "poetry", "uv", "pipx", "yarn", "pnpm", "brew", "nix-env", "python", "python3", "cat", "head", "tail", "less",
+    "more", "grep", "rg", "base64", "xxd", "od", "strings", "echo", "printenv", "env", "ssh", "scp", "sftp",
+    "install", "chmod", "chown", "ln", "touch", "mkdir", "tar", "unzip", "zip", "nc",
+})
+_SCAN_SEPARATORS = ";&|\n()`"
+
+
+def scan_elements(text: str, on_cluster: bool, cwd: str | None, only: frozenset[str] | None = None) -> list[Element]:
+    """Best-effort, over-approximate inspection records from raw text (quotes and wrappers ignored)."""
+    cleaned = text.replace("\\", "").replace("'", "").replace('"', "")
+    for sep in _SCAN_SEPARATORS:
+        cleaned = cleaned.replace(sep, "\n")
+    out: list[Element] = []
+    for line in cleaned.split("\n"):
+        words = line.split()
+        redirects: list[str] = []
+        for j, tok in enumerate(words):
+            if tok[:1] in "<>":
+                target = tok.lstrip("<>&|")
+                if not target and j + 1 < len(words):
+                    target = words[j + 1]
+                if target and target != "/dev/null":
+                    redirects.append(target)
+        for i, tok in enumerate(words):
+            name = std_name(tok)
+            argv: list[str] | None = None
+            if (name in SCAN_HEADS or name.startswith("pip")) and (only is None or name in only):
+                argv = words[i:]
+            elif tok == "push" and only is None:
+                argv = ["git", *words[i:]]
+            if argv:
+                key = mk_key("shell", Verb.UNKNOWN, "", " ".join(argv))
+                out.append(Element(key, tuple(argv), tuple(redirects), (), on_cluster, cwd, True, False, False))
+    return out
+
+
 # ---------------------------------------------------------------- command families
 
 _RO_SIMPLE = frozenset({
@@ -189,8 +268,6 @@ _SRUN_SHORT_ARG = frozenset("nNcptAwxJoeDqGCdmLMrBiT")
 _SRUN_SHORT_FLAG = frozenset("vQuksOHlXZE")
 _SRUN_LONG_BOOL = frozenset({"pty", "exclusive", "overcommit", "quiet", "verbose", "unbuffered", "label",
                              "no-kill", "oversubscribe", "contiguous", "requeue", "wait-all-nodes"})
-_SSH_ARG_OPTS = frozenset("bcDEeFIiJLlmOopQRSWw")
-_SSH_BAD_OPTS = frozenset({"proxycommand", "localcommand", "permitlocalcommand", "remotecommand", "knownhostscommand"})
 _GH_RO = {("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "status"), ("pr", "checks"), ("issue", "view"),
           ("issue", "list"), ("issue", "status"), ("repo", "view"), ("run", "list"), ("run", "view")}
 
@@ -214,6 +291,9 @@ def _ro_generic(name: str, args: list[str]) -> _Cls:
             return _Cls(Verb.SHELL_MUTATING, reason="sort -o writes a file")
         if any(f.startswith("--compress-program") for f in flags):
             return _unknown("sort runs a compress program")
+    if name == "file" and any(f in ("--magic-file", "--compile") or (f[1:2] != "-" and ("C" in f or "m" in f))
+                              for f in flags):
+        return _unknown("file with a magic database option")
     if name == "rg" and any(f.startswith(("--pre", "--hostname-bin")) for f in flags):
         return _unknown("rg runs a preprocessor")
     return _Cls(Verb.SHELL_READ_ONLY)
@@ -257,6 +337,8 @@ def _git(argv: list[str], raw_repo: str | None) -> _Cls:
     if sub == "clean":
         return _Cls(Verb.SHELL_MUTATING, FlagClass.HARD)
     if sub in _GIT_RO:
+        if sub == "diff" and "--no-index" in args:
+            return _unknown("git diff --no-index reads arbitrary files")
         if any(a == "--output" or a.startswith(("--output=", "--ext-diff", "--textconv")) for a in args):
             return _Cls(Verb.SHELL_MUTATING, reason="git writes or runs a helper")
         return _Cls(Verb.SHELL_READ_ONLY)
@@ -379,9 +461,8 @@ def classify_head(argv: list[str], raw_repo: str | None = None) -> _Cls:
 class _State:
     raw: RawAction
     out: list[Element] = field(default_factory=list)
-    facts: list[str] = field(default_factory=list)
-    hint_host: str = ""
     reasons: list[str] = field(default_factory=list)
+    redirected_git: bool = False  # cd/pushd or git -C/--git-dir/--work-tree seen: hint repo is not trustworthy
 
 
 def _emit(st: _State, cmd: SimpleCommand, argv: list[str], cls: _Cls, on_cluster: bool, cwd: str | None,
@@ -401,28 +482,39 @@ def _emit(st: _State, cmd: SimpleCommand, argv: list[str], cls: _Cls, on_cluster
         owner = True
     reason = cls.reason or ("dynamic words" if dynamic else "xargs" if xargs else "")
     scope = cls.scope or scope_default
+    head = std_name(argv[0])
     family = ("cluster" if verb in (Verb.CLUSTER_READ_ONLY, Verb.CLUSTER_MUTATING) else
-              "git" if std_name(argv[0]) == "git" else "gh" if std_name(argv[0]) == "gh" else "shell")
+              "git" if head == "git" else "gh" if head == "gh" else "shell")
     target = cls.target or " ".join(argv)
     key = mk_key(family, verb, scope, target, flag)
     st.out.append(Element(key, tuple(argv), real_redirects, cmd.env, on_cluster, cwd,
                           owner or verb is Verb.UNKNOWN, dynamic, xargs))
     if reason:
         st.reasons.append(reason)
+    if head == "git" and any(a in ("-C", "--git-dir", "--work-tree") or a.startswith(("--git-dir=", "--work-tree="))
+                             for a in argv[1:]):
+        st.redirected_git = True
 
 
 def _walk(st: _State, cmds: list[SimpleCommand], on_cluster: bool, cwd: str | None, depth: int,
           scope_default: str) -> None:
+    stack: list[str | None] = []
     for cmd in cmds:
         argv = [a for a in cmd.argv if a != XARGS_MARKER]
         xargs = len(argv) != len(cmd.argv)
         if not argv:
             continue
         head = std_name(argv[0])
-        if head == "cd":
-            target = argv[1] if len(argv) > 1 else "~"
+        if head in ("cd", "pushd", "popd"):
+            args = [a for a in argv[1:] if not a.startswith("-")]
             _emit(st, cmd, argv, _Cls(Verb.SHELL_READ_ONLY), on_cluster, cwd, scope_default, xargs)
-            cwd = resolve_path(target, cwd)
+            st.redirected_git = True
+            if head == "popd":
+                cwd = stack.pop() if stack else None
+            else:
+                if head == "pushd":
+                    stack.append(cwd)
+                cwd = resolve_path(args[0] if args else "~", cwd)
             continue
         if head in ("ssh", "srun", "sbatch"):
             _remote(st, cmd, argv, head, xargs, on_cluster, cwd, depth, scope_default)
@@ -433,18 +525,22 @@ def _walk(st: _State, cmds: list[SimpleCommand], on_cluster: bool, cwd: str | No
 
 def _remote_cmds(st: _State, text: str, cmd: SimpleCommand, cwd: str | None, depth: int, scope: str,
                  outer: list[str]) -> None:
+    def fallback(reason: str) -> None:
+        _emit(st, cmd, outer, _unknown(reason), True, cwd, scope, False)
+        st.out.extend(scan_elements(text, True, cwd))
+
     if depth >= _MAX_REMOTE_DEPTH:
-        _emit(st, cmd, outer, _unknown("remote nesting too deep"), True, cwd, scope, False)
+        fallback("remote nesting too deep")
         return
     try:
         inner = parse(text)
     except Unparseable as exc:
-        _emit(st, cmd, outer, _unknown(f"remote command unparseable: {exc}"), True, None, scope, False)
+        fallback(f"remote command unparseable: {exc}")
         return
     if not inner:
-        _emit(st, cmd, outer, _unknown("remote command parsed to nothing"), True, None, scope, False)
+        fallback("remote command parsed to nothing")
         return
-    _walk(st, inner, True, None, depth + 1, scope)
+    _walk(st, inner, True, cwd, depth + 1, scope)
 
 
 def _remote(st: _State, cmd: SimpleCommand, argv: list[str], head: str, xargs: bool, on_cluster: bool,
@@ -455,6 +551,21 @@ def _remote(st: _State, cmd: SimpleCommand, argv: list[str], head: str, xargs: b
         _srun(st, cmd, argv, xargs, cwd, depth, scope_default)
     else:
         _sbatch(st, cmd, argv, xargs, cwd, depth, scope_default)
+
+
+_SSH_FLAGS = frozenset("qTnt46xvC")
+_SSH_ARG_ALLOWED = frozenset("ipl")
+_SSH_OPT_ALLOWED = frozenset({"batchmode", "connecttimeout", "stricthostkeychecking", "proxyjump", "port", "user",
+                              "identityfile", "serveraliveinterval", "serveralivecountmax", "connectionattempts",
+                              "userknownhostsfile", "loglevel", "identitiesonly"})
+
+
+def _ssh_option_ok(letter: str, value: str) -> bool:
+    if letter == "J":
+        return True  # the fry veto inspects the value
+    if letter == "o":
+        return value.split("=", 1)[0].split(" ", 1)[0].strip().lower() in _SSH_OPT_ALLOWED
+    return letter in _SSH_ARG_ALLOWED
 
 
 def _ssh(st: _State, cmd: SimpleCommand, argv: list[str], xargs: bool, on_cluster: bool, cwd: str | None,
@@ -468,12 +579,12 @@ def _ssh(st: _State, cmd: SimpleCommand, argv: list[str], xargs: bool, on_cluste
         if not a.startswith("-") or a == "-":
             break
         letter = a[1:2]
-        if letter in _SSH_ARG_OPTS:
+        if letter in "iplJo":
             val = a[2:] if len(a) > 2 else (argv[i + 1] if i + 1 < n else "")
             i += 1 if len(a) > 2 else 2
-            if letter in "LRDWwF" or (letter == "o" and val.split("=", 1)[0].strip().lower() in _SSH_BAD_OPTS):
-                bad = True
+            bad = bad or not _ssh_option_ok(letter, val)
         else:
+            bad = bad or not all(c in _SSH_FLAGS for c in a[1:])
             i += 1
     if i >= n:
         _emit(st, cmd, argv, _unknown("ssh without a destination"), True, cwd, "", xargs)
@@ -481,7 +592,7 @@ def _ssh(st: _State, cmd: SimpleCommand, argv: list[str], xargs: bool, on_cluste
     host = argv[i].rsplit("@", 1)[-1].lower()
     remote = argv[i + 1:]
     if bad:
-        _emit(st, cmd, argv, _unknown("ssh option may run programs or forward ports"), True, cwd, host, xargs)
+        _emit(st, cmd, argv, _unknown("ssh option is not in the allowlist"), True, cwd, host, xargs)
     elif not remote:
         _emit(st, cmd, argv, _unknown("interactive ssh session"), True, cwd, host, xargs)
     else:
@@ -490,56 +601,78 @@ def _ssh(st: _State, cmd: SimpleCommand, argv: list[str], xargs: bool, on_cluste
         _remote_cmds(st, " ".join(remote), cmd, None, depth, host, argv)
 
 
-def _srun_command(argv: list[str]) -> tuple[list[str] | None, str]:
-    i, n = 1, len(argv)
+def _srun_command(argv: list[str]) -> tuple[list[str] | None, str, str | None]:
+    """Return (command argv or None when ambiguous, reason, --chdir/-D value)."""
+    i, n, chdir = 1, len(argv), None
     while i < n:
         a = argv[i]
         if a == "--":
-            return argv[i + 1:], ""
+            return argv[i + 1:], "", chdir
         if a.startswith("--"):
-            if "=" in a or a[2:] in _SRUN_LONG_BOOL:
+            if a.startswith("--chdir="):
+                chdir = a.split("=", 1)[1]
                 i += 1
-                continue
-            return None, f"srun option {a} has an ambiguous value"
+            elif a == "--chdir" and i + 1 < n:
+                chdir = argv[i + 1]
+                i += 2
+            elif "=" in a or a[2:] in _SRUN_LONG_BOOL:
+                i += 1
+            else:
+                return None, f"srun option {a} has an ambiguous value", chdir
+            continue
         if a.startswith("-") and len(a) > 1:
             if a[1] in _SRUN_SHORT_ARG:
+                value = a[2:] if len(a) > 2 else (argv[i + 1] if i + 1 < n else "")
+                if a[1] == "D":
+                    chdir = value
                 i += 1 if len(a) > 2 else 2
             elif all(c in _SRUN_SHORT_FLAG for c in a[1:]):
                 i += 1
             else:
-                return None, f"srun option {a} is not understood"
+                return None, f"srun option {a} is not understood", chdir
             continue
-        return argv[i:], ""
-    return [], ""
+        return argv[i:], "", chdir
+    return [], "", chdir
 
 
 def _srun(st: _State, cmd: SimpleCommand, argv: list[str], xargs: bool, cwd: str | None, depth: int,
           scope: str) -> None:
-    inner, why = _srun_command(argv)
+    inner, why, chdir = _srun_command(argv)
+    inner_cwd = resolve_path(chdir, cwd) if chdir is not None else cwd
     if inner is None:
         _emit(st, cmd, argv, _unknown(why), True, cwd, scope, xargs)
+        st.out.extend(scan_elements(" ".join(argv), True, inner_cwd))
         return
     if not inner:
         _emit(st, cmd, argv, _unknown("srun without a command"), True, cwd, scope, xargs)
         return
     _emit(st, cmd, argv, _Cls(Verb.CLUSTER_READ_ONLY), True, cwd, scope, xargs)
-    _remote_cmds(st, " ".join(inner), cmd, None, depth, scope, argv)
+    _remote_cmds(st, shlex.join(inner), cmd, inner_cwd, depth, scope, argv)
 
 
 def _sbatch(st: _State, cmd: SimpleCommand, argv: list[str], xargs: bool, cwd: str | None, depth: int,
             scope: str) -> None:
     wrap: str | None = None
+    chdir: str | None = None
     for i, a in enumerate(argv):
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
         if a.startswith("--wrap="):
             wrap = a.split("=", 1)[1]
-        elif a == "--wrap" and i + 1 < len(argv):
-            wrap = argv[i + 1]
+        elif a == "--wrap" and nxt is not None:
+            wrap = nxt
+        elif a.startswith("--chdir="):
+            chdir = a.split("=", 1)[1]
+        elif a == "--chdir" or a == "-D":
+            chdir = nxt
+        elif a.startswith("-D") and len(a) > 2 and not a.startswith("--"):
+            chdir = a[2:]
+    inner_cwd = resolve_path(chdir, cwd) if chdir is not None else cwd
     if wrap is None:
         _emit(st, cmd, argv, _Cls(Verb.CLUSTER_MUTATING, owner=True, reason="sbatch script is not inspected"),
               True, cwd, scope, xargs)
         return
     _emit(st, cmd, argv, _Cls(Verb.CLUSTER_MUTATING), True, cwd, scope, xargs)
-    _remote_cmds(st, wrap, cmd, None, depth, scope, argv)
+    _remote_cmds(st, wrap, cmd, inner_cwd, depth, scope, argv)
 
 
 # ---------------------------------------------------------------- structured tools
@@ -554,17 +687,36 @@ def _unknown_derived(raw: RawAction, reason: str, facts: list[str], details: tup
     return Derived(key, (), True, reason, tuple(facts), details, raw.command or "", hint_host)
 
 
+def split_recipients(values: Iterable[str]) -> tuple[set[str], bool]:
+    """Split on , ; and whitespace, drop display names; returns (addresses, saw_invalid_entry)."""
+    out: set[str] = set()
+    invalid = False
+    for value in values:
+        text = value
+        while "<" in text and ">" in text.split("<", 1)[1]:
+            before, rest = text.split("<", 1)
+            inner, after = rest.split(">", 1)
+            text = f"{before.rsplit(' ', 1)[0] if ' ' in before.strip() else ''} {inner} {after}"
+        for part in text.replace(",", " ").replace(";", " ").split():
+            addr = part.strip("<>\"'").lower()
+            if "@" not in addr or addr.startswith("@") or addr.endswith("@"):
+                invalid = True
+            elif addr:
+                out.add(addr)
+    return out, invalid
+
+
 def _email(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
     op = (raw.operation or "").strip().lower()
-    recipients = {r.strip().lower() for r in raw.recipients if r.strip()}
-    owner, notes = False, []
+    recipients, invalid = split_recipients(raw.recipients)
+    owner, notes = invalid, ["invalid recipient"] if invalid else []
     if "recipient" in hint:
-        attested = hint["recipient"].lower()
-        facts.append(f"recipient={attested}")
-        if recipients and attested not in recipients:
+        attested, bad = split_recipients([hint["recipient"]])
+        facts.append(f"recipient={hint['recipient'].lower()}")
+        if bad or (recipients and not attested <= recipients):
             owner = True
             notes.append("hint recipient disagrees with the request")
-        recipients.add(attested)
+        recipients |= attested
     if op not in ("draft", "send"):
         return _unknown_derived(raw, f"email operation {op!r} is not draft or send", facts)
     scope = ",".join(sorted(recipients))
@@ -596,43 +748,68 @@ def _deploy(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
     return Derived(key, (key,), False, "", tuple(facts))
 
 
+def _bare_env_records(text: str, cwd: str | None) -> list[Element]:
+    return scan_elements(text, False, cwd, frozenset({"env", "printenv"}))
+
+
 def _shell(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
     text = raw.command
     host = hint.get("host", "")
     if host:
         facts.append(f"host={host}")
+    hint_cwd = hint.get("cwd", "")
+    cwd = None
+    if hint_cwd:
+        facts.append(f"cwd={hint_cwd}")
+        cwd = resolve_path(hint_cwd, None)
     if text is None:
         return _unknown_derived(raw, "no command", facts, hint_host=host)
+    cluster_ctx = any(w in host.lower() for w in ("cluster", "hive", "farm", "franklin", "node"))
     try:
         cmds = parse(text)
     except Unparseable as exc:
-        return _unknown_derived(raw, f"unparseable: {exc}", facts, hint_host=host)
-    cwd = None
-    if "cwd" in hint:
-        facts.append(f"cwd={hint['cwd']}")
-        cwd = resolve_path(hint["cwd"], None)
+        recs = tuple(scan_elements(text, cluster_ctx or _mentions_cluster(text), cwd))
+        d = _unknown_derived(raw, f"unparseable: {exc}", facts, recs, host)
+        return replace(d, unparsed=True, hint_cwd=hint_cwd)
+    if not cmds:
+        recs = tuple(scan_elements(text, cluster_ctx or _mentions_cluster(text), cwd))
+        d = _unknown_derived(raw, "no executable command found", facts, recs, host)
+        return replace(d, unparsed=True, hint_cwd=hint_cwd)
     st = _State(raw)
-    scope_default = raw.repo or ""
-    if "repo" in hint:
+    _walk(st, cmds, False, cwd, 0, raw.repo or "")
+    notes: list[str] = []
+    use_hint_repo = "repo" in hint
+    if use_hint_repo:
         facts.append(f"repo={hint['repo']}")
-        scope_default = scope_default or hint["repo"]
-    _walk(st, cmds, False, cwd, 0, scope_default)
-    if not st.out:
-        return _unknown_derived(raw, "no executable command found", facts, hint_host=host)
+        if st.redirected_git:
+            use_hint_repo = False
+            notes.append("hint repo not trusted after cd or git -C/--git-dir/--work-tree")
+        elif not raw.repo:
+            st = _State(raw)
+            _walk(st, cmds, False, cwd, 0, hint["repo"])
     keys = tuple(e.key for e in st.out)
     best = keys[0]
     for k in keys[1:]:
         best = STRICTER(best, k)
-    owner = any(e.owner_decides for e in st.out)
-    reasons = list(dict.fromkeys(st.reasons))
+    owner = any(e.owner_decides for e in st.out) or bool(notes)
+    reasons = [*dict.fromkeys(st.reasons), *notes]
+    if hint_cwd and cwd is None:
+        owner = True
+        reasons.append("hint cwd is not an absolute path")
     repos = {e.key.resource_scope.casefold() for e in st.out if e.key.tool in ("git", "gh") and e.key.resource_scope}
-    attested = [v for k, v in hint.items() if k == "repo"] + ([raw.repo] if raw.repo else [])
+    attested = ([hint["repo"]] if use_hint_repo else []) + ([raw.repo] if raw.repo else [])
     repos |= {a.casefold() for a in attested}
     if len(repos) > 1:
         owner = True
         reasons.append("repository scopes disagree")
         facts.append("disagreement: repository scopes differ between hint, request and command")
-    return Derived(best, keys, owner, "; ".join(reasons), tuple(facts), tuple(st.out), text, host)
+    details = (*st.out, *_bare_env_records(text, cwd))
+    return Derived(best, keys, owner, "; ".join(reasons), tuple(facts), details, text, host, False, hint_cwd)
+
+
+def _mentions_cluster(text: str) -> bool:
+    words = text.lower().replace("'", " ").replace('"', " ").replace(";", " ").split()
+    return any(w in ("ssh", "srun", "sbatch") for w in words)
 
 
 _TOOLS: dict[str, Callable[[RawAction, dict[str, str], list[str]], Derived]] = {
