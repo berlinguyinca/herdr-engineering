@@ -14,7 +14,7 @@ Deploys are the operator's step.
 | P06 Team-first WebUI and visual map | Partial (logic only) | `team-map-model.js` + client methods + 9 node tests; `evidence/P06-RESULT.md` | the screens: "Your teams" home, Conversation, Team Map view, inspector, deep links; a `team` producer |
 | P07 Rakazo agent and safeguarded external actions | Not started | | Rakazo as an agent with approval-gated external actions (email, calendar, GitHub) |
 | P08 Subscriptions, attention and automations | Not started | | activity subscriptions, one attention/approval surface over the existing mechanisms, automations |
-| P09 Reliability, threat model, accessibility and rollout | Not started | | threat model, accessibility pass, chaos and rollout plan |
+| P09 Reliability, threat model, accessibility and rollout | Partial (docs only) | `security/THREAT_MODEL.md` (implementation section, read from code, nothing run), per-flag rollout/rollback table, accessibility checklist; `evidence/P09-RESULT.md` | E2E, chaos, load, tracing, security tests, per-user flags, repair command, accessibility audit |
 
 ## Decisions
 - One artifact registry. The registry owns ids, versions, ACLs and sharing; RustFS owns bytes. #366's separate storage, archive and previews are re-expressed as registry features and #366 is not merged. See `design/ARTIFACT_INTEGRATION.md`.
@@ -25,6 +25,9 @@ Deploys are the operator's step.
 - `ui-gates`: #389 (lineage filter coverage), #420 (collab baselines after #406), #439 (missions mobile baseline after #427), #457 (dashboard colour-contrast ratchet after #406). No floor or rule was relaxed; #457 tightened one.
 - `unit-gates`: #390 (inspector_snapshots test stub). P02/P03 test clash (committed versions are immutable) fixed inside #380.
 - Open item for the operator: the focus-control floor on main was lowered to 470 in `643d2b5f` by someone else.
+
+## Open risks from the P09 read (see `security/THREAT_MODEL.md`, none fixed)
+Opt-in task-lease fence, asynchronous room revoke, no artifact unlink, the member graph door and room-artifact access not running in the compose.collab topology, single-principal public share approval.
 
 ## Rollback
 Every migration is additive with a `-- DOWN:`. Flags: `control_plane.unified_workspace.enabled: false` (default) turns the graph routes back into 404s. Reverting a squash commit on main removes a phase; the archive branches `salvage/main-checkout-snapshot-20261028` and `salvage/arch-collab-stack-20261028` hold the original work.

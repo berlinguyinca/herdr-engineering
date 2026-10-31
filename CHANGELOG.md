@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Unified workspace P09 (docs only): threat model and rollout plan
+- `docs/specs/herdr-unified-workspace-20261028/security/THREAT_MODEL.md` now has an implementation threat model of what is on main: work graph routes, artifact registry and ACL, room-derived read access, share links (lab and public), crash-takeover leases, the collab public listener and the control-plane deploy, each with mitigations, residual risks and a severity, plus a turn-on, watch and turn-off table per flag and an accessibility checklist for screens not yet built. It was written by reading the code; nothing was run or verified. No code, schema or config changed. P09 is marked partial in `evidence/STATUS.md`; `evidence/P09-RESULT.md` lists what is not done and the code risks found.
+
 ### CI page: the history report is built once per few seconds
 - `GET /api/v1/ci/reports` took about 5 s per call and 6, 12 and 17 s for three at once, because every open CI page rebuilt it on every refresh. Pages that gave up showed "CI history: Failed to fetch" and left broken-pipe tracebacks in the log (106 in 40 minutes). The first caller now builds it and concurrent callers wait for that one result; a result is reused for up to 15 s (the page refreshes every 20 s) and only while no CI observation, report or log-test row has been added or replaced, so an upload shows at once. A failed build is not cached. What the endpoint reads from the CI monitor and GitHub language cache can be up to 15 s old.
 
