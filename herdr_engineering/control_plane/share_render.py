@@ -1,7 +1,18 @@
 """Static render of shared files for the annotation view: a thin adapter around ``nh3`` (the ammonia sanitizer).
 
-The sanitizer is a library; this module only chooses its options, rewrites the URLs it lets through and bounds size.
-There is no hand-written tokenizer or serializer here.
+The sanitizer is a library; this module only chooses its options, rewrites the URLs it lets through and bounds size and
+time. There is no hand-written tokenizer or serializer here.
+
+THE GUARANTEE is a hard resource bound, not an estimate: every ``nh3`` call runs in an isolated child process
+(``share_render_worker``, which imports only ``nh3`` and the standard library) under a wall-clock deadline of
+``SANITIZE_DEADLINE_SECONDS``. On expiry the parent kills the child with SIGKILL, reaps it, raises ``RenderTimeout`` and
+starts a fresh child lazily. ``_bound_nesting`` is only a cheap best-effort first filter that trims markup shaped to be
+slow; it is an optimisation and nothing relies on it being exhaustive.
+
+Exceptions callers map (all uniform and non-leaky):
+``RenderTooLarge`` (input or output over the caps), ``RenderFailed`` (the child crashed, spoke garbage, or the library
+failed) with its subclass ``RenderTimeout`` (deadline), and ``RenderBusy`` (more than ``MAX_PENDING_RENDERS`` renders
+are already waiting; answer 503 and let the client retry).
 
 Library facts, re-confirmed against nh3 0.3.7 (ammonia 4.1.4) for Step 0 of the plan:
 
@@ -9,15 +20,13 @@ Library facts, re-confirmed against nh3 0.3.7 (ammonia 4.1.4) for Step 0 of the 
 * The style element is kept when ``clean_content_tags`` is given explicitly and does not list it. The link element is
   kept with ``link`` in ``tags``. Both survive, so the static copy keeps author CSS.
 * ``attribute_filter`` runs AFTER the scheme check for absolute URLs (a ``javascript:`` href never reaches it) while
-  relative URLs do reach it; ``data:`` reaches it because ``data`` is in ``url_schemes``. This module does not depend on
-  that order: the resolver re-checks every scheme itself.
+  relative URLs do reach it; ``data:`` reaches it because ``data`` is in ``url_schemes``. The adapter does not depend on
+  that order: it re-checks every scheme itself.
 * ``@import url(http://...)`` inside style element text is kept verbatim. Nothing here parses CSS text, so the view's
-  CSP (``style-src-elem``) is the only barrier against that load. Style ATTRIBUTES are different: they are rewritten or
-  dropped here (see ``_filter_style``).
+  CSP (``style-src-elem``) is the only barrier against that load. Style ATTRIBUTES are rewritten or dropped.
 * Setting ``link_rel`` while ``rel`` is an allowed attribute raises ValueError, and a tag that is both allowed and in
   ``clean_content_tags`` is a Rust panic (``pyo3_runtime.PanicException``, a BaseException, not an Exception). Neither
-  combination is ever passed, and the panic is additionally contained at the call boundary so hostile input can never
-  take the process down.
+  combination is ever passed, and the panic is contained in the child.
 * Frame, plugin, svg, math, template, canvas, media, form-control and raw-text elements are removed WITH their content
   (``clean_content_tags``). Forms, meta, base, noscript and every ``on*`` attribute are not allowed, so they are dropped
   with their markup unwrapped.
@@ -25,24 +34,47 @@ Library facts, re-confirmed against nh3 0.3.7 (ammonia 4.1.4) for Step 0 of the 
 
 from __future__ import annotations
 
+import atexit
+import hashlib
 import html
+import json
+import os
 import posixpath
 import re
+import select
+import struct
+import subprocess
+import sys
 import threading
+import time
 from collections import OrderedDict
-from collections.abc import Callable, Collection
+from collections.abc import Collection, Hashable
+from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
-import nh3
-
 from .share_bundle import ShareBundleError, content_type_for, normalise_name
+from .share_render_worker import (
+    _ABSOLUTE_OK,
+    _DATA_IMAGE,
+    _FRAGMENT_SAFE,
+    _STRIP_IN_URL,
+    ALLOWED_TAGS,  # noqa: F401
+    CLEAN_CONTENT_TAGS,  # noqa: F401
+    MAX_FRAME,
+    Resolver,
+)
 
 RENDER_VERSION = 1
 MAX_RENDER_INPUT = 2 * 1024 * 1024
 MAX_RENDER_OUTPUT = 4 * 1024 * 1024
 STATIC_NOTE = "Scripts, frames and embedded media are not shown in this static copy"
 
-Resolver = Callable[[str, str], str | None]
+
+SANITIZE_DEADLINE_SECONDS = 3.0
+MAX_PENDING_RENDERS = 4
+OPTIONS_VERSION = 1
+FAILURE_TTL_SECONDS = 30.0
+SANITIZE_CACHE_BYTES = 32 * 1024 * 1024
 
 
 class RenderTooLarge(Exception):
@@ -50,7 +82,15 @@ class RenderTooLarge(Exception):
 
 
 class RenderFailed(Exception):
-    """The sanitizer library failed (including a Rust panic) on this input."""
+    """The sanitizer failed on this input: the child crashed, answered garbage, or the library failed."""
+
+
+class RenderTimeout(RenderFailed):
+    """The sanitizer did not finish within ``SANITIZE_DEADLINE_SECONDS`` and its child was killed."""
+
+
+class RenderBusy(Exception):
+    """Too many renders are already waiting (``MAX_PENDING_RENDERS``): answer 503 and let the client retry."""
 
 
 def render_kind(name: str, media_type: str | None = None) -> str:
@@ -67,11 +107,6 @@ def render_kind(name: str, media_type: str | None = None) -> str:
 
 
 # --------------------------------------------------------------------------------------------------------- URL rewriting
-_STRIP_IN_URL = re.compile(r"[\t\r\n]")
-_DATA_IMAGE = re.compile(r"data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]{0,262144}", re.I)
-_ABSOLUTE_OK = {"http", "https", "mailto"}
-_FRAGMENT_SAFE = "-._~!$&'()*+,;=:@/?"
-
 
 def share_resolver(name: str, index: Collection[str]) -> Resolver:
     """The share host's URL rewriting for the annotation view of the file ``name`` (a name in ``index``)."""
@@ -111,100 +146,6 @@ def share_resolver(name: str, index: Collection[str]) -> Resolver:
     return resolve
 
 
-# ----------------------------------------------------------------------------------------------------------- CSS in style
-_MAX_STYLE = 8192
-# One pass, no nesting, every quantifier bounded and over a class disjoint from its delimiters: failed starts are O(1).
-_CSS_URL = re.compile(
-    r"""url\(\s*(?:"([^"\\()]{0,2048})"|'([^'\\()]{0,2048})'|([^\s"'()\\]{0,2048}))\s*\)""",
-    re.I,
-)
-_CSS_REJECT = re.compile(
-    r"expression|@import|behaviou?r|binding|image-set|cross-fade|\bimage\s*\(|\bsrc\s*\(|\belement\s*\(|"
-    r"javascript:|vbscript:|/\*|\\|position\s*:\s*(?:fixed|sticky)",
-    re.I,
-)
-
-
-def _filter_style(value: str, resolve: Resolver) -> str | None:
-    """Rewrite url() through the resolver; drop the whole attribute for anything this cannot prove harmless."""
-    if len(value) > _MAX_STYLE or _CSS_REJECT.search(value):
-        return None
-
-    def sub(match: re.Match[str]) -> str:
-        target = next(g for g in match.groups() if g is not None) if any(g is not None for g in match.groups()) else ""
-        new = resolve("css", target)
-        if new is None or not _scheme_ok("css", new) or any(c in new for c in "()\"'\\ \n\r\t"):
-            return "none"
-        return f"url({new})"
-
-    out = _CSS_URL.sub(sub, value)
-    if re.search(r"url\s*\(", out, re.I) and out.lower().count("url(") != len(_CSS_URL.findall(value)):
-        return None  # a url( the single pass did not understand
-    return out
-
-
-# --------------------------------------------------------------------------------------------------------- sanitization
-ALLOWED_TAGS: frozenset[str] = frozenset(
-    "a abbr address article aside b bdi bdo blockquote br caption cite code col colgroup data dd del details dfn div dl dt "
-    "em figcaption figure footer h1 h2 h3 h4 h5 h6 header hr i img ins kbd li link main mark nav ol p pre q rp rt ruby s "
-    "samp section small span strong style sub summary sup table tbody td tfoot th thead time tr u ul var wbr".split()
-)
-CLEAN_CONTENT_TAGS: frozenset[str] = frozenset(
-    "script template iframe frame frameset noframes object embed applet portal fencedframe svg math canvas video audio "
-    "textarea select title noembed xmp plaintext".split()
-)
-_ATTRIBUTES: dict[str, set[str]] = {
-    "*": {"class", "id", "title", "lang", "dir", "role", "style"},
-    "a": {"href"},
-    "img": {"src", "alt", "width", "height"},
-    "td": {"colspan", "rowspan", "headers", "scope"},
-    "th": {"colspan", "rowspan", "headers", "scope"},
-    "ol": {"start", "reversed", "type"},
-    "li": {"value"},
-    "col": {"span"},
-    "colgroup": {"span"},
-    "time": {"datetime", "value"},
-    "data": {"datetime", "value"},
-    "link": {"rel", "href"},
-}
-_SET_ATTRS: dict[str, dict[str, str]] = {"a": {"target": "_blank", "rel": "noopener noreferrer"}}
-_URL_CONTEXT = {("a", "href"): "a", ("img", "src"): "img", ("link", "href"): "link"}
-
-# An overlap is a Rust panic inside the library; fail at import instead.
-assert not ALLOWED_TAGS & CLEAN_CONTENT_TAGS
-
-
-def _scheme_ok(context: str, url: str) -> bool:
-    """Defence in depth: whatever a resolver returns, only these shapes reach the output."""
-    compact = _STRIP_IN_URL.sub("", url).strip(" \x0c")
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in compact):
-        return False
-    if context == "img" and _DATA_IMAGE.fullmatch(compact):
-        return True
-    scheme = urlsplit(compact).scheme.lower() if ":" in compact.split("/")[0].split("?")[0].split("#")[0] else ""
-    if scheme:
-        return context == "a" and scheme in _ABSOLUTE_OK
-    return not compact.startswith(("//", "\\")) and "\\" not in compact
-
-
-def _make_filter(resolve: Resolver) -> Callable[[str, str, str], str | None]:
-    def attribute_filter(tag: str, attr: str, value: str) -> str | None:
-        try:
-            context = _URL_CONTEXT.get((tag, attr))
-            if context is not None:
-                new = resolve(context, value)
-                return new if new is not None and _scheme_ok(context, new) else None
-            if tag == "link" and attr == "rel":
-                return "stylesheet" if value.strip().lower() == "stylesheet" else None
-            if attr == "style":
-                return _filter_style(value, resolve)
-            return value
-        except Exception:  # noqa: BLE001 - a resolver bug must drop the attribute, never break or leak
-            return None
-
-    return attribute_filter
-
-
 # ammonia's cost is roughly (retained depth x number of end tags and formatting/table reconstructions), so hostile
 # markup is cut off before the library sees it. The scan is conservative BY CONSTRUCTION rather than faithful to HTML5:
 #   * It only TRUSTS syntax whose extent is provable with a strict grammar: a tag whose attribute values hold no angle
@@ -241,7 +182,7 @@ _METERED_START = frozenset(
 _OPTIONAL_END = frozenset("p li dt dd tr td th tbody thead tfoot option optgroup rt rp colgroup caption".split())
 _SCOPED_CLOSERS = frozenset(
     "ul ol dl table tbody thead tfoot tr td th div section article aside nav main header footer blockquote details "
-    "figure select body html".split()
+    "figure select".split()
 )
 _SELF_SIBLING = frozenset("p li dt dd option".split())
 _RAW_TEXT = frozenset("style script xmp iframe noembed noframes textarea title".split())
@@ -249,8 +190,13 @@ _RAW_END = {n: re.compile(r"</" + n + r"(?=[\s/>])", re.I) for n in _RAW_TEXT}
 
 
 def _bound_nesting(text: str) -> str:
-    """The text cut where estimated depth passes ``MAX_NESTING`` or metered work passes ``WORK_BUDGET``."""
+    """Best-effort first filter: the text cut where estimated depth passes ``MAX_NESTING`` or work passes ``WORK_BUDGET``.
+
+    This is an optimisation, NOT the guarantee. A markup shape that fools it is still stopped by the deadline in
+    ``sanitize_html``. It never returns early without metering: anything it cannot reason about taints it instead.
+    """
     stack: list[str] = []
+    foreign_at: int | None = None  # index of the lowest svg or math on the stack
     work = 0
     tainted = False
     pos = text.find("<")
@@ -266,11 +212,11 @@ def _bound_nesting(text: str) -> str:
                 pos = text.find("<", pos + 1)
                 continue
         if nxt in ("!", "?") or (nxt == "/" and not text[pos + 2 : pos + 3].isalpha()):
-            if nxt == "/" and text[pos + 2 : pos + 3] == "":
-                return text
             end = text.find(">", pos + 1)
             if end < 0:
-                return text
+                tainted = True
+                pos = text.find("<", pos + 1)
+                continue
             pos = text.find("<", end + 1)
             continue
         m = _PLAIN_TAG.match(text, pos)
@@ -284,7 +230,9 @@ def _bound_nesting(text: str) -> str:
         depth = len(stack)
         if m.group(1):
             work += depth
-            if not tainted:
+            if name in ("body", "html"):
+                pass  # a stray body or html closer must not delete the stack
+            elif not tainted:
                 if stack and stack[-1] == name:
                     stack.pop()
                 elif name in _SCOPED_CLOSERS and stack:
@@ -296,9 +244,11 @@ def _bound_nesting(text: str) -> str:
                         del stack[j:]
         else:
             work += depth if name in _METERED_START else 1
-            if name == "plaintext" and not tainted:
-                return text
-            if name not in _VOID:
+            if name == "plaintext":
+                tainted = True
+            if name in ("body", "html"):
+                pass  # not pushed: a fake one must not become a barrier
+            elif name not in _VOID or foreign_at is not None:
                 top = stack[-1] if stack else ""
                 if not tainted:
                     if top == name and name in _SELF_SIBLING:
@@ -311,15 +261,20 @@ def _bound_nesting(text: str) -> str:
                             stack.pop()
                 if name in _RAW_TEXT and not tainted:
                     work += depth
-                    if "svg" not in stack and "math" not in stack:
+                    if foreign_at is None and "noscript" not in stack:
                         found = _RAW_END[name].search(text, m.end())
                         if found is None:
-                            return text
-                        if name == "script" and "<!--" in text[m.end() : found.start()]:
                             tainted = True
-                        pos = found.start()
-                        continue
+                        else:
+                            if name == "script" and "<!--" in text[m.end() : found.start()]:
+                                tainted = True
+                            pos = found.start()
+                            continue
+                if name in ("svg", "math") and foreign_at is None:
+                    foreign_at = len(stack)
                 stack.append(name)
+        if foreign_at is not None and len(stack) <= foreign_at:
+            foreign_at = None
         if len(stack) > MAX_NESTING or work > WORK_BUDGET:
             return text[: m.start()]
         pos = text.find("<", m.end() if m.end() > pos else pos + 1)
@@ -338,35 +293,239 @@ def _checked(out: str) -> str:
     return out
 
 
-# Raw text ends only at the closing style tag, so a "<" inside a kept style element is suspicious: drop the element.
-_STYLE_ELEMENT = re.compile(r"<style(?:\s[^>]*)?>(.*?)</style>", re.I | re.S)
+# ------------------------------------------------------------------------------------------------- the isolated child
+_CHILD_CODE = "import sys; sys.path.insert(0, sys.argv[1]); from herdr_engineering.control_plane import share_render_worker as w; w.main()"
+_SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
 
 
-def _drop_suspicious_style(out: str) -> str:
-    return _STYLE_ELEMENT.sub(lambda m: "" if "<" in m.group(1) else m.group(0), out)
+class _ChildGone(Exception):
+    """The child exited, errored on its pipe, or sent something that is not a frame."""
 
 
-def sanitize_html(data: bytes, *, resolve: Resolver) -> str:
-    """The sanitized fragment for hostile HTML bytes. Raises ``RenderTooLarge`` or ``RenderFailed``."""
-    text = _bound_nesting(_decode(data))
-    try:
-        out = nh3.clean(
-            text,
-            tags=set(ALLOWED_TAGS),
-            clean_content_tags=set(CLEAN_CONTENT_TAGS),
-            attributes={k: set(v) for k, v in _ATTRIBUTES.items()},
-            attribute_filter=_make_filter(resolve),
-            strip_comments=True,
-            link_rel=None,
-            generic_attribute_prefixes={"aria-"},
-            set_tag_attribute_values={k: dict(v) for k, v in _SET_ATTRS.items()},
-            url_schemes={"http", "https", "mailto", "data"},
+class _Deadline(Exception):
+    """The wall-clock deadline for the current job passed."""
+
+
+class _Worker:
+    """One persistent child per parent process, used by one job at a time, killed on its deadline."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending = threading.BoundedSemaphore(MAX_PENDING_RENDERS)
+        self._proc: subprocess.Popen[bytes] | None = None
+        atexit.register(self._kill)
+
+    # -- process lifecycle (call with the lock held)
+    def _spawn(self) -> subprocess.Popen[bytes]:
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-c", _CHILD_CODE, _SOURCE_ROOT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
         )
-    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        assert proc.stdin is not None and proc.stdout is not None
+        os.set_blocking(proc.stdin.fileno(), False)
+        os.set_blocking(proc.stdout.fileno(), False)
+        self._proc = proc
+        return proc
+
+    def _kill(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        for pipe in (proc.stdin, proc.stdout):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # SIGKILL cannot be ignored; this is a stuck uninterruptible exit
+            pass
+
+    # -- framed I/O with a deadline
+    @staticmethod
+    def _write_all(fd: int, data: bytes, deadline: float) -> None:
+        view = memoryview(data)
+        poller = select.poll()
+        poller.register(fd, select.POLLOUT)
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _Deadline
+            if not poller.poll(remaining * 1000):
+                raise _Deadline
+            try:
+                sent = os.write(fd, view[: 1 << 16])
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                raise _ChildGone from exc
+            view = view[sent:]
+
+    @staticmethod
+    def _read_exact(fd: int, size: int, deadline: float) -> bytes:
+        chunks: list[bytes] = []
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLHUP)
+        while size > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _Deadline
+            if not poller.poll(remaining * 1000):
+                raise _Deadline
+            try:
+                chunk = os.read(fd, min(size, 1 << 20))
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                raise _ChildGone from exc
+            if not chunk:
+                raise _ChildGone
+            chunks.append(chunk)
+            size -= len(chunk)
+        return b"".join(chunks)
+
+    def _send(self, proc: subprocess.Popen[bytes], obj: dict[str, object], deadline: float) -> None:
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        assert proc.stdin is not None
+        self._write_all(proc.stdin.fileno(), struct.pack(">Q", len(data)) + data, deadline)
+
+    def _recv(self, proc: subprocess.Popen[bytes], deadline: float) -> dict[str, object]:
+        assert proc.stdout is not None
+        fd = proc.stdout.fileno()
+        (size,) = struct.unpack(">Q", self._read_exact(fd, 8, deadline))
+        if size > MAX_FRAME:
+            raise _ChildGone
+        try:
+            value = json.loads(self._read_exact(fd, size, deadline).decode("utf-8"))
+        except ValueError as exc:
+            raise _ChildGone from exc
+        if not isinstance(value, dict):
+            raise _ChildGone
+        return value
+
+    # -- one job
+    def run(self, text: str, resolve: Resolver) -> str:
+        if not self._pending.acquire(blocking=False):
+            raise RenderBusy("too many renders are waiting")
+        try:
+            with self._lock:
+                return self._run_locked(text, resolve)
+        finally:
+            self._pending.release()
+
+    def _run_locked(self, text: str, resolve: Resolver) -> str:
+        deadline = time.monotonic() + SANITIZE_DEADLINE_SECONDS
+        try:
+            proc = self._proc if self._proc is not None and self._proc.poll() is None else None
+            if proc is None:
+                self._kill()
+                proc = self._spawn()
+            self._send(proc, {"t": "job", "text": text}, deadline)
+            while True:
+                msg = self._recv(proc, deadline)
+                kind = msg.get("t")
+                if kind == "resolve":
+                    context, url = msg.get("c"), msg.get("u")
+                    if not isinstance(context, str) or not isinstance(url, str):
+                        raise _ChildGone
+                    try:
+                        answer = resolve(context, url)
+                    except Exception:  # noqa: BLE001 - a resolver bug drops the attribute
+                        answer = None
+                    self._send(proc, {"r": answer if isinstance(answer, str) else None}, deadline)
+                elif kind == "done" and isinstance(msg.get("out"), str):
+                    return str(msg["out"])
+                elif kind == "failed":
+                    raise RenderFailed("sanitizer failed")
+                else:
+                    raise _ChildGone
+        except _Deadline:
+            self._kill()
+            raise RenderTimeout("render deadline passed") from None
+        except _ChildGone:
+            self._kill()
+            raise RenderFailed("render worker failed") from None
+        except RenderFailed:
+            raise
+        except BaseException:
+            self._kill()
+            raise
+
+
+_WORKER = _Worker()
+
+class _Failures:
+    """Short-lived memory of inputs that failed, so a hostile file cannot burn the deadline on every request."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._items: OrderedDict[bytes, tuple[float, type[RenderFailed]]] = OrderedDict()
+
+    def get(self, key: bytes) -> type[RenderFailed] | None:
+        with self._lock:
+            hit = self._items.get(key)
+            if hit is None:
+                return None
+            if hit[0] < time.monotonic():
+                del self._items[key]
+                return None
+            return hit[1]
+
+    def put(self, key: bytes, kind: type[RenderFailed]) -> None:
+        with self._lock:
+            self._items[key] = (time.monotonic() + FAILURE_TTL_SECONDS, kind)
+            self._items.move_to_end(key)
+            while len(self._items) > 256:
+                self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+_FAILURES = _Failures()
+
+
+def sanitize_html(data: bytes, *, resolve: Resolver, cache_key: Hashable | None = None) -> str:
+    """The sanitized fragment for hostile HTML bytes.
+
+    Raises ``RenderTooLarge``, ``RenderFailed`` / ``RenderTimeout`` or ``RenderBusy`` (see the module docstring).
+    ``cache_key`` names everything the output depends on besides the bytes (for the share view: the file name and the
+    bundle index); without it successes are not cached. Failures are remembered by input hash for a short time.
+    """
+    text = _bound_nesting(_decode(data))
+    digest = hashlib.sha256(data).digest() + OPTIONS_VERSION.to_bytes(2, "big")
+    failed = _FAILURES.get(digest)
+    if failed is not None:
+        raise failed("render failed recently for this input")
+    name = repr(cache_key) if cache_key is not None else None
+    sha_hex = digest.hex()
+    if name is not None:
+        cached = _results().get(sha_hex, name)
+        if cached is not None:
+            return cached
+    try:
+        out = _checked(_WORKER.run(text, resolve))
+    except RenderFailed as exc:
+        _FAILURES.put(digest, type(exc))
         raise
-    except BaseException as exc:  # noqa: BLE001 - the library's Rust panic is a BaseException
-        raise RenderFailed(f"sanitizer failed: {type(exc).__name__}") from None
-    return _checked(_drop_suspicious_style(out))
+    if name is not None:
+        _results().put(sha_hex, name, out)
+    return out
+
+
+def clear_sanitize_caches() -> None:
+    """Forget cached successes and failures (tests, and a deliberate flush after an options change)."""
+    _FAILURES.clear()
+    _results().clear()
 
 
 def render_text(data: bytes) -> str:
@@ -418,3 +577,20 @@ class RenderCache:
             while len(self._items) > self._max_entries or self._bytes > self._max_bytes:
                 _, (_, evicted) = self._items.popitem(last=False)
                 self._bytes -= evicted
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self._bytes = 0
+
+
+_RESULTS: RenderCache | None = None
+_RESULTS_LOCK = threading.Lock()
+
+
+def _results() -> RenderCache:
+    global _RESULTS
+    with _RESULTS_LOCK:
+        if _RESULTS is None:
+            _RESULTS = RenderCache(max_entries=256, max_bytes=SANITIZE_CACHE_BYTES)
+        return _RESULTS

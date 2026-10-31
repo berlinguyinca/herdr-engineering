@@ -6,6 +6,7 @@ match this file.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from html.parser import HTMLParser
 import pytest
 
 from herdr_engineering.control_plane import share_render as sr
+from herdr_engineering.control_plane import share_render_worker as worker
 
 LT = "<"
 FRAME_RE = re.compile(r"<\s*(iframe|frame|frameset|object|embed|portal|fencedframe|applet)(?=[\s/>])", re.I)
@@ -196,18 +198,18 @@ def test_panic_in_the_library_is_contained(monkeypatch: pytest.MonkeyPatch) -> N
     def boom(*a, **k):
         raise PanicException("boom")
 
-    monkeypatch.setattr(sr.nh3, "clean", boom)
-    with pytest.raises(sr.RenderFailed):
-        sr.sanitize_html(b"<p>x</p>", resolve=keep_all)
+    monkeypatch.setattr(worker.nh3, "clean", boom)
+    with pytest.raises(worker.SanitizerFailed):
+        worker.sanitize_text("<p>x</p>", keep_all)
 
 
 def test_interrupts_are_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*a, **k):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(sr.nh3, "clean", boom)
+    monkeypatch.setattr(worker.nh3, "clean", boom)
     with pytest.raises(KeyboardInterrupt):
-        sr.sanitize_html(b"<p>x</p>", resolve=keep_all)
+        worker.sanitize_text("<p>x</p>", keep_all)
 
 
 def test_resolver_exception_does_not_crash_or_leak() -> None:
@@ -664,3 +666,186 @@ def test_tag_soup_fuzz_is_fast() -> None:
             parts.append(f)
             total += len(f)
         _timed("".join(parts).encode())
+
+
+# ------------------------------------------------------------------------------------------ the isolated child's deadline
+@pytest.fixture
+def guard():
+    """A hard alarm so a regression that hangs the parent FAILS the test instead of hanging the suite."""
+    import signal
+
+    def fire(signum, frame):
+        raise AssertionError("test exceeded its hard guard")
+
+    previous = signal.signal(signal.SIGALRM, fire)
+    signal.alarm(120)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _reviewer_shapes() -> dict[str, str]:
+    return {
+        "svg-plaintext": "<svg><plaintext>" + "<g>" * 80_000 + "</x>" * 80_000,
+        "svg-input": "<svg>" + "<input>" * 80_000 + "</x>" * 80_000,
+        "noscript-frame": "<noscript><" + "iframe></noscript><div>" + "<x>" * 80_000 + "</y>" * 80_000,
+        "body-optgroup": ("<body>" + "<optgroup>" * 9_000 + "</body>" + "</x>" * 100_000) * 3,
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_reviewer_shapes()))
+@pytest.mark.parametrize("estimator", [True, False])
+def test_reviewer_reproducers_return_within_the_deadline(
+    name: str, estimator: bool, monkeypatch: pytest.MonkeyPatch, guard: None
+) -> None:
+    if not estimator:
+        monkeypatch.setattr(sr, "_bound_nesting", lambda text: text)
+    sr.clear_sanitize_caches()
+    payload = _reviewer_shapes()[name].encode()
+    start = time.monotonic()
+    try:
+        out: str | None = sr.sanitize_html(payload, resolve=keep_all)
+    except (sr.RenderFailed, sr.RenderTooLarge):
+        out = None
+    elapsed = time.monotonic() - start
+    assert elapsed < sr.SANITIZE_DEADLINE_SECONDS + 1.5, (name, estimator, elapsed)
+    if out is not None:
+        assert_inert(out)
+    # the child was restarted if it was killed: the next call works
+    assert sr.sanitize_html(b"<p>after</p>", resolve=keep_all) == "<p>after</p>"
+
+
+def test_deadline_kills_the_child_and_a_failure_is_remembered(monkeypatch: pytest.MonkeyPatch, guard: None) -> None:
+    monkeypatch.setattr(sr, "SANITIZE_DEADLINE_SECONDS", 0.05)
+    sr.clear_sanitize_caches()
+    payload = b"<div>" * 9_000 + b"remembered"
+    with pytest.raises(sr.RenderTimeout):
+        sr.sanitize_html(payload, resolve=keep_all)
+    monkeypatch.setattr(sr, "SANITIZE_DEADLINE_SECONDS", 30.0)
+    start = time.monotonic()
+    with pytest.raises(sr.RenderTimeout):  # served from the failure memory, not re-run
+        sr.sanitize_html(payload, resolve=keep_all)
+    assert time.monotonic() - start < 0.5
+    sr.clear_sanitize_caches()
+    assert sr.sanitize_html(payload, resolve=keep_all).count("<div>") == 9_000
+    assert sr.sanitize_html(b"<p>fine</p>", resolve=keep_all) == "<p>fine</p>"
+
+
+def _children_of_self() -> list[int]:
+    me = os.getpid()
+    kids: list[int] = []
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                stat = open(f"/proc/{entry}/stat").read()
+            except OSError:
+                continue
+            if int(stat.rsplit(")", 1)[1].split()[1]) == me:
+                kids.append(int(entry))
+    return kids
+
+
+def test_two_hundred_timeouts_leak_no_fds_or_processes(monkeypatch: pytest.MonkeyPatch, guard: None) -> None:
+    import signal
+
+    signal.alarm(0)
+    signal.alarm(300)
+    monkeypatch.setattr(sr, "SANITIZE_DEADLINE_SECONDS", 0.03)
+    sr.clear_sanitize_caches()
+    assert sr.sanitize_html(b"<p>warm</p>", resolve=keep_all) == "<p>warm</p>"
+    fds_before = len(os.listdir("/proc/self/fd"))
+    for i in range(200):
+        with pytest.raises(sr.RenderFailed):
+            sr.sanitize_html(b"<div>" * 9_000 + str(i).encode(), resolve=keep_all)
+    sr._WORKER._kill()
+    assert len(os.listdir("/proc/self/fd")) <= fds_before + 1
+    zombies = [p for p in _children_of_self() if open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()[0] == "Z"]
+    assert not zombies
+    monkeypatch.setattr(sr, "SANITIZE_DEADLINE_SECONDS", 3.0)
+    assert sr.sanitize_html(b"<p>again</p>", resolve=keep_all) == "<p>again</p>"
+    assert len(_children_of_self()) <= 1
+    sr.clear_sanitize_caches()
+
+
+def test_a_crashing_child_is_a_render_failure_and_recovers(guard: None) -> None:
+    assert sr.sanitize_html(b"<p>x</p>", resolve=keep_all) == "<p>x</p>"
+    proc = sr._WORKER._proc
+    assert proc is not None
+    proc.kill()
+    proc.wait()
+    assert sr.sanitize_html(b"<p>y</p>", resolve=keep_all) == "<p>y</p>"  # noticed dead, respawned
+
+
+def test_concurrent_good_and_hostile_inputs(monkeypatch: pytest.MonkeyPatch, guard: None) -> None:
+    monkeypatch.setattr(sr, "SANITIZE_DEADLINE_SECONDS", 0.4)
+    sr.clear_sanitize_caches()
+    results: dict[int, object] = {}
+
+    def work(i: int) -> None:
+        payload = (b"<div>" * 9_000 + str(i).encode()) if i % 2 else f"<p>good {i}</p>".encode()
+        try:
+            results[i] = sr.sanitize_html(payload, resolve=keep_all)
+        except (sr.RenderFailed, sr.RenderBusy) as exc:
+            results[i] = exc
+
+    start = time.monotonic()
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert time.monotonic() - start < 30
+    for i in range(0, 8, 2):  # a good input may only lose a race for a slot, never be wrong
+        assert results[i] == f"<p>good {i}</p>" or isinstance(results[i], sr.RenderBusy)
+    assert sum(results[i] == f"<p>good {i}</p>" for i in range(0, 8, 2)) >= 1
+    monkeypatch.setattr(sr, "SANITIZE_DEADLINE_SECONDS", 3.0)
+    sr.clear_sanitize_caches()
+    assert sr.sanitize_html(b"<p>after</p>", resolve=keep_all) == "<p>after</p>"
+
+
+def test_busy_when_too_many_are_waiting(monkeypatch: pytest.MonkeyPatch, guard: None) -> None:
+    sem = sr._WORKER._pending
+    held = [sem.acquire(blocking=False) for _ in range(sr.MAX_PENDING_RENDERS)]
+    try:
+        assert all(held)
+        with pytest.raises(sr.RenderBusy):
+            sr.sanitize_html(b"<p>x</p>", resolve=keep_all)
+    finally:
+        for _ in held:
+            sem.release()
+    assert sr.sanitize_html(b"<p>x</p>", resolve=keep_all) == "<p>x</p>"
+
+
+def test_success_cache_needs_a_cache_key_and_honours_it(guard: None) -> None:
+    sr.clear_sanitize_caches()
+    calls: list[str] = []
+
+    def counting(context: str, url: str) -> str | None:
+        calls.append(url)
+        return url
+
+    data = b'<a href="https://example.org/x">t</a>'
+    first = sr.sanitize_html(data, resolve=counting, cache_key=("n", 1))
+    assert calls == ["https://example.org/x"]
+    assert sr.sanitize_html(data, resolve=counting, cache_key=("n", 1)) == first
+    assert calls == ["https://example.org/x"]  # served from the cache
+    sr.sanitize_html(data, resolve=counting, cache_key=("n", 2))
+    assert len(calls) == 2  # a different key re-renders
+    sr.sanitize_html(data, resolve=counting)
+    sr.sanitize_html(data, resolve=counting)
+    assert len(calls) == 4  # no key, no caching
+
+
+def test_oversized_frames_and_garbage_are_failures() -> None:
+    assert sr.MAX_FRAME >= sr.MAX_RENDER_OUTPUT
+
+
+def test_child_module_imports_only_nh3_and_stdlib() -> None:
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]);"
+        "from herdr_engineering.control_plane import share_render_worker;"
+        "bad = [m for m in sys.modules if m.startswith(('boto3','asyncpg','psycopg2','yaml','herdr_engineering.control_plane.share_'))];"
+        "print(sorted(bad))"
+    )
+    out = subprocess.run([sys.executable, "-I", "-c", code, _REPO], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "['herdr_engineering.control_plane.share_render_worker']"
