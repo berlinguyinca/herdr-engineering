@@ -51,8 +51,11 @@ path after ``/s/<token>/``                            methods        match
 ====================================================  =============  ================================================
 
 * ``v/<path>`` is the live view of a non-HTML file, built from our own template (``share_static/view.html``) under a
-  nonce CSP; it is sent without CORS. ``a/<path>`` is routed but answers the uniform 404 until the annotation view
-  lands (``a_view_pending`` in the events file).
+  nonce CSP; it is sent without CORS. ``a/<path>`` is the annotation view of ANY kind (``ANNOTATE_CSP``: per-response
+  nonce + ``strict-dynamic``, same-origin fetches only, no frames). HTML is sanitised in the isolated render child and
+  mounted in a declarative shadow root inside ``#herdr-viewport`` (``contain: paint``, ``overflow: clip``), so neither
+  its markup, ids nor styles reach our mode bar, panel, data node or the CSRF meta, which is delivered ONLY in this
+  page. It needs annotations enabled; otherwise the uniform 404.
 * The annotation POSTs are the only routes that read a body. A POST is refused (uniform 404, reason ``annotate_refused``)
   unless the session is valid and the share's allow-list still admits its email (``share_lab.still_admitted``: an email
   removed from ``allow_emails`` stops writing at once when the session's MAC'd admission basis is ``e``; a session
@@ -103,15 +106,18 @@ from .share_bundle import MAX_PROJECTION_BYTES, ShareBundleError, content_type_f
 from .share_lab import authorise, still_admitted
 from .share_render import (
     MAX_RENDER_INPUT,
+    RESOLVER_VERSION,
     RenderBusy,
     RenderCache,
     RenderFailed,
     RenderTooLarge,
     render_kind,
     render_text,
+    sanitize_html,
+    share_resolver,
     wrap_content,
 )
-from .share_session import MIN_SECRET_BYTES, check_csrf, check_session, mint_session
+from .share_session import MIN_SECRET_BYTES, check_csrf, check_session, csrf_token, mint_session
 
 log = logging.getLogger("herdr.share_public")
 
@@ -154,7 +160,7 @@ _RANGE_SPEC = re.compile(r"(\d{0,19})-(\d{0,19})")
 _SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,768}")
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,6}")
-_VIEW_PLACEHOLDER = re.compile(r"\{\{(NONCE|MODE|CSRF_META|SWITCH|DATA_JSON|CONTENT)\}\}")
+_VIEW_PLACEHOLDER = re.compile(r"\{\{(NONCE|MODE|CSRF_META|SWITCH|DATA_JSON|PANEL|CONTENT)\}\}")
 
 _CSP_TEMPLATE = ("sandbox allow-scripts allow-downloads; default-src {self}; script-src {self} 'unsafe-inline' "
                  "'wasm-unsafe-eval'; style-src {self} 'unsafe-inline'; img-src {self} data: blob:; font-src {self} data:; "
@@ -169,6 +175,16 @@ VIEW_CSP = ("default-src 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; st
             "font-src {origin}/s/{token}/ {origin}/s/static/ data:; connect-src {origin}/s/{token}/; "
             "worker-src {origin}/s/static/vendor/pdfjs/; frame-src 'none'; child-src 'none'; object-src 'none'; "
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+# The annotation view. Sanitised content lives in a shadow root of THIS document, so its <style> elements and style
+# attributes are governed by the page policy: 'unsafe-inline' is allowed for those two directives and nowhere else
+# (script-src has neither it nor 'self'; a style cannot run code). Every remote origin stays out of style-src-elem, so an
+# @import of a remote sheet cannot load. Fetches (images, fonts, XHR, the pdf.js worker) are same-origin only.
+ANNOTATE_CSP = ("default-src 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; style-src 'self'; "
+                "style-src-elem 'self' 'unsafe-inline'; style-src-attr 'unsafe-inline'; img-src 'self' data:; "
+                "font-src 'self'; connect-src 'self'; worker-src 'self'; frame-src 'none'; child-src 'none'; "
+                "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+PDFJS_CONFIG = {"module": "/s/static/vendor/pdfjs/pdf.min.mjs", "worker": "/s/static/vendor/pdfjs/pdf.worker.min.mjs",
+                "options": {"isEvalSupported": False, "enableXfa": False}}
 MODE_SWITCH_TEMPLATE = (
     '<a data-herdr-mode-switch href="{href}" rel="noopener" style="position:fixed;right:12px;bottom:12px;'
     'z-index:2147483647;display:block;margin:0;padding:6px 12px;font:600 14px/1.4 system-ui,sans-serif;color:#fff;'
@@ -1092,8 +1108,10 @@ class ShareHandler(BaseHTTPRequestHandler):
             return None
         if route == "lab_view":
             if parts[5] == "v":
-                return self._live_view(state, parts, got)
-            return deny(self, state, "a_view_pending", got["identity"])     # the annotation view is not built yet
+                return self._view(state, parts, got, "live", lab)
+            if not enabled:
+                return deny(self, state, "annotations_disabled", got["identity"])
+            return self._view(state, parts, got, "annotate", lab)
         if not enabled:
             return deny(self, state, "annotations_disabled", got["identity"])
         if route == "annotations" and self.command == "GET":
@@ -1127,8 +1145,11 @@ class ShareHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(UNAVAILABLE_BODY)
 
-    def _live_view(self, state: ShareState, parts, got: dict):
-        """``v/<path>``: image, PDF, text and other kinds from our own template (HTML's live view is ``f/``)."""
+    def _view(self, state: ShareState, parts, got: dict, mode: str, lab: LabSettings):
+        """``v/<path>`` (live) and ``a/<path>`` (annotate): one template, our own markup around the static render.
+
+        ``v/`` of an HTML file is the 404 (its live view is ``f/``). ``a/`` serves every kind: HTML is sanitised in the
+        isolated render child, text is escaped, image / PDF / other kinds are built by ``annotate.js`` from the data."""
         server = self.server
         token = parts[2]
         origin = server.public_origin
@@ -1139,7 +1160,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         if origin is None or name is None or item is None:
             return deny(self, state, "not_in_bundle" if origin is not None else "invalid_state", actor)
         kind = render_kind(name)
-        if kind == "html":
+        if kind == "html" and mode == "live":
             return deny(self, state, "not_in_mode", actor)
         share_id = state["share_id"]
         opened = _open_beneath(Path(server.config.shares_root), [share_id, "files", *name.split("/")])
@@ -1150,60 +1171,93 @@ class ShareHandler(BaseHTTPRequestHandler):
             if st.st_size != item["size"]:
                 return deny(self, state, "size_mismatch", actor)
             content, shown = "", kind
-            if kind == "text":
+            if kind in ("text", "html"):
                 if item["size"] > MAX_RENDER_INPUT:
-                    content, shown = f'<p class="herdr-static-note">{html.escape(TOO_LARGE_NOTE)}</p>', "document"
+                    content, shown = self._too_large(), "document"
                 else:
                     data = _read_all(fd, item["size"])
                     if data is None or hashlib.sha256(data).hexdigest() != item["sha256"]:
                         return deny(self, state, "size_mismatch", actor)
                     try:
-                        content = server.render_cache.get(item["sha256"], "text\0" + name)
-                        if content is None:
-                            content = wrap_content("text", render_text(data))
-                            server.render_cache.put(item["sha256"], "text\0" + name, content)
+                        content = self._static_copy(kind, share_id, name, item["sha256"], data, index)
                     except RenderTooLarge:
-                        content, shown = f'<p class="herdr-static-note">{html.escape(TOO_LARGE_NOTE)}</p>', "document"
+                        content, shown = self._too_large(), "document"
                     except RenderBusy:
                         return self._unavailable()
                     except RenderFailed:
                         return deny(self, state, "render_failed", actor)
         finally:
             os.close(fd)
-        page = self._render_view(state, parts, got, name, shown, content, origin)
-        nonce, body = page
+        nonce, body = self._render_view(state, parts, got, name, shown, content, mode, lab)
+        csp = (ANNOTATE_CSP.format(nonce=nonce) if mode == "annotate"
+               else VIEW_CSP.format(origin=origin, token=token, nonce=nonce))
         headers = [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
-                   ("Content-Security-Policy", VIEW_CSP.format(origin=origin, token=token, nonce=nonce)),
+                   ("Content-Security-Policy", csp),
                    ("X-Frame-Options", "DENY"), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
                    ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex")]
+        if mode == "annotate":
+            headers += [("Cross-Origin-Opener-Policy", "same-origin"), ("Cross-Origin-Resource-Policy", "same-origin")]
         _send_headers(self, 200, headers, cors=False)
         if self.command == "GET" and name == state.get("entry"):
             try:
-                server.events.opened(share_id, actor, {"file": name[:200], "mode": "live"})
+                server.events.opened(share_id, actor, {"file": name[:200], "mode": mode})
             except Exception:
                 _log("event append failed")
         if self.command != "HEAD":
             self.wfile.write(body)
         return None
 
-    def _render_view(self, state: ShareState, parts, got: dict, name: str, kind: str, content: str,
-                     origin: str) -> tuple[str, bytes]:
+    @staticmethod
+    def _too_large() -> str:
+        return f'<p class="herdr-static-note">{html.escape(TOO_LARGE_NOTE)}</p>'
+
+    def _static_copy(self, kind: str, share_id: str, name: str, sha256: str, data: bytes, index: dict) -> str:
+        """The wrapped static render of ``data`` (raises ``RenderTooLarge`` / ``RenderBusy`` / ``RenderFailed``).
+
+        HTML: the sanitised output depends on the bytes, the file name and WHICH names the bundle holds (the resolver
+        drops links to absent files), so the cache key names all of them plus the share and the resolver version."""
+        if kind == "html":
+            fingerprint = hashlib.sha256("\0".join(sorted(index)).encode("utf-8")).hexdigest()
+            key = (share_id, name, sha256, RESOLVER_VERSION, fingerprint)
+            return wrap_content("html", sanitize_html(data, resolve=share_resolver(name, index), cache_key=key))
+        cache = self.server.render_cache
+        cached = cache.get(sha256, "text\0" + name)
+        if cached is None:
+            cached = wrap_content("text", render_text(data))
+            cache.put(sha256, "text\0" + name, cached)
+        return cached
+
+    def _render_view(self, state: ShareState, parts, got: dict, name: str, kind: str, content: str, mode: str,
+                     lab: LabSettings) -> tuple[str, bytes]:
         """``(nonce, page)``: ``view.html`` with each placeholder replaced once, in one pass (so no substituted value is
-        ever re-scanned) -- the content last in the document order is irrelevant for the same reason."""
+        ever re-scanned). Every value of ours is escaped or JSON-encoded; ``content`` is the only untrusted markup and
+        it is already sanitised and sits inside a shadow root."""
         server = self.server
         up = "../" * (name.count("/") + 1)
         quoted = quote(name, safe="/")
         nonce = secrets.token_urlsafe(NONCE_BYTES)
-        links = [f'<a data-mode="live" href="{html.escape(up + "v/" + quoted)}" aria-current="page">Live</a>']
+        annotate = mode == "annotate"
+        live_href = up + ("f/" if render_kind(name) == "html" else "v/") + quoted
+        links = [f'<a data-mode="live" href="{html.escape(live_href)}"' + ("" if annotate else ' aria-current="page"')
+                 + ">Live</a>"]
         if server.annotations_enabled:
-            links.append(f'<a data-mode="annotate" href="{html.escape(up + "a/" + quoted)}">Annotate</a>')
-        data = {"file": name, "kind": kind, "mode": "live", "entry": state["entry"], "expires_at": int(got["exp"]),
+            links.append(f'<a data-mode="annotate" href="{html.escape(up + "a/" + quoted)}"'
+                         + (' aria-current="page"' if annotate else "") + ">Annotate</a>")
+        data = {"file": name, "kind": kind, "mode": mode, "entry": state["entry"], "expires_at": int(got["exp"]),
                 "max_comment_chars": server.config.annotations["max_comment_chars"], "raw_href": up + "f/" + quoted}
+        if annotate and kind == "pdf":
+            data["pdfjs"] = PDFJS_CONFIG
         data_json = json.dumps(data, sort_keys=True, ensure_ascii=True)
         for ch, esc in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026")):
             data_json = data_json.replace(ch, esc)
+        csrf = ""
+        panel = ""
+        if annotate:
+            token = csrf_token(lab.secret, state["share_id"], parts[4])
+            csrf = f'<meta name="herdr-annotate-csrf" content="{html.escape(token)}">'
+            panel = '<aside data-annotate-panel aria-label="Annotations"></aside>'
         values = {
-            "NONCE": nonce, "MODE": "live", "CSRF_META": "",
+            "NONCE": nonce, "MODE": mode, "CSRF_META": csrf, "PANEL": panel,
             "SWITCH": '<nav data-mode-switch aria-label="View mode">' + "".join(links) + "</nav>",
             "DATA_JSON": f'<script type="application/json" id="herdr-view-data" nonce="{nonce}">{data_json}</script>',
             "CONTENT": content}
@@ -1462,7 +1516,7 @@ class ShareServer(ThreadingHTTPServer):
         text = (static / VIEW_FILE).read_text(encoding="utf-8") if (static / VIEW_FILE).is_file() else ""
         found = [m.group(1) for m in _VIEW_PLACEHOLDER.finditer(text)]
         if self.lab is not None and sorted(found) != sorted(["NONCE", "MODE", "CSRF_META", "SWITCH", "DATA_JSON",
-                                                              "CONTENT"]):
+                                                              "PANEL", "CONTENT"]):
             raise RuntimeError("share_static/view.html must hold each placeholder exactly once")
         return text
 

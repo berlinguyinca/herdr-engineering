@@ -327,11 +327,9 @@ def test_text_view_is_escaped_and_wrapped(lab):
     assert '<template shadowrootmode="open">' in page
 
 
-def test_html_has_no_live_view_and_a_is_pending(lab):
+def test_html_has_no_live_view(lab):
     ref = lab.request("GET", "/nothing-here")[2]
     assert v(lab, "index.html")[0] == 404 and v(lab, "index.html")[2] == ref
-    status, _, body = lab.request("GET", base(kind="a") + "notes.txt")
-    assert status == 404 and body == ref
 
 
 def test_view_csp_has_no_remote_style_origin_and_no_frames(lab):

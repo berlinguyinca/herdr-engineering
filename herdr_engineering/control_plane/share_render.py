@@ -68,6 +68,7 @@ from .share_render_worker import (
 )
 
 RENDER_VERSION = 1
+RESOLVER_VERSION = 2          # bump whenever ``share_resolver`` output changes for the same input (cache key part)
 MAX_RENDER_INPUT = 2 * 1024 * 1024
 MAX_RENDER_OUTPUT = 4 * 1024 * 1024
 STATIC_NOTE = "Scripts, frames and embedded media are not shown in this static copy"
@@ -113,8 +114,8 @@ def render_kind(name: str, media_type: str | None = None) -> str:
 
 def share_resolver(name: str, index: Collection[str]) -> Resolver:
     """The share host's URL rewriting for the annotation view of the file ``name`` (a name in ``index``)."""
-    depth = name.count("/")
-    up = "../" * depth
+    # the annotation view lives at ``.../a/<name>``: one step for the mode segment plus one per directory of ``name``
+    up = "../" * (name.count("/") + 1)
 
     def resolve(context: str, url: str) -> str | None:
         if context not in ("a", "img", "link", "css"):

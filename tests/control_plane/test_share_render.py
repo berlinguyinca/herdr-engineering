@@ -251,7 +251,7 @@ def test_unterminated_markup_is_balanced() -> None:
 def test_link_only_stylesheet_survives() -> None:
     res = sr.share_resolver("index.html", IDX)
     out = sr.sanitize_html(b'<link rel="stylesheet" href="img/p.png">', resolve=res)
-    assert 'rel="stylesheet"' in out and 'href="f/img/p.png"' in out
+    assert 'rel="stylesheet"' in out and 'href="../f/img/p.png"' in out
     out = sr.sanitize_html(b'<link rel="icon" href="img/p.png"><link rel=import href=x>', resolve=res)
     assert "rel" not in out  # a link with no stylesheet rel is inert; the per-attribute filter cannot also drop its href
     assert "<link>" in out
@@ -262,9 +262,9 @@ def test_link_only_stylesheet_survives() -> None:
 def test_share_resolver_links() -> None:
     res = sr.share_resolver("index.html", IDX)
     out = sr.sanitize_html(b'<a href="page2.html">p</a>', resolve=res)
-    assert 'href="a/page2.html"' in out
+    assert 'href="../a/page2.html"' in out
     out = sr.sanitize_html(b'<a href="page2.html#sec">p</a><a href="#top">t</a>', resolve=res)
-    assert 'href="a/page2.html#sec"' in out and 'href="#top"' in out
+    assert 'href="../a/page2.html#sec"' in out and 'href="#top"' in out
     out = sr.sanitize_html(b'<a href="missing.html">p</a>', resolve=res)
     assert "href" not in out
     out = sr.sanitize_html(b'<a href="https://example.org">e</a>', resolve=res)
@@ -277,9 +277,9 @@ def test_share_resolver_links() -> None:
 def test_share_resolver_nested_name() -> None:
     res = sr.share_resolver("sub/x.html", IDX)
     out = sr.sanitize_html(b'<a href="../index.html">i</a><img src="img/q.png"><img src="../img/p.png">', resolve=res)
-    assert 'href="../a/index.html"' in out
-    assert 'src="../f/sub/img/q.png"' in out
-    assert 'src="../f/img/p.png"' in out
+    assert 'href="../../a/index.html"' in out
+    assert 'src="../../f/sub/img/q.png"' in out
+    assert 'src="../../f/img/p.png"' in out
     out = sr.sanitize_html(b'<a href="../../index.html">i</a><a href="../../../etc/passwd">j</a>', resolve=res)
     assert "href" not in out
 
@@ -287,7 +287,7 @@ def test_share_resolver_nested_name() -> None:
 def test_share_resolver_images() -> None:
     res = sr.share_resolver("index.html", IDX)
     out = sr.sanitize_html(b'<img src="img/p.png">', resolve=res)
-    assert 'src="f/img/p.png"' in out
+    assert 'src="../f/img/p.png"' in out
     out = sr.sanitize_html(b'<img src="data:image/svg+xml;base64,PHN2Zz4=">', resolve=res)
     assert "src" not in out
     out = sr.sanitize_html(b'<img src="data:image/png;base64,iVBORw0KGgo=">', resolve=res)
@@ -302,12 +302,12 @@ def test_share_resolver_direct_cases() -> None:
     assert res("a", "vbscript:x") is None
     assert res("a", "//evil/x") is None
     assert res("a", "data:text/html,x") is None
-    assert res("a", "page2.html?x=1") == "a/page2.html"
+    assert res("a", "page2.html?x=1") == "../a/page2.html"
     assert res("a", "") is None
-    assert res("a", "pa\tge2.html") == "a/page2.html"
+    assert res("a", "pa\tge2.html") == "../a/page2.html"
     assert res("a", " JaVaScRiPt:1") is None
     assert res("a", "java\nscript:1") is None
-    assert res("css", "img/p.png") == "f/img/p.png"
+    assert res("css", "img/p.png") == "../f/img/p.png"
     assert res("css", "https://evil/x.png") is None
     assert res("link", "https://evil/x.css") is None
     assert res("img", "..\\index.html") is None
@@ -317,7 +317,7 @@ def test_share_resolver_direct_cases() -> None:
 def test_style_attribute_urls_are_rewritten() -> None:
     res = sr.share_resolver("index.html", IDX)
     out = sr.sanitize_html(b'<p style="color:red;background:url(img/p.png)">x</p>', resolve=res)
-    assert 'url(f/img/p.png)' in out or 'url("f/img/p.png")' in out
+    assert 'url(../f/img/p.png)' in out or 'url("../f/img/p.png")' in out
     assert "color:red" in out
     out = sr.sanitize_html(b"<p style=\"background:url('img/p.png') no-repeat\">x</p>", resolve=res)
     assert "f/img/p.png" in out
