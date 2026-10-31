@@ -12,11 +12,11 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..assistant import AssistantError
-from .events import record_event
+from .events import EVENTS_PER_WORKER_PER_MINUTE, RateLimiter, record_event
 from .workers import Worker, WorkerAuthError
 
 if TYPE_CHECKING:
@@ -44,6 +44,9 @@ class Hub:
     registry: WorkerRegistry
     service: AssistantService
     store: AssistantStore
+    # Per-worker cap on event-writing paths (MCP ask/report and hook-events); each event persists a full snapshot.
+    event_limiter: RateLimiter = field(default_factory=RateLimiter)
+    event_rate_limit: int = EVENTS_PER_WORKER_PER_MINUTE
 
 
 class _ToolError(Exception):
@@ -124,6 +127,16 @@ def _limit(args: dict) -> int:
     return v
 
 
+def _record(hub: Hub, worker: Worker, **kwargs: Any):
+    """Rate-limit then record; record_event's own validation messages are ours and safe to show."""
+    if not hub.event_limiter.allow(worker.worker_id, hub.event_rate_limit):
+        raise _ToolError("rate limited")
+    try:
+        return record_event(hub.store, worker, **kwargs)
+    except ValueError as exc:
+        raise _ToolError(str(exc)) from exc
+
+
 def _ask(hub: Hub, worker: Worker, args: dict) -> dict:
     _check_args(args, {"question", "options", "context", "action", "session_id"})
     payload: dict[str, Any] = {"question": _req_str(args, "question")}
@@ -139,7 +152,7 @@ def _ask(hub: Hub, worker: Worker, args: dict) -> dict:
         if not isinstance(action, dict):
             raise _ToolError("action must be an object")
         payload["action"] = action
-    event = record_event(hub.store, worker, kind="ask", provenance="worker_reported",
+    event = _record(hub, worker, kind="ask", provenance="worker_reported",
                          session_id=_req_str(args, "session_id"), payload=payload)
     return _text({"status": "no_decision", "mode": "shadow", "event_id": event.event_id})
 
@@ -158,7 +171,7 @@ def _report(hub: Hub, worker: Worker, args: dict) -> dict:
             raise _ToolError("payload must be an object")
         payload["payload"] = extra
     # Provenance is fixed here and is not part of the tool schema: whatever the caller claims is only stored data.
-    event = record_event(hub.store, worker, kind="report", provenance="worker_reported",
+    event = _record(hub, worker, kind="report", provenance="worker_reported",
                          session_id=_req_str(args, "session_id"), payload=payload)
     return _text({"status": "recorded", "event_id": event.event_id})
 
@@ -237,8 +250,6 @@ def _call(hub: Hub, worker: Worker, name: str, args: dict) -> dict:
             raise _ToolError("assistant is not enabled")
         return run(hub, worker, args)
     except _ToolError as exc:
-        return _text({"error": str(exc)}, is_error=True)
-    except ValueError as exc:  # record_event / scrubbing validation
         return _text({"error": str(exc)}, is_error=True)
     except AssistantError as exc:
         log.warning("assistant hub tool %s failed (%s)", name, type(exc).__name__)

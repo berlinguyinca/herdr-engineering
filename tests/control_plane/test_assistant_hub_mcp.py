@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from herdr_engineering.control_plane.assistant import (
     AssistantApproval,
     AssistantService,
+    AssistantStore,
     assistant_config,
 )
 from herdr_engineering.control_plane.assistant_hub.events import list_events
@@ -311,3 +312,56 @@ def test_read_output_is_capped_at_64kib():
     assert len(json.dumps(out).encode()) <= 64 * 1024
     small = body_of(call(hub, enrol(hub, device="d2"), "connectors_list", {"limit": 2}))
     assert "truncated" not in small or small["truncated"] is False
+
+
+class ExplodingStore(AssistantStore):
+    def list_grants(self, **kwargs):
+        raise RuntimeError("/secret/path")
+
+
+class ValueErrorStore(AssistantStore):
+    def list_grants(self, **kwargs):
+        raise ValueError("internal detail /secret/path")
+
+
+def make_hub_with_store(store):
+    cfg = assistant_config({"personal_assistant": {"enabled": True}})
+    svc = AssistantService(config=cfg, store=store)
+    reg = WorkerRegistry(store, enrollment_ttl=timedelta(minutes=10), worker_ttl=timedelta(days=30),
+                         now=lambda: datetime(2026, 10, 30, 12, 0, tzinfo=UTC))
+    return Hub(registry=reg, service=svc, store=store)
+
+
+def test_unexpected_exception_yields_generic_tool_error_without_leak():
+    hub = make_hub_with_store(ExplodingStore())
+    res = call(hub, enrol(hub), "grants_list")
+    assert res["isError"] is True
+    assert json.loads(res["content"][0]["text"]) == {"error": "tool failed"}
+    assert "secret" not in res["content"][0]["text"]
+
+
+def test_value_error_from_a_list_handler_is_generic_not_echoed():
+    hub = make_hub_with_store(ValueErrorStore())
+    res = call(hub, enrol(hub), "grants_list")
+    assert res["isError"] is True
+    assert json.loads(res["content"][0]["text"]) == {"error": "tool failed"}
+    assert "secret" not in res["content"][0]["text"]
+
+
+def test_record_event_validation_message_is_still_echoed():
+    hub = make_hub()
+    res = call(hub, enrol(hub), "assistant_ask", {"question": "x" * 10000, "session_id": "s"})
+    assert res["isError"] is True and json.loads(res["content"][0]["text"])["error"] != "tool failed"
+
+
+def test_per_worker_event_rate_limit_applies_to_ask_and_report_only_for_that_worker():
+    hub = make_hub()
+    busy, calm = enrol(hub, device="d1"), enrol(hub, device="d2")
+    for i in range(30):
+        assert call(hub, busy, "assistant_ask", {"question": "q", "session_id": f"s{i}"})["isError"] is False
+    res = call(hub, busy, "report", {"kind": "outcome", "session_id": "s"})
+    assert res["isError"] is True and json.loads(res["content"][0]["text"]) == {"error": "rate limited"}
+    assert call(hub, busy, "assistant_ask", {"question": "q", "session_id": "s"})["isError"] is True
+    assert call(hub, calm, "assistant_ask", {"question": "q", "session_id": "s"})["isError"] is False
+    assert call(hub, busy, "grants_list")["isError"] is False   # reads are not event writes
+    assert len(list_events(hub.store, tenant_id="t1", user_id="u1", limit=500)) == 31

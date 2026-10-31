@@ -18,13 +18,12 @@ import json
 import logging
 import socket
 import threading
-import time
-from collections import OrderedDict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .events import record_event
+from .events import _MAX_TRACKED_PEERS, record_event
+from .events import RateLimiter as _RateLimiter
 from .mcp import Hub
 from .mcp import handle as mcp_handle
 from .netguard import bind_allowed, host_header_allowed, parse_networks, peer_allowed
@@ -35,42 +34,12 @@ log = logging.getLogger(__name__)
 ROUTE_MCP, ROUTE_ENROLL, ROUTE_HOOK = "/assistant/mcp", "/assistant/enroll", "/assistant/hook-events"
 _ROUTES = frozenset({ROUTE_MCP, ROUTE_ENROLL, ROUTE_HOOK})
 _MAX_CODE, _MAX_DEVICE = 256, 128
-_RATE_WINDOW = 60.0
-_MAX_TRACKED_PEERS = 4096
 _SOCKET_TIMEOUT = 10
 _MAX_CONNECTIONS = 64
 
 _ERRORS = {400: "bad request", 401: "unauthorized", 403: "forbidden", 404: "not found", 405: "method not allowed",
            413: "request body size not allowed", 415: "application/json required", 429: "too many requests",
            500: "internal", 503: "unavailable"}
-
-
-class _RateLimiter:
-    """Sliding-window counter per key (thread-safe). Memory is bounded: keys are kept in least-recently-used order, and
-    at the cap the oldest key is dropped (O(1)); an evicted peer simply starts a fresh window."""
-
-    def __init__(self, window: float = _RATE_WINDOW, max_keys: int = _MAX_TRACKED_PEERS) -> None:
-        self._window = window
-        self._max = max(1, max_keys)
-        self._hits: OrderedDict[Any, deque[float]] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def allow(self, key: Any, limit: int) -> bool:
-        now = time.monotonic()
-        with self._lock:
-            q = self._hits.get(key)
-            if q is None:
-                while len(self._hits) >= self._max:
-                    self._hits.popitem(last=False)
-                q = self._hits[key] = deque()
-            else:
-                self._hits.move_to_end(key)
-            while q and now - q[0] >= self._window:
-                q.popleft()
-            if len(q) >= limit:
-                return False
-            q.append(now)
-            return True
 
 
 class _Server(ThreadingHTTPServer):
@@ -383,15 +352,17 @@ def _make_handler(owner: HubServer) -> type[BaseHTTPRequestHandler]:
                               "device_id": worker.device_id, "expires_at": worker.expires_at.isoformat()})
 
         def _hook_events(self, message: Any) -> None:
-            if not owner.hub.service.is_enabled():
-                return self._reply(503)
-            try:
+            try:  # authenticate BEFORE anything that could reveal whether the assistant is enabled
                 worker = owner.hub.registry.authenticate(self.headers.get("Authorization", ""),
                                                          self.headers.get("X-Herdr-Device"))
             except WorkerAuthError:
                 return self._reply(401)
+            if not owner.hub.service.is_enabled():
+                return self._reply(503)
             if "report" not in worker.scopes:
                 return self._reply(403)
+            if not owner.hub.event_limiter.allow(worker.worker_id, owner.hub.event_rate_limit):
+                return self._reply(429, extra={"Retry-After": "60"})
             invalid = {"error": "invalid event"}
             if not isinstance(message, dict) or message.get("kind") != "observation":
                 return self._reply(400, invalid)

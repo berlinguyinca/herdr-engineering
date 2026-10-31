@@ -10,7 +10,10 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import threading
+import time
 import unicodedata
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -31,6 +34,9 @@ _TOKEN_RE = re.compile(
     r"|hca_[A-Za-z0-9_-]{10,}|Bearer\s+\S{8,}|Worker\s+\S{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", re.IGNORECASE)
 _ZERO_WIDTH_RE = re.compile("[\u200b-\u200d\u2060\ufeff]")
 MAX_DEPTH = 32
+_RATE_WINDOW = 60.0
+_MAX_TRACKED_PEERS = 4096
+EVENTS_PER_WORKER_PER_MINUTE = 30
 
 
 @dataclass
@@ -131,3 +137,31 @@ def list_events(store: AssistantStore, *, tenant_id: str, user_id: str, worker_i
                 if e.tenant_id == tenant_id and e.user_id == user_id
                 and (worker_id is None or e.worker_id == worker_id) and (kind is None or e.kind == kind)]
     return rows[:limit]
+
+
+class RateLimiter:
+    """Sliding-window counter per key (thread-safe). Memory is bounded: keys are kept in least-recently-used order, and
+    at the cap the oldest key is dropped (O(1)); an evicted peer simply starts a fresh window."""
+
+    def __init__(self, window: float = _RATE_WINDOW, max_keys: int = _MAX_TRACKED_PEERS) -> None:
+        self._window = window
+        self._max = max(1, max_keys)
+        self._hits: OrderedDict[Any, deque[float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def allow(self, key: Any, limit: int) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            q = self._hits.get(key)
+            if q is None:
+                while len(self._hits) >= self._max:
+                    self._hits.popitem(last=False)
+                q = self._hits[key] = deque()
+            else:
+                self._hits.move_to_end(key)
+            while q and now - q[0] >= self._window:
+                q.popleft()
+            if len(q) >= limit:
+                return False
+            q.append(now)
+            return True

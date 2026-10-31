@@ -274,9 +274,23 @@ def test_hook_events_validation_auth_scope_and_gate(started):
                      {"session_id": "s", "kind": "observation", "payload": {}}, headers=auth)
     assert st == 403
     hub2, srv2 = started(make_hub(enabled=False))
-    st, _, _ = jpost(srv2.port, "/assistant/hook-events",
-                     {"session_id": "s", "kind": "observation", "payload": {}}, headers=auth)
-    assert st == 503
+    creds2, _ = enrol(hub2, srv2.port)
+    auth2 = {"Authorization": f"Worker {creds2['credential']}", "X-Herdr-Device": "dev1"}
+    good = {"session_id": "s", "kind": "observation", "payload": {}}
+    # unauthenticated peers get 401 even when the assistant is disabled: enablement is never revealed to them
+    for headers in ({}, {**auth2, "X-Herdr-Device": "zzz"}, {"Authorization": "Worker hcw_nope", "X-Herdr-Device": "d"}):
+        assert jpost(srv2.port, "/assistant/hook-events", good, headers=headers)[0] == 401
+    assert jpost(srv2.port, "/assistant/hook-events", good, headers=auth2)[0] == 503
+
+
+def test_hook_events_per_worker_rate_limit_429(started):
+    hub, srv = started()
+    creds, _ = enrol(hub, srv.port)
+    auth = {"Authorization": f"Worker {creds['credential']}", "X-Herdr-Device": "dev1"}
+    good = {"session_id": "s", "kind": "observation", "payload": {}}
+    statuses = [jpost(srv.port, "/assistant/hook-events", good, headers=auth)[0] for _ in range(32)]
+    assert statuses == [200] * 30 + [429] * 2
+    assert len(list_events(hub.store, tenant_id="default", user_id="u1", limit=500)) == 30
 
 
 def test_rate_limit_429_before_auth_work(started):
@@ -287,7 +301,7 @@ def test_rate_limit_429_before_auth_work(started):
     statuses = [jpost(srv.port, "/assistant/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"},
                       headers=wrong)[0] for _ in range(12)]
     assert statuses[:5] == [401] * 5 and statuses[5:] == [429] * 7
-    assert len(hub.store.audit) == before + 5          # failed-auth audit cannot be flooded past the limit
+    assert len(hub.store.audit) == before + 1          # failed-auth audit is coalesced per worker and reason
     # enroll has its own, smaller bucket
     codes = [jpost(srv.port, "/assistant/enroll", {"code": "x", "device_id": "d"})[0] for _ in range(4)]
     assert codes == [401, 429, 429, 429]
