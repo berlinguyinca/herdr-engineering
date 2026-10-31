@@ -206,3 +206,89 @@ def test_new_scope_for_confirmed_verb_lowers_requirement():
         state=GrantState.ACTIVE, activated_at=T0, confirmed_by="", created_at=T0))
     _fill(s2, new, 3)
     assert _propose(s2, cfg, new) is None
+
+
+def _stale_setup(**grant_over):
+    store, cfg, k = AssistantStore(), _cfg(), _key()
+    _fill(store, k, 10)                                   # evidence at T0 .. T0+9min
+    g = _propose(store, cfg, k)
+    for name, value in grant_over.items():
+        setattr(g, name, value)
+    store.put_action_grant(g)
+    return store, cfg, k, g
+
+
+def _fresh(store, k, base_minutes: int) -> None:
+    for i in range(10):
+        store.add_action_evidence(_ev(200 + i, k, f"s{i % 3}", f"t{i % 2}", minutes=base_minutes + i))
+
+
+def test_proposed_past_expiry_needs_evidence_newer_than_expiry():
+    store, cfg, k, g = _stale_setup()
+    later = g.expires_at + timedelta(days=1)
+    assert _propose(store, cfg, k, now=later) is None
+    _fresh(store, k, int((g.expires_at - T0).total_seconds() // 60) + 5)
+    g2 = _propose(store, cfg, k, now=later)
+    assert g2 is not None and g2.grant_id != g.grant_id and g2.state is GrantState.PROPOSED
+    assert store.get_action_grant(g.grant_id, tenant_id=T, user_id=U).state is GrantState.PROPOSED   # untouched
+
+
+def test_active_grant_after_expiry_needs_newer_evidence():
+    store, cfg, k, g = _stale_setup(state=GrantState.ACTIVE, activated_at=LATE, confirmed_by="o")
+    later = g.expires_at + timedelta(days=1)
+    assert _propose(store, cfg, k, now=later) is None
+
+
+def test_policy_bump_proposed_needs_evidence_newer_than_proposed_at():
+    store, _, k, g = _stale_setup()
+    bumped = _cfg(policy_version=2)
+    assert _propose(store, bumped, k) is None             # no newer evidence
+    _fresh(store, k, 60 * 24 * 61)                        # after proposed_at (LATE = +60d)
+    g2 = _propose(store, bumped, k, now=LATE + timedelta(days=2))
+    assert g2 is not None and g2.grant_id != g.grant_id and g2.policy_version == 2
+
+
+def test_policy_bump_active_uses_activated_at_floor():
+    act = LATE + timedelta(days=3)
+    store, _, k, g = _stale_setup(state=GrantState.ACTIVE, activated_at=act, confirmed_by="o")
+    bumped = _cfg(policy_version=2)
+    now = act + timedelta(days=2)
+    _fresh(store, k, 60 * 24 * 61)                        # newer than proposed_at, older than activated_at
+    assert _propose(store, bumped, k, now=now) is None
+    _fresh(store, k, 60 * 24 * 64)
+    assert _propose(store, bumped, k, now=now) is not None
+
+
+def test_live_grant_wins_over_revoked_regardless_of_store_order():
+    for live_first in (True, False):
+        store, cfg, k = AssistantStore(), _cfg(), _key()
+        _fill(store, k, 10)
+        live = _propose(store, cfg, k)
+        dead = ActionGrant(grant_id="ag_dead", tenant_id=T, user_id=U, worker_id=W, key_id=k.key_id(),
+                           verb="git.push", state=GrantState.REVOKED, revoked_at=T0 + timedelta(days=1),
+                           created_at=LATE + timedelta(days=1 if live_first else -1))
+        store.put_action_grant(dead)
+        assert _propose(store, cfg, k).grant_id == live.grant_id
+
+
+def test_floor_is_max_over_all_stale_grants():
+    store, cfg, k = AssistantStore(), _cfg(), _key()
+    _fill(store, k, 10)
+    for gid, days in (("ag_a", 5), ("ag_b", 40)):
+        store.put_action_grant(ActionGrant(
+            grant_id=gid, tenant_id=T, user_id=U, worker_id=W, key_id=k.key_id(), verb="git.push",
+            state=GrantState.REVOKED, revoked_at=T0 + timedelta(days=days), created_at=T0 + timedelta(days=days)))
+    store.add_action_evidence(_ev(300, k, "s9", "t9", minutes=60 * 24 * 10))
+    for i in range(9):
+        store.add_action_evidence(_ev(310 + i, k, f"s{i % 3}", f"t{i % 2}", minutes=60 * 24 * 10 + i))
+    assert _propose(store, cfg, k) is None                # all evidence predates the later revocation (day 40)
+
+
+def test_grant_cap_returns_none():
+    store, cfg, k = AssistantStore(), _cfg(), _key()
+    store.max_action_grants_per_tenant = 1
+    store.put_action_grant(ActionGrant(grant_id="other", tenant_id=T, user_id=U, worker_id="wx", key_id="zz",
+                                       state=GrantState.REVOKED, created_at=T0))
+    _fill(store, k, 10)
+    assert _propose(store, cfg, k) is None
+    assert len(store.list_action_grants(T, U)) == 1
