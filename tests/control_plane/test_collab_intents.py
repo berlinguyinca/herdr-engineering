@@ -691,7 +691,9 @@ def commit_payload(text="hello"):
     return {"base_version_id": "ver_1", "changes": [{"name": "a.md", "op": "put", "text": text}]}
 
 
-def test_received_intents_of_a_busy_lane_never_starve_another_agents_fresh_intent(registry_pg, tmp_path, registry):
+@pytest.mark.parametrize("budget", [1, 2])
+def test_received_intents_of_a_busy_lane_never_starve_another_agents_fresh_intent(registry_pg, tmp_path, registry,
+                                                                                  budget):
     register_x()
     release = None
 
@@ -711,14 +713,15 @@ def test_received_intents_of_a_busy_lane_never_starve_another_agents_fresh_inten
         queued = [env.intent(agent(a), payload={"n": 2}), env.intent(agent(a), payload={"n": 2})]
         for i, raw in enumerate(queued):
             os.utime(env.outbox / "intents" / f"{raw['ticket']}.json", (env.clock() - 50 + i, env.clock() - 50 + i))
-        await env.tick(wait=0.05)
+        for _ in range(-(-len(queued) // budget)):       # the queued intents take the budget once, to be received
+            await env.tick(wait=0.05)
         for raw in queued:
             assert (await ledger(env, raw["ticket"]))["outcome"] == "received"
         fresh = env.intent(agent(b), payload={"n": 3})   # newest mtime: last in an mtime-ordered budget
         await env.tick(wait=0.05)
         assert await ledger(env, fresh["ticket"]) is not None
         release.set()
-    run(registry_pg, tmp_path, body, max_per_tick=2)
+    run(registry_pg, tmp_path, body, max_per_tick=budget)
 
 
 def test_the_scan_has_its_own_connection_when_every_lane_holds_one(registry_pg, tmp_path, registry):
@@ -965,4 +968,163 @@ def test_stale_stray_files_in_intents_are_removed(registry_pg, tmp_path, registr
         os.utime(intents / "junk-link", (env.clock() - 7200, env.clock() - 7200), follow_symlinks=False)
         await env.tick()
         assert not stale.exists() and young.exists() and outside.read_text() == "keep"
+        assert (intents / "junk-link").is_symlink()
+    run(registry_pg, tmp_path, body)
+
+
+# ----------------------------------------------------------------------------- review round 2
+
+def test_a_fresh_intent_joins_its_lane_behind_older_received_ones(registry_pg, tmp_path, registry):
+    register_x()
+    release = None
+    calls = []
+
+    async def handler(ctx, intent):
+        calls.append(intent.payload["n"])
+        if intent.payload["n"] == 1:
+            await release.wait()
+        return {"result": "done"}
+
+    async def body(env):
+        nonlocal release
+        release = asyncio.Event()
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        env.intent(agent(a), payload={"n": 1}, age=40)
+        await env.tick(wait=0.05)
+        for i in range(2):
+            raw = env.intent(agent(a), payload={"n": 10 + i}, age=30 - i)
+            os.utime(env.outbox / "intents" / f"{raw['ticket']}.json", (env.clock() - 30 + i,) * 2)
+        await env.tick(wait=0.05)                          # 10 and 11 are received behind the busy lane
+        release.set()
+        await env.applier.drain(timeout=5)
+        env.intent(agent(a), payload={"n": 99})            # fresh: must run after 10 and 11
+        for _ in range(4):
+            await env.tick()
+        assert calls == [1, 10, 11, 99]
+    run(registry_pg, tmp_path, body, max_per_tick=2)
+
+
+def test_stale_strays_cannot_wedge_an_over_cap_intents_dir(registry_pg, tmp_path, registry):
+    from herdr_engineering.control_plane import collab_intents as ci
+    register_x()
+
+    async def handler(ctx, intent):
+        return {"result": "done"}
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        intents = env.outbox / "intents"
+        old = env.clock() - 7200
+        for i in range(ci.INTENTS_MIN_ENTRIES + 1):
+            path = intents / f".tmp-{i:05d}"
+            path.write_text("")
+            os.utime(path, (old, old))
+        raw = env.intent(agent(a))
+        for _ in range(3):
+            await env.tick()
+            if env.result(raw["ticket"]) is not None:
+                break
+        assert env.result(raw["ticket"])["result"] == "done"
+        assert sorted(p.name for p in intents.iterdir()) == []
+    run(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("ahead,rejected", [(60.0, False), (60.01, True)])
+def test_the_future_skew_boundary(registry_pg, tmp_path, registry, ahead, rejected):
+    register_x()
+
+    async def handler(ctx, intent):
+        return {"result": "done"}
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        raw = env.intent(agent(a), age=-ahead)
+        await env.tick()
+        doc = env.result(raw["ticket"])
+        assert (doc.get("reason") == "invalid submitted_at") is rejected
+        assert doc["result"] == ("rejected" if rejected else "done")
+    run(registry_pg, tmp_path, body, clock=Clock(1_000_000_000.0))
+
+
+def test_a_nan_inside_conflicts_is_an_internal_error_in_ledger_and_result(registry_pg, tmp_path, registry):
+    register_x()
+
+    async def handler(ctx, intent):
+        return {"result": "conflict", "conflicts": [{"name": "a.md", "kind": "x", "score": float("nan")}]}
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        raw = env.intent(agent(a))
+        await env.tick()
+        doc, row = env.result(raw["ticket"]), await ledger(env, raw["ticket"])
+        assert (doc["result"], doc["reason"]) == ("rejected", "internal error")
+        assert (row["outcome"], row["reason"]) == ("rejected", "internal error")
+    run(registry_pg, tmp_path, body)
+
+
+def test_lane_and_key_locks_are_released_after_the_lane_finishes(registry_pg, tmp_path, registry):
+    register_x()
+
+    async def handler(ctx, intent):
+        return {"result": "done"}
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        env.intent(agent(a), key="k1")
+        # a pool's release runs pg_advisory_unlock_all(); a plain connection does not, so the applier must unlock
+        lane, other = await asyncpg.connect(registry_pg["dsn"]), await asyncpg.connect(registry_pg["dsn"])
+        try:
+            await env.applier.tick(Dedicated(lane), scan_acquire=Dedicated(other), wait=5)
+            await env.applier.drain(timeout=5)
+            assert env.result(env_ticket(env))["result"] == "done"
+            for lock in (_LOCK_SALT + f"lane:agent:{a}", _LOCK_SALT + f"key:agent:{a}:x.test:k1"):
+                assert await other.fetchval("SELECT pg_try_advisory_lock(hashtextextended($1, 0))", lock)
+                await other.fetchval("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock)
+        finally:
+            await lane.close()
+            await other.close()
+    run(registry_pg, tmp_path, body)
+
+
+def env_ticket(env):
+    return next((env.mirror_root / "results").iterdir()).name[:-5]
+
+
+def test_a_received_intent_whose_file_vanished_is_forgotten(registry_pg, tmp_path, registry):
+    register_x()
+    release = None
+    calls = []
+
+    async def handler(ctx, intent):
+        calls.append(intent.payload["n"])
+        if intent.payload["n"] == 1:
+            await release.wait()
+        return {"result": "done"}
+
+    async def body(env):
+        nonlocal release
+        release = asyncio.Event()
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        env.intent(agent(a), payload={"n": 1}, age=1)
+        await env.tick(wait=0.05)
+        gone = env.intent(agent(a), payload={"n": 2})
+        await env.tick(wait=0.05)                          # received behind the busy lane
+        (env.outbox / "intents" / f"{gone['ticket']}.json").unlink()
+        await env.tick(wait=0.05)
+        release.set()
+        await env.applier.drain(timeout=5)
+        await env.tick()
+        assert calls == [1] and gone["ticket"] not in env.applier._received
     run(registry_pg, tmp_path, body)

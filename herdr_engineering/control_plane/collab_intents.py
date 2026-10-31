@@ -30,6 +30,10 @@ The handler returns ``{result, version_id?, reason?, attempt_id?, …}``; the ap
 ``results/<ticket>.json`` into the mirror with ``atomic_write_json`` and unlinks the intent with ``unlink_beneath``.
 Every outbox access is fd-relative and no-follow (``list_beneath``/``read_json_beneath``/``unlink_beneath``); all
 blocking file I/O runs in worker threads. Log lines carry only ticket, kind, actor, artifact and outcome.
+
+Wiring (Task 9): the scan must never wait for a lane's connection, or fresh intents stop being received while every
+lane is busy and then expire. Pass ``tick(..., scan_acquire=...)`` over a dedicated connection, or size the applier's
+pool to at least ``limits.apply_concurrency + 1``.
 """
 from __future__ import annotations
 
@@ -60,6 +64,7 @@ from .collab_bridge_files import (
     Intent,
     IntentError,
     _validate_actor,
+    _walk_dirs,
     atomic_write_json,
     ensure_dir,
     list_beneath,
@@ -81,7 +86,8 @@ INTENTS_MIN_ENTRIES = 4096
 INTENT_FUTURE_SKEW = 60.0
 # Stray regular files in intents/ (stale .tmp-* of an interrupted atomic write, junk) older than this are removed.
 STRAY_MAX_AGE = 3600.0
-STRAY_SWEEP_BATCH = 1000
+STRAY_SWEEP_BATCH = 10_000      # deletions per tick
+STRAY_SCAN_ENTRIES = 50_000     # entries one stray pass looks at (it streams; nothing is held in memory)
 # sweep_results deletes at most this many files per call (the results dir is the worker's own tree: no cap, no
 # fail-closed listing; an oversized backlog drains over successive calls).
 RESULTS_SWEEP_BATCH = 10_000
@@ -133,6 +139,10 @@ class _Job:
     intent: Intent
     spec: _Kind
     lane: str
+    mtime: float = 0.0
+
+    def order(self) -> tuple:
+        return (self.intent.submitted_at, self.mtime, self.intent.ticket)
 
 
 def _default_lane(intent: Intent, _agent: dict | None) -> str:
@@ -175,7 +185,7 @@ class CollabIntentApplier:
         self._kinds: dict[str, _Kind] = {}
         self._busy: dict[str, asyncio.Task] = {}
         self._inflight: set[str] = set()
-        self._received: dict[str, str] = {}      # ticket -> lane, for tickets received but not yet dispatched
+        self._received: dict[str, _Job] = {}     # received (ledger row written) but not yet finished
         self._feed: dict | None = None
         self._sem = asyncio.Semaphore(limits.apply_concurrency)
         self._counts = self._zero()
@@ -227,9 +237,10 @@ class CollabIntentApplier:
         received while every lane is busy and expire. Either pass ``scan_acquire`` over a dedicated connection, or
         size ``acquire``'s pool to at least ``apply_concurrency + 1``.
 
-        The per-tick budget (``max_per_tick``) goes first to files with no known ``received`` row (only they are on the
-        age clock), then to received tickets whose lane is free; received tickets of a busy lane are not rescanned.
-        Lanes started here are awaited for at most ``wait`` seconds; a longer one keeps running and its lane is
+        The per-tick scan budget (``max_per_tick``) goes only to files with no known ``received`` row (only they are on
+        the age clock). A received ticket is kept in memory and never rescanned: when its lane is free, the lane starts
+        with ALL of its received tickets, strictly oldest first (``submitted_at``, then mtime, then ticket), so a fresh
+        ticket always runs behind its lane's older ones. Lanes started here are awaited for at most ``wait`` seconds; a longer one keeps running and its lane is
         skipped by later ticks until it finishes (``drain`` awaits them all).
         """
         feed, listing = await asyncio.to_thread(self._load_outbox)
@@ -239,13 +250,10 @@ class CollabIntentApplier:
         mtimes = {name: st.st_mtime for name, st in listing
                   if stat.S_ISREG(st.st_mode) and _INTENT_FILE.match(name) and name[:-5] not in self._inflight}
         present = {name[:-5] for name in mtimes}
-        self._received = {t: lane for t, lane in self._received.items() if t in present or t in self._inflight}
+        self._received = {t: job for t, job in self._received.items() if t in present or t in self._inflight}
         fresh = sorted((n for n in mtimes if n[:-5] not in self._received), key=lambda n: (mtimes[n], n))
-        queued = sorted((n for n in mtimes if n[:-5] in self._received and self._received[n[:-5]] not in self._busy),
-                        key=lambda n: (mtimes[n], n))
-        names = (fresh + queued)[:self.max_per_tick]
+        names = fresh[:self.max_per_tick]
         raws = await asyncio.to_thread(self._read_intents, names) if names else {}
-        lanes: dict[str, list[_Job]] = {}
         async with (scan_acquire or acquire)() as conn:
             for name in names:
                 try:
@@ -256,13 +264,16 @@ class CollabIntentApplier:
                     log.error("collab intent %s: scan failed (%s)", name[:-5], type(exc).__name__)
                     continue
                 if job is not None:
-                    lanes.setdefault(job.lane, []).append(job)
+                    job.mtime = mtimes[name]
+                    if job.lane in self._busy:
+                        self._counts["skipped"] += 1
+        lanes: dict[str, list[_Job]] = {}
+        for ticket, job in self._received.items():
+            if ticket not in self._inflight and job.lane not in self._busy:
+                lanes.setdefault(job.lane, []).append(job)
         started = []
         for lane, jobs in lanes.items():
-            if lane in self._busy:
-                self._counts["skipped"] += len(jobs)
-                continue
-            jobs.sort(key=lambda j: (j.intent.submitted_at, j.intent.ticket))
+            jobs.sort(key=_Job.order)
             self._inflight.update(j.intent.ticket for j in jobs)
             task = asyncio.create_task(self._run_lane(lane, jobs, acquire))
             self._busy[lane] = task
@@ -288,6 +299,7 @@ class CollabIntentApplier:
             await asyncio.wait(tasks)
 
     def _load_outbox(self):
+        self._sweep_strays()
         feed = read_json_beneath(self.outbox, [AGENTS_FEED], max_bytes=AGENTS_FEED_MAX_BYTES)
         agents = feed.get("agents") if isinstance(feed, dict) else None
         cap = max(INTENTS_MIN_ENTRIES,
@@ -297,13 +309,40 @@ class CollabIntentApplier:
         except BridgeError:
             log.warning("collab intents: outbox intents dir has too many entries; tick skipped")
             return feed, None
-        if listing is not None:
-            cutoff = self.clock() - STRAY_MAX_AGE
-            strays = [name for name, st in listing
-                      if stat.S_ISREG(st.st_mode) and not _INTENT_FILE.match(name) and st.st_mtime < cutoff]
-            for name in strays[:STRAY_SWEEP_BATCH]:      # regular files only: a symlink is never followed or removed
-                unlink_beneath(self.outbox, [INTENTS_DIR], name)
         return feed, listing
+
+    def _sweep_strays(self) -> int:
+        """Remove stale stray regular files (``.tmp-*`` of an interrupted write, junk) from ``intents/``.
+
+        It runs before, and independently of, the capped listing, so strays alone can never wedge an over-cap dir:
+        a bounded streaming pass (``STRAY_SCAN_ENTRIES`` entries, ``STRAY_SWEEP_BATCH`` deletions) over the
+        no-follow-opened dir fd. A ticket-named file, a symlink, a directory or anything younger than
+        ``STRAY_MAX_AGE`` is never touched; ``unlinkat`` never follows a link.
+        """
+        dfd = _walk_dirs(self.outbox, [INTENTS_DIR])
+        if dfd is None:
+            return 0
+        cutoff, seen, removed = self.clock() - STRAY_MAX_AGE, 0, 0
+        try:
+            with os.scandir(dfd) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > STRAY_SCAN_ENTRIES or removed >= STRAY_SWEEP_BATCH:
+                        break
+                    if _INTENT_FILE.match(entry.name):
+                        continue
+                    try:
+                        st = os.stat(entry.name, dir_fd=dfd, follow_symlinks=False)
+                        if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                            os.unlink(entry.name, dir_fd=dfd)
+                            removed += 1
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        finally:
+            os.close(dfd)
+        return removed
 
     def _read_intents(self, names: list[str]) -> dict[str, dict | None]:
         return {n: read_json_beneath(self.outbox, [INTENTS_DIR, n], max_bytes=INTENT_MAX_BYTES) for n in names}
@@ -358,8 +397,9 @@ class CollabIntentApplier:
             log.error("collab intent %s: lane key failed (%s)", ticket, type(exc).__name__)
             await self._finish(conn, name, intent, {"result": "rejected", "reason": REASON_INTERNAL})
             return None
-        self._received[intent.ticket] = lane
-        return _Job(name, intent, spec, lane)
+        job = _Job(name, intent, spec, lane)
+        self._received[intent.ticket] = job
+        return job
 
     @staticmethod
     def _key(intent: Intent) -> str:
