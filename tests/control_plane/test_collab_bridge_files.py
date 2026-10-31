@@ -1133,3 +1133,61 @@ def test_stream_new_beneath_never_follows_a_planted_symlink(tmp_path):
             cbf.stream_new_beneath(root, bad, "f", _chunks(b"x"), max_bytes=10)
     with pytest.raises(BridgeError):
         cbf.stream_new_beneath(root, ["e"], "../f", _chunks(b"x"), max_bytes=10)
+
+
+def test_stream_new_beneath_completes_without_proc(tmp_path, monkeypatch):
+    real_link = os.link
+
+    def no_proc(src, dst, *a, **kw):
+        if isinstance(src, str) and src.startswith("/proc/self/fd/"):
+            raise FileNotFoundError(errno.ENOENT, "no /proc")
+        return real_link(src, dst, *a, **kw)
+    monkeypatch.setattr(cbf.os, "link", no_proc)
+    assert cbf.stream_new_beneath(tmp_path, ["x"], "f", _chunks(b"hel", b"lo"), max_bytes=10) is True
+    assert (tmp_path / "x" / "f").read_bytes() == b"hello"
+    assert os.listdir(tmp_path / "x") == ["f"]
+    assert stat.S_IMODE(os.stat(tmp_path / "x" / "f").st_mode) == 0o644
+    assert cbf.link_new_bytes(tmp_path / "x", "g", b"bytes") is True
+    assert (tmp_path / "x" / "g").read_bytes() == b"bytes"
+
+
+def test_file_exists_beneath_never_follows_a_symlink_to_an_existing_file(tmp_path):
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"real file")
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "f").symlink_to(outside)
+    assert not cbf.file_exists_beneath(tmp_path, ["d"], "f")
+    (tmp_path / "e").symlink_to(tmp_path / "d")
+    (tmp_path / "d" / "g").write_bytes(b"x")
+    assert cbf.file_exists_beneath(tmp_path, ["d"], "g")
+    assert not cbf.file_exists_beneath(tmp_path, ["e"], "g")
+
+
+def test_dir_helpers_repair_the_mode_of_existing_dirs(tmp_path):
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    os.chmod(tmp_path / "a", 0o700)
+    os.chmod(tmp_path / "a" / "b", 0o777)
+    cbf.make_dirs_beneath(tmp_path, ["a", "b"])
+    assert stat.S_IMODE(os.stat(tmp_path / "a").st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(tmp_path / "a" / "b").st_mode) == 0o755
+    (tmp_path / "c").mkdir()
+    os.chmod(tmp_path / "c", 0o700)
+    old = os.umask(0o077)
+    try:
+        cbf.ensure_dir(tmp_path / "c" / "d" / "e")
+    finally:
+        os.umask(old)
+    for d in ("c/d", "c/d/e"):
+        assert stat.S_IMODE(os.stat(tmp_path / d).st_mode) == 0o755, d
+    cbf.ensure_dir(tmp_path / "c")
+    assert stat.S_IMODE(os.stat(tmp_path / "c").st_mode) == 0o755
+
+
+def test_stream_new_beneath_never_counts_a_symlink_to_an_existing_file_as_present(tmp_path):
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"real file")
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "f").symlink_to(outside)
+    with pytest.raises(FileExistsError):
+        cbf.stream_new_beneath(tmp_path, ["d"], "f", _chunks(b"x"), max_bytes=10)
+    assert outside.read_bytes() == b"real file"

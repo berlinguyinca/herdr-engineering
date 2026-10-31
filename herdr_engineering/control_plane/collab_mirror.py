@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import stat
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -45,11 +46,13 @@ from pathlib import Path
 from .artifact_collab_store import CollabGrantStore
 from .artifact_merge import _is_text_like
 from .collab_bridge_files import (
+    DIR_MODE,
     MAX_MESSAGE,
     SHA_RE,
     BridgeError,
     BridgeLimits,
     atomic_write_json,
+    ensure_dir,
     file_exists_beneath,
     list_beneath,
     make_dirs_beneath,
@@ -68,7 +71,6 @@ BLOBS_DIR = "blobs"
 REPORT_READ_ONLY = "report artifacts are read-only for collaborators"
 RENDERED_READ_ONLY = "renderer-built artifacts are read-only for collaborators"
 BAD_BLOB_TTL = 600.0
-DIR_MODE = 0o755
 # The mirror is the worker's own tree (collab-public mounts it read-only), so these are fail-safe bounds on listings
 # and sweeps, not anti-abuse limits: no other writer can flood it.
 MIRROR_ENTRY_SLACK = 4096
@@ -99,19 +101,35 @@ def _epoch(value) -> float | None:
     return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
 
 
-def _ensure_root(root: Path) -> None:
-    """Create the (trusted) mirror root and missing parents with mode 0755 whatever the umask."""
-    missing = []
-    probe = root
-    while not probe.exists():
-        missing.append(probe)
-        probe = probe.parent
-    for d in reversed(missing):
-        try:
-            d.mkdir()
-        except FileExistsError:
-            continue
-        os.chmod(d, DIR_MODE)
+class _Tap:
+    """Iterates a RustFS stream counting bytes, without ever closing it: ``stream_new_beneath`` stops reading at a
+    validator or size refusal, and the mirror then decides (by draining the rest) whether the object is genuinely
+    non-text or corrupt. ``RustFSClient.iter_get`` verifies the digest only once fully read."""
+
+    def __init__(self, iterable):
+        self.inner = iter(iterable)
+        self.seen = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
+        chunk = next(self.inner)
+        self.seen += len(chunk)
+        return chunk
+
+    def drain(self, size: int) -> bool:
+        """Read the rest; True only when it ends cleanly (digest verified) at exactly ``size`` bytes."""
+        for _chunk in self:
+            if self.seen > size:
+                return False
+        return self.seen == size
+
+    def release(self) -> None:
+        """Close the underlying stream (deliberately not named ``close``: the writer would call it on refusal)."""
+        close = getattr(self.inner, "close", None)
+        if close is not None:
+            close()
 
 
 def _by_artifact(agents: dict) -> dict[str, dict]:
@@ -133,6 +151,8 @@ class CollabMirror:
         self._listed: dict[str, frozenset[str]] = {}   # version ids the last head.json written listed
         self._binary: set[str] = set()                 # content-addressed, so "not UTF-8" never expires
         self._bad: dict[str, float] = {}               # sha -> retry-after (epoch) for failed fetches
+        self._cache_lock = threading.Lock()            # _bad/_binary are touched from worker threads
+        self._grants_lock = asyncio.Lock()             # one publish at a time: a stale snapshot never lands last
         self._grants_body: dict | None = None
         self._grants_written_at: float | None = None
         self._grants_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="collab-grants")
@@ -149,8 +169,13 @@ class CollabMirror:
         left out, so ``artifacts_list`` stops showing them with the next write; they come from ``retracted`` (a set of
         artifact ids), else ``gate.artifact_retracted`` (the worker's pre-loaded ``ArtifactGraphGate``), else
         ``store.load_retractions()`` (``store`` may be None). Never takes an artifact lock; the file write runs on a
-        dedicated thread, never on the default executor the mirror's downloads use.
+        dedicated thread, never on the default executor the mirror's downloads use. Calls are serialized, so a
+        snapshot read earlier can never overwrite a newer ``grants.json``.
         """
+        async with self._grants_lock:
+            return await self._publish_grants(grants, store, heartbeat=heartbeat, gate=gate, retracted=retracted)
+
+    async def _publish_grants(self, grants, store, *, heartbeat: float, gate, retracted) -> GrantsPublish:
         rows = await grants.live_grants() if hasattr(grants, "live_grants") else list(grants)
         if retracted is not None:
             is_retracted = set(retracted).__contains__
@@ -179,7 +204,7 @@ class CollabMirror:
         doc = {"generated_at": now, **body}
 
         def write() -> None:
-            _ensure_root(self.root)
+            ensure_dir(self.root, mode=DIR_MODE)
             atomic_write_json(self.root, GRANTS_NAME, doc)
         await asyncio.get_running_loop().run_in_executor(self._grants_pool, write)
         self._grants_body, self._grants_written_at = body, now
@@ -216,9 +241,23 @@ class CollabMirror:
             listed = frozenset(v["version_id"] for v in doc["versions"])
             previous = self._listed.get(artifact_id)
             shrunk = previous is None or bool(previous - listed)
-            complete = await asyncio.to_thread(self._write, artifact_id, doc, candidates, prune_first=shrunk,
-                                               fetch=fetch)
+            # the thread cannot be stopped: on cancellation keep the lock until it is done, so a later refresh (for
+            # example the prune after a retraction) never races with this one's final head.json
+            work = asyncio.ensure_future(asyncio.to_thread(self._write, artifact_id, doc, candidates,
+                                                           prune_first=shrunk, fetch=fetch))
+            cancelled = False
+            while True:
+                try:
+                    complete = await asyncio.shield(work)
+                    break
+                except asyncio.CancelledError:
+                    if work.done():
+                        raise
+                    cancelled = True
             self._listed[artifact_id] = listed
+            if cancelled:
+                self._fingerprints.pop(artifact_id, None)
+                raise asyncio.CancelledError
             if fetch and complete:
                 self._fingerprints[artifact_id] = self._fingerprint(artifact, versions, gate)
             else:
@@ -267,10 +306,11 @@ class CollabMirror:
                 size = item.get("size_bytes")
                 size = size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None
                 media_type = item.get("media_type") if isinstance(item.get("media_type"), str) else None
+                binary = self._is_binary(sha)
                 f = {"name": item.get("name"), "size_bytes": size, "sha256": sha, "media_type": media_type,
-                     "text": sha not in self._binary and _is_text_like(item), "mirrored": False}
+                     "text": not binary and _is_text_like(item), "mirrored": False}
                 files.append(f)
-                if not in_window or not isinstance(sha, str) or not _SHA.match(sha) or sha in self._binary:
+                if not in_window or not isinstance(sha, str) or not _SHA.match(sha) or binary:
                     continue
                 if sha in chosen:
                     chosen[sha]["refs"].append(f)
@@ -321,62 +361,96 @@ class CollabMirror:
                 unlink_beneath(self.root, parts, name)
 
     def _bad_blob(self, sha: str) -> bool:
-        return self._bad.get(sha, 0.0) > self.clock()
+        with self._cache_lock:
+            return self._bad.get(sha, 0.0) > self.clock()
 
     def _remember_bad(self, sha: str) -> None:
         now = self.clock()
-        if len(self._bad) >= _CACHE_MAX:
-            self._bad = {k: v for k, v in self._bad.items() if v > now}
+        with self._cache_lock:
             if len(self._bad) >= _CACHE_MAX:
-                self._bad.clear()
-        self._bad[sha] = now + BAD_BLOB_TTL
+                self._bad = {k: v for k, v in self._bad.items() if v > now}
+                if len(self._bad) >= _CACHE_MAX:
+                    self._bad.clear()
+            self._bad[sha] = now + BAD_BLOB_TTL
+
+    def _remember_binary(self, sha: str) -> None:
+        with self._cache_lock:
+            if len(self._binary) >= _CACHE_MAX:
+                self._binary.clear()
+            self._binary.add(sha)
+
+    def _is_binary(self, sha) -> bool:
+        with self._cache_lock:
+            return sha in self._binary
+
+    def _fetch(self, artifact_id: str, parts: list[str], candidate: dict) -> bool | None:
+        """Download one candidate: True mirrored, False genuinely non-text (fully read, digest verified, right size),
+        None failed (transport, digest, wrong size; remembered for ``BAD_BLOB_TTL``)."""
+        sha, size = candidate["sha256"], candidate["size_bytes"]
+        key = candidate["storage_key"]
+        if isinstance(key, str) and _SHA.match(key):
+            key = f"sha256/{key[:2]}/{key[2:4]}/{key}"
+        tap = None
+        try:
+            tap = _Tap(self.rustfs.iter_get(key, sha))
+            if stream_new_beneath(self.root, parts, sha, tap, max_bytes=size, accept=utf8_accept()):
+                return True
+            if tap.seen <= size and tap.drain(size):
+                self._remember_binary(sha)
+                return False
+            reason = "size mismatch"
+        except Exception as exc:                            # noqa: BLE001 - RustFS/IntegrityError/OS: per blob
+            reason = type(exc).__name__
+        finally:
+            if tap is not None:
+                tap.release()
+        log.warning("collab mirror blob fetch failed artifact=%s sha256=%s error=%s", artifact_id, sha, reason)
+        self._remember_bad(sha)
+        return None
 
     def _write(self, artifact_id: str, doc: dict, candidates: list[dict], *, prune_first: bool,
                fetch: bool) -> bool:
-        """Blocking. Mark blobs already present, publish a pruned ``head.json`` first when versions left the listing
-        (or downloads are off), then download the rest within the artifact budget and publish again. True when no
-        download failed."""
+        """Blocking. When versions left the listing (or downloads are off), first publish a ``head.json`` marking only
+        blobs already present. Then walk the candidates once in priority order (head first, then older versions newest
+        first): a present blob that fits the artifact budget is kept, a missing one that fits is downloaded and
+        charged only once in place. Publish again. True when nothing is left to reconsider: no download failed and no
+        blob was skipped for budget while a lower-priority one was kept."""
         parts = [ARTIFACTS_DIR, artifact_id, BLOBS_DIR]
-        _ensure_root(self.root)
+        ensure_dir(self.root, mode=DIR_MODE)
         make_dirs_beneath(self.root, parts, dir_mode=DIR_MODE)
-        budget = self.limits.mirror_max_artifact_bytes
-        pending = []
-        for candidate in candidates:
-            if file_exists_beneath(self.root, parts, candidate["sha256"]) and candidate["size_bytes"] <= budget:
-                budget -= candidate["size_bytes"]
-                self._mark(candidate, True)
-            else:
-                pending.append(candidate)
         if prune_first or not fetch:
+            budget = self.limits.mirror_max_artifact_bytes
+            for candidate in candidates:
+                if candidate["size_bytes"] <= budget and file_exists_beneath(self.root, parts, candidate["sha256"]):
+                    budget -= candidate["size_bytes"]
+                    self._mark(candidate, True)
             self._publish_head(artifact_id, doc)
             if not fetch:
                 return True
-        complete = True
-        for candidate in pending:
+            for candidate in candidates:
+                for ref in candidate["refs"]:
+                    ref["mirrored"] = False
+        budget = self.limits.mirror_max_artifact_bytes
+        complete, skipped = True, False
+        for candidate in candidates:
             sha, size = candidate["sha256"], candidate["size_bytes"]
             if size > budget:
+                skipped = True
                 continue
-            if self._bad_blob(sha):
+            if file_exists_beneath(self.root, parts, sha):
+                ok = True
+            elif self._bad_blob(sha):
                 complete = False
                 continue
-            key = candidate["storage_key"]
-            if isinstance(key, str) and _SHA.match(key):
-                key = f"sha256/{key[:2]}/{key[2:4]}/{key}"
-            try:
-                ok = stream_new_beneath(self.root, parts, sha, self.rustfs.iter_get(key, sha), max_bytes=size,
-                                        accept=utf8_accept())
-            except Exception as exc:                        # noqa: BLE001 - RustFS/IntegrityError/OS: per blob
-                log.warning("collab mirror blob fetch failed artifact=%s sha256=%s error=%s", artifact_id, sha,
-                            type(exc).__name__)
-                self._remember_bad(sha)
-                complete = False
-                continue
-            if ok:
-                budget -= size                              # charged only once the bytes are in place
             else:
-                if len(self._binary) >= _CACHE_MAX:
-                    self._binary.clear()
-                self._binary.add(sha)
+                ok = self._fetch(artifact_id, parts, candidate)
+                if ok is None:
+                    complete = False
+                    continue
+            if ok:
+                budget -= size
+                complete = complete and not skipped
+            else:
                 for ref in candidate["refs"]:
                     ref["text"] = False
             self._mark(candidate, ok)
@@ -426,7 +500,7 @@ class CollabMirror:
         grants = grants if grants is not None else CollabGrantStore(store._conn)
         granted = sorted({g["artifact_id"] for g in await grants.live_grants()})
         out = {"refreshed": [], "removed": [], "failed": []}
-        due = []
+        due, prune_failed = [], set()
         for artifact_id in granted:
             try:
                 artifact = await store.get(artifact_id)
@@ -447,7 +521,7 @@ class CollabMirror:
                         out["removed"].append(artifact_id)
             except Exception:                                  # noqa: BLE001 - one artifact never stops the sync
                 log.exception("collab mirror prune failed artifact=%s", artifact_id)
-                out["failed"].append(artifact_id)
+                prune_failed.add(artifact_id)
         wanted = set(granted)
         try:
             entries = await asyncio.to_thread(
@@ -463,9 +537,12 @@ class CollabMirror:
             try:
                 doc = await self.refresh(store, artifact_id, gate=gate)
                 out["refreshed" if doc else "removed"].append(artifact_id)
+                prune_failed.discard(artifact_id)
             except Exception:                                  # noqa: BLE001 - one artifact never stops the sync
                 log.exception("collab mirror refresh failed artifact=%s", artifact_id)
                 out["failed"].append(artifact_id)
+                prune_failed.discard(artifact_id)
+        out["failed"].extend(sorted(prune_failed))             # pruned nor refreshed: still failed
         return out
 
     async def _remove_into(self, artifact_id: str, out: dict) -> None:

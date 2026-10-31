@@ -301,8 +301,22 @@ def _tmp_name() -> str:
     return ".tmp-" + secrets.token_hex(8)
 
 
-def _ensure_dir(path: Path) -> int:
-    """An fd on ``path`` (trusted: the writer's own tree), creating missing directories with mode 0755."""
+DIR_MODE = 0o755
+
+
+def _fix_dir_mode(dfd: int, mode: int) -> None:
+    """``fchmod`` the directory ``dfd`` to ``mode`` when its mode differs (the umask or an earlier run decided it).
+    A directory this process does not own is left as it is (``EPERM``)."""
+    if stat.S_IMODE(os.fstat(dfd).st_mode) != mode:
+        try:
+            os.fchmod(dfd, mode)
+        except PermissionError:
+            pass
+
+
+def _ensure_dir(path: Path, mode: int = DIR_MODE) -> int:
+    """An fd on ``path`` (trusted: the writer's own tree), creating missing directories; every directory created and
+    ``path`` itself end up with ``mode`` whatever the umask."""
     path = Path(path)
     missing = []
     probe = path
@@ -311,11 +325,22 @@ def _ensure_dir(path: Path) -> int:
         probe = probe.parent
     for d in reversed(missing):
         try:
-            d.mkdir()
+            d.mkdir(mode=0o700)
         except FileExistsError:
             continue
-        os.chmod(d, 0o755)
-    return _open_root(path)
+        os.chmod(d, mode)
+    dfd = _open_root(path)
+    try:
+        _fix_dir_mode(dfd, mode)
+    except BaseException:
+        os.close(dfd)
+        raise
+    return dfd
+
+
+def ensure_dir(path: Path, *, mode: int = DIR_MODE) -> None:
+    """Create the trusted directory ``path`` (and missing parents) with ``mode``, repairing ``path``'s own mode."""
+    os.close(_ensure_dir(path, mode))
 
 
 def _create_tmp(dfd: int, data: bytes, mode: int) -> str:
@@ -372,7 +397,7 @@ def _open_tmpfile(dfd: int) -> int:
     flag = getattr(os, "O_TMPFILE", None)
     if flag is None:
         raise OSError(errno.EOPNOTSUPP, "O_TMPFILE is not available")
-    return os.open(".", flag | os.O_WRONLY | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    return os.open(".", flag | os.O_RDWR | os.O_CLOEXEC, 0o600, dir_fd=dfd)   # RDWR: the no-/proc fallback re-reads it
 
 
 def _link_tmpfile(dfd: int, name: str, data: bytes, mode: int) -> bool | None:
@@ -443,24 +468,22 @@ def file_exists_beneath(root: Path, parts: list[str], name: str) -> bool:
 
 
 def _make_dirs_beneath(root: Path, parts: list[str], dir_mode: int) -> int:
-    """An fd on ``root/parts...``: every component is created with ``mkdirat`` if missing (then ``fchmod``-ed to
-    ``dir_mode``, so the umask never decides) and always opened ``O_DIRECTORY|O_NOFOLLOW`` from the previous fd.
+    """An fd on ``root/parts...``: every component is created with ``mkdirat`` if missing, ``fchmod``-ed to
+    ``dir_mode`` whenever its mode differs (so the umask never decides), and always opened ``O_DIRECTORY|O_NOFOLLOW`` from the previous fd.
     ``BridgeError`` for an unsafe component, ``OSError`` for a symlinked or non-directory one."""
     if not _safe_parts(parts):
         raise BridgeError("unsafe path component")
     dfd = _open_root(Path(root))
     try:
         for part in parts:
-            created = True
             try:
                 os.mkdir(part, 0o700, dir_fd=dfd)
             except FileExistsError:
-                created = False
+                pass
             nfd = _open_subdir(part, dfd)
             os.close(dfd)
             dfd = nfd
-            if created:
-                os.fchmod(dfd, dir_mode)
+            _fix_dir_mode(dfd, dir_mode)
     except BaseException:
         os.close(dfd)
         raise
@@ -1285,7 +1308,7 @@ def validate_commit_payload(payload: dict, limits: BridgeLimits) -> CommitPayloa
 register_intent_kind("commit", validate_commit_payload, actors=frozenset({"agent"}), requires_artifact=True)
 
 __all__ = [
-    "Actor", "agent_owner_key", "file_exists_beneath", "make_dirs_beneath", "stream_new_beneath", "utf8_accept", "atomic_write_bytes", "atomic_write_json", "AUDITED_MARKER", "BridgeError",
+    "Actor", "agent_owner_key", "DIR_MODE", "ensure_dir", "file_exists_beneath", "make_dirs_beneath", "stream_new_beneath", "utf8_accept", "atomic_write_bytes", "atomic_write_json", "AUDITED_MARKER", "BridgeError",
     "BridgeLimits", "Change", "Chunk", "CHUNK_BYTES", "CommitPayload", "ENTRY_SLACK", "FEED_MAX_AGE", "Intent",
     "INTENT_MAX_AGE", "IntentError", "link_new_bytes", "list_beneath", "list_parts", "MAX_CHUNK_INDEX",
     "MAX_MESSAGE", "max_parts_for", "MAX_TREE_DEPTH", "MCP_UPLOAD_MAX_BODY", "META_MAX_BYTES", "META_NAME",
