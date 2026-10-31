@@ -103,6 +103,19 @@ class ActionKey:
     def key_id(self) -> str:
         return hashlib.sha256(self.canonical().encode("utf-8")).hexdigest()
 
+    @classmethod
+    def from_canonical(cls, text: str) -> ActionKey:
+        """Rebuild a key from its canonical JSON; ValueError on anything malformed (enum values are validated)."""
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("canonical key is not valid JSON") from exc
+        fields = ("tool", "verb", "resource_scope", "target", "flag_class", "risk_class")
+        if not isinstance(data, dict) or set(data) != set(fields) or not all(isinstance(data[f], str) for f in fields):
+            raise ValueError("canonical key must hold exactly the six string fields")
+        return cls(data["tool"], Verb(data["verb"]), data["resource_scope"], data["target"],
+                   FlagClass(data["flag_class"]), RiskClass(data["risk_class"]))
+
 
 def STRICTER(a: ActionKey, b: ActionKey) -> ActionKey:  # noqa: N802 - policy-vocabulary name
     """Return the more restrictive key: higher risk class first, then more severe flag; ties keep ``a``."""

@@ -117,3 +117,42 @@ def test_action_key_is_immutable():
     k = key()
     with pytest.raises(dataclasses.FrozenInstanceError):
         k.target = "x"  # type: ignore[misc]
+
+
+# ---- ActionKey.from_canonical -------------------------------------------------------------------------------------
+
+import json as _json  # noqa: E402
+
+import pytest as _pytest  # noqa: E402
+
+
+def test_from_canonical_round_trips_the_canonical_form_and_key_id():
+    from herdr_engineering.control_plane.assistant_hub.verbs import (
+        VERB_RISK,
+        ActionKey,
+        FlagClass,
+        Verb,
+    )
+    key = ActionKey("Git", Verb.GIT_PUSH, "Acme/Repo", " origin main ", FlagClass.NONE, VERB_RISK[Verb.GIT_PUSH])
+    back = ActionKey.from_canonical(key.canonical())
+    assert back.canonical() == key.canonical()
+    assert back.key_id() == key.key_id()
+
+
+@_pytest.mark.parametrize("text", [
+    "not json", "[]", "{}",
+    _json.dumps({"tool": "git", "verb": "git.nope", "resource_scope": "", "target": "", "flag_class": "none",
+                 "risk_class": "outward"}),
+    _json.dumps({"tool": "git", "verb": "git.push", "resource_scope": "", "target": "", "flag_class": "bogus",
+                 "risk_class": "remote_reversible"}),
+    _json.dumps({"tool": "git", "verb": "git.push", "resource_scope": "", "target": "", "flag_class": "none",
+                 "risk_class": "local_reversible"}),
+    _json.dumps({"tool": "git", "verb": "git.push", "resource_scope": 3, "target": "", "flag_class": "none",
+                 "risk_class": "remote_reversible"}),
+    _json.dumps({"tool": "git", "verb": "git.push", "resource_scope": "", "target": "", "flag_class": "none",
+                 "risk_class": "remote_reversible", "extra": 1}),
+])
+def test_from_canonical_rejects_malformed_input(text):
+    from herdr_engineering.control_plane.assistant_hub.verbs import ActionKey
+    with _pytest.raises(ValueError):
+        ActionKey.from_canonical(text)
