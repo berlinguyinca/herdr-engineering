@@ -1,7 +1,11 @@
 import json
 from datetime import UTC, datetime, timedelta
 
-from herdr_engineering.control_plane.assistant import AssistantApproval, AssistantService, assistant_config
+from herdr_engineering.control_plane.assistant import (
+    AssistantApproval,
+    AssistantService,
+    assistant_config,
+)
 from herdr_engineering.control_plane.assistant_hub.events import list_events
 from herdr_engineering.control_plane.assistant_hub.mcp import UNTRUSTED, Hub, handle
 from herdr_engineering.control_plane.assistant_hub.workers import WorkerRegistry
