@@ -50,6 +50,7 @@ from . import rakazo_spaces as sp
 from . import rakazo_tickets as tickets
 from . import rakazo_vault as vault
 from .assistant import (
+    TOOL_CATALOG,
     ApprovalRequired,
     AssistantError,
     AssistantForbidden,
@@ -78,6 +79,10 @@ MAX_AUTH_BODY = 8_192
 MAX_STREAMS = 8
 MAX_SENDS = 4
 MAX_NONCES = 512
+# Tools a phone operator's bots get on first use (preauthorized=False: every sensitive one still needs an approval card).
+# send_email is deliberately absent. Override with control_plane.rakazo_bridge.default_tools; [] disables.
+DEFAULT_TOOLS = ("set_reminder", "list_reminders", "cancel_reminder", "search_email", "read_email", "list_calendar_events",
+                 "find_free_time", "create_email_draft", "create_calendar_event")
 MAX_BOTS = 20                        # assistants per account
 MAX_RUN_ROWS = 20
 MAX_ACTIVE_ROWS = 50
@@ -175,7 +180,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
-                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push"})
+                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push", "default_tools"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -201,6 +206,11 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
                 or not all(isinstance(v, str) and v for v in hindsight.values())):
             raise ValueError("control_plane.rakazo_bridge.hindsight must be {url, token_file, project, cache_dir} "
                              "(the herdr-memory service; the token stays in its file)")
+    tools = raw.get("default_tools", list(DEFAULT_TOOLS))
+    if (not isinstance(tools, list) or len(tools) > 50 or not all(isinstance(t, str) for t in tools)
+            or any(t not in TOOL_CATALOG for t in tools) or "send_email" in tools):
+        raise ValueError("control_plane.rakazo_bridge.default_tools must be a list of known assistant tool ids "
+                         "(never send_email)")
     ttl_days = bounded("token_ttl_days", 30, 1, 365)
     max_tokens = bounded("max_tokens", 5, 1, 50)
     proxies = raw.get("trusted_proxies", [])
@@ -239,7 +249,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff, link))
     return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
-            "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join),
+            "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join), "default_tools": tuple(dict.fromkeys(tools)),
             "cognito": cognito_cfg, "push": _push_config(raw.get("push"))}
 
 
@@ -705,6 +715,7 @@ class RakazoBridge:
             "spaceSettings/setOverride": self._space_set_override, "notifications/registerPush": self._register_push,
             "notifications/unregisterPush": self._unregister_push, "analytics/screen": self._ok,
         }
+        self.default_tools = tuple(config.get("default_tools", DEFAULT_TOOLS))
         self.auto_join_rooms = tuple(config.get("auto_join_rooms", ()))
         self.rooms = rooms.Rooms(self, BridgeError)
         self._procs.update(self.rooms.procs())
@@ -999,7 +1010,30 @@ class RakazoBridge:
     def _assistant(self, ctx: _Ctx, bot_id: Any):
         if not isinstance(bot_id, str) or not bot_id:
             raise BridgeError(400, "BAD_REQUEST", "Provide exactly one of botId or groupId.")
-        return self.svc.get_assistant(bot_id, tenant_id=ctx.tenant, user_id=ctx.user)
+        assistant = self.svc.get_assistant(bot_id, tenant_id=ctx.tenant, user_id=ctx.user)
+        self._ensure_default_grants(ctx, assistant)
+        return assistant
+
+    def _ensure_default_grants(self, ctx: _Ctx, assistant) -> None:
+        """Once per bot, give a real operator phone's assistant the default tools (never preauthorized, so sensitive tools
+        still need an approval card). The meta flag makes a later revoke stick; a tool that already has any grant record is
+        skipped. Never raises: chat must not break over this."""
+        try:
+            if not self.default_tools or ctx.account.role != "operator":
+                return
+            if self.canonical_person(ctx.tenant, ctx.user) != (ctx.tenant, OPEN_LISTENER_USER):
+                return
+            bot_id = assistant.assistant_id
+            if self.bots.meta(ctx, bot_id).get("default_tools_applied"):
+                return
+            have = {g.tool_id for g in self.svc.store.list_grants(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id)}
+            for tool in self.default_tools:
+                if tool in TOOL_CATALOG and tool != "send_email" and tool not in have:
+                    self.svc.grant_tool(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id, tool_id=tool,
+                                        scope="*", preauthorized=False)
+            self.bots._put_meta(ctx, bot_id, {"default_tools_applied": True})
+        except Exception:  # noqa: BLE001 - a grant failure must never break chat
+            log.warning("rakazo bridge: default tool grants failed")
 
     def _target(self, ctx: _Ctx, inp: dict[str, Any]):
         if inp.get("groupId"):
@@ -1184,6 +1218,7 @@ class RakazoBridge:
                 raise BridgeError(400, "BAD_REQUEST", f"This server allows at most {MAX_BOTS} bots per account.")
             assistant = self.svc.create_assistant(tenant_id=ctx.tenant, user_id=ctx.user, name=name.strip(),
                                                   instructions=text, enabled=True)
+        self._ensure_default_grants(ctx, assistant)
         return self._bot(ctx, assistant)
 
     def _threads_head(self, ctx, inp):
