@@ -181,3 +181,33 @@ def test_id_regex_and_error_code():
     assert not ANNOTATION_ID_RE.fullmatch("ann_" + "A" * 21)
     with pytest.raises(ValueError):
         AnnotationInputError("nonsense")
+
+
+def test_huge_int_region_values_refused_not_overflow():
+    huge = int("9" * 400)
+    img = {"kind": "image_region", "file": "a", "x": 0, "y": 0, "w": huge, "h": 0.5}
+    assert code(clean_anchor, img) == "bad_anchor"
+    pdf = {
+        "kind": "pdf_page",
+        "file": "a",
+        "page": 1,
+        "region": {"x": 0, "y": 0, "w": 1, "h": -huge},
+    }
+    assert code(clean_anchor, pdf) == "bad_anchor"
+    raw = (
+        '{"anchor":{"kind":"image_region","file":"a","x":0,"y":0,"w":'
+        + "9" * 400
+        + ',"h":1},"comment":"c"}'
+    ).encode()
+    assert code(parse_annotation_request, raw) == "bad_anchor"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("exact", "\x00"), ("prefix", "\ud800"), ("suffix", "a\rb"), ("exact", "\x1b")],
+)
+def test_anchor_text_control_chars_refused(field, value):
+    anchor = {"kind": "text_quote", "file": "a", "exact": "x", field: value}
+    assert code(clean_anchor, anchor) == "bad_chars"
+    pdf = {"kind": "pdf_page", "file": "a", "page": 1, "exact": "\x00"}
+    assert code(clean_anchor, pdf) == "bad_chars"

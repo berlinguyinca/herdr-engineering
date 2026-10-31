@@ -20,13 +20,13 @@ MAX_PAGE: Final = 100000
 ANCHOR_KINDS: Final = ("document", "text_quote", "pdf_page", "image_region")
 ANNOTATION_ID_RE: Final = re.compile(r"ann_[A-Za-z0-9_-]{22}")
 
-_CODES = frozenset({"bad_anchor", "bad_file", "empty", "too_long", "bad_chars", "bad_id"})
+_CODES: Final = frozenset({"bad_anchor", "bad_file", "empty", "too_long", "bad_chars", "bad_id"})
 _BOX = ("x", "y", "w", "h")
-_ALLOWED_KEYS: Final = {
-    "document": {"kind", "file"},
-    "text_quote": {"kind", "file", "exact", "prefix", "suffix"},
-    "pdf_page": {"kind", "file", "page", "exact", "region"},
-    "image_region": {"kind", "file", *_BOX},
+_ALLOWED_KEYS: Final[dict[str, frozenset[str]]] = {
+    "document": frozenset({"kind", "file"}),
+    "text_quote": frozenset({"kind", "file", "exact", "prefix", "suffix"}),
+    "pdf_page": frozenset({"kind", "file", "page", "exact", "region"}),
+    "image_region": frozenset({"kind", "file", *_BOX}),
 }
 
 
@@ -84,6 +84,8 @@ def _unit(raw: dict[str, object], key: str) -> float:
     value = raw.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise AnnotationInputError("bad_anchor", f"{key} must be a number")
+    if isinstance(value, int) and not 0 <= value <= 1:
+        raise AnnotationInputError("bad_anchor", f"{key} must be within [0, 1]")
     number = float(value)
     if not math.isfinite(number) or not 0.0 <= number <= 1.0:
         raise AnnotationInputError("bad_anchor", f"{key} must be within [0, 1]")
@@ -99,7 +101,7 @@ def _box(raw: object) -> dict[str, float]:
     return out
 
 
-def clean_anchor(value: object) -> dict:
+def clean_anchor(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise AnnotationInputError("bad_anchor", "anchor must be an object")
     kind = value.get("kind")
@@ -156,7 +158,9 @@ def _only_keys(doc: dict[str, object], allowed: set[str]) -> None:
         raise AnnotationInputError("bad_anchor", "unknown field in request")
 
 
-def parse_annotation_request(raw: bytes, *, max_chars: int = MAX_COMMENT_CHARS) -> tuple[dict, str]:
+def parse_annotation_request(
+    raw: bytes, *, max_chars: int = MAX_COMMENT_CHARS
+) -> tuple[dict[str, object], str]:
     doc = _load_object(raw)
     _only_keys(doc, {"anchor", "comment"})
     if "anchor" not in doc or "comment" not in doc:
