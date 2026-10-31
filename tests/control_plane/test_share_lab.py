@@ -74,14 +74,15 @@ def authenticator():
 # ----------------------------------------------------------------------------- sessions
 
 def test_session_round_trip_and_shape():
-    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
+    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
     assert re.fullmatch(r"[A-Za-z0-9_.-]+", s) and "/" not in s and len(s) <= 768
-    assert check_session(SECRET, "shr-1", s, NOW0) == {"identity": "alice", "exp": NOW0 + 100, "email": "alice@lab.example"}
+    assert check_session(SECRET, "shr-1", s, NOW0) == {"identity": "alice", "exp": NOW0 + 100, "email": "alice@lab.example",
+                                                         "basis": "e"}
     assert check_session(SECRET, "shr-1", s, NOW0 + 99.9) is not None
 
 
 def test_session_rejections():
-    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
+    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
     assert check_session(SECRET, "shr-2", s, NOW0) is None                       # another share
     assert check_session(b"x" * 48, "shr-1", s, NOW0) is None                    # another secret
     assert check_session(SECRET, "shr-1", s, NOW0 + 100) is None                 # expired (exp is exclusive)
@@ -93,12 +94,12 @@ def test_session_rejections():
     for cut in range(len(s)):                                                    # every truncation
         assert check_session(SECRET, "shr-1", s[:cut], NOW0) is None
     assert check_session(SECRET, "shr-1", s + "A", NOW0) is None
-    bob = mint_session(SECRET, "shr-1", "bob", NOW0 + 100, email="bob@lab.example")
-    a_id, a_mail, a_exp, a_mac = s.split(".")
-    b_id, b_mail, b_exp, b_mac = bob.split(".")
-    assert check_session(SECRET, "shr-1", ".".join((b_id, a_mail, a_exp, a_mac)), NOW0) is None   # identity swap
-    assert check_session(SECRET, "shr-1", ".".join((a_id, b_mail, a_exp, a_mac)), NOW0) is None   # email swap
-    assert check_session(SECRET, "shr-1", ".".join((a_id, a_mail, str(int(a_exp) + 1000), a_mac)), NOW0) is None
+    bob = mint_session(SECRET, "shr-1", "bob", NOW0 + 100, email="bob@lab.example", basis="e")
+    a_id, a_mail, a_basis, a_exp, a_mac = s.split(".")
+    b_id, b_mail, b_basis, b_exp, b_mac = bob.split(".")
+    assert check_session(SECRET, "shr-1", ".".join((b_id, a_mail, a_basis, a_exp, a_mac)), NOW0) is None   # identity swap
+    assert check_session(SECRET, "shr-1", ".".join((a_id, b_mail, a_basis, a_exp, a_mac)), NOW0) is None   # email swap
+    assert check_session(SECRET, "shr-1", ".".join((a_id, a_mail, a_basis, str(int(a_exp) + 1000), a_mac)), NOW0) is None
     for garbage in (None, 1, b"bytes", "", "...", "a.b.c", "x" * 100_000, s.replace(".", "/"), s + "\n"):
         assert check_session(SECRET, "shr-1", garbage, NOW0) is None
     assert check_session(b"", "shr-1", s, NOW0) is None
@@ -111,10 +112,23 @@ def test_mint_refuses_bad_inputs():
                  (SECRET, "shr-1", "", NOW0), (SECRET, "shr-1", "a" * 300, NOW0), (SECRET, "shr-1", "a\x00b", NOW0),
                  (SECRET, "shr-1", "alice", float("nan")), (SECRET, "shr-1", "alice", -1)):
         with pytest.raises(ValueError):
-            mint_session(*args, email=mail)
+            mint_session(*args, email=mail, basis="e")
     for bad in ("", "a b@c.d", "a@\u00e9.d", "x" * 255, "a\x00@b.c", None):
         with pytest.raises(ValueError):
-            mint_session(SECRET, "shr-1", "alice", NOW0, email=bad)
+            mint_session(SECRET, "shr-1", "alice", NOW0, email=bad, basis="e")
+
+
+def test_session_basis_is_mac_bound():
+    e = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
+    g = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="g")
+    assert check_session(SECRET, "shr-1", g, NOW0)["basis"] == "g" and e != g
+    a_id, a_mail, _, a_exp, a_mac = g.split(".")
+    for flipped in ("e", "x", "G", ""):                      # a viewer cannot upgrade or drop their basis
+        assert check_session(SECRET, "shr-1", ".".join((a_id, a_mail, flipped, a_exp, a_mac)), NOW0) is None
+    assert check_session(SECRET, "shr-1", ".".join((a_id, a_mail, a_exp, a_mac)), NOW0) is None     # the 4-part form
+    for bad in ("", "x", None, "ge"):
+        with pytest.raises(ValueError):
+            mint_session(SECRET, "shr-1", "alice", NOW0, email="alice@lab.example", basis=bad)
 
 
 def test_mint_requires_an_email():
@@ -126,12 +140,12 @@ def test_session_email_is_bound_and_v1_is_gone():
     import base64
     import hashlib
     import hmac as hm
-    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
-    a_id, a_mail, a_exp, a_mac = s.split(".")
+    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
+    a_id, a_mail, a_basis, a_exp, a_mac = s.split(".")
     forged = base64.urlsafe_b64encode(b"mallory@lab.example").rstrip(b"=").decode()
-    assert check_session(SECRET, "shr-1", ".".join((a_id, forged, a_exp, a_mac)), NOW0) is None
+    assert check_session(SECRET, "shr-1", ".".join((a_id, forged, a_basis, a_exp, a_mac)), NOW0) is None
     one = a_mail[:-1] + ("A" if a_mail[-1] != "A" else "B")
-    assert check_session(SECRET, "shr-1", ".".join((a_id, one, a_exp, a_mac)), NOW0) is None
+    assert check_session(SECRET, "shr-1", ".".join((a_id, one, a_basis, a_exp, a_mac)), NOW0) is None
     ln = lambda v: len(v).to_bytes(4, "big") + v          # noqa: E731
     mac = hm.new(SECRET, b"herdr-share-session-v1\x00" + ln(b"shr-1") + ln(b"alice") + ln(str(NOW0 + 100).encode()),
                  hashlib.sha256).digest()
@@ -141,14 +155,14 @@ def test_session_email_is_bound_and_v1_is_gone():
 
 
 def test_longest_session_fits_the_limit():
-    s = mint_session(SECRET, "shr-1", "a" * 128, NOW0 + 100, email="e" * 250 + "@b.c")
+    s = mint_session(SECRET, "shr-1", "a" * 128, NOW0 + 100, email="e" * 250 + "@b.c", basis="e")
     assert len(s) <= 768
     assert check_session(SECRET, "shr-1", s, NOW0)["email"] == "e" * 250 + "@b.c"
 
 
 def test_csrf_token_binds_share_and_session():
-    s1 = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
-    s2 = mint_session(SECRET, "shr-1", "bob", NOW0 + 100, email="bob@lab.example")
+    s1 = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
+    s2 = mint_session(SECRET, "shr-1", "bob", NOW0 + 100, email="bob@lab.example", basis="e")
     t = csrf_token(SECRET, "shr-1", s1)
     assert re.fullmatch(r"[A-Za-z0-9_-]{43}", t)
     assert t == csrf_token(SECRET, "shr-1", s1)
@@ -166,7 +180,7 @@ def test_csrf_token_binds_share_and_session():
 
 def test_email_allows_without_any_group():
     got = authorise_lab(LAB_STATE, access("alice"), ident("alice"), authenticator())
-    assert got == {"identity": "alice", "email": "alice@lab.example", "exp": NOW0 + 3600}
+    assert got == {"identity": "alice", "email": "alice@lab.example", "exp": NOW0 + 3600, "basis": "e"}
 
 
 def test_non_ascii_emails_never_match():
@@ -184,6 +198,7 @@ def test_group_claim_allows_and_is_case_sensitive():
     tok = access("dave", groups=("Readers",))
     got = authorise_lab(LAB_STATE, tok, ident("dave", email="dave@else.example"), authenticator())
     assert got is not None and got["identity"] == "dave" and got["email"] == "dave@else.example"
+    assert got["basis"] == "g"
     tok = access("dave", groups=("readers", "Admins"))
     assert authorise_lab(LAB_STATE, tok, ident("dave", email="dave@else.example"), authenticator()) is None
 
@@ -509,10 +524,10 @@ def test_revoke_kills_a_live_session(lab):
 
 def test_lab_files_need_a_valid_session(lab):
     ref = reference(lab)
-    other_share = mint_session(SECRET, "shr-2", "alice", NOW0 + 100, email="alice@lab.example")
-    other_secret = mint_session(b"z" * 48, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
-    expired = mint_session(SECRET, "shr-1", "alice", NOW0 - 1, email="alice@lab.example")
-    good = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
+    other_share = mint_session(SECRET, "shr-2", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
+    other_secret = mint_session(b"z" * 48, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
+    expired = mint_session(SECRET, "shr-1", "alice", NOW0 - 1, email="alice@lab.example", basis="e")
+    good = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
     paths = [f"/s/{TOKEN}/f/index.html", f"/s/{TOKEN}/f/data/table.parquet",
              f"/s/{TOKEN}/k/garbage/f/index.html", f"/s/{TOKEN}/k//f/index.html",
              f"/s/{TOKEN}/k/{other_share}/f/index.html", f"/s/{TOKEN}/k/{other_secret}/f/index.html",
@@ -532,7 +547,7 @@ def test_public_share_refuses_sessions(tmp_path):
         ref = reference(e)
         status, _, body = open_session(e)
         assert status == 404 and body == ref
-        good = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
+        good = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
         assert e.request("GET", f"/s/{TOKEN}/k/{good}/f/index.html")[2] == ref
         status, h, _ = e.request("GET", f"/s/{TOKEN}/")                   # public behaviour is unchanged
         assert status == 302 and h["location"] == "f/index.html"
@@ -551,7 +566,7 @@ def test_lab_unconfigured_fails_closed(tmp_path, over):
             config_extra=lab_config(tmp_path, **over))
     try:
         ref = reference(e)
-        good = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
+        good = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
         for method, path in (("GET", f"/s/{TOKEN}/"), ("GET", "/s/callback"), ("GET", "/s/static/share.js"),
                              ("GET", "/s/static/config.json"), ("GET", f"/s/{TOKEN}/k/{good}/f/index.html")):
             assert e.request(method, path)[2] == ref, path
@@ -631,8 +646,8 @@ def test_landing_route_follows_the_entry_type(tmp_path, entry, kind):
 
 
 def test_email_part_must_be_canonical_base64():
-    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
-    a_id, a_mail, a_exp, a_mac = s.split(".")
+    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
+    a_id, a_mail, a_basis, a_exp, a_mac = s.split(".")
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     assert len(a_mail) % 4 != 0                       # the last char carries unused low bits
     unused = {2: 0b1111, 3: 0b11}[len(a_mail) % 4]
@@ -643,15 +658,15 @@ def test_email_part_must_be_canonical_base64():
     pad = lambda t: t + "=" * (-len(t) % 4)           # noqa: E731
     assert base64.urlsafe_b64decode(pad(twin)) == base64.urlsafe_b64decode(pad(a_mail))
     assert check_session(SECRET, "shr-1", s, NOW0) is not None
-    assert check_session(SECRET, "shr-1", ".".join((a_id, twin, a_exp, a_mac)), NOW0) is None
+    assert check_session(SECRET, "shr-1", ".".join((a_id, twin, a_basis, a_exp, a_mac)), NOW0) is None
 
 
 def test_csrf_domain_is_separated_from_the_session_mac():
     from herdr_engineering.control_plane import share_session as ss
     assert ss._CSRF_DOMAIN != ss._DOMAIN
-    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example")
+    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
     t = csrf_token(SECRET, "shr-1", s)
-    mac = s.split(".")[3]
+    mac = s.split(".")[4]
     assert t != mac and t not in s                    # nothing in the session equals the token
     # the same message under the session domain would give a different value: the tags really separate the two
     import hashlib
@@ -675,7 +690,7 @@ def test_v1_session_and_bad_sessions_are_the_uniform_404_over_http(lab):
                     hashlib.sha256).digest()
     b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()   # noqa: E731
     v1 = f"{b64(b'alice')}.{exp}.{b64(v1_mac)}"
-    good = mint_session(SECRET, "shr-1", "alice", exp, email="alice@lab.example")
+    good = mint_session(SECRET, "shr-1", "alice", exp, email="alice@lab.example", basis="e")
     assert lab.request("GET", f"/s/{TOKEN}/k/{good}/f/index.html")[0] == 200
     for bad in (v1, good[:-1] + ("A" if good[-1] != "A" else "B"), "x" * 769):
         status, _, body = lab.request("GET", f"/s/{TOKEN}/k/{bad}/f/index.html")

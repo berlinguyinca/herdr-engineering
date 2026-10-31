@@ -1,7 +1,8 @@
 """Stateless lab-share sessions: an HMAC path segment binding (share id, verified identity, expiry).
 
-A session is ``<b64url(identity)>.<b64url(email)>.<exp>.<b64url(mac)>`` where ``mac = HMAC-SHA256(secret, domain tag ||
-len-prefixed share_id || identity || email || exp)``. It is a bearer secret for one verified identity (and the verified
+A session is ``<b64url(identity)>.<b64url(email)>.<basis>.<exp>.<b64url(mac)>`` where ``mac = HMAC-SHA256(secret, domain
+tag || len-prefixed share_id || identity || email || basis || exp)``. ``basis`` is how the viewer was admitted: ``e`` (their
+email is on the share's allow-list) or ``g`` (a group claim); it is MAC'd, so a viewer cannot upgrade it. It is a bearer secret for one verified identity (and the verified
 email it signed in with) on one share until ``exp`` (exclusive); the
 server keeps no session state, so revoking the share (its ``state.json``) is what ends every live session at once.
 Only the URL-safe alphabet and ``.`` appear, so a session never contains ``/`` and is safe as one path segment.
@@ -15,7 +16,8 @@ import hmac
 import math
 import re
 
-_DOMAIN = b"herdr-share-session-v2"
+_DOMAIN = b"herdr-share-session-v3"
+BASES = ("e", "g")
 _CSRF_DOMAIN = b"herdr-annotate-csrf-v1"
 MIN_SECRET_BYTES = 32
 MAX_IDENTITY = 128
@@ -26,7 +28,7 @@ _EMAIL_RE = re.compile(rf"[\x21-\x7e]{{3,{MAX_EMAIL}}}")             # printable
 _ID_B64_MAX = 4 * MAX_IDENTITY // 3 + 4
 _EMAIL_B64_MAX = 4 * MAX_EMAIL // 3 + 4
 _SESSION_RE = re.compile(rf"([A-Za-z0-9_-]{{2,{_ID_B64_MAX}}})\.([A-Za-z0-9_-]{{4,{_EMAIL_B64_MAX}}})\."
-                         rf"([1-9][0-9]{{0,11}})\.([A-Za-z0-9_-]{{43}})")
+                         rf"([eg])\.([1-9][0-9]{{0,11}})\.([A-Za-z0-9_-]{{43}})")
 
 
 def _b64(data: bytes) -> str:
@@ -42,12 +44,13 @@ def _field(value: str) -> bytes:
     return len(raw).to_bytes(4, "big") + raw
 
 
-def _mac(secret: bytes, share_id: str, identity: str, email: str, exp: int) -> bytes:
-    msg = _DOMAIN + b"\x00" + _field(share_id) + _field(identity) + _field(email) + _field(str(exp))
+def _mac(secret: bytes, share_id: str, identity: str, email: str, basis: str, exp: int) -> bytes:
+    msg = (_DOMAIN + b"\x00" + _field(share_id) + _field(identity) + _field(email) + _field(basis)
+           + _field(str(exp)))
     return hmac.new(secret, msg, hashlib.sha256).digest()
 
 
-def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, email: str) -> str:
+def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, email: str, basis: str) -> str:
     """The session for ``identity`` on ``share_id`` valid until ``exp`` (epoch seconds, floored). Raises ValueError."""
     if not isinstance(secret, bytes) or len(secret) < MIN_SECRET_BYTES:
         raise ValueError("signing secret is missing or too short")
@@ -57,17 +60,19 @@ def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, ema
         raise ValueError("bad identity")
     if not isinstance(email, str) or not _EMAIL_RE.fullmatch(email):
         raise ValueError("bad email")
+    if basis not in BASES:
+        raise ValueError("bad basis")
     if not isinstance(exp, (int, float)) or isinstance(exp, bool) or not math.isfinite(exp) or exp < 1:
         raise ValueError("bad expiry")
     exp_int = int(math.floor(exp))
     if exp_int < 1 or exp_int >= 10 ** 12:
         raise ValueError("bad expiry")
-    mac = _mac(secret, share_id, identity, email, exp_int)
-    return f"{_b64(identity.encode('ascii'))}.{_b64(email.encode('ascii'))}.{exp_int}.{_b64(mac)}"
+    mac = _mac(secret, share_id, identity, email, basis, exp_int)
+    return f"{_b64(identity.encode('ascii'))}.{_b64(email.encode('ascii'))}.{basis}.{exp_int}.{_b64(mac)}"
 
 
 def check_session(secret: bytes, share_id: str, session: str, now: float) -> dict | None:
-    """``{"identity", "exp", "email"}`` when ``session`` was minted with ``secret`` for ``share_id`` and ``now < exp``; else None.
+    """``{"identity", "exp", "email", "basis"}`` when ``session`` was minted with ``secret`` for ``share_id`` and ``now < exp``; else None.
 
     Never raises: malformed, oversize, tampered, truncated, expired or other-share sessions are all None.
     """
@@ -78,7 +83,7 @@ def check_session(secret: bytes, share_id: str, session: str, now: float) -> dic
         match = _SESSION_RE.fullmatch(session)
         if match is None:
             return None
-        id_part, email_part, exp_part, mac_part = match.groups()
+        id_part, email_part, basis, exp_part, mac_part = match.groups()
         try:
             identity = _unb64(id_part).decode("ascii")
             email = _unb64(email_part).decode("ascii")
@@ -92,11 +97,11 @@ def check_session(secret: bytes, share_id: str, session: str, now: float) -> dic
         if _b64(given) != mac_part:
             return None
         exp = int(exp_part)
-        if not hmac.compare_digest(given, _mac(secret, share_id, identity, email, exp)):
+        if not hmac.compare_digest(given, _mac(secret, share_id, identity, email, basis, exp)):
             return None
         if not isinstance(now, (int, float)) or not now < exp:
             return None
-        return {"identity": identity, "exp": float(exp), "email": email}
+        return {"identity": identity, "exp": float(exp), "email": email, "basis": basis}
     except Exception:
         return None
 

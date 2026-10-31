@@ -28,7 +28,7 @@ FRAME_RE = re.compile(r"<\s*(iframe|frame|frameset|object|embed|portal|fencedfra
 HTML = b"<html><body><!-- </body> --><p>hello</p></BODY></html>"
 FILES = {
     "index.html": HTML,
-    "bare.html": b"<p>no end tag</p>",
+    "bare.html": b"<html><p>no body tag</p>",
     "sub/x.html": b"<html><body>x</body></html>",
     "a&b.html": b"<html><body>amp</body></html>",
     "notes.txt": b"hello <script>alert(1)</script> & more",
@@ -56,8 +56,8 @@ def lab(tmp_path):
     e.close()
 
 
-def session(identity="alice", email=EMAIL, exp=NOW0 + 3600, share_id="shr-1"):
-    return mint_session(SECRET, share_id, identity, exp, email=email)
+def session(identity="alice", email=EMAIL, exp=NOW0 + 3600, share_id="shr-1", basis="e"):
+    return mint_session(SECRET, share_id, identity, exp, email=email, basis=basis)
 
 
 def base(sess=None, kind="f"):
@@ -99,11 +99,11 @@ def link_for(depth, path):
     return share_public.mode_switch_link(depth, path)
 
 
-def test_link_is_inserted_before_the_last_body_close_and_nothing_else_changes(lab):
+def test_link_is_inserted_right_after_the_body_start_tag_and_nothing_else_changes(lab):
     status, h, body = doc_get(lab, "index.html")
     assert status == 200
     link = link_for(1, "index.html").encode()
-    cut = HTML.lower().rfind(b"</body")
+    cut = HTML.index(b"<body>") + len(b"<body>")
     assert body == HTML[:cut] + link + HTML[cut:]
     assert h["etag"] == f'"{hashlib.sha256(HTML).hexdigest()}-m1"'
     assert h["content-length"] == str(len(body))
@@ -114,9 +114,65 @@ def test_link_is_inserted_before_the_last_body_close_and_nothing_else_changes(la
     assert h["cache-control"] == "private, no-cache"
 
 
-def test_link_is_appended_without_a_body_close(lab):
-    status, h, body = doc_get(lab, "bare.html")
-    assert status == 200 and body == FILES["bare.html"] + link_for(1, "bare.html").encode()
+@pytest.mark.parametrize("name,html", [
+    ("fb1.html", b"<!doctype html><html lang=en><head><title>t</title></head><p>x</p>"),
+    ("fb2.html", b"<!DOCTYPE html><p>just a doctype</p>"),
+])
+def test_fallback_anchors_are_html_then_doctype(tmp_path, name, html):
+    env = make_env(tmp_path, files={**FILES, name: html})
+    try:
+        status, _, body = doc_get(env, name)
+        link = link_for(1, name).encode()
+        cut = html.index(b">", html.lower().find(b"<html")) + 1 if b"<html" in html.lower() else html.index(b">") + 1
+        assert status == 200 and body == html[:cut] + link + html[cut:]
+    finally:
+        env.close()
+
+
+SCRIPTY = b'<html><head><script>document.write("<body>")</script><style>/* <body> */</style></head><!-- <body> --><textarea><body></textarea><body class="a>b" data-x=\'>\'><p>real</p></body></html>'
+UTF16 = "<html><body>hi</body></html>".encode("utf-16")
+NO_ANCHOR = b"<p>no html, no body, no doctype</p>"
+WRITE = b'<html><head><script>document.write("</body>")</script></head><body><p>x</p><script>document.write("<body>")</script></body></html>'
+
+
+def test_injection_ignores_comments_scripts_and_quoted_angle_brackets(tmp_path):
+    env = make_env(tmp_path, files={**FILES, "scripty.html": SCRIPTY, "write.html": WRITE})
+    try:
+        status, _, body = doc_get(env, "scripty.html")
+        link = link_for(1, "scripty.html").encode()
+        start = SCRIPTY.index(b'<body class=')
+        cut = SCRIPTY.index(b"><p>real", start) + 1
+        assert body == SCRIPTY[:cut] + link + SCRIPTY[cut:]
+        status, _, body = doc_get(env, "write.html")
+        link = link_for(1, "write.html").encode()
+        cut = WRITE.index(b"<body><p>x") + len(b"<body>")
+        assert body == WRITE[:cut] + link + WRITE[cut:]
+        assert body.count(b'document.write("</body>")') == 1 and b'document.write("<body>")' in body
+    finally:
+        env.close()
+
+
+def test_unsafe_or_anchorless_html_is_served_untouched(tmp_path):
+    env = make_env(tmp_path, files={**FILES, "wide.html": UTF16, "none.html": NO_ANCHOR,
+                                    "open.html": b"<html><body class='x", "cmt.html": b"<!-- <body> --><p>x</p>"})
+    try:
+        for name, data in (("wide.html", UTF16), ("none.html", NO_ANCHOR), ("open.html", b"<html><body class='x"),
+                           ("cmt.html", b"<!-- <body> --><p>x</p>")):
+            assert_raw(env, base() + name, {"Sec-Fetch-Dest": "document"}, name, data)
+    finally:
+        env.close()
+
+
+def test_non_utf8_charset_is_served_untouched(lab, monkeypatch):
+    monkeypatch.setattr(share_public, "content_type_for", lambda n: "text/html; charset=shift_jis"
+                        if n == "index.html" else "application/octet-stream")
+    status, h, body = doc_get(lab, "index.html")
+    assert status == 200 and body == HTML and "vary" not in h
+    assert share_public._ascii_compatible("text/html; charset=utf-8", b"x")
+    assert share_public._ascii_compatible("text/html; charset=US-ASCII", b"x")
+    assert not share_public._ascii_compatible("text/html; charset=utf-16", b"x")
+    assert not share_public._ascii_compatible("text/html; charset=utf-8", b"\xff\xfea\x00")
+    assert not share_public._ascii_compatible("text/html", b"<\x00h\x00")
 
 
 def test_link_text_is_script_free_and_frame_free(lab):
@@ -146,8 +202,10 @@ def test_amp_file_gets_an_escaped_href(lab):
 
 def test_inject_helper_edge_cases():
     link = b"<a>L</a>"
-    assert share_public.inject_mode_switch(b"x</BoDy>y</body >z", link) == b"x</BoDy>y" + link + b"</body >z"
-    assert share_public.inject_mode_switch(b"abc", link) == b"abc" + link
+    assert share_public.inject_mode_switch(b"x<BoDy id=1>y</body>z", link) == b"x<BoDy id=1>" + link + b"y</body>z"
+    assert share_public.inject_mode_switch(b"abc", link) is None
+    assert share_public.inject_mode_switch(b"<bodyguard>x", link) is None
+    assert share_public.inject_mode_switch(b"<html><body>", link) == b"<html><body>" + link
 
 
 def test_conditional_and_range_on_the_modified_response(lab):
@@ -212,6 +270,10 @@ def test_public_share_and_disabled_annotations_are_untouched(tmp_path):
         assert_raw(off, base() + "index.html", {"Sec-Fetch-Dest": "document"}, "index.html", HTML)
     finally:
         off.close()
+
+
+def test_the_cap_is_two_mebibytes():
+    assert share_public.MODE_SWITCH_MAX_BYTES == 2 * 1024 * 1024
 
 
 def test_oversize_html_is_served_untouched(lab, monkeypatch):
@@ -398,7 +460,8 @@ def refused(env, path, body, expect_lines=0, sess=None, **over):
     {"Origin": "null"}, {"Origin": None}, {"Origin": "https://evil.example"}, {"Origin": ORIGIN + "/"},
     {"Origin": "http://share.example"}, {"X-Herdr-Annotate": None}, {"X-Herdr-Annotate": "x" * 43},
     {"X-Herdr-Annotate": ""}, {"Content-Type": "text/plain"}, {"Content-Type": None},
-    {"Content-Type": "application/x-www-form-urlencoded"}, {"Content-Length": None}, {"Content-Length": "0"},
+    {"Content-Type": "application/x-www-form-urlencoded"}, {"Content-Type": "application/json; charset=utf-8"},
+    {"Content-Type": "APPLICATION/JSON"}, {"Content-Length": None}, {"Content-Length": "0"},
 ])
 def test_header_gate_refusals(lab, over):
     refused(lab, api(), create_body(), **over)
@@ -478,13 +541,29 @@ def test_allow_list_is_rechecked_on_every_write(lab):
     assert post(lab, api(), create_body())[0] == 201
 
 
+def test_email_removal_is_honoured_even_when_the_share_has_groups(lab):
+    assert lab.state["allow_groups"]                                      # the fixture share has groups
+    write_state(lab.root, lab.token_hash, dict(lab.state, allow_emails=["someone@else.example"]))
+    refused(lab, api(), create_body())                                    # alice (basis e) was removed: no write
+    write_state(lab.root, lab.token_hash, dict(lab.state, allow_emails=[EMAIL]))
+    assert post(lab, api(), create_body())[0] == 201
+
+
 def test_group_admitted_sessions_may_write(lab):
-    bob = session("bob", "bob@lab.example")
-    assert post(lab, api(bob), create_body(), bob)[0] == 201             # allow_groups is non-empty: not rechecked
-    (line,) = lines(lab)
-    assert line["author_identity"] == "bob"
+    bob = session("bob", "bob@lab.example", basis="g")
+    assert post(lab, api(bob), create_body(), bob)[0] == 201             # allow_groups is non-empty
+    write_state(lab.root, lab.token_hash, dict(lab.state, allow_emails=[]))
+    assert post(lab, api(bob), create_body(), bob)[0] == 201             # a group session never depended on the list
+    assert [x["author_identity"] for x in lines(lab)] == ["bob", "bob"]
     write_state(lab.root, lab.token_hash, dict(lab.state, allow_groups=[]))
-    refused(lab, api(bob), create_body(), sess=bob, expect_lines=1)
+    refused(lab, api(bob), create_body(), sess=bob, expect_lines=2)
+
+
+def test_a_forged_basis_is_an_invalid_session(lab):
+    bob = session("bob", "bob@lab.example", basis="g")
+    a_id, a_mail, _, a_exp, a_mac = bob.split(".")
+    forged = ".".join((a_id, a_mail, "e", a_exp, a_mac))
+    refused(lab, api(forged), create_body(), sess=forged)
 
 
 def test_rate_limits_user_share_and_global(tmp_path):
@@ -495,7 +574,7 @@ def test_rate_limits_user_share_and_global(tmp_path):
         status, h, out = post(env, api(), create_body())
         assert status == 429 and json.loads(out) == {"error": "rate_limited"} and "access-control-allow-origin" not in h
         assert len(lines(env)) == 60
-        bob = session("bob", "bob@lab.example")
+        bob = session("bob", "bob@lab.example", basis="g")
         assert post(env, api(bob), create_body(), bob)[0] == 201          # another identity has its own budget
         env.clock[0] += 61
         assert post(env, api(), create_body())[0] == 201
@@ -506,7 +585,7 @@ def test_rate_limits_user_share_and_global(tmp_path):
 def test_share_and_global_budgets(tmp_path):
     env = make_env(tmp_path, annotations={"per_share_per_minute": 2})
     try:
-        sessions = [session(f"u{i}", f"u{i}@lab.example") for i in range(3)]
+        sessions = [session(f"u{i}", f"u{i}@lab.example", basis="g") for i in range(3)]
         codes = [post(env, api(s), create_body(), s)[0] for s in sessions]
         assert codes == [201, 201, 429]
     finally:
@@ -533,6 +612,21 @@ def test_annotations_file_is_world_readable_and_each_line_is_ascii(lab):
     assert data.isascii() and data.endswith(b"\n") and data.count(b"\n") == 1
     assert (lab.config.annotations_path.stat().st_mode & 0o777) == 0o644
     assert lines(lab)[0]["body"] == "café \U0001f600"
+
+
+def test_line_cap_is_the_workers_limit_and_refuses_longer_lines(lab, monkeypatch, tmp_path):
+    assert share_public.ANNOTATION_LINE_MAX == 65536
+    log = share_public.AnnotationLog(tmp_path / "x.jsonl")
+    assert not log.append({"body": "a" * 70000}) and not (tmp_path / "x.jsonl").exists()
+    just_under = {"body": "a" * (65536 - len('{"body": ""}\n') - 5)}
+    assert log.append(just_under)
+    assert len((tmp_path / "x.jsonl").read_bytes()) <= 65536
+    monkeypatch.setattr(share_public, "ANNOTATION_LINE_MAX", 200)          # an HTTP-level refusal: 503, nothing written
+    status, _, out = post(lab, api(), create_body(comment="c" * 300))
+    assert status == 503 and json.loads(out) == {"error": "unavailable"} and lines(lab) == []
+    assert post(lab, api(), create_body(comment="short"))[0] == 503       # the whole envelope is over 200 bytes
+    monkeypatch.setattr(share_public, "ANNOTATION_LINE_MAX", 65536)
+    assert post(lab, api(), create_body(comment="c" * 300))[0] == 201
 
 
 def test_worst_case_line_fits_the_worker_limit(lab):

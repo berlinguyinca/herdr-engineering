@@ -55,12 +55,16 @@ path after ``/s/<token>/``                            methods        match
   lands (``a_view_pending`` in the events file).
 * The annotation POSTs are the only routes that read a body. A POST is refused (uniform 404, reason ``annotate_refused``)
   unless the session is valid and the share's allow-list still admits its email (``share_lab.still_admitted``: an email
-  removed from ``allow_emails`` stops writing at once; members admitted through ``allow_groups`` cannot be re-checked
-  without their tokens and are bounded by the session expiry), ``Origin`` equals the share origin exactly, the CSRF
-  header passes a constant-time check, ``Content-Type`` is JSON and there is exactly one ``Content-Length`` of 1 to
+  removed from ``allow_emails`` stops writing at once when the session's MAC'd admission basis is ``e``; a session
+  admitted by a group claim (basis ``g``) needs the share to still have ``allow_groups``, but a removed group MEMBER
+  keeps writing until the session expires), ``Origin`` equals the share origin exactly, the CSRF
+  header passes a constant-time check, ``Content-Type`` is exactly ``application/json`` and there is exactly one ``Content-Length`` of 1 to
   32768 bytes and no ``Transfer-Encoding``. Accepted requests append one line to ``annotations.jsonl`` for the worker;
   author identity and email come from the session only. Edits and deletes are decided against the viewer's own
   read-back projection, so an annotation is editable only after the worker has ingested it.
+  A 201 or 202 means the request passed EDGE validation and its line was appended -- nothing more: the worker may still
+  deny it at ingest (caps, an unpublished version, a withdrawn share), and the viewer sees the outcome only through
+  the read-back projection. The lines are ASCII and refused (503) above ``ANNOTATION_LINE_MAX``.
 """
 from __future__ import annotations
 
@@ -132,7 +136,7 @@ STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text
 VIEW_FILE = "view.html"
 ANNOTATIONS_MAX_BYTES = 32 * 1024 * 1024     # the annotations file cap (the worker rotates it long before)
 ANNOTATION_LINE_MAX = 65536                  # the worker's max_line_bytes: a longer line would be dropped at ingest
-MODE_SWITCH_MAX_BYTES = 8 * 1024 * 1024      # larger HTML files are served untouched, without the link
+MODE_SWITCH_MAX_BYTES = 2 * 1024 * 1024      # larger HTML files are served untouched (streamed), without the link
 MODE_SWITCH_ETAG_SUFFIX = "-m1"
 NONCE_BYTES = 18                             # token_urlsafe(18) is 24 characters
 # One level below static/vendor/pdfjs/: exactly the two vendored pdf.js modules (the licence and SHA256SUMS stay unserved).
@@ -716,10 +720,46 @@ def mode_switch_link(depth: int, path: str) -> str:
     return MODE_SWITCH_TEMPLATE.format(href=html.escape("../" * depth + "a/" + path))
 
 
-def inject_mode_switch(data: bytes, link: bytes) -> bytes:
-    """``link`` inserted before the LAST case-insensitive ``</body`` of ``data``, or appended when there is none."""
-    cut = data.lower().rfind(b"</body")
-    return data + link if cut < 0 else data[:cut] + link + data[cut:]
+# One pass over the bytes (no lower-cased copy). Tokens that can hide a tag: comments and the raw-text / RCDATA
+# elements (their bodies run to the matching closer); the three markers we may insert after are `<body`, `<html` and
+# the doctype. Anything unterminated runs to the end of the data, so nothing after it is ever a candidate.
+_SCAN = re.compile(
+    rb"<!--.*?(?:-->|\Z)"
+    rb"|<(?P<raw>script|style|textarea|title)(?=[\s/>])(?:[^>]*>)?.*?(?:</(?P=raw)(?=[\s/>])|\Z)"
+    rb"|<(?P<tag>body|html)(?=[\s/>])|<(?P<doctype>!doctype)[^>]*>", re.I | re.S)
+_TAG_END = re.compile(rb"""(?:[^>"']|"[^"]*"|'[^']*')*>""")
+_WIDE_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff", b"\xef\xbb\xbf\x00")
+
+
+def _ascii_compatible(content_type: str, data: bytes) -> bool:
+    """False for a response whose bytes are not an ASCII-compatible text (a UTF-16/32 BOM, NUL bytes at the start, or a
+    declared charset other than utf-8 / us-ascii): inserting ASCII bytes there would corrupt it."""
+    for part in content_type.split(";")[1:]:
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "charset" and value.strip().strip('"').lower() not in ("utf-8", "utf8", "us-ascii"):
+            return False
+    return not data.startswith(_WIDE_BOMS) and b"\x00" not in data[:1024]
+
+
+def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
+    """``data`` with ``link`` inserted right after the first real ``<body ...>`` start tag (outside comments, script,
+    style, textarea and title), else after the first ``<html ...>`` tag, else after the doctype; None when the data has
+    none of them (the caller then serves the file untouched). Never inserts inside a script string or a comment."""
+    html_end = doctype_end = None
+    for match in _SCAN.finditer(data):
+        tag = match.group("tag")
+        if tag is not None:
+            end = _TAG_END.match(data, match.end())
+            if end is None:
+                return None                      # an unterminated start tag: nothing safe to anchor on
+            if tag.lower() == b"body":
+                return data[:end.end()] + link + data[end.end():]
+            if html_end is None:
+                html_end = end.end()
+        elif match.group("doctype") is not None and doctype_end is None:
+            doctype_end = match.end()
+    cut = html_end if html_end is not None else doctype_end
+    return None if cut is None else data[:cut] + link + data[cut:]
 
 
 def _read_all(fd: int, size: int) -> bytes | None:
@@ -777,9 +817,17 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
             return False
         etag = '"%s"' % item["sha256"]
         csp = sandbox_csp(getattr(handler.server, "public_origin", None), token)
+        injected = None
         if (mode_switch is not None and content_type_for(name).split(";")[0].strip() == "text/html"
                 and size <= MODE_SWITCH_MAX_BYTES):
-            return _serve_with_link(handler, state, name, item, fd, mode_switch, csp, cors=cors, actor=actor)
+            data = _read_all(fd, size)
+            if data is None:
+                deny(handler, state, "size_mismatch", actor)
+                return False
+            if _ascii_compatible(content_type_for(name), data):
+                injected = inject_mode_switch(data, mode_switch.encode("ascii"))
+            if injected is not None:
+                return _serve_with_link(handler, state, name, item, injected, csp, cors=cors, actor=actor)
         headers = _content_headers(name, etag, csp)
         if _announces_body(handler):
             handler.close_connection = True
@@ -839,14 +887,10 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         os.close(fd)
 
 
-def _serve_with_link(handler, state: dict, name: str, item: dict, fd: int, link: str, csp: str, *, cors: bool,
+def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, csp: str, *, cors: bool,
                      actor: str) -> bool:
-    """The full 200 of an HTML file with the mode-switch link injected (see ``serve_bundle_file``)."""
-    data = _read_all(fd, item["size"])
-    if data is None or hashlib.sha256(data).hexdigest() != item["sha256"]:
-        deny(handler, state, "size_mismatch", actor)
-        return False
-    body = inject_mode_switch(data, link.encode("ascii"))
+    """The full 200 of ``body`` (an HTML file with the mode-switch link injected; see ``serve_bundle_file``). The ETag is
+    the index sha256 plus ``-m1``, as for the raw file (the same size-only integrity check as the raw route)."""
     etag = f'"{item["sha256"]}{MODE_SWITCH_ETAG_SUFFIX}"'
     headers = [h for h in _content_headers(name, etag, csp) if h[0] != "Accept-Ranges"] + [("Vary", "Sec-Fetch-Dest")]
     if _announces_body(handler):
@@ -1214,7 +1258,7 @@ class ShareHandler(BaseHTTPRequestHandler):
                 or len(lengths) != 1 or not _CONTENT_LENGTH.fullmatch(lengths[0])
                 or not 1 <= int(lengths[0]) <= MAX_BODY_BYTES):
             return False
-        if ctype.split(";")[0].strip().lower() != "application/json":
+        if ctype != "application/json":              # exactly, case-sensitive, no parameters
             return False
         return check_csrf(lab.secret, state["share_id"], session, csrf)
 
@@ -1223,7 +1267,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         self.close_connection = True                      # the body is read once; the connection never carries a second request
         if not self._gate_ok(state, parts[4], got, lab):
             return deny(self, state, "annotate_refused", got["identity"])
-        if not still_admitted(state, got["email"]):
+        if not still_admitted(state, got["email"], got["basis"]):
             return deny(self, state, "not_on_list", got["identity"])      # removed from the allow-list since the session
         route_edit = len(parts) == 8
         annotation_id = parts[6] if route_edit else None
@@ -1370,7 +1414,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         if exp_int <= now:
             return deny(self, state, "token_expired", grant["identity"])
         try:
-            session = mint_session(lab.secret, share_id, grant["identity"], exp_int, email=grant["email"])
+            session = mint_session(lab.secret, share_id, grant["identity"], exp_int, email=grant["email"], basis=grant["basis"])
         except ValueError:
             return deny(self, state, "bad_identity", grant["identity"])
         entry = state["entry"]
