@@ -679,6 +679,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--api-key-file", required=True,
                     help="PATH to a file holding the API key of a principal in the tenant to anchor (never the key itself)")
     p2.set_defaults(func=_cmd_cp_assistant_audit)
+    p2 = csub.add_parser("assistant-worker", help="enroll, list or revoke tailnet-hub workers (owner API)")
+    p2.add_argument("action", choices=["enroll", "list", "revoke"])
+    p2.add_argument("worker_id", nargs="?", default=None, help="the worker to revoke (revoke only)")
+    p2.add_argument("--name", default=None, help="a label for the worker (enroll)")
+    p2.add_argument("--harness", default=None, help="claude | pi | codex | opencode (enroll)")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", required=True,
+                    help="PATH to a file holding an operator API key (never the key itself)")
+    p2.set_defaults(func=_cmd_cp_assistant_worker)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -3054,6 +3063,64 @@ def _cmd_cp_assistant_audit(args) -> int:
         return 1
 
 
+def _cmd_cp_assistant_worker(args) -> int:
+    """``control-plane assistant-worker enroll|list|revoke``: 0 on success, else a one-line stderr message (never the key)."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import quote
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    if args.action == "enroll" and not (args.name and args.harness):
+        print("enroll needs --name and --harness", file=sys.stderr)
+        return 2
+    if args.action == "revoke" and not args.worker_id:
+        print("revoke needs a WORKER_ID", file=sys.stderr)
+        return 2
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(f"{base}{path}", method=method, headers={
+            "X-API-Key": key, "Content-Type": "application/json"},
+            data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read(1024 * 1024))
+    try:
+        if args.action == "enroll":
+            out = call("POST", "/api/v1/assistant-workers", {"name": args.name, "harness": args.harness})
+            print(f"enrollment: {out['enrollment_id']}\ncode: {out['code']}\nexpires_at: {out['expires_at']}")
+            print("This code will not be shown again; it is single-use. Redeem it on the worker's device.")
+            setup = out.get("setup") or {}
+            if not setup.get("supported"):
+                print(f"setup: the {setup.get('harness', args.harness)} harness is not supported yet")
+            else:
+                print(f"redeem: {json.dumps(setup['redeem'])}")
+                print(f"then run: {setup['mcp_add']}")
+        elif args.action == "list":
+            rows = call("GET", "/api/v1/assistant-workers")["workers"]
+            print(f"{'WORKER_ID':<34} {'NAME':<20} {'HARNESS':<9} {'STATUS':<8} {'DEVICE':<16} EXPIRES")
+            for w in rows:
+                print(f"{w['worker_id']:<34} {w['name']:<20} {w['harness']:<9} {w['status']:<8} "
+                      f"{w['device_id']:<16} {w['expires_at']}")
+        else:
+            out = call("DELETE", f"/api/v1/assistant-workers/{quote(args.worker_id, safe='')}")
+            print(f"{out['worker_id']}: {out['status']}")
+        return 0
+    except urllib.error.HTTPError as exc:
+        print(f"assistant-worker {args.action} failed: HTTP {exc.code}", file=sys.stderr)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"assistant-worker {args.action} failed: {type(exc).__name__}", file=sys.stderr)
+    return 1
+
+
 def _cmd_cp_collab_repair(args) -> int:
     import asyncio
 
@@ -3468,7 +3535,8 @@ def _cmd_cp_web(args) -> int:
             )
     except Exception:
         logging.exception("self-report of stack services failed")
-    hub_server, hub_registry = _start_assistant_hub(svr.assistant)   # hub_registry: shared with the owner API (later task)
+    hub_server, hub_registry = _start_assistant_hub(svr.assistant)
+    svr.assistant_workers = hub_registry     # the SAME registry the hub authenticates against; None while the hub is off
     if hub_server is not None:
         logging.info("assistant hub listening on %s:%s", hub_server.host, hub_server.port)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
