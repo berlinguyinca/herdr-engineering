@@ -184,12 +184,15 @@ sections:
       #   # Real inference. When `endpoint` is set the service uses an HTTP
       #   # chat-completions runner (OpenAI-compatible, incl. tool-calling); when
       #   # empty it falls back to a deterministic local runner (skeleton only).
-      #   # `api_key` is the llm-proxy PROJECT key and is never logged. `model` must
-      #   # be one the proxy actually serves (check GET /v1/models) or every call
-      #   # returns capacity_unavailable.
+      #   # `api_key` is the llm-proxy PROJECT key and is never logged. The model is
+      #   # chosen from what the proxy serves now (GET /v1/models, cached a minute):
+      #   # `model` is tried first while the proxy still serves it, or set `auto`;
+      #   # otherwise the first match in `preferred_models` (ids or * patterns) wins,
+      #   # then any served text model. A 429/404/502/503 moves on to the next one.
       #   inference:
       #     endpoint: "http://llm-proxy:8088/v1/chat/completions"
-      #     model: "REDACTED_MODEL_ID"   # e.g. a qwen* id present in the proxy's /v1/models
+      #     model: auto
+      #     preferred_models: ["qwen3.8-flash_next-*", "qwen3.8-text"]
       #     timeout: 60
       #     api_key: "REDACTED"          # llm-proxy project key (never logged)
       #   # Optional durable store. When set, the assistant snapshots its store to
