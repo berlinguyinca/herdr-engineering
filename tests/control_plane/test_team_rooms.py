@@ -76,7 +76,8 @@ class Plane:
 
     def team(self, name="Crew"):
         self.sync_graph()
-        s, out, _ = keyed_call(self.srv, "/api/v1/graph/work/teams", method="POST", body={"name": name, "room_id": self.room})
+        s, out, _ = keyed_call(self.srv, "/api/v1/graph/work/teams", method="POST", body={"name": name, "room_id": self.room},
+                                 headers={"Content-Type": "application/json"})
         assert s == 200, out
         return out["team"]["native_id"]
 
@@ -231,6 +232,7 @@ def test_attach_refuses_bad_input_for_the_stated_reason(plane):
     p = plane
     impl, rev, roles = two_agents(p)
     team = p.team()
+    bobs = p.agent("bob", name="bobs")
     n = len(p.svc._log)
     assert p.attach(team, {})[0] == 400
     assert p.attach(team, {"implementer": []})[0] == 400
@@ -240,7 +242,6 @@ def test_attach_refuses_bad_input_for_the_stated_reason(plane):
     assert p.attach(team, {"implementer": ["no-such-agent"]})[0] == 404
     assert p.attach("team-not-an-id", roles)[0] == 400
     assert p.attach("team-" + "f" * 20, roles)[0] == 404                         # well formed, but no such team
-    bobs = p.agent("bob", name="bobs")
     assert p.attach(team, {"implementer": [bobs["agent_id"]]})[0] == 404         # only the owner's own agents
     assert len(p.svc._log) == n
 
@@ -319,7 +320,7 @@ def test_detach_completes_on_a_log_that_refuses_ordinary_writes(plane):
     team = p.team()
     p.attach(team, roles)
     p.svc.max_log_events = len(p.svc._log) + 1                                    # full for everything but a safety event
-    assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/messages", {"text": "hi"})[0] == 503
+    assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/messages", {"text": "hi", "idempotency_key": "m-full"})[0] == 503
     assert p.detach(team)[0] == 200
 
 
@@ -352,7 +353,8 @@ def test_a_team_made_without_a_room_is_not_widened_by_attaching(plane):
     p = plane
     impl, _, roles = two_agents(p)
     p.sync_graph()
-    s, out, _ = keyed_call(p.srv, "/api/v1/graph/work/teams", method="POST", body={"name": "Operators only"})
+    s, out, _ = keyed_call(p.srv, "/api/v1/graph/work/teams", method="POST", body={"name": "Operators only"},
+                           headers={"Content-Type": "application/json"})
     assert s == 200
     team = out["team"]["native_id"]
     assert p.attach(team, roles)[0] == 200
@@ -637,7 +639,7 @@ def test_level_attachment_and_the_pending_queue_are_identical_after_a_restart(pl
 
 def test_the_queue_survives_the_submitter_leaving_and_only_the_owner_can_still_decide(plane):
     p = plane
-    impl = worker(p)
+    worker(p)
     sug = p.suggest("dave")[1]
     assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/members/dave/remove", {})[0] == 200
     row = p.queue("alice")[1]["suggestions"][0]
@@ -651,7 +653,7 @@ def test_the_queue_survives_the_submitter_leaving_and_only_the_owner_can_still_d
 def test_with_the_flag_on_a_guest_sees_no_task_and_no_task_event_but_the_room_still(plane):
     p = plane
     impl = worker(p)
-    assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/messages", {"text": "hello room"})[0] in (200, 201)
+    assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/messages", {"text": "hello room", "idempotency_key": "m-hello"})[0] in (200, 201)
     p.c("alice", "POST", f"{BASE}/rooms/{p.room}/tasks", {"target_agent_id": impl["agent_id"], "text": "internal chore"})
     assert any(t["text"] == "internal chore" for t in p.tasks("alice")[1]["tasks"])
     assert p.tasks("dave")[1]["tasks"] == []
@@ -690,3 +692,16 @@ def test_the_queue_is_listed_for_the_operator_in_the_attention_inbox_when_insigh
     p.decide(sug["suggestion_id"], decision="reject", expected_digest=sug["digest"])
     out = p.c("alice", "GET", f"{BASE}/rooms/{p.room}/attention")[1]
     assert not [i for i in out["items"] if i["category"] == "suggestion_decide"]
+
+
+def test_without_the_flag_a_guest_still_sees_tasks_exactly_as_before(plane):
+    """Honest baseline for design contradiction 8: today a guest holds `read`, so `list_tasks` and the room feed show them
+    the room's tasks. Team rooms hides that only while the flag is on; switching it off restores the old behaviour."""
+    p = plane
+    impl = worker(p)
+    p.c("alice", "POST", f"{BASE}/rooms/{p.room}/tasks", {"target_agent_id": impl["agent_id"], "text": "internal chore"})
+    assert p.tasks("dave")[1]["tasks"] == []
+    p.svc.team_rooms = normalize_team_rooms({"enabled": False})
+    assert [t["text"] for t in p.tasks("dave")[1]["tasks"]] == ["internal chore"]
+    kinds = {e["event_type"] for e in p.c("dave", "GET", f"{BASE}/rooms/{p.room}/events?cursor=0")[1]["events"]}
+    assert "task_created" in kinds

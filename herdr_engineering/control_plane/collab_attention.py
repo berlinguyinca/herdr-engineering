@@ -34,14 +34,15 @@ INSIGHTS_KEYS = frozenset({
 ATTN_EVENTS = frozenset({"attn_ack", "attn_snooze", "attn_clear"})
 CATEGORIES = ("review_blocked", "stale_head", "rereview_required", "review_requested", "review_unverifiable",
               "ci_failed", "blocked", "expired_or_stuck", "steering_confirm", "promotion_confirm",
-              "proposal_accept", "consult_request")
+              "proposal_accept", "consult_request", "suggestion_decide")
 TITLES = {
     "review_blocked": "Review blocked at the current head", "stale_head": "Pull request head cannot be verified",
     "rereview_required": "Re-review needed: the head moved", "review_requested": "Review requested",
     "review_unverifiable": "Review status cannot be established", "ci_failed": "CI failed", "blocked": "Work is blocked",
     "expired_or_stuck": "Agent or task is stuck or expired", "steering_confirm": "Steering request waits for your confirmation",
     "promotion_confirm": "Fork or promotion waits for your confirmation", "proposal_accept": "Proposal waits for your decision",
-    "consult_request": "Someone asked you a question"}
+    "consult_request": "Someone asked you a question",
+    "suggestion_decide": "A guest's request waits for your decision"}
 _ACK_KEY = re.compile(r"[a-z_]{1,32}\|[\x21-\x7e]{1,420}\Z")
 _FP = re.compile(r"[0-9a-f]{24}\Z")
 PRIORITY_RULES = [
@@ -49,7 +50,8 @@ PRIORITY_RULES = [
     {"severity": "warning", "means": "a head moved, an agent is stuck, work has been blocked a long time",
      "categories": ["stale_head", "rereview_required", "expired_or_stuck", "blocked (after the escalation time)"]},
     {"severity": "notice", "means": "waiting for a person or a review",
-     "categories": ["review_requested", "blocked", "steering_confirm", "promotion_confirm", "proposal_accept", "consult_request"]},
+     "categories": ["review_requested", "blocked", "steering_confirm", "promotion_confirm", "proposal_accept", "consult_request",
+                    "suggestion_decide"]},
     {"severity": "info", "means": "context only", "categories": ["review_unverifiable"]}]
 ORDER_RULE = "severity (error first), then items addressed to you, then the oldest first, then key"
 MAX_SCAN_ROWS = 200      # rows of any one collab-side list examined per read
@@ -326,7 +328,9 @@ class AttentionMixin:
         from .collab import ROLE_ACTIONS
         m = self._member(room, pr.id) or {}
         role = m.get("role")
-        rows: dict[str, list] = {"steer": [], "proposal": [], "consult": [], "agent": []}
+        rows: dict[str, list] = {"steer": [], "proposal": [], "consult": [], "agent": [], "suggestion": []}
+        if role == "owner":                     # team rooms slice 1: the Suggest queue is the owner's to decide
+            rows["suggestion"] = self._tr_attention_rows(room_id)
         scfg = self.steer_cfg()
         if scfg["enabled"] and not scfg["kill_switch"] and role in scfg["confirm_roles"]:
             for sid in reversed(self._steers_by_room.get(room_id, ())[-MAX_SCAN_ROWS:]):
@@ -367,7 +371,7 @@ class AttentionMixin:
         def item(category, severity, key_id, subject, fp, since, detail=None, expires=None):
             out.append({"key": f"{category}|{key_id}", "category": category, "severity": severity, "subject": subject,
                         "since": since, "for_you": category in ("steering_confirm", "promotion_confirm", "proposal_accept",
-                                                                 "consult_request"),
+                                                                 "consult_request", "suggestion_decide"),
                         "fp": ins.fingerprint(category, key_id, *fp), "detail": detail, "expires_at": expires})
         for r in rows["steer"]:
             node = graph.node_context(reader, r["node_id"])
@@ -380,6 +384,9 @@ class AttentionMixin:
         for r in rows["proposal"]:
             item("proposal_accept", "notice", r["id"], {"node_id": None, "node_type": "proposal", "label": None},
                  (r["kind"],), r["at"], {"proposal_id": r["id"], "kind": ins.clip(r["kind"], 24), "size": r["size"]})
+        for r in rows["suggestion"]:             # ids and dates only: the request's words stay in the queue, never the inbox
+            item("suggestion_decide", "notice", r["id"], {"node_id": None, "node_type": "suggestion", "label": None},
+                 (r["digest"],), r["at"], {"suggestion_id": r["id"], "tainted": True}, self._iso(r["expires_epoch"]))
         for r in rows["consult"]:
             node = graph.node_context(reader, r["node_id"])
             subject = ({"node_id": r["node_id"], "node_type": node["node_type"], "label": ins.clip(node["label"])}
