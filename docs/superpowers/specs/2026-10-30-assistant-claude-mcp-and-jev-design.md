@@ -249,3 +249,28 @@ Decisions **(my call)**:
 - **Installer** writes only into the user-level config of the harness being enrolled, shows a diff and requires the owner to confirm; it never edits another harness's config and never touches cluster nodes (login-node-only workers use the voluntary `assistant_ask` path, no installed hook).
 - **Evidence still trusted only from the owner API/UI** (section 13). Hook-observed approvals made in the terminal are `worker_reported` and do not count toward activation.
 - **Phase 1 is split per harness:** 1a Claude Code, 1b Codex, 1c OpenCode, 1d Pi. Each has its own smoke test against the real tool, run in a throwaway HOME (never the real `~/.claude`, `~/.codex`, `~/.config/opencode` or `~/.pi`).
+
+## 15. Owner decisions of 2026-10-30 (later): hooks yes, learn inside the session, Pi work in pi-engineering
+
+Quoted: *"we are ok with hooks, but we want to do the learning inside the harness session, since we can't jump back and forth"* and *"can we add this functionality in pi-engineering?"*
+
+### 15.1 Learning happens in the harness session (supersedes the UI-only evidence rule in section 13)
+
+The owner keeps answering in the terminal of whichever harness they are in. The assistant learns by **observing** those answers through harness hooks, not through a second UI.
+
+- **Hook-attested evidence counts.** A decision observed by a hook run by the harness itself (not by the model) is `harness_attested` and counts toward N. Basis: a prompt-injected model cannot run or alter the hook process; the hook reports with the worker credential. What the model can call over MCP (`report`) stays `worker_reported` and counts for nothing. Residual risk, stated plainly: a compromised machine can forge attested evidence; that is accepted because it already controls the owner's session.
+- **How a hook observes the answer (per harness, to verify):** the `PermissionRequest` hook returns no decision (the normal prompt runs); a post-tool hook (`PostToolUse` / `PostToolUseFailure` or the harness equivalent) reports whether the tool then ran (owner approved) or was refused (owner denied). The hook sends action key, outcome, session id, task id, timestamp.
+- **First-grant confirmation also happens in-session.** When a verb/scope becomes `proposed`, the next time that action arises the hook surfaces it through the harness's own prompt with reason text ("Assistant proposes to auto-approve <verb> in <scope> from now on; you approved it N times: <summary>"), e.g. via `PreToolUse` `ask` or MCP elicitation. A yes creates the grant, recorded as `harness_attested` owner confirmation. A model-callable tool can never confirm a grant.
+- **Revocation and digest in-session:** a `SessionStart` hook injects a short digest of autonomous actions since last session and how to revoke (a slash command / `herdr assistant grants revoke`). The owner API/UI remains available but is no longer required for learning.
+- Consequence for the judge's miss label (7.4): "owner denied or regretted afterwards" is now observed from the same hook feed plus an explicit in-session `/regret` command **(my call)**.
+- Consequence for the shadow period: during shadow the hook never allows or denies on its own; it only observes and reports.
+
+### 15.2 Pi adapter lives in pi-engineering (new repo in scope)
+
+The Pi side is built in **berlinguyinca/pi-engineering**, not herdr-engineering. herdr-engineering owns the hub (MCP server, grants, judge, claude/codex/opencode adapters); pi-engineering owns the Pi extension that talks to it.
+
+- **Hard working rules for that repo:** work only in a fresh git worktree/clone off `origin/main` on a new branch. The live install at `/home/wohlgemuth/pi-engineering` (currently `main`, 67 commits behind origin) and `~/.pi/agent` and the real `~/IdeaProjects/pi-eng-*` mission worktrees are never edited or used for tests; tests use a throwaway HOME.
+- **Pi has no native MCP client** (survey). The pi-engineering `McpRegistry` today is a stdio-only policy registry with no headers/HTTP transport. Two options, **builder to choose after reading the type declarations**: (a) add a Streamable-HTTP MCP client transport with custom headers to pi-engineering and register the hub like any other MCP server; (b) a dedicated "assistant" extension that registers the assistant tools directly with `pi.registerTool` and calls the hub over HTTP. Preference **(my call)**: (b) first, because it is smaller, and it can later be re-expressed as (a).
+- **Extension responsibilities:** register assistant tools (`assistant_ask`, `action_request`, `assignments_next`, `report`, read tools); gate `pi.on("tool_call")` through the hub using the same canonical action format and the same rule (allow only on active grant, deny only on veto, else fall through); post-tool observation for evidence (Pi has no approval prompt, so "owner answered" does not exist in Pi: **Pi workers produce no approval evidence**, only outcomes; learning for Pi actions comes from the other harnesses' answers to the same action keys **(my call, owner to confirm)**); an enrollment command that stores the worker credential in pi-engineering's own config location, never in files in the repo.
+- **Fall-through for Pi when the hub is unreachable (open, section 14 question):** with no prompt to fall back to, default **block only fixed vetoes and allow the rest**, configurable per worker.
+- **Delivery:** its own phase 1d with its own PRs in pi-engineering; pi-engineering has its own CI (Woodpecker was only just activated and no required checks yet), review and merge rules apply per repo; no merge without the owner's word.
