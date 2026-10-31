@@ -177,7 +177,7 @@ def test_hook_main_reads_stdin_exits_zero(started, tmp_path):
 
 # ---------------------------------------------------------------- installer
 
-CMD = "/usr/bin/python3 -I /x/hook_relay.py"
+CMD = build_hook_command("/usr/bin/python3", "/x/hook_relay.py")
 
 
 def test_install_hooks_diff_confirm_and_idempotent(tmp_path):
@@ -465,3 +465,47 @@ def test_redeem_warns_on_plain_http_to_public_host(tmp_path, capsys):
                 "https://hub.example.invalid"):
         assert hook_relay.plain_http_warning(url) is None, url
     assert hook_relay.plain_http_warning("http://8.8.8.8:1")
+
+
+# ---------------------------------------------------------------- fix round 2: exact ownership
+
+def test_install_hooks_never_deletes_lookalike_user_hooks(tmp_path):
+    s = tmp_path / "settings.json"
+    lookalikes = ["/u/my_hook_relay.py", "grep hook_relay.py log", "python3 /somewhere/else/hook_relay.py",
+                  "echo 'unbalanced hook_relay.py", "/bin/sh -c 'echo hook_relay.py'"]
+    events_ = ("PermissionRequest", "PostToolUse", "PostToolUseFailure")
+    orig = {"hooks": {ev: [{"matcher": "x", "hooks": [{"type": "command", "command": c}]} for c in lookalikes]
+                      for ev in events_}}
+    s.write_text(json.dumps(orig))
+    cmd = build_hook_command("/a/python3", "/a/herdr_engineering/control_plane/assistant_hub/hook_relay.py")
+    install_hooks(s, command=cmd, confirm=lambda d: True)
+    data = json.loads(s.read_text())
+    for ev in events_:
+        assert data["hooks"][ev][:len(lookalikes)] == orig["hooks"][ev]
+        assert [e for e in data["hooks"][ev] if e["hooks"][0]["command"] == cmd]
+        assert len(data["hooks"][ev]) == len(lookalikes) + 1
+
+
+def test_install_hooks_replaces_ours_only_and_keeps_shared_entry_neighbours(tmp_path):
+    s = tmp_path / "settings.json"
+    old = build_hook_command("/old/python3", "/old/x/hook_relay.py")
+    legacy = "/old/python3 -I /old/herdr_engineering/control_plane/assistant_hub/hook_relay.py"
+    mine = {"type": "command", "command": "keepme"}
+    s.write_text(json.dumps({"hooks": {
+        "PostToolUse": [{"matcher": "*", "hooks": [mine, {"type": "command", "command": old}]},
+                        {"matcher": "*", "hooks": [{"type": "command", "command": legacy}]}]}}))
+    new = build_hook_command("/new/python3", "/new/y/hook_relay.py")
+    install_hooks(s, command=new, confirm=lambda d: True)
+    data = json.loads(s.read_text())
+    cmds = [h["command"] for e in data["hooks"]["PostToolUse"] for h in e["hooks"]]
+    assert cmds == ["keepme", new]
+    assert install_hooks(s, command=new, confirm=lambda d: pytest.fail("idempotent")) == ""
+
+
+def test_hook_main_ignores_marker_argument(started, tmp_path):
+    hub, _, _, _ = setup(started, tmp_path)
+    cmd = build_hook_command(sys.executable, hook_relay.__file__)
+    assert "--herdr-assistant-hook" in cmd
+    r = subprocess.run(cmd, shell=True, input=json.dumps(PERM), capture_output=True, text=True, timeout=30,
+                       env={"HOME": str(tmp_path), "HERDR_ASSISTANT_WORKER_FILE": str(tmp_path / "w.json")})
+    assert r.returncode == 0 and len(events(hub)) == 1

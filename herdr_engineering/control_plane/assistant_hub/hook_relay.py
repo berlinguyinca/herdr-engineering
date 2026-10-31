@@ -30,7 +30,8 @@ ENV_FILE = "HERDR_ASSISTANT_WORKER_FILE"
 DEFAULT_FILE = "~/.config/herdr/assistant-worker.json"
 MAX_COMMAND = 300
 HOOK_EVENTS = ("PermissionRequest", "PostToolUse", "PostToolUseFailure")
-MARKER = "hook_relay.py"
+MARKER = "--herdr-assistant-hook"  # fixed no-op argv token that identifies our own hook commands
+LEGACY_SUFFIX = "herdr_engineering/control_plane/assistant_hub/hook_relay.py"
 DEADLINE_S = 2.5
 SOCKET_TIMEOUT_S = 2.0
 _TOKENISH = re.compile(r"[A-Za-z0-9_.=/+\-]{24,}")
@@ -208,12 +209,27 @@ def _backup_path(settings: Path, *, stamp: str | None = None) -> Path:
 
 def build_hook_command(exe: str, script: str) -> str:
     """One shell command that runs the relay and can never block the harness: no output, always exit 0."""
-    inner = f"{shlex.quote(exe)} -I {shlex.quote(script)} >/dev/null 2>&1; exit 0"
+    inner = f"{shlex.quote(exe)} -I {shlex.quote(script)} {MARKER} >/dev/null 2>&1; exit 0"
     return f"/bin/sh -c {shlex.quote(inner)}"
 
 
+def _argv(command: str) -> list[str]:
+    argv = shlex.split(command)
+    if len(argv) == 3 and argv[0] == "/bin/sh" and argv[1] == "-c":
+        argv = shlex.split(argv[2])
+    return argv
+
+
 def _is_ours(hook: Any) -> bool:
-    return isinstance(hook, dict) and MARKER in str(hook.get("command", ""))
+    """Exact ownership: our argv marker token, or the older `<exe> -I <package>/hook_relay.py` forms. Unparseable
+    commands and look-alikes are never ours."""
+    if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
+        return False
+    try:
+        argv = _argv(hook["command"])
+    except ValueError:
+        return False
+    return MARKER in argv or any(a.endswith("/" + LEGACY_SUFFIX) for a in argv)
 
 
 def _with_hooks(data: dict, command: str) -> dict:
