@@ -72,9 +72,13 @@ STATE_CACHE_SIZE = 256
 SESSION_PER_SHARE_PER_MINUTE = 30   # session attempts per share per minute (blunts token guessing)
 SESSION_GLOBAL_PER_MINUTE = 600     # verified session attempts across all lab shares per minute (bounds JWT work)
 STATIC_MAX_BYTES = 1024 * 1024
+VENDOR_MAX_BYTES = 4 * 1024 * 1024   # the vendored pdf.js worker is ~1.4 MB
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parent / "share_static"
 VIEWER_FILE = "viewer.html"
 STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8"}
+# One level below static/vendor/pdfjs/: exactly the two vendored pdf.js modules (the licence and SHA256SUMS stay unserved).
+VENDOR_FILES = {"pdf.min.mjs": "text/javascript; charset=utf-8", "pdf.worker.min.mjs": "text/javascript; charset=utf-8"}
+VENDOR_CACHE = "public, max-age=31536000, immutable"   # the path names a pinned release; a bump changes the file set
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 _SHARE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -817,11 +821,14 @@ class ShareHandler(BaseHTTPRequestHandler):
                 return self._send_viewer_bytes(lab, lab.config_json, "application/json")
             if name in STATIC_FILES:
                 return self._send_static(lab, name, STATIC_FILES[name])
+        if len(parts) == 6 and parts[2:5] == ["static", "vendor", "pdfjs"] and parts[5] in VENDOR_FILES:
+            return self._send_static(lab, parts[5], VENDOR_FILES[parts[5]], subdir=("vendor", "pdfjs"))
         return deny(self, None, "unknown_route")
 
-    def _send_static(self, lab: LabSettings, name: str, content_type: str):
-        """One allow-listed file straight from ``static_dir`` (no directory walk, no symlink), or the 404."""
-        opened = _open_beneath(lab.static_dir, [name], max_size=STATIC_MAX_BYTES)
+    def _send_static(self, lab: LabSettings, name: str, content_type: str, subdir: tuple[str, ...] = ()):
+        """One allow-listed file straight from ``static_dir`` (no directory walk, no symlink), or the 404.
+        ``subdir`` is the fixed vendored-library directory: bigger cap, immutable cache (the path pins the release)."""
+        opened = _open_beneath(lab.static_dir, [*subdir, name], max_size=VENDOR_MAX_BYTES if subdir else STATIC_MAX_BYTES)
         if opened is None:
             return deny(self, None, "static_missing")
         fd, st = opened
@@ -835,12 +842,12 @@ class ShareHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
         finally:
             os.close(fd)
-        return self._send_viewer_bytes(lab, b"".join(chunks), content_type)
+        return self._send_viewer_bytes(lab, b"".join(chunks), content_type, VENDOR_CACHE if subdir else "no-store")
 
-    def _send_viewer_bytes(self, lab: LabSettings, body: bytes, content_type: str):
+    def _send_viewer_bytes(self, lab: LabSettings, body: bytes, content_type: str, cache: str = "no-store"):
         _send_headers(self, 200, [("Content-Type", content_type), ("Content-Length", str(len(body))),
                                   ("Content-Security-Policy", lab.viewer_csp), ("X-Content-Type-Options", "nosniff"),
-                                  ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"),
+                                  ("Cache-Control", cache), ("Referrer-Policy", "no-referrer"),
                                   ("X-Robots-Tag", "noindex"), ("X-Frame-Options", "DENY")], cors=False)
         if self.command != "HEAD":
             self.wfile.write(body)
