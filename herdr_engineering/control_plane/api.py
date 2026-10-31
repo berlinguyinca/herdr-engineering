@@ -303,7 +303,8 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None):
+                 share_store=None, shares_root=None, share_settings=None,
+                 collab_grant_store=None, collab_artifacts_enabled: bool = False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -440,6 +441,9 @@ class ControlPlaneServer:
         self.share_store = share_store
         self.shares_root = shares_root
         self.share_settings = share_settings
+        # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
+        self.collab_grant_store = collab_grant_store
+        self.collab_artifacts_enabled = collab_artifacts_enabled
         self.attachment_dedupe: dict = {}      # redelivery guard for the email-attachment route; lost on restart
         from .artifact_scope import install_gate
         self.artifact_graph_gate = install_gate(repo.graph, artifact_acl)   # None without an ACL: nodes stay private
@@ -2926,6 +2930,9 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_collab_api import route_collab
+                if route_collab(self, server, parts, resource):
+                    return None
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
                     return None

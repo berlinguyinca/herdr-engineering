@@ -3164,6 +3164,22 @@ def _share_wiring(cp: dict, dsn: str | None):
     return artifact_adapter.SyncArtifactAdapter(create_share_store), Path(share.get("shares_dir") or "/shares"), settings
 
 
+def _collab_grant_wiring(cp: dict, dsn: str | None):
+    """(grant store adapter, enabled) when control_plane.collab_artifacts.enabled is exactly true and a DSN exists, else
+    (None, False). The owner routes for collaborators, activity and diffs use the adapter's call path."""
+    section = cp.get("collab_artifacts")
+    if not isinstance(section, dict) or section.get("enabled") is not True or not dsn:
+        return None, False
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_collab_store import CollabGrantStore
+
+    async def create():
+        import asyncpg
+        return CollabGrantStore(await asyncpg.connect(dsn))
+
+    return artifact_adapter.SyncArtifactAdapter(create), True
+
+
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -3340,6 +3356,7 @@ def _cmd_cp_web(args) -> int:
         artifact_reviews.load(artifact_adapter("load_reviews"))
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
+    collab_grant_store, collab_artifacts_enabled = _collab_grant_wiring(cp, dsn)
     collab = None
     artifact_bridge = None
     if args.collab_cognito_pool:
@@ -3460,7 +3477,8 @@ def _cmd_cp_web(args) -> int:
                              operator_hosts=args.collab_operator_host,
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
-                             share_store=share_store, shares_root=shares_root, share_settings=share_settings)
+                             share_store=share_store, shares_root=shares_root, share_settings=share_settings,
+                             collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -3491,6 +3509,8 @@ def _cmd_cp_web(args) -> int:
             artifact_adapter.close()
         if share_store is not None:
             share_store.close()
+        if collab_grant_store is not None:
+            collab_grant_store.close()
     return 0
 
 

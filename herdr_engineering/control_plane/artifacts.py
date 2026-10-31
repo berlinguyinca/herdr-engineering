@@ -68,6 +68,11 @@ async def _transaction(conn: Any):
         yield conn
 
 
+# Display-only caps for ``version_text_diff``: they bound diff cost, they are not storage limits.
+MAX_DIFF_FILE_BYTES = 2 * 1024 * 1024
+MAX_DIFF_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
 class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycleMixin):
     def __init__(self, conn: Any, rustfs: RustFSClient):
         self._conn = conn
@@ -752,9 +757,102 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
     async def list_version_summaries(self, artifact_id: str) -> list[dict]:
         rows = await self._conn.fetch(
             "SELECT version_id, artifact_id, version_number, parent_version_id, parent_version_ids, created_via, "
-            "collaborator_agent_id, created_by, state, created_at, committed_at, (report_descriptor IS NOT NULL) AS is_report FROM artifact_versions "
+            "collaborator_agent_id, created_by, state, created_at, committed_at, (report_descriptor IS NOT NULL) AS is_report, "
+            "provenance->>'message' AS message FROM artifact_versions "
             "WHERE artifact_id=$1 ORDER BY version_number DESC", artifact_id)
         return [self._row(row) for row in rows]
+
+    async def collab_state(self, artifact_id: str) -> dict | None:
+        """Who owns an artifact and whether collaborators may write to it: ``{created_by, writable,
+        writable_reason}``, or None for an unknown artifact. Mirrors the rules ``merge_commit`` and the mirror use."""
+        from .collab_mirror import RENDERED_READ_ONLY, REPORT_READ_ONLY
+        artifact = await self._conn.fetchrow(
+            "SELECT created_by, artifact_type, lifecycle, current_version_id FROM artifacts WHERE artifact_id=$1",
+            artifact_id)
+        if artifact is None:
+            return None
+        reason = None
+        head = None
+        if artifact["current_version_id"]:
+            head = await self._conn.fetchrow(
+                "SELECT state, (report_descriptor IS NOT NULL) AS is_report, (source_manifest_blob IS NOT NULL) AS built "
+                "FROM artifact_versions WHERE version_id=$1 AND artifact_id=$2",
+                artifact["current_version_id"], artifact_id)
+        if artifact["artifact_type"] == "report":
+            reason = REPORT_READ_ONLY
+        elif artifact["lifecycle"] == "retracted":
+            reason = "artifact is retracted"
+        elif head is None:
+            reason = "artifact has no head version"
+        elif head["is_report"] or head["built"]:
+            reason = RENDERED_READ_ONLY
+        return {"created_by": artifact["created_by"], "writable": reason is None, "writable_reason": reason}
+
+    def _read_limited(self, entry: dict, limit: int) -> bytes | None:
+        """The blob's bytes, or None as soon as it is seen to exceed ``limit`` (never buffers more than limit + a chunk)."""
+        reference = entry.get("storage_key") or entry.get("blob_sha256") or entry.get("sha256")
+        if isinstance(reference, str) and len(reference) == 64 and "/" not in reference:
+            reference = f"sha256/{reference[:2]}/{reference[2:4]}/{reference}"
+        digest = entry.get("sha256") or entry.get("blob_sha256")
+        chunks, size = [], 0
+        try:
+            for chunk in self._rf.iter_get(reference, digest, chunk_size=1024 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    return None
+                chunks.append(chunk)
+        except Exception as exc:                          # noqa: BLE001 - missing object, IntegrityError, transport
+            raise ArtifactError(f"cannot read artifact blob for {entry.get('name')}") from exc
+        return b"".join(chunks)
+
+    async def version_text_diff(self, artifact_id: str, version_id: str) -> dict | None:
+        """Display diff of a version against its first parent (None for an unknown version).
+
+        ``{version_id, against, files: [{name, change, diff, reason?}]}`` with files sorted by name. ``diff`` text comes
+        from ``ArtifactBundle.diff``. A changed file bigger than ``MAX_DIFF_FILE_BYTES`` on either side, or met after
+        ``MAX_DIFF_RESPONSE_BYTES`` of diff text is already in the response, has ``reason: oversize``; a non-text
+        file has ``reason: binary``. The caps bound display cost only; nothing is truncated in storage."""
+        from .artifact_bundle import ArtifactBundle
+        version = await self.get_version(version_id, artifact_id)
+        if version is None:
+            return None
+        parents = version.get("parent_version_ids") or ([version["parent_version_id"]]
+                                                          if version.get("parent_version_id") else [])
+        against = parents[0] if parents else None
+        parent = await self.get_version(against, artifact_id) if against else None
+        new_files = self._manifest_by_name(version.get("output_manifest"))
+        old_files = self._manifest_by_name(parent.get("output_manifest")) if parent else {}
+        spent, out = 0, []
+        for name in sorted(set(new_files) | set(old_files)):
+            old, new = old_files.get(name), new_files.get(name)
+            change = ("added" if old is None else "deleted" if new is None
+                      else "unchanged" if old["sha256"] == new["sha256"] else "modified")
+            item = {"name": name, "change": change, "diff": None}
+            out.append(item)
+            if change == "unchanged":
+                continue
+            media_type = (new or old).get("media_type") or "application/octet-stream"
+            if not (media_type.startswith("text/") or media_type == "application/json"):
+                item["reason"] = "binary"
+                continue
+            sides = [side for side in (old, new) if side is not None]
+            if (spent >= MAX_DIFF_RESPONSE_BYTES
+                    or any(isinstance(s.get("size_bytes"), int) and s["size_bytes"] > MAX_DIFF_FILE_BYTES
+                           for s in sides)):
+                item["reason"] = "oversize"
+                continue
+            data = [self._read_limited(side, MAX_DIFF_FILE_BYTES) for side in sides]
+            if any(d is None for d in data):
+                item["reason"] = "oversize"
+                continue
+            if any(b"\x00" in d for d in data):
+                item["reason"] = "binary"
+                continue
+            left = data[0] if old is not None else b""
+            right = data[-1] if new is not None else b""
+            item["diff"] = ArtifactBundle.diff(left, right, media_type=media_type)
+            spent += len(item["diff"].encode("utf-8"))
+        return {"version_id": version_id, "against": against, "files": out}
 
     async def get_report_job(self, artifact_id: str, job_id: str) -> dict | None:
         row = await self._conn.fetchrow(
