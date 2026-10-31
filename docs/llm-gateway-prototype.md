@@ -32,6 +32,26 @@ Measured locally with the real gateway under the supervisor (shared client token
    the table: deny all, never the last good one. Measured: a new key worked and a revoked one
    was refused within ~2 s, with the gateway started once.
 
+## Token accounting (done)
+The gateway counts provider-reported tokens per caller principal and model and serves them at
+`GET /v1/admin/usage` (admin secret; counts only, no prompt text). `control-plane
+llm-gateway-usage` polls it and emits one `token_usage` event per request (`source=llm-gateway`)
+for `herdr:<project>:<key_id>`. The baseline is saved only after the control plane accepted the
+batch; a gateway restart is detected by `startedAt` and counted from zero.
+
+## Measured in a Linux container (arm64 build of the gateway commit, mock node)
+| step | result |
+| --- | --- |
+| chat with project key | 200; bogus key 401; usage route without admin secret 401 |
+| 4 + 2 requests, report | control plane shows 6 requests, 66 in / 30 out (11/5 each) |
+| report again, no traffic | unchanged (no double count) |
+| gateway restarted, 2 requests | +2 exactly, never negative |
+| key minted and synced | accepted with no gateway restart |
+| key revoked and synced | 401, principals file `{}` |
+
+Not measured: `--adaptive` (the compose command) serves no static nodes without a controller or
+peer, so the proof ran without it. Real traffic arrives through peering.
+
 ## Layout
 - `llm-gateway-sync` container: renders keys, loops, needs no Rust binary.
 - `llm-gateway` container: the gateway only, waits for the principals file.
@@ -39,14 +59,12 @@ Measured locally with the real gateway under the supervisor (shared client token
   sessions get `INFERWEAVE_BASE_URL` when `llm.inferweave_url` is set.
 
 ## Not done, and why
-- **Peering to llm.metabolomics.us.** Nothing persistent runs yet to peer, and it needs a
-  gateway-kind enrollment code on the production gateway plus a preserved identity (as on
-  Whiteale). Do it when the gateway runs on the fabric host.
-- **Token accounting from the gateway.** Its outbox holds raw prompt records and no per-request
-  token counts, so tailing it would copy prompts into the dashboard. Needs a usage feed in the
-  gateway. Until then llm-proxy remains the accounting path.
-- **Custom models** stay on llm-proxy for the same reason.
-- **Image.** `llm-gateway/Dockerfile` is ready but must be built from a reviewed Linux
-  release of a merged commit; none exists for these inferweave changes yet.
-- **Bring-up.** The compose file is covered by the render tests only; the containers were not
-  started (no reviewed binary).
+- **Peering to llm.metabolomics.us.** Needs a gateway-kind enrollment code minted on the
+  production gateway and a preserved identity (as on Whiteale), and something persistent running
+  to peer. Do it when the gateway runs on the fabric host.
+- **Custom models stay on llm-proxy, by design.** They are project-scoped routes to external
+  OpenAI-style URLs; the gateway is a fleet router and has no such proxy mode.
+- **A reviewed image.** The prototype binary was built locally from the branch and deleted after
+  the check. Production needs a Linux release of a merged commit, then `llm-gateway/Dockerfile`.
+- **Full compose bring-up** (control plane, postgres, `llm-proxy`): the gateway container and the
+  sync and usage commands ran for real; the compose file as a whole is covered by render tests.
