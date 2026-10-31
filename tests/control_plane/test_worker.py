@@ -704,3 +704,61 @@ def test_a_failed_later_retraction_refresh_keeps_the_last_good_gate(registry_pg,
             assert aid not in rig.grants()["agents"].get(pr.id, {})
             await until(lambda: rig.grants()["generated_at"] > before)  # and publishing continues
     loop_run(go())
+
+
+def _inline_commit(rig, pr, aid, base, text):
+    return rig.bridge.commit(pr, {"artifact_id": aid, "base_version_id": base, "message": "m",
+                                  "changes": [{"name": "doc.md", "op": "put", "text": text}]})["ticket"]
+
+
+def test_a_dead_scan_connection_is_replaced_and_a_fresh_intent_is_decided(registry_pg, svc, tmp_path):
+    """F1/A1: the applier's dedicated scan connection is killed by the server (restart, idle kill); intake must
+    recover, not stall forever, and the grants heartbeat must be unaffected."""
+    async def go():
+        async with LoopRig(svc, tmp_path, registry_pg["dsn"], FakeBlobs()) as rig:
+            aid, v1 = await rig.artifact()
+            pr = rig.agent("agent-a")
+            await rig.grant(aid, pr)
+            rig.start()
+            await until(lambda: rig.grants() and pr.id in rig.grants()["agents"])
+            await until(lambda: (rig.mirror_root / "artifacts" / aid / "head.json").exists())
+            first = _inline_commit(rig, pr, aid, v1, "first\nline 2\n")
+            await until(lambda: rig.result(first), timeout=10)
+            for conn in rig.conns.by_task("collab-applier"):         # the server kills every applier-task connection
+                if not conn.is_closed():
+                    await rig.pool.execute("SELECT pg_terminate_backend($1)", conn.get_server_pid())
+            await asyncio.sleep(0.3)
+            head = rig.result(first)["version_id"]
+            second = _inline_commit(rig, pr, aid, head, "second\nline 2\n")
+            decided = await until(lambda: rig.result(second), timeout=15)
+            assert decided["result"] in ("created", "merged")
+            before = rig.grants()["generated_at"]
+            await until(lambda: rig.grants()["generated_at"] > before + 0.3, timeout=3)
+    loop_run(go())
+
+
+def test_the_invite_scan_does_not_use_the_default_executor_so_the_heartbeat_survives_its_saturation(
+        registry_pg, svc, tmp_path):
+    """F1/A6: every default-executor thread is blocked; grants.json must still advance (heartbeat)."""
+    import concurrent.futures
+    import threading
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=2))
+        gate = threading.Event()
+        async with LoopRig(svc, tmp_path, registry_pg["dsn"], FakeBlobs()) as rig:
+            aid, _ = await rig.artifact()
+            pr = rig.agent("agent-a")
+            await rig.grant(aid, pr)
+            rig.start()
+            await until(lambda: rig.grants() and pr.id in rig.grants()["agents"])
+            blockers = [loop.run_in_executor(None, gate.wait, 30) for _ in range(2)]     # saturate the default pool
+            try:
+                await asyncio.sleep(0.2)
+                before = rig.grants()["generated_at"]
+                await until(lambda: rig.grants()["generated_at"] > before + 0.3, timeout=5)
+            finally:
+                gate.set()
+                await asyncio.gather(*blockers)
+    loop_run(go())

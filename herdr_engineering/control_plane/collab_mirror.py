@@ -161,6 +161,11 @@ class CollabMirror:
         self._grants_pool.shutdown(wait=False)
 
     # -- grants.json ------------------------------------------------------------------------------------------
+    async def run_on_grants_thread(self, fn, *args):
+        """Run a short blocking ``fn(*args)`` on the dedicated grants thread (never the default executor), so the
+        grants task can neither be starved by the mirror's downloads nor starve them."""
+        return await asyncio.get_running_loop().run_in_executor(self._grants_pool, fn, *args)
+
     async def publish_grants(self, grants, store, *, heartbeat: float = 30.0, gate=None,
                              retracted: set[str] | frozenset[str] | None = None) -> GrantsPublish:
         """Write ``grants.json`` when its content changed, else at least every ``heartbeat`` s.
@@ -206,7 +211,7 @@ class CollabMirror:
         def write() -> None:
             ensure_dir(self.root, mode=DIR_MODE, public_mode=True)
             atomic_write_json(self.root, GRANTS_NAME, doc)
-        await asyncio.get_running_loop().run_in_executor(self._grants_pool, write)
+        await self.run_on_grants_thread(write)
         self._grants_body, self._grants_written_at = body, now
         return GrantsPublish(True, changed)
 

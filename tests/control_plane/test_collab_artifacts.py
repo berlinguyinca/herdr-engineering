@@ -1357,3 +1357,11 @@ def test_collab_waiters_imports_neither_mcp_nor_artifacts():
         elif isinstance(node, ast.ImportFrom):
             names |= {node.module or ""} | {a.name for a in node.names}
     assert not {n for n in names if "collab_mcp" in n or "collab_artifacts" in n}
+
+
+def test_an_agent_id_that_is_not_a_valid_owner_key_is_a_4xx_not_a_500_when_checking_uploads(world):
+    from herdr_engineering.control_plane.collab import Principal
+    odd = Principal("agent", "m_reserved", "alice")             # the reserved member prefix: agent_owner_key refuses
+    upl = upload_id_for("x", X, "big.bin", sha(BIG), len(BIG))
+    checked = cbf.validate_changes([{"name": "big.bin", "op": "put", "upload_id": upl}], cbf.BridgeLimits())
+    assert status(world.bridge._check_uploads, odd, X, checked, cbf.BridgeLimits())[0] == 400

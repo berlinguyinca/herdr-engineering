@@ -349,19 +349,6 @@ class _PoolLease:
         await self._pool._give(self._conn, exc_type is None)
 
 
-class _Held:
-    """``async with held() as conn``: always the same, already open connection."""
-
-    def __init__(self, conn):
-        self._conn = conn
-
-    async def __aenter__(self):
-        return self._conn
-
-    async def __aexit__(self, *exc) -> None:
-        return None
-
-
 async def _close_quietly(conn) -> None:
     try:
         await conn.close()
@@ -454,7 +441,7 @@ class CollabBridgeLoop:
                 await self._wait(stop, self.interval)
                 continue
             try:
-                joins = await asyncio.to_thread(self._invite_joins)
+                joins = await self.mirror.run_on_grants_thread(self._invite_joins)
                 if joins:
                     await grants.resolve_invite_grants(joins)
             except Exception as exc:  # noqa: BLE001 - an invite problem must never hold back a revoke
@@ -508,11 +495,16 @@ class CollabBridgeLoop:
             log.warning("collab bridge: result sweep failed (%s)", type(exc).__name__)
 
     # -- applier ------------------------------------------------------------------------------------------------
-    async def _applier(self, conn, stop: asyncio.Event, pool: _ConnPool) -> None:
-        # the scan runs on this task's own connection and never waits for a lane's (see the applier's docstring);
-        # the pool holds one connection per lane plus one for the post-commit mirror refresher
-        scan = _Held(conn)
+    async def _applier(self, _conn, stop: asyncio.Event, pool: _ConnPool) -> None:
+        # the scan runs on its own connection and never waits for a lane's (see the applier's docstring); the pool
+        # holds one connection per lane plus one for the post-commit mirror refresher. The scan connection comes from
+        # a one-connection pool that replaces a connection that died or failed (a Postgres restart, an idle kill), so
+        # intake recovers by itself and the lanes, grants and mirror tasks never notice.
+        scan = _ConnPool(self.dsn_connect, 1)
         wait = min(self.interval, 0.5)
-        while not stop.is_set():
-            await self.applier.tick(pool.acquire, scan_acquire=lambda: scan, wait=wait)
-            await self._wait(stop, self.interval)
+        try:
+            while not stop.is_set():
+                await self.applier.tick(pool.acquire, scan_acquire=scan.acquire, wait=wait)
+                await self._wait(stop, self.interval)
+        finally:
+            await scan.aclose()

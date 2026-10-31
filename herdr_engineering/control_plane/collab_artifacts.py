@@ -864,7 +864,10 @@ class CollabArtifactBridge:
     def _check_uploads(self, pr: Principal, artifact_id: str, changes, limits: BridgeLimits) -> int:
         """Every staged put must be the CALLER's own complete upload for this artifact and name. Returns the declared
         bytes of the distinct uploads. A complete upload not yet audited is audited here (exactly once)."""
-        owner_key = agent_owner_key(pr.id)
+        try:
+            owner_key = agent_owner_key(pr.id)
+        except BridgeError as exc:
+            raise CollabError(400, exc.reason) from None
         seen: dict[str, int] = {}
         for change in changes:
             upload_id = change.upload_id
