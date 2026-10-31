@@ -56,7 +56,7 @@ def test_redeem_returns_credential_once_and_stores_digest_only():
     _, code = reg.create_enrollment(tenant_id="t1", user_id="u1", name="b", harness="claude")
     worker, cred = reg.redeem(code, device_id="d")
     assert cred.startswith("hcw_")
-    assert worker.scopes == ["ask", "report", "read"]
+    assert worker.scopes == ["ask", "report"]
     assert "secret_digest" not in worker.as_dict()
     blob = json.dumps(store.snapshot()) + json.dumps(store.audit)
     assert cred not in blob and code not in blob
@@ -265,3 +265,55 @@ def test_last_seen_persistence_is_throttled():
     clock.advance(seconds=60)
     reg.authenticate(f"Worker {cred}", "dev-1")
     assert backend.writes == base + 1
+
+
+def test_default_scopes_exclude_read_and_act():
+    _, reg, _ = make()
+    worker, _ = enroll(reg)
+    assert worker.scopes == ["ask", "report"]
+
+
+def test_enrollment_scopes_are_validated_deduped_sorted_and_applied():
+    store, reg, _ = make()
+    enrollment, code = reg.create_enrollment(tenant_id="t1", user_id="u1", name="b", harness="pi",
+                                             scopes=["act", "ask", "act", "read"])
+    assert enrollment.scopes == ["ask", "read", "act"]
+    worker, _ = reg.redeem(code, device_id="d")
+    assert worker.scopes == ["ask", "read", "act"]
+    for bad in ([], ["root"], ["ask", "nope"], "ask"):
+        with pytest.raises(ValueError):
+            reg.create_enrollment(tenant_id="t1", user_id="u1", name="b", harness="pi", scopes=bad)
+
+
+def test_existing_worker_keeps_its_stored_read_scope():
+    store, reg, _ = make()
+    worker, _ = enroll(reg)
+    worker.scopes = ["ask", "report", "read"]                     # a Phase 1 worker
+    assert store.workers[worker.worker_id].scopes == ["ask", "report", "read"]
+
+
+def test_set_scopes_updates_persists_and_audits():
+    store, reg, _ = make()
+    worker, _ = enroll(reg)
+    out = reg.set_scopes("t1", "u1", worker.worker_id, ["act", "ask"])
+    assert out.scopes == ["ask", "act"] and store.workers[worker.worker_id].scopes == ["ask", "act"]
+    entry = [a for a in store.audit if a["action"] == "assistant.worker.scopes_changed"][-1]
+    assert entry["subject_id"] == worker.worker_id and "ask,report->ask,act" in entry["detail"]
+
+
+def test_set_scopes_rejects_unknown_scope_and_empty():
+    _, reg, _ = make()
+    worker, _ = enroll(reg)
+    for bad in ([], ["admin"], ["ask", "ACT"]):
+        with pytest.raises(ValueError):
+            reg.set_scopes("t1", "u1", worker.worker_id, bad)
+    assert worker.scopes == ["ask", "report"]
+
+
+def test_set_scopes_is_tenant_and_user_scoped():
+    _, reg, _ = make()
+    worker, _ = enroll(reg)
+    for t, u, w in (("t2", "u1", worker.worker_id), ("t1", "u2", worker.worker_id), ("t1", "u1", "wrk_nope")):
+        with pytest.raises(KeyError):
+            reg.set_scopes(t, u, w, ["ask"])
+    assert worker.scopes == ["ask", "report"]

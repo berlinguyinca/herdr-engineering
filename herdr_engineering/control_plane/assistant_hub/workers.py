@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # assistant.py imports this module, so avoid a runtime cycle
     from ..assistant import AssistantStore
 
-DEFAULT_SCOPES: tuple[str, ...] = ("ask", "report", "read")
+SCOPES: tuple[str, ...] = ("ask", "report", "read", "act")
+DEFAULT_SCOPES: tuple[str, ...] = ("ask", "report")
 AUTH_SCHEME = "Worker"
 _AUTH_MESSAGE = "worker authentication failed"
 _CRED_PREFIX = "hcw_"
@@ -72,6 +73,19 @@ class Enrollment:
     code_digest: str
     expires_at: datetime
     redeemed_at: datetime | None = None
+    scopes: list[str] = field(default_factory=lambda: list(DEFAULT_SCOPES))    # older snapshots load with the default
+
+
+def _normalize_scopes(scopes: Sequence[str]) -> list[str]:
+    """Validated, de-duplicated scopes in vocabulary order; unknown names and the empty set are refused."""
+    if isinstance(scopes, str) or not isinstance(scopes, Sequence):
+        raise ValueError("scopes must be a list of scope names")
+    bad = [s for s in scopes if not isinstance(s, str) or s not in SCOPES]
+    if bad:
+        raise ValueError(f"unknown scope: {bad[0]!r}")
+    if not scopes:
+        raise ValueError("scopes must not be empty")
+    return [s for s in SCOPES if s in scopes]
 
 
 def _digest(value: str) -> str:
@@ -95,7 +109,8 @@ class WorkerRegistry:
         self._now = now
         self._fail_windows: dict[tuple[str, str], tuple[datetime, int]] = {}
 
-    def create_enrollment(self, *, tenant_id: str, user_id: str, name: str, harness: str) -> tuple[Enrollment, str]:
+    def create_enrollment(self, *, tenant_id: str, user_id: str, name: str, harness: str,
+                          scopes: Sequence[str] | None = None) -> tuple[Enrollment, str]:
         from ..assistant_dispatch import HARNESSES  # lazy: assistant_dispatch imports assistant
 
         if harness not in HARNESSES:
@@ -108,10 +123,11 @@ class WorkerRegistry:
             raise ValueError(f"name must be 1-{_MAX_NAME} characters")
         if not name.isprintable():
             raise ValueError("name must not contain control characters")
+        granted = _normalize_scopes(DEFAULT_SCOPES if scopes is None else scopes)
         code = _CODE_PREFIX + secrets.token_urlsafe(24)
         enrollment = Enrollment(
             enrollment_id="enr_" + secrets.token_hex(8), tenant_id=tenant_id, user_id=user_id, name=name,
-            harness=harness, code_digest=_digest(code), expires_at=self._now() + self._enrollment_ttl)
+            harness=harness, code_digest=_digest(code), expires_at=self._now() + self._enrollment_ttl, scopes=granted)
         with self._store._lock:
             self._store.enrollments[enrollment.enrollment_id] = enrollment
             self._store._after_mutation()
@@ -168,7 +184,7 @@ class WorkerRegistry:
             worker = Worker(
                 worker_id=worker_id, tenant_id=found.tenant_id, user_id=found.user_id,
                 name=found.name, harness=found.harness, device_id=device_id, secret_digest=_digest(cred),
-                status="active", created_at=now, expires_at=now + self._worker_ttl, scopes=list(DEFAULT_SCOPES))
+                status="active", created_at=now, expires_at=now + self._worker_ttl, scopes=list(found.scopes))
             self._store.workers[worker.worker_id] = worker
             self._store._after_mutation()
         return worker, cred
@@ -214,6 +230,21 @@ class WorkerRegistry:
             self._store._after_mutation()
             self._store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="worker.revoked",
                                      subject_id=w.worker_id)
+            return w
+
+    def set_scopes(self, tenant_id: str, user_id: str, worker_id: str, scopes: Sequence[str]) -> Worker:
+        granted = _normalize_scopes(scopes)
+        with self._store._lock:
+            try:
+                w = self._owned(worker_id, tenant_id, user_id)
+            except Exception as exc:
+                raise KeyError(worker_id) from exc
+            old = list(w.scopes)
+            w.scopes = granted
+            self._store._after_mutation()
+            self._store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                     action="assistant.worker.scopes_changed", subject_id=w.worker_id,
+                                     detail=f"{','.join(old)}->{','.join(granted)}")
             return w
 
     def list_workers(self, *, tenant_id: str, user_id: str) -> list[Worker]:

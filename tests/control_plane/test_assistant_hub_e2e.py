@@ -113,7 +113,8 @@ def test_full_flow_enroll_use_revoke_audit(world):
     cred, wid = redeemed["credential"], redeemed["worker_id"]
     assert http("POST", world.hub + "/assistant/enroll", {"code": code, "device_id": "dev1"})[0] == 401
 
-    # 3. MCP
+    # 3. MCP (a new worker has only ask+report; the owner opts it into read)
+    world.registry.set_scopes(TENANT, OWNER, wid, ["ask", "report", "read"])
     status, body = mcp(world, cred, "dev1", "initialize")
     assert status == 200 and body["result"]["serverInfo"]["name"] == "herdr-assistant"
     status, body = mcp(world, cred, "dev1", "tools/list")

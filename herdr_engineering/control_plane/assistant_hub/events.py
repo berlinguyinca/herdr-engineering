@@ -22,7 +22,7 @@ if TYPE_CHECKING:  # assistant.py imports this module, so avoid a runtime cycle
     from ..assistant import AssistantStore
     from .workers import Worker
 
-EVENT_KINDS: tuple[str, ...] = ("ask", "report", "observation")
+EVENT_KINDS: tuple[str, ...] = ("ask", "report", "observation", "action_request")
 PROVENANCES: tuple[str, ...] = ("worker_reported", "harness_attested")
 MAX_PAYLOAD_BYTES = 4 * 1024
 MAX_LIST_LIMIT = 500
