@@ -49,6 +49,18 @@ so a part or ``meta.json`` is never partial and never replaced.
   cannot be written the marker is removed again and the call is 503, so a retry audits it. Residual: a crash between
   the marker and the event loses that one event.
 
+Intents and results (Task 7c). ``append_intent`` is the generic intent write (any registered kind, agent or user actor);
+``commit`` authorizes an agent's commit (write grant, ``writable``, ``commits_per_minute``, pending cap, ``validate_changes``,
+and for every staged put the caller's OWN complete upload) and then calls it. An intent is a JSON envelope
+(``validate_intent`` shape) holding the actor's kind and id and the payload: never a credential, digest, device id or
+staged bytes. ``read_result`` is the generic long-poll over ``results/<ticket>.json`` of the mirror: ownership is checked
+twice (the in-memory, LRU-bounded ticket map, then the ``actor`` inside the result file) and a mismatch, an unknown or an
+evicted ticket is the identical 404 ``not found``, also after waiting. The poll sleeps in steps of at most 0.5 s on a
+server thread, so it is capped at 20 s, holds a ``collab_waiters`` slot and ends early when the principal is no longer
+valid. Residuals: the ticket map and the pending count are per process (a restart forgets which ticket was whose, so a
+result can no longer be fetched; a second process could exceed the pending cap by its own in-flight intents), and intent
+writes of one process are serialized by one lock (a write is a few ms).
+
 The methods are synchronous and do blocking file I/O and hashing: an async caller runs them on an executor
 (``asyncio.to_thread``), never on the event loop.
 """
@@ -69,6 +81,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from . import collab_waiters
 from .collab import CollabError, Principal
 from .collab_bridge_files import (
     AUDITED_MARKER,
@@ -79,7 +92,9 @@ from .collab_bridge_files import (
     META_NAME,
     SHA_RE,
     STAGING_DIR,
+    TICKET_RE,
     VERIFIED_MARKER,
+    Actor,
     BridgeError,
     BridgeLimits,
     Chunk,
@@ -90,6 +105,7 @@ from .collab_bridge_files import (
     link_new_beneath,
     list_beneath,
     list_parts,
+    new_ticket,
     open_beneath,
     read_bytes_beneath,
     read_json_beneath,
@@ -97,7 +113,9 @@ from .collab_bridge_files import (
     staging_parts,
     unlink_beneath,
     upload_id_for,
+    validate_changes,
     validate_chunk,
+    validate_intent,
 )
 from .collab_mirror import ARTIFACTS_DIR, BLOBS_DIR, GRANTS_NAME, HEAD_NAME
 
@@ -137,7 +155,29 @@ BAD_CHUNK_ARGS = "chunk arguments are missing or unknown"
 MAX_MISSING = 100
 STAGING_OWNERS_MAX = 100_000        # entries of staging/ one reservation reads (fail closed past it, for everyone)
 STAGING_UPLOADS_PER_OWNER = 4096    # upload dirs one owner may hold (the TTL sweep frees them)
+INTENTS_DIR = "intents"             # collab_intents.INTENTS_DIR
+RESULTS_DIR = "results"             # collab_intents.RESULTS_DIR
+INTENT_MAX_BYTES = 1024 * 1024      # collab_intents.INTENT_MAX_BYTES: the worker ignores a larger intent file
+FEED_REFRESH_AGE = 15.0             # an intent write refreshes agents.json when it is older than this
+RESULT_WAIT_MAX = 20.0
+RESULT_POLL_STEP = 0.5
+RESULT_EXTRA_BYTES = 1_048_576      # result file cap = limits.max_conflict_text_bytes + this
+TICKET_MAP_MAX = 10_000
+PENDING_ACTORS_MAX = 10_000
+TOO_MANY_PENDING = "too many pending intents; wait for a result"
+INTENT_TOO_LARGE = "intent is too large; stage large files with artifact_stage_chunk"
+INTENTS_UNAVAILABLE = "intents unavailable"
+UPLOAD_NOT_FOUND = "upload not found"
+UPLOAD_INCOMPLETE = "upload incomplete"
 STAGING_INDEX_TTL = 30.0            # seconds an owner's cached staging usage is trusted before a rescan
+
+
+class UploadIncomplete(CollabError):
+    """409 "upload incomplete": ``missing`` lists the first ``MAX_MISSING`` absent part indices."""
+
+    def __init__(self, missing: list[int]):
+        super().__init__(409, UPLOAD_INCOMPLETE)
+        self.missing = list(missing)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,7 +217,8 @@ class CollabArtifactBridge:
 
     def __init__(self, service, mirror: Path, outbox: Path, *, clock: Callable[[], float] = time.time,
                  feed_interval: float = FEED_INTERVAL, max_uploads_per_owner: int = STAGING_UPLOADS_PER_OWNER,
-                 staging_index_ttl: float = STAGING_INDEX_TTL):
+                 staging_index_ttl: float = STAGING_INDEX_TTL,
+                 monotonic: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep):
         self.service = service
         self.mirror = Path(mirror)
         self.outbox = Path(outbox)
@@ -196,6 +237,13 @@ class CollabArtifactBridge:
         self.max_uploads_per_owner = max_uploads_per_owner
         self.staging_index_ttl = float(staging_index_ttl)
         self._owner_usage: dict[str, _OwnerUsage] = {}            # guarded by _staging_lock
+        self.monotonic, self.sleep = monotonic, sleep          # the result long-poll's own (injectable) wall time
+        self.TICKET_MAP_MAX = TICKET_MAP_MAX                   # per instance, so a test can shrink it
+        self._tickets: collections.OrderedDict = collections.OrderedDict()   # ticket -> (actor kind, id); LRU
+        self._tickets_lock = threading.Lock()
+        self._pending: dict[tuple[str, str], dict[str, None]] = {}   # actor -> tickets of intents not yet consumed
+        self._intent_lock = threading.Lock()
+        self._feed_at: float | None = None                     # generated_at of this process's last feed write
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -647,6 +695,203 @@ class CollabArtifactBridge:
         log.info("collab upload %s owner=%s artifact=%s: staged complete", upload_id, owner_key, meta.artifact_id)
         return True
 
+    # -- intents and results (Task 7c) --------------------------------------------------------------------------
+    @staticmethod
+    def _actor_key(actor: Actor) -> tuple[str, str]:
+        return actor.kind, actor.id
+
+    def _refresh_feed(self) -> None:
+        """Rewrite ``agents.json`` when this process wrote it more than ``FEED_REFRESH_AGE`` s ago (or never): the
+        worker rejects an agent intent when the feed is stale, so an idle-but-for-commits bridge must not rely on its
+        timer thread alone."""
+        at = self._feed_at
+        age = None if at is None else self.clock() - at
+        if age is None or not 0 <= age <= FEED_REFRESH_AGE:
+            self.write_agents_feed()
+
+    def _live_pending(self, key: tuple[str, str]) -> dict[str, None]:
+        """The tickets of ``key`` whose intent file still exists (the worker unlinks it when it decides). Under
+        ``_intent_lock``."""
+        live = {t: None for t in self._pending.get(key, ()) if file_exists_beneath(self.outbox, [INTENTS_DIR], t + ".json")}
+        if live:
+            self._pending[key] = live
+        else:
+            self._pending.pop(key, None)
+        return live
+
+    def _check_pending(self, key: tuple[str, str], limits: BridgeLimits) -> None:
+        if len(self._live_pending(key)) >= limits.max_pending_intents_per_agent:
+            self.service.stats["rate_limited"] += 1
+            raise CollabError(429, TOO_MANY_PENDING)
+
+    def _remember_ticket(self, ticket: str, key: tuple[str, str]) -> None:
+        with self._tickets_lock:
+            self._tickets[ticket] = key
+            self._tickets.move_to_end(ticket)
+            while len(self._tickets) > self.TICKET_MAP_MAX:
+                self._tickets.popitem(last=False)
+                self.stats["tickets_evicted"] += 1
+
+    def append_intent(self, actor: Actor, kind: str, payload: dict, *, artifact_id: str | None,
+                      idempotency_key: str | None, ticket: str | None = None) -> str:
+        """Write one intent for ``actor`` and return its ticket. The CALLER authorizes (``commit`` does for agents).
+        The envelope is checked with the worker's own ``validate_intent`` (registered kind, allowed actor, payload) and
+        the per-actor ``max_pending_intents_per_agent`` cap, all before anything is written; an agent actor first
+        refreshes ``agents.json`` when it is older than ``FEED_REFRESH_AGE`` s."""
+        _agents, limits = self._require()
+        if not isinstance(actor, Actor):
+            raise CollabError(400, "invalid actor")
+        ticket = ticket or new_ticket()
+        raw = {"ticket": ticket, "kind": kind, "actor": {"kind": actor.kind, "id": actor.id},
+               "submitted_at": float(self.clock()), "payload": payload}
+        if artifact_id is not None:
+            raw["artifact_id"] = artifact_id
+        if idempotency_key is not None:
+            raw["idempotency_key"] = idempotency_key
+        try:
+            validate_intent(raw, filename=ticket + ".json", limits=limits)
+            size = len(json.dumps(raw, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        except (BridgeError, ValueError, TypeError, UnicodeError) as exc:
+            raise CollabError(400, exc.reason if isinstance(exc, BridgeError) else "invalid intent") from None
+        if size > INTENT_MAX_BYTES:
+            raise CollabError(413, INTENT_TOO_LARGE)
+        if actor.kind == "agent":
+            self._refresh_feed()
+        key = self._actor_key(actor)
+        with self._intent_lock:
+            self._check_pending(key, limits)
+            try:
+                atomic_write_json(self.outbox / INTENTS_DIR, ticket + ".json", raw)
+            except (OSError, BridgeError) as exc:
+                self.stats["intent_failures"] += 1
+                log.warning("collab artifacts: intent write failed ticket=%s error=%s", ticket,
+                            errno.errorcode.get(getattr(exc, "errno", None), type(exc).__name__))
+                raise CollabError(503, INTENTS_UNAVAILABLE) from None
+            self._pending.setdefault(key, {})[ticket] = None
+            if len(self._pending) > PENDING_ACTORS_MAX:
+                for stale in [k for k in self._pending if k != key]:
+                    self._live_pending(stale)
+        self._remember_ticket(ticket, key)
+        self.stats["intents_written"] += 1
+        log.info("collab intent %s kind=%s actor=%s:%s: written", ticket, kind, actor.kind, actor.id)
+        return ticket
+
+    def read_result(self, actor: Actor, ticket: str, *, wait: float, still_valid: Callable[[], bool]) -> dict:
+        """``{"status": "pending"}`` or the worker's ``results/<ticket>.json`` for a ticket ``actor`` submitted.
+        Waits up to ``wait`` s (at most ``RESULT_WAIT_MAX``) in steps of at most ``RESULT_POLL_STEP`` s, holding a
+        ``collab_waiters`` slot of the actor, and stops early when ``still_valid()`` turns false."""
+        key = self._actor_key(actor) if isinstance(actor, Actor) else None
+        if not isinstance(ticket, str) or not re.match(TICKET_RE, ticket) or key is None:
+            raise CollabError(404, NOT_FOUND)
+        with self._tickets_lock:
+            owner = self._tickets.get(ticket)
+            if owner is not None:
+                self._tickets.move_to_end(ticket)
+        if owner != key:
+            raise CollabError(404, NOT_FOUND)                  # unknown, evicted or someone else's: one answer
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait):
+            raise CollabError(400, "wait must be a number of seconds")
+        wait = min(max(float(wait), 0.0), RESULT_WAIT_MAX)
+        _agents, limits = self._require()
+        cap = limits.max_conflict_text_bytes + RESULT_EXTRA_BYTES
+        if not wait:
+            return self._result_once(key, ticket, cap) or {"status": "pending"}
+        with collab_waiters.waiter_slot(f"artifact_result:{key[0]}:{key[1]}") as acquired:
+            if not acquired:
+                raise CollabError(429, "too many waiting calls")
+            deadline = self.monotonic() + wait
+            while True:
+                found = self._result_once(key, ticket, cap)
+                if found is not None:
+                    return found
+                left = deadline - self.monotonic()
+                if left <= 0 or not still_valid():
+                    return {"status": "pending"}
+                self.sleep(min(RESULT_POLL_STEP, left))
+
+    def _result_once(self, key: tuple[str, str], ticket: str, cap: int) -> dict | None:
+        name = ticket + ".json"
+        doc = read_json_beneath(self.mirror, [RESULTS_DIR, name], max_bytes=cap)
+        if doc is None:
+            if file_exists_beneath(self.mirror, [RESULTS_DIR], name):     # there, but oversize or not a JSON object
+                self.stats["result_unreadable"] += 1
+                log.warning("collab artifacts: unreadable result ticket=%s", ticket)
+                raise CollabError(502, INTEGRITY)
+            return None
+        actor = doc.get("actor")
+        if doc.get("ticket") != ticket or not isinstance(actor, dict) or (actor.get("kind"), actor.get("id")) != key:
+            raise CollabError(404, NOT_FOUND)
+        return doc
+
+    # -- commit (Task 7c) ----------------------------------------------------------------------------------------
+    _COMMIT_KEYS = frozenset({"artifact_id", "base_version_id", "message", "changes", "idempotency_key"})
+
+    def commit(self, pr: Principal, args) -> dict:
+        """The ``artifact_commit`` tool. Returns ``{ticket, status: "pending"}``; the worker decides later."""
+        if not isinstance(args, dict) or not set(args) <= self._COMMIT_KEYS:
+            raise CollabError(400, "commit arguments are missing or unknown")
+        artifact_id = args.get("artifact_id")
+        permission, doc, limits = self._open_with_limits(pr, "commit", artifact_id)
+        if permission != "write":
+            raise self._refuse(pr, "commit", artifact_id, "read_only", 403, READ_ONLY)
+        if doc.get("writable") is not True:
+            raise self._refuse(pr, "commit", artifact_id, "not_writable", 403, NOT_WRITABLE)
+        svc = self.service
+        with svc._lock:
+            svc._throttle("artcommit:" + pr.id, limits.commits_per_minute, 60.0, "commit")
+        actor = Actor("agent", pr.id)
+        with self._intent_lock:
+            self._check_pending(self._actor_key(actor), limits)
+        changes = args.get("changes")
+        try:
+            checked = validate_changes(changes, limits)
+        except (BridgeError, TypeError, ValueError):
+            raise CollabError(400, "invalid changes") from None
+        staged_bytes = self._check_uploads(pr, artifact_id, checked, limits)
+        payload = {"base_version_id": args.get("base_version_id"), "changes": changes}
+        if "message" in args:
+            payload["message"] = args["message"]
+        inline = sum(len(c.text.encode("utf-8")) for c in checked if c.text is not None)
+        ticket = new_ticket()
+        with svc._lock:                      # audited before the intent exists: a refused audit refuses the commit
+            svc._commit("artifact_commit_submitted", svc._actor(
+                pr, action="artifact.commit", outcome="allowed", ticket=ticket, artifact_id=artifact_id,
+                resource_id=artifact_id, size_bytes=inline + staged_bytes, changes=len(checked), project_ids=[]))
+        self.append_intent(actor, "commit", payload, artifact_id=artifact_id,
+                           idempotency_key=args.get("idempotency_key"), ticket=ticket)
+        return {"ticket": ticket, "status": "pending"}
+
+    def _check_uploads(self, pr: Principal, artifact_id: str, changes, limits: BridgeLimits) -> int:
+        """Every staged put must be the CALLER's own complete upload for this artifact and name. Returns the declared
+        bytes of the distinct uploads. A complete upload not yet audited is audited here (exactly once)."""
+        owner_key = agent_owner_key(pr.id)
+        seen: dict[str, int] = {}
+        for change in changes:
+            upload_id = change.upload_id
+            if upload_id is None or upload_id in seen:
+                continue
+            try:
+                meta = read_staged_meta(self.outbox, owner_key, upload_id, limits)
+            except BridgeError:
+                meta = None
+            if meta is None or meta.artifact_id != artifact_id or meta.name != change.name:
+                raise CollabError(404, UPLOAD_NOT_FOUND)
+            if not file_exists_beneath(self.outbox, staging_parts(owner_key, upload_id), VERIFIED_MARKER):
+                progress = self._progress(owner_key, upload_id, meta)      # audits when complete
+                if not progress["complete"]:
+                    raise UploadIncomplete(progress["missing"])
+            else:
+                self._note_complete(owner_key, upload_id, meta)
+            seen[upload_id] = meta.size_bytes
+        return sum(seen.values())
+
+    def result(self, pr: Principal, ticket: str, *, wait: float) -> dict:
+        """The ``artifact_commit_result`` tool: ``read_result`` for the calling agent's own tickets."""
+        if not isinstance(pr, Principal) or not pr.is_agent:
+            raise CollabError(404, NOT_FOUND)
+        return self.read_result(Actor("agent", pr.id), ticket, wait=wait,
+                                still_valid=lambda: self.service.still_valid(pr))
+
     # -- blobs ------------------------------------------------------------------------------------------------
     def _remember_verified(self, key: tuple) -> None:
         with self._verified_lock:
@@ -728,7 +973,9 @@ class CollabArtifactBridge:
         """Atomically (tmp + rename in the outbox) rewrite ``agents.json``. Never raises: a failure is logged by type."""
         try:
             with self._feed_lock:
-                atomic_write_json(self.outbox, AGENTS_FEED, self._feed())
+                body = self._feed()
+                atomic_write_json(self.outbox, AGENTS_FEED, body)
+                self._feed_at = body["generated_at"]
             self.stats["feed_writes"] += 1
         except Exception as exc:                          # noqa: BLE001 - a feed write never breaks a caller
             self.stats["feed_failures"] += 1
@@ -766,6 +1013,6 @@ class CollabArtifactBridge:
         return self._thread is not None and self._thread.is_alive()
 
 
-__all__ = ["AGENTS_FEED", "AUDIT_EVERY", "BINARY", "CHUNK_CONFLICT", "CollabArtifactBridge", "INTEGRITY",
+__all__ = ["AGENTS_FEED", "INTENT_MAX_BYTES", "UploadIncomplete", "AUDIT_EVERY", "BINARY", "CHUNK_CONFLICT", "CollabArtifactBridge", "INTEGRITY",
            "MAX_MISSING", "MAX_READ_BYTES", "META_MISMATCH", "NOT_FOUND", "NOT_MIRRORED", "NOT_WRITABLE", "READ_ONLY",
            "STAGING_FULL", "STAGING_INDEX_TTL", "STAGING_UPLOADS_PER_OWNER", "UNAVAILABLE"]

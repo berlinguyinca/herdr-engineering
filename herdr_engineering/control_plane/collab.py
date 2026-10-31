@@ -71,7 +71,7 @@ BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_d
 SILENT_EVENTS = frozenset({"workspace_terminal_authorized", "artifact_tool_used", "artifact_commit_submitted",
                            "artifact_upload_staged"})
 # events after which the artifact bridge's agents.json may be out of date
-AGENT_FEED_EVENTS = frozenset({"agent_revoked", "user_decided"})
+AGENT_FEED_EVENTS = frozenset({"agent_revoked", "user_decided", "agent_enrolled"})
 # creation event -> kind (what is outstanding is recomputed from state, see _recount)
 REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
                     "join_token_created": "join", "xlink_created": "xlink", "workspace_linked": "workspace",

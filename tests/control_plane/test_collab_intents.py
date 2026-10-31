@@ -26,6 +26,8 @@ from herdr_engineering.control_plane.collab_bridge_files import (
 )
 from herdr_engineering.control_plane.collab_intents import _LOCK_SALT, CollabIntentApplier
 from tests.control_plane.registry_pg import ROOT, FakeBlobs, registry_pg, uid  # noqa: F401 - imported fixture
+from tests.control_plane.test_collab_artifacts import World, commit_args
+from tests.control_plane.test_collab_tasks import W, svc  # noqa: F401 - imported fixture
 
 SENTINEL = "SECRET-SENTINEL-7c1f0e"
 
@@ -2911,3 +2913,28 @@ def test_an_owner_with_more_uploads_than_the_scan_budget_is_still_swept(registry
             total += n
         assert total == 10 and not any(d.exists() for d in dirs)
     sweeping(registry_pg, tmp_path, body)
+
+
+# ----------------------------------------------------------------------------- bridge integration (Task 7c)
+def test_an_intent_written_by_the_bridge_commit_is_applied_and_read_back_through_result(registry_pg, tmp_path, svc):
+    world = World(W(svc), tmp_path)
+    seen = []
+
+    async def handler(ctx, intent):
+        seen.append((intent.actor, intent.artifact_id, intent.payload.base_version_id))
+        return {"result": "created", "version_id": "ver_2", "version_number": 3}
+
+    async def body(env):
+        env.applier.register("commit", handler, replay_outcomes=frozenset({"created"}))
+        out = await asyncio.to_thread(world.bridge.commit, world.a, commit_args("hello"))
+        assert await asyncio.to_thread(world.bridge.result, world.a, out["ticket"], wait=0) == {"status": "pending"}
+        counts = await env.tick()          # no env.feed(): the feed the worker checks is the one commit() refreshed
+        assert counts["applied"] == 1 and counts["rejected"] == 0
+        assert seen == [(Actor("agent", world.a.id), "art_x", "v_x2")]
+        got = await asyncio.to_thread(world.bridge.result, world.a, out["ticket"], wait=0)
+        assert got["result"] == "created" and got["version_id"] == "ver_2" and got["ticket"] == out["ticket"]
+        assert got["actor"] == {"kind": "agent", "id": world.a.id}
+        assert not env.pending(out["ticket"])
+        other = await asyncio.to_thread(world.bridge.commit, world.a, commit_args("again"))   # the pending slot is free
+        assert other["status"] == "pending"
+    run(registry_pg, tmp_path, body, clock=world.clock)

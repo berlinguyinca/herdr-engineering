@@ -10,10 +10,10 @@ wrapped as untrusted data."""
 from __future__ import annotations
 
 import json
-import threading
 import time
 from typing import Any
 
+from . import collab_waiters
 from .collab import MAX_TASK_TEXT, CollabError, CollabService
 
 PROTOCOL = "2025-03-26"
@@ -176,30 +176,25 @@ def _text(payload: Any, *, untrusted: bool = False, is_error: bool = False) -> d
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
 
-_waiters: dict[str, int] = {}
-_waiters_lock = threading.Lock()
-MAX_WAITERS = 2        # per agent: each waiting call holds a server thread
+def _inbox_poll(service: CollabService, pr, deadline: float) -> dict:
+    while True:
+        seen = service.seq                 # read before looking, so a commit in between wakes us
+        out = service.task_inbox(pr)
+        left = deadline - time.monotonic()
+        if out["tasks"] or left <= 0 or not service.still_valid(pr):
+            return out
+        service.wait_for_change(seen, min(2.0, left))
 
 
 def _inbox(service: CollabService, pr, wait: float) -> dict:
     deadline = time.monotonic() + wait
-    with _waiters_lock:
-        if wait and _waiters.get(pr.id, 0) >= MAX_WAITERS:
-            raise CollabError(429, "too many waiting calls")
-        if wait:
-            _waiters[pr.id] = _waiters.get(pr.id, 0) + 1
-    try:
-        while True:
-            seen = service.seq                 # read before looking, so a commit in between wakes us
-            out = service.task_inbox(pr)
-            left = deadline - time.monotonic()
-            if out["tasks"] or left <= 0 or not service.still_valid(pr):
-                break
-            service.wait_for_change(seen, min(2.0, left))
-    finally:
-        if wait:
-            with _waiters_lock:
-                _waiters[pr.id] -= 1
+    if wait:
+        with collab_waiters.waiter_slot(pr.id) as acquired:      # per agent: each waiting call holds a server thread
+            if not acquired:
+                raise CollabError(429, "too many waiting calls")
+            out = _inbox_poll(service, pr, deadline)
+    else:
+        out = _inbox_poll(service, pr, deadline)
     text = json.dumps({"notice": TASK_NOTICE if out["tasks"] else None, **out}, ensure_ascii=False)
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
@@ -216,13 +211,11 @@ def _helper_wait(service: CollabService, pr, helper_id: str, wait: float, *, str
     out = service.helper_result(pr, helper_id)       # the service decides who may read it
     if out["status"] not in _HELPER_LIVE_STATUS:
         return out
-    with _waiters_lock:
-        if _waiters.get(pr.id, 0) >= MAX_WAITERS:
+    with collab_waiters.waiter_slot(pr.id) as acquired:
+        if not acquired:
             if strict:
                 raise CollabError(429, "too many waiting calls")
             return out
-        _waiters[pr.id] = _waiters.get(pr.id, 0) + 1
-    try:
         while True:
             seen = service.seq
             out = service.helper_result(pr, helper_id)
@@ -230,9 +223,6 @@ def _helper_wait(service: CollabService, pr, helper_id: str, wait: float, *, str
             if out["status"] not in _HELPER_LIVE_STATUS or left <= 0 or not service.still_valid(pr):
                 return out
             service.wait_for_change(seen, min(2.0, left))
-    finally:
-        with _waiters_lock:
-            _waiters[pr.id] -= 1
 
 
 def _helper_call(service: CollabService, pr, name: str, args: dict) -> dict:

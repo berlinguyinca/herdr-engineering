@@ -11,13 +11,15 @@ import base64
 import hashlib
 import json
 import os
+import re
 import stat
 import threading
 import time
 
 import pytest
 
-from herdr_engineering.control_plane import collab
+from herdr_engineering.control_plane import collab, collab_waiters
+from herdr_engineering.control_plane import collab_bridge_files as cbf
 from herdr_engineering.control_plane.collab import (
     BULK_EVENTS,
     CollabError,
@@ -32,11 +34,14 @@ from herdr_engineering.control_plane.collab_artifacts import (
     STAGING_UPLOADS_PER_OWNER,
     UNAVAILABLE,
     CollabArtifactBridge,
+    UploadIncomplete,
 )
 from herdr_engineering.control_plane.collab_bridge_files import (
     CHUNK_BYTES,
     ENTRY_SLACK,
     FEED_MAX_AGE,
+    TICKET_RE,
+    Actor,
     BridgeLimits,
     atomic_write_bytes,
     atomic_write_json,
@@ -45,6 +50,7 @@ from herdr_engineering.control_plane.collab_bridge_files import (
     upload_complete,
     upload_id_for,
     validate_chunk,
+    validate_intent,
 )
 from herdr_engineering.control_plane.collab_intents import AGENTS_FEED as WORKER_FEED
 from herdr_engineering.control_plane.collab_intents import AGENTS_FEED_MAX_BYTES
@@ -891,3 +897,463 @@ def test_owner_usage_is_cached_and_rescanned_only_after_its_ttl(world):
     world.clock.t += STAGING_INDEX_TTL
     br.stage_chunk_for("m_one", as_chunk(X, b"z" * 10, 0, name="z.bin"), limits=BridgeLimits(), staging_cap=10 ** 9)
     assert br.stats["owner_scans"] == scans + 2                                          # each owner once again
+
+
+# ------------------------------------------------------------------------------ Task 7c: intents and results
+def intent_files(world):
+    d = world.outbox / "intents"
+    return sorted(d.glob("ict_*.json")) if d.exists() else []
+
+
+def read_intent(world, ticket):
+    return json.loads((world.outbox / "intents" / f"{ticket}.json").read_text())
+
+
+def commit_args(text="hello", *, name="a.txt", **extra):
+    return {"artifact_id": X, "base_version_id": "v_x2", "message": "m",
+            "changes": [{"name": name, "op": "put", "text": text}], **extra}
+
+
+def finish(world, ticket, actor, **body):
+    """What the worker does: write results/<ticket>.json into the mirror, drop the intent."""
+    doc = {"ticket": ticket, "kind": "commit", "actor": {"kind": actor[0], "id": actor[1]}, "artifact_id": X,
+           "result": "created", "version_id": "v_new", "decided_at": 1.0, **body}
+    atomic_write_json(world.mirror.root / "results", f"{ticket}.json", doc)
+    (world.outbox / "intents" / f"{ticket}.json").unlink(missing_ok=True)
+    return doc
+
+
+class Waits:
+    """An injectable monotonic clock and sleep, so a long-poll test never sleeps for real."""
+
+    def __init__(self):
+        self.t, self.sleeps, self.on_sleep = 1000.0, [], None
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.t += seconds
+        if self.on_sleep:
+            self.on_sleep(len(self.sleeps))
+
+
+def waiting_bridge(world, **kw):
+    waits = Waits()
+    br = CollabArtifactBridge(world.s, world.mirror.root, world.outbox, clock=world.clock, feed_interval=3600.0,
+                              monotonic=waits.monotonic, sleep=waits.sleep, **kw)
+    return br, waits
+
+
+@pytest.fixture
+def registry():
+    saved = dict(cbf._INTENT_KINDS)
+    yield
+    cbf._INTENT_KINDS.clear()
+    cbf._INTENT_KINDS.update(saved)
+
+
+def register_x(kind="x.test", actors=("user",)):
+    def check(payload, limits):
+        if not isinstance(payload, dict) or set(payload) - {"n"}:
+            raise cbf.IntentError("bad x payload")
+        return dict(payload)
+    cbf.register_intent_kind(kind, check, actors=frozenset(actors))
+
+
+def test_an_enrolled_agent_reaches_the_feed_promptly(world):
+    br = world.bridge
+    br.start()
+    ext_pr, _, _ = enroll(world.w)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ext_pr.id not in read_feed(world.outbox)["agents"]:
+        time.sleep(0.02)
+    assert ext_pr.id in read_feed(world.outbox)["agents"]
+    assert "agent_enrolled" in collab.AGENT_FEED_EVENTS
+
+
+def test_commit_needs_a_write_grant_and_a_writable_artifact(world):
+    br = world.bridge
+    assert status(br.commit, world.b, {**commit_args(), "artifact_id": Y}) == (403, "read-only grant")
+    world.mirror.grant(world.b.id, "art_ro", "write")
+    world.mirror.head("art_ro", [version("v_r1", 1, [file_entry("r.txt", b"r")])], writable=False)
+    world.mirror.grants()
+    assert status(br.commit, world.b, {**commit_args(), "artifact_id": "art_ro"})[0] == 403
+    assert status(br.commit, world.b, {**commit_args(), "artifact_id": "art_nope"}) == (404, "not found")
+    assert not intent_files(world)
+
+
+def test_a_commit_writes_one_intent_the_workers_validator_accepts(world):
+    out = world.bridge.commit(world.a, commit_args("hello", idempotency_key="k-1"))
+    assert out["status"] == "pending" and re.match(TICKET_RE, out["ticket"])
+    (path,) = intent_files(world)
+    raw = json.loads(path.read_text())
+    intent = validate_intent(raw, filename=path.name, limits=BridgeLimits())
+    assert intent.ticket == out["ticket"] and intent.kind == "commit" and intent.actor == Actor("agent", world.a.id)
+    assert intent.artifact_id == X and intent.idempotency_key == "k-1" and intent.payload.inline_bytes == 5
+    assert abs(raw["submitted_at"] - world.clock()) < 1e-6
+
+
+def test_the_commits_per_minute_limit_is_429(world):
+    world.mirror.grants(limits={"commits_per_minute": 2})
+    br = world.bridge
+    br.commit(world.a, commit_args("1"))
+    br.commit(world.a, commit_args("2"))
+    assert status(br.commit, world.a, commit_args("3")) == (429, "commit rate limit exceeded")
+    assert len(intent_files(world)) == 2
+
+
+def test_a_fifth_pending_intent_is_429_until_the_worker_consumes_one(world):
+    br = world.bridge
+    tickets = [br.commit(world.a, commit_args(str(i)))["ticket"] for i in range(4)]
+    code, _ = status(br.commit, world.a, commit_args("5"))
+    assert code == 429 and len(intent_files(world)) == 4
+    finish(world, tickets[0], ("agent", world.a.id))                       # the worker consumed one
+    assert br.commit(world.a, commit_args("6"))["status"] == "pending"
+    assert len(intent_files(world)) == 4
+
+
+def test_the_pending_cap_is_per_actor(world):
+    world.mirror.grant(world.b.id, X, "write")
+    world.mirror.grants()
+    for i in range(4):
+        world.bridge.commit(world.a, commit_args(str(i)))
+    assert world.bridge.commit(world.b, commit_args("b"))["status"] == "pending"
+
+
+def test_an_invalid_change_is_400_and_writes_nothing(world):
+    bad = {**commit_args(), "changes": [{"name": "../x", "op": "put", "text": "t"}]}
+    assert status(world.bridge.commit, world.a, bad)[0] == 400
+    assert status(world.bridge.commit, world.a, {**commit_args(), "extra": 1})[0] == 400
+    assert not intent_files(world)
+
+
+def test_a_commit_with_an_incomplete_upload_is_409_with_the_missing_indices(world):
+    br, a = world.bridge, world.a
+    br.stage_chunk(a, chunk_args(X, BIG, 0))
+    br.stage_chunk(a, chunk_args(X, BIG, 2))
+    upl = upload_id_for(a.id, X, "big.bin", sha(BIG), len(BIG))
+    args = {**commit_args(), "changes": [{"name": "big.bin", "op": "put", "upload_id": upl}]}
+    with pytest.raises(UploadIncomplete) as e:
+        br.commit(a, args)
+    assert (e.value.status, e.value.message, e.value.missing) == (409, "upload incomplete", [1])
+    assert not intent_files(world)
+    br.stage_chunk(a, chunk_args(X, BIG, 1))
+    assert br.commit(a, args)["status"] == "pending"
+
+
+def test_another_agents_upload_id_is_404_upload_not_found(world):
+    br, a, b = world.bridge, world.a, world.b
+    world.mirror.grant(b.id, X, "write")
+    world.mirror.grants()
+    for i in range(3):
+        br.stage_chunk(a, chunk_args(X, BIG, i))
+    upl = upload_id_for(a.id, X, "big.bin", sha(BIG), len(BIG))
+    args = {**commit_args(), "changes": [{"name": "big.bin", "op": "put", "upload_id": upl}]}
+    assert status(br.commit, b, args) == (404, "upload not found")
+    assert not intent_files(world)
+    for wrong in ({"name": "other.bin"}, {"upload_id": "upl_" + "0" * 24}):
+        change = {"name": "big.bin", "op": "put", "upload_id": upl, **wrong}
+        assert status(br.commit, a, {**commit_args(), "changes": [change]}) == (404, "upload not found")
+    change = {"name": "big.bin", "op": "put", "upload_id": upl}
+    assert br.commit(a, {**commit_args(), "changes": [change]})["status"] == "pending"    # the owner still can
+
+
+def test_an_upload_completed_out_of_order_is_audited_once_by_the_commit_precheck(world):
+    br, a = world.bridge, world.a
+    for i in (2, 0, 1):                                  # the last chunk sent is index 1: no reply scanned the dir
+        br.stage_chunk(a, chunk_args(X, BIG, i))
+    assert not staged_events(world)
+    upl = upload_id_for(a.id, X, "big.bin", sha(BIG), len(BIG))
+    args = {**commit_args(), "changes": [{"name": "big.bin", "op": "put", "upload_id": upl}]}
+    br.commit(a, args)
+    br.commit(a, {**args, "message": "again"})
+    (ev,) = staged_events(world)
+    assert ev["payload"]["upload_id"] == upl and ev["payload"]["size_bytes"] == len(BIG)
+
+
+def test_a_verified_upload_passes_the_precheck_without_parts(world):
+    br, a = world.bridge, world.a
+    for i in range(3):
+        br.stage_chunk(a, chunk_args(X, BIG, i))
+    d = upload_dir(world, a.id, X, BIG)
+    for part in d.glob("0*"):
+        part.unlink()
+    (d / "verified").write_bytes(b"")
+    upl = d.name
+    args = {**commit_args(), "changes": [{"name": "big.bin", "op": "put", "upload_id": upl}]}
+    assert br.commit(a, args)["status"] == "pending"
+
+
+def test_the_intent_holds_no_credential_digest_device_id_or_staged_bytes(world, caplog):
+    br, a = world.bridge, world.a
+    for i in range(3):
+        br.stage_chunk(a, chunk_args(X, BIG, i))
+    upl = upload_id_for(a.id, X, "big.bin", sha(BIG), len(BIG))
+    out = br.commit(a, {**commit_args("inline-text"), "changes": [
+        {"name": "a.txt", "op": "put", "text": "inline-text"},
+        {"name": "big.bin", "op": "put", "upload_id": upl}, {"name": "old.txt", "op": "delete"}]})
+    raw = read_intent(world, out["ticket"])
+    assert set(raw) <= {"ticket", "kind", "actor", "artifact_id", "idempotency_key", "submitted_at", "payload"}
+    assert raw["actor"] == {"kind": "agent", "id": a.id}
+    blob = json.dumps(raw)
+    for secret in (world.a_info["credential"], a.digest, world.a_info["device_id"], "Authorization", "Bearer",
+                   "SENTINEL-CHUNK-BYTES", chunk_args(X, BIG, 2)["data"][:40], "device"):
+        assert secret not in blob
+    assert upl in blob and "inline-text" in blob
+    assert "inline-text" not in caplog.text and "SENTINEL" not in caplog.text
+
+
+def test_a_commit_is_audited_once_without_text(world, caplog):
+    out = world.bridge.commit(world.a, commit_args("SECRET-TEXT-77"))
+    (ev,) = world.events("artifact_commit_submitted")
+    p = ev["payload"]
+    assert p["ticket"] == out["ticket"] and p["artifact_id"] == X and p["size_bytes"] == len("SECRET-TEXT-77")
+    assert p["actor_agent_id"] == world.a.id
+    assert "SECRET-TEXT-77" not in json.dumps(ev) and "SECRET-TEXT-77" not in caplog.text
+
+
+def test_a_refused_audit_refuses_the_commit_and_writes_no_intent(world, monkeypatch):
+    real = world.s._commit
+
+    def full(event_type, payload):
+        if event_type == "artifact_commit_submitted":
+            raise CollabError(503, "collaboration log unavailable")
+        return real(event_type, payload)
+    monkeypatch.setattr(world.s, "_commit", full)
+    assert status(world.bridge.commit, world.a, commit_args())[0] == 503
+    assert not intent_files(world)
+
+
+def test_commit_refreshes_an_old_agents_feed_first_so_the_worker_freshness_check_passes(world):
+    br = world.bridge
+    br.write_agents_feed()
+    world.clock.t += 200
+    world.mirror.grants()
+    assert world.clock() - read_feed(world.outbox)["generated_at"] > FEED_MAX_AGE
+    br.commit(world.a, commit_args("1"))
+    assert world.clock() - read_feed(world.outbox)["generated_at"] == 0          # refreshed before the intent
+    world.clock.t += 10
+    br.commit(world.a, commit_args("2"))
+    assert world.clock() - read_feed(world.outbox)["generated_at"] == 10         # younger than 15 s: left alone
+    world.clock.t += 6
+    world.mirror.grants()
+    br.commit(world.a, commit_args("3"))
+    assert read_feed(world.outbox)["generated_at"] == world.clock()
+
+
+def test_the_feed_is_written_even_when_none_exists_yet(world):
+    assert not (world.outbox / AGENTS_FEED).exists()
+    world.bridge.commit(world.a, commit_args())
+    assert world.a.id in read_feed(world.outbox)["agents"]
+
+
+# -- generic intents
+def test_append_intent_writes_an_envelope_the_worker_accepts_for_a_registered_kind(world, registry):
+    register_x()
+    br = world.bridge
+    ticket = br.append_intent(Actor("user", "u1"), "x.test", {"n": 1}, artifact_id=X, idempotency_key=None)
+    path = world.outbox / "intents" / f"{ticket}.json"
+    intent = validate_intent(json.loads(path.read_text()), filename=path.name, limits=BridgeLimits())
+    assert intent.actor == Actor("user", "u1") and intent.kind == "x.test" and intent.payload == {"n": 1}
+    assert not (world.outbox / AGENTS_FEED).exists()                       # a user actor does not refresh the agents feed
+
+
+def test_append_intent_with_an_unregistered_kind_or_wrong_actor_is_400_and_writes_nothing(world, registry):
+    register_x()
+    br = world.bridge
+    assert status(br.append_intent, Actor("user", "u1"), "nope.kind", {}, artifact_id=None,
+                  idempotency_key=None) == (400, "unknown intent kind")
+    assert status(br.append_intent, Actor("agent", world.a.id), "x.test", {"n": 1}, artifact_id=None,
+                  idempotency_key=None)[0] == 400
+    assert status(br.append_intent, Actor("user", "u1"), "x.test", {"bad": 1}, artifact_id=None,
+                  idempotency_key=None)[0] == 400
+    assert not intent_files(world)
+
+
+def test_append_intent_enforces_the_pending_cap_per_actor_itself(world, registry):
+    register_x()
+    br = world.bridge
+    for i in range(4):
+        br.append_intent(Actor("user", "u1"), "x.test", {"n": i}, artifact_id=None, idempotency_key=None)
+    assert status(br.append_intent, Actor("user", "u1"), "x.test", {"n": 9}, artifact_id=None,
+                  idempotency_key=None)[0] == 429
+    assert br.append_intent(Actor("user", "u2"), "x.test", {"n": 1}, artifact_id=None, idempotency_key=None)
+    assert len(intent_files(world)) == 5
+
+
+def test_a_result_belongs_to_the_actor_that_submitted_the_ticket(world, registry):
+    register_x()
+    br = world.bridge
+    ticket = br.append_intent(Actor("user", "u1"), "x.test", {"n": 1}, artifact_id=None, idempotency_key=None)
+    never = lambda: pytest.fail("must not wait")                               # noqa: E731
+    assert br.read_result(Actor("user", "u1"), ticket, wait=0, still_valid=lambda: True) == {"status": "pending"}
+    doc = finish(world, ticket, ("user", "u1"), result="done")
+    assert status(br.read_result, Actor("user", "u2"), ticket, wait=0, still_valid=never) == (404, "not found")
+    assert status(br.read_result, Actor("agent", "u1"), ticket, wait=0, still_valid=never) == (404, "not found")
+    assert br.read_result(Actor("user", "u1"), ticket, wait=0, still_valid=lambda: True) == doc
+
+
+def test_an_unknown_or_malformed_ticket_is_the_same_404(world):
+    br = world.bridge
+    for t in ("ict_" + "0" * 24, "ict_../x", "", "x" * 400, None, 5):
+        assert status(br.read_result, Actor("agent", world.a.id), t, wait=0, still_valid=lambda: True) == (
+            404, "not found")
+
+
+def test_the_ticket_map_is_bounded_and_an_evicted_ticket_is_404(world, registry):
+    register_x()
+    br = world.bridge
+    br.TICKET_MAP_MAX = 3
+    tickets = [br.append_intent(Actor("user", f"u{i}"), "x.test", {"n": i}, artifact_id=None, idempotency_key=None)
+               for i in range(5)]
+    assert len(br._tickets) == 3
+    assert status(br.read_result, Actor("user", "u0"), tickets[0], wait=0, still_valid=lambda: True)[0] == 404
+    assert br.read_result(Actor("user", "u4"), tickets[4], wait=0, still_valid=lambda: True) == {"status": "pending"}
+
+
+# -- result()
+def test_b_cannot_read_as_ticket_even_after_waiting(world):
+    world.mirror.grant(world.b.id, X, "write")
+    world.mirror.grants()
+    br, waits = waiting_bridge(world)
+    ticket = br.commit(world.a, commit_args())["ticket"]
+    assert status(br.result, world.b, ticket, wait=5) == (404, "not found")
+    assert not waits.sleeps                                                # no wait granted to a non-owner
+    br._tickets[ticket] = ("agent", world.b.id)                            # even a poisoned map ...
+    waits.on_sleep = lambda n: finish(world, ticket, ("agent", world.a.id)) if n == 2 else None
+    assert status(br.result, world.b, ticket, wait=5) == (404, "not found")   # ... the file's own actor decides
+    assert waits.sleeps                                                    # it did wait, and still says 404
+
+
+def test_result_returns_the_workers_file_when_it_appears_mid_wait(world):
+    br, waits = waiting_bridge(world)
+    ticket = br.commit(world.a, commit_args())["ticket"]
+    box = {}
+    waits.on_sleep = lambda n: box.setdefault("doc", finish(world, ticket, ("agent", world.a.id))) if n == 3 else None
+    out = br.result(world.a, ticket, wait=10)
+    assert out == box["doc"] and len(waits.sleeps) == 3
+    assert all(0 < x <= 0.5 for x in waits.sleeps)
+
+
+def test_result_pending_when_nothing_appears_and_the_wait_is_capped_at_20_seconds(world):
+    br, waits = waiting_bridge(world)
+    ticket = br.commit(world.a, commit_args())["ticket"]
+    assert br.result(world.a, ticket, wait=500) == {"status": "pending"}
+    assert 19.9 <= sum(waits.sleeps) <= 20.0 + 1e-6 and max(waits.sleeps) <= 0.5
+    waits.sleeps.clear()
+    assert br.result(world.a, ticket, wait=0) == {"status": "pending"} and not waits.sleeps
+    for bad in (float("nan"), "5", None, True):
+        assert status(br.result, world.a, ticket, wait=bad)[0] == 400
+
+
+def test_result_stops_waiting_when_the_agent_is_no_longer_valid(world):
+    br, waits = waiting_bridge(world)
+    ticket = br.commit(world.a, commit_args())["ticket"]
+    waits.on_sleep = lambda n: world.s.revoke_agent(world.w.alice, world.a.id) if n == 2 else None
+    assert br.result(world.a, ticket, wait=20) == {"status": "pending"}
+    assert len(waits.sleeps) == 2
+
+
+def test_the_third_concurrent_wait_by_one_actor_is_refused_and_slots_are_released(world):
+    gate, entered = threading.Event(), threading.Semaphore(0)
+    br = CollabArtifactBridge(world.s, world.mirror.root, world.outbox, clock=world.clock, feed_interval=3600.0,
+                              sleep=lambda s: (entered.release(), gate.wait(5)))
+    ticket = br.commit(world.a, commit_args())["ticket"]
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(br.result(world.a, ticket, wait=1))) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for _ in range(2):
+        assert entered.acquire(timeout=5)
+    assert status(br.result, world.a, ticket, wait=1)[0] == 429
+    assert br.result(world.a, ticket, wait=0) == {"status": "pending"}     # a non-waiting read needs no slot
+    gate.set()
+    for t in threads:
+        t.join(10)
+    assert len(results) == 2
+    assert not collab_waiters._waiters
+
+
+def test_a_failing_read_releases_the_waiter_slot(world):
+    br, waits = waiting_bridge(world)
+    ticket = br.commit(world.a, commit_args())["ticket"]
+
+    def boom(n):
+        raise RuntimeError("boom")
+    waits.on_sleep = boom
+    with pytest.raises(RuntimeError):
+        br.result(world.a, ticket, wait=5)
+    assert not collab_waiters._waiters
+
+
+def test_an_oversize_result_file_is_not_parsed(world, monkeypatch):
+    world.mirror.grants(limits={"max_conflict_text_bytes": 1000})
+    br = world.bridge
+    ticket = br.commit(world.a, commit_args())["ticket"]
+    cap = 1000 + 1_048_576
+    finish(world, ticket, ("agent", world.a.id), pad="x" * (cap + 10))
+    parsed = []
+    real = json.loads
+    monkeypatch.setattr(cbf.json, "loads", lambda x, *a, **k: parsed.append(len(x)) or real(x, *a, **k))
+    assert status(br.result, world.a, ticket, wait=0) == (502, "mirror integrity")
+    assert not [n for n in parsed if n > 100_000]                       # grants.json is parsed; the result is not
+
+
+def test_a_result_exactly_at_the_cap_is_read(world):
+    world.mirror.grants(limits={"max_conflict_text_bytes": 1000})
+    ticket = world.bridge.commit(world.a, commit_args())["ticket"]
+    doc = finish(world, ticket, ("agent", world.a.id))
+    path = world.mirror.root / "results" / f"{ticket}.json"
+    pad = 1000 + 1_048_576 - len(path.read_bytes()) - len(', "pad": ""')
+    doc["pad"] = "x" * pad
+    atomic_write_json(path.parent, path.name, doc)
+    assert path.stat().st_size == 1000 + 1_048_576
+    assert world.bridge.result(world.a, ticket, wait=0) == doc
+
+
+def test_a_symlinked_result_is_never_followed(world, tmp_path):
+    ticket = world.bridge.commit(world.a, commit_args())["ticket"]
+    outside = tmp_path / "elsewhere.json"
+    outside.write_text(json.dumps({"ticket": ticket, "actor": {"kind": "agent", "id": world.a.id}, "result": "x"}))
+    (world.mirror.root / "results").mkdir(exist_ok=True)
+    os.symlink(outside, world.mirror.root / "results" / f"{ticket}.json")
+    assert world.bridge.result(world.a, ticket, wait=0) == {"status": "pending"}     # as if absent: never its content
+
+
+def test_a_stale_grants_json_makes_results_unavailable(world):
+    ticket = world.bridge.commit(world.a, commit_args())["ticket"]
+    world.clock.t += FEED_MAX_AGE + 1
+    assert status(world.bridge.result, world.a, ticket, wait=0) == (503, UNAVAILABLE)
+
+
+def test_a_person_has_no_commit_or_result(world):
+    assert status(world.bridge.commit, world.w.alice, commit_args())[0] == 404
+    assert status(world.bridge.result, world.w.alice, "ict_" + "0" * 24, wait=0)[0] == 404
+
+
+# -- collab_waiters
+def test_waiter_slot_caps_per_key_and_releases():
+    with collab_waiters.waiter_slot("k") as one, collab_waiters.waiter_slot("k") as two, \
+            collab_waiters.waiter_slot("k") as three, collab_waiters.waiter_slot("other") as other:
+        assert (one, two, three, other) == (True, True, False, True)
+    assert not collab_waiters._waiters
+    with pytest.raises(ValueError):
+        with collab_waiters.waiter_slot("k") as ok:
+            assert ok
+            raise ValueError
+    assert not collab_waiters._waiters
+
+
+def test_collab_waiters_imports_neither_mcp_nor_artifacts():
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(collab_waiters))
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            names |= {node.module or ""} | {a.name for a in node.names}
+    assert not {n for n in names if "collab_mcp" in n or "collab_artifacts" in n}
