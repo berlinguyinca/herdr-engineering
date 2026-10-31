@@ -59,6 +59,9 @@ class ActionGrant:
             return GrantState.EXPIRED
         if self.state in (GrantState.PROPOSED, GrantState.ACTIVE) and self.policy_version < policy_version:
             return GrantState.SHADOW             # a policy change sends earned trust back to observation
+        if self.state is GrantState.ACTIVE and (self.activated_at is None or not self.confirmed_by
+                                                or self.expires_at is None):
+            return GrantState.SHADOW             # an ACTIVE row without its activation facts is not trusted
         return self.state
 
 

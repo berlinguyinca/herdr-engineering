@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shlex
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from .shellparse import XARGS_MARKER, SimpleCommand, Unparseable, parse
@@ -76,6 +76,20 @@ class _Cls:
     target: str = ""
     owner: bool = False
     reason: str = ""
+
+
+MAX_ELEMENTS = 64          # elements inspected per command; more is "too complex" (derive() sends it to the owner)
+MAX_ARGV = 256             # tokens per element for the quadratic checks
+MAX_REDIRECTS = 64
+
+
+def is_too_complex(details: Sequence[Element]) -> bool:
+    return len(details) > MAX_ELEMENTS or any(len(e.argv) > MAX_ARGV or len(e.redirects) > MAX_REDIRECTS
+                                              for e in details)
+
+
+def capped(details: Sequence[Element]) -> list[Element]:
+    return [replace(e, argv=e.argv[:MAX_ARGV], redirects=e.redirects[:MAX_REDIRECTS]) for e in details[:MAX_ELEMENTS]]
 
 
 def argv_digest(argv: Iterable[str]) -> str:
@@ -344,7 +358,7 @@ def scan_elements(text: str, on_cluster: bool, cwd: str | None, only: frozenset[
             elif tok == "push" and only is None:
                 argv = ["git", *words[i:]]
             if argv:
-                key = mk_key("shell", Verb.UNKNOWN, "", argv_digest(argv))
+                key = mk_key("shell", Verb.UNKNOWN, "", argv_digest(argv[:MAX_ARGV]))
                 out.append(Element(key, tuple(argv), tuple(redirects), (), on_cluster, cwd, True, False, False))
     return out
 
@@ -958,6 +972,10 @@ def _shell(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
         reasons.append("repository scopes disagree")
         facts.append("disagreement: repository scopes differ between hint, request and command")
     details = (*st.out, *_bare_env_records(text, cwd))
+    if is_too_complex(details):
+        owner = True
+        reasons.append("too complex")
+        best = replace(best, target=raw_digest(_normalized_text(text)))
     return Derived(best, keys, owner, "; ".join(reasons), tuple(facts), details, text, host, False, hint_cwd)
 
 
@@ -1001,5 +1019,8 @@ def derive(raw: RawAction) -> Derived:
     if tool in _TOOLS:
         return _TOOLS[tool](raw, hint, facts)
     if tool in SHELL_TOOLS:
-        return _shell(raw, hint, facts)
+        try:
+            return _shell(raw, hint, facts)
+        except RecursionError:
+            return _unknown_derived(raw, "too complex", facts)
     return _unknown_derived(raw, f"unknown tool {tool!r}", facts)

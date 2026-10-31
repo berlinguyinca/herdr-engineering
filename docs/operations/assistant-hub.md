@@ -73,11 +73,11 @@ tailnet interface.
 
 ## Scopes and what an enrolled worker can read
 
-A redeemed worker gets the default scopes `ask`, `report` and `read`. The `read` scope gives it read access to the
+A redeemed worker gets the default scopes `ask` and `report`. The optional `read` scope gives it read access to the
 owner's assistant memory (`memory_search`) and to the owner's grants, approvals, routines, connector metadata (never
 credentials), delegations and proposals. That is a lot of private context for one credential, so **enroll only
 harnesses you trust, and consider narrowing a worker's scopes** (a worker without `read` cannot use the list or search
-tools). 
+tools).
 
 ## Provenance
 
@@ -169,14 +169,14 @@ the owner still decides; a veto simply cannot catch them on its own.
 
 ### Grant states and defaults
 
-States: `shadow` (proposed or activated inside the global shadow period or a policy-version mismatch), `proposed`
+States: `shadow` (arises only from a `policy_version` mismatch; the GLOBAL shadow period does not change a grant's state, it acts through the shadow check: the grant keeps its state and requests are `pending` with source `shadow`), `proposed`
 (evidence suffices, waiting for the owner), `active`, `expired`, `revoked`. The state shown is always the effective
 state computed now.
 
 | Key (`personal_assistant.grants`) | Default | Meaning |
 |---|---|---|
 | `shadow_days` | `14` | Global shadow period; no grant is honoured and none can be activated before it ends. |
-| `shadow_started_at` | `null` | ISO-8601 with offset. `null` = the hub stamps it on first start. |
+| `shadow_started_at` | `null` | ISO-8601 with offset. `null` = stamped lazily at the first `action_request` or activation attempt (not at hub start), then persisted. |
 | `required_approvals` | `local_reversible 5`, `remote_reversible 10`, `outward 30` | Owner approvals of the exact key needed per risk class. A new scope for an already confirmed verb needs `max(3, n/3)`. |
 | `min_sessions` | `3` | Distinct `session_id` values among the counted approvals. |
 | `min_tasks` | `2` | Distinct `task_id` values among the counted approvals. |
@@ -198,7 +198,9 @@ state computed now.
 ### Why nothing is autonomous yet
 
 - **Phase 3** adds the Jev judge and its calibration gate. Until it exists, `POST /api/v1/assistant-grants/<id>/activate`
-  always answers **409 `judge_gate_not_satisfied`** and writes `assistant.grant.activate_refused`.
+  refuses every activation and writes `assistant.grant.activate_refused`. Refusals are checked in this order: 404
+  `not_found`, 409 `not_proposed`, `still_in_shadow`, `confirmation_missing`, `judge_gate_not_satisfied`. Until Phase 3
+  no request can reach success, because the gate is hard-coded to unsatisfied.
 - **Phase 4** adds hook-attested evidence (so tool outcomes the harness saw can count) and the in-session first-grant
   confirmation. The Phase 1 known limit above (a model with shell access can post `harness_attested` events) must be
   closed before attested evidence counts.
@@ -248,11 +250,18 @@ canonicalizer actually used is recorded as worker-attested, and **a hint that di
 says makes the owner decide**. A hint is ignored once the command redirects git elsewhere (`cd`, `git -C`, `--git-dir`).
 Hints can make a request stricter, never more permissive; they cannot clear a veto.
 
+### Persisted-file trust boundary
+
+The store snapshot file holds worker credential digests, the audit log, grants, requests, evidence and `policy_state`.
+Nothing in it is signed against the host: anyone who can write that file can forge state, including an active grant.
+Protect it with mode 0600 and treat host access as the trust boundary.
+
 ### Audit action names
 
 `assistant.action.requested`, `assistant.action.vetoed`, `assistant.action.authorized`, `assistant.action.decided`,
-`assistant.grant.activated`, `assistant.grant.activate_refused`, `assistant.grant.revoked`, plus the Phase 1 worker
-entries. Entries carry the key id and ids only: no command text, credentials or enrollment codes. The chain verifies with
+`assistant.grant.activated`, `assistant.grant.activate_refused`, `assistant.grant.revoked`,
+`assistant.worker.scopes_changed`, plus the Phase 1 worker entries (`worker.enrolled`, `worker.redeemed`,
+`worker.auth_failed`, `worker.revoked`). Entries carry the key id and ids only: no command text, credentials or enrollment codes. The chain verifies with
 `herdr-eng control-plane assistant-audit verify`.
 
 ## Testing notes

@@ -47,10 +47,11 @@ class ActivationRefused(ValueError):
 
 
 _MAX_DISPLAY = 300
-_SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w*|cookie)"
+_MAX_SCRUB_INPUT = 1000          # regexes only ever see this much text, so their cost is bounded
+_SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w{0,20}|cookie)"
 _USERINFO_RE = re.compile(r"(://)[^/\s@]*@")
-_OPTION_RE = re.compile(rf"(?i)(--?[\w-]*{_SECRET_WORDS}[\w-]*)(=|\s+)([^\s\"']+)")
-_ASSIGN_RE = re.compile(rf"(?i)\b([\w]*(?:{_SECRET_WORDS}|pwd|pass|key)|[\w]*{_SECRET_WORDS}[\w]*)=([^\s\"']+)")
+_OPTION_RE = re.compile(rf"(?i)(--?[\w-]{{0,40}}{_SECRET_WORDS}[\w-]{{0,40}})(=|\s+)([^\s\"']+)")
+_ASSIGN_RE = re.compile(rf"(?i)\b(\w{{0,40}}{_SECRET_WORDS}\w{{0,40}}|\w{{0,40}}(?:pwd|pass|key))=([^\s\"']+)")
 _BEARER_RE = re.compile(r"(?i)\b(bearer|basic)(\s+)[^\s\"']+")
 _USER_OPT_RE = re.compile(r"(?i)(\s(?:-u|--user|--proxy-user)(?:=|\s+))[^\s\"']+")
 _HEADER_RE = re.compile(r"(?i)\b(x-api-key|api-key|cookie|set-cookie|proxy-authorization|authorization)(\s*:\s*)[^\"'\n]*")
@@ -75,7 +76,7 @@ def scrub_display(text: str) -> str:
     scrubber. A secret that has no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why
     this text lives only on the request row and key_canonical holds a digest instead of command text.
     """
-    out = _CONTROL_RE.sub(" ", text)                    # no ESC/C0/C1 (or newline/tab) in anything a terminal may print
+    out = _CONTROL_RE.sub(" ", text[:_MAX_SCRUB_INPUT])                    # no ESC/C0/C1 (or newline/tab) in anything a terminal may print
     out = _USERINFO_RE.sub(r"\1" + _MASK + "@", out)
     out = _HEADER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
     out = _SSHPASS_RE.sub(lambda m: m.group(1) + _MASK, out)
@@ -85,7 +86,9 @@ def scrub_display(text: str) -> str:
     out = _OPTION_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
     out = _ASSIGN_RE.sub(lambda m: f"{m.group(1)}={_MASK}", out)
     out = _BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
-    return str(scrub_payload(out))[:_MAX_DISPLAY]
+    out = str(scrub_payload(out))
+    cut = max(0, len(out) - _MAX_DISPLAY) + max(0, len(text) - _MAX_SCRUB_INPUT)
+    return out[:_MAX_DISPLAY] + (f" \u2026(+{cut} chars)" if cut else "")
 
 
 def in_shadow(store: AssistantStore, cfg: dict, now: datetime) -> bool:
@@ -113,12 +116,31 @@ def _audit(store: AssistantStore, worker: Worker, actor: str, action: str, subje
                        subject_id=subject, detail=detail)
 
 
-def _deny(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derived, veto: Veto, session_id: str, task_id: str,
-          now: datetime) -> Decision:
+def _existing(store: AssistantStore, worker: Worker, status: str, session_id: str, task_id: str,
+              key_id: str) -> ActionRequestRow | None:
+    for r in store.list_action_requests(worker.tenant_id, worker.user_id, status):
+        if (r.worker_id, r.session_id, r.task_id, r.key_id) == (worker.worker_id, session_id, task_id, key_id):
+            return r
+    return None
+
+
+def _find_or_put(store: AssistantStore, worker: Worker, row: ActionRequestRow) -> tuple[ActionRequestRow, bool]:
+    """The existing identical row, or ``row`` once stored. The row (scrubbing included) is built outside the lock."""
+    with store._lock:
+        found = _existing(store, worker, row.status, row.session_id, row.task_id, row.key_id)
+        if found is not None:
+            return found, False
+        store.put_action_request(row)
+    return row, True
+
+
+def _deny(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derived, veto: Veto, session_id: str,
+          task_id: str, now: datetime) -> Decision:
     row = _new_row(worker, raw, derived, session_id, task_id, "vetoed", f"vetoed: {veto.reason}", now)
-    store.put_action_request(row)
-    _audit(store, worker, POLICY_ACTOR, "assistant.action.vetoed", row.request_id,
-           f"veto={veto.code} key_id={row.key_id}")
+    row, created = _find_or_put(store, worker, row)
+    if created:
+        _audit(store, worker, POLICY_ACTOR, "assistant.action.vetoed", row.request_id,
+               f"veto={veto.code} key_id={row.key_id}")
     return Decision("denied", f"Denied by the {veto.code} rule: {veto.reason}.", row.request_id, None, veto.code, "veto")
 
 
@@ -131,17 +153,13 @@ def _live_grant(store: AssistantStore, cfg: dict, worker: Worker, key: ActionKey
     return None
 
 
-def _pending(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derived, session_id: str, task_id: str, now: datetime,
-             source: Source, reason: str) -> Decision:
-    with store._lock:                                   # find-or-create must be atomic
-        key_id = derived.key.key_id() if derived.key else ""
-        for r in store.list_action_requests(worker.tenant_id, worker.user_id, "pending"):
-            if (r.worker_id, r.session_id, r.task_id, r.key_id) == (worker.worker_id, session_id, task_id, key_id):
-                return Decision("pending", reason, r.request_id, None, None, source)
-        row = _new_row(worker, raw, derived, session_id, task_id, "pending", reason, now)
-        store.put_action_request(row)
-    _audit(store, worker, POLICY_ACTOR, "assistant.action.requested", row.request_id,
-           f"source={source} key_id={row.key_id}")
+def _pending(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
+             task_id: str, now: datetime, source: Source, reason: str) -> Decision:
+    row = _new_row(worker, raw, derived, session_id, task_id, "pending", reason, now)
+    row, created = _find_or_put(store, worker, row)
+    if created:
+        _audit(store, worker, POLICY_ACTOR, "assistant.action.requested", row.request_id,
+               f"source={source} key_id={row.key_id}")
     return Decision("pending", reason, row.request_id, None, None, source)
 
 

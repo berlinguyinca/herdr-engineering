@@ -1943,7 +1943,9 @@ class AssistantStore:
         idx = index.setdefault(tenant_id, {})
         idx[row_id] = None                  # re-putting an id keeps its original position
         while len(idx) > self.max_action_rows_per_tenant:
-            old = next(iter(idx))
+            # decided rows go first, so a flood of vetoed or decided requests never pushes out a pending one
+            old = next((k for k in idx if getattr(rows.get(k), "status", "") in ("vetoed", "denied", "approved")),
+                       None) or next(iter(idx))
             del idx[old]
             rows.pop(old, None)
 

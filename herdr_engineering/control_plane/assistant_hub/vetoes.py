@@ -19,10 +19,12 @@ from .canonical import (
     Derived,
     Element,
     api_method,
+    capped,
     classify_head,
     expand_braces,
     expand_word,
     git_push_facts,
+    is_too_complex,
     normalize_text,
     resolve_path,
     split_git,
@@ -530,11 +532,11 @@ def _fixed(derived: Derived) -> Veto | None:
     text = normalize_text(derived.raw_text)
     if _fry_in([derived.raw_text, text, derived.hint_host]) or derived.hint_host.strip().lower() == "fry":
         return fry
-    if derived.unparsed:
+    if derived.unparsed or is_too_complex(derived.details):
         found = _text_scan(derived)
         if found is not None:
             return found
-    elements = [_flatten(e) for e in derived.details]
+    elements = [_flatten(e) for e in capped(derived.details)]
     anywhere = any(_touches_quobyte(e) for e, _ in elements)
     for el, risky in elements:
         if _fry_in([*el.argv, *el.redirects, *(v for _, v in el.env)]) or _fry_bare(el):
@@ -554,7 +556,7 @@ def _extra(derived: Derived, rules: Sequence[VetoRule]) -> Veto | None:
         if rule.verb is None and rule.argv_contains is None:
             return Veto(rule.code, rule.reason)
         needle = (rule.argv_contains or "").lower()
-        for el in derived.details:
+        for el in capped(derived.details):
             verb_ok = rule.verb is None or el.key.verb is rule.verb
             argv_ok = rule.argv_contains is None or needle in " ".join(el.argv).lower()
             if verb_ok and argv_ok:

@@ -240,10 +240,13 @@ def test_persisted_state_holds_no_command_text_and_display_is_masked():
         assert part not in others
 
 
-def test_display_is_truncated():
+def test_display_is_truncated_and_says_how_much_is_missing():
     store, cfg = AssistantStore(), _cfg()
-    d = _decide(store, cfg, RawAction(tool="Bash", command="echo " + "a" * 2000))
-    assert len(store.get_action_request(d.request_id, tenant_id=T, user_id=U).display) == 300
+    d = _decide(store, cfg, RawAction(tool="Bash", command="echo " + "a" * 1000))
+    shown = store.get_action_request(d.request_id, tenant_id=T, user_id=U).display
+    assert shown.startswith("echo " + "a" * 295) and shown.endswith(" \u2026(+705 chars)")
+    short = _decide(store, cfg, RawAction(tool="Bash", command="echo hi"))
+    assert store.get_action_request(short.request_id, tenant_id=T, user_id=U).display == "echo hi"
 
 
 # ---- F2: a grant covers one plain command, and the key binds the full argv
@@ -454,3 +457,79 @@ def test_display_masks_each_secret_shape(raw, masked, leaked):
     out = scrub_display(raw)
     assert masked in out and leaked not in out
     assert "ls -pfoo" not in raw and scrub_display("ls -pfoo") == "ls -pfoo"    # -p is only a secret for db clients
+
+
+# ---- I1: bounded work on pathological commands (through the real decide path)
+
+import time as _time  # noqa: E402
+
+COMPLEX = ["env " * 2000 + "ls", "a=1 " * 1500 + "ls", "(" * 2000, "$(" * 2000, "{" * 1000 + "a,b" + "}" * 1000,
+           "sudo " * 1600 + "ls", "git " + "-c x=y " * 900 + "push", "ssh h " * 1300 + "ls", "/quobyte" * 900,
+           "*" * 8000, "x;" * 4000, "auth" * 2000 + "=", "curl " + "-" * 8000, "auth" * 250 + "="]
+
+
+@pytest.mark.parametrize("cmd", COMPLEX)
+def test_pathological_commands_are_decided_quickly_and_never_authorized(cmd):
+    store, cfg = AssistantStore(), _cfg()
+    start = _time.perf_counter()
+    d = _decide(store, cfg, RawAction(tool="Bash", command=cmd[:8192], repo="acme/repo-a"))
+    assert _time.perf_counter() - start < 1.0
+    assert d.outcome in ("pending", "denied")
+
+
+@pytest.mark.parametrize("cmd", COMPLEX)
+def test_scrub_display_is_fast_on_pathological_input(cmd):
+    from herdr_engineering.control_plane.assistant_hub.policy import scrub_display
+    start = _time.perf_counter()
+    scrub_display(cmd)
+    assert _time.perf_counter() - start < 1.0
+
+
+def test_over_cap_commands_are_owner_decides_with_a_too_complex_reason():
+    d = derive(RawAction(tool="Bash", command="a b " * 40 + "; " + "x " * 300))
+    assert d.owner_decides
+    d = derive(RawAction(tool="Bash", command="echo " + "x " * 300))
+    assert d.owner_decides and "too complex" in d.reason
+
+
+def test_derive_survives_brace_recursion():
+    d = derive(RawAction(tool="Bash", command="{" * 1000 + "a,b" + "}" * 1000))
+    assert d.owner_decides and d.key is not None and d.key.target.startswith("raw:")
+
+
+# ---- I2: vetoed rows are deduplicated and never evict pending rows
+
+def test_identical_vetoed_requests_share_one_row():
+    store, cfg = AssistantStore(), _cfg()
+    ids = {_decide(store, cfg, _push("git push --force origin main")).request_id for _ in range(40)}
+    assert len(ids) == 1 and len(store.list_action_requests(T, U)) == 1
+    assert len([e for e in store._audit if e["action"] == "assistant.action.vetoed"]) == 1
+
+
+def test_vetoed_flood_never_evicts_pending_rows():
+    store, cfg = AssistantStore(), _cfg()
+    store.max_action_rows_per_tenant = 20
+    pend = _decide(store, cfg, _push())
+    for i in range(60):
+        _decide(store, cfg, _push(f"git push --force origin b{i}"), session=f"s{i}")
+    row = store.get_action_request(pend.request_id, tenant_id=T, user_id=U)
+    assert row is not None and row.status == "pending"
+    assert len(store.list_action_requests(T, U)) <= 20
+
+
+# ---- M2: a live grant needs activation facts
+
+@pytest.mark.parametrize("missing", ["activated_at", "confirmed_by", "expires_at"])
+def test_active_grant_missing_activation_facts_is_not_live(missing):
+    store, cfg = AssistantStore(), _cfg()
+    key = derive(_push()).key
+    fields = dict(grant_id="ag_c", tenant_id=T, user_id=U, worker_id=W, resource_scope=key.resource_scope,
+                  key_id=key.key_id(), verb=key.verb.value, key_canonical=key.canonical(), state=GrantState.ACTIVE,
+                  created_at=NOW, activated_at=NOW, expires_at=NOW + timedelta(days=5), confirmed_by="owner",
+                  policy_version=1)
+    assert _decide(store, cfg, _push()).outcome == "pending"                 # baseline, no grant yet
+    store.put_action_grant(ActionGrant(**fields))
+    assert _decide(store, cfg, _push(), session="s2").outcome == "authorized"
+    fields[missing] = "" if missing == "confirmed_by" else None
+    store.put_action_grant(ActionGrant(**fields))
+    assert _decide(store, cfg, _push(), session="s3").outcome == "pending"

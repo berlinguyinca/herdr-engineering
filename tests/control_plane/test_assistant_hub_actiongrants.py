@@ -21,7 +21,8 @@ T0 = datetime(2026, 10, 1, tzinfo=UTC)
 
 def _grant(gid: str = "g1", tenant: str = "t", user: str = "u", **kw) -> ActionGrant:
     base = dict(grant_id=gid, tenant_id=tenant, user_id=user, key_id="k1", verb="git.push",
-                state=GrantState.ACTIVE, created_at=T0, activated_at=T0, expires_at=T0 + timedelta(days=30))
+                state=GrantState.ACTIVE, created_at=T0, activated_at=T0, expires_at=T0 + timedelta(days=30),
+                confirmed_by="owner")
     base.update(kw)
     return ActionGrant(**base)
 

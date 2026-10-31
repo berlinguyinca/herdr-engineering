@@ -201,8 +201,9 @@ def test_phase2_flow_vetoes_evidence_proposal_gate_grant_revoke(acknowledged_sin
         assert owner(w, "GET", "/api/v1/assistant-grants")[1]["grants"][0]["state"] == "proposed"
 
         # Phase 3 supplies the real judge gate; here an ACTIVE grant is created through policy.activate_grant
-        w.svc.store.action_grants.pop(proposed["grant_id"])
-        gid = put_grant(w, wk.wid, GrantState.ACTIVE)
+        gid = proposed["grant_id"]
+        activate_grant(w.svc.store, w.svc.config["grants"], w.svc.now(), TENANT, OWNER, gid, confirmed_by="owner",
+                       judge_gate_satisfied=True)
         ok, _ = ask_action(w, wk, PUSH, session="s9", task="t9")
         assert (ok["outcome"], ok["grant_id"], ok["source"]) == ("authorized", gid, "grant")
         for variant in ("git push -u origin feature", "git push origin main && echo done"):
