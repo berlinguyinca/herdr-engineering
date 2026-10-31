@@ -199,12 +199,16 @@ class CollabGrantStore:
         return dict(row) if row else None
 
     async def record_outcome(self, ticket_id: str, outcome: str, *, version_id: str | None = None,
-                             attempt_id: str | None = None, reason: str | None = None) -> bool:
-        """Decide a ticket once.  True if this call changed the row; False if it was already decided or is unknown."""
+                             attempt_id: str | None = None, reason: str | None = None,
+                             bytes: int | None = None) -> bool:  # noqa: A002 - matches record_received
+        """Decide a ticket once.  True if this call changed the row; False if it was already decided or is unknown.
+
+        ``bytes`` (when given) replaces the row's inline-byte count in the same update: a ticket settled by replaying
+        an earlier one stored nothing new and is set to 0, so the quota never counts its text twice."""
         decided = await self.conn.fetchval(
             "UPDATE artifact_collab_intents SET outcome=$2, version_id=$3, attempt_id=$4, reason=$5, "
-            "decided_at=now() WHERE ticket_id=$1 AND outcome='received' RETURNING 1",
-            ticket_id, outcome, version_id, attempt_id, reason)
+            "bytes=COALESCE($6, bytes), decided_at=now() WHERE ticket_id=$1 AND outcome='received' RETURNING 1",
+            ticket_id, outcome, version_id, attempt_id, reason, bytes)
         return bool(decided)
 
     async def decided_for_key(self, actor, kind: str, idempotency_key: str,

@@ -20,7 +20,7 @@ from herdr_engineering.control_plane.collab_bridge_files import (
     new_ticket,
     request_digest,
 )
-from herdr_engineering.control_plane.collab_intents import CollabIntentApplier
+from herdr_engineering.control_plane.collab_intents import _LOCK_SALT, CollabIntentApplier
 from tests.control_plane.registry_pg import ROOT, FakeBlobs, registry_pg, uid  # noqa: F401 - imported fixture
 
 SENTINEL = "SECRET-SENTINEL-7c1f0e"
@@ -68,10 +68,10 @@ class Env:
                                            limits=kw.pop("limits", BridgeLimits()), spool_dir=tmp_path / "spool",
                                            clock=clock, **kw)
 
-    def feed(self, agents, *, age=0.0):
+    def feed(self, agents, *, age=0.0, **row):
         doc = {"generated_at": self.clock() - age, "agents": {
             a: {"owner": "owner@example.org", "status": status, "expires_at": self.clock() + 3600,
-                "external": False, "join_id": None, "hard_expiry": None} for a, status in agents.items()}}
+                "external": False, "join_id": None, "hard_expiry": None, **row} for a, status in agents.items()}}
         (self.outbox / "agents.json").write_text(json.dumps(doc))
 
     def intent(self, actor, *, kind="x.test", payload=None, key=None, artifact_id=None, age=0.0, ticket=None):
@@ -91,17 +91,17 @@ class Env:
     def pending(self, ticket):
         return (self.outbox / "intents" / f"{ticket}.json").exists()
 
-    async def tick(self, wait=5.0):
-        return await self.applier.tick(self.pool.acquire, wait=wait)
+    async def tick(self, wait=5.0, **kw):
+        return await self.applier.tick(self.pool.acquire, wait=wait, **kw)
 
 
 def agent(agent_id):
     return {"kind": "agent", "id": agent_id}
 
 
-def run(pg, tmp_path, body, *, clock=None, **kw):
+def run(pg, tmp_path, body, *, clock=None, pool_size=10, **kw):
     async def go():
-        pool = await asyncpg.create_pool(pg["dsn"], min_size=1, max_size=10)
+        pool = await asyncpg.create_pool(pg["dsn"], min_size=1, max_size=pool_size)
         try:
             env = Env(tmp_path, pool, clock or Clock(), **kw)
             try:
@@ -667,3 +667,302 @@ def test_an_invalid_intent_with_secret_text_leaves_no_trace(registry_pg, tmp_pat
     caplog.set_level(logging.DEBUG)
     run(registry_pg, tmp_path, body)
     assert caplog.records and SENTINEL not in caplog.text
+
+
+# ----------------------------------------------------------------------------- review round 1
+
+class Dedicated:
+    """``scan_acquire`` over one connection outside the lanes' pool."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def commit_payload(text="hello"):
+    return {"base_version_id": "ver_1", "changes": [{"name": "a.md", "op": "put", "text": text}]}
+
+
+def test_received_intents_of_a_busy_lane_never_starve_another_agents_fresh_intent(registry_pg, tmp_path, registry):
+    register_x()
+    release = None
+
+    async def handler(ctx, intent):
+        if intent.payload["n"] == 1:
+            await release.wait()
+        return {"result": "done"}
+
+    async def body(env):
+        nonlocal release
+        release = asyncio.Event()
+        a, b = uid("agent"), uid("agent")
+        env.feed({a: "active", b: "active"})
+        env.applier.register("x.test", handler)
+        env.intent(agent(a), payload={"n": 1})
+        await env.tick(wait=0.05)                          # A's lane is now blocked
+        queued = [env.intent(agent(a), payload={"n": 2}), env.intent(agent(a), payload={"n": 2})]
+        for i, raw in enumerate(queued):
+            os.utime(env.outbox / "intents" / f"{raw['ticket']}.json", (env.clock() - 50 + i, env.clock() - 50 + i))
+        await env.tick(wait=0.05)
+        for raw in queued:
+            assert (await ledger(env, raw["ticket"]))["outcome"] == "received"
+        fresh = env.intent(agent(b), payload={"n": 3})   # newest mtime: last in an mtime-ordered budget
+        await env.tick(wait=0.05)
+        assert await ledger(env, fresh["ticket"]) is not None
+        release.set()
+    run(registry_pg, tmp_path, body, max_per_tick=2)
+
+
+def test_the_scan_has_its_own_connection_when_every_lane_holds_one(registry_pg, tmp_path, registry):
+    register_x()
+    release = None
+
+    async def handler(ctx, intent):
+        if intent.payload["n"] == 1:
+            await release.wait()
+        return {"result": "done"}
+
+    async def body(env):
+        nonlocal release
+        release = asyncio.Event()
+        a, b = uid("agent"), uid("agent")
+        env.feed({a: "active", b: "active"})
+        env.applier.register("x.test", handler)
+        scan = await asyncpg.connect(registry_pg["dsn"])
+        try:
+            env.intent(agent(a), payload={"n": 1})
+            await env.tick(wait=0.05, scan_acquire=Dedicated(scan))      # the lane takes the pool's only slot
+            fresh = env.intent(agent(b), payload={"n": 3})
+            await asyncio.wait_for(env.tick(wait=0, scan_acquire=Dedicated(scan)), 1.0)
+            row = await scan.fetchrow("SELECT outcome FROM artifact_collab_intents WHERE ticket_id=$1",
+                                      fresh["ticket"])
+            assert row is not None and row["outcome"] == "received"
+            release.set()
+            await env.applier.drain(timeout=5)
+        finally:
+            await scan.close()
+    run(registry_pg, tmp_path, body, pool_size=1, limits=BridgeLimits(apply_concurrency=1))
+
+
+def test_a_ticket_replayed_in_the_lane_is_not_charged_twice(registry_pg, tmp_path, registry):
+    async def handler(ctx, intent):
+        await asyncio.sleep(0.05)
+        return {"result": "created", "version_id": "ver_2"}
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("commit", handler, replay_outcomes=frozenset({"created"}))
+        art = uid("art")
+        one = env.intent(agent(a), kind="commit", artifact_id=art, key="ck", payload=commit_payload(), age=1)
+        two = env.intent(agent(a), kind="commit", artifact_id=art, key="ck", payload=commit_payload())
+        await env.tick()
+        assert env.result(two["ticket"])["result"] == "created"
+        async with env.pool.acquire() as conn:
+            assert await CollabGrantStore(conn).bytes_last_24h(a) == len("hello")
+        assert (await ledger(env, two["ticket"]))["bytes"] == 0 and (await ledger(env, one["ticket"]))["bytes"] == 5
+    run(registry_pg, tmp_path, body)
+
+
+def test_an_agent_revoked_while_queued_behind_its_lane_is_rejected(registry_pg, tmp_path, registry):
+    register_x()
+    release = None
+    calls = []
+
+    async def handler(ctx, intent):
+        calls.append(intent.payload["n"])
+        if intent.payload["n"] == 1:
+            await release.wait()
+        return {"result": "done"}
+
+    async def body(env):
+        nonlocal release
+        release = asyncio.Event()
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        env.intent(agent(a), payload={"n": 1}, age=1)
+        queued = env.intent(agent(a), payload={"n": 2})
+        await env.tick(wait=0.05)
+        env.feed({a: "revoked"})
+        await env.tick(wait=0.05)                          # loads the new feed; the lane is still busy
+        release.set()
+        await env.applier.drain(timeout=5)
+        doc = env.result(queued["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == "agent not active" and calls == [1]
+    run(registry_pg, tmp_path, body)
+
+
+def test_a_raising_handler_is_an_internal_error_with_no_echo(registry_pg, tmp_path, registry, caplog):
+    register_x()
+
+    async def handler(ctx, intent):
+        raise RuntimeError(SENTINEL)
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        raw = env.intent(agent(a))
+        await env.tick()
+        text = (env.mirror_root / "results" / f"{raw['ticket']}.json").read_text()
+        assert json.loads(text)["reason"] == "internal error" and SENTINEL not in text
+
+    caplog.set_level(logging.DEBUG)
+    run(registry_pg, tmp_path, body)
+    assert SENTINEL not in caplog.text
+
+
+def test_an_invalid_actor_is_never_echoed(registry_pg, tmp_path, registry, caplog):
+    register_x()
+
+    async def body(env):
+        raw = env.intent({"kind": "agent", "id": "../" + SENTINEL})
+        await env.tick()
+        text = (env.mirror_root / "results" / f"{raw['ticket']}.json").read_text()
+        doc = json.loads(text)
+        assert doc["actor"] is None and doc["reason"] == "invalid actor" and SENTINEL not in text
+
+    caplog.set_level(logging.DEBUG)
+    run(registry_pg, tmp_path, body)
+    assert SENTINEL not in caplog.text
+
+
+@pytest.mark.parametrize("field", ["expires_at", "hard_expiry"])
+def test_an_expired_agent_is_rejected(registry_pg, tmp_path, registry, field):
+    register_x()
+
+    async def handler(ctx, intent):  # pragma: no cover
+        raise AssertionError("expired agent reached its handler")
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"}, **{field: env.clock() - 1})
+        env.applier.register("x.test", handler)
+        raw = env.intent(agent(a))
+        await env.tick()
+        assert env.result(raw["ticket"])["reason"] == "agent not active"
+    run(registry_pg, tmp_path, body)
+
+
+def test_lane_order_holds_when_the_first_intents_key_is_locked_elsewhere(registry_pg, tmp_path, registry):
+    register_x()
+    calls = []
+
+    async def handler(ctx, intent):
+        calls.append(intent.idempotency_key)
+        return {"result": "done"}
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        env.intent(agent(a), key="k1", age=1)
+        env.intent(agent(a), key="k2")
+        other = await asyncpg.connect(registry_pg["dsn"])
+        try:
+            lock = _LOCK_SALT + f"key:agent:{a}:x.test:k1"
+            assert await other.fetchval("SELECT pg_try_advisory_lock(hashtextextended($1, 0))", lock)
+            counts = await env.tick()
+            assert calls == [] and counts["skipped"] == 2
+            await other.fetchval("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock)
+        finally:
+            await other.close()
+        await env.tick()
+        assert calls == ["k1", "k2"]
+    run(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("out", [
+    {"result": "received"}, {"result": "done", "reason": 7}, {"result": "done", "version_id": ["x"]},
+    {"result": "done", "conflicts": "nope"}, {"result": "done", "version_number": "1"},
+    {"result": "done", "merged_names": [1]}, {"result": "done", "attempt_id": 3}])
+def test_an_invalid_handler_return_is_an_internal_error_in_ledger_and_result(registry_pg, tmp_path, registry, out):
+    register_x()
+
+    async def handler(ctx, intent):
+        return out
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        raw = env.intent(agent(a))
+        await env.tick()
+        doc, row = env.result(raw["ticket"]), await ledger(env, raw["ticket"])
+        assert (doc["result"], doc["reason"]) == ("rejected", "internal error")
+        assert (row["outcome"], row["reason"], row["version_id"]) == ("rejected", "internal error", None)
+    run(registry_pg, tmp_path, body)
+
+
+def test_an_expired_commit_records_no_bytes(registry_pg, tmp_path, registry):
+    async def handler(ctx, intent):  # pragma: no cover
+        raise AssertionError("expired commit reached its handler")
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("commit", handler)
+        raw = env.intent(agent(a), kind="commit", artifact_id=uid("art"), payload=commit_payload(), age=61)
+        await env.tick()
+        row = await ledger(env, raw["ticket"])
+        assert row["outcome"] == "expired" and row["bytes"] == 0
+    run(registry_pg, tmp_path, body)
+
+
+def test_a_future_submitted_at_is_rejected(registry_pg, tmp_path, registry):
+    register_x()
+
+    async def handler(ctx, intent):  # pragma: no cover
+        raise AssertionError("future intent reached its handler")
+
+    async def body(env):
+        a = uid("agent")
+        env.feed({a: "active"})
+        env.applier.register("x.test", handler)
+        raw = env.intent(agent(a), age=-3600)
+        await env.tick()
+        assert env.result(raw["ticket"])["reason"] == "invalid submitted_at"
+    run(registry_pg, tmp_path, body)
+
+
+def test_sweep_results_deletes_in_bounded_batches_past_any_cap(registry_pg, tmp_path, monkeypatch):
+    from herdr_engineering.control_plane import collab_intents as ci
+    monkeypatch.setattr(ci, "RESULTS_SWEEP_BATCH", 3)
+
+    async def body(env):
+        results = env.mirror_root / "results"
+        results.mkdir(parents=True)
+        for _ in range(7):
+            path = results / f"{new_ticket()}.json"
+            path.write_text("{}")
+            os.utime(path, (env.clock() - 7200, env.clock() - 7200))
+        assert await env.applier.sweep_results(max_age=3600) == 3
+        assert await env.applier.sweep_results(max_age=3600) == 3
+        assert await env.applier.sweep_results(max_age=3600) == 1
+        assert list(results.iterdir()) == []
+    run(registry_pg, tmp_path, body)
+
+
+def test_stale_stray_files_in_intents_are_removed(registry_pg, tmp_path, registry):
+    async def body(env):
+        intents = env.outbox / "intents"
+        stale, young = intents / ".tmp-abc", intents / ".tmp-def"
+        stale.write_text("x")
+        young.write_text("x")
+        os.utime(stale, (env.clock() - 7200, env.clock() - 7200))
+        outside = tmp_path / "outside"
+        outside.write_text("keep")
+        (intents / "junk-link").symlink_to(outside)
+        os.utime(intents / "junk-link", (env.clock() - 7200, env.clock() - 7200), follow_symlinks=False)
+        await env.tick()
+        assert not stale.exists() and young.exists() and outside.read_text() == "keep"
+    run(registry_pg, tmp_path, body)

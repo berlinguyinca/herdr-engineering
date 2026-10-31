@@ -34,8 +34,10 @@ blocking file I/O runs in worker threads. Log lines carry only ticket, kind, act
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import os
 import re
 import stat
 import time
@@ -65,7 +67,6 @@ from .collab_bridge_files import (
     unlink_beneath,
     validate_intent,
 )
-from .collab_mirror import MIRROR_MAX_ENTRIES
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,14 @@ AGENTS_FEED_MAX_BYTES = 4 * 1024 * 1024
 # A commit body is capped at 64 KiB on the wire, but JSON escaping can grow text up to 6x; plan 4/5 kinds are small.
 INTENT_MAX_BYTES = 1024 * 1024
 INTENTS_MIN_ENTRIES = 4096
+# collab-public's own clock may run ahead a little; a submitted_at further in the future is refused (never received).
+INTENT_FUTURE_SKEW = 60.0
+# Stray regular files in intents/ (stale .tmp-* of an interrupted atomic write, junk) older than this are removed.
+STRAY_MAX_AGE = 3600.0
+STRAY_SWEEP_BATCH = 1000
+# sweep_results deletes at most this many files per call (the results dir is the worker's own tree: no cap, no
+# fail-closed listing; an oversized backlog drains over successive calls).
+RESULTS_SWEEP_BATCH = 10_000
 
 REASON_UNREADABLE = "intent is not readable"
 REASON_UNKNOWN_KIND = "unknown intent kind"
@@ -85,8 +94,10 @@ REASON_EXPIRED = "intent expired"
 REASON_FEED_STALE = "agent feed stale"
 REASON_AGENT = "agent not active"
 REASON_INTERNAL = "internal error"
+REASON_FUTURE = "invalid submitted_at"
 
 _RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason")
+_STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id")
 _OUTCOME = re.compile(r"[a-z_]{1,32}\Z")
 _INTENT_FILE = re.compile(TICKET_RE[:-2] + r"\.json\Z")
 _KIND_NAME = re.compile(r"[a-z][a-z0-9_.]{0,47}\Z")
@@ -164,6 +175,7 @@ class CollabIntentApplier:
         self._kinds: dict[str, _Kind] = {}
         self._busy: dict[str, asyncio.Task] = {}
         self._inflight: set[str] = set()
+        self._received: dict[str, str] = {}      # ticket -> lane, for tickets received but not yet dispatched
         self._feed: dict | None = None
         self._sem = asyncio.Semaphore(limits.apply_concurrency)
         self._counts = self._zero()
@@ -172,7 +184,12 @@ class CollabIntentApplier:
     def register(self, kind: str, handler: Callable[[IntentContext, Intent], Awaitable[dict]], *,
                  lane_key: Callable[[Intent, dict | None], str] | None = None,
                  replay_outcomes: frozenset[str] = frozenset()) -> None:
-        """Attach the handler of an intent kind (its validator is registered with ``register_intent_kind``)."""
+        """Attach the handler of an intent kind (its validator is registered with ``register_intent_kind``).
+
+        A handler must be idempotent on ``(actor, kind, idempotency key)``: a crash between its return and
+        ``record_outcome`` leaves the ticket ``received``, and the restarted worker runs the handler again (age-exempt).
+        ``commit`` gets that from ``merge_commit``'s own idempotency key.
+        """
         if not isinstance(kind, str) or not _KIND_NAME.match(kind):
             raise ValueError("invalid intent kind name")
         if kind in self._kinds:
@@ -201,12 +218,19 @@ class CollabIntentApplier:
         counts, self._counts = self._counts, self._zero()
         return counts
 
-    async def tick(self, acquire, *, wait: float = 1.0) -> dict:
+    async def tick(self, acquire, *, scan_acquire=None, wait: float = 1.0) -> dict:
         """Scan the outbox once and start the free lanes; returns the outcomes decided since the previous tick.
 
-        ``acquire()`` is an async context manager yielding a connection of the applier's own pool (one for the scan,
-        one per running lane). Lanes started here are awaited for at most ``wait`` seconds; a longer one keeps
-        running and its lane is skipped by later ticks until it finishes (``drain`` awaits them all).
+        ``acquire()`` is an async context manager yielding a connection of the applier's own pool; each running lane
+        holds one (at most ``limits.apply_concurrency`` at once). The scan uses ``scan_acquire()`` (default:
+        ``acquire``). **Pool sizing:** the scan must never wait for a lane's connection, or fresh intents stop being
+        received while every lane is busy and expire. Either pass ``scan_acquire`` over a dedicated connection, or
+        size ``acquire``'s pool to at least ``apply_concurrency + 1``.
+
+        The per-tick budget (``max_per_tick``) goes first to files with no known ``received`` row (only they are on the
+        age clock), then to received tickets whose lane is free; received tickets of a busy lane are not rescanned.
+        Lanes started here are awaited for at most ``wait`` seconds; a longer one keeps running and its lane is
+        skipped by later ticks until it finishes (``drain`` awaits them all).
         """
         feed, listing = await asyncio.to_thread(self._load_outbox)
         self._feed = feed
@@ -214,11 +238,15 @@ class CollabIntentApplier:
             return self._take_counts()
         mtimes = {name: st.st_mtime for name, st in listing
                   if stat.S_ISREG(st.st_mode) and _INTENT_FILE.match(name) and name[:-5] not in self._inflight}
-        names = sorted(mtimes, key=lambda n: (mtimes[n], n))
-        names = names[:self.max_per_tick]
+        present = {name[:-5] for name in mtimes}
+        self._received = {t: lane for t, lane in self._received.items() if t in present or t in self._inflight}
+        fresh = sorted((n for n in mtimes if n[:-5] not in self._received), key=lambda n: (mtimes[n], n))
+        queued = sorted((n for n in mtimes if n[:-5] in self._received and self._received[n[:-5]] not in self._busy),
+                        key=lambda n: (mtimes[n], n))
+        names = (fresh + queued)[:self.max_per_tick]
         raws = await asyncio.to_thread(self._read_intents, names) if names else {}
         lanes: dict[str, list[_Job]] = {}
-        async with acquire() as conn:
+        async with (scan_acquire or acquire)() as conn:
             for name in names:
                 try:
                     job = await self._scan(conn, name, raws.get(name))
@@ -269,6 +297,12 @@ class CollabIntentApplier:
         except BridgeError:
             log.warning("collab intents: outbox intents dir has too many entries; tick skipped")
             return feed, None
+        if listing is not None:
+            cutoff = self.clock() - STRAY_MAX_AGE
+            strays = [name for name, st in listing
+                      if stat.S_ISREG(st.st_mode) and not _INTENT_FILE.match(name) and st.st_mtime < cutoff]
+            for name in strays[:STRAY_SWEEP_BATCH]:      # regular files only: a symlink is never followed or removed
+                unlink_beneath(self.outbox, [INTENTS_DIR], name)
         return feed, listing
 
     def _read_intents(self, names: list[str]) -> dict[str, dict | None]:
@@ -301,6 +335,9 @@ class CollabIntentApplier:
         if await self._replayed(conn, name, intent, spec, row):                                       # step 3
             return None
         if row is None:                                                                             # step 4
+            if intent.submitted_at > self.clock() + INTENT_FUTURE_SKEW:
+                await self._decide(conn, intent, None, {"result": "rejected", "reason": REASON_FUTURE}, charge=False)
+                return None
             if self.clock() - intent.submitted_at > INTENT_MAX_AGE:
                 await self._decide(conn, intent, None, {"result": "expired", "reason": REASON_EXPIRED}, charge=False)
                 return None
@@ -321,6 +358,7 @@ class CollabIntentApplier:
             log.error("collab intent %s: lane key failed (%s)", ticket, type(exc).__name__)
             await self._finish(conn, name, intent, {"result": "rejected", "reason": REASON_INTERNAL})
             return None
+        self._received[intent.ticket] = lane
         return _Job(name, intent, spec, lane)
 
     @staticmethod
@@ -360,7 +398,7 @@ class CollabIntentApplier:
             out = await asyncio.to_thread(self._result_of_row, prior)
             out = {k: v for k, v in out.items() if k == "result" or k in _RESULT_KEYS}
             out["attempt_id"] = prior.get("attempt_id")
-        await self._decide(conn, intent, row, out, charge=False, name=name)
+        await self._decide(conn, intent, row, out, charge=False, name=name, zero_bytes=True)
         return True
 
     # -- lanes ------------------------------------------------------------------------------------------------
@@ -422,9 +460,7 @@ class CollabIntentApplier:
                             extras=self.extras)
         try:
             out = await job.spec.handler(ctx, intent)
-            if not isinstance(out, dict) or not isinstance(out.get("result"), str) \
-                    or not _OUTCOME.match(out["result"]) or out["result"] == "received":
-                raise TypeError("handler returned an invalid outcome")
+            _check_outcome(out)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -439,7 +475,7 @@ class CollabIntentApplier:
         return dict(row) if row else None
 
     async def _decide(self, conn, intent: Intent, row: dict | None, out: dict, *, charge: bool = True,
-                      name: str | None = None) -> None:
+                      name: str | None = None, zero_bytes: bool = False) -> None:
         """Record a validated intent's outcome (writing its ``received`` row first when it has none) and finish it."""
         if row is None:
             existing = await CollabGrantStore(conn).record_received(
@@ -448,15 +484,14 @@ class CollabIntentApplier:
             if existing is not None and existing["outcome"] != "received":
                 await self._settle_from_row(name or intent.ticket + ".json", existing)
                 return
-        await self._finish(conn, name or intent.ticket + ".json", intent, out)
+        await self._finish(conn, name or intent.ticket + ".json", intent, out, zero_bytes=zero_bytes)
 
-    async def _finish(self, conn, name: str, intent: Intent, out: dict) -> None:
+    async def _finish(self, conn, name: str, intent: Intent, out: dict, *, zero_bytes: bool = False) -> None:
+        """Record and publish ``out``, which ``_check_outcome`` accepts (the applier's own outcomes always do)."""
         result = out["result"]
-        reason = out.get("reason") if isinstance(out.get("reason"), str) else None
-        version_id = out.get("version_id") if isinstance(out.get("version_id"), str) else None
-        attempt_id = out.get("attempt_id") if isinstance(out.get("attempt_id"), str) else None
-        decided = await CollabGrantStore(conn).record_outcome(intent.ticket, result, version_id=version_id,
-                                                              attempt_id=attempt_id, reason=reason)
+        decided = await CollabGrantStore(conn).record_outcome(
+            intent.ticket, result, version_id=out.get("version_id"), attempt_id=out.get("attempt_id"),
+            reason=out.get("reason"), bytes=0 if zero_bytes else None)
         if not decided:                                    # decided elsewhere first: that decision is the result
             row = await self._ledger(conn, intent.ticket)
             if row is not None and row["outcome"] != "received":
@@ -532,26 +567,60 @@ class CollabIntentApplier:
         self._consume(name)
 
     def _done(self, ticket, kind, actor_kind, actor_id, artifact_id, outcome: str) -> None:
+        self._received.pop(ticket, None)
         self._count(outcome)
         log.info("collab intent %s kind=%s actor=%s:%s artifact=%s outcome=%s",
                  ticket, kind, actor_kind, actor_id, artifact_id, outcome)
 
     # -- results sweep ----------------------------------------------------------------------------------------
     async def sweep_results(self, max_age: float = 3600) -> int:
-        """Delete result files older than ``max_age`` seconds (by mtime); returns how many."""
+        """Delete result files older than ``max_age`` seconds (by mtime), at most ``RESULTS_SWEEP_BATCH`` per call;
+        returns how many. The results dir is the worker's own tree, so it streams the directory with no entry cap
+        (nothing is held in memory) instead of failing closed: a backlog drains over successive calls."""
         def go() -> int:
             try:
-                entries = list_beneath(Path(self.mirror.root), [RESULTS_DIR], max_entries=MIRROR_MAX_ENTRIES)
-            except BridgeError:
-                log.warning("collab intents: results dir has too many entries; sweep skipped")
+                dfd = os.open(Path(self.mirror.root) / RESULTS_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError:
                 return 0
-            cutoff = self.clock() - max_age
-            removed = 0
-            for name, st in entries or ():
-                if stat.S_ISREG(st.st_mode) and _INTENT_FILE.match(name) and st.st_mtime < cutoff:
-                    removed += unlink_beneath(Path(self.mirror.root), [RESULTS_DIR], name)
+            cutoff, removed = self.clock() - max_age, 0
+            try:
+                with os.scandir(dfd) as entries:
+                    for entry in entries:
+                        if removed >= RESULTS_SWEEP_BATCH:
+                            break
+                        if not _INTENT_FILE.match(entry.name):
+                            continue
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                            if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                                os.unlink(entry.name, dir_fd=dfd)
+                                removed += 1
+                        except OSError:
+                            continue
+            finally:
+                os.close(dfd)
             return removed
         return await asyncio.to_thread(go)
+
+
+def _check_outcome(out) -> None:
+    """A handler's return value, or ``TypeError``: checked before ``record_outcome`` so ledger and result agree."""
+    if not isinstance(out, dict) or not isinstance(out.get("result"), str) or not _OUTCOME.match(out["result"]) \
+            or out["result"] == "received":
+        raise TypeError("invalid outcome")
+    for key in _STR_KEYS:
+        if out.get(key) is not None and not isinstance(out[key], str):
+            raise TypeError("invalid outcome field")
+    number = out.get("version_number")
+    if number is not None and (isinstance(number, bool) or not isinstance(number, int)):
+        raise TypeError("invalid outcome field")
+    names = out.get("merged_names")
+    if names is not None and (not isinstance(names, list) or not all(isinstance(n, str) for n in names)):
+        raise TypeError("invalid outcome field")
+    conflicts = out.get("conflicts")
+    if conflicts is not None and (not isinstance(conflicts, list) or not all(isinstance(c, dict) for c in conflicts)):
+        raise TypeError("invalid outcome field")
+    json.dumps(out, ensure_ascii=False, allow_nan=False)   # TypeError/ValueError: not writable as a result
 
 
 def _base_of(intent: Intent) -> str | None:
