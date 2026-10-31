@@ -100,6 +100,12 @@ def _normalize_entry(entry: str) -> str | None:
     return None
 
 
+def normalize_host_entry(entry: str) -> str | None:
+    """The bare lowercase host of an ``allowed_hosts``-style entry (port stripped, IPv6 without brackets), or None
+    when it is not a plain host/IP (scheme, whitespace, path, userinfo, shell metacharacters, ...)."""
+    return _normalize_entry(entry)
+
+
 def host_header_allowed(header: str | None, allowed_hosts: list[str]) -> bool:
     if not header:
         return False

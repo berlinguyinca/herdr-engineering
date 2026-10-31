@@ -2,6 +2,7 @@ from herdr_engineering.control_plane.assistant_hub.netguard import (
     DEFAULT_NETWORKS,
     bind_allowed,
     host_header_allowed,
+    normalize_host_entry,
     parse_networks,
     peer_allowed,
 )
@@ -88,3 +89,11 @@ def test_allowed_hosts_bracketed_ipv6_entries_match():
     assert host_header_allowed("[fd7a::1]:9483", ["fd7a::1"])
     assert host_header_allowed("[FD7A::1]", ["[fd7a::1]:9483"])
     assert not host_header_allowed("[fd7a::2]:9483", ["[fd7a::1]"])
+
+
+def test_normalize_host_entry():
+    assert normalize_host_entry("Box.TS.net:9483") == "box.ts.net"
+    assert normalize_host_entry("[fd7a::1]:9483") == "fd7a::1"
+    assert normalize_host_entry("fd7a::1") == "fd7a::1"
+    for bad in ("http://x", "a b", "x; ls", "$(id)", "u@h", "h/path", "", None):
+        assert normalize_host_entry(bad) is None

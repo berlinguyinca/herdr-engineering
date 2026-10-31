@@ -1,6 +1,7 @@
 """Owner enrollment routes (/api/v1/assistant-workers) and CLI. A real ControlPlaneServer and a real HubServer share
 ONE WorkerRegistry; nothing is mocked."""
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -281,7 +282,7 @@ def _setup_for(sink, hub_cfg):
 ])
 def test_setup_url_host(acknowledged_sink, hub_cfg, host, placeholder):
     setup = _setup_for(acknowledged_sink, hub_cfg)
-    assert setup["mcp_add"].split()[6] == f"http://{host}:9483/assistant/mcp"
+    assert re.search(r"herdr-assistant (\S+) --header", setup["mcp_add"]).group(1) == f"http://{host}:9483/assistant/mcp"
     assert setup["host_is_placeholder"] is placeholder
 
 
@@ -370,3 +371,26 @@ def test_cp_web_wiring_shares_the_hub_registry(acknowledged_sink):
     off = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), api_keys=ROLES)
     assert cli._wire_assistant_hub(off) is None and off.assistant_workers is None
     off.shutdown()
+
+
+@pytest.mark.parametrize("entries,host,placeholder", [
+    (["[fd7a::1]:9483"], "[fd7a::1]", False),
+    (["box.ts.net:9483"], "box.ts.net", False),
+    (["BOX.Ts.Net"], "box.ts.net", False),
+    (["localhost:9483"], "<HUB_HOST>", True),
+    (["[::1]:9483"], "<HUB_HOST>", True),
+    (["127.0.0.2:1"], "<HUB_HOST>", True),
+    (["http://x"], "<HUB_HOST>", True),
+    (["x; touch /tmp/pwn #"], "<HUB_HOST>", True),
+    (["$(id)"], "<HUB_HOST>", True),
+    (["a b"], "<HUB_HOST>", True),
+    (["a_b.example"], "<HUB_HOST>", True),
+    (["http://x", "$(id)", "good.ts.net:1"], "good.ts.net", False),
+    (["localhost", "good.ts.net", "other.ts.net"], "good.ts.net", False),
+])
+def test_setup_url_host_from_allowed_hosts(acknowledged_sink, entries, host, placeholder):
+    setup = _setup_for(acknowledged_sink, {"host": "0.0.0.0", "allowed_hosts": entries})
+    url = re.search(r"herdr-assistant (\S+) --header", setup["mcp_add"]).group(1)
+    assert url == f"http://{host}:9483/assistant/mcp"
+    assert setup["host_is_placeholder"] is placeholder
+    assert setup["mcp_add"].endswith('--header "Authorization: Worker <CREDENTIAL>" --header "X-Herdr-Device: <DEVICE>"')

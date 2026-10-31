@@ -4381,28 +4381,32 @@ def _make_handler(server, public=False, operator=False):
 
         @staticmethod
         def _worker_hub_host(hub):
-            """(host, is_placeholder): a host a worker's device can reach. Wildcard/loopback binds are useless there, so
-            use the first non-loopback allowed host, else the literal <HUB_HOST> placeholder. IPv6 is bracketed."""
+            """(host, is_placeholder): a host a worker's device can reach, safe to paste into a shell. Every candidate is
+            normalised like the hub's Host check (port stripped, junk skipped); wildcard/loopback results are unusable,
+            so the first usable ``allowed_hosts`` entry is used, else the literal <HUB_HOST>. IPv6 is bracketed."""
             import ipaddress
+            import re
 
-            def unusable(h):
-                h = (h or "").strip().strip("[]")
-                if not h or h.lower() == "localhost":
-                    return True
+            from .assistant_hub.netguard import normalize_host_entry
+
+            def usable(entry):
+                host = normalize_host_entry(entry) if isinstance(entry, str) else None
+                if not host:
+                    return None
                 try:
-                    a = ipaddress.ip_address(h)
+                    ip = ipaddress.ip_address(host)
                 except ValueError:
-                    return False
-                return a.is_unspecified or a.is_loopback
+                    if host == "localhost" or not re.fullmatch(r"[a-z0-9.-]+", host):
+                        return None
+                    return host
+                if ip.is_unspecified or ip.is_loopback:
+                    return None
+                return f"[{ip}]" if ip.version == 6 else str(ip)
 
-            def fmt(h):
-                h = h.strip().strip("[]")
-                return f"[{h}]" if ":" in h else h
-            if not unusable(hub.get("host")):
-                return fmt(hub["host"]), False
-            for h in hub.get("allowed_hosts") or []:
-                if isinstance(h, str) and not unusable(h):
-                    return fmt(h), False
+            for candidate in [hub.get("host"), *(hub.get("allowed_hosts") or [])]:
+                found = usable(candidate)
+                if found:
+                    return found, False
             return "<HUB_HOST>", True
 
         def _worker_setup(self, harness):
