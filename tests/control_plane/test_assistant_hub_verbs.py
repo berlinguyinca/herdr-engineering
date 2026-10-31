@@ -156,3 +156,18 @@ def test_from_canonical_rejects_malformed_input(text):
     from herdr_engineering.control_plane.assistant_hub.verbs import ActionKey
     with _pytest.raises(ValueError):
         ActionKey.from_canonical(text)
+
+
+def test_from_canonical_rejects_non_normalized_input():
+    from herdr_engineering.control_plane.assistant_hub.verbs import (
+        VERB_RISK,
+        ActionKey,
+        FlagClass,
+        Verb,
+    )
+    key = ActionKey("git", Verb.GIT_PUSH, "acme/repo", "x", FlagClass.NONE, VERB_RISK[Verb.GIT_PUSH])
+    spaced = _json.dumps(_json.loads(key.canonical()), indent=1)
+    upper = key.canonical().replace("acme/repo", "ACME/Repo")
+    for text in (spaced, upper):
+        with _pytest.raises(ValueError):
+            ActionKey.from_canonical(text)

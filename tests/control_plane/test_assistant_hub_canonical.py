@@ -13,10 +13,10 @@ def sh(command, **kw):
 
 ROWS = [
     # benign reads
-    ("git status && ls", V.SHELL_READ_ONLY, F.NONE, False),
+    ("git status && ls", V.SHELL_READ_ONLY, F.NONE,True),
     ("ls -la /tmp", V.SHELL_READ_ONLY, F.NONE, False),
-    ("cat README.md | head -5", V.SHELL_READ_ONLY, F.NONE, False),
-    ("grep -rn foo src | wc -l", V.SHELL_READ_ONLY, F.NONE, False),
+    ("cat README.md | head -5", V.SHELL_READ_ONLY, F.NONE,True),
+    ("grep -rn foo src | wc -l", V.SHELL_READ_ONLY, F.NONE,True),
     ("find . -name '*.py'", V.SHELL_READ_ONLY, F.NONE, False),
     ("git log --oneline", V.SHELL_READ_ONLY, F.NONE, False),
     ("git diff HEAD~1", V.SHELL_READ_ONLY, F.NONE, False),
@@ -26,7 +26,7 @@ ROWS = [
     ("git -C /repo status", V.SHELL_READ_ONLY, F.NONE, False),
     ("date +%s", V.SHELL_READ_ONLY, F.NONE, False),
     ("sort a.txt", V.SHELL_READ_ONLY, F.NONE, False),
-    ("ls > /dev/null", V.SHELL_READ_ONLY, F.NONE, False),
+    ("ls > /dev/null", V.SHELL_READ_ONLY, F.NONE,True),
     # push evasion forms (Review Focus 1)
     ("git push origin main", V.GIT_PUSH, F.NONE, False),
     ("git push --force-with-lease", V.GIT_FORCE_PUSH, F.FORCE, False),
@@ -36,21 +36,21 @@ ROWS = [
     ("git push --mirror", V.GIT_FORCE_PUSH, F.FORCE, False),
     ("git push -uf origin x", V.GIT_FORCE_PUSH, F.FORCE, False),
     ("git push --force-if-includes", V.GIT_FORCE_PUSH, F.FORCE, False),
-    ("FOO=1 git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
+    ("FOO=1 git push -f", V.GIT_FORCE_PUSH, F.FORCE,True),
     ("git -c x=y push --force", V.UNKNOWN, F.NONE, True),
     ("git -c core.sshCommand=evil push", V.UNKNOWN, F.NONE, True),
     ("git -c alias.st=!sh status", V.UNKNOWN, F.NONE, True),
-    ("sh -c 'git push -f'", V.GIT_FORCE_PUSH, F.FORCE, False),
-    ('bash -lc "git push -f"', V.GIT_FORCE_PUSH, F.FORCE, False),
+    ("sh -c 'git push -f'", V.GIT_FORCE_PUSH, F.FORCE,True),
+    ('bash -lc "git push -f"', V.GIT_FORCE_PUSH, F.FORCE,True),
     ("echo $(git push -f)", V.GIT_FORCE_PUSH, F.FORCE, True),
     ("echo `git push -f`", V.GIT_FORCE_PUSH, F.FORCE, True),
-    ("ls\ngit push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
-    ("ls || git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
-    ("ls; git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
-    ("echo hi | git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
+    ("ls\ngit push -f", V.GIT_FORCE_PUSH, F.FORCE,True),
+    ("ls || git push -f", V.GIT_FORCE_PUSH, F.FORCE,True),
+    ("ls; git push -f", V.GIT_FORCE_PUSH, F.FORCE,True),
+    ("echo hi | git push -f", V.GIT_FORCE_PUSH, F.FORCE,True),
     ("ls | xargs git push", V.GIT_PUSH, F.NONE, True),
     ("xargs git push -f", V.GIT_FORCE_PUSH, F.FORCE, True),
-    ("env X=1 git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
+    ("env X=1 git push -f", V.GIT_FORCE_PUSH, F.FORCE,True),
     ("command git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
     ("exec git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
     ("time git push -f", V.GIT_FORCE_PUSH, F.FORCE, False),
@@ -62,10 +62,10 @@ ROWS = [
     ("eval 'git push -f'", V.UNKNOWN, F.NONE, True),
     ("git push $REMOTE", V.GIT_PUSH, F.NONE, True),
     # sudo / redirects / dynamic never read-only
-    ("sudo ls", V.SHELL_MUTATING, F.NONE, False),
-    ("sudo -u bob cat /etc/hosts", V.SHELL_MUTATING, F.NONE, False),
-    ("echo hi > out.txt", V.SHELL_MUTATING, F.NONE, False),
-    ("cat a >> b", V.SHELL_MUTATING, F.NONE, False),
+    ("sudo ls", V.SHELL_MUTATING, F.NONE,True),
+    ("sudo -u bob cat /etc/hosts", V.SHELL_MUTATING, F.NONE,True),
+    ("echo hi > out.txt", V.SHELL_MUTATING, F.NONE,True),
+    ("cat a >> b", V.SHELL_MUTATING, F.NONE,True),
     ("ls *.py", V.SHELL_READ_ONLY, F.NONE, True),
     ("sort -o out in", V.SHELL_MUTATING, F.NONE, False),
     ("tee out", V.SHELL_MUTATING, F.NONE, False),
@@ -106,7 +106,7 @@ ROWS = [
     ("ssh hive squeue -u me", V.CLUSTER_READ_ONLY, F.NONE, False),
     ("ssh hive 'squeue; rm -rf /x'", V.CLUSTER_MUTATING, F.RECURSIVE, False),
     ("ssh hive 'cd /x && ls'", V.CLUSTER_READ_ONLY, F.NONE, False),
-    ("ssh hive 'ls > f'", V.CLUSTER_MUTATING, F.NONE, False),
+    ("ssh hive 'ls > f'", V.CLUSTER_MUTATING, F.NONE,True),
     ("ssh hive 'python3 x.py'", V.CLUSTER_MUTATING, F.NONE, True),
     ("ssh hive", V.CLUSTER_MUTATING, F.NONE, True),
     ("ssh -o ProxyCommand=evil hive ls", V.CLUSTER_MUTATING, F.NONE, True),
@@ -245,3 +245,39 @@ def test_key_is_stable_for_spelling_variants():
 def test_nested_ssh_depth_is_bounded():
     d = derive(sh("ssh a \"ssh b 'ssh c \\\"ssh d ls\\\"'\""))
     assert d.owner_decides or d.key.verb is Verb.CLUSTER_READ_ONLY
+
+
+# ---- grant-safety: one plain command, full-argv target ------------------------------------------------------------
+
+@pytest.mark.parametrize("command", [
+    "git push origin feature; ls", "git push origin feature && ls", "git push origin feature || true",
+    "git push origin feature &", "git push origin feature &> /tmp/x", "git push origin feature > /tmp/x",
+    "git push origin feature | cat", "FOO=1 git push origin feature", "(git push origin feature)",
+    "{ git push origin feature; }", "git push origin feature\nid", "git push origin feature `id`",
+    "echo x | xargs git push origin feature", "sudo git push origin feature",
+])
+def test_compound_or_decorated_commands_are_owner_decides(command):
+    d = derive(sh(command))
+    assert d.key is not None and d.owner_decides, command
+
+
+def test_single_plain_command_is_not_owner_decides_and_target_binds_argv():
+    import hashlib
+    d = derive(sh("git push origin 'feature'", repo="acme/r"))
+    assert not d.owner_decides
+    assert d.key.target == "argv:" + hashlib.sha256(b"git\0push\0origin\0feature").hexdigest()
+    assert derive(sh("git  push origin feature", repo="acme/r")).key == d.key
+
+
+@pytest.mark.parametrize("command", ["git push -u origin feature", "git push --tags origin feature",
+                                     "git push --no-verify origin feature", "git push --repo=evil origin feature",
+                                     "git push origin other", "git push upstream feature"])
+def test_any_argv_difference_changes_the_key(command):
+    base = derive(sh("git push origin feature", repo="acme/r")).key
+    assert derive(sh(command, repo="acme/r")).key.key_id() != base.key_id()
+
+
+def test_unknown_and_unparseable_targets_are_digests_not_text():
+    for cmd in ("frobnicate --secret hunter2-canary", "echo $(((("):
+        k = derive(sh(cmd)).key
+        assert k.target.startswith(("argv:", "raw:")) and "hunter2" not in k.canonical()

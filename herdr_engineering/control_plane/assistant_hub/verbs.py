@@ -113,8 +113,11 @@ class ActionKey:
         fields = ("tool", "verb", "resource_scope", "target", "flag_class", "risk_class")
         if not isinstance(data, dict) or set(data) != set(fields) or not all(isinstance(data[f], str) for f in fields):
             raise ValueError("canonical key must hold exactly the six string fields")
-        return cls(data["tool"], Verb(data["verb"]), data["resource_scope"], data["target"],
-                   FlagClass(data["flag_class"]), RiskClass(data["risk_class"]))
+        key = cls(data["tool"], Verb(data["verb"]), data["resource_scope"], data["target"],
+                  FlagClass(data["flag_class"]), RiskClass(data["risk_class"]))
+        if key.canonical() != text:
+            raise ValueError("canonical key is not in normalized form")
+        return key
 
 
 def STRICTER(a: ActionKey, b: ActionKey) -> ActionKey:  # noqa: N802 - policy-vocabulary name

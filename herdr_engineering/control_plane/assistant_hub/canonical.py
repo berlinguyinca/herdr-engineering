@@ -12,6 +12,7 @@ normalized with ``os.path.normpath``; symlinks are not followed, so any ``hint``
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shlex
 from collections.abc import Callable, Iterable, Mapping
@@ -75,6 +76,36 @@ class _Cls:
     target: str = ""
     owner: bool = False
     reason: str = ""
+
+
+def argv_digest(argv: Iterable[str]) -> str:
+    """Key target for shell commands: binds every token without storing any free-form command text."""
+    return "argv:" + hashlib.sha256("\0".join(argv).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def raw_digest(text: str) -> str:
+    return "raw:" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+_UNQUOTED_STRUCTURE = frozenset(";&|\n()`{}<>\r")
+
+
+def is_single_simple_text(text: str) -> bool:
+    """True when ``text`` has no unquoted shell structure (separators, groups, redirects, background, newlines)."""
+    quote = ""
+    escaped = False
+    for ch in text.strip():
+        if escaped:
+            escaped = False
+        elif ch == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch in _UNQUOTED_STRUCTURE:
+            return False
+    return True
 
 
 def mk_key(tool: str, verb: Verb, scope: str = "", target: str = "", flag: FlagClass = FlagClass.NONE) -> ActionKey:
@@ -309,7 +340,7 @@ def scan_elements(text: str, on_cluster: bool, cwd: str | None, only: frozenset[
             elif tok == "push" and only is None:
                 argv = ["git", *words[i:]]
             if argv:
-                key = mk_key("shell", Verb.UNKNOWN, "", " ".join(argv))
+                key = mk_key("shell", Verb.UNKNOWN, "", argv_digest(argv))
                 out.append(Element(key, tuple(argv), tuple(redirects), (), on_cluster, cwd, True, False, False))
     return out
 
@@ -546,7 +577,7 @@ def _emit(st: _State, cmd: SimpleCommand, argv: list[str], cls: _Cls, on_cluster
     head = std_name(argv[0])
     family = ("cluster" if verb in (Verb.CLUSTER_READ_ONLY, Verb.CLUSTER_MUTATING) else
               "git" if head == "git" else "gh" if head == "gh" else "shell")
-    target = cls.target or " ".join(argv)
+    target = argv_digest(argv)
     key = mk_key(family, verb, scope, target, flag)
     st.out.append(Element(key, tuple(argv), real_redirects, cmd.env, on_cluster, cwd,
                           owner or verb is Verb.UNKNOWN, dynamic, xargs))
@@ -795,7 +826,7 @@ def _hint(raw: RawAction) -> dict[str, str]:
 
 def _unknown_derived(raw: RawAction, reason: str, facts: list[str], details: tuple[Element, ...] = (),
                      hint_host: str = "") -> Derived:
-    key = mk_key(raw.tool.strip().lower() or "unknown", Verb.UNKNOWN, raw.repo or "", raw.command or "")
+    key = mk_key(raw.tool.strip().lower() or "unknown", Verb.UNKNOWN, raw.repo or "", raw_digest(raw.command or ""))
     return Derived(key, (), True, reason, tuple(facts), details, raw.command or "", hint_host)
 
 
@@ -854,7 +885,7 @@ def _deploy(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
         repo = repo or hint["repo"]
     verb = {"canary": Verb.DEPLOY_CANARY, "prod": Verb.DEPLOY_PROD, "production": Verb.DEPLOY_PROD}.get(env)
     if verb is None:
-        key = mk_key("deploy", Verb.UNKNOWN, repo, env)
+        key = mk_key("deploy", Verb.UNKNOWN, repo, raw_digest(env))
         return Derived(key, (key,), True, f"unknown deploy environment {env!r}", tuple(facts))
     key = mk_key("deploy", verb, repo)
     return Derived(key, (key,), False, "", tuple(facts))
@@ -904,6 +935,12 @@ def _shell(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
     for k in keys[1:]:
         best = STRICTER(best, k)
     owner = any(e.owner_decides for e in st.out) or bool(notes)
+    if _single_simple(text, cmds, st.out):
+        # The top-level argv binds everything a wrapper (ssh, srun, sh -c ...) goes on to run.
+        best = replace(best, target=argv_digest(a for a in cmds[0].argv if a != XARGS_MARKER))
+    else:
+        owner = True
+        notes.append("a grant covers only one plain command")
     reasons = [*dict.fromkeys(st.reasons), *notes]
     if hint_cwd and cwd is None:
         owner = True
@@ -917,6 +954,14 @@ def _shell(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
         facts.append("disagreement: repository scopes differ between hint, request and command")
     details = (*st.out, *_bare_env_records(text, cwd))
     return Derived(best, keys, owner, "; ".join(reasons), tuple(facts), details, text, host, False, hint_cwd)
+
+
+def _single_simple(text: str, cmds: list, out: list[Element]) -> bool:
+    """One command: no list, env prefix, redirect, grouping, background, delegation or xargs."""
+    if len(cmds) != 1 or not is_single_simple_text(text) or XARGS_MARKER in cmds[0].argv:
+        return False
+    cmd = cmds[0]
+    return not (cmd.env or cmd.redirects or cmd.wrapped or any(el.env or el.redirects or el.xargs for el in out))
 
 
 def _mentions_cluster(text: str) -> bool:

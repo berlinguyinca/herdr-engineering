@@ -206,15 +206,74 @@ def test_identical_pending_requests_share_one_row():
     assert len([e for e in store._audit if e["action"] == "assistant.action.requested"]) == 2
 
 
-def test_request_row_never_contains_the_raw_command_or_a_secret():
+SECRET_CMDS = [
+    "curl https://bob:pw0rd-userinfo@example.com/x --token=tok-abc-123",
+    "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 git push origin main",
+    'curl -H "Authorization: Bearer bearer-xyz-987" https://example.com',
+]
+SECRET_PARTS = ("pw0rd-userinfo", "tok-abc-123", "ghp_abcdefghijklmnopqrstuvwxyz0123456789", "bearer-xyz-987")
+
+
+def test_persisted_state_holds_no_command_text_and_display_is_masked():
     store, cfg = AssistantStore(), _cfg()
-    for raw in (_push(f"git push origin main # {SECRET}"),
-                RawAction(tool="Bash", command=f"frobnicate --token {SECRET}")):
-        _decide(store, cfg, raw)
+    for cmd in SECRET_CMDS + ["git push --force origin main  # hunter2-canary", "frobnicate --x $(((("]:
+        d = _decide(store, cfg, RawAction(tool="Bash", command=cmd, repo="acme/repo-a"))
+        record = store.get_action_request(d.request_id, tenant_id=T, user_id=U)
+        for word in ("curl", "Bearer", "frobnicate", "hunter2", "origin"):
+            assert word not in record.key_canonical
+        assert "argv:" in record.key_canonical or "raw:" in record.key_canonical or record.verb != "unknown"
+        for part in SECRET_PARTS:
+            assert part not in record.display
+        assert len(record.display) <= 300
     rows = store.list_action_requests(T, U)
-    assert len(rows) == 2
-    blob = repr(rows) + repr(store._audit)
-    assert SECRET not in blob and "frobnicate --token" not in blob
+    assert any("https://***@example.com" in r.display and "--token=***" in r.display for r in rows)
+    assert any("GITHUB_TOKEN=***" in r.display for r in rows)
+    assert any("Bearer ***" in r.display for r in rows)
+    approvable = next(r for r in rows if r.status == "pending" and r.verb == "git.push")
+    record_owner_decision(store, cfg, NOW, T, U, approvable.request_id, True, "owner")
+    store.put_action_grant(ActionGrant(grant_id="ag_s", tenant_id=T, user_id=U, worker_id=W, key_id="k",
+                                       key_canonical=approvable.key_canonical, state=GrantState.PROPOSED))
+    others = repr(store._audit) + repr(store.list_action_evidence(T, U)) + repr(store.list_action_grants(T, U))
+    snap = store.snapshot() if hasattr(store, "snapshot") else {}
+    others += repr(snap.get("action_grants", [])) + repr(snap.get("action_evidence", []))
+    for part in (*SECRET_PARTS, "hunter2-canary", "curl", "display"):
+        assert part not in others
+
+
+def test_display_is_truncated():
+    store, cfg = AssistantStore(), _cfg()
+    d = _decide(store, cfg, RawAction(tool="Bash", command="echo " + "a" * 2000))
+    assert len(store.get_action_request(d.request_id, tenant_id=T, user_id=U).display) == 300
+
+
+# ---- F2: a grant covers one plain command, and the key binds the full argv
+
+GRANT_CMD = "git push origin feature"
+WIDER = [
+    "git push --repo=evil origin feature", "git push -u origin feature", "git push --tags origin feature",
+    "git push --no-verify origin feature", "git push origin feature &> /tmp/x", "git push origin feature; ls",
+    "git push origin feature && ls", "git push origin feature && git diff", "git push origin feature || true",
+    "git push origin feature; cd /tmp", "git push origin feature && echo hunter2-canary", "git push origin feature &",
+    "FOO=1 git push origin feature", "(git push origin feature)", "{ git push origin feature; }",
+    "git push origin feature\nid", "git push origin other", "git push upstream feature",
+    "git push origin feature > /tmp/x", "git push origin feature | cat", "git push origin feature `id`",
+]
+
+
+@pytest.mark.parametrize("cmd", WIDER)
+def test_active_grant_never_covers_a_wider_or_different_command(cmd):
+    store, cfg = AssistantStore(), _cfg()
+    _active_grant(store, cfg, _push(GRANT_CMD))
+    d = _decide(store, cfg, _push(cmd))
+    assert d.outcome == "pending" and d.grant_id is None
+
+
+@pytest.mark.parametrize("cmd", [GRANT_CMD, "git  push origin 'feature'", "git push   origin feature  "])
+def test_active_grant_covers_the_same_argv(cmd):
+    store, cfg = AssistantStore(), _cfg()
+    g = _active_grant(store, cfg, _push(GRANT_CMD))
+    d = _decide(store, cfg, _push(cmd))
+    assert (d.outcome, d.grant_id) == ("authorized", g.grant_id)
 
 
 # ------------------------------------------------------------------ owner decisions

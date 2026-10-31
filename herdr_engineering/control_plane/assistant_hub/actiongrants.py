@@ -84,6 +84,7 @@ class ActionRequestRow:
     created_at: datetime = _EPOCH
     decided_at: datetime | None = None
     decided_by: str = ""
+    display: str = ""                # scrubbed, truncated command for the owner API only; never audit/grants/events
 
 
 @dataclass

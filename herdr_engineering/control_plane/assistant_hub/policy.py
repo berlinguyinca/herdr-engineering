@@ -8,6 +8,7 @@ rows and audit entries carry the canonical key and key id only, never the raw co
 
 from __future__ import annotations
 
+import re
 import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -16,6 +17,7 @@ from typing import Literal
 from ..assistant import AssistantStore
 from .actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, GrantState, as_utc, revoke
 from .canonical import Derived, RawAction, derive
+from .events import scrub_payload
 from .evidence import _shadow_elapsed, propose_if_ready
 from .verbs import ActionKey, Verb
 from .vetoes import Veto, VetoRule, check_vetoes
@@ -42,6 +44,36 @@ class ActivationRefused(ValueError):
         self.code = code
 
 
+_MAX_DISPLAY = 300
+_SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w*|cookie)"
+_USERINFO_RE = re.compile(r"(://)[^/\s@]*@")
+_OPTION_RE = re.compile(rf"(?i)(--?[\w-]*{_SECRET_WORDS}[\w-]*)(=|\s+)(\S+)")
+_ASSIGN_RE = re.compile(rf"(?i)\b([\w]*{_SECRET_WORDS}[\w]*)=(\S+)")
+_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)(\s+)\S+")
+_MASK = "***"
+
+
+def display_text(raw: RawAction) -> str:
+    if raw.command:
+        return raw.command
+    return " ".join(p for p in (raw.tool, raw.operation or "", ",".join(raw.recipients), raw.repo or "",
+                                raw.environment or "") if p)
+
+
+def scrub_display(text: str) -> str:
+    """A masked, truncated rendering for the OWNER-facing request row only (never audit, grants or events).
+
+    Pattern based: URL userinfo, secret-named options and NAME=value pairs, Bearer headers, plus the hub's token-shape
+    scrubber. A secret that has no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why
+    this text lives only on the request row and key_canonical holds a digest instead of command text.
+    """
+    out = _USERINFO_RE.sub(r"\1" + _MASK + "@", text)
+    out = _OPTION_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
+    out = _ASSIGN_RE.sub(lambda m: f"{m.group(1)}={_MASK}", out)
+    out = _BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
+    return str(scrub_payload(out))[:_MAX_DISPLAY]
+
+
 def in_shadow(store: AssistantStore, cfg: dict, now: datetime) -> bool:
     return not _shadow_elapsed(store, cfg, now)
 
@@ -51,17 +83,15 @@ def _extra_rules(cfg: dict) -> list[VetoRule]:
                      argv_contains=e.get("argv_contains")) for e in cfg.get("extra_vetoes", [])]
 
 
-def _new_row(worker: Worker, derived: Derived, session_id: str, task_id: str, status: str, reason: str,
+def _new_row(worker: Worker, raw: RawAction, derived: Derived, session_id: str, task_id: str, status: str, reason: str,
              now: datetime) -> ActionRequestRow:
     key = derived.key
-    shown = replace(key, target="") if key and (key.verb is Verb.UNKNOWN or status == "vetoed") else key
-    # An unknown or vetoed action's target is its raw command text; the row keeps the key id (a hash) but not the text.
     return ActionRequestRow(
         request_id="ar_" + secrets.token_urlsafe(12), tenant_id=worker.tenant_id, user_id=worker.user_id,
         worker_id=worker.worker_id, session_id=session_id, task_id=task_id,
-        key_canonical=shown.canonical() if shown else "", key_id=key.key_id() if key else "",
+        key_canonical=key.canonical() if key else "", key_id=key.key_id() if key else "",
         verb=key.verb.value if key else Verb.UNKNOWN.value, risk_class=key.risk_class.value if key else "outward",
-        status=status, reason=reason, created_at=as_utc(now))
+        status=status, reason=reason, created_at=as_utc(now), display=scrub_display(display_text(raw)))
 
 
 def _audit(store: AssistantStore, worker: Worker, actor: str, action: str, subject: str, detail: str = "") -> None:
@@ -69,9 +99,9 @@ def _audit(store: AssistantStore, worker: Worker, actor: str, action: str, subje
                        subject_id=subject, detail=detail)
 
 
-def _deny(store: AssistantStore, worker: Worker, derived: Derived, veto: Veto, session_id: str, task_id: str,
+def _deny(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derived, veto: Veto, session_id: str, task_id: str,
           now: datetime) -> Decision:
-    row = _new_row(worker, derived, session_id, task_id, "vetoed", f"vetoed: {veto.reason}", now)
+    row = _new_row(worker, raw, derived, session_id, task_id, "vetoed", f"vetoed: {veto.reason}", now)
     store.put_action_request(row)
     _audit(store, worker, POLICY_ACTOR, "assistant.action.vetoed", row.request_id,
            f"veto={veto.code} key_id={row.key_id}")
@@ -87,14 +117,14 @@ def _live_grant(store: AssistantStore, cfg: dict, worker: Worker, key: ActionKey
     return None
 
 
-def _pending(store: AssistantStore, worker: Worker, derived: Derived, session_id: str, task_id: str, now: datetime,
+def _pending(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derived, session_id: str, task_id: str, now: datetime,
              source: Source, reason: str) -> Decision:
     with store._lock:                                   # find-or-create must be atomic
         key_id = derived.key.key_id() if derived.key else ""
         for r in store.list_action_requests(worker.tenant_id, worker.user_id, "pending"):
             if (r.worker_id, r.session_id, r.task_id, r.key_id) == (worker.worker_id, session_id, task_id, key_id):
                 return Decision("pending", reason, r.request_id, None, None, source)
-        row = _new_row(worker, derived, session_id, task_id, "pending", reason, now)
+        row = _new_row(worker, raw, derived, session_id, task_id, "pending", reason, now)
         store.put_action_request(row)
     _audit(store, worker, POLICY_ACTOR, "assistant.action.requested", row.request_id,
            f"source={source} key_id={row.key_id}")
@@ -106,20 +136,20 @@ def decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, ses
     derived = derive(raw)
     veto = check_vetoes(derived, _extra_rules(cfg))
     if veto is not None:
-        return _deny(store, worker, derived, veto, session_id, task_id, now)
+        return _deny(store, worker, raw, derived, veto, session_id, task_id, now)
     if derived.owner_decides or derived.key is None:
-        return _pending(store, worker, derived, session_id, task_id, now, "unknown",
+        return _pending(store, worker, raw, derived, session_id, task_id, now, "unknown",
                         "The action could not be classified with certainty, so the owner decides.")
     grant = _live_grant(store, cfg, worker, derived.key, now)
     if grant is not None and in_shadow(store, cfg, now):
-        return _pending(store, worker, derived, session_id, task_id, now, "shadow",
+        return _pending(store, worker, raw, derived, session_id, task_id, now, "shadow",
                         "The shadow period is still running, so the owner decides.")
     if grant is not None:
         _audit(store, worker, POLICY_ACTOR, "assistant.action.authorized", grant.grant_id,
                f"grant={grant.grant_id} key_id={grant.key_id} worker={worker.worker_id}")
         return Decision("authorized", "Authorized by the owner's active grant for this exact action.", None,
                         grant.grant_id, None, "grant")
-    return _pending(store, worker, derived, session_id, task_id, now, "owner",
+    return _pending(store, worker, raw, derived, session_id, task_id, now, "owner",
                     "No active grant covers this exact action, so the owner decides.")
 
 
