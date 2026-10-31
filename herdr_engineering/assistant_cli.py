@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .assistant_packages import agent_package_record
+
 SCHEMA_VERSION = 1
 MAX_RESPONSE = 2_000_000
 MAX_INPUT = 64 * 1024
@@ -187,6 +189,25 @@ class AssistantClient:
     def approvals_list(self, room_id: str) -> dict:
         return self._request("GET", f"/api/v1/collab/rooms/{_segment(room_id)}/approval-proposals")
 
+    def package_register(self, room_id: str, manifest: dict) -> dict:
+        normalized = agent_package_record(manifest)["manifest"]
+        return self._request(
+            "POST", f"/api/v1/collab/rooms/{_segment(room_id)}/assistant-packages",
+            {"manifest": normalized},
+        )
+
+    def packages_list(self, room_id: str) -> dict:
+        return self._request("GET", f"/api/v1/collab/rooms/{_segment(room_id)}/assistant-packages")
+
+    def package_get(self, room_id: str, package_id: str) -> dict:
+        payload = self._request(
+            "GET", f"/api/v1/collab/rooms/{_segment(room_id)}/assistant-packages/"
+            f"{_segment(package_id)}")
+        package = payload.get("package")
+        if not isinstance(package, dict):
+            raise AssistantAPIError(502, "assistant API returned an invalid package response")
+        return package
+
 
 def _segment(value: str | None) -> str:
     if not isinstance(value, str) or not value or "/" in value or value in {".", ".."}:
@@ -198,7 +219,10 @@ def _read_object(path: str) -> dict:
     source = Path(path)
     if source.stat().st_size > MAX_INPUT:
         raise ConfigError("input file exceeds 64 KiB")
-    value = json.loads(source.read_text(encoding="utf-8"))
+    try:
+        value = json.loads(source.read_text(encoding="utf-8"))
+    except RecursionError:
+        raise ConfigError("input JSON is nested too deeply") from None
     if not isinstance(value, dict):
         raise ConfigError("input file must contain one JSON object")
     return value
@@ -248,8 +272,12 @@ def _failure(exc: Exception) -> dict:
 
 def _run(args: argparse.Namespace) -> int:
     try:
-        client = AssistantClient(AssistantConfig.from_env())
         op = args.assistant_operation
+        if op == "packages-validate":
+            result = agent_package_record(_read_object(args.file))
+            print(json.dumps(_success(result), indent=2, sort_keys=True))
+            return 0
+        client = AssistantClient(AssistantConfig.from_env())
         if op == "agents-list":
             result = client.agents_list(args.room)
         elif op == "agents-inspect":
@@ -283,6 +311,12 @@ def _run(args: argparse.Namespace) -> int:
             result = client.approval_request(args.room, body)
         elif op == "approvals-list":
             result = client.approvals_list(args.room)
+        elif op == "packages-register":
+            result = client.package_register(args.room, _read_object(args.file))
+        elif op == "packages-list":
+            result = client.packages_list(args.room)
+        elif op == "packages-inspect":
+            result = client.package_get(args.room, args.package_id)
         else:  # pragma: no cover - argparse constrains this
             raise ConfigError("unknown assistant operation")
         print(json.dumps(_success(result), indent=2, sort_keys=True))
@@ -343,6 +377,23 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     cmd = approval_ops.add_parser("list")
     cmd.add_argument("--room", required=True)
     _finish(cmd, "approvals-list")
+
+    packages = groups.add_parser("packages", help="validate and register assistant definitions")
+    package_ops = packages.add_subparsers(required=True)
+    cmd = package_ops.add_parser("validate")
+    cmd.add_argument("--file", required=True)
+    _finish(cmd, "packages-validate")
+    cmd = package_ops.add_parser("register")
+    cmd.add_argument("--room", required=True)
+    cmd.add_argument("--file", required=True)
+    _finish(cmd, "packages-register")
+    cmd = package_ops.add_parser("list")
+    cmd.add_argument("--room", required=True)
+    _finish(cmd, "packages-list")
+    cmd = package_ops.add_parser("inspect")
+    cmd.add_argument("package_id")
+    cmd.add_argument("--room", required=True)
+    _finish(cmd, "packages-inspect")
 
 
 def _finish(parser: argparse.ArgumentParser, operation: str) -> None:

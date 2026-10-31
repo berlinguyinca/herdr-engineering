@@ -35,6 +35,10 @@ herdr-eng assistant tasks update TASK_ID --status accepted --json
 herdr-eng assistant tasks update TASK_ID --status done --result 'Draft ready' --json
 herdr-eng assistant approvals request --room ROOM_ID --file proposal.json --json
 herdr-eng assistant approvals list --room ROOM_ID --json
+herdr-eng assistant packages validate --file package.json --json
+herdr-eng assistant packages register --room ROOM_ID --file package.json --json
+herdr-eng assistant packages list --room ROOM_ID --json
+herdr-eng assistant packages inspect PACKAGE_ID --room ROOM_ID --json
 ```
 
 `task.json` contains exactly:
@@ -82,3 +86,5 @@ successful envelope.
 - Task inbox/update require an agent credential. Agent administration and grant approval
   remain server-owned and are not exposed by this slice.
 - This CLI does not launch Pi, containers, browsers, email, purchases, or external writes.
+- Package validation is local and credential-free. Package registration is owner-only and
+  definition-only; every runtime reports `runtime_launch_supported: false`.

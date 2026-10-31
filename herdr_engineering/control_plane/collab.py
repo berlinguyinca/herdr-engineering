@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from ..assistant_packages import ManifestError, agent_package_record
 from . import collab_models, ids
 from .redact import redact_text
 
@@ -88,6 +89,8 @@ MAX_APPROVAL_PROPOSALS_PER_OWNER = 100
 APPROVAL_PROPOSAL_RATE = 20       # per requester per 10 minutes
 MAX_APPROVAL_SUMMARY = 500
 MAX_APPROVAL_DETAILS = 8 * 1024
+MAX_ASSISTANT_PACKAGES_PER_OWNER_ROOM = 100
+ASSISTANT_PACKAGE_RATE = 20       # immutable definitions per owner per 10 minutes
 MAX_PENDING_REQUESTS = 120       # open access requests per room (one family of agents fits)
 SPAWN_FAMILIES = ("claude-code", "codex", "pi", "agent")   # what the host runner knows how to start
 PROFILE_LIMIT_DEFAULTS = {"live_per_agent": 3, "depth": 2, "per_hour": 20}   # a room profile may only lower these
@@ -343,6 +346,8 @@ class CollabService:
         self._tasks_by_target: dict[str, list[str]] = defaultdict(list)
         self._approval_proposals: dict[str, dict] = {}
         self._approval_proposal_idem: dict[tuple[str, str, str], tuple[str, str]] = {}
+        self._assistant_packages: dict[tuple[str, str, str], dict] = {}
+        self._assistant_package_versions: dict[tuple[str, str, str, str], str] = {}
         self._requests: dict[str, dict] = {}                 # open agent-access requests
         # Indexes kept only by _apply (so hydrate rebuilds them): they replace whole-state scans.
         self._agents_by_owner: dict[str, set] = defaultdict(set)
@@ -597,6 +602,13 @@ class CollabService:
             }
             self._approval_proposal_idem[(requester_key, p["room_id"], p["idempotency_key"])] = (
                 p["fingerprint"], p["proposal_id"])
+        elif t == "assistant_package_registered":
+            package = copy.deepcopy(p["package"])
+            key = (p["room_id"], p["actor_user_id"], package["package_id"])
+            version_key = (p["room_id"], p["actor_user_id"],
+                           package["manifest"]["name"], package["manifest"]["version"])
+            self._assistant_packages[key] = package
+            self._assistant_package_versions[version_key] = package["package_id"]
         elif t == "agent_granted":
             self._rooms[p["room_id"]]["grants"][p["agent_id"]] = {
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
@@ -2970,6 +2982,81 @@ class CollabService:
             rows.sort(key=lambda p: p["sequence"], reverse=True)
         return {"proposals": [self._approval_proposal_json(p) for p in rows]}
 
+    # -- immutable assistant package definitions (definitions only; never authority)
+    def _assistant_package_owner(self, pr: Principal, room_id: str, action: str) -> dict:
+        self._require_user(pr)
+        if not self._ok(pr.id):
+            raise CollabError(404, "not found")
+        room, _ = self._authorize(pr, room_id, "read", action)
+        member = self._member(room, pr.id)
+        if not member or member["role"] != "owner":
+            self._audit_denied(pr, action, "not_owner", room_id=room_id,
+                               project_ids=[room["project_id"]])
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden")
+        return room
+
+    @staticmethod
+    def _assistant_package_json(package: dict) -> dict:
+        return copy.deepcopy(package)
+
+    def create_assistant_package(self, pr: Principal, room_id: str,
+                                 body: dict) -> tuple[int, dict]:
+        """Register one private immutable definition; this cannot launch or grant capabilities."""
+        with self._lock:
+            room = self._assistant_package_owner(pr, room_id, "assistant_package.create")
+            if not isinstance(body, dict) or set(body) != {"manifest"}:
+                raise CollabError(400, "request must contain exactly manifest")
+            try:
+                record = agent_package_record(body["manifest"])
+            except ManifestError:
+                raise CollabError(400, "invalid assistant package manifest") from None
+            manifest = record["manifest"]
+            version_key = (room_id, pr.id, manifest["name"], manifest["version"])
+            prior_id = self._assistant_package_versions.get(version_key)
+            if prior_id is not None:
+                prior = self._assistant_packages[(room_id, pr.id, prior_id)]
+                if prior["digest"] != record["digest"]:
+                    raise CollabError(409, "assistant package name and version are immutable")
+                return 200, {"package": self._assistant_package_json(prior), "replayed": True}
+            count = sum(1 for rid, owner, _ in self._assistant_packages
+                        if rid == room_id and owner == pr.id)
+            if count >= MAX_ASSISTANT_PACKAGES_PER_OWNER_ROOM:
+                raise CollabError(429, "assistant package limit reached")
+            self._throttle("assistant-package:" + pr.id,
+                           ASSISTANT_PACKAGE_RATE, 600.0, "assistant package")
+            digest_hex = record["digest"].removeprefix("sha256:")
+            package = {
+                "package_id": "package_" + digest_hex,
+                **record,
+                "status": "definition-only",
+                "created_at": self._iso(),
+            }
+            self._commit("assistant_package_registered", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id,
+                package=copy.deepcopy(package), visibility_scope="owner", room_notify=False,
+                action="assistant_package.register", outcome="allowed",
+                project_ids=[room["project_id"]], resource_id=room_id))
+        return 201, {"package": self._assistant_package_json(package)}
+
+    def list_assistant_packages(self, pr: Principal, room_id: str) -> dict:
+        with self._lock:
+            self._assistant_package_owner(pr, room_id, "assistant_package.list")
+            rows = [package for (rid, owner, _), package in self._assistant_packages.items()
+                    if rid == room_id and owner == pr.id]
+            rows.sort(key=lambda p: (p["manifest"]["name"], p["manifest"]["version"],
+                                     p["package_id"]))
+        return {"packages": [self._assistant_package_json(p) for p in rows]}
+
+    def get_assistant_package(self, pr: Principal, room_id: str,
+                              package_id: str) -> dict:
+        with self._lock:
+            self._assistant_package_owner(pr, room_id, "assistant_package.get")
+            package = self._assistant_packages.get((room_id, pr.id, package_id))
+            if package is None:
+                raise CollabError(404, "not found")
+        return {"package": self._assistant_package_json(package)}
+
     def _grant_expiry(self, body: dict) -> float:
         """Every agent grant lapses: the owner may pick a date (up to a year), else the default."""
         exp = _finite_expiry(body.get("expires_at"), self._now())
@@ -3420,6 +3507,10 @@ class CollabService:
                         return 200, self.get_task(pr, rid, parts[3])
                     if parts[2:] == ["approval-proposals"]:
                         return 200, self.list_approval_proposals(pr, rid)
+                    if parts[2:] == ["assistant-packages"]:
+                        return 200, self.list_assistant_packages(pr, rid)
+                    if n == 4 and parts[2] == "assistant-packages":
+                        return 200, self.get_assistant_package(pr, rid, parts[3])
                     if parts[2:] == ["flow"]:
                         return 200, self.room_flow(pr, rid)
                     if parts[2:] == ["state"]:
@@ -3526,6 +3617,8 @@ class CollabService:
                         return 201, self.create_task(pr, rid, body)
                     if parts[2:] == ["approval-proposals"]:
                         return self.create_approval_proposal(pr, rid, body)
+                    if parts[2:] == ["assistant-packages"]:
+                        return self.create_assistant_package(pr, rid, body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
                         return 200, self.cancel_task(pr, rid, parts[3])
                     if parts[2:] == ["messages"]:

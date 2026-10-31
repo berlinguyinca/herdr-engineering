@@ -21,24 +21,94 @@
 # No bubblewrap, no run: this never falls back to running unboxed.
 set -euo pipefail
 
+verify_strict_limits() {
+  local tasks="$1" memory="$2" cpu="$3" rel base actual_tasks actual_memory quota period
+  rel="$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)"
+  case "$rel" in /*) ;; *) exit 1 ;; esac
+  case "/$rel/" in */../*|*/./*) exit 1 ;; esac
+  base="/sys/fs/cgroup$rel"
+  [ -n "$rel" ] && [ -r "$base/pids.max" ] && [ -r "$base/memory.max" ] && [ -r "$base/cpu.max" ] || exit 1
+  actual_tasks="$(cat "$base/pids.max")"; actual_memory="$(cat "$base/memory.max")"
+  case "$actual_tasks:$actual_memory" in *max*|*[!0-9:]*) exit 1 ;; esac
+  [ "$actual_tasks" -le "$tasks" ] && [ "$actual_memory" -le "$memory" ] || exit 1
+  read -r quota period < "$base/cpu.max"
+  case "$quota:$period" in *max*|*[!0-9:]*) exit 1 ;; esac
+  [ "$quota" -le $((cpu * period / 100)) ] || exit 1
+}
+if [ "${1:-}" = "--run-strict" ]; then
+  tasks="${2:?tasks}"; memory="${3:?memory}"; cpu="${4:?cpu}"; wall="${5:?wall}"; timeout_bin="${6:?timeout}"
+  shift 6
+  verify_strict_limits "$tasks" "$memory" "$cpu"
+  exec "$timeout_bin" --signal=TERM --kill-after=10s "$wall"s "$@"
+fi
+
+deny() { echo "collab-sandbox: $1; refusing to run" >&2; exit 126; }
+owner_mode() { stat -c '%u %a' "$1" 2>/dev/null || stat -f '%u %Lp' "$1"; }
+bounded_decimal() {
+  local name="$1" value="$2" minimum="$3" maximum="$4" digits="$5"
+  case "$value" in ''|0|0*|*[!0-9]*) deny "$name must be a canonical positive integer" ;; esac
+  [ "${#value}" -le "$digits" ] && [ "$value" -ge "$minimum" ] && [ "$value" -le "$maximum" ] ||
+    deny "$name must be $minimum-$maximum"
+}
+PROFILE="${HERDR_SANDBOX_PROFILE:-legacy}"
+case "$PROFILE" in legacy|task-restricted-v1) ;; *) deny "unknown sandbox profile $PROFILE" ;; esac
+STRICT=0
+if [ "$PROFILE" = task-restricted-v1 ]; then
+  STRICT=1
+  [ -n "${HERDR_SANDBOX_HARNESS_DIR:-}" ] || deny "task-restricted-v1 requires a private harness directory"
+  [ -n "${HERDR_EGRESS_SOCK:-}" ] || deny "task-restricted-v1 requires broker-only network egress"
+  if [ -n "${HERDR_SANDBOX_RO_BINDS+x}" ] || [ -n "${HERDR_SANDBOX_SSH_DIR+x}" ]; then
+    deny "task-restricted-v1 does not permit SSH or extra host mounts"
+  fi
+  bounded_decimal HERDR_SANDBOX_MEM_BYTES "${HERDR_SANDBOX_MEM_BYTES:-}" 268435456 17179869184 11
+  bounded_decimal HERDR_SANDBOX_TASKS "${HERDR_SANDBOX_TASKS:-}" 16 1024 4
+  bounded_decimal HERDR_SANDBOX_TIMEOUT_SECONDS "${HERDR_SANDBOX_TIMEOUT_SECONDS:-}" 30 86400 5
+  bounded_decimal HERDR_SANDBOX_CPU_PERCENT "${HERDR_SANDBOX_CPU_PERCENT:-}" 10 800 3
+  [ -d "$HERDR_SANDBOX_HARNESS_DIR" ] && [ ! -L "$HERDR_SANDBOX_HARNESS_DIR" ] || deny "the harness directory must be a directory, not a link"
+  [ "$(owner_mode "$HERDR_SANDBOX_HARNESS_DIR")" = "$(id -u) 700" ] || deny "the harness directory must be yours with mode 0700"
+  [ -S "$HERDR_EGRESS_SOCK" ] && [ ! -L "$HERDR_EGRESS_SOCK" ] || deny "task-restricted-v1 requires a private broker egress socket"
+  sock_parent="$(dirname "$HERDR_EGRESS_SOCK")"
+  [ ! -L "$sock_parent" ] && [ "$(owner_mode "$sock_parent")" = "$(id -u) 700" ] || deny "the egress socket directory must be yours with mode 0700"
+  read -r sock_uid sock_mode <<< "$(owner_mode "$HERDR_EGRESS_SOCK")"
+  [ "$sock_uid" = "$(id -u)" ] && (( (8#$sock_mode & 022) == 0 )) || deny "the egress socket must be yours and not group/other writable"
+  TIMEOUT_BIN="$(command -v timeout)" || deny "task-restricted-v1 requires timeout enforcement"
+fi
+
 WORK="${1:?usage: collab-sandbox.sh WORKDIR COMMAND}"
 CMD="${2:?usage: collab-sandbox.sh WORKDIR COMMAND}"
-BWRAP="$(command -v bwrap)" || { echo "collab-sandbox: bubblewrap (bwrap) is not installed; refusing to run unboxed" >&2; exit 126; }
 AREA="$HOME/herdr-agents/work"
 case "/$WORK/" in */../*) echo "collab-sandbox: workdir must not contain .." >&2; exit 126 ;; esac
 case "$WORK" in "$AREA"/*) ;; *) echo "collab-sandbox: workdir must be under ~/herdr-agents/work/" >&2; exit 126 ;; esac
-mkdir -p -m 0700 "$WORK"
+if [ "$STRICT" = 1 ]; then
+  [ -d "$AREA" ] && [ ! -L "$AREA" ] || deny "task-restricted-v1 requires a private work root"
+  [ "$(owner_mode "$AREA")" = "$(id -u) 700" ] || deny "the work root must be yours with mode 0700"
+  home_real="$(cd "$HOME" && pwd -P)"; area_real="$(cd "$AREA" && pwd -P)"
+  [ "$area_real" = "$home_real/herdr-agents/work" ] || deny "the work root must not traverse links"
+  [ "$(dirname "$WORK")" = "$AREA" ] || deny "task-restricted-v1 workspaces must be direct children of the work root"
+  if [ -e "$WORK" ] || [ -L "$WORK" ]; then
+    [ -d "$WORK" ] && [ ! -L "$WORK" ] || deny "the workspace must be a directory, not a link"
+  else
+    mkdir -m 0700 "$WORK"
+  fi
+  [ "$(owner_mode "$WORK")" = "$(id -u) 700" ] || deny "the workspace must be yours with mode 0700"
+else
+  mkdir -p -m 0700 "$WORK"
+fi
 WORK="$(cd "$WORK" && pwd -P)"
 # a symlink inside the work area must not lead out of it
 case "$WORK" in "$(cd "$AREA" && pwd -P)"/*) ;; *) echo "collab-sandbox: workdir resolves outside ~/herdr-agents/work/" >&2; exit 126 ;; esac
+if [ "$STRICT" = 1 ] && { find "$WORK" -xdev \( -type s -o -type p -o -type b -o -type c -o \( -type f -links +1 \) \) -print -quit | grep -q .; }; then
+  deny "task-restricted-v1 workspace must not contain host-linked or special files"
+fi
 
 # Local name resolution only for a box with the host network: a no-network box must not reach systemd-resolved's
 # socket (a DNS side channel); the egress proxy resolves names on the host side.
-resolver=(--ro-bind-try /etc/resolv.conf /etc/resolv.conf --ro-bind-try /run/systemd/resolve /run/systemd/resolve)
-if [ -n "${HERDR_EGRESS_SOCK+x}" ]; then resolver=(); fi
 args=(--die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts --cap-drop ALL
-      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
-      "${resolver[@]}"
+      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin)
+if [ -z "${HERDR_EGRESS_SOCK+x}" ]; then
+  args+=(--ro-bind-try /etc/resolv.conf /etc/resolv.conf --ro-bind-try /run/systemd/resolve /run/systemd/resolve)
+fi
+args+=(
       --ro-bind-try /etc/hosts /etc/hosts --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf
       --ro-bind-try /etc/ssl /etc/ssl --ro-bind-try /etc/ca-certificates /etc/ca-certificates
       --ro-bind-try /etc/passwd /etc/passwd --ro-bind-try /etc/group /etc/group --ro-bind-try /etc/localtime /etc/localtime
@@ -53,6 +123,7 @@ bindro() { case "$seen" in *":$1:"*) return 0 ;; esac; seen="$seen$1:"; if [ -e 
 for n in claude codex pi node; do
   p="$(command -v "$n" 2>/dev/null)" || continue
   r="$(readlink -f "$p")"
+  if [ "$STRICT" = 1 ]; then case "$p:$r" in *"$HOME"/*) deny "task-restricted-v1 requires harness executables outside the operator home" ;; esac; fi
   case "$p" in "$HOME"/*) bindro "$(dirname "$p")" ;; esac
   # every hop of the link chain must exist in the box, not just both ends: codex's standalone install is
   # ~/.local/bin/codex -> ~/.codex/packages/standalone/current/bin/codex with `current` itself a link to
@@ -75,20 +146,31 @@ done
 #                              CLAUDE_CONFIG_DIR, CODEX_HOME and PI_CODING_AGENT_DIR pointing into it. The operator's
 #                              ~/.claude, ~/.codex, ~/.pi and ~/.claude.json (memory, hooks, settings, plugins,
 #                              projects) are then NOT in the box at all.
-deny() { echo "collab-sandbox: $1; refusing to run" >&2; exit 126; }
 harness_env=()
 if [ -n "${HERDR_SANDBOX_HARNESS_DIR+x}" ]; then
   HD="$HERDR_SANDBOX_HARNESS_DIR"
   case "$HD" in /*) ;; *) deny "the harness directory must be an absolute path" ;; esac
   if [ -L "$HD" ] || [ ! -d "$HD" ]; then deny "the harness directory must be a directory, not a link"; fi
-  [ "$(stat -c '%u %a' "$HD")" = "$(id -u) 700" ] || deny "the harness directory must be yours with mode 0700"
+  [ "$(owner_mode "$HD")" = "$(id -u) 700" ] || deny "the harness directory must be yours with mode 0700"
   hreal="$(cd "$HD" && pwd -P)"
-  for d in .claude .codex .pi; do
+  credential_roots=(.claude .codex .pi)
+  if [ "$STRICT" = 1 ]; then credential_roots+=(.ssh .aws .config); fi
+  for d in "${credential_roots[@]}"; do
     if [ -d "$HOME/$d" ]; then
       oreal="$(cd "$HOME/$d" && pwd -P)"
       case "$hreal/" in "$oreal"/*) deny "the harness directory must not be the operator's $d" ;; esac
+      if [ "$STRICT" = 1 ]; then case "$oreal/" in "$hreal"/*) deny "the harness directory must not contain the operator's $d" ;; esac; fi
     fi
   done
+  if [ "$STRICT" = 1 ]; then
+    [ "$hreal" != "$(cd "$HOME" && pwd -P)" ] || deny "the harness directory must not be the operator home"
+    if find "$hreal" -xdev \( ! -type d ! -type f -o -type f -links +1 \) -print -quit | grep -q .; then deny "the harness directory must contain only private regular files and directories"; fi
+    for entry in "$hreal"/* "$hreal"/.[!.]* "$hreal"/..?*; do
+      [ -e "$entry" ] || continue
+      name="$(basename "$entry")"
+      case "$name" in claude|codex|pi) [ -d "$entry" ] || deny "the harness directory may contain only claude, codex and pi directories" ;; *) deny "the harness directory may contain only claude, codex and pi directories" ;; esac
+    done
+  fi
   HB="$HOME/.herdr-harness"
   args+=(--bind "$hreal" "$HB")
   harness_env=(--setenv CLAUDE_CONFIG_DIR "$HB/claude" --setenv CODEX_HOME "$HB/codex"
@@ -113,7 +195,7 @@ if [ -n "${HERDR_SANDBOX_SSH_DIR+x}" ]; then
   SSHD="$HERDR_SANDBOX_SSH_DIR"
   case "$SSHD" in /*) ;; *) deny "the ssh directory must be an absolute path" ;; esac
   if [ -L "$SSHD" ] || [ ! -d "$SSHD" ]; then deny "the ssh directory must be a directory, not a link"; fi
-  [ "$(stat -c '%u %a' "$SSHD")" = "$(id -u) 700" ] || deny "the ssh directory must be yours with mode 0700"
+  [ "$(owner_mode "$SSHD")" = "$(id -u) 700" ] || deny "the ssh directory must be yours with mode 0700"
   sreal="$(cd "$SSHD" && pwd -P)"
   if [ -d "$HOME/.ssh" ]; then             # a copy of the room's keys, never the operator's own keys
     oreal="$(cd "$HOME/.ssh" && pwd -P)"
@@ -126,6 +208,7 @@ args+=(--bind "$WORK" "$WORK" --chdir "$WORK"
        --clearenv --setenv PATH "$(dirname "$(command -v claude 2>/dev/null || echo /usr/bin/x)"):$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
        --setenv HOME "$HOME" --setenv USER "${USER:-agent}" --setenv LANG "${LANG:-C.UTF-8}" --setenv TERM dumb
        --setenv TMPDIR /tmp --setenv HERDR_SANDBOX 1 "${harness_env[@]}")
+if [ "$STRICT" = 1 ]; then args+=(--setenv HERDR_SANDBOX_PROFILE task-restricted-v1); fi
 
 # file-size and fd limits apply to everything in the box. A process cap (ulimit -u) would count every process
 # of this user, so the process and memory caps are a systemd scope instead (a fork bomb stops at the cap).
@@ -143,13 +226,14 @@ if [ -n "${HERDR_EGRESS_SOCK+x}" ]; then   # set but empty is a runner bug: fail
   args+=(--unshare-net --ro-bind "$RELAY" /run/herdr-egress/egress.py --ro-bind "$HERDR_EGRESS_SOCK" /run/herdr-egress/sock
          --setenv HTTPS_PROXY "$url" --setenv HTTP_PROXY "$url" --setenv https_proxy "$url" --setenv http_proxy "$url"
          --setenv NO_PROXY 127.0.0.1,localhost --setenv no_proxy 127.0.0.1,localhost)
-  IFS=',' read -r -a svcs <<< "${HERDR_EGRESS_SERVICES:-}"
-  for s in "${svcs[@]}"; do
-    [ -n "$s" ] || continue
-    [[ "$s" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || no "bad service name in HERDR_EGRESS_SERVICES"
-    n="${s^^}"
-    args+=(--setenv "SVC_${n//-/_}_URL" "$url/svc/$s")
-  done
+  if [ -n "${HERDR_EGRESS_SERVICES:-}" ]; then
+    IFS=',' read -r -a svcs <<< "$HERDR_EGRESS_SERVICES"
+    for s in "${svcs[@]}"; do
+      [[ "$s" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || no "bad service name in HERDR_EGRESS_SERVICES"
+      n="${s^^}"
+      args+=(--setenv "SVC_${n//-/_}_URL" "$url/svc/$s")
+    done
+  fi
   # inside the box: start the relay (stdin stays the task's, output stays out of the result), wait until it listens,
   # then run the command. The relay exits at once if it cannot reach the proxy; then the command never runs.
   inner=(/usr/bin/env bash -c '
@@ -163,7 +247,12 @@ if [ -n "${HERDR_EGRESS_SOCK+x}" ]; then   # set but empty is a runner bug: fail
     echo "collab-sandbox: the egress relay did not come up; refusing to run" >&2
     exit 126' collab-sandbox "$PORT" "$CMD")
 fi
+BWRAP="$(command -v bwrap)" || { echo "collab-sandbox: bubblewrap (bwrap) is not installed; refusing to run unboxed" >&2; exit 126; }
 run=("$BWRAP" "${args[@]}" -- "${inner[@]}")
+if [ "$STRICT" = 1 ]; then
+  command -v systemd-run >/dev/null || deny "cannot enforce the strict resource limits on this host"
+  exec systemd-run --user --scope -q -p TasksMax="$HERDR_SANDBOX_TASKS" -p MemoryMax="$HERDR_SANDBOX_MEM_BYTES" -p CPUQuota="$HERDR_SANDBOX_CPU_PERCENT%" -- "$0" --run-strict "$HERDR_SANDBOX_TASKS" "$HERDR_SANDBOX_MEM_BYTES" "$HERDR_SANDBOX_CPU_PERCENT" "$HERDR_SANDBOX_TIMEOUT_SECONDS" "$TIMEOUT_BIN" "${run[@]}"
+fi
 if systemd-run --user --scope -q -p TasksMax=1000 true 2>/dev/null; then
   exec systemd-run --user --scope -q -p TasksMax="${HERDR_SANDBOX_TASKS:-512}" -p MemoryMax="${HERDR_SANDBOX_MEM:-8G}" -- "${run[@]}"
 fi
