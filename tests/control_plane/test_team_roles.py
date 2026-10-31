@@ -563,7 +563,7 @@ def test_a_holder_who_leaves_or_is_cleared_is_fed_into_the_policy_at_the_next_sw
     assert out["escalated"] == 1                                                        # reassign already used: escalate
 
 
-def test_the_sweep_is_skipped_while_degraded_and_never_raises_on_a_full_log(rp):
+def test_the_sweep_is_skipped_while_degraded_and_stops_quietly_on_a_full_log(rp):
     p = rp
     team, _ = crew(p)
     p.assign(team, "tester", "user:dave")
@@ -572,7 +572,48 @@ def test_the_sweep_is_skipped_while_degraded_and_never_raises_on_a_full_log(rp):
     p.svc.degraded = True
     assert p.sweep() == {"active": True, "degraded": True}
     p.svc.degraded = False
-    assert p.sweep()["reminded"] == 1
+    cap = p.svc.max_log_events
+    p.svc.max_log_events = len(p.svc._log)                                              # no ordinary write is admitted any more
+    assert p.sweep() == {"active": True, "reminded": 0, "reassigned": 0, "escalated": 0, "extended": 0}
+    p.svc.max_log_events = cap
+    assert p.sweep()["reminded"] == 1                                                   # nothing was lost: the next sweep does it
+
+
+def test_the_control_plane_thread_runs_the_sweep_without_anyone_polling(rp):
+    """The real loop of ControlPlaneServer, not a call from the test: a person who never polls still gets the policy applied."""
+    import threading as _t
+    import time as _time
+    p = rp
+    p.svc.team_roles = normalize_team_roles({**ROLES, "sweep_interval_seconds": 5})
+    team, _ = crew(p)
+    p.assign(team, "tester", "user:dave")
+    p.make("alice", target_role="tester")
+    p.clock.t += 2000
+    _t.Thread(target=p.srv._team_roles_loop, daemon=True).start()
+    deadline = _time.monotonic() + 20
+    while _time.monotonic() < deadline and not p.events("task_escalated"):
+        _time.sleep(0.2)
+    assert len(p.events("task_escalated")) == 1
+
+
+def test_an_agent_delegates_by_role_only_from_a_task_it_accepted_and_never_to_a_named_person(rp):
+    p = rp
+    team, (a1, a2) = crew(p)
+    boss = p.agent(name="boss")
+    out = p.svc.grant_agent(user_pr(p.svc, "alice"), p.room, {"agent_id": boss["agent_id"], "actions": ["read", "post", "execute", "instruct"]})
+    assert out["status"] != "pending", out
+    bpr = p.svc.authenticate(f"Agent {boss['credential']}", boss["device_id"])
+    root = p.make("alice", target_agent_id=boss["agent_id"], text="plan")[1]["task_id"]
+    with pytest.raises(Exception) as err:
+        p.svc.create_task(bpr, p.room, {"target_role": "implementer", "text": "child"})
+    assert getattr(err.value, "status", None) == 400                                    # no accepted parent
+    p.svc.update_task(bpr, root, {"status": "accepted"})
+    kid = p.svc.create_task(bpr, p.room, {"target_role": "implementer", "text": "child", "parent_task_id": root})
+    assert kid["routed_to"] in ("agent:" + a1["agent_id"], "agent:" + a2["agent_id"])
+    with pytest.raises(Exception) as err:
+        p.svc.create_task(bpr, p.room, {"target_user_id": "bob", "text": "child", "parent_task_id": root})
+    assert getattr(err.value, "status", None) == 403
+    assert p.svc._tasks[kid["task_id"]]["depth"] == 1 and p.svc._tasks[kid["task_id"]]["parent"] == root
 
 
 def test_the_operator_sees_an_overdue_person_task_in_attention_and_the_assignee_sees_theirs(rp):

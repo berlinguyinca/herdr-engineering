@@ -284,7 +284,7 @@ class TeamRolesMixin:
         return role, holder, ROLE_KIND[role]
 
     def assign_team_role(self, pr, room_id: str, team_id: str, body: dict) -> dict:
-        cfg = self._tr2_need_on()
+        self._tr2_need_on()
         with self._lock:
             room = self._tr_owner(pr, room_id, "team.role.assign")
             if self._tr2_attached(room_id, team_id) is None:
@@ -303,7 +303,6 @@ class TeamRolesMixin:
                 pr, project_id=room["project_id"], room_id=room_id, team_id=team_id, role=role, holder=holder, kind=kind,
                 visibility_scope="room", action="team.role.assign", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=team_id))
-            _ = cfg
             return {"room_id": room_id, "team_id": team_id, "role": role, "holder": holder, "kind": kind, "replayed": False}
 
     def clear_team_role(self, pr, room_id: str, team_id: str, body: dict) -> dict:
@@ -415,7 +414,7 @@ class TeamRolesMixin:
     def my_tasks(self, pr, room_id: str) -> dict:
         self._tr2_need_on()
         with self._lock:
-            room = self._tr2_person(pr, room_id, "task.mine")
+            self._tr2_person(pr, room_id, "task.mine")
             out = []
             for tid in list(self._tasks_by_user.get(pr.id, ())):
                 t = self._tasks.get(tid)
@@ -432,13 +431,13 @@ class TeamRolesMixin:
                             "hard_expiry": self._iso(t["hard_expiry"]), "reminders_sent": len(lease["sent"]),
                             "no_response_policy": lease["policy"], "untrusted": True})
             out.sort(key=lambda r: r["created_at"], reverse=True)
-            _ = room
             return {"tasks": out}
 
     def respond_task(self, pr, room_id: str, task_id: str, body: dict) -> dict:
         self._tr2_need_on()
         with self._lock:
-            room = self._tr2_person(pr, room_id, "task.respond")
+            self._tr2_person(pr, room_id, "task.respond")
+            room = self._rooms[room_id]
             t = self._tasks.get(task_id) if isinstance(task_id, str) else None
             if not t or t["room_id"] != room_id or t.get("target_user") != pr.id or not self._ok(pr.id):
                 raise _err(404, "not found")
