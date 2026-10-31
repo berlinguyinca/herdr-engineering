@@ -14,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .artifact_collab_store import CollabGrantStore
+from .artifacts import ArtifactStore
 from .share_bundle import remove_bundle, remove_state
 
 log = logging.getLogger(__name__)
@@ -279,3 +281,235 @@ async def run_worker(conn, *, interval: float = 30.0,
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
             continue
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# The collaborator bridge loop (plan 3, Task 9)
+# ----------------------------------------------------------------------------------------------------------------------
+
+BRIDGE_RECONNECT = 5.0
+
+
+class _ConnPool:
+    """A small lazy pool of ``size`` connections made by ``connect``.
+
+    A connection is opened on first use. One that was in use when an exception passed through (or that reports itself
+    closed) is closed and replaced on the next use, so a broken connection never goes back into the pool."""
+
+    def __init__(self, connect, size: int):
+        self._connect = connect
+        self._slots: asyncio.Queue = asyncio.Queue()
+        for _ in range(size):
+            self._slots.put_nowait(None)
+        self._open: list = []
+        self._closed = False
+
+    def acquire(self):
+        return _PoolLease(self)
+
+    async def _take(self):
+        slot = await self._slots.get()
+        try:
+            if slot is None or slot.is_closed():
+                slot = await self._connect()
+                self._open.append(slot)
+            return slot
+        except BaseException:
+            self._slots.put_nowait(None)
+            raise
+
+    async def _give(self, conn, ok: bool) -> None:
+        if ok and not self._closed and not conn.is_closed():
+            self._slots.put_nowait(conn)
+            return
+        self._slots.put_nowait(None)
+        await _close_quietly(conn)
+
+    async def aclose(self) -> None:
+        self._closed = True
+        while self._slots.qsize():
+            conn = self._slots.get_nowait()
+            if conn is not None:
+                await _close_quietly(conn)
+        for conn in self._open:
+            if not conn.is_closed():
+                await _close_quietly(conn)
+
+
+class _PoolLease:
+    def __init__(self, pool: _ConnPool):
+        self._pool, self._conn = pool, None
+
+    async def __aenter__(self):
+        self._conn = await self._pool._take()
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self._pool._give(self._conn, exc_type is None)
+
+
+class _Held:
+    """``async with held() as conn``: always the same, already open connection."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+
+async def _close_quietly(conn) -> None:
+    try:
+        await conn.close()
+    except Exception:  # noqa: BLE001 - a connection that will not close cleanly is dropped
+        pass
+
+
+class CollabBridgeLoop:
+    """The fast side of the collaborator bridge: three independent tasks beside the 30 s worker pass.
+
+    * **grants** (own connection, every ``interval``): refreshes the shared retraction gate every
+      ``retractions_every``, resolves invite grants from the fresh ``agents.json`` and publishes ``grants.json``
+      (``heartbeat``). It never awaits a mirror refresh, so a revoke reaches ``grants.json`` within about ``interval``
+      and the file stays fresh whatever the mirror or the applier are doing.
+    * **mirror** (own connection): ``mirror.sync`` every ``mirror_every``, at once for artifacts whose grants changed
+      or whose post-commit refresh failed, then the staging and result sweeps. A slow refresh delays only this task.
+    * **applier** (a dedicated scan connection plus a pool for the lanes): ``applier.tick`` every ``interval``.
+
+    ``agents.json`` is written by the bridge in collab-public, not here. Each task logs its own exceptions (type only)
+    and reconnects after ``reconnect_delay`` (5 s); a failing task never stops the others. The gate, limits and clock
+    are the mirror's and the applier's own (one of each, built by the caller)."""
+
+    def __init__(self, dsn_connect, mirror, applier, *, interval: float = 1.0, mirror_every: float = 30.0,
+                 retractions_every: float = 30.0, heartbeat: float = 30.0, sweep_every: float | None = None,
+                 reconnect_delay: float = BRIDGE_RECONNECT, close_timeout: float = 10.0):
+        self.dsn_connect, self.mirror, self.applier = dsn_connect, mirror, applier
+        self.interval, self.mirror_every, self.retractions_every = interval, mirror_every, retractions_every
+        self.heartbeat = heartbeat
+        self.sweep_every = mirror_every if sweep_every is None else sweep_every
+        self.reconnect_delay, self.close_timeout = reconnect_delay, close_timeout
+        self.gate = applier.gate
+        self.rustfs = mirror.rustfs
+        self._force: set[str] = set()                    # artifacts the grants task saw change, for the mirror task
+
+    # -- lifecycle ----------------------------------------------------------------------------------------------
+    async def run(self, stop: asyncio.Event) -> None:
+        pool = _ConnPool(self.dsn_connect, self.mirror.limits.apply_concurrency + 1)
+        tasks = [asyncio.create_task(self._supervise(name, body, stop, pool), name=name) for name, body in (
+            ("collab-grants", self._grants), ("collab-mirror", self._mirror), ("collab-applier", self._applier))]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await self.applier.aclose(self.close_timeout)
+            finally:
+                await pool.aclose()
+                self.mirror.close()
+
+    async def _supervise(self, name: str, body, stop: asyncio.Event, pool: _ConnPool) -> None:
+        while not stop.is_set():
+            conn = None
+            try:
+                conn = await self.dsn_connect()
+                await body(conn, stop, pool)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - logged by type only: a message may carry a DSN
+                log.warning("collab bridge %s task failed (%s); reconnecting in %.0fs", name, type(exc).__name__,
+                            self.reconnect_delay)
+            finally:
+                if conn is not None:
+                    await _close_quietly(conn)
+            await self._wait(stop, self.reconnect_delay)
+
+    @staticmethod
+    async def _wait(stop: asyncio.Event, seconds: float) -> None:
+        """Sleep ``seconds``, or less when ``stop`` is set."""
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=seconds)
+        except TimeoutError:
+            pass
+
+    # -- grants -------------------------------------------------------------------------------------------------
+    async def _grants(self, conn, stop: asyncio.Event, _pool) -> None:
+        store = ArtifactStore(conn, self.rustfs)
+        grants = CollabGrantStore(conn)
+        loaded: float | None = None
+        while not stop.is_set():
+            now = self.mirror.clock()
+            if loaded is None or now - loaded >= self.retractions_every or now < loaded:
+                try:
+                    self.gate.load_retractions(await store.load_retractions())
+                    loaded = now
+                except Exception as exc:  # noqa: BLE001 - keep publishing with the gate as it is
+                    log.warning("collab bridge: retraction refresh failed (%s)", type(exc).__name__)
+                    loaded = now
+            try:
+                joins = await asyncio.to_thread(self._invite_joins)
+                if joins:
+                    await grants.resolve_invite_grants(joins)
+            except Exception as exc:  # noqa: BLE001 - an invite problem must never hold back a revoke
+                log.warning("collab bridge: invite grants failed (%s)", type(exc).__name__)
+            published = await self.mirror.publish_grants(grants, store, heartbeat=self.heartbeat, gate=self.gate)
+            if published.changed:
+                self._force |= published.changed           # the mirror task syncs them on its next pass
+            await self._wait(stop, self.interval)
+
+    def _invite_joins(self) -> dict[str, dict]:
+        """invite id -> {agent_id, hard_expiry} for the active agents of a fresh ``agents.json``; blocking."""
+        agents = self.applier._fresh_feed_agents()
+        joins: dict[str, dict] = {}
+        for agent_id, row in (agents or {}).items():
+            if isinstance(row, dict) and row.get("status") == "active" and isinstance(row.get("join_id"), str):
+                joins[row["join_id"]] = {"agent_id": agent_id, "hard_expiry": row.get("hard_expiry")}
+        return joins
+
+    # -- mirror -------------------------------------------------------------------------------------------------
+    async def _mirror(self, conn, stop: asyncio.Event, _pool) -> None:
+        store = ArtifactStore(conn, self.rustfs)
+        grants = CollabGrantStore(conn)
+        last_sync: float | None = None
+        last_sweep: float | None = None
+        while not stop.is_set():
+            now = self.mirror.clock()
+            force, self._force = self._force | self.applier.take_mirror_force(), set()
+            if force or last_sync is None or now - last_sync >= self.mirror_every or now < last_sync:
+                try:
+                    await self.mirror.sync(store, gate=self.gate, force=force, grants=grants)
+                except BaseException:
+                    self._force |= force                  # not lost: the next pass (after the reconnect) retries
+                    raise
+                last_sync = now
+            if last_sweep is None or now - last_sweep >= self.sweep_every or now < last_sweep:
+                last_sweep = now
+                await self._sweeps(conn, grants)
+            await self._wait(stop, self.interval)
+
+    async def _sweeps(self, conn, grants: CollabGrantStore) -> None:
+        """Staging sweep (only with a fresh ``agents.json``) and result sweep. ANY exception is logged by type."""
+        try:
+            agents = await asyncio.to_thread(self.applier._fresh_feed_agents)
+            if agents is not None:
+                await self.applier.sweep_staging(conn, agents=agents, grants=await grants.live_grants())
+        except Exception as exc:  # noqa: BLE001 - e.g. RecursionError: a sweep never kills the task
+            log.warning("collab bridge: staging sweep failed (%s)", type(exc).__name__)
+        try:
+            await self.applier.sweep_results()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("collab bridge: result sweep failed (%s)", type(exc).__name__)
+
+    # -- applier ------------------------------------------------------------------------------------------------
+    async def _applier(self, conn, stop: asyncio.Event, pool: _ConnPool) -> None:
+        # the scan runs on this task's own connection and never waits for a lane's (see the applier's docstring);
+        # the pool holds one connection per lane plus one for the post-commit mirror refresher
+        scan = _Held(conn)
+        wait = min(self.interval, 0.5)
+        while not stop.is_set():
+            await self.applier.tick(pool.acquire, scan_acquire=lambda: scan, wait=wait)
+            await self._wait(stop, self.interval)

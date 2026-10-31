@@ -16,6 +16,7 @@ import signal
 import socket
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -745,6 +746,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="read Cognito JWKS (jwks.json) and group members (members.json) from this "
                          "directory, refreshed by a host job, instead of calling AWS: the "
                          "container then needs no credentials and no outbound network")
+    p2.add_argument("--collab-artifacts-mirror", default=None,
+                    help="with --collab-only: the read-only mirror directory the worker publishes (mounted :ro); the "
+                         "artifact bridge starts only with both this and --collab-artifacts-outbox AND "
+                         "control_plane.collab_artifacts.enabled: true in the slice (otherwise it does nothing)")
+    p2.add_argument("--collab-artifacts-outbox", default=None,
+                    help="with --collab-only: the outbox directory collab-public writes intents and staging into "
+                         "(see --collab-artifacts-mirror)")
     p2.add_argument("--collab-operator-port", type=int, default=None,
                     help="with --collab-only: also serve the collaboration API WITHOUT sign-in on this "
                          "port, as --collab-operator-user, for the local owner's dashboard (publish it "
@@ -3178,7 +3186,7 @@ def _cmd_cp_web(args) -> int:
     if args.collab_only:
         # The public collab container is given only the collab slice of the central
         # file (`fleet config render-collab`): no fleet endpoint, no API keys, no DSN.
-        if args.pg_dsn or set(cp) - {"collab"}:
+        if args.pg_dsn or set(cp) - {"collab", "collab_artifacts"}:
             raise SystemExit("--collab-only must not be given database credentials or other "
                              "control-plane settings (mount the render-collab slice, not the "
                              "central file)")
@@ -3333,6 +3341,7 @@ def _cmd_cp_web(args) -> int:
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     collab = None
+    artifact_bridge = None
     if args.collab_cognito_pool:
         if args.collab_users_file:
             raise SystemExit("use either --collab-cognito-pool or --collab-users-file, not both")
@@ -3379,6 +3388,9 @@ def _cmd_cp_web(args) -> int:
         collab.task_lease_seconds = _task_lease(args, cp)
         if args.collab_only:
             collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
+            artifact_bridge = _wire_collab_artifacts_bridge(
+                collab, cp, getattr(args, "collab_artifacts_mirror", None),
+                getattr(args, "collab_artifacts_outbox", None))
     elif args.collab_users_file:
         from pathlib import Path
 
@@ -3473,6 +3485,8 @@ def _cmd_cp_web(args) -> int:
         pass
     finally:
         svr.shutdown()
+        if artifact_bridge is not None:
+            artifact_bridge.stop()
         if artifact_adapter is not None:
             artifact_adapter.close()
         if share_store is not None:
@@ -4090,6 +4104,97 @@ def _seed_demo(repo):
     repo.register_service("analytics-api", hid2, 9001, status="healthy")
 
 
+_COLLAB_ARTIFACTS_PATHS = {"mirror_dir": "/collab-mirror", "outbox_dir": "/collab-outbox", "spool_dir": "/collab-spool"}
+
+
+@dataclass(frozen=True)
+class CollabArtifactsSettings:
+    """``control_plane.collab_artifacts`` as the worker uses it (YAML only; no environment variable)."""
+    enabled: bool
+    limits: Any
+    mirror_dir: Path
+    outbox_dir: Path
+    spool_dir: Path
+
+
+def _collab_artifacts_settings(cp) -> CollabArtifactsSettings:
+    """Validate the worker's ``control_plane.collab_artifacts`` section. The bridge is off unless ``enabled`` is exactly
+    ``true``; only an enabled section is validated (every limit a positive integer, no unknown key), and an invalid one
+    stops the worker start with a clear message."""
+    from .control_plane.collab_bridge_files import BridgeError, BridgeLimits
+    section = (cp or {}).get("collab_artifacts")
+    if section is not None and not isinstance(section, dict):
+        raise SystemExit("fleet config control_plane.collab_artifacts must be a mapping")
+    section = section or {}
+    paths = {key: Path(default) for key, default in _COLLAB_ARTIFACTS_PATHS.items()}
+    if section.get("enabled") is not True:
+        return CollabArtifactsSettings(False, BridgeLimits(), **paths)
+    limits = {k: v for k, v in section.items() if k != "enabled" and k not in _COLLAB_ARTIFACTS_PATHS}
+    for key in _COLLAB_ARTIFACTS_PATHS:
+        if key in section:
+            if not isinstance(section[key], str) or not section[key]:
+                raise SystemExit(f"fleet config control_plane.collab_artifacts.{key} must be a path string")
+            paths[key] = Path(section[key])
+    try:
+        return CollabArtifactsSettings(True, BridgeLimits.from_mapping(limits), **paths)
+    except BridgeError as exc:
+        raise SystemExit(f"fleet config control_plane.collab_artifacts: {exc.reason}") from None
+
+
+def _collab_lineage_hook(worker_cfg):
+    """The applier's ``lineage`` hook from ``control_plane.artifact_worker.lineage`` (None when the section is absent)."""
+    from .control_plane.artifact_lineage import collab_lineage_poster_from_section
+    try:
+        return collab_lineage_poster_from_section((worker_cfg or {}).get("lineage"))
+    except (ValueError, OSError) as exc:
+        raise SystemExit(f"control_plane.artifact_worker.lineage: {exc}") from None
+
+
+def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, rustfs, connect, lineage):
+    """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
+    applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
+    and staging owner here)."""
+    import time
+
+    from .control_plane import worker as cp_worker
+    from .control_plane.artifact_scope import ArtifactGraphGate
+    from .control_plane.collab_intents import CollabIntentApplier
+    from .control_plane.collab_mirror import CollabMirror
+    clock = time.time
+    gate = ArtifactGraphGate(None)
+    mirror = CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=clock)
+    applier = CollabIntentApplier(settings.outbox_dir, mirror, rustfs=rustfs, limits=settings.limits,
+                                  spool_dir=settings.spool_dir, lineage=lineage, context_extras={}, clock=clock,
+                                  gate=gate)
+    applier.register_commit()
+    return cp_worker.CollabBridgeLoop(connect, mirror, applier)
+
+
+def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):
+    """collab-public: build the ``CollabArtifactBridge`` and set ``service.artifact_bridge`` only when the rendered slice
+    says ``collab_artifacts.enabled: true`` AND both mount flags are present; otherwise the service keeps None and the
+    MCP tools say "unknown tool"."""
+    section = (cp or {}).get("collab_artifacts")
+    if not (isinstance(section, dict) and section.get("enabled") is True and mirror_dir and outbox_dir):
+        return None
+    from .control_plane.collab_artifacts import CollabArtifactBridge
+    bridge = CollabArtifactBridge(service, Path(mirror_dir), Path(outbox_dir))
+    service.artifact_bridge = bridge
+    bridge.start()
+    return bridge
+
+
+def _worker_control_plane_section(fleet_config_path) -> dict:
+    """The fleet file's ``control_plane`` section for the worker, or {} when there is no file."""
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return {}
+    try:
+        return dict(load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane"))
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+
+
 def _cmd_cp_worker(args) -> int:
     import asyncio
     import logging
@@ -4101,6 +4206,8 @@ def _cmd_cp_worker(args) -> int:
     from .control_plane.worker import run_one_pass, run_worker
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # validated before anything connects: an invalid collab_artifacts section refuses the start (also with --once)
+    collab_settings = _collab_artifacts_settings(_worker_control_plane_section(getattr(args, "fleet_config", None)))
 
     async def _run():
         cp = _cp_config(getattr(args, "fleet_config", None))
@@ -4130,10 +4237,25 @@ def _cmd_cp_worker(args) -> int:
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                           fabric_compactor=compactor, share_housekeeper=share_hk,
                                           artifact_reconciler=reconciler)
-            await run_worker(conn, interval=args.interval, worker_id=worker_id,
-                             artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                             fabric_compactor=compactor, share_housekeeper=share_hk,
-                             artifact_reconciler=reconciler)
+            stop = asyncio.Event()
+            bridge_task = None
+            if collab_settings.enabled:     # a long-running loop on its own connections; --once never starts it
+                if rustfs is None:
+                    raise SystemExit("control_plane.collab_artifacts needs RustFS (control_plane.rustfs_endpoint)")
+                dsn = cp["postgres_dsn"]
+                bridge_loop = _build_collab_bridge_loop(
+                    collab_settings, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
+                    lineage=_collab_lineage_hook(worker_cfg))
+                bridge_task = asyncio.create_task(bridge_loop.run(stop), name="collab-bridge-loop")
+            try:
+                await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
+                                 artifact_job_runner=runner, inspector_snapshotter=snapshotter,
+                                 fabric_compactor=compactor, share_housekeeper=share_hk,
+                                 artifact_reconciler=reconciler)
+            finally:
+                stop.set()
+                if bridge_task is not None:
+                    await asyncio.wait_for(bridge_task, 60)    # applier.aclose / mirror.close run in its teardown
             return None
         finally:
             await conn.close()

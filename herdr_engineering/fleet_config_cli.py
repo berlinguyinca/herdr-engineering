@@ -256,11 +256,25 @@ def _rakazo_slice(cfg: FleetConfig) -> dict:
     return {}
 
 
+def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
+    """The one thing collab-public needs of ``control_plane.collab_artifacts``: whether the bridge is on. Exactly
+    ``enabled: true`` renders true; anything else (absent, false, "true", 1) renders false. No limit travels here: the
+    worker publishes its limits in grants.json."""
+    try:
+        section = cfg.section(CONTROL_PLANE_SECTION).get("collab_artifacts")
+    except FleetConfigError:
+        section = None
+    enabled = isinstance(section, dict) and section.get("enabled") is True
+    return {"collab_artifacts": {"enabled": enabled}}
+
+
 def render_collab(cfg: FleetConfig, out: Path) -> None:
-    """Write a minimal fleet file (JSON, valid YAML, 0600) holding only control_plane.collab."""
+    """Write a minimal fleet file (JSON, valid YAML, 0600) holding only control_plane.collab and the
+    ``collab_artifacts: {enabled: <bool>}`` switch."""
     data = {"version": SCHEMA_VERSION,
             "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
-                                                 "values": {"collab": collab_values(cfg), **_rakazo_slice(cfg)}}},
+                                                 "values": {"collab": collab_values(cfg), **_collab_artifacts_slice(cfg),
+                                                            **_rakazo_slice(cfg)}}},
             "hosts": {}}
     _parse(data)
     write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")
