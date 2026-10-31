@@ -2338,12 +2338,14 @@ def _make_handler(server, public=False, operator=False):
             # Decide on the DECODED resource: routing unquotes each segment, so a raw
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = [unquote(seg) for seg in path.split("/")]
-            dpath = "/".join(segs)          # what the router matches: every guard below tests THIS, never the raw path
+            # What the router matches: every guard below tests THIS, never the raw path. A decoded %2F stays inside its
+            # segment (the router keeps ``a/b`` as ONE part), so it is masked and ``[^/]+`` still matches it.
+            dpath = "/".join(seg.replace("/", "\x00") for seg in segs)
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
-                    or _TERMINAL_ATTACH.match(dpath) or _STEER_ACK.match(dpath) or _is_rereview(dpath)):
+                    or _TERMINAL_ATTACH.match(dpath) or _STEER_ACK.match(dpath) or _is_rereview(path)):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):

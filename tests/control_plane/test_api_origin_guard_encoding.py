@@ -27,6 +27,12 @@ ROUTES = [
     ("/api/v1/artifact-reviews/r1/decision", "/api/v1/artifact%2Dreviews/r1/decision"),
     ("/api/v1/publications/p1/revoke", "/api/v1/%70ublications/p1/revoke"),
     ("/api/v1/artifact-reports/r1/approve", "/api/v1/artifact-%72eports/r1/approve"),
+    # a decoded %2F stays ONE segment for the router, so the regex guards must still match
+    ("/api/v1/graph/nodes/xy/review-quorum/rereview", "/api/v1/graph/nodes/x%2Fy/review-quorum/rereview"),
+    ("/api/v1/sessions/ab/terminal", "/api/v1/sessions/a%2Fb/terminal"),
+    ("/api/v1/steering/ab/ack", "/api/v1/steering/a%2Fb/ack"),
+    ("/api/v1/sessions/ab/summary/fix", "/api/v1/sessions/a%2Fb/summary/fix"),
+    ("/api/v1/artifacts/a1/collab-restrict", "/api/v1/artifacts/a%2Fb%2F1/collab-restrict"),
 ]
 
 
