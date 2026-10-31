@@ -1,3 +1,4 @@
+# ruff: noqa: F811  (the registry_pg fixture is imported by name)
 """Artifact-room links: link checks the room, unlink exists and needs edit, room grants follow, the repair removes the rest.
 
 Real Postgres (registry_pg), a real CollabService and the real HTTP server; no stand-ins."""
