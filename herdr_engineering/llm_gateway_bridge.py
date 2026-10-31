@@ -6,10 +6,9 @@ The control plane keeps only the SHA-256 of every ``hk-`` key. The gateway's
 plaintext key is ever written next to the gateway. Each key becomes the principal
 ``herdr:<project>:<key_id>``, which the gateway uses to attribute and prioritise the caller.
 
-The gateway reads that file at startup only, so ``supervise`` restarts it when the key set
-changes, at most once per ``debounce`` seconds, and only when the rendered file differs.
-Prototype limit: every restart drains in-flight requests (up to the gateway's own grace).
-The fix is a live reload in the gateway, not a faster restart here.
+The gateway polls that file and swaps its key table in place, so a key minted or revoked
+here works or stops within a poll interval of each side, with no restart. A failed read on
+the gateway side denies every client key (fail closed); a failed fetch here keeps the file.
 """
 from __future__ import annotations
 
@@ -17,8 +16,6 @@ import json
 import logging
 import os
 import re
-import signal
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -79,31 +76,10 @@ def sync_once(control: ControlPlaneClient, path: Path) -> bool | None:
     return write_if_changed(path, render_principals(config))
 
 
-def supervise(control: ControlPlaneClient, path: Path, command: list[str], *,
-              interval: float = 5.0, debounce: float = 30.0, sleep=time.sleep,
-              clock=time.monotonic, stop=lambda: False) -> int:
-    """Keep ``command`` (the gateway) running against the current principals file."""
-    sync_once(control, path)  # the file must exist before the gateway starts
-    child = subprocess.Popen(command)  # noqa: S603
-    last_restart = clock()
-    pending = False
-    try:
-        while not stop():
-            sleep(interval)
-            code = child.poll()
-            if code is not None:
-                log.error("gateway exited with %s", code)
-                return code or 1
-            if sync_once(control, path):
-                pending = True
-            if pending and clock() - last_restart >= debounce:
-                log.info("key set changed: restarting the gateway")
-                child.send_signal(signal.SIGTERM)
-                child.wait()
-                child = subprocess.Popen(command)  # noqa: S603
-                last_restart, pending = clock(), False
-    finally:
-        if child.poll() is None:
-            child.send_signal(signal.SIGTERM)
-            child.wait()
-    return 0
+def run(control: ControlPlaneClient, path: Path, *, interval: float = 5.0,
+        sleep=time.sleep, stop=lambda: False) -> None:
+    """Keep ``path`` current for as long as the process lives. The gateway follows the file
+    itself, so nothing here restarts it."""
+    while not stop():
+        sync_once(control, path)
+        sleep(interval)

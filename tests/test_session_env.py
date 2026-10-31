@@ -201,3 +201,16 @@ def test_cli_session_run_end_to_end(cp, tmp_path, monkeypatch):
     assert rc == 0 and json.loads(out.read_text())["OPENAI_API_KEY"] == f"{SECRET}-1"
     assert cp.keys == {"k1": True}
     assert main(["session", "run", "--project", "p", "--"]) == 2
+
+
+def test_inferweave_gateway_address_is_injected_only_when_configured(cp, tmp_path):
+    out = tmp_path / "env.json"
+    code = ("import json,os;json.dump({k:v for k,v in os.environ.items() if k.startswith(('INFERWEAVE','OPENAI'))},"
+            f"open({str(out)!r},'w'))")
+    se.run_session(_cfg(cp, inferweave_url="http://dev.lan:8089"), project="p",
+                   command=[sys.executable, "-c", code])
+    env = json.loads(out.read_text())
+    assert env["INFERWEAVE_BASE_URL"] == "http://dev.lan:8089"
+    assert env["OPENAI_API_KEY"] == f"{SECRET}-1"          # the one key serves both addresses
+    se.run_session(_cfg(cp), project="p", command=[sys.executable, "-c", code])
+    assert "INFERWEAVE_BASE_URL" not in json.loads(out.read_text())

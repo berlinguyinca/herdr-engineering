@@ -1,11 +1,9 @@
 import hashlib
 import json
 import stat
-import sys
-import time
 
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
-from herdr_engineering.llm_gateway_bridge import (render_principals, supervise, sync_once,
+from herdr_engineering.llm_gateway_bridge import (render_principals, run, sync_once,
                                                   write_if_changed)
 
 
@@ -61,23 +59,18 @@ def test_malformed_keys_are_skipped_not_forwarded():
     assert render_principals(cfg) == {"herdr:ok:k1": "sha256:" + good}
 
 
-def test_supervisor_restarts_the_gateway_once_per_debounce_and_only_on_change(tmp_path):
+def test_the_loop_keeps_the_file_current_without_touching_anything_else(tmp_path):
     repo = ControlPlaneRepo()
-    repo.create_project_key("proj")
-    starts = tmp_path / "starts"
-    cmd = [sys.executable, "-c",
-           f"open({str(starts)!r},'a').write('x');import time;time.sleep(60)"]
-    now = [0.0]
-    ticks = [0]
+    first = repo.create_project_key("proj")
+    path = tmp_path / "p.json"
+    steps = []
 
     def sleep(_):
-        time.sleep(0.4)  # let the child process get as far as writing its start mark
-        ticks[0] += 1
-        now[0] += 10
-        if ticks[0] == 2:
-            repo.create_project_key("proj")   # a change inside the debounce window
+        steps.append(json.loads(path.read_text()))
+        if len(steps) == 1:
+            repo.revoke_project_key(first["key_id"])
+            repo.create_project_key("proj")
 
-    supervise(RepoControl(repo), tmp_path / "p.json", cmd, interval=1, debounce=30,
-              sleep=sleep, clock=lambda: now[0], stop=lambda: ticks[0] >= 6)
-    # started once, restarted once after the 30 s window, never per key
-    assert starts.read_text() == "xx"
+    run(RepoControl(repo), path, interval=0, sleep=sleep, stop=lambda: len(steps) >= 2)
+    assert len(steps[0]) == 1 and len(steps[1]) == 1
+    assert list(steps[0]) != list(steps[1]), "revoked key replaced by the new one"

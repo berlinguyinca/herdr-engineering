@@ -212,25 +212,23 @@ services:
       timeout: 3s
       retries: 3
 
-  # ---- PROTOTYPE: InferWeave gateway at the fabric edge (replaces llm-proxy) -----
-  # Opt-in: `docker compose --profile llm-gateway up`. The sync supervisor renders the
-  # control plane's project keys as sha256-only principals and restarts the gateway
-  # (debounced) when the key set changes. Needs `deploy/control-plane/llm-gateway` built
-  # with a reviewed Linux inferweave binary; see docs/llm-gateway-prototype.md. HERDR_LLM_GATEWAY_DIR
-  # must be a 0700 directory holding secrets/kek, secrets/admin and secrets/client-token.
-  # Defaults, not `:?` guards: compose interpolates every service, enabled or not.
-  llm-gateway:
+  # ---- PROTOTYPE: InferWeave gateway at the fabric edge, next to llm-proxy --------
+  # Opt-in: `docker compose --profile llm-gateway up`. The same hk- project key works on both
+  # addresses. llm-proxy keeps chat, token accounting and custom models; this gateway adds
+  # System One and the rest of the InferWeave surface (agents get INFERWEAVE_BASE_URL when
+  # `llm.inferweave_url` is set). llm-gateway-sync renders the control plane's keys as
+  # sha256-only principals; the gateway follows that file live, so keys need no restart.
+  # HERDR_LLM_GATEWAY_DIR must be a 0700 directory holding secrets/kek, secrets/admin and
+  # secrets/client-token. Defaults, not `:?` guards: compose interpolates every service.
+  llm-gateway-sync:
     profiles: ["llm-gateway"]
-    image: herdr-llm-gateway:${HERDR_CP_IMAGE_TAG:-unset}
-    container_name: herdr-llm-gateway
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-unset}
+    container_name: herdr-llm-gateway-sync
     restart: unless-stopped
     depends_on:
       - control-plane-web
     volumes:
       - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
-      - ./llm-gateway/gateway.yaml:/etc/herdr/llm-gateway/gateway.yaml:ro
-    ports:
-      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_GATEWAY_PORT:-8089}:8089"
     command:
       - "control-plane"
       - "llm-gateway-sync"
@@ -238,8 +236,26 @@ services:
       - "http://control-plane-web:8080"
       - "--principals-file"
       - "/var/lib/herdr-llm-gateway/principals.json"
-      - "--"
-      - "inferweave"
+    healthcheck:
+      test: ["CMD", "test", "-s", "/var/lib/herdr-llm-gateway/principals.json"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  llm-gateway:
+    profiles: ["llm-gateway"]
+    image: herdr-llm-gateway:${HERDR_LLM_GATEWAY_TAG:-unset}
+    container_name: herdr-llm-gateway
+    restart: unless-stopped
+    depends_on:
+      llm-gateway-sync:
+        condition: service_healthy
+    volumes:
+      - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+      - ./llm-gateway/gateway.yaml:/etc/herdr/llm-gateway/gateway.yaml:ro
+    ports:
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_GATEWAY_PORT:-8089}:8089"
+    command:
       - "gateway"
       - "serve"
       - "--config"

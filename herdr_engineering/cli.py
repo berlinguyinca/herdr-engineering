@@ -602,17 +602,12 @@ def _build_parser() -> argparse.ArgumentParser:
                          "control_plane.llm_proxy tuning (the only source of configuration)")
     p2.set_defaults(func=_cmd_cp_llm_proxy)
     p2 = csub.add_parser("llm-gateway-sync",
-                         help="render project keys as gateway principals (sha256 only); "
-                              "with a command after --, supervise an InferWeave gateway")
+                         help="keep project keys rendered as sha256-only gateway principals")
     p2.add_argument("--control-plane", default="http://control-plane-web:8080")
     p2.add_argument("--principals-file", required=True,
                     help="file the gateway reads as auth.client_principals_file (written 0600)")
     p2.add_argument("--interval", type=float, default=5.0)
-    p2.add_argument("--debounce", type=float, default=30.0,
-                    help="minimum seconds between gateway restarts")
     p2.add_argument("--once", action="store_true", help="render once and exit")
-    p2.add_argument("command", nargs=argparse.REMAINDER,
-                    help="-- <gateway command>; restarted when the key set changes")
     p2.set_defaults(func=_cmd_cp_llm_gateway_sync)
 
     return parser
@@ -695,18 +690,16 @@ def _cmd_cp_llm_proxy(args) -> int:
 def _cmd_cp_llm_gateway_sync(args) -> int:
     from pathlib import Path
 
-    from .llm_gateway_bridge import supervise, sync_once
+    from .llm_gateway_bridge import run, sync_once
     from .llm_proxy import ControlPlaneClient
     control = ControlPlaneClient(args.control_plane)
     path = Path(args.principals_file).expanduser()
-    command = [c for c in args.command if c != "--"] if args.command[:1] == ["--"] else []
-    if command and args.once:
-        print("--once and a gateway command are exclusive", file=sys.stderr)
-        return 2
-    if command:
-        return supervise(control, path, command, interval=args.interval, debounce=args.debounce)
-    if sync_once(control, path) is None:
-        return 1
+    if args.once:
+        return 1 if sync_once(control, path) is None else 0
+    try:
+        run(control, path, interval=args.interval)
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
