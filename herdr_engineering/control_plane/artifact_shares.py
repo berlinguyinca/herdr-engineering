@@ -29,19 +29,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import secrets
-import stat
-import tempfile
 import time
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import asyncpg
 
+from .jsonl_ingest import JsonlIngestor, open_regular
+from .jsonl_ingest import transaction as _transaction
 from .share_bundle import BundleIndex
 
 __all__ = ["ShareStore", "ShareError", "new_token"]
@@ -58,14 +56,12 @@ _MAX_INGEST_BYTES = 16 * 1024 * 1024
 _MAX_LINE_BYTES = 16 * 1024
 _MAX_DETAIL_BYTES = 4096
 _MAX_ACTOR_CHARS = 200
-_FINGERPRINT_BYTES = 64
 # The worker renames events.jsonl to events.jsonl.1 once this much of it is ingested (share-public stops appending at
 # its own 8 MiB cap, so this must stay well under that).  The renamed file is deleted only once fully read AND not
 # written for ROTATED_GRACE_SECONDS: share-public opens the path per append, so a writer that opened the old inode
 # just before the rename can still land one line in it.
 EVENTS_ROTATE_BYTES = 4 * 1024 * 1024
 ROTATED_GRACE_SECONDS = 30.0
-_INGEST_ROUNDS = 64
 # The share container writes the events file, so it may only report what it observed; the lifecycle kinds
 # (created/approved/revoked/expired) are written by this store alone.
 INGESTIBLE_KINDS = ("opened", "denied")
@@ -89,16 +85,6 @@ def new_token() -> tuple[str, str]:
     """A fresh 256-bit URL-safe token and its sha256 hex.  Only the hash is ever stored."""
     token = secrets.token_urlsafe(32)
     return token, hashlib.sha256(token.encode("ascii")).hexdigest()
-
-
-@asynccontextmanager
-async def _transaction(conn: Any):
-    transaction = getattr(conn, "transaction", None)
-    if transaction is None:
-        yield conn
-        return
-    async with transaction():
-        yield conn
 
 
 def _row(record: Any, *, keep_hash: bool = False) -> dict:
@@ -283,126 +269,35 @@ class ShareStore:
         """
         path = Path(path)
         marker = Path(marker_path) if marker_path is not None else path.with_name(path.name + ".offset")
-        return (await self._ingest_once(path, marker))[0]
+        return await self._ingestor().ingest_file(path, marker)
 
     async def ingest_and_rotate_events(self, path: Path, *, marker_path: Path | None = None,
                                        rotate_bytes: int | None = None, now: float | None = None,
                                        grace: float | None = None) -> int:
         """Ingest ``path`` (and a pending ``path.1``) and rotate ``path`` once ``rotate_bytes`` of it are consumed.
 
-        Per call: (1) a leftover ``.1`` (previous rotation, or a crash) is read to its end with its own marker; it is
-        deleted, then its marker, only when no complete line remains and it was not written for ``grace`` seconds.
-        (2) ``path`` is ingested as by ``ingest_events_file``.  (3) Only when no ``.1`` exists and at least
-        ``rotate_bytes`` of ``path`` were consumed, ``path`` is renamed to ``.1`` and its marker moved along (the bytes,
-        offsets and fingerprint are unchanged), so the rest is drained by (1) on a later call, never in the call that
-        renamed it.  Every step is crash-safe: a missing or stale marker re-reads from 0 and the ``ingest_key``
-        unique index (sha256(line):offset, preserved by the rename) drops the replays.  Returns rows inserted.
+        The mechanics (leftover ``.1`` drain, rename, marker move, crash safety) live in
+        ``JsonlIngestor.ingest_and_rotate``.  Returns rows inserted.
         """
         path = Path(path)
         marker = Path(marker_path) if marker_path is not None else path.with_name(path.name + ".offset")
-        rotated = path.with_name(path.name + ".1")
-        rotated_marker = marker.with_name(marker.stem + ".rotated" + marker.suffix)
-        now = time.time() if now is None else now
-        rotate_bytes = EVENTS_ROTATE_BYTES if rotate_bytes is None else rotate_bytes
-        grace = ROTATED_GRACE_SECONDS if grace is None else grace
-        inserted = 0
-        if os.path.lexists(rotated):
-            count, drained, _, mtime = await self._drain(rotated, rotated_marker)
-            inserted += count
-            try:
-                regular = stat.S_ISREG(os.lstat(rotated).st_mode)
-            except OSError:
-                regular = True                                          # unknown: keep it
-            # a planted non-file goes at once; a regular file only once fully read and quiet (an open failure such
-            # as EMFILE leaves mtime None: it is kept and retried next sweep)
-            if not regular or (mtime is not None and drained and now - mtime >= grace):
-                try:
-                    os.unlink(rotated)
-                    rotated_marker.unlink(missing_ok=True)
-                except OSError:
-                    pass                                                # a planted directory: left alone
-        count, _, offset, mtime = await self._drain(path, marker)
-        inserted += count
-        if mtime is not None and offset >= rotate_bytes and not os.path.lexists(rotated):
-            os.rename(path, rotated)
-            try:
-                os.replace(marker, rotated_marker)
-            except FileNotFoundError:
-                pass
-        return inserted
+        return await self._ingestor().ingest_and_rotate(
+            path, marker,
+            rotate_bytes=EVENTS_ROTATE_BYTES if rotate_bytes is None else rotate_bytes,
+            now=time.time() if now is None else now,
+            grace=ROTATED_GRACE_SECONDS if grace is None else grace)
 
-    async def _drain(self, path: Path, marker: Path) -> tuple[int, bool, int, float | None]:
-        inserted, drained, offset, mtime = 0, False, 0, None
-        for _ in range(_INGEST_ROUNDS):
-            count, drained, offset, mtime = await self._ingest_once(path, marker)
-            inserted += count
-            if drained or mtime is None:
-                break
-        return inserted, drained, offset, mtime
+    def _ingestor(self) -> JsonlIngestor:
+        async def store(conn: Any, parsed: tuple, key: str) -> bool:
+            share_id, kind, actor, at, detail = parsed
+            return await self._event(conn, share_id, kind, actor, detail, at, key)
+        # built per call so the module limit and ``_open_regular`` are read at call time
+        return JsonlIngestor(self._conn, parse_line=self._parse_line, store=store, max_line_bytes=_MAX_LINE_BYTES,
+                             max_ingest_bytes=_MAX_INGEST_BYTES, opener=self._open_regular)
 
     @staticmethod
     def _open_regular(path: Path):
-        """A read handle on ``path`` when it is a regular file (never through a symlink, never blocking on a FIFO)."""
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-        except OSError:
-            return None
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                os.close(fd)
-                return None
-        except OSError:
-            os.close(fd)
-            return None
-        return os.fdopen(fd, "rb")
-
-    async def _ingest_once(self, path: Path, marker: Path) -> tuple[int, bool, int, float | None]:
-        """One bounded pass: ``(inserted, drained, consumed_offset, mtime)``; mtime None when ``path`` is not a
-        regular file.  ``drained``: no complete line is left after the consumed offset (a torn tail may remain)."""
-        handle = self._open_regular(path)
-        if handle is None:
-            return 0, True, 0, None
-        with handle:
-            st = os.fstat(handle.fileno())
-            size, mtime = st.st_size, st.st_mtime
-            offset, skipping = self._read_marker(marker, handle, size)
-            handle.seek(offset)
-            chunk = handle.read(_MAX_INGEST_BYTES)
-            full = len(chunk) >= _MAX_INGEST_BYTES
-            consumed = 0
-            inserted = 0
-            if skipping:  # discard the rest of an oversize line
-                newline = chunk.find(b"\n")
-                if newline < 0:
-                    consumed, skipping = len(chunk), True
-                else:
-                    consumed, skipping = newline + 1, False
-            start = consumed
-            end = chunk.rfind(b"\n") + 1  # only complete lines; a torn tail waits for its newline
-            if end > start:
-                async with _transaction(self._conn) as conn:
-                    position = offset + start
-                    for raw in chunk[start:end].splitlines(keepends=True):
-                        parsed = self._parse_line(raw)
-                        if parsed is not None:
-                            share_id, kind, actor, at, detail = parsed
-                            key = hashlib.sha256(raw).hexdigest() + f":{position}"
-                            try:
-                                async with _transaction(conn):
-                                    if await self._event(conn, share_id, kind, actor, detail, at, key):
-                                        inserted += 1
-                            except (asyncpg.PostgresError, UnicodeError, ValueError):
-                                pass  # poison line: skipped, but consumed below
-                        position += len(raw)
-                consumed = end
-            elif end == 0 and start == 0 and full:  # one huge line with no newline: skip it
-                consumed, skipping = len(chunk), True
-            drained = not full and b"\n" not in chunk[consumed:]
-            if consumed == 0 and not skipping:
-                return 0, drained, offset, mtime
-            new_offset = offset + consumed
-            self._write_marker(marker, handle, new_offset, skipping)
-        return inserted, drained, new_offset, mtime
+        return open_regular(path)
 
     @staticmethod
     def _clean(value: Any) -> bool:
@@ -444,40 +339,3 @@ class ShareStore:
         if not isinstance(detail, dict) or len(json.dumps(detail)) > _MAX_DETAIL_BYTES:
             detail = {}
         return share_id[:200], kind, actor[:_MAX_ACTOR_CHARS], at, detail
-
-    @staticmethod
-    def _fingerprint(handle: Any, offset: int) -> str:
-        """sha256 over the first and last ``_FINGERPRINT_BYTES`` of the consumed prefix ``[0, offset)``."""
-        n = min(_FINGERPRINT_BYTES, offset)
-        handle.seek(0)
-        first = handle.read(n)
-        handle.seek(offset - n)
-        last = handle.read(n)
-        return hashlib.sha256(first + b"|" + last).hexdigest()
-
-    @classmethod
-    def _read_marker(cls, marker: Path, handle: Any, size: int) -> tuple[int, bool]:
-        try:
-            data = json.loads(marker.read_text())
-            offset, skipping = data["offset"], bool(data.get("skipping", False))
-            if not isinstance(offset, int) or offset < 0 or offset > size:
-                return 0, False
-            if offset == 0 or cls._fingerprint(handle, offset) == data.get("fp"):
-                return offset, skipping
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            pass
-        return 0, False
-
-    @classmethod
-    def _write_marker(cls, marker: Path, handle: Any, offset: int, skipping: bool) -> None:
-        fp = cls._fingerprint(handle, offset) if offset else ""
-        fd, tmp = tempfile.mkstemp(prefix=marker.name + ".", suffix=".tmp", dir=marker.parent)
-        try:
-            with os.fdopen(fd, "w") as fh:
-                json.dump({"offset": offset, "fp": fp, "skipping": skipping}, fh)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, marker)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
