@@ -73,3 +73,29 @@ def test_the_requeue_survives_a_restart(w):
     again.hydrate(w.s._log)
     row = next(t for t in again.list_tasks(user(again, "bob"), w.room)["tasks"] if t["task_id"] == tid)
     assert row["status"] == "pending" and row["attempt"] == 2
+
+
+def test_a_run_that_omits_attempt_cannot_finish_a_requeued_task(w):
+    """R-TL1: the fence is not opt-in once a task has been requeued."""
+    w.s.task_lease_seconds = LEASE
+    a, tid = _accepted(w)
+    w.s.clock.t += LEASE + 1
+    w.s.task_inbox(a)
+    assert code(w.s.update_task, a, tid, {"status": "accepted"}) == 409
+    w.s.update_task(a, tid, {"status": "accepted", "attempt": 2})
+    assert code(w.s.update_task, a, tid, {"status": "done", "result": "late"}) == 409
+    assert code(w.s.update_task, a, tid, {"status": "failed", "result": "late"}) == 409
+    assert _status(w, tid)["status"] == "accepted"
+    assert w.s.update_task(a, tid, {"status": "done", "result": "ok", "attempt": 2})["status"] == "done"
+
+
+def test_a_task_never_requeued_still_accepts_updates_without_attempt(w):
+    w.s.task_lease_seconds = LEASE
+    a, tid = _accepted(w)
+    assert w.s.update_task(a, tid, {"status": "done", "result": "ok"})["status"] == "done"
+
+
+def test_the_mcp_task_update_carries_attempt(w):
+    from herdr_engineering.control_plane import collab_mcp
+    schema = next(t for t in collab_mcp.TOOLS if t["name"] == "task_update")["inputSchema"]
+    assert "attempt" in schema["properties"]

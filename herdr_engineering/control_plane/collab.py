@@ -4580,8 +4580,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             bad = [k for k in body if k not in ("status", "result", "attempt")]
             status = body.get("status")
             cur = self._task_status(t)
+            # R-TL1: once a lease has requeued the task (attempt > 1) the fence is mandatory, so an old run that never
+            # learned of ``attempt`` cannot finish it. A task never requeued (lease off, or not yet expired) is unchanged.
             if "attempt" in body and body["attempt"] != t.get("attempt", 1):
                 raise CollabError(409, "stale attempt: this task was requeued")
+            if "attempt" not in body and t.get("attempt", 1) > 1:
+                raise CollabError(409, "stale attempt: this task was requeued; send the attempt from tasks_inbox")
             if not bad and status == cur and status in ("done", "failed"):
                 # P05: a retry of a completion that already happened (the answer was lost, the agent restarted) gets
                 # the recorded outcome and writes nothing; it cannot change a finished task's result. A repeated

@@ -92,12 +92,14 @@ for t in tasks:
     if m and m.group(1).lower() in own:
         text = text[m.end():]
     open(f"{sys.argv[2]}/tasks/{t['task_id']}.txt", "w").write(text)
+    # the lease fence: report back with the attempt this run was handed (a requeued task rejects any other)
+    open(f"{sys.argv[2]}/tasks/{t['task_id']}.attempt", "w").write(str(t.get("attempt", 1)))
     print(t["task_id"])
 PY
   for f in "$TMP"/tasks/*.txt; do
     [ -e "$f" ] || continue
     tid=$(basename "$f" .txt)
-    call task_update "$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":"accepted"}))' "$tid")" >/dev/null || true
+    call task_update "$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":"accepted","attempt":int(open(sys.argv[2]).read())}))' "$tid" "$TMP/tasks/$tid.attempt")" >/dev/null || true
     status=done; rc=0
     audit task_start task_id="$tid" text_sha256="$(sha256sum "$f" | cut -d' ' -f1)" text_bytes="$(wc -c < "$f")"
     [ -z "$SANDBOX" ] || snap "$WORK" "$TMP/before.json"
@@ -112,9 +114,9 @@ PY
     changes=""
     if [ -n "$SANDBOX" ]; then snap "$WORK" "$TMP/after.json"; changes=$(diffsnap "$TMP/before.json" "$TMP/after.json"); fi
     audit task_end task_id="$tid" status="$status" exit="$rc" seconds="$(( $(date +%s) - started ))" output_bytes="$(wc -c < "$TMP/out.txt")" work_changes="$changes"
-    args=$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":sys.argv[2],"result":open(sys.argv[3]).read()[:3500]}))' "$tid" "$status" "$TMP/out.txt")
+    args=$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":sys.argv[2],"result":open(sys.argv[3]).read()[:3500],"attempt":int(open(sys.argv[4]).read())}))' "$tid" "$status" "$TMP/out.txt" "$TMP/tasks/$tid.attempt")
     call task_update "$args" >/dev/null || true
     echo "$tid $status"
-    rm -f "$f"
+    rm -f "$f" "$TMP/tasks/$tid.attempt"
   done
 done
