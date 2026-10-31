@@ -7,7 +7,8 @@ Routes (``admin`` on the artifact, except ``diff`` which needs ``read``; every d
 * ``POST /api/v1/artifacts/{id}/collaborators/{agent_id}/revoke``
 * ``POST /api/v1/artifacts/{id}/collaborators/invite-grant``          ``{invite_id, permission, expires_in_days}``
 * ``POST /api/v1/artifacts/{id}/collab-restrict``                     revoke ALL collaborator grants of this artifact
-                                                                      (operator action, never automatic) -> ``{revoked}``
+                                                                      (operator action, never automatic) ->
+                                                                      ``{revoked, pending_invites_revoked}``
 * ``GET  /api/v1/artifacts/{id}/collab-activity``                     conflicts and rejected commits
 * ``GET  /api/v1/artifacts/{id}/versions/{vid}/diff``                 display diff against the first parent
 
@@ -150,7 +151,8 @@ def route_collab(handler, server, parts, resource) -> bool:
         handler._json({"agent_id": agent_id, "revoked": bool(grants("revoke", artifact_id, agent_id))})
     elif kind == "restrict":
         _body(handler, set(), optional=True)
-        handler._json({"revoked": grants("revoke_all_grants", artifact_id)})
+        counts = grants("revoke_grants", artifact_id, write_only=False)
+        handler._json({"revoked": counts["grants"], "pending_invites_revoked": counts["pending_invites"]})
     elif kind == "invite-grant":
         body = _body(handler, {"invite_id", "permission", "expires_in_days"})
         invite_id = _text(body.get("invite_id"), INVITE_ID, "invite_id")

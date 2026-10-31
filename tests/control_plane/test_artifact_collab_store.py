@@ -381,3 +381,34 @@ def test_add_invite_grant_is_idempotent_for_the_same_grant_and_refuses_any_other
         assert [(r["artifact_id"], r["permission"]) for r in rows] == [(a, "read")]
         assert await store.pending_invite_grants(b) == []
     run(registry_pg, body)
+
+
+def test_revoke_neutralises_pending_invites_in_scope_and_they_never_convert(registry_pg):
+    async def body(store, conn):
+        a, b = await artifact(conn), await artifact(conn)
+        far = now() + timedelta(days=5)
+        for inv, aid, perm in (("iw", a, "write"), ("ir", a, "read"), ("ow", b, "write"), ("or", b, "read")):
+            await store.add_invite_grant(f"{inv}-{aid}", aid, perm, expires_at=far, granted_by="o")
+        await store.grant(a, "w1", "write", expires_at=far, granted_by="o")
+        await store.grant(a, "r1", "read", expires_at=far, granted_by="o")
+        assert await store.revoke_grants(a, write_only=True) == {"grants": 1, "pending_invites": 1}
+        assert [g["permission"] for g in await store.pending_invite_grants(a)] == ["read"]      # read invite survives
+        assert len(await store.pending_invite_grants(b)) == 2                                    # other artifact untouched
+        joins = {f"iw-{a}": {"agent_id": "n1"}, f"ir-{a}": {"agent_id": "n2"}}
+        assert await store.resolve_invite_grants(joins) == 1
+        assert await store.grant_for(a, "n1") is None and (await store.grant_for(a, "n2"))["permission"] == "read"
+        assert await store.revoke_all_grants(a) == 2                                             # n2 and r1
+        assert await store.pending_invite_grants(a) == [] and len(await store.pending_invite_grants(b)) == 2
+        assert await store.add_invite_grant(f"iw-{a}", a, "write", expires_at=far, granted_by="o")   # id stays reserved
+        assert await store.pending_invite_grants(a) == []
+    run(registry_pg, body)
+
+
+def test_resolve_skips_invites_of_a_retracted_artifact(registry_pg):
+    async def body(store, conn):
+        aid = await artifact(conn)
+        await store.add_invite_grant("inv-ret", aid, "write", expires_at=now() + timedelta(days=5), granted_by="o")
+        await conn.execute("UPDATE artifacts SET lifecycle='retracted' WHERE artifact_id=$1", aid)
+        assert await store.resolve_invite_grants({"inv-ret": {"agent_id": "ag"}}) == 0
+        assert await store.grant_for(aid, "ag") is None
+    run(registry_pg, body)

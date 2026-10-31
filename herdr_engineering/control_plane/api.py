@@ -5282,19 +5282,27 @@ def _make_handler(server, public=False, operator=False):
                 def persist(aid, vid, why):
                     self._artifact_call("record_retraction", aid, vid, why)
             grants = server.collab_grant_store if server.collab_artifacts_enabled else None
-            on_unpersisted = None
+            on_unpersisted, pending = None, {}
             if grants is not None:
                 def on_unpersisted(aid):
-                    return grants("revoke_write_grants", aid)
+                    counts = grants("revoke_grants", aid, write_only=True)
+                    pending["write"] = counts["pending_invites"]
+                    return counts["grants"]
             result = retract(gate=server.artifact_graph_gate, ingest=server.ingest, principal=self._principal(),
                              artifact_id=artifact_id, version_id=version_id, reason=body.get("reason"),
                              persist=persist, on_unpersisted=on_unpersisted)
+            result["restrict_all_applied"] = False
             if result["error"]:
                 result["restrict_all_offered"] = True
+                if "write" in pending:
+                    result["pending_invites_revoked"] = pending["write"]
                 if restrict_all and grants is not None:       # operator-requested, after the write-grant fail-safe
                     result["collab_all_grants_revoked"], result["collab_restrict_error"] = None, None
                     try:
-                        result["collab_all_grants_revoked"] = grants("revoke_all_grants", artifact_id)
+                        counts = grants("revoke_grants", artifact_id, write_only=False)
+                        result["collab_all_grants_revoked"] = counts["grants"]
+                        result["pending_invites_revoked"] = pending.get("write", 0) + counts["pending_invites"]
+                        result["restrict_all_applied"] = True
                     except Exception as exc:                  # noqa: BLE001 - type name only; the 500 stands
                         result["collab_restrict_error"] = type(exc).__name__
             return self._json(result, 500 if result["error"] else 200)

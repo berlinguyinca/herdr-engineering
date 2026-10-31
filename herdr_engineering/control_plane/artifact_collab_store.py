@@ -110,17 +110,30 @@ class CollabGrantStore:
             artifact_id, PREFIX + agent_id)
         return bool(deleted)
 
+    async def revoke_grants(self, artifact_id: str, *, write_only: bool) -> dict:
+        """Revoke this artifact's collaborator grants AND neutralise its pending invite grants, in one transaction.
+
+        ``write_only``: only ``edit`` ACL rows and pending ``write`` invites; otherwise every ``collab:`` row and every
+        pending invite.  A neutralised invite is marked resolved with no agent, so ``resolve_invite_grants`` can never
+        turn it into a grant and the invite id stays reserved.  Returns ``{"grants", "pending_invites"}`` counts."""
+        edit = " AND permissions ? 'edit'" if write_only else ""
+        write = " AND permission = 'write'" if write_only else ""
+        async with self.conn.transaction():
+            rows = await self.conn.fetch(
+                "DELETE FROM artifact_acl WHERE artifact_id=$1 AND left(principal_id, $2) = $3" + edit + " RETURNING 1",
+                artifact_id, len(PREFIX), PREFIX)
+            pending = await self.conn.fetch(
+                "UPDATE artifact_collab_invite_grants SET resolved_at=now() "
+                "WHERE artifact_id=$1 AND resolved_at IS NULL" + write + " RETURNING 1", artifact_id)
+        return {"grants": len(rows), "pending_invites": len(pending)}
+
     async def revoke_write_grants(self, artifact_id: str) -> int:
-        rows = await self.conn.fetch(
-            "DELETE FROM artifact_acl WHERE artifact_id=$1 AND left(principal_id, $2) = $3 "
-            "AND permissions ? 'edit' RETURNING 1", artifact_id, len(PREFIX), PREFIX)
-        return len(rows)
+        """Write grants and pending write invites go; returns the number of ACL rows removed."""
+        return (await self.revoke_grants(artifact_id, write_only=True))["grants"]
 
     async def revoke_all_grants(self, artifact_id: str) -> int:
-        rows = await self.conn.fetch(
-            "DELETE FROM artifact_acl WHERE artifact_id=$1 AND left(principal_id, $2) = $3 RETURNING 1",
-            artifact_id, len(PREFIX), PREFIX)
-        return len(rows)
+        """Every collaborator grant and pending invite goes; returns the number of ACL rows removed."""
+        return (await self.revoke_grants(artifact_id, write_only=False))["grants"]
 
     async def live_grants(self) -> list[dict]:
         rows = await self.conn.fetch(
@@ -174,7 +187,9 @@ class CollabGrantStore:
             return 0
         rows = await self.conn.fetch(
             "SELECT invite_id, artifact_id, permission, expires_at, granted_by FROM artifact_collab_invite_grants "
-            "WHERE resolved_at IS NULL AND invite_id = ANY($1::text[]) ORDER BY invite_id", list(join_to_agent))
+            "WHERE resolved_at IS NULL AND invite_id = ANY($1::text[]) AND NOT EXISTS (SELECT 1 FROM artifacts a "
+            "WHERE a.artifact_id = artifact_collab_invite_grants.artifact_id AND a.lifecycle = 'retracted') "
+            "ORDER BY invite_id", list(join_to_agent))
         resolved = 0
         for row in rows:
             agent = join_to_agent[row["invite_id"]]
