@@ -236,6 +236,21 @@ def test_the_bridge_loop_and_the_annotation_housekeeper_share_one_mirror(monkeyp
     assert housekeeper.owner_emails == frozenset({"owner@lab.test"}) and housekeeper.settings["max_per_share"] == 9
 
 
+def test_a_bad_annotations_block_refuses_the_start_before_any_task(monkeypatch, registry_pg, tmp_path):
+    SpyLoop.last_mirror = None
+    created = []
+    real = asyncio.create_task
+    monkeypatch.setattr(asyncio, "create_task", lambda *a, **k: created.append(a) or real(*a, **k))
+    with pytest.raises(SystemExit, match="annotations"):
+        run_worker_cmd(
+            monkeypatch, registry_pg, tmp_path,
+            cp_extra={"collab_artifacts": {"enabled": True, "mirror_dir": str(tmp_path / "m"),
+                                           "outbox_dir": str(tmp_path / "o"), "spool_dir": str(tmp_path / "s")},
+                      "share": {"enabled": True, "annotations": {"nope": 1}}})
+    assert SpyLoop.started == 0 and SpyLoop.last_mirror is None
+    assert not [c for c in created if getattr(c[0], "__name__", "") == "run" or "bridge" in repr(c)]
+
+
 def test_without_collab_artifacts_the_housekeeper_has_no_mirror(monkeypatch, registry_pg, tmp_path):
     rc, seen = run_worker_cmd(monkeypatch, registry_pg, tmp_path, cp_extra={"share": {"enabled": True}})
     assert rc == 0 and seen["kw"]["annotation_housekeeper"].mirror is None

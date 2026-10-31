@@ -9,6 +9,7 @@ with ``O_EXCL | O_NOFOLLOW`` under a destination that must not exist, and a dest
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -371,6 +372,7 @@ def remove_bundle(root: Path, share_id: str) -> None:
         shutil.rmtree(target, ignore_errors=True)
 
 
+_ABSENT = frozenset({errno.ENOENT, errno.ELOOP, errno.ENOTDIR})   # anything else is a real failure
 MAX_PROJECTION_BYTES = 2 * 1024 * 1024
 ANNOTATIONS_DIR = "annotations"
 
@@ -405,8 +407,10 @@ def write_own_projection(root: Path, share_id: str, identity: str, rows: list[di
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         share_fd = os.open(Path(root) / share_id, flags)
-    except OSError:
-        return
+    except OSError as exc:
+        if exc.errno in _ABSENT:
+            return                                               # no such share dir, or a symlink: skipped
+        raise
     try:
         try:
             os.mkdir(ANNOTATIONS_DIR, 0o755, dir_fd=share_fd)
@@ -414,8 +418,10 @@ def write_own_projection(root: Path, share_id: str, identity: str, rows: list[di
             pass
         try:
             dir_fd = os.open(ANNOTATIONS_DIR, flags, dir_fd=share_fd)
-        except OSError:
-            return                                               # a planted symlink or file: left alone
+        except OSError as exc:
+            if exc.errno in _ABSENT:
+                return                                           # a planted symlink or file: left alone
+            raise
         try:
             os.fchmod(dir_fd, 0o755)
             tmp = f".{name}.{os.getpid()}.{os.urandom(4).hex()}.tmp"

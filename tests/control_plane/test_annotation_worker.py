@@ -2,6 +2,7 @@
 # ruff: noqa: F811 - pytest fixtures are imported by name
 import hashlib
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -62,7 +63,8 @@ def test_settings_defaults_equal_the_constant():
 
 @pytest.mark.parametrize("bad", [{"enabled": "yes"}, {"enabled": 1}, {"per_user_per_minute": 0},
                                  {"per_user_per_minute": True}, {"global_per_minute": "3"},
-                                 {"max_comment_chars": 4001}, {"max_comment_chars": 0}, {"nope": 1}, []])
+                                 {"max_comment_chars": 4001}, {"max_comment_chars": 0}, {"nope": 1}, [],
+                                 {"max_per_share": 10**19}, {"global_per_minute": 10**9 + 1}])
 def test_settings_refuse(bad):
     with pytest.raises(ValueError):
         annotation_settings(bad)
@@ -202,4 +204,88 @@ def test_run_one_pass_ticks_the_annotation_housekeeper(registry_pg, tmp_path):
         summary = await worker.run_one_pass(conn, annotation_housekeeper=housekeeper(tmp_path))
         assert isinstance(summary["annotation_housekeeping"], dict)
         assert "annotation_housekeeping" not in await worker.run_one_pass(conn)
+    run(registry_pg, body)
+
+
+def test_settings_accept_the_cap_itself():
+    assert annotation_settings({"max_per_share": 10**9})["max_per_share"] == 10**9
+
+
+class Flaky:
+    """TASK 15 MUST REPLACE this double with a real CollabMirror: it exists only because ``publish_annotations`` does
+    not exist yet, to exercise the housekeeper's own dirty-set and backoff seam."""
+
+    def __init__(self) -> None:
+        self.fail = True
+        self.calls: list[str] = []
+
+    async def publish_annotations(self, artifact_id: str, rows: list[dict]) -> None:
+        self.calls.append(artifact_id)
+        if self.fail:
+            raise OSError("disk full")
+
+
+def test_failed_publishes_stay_dirty_back_off_and_retry_without_holding_the_window(registry_pg, tmp_path, caplog):
+    async def body(store, conn):
+        aid, _, sid = await seed(conn)
+        (tmp_path / "shares").mkdir()
+        (tmp_path / "shares" / sid).mkdir()
+        now = [1000.0]
+        mirror = Flaky()
+        hk = housekeeper(tmp_path, mirror=mirror, interval=15.0, clock=lambda: now[0])
+        append(tmp_path / "events" / "annotations.jsonl", create(sid, 7))
+        out = await hk.tick(conn)
+        assert out["published"] == 0 and hk._dirty_artifacts == {aid} and mirror.calls == [aid]
+        assert hk._since is not None                                           # the projection window advanced
+        assert any(aid in r.getMessage() and "OSError" in r.getMessage() and r.exc_info is None
+                   for r in caplog.records)
+        now[0] += 15.0
+        await hk.tick(conn)
+        assert mirror.calls == [aid]                                           # still backing off
+        now[0] += 400.0
+        await hk.tick(conn)
+        assert len(mirror.calls) == 2
+        mirror.fail = False
+        now[0] += 400.0
+        out = await hk.tick(conn)
+        assert out["published"] == 1 and hk._dirty_artifacts == set()
+        assert len(mirror.calls) == 3
+    run(registry_pg, body)
+
+
+def test_a_mirror_without_publish_annotations_is_skipped_quietly(registry_pg, tmp_path, caplog):
+    async def body(store, conn):
+        _, _, sid = await seed(conn)
+        hk = housekeeper(tmp_path, mirror=object())
+        append(tmp_path / "events" / "annotations.jsonl", create(sid, 8))
+        assert (await hk.tick(conn))["published"] == 0
+        assert not [r for r in caplog.records if r.levelname in ("WARNING", "ERROR")]
+    run(registry_pg, body)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+def test_a_real_filesystem_error_is_raised_so_the_window_holds(registry_pg, tmp_path):
+    share = tmp_path / "share_locked"
+    share.mkdir()
+    share.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            write_own_projection(tmp_path, "share_locked", "u1", [])
+    finally:
+        share.chmod(0o755)
+
+    async def body(store, conn):
+        _, _, sid = await seed(conn)
+        (tmp_path / "shares").mkdir(exist_ok=True)
+        (tmp_path / "shares" / sid).mkdir()
+        hk = housekeeper(tmp_path)
+        append(tmp_path / "events" / "annotations.jsonl", create(sid, 9))
+        (tmp_path / "shares" / sid).chmod(0)
+        try:
+            await hk.tick(conn)
+            assert hk._since is None                                           # failed: the window stays open
+        finally:
+            (tmp_path / "shares" / sid).chmod(0o755)
+        await hk.tick(conn)
+        assert hk._since is not None
     run(registry_pg, body)

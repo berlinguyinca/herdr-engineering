@@ -135,6 +135,7 @@ class ShareHousekeeper:
 
 
 ANNOTATION_INTERVAL = 15.0
+ANNOTATION_MAX_BACKOFF = 300.0
 ANNOTATION_OVERLAP = timedelta(minutes=1)    # ``updated_at`` is the START of the writing transaction: read with margin
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _APPLIED = frozenset({"inserted", "edited", "withdrawn"})
@@ -149,8 +150,8 @@ class AnnotationHousekeeper:
       could race ``remove``/``sync``); without one the mirror step is skipped.
     * The first tick after start treats every annotation as touched; later ticks read ``touched_since`` with an overlap
       margin (a superset is harmless: projections and publishes are idempotent).
-    * A projection that failed keeps the window open for the next tick; a failed mirror publish is logged and
-      repaired by the artifact's next change or a restart."""
+    * A projection that failed keeps the window open for the next tick; a failed mirror publish is retried with
+      capped backoff from ``_dirty_artifacts`` and never holds that window."""
 
     def __init__(self, shares_root, events_dir, marker_dir, settings: dict, *, owner_emails, mirror=None,
                  interval: float = ANNOTATION_INTERVAL, clock=time.time):
@@ -159,6 +160,9 @@ class AnnotationHousekeeper:
         self.mirror, self.interval, self._clock = mirror, interval, clock
         self._last: float | None = None
         self._since: datetime | None = None
+        self._dirty_artifacts: set[str] = set()
+        self._backoff: dict[str, tuple[float, int]] = {}
+        self._warned_no_publish = False
 
     async def tick(self, conn) -> dict | str:
         if not self.settings["enabled"]:
@@ -209,17 +213,41 @@ class AnnotationHousekeeper:
             except Exception:  # noqa: BLE001
                 failed = True
                 log.exception("annotation projection of %s failed", share_id)
-        published = 0
-        if self.mirror is not None:
-            for artifact_id in sorted(artifacts):
-                try:
-                    await self.mirror.publish_annotations(artifact_id, await store.open_for_agents(artifact_id))
-                    published += 1
-                except Exception:  # noqa: BLE001
-                    log.exception("annotation mirror publish of %s failed", artifact_id)
+        published = await self._publish(store, artifacts, now)
         if not failed:
             self._since = started
         return {"ingested": ingested, "projected": projected, "published": published}
+
+    async def _publish(self, store, touched: set[str], now: float) -> int:
+        """Mirror step: every touched artifact joins ``_dirty_artifacts``; the whole set is retried each tick (an
+        artifact in backoff waits) and an artifact leaves it only after a successful publish.  Never holds the
+        projection window."""
+        if self.mirror is None:
+            return 0
+        self._dirty_artifacts |= touched
+        publish = getattr(self.mirror, "publish_annotations", None)
+        if publish is None:
+            if not self._warned_no_publish:
+                self._warned_no_publish = True
+                log.debug("mirror has no publish_annotations yet; annotations are not mirrored")
+            return 0
+        published = 0
+        for artifact_id in sorted(self._dirty_artifacts):
+            if now < self._backoff.get(artifact_id, (0.0, 0))[0]:   # (the overlap margin re-touches: no reset)
+                continue
+            try:
+                await publish(artifact_id, await store.open_for_agents(artifact_id))
+            except Exception as exc:  # noqa: BLE001
+                failures = self._backoff.get(artifact_id, (0.0, 0))[1] + 1
+                delay = min(self.interval * 2 ** failures, ANNOTATION_MAX_BACKOFF)
+                self._backoff[artifact_id] = (now + delay, failures)
+                log.warning("annotation mirror publish of %s failed (%s); retry in %.0fs",
+                            artifact_id, type(exc).__name__, delay)
+                continue
+            self._dirty_artifacts.discard(artifact_id)
+            self._backoff.pop(artifact_id, None)
+            published += 1
+        return published
 
     async def _project(self, conn, store, share_id: str) -> None:
         own = await store.own_rows(share_id)

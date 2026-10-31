@@ -4111,8 +4111,8 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
         return source
     from .control_plane.collab_attention import normalize_insights
     from .control_plane.collab_context import normalize_contextual
-    from .control_plane.collab_workbench import normalize_steering
     from .control_plane.collab_team_rooms import normalize_team_rooms
+    from .control_plane.collab_workbench import normalize_steering
     normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights,
                    "team_rooms": normalize_team_rooms}
 
@@ -4717,11 +4717,19 @@ def _cmd_cp_worker(args) -> int:
                     raise SystemExit("control_plane.collab_artifacts needs RustFS (control_plane.rustfs_endpoint)")
                 dsn = cp["postgres_dsn"]
                 mirror = _build_collab_mirror(collab_settings, rustfs=rustfs)
-                bridge_loop = _build_collab_bridge_loop(
-                    collab_settings, mirror=mirror, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
-                    lineage=_collab_lineage_hook(worker_cfg))
+            try:       # everything is validated and built before any task starts
+                annotation_hk = _worker_annotation_housekeeper(getattr(args, "fleet_config", None), mirror)
+                bridge_loop = None
+                if mirror is not None:
+                    bridge_loop = _build_collab_bridge_loop(
+                        collab_settings, mirror=mirror, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
+                        lineage=_collab_lineage_hook(worker_cfg))
+            except BaseException:
+                if mirror is not None:
+                    mirror.close()
+                raise
+            if bridge_loop is not None:
                 bridge_task = asyncio.create_task(bridge_loop.run(stop), name="collab-bridge-loop")
-            annotation_hk = _worker_annotation_housekeeper(getattr(args, "fleet_config", None), mirror)
             try:
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,

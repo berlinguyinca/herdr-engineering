@@ -14,6 +14,7 @@ from .share_bundle import ShareBundleError, normalise_name
 
 MAX_BODY_BYTES: Final = 32768
 MAX_COMMENT_CHARS: Final = 4000
+MAX_LIMIT: Final = 10**9
 MAX_EXACT_CHARS: Final = 1000
 MAX_CONTEXT_CHARS: Final = 64
 MAX_PAGE: Final = 100000
@@ -86,8 +87,10 @@ def annotation_settings(raw: dict[str, object] | None) -> dict[str, bool | int]:
     for key, value in out.items():
         if key == "enabled":
             continue
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"control_plane.share.annotations.{key} must be a positive integer")
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= MAX_LIMIT:
+            raise ValueError(
+                f"control_plane.share.annotations.{key} must be an integer from 1 to {MAX_LIMIT}"
+            )
     if not 1 <= out["max_comment_chars"] <= MAX_COMMENT_CHARS:
         raise ValueError(
             f"control_plane.share.annotations.max_comment_chars must be 1-{MAX_COMMENT_CHARS}"
