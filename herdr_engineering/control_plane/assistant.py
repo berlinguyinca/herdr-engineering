@@ -1322,9 +1322,13 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
                     _log.warning("assistant model %r not used; asking %r", wanted or "auto", model)
                 return self._post_one({**payload, "model": model})
             except Exception as exc:  # noqa: BLE001
-                if getattr(exc, "code", None) not in RETRY_CODES:
+                code = getattr(exc, "code", None)
+                if code is None and not isinstance(exc, OSError):      # timeouts and resets are OSErrors; a bug is not
                     raise
-                _log.warning("assistant model %r answered %s; trying the next", model, exc.code)
+                if code is not None and code not in RETRY_CODES:
+                    raise
+                _log.warning("assistant model %r failed (%s); trying the next", model,
+                             code if code is not None else type(exc).__name__)
                 last = exc
         raise last  # type: ignore[misc]
 
@@ -1383,7 +1387,8 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
     def execute(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
         try:
             return self._parse_reply(self._post(self._payload(run, messages)))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._log_failure(exc)
             return "[http-model runner] inference unavailable"
 
     def step(self, run: AssistantRun, messages: list[dict],
@@ -1401,8 +1406,14 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
                    "tool_choice": "auto"}
         try:
             return self._parse_step(self._post(payload))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._log_failure(exc)
             return {"content": "[http-model runner] inference unavailable", "tool_calls": []}
+
+    @staticmethod
+    def _log_failure(exc: Exception) -> None:
+        """Why a reply degraded: the exception class and HTTP status only, never its text (it could carry a URL or key)."""
+        _log.warning("assistant inference unavailable: %s (status %s)", type(exc).__name__, getattr(exc, "code", None))
 
 
 def _urllib_transport(url: str, method: str, headers: dict[str, str],

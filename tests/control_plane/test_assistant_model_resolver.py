@@ -155,3 +155,22 @@ def test_server_errors_move_on_to_the_next_model(code):
     r, seen = runner("auto", [Busy(code), OK], preferred=["laya", "qwen3.8-text"])
     assert r._post({"model": "auto", "messages": []}) == OK
     assert seen == ["laya", "qwen3.8-text"]
+
+
+def test_a_timeout_or_reset_moves_on_to_the_next_model():
+    r, seen = runner("auto", [TimeoutError("timed out"), OK], preferred=["laya", "qwen3.8-text"])
+    assert r._post({"model": "auto", "messages": []}) == OK
+    assert seen == ["laya", "qwen3.8-text"]
+
+
+def test_a_final_failure_is_logged_with_its_cause(caplog):
+    r, _ = runner("auto", [Busy(400)], preferred=["laya"])
+    with caplog.at_level("WARNING"):
+        assert "unavailable" in r.execute(_Run(), [])
+    assert any("Busy" in m and "400" in m for m in caplog.messages)
+
+
+class _Run:
+    assistant_id = "asst_x"
+    tenant_id = "t"
+    user_id = "u"
