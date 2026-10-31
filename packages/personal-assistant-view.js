@@ -754,7 +754,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       <div id="pa-threads">${skeleton('threads')}</div>
       <div id="pa-messages" class="pa-chat" style="min-height:180px;margin-top:10px"></div>
       <div class="pa-row" style="margin-top:10px">
-        <input style="flex:1" placeholder="Message…  ( / to focus, Enter to send )" aria-label="Message" data-msg>
+        <input style="flex:1" placeholder="Message…  (press / to focus)" aria-label="Message" data-msg>
         <button class="hd-btn" data-send>Send</button>
         <button class="hd-btn hd-btn--ghost" data-voice title="Voice input">🎤</button>
         <button class="hd-btn hd-btn--ghost" data-speak title="Speak reply">🔊</button>

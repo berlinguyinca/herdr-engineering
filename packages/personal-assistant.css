@@ -108,4 +108,4 @@ a.hd-btn { text-decoration: none; display: inline-flex; align-items: center; }
 .pa-palette__list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 50vh; overflow: auto; }
 .pa-palette__list li { display: flex; justify-content: space-between; gap: 12px; padding: 7px 10px; border-radius: var(--radius-sm); cursor: pointer; }
 .pa-palette__list li.is-on { background: var(--accent-weak); outline: 1px solid var(--accent); }
-@media (max-width: 480px) { .pa-overlay { padding-top: 6vh; } }
+@media (max-width: 480px) { .pa-overlay { padding-top: 6vh; } [data-keys] { display: none; } }   /* a phone has no keyboard to learn */
