@@ -478,3 +478,99 @@ def test_cache_is_thread_safe() -> None:
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert not errors and len(cache) <= 8
+
+
+def test_style_element_with_markup_inside_is_dropped() -> None:
+    payload = b"<style></template><script>alert(1)</script></style><p>ok</p>"
+    out = sr.sanitize_html(payload, resolve=keep_all)
+    assert "<style" not in out and "script" not in out.lower() and out.endswith("<p>ok</p>")
+    out = sr.sanitize_html(b"<style>a>b{color:red}</style>", resolve=keep_all)
+    assert "<style>" not in out or "<" not in out.split("<style>")[1].split("</style>")[0]
+
+
+def _timed(payload: bytes) -> str:
+    start = time.monotonic()
+    try:
+        out = sr.sanitize_html(payload, resolve=keep_all)
+    except sr.RenderTooLarge:  # a bounded, typed refusal is fine; only time matters here
+        out = ""
+    assert time.monotonic() - start < 3, payload[:40]
+    return out
+
+
+def _fill(unit: str, size: int = 1_100_000) -> bytes:
+    return (unit * (size // len(unit) + 1)).encode()
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "<b></i>",
+        "<div></i>",
+        "<span></p>",
+        "<DIV></I>",
+        "<div></span>",
+        '<a title="</b>">',
+        '<div title="</div>"><div>',
+        "<div><!-- </div> -->",
+        "<div><![CDATA[</div>]]>",
+        "<div><![if x]></div>",
+        "<div><?pi </div> ?>",
+        '<div title="x',
+        "<a><b></a></b>",
+        "<b><div></b>",
+        "<div><b></div>",
+        "<div></div></div></div><div>",
+        "<style></style><div>",
+        "<div/><div / >",
+        "<table><div>",
+        "<svg><div>",
+        "<div></ div><div>",
+        "<div></>",
+    ],
+)
+def test_nesting_shapes_stay_fast(unit: str) -> None:
+    _timed(_fill(unit))
+
+
+def test_plain_nested_divs_are_cut_at_max_nesting() -> None:
+    out = _timed(b"<div>" * 100_000)
+    assert out.count("<div>") == sr.MAX_NESTING
+
+
+def test_nesting_scan_ignores_stray_closers_but_counts_real_depth() -> None:
+    assert sr._bound_nesting("<b></i>" * 5) == "<b></i>" * 5
+    deep = "<b></i>" * (sr.MAX_NESTING + 5)
+    assert sr._bound_nesting(deep).count("<b>") == sr.MAX_NESTING
+    ok = "<div>" * 100 + "</div>" * 100 + "<div>" * 100
+    assert sr._bound_nesting(ok) == ok
+    wrong_order = "<a><b></a></b>" * 20_000
+    assert sr._bound_nesting(wrong_order) == wrong_order  # wrong-order closers still balance
+    assert sr._bound_nesting("<b><div></b>" * 20_000).count("<b>") < 20_000  # adoption-style growth is counted
+
+
+def test_input_over_max_input_bytes_is_cut_on_a_tag_boundary() -> None:
+    big = "<p>x</p>" * (sr.MAX_INPUT_BYTES // 8 + 10)
+    cut = sr._bound_nesting(big)
+    assert sr.MAX_INPUT_BYTES - 8 < len(cut) <= sr.MAX_INPUT_BYTES
+    assert big.startswith(cut) and big[len(cut)] == "<"
+
+
+def test_tag_soup_fuzz_is_fast() -> None:
+    import random
+
+    rng = random.Random(1234)
+    frags = [
+        "<b>", "</b>", "<i>", "</i>", "<div>", "</div>", "<span>", "</p>", "<a href=x>", "</a>", "<table>", "<td>",
+        "<DIV>", "</Div>", "<!--", "-->", "<![CDATA[", "]]>", "<![", "<style>", "</style>", "<svg>", "</svg>",
+        '<a title="', '">', "'", '"', "=", "<", ">", "</", "<br>", "<template>", "</template>", "<b></i>",
+    ]
+    for _ in range(25):
+        parts: list[str] = []
+        total = 0
+        while total < 500_000:
+            f = rng.choice(frags)
+            parts.append(f)
+            total += len(f)
+        out = _timed("".join(parts).encode())
+        assert_inert(out)

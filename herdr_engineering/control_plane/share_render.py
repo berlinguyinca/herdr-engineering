@@ -206,26 +206,110 @@ def _make_filter(resolve: Resolver) -> Callable[[str, str, str], str | None]:
 
 
 # ammonia's cost grows with the square of the retained nesting depth (about 3 s at 40 000 levels, 30 s at 100 000), so
-# hostile depth is cut off before the library sees it. This is a linear over-estimate from tag names only (it parses
-# nothing and builds nothing): void and optional-end-tag elements do not count, any closing tag pops one level.
+# hostile depth is cut off before the library sees it. The scan below builds no tree and emits nothing: it follows the
+# tokenizer closely enough (comments, bogus comments, CDATA, quoted attribute values, raw-text elements) that markup
+# inside those cannot desync it, and it keeps a stack of open element names. A closing tag with no matching open
+# element is ignored (so stray closers cannot hide depth); otherwise it pops back to its match. Formatting elements
+# are removed alone (the parser's adoption step can re-open them), and void and optional-end-tag elements never push.
+# Over-estimating only truncates earlier; under-estimating would let depth through.
 MAX_NESTING = 10_000
-_TAG_NAME = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9]*)")
+MAX_INPUT_BYTES = 4 * 1024 * 1024
+_TAG_START = re.compile(r"<(/?)([A-Za-z][^\s/>]*)")
 _NOT_NESTING = frozenset(
     "area base br col embed hr img input link meta source track wbr p li dt dd tr td th tbody thead tfoot option optgroup "
     "colgroup rp rt".split()
 )
+_FORMATTING = frozenset("a b big code em font i nobr s small strike strong tt u".split())
+_RAW_TEXT = frozenset("style script textarea title xmp iframe noembed noframes".split())
+_RAW_END: dict[str, re.Pattern[str]] = {n: re.compile(r"</" + n + r"(?=[\s/>]|\Z)", re.I) for n in _RAW_TEXT}
+
+
+def _tag_end(text: str, pos: int) -> int:
+    """The index just past the ``>`` that ends the tag whose name ends at ``pos``, or -1 (an open quote swallows the rest)."""
+    n = len(text)
+    while pos < n:
+        c = text[pos]
+        if c == ">":
+            return pos + 1
+        if c in "\"'":
+            back = pos - 1
+            while back >= 0 and text[back] in " \t\r\n\x0c":
+                back -= 1
+            if back >= 0 and text[back] == "=":
+                close = text.find(c, pos + 1)
+                if close < 0:
+                    return -1
+                pos = close
+        pos += 1
+    return -1
 
 
 def _bound_nesting(text: str) -> str:
-    """The text cut at the point where estimated nesting would pass ``MAX_NESTING`` (the library closes what is open)."""
+    """The text cut where estimated nesting would pass ``MAX_NESTING`` (the library closes what is still open)."""
+    if len(text) > MAX_INPUT_BYTES:
+        cut = text.rfind("<", 0, MAX_INPUT_BYTES)
+        text = text[: cut if cut > 0 else MAX_INPUT_BYTES]
+    stack: list[str] = []
+    live: dict[str, int] = {}
+    dead: dict[str, int] = {}
     depth = 0
-    for match in _TAG_NAME.finditer(text):
-        if match.group(1):
-            depth = max(0, depth - 1)
-        elif match.group(2).lower() not in _NOT_NESTING:
-            depth += 1
-            if depth > MAX_NESTING:
-                return text[: match.start()]
+    n = len(text)
+    i = text.find("<")
+    while 0 <= i < n:
+        if text.startswith("<!--", i):
+            end = text.find("-->", i + 4)
+            if end < 0:
+                return text
+            i = text.find("<", end + 3)
+            continue
+        if text.startswith(("<!", "<?"), i) or text.startswith("</", i) and not text[i + 2 : i + 3].isalpha():
+            end = text.find(">", i + 2)
+            if end < 0:
+                return text
+            i = text.find("<", end + 1)
+            continue
+        m = _TAG_START.match(text, i)
+        if m is None:
+            i = text.find("<", i + 1)
+            continue
+        name = m.group(2).lower()
+        end = _tag_end(text, m.end())
+        if end < 0:
+            return text[:i]
+        if m.group(1):
+            if live.get(name, 0) > 0:
+                if name in _FORMATTING:
+                    live[name] -= 1
+                    depth -= 1
+                    if stack[-1] == name:
+                        stack.pop()
+                    else:
+                        dead[name] = dead.get(name, 0) + 1
+                else:
+                    while stack:
+                        top = stack.pop()
+                        if dead.get(top, 0) > 0:
+                            dead[top] -= 1
+                            continue
+                        live[top] -= 1
+                        depth -= 1
+                        if top == name:
+                            break
+        elif name == "plaintext":
+            return text
+        elif name not in _NOT_NESTING:
+            if name in _RAW_TEXT:
+                found = _RAW_END[name].search(text, end)
+                if found is None:
+                    return text
+                end = found.start()
+            else:
+                stack.append(name)
+                live[name] = live.get(name, 0) + 1
+                depth += 1
+                if depth > MAX_NESTING:
+                    return text[:i]
+        i = text.find("<", end)
     return text
 
 
@@ -239,6 +323,14 @@ def _checked(out: str) -> str:
     if len(out) > MAX_RENDER_OUTPUT or len(out.encode("utf-8")) > MAX_RENDER_OUTPUT:
         raise RenderTooLarge("rendered output is over the cap")
     return out
+
+
+# Raw text ends only at the closing style tag, so a "<" inside a kept style element is suspicious: drop the element.
+_STYLE_ELEMENT = re.compile(r"<style(?:\s[^>]*)?>(.*?)</style>", re.I | re.S)
+
+
+def _drop_suspicious_style(out: str) -> str:
+    return _STYLE_ELEMENT.sub(lambda m: "" if "<" in m.group(1) else m.group(0), out)
 
 
 def sanitize_html(data: bytes, *, resolve: Resolver) -> str:
@@ -261,7 +353,7 @@ def sanitize_html(data: bytes, *, resolve: Resolver) -> str:
         raise
     except BaseException as exc:  # noqa: BLE001 - the library's Rust panic is a BaseException
         raise RenderFailed(f"sanitizer failed: {type(exc).__name__}") from None
-    return _checked(out)
+    return _checked(_drop_suspicious_style(out))
 
 
 def render_text(data: bytes) -> str:
