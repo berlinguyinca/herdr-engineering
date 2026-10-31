@@ -89,3 +89,9 @@ def test_bad_extra_vetoes_rejected(entry: Any) -> None:
 def test_extra_vetoes_must_be_list() -> None:
     with pytest.raises(ValueError, match="extra_vetoes"):
         _grants({"extra_vetoes": {"code": "c"}})
+
+
+def test_naive_shadow_started_at_rejected() -> None:
+    with pytest.raises(ValueError, match="must include a UTC offset"):
+        _grants({"shadow_started_at": "2026-10-01T00:00:00"})
+    assert _grants({"shadow_started_at": "2026-10-01T00:00:00Z"})["shadow_started_at"]

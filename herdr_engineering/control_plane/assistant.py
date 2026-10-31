@@ -43,7 +43,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow
+from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_hub.verbs import Verb
 from .assistant_hub.vetoes import FIXED_VETOES
@@ -365,9 +365,11 @@ def _grants_config(raw: Any) -> dict[str, Any]:
         try:
             if not isinstance(started, str):
                 raise ValueError("not a string")
-            datetime.fromisoformat(started)
+            parsed = datetime.fromisoformat(started)
         except ValueError as exc:
             raise ValueError(f"{where}.shadow_started_at must be an ISO-8601 string or null") from exc
+        if parsed.tzinfo is None:
+            raise ValueError(f"{where}.shadow_started_at must include a UTC offset")
     approvals = raw.get("required_approvals", {})
     if not isinstance(approvals, dict):
         raise ValueError(f"{where}.required_approvals must be a mapping")
@@ -1900,6 +1902,12 @@ class AssistantStore:
             for ev in self.action_evidence.values():
                 self._evidence_index.setdefault(ev.tenant_id, {})[ev.evidence_id] = None
             self.policy_state = dict(snap.get("policy_state", {}))
+            for rows, index in ((self.action_requests, self._request_index),
+                                (self.action_evidence, self._evidence_index)):
+                for idx in index.values():           # an oversized snapshot must not stay over the cap
+                    while len(idx) > self.max_action_rows_per_tenant:
+                        rows.pop(next(iter(idx)), None)
+                        del idx[next(iter(idx))]
             self._routine_fired = set(snap.get("routine_fired", []))
             kept = {e.get("event_id") for e in snap.get("audit", [])}
             merged = [dict(e) for e in snap.get("audit", [])]
@@ -1928,13 +1936,16 @@ class AssistantStore:
     # -- action grants, requests and evidence (assistant hub) -------------------
     def _bounded_put(self, rows: dict[str, Any], index: dict[str, dict[str, None]], tenant_id: str, row_id: str,
                      row: Any) -> None:
+        existing = rows.get(row_id)
+        if existing is not None and existing.tenant_id != tenant_id:
+            raise ValueError(f"id {row_id!r} already belongs to another tenant")     # ids are immutable per tenant
         rows[row_id] = row
         idx = index.setdefault(tenant_id, {})
         idx[row_id] = None                  # re-putting an id keeps its original position
         while len(idx) > self.max_action_rows_per_tenant:
             old = next(iter(idx))
             del idx[old]
-            del rows[old]
+            rows.pop(old, None)
 
     @staticmethod
     def _sorted_copies(rows: list[Any]) -> list[Any]:
@@ -1949,10 +1960,10 @@ class AssistantStore:
             self.action_grants[grant.grant_id] = replace(grant)
             self._after_mutation()
 
-    def get_action_grant(self, grant_id: str) -> ActionGrant | None:
+    def get_action_grant(self, grant_id: str, *, tenant_id: str, user_id: str) -> ActionGrant | None:
         with self._lock:
             g = self.action_grants.get(grant_id)
-            return replace(g) if g else None
+            return replace(g) if g and g.tenant_id == tenant_id and g.user_id == user_id else None
 
     def list_action_grants(self, tenant_id: str, user_id: str) -> list[ActionGrant]:
         with self._lock:
@@ -1965,10 +1976,10 @@ class AssistantStore:
                               replace(request))
             self._after_mutation()
 
-    def get_action_request(self, request_id: str) -> ActionRequestRow | None:
+    def get_action_request(self, request_id: str, *, tenant_id: str, user_id: str) -> ActionRequestRow | None:
         with self._lock:
             r = self.action_requests.get(request_id)
-            return replace(r) if r else None
+            return replace(r) if r and r.tenant_id == tenant_id and r.user_id == user_id else None
 
     def list_action_requests(self, tenant_id: str, user_id: str, status: str | None = None) -> list[ActionRequestRow]:
         with self._lock:
@@ -1991,11 +2002,12 @@ class AssistantStore:
     def ensure_shadow_started(self, now: datetime, configured: datetime | None = None) -> datetime:
         """The shadow period's start: the configured time if set, else the first time seen (persisted)."""
         if configured is not None:
-            return configured
+            return as_utc(configured)
+        now = as_utc(now)
         with self._lock:
             stored = self.policy_state.get("shadow_started_at")
             if stored:
-                return datetime.fromisoformat(stored)
+                return as_utc(datetime.fromisoformat(stored))
             self.policy_state["shadow_started_at"] = now.isoformat()
             self._after_mutation()
             return now

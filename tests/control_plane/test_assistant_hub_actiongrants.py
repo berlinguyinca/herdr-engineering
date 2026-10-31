@@ -67,9 +67,9 @@ def test_round_trip_through_snapshot() -> None:
     s.add_action_evidence(_ev("e1"))
     fresh = AssistantStore()
     fresh.restore(json.loads(json.dumps(s.snapshot())))
-    assert fresh.get_action_grant("g1") == _grant()
-    assert fresh.get_action_grant("g1").state is GrantState.ACTIVE
-    assert fresh.get_action_request("r1").decided_at == T0
+    assert fresh.get_action_grant("g1", tenant_id="t", user_id="u") == _grant()
+    assert fresh.get_action_grant("g1", tenant_id="t", user_id="u").state is GrantState.ACTIVE
+    assert fresh.get_action_request("r1", tenant_id="t", user_id="u").decided_at == T0
     assert fresh.list_action_evidence("t", "u") == [_ev("e1")]
 
 
@@ -81,7 +81,7 @@ def test_round_trip_through_real_persist_file_stays_0600(tmp_path: Path) -> None
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     fresh = AssistantStore()
     fresh.restore(json.loads(Path(path).read_text()))
-    assert fresh.get_action_grant("g1") == _grant()
+    assert fresh.get_action_grant("g1", tenant_id="t", user_id="u") == _grant()
     assert len(fresh.list_action_evidence("t", "u")) == 1
 
 
@@ -94,7 +94,7 @@ def test_old_snapshot_without_new_keys_restores() -> None:
 def test_old_grant_row_missing_fields_uses_defaults() -> None:
     s = AssistantStore()
     s.restore({"action_grants": [{"grant_id": "g", "tenant_id": "t", "user_id": "u", "state": "active"}]})
-    g = s.get_action_grant("g")
+    g = s.get_action_grant("g", tenant_id="t", user_id="u")
     assert g.state is GrantState.ACTIVE and g.policy_version == 1 and g.judge_version == ""
 
 
@@ -121,7 +121,7 @@ def test_request_cap_drops_oldest_and_reput_keeps_position() -> None:
     s.put_action_request(_req("r0", created_at=T0, status="approved"))     # update, not a new row
     assert len(s.list_action_requests("t", "u")) == 2
     s.put_action_request(_req("r2", created_at=T0 + timedelta(seconds=2)))
-    assert s.get_action_request("r0") is None
+    assert s.get_action_request("r0", tenant_id="t", user_id="u") is None
     assert [r.request_id for r in s.list_action_requests("t", "u")] == ["r1", "r2"]
 
 
@@ -159,9 +159,9 @@ def test_store_keeps_defensive_copies() -> None:
     g = _grant()
     s.put_action_grant(g)
     g.state = GrantState.REVOKED
-    s.get_action_grant("g1").state = GrantState.REVOKED
+    s.get_action_grant("g1", tenant_id="t", user_id="u").state = GrantState.REVOKED
     s.list_action_grants("t", "u")[0].state = GrantState.REVOKED
-    assert s.get_action_grant("g1").state is GrantState.ACTIVE
+    assert s.get_action_grant("g1", tenant_id="t", user_id="u").state is GrantState.ACTIVE
 
 
 def test_shadow_started_is_persisted_first_seen_and_config_wins(tmp_path: Path) -> None:
@@ -174,3 +174,75 @@ def test_shadow_started_is_persisted_first_seen_and_config_wins(tmp_path: Path) 
     assert fresh.ensure_shadow_started(T0 + timedelta(days=9)) == T0       # survives restart
     cfg = T0 - timedelta(days=5)
     assert fresh.ensure_shadow_started(T0, configured=cfg) == cfg
+
+
+def test_get_is_scoped_to_tenant_and_user() -> None:
+    s = AssistantStore()
+    s.put_action_grant(_grant())
+    s.put_action_request(_req("r1"))
+    assert s.get_action_grant("g1", tenant_id="t2", user_id="u") is None
+    assert s.get_action_grant("g1", tenant_id="t", user_id="x") is None
+    assert s.get_action_grant("nope", tenant_id="t", user_id="u") is None
+    assert s.get_action_request("r1", tenant_id="t2", user_id="u") is None
+    assert s.get_action_request("r1", tenant_id="t", user_id="x") is None
+    assert s.get_action_request("r1", tenant_id="t", user_id="u") is not None
+
+
+def test_lists_are_scoped_across_tenants_with_same_user() -> None:
+    s = AssistantStore()
+    s.put_action_grant(_grant("a", tenant="t1"))
+    s.put_action_grant(_grant("b", tenant="t2"))
+    s.put_action_request(_req("r1", tenant="t1"))
+    s.put_action_request(_req("r2", tenant="t2"))
+    s.add_action_evidence(_ev("e1", tenant="t1"))
+    s.add_action_evidence(_ev("e2", tenant="t2"))
+    assert [g.grant_id for g in s.list_action_grants("t1", "u")] == ["a"]
+    assert [r.request_id for r in s.list_action_requests("t2", "u")] == ["r2"]
+    assert [e.evidence_id for e in s.list_action_evidence("t1", "u")] == ["e1"]
+
+
+def test_request_cap_survives_restore() -> None:
+    s = AssistantStore()
+    s.max_action_rows_per_tenant = 3
+    for i in range(3):
+        s.put_action_request(_req(f"r{i}", created_at=T0 + timedelta(seconds=i)))
+    fresh = AssistantStore()
+    fresh.max_action_rows_per_tenant = 3
+    fresh.restore(s.snapshot())
+    fresh.put_action_request(_req("r3", created_at=T0 + timedelta(seconds=9)))
+    assert [r.request_id for r in fresh.list_action_requests("t", "u")] == ["r1", "r2", "r3"]
+
+
+def test_restore_trims_oversized_snapshot_oldest_first() -> None:
+    big = AssistantStore()
+    for i in range(5):
+        big.put_action_request(_req(f"r{i}", created_at=T0 + timedelta(seconds=i)))
+        big.add_action_evidence(_ev(f"e{i}", created_at=T0 + timedelta(seconds=i)))
+        big.put_action_grant(_grant(f"g{i}"))
+    small = AssistantStore()
+    small.max_action_rows_per_tenant = 2
+    small.restore(big.snapshot())
+    assert [r.request_id for r in small.list_action_requests("t", "u")] == ["r3", "r4"]
+    assert [e.evidence_id for e in small.list_action_evidence("t", "u")] == ["e3", "e4"]
+    assert len(small.list_action_grants("t", "u")) == 5
+
+
+def test_reput_under_another_tenant_is_refused() -> None:
+    s = AssistantStore()
+    s.put_action_request(_req("r1", tenant="t1"))
+    with pytest.raises(ValueError, match="another tenant"):
+        s.put_action_request(_req("r1", tenant="t2"))
+    s.add_action_evidence(_ev("e1", tenant="t1"))
+    with pytest.raises(ValueError, match="another tenant"):
+        s.add_action_evidence(_ev("e1", tenant="t2"))
+    assert s.get_action_request("r1", tenant_id="t1", user_id="u") is not None
+
+
+def test_naive_datetimes_are_treated_as_utc() -> None:
+    naive_exp = (T0 + timedelta(days=30)).replace(tzinfo=None)
+    g = _grant(expires_at=naive_exp)
+    assert g.effective_state(T0 + timedelta(days=31), 1) is GrantState.EXPIRED
+    assert g.effective_state((T0 + timedelta(days=1)).replace(tzinfo=None), 1) is GrantState.ACTIVE
+    s = AssistantStore()
+    assert s.ensure_shadow_started(T0.replace(tzinfo=None)) == T0
+    assert s.ensure_shadow_started(T0, configured=T0.replace(tzinfo=None)) == T0

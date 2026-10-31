@@ -14,6 +14,11 @@ from datetime import UTC, datetime
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
+def as_utc(value: datetime) -> datetime:
+    """A naive datetime is taken to be UTC, so comparisons never raise TypeError."""
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
 class GrantState(enum.StrEnum):
     SHADOW = "shadow"
     PROPOSED = "proposed"
@@ -47,9 +52,10 @@ class ActionGrant:
 
     def effective_state(self, now: datetime, policy_version: int) -> GrantState:
         """The state that governs decisions at ``now`` under the current ``policy_version``."""
+        now = as_utc(now)
         if self.state is GrantState.REVOKED:
             return GrantState.REVOKED
-        if self.state is GrantState.ACTIVE and self.expires_at is not None and now >= self.expires_at:
+        if self.state is GrantState.ACTIVE and self.expires_at is not None and now >= as_utc(self.expires_at):
             return GrantState.EXPIRED
         if self.state in (GrantState.PROPOSED, GrantState.ACTIVE) and self.policy_version < policy_version:
             return GrantState.SHADOW             # a policy change sends earned trust back to observation
