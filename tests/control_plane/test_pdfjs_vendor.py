@@ -22,6 +22,10 @@ EXPECTED = {*MAIN_FILES, "LICENSE", "SHA256SUMS"}
 SHA_LINE_PARTS = 2
 
 
+def _etag(name):
+    return f'"{_sums()[name]}"'          # the strong ETag is the SHA256SUMS digest
+
+
 def _sums():
     out = {}
     for line in (VENDOR / "SHA256SUMS").read_text().splitlines():
@@ -74,15 +78,19 @@ def dashboard(tmp_path):
     t = threading.Thread(target=srv.serve, daemon=True)
     t.start()
     srv.wait_until_ready()
-    yield Api(srv.port)
+    api = Api(srv.port)
+    api.web = web
+    yield api
     srv.shutdown()
     t.join(timeout=5)
 
 
-def _raw_get(port, path):
+def _raw_get(port, path, headers=None):
     import http.client
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     conn.putrequest("GET", path, skip_accept_encoding=True)  # putrequest keeps the path byte for byte
+    for k, v in (headers or {}).items():
+        conn.putheader(k, v)
     conn.endheaders()
     resp = conn.getresponse()
     body = resp.read()
@@ -95,21 +103,42 @@ def test_dashboard_serves_vendored_modules_as_javascript(dashboard, name):
     status, h, body = _raw_get(dashboard.port, f"/vendor/pdfjs/{name}")
     assert status == 200 and body == (VENDOR / name).read_bytes()
     assert h["content-type"].startswith("text/javascript") and h["x-content-type-options"] == "nosniff"
-    assert "max-age=31536000" in h["cache-control"] and "immutable" in h["cache-control"]
+    assert h["cache-control"] == "no-cache" and h["etag"] == _etag(name)
     assert "content-security-policy" not in h          # the dashboard has no CSP (Task 13)
 
 
-def test_dashboard_static_files_get_nosniff_and_mjs_is_javascript(dashboard, tmp_path):
+@pytest.mark.parametrize("name", MAIN_FILES)
+def test_dashboard_vendored_modules_revalidate_with_if_none_match(dashboard, name):
+    path, tag = f"/vendor/pdfjs/{name}", _etag(name)
+    status, h, body = _raw_get(dashboard.port, path, {"If-None-Match": tag})
+    assert status == 304 and body == b"" and h["etag"] == tag and h["cache-control"] == "no-cache"
+    assert h["x-content-type-options"] == "nosniff"
+    for header in (f"W/{tag}", f'"other", {tag}', "*"):
+        status, _, body = _raw_get(dashboard.port, path, {"If-None-Match": header})
+        assert status == 304 and body == b"", header
+    status, h, body = _raw_get(dashboard.port, path, {"If-None-Match": '"0000"'})
+    assert status == 200 and body == (VENDOR / name).read_bytes() and h["etag"] == tag
+
+
+def test_dashboard_static_files_get_nosniff_and_no_store(dashboard):
     status, h, _ = _raw_get(dashboard.port, "/app.js")
     assert status == 200 and h["x-content-type-options"] == "nosniff" and h["cache-control"] == "no-store"
+    assert "etag" not in h
+
+
+def test_dashboard_serves_mjs_as_javascript(dashboard):
+    (dashboard.web / "m.mjs").write_text("export const a = 1;")
+    status, h, _ = _raw_get(dashboard.port, "/m.mjs")
+    assert status == 200 and h["content-type"] == "text/javascript" and h["x-content-type-options"] == "nosniff"
 
 
 def test_dashboard_vendor_allow_list_is_exact(dashboard):
-    for path in ("/vendor/pdfjs/../x", "/vendor/pdfjs/../app.js", "/vendor/pdfjs/%2e%2e/app.js", "/vendor/pdfjs/LICENSE",
-                 "/vendor/pdfjs/SHA256SUMS", "/vendor/pdfjs/", "/vendor/pdfjs/nope.mjs", "/vendor/pdfjs/pdf.min.mjs/x",
-                 "/vendor/pdfjs/Pdf.min.mjs"):
-        status, _, _ = _raw_get(dashboard.port, path)
-        assert status in (403, 404), path
+    for path in ("/vendor/pdfjs/../x", "/vendor/pdfjs/../app.js"):
+        assert _raw_get(dashboard.port, path)[0] == 403, path        # the existing ".." rule
+    not_found = ("/vendor/pdfjs/%2e%2e/app.js", "/vendor/pdfjs/LICENSE", "/vendor/pdfjs/SHA256SUMS", "/vendor/pdfjs/",
+                 "/vendor/pdfjs/nope.mjs", "/vendor/pdfjs/pdf.min.mjs/x", "/vendor/pdfjs/Pdf.min.mjs")
+    for path in not_found:
+        assert _raw_get(dashboard.port, path)[0] == 404, path
 
 
 @pytest.mark.parametrize("name", MAIN_FILES)
@@ -117,8 +146,20 @@ def test_share_public_serves_vendored_modules(lab, name):  # noqa: F811
     status, h, body = lab.request("GET", f"/s/static/vendor/pdfjs/{name}")
     assert status == 200 and body == (VENDOR / name).read_bytes()
     assert h["content-type"].startswith("text/javascript") and h["x-content-type-options"] == "nosniff"
-    assert "max-age=31536000" in h["cache-control"] and "immutable" in h["cache-control"]
+    assert h["cache-control"] == "no-cache" and h["etag"] == _etag(name)
     assert h["content-security-policy"]
+
+
+@pytest.mark.parametrize("name", MAIN_FILES)
+def test_share_public_vendored_modules_revalidate_with_if_none_match(lab, name):  # noqa: F811
+    path, tag = f"/s/static/vendor/pdfjs/{name}", _etag(name)
+    status, h, body = lab.request("GET", path, {"If-None-Match": tag})
+    assert status == 304 and body == b"" and h["etag"] == tag and h["cache-control"] == "no-cache"
+    assert h["x-content-type-options"] == "nosniff" and h["content-security-policy"]
+    for header in (f"W/{tag}", f'"other", {tag}', "*"):
+        assert lab.request("GET", path, {"If-None-Match": header})[0] == 304, header
+    status, h, body = lab.request("GET", path, {"If-None-Match": '"0000"'})
+    assert status == 200 and body == (VENDOR / name).read_bytes() and h["etag"] == tag
 
 
 def test_share_public_vendor_allow_list_is_exact(lab):  # noqa: F811

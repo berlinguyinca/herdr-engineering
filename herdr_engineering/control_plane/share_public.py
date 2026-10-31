@@ -78,7 +78,9 @@ VIEWER_FILE = "viewer.html"
 STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8"}
 # One level below static/vendor/pdfjs/: exactly the two vendored pdf.js modules (the licence and SHA256SUMS stay unserved).
 VENDOR_FILES = {"pdf.min.mjs": "text/javascript; charset=utf-8", "pdf.worker.min.mjs": "text/javascript; charset=utf-8"}
-VENDOR_CACHE = "public, max-age=31536000, immutable"   # the path names a pinned release; a bump changes the file set
+# The URL carries no version, so a bump keeps the path: browsers revalidate every time (no-cache) against a strong
+# ETag that is the file's sha256 (the SHA256SUMS value), and get a 304 while it is unchanged.
+VENDOR_CACHE = "no-cache"
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 _SHARE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -465,6 +467,19 @@ def _weak(tag: str) -> str:
     return tag[2:] if tag.startswith("W/") else tag
 
 
+def vendor_etag(body: bytes) -> str:
+    """Strong validator for a vendored file: its sha256, the same digest SHA256SUMS records."""
+    return f'"{hashlib.sha256(body).hexdigest()}"'
+
+
+def etag_matches(if_none_match: str | None, etag: str) -> bool:
+    """If-None-Match (weak comparison, ``*`` matches) against one ETag."""
+    if if_none_match is None:
+        return False
+    tags = [_weak(t) for t in _parse_etags(if_none_match)]
+    return "*" in tags or etag in tags
+
+
 def parse_range(value: str, size: int):
     """None to ignore the header (serve 200), "unsatisfiable" for 416, or an inclusive (start, end) for 206.
 
@@ -842,14 +857,26 @@ class ShareHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
         finally:
             os.close(fd)
-        return self._send_viewer_bytes(lab, b"".join(chunks), content_type, VENDOR_CACHE if subdir else "no-store")
+        body = b"".join(chunks)
+        if not subdir:
+            return self._send_viewer_bytes(lab, body, content_type)
+        etag = vendor_etag(body)
+        if etag_matches(self.headers.get("If-None-Match"), etag):
+            return self._send_viewer_bytes(lab, body, content_type, VENDOR_CACHE, etag=etag, status=304)
+        return self._send_viewer_bytes(lab, body, content_type, VENDOR_CACHE, etag=etag)
 
-    def _send_viewer_bytes(self, lab: LabSettings, body: bytes, content_type: str, cache: str = "no-store"):
-        _send_headers(self, 200, [("Content-Type", content_type), ("Content-Length", str(len(body))),
-                                  ("Content-Security-Policy", lab.viewer_csp), ("X-Content-Type-Options", "nosniff"),
-                                  ("Cache-Control", cache), ("Referrer-Policy", "no-referrer"),
-                                  ("X-Robots-Tag", "noindex"), ("X-Frame-Options", "DENY")], cors=False)
-        if self.command != "HEAD":
+    def _send_viewer_bytes(self, lab: LabSettings, body: bytes, content_type: str, cache: str = "no-store",
+                           *, etag: str | None = None, status: int = 200):
+        headers = [("Content-Type", content_type), ("Content-Length", str(len(body))),
+                   ("Content-Security-Policy", lab.viewer_csp), ("X-Content-Type-Options", "nosniff"),
+                   ("Cache-Control", cache), ("Referrer-Policy", "no-referrer"),
+                   ("X-Robots-Tag", "noindex"), ("X-Frame-Options", "DENY")]
+        if etag:
+            headers.append(("ETag", etag))
+        if status == 304:
+            headers = [h for h in headers if h[0] not in ("Content-Type", "Content-Length")]
+        _send_headers(self, status, headers, cors=False)
+        if self.command != "HEAD" and status == 200:
             self.wfile.write(body)
 
     def _single_header(self, name: str) -> str | None:

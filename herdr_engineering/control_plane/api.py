@@ -42,6 +42,7 @@ from .graph import read_graph
 from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_delivery, redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
+from .share_public import etag_matches, vendor_etag
 from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
@@ -139,7 +140,6 @@ _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 # two modules into its web root's /vendor/pdfjs/. Nothing else of that directory (LICENSE, SHA256SUMS) is served.
 _PDFJS_VENDOR_DIR = Path(__file__).resolve().parent / "share_static" / "vendor" / "pdfjs"
 _VENDORED_PDFJS = frozenset({"vendor/pdfjs/pdf.min.mjs", "vendor/pdfjs/pdf.worker.min.mjs"})
-_VENDOR_CACHE = "public, max-age=31536000, immutable"
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
 _MAX_ATTACHMENT_JSON = 36 * 1024 * 1024        # a 25 MiB attachment is ~33.4 MiB of base64 plus its mail envelope
@@ -5403,11 +5403,20 @@ def _make_handler(server, public=False, operator=False):
                 ".js": "text/javascript", ".svg": "image/svg+xml",
             }.get(target.suffix, "application/octet-stream")
             data = target.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
+            etag = vendor_etag(data) if vendored else None
+            not_modified = vendored and etag_matches(self.headers.get("If-None-Match"), etag)
+            self.send_response(304 if not_modified else 200)
+            if not not_modified:
+                self.send_header("Content-Type", ctype)
             self.send_header("X-Content-Type-Options", "nosniff")
-            # The vendored path names a pinned release; everything else is the dashboard's own, edited code.
-            self.send_header("Cache-Control", _VENDOR_CACHE if vendored else "no-store")
+            # The vendored path carries no version: revalidate (no-cache) against a sha256 ETag; the rest is the
+            # dashboard's own, edited code.
+            self.send_header("Cache-Control", "no-cache" if vendored else "no-store")
+            if etag:
+                self.send_header("ETag", etag)
+            if not_modified:
+                self.end_headers()
+                return None
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
