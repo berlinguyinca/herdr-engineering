@@ -2440,3 +2440,221 @@ def test_staged_bytes_never_reach_the_logs(registry_pg, tmp_path, caplog):
         assert env.result(two["ticket"])["reason"] == FAILED
     committing(registry_pg, tmp_path, body)
     assert SENTINEL not in caplog.text and SENTINEL[::-1] not in caplog.text
+
+
+# ----------------------------------------------------------------------------- staging sweep (Task 5d)
+
+TTL = BridgeLimits().staging_ttl_seconds
+
+
+def age_dir(env, d, seconds):
+    """Make every file in ``d`` (and ``d``) ``seconds`` old by the fake clock."""
+    when = env.clock() - seconds
+    for p in [*d.rglob("*"), d]:
+        os.utime(p, (when, when), follow_symlinks=False)
+
+
+def live_grant(aid, agent_id, permission="write", *, expires=None):
+    return {"artifact_id": aid, "agent_id": agent_id, "permission": permission,
+            "expires_at": expires or datetime.now(UTC) + timedelta(days=1)}
+
+
+def active(*ids):
+    return {i: {"status": "active"} for i in ids}
+
+
+def swept(env, agents, grants):
+    return env.applier.sweep_staging(None, agents=agents, grants=grants)
+
+
+def sweeping(pg, tmp_path, body, **kw):
+    async def go(env):
+        return await body(env, uid("agent"))
+    return run(pg, tmp_path, go, **kw)
+
+
+def test_sweep_removes_an_upload_older_than_the_ttl_and_keeps_a_fresh_one(registry_pg, tmp_path):
+    async def body(env, a):
+        old, d_old = stage(env, a, "art1", "old.bin", BLOB)
+        new, d_new = stage(env, a, "art1", "new.bin", BLOB[:100])
+        age_dir(env, d_old, TTL + 1)
+        age_dir(env, d_new, TTL - 60)
+        n = await swept(env, active(a), [live_grant("art1", a)])
+        assert n == 1 and not d_old.exists() and d_new.is_dir()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_the_ttl_counts_from_the_newest_part_not_the_oldest(registry_pg, tmp_path):
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "big.bin", BLOB)
+        age_dir(env, d, TTL + 1000)
+        fresh = env.clock() - 5
+        os.utime(d / "0000002", (fresh, fresh))
+        assert await swept(env, active(a), [live_grant("art1", a)]) == 0 and d.is_dir()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_sweep_removes_the_uploads_of_a_revoked_agent(registry_pg, tmp_path):
+    async def body(env, a):
+        b = uid("agent")
+        _, d_a = stage(env, a, "art1", "a.bin", BLOB[:50])
+        _, d_b = stage(env, b, "art1", "b.bin", BLOB[:50])
+        assert await swept(env, {a: {"status": "revoked"}}, [live_grant("art1", a), live_grant("art1", b)]) == 2
+        assert not d_a.exists() and not d_b.exists()      # b is absent from agents.json altogether
+    sweeping(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("grants", [
+    "none", "other_artifact", "read_only", "expired",
+])
+def test_sweep_removes_an_upload_whose_write_grant_is_gone(registry_pg, tmp_path, grants):
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "a.bin", BLOB[:50])
+        _, keep = stage(env, a, "art2", "b.bin", BLOB[:50])
+        live = {
+            "none": [], "other_artifact": [live_grant("art3", a)], "read_only": [live_grant("art1", a, "read")],
+            "expired": [live_grant("art1", a, expires=datetime.now(UTC) - timedelta(seconds=1))],
+        }[grants]
+        n = await swept(env, active(a), [*live, live_grant("art2", a)])
+        assert n == 1 and not d.exists() and keep.is_dir()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_sweep_keeps_an_upload_referenced_by_a_pending_intent(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, v1 = "art1", "ver1"
+        upl, d = stage(env, a, aid, "blob.bin", BLOB)
+        gone, d_gone = stage(env, a, aid, "gone.bin", BLOB[:50])
+        age_dir(env, d, TTL + 1)
+        age_dir(env, d_gone, TTL + 1)
+        env.intent(agent(a), kind="commit", artifact_id=aid,
+                   payload={"base_version_id": v1, "message": "m", "changes": [staged("blob.bin", upl)]})
+        n = await swept(env, {}, [])                          # revoked, no grant, past the TTL: still pending
+        assert n == 1 and d.is_dir() and not d_gone.exists()
+        for f in (env.outbox / "intents").iterdir():
+            f.unlink()
+        assert await swept(env, {}, []) == 1 and not d.exists()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_sweep_keeps_a_young_dir_without_meta_and_removes_an_old_one(registry_pg, tmp_path):
+    async def body(env, a):
+        young = env.outbox / "staging" / a / cbf.upload_id_for(a, "art1", "y.bin", "0" * 64, 5)
+        old = env.outbox / "staging" / a / cbf.upload_id_for(a, "art1", "o.bin", "1" * 64, 5)
+        bad = env.outbox / "staging" / a / cbf.upload_id_for(a, "art1", "b.bin", "2" * 64, 5)
+        for d in (young, old, bad):
+            d.mkdir(parents=True)
+            (d / "0000000").write_bytes(b"x")
+        (bad / "meta.json").write_text("{not json")
+        age_dir(env, old, 61)
+        age_dir(env, bad, 61)
+        age_dir(env, young, 30)
+        n = await swept(env, active(a), [live_grant("art1", a)])
+        assert n == 2 and young.is_dir() and not old.exists() and not bad.exists()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_a_registered_prefix_is_exempt_from_the_agent_and_grant_rules(registry_pg, tmp_path):
+    async def body(env, a):
+        verdict = {"keep": True}
+        seen = []
+
+        async def keep(owner, meta):
+            seen.append((owner, meta.upload_id))
+            return verdict["keep"]
+        env.applier.register_staging_owner("m_", keep)
+        upl, d = stage(env, "m_x", "art1", "m.bin", BLOB[:50])      # no agent, no grant
+        assert await swept(env, {}, []) == 0 and d.is_dir() and seen == [("m_x", upl)]
+        verdict["keep"] = False
+        assert await swept(env, {}, []) == 1 and not d.exists()
+        _, d2 = stage(env, "m_x", "art1", "m2.bin", BLOB[:60])
+        age_dir(env, d2, TTL + 1)
+        verdict["keep"] = True
+        assert await swept(env, {}, []) == 1 and not d2.exists()    # the TTL still applies
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_a_failing_keep_predicate_deletes_nothing(registry_pg, tmp_path):
+    async def body(env, a):
+        async def keep(owner, meta):
+            raise RuntimeError(SENTINEL)
+        env.applier.register_staging_owner("m_", keep)
+        _, d = stage(env, "m_x", "art1", "m.bin", BLOB[:50])
+        assert await swept(env, {}, []) == 0 and d.is_dir()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_register_staging_owner_validates(registry_pg, tmp_path):
+    async def body(env, a):
+        async def keep(owner, meta):
+            return True
+        for bad in ("", "x_", "m", 5, "m_/"):
+            with pytest.raises(ValueError):
+                env.applier.register_staging_owner(bad, keep)
+        with pytest.raises(ValueError):
+            env.applier.register_staging_owner("m_", "nope")
+        env.applier.register_staging_owner("m_", keep)
+        with pytest.raises(ValueError):
+            env.applier.register_staging_owner("m_", keep)
+    sweeping(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("level", ["owner_dir", "upload_dir"])
+def test_sweep_never_follows_a_symlinked_owner_or_upload_dir(registry_pg, tmp_path, level):
+    async def body(env, a):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "sentinel").write_text(SENTINEL)
+        upl, d = stage(env, a, "art1", "x.bin", BLOB[:50])
+        age_dir(env, d, TTL + 1)
+        if level == "owner_dir":
+            link = env.outbox / "staging" / "evil"
+            (outside / upl).mkdir()
+            (outside / upl / "0000000").write_bytes(b"x")
+            link.symlink_to(outside, target_is_directory=True)
+        else:
+            link = env.outbox / "staging" / a / cbf.upload_id_for(a, "art1", "link.bin", "3" * 64, 5)
+            link.symlink_to(outside, target_is_directory=True)
+        before = tree(outside)
+        n = await swept(env, {}, [])
+        assert n == 1 and not d.exists()                  # the real expired upload went; the link did not count
+        assert link.is_symlink() and tree(outside) == before
+        assert (outside / "sentinel").read_text() == SENTINEL
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_a_broken_entry_does_not_stop_the_sweep_and_the_count_is_returned(registry_pg, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+
+    async def body(env, a):
+        broken = env.outbox / "staging" / a / cbf.upload_id_for(a, "art1", "z.bin", "4" * 64, 5)
+        broken.mkdir(parents=True)
+        (broken / "meta.json").write_text(SENTINEL)
+        for i in range(cbf.tree_entry_cap(env.applier.limits) + 5):      # listing it trips the entry cap
+            (broken / f"junk{i}").write_bytes(b"")
+        age_dir(env, broken, TTL + 1)
+        unreadable = env.outbox / "staging" / a / cbf.upload_id_for(a, "art1", "u.bin", "5" * 64, 5)
+        unreadable.mkdir()
+        (unreadable / "meta.json").write_text("{}")
+        os.chmod(unreadable / "meta.json", 0)
+        age_dir(env, unreadable, 100)
+        _, d1 = stage(env, a, "art1", "e1.bin", BLOB[:50])
+        _, d2 = stage(env, a, "art1", "e2.bin", BLOB[:60])
+        age_dir(env, d1, TTL + 1)
+        age_dir(env, d2, TTL + 1)
+        n = await swept(env, active(a), [live_grant("art1", a)])
+        assert n == 3 and broken.is_dir() and not d1.exists() and not d2.exists() and not unreadable.exists()
+    sweeping(registry_pg, tmp_path, body, limits=BridgeLimits(max_file_bytes=CHUNK))
+    assert SENTINEL not in caplog.text
+
+
+def test_a_verified_upload_dir_is_swept_by_the_ttl_like_any_other(registry_pg, tmp_path):
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "v.bin", BLOB[:50])
+        for p in list(d.iterdir()):
+            if p.name != "meta.json":
+                p.unlink()
+        (d / "verified").write_bytes(b"")
+        age_dir(env, d, TTL + 1)
+        assert await swept(env, active(a), [live_grant("art1", a)]) == 1 and not d.exists()
+    sweeping(registry_pg, tmp_path, body)
