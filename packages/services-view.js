@@ -2,6 +2,9 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { reportFreshness } from './record-state.js';
 import { formatTimestamp, formatDuration } from './herdr-web-components/format.js';
+import { snapshotText, animateChanges } from './motion.js';
+import { patchText } from './patch.js';
+import './freshness.js';
 
 const metadataObservation = service => service.catalog?.metadata_observation ?? service.metadata_observation;
 const localOnly = service => service.endpoint_scope === 'local_only' || service.catalog?.endpoint_scope === 'local_only';
@@ -84,8 +87,8 @@ export function groupServices(services, by = 'project') {
   return [...groups.values()].sort((a,b) => a.label.localeCompare(b.label));
 }
 
-function lastSeen(s) {
-  const date = s.lifecycle?.last_seen_at || s.updated_at;
+function lastSeen(s) { return seenAgo(s.lifecycle?.last_seen_at || s.updated_at); }
+function seenAgo(date) {
   const age = date ? Date.now() - Date.parse(date) : NaN;
   return Number.isFinite(age) ? `${formatDuration(Math.max(0,age))} ago` : 'Not reported';
 }
@@ -106,7 +109,7 @@ function serviceRow(s) {
       <span class="sc-meta">${esc(typeLabel(s))}${s.owner ? ` · Process: ${esc(s.owner)}` : ''}</span></div>
     <div class="sc-location"><a href="#/hosts/${esc(encodeURIComponent(hostLabel(s)))}">${esc(hostLabel(s))}</a>
       <span>${localOnly(s) ? 'Observed port ' : `${s.catalog?.source_port != null ? `Source :${esc(s.catalog.source_port)} · ` : ''}Exposed `}${s.port != null ? `:${esc(s.port)}` : 'port unknown'}</span>${endpoint(s)}</div>
-    <div class="sc-health"><strong data-state="${serviceState(s)}">${stateLabel(s)}</strong><span>Last report ${esc(lastSeen(s))}</span>
+    <div class="sc-health"><strong data-state="${serviceState(s)}">${stateLabel(s)}</strong><span>Last report <span data-service-seen="${esc(s.lifecycle?.last_seen_at || s.updated_at || '')}">${esc(lastSeen(s))}</span></span>
       <span class="sc-meta">${esc(serviceReason(s))}</span></div>
   </article>`;
 }
@@ -115,7 +118,7 @@ const styles = `<style>
 .sc-intro {color:var(--text-secondary); max-width:80ch; line-height:1.6}
 .sc-history>summary {cursor:pointer;color:var(--text-secondary);font-size:13px}.sc-history .sc-counts {margin:12px 0}
 .sc-counts {display:flex; flex-wrap:wrap; gap:8px; margin:12px 0}
-.sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px;font-size:13px}
+.sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:var(--control-radius);padding:10px 14px;font-size:13px}
 .sc-counts strong {font-size:20px;margin-right:5px}
 .sc-controls {display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:12px 0}
 .sc-controls label {display:flex;flex-direction:column;gap:5px;font-size:13px}
@@ -148,15 +151,19 @@ export function renderServiceDetails(s) {
   ];
   return `${styles}<a data-service-back href="${SCOPE_PAGE[{herdr:'herdr',system:'system'}[serviceScope(s)] || 'local'].path}">← ${SCOPE_PAGE[{herdr:'herdr',system:'system'}[serviceScope(s)] || 'local'].title}</a><h1>${esc(s.service_name || s.service_id)}</h1>
     <p class="sc-intro">${esc(s.description || s.catalog?.purpose || 'Description not reported.')}</p>
-    <p><strong>${stateLabel(s)}</strong> · ${esc(serviceReason(s))} Last report <span data-service-age>${esc(lastSeen(s))}</span>.</p>
+    <p><strong data-service-state>${stateLabel(s)}</strong> · ${esc(serviceReason(s))} Last report <span data-service-age>${esc(lastSeen(s))}</span>.</p>
     ${s.lifecycle?.archived ? '<p class="sc-intro">Archived services are hidden from the current catalog. A healthy report restores this service automatically; its history is retained.</p>' : ''}
     <dl class="sc-detail">${fields.map(([k,v])=>`<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
     <p>${endpoint(s)}</p>${reportedText(s.session_id) ? `<p><a data-owning-session href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">Owning agent →</a></p>` : ''}`;
 }
 
 // Keep an open detail page honest even when the provider stops updating.
-export function mountServiceDetails(root, client, initial) {
+export function mountServiceDetails(page, client, initial) {
   let service=initial, disposed=false, controller=null, signature='', error='';
+  // The chip sits above the detail body, which is redrawn whenever the report changes.
+  page.innerHTML='<div class="hd-live-head"><herdr-freshness interval="30000"></herdr-freshness></div><div data-service-body></div>';
+  const chip=page.querySelector('herdr-freshness'),root=page.querySelector('[data-service-body]');
+  chip.touch(true);
   function draw() {
     if(disposed)return;
     const next=JSON.stringify([service,serviceState(service)]);
@@ -166,7 +173,9 @@ export function mountServiceDetails(root, client, initial) {
       const href=root.contains(focused) ? focused.getAttribute('href') : null;
       const restore=root.contains(focused);
       const scroll={x:window.scrollX,y:window.scrollY};
+      const before=snapshotText(root,'[data-service-state]',()=> 'state');
       root.innerHTML=renderServiceDetails(service)+'<p class="sc-meta" data-service-refresh role="status"></p>';
+      animateChanges(root,'[data-service-state]',before,()=> 'state',{count:false});
       if(restore) {
         const target=[...root.querySelectorAll('a')].find(anchor=>href && anchor.getAttribute('href')===href) || root.querySelector('[data-service-back]');
         target?.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);
@@ -184,9 +193,9 @@ export function mountServiceDetails(root, client, initial) {
       if(disposed||request.signal.aborted)return;
       const found=Array.isArray(data?.services) && data.services.find(item=>item?.service_id===service.service_id);
       if(!found)throw new Error('Service report unavailable');
-      service=found;error='';
-    } catch {
-      if(!disposed)error='Could not refresh this service. Showing its last received report.';
+      service=found;error='';chip.touch(true);
+    } catch (failure) {
+      if(!disposed){error='Could not refresh this service. Showing its last received report.';chip.touch(false,request.signal.aborted?'timed out':failure?.message||'request failed');}
     } finally {clearTimeout(timeout);controller=null;if(!disposed)draw();}
   }
   function visibility(){if(document.hidden)controller?.abort();else{draw();refresh();}}
@@ -203,7 +212,7 @@ export function mountServices(root, client, initial, {showAll = false, status, s
   let pending = false;
   const state = {scope:SCOPE_PAGE[scope] ? scope : 'herdr',search:'',host:'',status:['current','unavailable','unknown','all','archived'].includes(status)?status:showAll?'all':'current',archived:status==='archived',group:SCOPE_PAGE[scope] && scope!=='herdr'?'type':'project'};
   const openGroups = new Map();
-  root.innerHTML = `${styles}<h1>${SCOPE_PAGE[state.scope].title}</h1>
+  root.innerHTML = `${styles}<div class="hd-live-head"><h1>${SCOPE_PAGE[state.scope].title}</h1><herdr-freshness interval="30000"></herdr-freshness></div>
     <p class="sc-intro">${SCOPE_INTRO[state.scope]}</p>
     <p class="sc-meta">${Object.entries(SCOPE_PAGE).filter(([key])=>key!==state.scope).map(([,page])=>`<a href="${page.path}">${page.label} →</a>`).join(' · ')}</p>
     <div class="sc-counts" id="sc-counts"></div><details class="sc-history" id="sc-history"><summary id="sc-history-summary">History and unconfirmed reports</summary><div class="sc-counts" id="sc-history-counts"></div></details>
@@ -215,10 +224,12 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       <label>Group by<select id="sc-group"><option value="project">Project / repository</option><option value="host">Host</option><option value="type">Service type</option></select></label>
       <label class="sc-check"><input type="checkbox" id="sc-archived">Include archived</label>
     </div>
-    <div class="sc-toolbar"><span id="sc-result" role="status"></span><div><button class="hd-btn" id="sc-expand">Expand groups</button> <button class="hd-btn" id="sc-collapse">Collapse groups</button></div></div>
+    <div class="sc-toolbar"><span id="sc-result" role="status"></span><div><button class="hd-btn hd-btn--secondary" id="sc-expand">Expand groups</button> <button class="hd-btn hd-btn--secondary" id="sc-collapse">Collapse groups</button></div></div>
     <p id="sc-error" role="status" class="sc-meta"></p><div id="sc-results"></div>`;
   const el = id => root.querySelector(`#sc-${id}`);
   el('status').value = state.status; el('archived').checked = state.archived; el('group').value = state.group;
+  const filterKey=node=>node.closest('[data-filter]')?.dataset.filter;
+  const serviceKey=node=>node.closest('[data-service-id]')?.dataset.serviceId;
   function draw() {
     const focused=document.activeElement;
     const focusedRow=root.contains(focused) ? focused.closest('[data-service-id]') : null;
@@ -236,6 +247,10 @@ export function mountServices(root, client, initial, {showAll = false, status, s
     const counts = {current:0,unavailable:0,archived:0,unknown:0};
     scoped.forEach(s=>counts[serviceState(s)]++);
     const countButton = (key,label) => `<button type="button" data-filter="${key}" aria-pressed="${state.status===key}"><strong>${counts[key]}</strong>${label}</button>`;
+    // The panels are rebuilt with innerHTML (Task 19 moves them onto the patcher), so motion pairs
+    // old and new nodes by key: counts by filter, rows by service id (state label change = flash).
+    const countsBefore=snapshotText(root,'[data-filter] strong',filterKey);
+    const statesBefore=snapshotText(el('results'),'[data-service-id] .sc-health strong',serviceKey);
     el('counts').innerHTML = countButton('current','Reported healthy');
     el('history-counts').innerHTML = [['unavailable','Unavailable'],['unknown','Unconfirmed'],['archived','Archived']].map(([key,label])=>countButton(key,label)).join('');
     el('history-summary').textContent = `${scoped.length-counts.current} history and unconfirmed reports`;
@@ -253,6 +268,8 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       const summary=[...new Set(g.services.map(stateLabel))].map(label=>`${g.services.filter(s=>stateLabel(s)===label).length} ${label.toLowerCase()}`).join(' · ');
       return `<details class="sc-group" data-group="${esc(key)}" ${open?'open':''}><summary>${esc(g.label)}<span>${g.services.length} services · ${esc(summary)}</span></summary>${g.services.map(serviceRow).join('')}</details>`;
     }).join(''):`<herdr-empty message="${!scoped.length ? state.scope==='herdr' ? 'No services have a confirmed HerdR launch association yet. Discovered listeners are under Local services.' : state.scope==='system' ? 'No services have been confirmed as system units.' : 'No local services have been reported.' : 'No services match these filters. Choose a status count above, select All statuses, or clear your search to explore the catalog.'}"></herdr-empty>`;
+    animateChanges(root,'[data-filter] strong',countsBefore,filterKey);
+    animateChanges(el('results'),'[data-service-id] .sc-health strong',statesBefore,serviceKey,{count:false,target:node=>node.closest('[data-service-id]')});
     root.querySelectorAll('.sc-group').forEach(d=>d.addEventListener('toggle',()=>{if(d.isConnected)openGroups.set(d.dataset.group,d.open);}));
     if(focusKey && !focused.isConnected) {
       let target;
@@ -298,19 +315,25 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       if(disposed)return;
       services=data.services;
       el('error').textContent='';
+      chip()?.touch(true);
       // Capture before replacement, including toggles whose queued event has not fired.
       root.querySelectorAll('.sc-group').forEach(d=>openGroups.set(d.dataset.group,d.open));
       draw();
-    } catch { if(!disposed)el('error').textContent='Could not refresh services. Showing the last received catalog.'; }
+    } catch (error) { if(!disposed){el('error').textContent='Could not refresh services. Showing the last received catalog.';chip()?.touch(false,error?.message||'request failed');} }
     finally {pending=false;}
   }
   draw();
+  // The catalog arrived with the route; the chip starts fresh and follows each 30 s poll.
+  const chip=()=>root.querySelector('herdr-freshness');
+  chip()?.touch(true);
   const timer=setInterval(refresh,30000);
   let classification=services.map(s=>serviceState(s)).join(',');
   const clock=setInterval(()=>{
     if(disposed||document.hidden)return;
     const next=services.map(s=>serviceState(s)).join(',');
     if(next!==classification){classification=next;draw();}
+    // "Last report N ago" keeps counting between refreshes (written only when the text changes).
+    for(const age of root.querySelectorAll('[data-service-seen]'))patchText(age,seenAgo(age.dataset.serviceSeen));
   },1000);
   return {refresh,dispose(){disposed=true;clearInterval(timer);clearInterval(clock);root.removeEventListener('click',chooseStatus);}};
 }

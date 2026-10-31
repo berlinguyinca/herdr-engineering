@@ -35,7 +35,7 @@ class Client:
 @pytest.fixture()
 def server(acknowledged_sink):
     repo = ControlPlaneRepo(sink=acknowledged_sink)
-    svr = ControlPlaneServer(repo)
+    svr = ControlPlaneServer(repo, scheduler_admission=True)
     thread = threading.Thread(target=svr.serve, daemon=True)
     thread.start()
     svr.wait_until_ready()
@@ -79,6 +79,82 @@ def test_mission_not_found_404(server):
     assert status == 404
 
 
+def test_mission_delivery_routes(server):
+    c, repo = server
+    mid = repo.create_mission("Delivery routes")
+    repo.upsert_test_run("tr1", mission_id=mid, status="passed",
+                         passed=3, failed=0, total=3, kind="test")
+    repo.upsert_test_run("tr2", mission_id=mid, status="passed",
+                         passed=1, failed=0, total=1, kind="test")
+    repo.upsert_test_run("build1", mission_id=mid, status="ok", kind="build")
+    # a run belonging to a different mission must not leak into this one's lists
+    repo.upsert_test_run("other", mission_id="MSN-other", status="failed",
+                         failed=1, total=1, kind="test")
+    repo.upsert_review("rv1", mission_id=mid, reviewer="codex",
+                       status="completed", verdict="approved")
+    repo.upsert_pull_request("pr1", mission_id=mid, repository="acme/w",
+                             number=7, url="https://github.com/acme/w/pull/7",
+                             status="merged")
+    repo.upsert_pull_request("pr2", mission_id=mid, repository="acme/w",
+                             number=8, url="https://github.com/acme/w/pull/8",
+                             status="open")
+
+    _, _, body = c.get(f"/api/v1/missions/{mid}/tests")
+    tests = json.loads(body)["tests"]
+    assert [t["test_run_id"] for t in tests] == ["tr1", "tr2"]
+    assert all(t["mission_id"] == mid for t in tests)
+    # Counts must survive value-only redaction: the ``passed`` key is not a
+    # secret hint (key-name redaction would wrongly turn it into [REDACTED]).
+    assert tests[0]["passed"] == 3 and tests[0]["failed"] == 0
+
+    _, _, body = c.get(f"/api/v1/missions/{mid}/builds")
+    builds = json.loads(body)["builds"]
+    assert [b["test_run_id"] for b in builds] == ["build1"]
+
+    _, _, body = c.get(f"/api/v1/missions/{mid}/reviews")
+    reviews = json.loads(body)["reviews"]
+    assert [rv["review_id"] for rv in reviews] == ["rv1"]
+    assert reviews[0]["verdict"] == "approved"
+
+    _, _, body = c.get(f"/api/v1/missions/{mid}/pulls")
+    pulls = json.loads(body)["pulls"]
+    assert [p["pr_id"] for p in pulls] == ["pr1", "pr2"]
+    assert all(p["mission_id"] == mid for p in pulls)
+
+
+def test_mission_delivery_redaction_keeps_counts_but_scans_values(server):
+    c, repo = server
+    mid = repo.create_mission("Redaction")
+    repo.upsert_test_run("tr", mission_id=mid, status="failed",
+                         passed=4, failed=1, total=5,
+                         results=[{"name": "runner leaked token abc123xyz789"}])
+    repo.upsert_pull_request("pr", mission_id=mid, number=1, status="open",
+                             url="https://example.com/pr/1")
+    _, _, body = c.get(f"/api/v1/missions/{mid}/tests")
+    tests = json.loads(body)["tests"]
+    assert tests[0]["passed"] == 4 and tests[0]["failed"] == 1
+    # a leaked secret in a string value is redacted, a URL is preserved
+    assert "abc123xyz789" not in body.decode()
+    _, _, body = c.get(f"/api/v1/missions/{mid}/pulls")
+    assert json.loads(body)["pulls"][0]["url"] == "https://example.com/pr/1"
+
+
+def test_mission_delivery_routes_unknown_mission_404(server):
+    c, _ = server
+    for sub in ("tests", "builds", "reviews", "pulls"):
+        status, _, _ = c.get(f"/api/v1/missions/mission_nope/{sub}")
+        assert status == 404, sub
+
+
+def test_mission_delivery_routes_empty_for_known_mission(server):
+    c, repo = server
+    mid = repo.create_mission("No delivery records")
+    for sub in ("tests", "builds", "reviews", "pulls"):
+        status, _, body = c.get(f"/api/v1/missions/{mid}/{sub}")
+        assert status == 200, sub
+        assert json.loads(body)[sub] == [], sub
+
+
 def test_sessions_and_services(server):
     c, repo = server
     mid = repo.create_mission("m")
@@ -88,6 +164,39 @@ def test_sessions_and_services(server):
     assert len(json.loads(body)["sessions"]) == 1
     status, _, body = c.get("/api/v1/services")
     assert json.loads(body)["services"][0]["port"] == 8080
+
+
+def test_session_commits_endpoint_reports_a_state_and_404_for_an_unknown_agent(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x")
+    status, _, body = c.get("/api/v1/sessions/sx/commits")
+    out = json.loads(body)
+    assert status == 200 and out["state"] == "unknown" and out["session_id"] == "sx" and out["commits"] == []
+    assert c.get("/api/v1/sessions/nope/commits")[0] == 404
+
+
+def test_pull_request_trail_endpoint_links_the_agent_and_rejects_bad_or_unknown_pull_requests(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x", status="active")
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="open", branch="feat/x")
+    status, _, body = c.get("/api/v1/pull-requests/org/app/7/trail")
+    out = json.loads(body)
+    assert status == 200 and out["pull_request"]["number"] == 7 and out["state"] == "linked"
+    assert [s["session_id"] for s in out["sessions"]] == ["sx"] and out["sources"]["ci"] == "unavailable"
+    assert out["signals"]["ci_green_first_try"]["value"] is None
+    assert c.get("/api/v1/pull-requests/org/app/8/trail")[0] == 404
+    assert c.get("/api/v1/pull-requests/org/app/0/trail")[0] == 400
+
+
+def test_pull_request_trail_is_cached_briefly_and_validates_the_host(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x", status="active")
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="open", branch="feat/x")
+    first = json.loads(c.get("/api/v1/pull-requests/org/app/7/trail")[2])
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="merged", branch="feat/x")
+    assert json.loads(c.get("/api/v1/pull-requests/org/app/7/trail")[2])["pull_request"]["status"] == first["pull_request"]["status"] == "open"
+    assert c.get("/api/v1/pull-requests/org/app/7/trail?host=github.com")[0] == 200
+    assert c.get("/api/v1/pull-requests/org/app/7/trail?host=bad%20host!")[0] == 400
 
 
 def test_session_with_colon_id_fetches_percent_encoded(server):
@@ -162,6 +271,35 @@ def test_analytics(server):
     assert json.loads(body)["total"] == 1
     status, _, body = c.get("/api/v1/analytics/hosts")
     assert json.loads(body)["total"] == 0
+
+
+def test_analytics_tokens_survives_projectless_ingest_row(server):
+    c, repo = server
+    repo.add_token_usage({"mission_id": "m1", "model": "gpt",
+                          "request_id": "req-np", "input_tokens": 3})
+    status, _, body = c.get("/api/v1/analytics/tokens")
+    assert status == 200
+    assert json.loads(body)["total"]["input_tokens"] == 3
+
+
+def test_analytics_stages_and_usage(server):
+    c, repo = server
+    mid = repo.create_mission("stage-api")
+    repo.set_mission_stage(mid, "implementation")
+    repo.set_mission_stage(mid, "complete")
+    repo.add_token_usage({"mission_id": mid, "model": "gpt-4o",
+                          "request_id": "req-a", "input_tokens": 3})
+    repo.add_resource_usage({"mission_id": mid, "kind": "cpu", "value": 1.0})
+    status, _, body = c.get("/api/v1/analytics/stages")
+    assert status == 200
+    assert json.loads(body)["bottleneck"] == "implementation"
+    status, _, body = c.get("/api/v1/analytics/usage")
+    u = json.loads(body)
+    assert u["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 3
+    assert u["resources"]["cpu"]["total"] == 1.0
+    # Mission-scoped usage via ?mission=
+    status, _, body = c.get(f"/api/v1/analytics/usage?mission={mid}")
+    assert json.loads(body)["resources"]["cpu"]["total"] == 1.0
 
 
 def test_sse_stream_content_type(server):
@@ -253,8 +391,34 @@ def test_ingest_endpoint_upserts_host(server):
     # the ingested events are visible to a GET on the same stream
     _, _, stream = c.get("/api/v1/events?entity_type=host&entity_id=bender")
     evs = json.loads(stream)["events"]
-    assert [e["event_type"] for e in evs] == [
-        "HostRegistered", "HostHeartbeat"]
+    # a routine heartbeat (same identity) records no HostHeartbeat event
+    assert [e["event_type"] for e in evs] == ["HostRegistered"]
+
+
+def test_ingest_review_names_its_pull_request_and_a_bad_number_is_a_400(server):
+    c, repo = server
+    ok = {"entity_type": "review", "entity_id": "rv-pr", "event_type": "review.started",
+          "payload": {"reviewer": "codex", "repository": "github.com/org/app", "pull_request_number": 7}}
+    status, _ = c.post("/api/v1/ingest", ok)
+    assert status == 200
+    assert repo.list_reviews()[0]["pull_request_number"] == 7
+    status, body = c.post("/api/v1/ingest", {**ok, "entity_id": "rv-bad", "payload": {**ok["payload"], "pull_request_number": "7"}})
+    assert status == 400, body
+    assert [r["review_id"] for r in repo.list_reviews()] == ["rv-pr"]
+
+
+def test_ingest_delivery_entities_via_http_preserves_counts(server):
+    c, repo = server
+    # A numeric ``passed`` count must survive ingest-body redaction (the key
+    # contains the substring ``pass``) so the HTTP path accepts a real report.
+    status, body = c.post("/api/v1/ingest", {
+        "entity_type": "test_run", "entity_id": "http-run-1",
+        "event_type": "test_run.started",
+        "payload": {"mission_id": "m1", "status": "failed",
+                    "passed": 5, "failed": 1, "skipped": 0, "total": 6}})
+    assert status == 200, body
+    runs = repo.list_test_runs(mission_id="m1")
+    assert len(runs) == 1 and runs[0]["passed"] == 5
 
 
 def test_ingest_endpoint_validates_body(server):
@@ -604,6 +768,7 @@ def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink
     store = FlippingStore()
     svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), fleet_config=store)
     store.calls = 0  # construction reads the review_gate section once; count requests only
+    svr._deployments_stop.set()  # the deployment tick reads the config on its own thread; count requests only
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     try:
@@ -612,3 +777,104 @@ def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink
         assert store.calls == 1
     finally:
         svr.shutdown()
+
+
+def test_scheduler_api_is_readable_and_queues_untrusted_host(server):
+    c, repo = server
+    repo.upsert_host("beast", "beast", "100.0.0.2", host_uid="uid-beast", aliases=["beast"],
+                     platform="linux", scheduler_capacity={"total_cpu": 16, "total_memory_gib": 64})
+    status, _, body = c.get("/api/v1/scheduler")
+    assert status == 200 and json.loads(body)["hosts"][0]["host_uid"] == "uid-beast"
+    status, body = c.post("/api/v1/scheduler/plan", {
+        "request_id": "api-request", "agent_family": "codex", "placement_mode": "automatic",
+        "resource_profile": {"class": "coding", "cpu_cores": 1, "memory_gib": 1},
+    })
+    assert status == 200
+    assert json.loads(body)["state"] == "queued"
+
+
+def test_scheduler_lease_heartbeat_route_renews_and_rejects_stale_token(server):
+    c, repo = server
+    repo.upsert_host("beast", "beast", "100.0.0.2", host_uid="uid-beast", aliases=["beast"],
+                     platform="linux", scheduler_owned=True, scheduler_trusted=True,
+                     scheduler_policy={"mode": "automatic", "revision": 1},
+                     scheduler_capacity={"total_cpu": 4, "total_memory_gib": 8, "total_disk_gib": 20})
+    repo.record_telemetry("beast", {"freshness_seconds": 1, "sequence": 1})
+    base = {"request_id": "api-lease", "agent_family": "codex", "placement_mode": "automatic",
+            "resource_profile": {"class": "coding", "cpu_cores": 1, "memory_gib": 1}}
+    status, body = c.post("/api/v1/scheduler/reservations", base)
+    assert status == 201
+    reservation = json.loads(body)
+    status, body = c.post("/api/v1/scheduler/reservations/commit", {"reservation_id": reservation["reservation_id"]})
+    assert status == 200
+    committed = json.loads(body)
+    lease = repo.list_scheduler_leases()[0]
+    status, body = c.post("/api/v1/scheduler/leases/heartbeat", {
+        "lease_id": lease["lease_id"], "generation": lease["generation"], "token": lease["token"], "ttl": 120,
+    })
+    assert status == 200 and json.loads(body)["lease_id"] == committed["lease_id"]
+    status, body = c.post("/api/v1/scheduler/leases/heartbeat", {
+        "lease_id": lease["lease_id"], "generation": lease["generation"], "token": "wrong", "ttl": 120,
+    })
+    assert status == 409
+
+
+def test_agent_evolution_endpoint_serves_phases_and_a_learning_record_and_404s_for_an_unknown_agent(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x", status="finished")
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="open", branch="feat/x")
+    repo.inspector.ingest("sx", {"events": [{"kind": "tool", "call_id": "c1", "phase": "start", "tool": "bash", "args_preview": "pytest -q"},
+                                            {"kind": "tool", "call_id": "c1", "phase": "end", "output": "boom", "is_error": True, "exit_code": 1}]})
+    status, _, body = c.get("/api/v1/sessions/sx/evolution")
+    out = json.loads(body)
+    assert status == 200 and out["session_id"] == "sx"
+    assert [p["key"] for p in out["phases"]] == ["assigned", "worked", "handed_off", "produced", "verified", "outcome", "cost"]
+    lr = out["learning_record"]
+    assert lr["tool_calls"]["total"]["value"] == 1 and lr["tool_calls"]["failed"]["value"] == 1 and lr["outcome"]["value"] == "finished"
+    assert lr["cost_usd_estimate"]["value"] is None and "price table" in lr["cost_usd_estimate"]["reason"]
+    pr = next(i for p in out["phases"] if p["key"] == "produced" for i in p["items"] if i["kind"] == "pull_request")
+    assert pr["number"] == 7 and pr["trail"].startswith("#/pr/org/app/7")
+    assert c.get("/api/v1/sessions/nope/evolution")[0] == 404
+
+
+def test_agent_evolution_is_cached_briefly(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", status="running")
+    first = json.loads(c.get("/api/v1/sessions/sx/evolution")[2])
+    repo.upsert_session("sx", host_id="h", agent_role="pi", status="failed")
+    again = json.loads(c.get("/api/v1/sessions/sx/evolution")[2])
+    assert first["learning_record"]["outcome"]["value"] == again["learning_record"]["outcome"]["value"] == "running"
+
+
+def test_agent_evolution_requires_a_viewer_key_like_commits(fc_server):
+    port, _, _ = fc_server
+    for path in ("/api/v1/sessions/nope/evolution", "/api/v1/sessions/nope/commits"):
+        assert _fc_req(port, "GET", path)[0] == 401
+        assert _fc_req(port, "GET", path, {"X-API-Key": "wrong"})[0] == 401
+        assert _fc_req(port, "GET", path, {"X-API-Key": "viewkey"})[0] == 404          # authorised, then the agent is unknown
+
+
+def test_agent_evolution_reports_an_absent_tool_ring_as_not_held_not_as_none(server):
+    c, repo = server
+    repo.upsert_session("sy", host_id="h", agent_role="pi", status="running")
+    out = json.loads(c.get("/api/v1/sessions/sy/evolution")[2])
+    total = out["learning_record"]["tool_calls"]["total"]
+    assert total["value"] is None and "evicted" in total["reason"]
+
+
+def test_evolution_config_is_validated():
+    from herdr_engineering.control_plane.agent_evolution import evolution_config
+    assert evolution_config(None) == {"stale_after_minutes": 120} and evolution_config({"stale_after_minutes": 30}) == {"stale_after_minutes": 30}
+    for bad in ([], {"stale_after_minutes": 0}, {"stale_after_minutes": True}, {"stale_after_minutes": "5"}, {"nope": 1}):
+        with pytest.raises(ValueError):
+            evolution_config(bad)
+
+
+def test_learning_trails_default_to_the_operator_role_and_reject_missing_or_wrong_keys(fc_server):
+    port, _, _ = fc_server
+    for path in ("/api/v1/learning/trails", "/api/v1/learning/trails.jsonl"):
+        assert _fc_req(port, "GET", path)[0] == 401
+        assert _fc_req(port, "GET", path, {"X-API-Key": "wrong"})[0] == 401
+        assert _fc_req(port, "GET", path, {"X-API-Key": "viewkey"})[0] == 403
+        assert _fc_req(port, "GET", path, {"X-API-Key": "opkey"})[0] == 200
+        assert _fc_req(port, "GET", path + "?limit=0", {"X-API-Key": "opkey"})[0] == 400

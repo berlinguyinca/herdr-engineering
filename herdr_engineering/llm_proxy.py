@@ -81,6 +81,7 @@ class ProxyState:
         self.refresh_seconds = refresh_seconds
         self._keys: dict[str, dict] = {}
         self._models: dict[str, dict] = {}
+        self._egress: dict = {}
         self._lock = threading.Lock()
         self._slots: dict[str, threading.BoundedSemaphore] = {}
         self._inflight: dict[str, int] = {}
@@ -102,6 +103,7 @@ class ProxyState:
         with self._lock:
             self._keys = {k["key_hash"]: k for k in cfg.get("keys", [])}
             self._models = {m["name"]: m for m in cfg.get("custom_models", [])}
+            self._egress = cfg.get("egress") if isinstance(cfg.get("egress"), dict) else {}
             self._last = time.monotonic()
 
     def authenticate(self, presented: str) -> dict | None:
@@ -223,6 +225,27 @@ class ProxyState:
             return self.upstream, self.upstream_key, concrete
         return custom["base_url"], None, custom.get("upstream_model") or model
 
+    def egress_check(self, model: str | None, data_class: str | None) -> tuple[bool, str]:
+        """Classified-content gate. Route kinds come from operator config (``egress.upstream_kind``,
+        ``egress.custom_kinds``), never from the request; an unconfigured route is treated as external."""
+        from .control_plane.intel_egress import may_route
+        with self._lock:
+            egress = self._egress
+        custom = self.custom_model(model)
+        kinds = egress.get("custom_kinds") if isinstance(egress.get("custom_kinds"), dict) else {}
+        approved = frozenset(x for x in (egress.get("approved") or []) if isinstance(x, str))
+
+        def norm(kind):
+            return kind if kind in ("local", "approved_cloud", "external") else "external"
+        # A custom model may be served by its own endpoint OR resolved onto the shared upstream (fabric model), so the
+        # content must be allowed on BOTH routes: marking a custom model local cannot launder data to the upstream.
+        routes = [norm(egress.get("upstream_kind"))] if not custom else [norm(kinds.get(custom["name"])), norm(egress.get("upstream_kind"))]
+        for kind in routes:
+            ok, why = may_route(data_class, kind, approved=approved)
+            if not ok:
+                return ok, why
+        return True, "allowed on every route the model can take"
+
     def route(self, model: str | None) -> tuple[str, str | None, str | None]:
         """(base_url, bearer, upstream model name) for ``model``."""
         custom = self.custom_model(model)
@@ -231,14 +254,44 @@ class ProxyState:
         return self.upstream, self.upstream_key, model
 
 
-def _usage_of(obj: dict) -> dict:
-    u = obj.get("usage") or {}
-    details = u.get("completion_tokens_details") or {}
-    cache = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-    return {"input_tokens": u.get("prompt_tokens", 0) or 0,
-            "output_tokens": u.get("completion_tokens", 0) or 0,
-            "reasoning_tokens": details.get("reasoning_tokens", 0) or 0,
-            "cache_read_tokens": cache or 0}
+_TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens")
+
+
+class _ClientGone(Exception):
+    """A write to the calling client failed (it disconnected)."""
+
+
+def _count(container, key):
+    """A reported token count, or None when the source did not report it (never 0)."""
+    value = container.get(key) if isinstance(container, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _usage_of(obj) -> dict | None:
+    """Token counts from an OpenAI ``usage`` object; None when there is none."""
+    u = obj.get("usage") if isinstance(obj, dict) else None
+    if not isinstance(u, dict):
+        return None
+    return {"input_tokens": _count(u, "prompt_tokens"),
+            "output_tokens": _count(u, "completion_tokens"),
+            "reasoning_tokens": _count(u.get("completion_tokens_details"), "reasoning_tokens"),
+            "cache_read_tokens": _count(u.get("prompt_tokens_details"), "cached_tokens")}
+
+
+def _upstream_error_class(status: int) -> str | None:
+    """Error class of an upstream HTTP status (design doc taxonomy). The body is not
+    inspected, so a gateway 400 over identity metadata is an upstream_client_error."""
+    if 200 <= status < 300:
+        return None
+    if status in (429, 503):
+        return "upstream_admission"
+    if 400 <= status < 500:
+        return "upstream_client_error"
+    return "upstream_server_error"
+
+
+def _ms(start: float | None, end: float | None) -> int | None:
+    return None if start is None or end is None else max(0, int((end - start) * 1000))
 
 
 def make_handler(state: ProxyState):
@@ -279,21 +332,40 @@ def make_handler(state: ProxyState):
                 return self._json(404, {"error": "not found"})
             key = self._auth()
             if key is None:
+                # No project to attribute it to, and an anonymous caller must not be
+                # able to write records: 401s are never recorded.
                 return self._json(401, {"error": "invalid or missing project key"})
+            started = time.monotonic()
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                return self._json(400, {"error": "bad length"})
+                return self._reject(key, started, 400, {"error": "bad length"}, "request_invalid")
             if length > MAX_BODY:
-                return self._json(413, {"error": "request too large"})
+                self.close_connection = True  # the unread body must not be parsed as a request
+                return self._reject(key, started, 413, {"error": "request too large"}, "request_too_large")
             raw = self.rfile.read(length)
             try:
                 body = json.loads(raw or b"{}")
             except json.JSONDecodeError:
-                return self._json(400, {"error": "invalid json"})
+                return self._reject(key, started, 400, {"error": "invalid json"}, "request_invalid")
             if not isinstance(body, dict):
-                return self._json(400, {"error": "json object required"})
+                return self._reject(key, started, 400, {"error": "json object required"}, "request_invalid")
+            data_class = self.headers.get("X-Herdr-Data-Class")
+            if data_class is not None:
+                # Tagged content (mail, attachments, scientific data) is gated by class; untagged traffic is unchanged.
+                allowed, why = state.egress_check(body.get("model"), data_class.strip().lower())
+                if not allowed:
+                    return self._reject(key, started, 403, {"error": {"type": "egress_denied", "message": why}},
+                                        "egress_denied")
             return self._forward(key, raw, body)
+
+        def _reject(self, key: dict, started: float, status: int, payload: dict, error_class: str):
+            try:
+                self._json(status, payload)
+            finally:
+                meta = self._meta(key, None)
+                meta.update(status=status, error_class=error_class, queue_ms=0)
+                self._report(key, meta, started)
 
         def _identity_headers(self, key: dict) -> dict:
             """Who the gateway should admit this request as.
@@ -313,25 +385,54 @@ def make_handler(state: ProxyState):
                 out["X-InferWeave-Agent-ID"] = agent
             return out
 
+        def _meta(self, key: dict, body: dict | None) -> dict:
+            """The usage record's request facts; unknown stays None, never 0.
+
+            The session id is the caller's header, else the key label ``session:<id>``
+            (``herdr-eng session run`` keys), else None. The gateway-bucket fallback
+            ``<project>:<key_id>`` is not a session and is never recorded as one.
+            """
+            label = key.get("label") if isinstance(key.get("label"), str) else ""
+            session = (_meta(self.headers.get("X-InferWeave-Session-ID")) or _meta(self.headers.get("X-Session-Id"))
+                       or (_meta(label[len("session:"):]) if label.startswith("session:") else None))
+            model = body.get("model") if body else None
+            return {"model": model if isinstance(model, str) else None, "upstream_model": None,
+                    "session_id": session, "agent_id": _meta(self.headers.get("X-InferWeave-Agent-ID")),
+                    "stream": bool(body.get("stream")) if body is not None else None,
+                    "route": None, "fallback": False, "status": None, "error_class": None,
+                    "queue_ms": None, "ttft_ms": None, "gen_ms": None, "usage": None, "engine": None}
+
         def _forward(self, key: dict, raw: bytes, body: dict | None):
             project = key["project"]
-            if not state.acquire(project):
-                wait = max(1, int(state.wait_seconds))
-                payload = json.dumps({"error": {
-                    "type": "proxy_backpressure", "code": "project_inflight_cap",
-                    "message": f"project {project} has {state.max_inflight} requests in flight; retry shortly",
-                    "retry_after_ms": wait * 1000}}).encode()
-                self.send_response(429)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Retry-After", str(wait))
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-                return
+            started = time.monotonic()
+            meta = self._meta(key, body)
+            acquired = state.acquire(project)
+            meta["queue_ms"] = _ms(started, time.monotonic())
+            complete = False
             try:
-                complete = self._forward_slotted(key, raw, body)
+                if not acquired:
+                    wait = max(1, int(state.wait_seconds))
+                    meta.update(status=429, error_class="proxy_backpressure")
+                    payload = json.dumps({"error": {
+                        "type": "proxy_backpressure", "code": "project_inflight_cap",
+                        "message": f"project {project} has {state.max_inflight} requests in flight; retry shortly",
+                        "retry_after_ms": wait * 1000}}).encode()
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Retry-After", str(wait))
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                try:
+                    complete = self._forward_slotted(key, raw, body, meta)
+                finally:
+                    state.release(project)
             finally:
-                state.release(project)
+                # Record before closing the response so a client that reads the
+                # end of the stream always sees its usage counted.
+                if self.command == "POST":
+                    self._report(key, meta, started)
             if complete:
                 # Release admission before the client observes response completion.
                 try:
@@ -339,27 +440,36 @@ def make_handler(state: ProxyState):
                 except OSError:
                     self.close_connection = True
 
-        def _forward_slotted(self, key: dict, raw: bytes, body: dict | None):
-            started = time.monotonic()
+        def _client_write(self, data: bytes):
+            try:
+                self.wfile.write(data)
+                self.wfile.flush()
+            except OSError as exc:
+                raise _ClientGone() from exc
+
+        def _forward_slotted(self, key: dict, raw: bytes, body: dict | None, meta: dict):
             model = body.get("model") if body else None
             custom = state.custom_model(model)
             guarded = self.headers.get(REGISTERED_MODEL_HEADER, "").lower() == "true"
             if guarded and custom is None:
+                meta.update(status=503, error_class="model_not_registered")
                 return self._json(503, {"error": {"code": "model_not_registered",
                                                  "message": "required model is not registered"}})
             if (custom and (guarded or custom.get("fabric_model")) and custom.get("project")
                     and custom["project"] != key["project"]):
+                meta.update(status=403, error_class="model_project_mismatch")
                 return self._json(403, {"error": {"code": "model_project_mismatch"}})
             base, bearer, upstream_model = (state.custom_route(custom, model) if custom
                                             else (state.upstream, state.upstream_key, model))
             policy = bool(custom and custom.get("fabric_model"))
             route_kind = "fabric" if policy and bearer is not None else "cpu"
             stream = bool(body and body.get("stream"))
-            fallback = bool(policy and bearer is not None and not stream)
-            usage, status, reported, sent_headers = {}, 502, False, False
+            may_fall_back = bool(policy and bearer is not None and not stream)
+            sent_headers = False
             conn = None
             try:
                 while True:
+                    meta.update(route=route_kind if custom else "upstream", upstream_model=upstream_model)
                     outbound = dict(body) if body is not None else None
                     if outbound is not None:
                         if upstream_model:
@@ -380,31 +490,37 @@ def make_handler(state: ProxyState):
                     if bearer:
                         headers["Authorization"] = f"Bearer {bearer}"
                     try:
-                        conn = conn_cls(parts.hostname, parts.port, timeout=10 if fallback else 600)
+                        conn = conn_cls(parts.hostname, parts.port, timeout=10 if may_fall_back else 600)
+                        sent = time.monotonic()
                         conn.request(self.command, parts.path + (f"?{parts.query}" if parts.query else ""),
                                      body=raw or None, headers=headers)
                         resp = conn.getresponse()
-                        if not fallback or resp.status not in {429, 503}:
+                        if not may_fall_back or resp.status not in {429, 503}:
                             break
                     except (OSError, http.client.HTTPException):
-                        if not fallback:
+                        if not may_fall_back:
                             raise
                     conn.close()
-                    fallback = False
+                    may_fall_back = False
+                    meta["fallback"] = True
                     route_kind = "cpu"
                     base, bearer, upstream_model = (custom["base_url"], None,
                                                     custom.get("upstream_model") or model)
-                status = resp.status
-                self.send_response(status)
-                if policy:
-                    self.send_header("X-Herdr-LLM-Route", route_kind)
-                ctype = resp.getheader("Content-Type", "application/json")
-                self.send_header("Content-Type", ctype)
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
+                meta.update(status=resp.status, error_class=_upstream_error_class(resp.status))
+                try:
+                    self.send_response(resp.status)
+                    if policy:
+                        self.send_header("X-Herdr-LLM-Route", route_kind)
+                    ctype = resp.getheader("Content-Type", "application/json")
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                except OSError as exc:
+                    raise _ClientGone() from exc
                 sent_headers = True
                 tail = b""
                 collected = bytearray()
+                first = last = None
                 while True:
                     chunk = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
                     if not chunk:
@@ -413,25 +529,29 @@ def make_handler(state: ProxyState):
                         if resp.length is not None and resp.length > 0:
                             raise http.client.IncompleteRead(b"", resp.length)
                         break
-                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
-                    self.wfile.flush()
+                    last = time.monotonic()
+                    if first is None:
+                        first = last
+                    self._client_write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                     if stream:
                         tail = (tail + chunk)[-65536:]
                     elif len(collected) < MAX_BODY:
                         collected.extend(chunk)
-                usage = self._extract(stream, bytes(tail), bytes(collected))
-                # Record before closing the response so a client that reads the
-                # end of the stream always sees its usage counted.
-                if self.command == "POST" and body is not None:
-                    self._report(key, model, usage, status, started)
-                    reported = True
+                if stream:  # TTFT and generation time are defined for streams only
+                    meta.update(ttft_ms=_ms(sent, first), gen_ms=_ms(first, last))
+                # The body stays in memory only long enough to read its usage.
+                meta["usage"] = self._extract(stream, bytes(tail), bytes(collected))
                 return True
+            except _ClientGone:
+                meta["error_class"] = "client_disconnected"
+                self.close_connection = True
             except Exception as exc:
-                status = 502
                 log.warning("forward failed: %s", type(exc).__name__)
                 if sent_headers:
+                    meta["error_class"] = "stream_truncated"
                     self.close_connection = True
                 else:
+                    meta.update(status=502, error_class="upstream_unreachable")
                     try:
                         self._json(502, {"error": "upstream unavailable"})
                     except Exception:
@@ -439,25 +559,34 @@ def make_handler(state: ProxyState):
             finally:
                 if conn:
                     conn.close()
-                if self.command == "POST" and body is not None and not reported:
-                    self._report(key, model, usage, status, started)
 
         @staticmethod
-        def _extract(stream: bool, tail: bytes, whole: bytes) -> dict:
+        def _extract(stream: bool, tail: bytes, whole: bytes) -> dict | None:
             try:
                 if stream:
                     for line in reversed(tail.decode("utf-8", "replace").splitlines()):
                         if line.startswith("data:") and "usage" in line and "[DONE]" not in line:
-                            return _usage_of(json.loads(line[5:].strip()))
-                    return {}
+                            usage = _usage_of(json.loads(line[5:].strip()))
+                            if usage is not None:
+                                return usage
+                    return None
                 return _usage_of(json.loads(whole or b"{}"))
             except Exception:
-                return {}
+                return None
 
-        def _report(self, key: dict, model, usage: dict, status: int, started: float):
-            record = {"project": key["project"], "key_id": key["key_id"], "model": model or "unknown",
-                      "success": 200 <= status < 300,
-                      "duration_ms": int((time.monotonic() - started) * 1000), **usage}
+        def _report(self, key: dict, meta: dict, started: float):
+            """Send one schema-2 usage record: metadata only, never request or response text."""
+            usage = meta["usage"]
+            status, error_class = meta["status"], meta["error_class"]
+            record = {"schema": 2, "source": "llm-proxy", "project": key["project"],
+                      "key_id": key["key_id"], "model": meta["model"] or "unknown",
+                      **{k: meta[k] for k in ("upstream_model", "session_id", "agent_id", "route",
+                                              "fallback", "stream", "status", "error_class",
+                                              "queue_ms", "ttft_ms", "gen_ms", "engine")},
+                      "success": status is not None and 200 <= status < 300 and error_class is None,
+                      "duration_ms": _ms(started, time.monotonic()),
+                      "usage_known": usage is not None,
+                      **{k: (usage or {}).get(k) for k in _TOKEN_FIELDS}}
             try:
                 state.control.report(record)
             except Exception as exc:  # accounting must never fail the request

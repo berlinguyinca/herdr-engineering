@@ -27,6 +27,10 @@ class PrSnapshot:
     approved_sha: str | None
     approved_patch_id: str | None
     reason: str | None
+    # The PR base the approving review saw (None: unknown, e.g. an old event).
+    approved_base_ref: str | None = None
+    # Number of legal operator resumes: the notification generation.
+    resume_count: int = 0
 
 
 def _redacted(f: Finding) -> Finding:
@@ -45,7 +49,15 @@ def _payload(event: dict) -> dict:
     return payload
 
 
+_REASON_MAX = 200
+
+
+def _clip_reason(reason: str) -> str:
+    return redact_text(reason)[:_REASON_MAX]
+
+
 _REVIEWABLE = (State.CI_GREEN, State.REVIEW_QUEUED, State.REVIEWING)
+BASE_CHANGED = "base branch changed"
 
 
 def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
@@ -85,11 +97,13 @@ def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
         if not on_head or snap.state != State.REVIEWING:
             return snap
         if p.get("verdict") == "PASS":
+            base = p.get("base_ref")
             return replace(
                 snap,
                 state=State.APPROVED,
                 approved_sha=sha,
                 approved_patch_id=p.get("patch_id"),
+                approved_base_ref=base if isinstance(base, str) and base else None,
                 reason=None,
             )
         if p.get("verdict") != "FAIL":
@@ -100,8 +114,25 @@ def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
             last_findings=tuple(Finding(**f) for f in p.get("findings", ())),
             approved_sha=None,
             approved_patch_id=None,
+            approved_base_ref=None,
             state=State.ESCALATED if p.get("escalated") else State.CHANGES_REQUESTED,
             reason=p.get("reason"),
+        )
+    if event_type == "review_failed":
+        reason = p.get("reason")
+        if not on_head or snap.state != State.REVIEWING or not isinstance(reason, str):
+            return snap
+        return replace(snap, state=State.ESCALATED, reason=_clip_reason(reason))
+    if event_type == "base_changed":
+        if not on_head or snap.state != State.APPROVED:
+            return snap
+        return replace(
+            snap,
+            state=State.CI_GREEN,
+            approved_sha=None,
+            approved_patch_id=None,
+            approved_base_ref=None,
+            reason=BASE_CHANGED,
         )
     if event_type == "merged":
         if not on_head or snap.state != State.APPROVED:
@@ -117,6 +148,7 @@ def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
             ci_fix_rounds=0,
             last_findings=(),
             reason=None,
+            resume_count=snap.resume_count + 1,
         )
     if event_type == "carry_over_approval":
         if (
@@ -213,7 +245,9 @@ class PipelineStore:
                 payload.update(escalated=True, reason="ci fix cap reached")
             return self._record(key, "ci_red", payload)
 
-    def on_review_started(self, key: PrKey, sha: str, reviewer_model: str) -> bool:
+    def on_review_started(
+        self, key: PrKey, sha: str, reviewer_model: str, base_ref: str | None = None
+    ) -> bool:
         with self._lock:
             snap = self.snapshot(key)
             # REVIEWING -> REVIEWING is allowed for the current head: a worker
@@ -224,11 +258,21 @@ class PipelineStore:
                 State.REVIEWING,
             ):
                 return False
-            return self._record(
-                key, "review_started", {"sha": sha, "reviewer_model": reviewer_model}
-            )
+            payload = {"sha": sha, "reviewer_model": reviewer_model}
+            if base_ref is not None:
+                payload["base_ref"] = base_ref  # informational; the verdict's base decides
+            return self._record(key, "review_started", payload)
 
-    def on_verdict(self, key: PrKey, verdict: Verdict, *, patch_id: str | None = None) -> bool:
+    def on_verdict(
+        self,
+        key: PrKey,
+        verdict: Verdict,
+        *,
+        patch_id: str | None = None,
+        base_ref: str | None = None,
+    ) -> bool:
+        """Record a verdict. ``base_ref`` is the PR base the reviewer saw; a PASS
+        approves for that base only (GateService re-reviews after a retarget)."""
         with self._lock:
             snap = self.snapshot(key)
             if verdict.sha != snap.head_sha or snap.state != State.REVIEWING:
@@ -241,6 +285,8 @@ class PipelineStore:
                 "patch_id": patch_id,
                 "findings": [asdict(f) for f in findings],
             }
+            if base_ref is not None:
+                payload["base_ref"] = base_ref
             if verdict.verdict == "FAIL":
                 previous = {finding_fingerprint(f) for f in snap.last_findings}
                 repeated = any(finding_fingerprint(f) in previous for f in findings)
@@ -250,12 +296,31 @@ class PipelineStore:
                     payload.update(escalated=True, reason="repeated finding")
             return self._record(key, "verdict", payload)
 
-    def on_merged(self, key: PrKey, sha: str) -> bool:
+    def on_review_failed(self, key: PrKey, sha: str, reason: str) -> bool:
+        """The review could not complete: escalate without consuming a review round."""
+        with self._lock:
+            snap = self.snapshot(key)
+            if sha != snap.head_sha or snap.state != State.REVIEWING:
+                return False
+            return self._record(key, "review_failed", {"sha": sha, "reason": _clip_reason(reason)})
+
+    def on_base_changed(self, key: PrKey, sha: str, base_ref: str) -> bool:
+        """An approved head's PR now targets another base: back to CI_GREEN for re-review."""
         with self._lock:
             snap = self.snapshot(key)
             if sha != snap.head_sha or snap.state != State.APPROVED:
                 return False
-            return self._record(key, "merged", {"sha": sha})
+            return self._record(key, "base_changed", {"sha": sha, "base_ref": base_ref})
+
+    def on_merged(self, key: PrKey, sha: str, merge_sha: str | None = None) -> bool:
+        with self._lock:
+            snap = self.snapshot(key)
+            if sha != snap.head_sha or snap.state != State.APPROVED:
+                return False
+            payload = {"sha": sha}
+            if merge_sha:
+                payload["merge_sha"] = merge_sha      # the commit now on the base branch; lets later main-CI results be tied to this PR
+            return self._record(key, "merged", payload)
 
     def resume(self, key: PrKey) -> bool:
         with self._lock:

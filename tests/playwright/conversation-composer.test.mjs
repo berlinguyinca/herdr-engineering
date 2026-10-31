@@ -111,7 +111,7 @@ test('paste and drop use the upload adapter, previews are removable and disabled
   assert.deepEqual(await page.evaluate(() => window.sent), []);
 }));
 
-test('Collaboration uses shared Markdown and composer while preserving authenticated agent task routing', async () => withComposer(async (page) => {
+test('Collaboration uses shared Markdown and composer, routes a leading agent to a task with the verbatim text', async () => withComposer(async (page) => {
   const requests = [];
   let stateCount = 0;
   await page.route('**/api/v1/collab/**', async (route) => {
@@ -144,16 +144,20 @@ test('Collaboration uses shared Markdown and composer while preserving authentic
   assert.equal(await input.inputValue(), '@coder ');
   await input.press('i'); await input.press('Enter');
   await page.getByRole('status').filter({ hasText: 'Task created' }).waitFor();
-  assert.deepEqual(requests[0], { path: '/rooms/room-one/tasks', auth: 'Bearer operator', body: { target_agent_id: 'coder-id', text: 'i' } });
+  // the task carries the text exactly as typed (a harness reads what was written, address included)
+  assert.deepEqual(requests[0], { path: '/rooms/room-one/tasks', auth: 'Bearer operator', body: { target_agent_id: 'coder-id', text: '@coder i' } });
   await input.fill('hello'); await input.press('Enter');
   await page.getByRole('status').filter({ hasText: 'Message posted' }).waitFor();
   assert.equal(requests[1].path, '/rooms/room-one/messages');
   assert.equal(requests[1].auth, 'Bearer operator');
   assert.equal(requests[1].body.text, 'hello');
-  await input.fill('@missing do work'); await input.press('Enter');
-  await page.getByRole('alert').filter({ hasText: 'No agent named @missing' }).waitFor();
-  assert.equal(requests.length, 2);
-  assert.equal(await input.inputValue(), '@missing do work');
+  // an unresolved name is flagged before send, then sent as plain text (never blocked, never rewritten)
+  await input.fill('@missing do work');
+  await page.locator('.conversation-status').filter({ hasText: '@missing addresses nobody' }).waitFor();
+  await input.press('Enter');
+  await page.waitForFunction(() => !document.querySelector('[aria-label="Message"]').value);
+  assert.equal(requests.length, 3);
+  assert.deepEqual([requests[2].path, requests[2].body.text], ['/rooms/room-one/messages', '@missing do work']);
   await page.getByRole('tab', { name: 'Flow', exact: true }).click();
   await page.locator('[data-node="coder-id"]').click();
   assert.equal(await page.getByRole('link', { name: 'Open agent conversation' }).getAttribute('href'), '/#/herd/session/session%3Aone');
@@ -236,17 +240,22 @@ test('editor JSON format and find replace are undoable and preview is safely ren
   const input = page.getByRole('combobox', { name: 'Message' });
   await input.fill('{"a":1}');
   await page.getByRole('button', { name: 'Expand editor' }).click();
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));   // secondary tools sit behind More
   await page.getByRole('button', { name: 'Format JSON' }).click();
   assert.equal(await input.inputValue(), '{\n  "a": 1\n}');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Undo', exact: true }).click();
   assert.equal(await input.inputValue(), '{"a":1}');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Redo', exact: true }).click();
   assert.equal(await input.inputValue(), '{\n  "a": 1\n}');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Find and replace' }).click();
   await page.getByRole('textbox', { name: 'Find text', exact: true }).fill('a');
   await page.getByRole('textbox', { name: 'Replace with', exact: true }).fill('b');
   await page.getByRole('button', { name: 'Replace all', exact: true }).click();
   assert.ok((await input.inputValue()).includes('"b"'));
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Undo', exact: true }).click();
   assert.ok((await input.inputValue()).includes('"a"'));
   await input.fill('{bad');
@@ -254,10 +263,35 @@ test('editor JSON format and find replace are undoable and preview is safely ren
   await page.getByRole('alert').filter({ hasText: 'Invalid JSON' }).waitFor();
   assert.equal(await input.inputValue(), '{bad');
   await input.fill('# Heading\n\n<script>bad()</script>');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Split preview', exact: true }).click();
   assert.equal(await page.locator('.conversation-editor-preview h1').innerText(), 'Heading');
   assert.equal(await page.locator('.conversation-editor-preview script').count(), 0);
   assert.deepEqual(await page.evaluate(() => window.sent), []);
+}));
+
+test('preview links fabric addresses through options.urls and never edits the draft', async () => withComposer(async (page) => {
+  const o = 'http://localhost:3188/app';
+  await page.evaluate((url) => {
+    window.prefetched = [];
+    window.mount({ urls: { prefetch: (t) => window.prefetched.push(t), resolver: { resolve: (u) => (u === url
+      ? { original: u, canonical: 'https://dev.lan:3188/app', status: 'resolved', service: 'web', host: '127.0.0.1' } : null) } } });
+  }, o);
+  const input = page.getByRole('combobox', { name: 'Message' });
+  await input.fill(`try ${o} now`);
+  await page.getByRole('button', { name: 'Expand editor' }).click();
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
+  await page.getByRole('button', { name: 'Split preview', exact: true }).click();
+  const link = page.locator('.conversation-editor-preview a.md-fabric-link');
+  assert.equal(await link.getAttribute('href'), 'https://dev.lan:3188/app');
+  assert.equal(await input.inputValue(), `try ${o} now`);          // the draft keeps the address as typed
+  assert.ok((await page.evaluate(() => window.prefetched)).some((t) => t.includes('localhost:3188')));
+  await page.evaluate(() => window.mount());                       // without a resolver the preview is unchanged
+  await page.getByRole('combobox', { name: 'Message' }).fill(`try ${o} now`);
+  await page.getByRole('button', { name: 'Expand editor' }).click();
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
+  await page.getByRole('button', { name: 'Split preview', exact: true }).click();
+  assert.equal(await page.locator('.conversation-editor-preview a.md-fabric-link').count(), 0);
 }));
 
 test('JSON viewer toggles raw content and handles clipboard denial', async () => withComposer(async (page) => {
@@ -289,6 +323,7 @@ test('expanded keyboard editing, indentation and previews never submit implicitl
   assert.equal(await input.isVisible(), false);
   await page.getByRole('button', { name: 'Edit', exact: true }).click();
   assert.equal(await input.inputValue(), 'one\ntwo\nx');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Find and replace' }).click();
   await page.getByRole('textbox', { name: 'Find text', exact: true }).fill('two');
   await page.getByRole('textbox', { name: 'Find text', exact: true }).press('Enter');

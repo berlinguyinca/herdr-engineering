@@ -6,12 +6,12 @@ import threading
 import pytest
 import yaml
 
-from herdr_engineering import cli, fleet_config_cli as fcc
+from herdr_engineering import cli
+from herdr_engineering import fleet_config_cli as fcc
 from herdr_engineering.control_plane import db
 from herdr_engineering.control_plane.ci_monitor import CIMonitor
 from herdr_engineering.control_plane.inspector import InspectorStore
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
-
 
 
 def _url(hostport, database, user, pw):
@@ -112,6 +112,19 @@ def test_cp_config_takes_dsn_from_fleet_file(tmp_path, old_env):
     assert cli._cp_config(str(path))["postgres_dsn"] == dsn
 
 
+def test_cp_config_takes_rustfs_endpoint_and_credentials_from_fleet_file(tmp_path, old_env):
+    path = make_file(tmp_path)
+    doc = yaml.safe_load(path.read_text())
+    values = doc["sections"]["control_plane"]["values"]
+    values.update({"rustfs_endpoint": "http://rustfs:9000", "rustfs_bucket": "b", "minio_user": "u", "minio_password": "p"})
+    path.write_text(yaml.safe_dump(doc))
+    path.chmod(0o600)
+    cfg = cli._cp_config(str(path))
+    assert (cfg["rustfs_endpoint"], cfg["rustfs_bucket"], cfg["minio_user"], cfg["minio_password"]) == (
+        "http://rustfs:9000", "b", "u", "p")
+    assert cli._cp_config(None).get("minio_user") is None     # no fleet file: no invented credentials
+
+
 # ------------------------------------------------------------------ web / rustfs
 
 def test_rustfs_client_not_built_from_env(old_env, monkeypatch):
@@ -146,7 +159,7 @@ def _run_web(monkeypatch, path, **overrides):
     import herdr_engineering.control_plane.sink as sink
     monkeypatch.setattr(api, "ControlPlaneServer", FakeServer)
     monkeypatch.setattr(sink, "DurableEventSink", lambda dsn: seen.setdefault("sink_dsn", dsn))
-    monkeypatch.setattr(cli, "_maybe_pg_source", lambda dsn: None)
+    monkeypatch.setattr(cli, "_maybe_pg_source", lambda dsn, **_: None)
     monkeypatch.setattr(cli, "_maybe_rustfs_client", lambda cp: seen.setdefault("rustfs_cp", cp) and None)
     monkeypatch.setattr(cli, "_self_report_services",
                         lambda repo, **kw: seen.setdefault("self_report", kw))
@@ -163,7 +176,7 @@ def _run_web(monkeypatch, path, **overrides):
                               collab_operator_user=None, collab_operator_email=None,
                               collab_operator_host=[], collab_operator_url=None,
                               collab_dashboard_host=[], collab_open_signup=False,
-                              collab_approver_group=[])
+                              collab_approver_group=[], collab_delegation_enabled=False)
     for k, v in overrides.items():
         setattr(args, k, v)
     assert cli._cmd_cp_web(args) == 0
@@ -183,11 +196,47 @@ def test_web_reads_everything_from_the_fleet_file_and_ignores_env(tmp_path, monk
     assert seen["repo"]._host_aliases == {"x": "y"}
     assert seen["repo"].inspector.limits["max_sessions"] == 9
     assert seen["server_kw"]["ci_actions"] is True
+    assert seen["server_kw"]["github_pg_dsn"] == cp["pg_dsn"]  # the GitHub catalog persists there
+
+
+def test_web_wires_personal_assistant_from_fleet_config(tmp_path, monkeypatch, old_env, capsys):
+    # enabled section is passed through to the server as assistant_config
+    p1 = make_file(tmp_path / "pa", personal_assistant={"enabled": True, "inference": {"endpoint": "x"}})
+    seen = _run_web(monkeypatch, p1)
+    assert seen["server_kw"]["assistant_config"] == {"personal_assistant": {"enabled": True, "inference": {"endpoint": "x"}}}
+    # absent section stays disabled (None -> feature flag off)
+    seen = _run_web(monkeypatch, make_file(tmp_path / "none"))
+    assert seen["server_kw"]["assistant_config"] is None
+
+
+def test_web_reads_usage_retention_from_llm_proxy_section(tmp_path, monkeypatch, old_env, capsys):
+    seen = _run_web(monkeypatch, make_file(tmp_path, llm_proxy={"max_inflight": 4, "raw_retention_days": 3}))
+    assert seen["server_kw"]["usage_retention"] == {"raw_retention_days": 3, "rollup_retention_days": 400}
+    seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
+    assert seen["server_kw"]["usage_retention"] == {"raw_retention_days": 14, "rollup_retention_days": 400}
+
+
+def test_web_refuses_invalid_usage_retention(tmp_path, monkeypatch, old_env, capsys):
+    with pytest.raises(SystemExit, match="raw_retention_days"):
+        _run_web(monkeypatch, make_file(tmp_path, llm_proxy={"raw_retention_days": 0}))
+
+
+def test_web_reads_ci_fix_from_the_fleet_file_disabled_by_default(tmp_path, monkeypatch, old_env, capsys):
+    seen = _run_web(monkeypatch, make_file(tmp_path, ci_fix={"agent_api_key": "test-ci-fix-agent-key", "enabled": True, "hosts": ["bender"]}))
+    assert seen["server_kw"]["ci_fix"]["enabled"] is True and seen["server_kw"]["ci_fix"]["hosts"] == ["bender"]
+    seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
+    assert seen["server_kw"]["ci_fix"]["enabled"] is False
+
+
+def test_web_refuses_invalid_ci_fix(tmp_path, monkeypatch, old_env, capsys):
+    with pytest.raises(SystemExit, match="ci_fix.hosts"):
+        _run_web(monkeypatch, make_file(tmp_path, ci_fix={"enabled": True}))
 
 
 def test_web_without_file_has_no_durable_config_even_with_env(tmp_path, monkeypatch, old_env, capsys):
     seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
     assert "sink_dsn" not in seen and seen["self_report"]["dsn"] is None
+    assert seen["server_kw"]["github_pg_dsn"] is None  # the GitHub catalog stays in memory
     assert seen["self_report"]["rustfs_endpoint"] is None
     assert seen["self_report"]["host_id"] != "env-self"
     assert seen["server_kw"]["ci_actions"] is False
@@ -219,11 +268,68 @@ def test_render_collab_slice_holds_only_the_collab_mapping(tmp_path):
     assert oct(out.stat().st_mode & 0o777) == "0o600"
     text = out.read_text()
     data = yaml.safe_load(text)
-    assert data["sections"]["control_plane"]["values"] == {"collab": COLLAB}
+    assert data["sections"]["control_plane"]["values"] == {"collab": COLLAB, "collab_artifacts": {"enabled": False}}
     assert data["hosts"] == {}
     cp = yaml.safe_load(central.read_text())["sections"]["control_plane"]["values"]
     for secret in (cp["pg_dsn"], cp["minio_password"], *cp["api_keys"]):
         assert secret not in text
+
+
+def _artifacts_slice(tmp_path, **cp_extra):
+    central = make_file(tmp_path, collab=dict(COLLAB), **cp_extra)
+    out = tmp_path / "slice" / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(central), out)
+    return out, yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"]
+
+
+@pytest.mark.parametrize("section, expected", [
+    (None, False), ({}, False), ({"enabled": False}, False), ({"enabled": True}, True),
+    ({"enabled": "true"}, False), ({"enabled": 1}, False), ({"enabled": None}, False), ("enabled", False)])
+def test_render_collab_renders_collab_artifacts_enabled_only_for_exactly_true(tmp_path, section, expected):
+    extra = {} if section is None else {"collab_artifacts": section}
+    _, values = _artifacts_slice(tmp_path, **extra)
+    assert values["collab_artifacts"] == {"enabled": expected}
+    assert set(values) == {"collab", "collab_artifacts"}
+
+
+def test_render_collab_carries_no_collab_artifacts_limit_or_path(tmp_path):
+    _, values = _artifacts_slice(tmp_path, collab_artifacts={"enabled": True, "daily_bytes_per_agent": 7,
+                                                             "mirror_dir": "/secret-path"})
+    assert values["collab_artifacts"] == {"enabled": True}
+
+
+def _bridge_run(tmp_path, monkeypatch, old_env, *, enabled, mirror=True, outbox=True, slice_values=None):
+    import herdr_engineering.control_plane.collab_cognito as cc
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    extra = {} if enabled is None else {"collab_artifacts": {"enabled": enabled}}
+    out, _ = _artifacts_slice(tmp_path, **extra)
+    (tmp_path / "mirror").mkdir()
+    (tmp_path / "outbox").mkdir()
+    seen = _run_web(monkeypatch, out, **_collab_only_args(tmp_path),
+                    collab_artifacts_mirror=str(tmp_path / "mirror") if mirror else None,
+                    collab_artifacts_outbox=str(tmp_path / "outbox") if outbox else None)
+    return seen["server_kw"]["collab"]
+
+
+def test_collab_public_builds_the_bridge_only_with_the_slice_enabled_and_both_flags(tmp_path, monkeypatch, old_env, capsys):
+    from herdr_engineering.control_plane.collab_artifacts import CollabArtifactBridge
+    service = _bridge_run(tmp_path, monkeypatch, old_env, enabled=True)
+    assert isinstance(service.artifact_bridge, CollabArtifactBridge)
+    assert (tmp_path / "outbox" / "agents.json").exists()          # started: the feed is written
+
+
+@pytest.mark.parametrize("enabled, mirror, outbox", [(False, True, True), (None, True, True),
+                                                      (True, False, True), (True, True, False),
+                                                      (True, False, False)])
+def test_collab_public_builds_no_bridge_otherwise(tmp_path, monkeypatch, old_env, capsys, enabled, mirror, outbox):
+    service = _bridge_run(tmp_path, monkeypatch, old_env, enabled=enabled, mirror=mirror, outbox=outbox)
+    assert service.artifact_bridge is None
+    assert not (tmp_path / "outbox" / "agents.json").exists()
+
+
+def test_collab_public_stops_the_bridge_feed_thread_at_shutdown(tmp_path, monkeypatch, old_env, capsys):
+    service = _bridge_run(tmp_path, monkeypatch, old_env, enabled=True)
+    assert service.artifact_bridge.feed_thread_alive() is False
 
 
 def test_render_collab_refuses_missing_or_unknown_keys(tmp_path):
@@ -500,6 +606,277 @@ def test_dashboard_host_names_are_a_collab_config_key():
     assert "dashboard_hosts" in fcc.COLLAB_KEYS
 
 
+def test_lineage_key_scopes_reach_the_server_and_bad_entries_stop_startup(tmp_path, monkeypatch, old_env):
+    ing, op = "in-" + "k1", "op-" + "k1"
+    keys = {ing: "ingest", op: "operator"}
+    ok = make_file(tmp_path, api_keys=keys, lineage_key_scopes={ing: {"rooms": ["r1"], "missions": ["m1"]}})
+    seen = _run_web(monkeypatch, ok)
+    assert seen["server_kw"]["lineage_key_scopes"] == {ing: {"rooms": ["r1"], "missions": ["m1"]}}
+    for name, bad in (("operator", {op: {"rooms": ["r1"]}}), ("unknown", {"no-" + "such": {"rooms": ["r1"]}}),
+                      ("shape", {ing: {"rooms": "r1"}}), ("extra", {ing: {"admin": True}})):
+        d = tmp_path / name
+        d.mkdir()
+        with pytest.raises(SystemExit) as e:
+            _run_web(monkeypatch, make_file(d, api_keys=keys, lineage_key_scopes=bad))
+        assert ing not in str(e.value) and op not in str(e.value), "the key is never echoed"
+    d = tmp_path / "opmsg"
+    d.mkdir()
+    with pytest.raises(SystemExit) as e:
+        _run_web(monkeypatch, make_file(d, api_keys=keys, lineage_key_scopes={op: {"rooms": ["r1"]}}))
+    assert "operator" in str(e.value)
+
+
+# ------------------------------------------------- T11 delegation kill switch (YAML only, default off)
+def test_delegation_kill_switch_is_off_by_default_and_a_collab_yaml_key(tmp_path, monkeypatch, old_env):
+    import herdr_engineering.control_plane.collab_cognito as cc
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    assert "delegation_enabled" in fcc.COLLAB_KEYS and "delegation_enabled" in cli.COLLAB_CONFIG_KEYS
+    _, off = _collab_slice(tmp_path)
+    assert _run_web(monkeypatch, off, **_collab_only_args(tmp_path))["server_kw"]["collab"].delegation_enabled is False
+    d = tmp_path / "on"
+    d.mkdir()
+    _, on = _collab_slice(d, dict(COLLAB, delegation_enabled=True))
+    assert _run_web(monkeypatch, on, **_collab_only_args(d))["server_kw"]["collab"].delegation_enabled is True
+    d = tmp_path / "bad"
+    d.mkdir()
+    _, bad = _collab_slice(d, dict(COLLAB, delegation_enabled="yes"))
+    with pytest.raises(SystemExit) as e:
+        _run_web(monkeypatch, bad, **_collab_only_args(d))
+    assert "delegation_enabled" in str(e.value)
+
+
+def test_delegation_kill_switch_reaches_the_combined_server_too(tmp_path, monkeypatch, old_env):
+    import json as _json
+    users = tmp_path / "users.json"
+    users.write_text(_json.dumps({"alice": "0" * 64}))
+    for name, collab, want in (("unset", None, False), ("off", {"delegation_enabled": False}, False),
+                               ("on", {"delegation_enabled": True}, True)):
+        d = tmp_path / name
+        d.mkdir()
+        path = make_file(d, pg_dsn="", **({"collab": collab} if collab else {}))
+        seen = _run_web(monkeypatch, path, collab_users_file=str(users))
+        assert seen["server_kw"]["collab"].delegation_enabled is want, name
+    d = tmp_path / "typo"
+    d.mkdir()
+    with pytest.raises(SystemExit) as e:
+        _run_web(monkeypatch, make_file(d, pg_dsn="", collab={"delegation_enabled": "true"}), collab_users_file=str(users))
+    assert "delegation_enabled" in str(e.value)
+
+
+def test_replay_history_is_validated_in_the_collab_slice(tmp_path):
+    central = make_file(tmp_path, collab=dict(COLLAB, replay_history="full"))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["replay_history"] == "full"
+    central.unlink()
+    central = make_file(tmp_path, collab=dict(COLLAB, replay_history="everything"))
+    with pytest.raises(fcc.FleetConfigError, match="replay_history must be"):
+        fcc.collab_values(fcc.load_fleet_config(central))
+
+
+def test_steering_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    from herdr_engineering.control_plane.collab_workbench import normalize_steering
+    assert normalize_steering(None)["enabled"] is False and normalize_steering(None)["kill_switch"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, steering={"enabled": True, "kill_switch": False}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["steering"]["enabled"] is True
+    central.unlink()
+    for bad in ({"enabled": "yes"}, {"shell": True}, {"actions": ["pause", "exec"]}):
+        central = make_file(tmp_path, collab=dict(COLLAB, steering=bad))
+        with pytest.raises(fcc.FleetConfigError, match="steering"):
+            fcc.collab_values(fcc.load_fleet_config(central))
+        central.unlink()
+    args = argparse.Namespace()
+    cli._apply_collab_config(args, {"collab": {"steering": {"enabled": True, "self_confirm": True}}})
+    assert args.collab_steering == {"enabled": True, "self_confirm": True}
+    with pytest.raises(SystemExit):
+        cli._apply_collab_config(argparse.Namespace(), {"collab": {"steering": {"kill_switch": "no"}}})
+    assert "steering" in fcc.COLLAB_KEYS
+
+
+# ------------------------------------------------- T14 contextual chat / consultation / links (YAML only, default off)
+def test_contextual_settings_are_yaml_only_validated_and_off_by_default(tmp_path, monkeypatch, old_env):
+    import argparse
+
+    import herdr_engineering.control_plane.collab_cognito as cc
+    from herdr_engineering.control_plane.collab_context import normalize_contextual
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    assert "contextual" in fcc.COLLAB_KEYS and "contextual" in cli.COLLAB_CONFIG_KEYS
+    assert normalize_contextual(None)["enabled"] is False and normalize_contextual(None)["kill_switch"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True, "consultation": False}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["contextual"]["consultation"] is False
+    central.unlink()
+    for bad in ({"enabled": "yes"}, {"shell": True}, {"max_refs_per_read": 0}, "on"):
+        central = make_file(tmp_path, collab=dict(COLLAB, contextual=bad))
+        with pytest.raises(fcc.FleetConfigError, match="contextual"):
+            fcc.collab_values(fcc.load_fleet_config(central))
+        central.unlink()
+    args = argparse.Namespace()
+    cli._apply_collab_config(args, {"collab": {"contextual": {"enabled": True}}})
+    assert args.collab_contextual == {"enabled": True}
+    with pytest.raises(SystemExit):
+        cli._apply_collab_config(argparse.Namespace(), {"collab": {"contextual": {"kill_switch": "no"}}})
+    # the collab-only server: absent = off, set = on, and the section is re-read per request (hot kill switch)
+    _, off = _collab_slice(tmp_path)
+    svc_off = _run_web(monkeypatch, off, **_collab_only_args(tmp_path))["server_kw"]["collab"]
+    assert svc_off.contextual["enabled"] is False and svc_off.ctx_cfg()["enabled"] is False
+    d = tmp_path / "on"
+    d.mkdir()
+    _, on = _collab_slice(d, dict(COLLAB, contextual={"enabled": True}))
+    svc_on = _run_web(monkeypatch, on, **_collab_only_args(d))["server_kw"]["collab"]
+    assert svc_on.contextual["enabled"] is True and svc_on.ctx_cfg()["enabled"] is True      # a restart picks up an edit here
+
+
+def test_contextual_settings_reach_the_combined_server_too(tmp_path, monkeypatch, old_env):
+    import json as _json
+    users = tmp_path / "users.json"
+    users.write_text(_json.dumps({"alice": "0" * 64}))
+    for name, collab, want in (("unset", None, False), ("off", {"contextual": {"enabled": False}}, False),
+                               ("on", {"contextual": {"enabled": True}}, True)):
+        d = tmp_path / name
+        d.mkdir()
+        path = make_file(d, pg_dsn="", **({"collab": collab} if collab else {}))
+        seen = _run_web(monkeypatch, path, collab_users_file=str(users))
+        assert seen["server_kw"]["collab"].ctx_cfg()["enabled"] is want, name     # re-read from the YAML on every request
+    d = tmp_path / "typo"
+    d.mkdir()
+    bad = _run_web(monkeypatch, make_file(d, pg_dsn="", collab={"contextual": {"enabled": "true"}}), collab_users_file=str(users))
+    cfg = bad["server_kw"]["collab"].ctx_cfg()
+    assert cfg["enabled"] is False and cfg["kill_switch"] is True                  # an invalid section fails CLOSED
+
+
+# ------------------------------------------------- T15 attention / progress / analytics (YAML only, default off)
+def test_insights_settings_are_yaml_only_validated_and_off_by_default(tmp_path, monkeypatch, old_env):
+    import argparse
+
+    import herdr_engineering.control_plane.collab_cognito as cc
+    from herdr_engineering.control_plane.collab_attention import normalize_insights
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    assert "insights" in fcc.COLLAB_KEYS and "insights" in cli.COLLAB_CONFIG_KEYS
+    assert normalize_insights(None)["enabled"] is False and normalize_insights(None)["kill_switch"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, insights={"enabled": True, "min_group_size": 7}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["insights"]["min_group_size"] == 7
+    with pytest.raises(SystemExit):
+        cli._apply_collab_config(argparse.Namespace(), {"collab": {"insights": {"kill_switch": "no"}}})
+
+
+def test_team_rooms_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    import pytest as _pytest
+
+    from herdr_engineering.control_plane.collab_team_rooms import normalize_team_rooms
+    assert "team_rooms" in fcc.COLLAB_KEYS and "team_rooms" in cli.COLLAB_CONFIG_KEYS
+    assert "team_rooms" in cli.HOT_COLLAB_SWITCHES                                  # read per request, fail closed
+    assert normalize_team_rooms(None)["enabled"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, team_rooms={"enabled": True, "default_guest_level": "read_only"}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["team_rooms"]["default_guest_level"] == "read_only"
+    args = argparse.Namespace(collab_team_rooms=None)
+    cli._apply_collab_config(args, {"collab": {"team_rooms": {"enabled": True}}})
+    assert args.collab_team_rooms == {"enabled": True}
+    for bad in ({"default_guest_level": "direct"}, {"kill_switch": "no"}, {"unknown": 1}):
+        with _pytest.raises(SystemExit):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"team_rooms": bad}})
+        with _pytest.raises(fcc.FleetConfigError):
+            fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, team_rooms=bad))))
+
+
+def test_team_roles_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    import pytest as _pytest
+
+    from herdr_engineering.control_plane.collab_team_roles import normalize_team_roles
+    assert "team_roles" in fcc.COLLAB_KEYS and "team_roles" in cli.COLLAB_CONFIG_KEYS
+    assert "team_roles" in cli.HOT_COLLAB_SWITCHES                                  # read per request, fail closed
+    assert normalize_team_roles(None)["enabled"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, team_roles={"enabled": True, "default_no_response_policy": "wait"}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["team_roles"]["default_no_response_policy"] == "wait"
+    args = argparse.Namespace(collab_team_roles=None)
+    cli._apply_collab_config(args, {"collab": {"team_roles": {"enabled": True}}})
+    assert args.collab_team_roles == {"enabled": True}
+    for bad in ({"default_no_response_policy": "drop"}, {"kill_switch": "no"}, {"unknown": 1}, {"person_lease_seconds": 5}):
+        with _pytest.raises(SystemExit):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"team_roles": bad}})
+        with _pytest.raises(fcc.FleetConfigError):
+            fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, team_roles=bad))))
+
+
+def test_collab_skills_slice_is_accepted_and_forwarded(tmp_path):
+    central = make_file(tmp_path, collab=dict(COLLAB, skills={"enabled": True}))
+    values = fcc.collab_values(fcc.load_fleet_config(central))
+    assert values["skills"] == {"enabled": True}
+    assert "skills" in cli.COLLAB_CONFIG_KEYS
+
+# ------------------------------------------- unreadable fleet file: security switches fail closed (T14 review)
+
+def _contextual_source(store):
+    return lambda: (store.secure_section("control_plane").get("collab") or {}).get("contextual")
+
+
+def _bump(path):
+    import os
+    import time
+    t = time.time() + 5
+    os.utime(path, (t, t))
+
+
+@pytest.mark.parametrize("breakage", ["delete", "garbage", "invalid_value"])
+def test_a_deleted_or_unparseable_fleet_file_turns_security_switches_off(tmp_path, breakage):
+    from herdr_engineering.control_plane.collab_context import normalize_contextual
+    from herdr_engineering.fleet_config import FleetConfigStore
+    path = make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True}))
+    store = FleetConfigStore(path)
+    src = _contextual_source(store)
+    assert normalize_contextual(src())["enabled"] is True
+    if breakage == "delete":
+        path.unlink()
+    elif breakage == "garbage":
+        path.write_text("sections: [unclosed\n  - : :")
+        path.chmod(0o600)
+    else:
+        data = yaml.safe_load(path.read_text())
+        data["sections"]["control_plane"]["values"]["collab"]["contextual"]["kill_switch"] = "yes"
+        path.write_text(yaml.safe_dump(data))
+        path.chmod(0o600)
+    _bump(path) if path.exists() else None
+    with pytest.raises(Exception):
+        normalize_contextual(src())                        # the consumer fails closed (ctx_cfg turns this into OFF)
+    if breakage != "invalid_value":                        # a value error is the section's, not the file's
+        assert store.last_error
+        assert store.current().section("control_plane")    # everything else keeps serving the last good file
+
+
+def test_the_service_treats_an_unreadable_fleet_file_as_the_feature_off(tmp_path, caplog):
+    from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
+    from herdr_engineering.fleet_config import FleetConfigStore
+    path = make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True}))
+    store = FleetConfigStore(path)
+    svc = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
+    svc.contextual_source = _contextual_source(store)
+    assert svc.ctx_cfg()["enabled"] is True
+    with caplog.at_level("ERROR"):
+        path.unlink()
+        assert svc.ctx_cfg()["enabled"] is False and svc.ctx_cfg()["kill_switch"] is True
+    assert any("FAIL CLOSED" in r.message for r in caplog.records)
+    assert svc._ctx_on(svc.ctx_cfg(), "consultation") is False
+    # the file comes back valid: the switch follows it again
+    make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True}))
+    assert svc.ctx_cfg()["enabled"] is True
+
+
+def test_config_failure_mode_last_good_is_an_explicit_operator_opt_in(tmp_path):
+    from herdr_engineering.control_plane.collab_context import normalize_contextual
+    from herdr_engineering.fleet_config import FleetConfigStore
+    path = make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True}), config_failure_mode="last_good")
+    store = FleetConfigStore(path)
+    path.unlink()
+    assert normalize_contextual(_contextual_source(store)())["enabled"] is True
+    assert store.last_error and store.failure_mode() == "last_good"
+    other = make_file(tmp_path / "x" if (tmp_path / "x").mkdir() is None else tmp_path,
+                      collab=dict(COLLAB, contextual={"enabled": True}), config_failure_mode="whatever")
+    assert FleetConfigStore(other).failure_mode() == "fail_closed"      # anything but the exact opt-in
+
+
 SUMMARY_FIX = {"room_id": "collab_room1", "requester_agent_id": "collab_agent1"}
 
 
@@ -563,3 +940,29 @@ def test_web_starts_enabled_review_gate_with_a_dsn(tmp_path, monkeypatch, old_en
 def test_web_without_dsn_is_fine_when_review_gate_disabled(tmp_path, monkeypatch, old_env):
     path = make_file(tmp_path, pg_dsn=None, review_gate=_gate(tmp_path, enabled=False))
     assert "sink_dsn" not in _run_web(monkeypatch, path)
+
+
+# ------------------------------------------------- P05 crash takeover lease (YAML only, default off)
+def test_task_lease_is_a_validated_startup_collab_key_and_off_by_default():
+    import argparse
+    assert "task_lease_seconds" in fcc.COLLAB_KEYS and "task_lease_seconds" in cli.COLLAB_CONFIG_KEYS
+    assert "task_lease_seconds" in cli.STARTUP_ONLY_COLLAB_KEYS
+    assert cli._task_lease(argparse.Namespace(), {}) is None
+    assert cli._task_lease(argparse.Namespace(), {"collab": {"task_lease_seconds": 900}}) == 900.0
+    args = argparse.Namespace(collab_task_lease_seconds=None)
+    cli._apply_collab_config(args, {"collab": {"task_lease_seconds": 1800}})
+    assert args.collab_task_lease_seconds == 1800.0 and cli._task_lease(args, {}) == 1800.0
+    for bad in (True, "600", 10, 10 * 86400):
+        with pytest.raises(SystemExit):
+            cli._task_lease(argparse.Namespace(), {"collab": {"task_lease_seconds": bad}})
+
+
+def test_render_collab_slice_never_carries_rakazo_settings(tmp_path):
+    # The public --collab-only container refuses any setting beyond control_plane.collab: a Rakazo key in the slice
+    # crash-loops it (seen on the 2026-10-30 deploy).
+    central = make_file(tmp_path, collab=dict(COLLAB), rakazo_bridge={"enabled": True, "cognito": {
+        "pool_id": "us-west-2_TESTPOOL", "client_ids": ["clientabc123456"], "required_group": "rakazo-users",
+        "sync_dir": "/etc/herdr/collab-sync"}})
+    out = tmp_path / "s" / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(central), out)
+    assert yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"] == {"collab": COLLAB, "collab_artifacts": {"enabled": False}}

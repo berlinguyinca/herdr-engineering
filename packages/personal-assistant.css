@@ -1,0 +1,111 @@
+/* Herdr Personal Assistant — feature-scoped styles.
+   Uses the canonical design tokens (packages/herdr-design-system/theme.css)
+   and the shared hd-* primitives. No new component library. */
+.pa-shell { display: grid; grid-template-columns: 240px 1fr; gap: var(--density-gap, 16px); align-items: start; }
+.pa-shell__side { display: flex; flex-direction: column; gap: 8px; }
+.pa-item { border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 10px 12px; cursor: pointer; background: var(--surface); }
+.pa-item--active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.pa-item__name { font-weight: 600; }
+.pa-item__meta { color: var(--text-muted); font-size: var(--text-sm, 13px); }
+.pa-main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; }
+.pa-col { display: flex; flex-direction: column; gap: 12px; }
+.pa-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border-color); margin-bottom: 12px; flex-wrap: wrap; }
+.pa-tab { padding: 6px 12px; border: 1px solid transparent; border-radius: var(--radius-sm) var(--radius-sm) 0 0; cursor: pointer; background: transparent; color: var(--text-secondary); font: inherit; }
+.pa-tab--active { border-color: var(--border-color); border-bottom-color: transparent; background: var(--surface); color: var(--text-primary); font-weight: 600; }
+.pa-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.pa-field label { font-size: var(--text-sm, 13px); color: var(--text-secondary); }
+.pa-field input, .pa-field textarea, .pa-field select { border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 7px 9px; font: inherit; background: var(--surface); color: var(--text); }
+.pa-field textarea { min-height: 64px; resize: vertical; font-family: var(--font-sans); }
+.pa-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pa-status { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: var(--text-sm, 13px); border: 1px solid var(--border-color); }
+.pa-status--ready { color: var(--status-ok); border-color: var(--status-ok); }
+.pa-status--disabled { color: var(--text-muted); }
+.pa-status--running { color: var(--status-active); border-color: var(--status-active); }
+.pa-status--needs { color: var(--status-attention); border-color: var(--status-attention); }
+.pa-chat { display: flex; flex-direction: column; gap: 10px; }
+.pa-msg { padding: 9px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border-color); background: var(--surface); white-space: pre-wrap; }
+.pa-msg--user { background: var(--accent-weak); }
+.pa-msg--meta { color: var(--text-muted); font-size: var(--text-sm, 12px); }
+.pa-approval { border-left: 3px solid var(--status-attention); padding-left: 10px; }
+.pa-muted { color: var(--text-muted); font-size: var(--text-sm, 13px); }
+.pa-empty { padding: 24px; text-align: center; color: var(--text-muted); }
+.pa-badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border-color); }
+.pa-badge--granted { color: var(--status-ok); border-color: var(--status-ok); }
+.pa-badge--sensitive { color: var(--status-attention); border-color: var(--status-attention); }
+@media (max-width: 900px) { .pa-shell, .pa-main { grid-template-columns: 1fr; } }
+
+/* Mobile (375px) — stack the composer, keep touch targets comfortable, and
+   let tab labels wrap instead of overflowing. */
+@media (max-width: 480px) {
+  .pa-tab { padding: 8px 10px; font-size: 13px; }
+  .pa-row { flex-direction: column; align-items: stretch; }
+  .pa-row input, .pa-row textarea, .pa-row select, .pa-row button { width: 100%; }
+  .pa-row .hd-btn { min-height: 40px; }
+  .pa-shell__side { flex-direction: row; flex-wrap: wrap; }
+  .pa-item { flex: 1 1 40%; }
+  .pa-msg { font-size: 14px; }
+}
+/* Chat first: one bar to pick an assistant, an approvals strip when something waits, the conversation, then an optional Configure card. */
+.pa-bar { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-bottom: 8px; }
+.pa-pick { display: flex; flex-direction: column; gap: 4px; font-size: .75rem; color: var(--text-secondary); }
+.pa-pick select { font: inherit; min-width: 240px; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); }
+.pa-grow { flex: 1; }
+.pa-hidden-note { font-size: .75rem; margin: 0 0 8px; }
+.pa-strip { border: 1px solid var(--status-attention); background: var(--surface); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
+.pa-strip[hidden] { display: none; }
+.pa-config { margin-top: 14px; }
+
+.pa-h3 { font-size: 14px; margin: 14px 0 6px; color: var(--text-secondary); }
+.pa-flash:empty { display: none; }
+.pa-flash { margin-bottom: 8px; padding: 6px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border-color); }
+.pa-flash[role="alert"] { border-color: var(--status-attention); color: var(--status-attention); }
+.pa-approval, .pa-msg { overflow-wrap: anywhere; }
+.pa-msg + .pa-msg { margin-top: 8px; }
+
+/* Connectors tab: Apps, blocked calendars, Drafts, Reminders */
+.pa-h4 { font-size: 13px; margin: 12px 0 6px; color: var(--text-secondary); }
+.pa-apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin-top: 8px; }
+.pa-app { border: 1px solid var(--border-color); border-radius: var(--radius); padding: 12px; background: var(--surface); display: flex; flex-direction: column; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.pa-app--on { border-color: var(--status-ok); }
+.pa-app--soon { border-style: dashed; background: transparent; }
+.pa-app__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pa-app__what { margin: 0; }
+.pa-app__state { font-size: var(--text-sm, 13px); color: var(--text-secondary); }
+.pa-app__actions { margin-top: auto; }
+.pa-setup { margin-top: 14px; border: 1px solid var(--border-color); border-radius: var(--radius); padding: 12px; background: var(--surface); }
+.pa-setup .pa-h4 { margin-top: 0; }
+.pa-uri { font-family: var(--font-mono); font-size: 12px; padding: 4px 8px; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text); overflow-wrap: anywhere; min-width: 0; }
+.pa-state-ok { color: var(--status-ok); font-weight: 600; margin: 8px 0 0; }
+.pa-details { margin-top: 8px; }
+.pa-details summary { cursor: pointer; padding: 4px 0; color: var(--text-secondary); }
+.pa-details form { margin-top: 8px; max-width: 480px; }
+#pa-blocked { margin-top: 14px; }
+.pa-fieldset { border: 0; padding: 0; margin: 0 0 8px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.pa-check { display: flex; align-items: flex-start; gap: 8px; min-height: 28px; overflow-wrap: anywhere; }
+.pa-check input { margin-top: 3px; flex: none; }
+.pa-check__id { display: block; }
+.pa-snippet { color: var(--text-secondary); font-size: var(--text-sm, 13px); margin-top: 2px; }
+a.hd-btn { text-decoration: none; display: inline-flex; align-items: center; }
+@media (max-width: 480px) {
+  .pa-apps { grid-template-columns: 1fr; }
+  .pa-row a.hd-btn { width: 100%; justify-content: center; min-height: 40px; }
+}
+#pa-drafts .pa-msg, #pa-reminders .pa-msg { white-space: normal; }
+.pa-row--tight { margin-top: 6px; }
+.pa-fieldset legend { padding: 0; margin-bottom: 4px; }
+
+/* Keyboard layer: shortcut sheet, command palette, focus. */
+.pa-tab:focus-visible, .pa-pick select:focus-visible, .pa-strip button:focus-visible, [data-msg]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pa-tabs [role="tab"][tabindex="-1"] { cursor: pointer; }
+.pa-dialog kbd, .pa-keys kbd, .pa-palette__list kbd, [data-keys] kbd { font-family: var(--font-mono); font-size: 12px; padding: 1px 6px; border: 1px solid var(--border-color); border-bottom-width: 2px; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text); }
+.pa-overlay { position: fixed; inset: 0; background: rgb(0 0 0 / .45); display: flex; align-items: flex-start; justify-content: center; padding: 12vh 16px 16px; z-index: 1000; }
+.pa-dialog { background: var(--surface); color: var(--text); border: 1px solid var(--border-color); border-radius: var(--radius); box-shadow: 0 12px 40px rgb(0 0 0 / .35); width: min(560px, 100%); max-height: 76vh; overflow: auto; padding: 16px; }
+.pa-dialog__title { font-size: 16px; margin: 0 0 10px; }
+.pa-keys { width: 100%; border-collapse: collapse; margin-bottom: 10px; }
+.pa-keys th { text-align: left; font-weight: 400; width: 38%; padding: 5px 8px 5px 0; vertical-align: top; }
+.pa-keys td { padding: 5px 0; }
+.pa-palette__input { width: 100%; font: inherit; padding: 9px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); }
+.pa-palette__list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 50vh; overflow: auto; }
+.pa-palette__list li { display: flex; justify-content: space-between; gap: 12px; padding: 7px 10px; border-radius: var(--radius-sm); cursor: pointer; }
+.pa-palette__list li.is-on { background: var(--accent-weak); outline: 1px solid var(--accent); }
+@media (max-width: 480px) { .pa-overlay { padding-top: 6vh; } [data-keys] { display: none; } }   /* a phone has no keyboard to learn */

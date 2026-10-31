@@ -1,0 +1,20 @@
+when:
+  - event: manual
+  - event: pull_request
+
+skip_clone: true
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'test -r /etc/woodpecker-git-credentials'
+      - 'git init -q .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      - 'git fetch --no-tags --depth=1 origin "$CI_COMMIT_SHA"'
+      - 'git checkout -q FETCH_HEAD'
+  - name: artifact-handoff-contracts
+    image: bash
+    commands:
+      - bash scripts/ci/artifact-handoff-gates.sh

@@ -1,0 +1,42 @@
+# Conceptual contracts: not drop-in Herdr configuration
+artifact_manifest:
+  schema_version: 1
+  artifact_id: art_123
+  version: 3
+  base_version_id: ver_2
+  profile: interactive-web
+  sources:
+    - content_sha256: "<actual digest>"
+      name: source.tar.zst
+      media_type: application/zstd
+  outputs:
+    - name: index.html
+      blob_sha256: "<actual digest>"
+      media_type: text/html
+  provenance:
+    agent_id: agent_456
+    host_id: nibbler
+    mission_id: mission_24
+    git_commit: "<immutable SHA>"
+    generator_skill: herdr-artifact
+    generator_revision: "<pinned revision>"
+  validation:
+    status: passed
+    report_blob_sha256: "<actual digest>"
+publication:
+  schema_version: 1
+  id: pub_123
+  kind: artifact
+  resource_id: art_123
+  pinned_version_id: ver_3
+  desired_state: active
+  audience: unlisted_link
+  human_approval_required: true
+  approved_by: "<trusted principal>"
+  expires_at: "2026-11-01T00:00:00Z"
+  provider: tailscale_funnel
+  request_policy:
+    allowed_methods: [GET, HEAD]
+    max_request_body_bytes: 0
+    websocket: false
+  public_gateway_policy_revision: 12

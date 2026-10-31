@@ -2,7 +2,7 @@
 # Gather a version/registration fingerprint for the current host (no changes).
 # Requires fleet_home / fleet_user to be set (see playbook preamble).
 # Registers:
-#   fp_herdr_version, fp_buildgate_md5, fp_agent, fp_revision, fp_cleanup
+#   fp_herdr_version, fp_herdr_path, fp_buildgate_md5, fp_summary_sha, fp_agent, fp_revision, fp_cleanup
 - name: "Capture herdr-eng version fingerprint"
   # become: false — must read the FLEET user's venv/services, not root's.
   become: false
@@ -11,6 +11,15 @@
   changed_when: false
   ignore_errors: true
 
+- name: "Capture resolved herdr-eng binary path"
+  become: false
+  ansible.builtin.shell: "readlink -f {{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng 2>/dev/null || realpath {{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng 2>/dev/null || echo MISSING"
+  args:
+    executable: /bin/bash
+  register: fp_herdr_path
+  changed_when: false
+  failed_when: false
+
 - name: "Capture build-gate extension checksum"
   become: false
   ansible.builtin.command: >-
@@ -18,6 +27,16 @@
     p=os.path.expanduser('{{ fleet_home }}/.pi/agent/extensions/build-gate.ts');
     print(hashlib.md5(open(p,'rb').read()).hexdigest() if os.path.exists(p) else 'MISSING')"
   register: fp_buildgate_md5
+  changed_when: false
+  ignore_errors: true
+
+- name: "Capture summary skill checksum"
+  become: false
+  ansible.builtin.command: >-
+    python3 -c "import hashlib,os;
+    p=os.path.expanduser('{{ fleet_home }}/.local/share/herdr-engineering/skills/summary/SKILL.md');
+    print(hashlib.sha256(open(p,'rb').read()).hexdigest() if os.path.exists(p) else 'MISSING')"
+  register: fp_summary_sha
   changed_when: false
   ignore_errors: true
 
@@ -73,6 +92,7 @@
 - name: "Decode valid installed release attestations"
   ansible.builtin.set_fact:
     fp_revision: "{{ (fp_release.stdout | from_json).get('revision', 'MISSING') if fp_release.rc == 0 else 'MISSING' }}"
+    fp_herdr_release_path: "{{ (fp_release.stdout | from_json).get('sourceRoot', 'MISSING') if fp_release.rc == 0 else 'MISSING' }}"
     fp_pi_revision: "{{ (fp_pi_release.stdout | from_json).get('revision', 'MISSING') if fp_pi_release.rc == 0 else 'MISSING' }}"
     fp_pi_path: "{{ (fp_pi_release.stdout | from_json).get('sourceRoot', '') if fp_pi_release.rc == 0 else '' }}"
 
@@ -89,3 +109,26 @@
     executable: /bin/bash
   register: fp_cleanup
   changed_when: false
+
+- name: "Capture AutoSpec source revision"
+  become: false
+  ansible.builtin.command:
+    argv:
+      - git
+      - -C
+      - "{{ fleet_home }}/autospec-runtime-main"
+      - rev-parse
+      - HEAD
+  register: fp_autospec_revision
+  changed_when: false
+  failed_when: false
+
+- name: "Capture installed AutoSpec incident command"
+  become: false
+  ansible.builtin.shell: |
+    {{ fleet_home }}/.autospec/bin/autospec --help 2>/dev/null | grep -qE '^    incident[[:space:]]' && echo active || echo missing
+  args:
+    executable: /bin/bash
+  register: fp_autospec_cli
+  changed_when: false
+  failed_when: false

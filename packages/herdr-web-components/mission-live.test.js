@@ -159,3 +159,21 @@ test('terminal lifecycle moves cached running workers into recorded history', ()
   assert.match(html, /data-detail-workers>Last recorded workers/);
   assert.ok(html.indexOf('data-disclosure="worker-history"') < html.indexOf('data-worker="reviewer"'));
 });
+test('model use shows the pin, agents elsewhere, and is absent for older Pi', () => {
+  const withUse = { ...projection, activity: { ...projection.activity, modelUse: { pin: 'gw/qwen3.8-27b', pinnedAt: '2026-10-30T00:00:00Z', elsewhere: 1, agents: [
+    { workerId: 'W1', role: 'implementer', model: 'gw/qwen3.8-27b', state: 'completed', onPin: true },
+    { workerId: 'W2', role: 'reviewer', model: 'gw/deepseek', state: 'running', onPin: false, why: 'independent review runs on a different model than the work it reviews' },
+    { workerId: 'W3', role: 'scout', state: 'running', onPin: null },
+  ] } } };
+  const card = missionCard(withUse, now);
+  assert.match(card, /Pinned to gw\/qwen3.8-27b · 1 agent on another model/);
+  const detail = missionDetail(withUse, now);
+  assert.match(detail, /Models and agents · 3/); assert.match(detail, /reviewer · W2/);
+  assert.match(detail, /gw\/deepseek · other model \(independent review runs on a different model/); assert.match(detail, /Model not reported/);
+  assert.doesNotMatch(missionCard(projection, now), /Pinned to|Not pinned/);
+  assert.match(missionCard({ ...projection, activity: { ...projection.activity, modelUse: { pin: null, agents: [] } } }, now), /Not pinned · models chosen by role/);
+});
+test('model use text is escaped', () => {
+  const html = missionCard({ ...projection, activity: { ...projection.activity, modelUse: { pin: '<img src=x onerror=alert(1)>', agents: [] } } }, now);
+  assert.doesNotMatch(html, /<img src=x/);
+});

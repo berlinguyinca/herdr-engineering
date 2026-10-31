@@ -21,10 +21,8 @@ class RepoControl:
         return self.repo.llm_config()
 
     def report(self, rec):
-        self.repo.record_token_usage(
-            rec["project"], rec["model"], rec.get("input_tokens"), rec.get("output_tokens"),
-            reasoning_tokens=rec.get("reasoning_tokens"), success=rec.get("success", True),
-            key_id=rec.get("key_id"))
+        # The same whitelist the POST /api/v1/token-usage route applies.
+        self.repo.record_token_usage_row(json.loads(json.dumps(rec)))
 
 
 def _upstream(seen):
@@ -509,5 +507,415 @@ def test_legacy_static_model_project_is_metadata_unless_registration_guard_reque
                           {"X-Herdr-Require-Registered-Model": "true"})
         assert forbidden.value.code == 403
         assert len(custom) == 1 and upstream == []
+    finally:
+        _teardown(proxy, srvs)
+
+
+# ------------------------------------------------------------- usage record v2
+# Design: docs/superpowers/specs/2026-10-23-llm-page-design.md (slice 1).
+
+import socket  # noqa: E402
+import time  # noqa: E402
+
+
+def _records(repo):
+    """Every token_usage payload, in recording order, with the event's session id."""
+    out = []
+    for etype, eid, seq in repo._event_order:
+        if etype != "token_usage":
+            continue
+        for ev in repo._events[(etype, eid)]:
+            if ev["sequence"] == seq:
+                out.append({**ev["payload"], "_event_session_id": ev.get("session_id")})
+    return out
+
+
+def _wait_records(repo, n, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        recs = _records(repo)
+        if len(recs) >= n:
+            return recs
+        time.sleep(0.02)
+    return _records(repo)
+
+
+def _reply(handler, status, payload: bytes, ctype="application/json"):
+    handler.rfile.read(int(handler.headers["Content-Length"]))
+    handler.send_response(status)
+    handler.send_header("Content-Type", ctype)
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.end_headers()
+    handler.wfile.write(payload)
+
+
+def test_v2_record_for_a_non_stream_request():
+    repo, key, proxy, _, _, srvs = _setup()
+    try:
+        _post(proxy, key, {"model": "qwen", "messages": []})
+        (rec,) = _wait_records(repo, 1)
+        assert rec["schema"] == 2 and rec["source"] == "llm-proxy"
+        assert (rec["project"], rec["model"], rec["upstream_model"]) == ("proj-a", "qwen", "qwen")
+        assert (rec["status"], rec["error_class"], rec["success"]) == (200, None, True)
+        assert (rec["stream"], rec["route"], rec["fallback"]) == (False, "upstream", False)
+        assert rec["ttft_ms"] is None and rec["gen_ms"] is None  # streams only, never estimated
+        assert isinstance(rec["queue_ms"], int) and 0 <= rec["queue_ms"] <= rec["duration_ms"]
+        assert rec["usage_known"] is True
+        assert (rec["input_tokens"], rec["output_tokens"], rec["reasoning_tokens"]) == (7, 3, 1)
+        assert rec["cache_read_tokens"] is None  # the upstream did not report it: unknown, not 0
+        assert rec["engine"] is None
+        assert rec["session_id"] is None and rec["agent_id"] is None
+        assert rec["key_id"] and "key_hash" not in rec and key not in json.dumps(rec)
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_streaming_records_ttft_and_generation_time_from_the_wire():
+    repo, key, proxy, _, _, srvs = _setup()
+    usage = {"prompt_tokens": 5, "completion_tokens": 4}
+
+    def slow_stream(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.flush()
+        time.sleep(0.15)  # time to first token
+        for i in range(3):
+            self.wfile.write(b'data: {"choices":[{"delta":{"content":"t%d"}}]}\n\n' % i)
+            self.wfile.flush()
+            time.sleep(0.1)
+        self.wfile.write(b"data: " + json.dumps({"choices": [], "usage": usage}).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    srvs[0].RequestHandlerClass.do_POST = slow_stream
+    try:
+        _post(proxy, key, {"model": "qwen", "stream": True, "messages": []})
+        (rec,) = _wait_records(repo, 1)
+        assert rec["stream"] is True and rec["status"] == 200 and rec["error_class"] is None
+        assert rec["ttft_ms"] >= 120
+        assert rec["gen_ms"] >= 250
+        assert rec["ttft_ms"] <= rec["ttft_ms"] + rec["gen_ms"] <= rec["duration_ms"]
+        assert (rec["usage_known"], rec["output_tokens"]) == (True, 4)
+    finally:
+        _teardown(proxy, srvs)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_missing_usage_is_unknown_not_zero(stream):
+    repo, key, proxy, _, _, srvs = _setup()
+
+    def no_usage(self):
+        if stream:
+            body = b'data: {"choices":[{"delta":{"content":"a"}}]}\n\ndata: [DONE]\n\n'
+            return _reply(self, 200, body, "text/event-stream")
+        return _reply(self, 200, b'{"choices":[{"message":{"content":"ok"}}]}')
+
+    srvs[0].RequestHandlerClass.do_POST = no_usage
+    try:
+        _post(proxy, key, {"model": "qwen", "stream": stream, "messages": []})
+        (rec,) = _wait_records(repo, 1)
+        assert rec["usage_known"] is False and rec["error_class"] is None and rec["success"] is True
+        for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens"):
+            assert rec[k] is None
+        totals = repo.token_analytics()["total"]  # still aggregates (as lower bounds)
+        assert (totals["requests"], totals["output_tokens"]) == (1, 0)
+    finally:
+        _teardown(proxy, srvs)
+
+
+@pytest.mark.parametrize("status,error_class", [
+    (429, "upstream_admission"), (503, "upstream_admission"), (400, "upstream_client_error"),
+    (404, "upstream_client_error"), (500, "upstream_server_error"), (502, "upstream_server_error")])
+def test_upstream_status_maps_to_an_error_class(status, error_class):
+    repo, key, proxy, _, _, srvs = _setup()
+    srvs[0].RequestHandlerClass.do_POST = lambda self: _reply(self, status, b'{"error":"x"}')
+    try:
+        with pytest.raises(urllib.error.HTTPError) as err:
+            _post(proxy, key, {"model": "qwen", "messages": []})
+        assert err.value.code == status
+        (rec,) = _wait_records(repo, 1)
+        assert (rec["status"], rec["error_class"], rec["success"]) == (status, error_class, False)
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_unreachable_upstream_is_recorded_as_502():
+    repo, key, proxy, _, _, srvs = _setup()
+    dead = socket.socket()
+    dead.bind(("127.0.0.1", 0))
+    port = dead.getsockname()[1]
+    dead.close()
+    proxy.RequestHandlerClass.state.upstream = f"http://127.0.0.1:{port}"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as err:
+            _post(proxy, key, {"model": "qwen", "messages": []})
+        assert err.value.code == 502
+        (rec,) = _wait_records(repo, 1)
+        assert (rec["status"], rec["error_class"]) == (502, "upstream_unreachable")
+        assert rec["usage_known"] is False and rec["output_tokens"] is None
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_truncated_stream_is_classified():
+    repo, key, proxy, _, _, srvs = _setup()
+
+    def truncated(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Length", "5000")
+        self.end_headers()
+        self.wfile.write(b'{"choices":[')
+        self.wfile.flush()
+        self.close_connection = True
+
+    srvs[0].RequestHandlerClass.do_POST = truncated
+    try:
+        with pytest.raises(http.client.IncompleteRead):
+            _post(proxy, key, {"model": "qwen", "messages": []})
+        (rec,) = _wait_records(repo, 1)
+        assert (rec["status"], rec["error_class"], rec["success"]) == (200, "stream_truncated", False)
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_client_disconnect_mid_stream_is_classified():
+    repo, key, proxy, _, _, srvs = _setup()
+
+    def endless(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        try:
+            for _ in range(400):
+                self.wfile.write(b'data: {"choices":[{"delta":{"content":"aaaa"}}]}\n\n' * 20)
+                self.wfile.flush()
+                time.sleep(0.01)
+        except OSError:
+            pass
+
+    srvs[0].RequestHandlerClass.do_POST = endless
+    try:
+        body = json.dumps({"model": "qwen", "stream": True, "messages": []}).encode()
+        sock = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                     b"Authorization: Bearer " + key.encode() + b"\r\n"
+                     b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        assert sock.recv(64).startswith(b"HTTP/1.1 200")
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+        sock.close()  # RST: the proxy's next writes fail
+        (rec,) = _wait_records(repo, 1)
+        assert (rec["status"], rec["error_class"], rec["success"]) == (200, "client_disconnected", False)
+        assert proxy.RequestHandlerClass.state.inflight("proj-a") == 0
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_proxy_backpressure_429_is_recorded_with_its_queue_wait():
+    repo, key, proxy, seen, _, srvs = _setup()
+    try:
+        state = proxy.RequestHandlerClass.state
+        state.configure_limits(max_inflight=1, wait_seconds=0.1)
+        assert state.acquire("proj-a")
+        with pytest.raises(urllib.error.HTTPError) as err:
+            _post(proxy, key, {"model": "qwen", "stream": True, "messages": []})
+        assert err.value.code == 429 and seen == []
+        state.release("proj-a")
+        (rec,) = _wait_records(repo, 1)
+        assert (rec["status"], rec["error_class"], rec["success"]) == (429, "proxy_backpressure", False)
+        assert rec["queue_ms"] >= 80 and rec["duration_ms"] >= rec["queue_ms"]
+        assert (rec["model"], rec["stream"], rec["route"]) == ("qwen", True, None)
+        assert rec["ttft_ms"] is None and rec["usage_known"] is False and rec["input_tokens"] is None
+        assert repo.token_analytics()["total"]["failed"] == 1  # requests include proxy 429s
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_pre_dispatch_rejections_are_recorded_with_their_class():
+    repo, key, proxy, gpu, cpu, srvs, _ = _policy_setup()
+    try:
+        with pytest.raises(urllib.error.HTTPError):
+            _summary_post(proxy, key, model="missing")
+        foreign = repo.create_project_key("proj-b")["key"]
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        with pytest.raises(urllib.error.HTTPError):
+            _summary_post(proxy, foreign)
+        port = proxy.server_address[1]
+        for raw, length in ((b"{not json", None), (b"[1]", None), (b"", "abc")):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.putrequest("POST", "/v1/chat/completions")
+            conn.putheader("Authorization", f"Bearer {key}")
+            conn.putheader("Content-Length", length or str(len(raw)))
+            conn.endheaders(raw)
+            assert conn.getresponse().status == 400
+            conn.close()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/v1/chat/completions")
+        conn.putheader("Authorization", f"Bearer {key}")
+        conn.putheader("Content-Length", str(64 * 1024 * 1024))
+        conn.endheaders()
+        assert conn.getresponse().status == 413
+        conn.close()
+        with pytest.raises(urllib.error.HTTPError) as unauth:  # no project: never recorded
+            _post(proxy, "hk-unknown", {"model": "qwen"})
+        assert unauth.value.code == 401
+        recs = _wait_records(repo, 6)
+        # Error responses can reach the client before their handler's final
+        # accounting call. Independent HTTP handlers need not record in request
+        # order; every rejection and its classification must still be present.
+        assert sorted((r["project"], r["status"], r["error_class"]) for r in recs) == sorted([
+            ("proj-a", 503, "model_not_registered"), ("proj-b", 403, "model_project_mismatch"),
+            ("proj-a", 400, "request_invalid"), ("proj-a", 400, "request_invalid"),
+            ("proj-a", 400, "request_invalid"), ("proj-a", 413, "request_too_large")])
+        assert next(r for r in recs if r["error_class"] == "model_not_registered")["model"] == "missing"
+        assert all(r["model"] == "unknown" for r in recs if r["error_class"] == "request_invalid")
+        assert gpu == cpu == []
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_session_id_comes_from_the_header_then_the_key_label():
+    repo, _, proxy, _, _, srvs = _setup()
+    try:
+        labelled = repo.create_project_key("proj-a", label="session:amber-swift")["key"]
+        plain = repo.create_project_key("proj-a", label="ci")["key"]
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        _post_headers(proxy, labelled, {"model": "qwen", "messages": []},
+                      {"X-InferWeave-Session-ID": "hdr-1", "X-InferWeave-Agent-ID": "implementer"})
+        _post_headers(proxy, labelled, {"model": "qwen", "messages": []}, {"X-Session-Id": "alias-2"})
+        _post_headers(proxy, labelled, {"model": "qwen", "messages": []})
+        _post_headers(proxy, labelled, {"model": "qwen", "messages": []}, {"X-InferWeave-Session-ID": "bad id"})
+        _post_headers(proxy, plain, {"model": "qwen", "messages": []})
+        recs = _wait_records(repo, 5)
+        assert [r["session_id"] for r in recs] == ["hdr-1", "alias-2", "amber-swift", "amber-swift", None]
+        assert [r["_event_session_id"] for r in recs] == ["hdr-1", "alias-2", "amber-swift", "amber-swift", None]
+        assert [r["agent_id"] for r in recs] == ["implementer", None, None, None, None]
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_route_and_fallback_flags():
+    repo, key, proxy, *_rest, srvs, _ = _policy_setup()
+    try:
+        _summary_post(proxy, key)
+        (rec,) = _wait_records(repo, 1)
+        assert (rec["route"], rec["fallback"], rec["upstream_model"]) == ("fabric", False, "gpu/qwen-small")
+        assert rec["model"] == "summary" and rec["session_id"] == "summary-session"
+    finally:
+        _teardown(proxy, srvs)
+    repo, key, proxy, *_rest, srvs, _ = _policy_setup(gpu_status=503)
+    try:
+        _summary_post(proxy, key)
+        (rec,) = _wait_records(repo, 1)
+        assert (rec["route"], rec["fallback"], rec["upstream_model"]) == ("cpu", True, "cpu-small")
+        assert (rec["status"], rec["error_class"]) == (200, None)  # a successful fallback is no error
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_no_prompt_or_response_text_is_ever_stored():
+    repo, key, proxy, _, _, srvs = _setup()
+    handler = srvs[0].RequestHandlerClass
+    original = handler.do_POST
+
+    def answer(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if body.get("fail"):
+            return _reply_raw(self, 500, b'{"error":{"message":"ZEBRA-RESPONSE-SECRET"}}')
+        reply = {"choices": [{"message": {"content": "ZEBRA-RESPONSE-SECRET"}}],
+                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        return _reply_raw(self, 200, json.dumps(reply).encode())
+
+    def _reply_raw(self, status, payload):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    handler.do_POST = answer
+    try:
+        messages = [{"role": "user", "content": "AARDVARK-PROMPT-SECRET"}]
+        _post(proxy, key, {"model": "qwen", "messages": messages})
+        with pytest.raises(urllib.error.HTTPError):
+            _post(proxy, key, {"model": "qwen", "messages": messages, "fail": True})
+        handler.do_POST = original
+        _post(proxy, key, {"model": "qwen", "stream": True, "messages": messages})
+        assert len(_wait_records(repo, 3)) == 3
+        stored = json.dumps(repo.export_state())
+        assert "AARDVARK-PROMPT-SECRET" not in stored and "ZEBRA-RESPONSE-SECRET" not in stored
+        assert '"messages"' not in stored
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_v1_records_and_analytics_shape_are_unchanged():
+    repo = ControlPlaneRepo()
+    repo.record_token_usage("p", "m", 1, 2)                       # v1 positional call
+    repo.record_token_usage_row({"project": "p", "model": "m"})   # v1 row without token fields
+    repo.record_token_usage_row({"project": "p", "model": "m", "input_tokens": 3,
+                                 "output_tokens": 4, "success": False})
+    repo.record_token_usage_row({"schema": 2, "project": "p", "model": "m2", "status": 200,
+                                 "usage_known": False, "input_tokens": None})
+    v1 = _records(repo)[1]
+    assert v1["input_tokens"] == 0 and "schema" not in v1  # v1 payloads keep the old shape
+    out = repo.token_analytics()
+    assert set(out) == {"total", "by_project", "by_model", "by_day", "by_session"}
+    assert out["total"] == {"requests": 4, "input_tokens": 4, "output_tokens": 6,
+                            "reasoning_tokens": 0, "cache_read_tokens": 0,
+                            "cache_write_tokens": 0, "failed": 1}
+    assert set(out["by_model"]) == {"m", "m2"}
+    assert set(out["by_model"]["m"]) == set(out["total"])
+
+
+def test_row_whitelist_drops_unknown_fields_and_bad_values():
+    repo = ControlPlaneRepo()
+    repo.record_token_usage_row({
+        "schema": 2, "project": "p", "model": "m", "messages": [{"content": "LEAK"}],
+        "prompt": "LEAK", "status": "200", "error_class": "made_up", "ttft_ms": -5,
+        "gen_ms": "fast", "queue_ms": 3.7, "stream": "yes", "route": "elsewhere",
+        "engine": "x" * 500, "session_id": "s" * 500, "output_tokens": True})
+    (rec,) = _wait_records(repo, 1)
+    assert "messages" not in rec and "prompt" not in rec and "LEAK" not in json.dumps(rec)
+    assert rec["status"] is None and rec["error_class"] is None
+    assert rec["ttft_ms"] is None and rec["gen_ms"] is None and rec["queue_ms"] == 3
+    assert rec["stream"] is None and rec["route"] is None and rec["output_tokens"] is None
+    assert rec["engine"] is None and rec["session_id"] is None  # over-long ids are dropped, not cut
+
+
+def test_tagged_content_is_gated_by_operator_egress_routes():
+    repo, key, proxy, seen, seen_custom, srvs = _setup()
+    try:
+        body = {"model": "plain", "messages": [{"role": "user", "content": "x"}]}
+        # untagged traffic is unchanged
+        assert _post_headers(proxy, key, body)[0] == 200
+        # tagged, but the upstream route is not configured -> treated as external -> mail is refused, nothing forwarded
+        before = len(seen)
+        for tag in ("private_mail", "scientific", "garbage"):
+            with pytest.raises(urllib.error.HTTPError) as err:
+                _post_headers(proxy, key, body, {"X-Herdr-Data-Class": tag})
+            assert err.value.code == 403
+        assert len(seen) == before
+        # public data may go to an external route
+        assert _post_headers(proxy, key, body, {"X-Herdr-Data-Class": "public"})[0] == 200
+        # operator marks the upstream local: mail is allowed there; the custom model stays unconfigured/external
+        repo.egress_fn = lambda: {"upstream_kind": "local", "custom_kinds": {"my-model": "approved_cloud"},
+                                  "approved": ["internal", "private_mail"]}
+        state = ProxyState(RepoControl(repo), "http://127.0.0.1:9", "k")
+        state.refresh(force=True)
+        assert state.egress_check("plain", "private_mail")[0] is True
+        assert state.egress_check("my-model", "private_mail")[0] is False   # local-only class never goes to cloud
+        assert state.egress_check("my-model", "internal")[0] is True
+        # a custom model marked local cannot launder data onto an external upstream it may resolve to
+        repo.egress_fn = lambda: {"upstream_kind": "external", "custom_kinds": {"my-model": "local"}, "approved": []}
+        state.refresh(force=True)
+        assert state.egress_check("my-model", "private_mail")[0] is False
+        assert state.egress_check("my-model", "public")[0] is True
+        repo.egress_fn = lambda: {"upstream_kind": "local", "custom_kinds": {"my-model": "approved_cloud"}, "approved": ["internal", "private_mail"]}
+        state.refresh(force=True)
+        assert state.egress_check("plain", None)[0] is False
     finally:
         _teardown(proxy, srvs)

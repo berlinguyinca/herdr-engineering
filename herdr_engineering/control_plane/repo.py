@@ -13,17 +13,48 @@ durable Postgres/RustFS path (Phase 1 async stores) is bridged in deployment.
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import hashlib
 import json
+import logging
+import math
+import re
 import threading
 import time
+from contextlib import contextmanager
 from uuid import uuid4
 
-from .agent_identity import AgentIdentityRegistry
-from .ids import new_id
+from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
+from ..llm_session_id import dashboard_form
+from . import llm_stats, usage_spend
+from .agent_identity import (
+    AgentIdentityConflict,
+    AgentIdentityRegistry,
+    AgentIdentityVersionConflict,
+)
+from .deployment_actions import ENTITY_TYPE as DEPLOYMENT_REQUEST_ENTITY
+from .deployment_actions import ForceRequests
+from .deployment_coordinator import ENTITY_TYPE as DEPLOYMENT_PLAN_ENTITY
+from .deployment_coordinator import CoordinatorState
+from .deployment_escalation import ENTITY_TYPE as DEPLOYMENT_ESCALATION_ENTITY
+from .deployment_escalation import EscalationLedger
+from .deployments_monitor import ENTITY_TYPE as DEPLOYMENT_ENTITY
+from .deployments_monitor import DeploymentsMonitor
+from .envelope import SourceLedger, envelope_event_fields
+from .graph import GraphProjection
+from .graph import _lseq as _graph_lseq
+from .graph import _rank as _graph_rank
+from .graph import from_stored as _graph_from_stored
+from .history_cursor import fingerprint
+from .host_metrics_store import ENTITY_TYPE as HOST_METRICS_ENTITY
+from .host_metrics_store import STATE_KEYS as HOST_STATE_KEYS
+from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
+from .host_problems import compute_problems
+from .ids import new_id, validate_mission_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
+from . import review_refs
 from .service_catalog import (
     INACTIVE,
     capture_service_origin,
@@ -38,6 +69,11 @@ from .service_catalog import (
     track_availability,
     validate_archive_days,
 )
+
+#: Hard bound on one durable deployment write made under a store lock (seconds).
+DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S = 10
+
+_CI_EVENT_KINDS = frozenset({"ci_report", "ci_observation", "ci_telemetry", "ci_logtests"})
 
 _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
@@ -57,7 +93,8 @@ def _session_mission_identity(mission_id, source):
         namespace, raw_id = mission_id.split(":", 1)
         if not raw_id or ":" in raw_id or (source != "herdr" and namespace != source):
             raise ValueError("mission identity conflicts with its source")
-        return {"mission_key": mission_id, "mission_source": namespace}
+        return {"mission_key": mission_id,
+                "mission_source": "herdr" if namespace == "herdr-ws" else namespace}
     return {"mission_key": mission_id if source == "herdr" else f"{source}:{mission_id}",
             "mission_source": source}
 
@@ -114,6 +151,43 @@ def _label(value, forbidden=None):
     return value if all(c.isprintable() for c in value) else None
 
 
+RUNTIME_KINDS = ("standard-pi", "pi-bolt", "pi-bolt-jit")
+
+
+def _runtime(value):
+    """Runtime facts a Pi agent reports about itself (which Pi binary, engine, CPU, RSS), or None.
+
+    Untrusted emitter: an allowlisted shape with bounded values, never the raw payload. Runtime metrics only;
+    inference metrics (tokens, latency, queue) stay in the inference telemetry."""
+    if not isinstance(value, dict) or value.get("runtime_kind") not in RUNTIME_KINDS:
+        return None
+    def text(key, limit=64):
+        v = value.get(key)
+        return v[:limit] if isinstance(v, str) and all(c.isprintable() for c in v) else None
+    def number(key, hi):
+        v = value.get(key)
+        return round(float(v), 3) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= hi else None
+    out = {"runtime_kind": value["runtime_kind"], "runtime_source": text("runtime_source", 32),
+           "js_engine": value.get("js_engine") if value.get("js_engine") in ("bun", "node") else None,
+           "js_engine_version": text("js_engine_version", 32), "cpu_s": number("cpu_s", 1e7),
+           "rss_mib": number("rss_mib", 1e6), "fallback_reason": text("fallback_reason", 200)}
+    return {k: v for k, v in out.items() if v is not None}
+
+
+class _BootPhases:
+    """Logs how long each startup phase takes, so a slow boot says where the time went."""
+
+    def __init__(self, name):
+        self._log = logging.getLogger(__name__)
+        self._name = name
+        self._start = self._last = time.monotonic()
+
+    def __call__(self, phase):
+        now = time.monotonic()
+        self._log.info("boot %s: %s took %.1fs (total %.1fs)", self._name, phase, now - self._last, now - self._start)
+        self._last = now
+
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -130,8 +204,10 @@ class ControlPlaneRepo:
         self._event_lock = threading.RLock()
         self._agent_projection_lock = threading.RLock()
         self._agent_records = {}
+        self._agent_identity_history = []
         self._agent_sequence = 0
         self._sink = sink
+        self._durable_history = None
         self._now = now or (lambda: time.time())
         self._missions = {}
         self._sessions = {}
@@ -141,19 +217,119 @@ class ControlPlaneRepo:
         self._artifacts = {}
         self._blobs = {}  # artifact_id -> bytes (in-memory RustFS stand-in)
         self._leases = {}
+        self._scheduler_reservations = {}
+        self._scheduler_leases = {}
+        self._scheduler_observations = {}
+        self._pending_scheduler_observations = None
+        self._pending_scheduler_events = None
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
+        self.pull_request_version = 0      # bumped on every change to a PR record: lets a consumer tell cheaply that nothing moved
+        self._stage_runs = {}  # mission_key -> [open+closed stage runs, ...]
+        self._token_usage = {}  # request_id -> token usage record (issue #36)
+        self._resource_usage = {}  # (mission_id, kind) -> [resource usage record, ...]
         self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
+        # Rebuilding delivery projections replays stored events into the upsert
+        # methods, which would otherwise re-record the very events being rebuilt.
+        self._suppress_record_events = False
         self._ci_sequence = 0  # one bounded counter survives stream eviction
+        self._ci_history_truncated = set()
+        self._ci_test_projection = None
+        # Envelope v2 idempotency / sequence / freshness state (envelope.py).
+        self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
+        self.collab_quarantine_reasons = []
+        self.collab_quarantine = []  # foreign 'collab' rows found at startup (never replayed)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
-        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
+        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
+            verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
+        # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
+        # from them on import_state; owns no storage of its own.
+        self.graph = GraphProjection()
+        self.host_metrics = self._new_host_metrics()
+        # Deployment events reported by the host updaters (deploy-4): a private stream, like host metrics.
+        self.deployments = self._new_deployments()
+        # The deployment coordinator's plan generation and attempts (deploy-4 Task 3): private too.
+        self.deployment_plans = self._new_deployment_plans()
+        # Operator force-redeploy requests the hosts pick up (deploy-4 Task 5): private too.
+        self.deployment_requests = self._new_deployment_requests()
+        # The repair ledger and escalation records (deploy-4 Task 8): private too.
+        self.deployment_escalations = self._new_deployment_escalations()
+
+    def _new_deployment_escalations(self):
+        return EscalationLedger(persist=self._persist_deployments,
+                                persist_required=self._persist_deployments_required)
+
+    def _new_deployment_requests(self):
+        return ForceRequests(persist=self._persist_deployments,
+                             persist_required=self._persist_deployments_required, now=lambda: self._now())
+
+    def _new_deployment_plans(self):
+        return CoordinatorState(persist=self._persist_deployments)
+
+    def _new_host_metrics(self):
+        return HostMetricsStore(now=lambda: self._now(), persist=self._persist_host_metrics)
+
+    def _new_deployments(self):
+        return DeploymentsMonitor(now=lambda: self._now(), persist=self._persist_deployments)
+
+    def _persist_deployments(self, ev):
+        """Deployment events take the same private sink path as host-metrics rollups."""
+        self._persist_host_metrics(ev)
+
+    def _persist_deployments_required(self, ev):
+        """Like ``_persist_deployments`` but durable: raises unless the sink acknowledged the
+        record (a force pickup must not be lost, or a restart would grant the force again)."""
+        if self._sink is None:
+            return
+        required = getattr(self._sink, "record_required", None)
+        if not callable(required):
+            # a legacy best-effort sink cannot acknowledge: fail safe (the route answers 503)
+            raise RuntimeError("durable deployment persistence requires an acknowledged sink")
+        stamp = self._stamp()
+        row = {"event_id": new_id("event"), "schema_version": 1, "source_timestamp": stamp,
+               "ingest_timestamp": stamp, "mission_id": None, "session_id": None, **ev}
+        # Callers hold a store lock (the force requests, the escalation ledger): a hung
+        # database must fail this write (fail closed), not pin the permit and inbox threads.
+        # A write that lands after the timeout only ever errs towards "not done".
+        box = {}
+
+        def write():
+            try:
+                required(row)
+                box["ok"] = True
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the caller below
+                box["error"] = exc
+
+        worker = threading.Thread(target=write, name="deployment-durable-write", daemon=True)
+        worker.start()
+        worker.join(DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S)
+        if worker.is_alive():
+            raise TimeoutError("durable deployment write timed out")
+        if "error" in box:
+            raise box["error"]
+
+    def _persist_host_metrics(self, ev):
+        """Rollups and host-state changes go to the sink, not the shared streams/SSE."""
+        if self._sink is None:
+            return
+        stamp = self._stamp()
+        self._sink.record({"event_id": new_id("event"), "schema_version": 1,
+                           "source_timestamp": stamp, "ingest_timestamp": stamp,
+                           "mission_id": None, "session_id": None, **ev})
+
+    def _persist_source_state(self, state):
+        """Mirror per-source state to the durable sink when it supports it."""
+        mirror = getattr(self._sink, "record_source_state", None)
+        if callable(mirror):
+            mirror(state)
 
     def _persist_inspector(self, ev):
         """Persist inspector detail outside global streams; require capture ACKs."""
@@ -201,7 +377,12 @@ class ControlPlaneRepo:
                         and m.get("source", "herdr") == "herdr"):
                     rec = m
                     break
-        return _copy(rec)
+        if rec is None:
+            return None
+        rec = _copy(rec)
+        rec["telemetry_state"], rec["report_age_seconds"] = self._mission_telemetry_state(
+            rec.get("mission_key") or rec["mission_id"])
+        return rec
 
     def _resolve_mission_key(self, mission_id, source="herdr"):
         """Return the stored key for ``mission_id`` under ``source``.
@@ -224,8 +405,39 @@ class ControlPlaneRepo:
             return mission_id
         return None
 
+    def _mission_telemetry_state(self, mission_key: str) -> tuple:
+        """Return (telemetry_state, report_age_seconds) from the activity store.
+
+        telemetry_state is ``live``/``stale``/``unknown`` reflecting *collection*
+        freshness of the Pi transport, never worker health: a mission with no
+        collector is ``unknown``, not stalled. report_age_seconds is the age of the
+        most recent activity report (the stall age) or ``None`` when there is no
+        collector, so the UI never fabricates a liveness reading. Both reuse the
+        real freshness the activity store already computes (issue #28); no
+        fabricated heartbeat is ever invented.
+        """
+        try:
+            live = self.mission_activity.get(mission_key)
+        except Exception:  # noqa: BLE001 - one unreadable entry never hides the rest
+            live = None
+        if not live:
+            return "unknown", None
+        freshness = live.get("freshness") or {}
+        state = freshness.get("state")
+        age = freshness.get("age_seconds")
+        if state in ("live", "updating"):
+            return "live", age
+        if state in ("stale", "disconnected"):
+            return "stale", age
+        return "unknown", age
+
     def list_missions(self, status=None):
-        out = [_copy(m) for m in self._missions.values()]
+        out = []
+        for m in self._missions.values():
+            rec = _copy(m)
+            rec["telemetry_state"], rec["report_age_seconds"] = self._mission_telemetry_state(
+                rec.get("mission_key") or rec["mission_id"])
+            out.append(rec)
         if status:
             out = [m for m in out if m["status"] == status]
         return _sort_by(out, "created_at", reverse=True)
@@ -243,6 +455,85 @@ class ControlPlaneRepo:
         m["updated_at"] = self._stamp()
         self.record_event("mission", key, "MissionStageChanged",
                           {"from": old, "to": stage}, mission_id=mission_id)
+        self._transition_stage(key, old, stage)
+        self._mission_stage_changed(key, old, stage)
+
+    def _mission_stage_changed(self, key, old, new):
+        # A durable outcome is written when a mission ends; it can never break the stage change itself.
+        outcomes = self.mission_outcomes
+        if outcomes is None:
+            return
+        try:
+            outcomes.on_stage(key, old, new)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _transition_stage(self, mission_key, old, new, when=None):
+        """Record a stage run: close the open run (if any) and open the next.
+
+        Stage durations are derived purely from stage transitions (issue #37).
+        The first observed transition opens the incoming stage's run; a later
+        transition closes the previously open run (``ended_at``/``duration_ms``)
+        and opens the new one. A stage change that repeats the current stage is
+        a no-op so a re-emitted event never truncates an open run.
+
+        ``when`` is the transition timestamp (an ISO string); it defaults to the
+        current clock so live transitions use wall time and event-only replays
+        can supply each event's stored ``source_timestamp``.
+        """
+        if old == new:
+            return
+        now = when or self._stamp()
+        runs = self._stage_runs.setdefault(mission_key, [])
+        if runs and runs[-1].get("ended_at") is None:
+            prev = runs[-1]
+            prev["ended_at"] = now
+            prev["duration_ms"] = max(0, int(
+                self._epoch_ms(now) - self._epoch_ms(prev["started_at"])))
+        runs.append({
+            "mission_id": mission_key, "stage": new,
+            "started_at": now, "ended_at": None, "duration_ms": None,
+        })
+
+    @staticmethod
+    def _epoch_ms(iso: str) -> int:
+        return int(_dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
+
+    def stage_analytics(self):
+        """p50/p95 duration per stage plus the bottleneck stage (issue #37).
+
+        Only closed runs contribute to percentiles; the currently open run of a
+        mission appears under ``in_progress`` and never in a percentile.
+        Bottleneck = stage with the largest total closed-run duration, ties
+        broken by stage name.
+        """
+        closed = {}   # stage -> [duration_ms, ...]
+        total = {}    # stage -> sum(duration_ms)
+        in_progress = {}
+        for mission, runs in self._stage_runs.items():
+            for run in runs:
+                stage = run.get("stage")
+                if run.get("ended_at") is None:
+                    in_progress.setdefault(mission, []).append(stage)
+                    continue
+                dur = run.get("duration_ms")
+                if dur is None:
+                    continue
+                closed.setdefault(stage, []).append(dur)
+                total[stage] = total.get(stage, 0) + dur
+        stages = {}
+        for stage, durations in closed.items():
+            srt = sorted(durations)
+            stages[stage] = {
+                "p50_ms": _percentile(srt, 50),
+                "p95_ms": _percentile(srt, 95),
+                "runs": len(durations),
+            }
+        bottleneck = None
+        if total:
+            bottleneck = max(sorted(total), key=lambda s: total[s])
+        return {"stages": stages, "bottleneck": bottleneck,
+                "in_progress": in_progress}
 
     # -------------------------------------------------------------- sessions
     def create_session(self, mission_id=None, agent_role="", model="",
@@ -285,7 +576,15 @@ class ControlPlaneRepo:
     def _named_session(self, record):
         if record is None:
             return None
-        profile = self.agent_identities.allocate(record["session_id"], record.get("name"))
+        try:
+            profile = self.agent_identities.allocate(record["session_id"], record.get("name"))
+        except AgentIdentityConflict:
+            if not self.agent_identities.is_conflicted(record["session_id"]):
+                raise
+            profile = self.agent_identities.get(record["session_id"])
+            return {**record, "display_name": record["session_id"], "agent_handle": None,
+                    "name_version": profile["version"],
+                    "name_error": "Saved agent name has conflicting reservations or versions; using the session ID until renamed."}
         return {**record, "display_name": profile["display_name"],
                 "agent_handle": profile["handle"], "name_version": profile["version"]}
 
@@ -309,9 +608,26 @@ class ControlPlaneRepo:
                 required = getattr(self._sink, "record_required", None)
                 if not callable(required):
                     raise RuntimeError("agent projections require acknowledged persistence")
-                required(event)
-            self._agent_sequence = sequence
-            self._agent_records[(event["entity_type"], event["entity_id"])] = event
+                try:
+                    acknowledged = required(event)
+                except AgentIdentityVersionConflict as error:
+                    current = getattr(error, "current_event", None)
+                    if isinstance(current, dict) and current.get("entity_id") == event["entity_id"]:
+                        self._remember_agent_projection(copy.deepcopy(current))
+                    raise
+                if event["entity_type"] == "agent_identity" and isinstance(acknowledged, dict):
+                    event = copy.deepcopy(acknowledged)
+                    sequence = int(event["sequence"])
+            self._remember_agent_projection(event)
+            if event["entity_type"] == "agent_identity":
+                return copy.deepcopy(event["payload"])
+
+    def _remember_agent_projection(self, event):
+        self._agent_sequence = max(self._agent_sequence, int(event["sequence"]))
+        self._agent_records[(event["entity_type"], event["entity_id"])] = event
+        if event["entity_type"] == "agent_identity":
+            if not any(old.get("event_id") == event.get("event_id") for old in self._agent_identity_history):
+                self._agent_identity_history.append(copy.deepcopy(event))
 
     def persist_agent_summary(self, event):
         sid = event["session_id"]
@@ -707,29 +1023,48 @@ class ControlPlaneRepo:
 
     # ---------------------------------------------------------------- hosts
     def register_host(self, host_name, tailnet_ip):
-        hid = new_id("host")
-        rec = {
-            "host_id": hid, "host_name": host_name, "tailnet_ip": tailnet_ip,
-            "status": "healthy", "last_seen": self._stamp(),
-            "created_at": self._stamp(),
-        }
-        self._hosts[hid] = rec
-        self.record_event("host", hid, "HostRegistered",
-                          {"host_name": host_name, "tailnet_ip": tailnet_ip})
-        return hid
+        with self._event_lock:
+            hid = new_id("host")
+            rec = {
+                "host_id": hid, "host_name": host_name, "tailnet_ip": tailnet_ip,
+                "status": "healthy", "last_seen": self._stamp(),
+                "created_at": self._stamp(),
+            }
+            self._hosts[hid] = rec
+            self.record_event("host", hid, "HostRegistered",
+                              {"host_name": host_name, "tailnet_ip": tailnet_ip})
+            return hid
 
     def get_host(self, host_id):
-        return self._merged_hosts().get(self._canonical_host(host_id))
+        host = self._merged_hosts().get(self._canonical_host(host_id))
+        return self._with_problems(host) if host is not None else None
+
+    def get_host_record(self, host_id):
+        """A copy of the stored record for exactly ``host_id`` (no alias merge, no problems)."""
+        with self._event_lock:
+            rec = self._hosts.get(host_id)
+            return _copy(rec) if rec is not None else None
+
+    def _with_problems(self, host):
+        """A copy of ``host`` carrying ``problems`` and ``problem_count`` (the store is untouched)."""
+        history = self.host_history(host["host_id"], "1h")
+        problems = compute_problems(host, history, self._now())
+        return {**host, "problems": problems, "problem_count": len(problems)}
 
     def _merged_hosts(self):
         """Hosts keyed by canonical id; an alias contributes its freshest report."""
+        # Snapshot under the lock: ingest threads add hosts while a reader iterates.
+        with self._event_lock:
+            raw = list(self._hosts.items())
+            aliases = dict(self._host_aliases)
+            hosts = {hid: _copy(rec) for hid, rec in raw}
         merged = {}
-        for hid, rec in self._hosts.items():
-            if hid in self._host_aliases:
+        for hid, rec in hosts.items():
+            if hid in aliases:
                 continue
-            merged[hid] = _copy(rec)
-        for alias, canonical in self._host_aliases.items():
-            rec = self._hosts.get(alias)
+            merged[hid] = rec
+        for alias, canonical in aliases.items():
+            rec = hosts.get(alias)
             if rec is None:
                 continue
             base = merged.get(canonical)
@@ -737,16 +1072,85 @@ class ControlPlaneRepo:
                 base = merged[canonical] = _copy(rec)
                 base["host_id"] = base["host_name"] = canonical
                 continue
-            if (rec.get("last_seen") or "") > (base.get("last_seen") or ""):
+            fresher = (rec.get("last_seen") or "") > (base.get("last_seen") or "")
+            if fresher:
                 for key in ("last_seen", "status", "cpu", "mem"):
                     if rec.get(key) is not None:
                         base[key] = rec[key]
+            # Report and state keys may live on either record (the agent heartbeats
+            # under one id, the fleet update posts under another): the fresher
+            # record wins a shared key, and a key on only one record survives.
+            for key in ("latest", *HOST_STATE_KEYS):
+                if rec.get(key) is not None and (fresher or base.get(key) is None):
+                    base[key] = rec[key]
             if rec.get("inventory") and not base.get("inventory"):
                 base["inventory"] = _copy(rec["inventory"])
         return merged
 
     def list_hosts(self):
-        return _sort_by(list(self._merged_hosts().values()), "host_name")
+        hosts = [self._with_problems(h) for h in self._merged_hosts().values()]
+        return _sort_by(hosts, "host_name")
+
+    def host_snapshot(self, host_id):
+        """Return the scheduler view of one host, or ``None`` when unknown."""
+        from datetime import datetime
+        record = self.get_host(host_id)
+        if record is None:
+            return None
+        samples = self.list_telemetry(record.get("host_id"), limit=1)
+        observation = self._scheduler_observations.get(record.get("host_id"))
+        latest = observation["sample"] if observation else (samples[-1] if samples else None)
+        at = latest.get("at") if latest else record.get("last_seen")
+        try:
+            telemetry_at = datetime.fromisoformat(at) if at else None
+            if telemetry_at and telemetry_at.tzinfo is None:
+                telemetry_at = None
+        except (TypeError, ValueError):
+            telemetry_at = None
+        freshness = latest.get("freshness_seconds") if latest else None
+        policy = record.get("scheduler_policy") or {}
+        return HostSnapshot(
+            host_uid=record.get("host_uid") or record.get("host_id"),
+            host_name=record.get("host_name") or record.get("host_id"),
+            aliases=tuple(record.get("aliases") or (record.get("host_name"),)),
+            platform=record.get("platform") or "unknown",
+            owned=record.get("scheduler_owned", False),
+            trusted=record.get("scheduler_trusted", False),
+            reachable=record.get("status") not in {"unavailable", "unknown"},
+            telemetry_at=telemetry_at,
+            telemetry_freshness_seconds=freshness,
+            policy=HostPolicy(
+                mode=PolicyMode(policy.get("mode", PolicyMode.MANUAL_ONLY)),
+                revision=int(policy.get("revision", 0)),
+                allow_tags=frozenset(policy.get("allow_tags") or ()),
+                deny_tags=frozenset(policy.get("deny_tags") or ()),
+            ),
+        )
+
+    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=(), deny_tags=(), reason=None):
+        """Update scheduler policy with optimistic concurrency and an audit event."""
+        with self.scheduler_admission():
+            return self._set_host_policy(host_id, mode=mode, expected_revision=expected_revision,
+                                         allow_tags=allow_tags, deny_tags=deny_tags, reason=reason)
+
+    def _set_host_policy(self, host_id, *, mode, expected_revision, allow_tags, deny_tags, reason):
+        host = self._hosts.get(host_id)
+        if host is None:
+            raise KeyError(host_id)
+        mode = PolicyMode(mode)
+        current = host.get("scheduler_policy") or {"revision": 0, "mode": PolicyMode.MANUAL_ONLY}
+        if int(expected_revision) != int(current.get("revision", 0)):
+            raise ValueError("host policy revision conflict")
+        next_policy = {
+            "mode": mode.value,
+            "revision": int(current.get("revision", 0)) + 1,
+            "allow_tags": sorted({str(v).strip().lower() for v in allow_tags if str(v).strip()}),
+            "deny_tags": sorted({str(v).strip().lower() for v in deny_tags if str(v).strip()}),
+            "reason": str(reason)[:300] if reason else None,
+        }
+        self.record_event("host", host_id, "HostPolicyChanged", next_policy, require_durable=True)
+        host["scheduler_policy"] = next_policy
+        return _copy(next_policy)
 
     def fleet_inventory(self):
         """Host x component version matrix with drift against the fleet reference.
@@ -785,25 +1189,28 @@ class ControlPlaneRepo:
                             "missing": sum(c["missing"] for c in components)}}
 
     def record_heartbeat(self, host_id, tailnet_ip=None, cpu=None, mem=None):
-        h = self._hosts.get(host_id)
-        if h is None:
-            return False
-        h["last_seen"] = self._stamp()
-        h["status"] = "healthy"
-        if tailnet_ip is not None:
-            h["tailnet_ip"] = tailnet_ip
-        if cpu is not None:
-            h["cpu"] = cpu
-        if mem is not None:
-            h["mem"] = mem
-        return True
+        """Refresh liveness in memory only (no event): the per-sample hot path."""
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            h["last_seen"] = self._stamp()
+            h["status"] = "healthy"
+            if tailnet_ip is not None:
+                h["tailnet_ip"] = tailnet_ip
+            if cpu is not None:
+                h["cpu"] = cpu
+            if mem is not None:
+                h["mem"] = mem
+            return True
 
     def mark_host_unavailable(self, host_id):
-        h = self._hosts.get(host_id)
-        if h is None:
-            return False
-        h["status"] = "unavailable"
-        return True
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            h["status"] = "unavailable"
+            return True
 
     def record_telemetry(self, host_id, sample):
         """Record a telemetry sample (cpu/mem/disk/network/gpu) for a host."""
@@ -817,6 +1224,46 @@ class ControlPlaneRepo:
         samples = self._telemetry.get(host_id, [])
         return samples[-limit:]
 
+    def record_host_metrics(self, host_id, sample, *, updates=None, versions=None,
+                            pins=None, fleet_update=None, maintenance=None):
+        """Store one fabric-agent sample: history, ``host["latest"]`` and host state.
+
+        Everything is validated before anything is written, so a ``ValueError``
+        leaves the host record untouched. A state field that is ``None`` was not
+        reported this time and keeps its previous value. ``sample`` may be
+        ``None`` when only state was reported."""
+        cleaned = clean_metrics(sample) if sample is not None else None
+        state = {k: clean_state(k, v) for k, v in
+                 (("updates", updates), ("versions", versions), ("pins", pins),
+                  ("fleet_update", fleet_update), ("maintenance", maintenance))}
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            latest = None
+            if cleaned is not None:
+                latest = {**cleaned, "at": self._stamp()}
+                self.host_metrics.record(host_id, cleaned)
+                self.record_telemetry(host_id, {**cleaned, "cpu_pct": cleaned.get("cpu"),
+                                                "mem_pct": cleaned.get("mem"),
+                                                "disk_pct": cleaned.get("disk")})
+            if h is None:
+                return
+            if latest is not None:
+                h["latest"] = latest
+            for key, value in state.items():
+                if value is not None:
+                    h[key] = value
+            self.host_metrics.observe_state(host_id, {k: h.get(k) for k in HOST_STATE_KEYS},
+                                            h.get("latest"))
+
+    def host_history(self, host_id, range):
+        """At most 300 history points for ``range`` (1h raw, 24h/7d from rollups)."""
+        canonical = self._canonical_host(host_id)
+        ids = [host_id, canonical] + [a for a, c in self._host_aliases.items() if c == canonical]
+        for hid in dict.fromkeys(ids):
+            if self.host_metrics.has(hid):
+                return self.host_metrics.history(hid, range)
+        return self.host_metrics.history(host_id, range)
+
     # ---------------------------------------------------------- ingestion
     # Idempotent upserts that honor an external (runtime-supplied) entity id, so
     # agents/machines can report their lifecycle without minting new ids on every
@@ -824,39 +1271,53 @@ class ControlPlaneRepo:
     # after a restart reproduces exactly the same stable entities.
 
     def upsert_host(self, host_id, host_name, tailnet_ip, *,
-                    cpu=None, mem=None, status="healthy", inventory=None):
-        stamp = self._stamp()
-        inventory = _clean_inventory(inventory)
-        existing = self._hosts.get(host_id)
-        if existing is None:
-            rec = {"host_id": host_id, "host_name": host_name,
-                   "tailnet_ip": tailnet_ip, "status": status,
-                   "cpu": cpu, "mem": mem,
-                   "last_seen": stamp, "created_at": stamp}
+                    cpu=None, mem=None, status="healthy", inventory=None,
+                    host_uid=None, aliases=None, platform=None,
+                    scheduler_owned=None, scheduler_trusted=None,
+                    scheduler_policy=None, scheduler_capacity=None):
+        scheduler = {key: value for key, value in (
+            ("host_uid", host_uid), ("platform", platform),
+            ("aliases", normalize_aliases(aliases) if aliases is not None else None),
+            ("scheduler_owned", bool(scheduler_owned) if scheduler_owned is not None else None),
+            ("scheduler_trusted", bool(scheduler_trusted) if scheduler_trusted is not None else None),
+            ("scheduler_policy", _deep_copy(scheduler_policy)),
+            ("scheduler_capacity", _deep_copy(scheduler_capacity)),
+        ) if value is not None}
+        with self._event_lock:
+            stamp = self._stamp()
+            inventory = _clean_inventory(inventory)
+            existing = self._hosts.get(host_id)
+            if existing is None:
+                rec = {"host_id": host_id, "host_name": host_name,
+                       "tailnet_ip": tailnet_ip, "status": status,
+                       "cpu": cpu, "mem": mem,
+                       "last_seen": stamp, "created_at": stamp, **scheduler}
+                if inventory:
+                    rec["inventory"] = {**inventory, "collected_at": stamp}
+                self._hosts[host_id] = rec
+                self.record_event("host", host_id, "HostRegistered",
+                                  {"host_name": host_name,
+                                   "tailnet_ip": tailnet_ip,
+                                   "status": status, **scheduler,
+                                   **({"inventory": inventory} if inventory else {})})
+                return _copy(rec)
+            existing["host_name"] = host_name or existing["host_name"]
+            existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
+            existing["status"] = status
+            existing["last_seen"] = stamp
+            existing.update(scheduler)
+            if cpu is not None:
+                existing["cpu"] = cpu
+            if mem is not None:
+                existing["mem"] = mem
+            payload = {"host_name": existing["host_name"],
+                       "tailnet_ip": existing["tailnet_ip"],
+                       "cpu": cpu, "mem": mem, "status": status, **scheduler}
             if inventory:
-                rec["inventory"] = {**inventory, "collected_at": stamp}
-            self._hosts[host_id] = rec
-            self.record_event("host", host_id, "HostRegistered",
-                              {"host_name": host_name,
-                               "tailnet_ip": tailnet_ip,
-                               **({"inventory": inventory} if inventory else {})})
-            return _copy(rec)
-        existing["host_name"] = host_name or existing["host_name"]
-        existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
-        existing["status"] = status
-        existing["last_seen"] = stamp
-        if cpu is not None:
-            existing["cpu"] = cpu
-        if mem is not None:
-            existing["mem"] = mem
-        payload = {"host_name": existing["host_name"],
-                   "tailnet_ip": existing["tailnet_ip"],
-                   "cpu": cpu, "mem": mem}
-        if inventory:
-            existing["inventory"] = {**inventory, "collected_at": stamp}
-            payload["inventory"] = inventory
-        self.record_event("host", host_id, "HostHeartbeat", payload)
-        return _copy(existing)
+                existing["inventory"] = {**inventory, "collected_at": stamp}
+                payload["inventory"] = inventory
+            self.record_event("host", host_id, "HostHeartbeat", payload)
+            return _copy(existing)
 
     def upsert_session(self, session_id, *, host_id=None, mission_id=None,
                        agent_role="", model="", status="active",
@@ -866,7 +1327,8 @@ class ControlPlaneRepo:
                        agent_session=None, revision=None, interactive_ready=None,
                        launch_pending=None, state_change_seq=None,
                        repository_id=None, commit_sha=None,
-                       transcript=None, parent_session_id=None, name=None):
+                       transcript=None, parent_session_id=None, name=None, runtime=None, worktree_id=None):
+        runtime = _runtime(runtime)
         if transcript is not None:
             if (not isinstance(transcript, dict) or transcript.get("status") not in (
                     "recording", "unsupported", "identity_unavailable", "unreadable", "unavailable") or
@@ -893,8 +1355,9 @@ class ControlPlaneRepo:
                   "agent_session": agent_session, "revision": revision,
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
                   "state_change_seq": state_change_seq,
-                  "repository_id": repository_id, "commit_sha": commit_sha,
-                  "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name)}
+                  "repository_id": repository_id, "commit_sha": commit_sha, "worktree_id": worktree_id,
+                  "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name),
+                  "runtime": runtime}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
@@ -943,17 +1406,15 @@ class ControlPlaneRepo:
                               "status", "cwd", "branch", "pid", "cmdline",
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
-                              "launch_pending", "state_change_seq", "repository_id", "commit_sha",
-                              "transcript", "parent_session_id", "name") if existing.get(k) is not None}},
+                              "launch_pending", "state_change_seq", "repository_id", "commit_sha", "worktree_id",
+                              "transcript", "parent_session_id", "name", "runtime") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
 
     def upsert_mission(self, mission_id, *, title, purpose="", stage="active",
                        cwd=None, source="herdr", repository_id=None, commit_sha=None):
-        if ":" in source or ":" in mission_id:
-            raise ValueError(
-                "mission source and mission_id must not contain ':'")
+        validate_mission_id(mission_id, source)
         key = mission_id if source == "herdr" else f"{source}:{mission_id}"
         stamp = self._stamp()
         existing = self._missions.get(key)
@@ -986,6 +1447,7 @@ class ControlPlaneRepo:
         for field, value in (("repository_id", repository_id), ("commit_sha", commit_sha)):
             if value is not None:
                 existing[field] = value
+        previous_stage = existing.get("stage")
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", key, "MissionUpdated",
@@ -997,6 +1459,9 @@ class ControlPlaneRepo:
                            "repository_id": existing.get("repository_id"),
                            "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
+        if stage:
+            self._transition_stage(key, previous_stage, stage)
+            self._mission_stage_changed(key, previous_stage, stage)
         return _copy(existing)
 
     # --------------------------------------------- CI: test runs / builds
@@ -1136,9 +1601,18 @@ class ControlPlaneRepo:
         verdict=None,
         started_at=None,
         completed_at=None,
+        repository=None,
+        pull_request_number=None,
     ):
+        repository = review_refs.repository(repository)
+        pull_request_number = review_refs.pull_request_number(pull_request_number)
         stamp = self._stamp()
         existing = self._reviews.get(review_id)
+        if pull_request_number is not None and not (repository or (existing or {}).get("repository")):
+            raise ValueError("pull_request_number needs the repository it belongs to")
+        if existing is not None:   # before anything is written: a stored reference is never changed or moved
+            repository, pull_request_number = review_refs.keep_reference(
+                existing.get("repository"), existing.get("pull_request_number"), repository, pull_request_number)
         if existing is None:
             rec = {
                 "review_id": review_id,
@@ -1149,6 +1623,8 @@ class ControlPlaneRepo:
                 "verdict": verdict,
                 "started_at": started_at or stamp,
                 "completed_at": completed_at,
+                "repository": repository,
+                "pull_request_number": pull_request_number,
                 "findings": [],
                 "created_at": stamp,
                 "updated_at": stamp,
@@ -1168,6 +1644,8 @@ class ControlPlaneRepo:
                         "verdict",
                         "started_at",
                         "completed_at",
+                        "repository",
+                        "pull_request_number",
                     )
                 },
                 mission_id=mission_id,
@@ -1183,6 +1661,8 @@ class ControlPlaneRepo:
             "verdict": verdict,
             "started_at": started_at,
             "completed_at": completed_at,
+            "repository": repository,
+            "pull_request_number": pull_request_number,
         }.items():
             if v is not None:
                 existing[k] = v
@@ -1200,6 +1680,8 @@ class ControlPlaneRepo:
                     "verdict",
                     "started_at",
                     "completed_at",
+                    "repository",
+                    "pull_request_number",
                 )
             },
             mission_id=existing["mission_id"],
@@ -1262,8 +1744,12 @@ class ControlPlaneRepo:
         branch=None,
         base=None,
         created_at=None,
+        merged_at=None,
+        closed_at=None,
+        ended_source=None,
     ):
         stamp = self._stamp()
+        self.pull_request_version += 1
         existing = self._pull_requests.get(pr_id)
         if existing is None:
             rec = {
@@ -1277,7 +1763,12 @@ class ControlPlaneRepo:
                 "base": base,
                 "created_at": created_at or stamp,
                 "updated_at": stamp,
+                "merged_at": None,
+                "closed_at": None,
+                "ended_source": None,
+                "end_count": 0,
             }
+            self._stamp_pr_end(rec, status, merged_at, closed_at, stamp, ended_source)
             self._pull_requests[pr_id] = rec
             self.record_event(
                 "pull_request",
@@ -1294,6 +1785,10 @@ class ControlPlaneRepo:
                         "branch",
                         "base",
                         "created_at",
+                        "merged_at",
+                        "closed_at",
+                        "ended_source",
+                        "end_count",
                     )
                 },
                 mission_id=mission_id,
@@ -1303,6 +1798,10 @@ class ControlPlaneRepo:
             return _copy(rec)
         old_status = existing.get("status")
         existing["updated_at"] = stamp
+        existing.setdefault("merged_at", None)
+        existing.setdefault("closed_at", None)
+        existing.setdefault("ended_source", None)
+        self._stamp_pr_end(existing, status, merged_at, closed_at, stamp, ended_source)
         for k, v in {
             "mission_id": mission_id,
             "repository": repository,
@@ -1330,6 +1829,10 @@ class ControlPlaneRepo:
                     "branch",
                     "base",
                     "created_at",
+                    "merged_at",
+                    "closed_at",
+                    "ended_source",
+                    "end_count",
                 )
             },
             mission_id=existing["mission_id"],
@@ -1337,6 +1840,36 @@ class ControlPlaneRepo:
         if existing["status"] == "merged" and old_status != "merged":
             self._record_pr_merged(pr_id, existing)
         return _copy(existing)
+
+    @staticmethod
+    def _stamp_pr_end(rec, status, merged_at, closed_at, stamp, ended_source=None):
+        """Keep when a pull request ended. A time the provider reported is kept as given (``ended_source`` "reported");
+        otherwise the first moment this server saw the PR merged or closed is used and labelled "observed", which can be
+        later than the real merge. A PR that is open again loses its end time; a time already stored is never overwritten
+        by a later observation. ``end_count`` counts ends (the first, and each after a reopen); a record that predates it but has an
+        end time has ended once. ``ended_source`` is passed only when rebuilding from the durable event log (an ingest request
+        never supplies it), so a restart keeps "observed" times observed."""
+        if (rec.get("merged_at") or rec.get("closed_at")) and not rec.get("end_count"):
+            rec["end_count"] = 1
+        if status == "open":
+            rec["merged_at"] = rec["closed_at"] = rec["ended_source"] = None
+            return
+        def valid(value):
+            try:
+                return isinstance(value, str) and len(value) <= 64 and bool(_dt.datetime.fromisoformat(value.replace("Z", "+00:00")))
+            except ValueError:
+                return False
+        merged_at, closed_at = (merged_at if valid(merged_at) else None), (closed_at if valid(closed_at) else None)
+        if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
+            rec["end_count"] = (rec.get("end_count") or 0) + 1      # a new end (the first, or after a reopen), not a corrected time
+        label = "observed" if ended_source == "observed" else "reported"
+        if merged_at:
+            rec["merged_at"], rec["ended_source"] = merged_at, label
+        if closed_at:
+            rec["closed_at"], rec["ended_source"] = closed_at, label
+        if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
+            rec["merged_at" if status == "merged" else "closed_at"] = stamp
+            rec["ended_source"] = "observed"
 
     def _record_pr_merged(self, pr_id, rec):
         self.record_event(
@@ -1367,15 +1900,18 @@ class ControlPlaneRepo:
     # ------------------------------------------------------------- artifacts
     def register_artifact(self, session_id=None, original_filename="",
                           mime_type="", size_bytes=0, sha256="",
-                          storage_key="", mission_id=None, data=None):
+                          storage_key="", mission_id=None, data=None,
+                          artifact_id=None, created_by=None):
         import hashlib
         if data is not None and not sha256:
             sha256 = hashlib.sha256(data).hexdigest()
-        aid = new_id("artifact")
+        aid = artifact_id or new_id("artifact")
         rec = {
             "artifact_id": aid, "session_id": session_id,
+            "created_by": created_by,
             "mission_id": mission_id, "original_filename": original_filename,
             "mime_type": mime_type, "size_bytes": size_bytes, "sha256": sha256,
+            "artifact_type": "other",
             "storage_key": storage_key, "status": "available",
             "materializations": 0, "created_at": self._stamp(),
         }
@@ -1390,6 +1926,7 @@ class ControlPlaneRepo:
                            "storage_key": storage_key,
                            "size_bytes": rec.get("size_bytes", 0),
                            "mime_type": mime_type,
+                           "created_by": created_by,
                            "session_id": session_id,
                            "mission_id": mission_id},
                           mission_id=mission_id, session_id=session_id)
@@ -1400,6 +1937,25 @@ class ControlPlaneRepo:
 
     def get_artifact(self, artifact_id):
         return _copy(self._artifacts.get(artifact_id))
+
+    def list_artifacts(self, *, query=None, artifact_type=None, status=None,
+                       created_by=None, limit=200, offset=0):
+        rows = []
+        needle = str(query or "").casefold()
+        for record in self._artifacts.values():
+            if artifact_type and record.get("artifact_type") != artifact_type:
+                continue
+            if status and record.get("status") != status:
+                continue
+            if created_by and record.get("created_by") != created_by:
+                continue
+            haystack = " ".join(str(record.get(key) or "")
+                                for key in ("artifact_id", "original_filename", "mime_type"))
+            if needle and needle not in haystack.casefold():
+                continue
+            rows.append(_copy(record))
+        ordered = _sort_by(rows, "created_at", id_key="artifact_id")
+        return ordered[max(0, int(offset)):max(0, int(offset)) + min(500, max(1, int(limit)))]
 
     def materialize_artifact(self, artifact_id, host_id, session_id,
                              local_path):
@@ -1465,7 +2021,9 @@ class ControlPlaneRepo:
             records = [copy.deepcopy(stream[-1]['payload'])
                        for (kind, _), stream in self._events.items()
                        if kind == 'ci_telemetry' and stream]
-            pipelines = self.ci_reports()['pipelines']
+            pipelines = [copy.deepcopy(stream[-1]['payload'])
+                         for (kind, _), stream in self._events.items()
+                         if kind == 'ci_observation' and stream]
             if inventory is not None:
                 from .project_links import annotate_ci_history
                 # Resolve inventory identities before calculating group membership.
@@ -1477,19 +2035,31 @@ class ControlPlaneRepo:
                                persistence='durable_sink' if self._sink is not None else 'memory_only',
                                repository=repository, branch=branch, days=days)
 
-    def ingest_ci_report(self, body):
-        from .ci_reports import normalize_report, reconcile_report_identities
+    def ingest_ci_report(self, body, *, redact=None):
+        from .ci_reports import matches_legacy_report, normalize_report, reconcile_report_identities
         with self._event_lock:
-            report = normalize_report(body, self._stamp())
+            report = normalize_report(body, self._stamp(), redact=redact)
             existing = self._events.get(("ci_report", report["report_id"]))
             if existing:
                 return copy.deepcopy(existing[-1]["payload"])
+            # Recompute the historical hash from the raw upload, not truncated
+            # or redacted case labels. A match returns the original receipt and
+            # never promotes missing legacy file/provider evidence to certainty.
+            if report.get('provider_url') is None and any(
+                    kind == 'ci_report' and stream and
+                    stream[-1]['payload'].get('identity_version', 1) == 1
+                    for (kind, _), stream in self._events.items()):
+                legacy = normalize_report(body, report['reported_at'], redact=redact,
+                                          _identity_version=1)
+                existing = self._events.get(('ci_report', legacy['report_id']))
+                if existing and matches_legacy_report(existing[-1]['payload'], legacy):
+                    return copy.deepcopy(existing[-1]['payload'])
             history = self.ci_reports()
             projected = copy.deepcopy(report)
             reconcile_report_identities([projected], history["pipelines"])
             attempts = [row.get("attempt", 1) for row in history["reports"]
-                        if (row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
-                           (projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
+                        if row.get("source") != "log_parse" and (row.get("provider_url"), row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
+                           (projected.get("provider_url"), projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
             report["attempt"] = max(attempts, default=0) + 1
             report["ingested_at"] = self._stamp()
             self.record_event("ci_report", report["report_id"], "CITestReportReceived", report,
@@ -1497,9 +2067,69 @@ class ControlPlaneRepo:
             self._trim_ci_history("ci_report")
             return copy.deepcopy(report)
 
+    def ingest_ci_log_report(self, body, *, redact=None):
+        """Keep the tests parsed from one run's CI logs. A real uploaded report for the run always wins.
+
+        One record per run: analysing the run again replaces it. Records that found no tests are kept too, so a
+        collector does not fetch the same logs again; `ci_reports()` never shows them.
+        """
+        from .ci_reports import compact_log_report, normalize_log_report
+        with self._event_lock:
+            report = normalize_log_report(body, self._stamp(), redact=redact)
+            if self._junit_shadows(report):
+                # Remembered as a run with nothing to count, so a restart does not fetch its logs again.
+                marker = normalize_log_report({**body, 'outcome': 'no_tests', 'summary': {}, 'tests': [], 'runners': [],
+                                               'steps': [], 'provisional': False,
+                                               'skipped_steps': [{'step': '*', 'reason': 'junit_report_exists'}]},
+                                              self._stamp(), redact=redact)
+                self.record_event("ci_logtests", marker["run_key"], "CILogTestsAnalysed", marker, require_durable=True)
+                self._trim_ci_history("ci_logtests")
+                return {**{k: report[k] for k in ('run_key', 'outcome')}, 'skipped': 'junit_report_exists'}
+            # Only the compact form is persisted; the full per-test index lives in memory for the newest runs.
+            self.record_event("ci_logtests", report["run_key"], "CILogTestsAnalysed", compact_log_report(report),
+                              require_durable=True)
+            stream = self._events.get(("ci_logtests", report["run_key"]))
+            if report.get('tests') and stream:
+                stream[-1]['payload'] = report
+            self._trim_ci_history("ci_logtests")
+            return {k: report[k] for k in ('run_key', 'outcome', 'summary', 'runners')}
+
+    def _junit_shadows(self, log_report, pipelines=None):
+        from .ci_observability import bind_report_provider
+        if pipelines is None:
+            pipelines = [stream[-1]['payload'] for (kind, _), stream in self._events.items()
+                         if kind == 'ci_observation' and stream]
+        want = (log_report.get('provider_url'), str(log_report.get('provider_repo_id')), log_report['run_number'])
+        for (kind, _), stream in self._events.items():
+            if kind != 'ci_report' or not stream:
+                continue
+            row = bind_report_provider(stream[-1]['payload'], pipelines)
+            if (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('run_number')) == want:
+                return True
+        return False
+
+    def ci_log_analysis(self, provider_url, provider_repo_id, run_number):
+        """What the collector already knows about one run's logs: {outcome, analysed_at} or None."""
+        from .ci_reports import log_run_key
+        with self._event_lock:
+            stream = self._events.get(("ci_logtests", log_run_key(provider_url, provider_repo_id, run_number)))
+            if not stream:
+                return None
+            payload = stream[-1]['payload']
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return {'outcome': payload.get('outcome'), 'analysed_at': payload.get('analysed_at'),
+                    'provisional': payload.get('provisional') is True}
+
     def observe_ci_pipeline(self, row):
+        from .ci_reports import normalize_provider_url
+        if row.get('provider_url') is not None:
+            row = {**row, 'provider_url': normalize_provider_url(row['provider_url'])}
         row = redact_payload(copy.deepcopy(row))
         key = f"{row.get('provider_repo_id') or row.get('repository')}:{row.get('run_number')}"
+        if row.get('provider_url') is not None:
+            key = json.dumps([row['provider_url'], str(row.get('provider_repo_id')),
+                              row.get('repository'), row.get('run_number')], separators=(',', ':'))
         with self._event_lock:
             previous = self._events.get(("ci_observation", key), [])
             if previous and previous[-1]["payload"] == row:
@@ -1509,13 +2139,24 @@ class ControlPlaneRepo:
             self._trim_ci_history("ci_observation")
 
     def _trim_ci_history(self, kind=None):
+        from .ci_observability import _identity
         from .ci_performance import RECORD_LIMIT
-        from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
+        from .ci_reports import (
+            HISTORY_BYTES,
+            LOG_HISTORY_BYTES,
+            LOG_INDEX_RUNS,
+            LOG_NEGATIVE_LIMIT,
+            LOG_REPORT_LIMIT,
+            PIPELINE_LIMIT,
+            REPORT_LIMIT,
+            compact_log_report,
+            log_finished_epoch,
+        )
         keep = set()
-        kinds = {kind} if kind is not None else {"ci_report", "ci_observation", "ci_telemetry"}
+        kinds = {kind} if kind is not None else set(_CI_EVENT_KINDS)
         arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
         for kind, limit in (("ci_report", REPORT_LIMIT), ("ci_observation", PIPELINE_LIMIT),
-                            ("ci_telemetry", RECORD_LIMIT)):
+                            ("ci_telemetry", RECORD_LIMIT), ("ci_logtests", LOG_REPORT_LIMIT)):
             if kind not in kinds:
                 continue
             keys = [key for key in self._events if key[0] == kind]
@@ -1523,26 +2164,87 @@ class ControlPlaneRepo:
                 for event in self._events[key]:
                     if isinstance(event.get("payload"), str):
                         event["payload"] = json.loads(event["payload"])
-            keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
-                                      arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
-                      reverse=True)
-            size = 0
-            for key in keys[:limit]:
+            if kind == 'ci_logtests':
+                # Newest run first, by when the run finished and not by when it happened to be read: a backlog analysed
+                # today must not push out the runs that matter most.
+                keys.sort(key=lambda key: (log_finished_epoch(self._events[key][-1]['payload'],
+                                                              self._events[key][-1].get("ingest_timestamp", "")),
+                                           self._events[key][-1].get("ingest_timestamp", ""),
+                                           arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                          reverse=True)
+            else:
+                keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
+                                          arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                          reverse=True)
+            if kind == 'ci_observation' and any(not key[1].startswith('[') for key in keys):
+                # Upgrade may retain a legacy "repo_id:run" stream alongside
+                # a new provider-scoped stream. Supersede only exact full
+                # identities, newest first; missing provider identity stays
+                # unresolved. Journal events themselves are never rewritten.
+                seen, unique = set(), []
+                for key in keys:
+                    identity = _identity(self._events[key][-1]['payload'])
+                    if identity is not None and identity in seen:
+                        del self._events[key]
+                    else:
+                        unique.append(key)
+                        if identity is not None:
+                            seen.add(identity)
+                keys = unique
+            size, budget, ordered, indexed = 0, HISTORY_BYTES, keys[:limit], set()
+            if kind == 'ci_logtests':
+                budget = LOG_HISTORY_BYTES
+                # Runs with counts and runs with nothing to count are limited separately, so a long tail of the latter
+                # can never evict the former.
+                counted = [key for key in keys if self._events[key][-1]['payload'].get('outcome') == 'counted']
+                empty = [key for key in keys if self._events[key][-1]['payload'].get('outcome') != 'counted']
+                ordered = counted[:limit] + empty[:LOG_NEGATIVE_LIMIT]
+                # The per-test index stays in memory for the newest run of every repository and branch first, then for
+                # the newest of the rest, up to LOG_INDEX_RUNS; older runs keep their counts and failing tests.
+                withindex = [key for key in ordered if self._events[key][-1]['payload'].get('tests')
+                             and not self._events[key][-1]['payload'].get('index_dropped')]
+                seen = set()
+                for key in withindex:
+                    payload = self._events[key][-1]['payload']
+                    lane = (payload.get('provider_url'), str(payload.get('provider_repo_id')), payload.get('branch'))
+                    if lane not in seen and len(indexed) < LOG_INDEX_RUNS:
+                        seen.add(lane)
+                        indexed.add(key)
+                for key in withindex:
+                    if len(indexed) < LOG_INDEX_RUNS:
+                        indexed.add(key)
+            for key in ordered:
                 latest = self._events[key][-1]
+                if (kind == 'ci_logtests' and latest['payload'].get('tests') and not latest['payload'].get('index_dropped')
+                        and key not in indexed):
+                    latest['payload'] = compact_log_report(latest['payload'])
                 size += len(json.dumps(latest).encode())
-                if size > HISTORY_BYTES:
+                if size > budget:
                     break
                 self._events[key] = [latest]
                 keep.add(key)
             for key in keys:
                 if key not in keep:
+                    self._ci_history_truncated.add(kind)
                     del self._events[key]
         self._event_order = [entry for entry in self._event_order
                              if entry[0] not in kinds
                              or ((entry[0], entry[1]) in keep and
                                  entry[2] == self._events[(entry[0], entry[1])][-1]["sequence"])]
 
-    def ci_reports(self):
+    def ci_reports_version(self) -> int:
+        """Changes whenever a CI observation, report or log-test row is added or replaced, and for nothing else (fleet
+        telemetry does not move it). Cheap: it walks the CI streams' latest sequence numbers, it builds nothing."""
+        kinds = ("ci_observation", "ci_report", "ci_logtests")
+        acc = 0
+        with self._event_lock:
+            for (etype, entity), stream in self._events.items():
+                if etype in kinds and stream:
+                    acc ^= hash((etype, entity, stream[-1].get("sequence"), len(stream)))
+        return acc
+
+    def ci_reports(self, *, compact=False, run=None):
+        from .ci_observability import _PIPELINE_FIELDS, _REPORT_FIELDS, bind_report_provider
         from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
         with self._event_lock:
             arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
@@ -1551,26 +2253,533 @@ class ControlPlaneRepo:
                           if etype == kind and stream]
                 events.sort(key=lambda event: (event.get("ingest_timestamp", ""), arrivals.get(
                     (event["entity_type"], event["entity_id"], event["sequence"]), -1)), reverse=True)
-                return [copy.deepcopy(event["payload"]) for event in events]
-            reports, pipelines = rows("ci_report"), rows("ci_observation")
+                payloads = [event['payload'] for event in events]
+                if kind == 'ci_logtests':
+                    payloads = [row for row in payloads if row.get('outcome') == 'counted']
+                if kind in ('ci_report', 'ci_logtests') and run is not None:
+                    payloads = [row for row in payloads
+                                if (bound := bind_report_provider(row, pipelines)) and all(
+                                    str(bound.get(key)) == str(value) for key, value in run.items())]
+                if compact:
+                    fields = ((*_REPORT_FIELDS, 'report_id', 'summary', 'attempt', 'source', 'runners',
+                               'index_complete', 'skipped_steps') if kind in ('ci_report', 'ci_logtests')
+                              else (*_PIPELINE_FIELDS, 'event', 'ref', 'url', 'coverage', 'stale',
+                                    'project_id', 'language', 'mission_id', 'mission_key', 'session_id'))
+                    payloads = [{key: row[key] for key in fields if key in row} for row in payloads]
+                return copy.deepcopy(payloads)
+            pipelines = rows("ci_observation")
+            reports = rows("ci_report")
+            # Tests parsed from logs stand in only for runs with no uploaded report; a JUnit upload always wins.
+            shown = {(b.get('provider_url'), str(b.get('provider_repo_id')), b.get('run_number'))
+                     for b in (bind_report_provider(row, pipelines) for row in reports)}
+            parsed = [row for row in rows("ci_logtests")
+                      if (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('run_number')) not in shown]
+            if parsed:
+                reports = sorted(reports + parsed, reverse=True,
+                                 key=lambda row: row.get('ingested_at') or row.get('reported_at') or '')
             from .ci_reports import reconcile_report_identities
             reconcile_report_identities(reports, pipelines)
+            if compact:
+                reports = [bind_report_provider(row, pipelines) for row in reports]
             return {"reports": reports, "pipelines": pipelines,
                     "scope": {"kind": "retained_observations", "complete": False,
+                              "truncated": bool(self._ci_history_truncated & {"ci_report", "ci_observation"}),
                               "persistence": "durable_sink" if self._sink is not None else "memory_only",
                               "report_limit": REPORT_LIMIT, "pipeline_limit": PIPELINE_LIMIT,
                               "byte_limit_per_kind": HISTORY_BYTES,
                               "report_count": len(reports), "pipeline_count": len(pipelines),
+                              "test_details": "omitted" if compact else "included",
                               "description": "Uploaded test reports and observed provider runs only; missing reports do not mean zero tests."}}
+
+    def ci_test_history(self, repository=None, branch=None, test=None, days=30, *,
+                        provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
+                 mode='days', run_number=None,
+                        pipelines=(), inventory=()):
+        """Reuse compact projections until retained report/observation events change.
+
+        Cache only one bounded store, not arbitrary filter/window responses. Reads
+        reapply the current clock and filters; imports, eviction, new attempts and
+        changed provider bindings invalidate the source signature.
+        """
+        from datetime import UTC, datetime
+
+        from .ci_observability import (
+            _REPORT_FIELDS,
+            CIObservationStore,
+            _identity,
+            bind_report_provider,
+            project_report,
+        )
+        from .ci_performance import _timestamp
+
+        with self._event_lock:
+            events = [stream[-1] for (kind, _), stream in self._events.items()
+                      if kind in ('ci_report', 'ci_observation') and stream]
+            signature = tuple((event['entity_type'], event['entity_id'], event['sequence'])
+                              for event in events)
+            if self._ci_test_projection is None or self._ci_test_projection[0] != signature:
+                arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
+                events.sort(key=lambda event: (event.get('ingest_timestamp', ''), arrivals.get(
+                    (event['entity_type'], event['entity_id'], event['sequence']), -1)))
+                observed_pipelines = [event['payload'] for event in events if event['entity_type'] == 'ci_observation']
+                store = CIObservationStore(wall_now=lambda: datetime.fromtimestamp(self._now(), UTC))
+                for row in observed_pipelines:
+                    store.record_pipeline(row)
+                previous = self._ci_test_projection[3] if self._ci_test_projection else {}
+                projections, unjoined = {}, []
+                for event in events:
+                    if event['entity_type'] != 'ci_report':
+                        continue
+                    row = bind_report_provider(event['payload'], observed_pipelines)
+                    source = (event['entity_id'], event['sequence'], _identity(row))
+                    projection = previous[source] if source in previous else project_report(row)
+                    projections[source] = projection
+                    if not store._record_report_projection(projection):
+                        unjoined.append({key: row.get(key) for key in _REPORT_FIELDS})
+                self._ci_test_projection = (signature, store, unjoined, projections)
+            _, store, unjoined, _ = self._ci_test_projection
+            view = store.test_summary(repository=repository, branch=branch, test=test, days=days,
+                                      provider_url=provider_url, provider_repo_id=provider_repo_id,
+                                      scope=scope, start=start, end=end, mode=mode, run_number=run_number,
+                                      pipelines=pipelines, inventory=inventory)
+            now = self._now()
+            unjoined_count = sum(
+                (repository is None or row['repository'] == repository) and
+                (branch is None or row['branch'] == branch) and
+                (provider_url is None or (row.get('provider_url') or '').rstrip('/') == provider_url) and
+                (provider_repo_id is None or str(row.get('provider_repo_id')) == str(provider_repo_id)) and
+                (stamp := _timestamp(row.get('reported_at'))) is not None and
+                now - days * 86400 <= stamp <= now for row in unjoined
+                if mode == 'days' and run_number is None and scope == 'all' and start is None and end is None)
+            source_truncated = bool(self._ci_history_truncated & {'ci_report', 'ci_observation'})
+            view['scope'].update(persistence='durable_sink' if self._sink is not None else 'memory_only',
+                                 memory_only=self._sink is None,
+                                 source_truncated=source_truncated,
+                                 projection_truncated=view['scope']['truncated'],
+                                 truncated=source_truncated or view['scope']['truncated'],
+                                 unjoined_report_count=unjoined_count)
+            if provider_url is not None or provider_repo_id is not None:
+                view['scope'].update(provider_url=provider_url, provider_repo_id=provider_repo_id)
+            return view
+
+    def ci_summary(self, *, pipelines=(), inventory=(), cached=None, days=14,
+                   repository=None, branch=None, scope='all', provider_url=None,
+                   provider_repo_id=None, start=None, end=None, mode='days', run_number=None):
+        """Windowed aggregates of cached history and durable observations, never I/O.
+
+        The durable store keeps its existing 2,000-run bound; history's separate
+        20,000-run budget is aggregated in place rather than silently truncated
+        to the durable store's limit. Exact duplicate runs prefer cached history.
+        """
+        from collections import Counter
+        from datetime import UTC, datetime
+
+        from .ci_observability import (
+            CIObservationStore,
+            _identity,
+            pipeline_outcome,
+            run_in_scope,
+            run_window,
+            select_run_window,
+        )
+        from .ci_performance import _iso, _stats, _timestamp
+
+        cached = cached or {}
+        now = self._now()
+        # Match the heatmap and run list: UTC calendar days including today.
+        window_start, window_end = run_window(now, days, start, end, mode)
+        store = CIObservationStore()
+        with self._event_lock:
+            retained = [stream[-1]['payload'] for (kind, _), stream in self._events.items()
+                        if kind == 'ci_observation' and stream]
+            source_truncated = 'ci_observation' in self._ci_history_truncated
+        for row in retained:
+            store.record_pipeline(row)
+        observed = store.summary()
+        # Event/ref are not part of the observation store projection; retain
+        # only those scope fields from the same exact durable observation.
+        metadata = {_identity(row): row for row in retained}
+        rows = [dict(row, **{key: metadata.get(_identity(row), {}).get(key)
+                            for key in ('event', 'ref')}) for row in observed['pipelines']]
+        rows.extend(pipelines)
+        identities, runs, unjoined = {}, {}, 0
+        for row in rows:
+            key = (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('repository'))
+            if key not in identities:
+                identity = _identity({**dict(zip(('provider_url', 'provider_repo_id', 'repository'), key)),
+                                      'run_number': 1})
+                identities[key] = identity[:3] if identity else None
+            identity = identities[key]
+            number = row.get('run_number')
+            if identity is None or type(number) not in (str, int) or not str(number).isdigit() or int(number) < 1:
+                unjoined += 1
+                continue
+            if ((repository is not None and identity[2] != repository) or
+                    (provider_url is not None and identity[0] != provider_url) or
+                    (provider_repo_id is not None and identity[1] != str(provider_repo_id))):
+                continue
+            runs[(*identity, int(number))] = row
+        defaults = {(r.get('provider_url', '').rstrip('/'), str(r.get('id')), r.get('repository')):
+                    r.get('default_branch') for r in inventory}
+        coverage = {(p['provider_url'].rstrip('/'), str(p['provider_repo_id']), p['repository']):
+                    p.get('coverage', {}) for p in cached.get('projects', [])}
+        groups, daily, selected = {}, {}, []
+        for project in cached.get('projects', []):
+            identity = _identity({**project, 'run_number': 1})
+            if identity is None:
+                continue
+            key = identity[:3]
+            if ((repository is not None and key[2] != repository) or
+                    (provider_url is not None and key[0] != provider_url) or
+                    (provider_repo_id is not None and key[1] != str(provider_repo_id))):
+                continue
+            groups[key] = {'rows': [], 'unknown_time_run_count': 0,
+                           'scope_unavailable': scope == 'default' and not defaults.get(key)}
+        unknown_time = scope_unavailable = 0
+        scoped_runs = {}
+        for key, row in runs.items():
+            if branch is not None and row.get('branch') != branch:
+                continue
+            project = key[:3]
+            group = groups.setdefault(project, {'rows': [], 'unknown_time_run_count': 0,
+                                                'scope_unavailable': False})
+            if scope == 'default' and not defaults.get(project):
+                group['scope_unavailable'] = True
+                scope_unavailable += 1
+                continue
+            if not run_in_scope(row, scope, defaults.get(project)):
+                continue
+            scoped_runs[key] = row
+            if _timestamp(row.get('created_at')) is None:
+                unknown_time += 1
+                group['unknown_time_run_count'] += 1
+        for key, row in select_run_window(scoped_runs, now, days, start, end, mode, run_number).items():
+            groups[key[:3]]['rows'].append(row)
+            selected.append(row)
+            stamp = _timestamp(row.get('created_at'))
+            if stamp is not None:
+                day = datetime.fromtimestamp(stamp, UTC).date().isoformat()
+                daily.setdefault(day, []).append(row)
+
+        def metrics(values):
+            counts = Counter(pipeline_outcome(row) for row in values)
+            success = counts['success']
+            failed = counts['failure']
+            completed = success + failed
+            durations = []
+            for row in values:
+                if pipeline_outcome(row) not in ('success', 'failure'):
+                    continue
+                begin, end = (_timestamp(row.get(field)) for field in ('started_at', 'finished_at'))
+                if begin is not None and end is not None and end >= begin:
+                    durations.append(end - begin)
+            return dict(pipeline_count=len(values), outcomes=dict(sorted(counts.items())),
+                        completed_count=completed, success_count=success, failure_count=failed,
+                        pass_rate=success / completed if completed else None,
+                        failure_rate=failed / completed if completed else None,
+                        active_count=sum(counts[state] for state in
+                                         ('running', 'queued', 'blocked')),
+                        duration_seconds=_stats(durations))
+
+        projects = []
+        for key, group in sorted(groups.items()):
+            projects.append(dict(project_id=json.dumps(key, separators=(',', ':')),
+                provider_url=key[0], provider_repo_id=key[1], repository=key[2],
+                **metrics(group['rows']), unknown_time_run_count=group['unknown_time_run_count'],
+                scope_unavailable=group['scope_unavailable'], coverage=coverage.get(key, {'complete': False})))
+        result = dict(projects=projects, kpis=dict(project_count=len(projects), **metrics(selected)),
+            charts=[dict(day=day, **metrics(values)) for day, values in sorted(daily.items())],
+            available=bool(cached.get('available') or rows), status=cached.get('status', 'unknown'),
+            refreshing=cached.get('refreshing', False),
+            scope=dict(kind='retained_observations', complete=False, partial=True,
+                stale=bool(cached.get('stale')) or observed['scope']['stale'],
+                truncated=source_truncated or observed['scope']['truncated'] or
+                          any(p['coverage'].get('truncated') for p in projects),
+                memory_only=self._sink is None, history_memory_only=True,
+                persistence='durable_sink' if self._sink is not None else 'memory_only',
+                days=days if mode == 'days' else None, mode=mode, run_number=run_number,
+                window={'start': _iso(window_start), 'end': _iso(window_end)}, repository=repository,
+                start=start, end=end,
+                branch=branch, scope=scope, provider_url=provider_url, provider_repo_id=provider_repo_id,
+                denominator='successful_or_failed_runs', time_basis='created_at', window_basis=('last_24_runs_per_project' if mode == 'runs' else
+                    'trailing_24_hours' if mode == 'hours' else 'utc_calendar_days_including_today'),
+                minimum_percentile_samples=5, unknown_time_run_count=unknown_time,
+                scope_unavailable_run_count=scope_unavailable, unjoined_run_count=unjoined,
+                history=cached.get('scope', {})))
+        # A content revision is stable across unchanged reads and changes when
+        # filters, aggregates, or coverage change. Wall time alone isn't data.
+        versioned = copy.deepcopy(result)
+        versioned['scope'].pop('window')
+        for project in versioned['projects']:
+            project['coverage'].pop('checked_at', None)
+        result['revision'] = hashlib.sha256(json.dumps(versioned, sort_keys=True).encode()).hexdigest()
+        result['generated_at'] = cached.get('generated_at')
+        return result
+
+    def ci_tests(self, *, redact, days=14, repository=None, branch=None, test=None,
+                 provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
+                 mode='days', run_number=None,
+                 pipelines=(), inventory=()):
+        """Bounded HTTP projection; the full retained-history contract is unchanged."""
+        view = self.ci_test_history(repository=repository, branch=branch, test=test, days=days,
+                                    provider_url=provider_url, provider_repo_id=provider_repo_id,
+                                    scope=scope, start=start, end=end, mode=mode, run_number=run_number,
+                                      pipelines=pipelines, inventory=inventory)
+        view = redact(view)
+        tests = sorted(view['tests'], key=lambda row: (
+            -row['failure_count'], -(row['duration_ms']['p95'] or row['last_duration_ms'] or 0),
+            row['provider_url'], str(row['provider_repo_id']), row['repository'], row['branch'], row['id']))
+        view['tests'] = []
+        budget = 240 * 1024
+        used = 0
+        for row in tests[:200]:
+            size = len(json.dumps(row).encode())
+            if used + size > budget:
+                break
+            view['tests'].append(row)
+            used += size
+        limited = len(view['tests']) != len(tests)
+        view['scope'].update(test_count=len(tests), returned_test_count=len(view['tests']),
+                             omitted_test_count=len(tests) - len(view['tests']),
+                             omitted_failure_test_count=sum(row['failure_count'] > 0 for row in tests[len(view['tests']):]),
+                             ranking='failures_then_duration_then_identity',
+                             response_truncated=limited, test_limit=200, response_byte_limit=256 * 1024,
+                             truncated=view['scope']['truncated'] or limited)
+        return view
+
+    def ci_diagnosis(self, pipeline, *, redact):
+        """Join exact run evidence; never infer a test-to-step edge from labels/logs."""
+        from .ci_observability import _identity, _test_cases, bind_report_provider
+
+        result = dict(evidence_availability='unavailable', reason='Pipeline evidence unavailable.',
+                      failed_steps=[], failed_workflows=[], failed_tests=[], truncated=False,
+                      step_test_association='unavailable',
+                      step_test_reason='Uploaded reports do not identify a provider step.',
+                      log={'availability': 'not_loaded', 'route': '/api/v1/ci/log'})
+        if not pipeline:
+            return result
+        used = dict(failed_steps=0, failed_workflows=0, failed_tests=0)
+        budgets = dict(failed_steps=32 * 1024, failed_workflows=16 * 1024, failed_tests=64 * 1024)
+
+        def append(target, item):
+            item = redact(item)
+            size = len(json.dumps(item).encode()) + 2
+            if used[target] + size > budgets[target]:
+                result['truncated'] = True
+                return
+            result[target].append(item)
+            used[target] += size
+
+        failed = {'failure', 'failed', 'error', 'errored', 'timed_out', 'crashed'}
+        for source, target in (('tasks', 'failed_steps'), ('workflows', 'failed_workflows')):
+            entries = [row for row in pipeline.get(source, [])
+                       if (row.get('state') or row.get('status')) in failed]
+            result['truncated'] |= len(entries) > 50
+            for row in entries[:50]:
+                item = {key: (value[:500] if isinstance(value, str) else value)
+                        for key, value in row.items() if key in
+                        ('id', 'name', 'state', 'status', 'workflow', 'workflow_id', 'exit_code', 'error')
+                        and type(value) in (str, int, float, bool, type(None))}
+                edges = row.get('depends_on')
+                item['dependency_evidence'] = 'reported' if isinstance(edges, list) else 'unavailable'
+                if isinstance(edges, list):
+                    item['depends_on'] = [str(edge)[:200] for edge in edges[:50]]
+                    result['truncated'] |= len(edges) > 50
+                append(target, item)
+        history = self.ci_reports()
+        row = {**pipeline, 'revision': pipeline.get('revision') or pipeline.get('commit'),
+               'run_number': pipeline.get('run_number') or pipeline.get('number')}
+        # Numeric detail requests report the requested ID as repository. Resolve
+        # the name only from one exact retained identity with matching run metadata.
+        candidates = {identity for observed in history['pipelines']
+                      if (identity := _identity(observed)) is not None and
+                      identity[0] == row.get('provider_url', '').rstrip('/') and
+                      identity[3] == row['run_number'] and
+                      row.get('provider_repo_id') is not None and identity[1] == str(row['provider_repo_id']) and
+                      (row.get('repository') == identity[2] or
+                       row.get('repository') == identity[1] == str(row.get('provider_repo_id'))) and
+                      all(observed.get(key) == row.get(key) for key in ('revision', 'branch'))}
+        if len(candidates) == 1:
+            identity = candidates.pop()
+            row.update(provider_url=identity[0], provider_repo_id=identity[1], repository=identity[2])
+        identity = _identity(row)
+        if identity is None or row.get('repository') == str(row.get('provider_repo_id')):
+            result['reason'] = 'Exact provider/repository/run identity is unavailable or ambiguous.'
+            return result
+        matches = []
+        for report in reversed(history['reports']):
+            report = bind_report_provider(report, history['pipelines'])
+            if (_identity(report) == identity and row.get('branch') and row.get('revision') and
+                    all(report.get(key) == row[key] for key in ('branch', 'revision'))):
+                cases = _test_cases(report)
+                if cases is not None:
+                    matches.append((report, cases))
+        if not matches:
+            result['reason'] = 'No validated report matches this exact provider, repository, run, branch and revision.'
+            return result
+        result.update(evidence_availability='reported', reason=None, report_count=len(matches))
+        history_view = self.ci_test_history(repository=row['repository'], branch=row['branch'], days=30,
+                                            provider_url=identity[0], provider_repo_id=identity[1])
+        test_history = {test['id']: test for test in history_view['tests']}
+        result['history_scope'] = redact(history_view['scope'])
+        failures = [(report, case) for report, cases in matches for case in cases if case['status'] in ('failed', 'errored')]
+        result['failed_test_count'] = len(failures)
+        result['truncated'] |= len(failures) > 25
+        for report, case in failures[:25]:
+            aggregate = test_history.get(case['id'])
+            case = redact(case)  # Before excerpt limits: never expose a token prefix.
+            item = {key: case[key] for key in ('id', 'name', 'suite', 'classname', 'file',
+                                              'status', 'duration_ms', 'identity_ambiguous')}
+            item.update(message=case['message'][:500], trace=case['trace'][:1000], report_id=report['report_id'],
+                history={key: aggregate[key] for key in ('failure_count', 'completed_count', 'failure_rate',
+                    'first_failure', 'last_pass', 'duration_ms', 'classification', 'inconsistent_count')}
+                    if aggregate else None)
+            result['truncated'] |= len(case['message']) > 500 or len(case['trace']) > 1000
+            append('failed_tests', item)
+        return result
+
+    # ------------------------------------------------------- scheduler state
+    def scheduler_execution_ready(self):
+        return callable(getattr(self._sink, "record_required", None))
+
+    @contextmanager
+    def scheduler_admission(self):
+        # Match record_event's event -> sink ordering. Holding the sink lock
+        # while waiting for an event writer would deadlock with that writer.
+        with self._command_lock, self._event_lock:
+            transaction = getattr(self._sink, "scheduler_admission", None)
+            if callable(transaction):
+                pending = []
+                pending_events = []
+                before = None
+                try:
+                    with transaction() as rows:
+                        self._scheduler_reservations = {
+                            row["reservation_id"]: _deep_copy(row) for row in rows}
+                        observations = getattr(self._sink, "scheduler_observations", None)
+                        if callable(observations):
+                            for host_id, observation in observations().items():
+                                self._apply_scheduler_observation(host_id, observation)
+                        leases = getattr(self._sink, "scheduler_leases", None)
+                        if callable(leases):
+                            self._scheduler_leases = _deep_copy(leases())
+                        policies = getattr(self._sink, "scheduler_policies", None)
+                        if callable(policies):
+                            for host_id, policy in policies().items():
+                                if host_id in self._hosts:
+                                    self._hosts[host_id]["scheduler_policy"] = _deep_copy(policy)
+                        before = (_deep_copy(self._scheduler_reservations),
+                                  _deep_copy(self._scheduler_leases),
+                                  {hid: _deep_copy(host.get("scheduler_policy"))
+                                   for hid, host in self._hosts.items()})
+                        self._pending_scheduler_observations = pending
+                        self._pending_scheduler_events = pending_events
+                        try:
+                            yield rows
+                        finally:
+                            self._pending_scheduler_observations = None
+                            self._pending_scheduler_events = None
+                except BaseException:
+                    # An acknowledged INSERT can still be rolled back by COMMIT.
+                    if before is not None:
+                        self._scheduler_reservations, self._scheduler_leases, policies = before
+                        for host_id, policy in policies.items():
+                            if policy is None:
+                                self._hosts[host_id].pop("scheduler_policy", None)
+                            else:
+                                self._hosts[host_id]["scheduler_policy"] = policy
+                    raise
+                for host_id, observation, _ in pending:
+                    self._apply_scheduler_observation(host_id, observation)
+                for event, feed, publish in pending_events:
+                    key = (event["entity_type"], event["entity_id"])
+                    self._events.setdefault(key, []).append(event)
+                    if event["entity_type"] in _CI_EVENT_KINDS:
+                        self._ci_sequence = max(self._ci_sequence, event["sequence"] + 1)
+                    if feed:
+                        self._event_order.append((*key, event["sequence"]))
+                for event, _, publish in pending_events:
+                    if publish:
+                        for listener in self._listeners:
+                            try:
+                                listener(_copy(event))
+                            except Exception:
+                                pass
+            else:
+                yield self.list_scheduler_reservations()
+
+    def save_scheduler_observation(self, host_id, observation):
+        record = _deep_copy(observation)
+        event = self.record_event("scheduler_observation", host_id, "SchedulerHostObserved", record,
+                                  require_durable=True, publish=False)
+        if self._pending_scheduler_observations is not None:
+            self._pending_scheduler_observations.append((host_id, record, event))
+        else:
+            self._apply_scheduler_observation(host_id, record)
+
+    def scheduler_observation(self, host_id):
+        return _deep_copy(self._scheduler_observations.get(host_id))
+
+    def _apply_scheduler_observation(self, host_id, observation):
+        previous = self._scheduler_observations.get(host_id)
+        if previous and previous["sample"]["sequence"] >= observation["sample"]["sequence"]:
+            return
+        self._scheduler_observations[host_id] = _deep_copy(observation)
+        host = self._hosts.setdefault(host_id, {"host_id": host_id, "tailnet_ip": None})
+        policy = host.get("scheduler_policy")
+        host.update(_deep_copy(observation["host"]))
+        host["scheduler_policy"] = _clean_scheduler_policy(host.get("scheduler_policy"))
+        # Resource reports cannot undo an operator's newer policy revision.
+        if policy and policy.get("revision", 0) >= host["scheduler_policy"].get("revision", 0):
+            host["scheduler_policy"] = policy
+        sample = _deep_copy(observation["sample"])
+        self.record_telemetry(host_id, sample)
+
+    def save_scheduler_reservation(self, reservation: dict):
+        """Persist scheduler reservation/lease state through the existing event sink."""
+        reservation_id = str(reservation.get("reservation_id") or "")
+        if not reservation_id:
+            raise ValueError("reservation_id is required")
+        record = _deep_copy(reservation)
+        self.record_event("scheduler_reservation", reservation_id,
+                          "SchedulerReservationChanged", record, require_durable=True)
+        self._scheduler_reservations[reservation_id] = record
+        return _deep_copy(record)
+
+    def list_scheduler_reservations(self):
+        return [_deep_copy(row) for row in self._scheduler_reservations.values()]
+
+    def save_scheduler_lease(self, lease: dict):
+        lease_id = str(lease.get("lease_id") or "")
+        if not lease_id:
+            raise ValueError("lease_id is required")
+        record = _deep_copy(lease)
+        self.record_event("scheduler_lease", lease_id, "SchedulerLeaseChanged", record,
+                          require_durable=True)
+        self._scheduler_leases[lease_id] = record
+        return _deep_copy(record)
+
+    def list_scheduler_leases(self):
+        return [_deep_copy(row) for row in self._scheduler_leases.values()]
 
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
-                     mission_id=None, session_id=None, require_durable=False, publish=True):
+                     mission_id=None, session_id=None, require_durable=False, publish=True,
+                     envelope=None, feed=True):
+        """Record one event. ``envelope`` (a normalised v2 envelope) makes it the
+        canonical envelope row: emitter event_id, server-set actor/received_at,
+        durable before return. ``feed=False`` keeps it out of the global feed."""
+        if self._suppress_record_events and not require_durable and envelope is None:
+            return
         with self._event_lock:
             key = (entity_type, entity_id)
-            stream = self._events.setdefault(key, [])
+            stream = (self._events.setdefault(key, []) if self._pending_scheduler_events is None
+                      else self._events.get(key, []))
             seq = max((e.get("sequence", -1) for e in stream), default=-1) + 1
-            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
+            if self._pending_scheduler_events is not None:
+                seq = max(seq, max((e["sequence"] + 1 for e, _, _ in self._pending_scheduler_events
+                                   if (e["entity_type"], e["entity_id"]) == key), default=seq))
+            if entity_type in _CI_EVENT_KINDS:
                 seq = max(seq, self._ci_sequence)
             ev = {
                 "event_id": new_id("event"),
@@ -1582,19 +2791,49 @@ class ControlPlaneRepo:
                 "sequence": seq, "event_type": event_type,
                 "payload": payload or {},
             }
+            env = envelope
+            if env is not None:
+                ev.update(envelope_event_fields(env))
+                ev["event_id"] = env["event_id"]
+                ev["schema_version"] = env["schema_version"]
+                ev["source_timestamp"] = env["occurred_at"] or env["received_at"]
+                ev["ingest_timestamp"] = env["received_at"]
+                ev["mission_id"] = mission_id or env.get("mission_id")
+                meta = {"content_sha256": env["content_hash"]}
+                if env.get("lineage_seq") is not None:
+                    meta["lineage_seq"] = env["lineage_seq"]
+                if env.get("lineage_mode"):
+                    meta["lineage_mode"] = env["lineage_mode"]
+                if env.get("claimed_actor") is not None:
+                    meta["claimed_actor"] = _bounded_claim(env["claimed_actor"])
+                # a clamped (peer) principal's claims: evidence of what the sender said, never read as authority
+                for name in ("claimed_origin", "claimed_visibility_scope", "claimed_ids", "claimed_evidence_refs"):
+                    if env.get(name) is not None:
+                        meta[name] = _bounded_claim(env[name])
+                ev["payload"] = {**ev["payload"], "_envelope": meta}
+                require_durable = callable(getattr(self._sink, "record_required", None))
             if require_durable and self._sink is not None:
                 # Command side effects require persistence before submission. A
                 # legacy best-effort sink cannot establish this prerequisite.
                 try:
                     self._sink.record_required(ev)
                 except Exception:
-                    if entity_type in {"ci_report", "ci_observation", "ci_telemetry"} and not stream:
+                    if entity_type in _CI_EVENT_KINDS and not stream:
                         self._events.pop(key, None)
                     raise
-            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
+            if self._pending_scheduler_events is not None:
+                if self._sink is not None and not require_durable:
+                    try:
+                        self._sink.record(ev)
+                    except Exception:
+                        pass
+                self._pending_scheduler_events.append((ev, feed, publish))
+                return _copy(ev)
+            if entity_type in _CI_EVENT_KINDS:
                 self._ci_sequence = seq + 1
             stream.append(ev)
-            self._event_order.append((entity_type, entity_id, seq))
+            if feed:
+                self._event_order.append((entity_type, entity_id, seq))
             if self._sink is not None and not require_durable:
                 try:
                     self._sink.record(ev)
@@ -1660,13 +2899,78 @@ class ControlPlaneRepo:
                                             i['entity_id'] or ''))
 
     def stream(self, entity_type, entity_id):
+        if self._durable_history is not None and entity_type in {"host", "session", "service"}:
+            return self._durable_history.history_stream(entity_type, entity_id)
         return [_copy(e) for e in self._events.get((entity_type, entity_id), [])]
+
+    def stream_page(self, entity_type, entity_id, *, limit=50, before=None):
+        """Return an ascending slice before an entity-bound, anchored index.
+
+        Appends leave older pages stable. Retention or a changed boundary makes
+        the cursor stale instead of silently skipping history. Sequence numbers
+        are metadata only: duplicates and gaps retain their stored ordering.
+        """
+        if self._durable_history is not None and entity_type in {"host", "session", "service"}:
+            return self._durable_history.history_page(entity_type, entity_id, limit=limit, before=before)
+        import base64
+
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be an integer between 1 and 200")
+
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                             default=str).encode()).hexdigest()
+
+        identity = digest([entity_type, entity_id])
+        boundary = None
+        anchor = None
+        if before is not None:
+            if not isinstance(before, str) or not 1 <= len(before) <= 256 \
+                    or not re.fullmatch(r"[A-Za-z0-9_-]+", before):
+                raise ValueError("invalid history cursor")
+            try:
+                raw = base64.b64decode(before + "=" * (-len(before) % 4), altchars=b"-_", validate=True)
+                cursor = json.loads(raw)
+            except (ValueError, UnicodeError):
+                raise ValueError("invalid history cursor") from None
+            if (base64.urlsafe_b64encode(raw).decode().rstrip("=") != before
+                    or not isinstance(cursor, list) or len(cursor) != 4
+                    or type(cursor[0]) is not int or cursor[0] != 1
+                    or type(cursor[1]) is not int or not 0 < cursor[1] < 2**63
+                    or cursor[2] != identity
+                    or not isinstance(cursor[3], str) or not re.fullmatch(r"[0-9a-f]{64}", cursor[3])):
+                raise ValueError("invalid history cursor")
+            boundary, anchor = cursor[1], cursor[3]
+
+        with self._event_lock:
+            stream = self._events.get((entity_type, entity_id), [])
+            end = len(stream)
+            if boundary is not None:
+                if boundary >= len(stream) or fingerprint(stream[boundary]) != anchor:
+                    raise ValueError("staleHistoryCursor")
+                end = boundary
+            start = max(0, end - limit)
+            next_cursor = None
+            if start:
+                raw = json.dumps([1, start, identity, fingerprint(stream[start])], separators=(",", ":")).encode()
+                next_cursor = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+            latest = stream[-1] if stream else {}
+            return {"events": [_copy(event) for event in stream[start:end]],
+                    "has_more": start > 0, "next_cursor": next_cursor,
+                    "latest_sequence": latest.get("sequence"), "last_event_id": latest.get("event_id")}
 
     def entity_ids(self, entity_type):
         """Ids of every entity of ``entity_type`` that has at least one event."""
         with self._event_lock:
             return [eid for (etype, eid), stream in self._events.items()
                     if etype == entity_type and stream]
+
+    def events_of_type(self, entity_type):
+        """Every stored event of one entity type, oldest stream first (a copy). Used to read back append-only logs
+        that a service writes through ``record_event`` (e.g. the assistant audit log) after a restart."""
+        with self._event_lock:
+            return [_copy(e) for (etype, _), stream in sorted(self._events.items()) if etype == entity_type
+                    for e in stream]
 
     def recent_events(self, limit=50):
         out = []
@@ -1693,31 +2997,128 @@ class ControlPlaneRepo:
     # All persisted as events (entity types ``token_usage``, ``llm_key``,
     # ``custom_model``) so the existing durable sink and replay carry them.
     def record_token_usage(self, project, model, input_tokens=0, output_tokens=0, *,
-                           reasoning_tokens=0, cache_read_tokens=0, duration_ms=None,
-                           success=True, request_id=None, session_id=None,
-                           mission_id=None, key_id=None, source="llm-proxy"):
+                           reasoning_tokens=0, cache_read_tokens=0, cache_write_tokens=0,
+                           duration_ms=None, success=True, request_id=None, session_id=None,
+                           mission_id=None, key_id=None, source="llm-proxy", v2=None):
+        """One usage record. ``v2`` (already whitelisted, see ``record_token_usage_row``)
+        makes it a schema-2 record whose unreported token fields stay None (unknown);
+        a v1 record keeps the old shape, with missing token counts stored as 0."""
         if not project:
             raise ValueError("project is required")
+        tokens = (input_tokens, output_tokens, reasoning_tokens, cache_read_tokens)
+        if v2 is None:
+            tokens = tuple(int(t or 0) for t in tokens)
         payload = {"project": project, "model": model or "unknown",
-                   "input_tokens": int(input_tokens or 0),
-                   "output_tokens": int(output_tokens or 0),
-                   "reasoning_tokens": int(reasoning_tokens or 0),
-                   "cache_read_tokens": int(cache_read_tokens or 0),
+                   "input_tokens": tokens[0], "output_tokens": tokens[1],
+                   "reasoning_tokens": tokens[2], "cache_read_tokens": tokens[3],
+                   "cache_write_tokens": _usage_int(cache_write_tokens),
                    "duration_ms": duration_ms, "success": bool(success),
                    "request_id": request_id, "key_id": key_id, "source": source}
-        return self.record_event("token_usage", project, "token_usage.recorded",
-                                 payload, mission_id=mission_id, session_id=session_id)
+        if v2 is not None:
+            payload.update(v2, schema=2, session_id=session_id)
+        event = self.record_event("token_usage", project, "token_usage.recorded",
+                                  payload, mission_id=mission_id, session_id=session_id)
+        # The mission-scoped usage projection (issue #36) must reflect the same
+        # record so usage_analytics() is populated during normal runtime, not
+        # only after an event-only reload. The event above is the single durable
+        # record, so the projection is fed without emitting a duplicate event.
+        self.add_token_usage({
+            "request_id": request_id,
+            "mission_id": mission_id,
+            "session_id": session_id,
+            "model": payload.get("model"),
+            "occurred_at": event.get("source_timestamp"),
+            "input_tokens": payload.get("input_tokens"),
+            "output_tokens": payload.get("output_tokens"),
+            "reasoning_tokens": payload.get("reasoning_tokens"),
+            "cache_read_tokens": payload.get("cache_read_tokens"),
+            "cache_write_tokens": payload.get("cache_write_tokens"),
+        }, record_event=False)
+        return event
+
+    def record_token_usage_row(self, row):
+        """Record one usage row as posted to ``/api/v1/token-usage`` (or reported by the
+        proxy). Only known fields are kept, each type-checked; anything else in the row
+        (a prompt, a response, a key) is dropped, so no body text can be stored."""
+        if not isinstance(row, dict):
+            raise ValueError("usage row must be an object")
+        project = _usage_str(row.get("project"), 128) if isinstance(row.get("project"), str) else None
+        if not project:
+            raise ValueError("project is required")
+        model = _usage_str(row.get("model"), 256) or "unknown"
+        common = {"request_id": _usage_str(row.get("request_id"), 128),
+                  "session_id": _usage_id(row.get("session_id")),
+                  "mission_id": _usage_id(row.get("mission_id")),
+                  "key_id": _usage_str(row.get("key_id"), 128),
+                  "duration_ms": _usage_int(row.get("duration_ms"))}
+        tokens = [_usage_int(row.get(k)) for k in _TOKEN_FIELDS]
+        source = (row.get("source") if row.get("source") in ("llm-proxy", "transcript", "llm-gateway")
+                  else "llm-proxy")
+        if row.get("schema") != 2:
+            return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
+                                           cache_read_tokens=tokens[3],
+                                           cache_write_tokens=tokens[4],
+                                           success=row.get("success", True), source=source,
+                                           **common)
+        status = _usage_int(row.get("status"))
+        error_class = row.get("error_class") if row.get("error_class") in USAGE_ERROR_CLASSES else None
+        success = row.get("success")
+        if not isinstance(success, bool):
+            success = status is not None and 200 <= status < 300 and error_class is None
+        v2 = {"agent_id": _usage_id(row.get("agent_id")),
+              "upstream_model": _usage_str(row.get("upstream_model"), 256),
+              "route": row.get("route") if row.get("route") in ("fabric", "cpu", "upstream") else None,
+              "status": status, "error_class": error_class,
+              "usage_known": row.get("usage_known") is True,
+              "engine": _usage_str(row.get("engine"), 128)}
+        for k in ("fallback", "stream"):
+            v2[k] = row[k] if isinstance(row.get(k), bool) else None
+        for k in ("queue_ms", "ttft_ms", "gen_ms"):
+            v2[k] = _usage_int(row.get(k))
+        return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
+                                       cache_read_tokens=tokens[3],
+                                       cache_write_tokens=tokens[4], success=success,
+                                       source=source, v2=v2, **common)
+
+    def resolve_usage_session(self, value):
+        """Map a usage row's raw ``session_id`` to a dashboard session (Decision 4).
+
+        ``match`` says how: ``direct`` (it is a dashboard id), ``decoded`` (its header
+        form, see ``llm_session_id``), ``agent_session`` (the native conversation id of
+        exactly one session record: pi sends its session id, which is also the id at
+        the end of its ``<ts>_<id>.jsonl`` file), ``unmatched`` (none, or ambiguous),
+        or ``none`` (the row has no session). Never guesses between candidates."""
+        if not isinstance(value, str) or not value:
+            return {"session_id": None, "match": "none"}
+        if value in self._sessions:
+            return {"session_id": value, "match": "direct"}
+        decoded = dashboard_form(value)
+        if decoded is not None and decoded in self._sessions:
+            return {"session_id": decoded, "match": "decoded"}
+        if _NATIVE_ID.fullmatch(value):
+            hits = [sid for sid, rec in list(self._sessions.items())
+                    if _native_id_matches(rec.get("agent_session"), value)]
+            if len(hits) == 1:
+                return {"session_id": hits[0], "match": "agent_session"}
+        return {"session_id": None, "match": "unmatched"}
 
     def token_analytics(self, project=None, since=None):
-        """Aggregate token usage by project, model and day (UTC)."""
+        """Aggregate token usage by project, model, day (UTC) and dashboard session.
+
+        ``by_session`` is keyed by the dashboard session id, or ``unmatched:<raw id>``
+        when ``resolve_usage_session`` cannot place it; rows without a session id
+        count only in the other groupings."""
         total = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
-                 "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 0}
-        by_project, by_model, by_day = {}, {}, {}
+                 "reasoning_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                 "failed": 0}
+        by_project, by_model, by_day, by_session = {}, {}, {}, {}
+        resolved = {}
 
         def add(bucket, key, p):
             b = bucket.setdefault(key, {k: 0 for k in total})
             _accumulate(b, p)
 
+        seen_requests = set()
         for (etype, eid), stream in self._events.items():
             if etype != "token_usage" or (project and eid != project):
                 continue
@@ -1725,12 +3126,209 @@ class ControlPlaneRepo:
                 if since and ev["source_timestamp"] < since:
                     continue
                 p = _payload(ev)
+                request_id = p.get("request_id")
+                if request_id:
+                    # The mission-scoped usage projection is idempotent on request_id;
+                    # keep token_analytics consistent so a retried request is counted once.
+                    if request_id in seen_requests:
+                        continue
+                    seen_requests.add(request_id)
                 _accumulate(total, p)
-                add(by_project, p["project"], p)
-                add(by_model, p["model"], p)
+                # The mission-scoped ingest path may record rows without the legacy
+                # project field; skip/normalize them here so /analytics/tokens never
+                # 500s on a missing key (they still count in total and usage).
+                if p.get("project") is not None:
+                    add(by_project, p["project"], p)
+                if p.get("model") is not None:
+                    add(by_model, p["model"], p)
                 add(by_day, ev["source_timestamp"][:10], p)
+                raw = p.get("session_id") or ev.get("session_id")  # v1 rows: envelope only
+                if not raw:
+                    continue
+                if raw not in resolved:
+                    resolved[raw] = self.resolve_usage_session(raw)
+                hit = resolved[raw]
+                key = hit["session_id"] or f"unmatched:{raw}"
+                b = by_session.get(key)
+                if b is None:
+                    b = by_session[key] = {**{k: 0 for k in total}, "session_id": hit["session_id"],
+                                           "matched_by": [], "raw_session_ids": []}
+                _accumulate(b, p)
+                if hit["match"] not in b["matched_by"]:
+                    b["matched_by"] = sorted([*b["matched_by"], hit["match"]])
+                if raw not in b["raw_session_ids"]:
+                    b["raw_session_ids"] = sorted([*b["raw_session_ids"], raw])
         return {"total": total, "by_project": by_project, "by_model": by_model,
-                "by_day": dict(sorted(by_day.items()))}
+                "by_day": dict(sorted(by_day.items())), "by_session": by_session}
+
+    # -------------------------------------------------------------- usage (#36)
+    # Mission-scoped token and resource usage, idempotent on request_id, mirroring
+    # the token_usage / resource_usage tables. Missing fields stay None (never 0).
+    _TOKEN_COUNT_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens",
+                           "cache_read_tokens", "cache_write_tokens")
+
+    def add_token_usage(self, rec, record_event=True):
+        """Store one mission-scoped token usage record, idempotent on request_id.
+
+        ``record_event`` is False when an envelope already persisted the durable
+        row (schema-v2 ingest), so the projection does not write a duplicate.
+        """
+        if not isinstance(rec, dict):
+            raise ValueError("token usage must be an object")
+        request_id = _usage_str(rec.get("request_id"), 128)
+        if not request_id:
+            request_id = uuid4().hex  # a stable key; never a registered entity id
+        clean = {"request_id": request_id,
+                 "mission_id": _usage_id(rec.get("mission_id")),
+                 "session_id": _usage_id(rec.get("session_id")),
+                 "agent_id": _usage_id(rec.get("agent_id")),
+                 "host_id": _usage_id(rec.get("host_id")),
+                 "model": _usage_str(rec.get("model"), 256),
+                 "provider": _usage_str(rec.get("provider"), 128),
+                 "stage": _usage_str(rec.get("stage"), 128),
+                 "occurred_at": _normalize_occurred_at(rec.get("occurred_at")) or self._stamp(),
+                 "duration_ms": _usage_int(rec.get("duration_ms")),
+                 "retry_number": _usage_int(rec.get("retry_number")),
+                 "success": rec.get("success")
+                     if isinstance(rec.get("success"), bool) else None,
+                 "error_code": _usage_str(rec.get("error_code"), 256)}
+        for k in self._TOKEN_COUNT_FIELDS:
+            clean[k] = _usage_int(rec.get(k))
+        existing = self._token_usage.get(request_id)
+        if existing is not None:
+            return existing
+        self._token_usage[request_id] = clean
+        if record_event:
+            self.record_event("token_usage", request_id, "token_usage.recorded", clean,
+                              mission_id=clean["mission_id"], session_id=clean["session_id"])
+        return clean
+
+    def add_resource_usage(self, rec, record_event=True):
+        """Store one mission-scoped resource usage record."""
+        if not isinstance(rec, dict):
+            raise ValueError("resource usage must be an object")
+        mission_id = _usage_id(rec.get("mission_id"))
+        kind = _usage_str(rec.get("kind"), 128)
+        if not kind:
+            raise ValueError("resource kind is required")
+        clean = {"mission_id": mission_id, "kind": kind,
+                 "session_id": _usage_id(rec.get("session_id")),
+                 "value": rec.get("value"), "unit": _usage_str(rec.get("unit"), 32),
+                 "payload": rec.get("payload"),
+                 "occurred_at": _normalize_occurred_at(rec.get("occurred_at")) or self._stamp()}
+        value = clean["value"]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            raise ValueError("resource value must be a finite non-negative number")
+        key = (mission_id, kind)
+        bucket = self._resource_usage.setdefault(key, [])
+        bucket.append(clean)
+        if record_event:
+            self.record_event("resource_usage", f"{mission_id}:{kind}:{len(bucket) - 1}",
+                              "resource_usage.recorded", clean, mission_id=mission_id,
+                              session_id=clean["session_id"])
+        return clean
+
+    def usage_analytics(self, mission_id=None):
+        """Tokens by model and resources by kind, optionally scoped to a mission."""
+        tokens_by_model = {}
+        token_totals = {}
+        for request_id, rec in self._token_usage.items():
+            if mission_id is not None and rec.get("mission_id") != mission_id:
+                continue
+            model = rec.get("model") or "unknown"
+            b = tokens_by_model.setdefault(model, {k: 0 for k in self._TOKEN_COUNT_FIELDS})
+            for k in self._TOKEN_COUNT_FIELDS:
+                b[k] += int(rec.get(k) or 0)
+            for k in self._TOKEN_COUNT_FIELDS:
+                token_totals[k] = token_totals.get(k, 0) + int(rec.get(k) or 0)
+        resources = {}
+        for (mid, kind), recs in self._resource_usage.items():
+            if mission_id is not None and mid != mission_id:
+                continue
+            for rec in recs:
+                b = resources.setdefault(kind, {"count": 0, "total": 0.0, "unit": rec.get("unit")})
+                b["count"] += 1
+                b["total"] += float(rec.get("value") or 0)
+        return {"tokens": {"by_model": tokens_by_model, "total": token_totals},
+                "resources": resources}
+
+    # LLM page (docs/superpowers/specs/2026-10-23-llm-page-design.md, slice 2). Computed from
+    # the retained raw records on each call, like ``token_analytics``; ``retained_since`` says
+    # how far back they go and ``partial`` is true when the window starts before that.
+    def _llm_window(self, window, filters):
+        if window not in llm_stats.WINDOWS:
+            raise ValueError(f"window must be one of {', '.join(llm_stats.WINDOWS)}")
+        now = self._now()
+        if filters.pop("previous", None):    # the window of the same length just before this one, to compare against
+            now -= llm_stats.WINDOWS[window]
+        since = now - llm_stats.WINDOWS[window]
+        cache = {}
+
+        def resolve(raw):
+            if raw not in cache:
+                cache[raw] = self.resolve_usage_session(raw)
+            return cache[raw]
+
+        project = filters.get("project")
+        source = filters.pop("source", None)
+        if source not in (None, "", "llm-proxy", "transcript"):
+            raise ValueError("source must be llm-proxy or transcript")
+        with self._event_lock:
+            streams = [s for (etype, eid), s in self._events.items()
+                       if etype == "token_usage" and (not project or eid == project)]
+            events = [ev for s in streams for ev in s]
+        oldest = min((llm_stats._parse(s[0]["source_timestamp"]) for s in streams if s), default=None)
+        if source in (None, "", "transcript"):   # the agents' own transcripts (tokens only)
+            events += list(llm_stats.transcript_events(self.inspector.usage_events()))
+        records = [(ts, p) for ts, p in llm_stats.select(events, _payload, since=since, until=now + 1,
+                                                          resolve=resolve, **{k: v for k, v in filters.items() if v})
+                   if not source or (p.get("source") or "llm-proxy") == source]
+        meta = {"window": window, "since": llm_stats._iso(since),
+                "retained_since": llm_stats._iso(oldest),
+                "partial": oldest is None or oldest > since}
+        return records, resolve, meta, since, now
+
+    def llm_stats(self, window="24h", group="model", **filters):
+        if group not in llm_stats.GROUPS:
+            raise ValueError(f"group must be one of {', '.join(llm_stats.GROUPS)}")
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, group=group, groups=llm_stats.stats(records, group, resolve))
+
+    def llm_timeseries(self, window="24h", step="1h", metric="requests", **filters):
+        if step not in llm_stats.STEPS:
+            raise ValueError(f"step must be one of {', '.join(llm_stats.STEPS)}")
+        if metric not in llm_stats.METRICS:
+            raise ValueError(f"metric must be one of {', '.join(llm_stats.METRICS)}")
+        filters.setdefault("source", "llm-proxy")   # a time series is one source, never a sum
+        records, _, meta, since, now = self._llm_window(window, filters)
+        step_s = llm_stats.STEPS[step]
+        points = llm_stats.timeseries(records, metric, since=since, until=now, step=step_s)
+        return dict(meta, step=step, metric=metric, points=points)
+
+    def llm_spend(self, window="24h", prices=(), **filters):
+        """Priced estimate of the window's tokens (docs/usage-spend-estimate.md). Proxy traffic only unless a source is asked
+        for: a transcript and the proxy can describe the same call, so the two are never summed."""
+        source = filters.get("source") or "llm-proxy"
+        filters["source"] = source
+        if not prices:
+            return {"configured": False}
+        records, _, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, source=source, **usage_spend.estimate(records, prices, source))
+
+    def llm_errors(self, window="24h", error_class=None, **filters):
+        filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, problems=llm_stats.errors(records, resolve, error_class=error_class))
+
+    def record_attention(self, event_type, payload):
+        """Store an operator acknowledge/snooze/clear. Private stream: never in the feed or the SSE."""
+        self.record_event("attention", "operator", event_type, payload, feed=False, publish=False)
+
+    def attention_events(self):
+        with self._event_lock:
+            return [{"event_type": e["event_type"], "payload": dict(_payload(e))}
+                    for e in self._events.get(("attention", "operator"), [])]
 
     def create_project_key(self, project, label=""):
         """Mint a gateway key for ``project``; the secret is returned once and only
@@ -1801,10 +3399,21 @@ class ControlPlaneRepo:
 
     def llm_config(self):
         """What the LLM proxy needs: active key hashes and custom models."""
+        # The label is not secret; the proxy reads a session id from "session:<id>".
         return {"keys": [{"key_id": k["key_id"], "project": k["project"],
-                          "key_hash": k["key_hash"]}
+                          "key_hash": k["key_hash"], "label": k.get("label", "")}
                          for k in self._llm_keys() if not k.get("revoked")],
-                "custom_models": list(self.list_custom_models().values())}
+                "custom_models": list(self.list_custom_models().values()),
+                "egress": self._egress_config()}
+
+    egress_fn = None   # set by the API: () -> operator YAML egress routes (project_intelligence.egress)
+
+    def _egress_config(self):
+        try:
+            value = self.egress_fn() if self.egress_fn else {}
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
 
     # ------------------------------------------------------------- analytics
     def mission_analytics(self):
@@ -1836,58 +3445,147 @@ class ControlPlaneRepo:
     # --------------------------------------------------- backup / restore
     def export_state(self):
         """Serialize the full structured state for backup/restore (Spec §102)."""
+        # Do not hold the event lock while exporting the source ledger/graph:
+        # ingestion takes those locks before writing events. Capture only the
+        # scheduler projections here, after any in-flight admission commits.
+        with self._event_lock:
+            if self._pending_scheduler_events is not None:
+                raise RuntimeError("backup requires completed scheduler admission")
+            scheduler_state = {
+                "hosts": _deep_copy(self._hosts),
+                "reservations": _deep_copy(self._scheduler_reservations),
+                "leases": _deep_copy(self._scheduler_leases),
+                "observations": _deep_copy(self._scheduler_observations),
+                "events": {f"{t}|{i}": [dict(event) for event in stream]
+                           for (t, i), stream in self._events.items()},
+                "event_order": list(self._event_order),
+            }
         return {
             "version": 1,
             "missions": _copy(self._missions),
             "sessions": _copy(self._sessions),
             "services": _copy(self._services),
-            "hosts": _copy(self._hosts),
+            "hosts": scheduler_state["hosts"],
             "artifacts": _copy(self._artifacts),
             "blobs": {k: __import__("base64").b64encode(v).decode()
                       for k, v in self._blobs.items()},
             "leases": _copy(self._leases),
+            "scheduler_reservations": scheduler_state["reservations"],
+            "scheduler_leases": scheduler_state["leases"],
+            "scheduler_observations": scheduler_state["observations"],
             "telemetry": {k: [dict(s) for s in v]
                           for k, v in self._telemetry.items()},
-            "events": {f"{t}|{i}": [dict(e) for e in s]
-                       for (t, i), s in self._events.items()},
-            "event_order": list(self._event_order),
+            "delivery": {
+                "test_runs": _copy(self._test_runs),
+                "reviews": _copy(self._reviews),
+                "pull_requests": _copy(self._pull_requests),
+                "token_usage": _copy(self._token_usage),
+                "resource_usage": {json.dumps(list(k)): [dict(x) for x in v]
+                                    for k, v in self._resource_usage.items()},
+                "stage_runs": _copy(self._stage_runs),
+            },
+            "events": scheduler_state["events"],
+            "event_order": scheduler_state["event_order"],
             "ci_sequence": self._ci_sequence,
+            "ci_history_truncated": sorted(self._ci_history_truncated),
             "agent_projections": copy.deepcopy(list(self._agent_records.values())),
+            "agent_identity_history": copy.deepcopy(self._agent_identity_history),
         }
 
     def import_state(self, state):
         """Restore state from an export (used by restore tests / recovery)."""
+        self._durable_history = None
+        phase = _BootPhases("import_state")
         self._missions = dict(state.get("missions", {}))
         self._sessions = dict(state.get("sessions", {}))
         self._services = dict(state.get("services", {}))
-        self._hosts = dict(state.get("hosts", {}))
+        self._hosts = _deep_copy(state.get("hosts", {}))
+        for host in self._hosts.values():
+            if host.get("scheduler_policy"):
+                host["scheduler_policy"] = _clean_scheduler_policy(host["scheduler_policy"])
         self._artifacts = dict(state.get("artifacts", {}))
         self._blobs = {k: __import__("base64").b64decode(v)
                        for k, v in state.get("blobs", {}).items()}
         self._leases = dict(state.get("leases", {}))
+        self._scheduler_reservations = _deep_copy(state.get("scheduler_reservations", {}))
+        self._scheduler_leases = _deep_copy(state.get("scheduler_leases", {}))
         self._telemetry = {k: [dict(s) for s in v]
                           for k, v in state.get("telemetry", {}).items()}
+        delivery_present = "delivery" in state
+        delivery = state.get("delivery", {})
+        self._test_runs = dict(delivery.get("test_runs", {}))
+        self._reviews = dict(delivery.get("reviews", {}))
+        self._pull_requests = dict(delivery.get("pull_requests", {}))
+        for pull in self._pull_requests.values():      # a record stored before end_count existed has ended once if it has an end time
+            if isinstance(pull, dict) and (pull.get("merged_at") or pull.get("closed_at")) and not pull.get("end_count"):
+                pull["end_count"] = 1
+        self.pull_request_version += 1
+        self._token_usage = dict(delivery.get("token_usage", {}))
+        self._resource_usage = {tuple(json.loads(k)): [dict(x) for x in v]
+                                for k, v in delivery.get("resource_usage", {}).items()}
+        self._stage_runs = dict(delivery.get("stage_runs", {}))
         self._events = {}
         for key, stream in state.get("events", {}).items():
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        phase("copy event streams")
+        # Scheduler reservations are event-sourced, so a restart can recover
+        # even when the structured export contains only the event streams.
+        self._scheduler_observations = {}
+        for host_id, observation in state.get("scheduler_observations", {}).items():
+            self._apply_scheduler_observation(host_id, observation)
+        for (etype, entity_id), stream in self._events.items():
+            if etype == "scheduler_observation":
+                for event in stream:
+                    self._apply_scheduler_observation(entity_id, _payload(event))
+        for (etype, entity_id), stream in self._events.items():
+            if etype == "scheduler_reservation" and "scheduler_reservations" in state:
+                continue
+            if etype == "scheduler_lease" and "scheduler_leases" in state:
+                continue
+            if etype != "scheduler_reservation":
+                if etype != "scheduler_lease":
+                    continue
+                for event in stream:
+                    payload = _payload(event)
+                    if payload:
+                        self._scheduler_leases[entity_id] = _deep_copy(payload)
+                continue
+            for event in stream:
+                payload = _payload(event)
+                if payload:
+                    self._scheduler_reservations[entity_id] = _deep_copy(payload)
+        phase("scheduler state")
+        self.ledger.hydrate([e for stream in self._events.values() for e in stream])
+        phase("ledger")
+        self._rebuild_graph()
+        phase("lineage graph")
+        if not delivery_present:
+            # The bridge durable-reload path restores event streams but carries no
+            # delivery snapshot; rebuild the projections from those streams so
+            # tests/builds/reviews/PRs survive a restart instead of going silent.
+            self._rebuild_delivery_from_events()
         self._ci_sequence = max(int(state.get("ci_sequence", 0)),
                                 max((event.get("sequence", -1) + 1
                                      for key, stream in self._events.items()
-                                     if key[0] in {"ci_report", "ci_observation", "ci_telemetry"}
+                                     if key[0] in _CI_EVENT_KINDS
                                      for event in stream), default=0))
+        self._ci_test_projection = None
+        self._ci_history_truncated = set(state.get('ci_history_truncated', []))
         self._trim_ci_history()
+        phase("delivery and CI history")
         # Replay durable naming reservations before any session is presented.
         # Summary continuity lives outside transcript retention and public feeds.
-        projections = list(state.get("agent_projections", []))
+        projections = list(state.get("agent_identity_history", [])) + list(state.get("agent_projections", []))
         self._agent_records = {}
+        self._agent_identity_history = []
         self._agent_sequence = 0
-        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
         private_types = {"agent_identity", "agent_summary"}
         for key in [k for k in self._events if k[0] in private_types]:
             projections.extend(self._events.pop(key))
         self._event_order = [row for row in self._event_order if row[0] not in private_types]
+        seen_identity_events = {}
         for event in projections:
             if event.get("entity_type") not in private_types:
                 continue
@@ -1895,8 +3593,34 @@ class ControlPlaneRepo:
             key = (event["entity_type"], event["entity_id"])
             self._agent_records[key] = event
             self._agent_sequence = max(self._agent_sequence, int(event.get("sequence") or 0))
-        self.agent_identities.hydrate([event for (kind, _), event in self._agent_records.items()
-                                       if kind == "agent_identity"])
+            if event["entity_type"] == "agent_identity":
+                identity_key = event.get("event_id") or json.dumps(event, sort_keys=True, default=str)
+                previous = seen_identity_events.get(identity_key)
+                if previous is not None:
+                    if previous != event:
+                        raise ValueError("divergent private identity event")
+                    continue
+                seen_identity_events[identity_key] = event
+                self._agent_identity_history.append(copy.deepcopy(event))
+        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
+            verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
+        self.agent_identities.hydrate(self._agent_identity_history, quarantine_conflicts=True,
+                                     tolerate_version_resets=True)
+        # Keep the acknowledged canonical event, even if a later stale observation
+        # has a lower optimistic version. Full history remains private for audit.
+        for identity, record in self.agent_identities._records.items():
+            for event in reversed(self._agent_identity_history):
+                payload = event["payload"]
+                if event["entity_type"] == "agent_identity" and all(
+                    payload.get(field) == record[field]
+                    for field in ("identity", "display_name", "handle", "version")
+                ):
+                    self._agent_records[("agent_identity", identity)] = event
+                    break
+        if self.agent_identities.conflict_count:
+            logging.getLogger(__name__).error(
+                "restored sessions with %d ambiguous agent names; aliases remain blocked and stable session IDs are shown until renamed",
+                self.agent_identities.conflict_count)
         # Inspector summaries ride the durable log as ``inspector`` streams;
         # move them into the bounded store instead of the unbounded raw streams.
         durable = []
@@ -1905,11 +3629,244 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != "inspector"]
         # HCN events are private to the collaboration service: they must never sit
         # in the shared streams that /activity and the global SSE feed expose.
+        from .collab_repair import classify
+        stored = []
         for key in [k for k in self._events if k[0] == "collab"]:
-            self._collab_replay.extend(self._events.pop(key))
-        self._event_order = [t for t in self._event_order if t[0] != "collab"]
+            stored.extend(self._events.pop(key))
+        # T16 H1: only rows the collaboration service itself could have written are replayed; the rest are kept
+        # in storage, reported at ERROR and left alone (`collab-repair` moves them aside on request).
+        keep, bad = classify(stored)
+        self._collab_replay.extend(keep)
+        self.collab_quarantine.extend(row for row, _ in bad)
+        self.collab_quarantine_reasons = [why for _, why in bad]
+        if self.collab_quarantine:
+            logging.getLogger(__name__).error(
+                "quarantined %d foreign 'collab' row(s) from the durable log (%s); they are kept in storage and "
+                "were NOT replayed; see `collab-repair`", len(self.collab_quarantine),
+                ", ".join(sorted(set(self.collab_quarantine_reasons))))
+        self._event_order = [t for t in self._event_order if t[0] not in ("collab", "review_request")]
         if durable:
-            self.inspector.hydrate(durable)
+            from .inspector_snapshot import apply_to_store
+            outcome = apply_to_store(self.inspector, state.get("inspector_snapshot"), durable,
+                                    backfill=state.get("inspector_backfill"))
+            logging.getLogger(__name__).info("boot inspector replay: %s (%d events)", outcome, len(durable))
+        # Deployment events ride a private stream too: untrusted host evidence never enters the shared feed.
+        deployment_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_ENTITY]:
+            deployment_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_ENTITY]
+        self.deployments = self._new_deployments()
+        self.deployments.hydrate(deployment_rows)
+        plan_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_PLAN_ENTITY]:
+            plan_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_PLAN_ENTITY]
+        self.deployment_plans = self._new_deployment_plans()
+        self.deployment_plans.hydrate(plan_rows)
+        request_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_REQUEST_ENTITY]:
+            request_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_REQUEST_ENTITY]
+        self.deployment_requests = self._new_deployment_requests()
+        self.deployment_requests.hydrate(request_rows)
+        escalation_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_ESCALATION_ENTITY]:
+            escalation_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_ESCALATION_ENTITY]
+        self.deployment_escalations = self._new_deployment_escalations()
+        self.deployment_escalations.hydrate(escalation_rows)
+        # Host telemetry rollups/state ride a private stream: rebuild history and
+        # put the latest record back on each host.
+        metrics = []
+        for key in [k for k in self._events if k[0] == HOST_METRICS_ENTITY]:
+            metrics.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != HOST_METRICS_ENTITY]
+        self.host_metrics = self._new_host_metrics()
+        for hid, rec in self.host_metrics.hydrate(metrics).items():
+            host = self._hosts.get(hid)
+            if host is not None:
+                host.update({k: v for k, v in rec.items() if v is not None})
+
+        # Policies are authoritative independently of stream iteration order.
+        for (etype, entity_id), stream in self._events.items():
+            if etype != "host":
+                continue
+            for event in stream:
+                if event.get("event_type") != "HostPolicyChanged":
+                    continue
+                policy = _payload(event)
+                if "_envelope" in policy:
+                    continue
+                host = self._hosts.setdefault(entity_id, {"host_id": entity_id, "host_name": entity_id})
+                if policy.get("revision", -1) >= (host.get("scheduler_policy") or {}).get("revision", -1):
+                    host["scheduler_policy"] = _deep_copy(policy)
+        phase("agent, inspector and host projections")
+
+    def _rebuild_graph(self):
+        """Replay stored ``lineage`` envelope rows into a fresh projection.
+
+        Lineage is envelope-only: it never sits in the global feed. Rows that no
+        longer validate are skipped and counted, never fatal to startup.
+        """
+        graph = GraphProjection()
+        rows = [e for key, stream in self._events.items() if key[0] == "lineage"
+                for e in stream if e.get("source") is not None
+                and e.get("source_sequence") is not None]
+        rows = [_graph_from_stored({**e, "payload": _payload(e)}) for e in rows]
+        rows.sort(key=_graph_rank)          # admission order, independent of stream grouping
+        for event in rows:
+            try:
+                graph.apply(event)
+            except ValueError:
+                graph.events_rejected += 1
+        graph._seq = max([graph._seq] + [_graph_lseq(e) for e in rows])
+        graph._write_gates = dict(self.graph._write_gates)
+        graph._node_gates = dict(self.graph._node_gates)    # read-time gates are server config, not stored state
+        self.graph = graph
+        self._event_order = [t for t in self._event_order if t[0] != "lineage"]
+
+    def _rebuild_delivery_from_events(self):
+        """Replay delivery event streams into their projections.
+
+        Used by the durable reload path (bridge.py) which restores event streams
+        but carries no delivery snapshot: replaying the stored payloads rebuilds
+        the test_run/build/review/pull_request projections so delivery APIs and
+        mission pages show them after a restart. Idempotent — re-runs overwrite
+        the same records in place. Event recording is suppressed so the rebuilt
+        streams are not duplicated by the upsert methods.
+        """
+        self._suppress_record_events = True
+        try:
+            self._rebuild_delivery_from_events_impl()
+        finally:
+            self._suppress_record_events = False
+
+    def _rebuild_delivery_from_events_impl(self):
+        # Usage analytics (issue #36) and stage analytics (issue #37) ride the
+        # same durable event log, so an event-only reload must rebuild them too
+        # or they silently vanish after a restart.
+        self._token_usage = {}
+        self._resource_usage = {}
+        for entity_type in ("token_usage", "resource_usage"):
+            for ids in self.entity_ids(entity_type):
+                for ev in self._events.get((entity_type, ids), []):
+                    payload = dict(_payload(ev))
+                    try:
+                        # mission_id/session_id/timestamp live on the event envelope,
+                        # not necessarily in the payload, so merge them back for the
+                        # projection (namespace by the event's source so the rebuild
+                        # matches live ingest; keep the backdated occurred_at so
+                        # retention ages the rebuilt record out correctly).
+                        payload.setdefault("session_id", ev.get("session_id"))
+                        if not payload.get("occurred_at") and ev.get("source_timestamp"):
+                            payload["occurred_at"] = ev.get("source_timestamp")
+                        payload["mission_id"] = _usage_mission_key(
+                            payload.get("mission_id") or ev.get("mission_id"),
+                            ev.get("source") or "herdr")
+                        if entity_type == "token_usage":
+                            self.add_token_usage(payload)
+                        else:
+                            self.add_resource_usage(payload)
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        # Stage transitions: rebuild stage runs from each mission's event stream
+        # so per-stage durations survive a restart. set_mission_stage emits
+        # MissionStageChanged (with from/to); upsert_mission emits MissionUpdated
+        # (with only the current stage), so the running stage is tracked per
+        # mission to detect a change and derive the transition.
+        self._stage_runs = {}
+        for (etype, eid), stream in list(self._events.items()):
+            if etype != "mission":
+                continue
+            current = None
+            for ev in stream:
+                ev_type = ev.get("event_type")
+                p = _payload(ev)
+                if ev_type == "MissionStarted":
+                    # Initial stage is set at creation with no transition: seed the
+                    # running stage without opening a run (matches live upsert).
+                    current = p.get("stage")
+                    continue
+                if ev_type == "MissionStageChanged":
+                    old, new = p.get("from"), p.get("to")
+                elif ev_type == "MissionUpdated":
+                    old, new = current, p.get("stage")
+                else:
+                    continue
+                try:
+                    self._transition_stage(eid, old, new,
+                                           when=ev.get("source_timestamp"))
+                except (ValueError, KeyError, TypeError):
+                    pass
+                current = new
+        for entity_type in ("test_run", "build", "review", "pull_request"):
+            for ids in self.entity_ids(entity_type):
+                stream = self._events.get((entity_type, ids), [])
+                if not stream:
+                    continue
+                # Replay the whole stream in order: a review's findings are their
+                # own events, and a merged PR ends with a partial merge event, so
+                # rebuilding from only the last event would drop data. Each event
+                # payload carries enough to rebuild (record_event is suppressed, so
+                # nothing is re-persisted and the streams are not duplicated).
+                for ev in stream:
+                    payload = _payload(ev)
+                    event_type = ev.get("event_type", "")
+                    try:
+                        if entity_type in ("test_run", "build"):
+                            self.upsert_test_run(
+                                ids, kind=payload.get("kind") or entity_type,
+                                mission_id=payload.get("mission_id"),
+                                session_id=payload.get("session_id"),
+                                repository=payload.get("repository"),
+                                status=payload.get("status"),
+                                passed=payload.get("passed"),
+                                failed=payload.get("failed"),
+                                skipped=payload.get("skipped"),
+                                total=payload.get("total"),
+                                started_at=payload.get("started_at"),
+                                ended_at=payload.get("ended_at"),
+                                results=payload.get("results"),
+                            )
+                        elif entity_type == "review":
+                            if event_type == "ReviewFindingAdded":
+                                self.add_review_finding(
+                                    ids, severity=payload.get("severity"),
+                                    summary=payload.get("summary"),
+                                    detail=payload.get("detail") or "",
+                                    status=payload.get("status") or "open",
+                                    finding_id=payload.get("finding_id"),
+                                )
+                            else:
+                                self.upsert_review(
+                                    ids, mission_id=payload.get("mission_id"),
+                                    session_id=payload.get("session_id"),
+                                    reviewer=payload.get("reviewer"),
+                                    status=payload.get("status"),
+                                    verdict=payload.get("verdict"),
+                                    started_at=payload.get("started_at"),
+                                    completed_at=payload.get("completed_at"),
+                                    repository=payload.get("repository"),
+                                    pull_request_number=payload.get("pull_request_number"),
+                                )
+                        elif entity_type == "pull_request":
+                            if event_type == "PullRequestMerged":
+                                continue  # subset of the last Opened/Updated event
+                            self.upsert_pull_request(
+                                ids, mission_id=payload.get("mission_id"),
+                                repository=payload.get("repository"),
+                                number=payload.get("number"),
+                                url=payload.get("url"),
+                                status=payload.get("status"),
+                                branch=payload.get("branch"),
+                                base=payload.get("base"),
+                                created_at=payload.get("created_at"),
+                                merged_at=payload.get("merged_at"),
+                                closed_at=payload.get("closed_at"),
+                                ended_source=payload.get("ended_source"),
+                            )
+                    except (ValueError, KeyError, TypeError):  # a bad row never blocks startup
+                        continue
 
     def take_collab_replay(self):
         """Hand the diverted durable HCN events to the collaboration service (once)."""
@@ -1933,6 +3890,39 @@ class ControlPlaneRepo:
 
 
 # ------------------------------------------------------------ helpers
+#: pi/claude/codex conversation ids (same rule as the feed plugin's session-transcript.js ID).
+_NATIVE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{7,79}$")
+_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _native_id_matches(agent_session, value):
+    """True when ``agent_session`` (herdr's native conversation evidence) names ``value``:
+    its ``nativeId``, a ``kind: id`` value, or a ``kind: path`` transcript named
+    ``<id>.jsonl`` / ``*_<id>.jsonl`` / ``*-<id>.jsonl`` (session-transcript.js identityName)."""
+    if not isinstance(agent_session, dict):
+        return False
+    if agent_session.get("nativeId") == value:
+        return True
+    kind, ref = agent_session.get("kind"), agent_session.get("value")
+    if not isinstance(ref, str):
+        return False
+    if kind == "id":
+        return ref == value
+    if kind == "path":
+        name = ref.rsplit("/", 1)[-1]
+        # A suffix match needs a whole UUID: a fragment of one ends the name too.
+        return name == f"{value}.jsonl" or (bool(_UUID.fullmatch(value)) and name.endswith(
+            (f"_{value}.jsonl", f"-{value}.jsonl")))
+    return False
+
+
+def _clean_scheduler_policy(policy):
+    if isinstance(policy, dict) and "_envelope" in policy:
+        return {"mode": "disabled", "revision": 0,
+                "reason": "historical client policy requires operator reconciliation"}
+    return _deep_copy(policy)
+
+
 def _payload(ev):
     """An event's payload as a dict (a hydrated jsonb column arrives as text)."""
     p = ev.get("payload") or {}
@@ -1944,9 +3934,87 @@ def _payload(ev):
     return p if isinstance(p, dict) else {}
 
 
+_TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens",
+                  "cache_read_tokens", "cache_write_tokens")
+# The usage-record error taxonomy (docs/superpowers/specs/2026-10-23-llm-page-design.md).
+USAGE_ERROR_CLASSES = frozenset({
+    "auth_invalid_key", "request_invalid", "request_too_large", "model_project_mismatch",
+    "model_not_registered", "proxy_backpressure", "upstream_admission",
+    "upstream_rejected_metadata", "upstream_client_error", "upstream_server_error",
+    "upstream_unreachable", "stream_truncated", "client_disconnected", "egress_denied"})
+_USAGE_ID = re.compile(r"^[A-Za-z0-9\-_.:/]{1,128}$")
+
+
+def _usage_int(value):
+    """A non-negative int, or None (unknown) for anything else (bools, non-finite)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return int(value) if math.isfinite(value) and value >= 0 else None
+    except (ValueError, OverflowError):  # pragma: no cover - non-finite already caught
+        return None
+
+
+def _usage_mission_key(mission_id, source):
+    """Namespace a raw mission_id by its source, mirroring ingest's
+    ``_delivery_mission_key`` so usage projections and their event-only rebuild
+    store the same key (e.g. ``pi:M1``). Already-namespaced ids pass through.
+    """
+    if mission_id is None:
+        return None
+    if not isinstance(mission_id, str) or not mission_id:
+        raise ValueError("mission_id must be a non-empty string")
+    if ":" in mission_id:
+        return mission_id
+    return mission_id if source == "herdr" else f"{source}:{mission_id}"
+
+
+def _normalize_occurred_at(value):
+    """Return a valid ISO timestamp string, or None for anything malformed.
+
+    Guards the retention sweep, which parses ``occurred_at`` with
+    ``datetime.fromisoformat`` and compares it to a timezone-aware cutoff; a
+    garbage value or a timezone-naive timestamp there would fail the sweep with
+    ValueError/TypeError. ``Z`` is normalized to ``+00:00`` (a timezone).
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None  # timezone-naive would break the aware cutoff comparison
+    return value
+
+
+def _usage_str(value, limit):
+    return value if isinstance(value, str) and 0 < len(value) <= limit else None
+
+
+def _usage_id(value):
+    """Session/agent/mission ids: the gateway's metadata charset, else None."""
+    return value if isinstance(value, str) and _USAGE_ID.match(value) else None
+
+
+def _percentile(sorted_values, pct):
+    """Nearest-rank percentile of an ascending list (pct in 0..100).
+
+    The nearest-rank method selects ``ceil(pct/100 * n)``-th smallest value
+    (1-indexed); with n=2, p50 is the 1st (index 0) and p95 the 2nd (index 1).
+    """
+    n = len(sorted_values)
+    if n == 0:
+        return None
+    rank = math.ceil(pct / 100.0 * n)
+    idx = max(0, min(n - 1, rank - 1))
+    return sorted_values[idx]
+
+
 def _accumulate(bucket, p):
     bucket["requests"] += 1
-    for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens"):
+    for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
+              "cache_write_tokens"):
         bucket[k] += int(p.get(k) or 0)
     if not p.get("success", True):
         bucket["failed"] += 1
@@ -1961,6 +4029,12 @@ def _deep_copy(d):
     if d is None:
         return None
     return copy.deepcopy(d)
+
+
+def _bounded_claim(value):
+    """A client-claimed actor is evidence of what was claimed, never trusted."""
+    text = json.dumps(value, default=str)
+    return value if len(text) <= 1024 else text[:1024]
 
 
 def _iso(ts):

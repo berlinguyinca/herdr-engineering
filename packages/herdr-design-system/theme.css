@@ -29,6 +29,7 @@
   --accent: #10a37f;
   --accent-hover: #0d8f6f;
   --accent-weak: #d2f0e8;
+  --accent-strong: var(--accent-hover);
 
   /* planator / planning violet accent (subtle) */
   --violet: #7152e3;
@@ -58,6 +59,10 @@
   /* layout / elevation */
   --radius: 8px;
   --radius-sm: 4px;
+  /* Controls (buttons, tabs, chips): one height scale and one radius everywhere. */
+  --control-h: 32px;
+  --control-h-sm: 28px;
+  --control-radius: var(--radius-sm);
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
   --shadow-lg: 0 8px 24px rgba(16, 24, 40, 0.1);
   --sidebar-width: 232px;
@@ -66,11 +71,195 @@
   /* motion */
   --motion-fast: 120ms;
   --motion-normal: 200ms;
+
+  /* aliases used across views; they follow the base tokens, light or dark */
+  --bg: var(--background);
+  --accent-strong: var(--accent-hover);
+  --shadow-sm: var(--shadow);
+  --accent-contrast: var(--text-on-accent);
+  --surface-alt: var(--surface-2);
+  --surface-card: var(--surface);
+  --surface-raised: var(--surface);
+  --surface-sunken: var(--background);
+  --border-color: var(--border);
+  --hd-border: var(--border);
+  --text-primary: var(--text);
+  --text-sm: 0.8125rem;
+  --status-danger: var(--status-failed);
+  --status-error: var(--status-failed);
+  --status-success: var(--status-ok);
+  --freshness-warn: #b45309;
+  --error-bg: #fef2f2;
+  --info-bg: var(--accent-weak);
+  --warn-text: #9b5d00;
+  --drift-bg: #fff4e5;
+  --drift-text: #8a4b00;
+  --missing-bg: #f6f6f6;
+  /* CI outcome colours (pipeline steps, test results) and the CI health map's cells */
+  --ci-pass: #238636;
+  --ci-fail: #dc3545;
+  --ci-queued: #bf8700;
+  --ci-blocked: #a56ae0;
+  --ci-cell-bg: #e7ebef;
+  --ci-cell-text: #263449;
+  --ci-cell-success-bg: #bfe9ce;
+  --ci-cell-success-text: #155e32;
+  --ci-cell-failure-bg: #f5bcc2;
+  --ci-cell-failure-text: #8f1424;
+  --ci-cell-mixed-bg: #f8dc9a;
+  --ci-cell-mixed-text: #775000;
+  --ci-cell-active-bg: #c4dcfa;
+  --ci-cell-active-text: #184c91;
+  --ci-cell-neutral-bg: #dfe0eb;
+  --ci-cell-neutral-text: #4f4a6b;
+  --ci-cell-stripe-a: #eef0f4;
+  --ci-cell-stripe-b: #d8dde6;
+  --ci-cell-incomplete-border: #697488;
+  --ci-cell-active-dot: #1263c4;
+  --ci-cell-selected: #202f48;
+  --focus-ring: #276ec5;
+  color-scheme: light;
 }
+
+/* Dark palette: follows the OS unless the user forces light; data-theme="dark" forces it. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --background: #17181c;
+    --surface: #1f2026;
+    --surface-2: #2a2b33;
+    --surface-hover: #2a2b33;
+    --border: #3a3b45;
+    --border-subtle: #2c2d36;
+    --text: #e6e6ea;
+    --text-secondary: #a4a4b3;
+    --text-muted: #8a8a9a;
+    --text-on-accent: #07211a;
+    --accent: #2fc59c;
+    --accent-hover: #4ad6b0;
+    --accent-weak: #153d33;
+    --violet: #a08cf5;
+    --violet-weak: #2a2447;
+    --status-ok: #34d399;
+    --status-active: #60a5fa;
+    --status-waiting: #9ca3af;
+    --status-attention: #fbbf24;
+    --status-blocked: #fb923c;
+    --status-failed: #f87171;
+    --status-planning: #a08cf5;
+    --status-ready: #9ca3af;
+    --status-testing: #22d3ee;
+    --status-review: #fbbf24;
+    --status-repair: #fb923c;
+    --status-validation: #2dd4bf;
+    --status-pr: #818cf8;
+    --freshness-warn: #fbbf24;
+    --error-bg: #3a1a1a;
+    --warn-text: #fbbf24;
+    --drift-bg: #3a2a10;
+    --drift-text: #ffc46b;
+    --missing-bg: #1f2227;
+    --ci-pass: #4ade80;
+    --ci-fail: #f87171;
+    --ci-queued: #fbbf24;
+    --ci-blocked: #c4a5f5;
+    --ci-cell-bg: #2a2b33;
+    --ci-cell-text: #d6dbe4;
+    --ci-cell-success-bg: #14432a;
+    --ci-cell-success-text: #bbf7d0;
+    --ci-cell-failure-bg: #5a1d24;
+    --ci-cell-failure-text: #fecdd3;
+    --ci-cell-mixed-bg: #4a3a0f;
+    --ci-cell-mixed-text: #fde68a;
+    --ci-cell-active-bg: #1e3a5f;
+    --ci-cell-active-text: #bfdbfe;
+    --ci-cell-neutral-bg: #33344a;
+    --ci-cell-neutral-text: #d4d4e4;
+    --ci-cell-stripe-a: #2a2b33;
+    --ci-cell-stripe-b: #3a3b45;
+    --ci-cell-incomplete-border: #8a8a9a;
+    --ci-cell-active-dot: #93c5fd;
+    --ci-cell-selected: #e6e6ea;
+    --focus-ring: #60a5fa;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --background: #17181c;
+  --surface: #1f2026;
+  --surface-2: #2a2b33;
+  --surface-hover: #2a2b33;
+  --border: #3a3b45;
+  --border-subtle: #2c2d36;
+  --text: #e6e6ea;
+  --text-secondary: #a4a4b3;
+  --text-muted: #8a8a9a;
+  --text-on-accent: #07211a;
+  --accent: #2fc59c;
+  --accent-hover: #4ad6b0;
+  --accent-weak: #153d33;
+  --violet: #a08cf5;
+  --violet-weak: #2a2447;
+  --status-ok: #34d399;
+  --status-active: #60a5fa;
+  --status-waiting: #9ca3af;
+  --status-attention: #fbbf24;
+  --status-blocked: #fb923c;
+  --status-failed: #f87171;
+  --status-planning: #a08cf5;
+  --status-ready: #9ca3af;
+  --status-testing: #22d3ee;
+  --status-review: #fbbf24;
+  --status-repair: #fb923c;
+  --status-validation: #2dd4bf;
+  --status-pr: #818cf8;
+  --freshness-warn: #fbbf24;
+  --error-bg: #3a1a1a;
+  --warn-text: #fbbf24;
+  --drift-bg: #3a2a10;
+  --drift-text: #ffc46b;
+  --missing-bg: #1f2227;
+  --ci-pass: #4ade80;
+  --ci-fail: #f87171;
+  --ci-queued: #fbbf24;
+  --ci-blocked: #c4a5f5;
+  --ci-cell-bg: #2a2b33;
+  --ci-cell-text: #d6dbe4;
+  --ci-cell-success-bg: #14432a;
+  --ci-cell-success-text: #bbf7d0;
+  --ci-cell-failure-bg: #5a1d24;
+  --ci-cell-failure-text: #fecdd3;
+  --ci-cell-mixed-bg: #4a3a0f;
+  --ci-cell-mixed-text: #fde68a;
+  --ci-cell-active-bg: #1e3a5f;
+  --ci-cell-active-text: #bfdbfe;
+  --ci-cell-neutral-bg: #33344a;
+  --ci-cell-neutral-text: #d4d4e4;
+  --ci-cell-stripe-a: #2a2b33;
+  --ci-cell-stripe-b: #3a3b45;
+  --ci-cell-incomplete-border: #8a8a9a;
+  --ci-cell-active-dot: #93c5fd;
+  --ci-cell-selected: #e6e6ea;
+  --focus-ring: #60a5fa;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
+}
+
+/* Shared data table */
+.hd-table-wrap { max-width: 100%; overflow-x: auto; }
+[data-artifact-registry] .hd-inline { flex-wrap: wrap; }
+[data-artifact-registry] .hd-input { min-width: 0; max-width: 100%; padding: 8px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font: inherit; }
+.hd-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; background: var(--surface); }
+.hd-table th, .hd-table td { padding: var(--density-row-padding, 8px) 12px; text-align: left; border-bottom: 1px solid var(--border-subtle); }
+.hd-table th { color: var(--text-secondary); font-weight: 500; font-size: 0.8125rem; background: var(--surface-alt); }
+.hd-table td { font-variant-numeric: tabular-nums; }
+.hd-table tbody tr:hover { background: var(--surface-hover); }
 
 /* reduced-motion (Spec §88 a11y): honor the OS preference */
 @media (prefers-reduced-motion: reduce) {
-  * {
+  :root:not([data-calm="off"]) *, :root:not([data-calm="off"]) *::before, :root:not([data-calm="off"]) *::after {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
@@ -96,12 +285,12 @@
 :root[data-density] :is(.ov-panel, .hd-card) { padding: var(--density-panel-padding); }
 :root[data-density] :is(.ov-layout, .hd-grid, .gh-layout, .gh-issue-layout, .sc-row) { gap: var(--density-gap); }
 :root[data-density] :is(.ov-row, .gh-issue, .gh-repo, .sc-row) { padding-top: var(--density-row-padding); padding-bottom: var(--density-row-padding); }
-:root[data-density] .ci-health-tree button { padding-block: var(--density-row-padding); }
+:root[data-density] .ci-health-detail button { padding-block: var(--density-row-padding); }
 /* Fit operational analytics to the available content width, including tablets. */
 :root .an-links { grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); }
 @media (max-width: 900px) {
-  :root[data-density] :is(button, select, input:not([type=checkbox]):not([type=radio]), summary, .gh-issue-title, .ov-row a, .ci-health-tree a) { min-height: 44px; }
-  :root[data-density] :is(.ov-row a, .ci-health-tree a) { display: inline-flex; align-items: center; }
+  :root[data-density] :is(button, select, input:not([type=checkbox]):not([type=radio]), summary, .gh-issue-title, .ov-row a, .ci-health-detail a) { min-height: 44px; }
+  :root[data-density] :is(.ov-row a, .ci-health-detail a) { display: inline-flex; align-items: center; }
   /* The 44px button plus cell padding must fit the bucket's actual column. */
   :root[data-density] .ci-health-grid { width: max-content; table-layout: auto; }
   :root[data-density] .ci-health-grid :is(td, thead th:not(.ci-health-project)) { width: 48px; min-width: 48px; }

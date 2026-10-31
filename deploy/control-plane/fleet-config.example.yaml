@@ -26,13 +26,67 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: hosts that are meant to be off (benchmark boxes, powered-off machines). They raise no host_stale item and
+      # are listed quietly as "Expected offline" on Attention. Host names or ids. Empty by default; REPLACE with your own.
+      # attention:
+      #   expected_offline_hosts: []     # e.g. ["beast", "bender"]
+      # OPTIONAL: prices for the Usage "Spend (est.)" tab and the PR trail cost figure, in dollars per million tokens.
+      # There are no built-in prices; without a table (or with any unpriced model) cost is shown as unknown.
+      # usage:
+      #   prices:
+      #     - {model: "claude-sonnet-*", input: 0.0, output: 0.0, cached: 0.0}   # REPLACE the zeros with your real prices
+      #     - {model: "qwen*", input: 0, output: 0}                              # self-hosted: say so with an explicit zero
+      # OPTIONAL: the Evolution tab's staleness limit (docs/agent-evolution.md) and the learning export
+      # (docs/learning-trails.md: records per merged PR, GET /api/v1/learning/trails). Both work with these defaults.
+      # evolution:
+      #   stale_after_minutes: 120
+      # learning:
+      #   enabled: true
+      #   require_role: operator          # operator | viewer; the export is fleet-wide
+      # OPTIONAL: absolute path (as the web container sees it) to a checkout of InferWeave's
+      # deploy/pipelines/*.yaml. Read live. Absent: no definitions, and any host token may report
+      # deployment events for any component (the Deployments snapshot then carries a warning).
+      # Set but invalid: the last valid set stays in use; events are refused (503) only when no
+      # set was ever valid.
+      # NOTE: release evidence (the release asset's .commit and its ancestry on main) is read from
+      # GitHub with the github.app (or else github.token) below (read only; the repository is
+      # private). Without a credential,
+      # or while GitHub fails, it is unknown: every permit answers false ("release not confirmed"),
+      # so a host updater with a gate URL (IW_DEPLOY_GATE_URL) stays on its running version.
+      # A definition may carry `requires: [{repo, ci_context, stage}]` to hold its track until that
+      # stage of another follows track is rolled out (see the README, "Cross-track order").
+      # deploy.sh mounts ~/.local/share/herdr-engineering/pipelines (kept equal to InferWeave's
+      # deploy/pipelines on main by the herdr-pipelines-sync timer) at /etc/herdr/pipelines.
+      # deployment_definitions: "/etc/herdr/pipelines"
+      # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
+      # /ack, operator role). Read live; anything but true is off. Force only records a request the
+      # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.
+      # A force never permits a release that is not confirmed (see the NOTE above).
+      deployment_actions: false
+      # OPTIONAL: side effects of a deployment failure escalation (all off by default). issues: a
+      # GitHub issue per software finding (needs github.token with issue write access; the
+      # read-only github.app is never used for it).
+      # deployment_escalation:
+      #   issues: false
+      #   assistant: false
+      # OPTIONAL: head-bound post-PR review quorum (GET /api/v1/graph/nodes/{pr}/review-quorum).
+      # Principal ids are the server-side `key:<digest>` actors; omit the block to turn it off.
+      # review_quorum:
+      #   required: 2
+      #   trusted_head_writers: ["key:REDACTED"]   # who may define a PR's current head / author
+      #   reviewers:
+      #     "key:REDACTED": {}
+      #     "key:REDACTED2": {login: "reviewer-login"}
+      #   reviewer_groups: []                       # e.g. [["key:REDACTED", "key:REDACTED2"]] = one person
       # OPTIONAL: the public collaboration container (only when the host has the marker
       # ~/.config/herdr-engineering/collab-enabled). Public identifiers only - deploy.sh
       # hands exactly this mapping (nothing else from this file) to collab-public, and
       # an unknown key is refused. Omit the whole block when collab is not used.
       collab:
         cognito_pool: "us-west-2_REDACTED"           # also read by collab-sync.sh
-        cognito_clients: ["REDACTED"]                # allowed app client ids (tokens)
+        # allowed app client ids (tokens). The pool is SHARED (e.g. with lc-binbase-scheduler): list only the
+        # clients whose tokens may sign in here AND open lab share links; a token of any listed client counts.
+        cognito_clients: ["REDACTED"]
         cognito_group: "local.dev"                   # required cognito:groups membership
         cognito_web_client: "REDACTED"               # browser page app client (Hosted UI, PKCE)
         cognito_domain: "https://REDACTED.auth.us-west-2.amazoncognito.com"
@@ -40,6 +94,198 @@ sections:
         operator_user: "REDACTED"                    # Cognito username the dashboard's no-sign-in
                                                      # collaboration acts as (required)
         # operator_email: "owner@example.test"       # optional, shown for the operator
+        # public_url must be a bare https origin (empty path or "/") when shares are enabled: links and the lab
+        # sign-in callback live at <public_url>/s/... and the web client needs <public_url>/s/callback as an
+        # allowed callback + logout URL (see COLLAB.md, "Share links").
+        # T15 attention inbox, evidence-based progress, analytics (everything off unless enabled):
+        # insights:
+        #   enabled: false                 # kill_switch: true turns every route off at once
+        #   kill_switch: false
+        #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
+        #   min_group_size: 5              # aggregates over fewer items are hidden
+        #   reads_per_minute: 60
+      # OPTIONAL: artifact share links (/s/ on collab.public_url). OFF unless `enabled: true`, which needs the
+      # collab marker and a signing_secret: deploy.sh refuses otherwise. share-public gets only the serving keys
+      # below plus collab's cognito_pool/cognito_clients/cognito_web_client/cognito_domain/public_url (render-share).
+      # share:
+      #   enabled: false
+      #   signing_secret: "REDACTED"       # >= 32 bytes; generate locally, never commit or print it:
+      #                                    #   openssl rand -hex 32   (paste the output here)
+      #   session_seconds: 14400           # lab session lifetime cap; also never past the share's expiry NOR the
+      #                                    # Cognito access token's exp (~1 h with pool defaults), so ~1 h in practice
+      #   default_public_days: 30          # public links: 1-90 days
+      #   max_share_bytes: 536870912       # one bundle
+      #   max_total_bytes: 2147483648      # all live bundles
+      #   max_files: 20000                 # files per bundle
+      #   # container paths; keep the defaults with deploy.sh (its mounts are fixed):
+      #   # shares_dir: /shares   events_dir: /share-events   marker_dir: /var/lib/herdr/share-markers
+      # OPTIONAL: the collaborator bridge (external agents read and commit artifacts through collab-public's MCP tools).
+      # OFF unless `enabled: true` (exactly true). Needs the collab marker for collab-public to serve it; the worker runs
+      # the bridge loop whenever this is true. YAML only: no environment variable is read. Every limit is a positive
+      # integer (0, a negative number, a boolean or an unknown key stops the worker start). The worker publishes the
+      # effective limits in grants.json, so collab-public enforces the same values with no limits of its own; its only
+      # input from this section is `enabled`. Storage is plentiful, so every default is generous.
+      # collab_artifacts:
+      #   enabled: false
+      #   daily_bytes_per_agent: 100000000000        # 100 GB quota
+      #   commits_per_minute: 30                     # anti-abuse
+      #   chunks_per_minute: 1200                    # anti-abuse (~10 MiB/s per agent)
+      #   max_changes_per_commit: 100
+      #   max_pending_intents_per_agent: 4
+      #   max_file_bytes: 100000000000               # per staged file
+      #   staging_ttl_seconds: 86400                 # sweeper
+      #   staging_bytes_per_agent: 200000000000      # reserved by declared size
+      #   staging_bytes_total: 2000000000000         # whole outbox volume
+      #   max_text_merge_bytes: 2097152              # three-way text merge only
+      #   max_conflict_text_bytes: 8388608           # per result
+      #   mirror_history_versions: 5
+      #   mirror_max_manifests: 100000               # effectively "all versions"
+      #   mirror_max_file_bytes: 1073741824          # per mirrored text file
+      #   mirror_max_artifact_bytes: 17179869184     # per mirrored artifact
+      #   apply_concurrency: 4                       # applier lanes (DB connections)
+      #   audit_coalesce_seconds: 60                 # one commit/upload audit event per agent+artifact per window
+      #   # container paths; keep the defaults with deploy.sh (its mounts are fixed):
+      #   # mirror_dir: /collab-mirror   outbox_dir: /collab-outbox   spool_dir: /collab-spool
+      #   # Host side (deploy.sh creates them beside the share dirs, always): HERDR_COLLAB_MIRROR_DIR and
+      #   # HERDR_COLLAB_OUTBOX_DIR as the deploying uid (0755), HERDR_COLLAB_SPOOL_DIR 0700. The outbox (staged uploads)
+      #   # and the spool (assembled uploads) must sit on LARGE storage. Run ONE collab-public per outbox.
+      # OPTIONAL: lineage-graph evidence in the merge gate. OFF unless you uncomment AND set `enabled: true`.
+      # It runs after decide_merge for every PR and can only withhold a merge. `evidence_writers` is REQUIRED and
+      # must be explicit graph principal ids ("key:<12 hex of sha256(the CI reporter's API key)>"): an empty list,
+      # a wildcard or a bare word stops startup (and `fleet-config validate`) instead of enabling anything.
+      # Only `validated` edges written by these principals, bound to the PR's exact head SHA, count.
+      # See docs/operations/lineage-continuity-runbook.md ("Turning the graph merge gate on").
+      # graph_merge_gate:
+      #   enabled: false                 # true to turn it on; false/removed = hot kill switch
+      #   evidence_writers: ["key:<12-hex-of-the-ci-reporter-key>"]   # REPLACE: the placeholder is refused at startup
+      #   required_checks: ["ci"]        # edges name their check in attrs.check (default "ci")
+      #   require_review_quorum: false   # true also needs control_plane.review_quorum to be satisfied
+      #   evidence_source:               # OPTIONAL: the writer of the `validated` edges the gate reads (own switch, off by default)
+      #     enabled: false               # step 1 of the enable sequence; the gate's evidence_writers is step 3
+      #     principal: "ci-evidence:woodpecker"   # dedicated in-process id; must start with ci-evidence: (API-key ids are refused)
+      #     check: "ci"                  # the check name written to attrs.check
+      #     repos:                       # ONLY these repos / PRs get evidence (also enrolled in control_plane.review_gate)
+      #       - repo: github.com/<owner>/<name>
+      #         prs: [123]               # optional; omit for every open non-draft PR of the repo
+      # OPTIONAL: the Rakazo mobile bridge (off unless `enabled: true`; then /rpc/* and /api/auth/* serve the Rakazo
+      # iPhone app from the Personal Assistant below, which must be enabled too). Passwords are scrypt HASHES made
+      # with `herdr-eng bridge hash-password`; never put a password here. See deploy/control-plane/README.md.
+      # rakazo_bridge:
+      #   enabled: false
+      #   token_ttl_days: 30             # a signed-in phone stays signed in this long (1-365)
+      #   max_tokens: 5                  # live sessions per account; the oldest is dropped (1-50)
+      #   trusted_proxies: []            # proxies whose X-Forwarded-For is believed (loopback always); the fabric gateway's
+      #                                  # address as the control plane sees it goes here so lockout keys on the real client
+      #   accounts:                      # shape reserved for a later multi-user mode; today only role: operator
+      #     - email: "you@example.com"
+      #       password_scrypt: "scrypt$32768$8$1$<salt_b64>$<hash_b64>"
+      #       role: operator
+      #       # tokens_valid_after: "2026-11-02T09:30:00Z"   # revoke every token issued before this (lost phone)
+      # OPTIONAL: the Personal Assistant (inert unless `enabled: true`). Nothing in
+      # the assistant module runs while disabled; the /personal-assistant dashboard
+      # view only appears when the `assistant_v1` capability is advertised (enabled).
+      # Deny-by-default throughout: tools are never offered to the model unless the
+      # user grants them, sensitive tools require an operator approval, and secrets
+      # are redacted from prompts, logs and events. Copy only what you need.
+      # personal_assistant:
+      #   enabled: false                 # master kill-switch (also gates the capability flag)
+      #   # OPTIONAL: tailnet-only MCP hub for coding agents (Claude Code). Off by default; records asks, reports and
+      #   # hook observations only (answers nothing, approves nothing). Bind loopback or the tailnet address, NEVER
+      #   # 0.0.0.0 and never behind the nginx edge. See docs/operations/assistant-hub.md.
+      #   hub:
+      #     enabled: false
+      #     host: "127.0.0.1"            # bind address; use your tailnet address (100.x) to serve other machines
+      #     port: 9483
+      #     allowed_networks: ["127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+      #     allowed_hosts: []            # extra accepted Host names, e.g. ["assistant.tailnet-name.ts.net"]
+      #     enrollment_ttl_seconds: 900  # one-time enrollment code lifetime
+      #     worker_ttl_days: 90          # redeemed worker credential lifetime
+      #     # tenant: default            # defaults to the assistant's default tenant
+      #   # OPTIONAL: earned action grants for hub workers with the `act` scope (docs/operations/assistant-hub.md).
+      #   # Nothing is autonomous yet: activation answers 409 until the Phase 3 judge gate exists.
+      #   grants:
+      #     shadow_days: 14              # global shadow period before any grant can be activated or honoured
+      #     shadow_started_at: null      # ISO-8601 with offset; null = stamped on first start
+      #     required_approvals:          # owner approvals of the exact action needed, per risk class
+      #       local_reversible: 5
+      #       remote_reversible: 10
+      #       outward: 30
+      #     min_sessions: 3              # distinct session ids among the counted approvals
+      #     min_tasks: 2                 # distinct task ids among the counted approvals
+      #     grant_ttl_days: 30           # lifetime of a proposed grant, and of an active one from activation
+      #     extra_vetoes: []             # extra hard denies: [{code: no_prod, reason: "...", argv_contains: "prod"}]
+      #     policy_version: 1            # bump to invalidate every existing grant
+      #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
+      #   audit:
+      #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)
+      #     anchor_file: "/var/lib/herdr-anchor/assistant-audit.anchor"  # append-only; ideally a different device
+      #   # Hand approved request_mission / propose_branch delegations to the handoff queue:
+      #   delegation_consumer:
+      #     enabled: false
+      #     source_harness: pi
+      #   # Scheduled CI watch: every interval the server looks for NEW failed CI runs and queues repair / re-run
+      #   # PROPOSALS (nothing is merged, pushed or run without an approval). Off by default. Needs, per listed
+      #   # user: project_intelligence.enabled (no kill switch), a project_intelligence.assistant_viewers
+      #   # "<tenant>/<user>" entry, an enabled assistant and an active watch_ci grant (scope "*").
+      #   ci_watch:
+      #     enabled: false
+      #     interval_seconds: 300          # minimum 60
+      #     auto_grant: false              # true = create the standing watch_ci grant (30 day max, audited as
+      #                                    # actor system:ci_watch) when missing; false = log a WARNING hourly
+      #     # source: both                 # monitor (CI monitor snapshot) | lineage (ci graph nodes) | both
+      #     # max_age_seconds: 21600       # ignore failures that finished longer ago than this
+      #     users:                         # tenant_id: from personal_assistant.tenancy (default tenant is "default")
+      #       - {tenant_id: default, user_id: open-listener}        # the dashboard / open tailnet listener
+      #       - {tenant_id: default, user_id: "rakazo:<16 hex>"}    # a Rakazo bridge account (see README)
+      #   # Real inference. When `endpoint` is set the service uses an HTTP
+      #   # chat-completions runner (OpenAI-compatible, incl. tool-calling); when
+      #   # empty it falls back to a deterministic local runner (skeleton only).
+      #   # `api_key` is the llm-proxy PROJECT key and is never logged. The model is
+      #   # chosen from what the proxy serves now (GET /v1/models, cached a minute):
+      #   # `model` is tried first while the proxy still serves it, or set `auto`;
+      #   # otherwise the first match in `preferred_models` (ids or * patterns) wins,
+      #   # then any served text model. A 429/404/502/503 moves on to the next one.
+      #   inference:
+      #     endpoint: "http://llm-proxy:8088/v1/chat/completions"
+      #     model: auto
+      #     preferred_models: ["qwen3.8-flash_next-*", "qwen3.8-text"]
+      #     timeout: 60
+      #     api_key: "REDACTED"          # llm-proxy project key (never logged)
+      #   # Optional durable store. When set, the assistant snapshots its store to
+      #   # pa_store_snapshot (JSONB) in this database on every mutation and reloads
+      #   # it on startup, so threads/memory/grants/approvals survive a restart.
+      #   persistence:
+      #     dsn: "postgresql://REDACTED:REDACTED@postgres:5432/herdr_pa"
+      #   # Inject a redacted, INFORMATIONAL-ONLY snapshot of live fleet state (hosts,
+      #   # missions, sessions, services, activity) as a system message so the
+      #   # assistant can answer questions about the fleet. Payloads are treated as
+      #   # data, never instructions (prompt-injection guard), and are secret-redacted.
+      #   fleet_context:
+      #     enabled: false
+      #     max_chars: 6000              # hard cap on the injected snapshot
+      #     per_section: 10              # items shown per section
+      #   # Agentic tool-calling loop. When enabled, the model may request tools, but
+      #   # ONLY tools the user has an active grant for are ever offered (deny-by-
+      #   # default), each call is gated, and sensitive tools surface an approval
+      #   # instead of auto-running. The loop is capped at max_iterations; each tool
+      #   # result is truncated to max_result_chars and secret-redacted before return.
+      #   tools:
+      #     enabled: false
+      #     max_iterations: 5            # max model<->tool round-trips per reply
+      #     max_result_chars: 2000       # per-tool-result truncation cap
+      #   # Sandbox policy for the computer tools (run_shell / browse /
+      #   # connector_request). deny-by-default: they do nothing unless the operator
+      #   # opts in AND the target host/command/origin is allowlisted.
+      #   computer:
+      #     allow_shell: false
+      #     allow_browser: false
+      #     allowed_hosts: []            # e.g. ["bender"] - never the operator laptop
+      #     allowed_commands: []         # exact-command allowlist for run_shell
+      #     allowed_connector_origins: []  # https origins reachable by connector/browse (SSRF guard)
+      #     max_timeout_seconds: 30
+      #   approval_ttl_seconds: 3600     # how long a pending approval stays actionable
+      #   grant_max_ttl_seconds: 2592000 # ceiling on a tool grant's lifetime (30d)
+      #   max_requests_per_minute: 120   # fixed-window per-key rate limit
       # Variables docker compose itself substitutes; deploy.sh renders exactly this
       # mapping into a transient 0600 env file. The first eight keys are required.
       compose:
@@ -73,7 +319,35 @@ sections:
   github:
     roles: [ci]
     values:
+      # Static personal token. Used for every GitHub read only while no `app` block is set
+      # (then: the deployment release evidence needs read access to InferWeave/inferweave -
+      # releases, compare - and the GitHub cache reads repositories/issues/projects). Always
+      # the credential of deployment_escalation.issues (issue WRITE; the App is read only).
       token: "REDACTED"
+      # OPTIONAL (recommended): authenticate GitHub reads as a read-only GitHub App instead of
+      # the token. When set it WINS for every read (one warning is logged if `token` is also
+      # set); an invalid block means no credential at all (no fallback to `token`).
+      # App permissions (Repository): Contents read, Metadata read, Issues read; (Organization)
+      # Projects read only for the cache's Projects v2 sync. Commit statuses, Checks and
+      # Actions are NOT needed (no herdr reader fetches them). Each reader asks GitHub for only
+      # its own subset: evidence {contents, metadata}, cache {issues, metadata}
+      # (+ organization_projects for Projects v2).
+      # private_key_file: absolute path inside control-plane-web, a regular file, mode exactly
+      # 0600 or 0400, owned by the reading uid (root may read the host user's key), no symlink
+      # in the path. Keep the App private (`auto` matches installations by account login). Put the key at
+      # ~/.config/herdr-engineering/github-app/github-app.pem (dir 0700, owned by the deploying
+      # user): deploy.sh validates it and mounts that dir read-only into control-plane-web at
+      # /etc/herdr/github-app (NOT the fleet dir: only fleet-config.yaml is allowed there).
+      # Only its path is in this file, never the key.
+      # installations: one entry per repository owner herdr reads; owners not listed never
+      # get a token. `auto` looks the installation id up once (GET /app/installations).
+      # app:
+      #   app_id: 123456
+      #   private_key_file: "/etc/herdr/github-app/github-app.pem"
+      #   installations:
+      #     InferWeave: 11111111
+      #     metabolomics-us: 22222222
+      #     berlinguyinca: auto
 
   # Posted by every host's feeds as the control-plane API key (role ingest).
   # Empty = send no X-API-Key (open control plane, the default).

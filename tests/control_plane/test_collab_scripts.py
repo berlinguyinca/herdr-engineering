@@ -86,17 +86,25 @@ def test_fleet_end_to_end_register_approve_work_and_delegate(stack, shim, tmp_pa
     # a person gives fleet-1 a task; the worker script does it and reports
     s, t = api.call("POST", f"{BASE}/rooms/{room}/tasks", {"target_agent_id": ids["fleet-1"], "text": "say hi"}, user="alice")
     assert s == 201
+    # the worker drops ONE leading @<its own name> before the harness reads the text; anything else stays literal
+    texts = {"own": "@fleet-1  /skill:review @fleet-1 now", "other": "@fleet-2 keep", "bare": "@fleet-1"}
+    more = {k: api.call("POST", f"{BASE}/rooms/{room}/tasks", {"target_agent_id": ids["fleet-1"], "text": v},
+                        user="alice")[1]["task_id"] for k, v in texts.items()}
     worker_env = {**env, "HERDR_AGENT_CMD": "echo got:$(cat)"}
     proc = subprocess.Popen(["bash", str(tmp_path / "agents" / "worker.sh"), str(files[0])], env=worker_env,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        for _ in range(40):
+        for _ in range(80):
             s, tasks = api.call("GET", f"{BASE}/rooms/{room}/tasks", user="alice")
-            done = [x for x in tasks["tasks"] if x["task_id"] == t["task_id"] and x["status"] == "done"]
-            if done:
+            done = {x["task_id"]: x for x in tasks["tasks"] if x["status"] == "done"}
+            if t["task_id"] in done and all(i in done for i in more.values()):
                 break
             time.sleep(0.5)
-        assert done and done[0]["result"].strip() == "got:say hi"
+        assert done[t["task_id"]]["result"].strip() == "got:say hi"
+        assert done[more["own"]]["result"].strip() == "got:/skill:review @fleet-1 now"
+        assert done[more["other"]]["result"].strip() == "got:@fleet-2 keep"
+        assert done[more["bare"]]["result"].strip() == "got:@fleet-1"
+        assert done[more["own"]]["text"] == texts["own"]                     # the room keeps the literal text
     finally:
         proc.terminate()
         proc.wait(5)

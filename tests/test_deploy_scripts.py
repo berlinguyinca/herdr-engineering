@@ -34,8 +34,20 @@ def _strings(node):
         yield node
 
 
+@pytest.fixture(scope="module")
+def candidate_ref():
+    """Pin HEAD once: deploy.sh must render the real committed candidate's code.
+
+    The script itself is exercised from this working tree so its uncommitted
+    hardening is tested. Never substitute caller imports for target-ref rendering.
+    """
+    ref = os.environ.get("HERDR_DEPLOY_TEST_REF", "HEAD")
+    return _git("rev-parse", "--verify", f"{ref}^{{commit}}")
+
+
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, candidate_ref, monkeypatch):
+    monkeypatch.setitem(globals(), "_head", lambda: candidate_ref[:12])
     home = tmp_path / "home"
     home.mkdir()
     central = tmp_path / "central" / "fleet-config.yaml"
@@ -46,16 +58,69 @@ def env(tmp_path):
     log = tmp_path / "docker.log"
     stub = bindir / "docker"
     running = tmp_path / "running-tag"
+    health_reads = tmp_path / "health-reads"
+    running_mount = tmp_path / "running-mount"
+    running_images = tmp_path / "running-images.json"
+    running_config = tmp_path / "running-config-image"
+    # Containers named in `missing` do not exist (inspect says "No such object") until a
+    # compose up names their service; STUB_FAIL_REMOVES adds names when a forward up fails
+    # (an interrupted recreate). STUB_REMOVAL_IN_PROGRESS=N makes the first N ups fail with
+    # Docker's "removal ... already in progress", collab-public reporting `removing` once.
+    missing = tmp_path / "missing"
+    removal_left = tmp_path / "removal-left"
+    removing = tmp_path / "removing"
     # Records each call. `inspect` answers $STUB_RUNNING_IMAGE. On `compose ... up` it
     # snapshots the --env-file (mode, dir mode), the -f files and the image tag, fails
     # when FAIL_COMPOSE is set or the tag is in FAIL_COMPOSE_TAGS, and otherwise records
     # the tag as "running" (what the stub curl's health answer reports).
     stub.write_text(f"""#!/usr/bin/env bash
 echo "docker $*" >> {log}
+# deploy-state.py asks for `inspect --type container NAME`: answer it like `inspect NAME`
+if [ "$1 ${{2:-}} ${{3:-}}" = "inspect --type container" ] && [ "$#" = 4 ]; then set -- inspect "$4"; fi
+is_missing() {{ case " $(cat {missing} 2>/dev/null) " in *" $1 "*) return 0 ;; esac; return 1; }}
+if [ "$1" = inspect ] && [ "${{@: -1}}" = "${{STUB_INSPECT_ERROR:-}}" ]; then
+  echo "permission denied while trying to connect to the docker daemon" >&2; exit 1
+fi
+if [ "$1" = inspect ] && is_missing "${{@: -1}}"; then
+  echo "Error: No such object: ${{@: -1}}" >&2; exit 1
+fi
+if [ "$1 $2" = 'image inspect' ]; then
+  python3 - "$3" <<'PY'
+import json, os, sys
+old_id = 'sha256:' + 'a' * 64
+old_tag = 'herdr-engineering:' + os.environ.get('STUB_PREVIOUS_TAG', '')
+previous = sys.argv[1] in (old_id, old_tag)
+identity = old_id if previous else 'sha256:' + 'b' * 64
+if sys.argv[1] == old_tag:
+    identity = os.environ.get('STUB_PREVIOUS_TAG_ID', identity)
+commit = os.environ.get('STUB_PREVIOUS_COMMIT', '') if previous else {candidate_ref!r}
+env = json.loads(os.environ['STUB_IMAGE_ENV']) if previous and 'STUB_IMAGE_ENV' in os.environ else ['HERDR_ENGINEERING_COMMIT=' + commit]
+print(json.dumps([{{'Id': identity, 'Config': {{'Env': env}}}}]))
+PY
+  exit 0
+fi
 if [ "$1" = inspect ]; then
+  if [ "$#" = 2 ]; then
+    [ -n "${{STUB_RUNNING_IMAGE:-}}" ] || [ -s {running} ] || exit 1
+    python3 - "$2" <<'PY'
+import json, os, pathlib, sys
+mount = pathlib.Path({str(running_mount)!r})
+images = pathlib.Path({str(running_images)!r})
+ids = json.loads(images.read_text()) if images.exists() else {{}}
+config = pathlib.Path({str(running_config)!r})
+print(json.dumps([{{"Image": ids.get(sys.argv[1], "sha256:" + "a" * 64),
+    "Config": {{"Image": config.read_text() if config.exists() else os.environ.get("STUB_RUNNING_IMAGE", "herdr-engineering:test")}},
+    "Mounts": [{{"Destination": "/etc/herdr/fleet", "Source": mount.read_text() if mount.exists() else os.environ["STUB_FLEET_DIR"]}}]}}]))
+PY
+    exit 0
+  fi
   case "$*" in
     *.State*)   # container state: crash-looping when "<running tag>:<container>" is in STUB_CRASH
       name="${{@: -1}}"; tag="$(cat {running} 2>/dev/null)"
+      left="$(cat {removing} 2>/dev/null || echo 0)"
+      if [ "$name" = herdr-collab-public ] && [ "$left" -gt 0 ]; then
+        echo $((left - 1)) > {removing}; echo "removing false 0 none"; exit 0
+      fi
       [ -n "$tag" ] || {{ echo "missing false 0 none"; exit 0; }}
       case " ${{STUB_CRASH:-}} " in
         *" $tag:$name "*) echo "restarting true $(date +%s%N) none" ;;
@@ -63,27 +128,80 @@ if [ "$1" = inspect ]; then
       esac
       exit 0 ;;
   esac
+  if [ -f {running_config} ]; then cat {running_config}; exit 0; fi
   [ -n "${{STUB_RUNNING_IMAGE:-}}" ] || exit 1
   echo "$STUB_RUNNING_IMAGE"; exit 0
 fi
 if [ "$1" = build ] && [ -n "${{FAIL_BUILD:-}}" ]; then exit 1; fi
 if [ "$1" = compose ]; then
-  echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}}" >> {log}
+  echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}} githubappdir=${{HERDR_CP_GITHUB_APP_DIR:-}}" >> {log}
   if [ -n "${{HERDR_LLM_SLICE_DIR:-}}" ]; then echo "llmslice $(cat "$HERDR_LLM_SLICE_DIR/llm-config.json" | tr -d '\n')" >> {log}; fi
-  prev=""; files=""; up=0
+  prev=""; files=""; up=0; pins=""
   for a in "$@"; do
     if [ "$prev" = --env-file ]; then
       echo "envfile $a mode=$(stat -c %a "$a") dirmode=$(stat -c %a "$(dirname "$a")")" >> {log}
+      echo "webport tag=${{HERDR_CP_IMAGE_TAG:-}} $(grep '^HERDR_CP_WEB_PUBLIC_PORT=' "$a")" >> {log}
     fi
-    if [ "$prev" = -f ]; then files="$files $a"; fi
+    if [ "$prev" = -f ]; then
+      files="$files $a"
+      case "$a" in *rollback-images.json) pins="$a"; echo "pinned $(cat "$a")" >> {log} ;; esac
+    fi
     [ "$a" = up ] && up=1
     prev="$a"
   done
   echo "composefiles tag=${{HERDR_CP_IMAGE_TAG:-}}$files" >> {log}
+  lock="$HOME/.local/share/herdr-engineering/collab-sync.lock"
+  if [ "$up" = 1 ] && [ -e "$lock" ]; then
+    if flock -n "$lock" true; then echo "collablock free" >> {log}; else echo "collablock held" >> {log}; fi
+  fi
+  if [ "$up" = 1 ] && [ -n "${{STUB_REMOVAL_IN_PROGRESS:-}}" ]; then
+    [ -e {removal_left} ] || echo "$STUB_REMOVAL_IN_PROGRESS" > {removal_left}
+    n="$(cat {removal_left})"
+    if [ "$n" -gt 0 ]; then
+      echo $((n - 1)) > {removal_left}; echo 1 > {removing}
+      echo "removalinprogress" >> {log}
+      echo "Error response from daemon: removal of container herdr-collab-public is already in progress" >&2
+      exit 1
+    fi
+  fi
+  if [ "$up" = 1 ] && [ -n "${{STUB_FAIL_REMOVES:-}}" ]; then
+    case " ${{FAIL_COMPOSE_TAGS:-}} " in *" ${{HERDR_CP_IMAGE_TAG:-}} "*)
+      echo "${{STUB_FAIL_REMOVES}} $(cat {missing} 2>/dev/null)" > {missing} ;; esac
+  fi
   if [ "$up" = 1 ]; then
-    [ -n "${{FAIL_COMPOSE:-}}" ] && exit 1
+    python3 - <<'PY' >> {log}
+import json, pathlib, os
+state = pathlib.Path(os.environ['HOME']) / '.local/state/herdr-engineering/deploys'
+attempts = list(state.glob('attempt-*/metadata.json'))
+print('prepared_before_recreate', any(json.loads(p.read_text())['outcome'] == 'prepared' for p in attempts))
+PY
+    if [ -n "${{FAIL_COMPOSE:-}}" ]; then [ -z "${{STUB_COMPOSE_STDERR:-}}" ] || echo "$STUB_COMPOSE_STDERR" >&2; exit 1; fi
     case " ${{FAIL_COMPOSE_TAGS:-}} " in *" ${{HERDR_CP_IMAGE_TAG:-}} "*) exit 1 ;; esac
     echo "${{HERDR_CP_IMAGE_TAG:-}}" > {running}
+    if [ -e {missing} ]; then   # the services this up names exist again
+      keep=""
+      for m in $(cat {missing}); do
+        svc="$(case "$m" in herdr-cp-web) echo control-plane-web ;; herdr-cp-worker) echo control-plane-worker ;;
+          herdr-llm-proxy) echo llm-proxy ;; herdr-collab-public) echo collab-public ;; herdr-collab-edge) echo collab-edge ;;
+          herdr-share-public) echo share-public ;; esac)"
+        case " $* " in *" $svc "*) ;; *) keep="$keep $m" ;; esac
+      done
+      echo "$keep" > {missing}
+    fi
+    if [ -z "$pins" ] || [ -z "${{STUB_IGNORE_ROLLBACK_MOUNT:-}}" ]; then
+      printf %s "$HERDR_CP_FLEET_DIR" > {running_mount}
+    fi
+    python3 - "$pins" <<'PY'
+import json, os, pathlib, sys
+names = {{'control-plane-web':'herdr-cp-web', 'control-plane-worker':'herdr-cp-worker',
+         'llm-proxy':'herdr-llm-proxy', 'collab-public':'herdr-collab-public', 'collab-edge':'herdr-collab-edge',
+         'share-public':'herdr-share-public'}}
+ids = {{v: 'sha256:' + 'b' * 64 for v in names.values()}}
+if sys.argv[1] and not os.environ.get('STUB_IGNORE_ROLLBACK_IMAGES'):
+    ids.update({{names[k]: v['image'] for k,v in json.loads(pathlib.Path(sys.argv[1]).read_text())['services'].items()}})
+pathlib.Path({str(running_images)!r}).write_text(json.dumps(ids))
+pathlib.Path({str(running_config)!r}).write_text(ids['herdr-cp-web'] if sys.argv[1] else 'herdr-engineering:' + os.environ['HERDR_CP_IMAGE_TAG'])
+PY
   fi
 fi
 exit 0
@@ -102,6 +220,11 @@ case "$url" in
   *api/v1/health*)
     tag="$(cat {running} 2>/dev/null)"
     [ -n "$tag" ] || exit 7
+    if [ -n "${{STUB_READY_AFTER:-}}" ]; then
+      count="$(cat {health_reads} 2>/dev/null || echo 0)"
+      count=$((count + 1)); echo "$count" > {health_reads}
+      [ "$count" -gt "$STUB_READY_AFTER" ] || exit 7
+    fi
     case " ${{STUB_UNHEALTHY_TAGS:-}} " in *" $tag "*) exit 22 ;; esac
     echo '{{"status":"ok","commit":"'"$tag"'"}}' ;;
   *) echo '{{"keys":[{{"kid":"k"}}]}}' > "${{out:-/dev/stdout}}" ;;
@@ -118,8 +241,9 @@ esac
         if k.startswith(("HERDR_CP_", "FABRIC_")):
             del e[k]
     e.update(HERDR_CP_HEALTH_URL="http://stub.invalid/api/v1/health", HERDR_CP_HEALTH_TRIES="2",
-             HERDR_CP_HEALTH_INTERVAL="0")
+             HERDR_CP_HEALTH_INTERVAL="0", STUB_FLEET_DIR=str(central.parent))
     return {"home": home, "central": central, "log": log, "env": e, "secrets": secrets,
+            "ref": candidate_ref,
             "tmp": tmp_path}
 
 
@@ -129,7 +253,7 @@ def run(script, e, *args, timeout=120):
 
 
 def deploy(e, *args, central=True):
-    base = ["--no-fetch", "--ref", "HEAD"]
+    base = ["--no-fetch", "--ref", e["ref"]]
     if central:
         base += ["--fleet-config", str(e["central"])]
     return run(DEPLOY, e, *base, *args)
@@ -149,6 +273,16 @@ def test_deploy_dry_run_renders_env_from_central_file_and_removes_it(env):
     assert compose_calls and " config -q" in compose_calls[0]
     path = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("envfile ")][0].split()[1]
     assert not os.path.exists(path) and not os.path.exists(os.path.dirname(path))
+
+
+def test_default_readiness_budget_waits_past_the_old_thirty_probe_window(env):
+    env['env'].pop('HERDR_CP_HEALTH_TRIES')
+    env['env']['STUB_READY_AFTER'] = '35'
+    result = deploy(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'ok:' in result.stdout
+    assert 'rolled back' not in result.stdout + result.stderr
+    assert int((env['tmp'] / 'health-reads').read_text()) > 35
 
 
 def test_deploy_refuses_when_central_file_missing(env):
@@ -189,7 +323,7 @@ def test_deploy_mounts_the_resolved_directory_of_a_symlinked_central_file(env):
     link = env["tmp"] / "legacy-fleet-config.yaml"
     link.symlink_to(env["central"])
     env["env"]["FAIL_COMPOSE"] = "1"
-    run(DEPLOY, env, "--no-fetch", "--ref", "HEAD", "--fleet-config", str(link))
+    run(DEPLOY, env, "--no-fetch", "--ref", env["ref"], "--fleet-config", str(link))
     lines = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composeenv ")]
     assert lines and f"fleetdir={env['central'].parent} " in lines[0]
 
@@ -232,8 +366,7 @@ def test_deploy_recreates_web_worker_and_proxy_on_one_tag(env):
     log = env["log"].read_text().splitlines()
     up = [ln for ln in log if ln.startswith("docker compose") and " up " in ln]
     assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy")
-    sha = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], cwd=ROOT, capture_output=True,
-                         text=True).stdout.strip()
+    sha = _head()
     assert any(ln.startswith("composeenv ") and f" tag={sha} " in ln for ln in log)
     assert any(ln.startswith("docker build") and f"herdr-engineering:{sha}" in ln for ln in log)
 
@@ -250,8 +383,9 @@ def test_trap_removes_env_file_on_failure(env):
     assert not os.path.exists(path) and not os.path.exists(os.path.dirname(path))
     for secret in env["secrets"]:
         assert secret not in r.stdout + r.stderr
-    # no receipt on failure, and none ever carries config values
-    assert not (env["home"] / ".local/state/herdr-engineering/deploys").exists()
+    # Failure retains recovery metadata, but never a successful deploy receipt.
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    assert not (state / f"{_head()}.json").exists()
 
 
 def test_compose_gets_central_file_mount_and_no_authored_env(env):
@@ -292,7 +426,9 @@ def test_collab_overlay_reads_only_the_collab_slice():
     doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())
     base = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
     web = doc["services"]["control-plane-web"]
-    assert set(web) == {"command"}
+    # plus one read-only mount: the Rakazo Cognito sign-in reads group membership from collab-sync's files
+    assert set(web) == {"command", "volumes"}
+    assert web["volumes"] == ["${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/etc/herdr/collab-sync:ro"]
     wcmd = web["command"]
     i = wcmd.index("--collab-operator-url")
     assert wcmd[:i] + wcmd[i + 2:] == base["services"]["control-plane-web"]["command"]
@@ -314,6 +450,118 @@ def test_collab_overlay_reads_only_the_collab_slice():
     assert not any("/etc/herdr/fleet" in v or "HERDR_CP_FLEET" in v for v in vols)
     edge = doc["services"]["collab-edge"]
     assert "environment" not in edge and "env_file" not in edge
+
+
+def _volume_map(svc):
+    out = {}
+    for v in svc["volumes"]:
+        if "}:" not in v:      # a named volume (src:target)
+            continue
+        src, rest = v.split("}:", 1)
+        target, *mode = rest.split(":")
+        out[target] = (src + "}", mode)
+    return out
+
+
+def test_bridge_mounts_and_static_flags_in_the_compose_files():
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())
+    base = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    worker = _volume_map(base["services"]["control-plane-worker"])
+    pub_svc = doc["services"]["collab-public"]
+    pub = _volume_map(pub_svc)
+    assert worker["/collab-mirror"] == ("${HERDR_COLLAB_MIRROR_DIR:?run deploy.sh}", [])
+    assert worker["/collab-outbox"] == ("${HERDR_COLLAB_OUTBOX_DIR:?run deploy.sh}", [])
+    assert worker["/collab-spool"] == ("${HERDR_COLLAB_SPOOL_DIR:?run deploy.sh}", [])
+    assert pub["/collab-mirror"] == ("${HERDR_COLLAB_MIRROR_DIR:?run deploy.sh}", ["ro"])
+    assert pub["/collab-outbox"] == ("${HERDR_COLLAB_OUTBOX_DIR:?run deploy.sh}", [])
+    assert "/collab-spool" not in pub and not any("SPOOL" in v for v in pub_svc["volumes"])
+    assert "user" not in base["services"]["control-plane-worker"]      # root: writes the mirror, unlinks in the outbox
+    cmd = pub_svc["command"]
+    assert cmd[cmd.index("--collab-artifacts-mirror") + 1] == "/collab-mirror"
+    assert cmd[cmd.index("--collab-artifacts-outbox") + 1] == "/collab-outbox"
+    assert "environment" not in pub_svc and "env_file" not in pub_svc and "cap_add" not in pub_svc
+    assert not any("/collab-" in v for v in base["services"]["control-plane-web"]["volumes"])
+
+
+def test_example_config_documents_every_bridge_key_with_its_default():
+    import dataclasses
+
+    from herdr_engineering.control_plane.collab_bridge_files import BridgeLimits
+    lines = (ROOT / "deploy/control-plane/fleet-config.example.yaml").read_text().splitlines()
+    start = lines.index("      # collab_artifacts:")
+    block = []
+    for ln in lines[start:]:
+        if not ln.startswith("      #   ") and ln != "      # collab_artifacts:":
+            break
+        block.append(ln.replace("# ", "", 1) if ln.startswith("      # ") else ln)
+    section = yaml.safe_load("\n".join(block))["collab_artifacts"]
+    assert section.pop("enabled") is False
+    defaults = {f.name: getattr(BridgeLimits(), f.name) for f in dataclasses.fields(BridgeLimits)}
+    assert section == defaults
+    text = "\n".join(lines[start:start + 40])
+    assert "ONE collab-public per outbox" in text and "LARGE storage" in text
+
+
+def _bridge_dirs(e):
+    root = e["home"] / ".local/share/herdr-engineering"
+    return root / "collab-mirror", root / "collab-outbox", root / "collab-spool"
+
+
+def test_deploy_always_creates_the_bridge_directories_with_pinned_modes(env):
+    # no collab marker at all: the worker mounts the three directories regardless
+    r = deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    mirror, outbox, spool = _bridge_dirs(env)
+    assert [stat.S_IMODE(p.stat().st_mode) for p in (mirror, outbox, spool)] == [0o755, 0o755, 0o700]
+    assert all(p.stat().st_uid == os.getuid() for p in (mirror, outbox, spool))
+    # beside the share dirs on the same storage, pairwise disjoint (none nested in another or in collab-public's data dir)
+    shares = env["home"] / ".local/share/herdr-engineering"
+    assert (shares / "shares").is_dir() and (shares / "share-events").is_dir()
+    dirs = [mirror, outbox, spool, shares / "collab"]
+    assert all(a == b or a not in b.parents for a in dirs for b in dirs)
+    # re-deploying over existing dirs keeps working and does not loosen the spool
+    os.chmod(spool, 0o700)
+    assert deploy(env).returncode == 0
+    assert stat.S_IMODE(spool.stat().st_mode) == 0o700
+
+
+def test_deploy_exports_the_three_bridge_variables():
+    text = (ROOT / "deploy/control-plane/deploy.sh").read_text()
+    for var, leaf in (("MIRROR", "collab-mirror"), ("OUTBOX", "collab-outbox"), ("SPOOL", "collab-spool")):
+        assert f'export HERDR_COLLAB_{var}_DIR="$HOME/.local/share/herdr-engineering/{leaf}"' in text
+        assert f'export HERDR_COLLAB_{var}_DIR="$ENV_DIR/{leaf}"' in text      # dry run: throwaway
+
+
+def test_deploy_warns_when_collab_public_would_not_own_the_outbox(env):
+    _with_collab(env)
+    data = yaml.safe_load(env["central"].read_text())
+    data["sections"]["control_plane"]["values"]["compose"]["HERDR_COLLAB_CERT_UID"] = str(os.getuid() + 1)
+    env["central"].unlink()
+    fcc.write_private_file(env["central"], yaml.safe_dump(data, sort_keys=False))
+    r = deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    mirror, outbox, _ = _bridge_dirs(env)
+    assert f"WARNING: collab-public runs as uid {os.getuid() + 1}" in r.stderr
+    assert str(outbox) in r.stderr and str(mirror) in r.stderr
+
+
+def test_worker_modes_on_the_bridge_directories_hold_under_a_hostile_umask(tmp_path):
+    """The root worker writes mirror files 0644 / dirs 0755 (collab-public's uid reads them), reads
+    0600 staged parts and unlinks in the outbox, whatever the umask."""
+    from herdr_engineering.control_plane import collab_bridge_files as cbf
+    mirror, outbox = tmp_path / "mirror", tmp_path / "outbox"
+    mirror.mkdir(mode=0o755), outbox.mkdir(mode=0o755)
+    old = os.umask(0o077)
+    try:
+        cbf.atomic_write_bytes(mirror, "grants.json", b"{}")
+        assert cbf.link_new_bytes(outbox, "part-1", b"x")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((mirror / "grants.json").stat().st_mode) == 0o644
+    assert cbf.DIR_MODE == 0o755
+    assert stat.S_IMODE((outbox / "part-1").stat().st_mode) == 0o600
+    assert (outbox / "part-1").read_bytes() == b"x"
+    (outbox / "part-1").unlink()
 
 
 COLLAB = {"cognito_pool": "us-west-2_TESTPOOL", "cognito_clients": ["client-a"],
@@ -563,6 +811,7 @@ def _seed_previous(e, commit, extra=None):
     receipt = {"ref": "x", "commit": full, "image": f"herdr-engineering:{tag}", **(extra or {})}
     (state / f"{tag}.json").write_text(json.dumps(receipt))
     e["env"]["STUB_RUNNING_IMAGE"] = f"herdr-engineering:{tag}"
+    e["env"].update(STUB_PREVIOUS_TAG=tag, STUB_PREVIOUS_COMMIT=tag)
     return full, tag
 
 
@@ -576,8 +825,23 @@ def _layout_commit():
     return first
 
 
-def _worktrees():
-    return _git("worktree", "list", "--porcelain")
+def _assert_deploy_worktrees_removed(e):
+    # Other sessions may have a live rollback-worktree. Verify every worktree
+    # created by THIS invocation, including Git registration and filesystem state.
+    registered = {line.removeprefix("worktree ")
+                  for line in _git("worktree", "list", "--porcelain").splitlines()
+                  if line.startswith("worktree ")}
+    trees = set()
+    for line in e["log"].read_text().splitlines():
+        if line.startswith("envfile "):
+            trees.add(Path(line.split()[1]).parent / "rollback-worktree")
+        elif line.startswith("composefiles "):
+            trees.update(Path(p).parents[2] for p in line.split()[2:]
+                         if Path(p).name == "compose.yaml")
+    assert trees
+    for tree in trees:
+        assert str(tree) not in registered, tree
+        assert not tree.exists(), tree
 
 
 def test_forward_compose_failure_rolls_back_with_the_previous_commits_files(env):
@@ -593,7 +857,7 @@ def test_forward_compose_failure_rolls_back_with_the_previous_commits_files(env)
     assert f"rolled back to herdr-engineering:{prev_tag} (commit {prev_tag}) and healthy" in r.stderr
     assert "FAILED" in r.stderr                    # the deploy itself is reported failed
     assert not (env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json").exists()
-    assert "rollback-worktree" not in _worktrees()  # removed by the trap
+    _assert_deploy_worktrees_removed(env)
 
 
 def test_unhealthy_new_commit_rolls_back_and_reports_healthy(env):
@@ -611,7 +875,7 @@ def test_failed_rollback_is_non_zero_and_honest(env):
     assert r.returncode == 3
     assert "FAILED TO ROLL BACK" in r.stderr and "and healthy" not in r.stderr
     assert f"--ref {prev_full}" in r.stderr         # the manual command
-    assert "rollback-worktree" not in _worktrees()
+    _assert_deploy_worktrees_removed(env)
     for secret in env["secrets"]:
         assert secret not in r.stdout + r.stderr
 
@@ -654,6 +918,280 @@ def test_success_writes_a_receipt_with_the_previous_commit_and_no_values(env):
     assert receipt["collab_slice_sha256"] == ""
     for secret in env["secrets"]:
         assert secret not in receipt_path.read_text()
+
+
+def test_failed_rollout_restores_previous_config_and_immutable_images(env):
+    """A candidate config must never be reused as the rollback config."""
+    _, prev_tag = _seed_previous(env, _layout_commit())
+    previous = env["tmp"] / "live-previous"
+    previous.mkdir()
+    old_bytes = env["central"].read_bytes()
+    (previous / "fleet-config.yaml").write_bytes(old_bytes)
+    env["env"]["STUB_FLEET_DIR"] = str(previous)
+    data = yaml.safe_load(old_bytes)
+    data["sections"]["control_plane"]["values"]["public_url"] = "https://candidate.example.test"
+    data["sections"]["control_plane"]["values"]["compose"]["HERDR_CP_WEB_PUBLIC_PORT"] = "8181"
+    fcc.write_private_file(env["central"], yaml.safe_dump(data))
+    candidate_bytes = env["central"].read_bytes()
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    metadata_files = list(state.glob("attempt-*/metadata.json"))
+    assert len(metadata_files) == 1
+    metadata = json.loads(metadata_files[0].read_text())
+    assert metadata["outcome"] == "rolled_back"
+    snapshot = Path(metadata["previous"]["fleet_config_snapshot"])
+    assert snapshot.read_bytes() == old_bytes
+    assert Path(metadata["candidate"]["fleet_config_snapshot"]).read_bytes() == candidate_bytes
+    assert metadata["previous"]["fleet_config_source"] == str(previous / "fleet-config.yaml")
+    assert metadata["candidate"]["fleet_config_source"] == str(env["central"])
+    assert metadata["previous"]["images"]["control-plane-web"] == "sha256:" + "a" * 64
+    assert metadata["candidate"]["image_id"] == "sha256:" + "b" * 64
+    log = env["log"].read_text()
+    assert f"fleetdir={snapshot.parent} tag={prev_tag}" in log
+    assert "prepared_before_recreate True" in log
+    assert f"webport tag={_head()} HERDR_CP_WEB_PUBLIC_PORT='8181'" in log
+    assert f"webport tag={prev_tag} HERDR_CP_WEB_PUBLIC_PORT='8080'" in log
+    pins = json.loads(next(ln.removeprefix("pinned ") for ln in log.splitlines() if ln.startswith("pinned ")))
+    assert pins["services"]["control-plane-web"]["image"] == "sha256:" + "a" * 64
+    assert set(pins["services"]) == {"control-plane-web", "control-plane-worker", "llm-proxy"}
+    assert env["central"].read_bytes() == candidate_bytes  # no host config rewrite
+    for p in (snapshot, Path(metadata["candidate"]["fleet_config_snapshot"]), metadata_files[0]):
+        assert stat.S_IMODE(p.stat().st_mode) == 0o600
+    for p in (state, metadata_files[0].parent, snapshot.parent):
+        assert stat.S_IMODE(p.stat().st_mode) == 0o700
+    for secret in env["secrets"]:
+        assert secret not in metadata_files[0].read_text() + r.stdout + r.stderr
+
+
+def test_success_receipt_retains_protected_config_but_mounts_canonical_source(env):
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    receipt = json.loads((state / f"{_head()}.json").read_text())
+    assert receipt["image_id"] == "sha256:" + "b" * 64
+    snapshot = Path(receipt["fleet_config_snapshot"])
+    assert snapshot.is_relative_to(state)
+    assert snapshot.read_bytes() == env["central"].read_bytes()
+    assert receipt["fleet_config_source"] == str(env["central"].resolve())
+    assert f"fleetdir={env['central'].parent} tag={_head()}" in env["log"].read_text()
+    assert json.loads(Path(receipt["rollback_metadata"]).read_text())["outcome"] == "succeeded"
+
+
+def _seed_pinned_previous(env):
+    full, tag = _seed_previous(env, _layout_commit())
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    state.chmod(0o700)
+    mounted = state / "protected-rollback"
+    mounted.mkdir(mode=0o700)
+    saved = mounted / "fleet-config.yaml"
+    saved.write_bytes(env["central"].read_bytes())
+    saved.chmod(0o600)
+    env["env"].update(STUB_RUNNING_IMAGE="sha256:" + "a" * 64,
+                      STUB_FLEET_DIR=str(mounted))
+    return full, tag, state, saved
+
+
+@pytest.mark.parametrize("full_stamp", [False, True])
+def test_pinned_previous_resolves_receipt_and_keeps_actual_mount_and_service_ids(env, full_stamp):
+    full, tag, state, saved = _seed_pinned_previous(env)
+    if full_stamp:
+        env["env"]["STUB_PREVIOUS_COMMIT"] = full
+    receipt_path = state / f"{tag}.json"
+    receipt = json.loads(receipt_path.read_text())
+    # A recorded immutable ID remains valid even if the mutable tag has moved.
+    receipt.update(image_id="sha256:" + "a" * 64,
+                   fleet_config_snapshot=str(state / "obsolete-snapshot"))
+    receipt_path.write_text(json.dumps(receipt))
+    env["env"]["STUB_PREVIOUS_TAG_ID"] = "sha256:" + "f" * 64
+    ids = {"herdr-cp-web": "sha256:" + "a" * 64,
+           "herdr-cp-worker": "sha256:" + "c" * 64,
+           "herdr-llm-proxy": "sha256:" + "d" * 64}
+    (env["tmp"] / "running-images.json").write_text(json.dumps(ids))
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    assert f"automatic rollback target: sha256:{'a' * 64} (commit {tag})" in r.stdout
+    metadata = json.loads(next(state.glob("attempt-*/metadata.json")).read_text())
+    previous = metadata["previous"]
+    assert previous["commit"] == full
+    assert previous["fleet_config_source"] == str(saved)
+    assert Path(previous["fleet_config_snapshot"]).read_bytes() == saved.read_bytes()
+    assert previous["images"] == {
+        "control-plane-web": ids["herdr-cp-web"],
+        "control-plane-worker": ids["herdr-cp-worker"], "llm-proxy": ids["herdr-llm-proxy"],
+    }
+    assert json.loads((state / f"{_head()}.json").read_text())["previous_commit"] == full
+
+
+def test_next_failed_candidate_after_pinned_rollback_is_still_protected(env):
+    full, tag = _seed_previous(env, _layout_commit())
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    old_bytes = env["central"].read_bytes()
+    first = deploy(env)
+    assert first.returncode == 1 and "and healthy" in first.stderr
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    first_path = next(state.glob("attempt-*/metadata.json"))
+    first_metadata = json.loads(first_path.read_text())
+    first_snapshot = Path(first_metadata["previous"]["fleet_config_snapshot"])
+    data = yaml.safe_load(old_bytes)
+    data["sections"]["control_plane"]["values"]["compose"]["HERDR_CP_WEB_PUBLIC_PORT"] = "8181"
+    fcc.write_private_file(env["central"], yaml.safe_dump(data))
+    second = deploy(env)
+    assert second.returncode == 1 and "and healthy" in second.stderr, second.stderr
+    second_path, = set(state.glob("attempt-*/metadata.json")) - {first_path}
+    metadata = json.loads(second_path.read_text())
+    assert metadata["outcome"] == "rolled_back"
+    assert metadata["previous"]["commit"] == full
+    assert metadata["previous"]["fleet_config_source"] == str(first_snapshot)
+    snapshot = Path(metadata["previous"]["fleet_config_snapshot"])
+    assert snapshot.read_bytes() == old_bytes != env["central"].read_bytes()
+    assert metadata["previous"]["images"] == first_metadata["previous"]["images"]
+    assert f"fleetdir={snapshot.parent} tag={tag}" in env["log"].read_text()
+    for path in (snapshot, second_path):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    for secret in env["secrets"]:
+        assert secret not in second.stdout + second.stderr + second_path.read_text()
+    _assert_deploy_worktrees_removed(env)
+
+
+@pytest.mark.parametrize("fault", [
+    "missing_stamp", "invalid_stamp", "duplicate_stamp", "wrong_stamp", "wrong_full_stamp",
+    "missing_receipt", "wrong_commit", "wrong_receipt_tag", "wrong_receipt_id", "retagged",
+    "wrong_config_id", "unprotected_mount",
+])
+def test_pinned_previous_identity_mismatch_refuses_before_mutation(env, fault):
+    full, tag, state, saved = _seed_pinned_previous(env)
+    receipt_path = state / f"{tag}.json"
+    receipt = json.loads(receipt_path.read_text())
+    if fault.endswith("stamp"):
+        stamps = {
+            "missing_stamp": [], "invalid_stamp": ["HERDR_ENGINEERING_COMMIT=secret-invalid"],
+            "duplicate_stamp": [f"HERDR_ENGINEERING_COMMIT={tag}"] * 2,
+            "wrong_stamp": ["HERDR_ENGINEERING_COMMIT=" + "f" * 12],
+            "wrong_full_stamp": ["HERDR_ENGINEERING_COMMIT=" + tag + "f" * 28],
+        }
+        env["env"]["STUB_IMAGE_ENV"] = json.dumps(stamps[fault] + ["UNRELATED_SECRET=never-print-this"])
+    elif fault == "wrong_commit":
+        receipt["commit"] = "f" * 40
+    elif fault == "wrong_receipt_tag":
+        receipt["image"] = "herdr-engineering:" + "f" * 12
+    elif fault == "wrong_receipt_id":
+        receipt["image_id"] = "sha256:" + "f" * 64
+    elif fault == "retagged":
+        env["env"]["STUB_PREVIOUS_TAG_ID"] = "sha256:" + "f" * 64
+    elif fault == "wrong_config_id":
+        env["env"]["STUB_RUNNING_IMAGE"] = "sha256:" + "f" * 64
+    elif fault == "unprotected_mount":
+        saved.parent.chmod(0o755)
+    receipt_path.write_text(json.dumps(receipt))
+    if fault == "missing_receipt":
+        receipt_path.unlink()
+    r = deploy(env)
+    assert r.returncode != 0, r.stdout
+    assert " up " not in env["log"].read_text()
+    assert not (env["home"] / ".config/herdr-engineering/llm-proxy").exists()
+    assert "deployment recovery state operation failed" in r.stderr
+    assert "never-print-this" not in r.stdout + r.stderr
+    assert "secret-invalid" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("retagged", [False, True])
+def test_legacy_receipt_without_buildstamp_requires_tag_to_match_running_id(env, retagged):
+    full, _ = _seed_previous(env, _layout_commit())
+    env["env"]["STUB_IMAGE_ENV"] = "[]"
+    if retagged:
+        env["env"]["STUB_PREVIOUS_TAG_ID"] = "sha256:" + "f" * 64
+    r = deploy(env)
+    if retagged:
+        assert r.returncode != 0
+        assert " up " not in env["log"].read_text()
+        assert "deployment recovery state operation failed" in r.stderr
+    else:
+        assert r.returncode == 0, r.stderr
+        receipt = env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json"
+        assert json.loads(receipt.read_text())["previous_commit"] == full
+
+
+def test_rollback_prefers_last_deployed_snapshot_when_canonical_file_was_edited(env):
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    saved = state / "last-good" / "fleet-config.yaml"
+    saved.parent.mkdir(parents=True, mode=0o700)
+    old_bytes = env["central"].read_bytes()
+    saved.write_bytes(old_bytes)
+    saved.chmod(0o600)
+    _seed_previous(env, _layout_commit(), {
+        "image_id": "sha256:" + "a" * 64,
+        "fleet_config_source": str(env["central"]), "fleet_config_snapshot": str(saved),
+    })
+    data = yaml.safe_load(old_bytes)
+    data["sections"]["control_plane"]["values"]["public_url"] = "https://changed.example.test"
+    fcc.write_private_file(env["central"], yaml.safe_dump(data))
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    metadata = json.loads(next(state.glob("attempt-*/metadata.json")).read_text())
+    assert metadata["outcome"] == "rolled_back"
+    assert Path(metadata["previous"]["fleet_config_snapshot"]).read_bytes() == old_bytes
+    assert env["central"].read_bytes() != old_bytes
+
+
+@pytest.mark.parametrize("fault", ["unavailable", "wrong_image", "unprotected"])
+def test_invalid_previous_snapshot_aborts_before_service_mutation(env, fault):
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    saved = state / "last-good" / "fleet-config.yaml"
+    if fault != "unavailable":
+        saved.parent.mkdir(parents=True, mode=0o700)
+        saved.write_bytes(env["central"].read_bytes())
+        saved.chmod(0o600)
+        if fault == "unprotected":
+            saved.parent.chmod(0o755)
+    _seed_previous(env, _layout_commit(), {
+        "image_id": "sha256:" + ("c" if fault == "wrong_image" else "a") * 64,
+        "fleet_config_snapshot": str(saved),
+    })
+    r = deploy(env)
+    assert r.returncode != 0
+    log = env["log"].read_text()
+    assert " up " not in log
+    assert not (env["home"] / ".config/herdr-engineering/llm-proxy").exists()
+    assert "deployment recovery state operation failed" in r.stderr
+
+
+@pytest.mark.parametrize("fault", ["IMAGES", "MOUNT"])
+def test_rollback_cannot_claim_success_on_health_with_wrong_image_or_config(env, fault):
+    _seed_previous(env, _layout_commit())
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    env["env"][f"STUB_IGNORE_ROLLBACK_{fault}"] = "1"
+    r = deploy(env)
+    assert r.returncode == 3
+    assert "FAILED TO ROLL BACK" in r.stderr and "and healthy" not in r.stderr
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    metadata = json.loads(next(state.glob("attempt-*/metadata.json")).read_text())
+    assert metadata["outcome"] == "rollback_failed"
+
+
+def test_full_collab_rollback_pins_edge_without_replacing_command_overlay(env):
+    _with_collab(env)
+    _, prev_tag = _seed_previous(env, _layout_commit())
+    target = _head()
+    env["env"]["STUB_UNHEALTHY_TAGS"] = target
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    metadata_path = next(state.glob("attempt-*/metadata.json"))
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["outcome"] == "rolled_back"
+    pins = json.loads((metadata_path.parent / "rollback-images.json").read_text())
+    assert set(pins["services"]) == {
+        "control-plane-web", "control-plane-worker", "llm-proxy", "collab-public", "collab-edge",
+    }
+    assert all(set(v) == {"image"} for v in pins["services"].values())
+    log = env["log"].read_text()
+    rb = next(line for line in log.splitlines() if line.startswith(f"composefiles tag={prev_tag} "))
+    assert "compose.collab.yaml" in rb and rb.endswith("rollback-images.json")
+    assert "collab-public collab-edge" in log
 
 
 def _collab_ups(e):
@@ -807,7 +1345,7 @@ def test_receipt_is_valid_json_for_a_ref_with_a_quote(env):
     r = deploy(env)
     assert r.returncode == 0, r.stderr
     receipt = json.loads((env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json").read_text())
-    assert receipt["ref"] == "HEAD"
+    assert receipt["ref"] == env["ref"]
 
 
 def test_llm_slice_dir_holding_other_files_is_refused(env):
@@ -880,3 +1418,573 @@ def test_collab_sync_install_failure_triggers_rollback(env):
     assert edge.read_text() == "previous nginx conf\n"
     ups = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]
     assert not any(f"tag={_head()} " in ln for ln in ups)     # forward compose never ran
+
+
+# ---------------------------------------------------------------- GitHub App key mount
+
+def _app_dir(e):
+    return e["home"] / ".config/herdr-engineering/github-app"
+
+
+def test_compose_mounts_the_github_app_dir_read_only_into_web_only():
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    mount = "${HERDR_CP_GITHUB_APP_DIR:?run deploy.sh}:/etc/herdr/github-app:ro"
+    assert mount in doc["services"]["control-plane-web"]["volumes"]
+    for name, svc in doc["services"].items():
+        if name != "control-plane-web":
+            assert not any("github-app" in str(v) for v in svc.get("volumes") or []), name
+
+
+def test_dry_run_reports_the_github_app_mount_and_creates_nothing(env):
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "/etc/herdr/github-app" in r.stdout and "would create it empty" in r.stdout
+    assert not _app_dir(env).exists()
+
+
+def test_deploy_creates_an_empty_0700_github_app_dir_and_mounts_it(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    deploy(env)
+    d = _app_dir(env)
+    assert d.is_dir() and (d.stat().st_mode & 0o777) == 0o700 and not list(d.iterdir())
+    lines = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composeenv ")]
+    assert lines and all(f"githubappdir={d}" in ln for ln in lines)
+
+
+def test_a_valid_github_app_key_dir_is_accepted_and_the_key_never_printed(env):
+    d = _app_dir(env)
+    d.mkdir(parents=True, mode=0o700)
+    d.chmod(0o700)
+    key = d / "github-app.pem"
+    key.write_text("-----BEGIN PRIVATE KEY-----\nPLACEHOLDERKEYMATERIAL\n-----END PRIVATE KEY-----\n")
+    key.chmod(0o600)
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "PLACEHOLDERKEYMATERIAL" not in r.stdout + r.stderr
+    assert "would create" not in r.stdout
+
+
+@pytest.mark.parametrize("fault,needle", [
+    ("dir_mode", "must be mode 0700"),
+    ("extra_file", "must hold only github-app.pem"),
+    ("key_mode", "must be mode 0600 or 0400"),
+    ("key_symlink", "must be a regular file"),
+    ("dir_symlink", "must be a real directory"),
+    ("key_dir", "must be a regular file"),
+])
+def test_a_bad_github_app_dir_is_refused_before_anything_runs(env, fault, needle):
+    d = _app_dir(env)
+    if fault == "dir_symlink":
+        real = env["tmp"] / "elsewhere"
+        real.mkdir(mode=0o700)
+        d.parent.mkdir(parents=True, exist_ok=True)
+        d.symlink_to(real)
+    else:
+        d.mkdir(parents=True, mode=0o700)
+        d.chmod(0o700)
+        key = d / "github-app.pem"
+        if fault == "key_symlink":
+            target = env["tmp"] / "key.pem"
+            target.write_text("k")
+            target.chmod(0o600)
+            key.symlink_to(target)
+        elif fault == "key_dir":
+            key.mkdir()
+        else:
+            key.write_text("k")
+            key.chmod(0o640 if fault == "key_mode" else 0o600)
+        if fault == "dir_mode":
+            d.chmod(0o750)
+        if fault == "extra_file":
+            (d / "notes.txt").write_text("x")
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0
+    assert needle in r.stderr
+    assert not env["log"].exists()
+
+
+# ------------- 2026-10-29: deploy vs. the collab-sync timer, and missing containers
+
+def _sync_lock(e):
+    return e["home"] / ".local/share/herdr-engineering/collab-sync.lock"
+
+
+def _lock_is_free(e, wait=5.0):
+    """True once nothing holds the lock (a just-exited deploy's children may linger briefly)."""
+    import time
+    deadline = time.monotonic() + wait
+    while True:
+        free = subprocess.run(["flock", "-n", str(_sync_lock(e)), "true"]).returncode == 0
+        if free or time.monotonic() > deadline:
+            return free
+        time.sleep(0.05)
+
+
+def _metadata(e):
+    state = e["home"] / ".local/state/herdr-engineering/deploys"
+    return json.loads(next(state.glob("attempt-*/metadata.json")).read_text())
+
+
+def test_collab_lock_held_by_another_process_fails_before_touching_anything(env):
+    import time
+    _with_collab(env)
+    _seed_previous(env, _layout_commit())
+    lock = _sync_lock(env)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "60"])
+    try:
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            time.sleep(0.02)
+        r = deploy(env, "--collab-lock-wait", "1")
+    finally:
+        holder.kill()
+        holder.wait()
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "collab-sync is still running after 1s" in r.stderr and "nothing was changed" in r.stderr
+    log = env["log"].read_text()
+    assert " up " not in log and "systemctl" not in log
+    assert not (env["home"] / ".config/herdr-engineering/llm-proxy/llm-config.json").exists()
+    assert not (env["home"] / ".config/herdr-engineering/collab/collab-config.json").exists()
+    assert _metadata(env)["outcome"] == "collab_sync_busy"
+
+
+@pytest.mark.parametrize("path", ["succeeded", "rolled_back", "rollback_failed"])
+def test_deploy_holds_the_collab_lock_across_compose_and_rollback_and_releases_it(env, path):
+    _with_collab(env)
+    _seed_previous(env, _layout_commit())
+    if path == "rolled_back":
+        env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    elif path == "rollback_failed":
+        env["env"]["STUB_UNHEALTHY_TAGS"] = f"{_head()} {_layout_commit()[:12]}"
+    r = deploy(env)
+    assert r.returncode == {"succeeded": 0, "rolled_back": 1, "rollback_failed": 3}[path], r.stderr
+    assert _metadata(env)["outcome"] == path
+    log = env["log"].read_text().splitlines()
+    held = [ln for ln in log if ln.startswith("collablock ")]
+    assert held and set(held) == {"collablock held"}            # every up ran under the lock
+    if path != "succeeded":
+        assert len(held) >= 2                                   # forward AND rollback
+    # the refresh deploy.sh runs itself was not skipped by its own lock
+    assert "another collab-sync is running" not in r.stderr
+    assert (env["home"] / ".local/share/herdr-engineering/collab-sync/jwks.json").is_file()
+    unit = (env["home"] / ".config/systemd/user/herdr-collab-sync.service")
+    assert path != "succeeded" or "--lock-held" not in unit.read_text()
+    assert not any(" stop " in ln or " disable " in ln for ln in log if ln.startswith("systemctl"))
+    assert _lock_is_free(env)
+
+
+def test_collab_lock_is_released_when_the_deploy_is_terminated(env):
+    import signal
+    import time
+    _with_collab(env)
+    _seed_previous(env, _layout_commit())
+    env["env"].update(STUB_READY_AFTER="100000", HERDR_CP_HEALTH_TRIES="100000",
+                      HERDR_CP_HEALTH_INTERVAL="0.05")
+    p = subprocess.Popen(["bash", str(DEPLOY), "--no-fetch", "--ref", env["ref"],
+                          "--fleet-config", str(env["central"])], env=env["env"], cwd=ROOT,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 90
+        while "api/v1/health" not in (env["log"].read_text() if env["log"].exists() else ""):
+            assert p.poll() is None and time.monotonic() < deadline, p.communicate()
+            time.sleep(0.05)
+        assert not _lock_is_free(env, wait=0)                   # held mid-deploy
+        p.send_signal(signal.SIGTERM)
+        p.communicate(timeout=30)
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+    assert p.returncode == 143
+    assert _lock_is_free(env)
+
+
+def test_removal_in_progress_is_waited_out_and_retried(env):
+    _with_collab(env)
+    env["env"]["STUB_REMOVAL_IN_PROGRESS"] = "1"
+    r = deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ok:" in r.stdout
+    log = env["log"].read_text()
+    assert log.count("removalinprogress") == 1
+    assert "removal of container herdr-collab-public is already in progress" in r.stderr
+    assert "docker inspect -f {{.State.Status}} herdr-collab-public" in log
+    ups = [ln for ln in log.splitlines() if ln.startswith("docker compose") and " up " in ln]
+    # first deploy = changed slice: the failed collab-public up, its retry, then the rest once
+    assert [("--force-recreate collab-public" in ln) for ln in ups] == [True, True, False]
+
+
+def test_removal_in_progress_retries_are_bounded(env):
+    _with_collab(env)
+    env["env"]["STUB_REMOVAL_IN_PROGRESS"] = "10"
+    r = deploy(env)
+    assert r.returncode == 1 and "ok:" not in r.stdout
+    assert env["log"].read_text().count("removalinprogress") == 4    # first try + 3 retries
+    assert "NOT rolled back" in r.stderr
+
+
+def test_rollback_recreates_a_collab_public_the_failed_forward_removed(env):
+    _with_collab(env)
+    _, prev_tag = _seed_previous(env, _layout_commit())
+    env["env"].update(FAIL_COMPOSE_TAGS=_head(), STUB_FAIL_REMOVES="herdr-collab-public")
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    assert "and healthy" in r.stderr and "collab-public collab-edge" in r.stderr
+    assert _metadata(env)["outcome"] == "rolled_back"
+    rb = [ln for ln in env["log"].read_text().splitlines()
+          if ln.startswith("docker compose") and " up " in ln and "rollback-worktree" in ln]
+    assert rb and " collab-public " in rb[-1] + " "
+    assert "herdr-collab-public" not in (env["tmp"] / "missing").read_text()
+
+
+def test_capture_records_an_absent_service_and_rollback_recreates_it_from_the_web_image(env):
+    _with_collab(env)
+    _seed_previous(env, _layout_commit())
+    (env["tmp"] / "missing").write_text("herdr-collab-public")
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    assert "missing service containers (will be created by this deploy): collab-public" in r.stdout
+    metadata = _metadata(env)
+    assert metadata["outcome"] == "rolled_back"
+    previous = metadata["previous"]
+    assert previous["absent"] == ["collab-public"]
+    assert previous["images"]["collab-public"] == previous["images"]["control-plane-web"]
+    pins = json.loads(next(ln.removeprefix("pinned ") for ln in env["log"].read_text().splitlines()
+                           if ln.startswith("pinned ")))
+    assert pins["services"]["collab-public"]["image"] == previous["images"]["control-plane-web"]
+
+
+def test_absent_edge_is_not_pinned_and_comes_from_the_compose_file(env):
+    _with_collab(env)
+    _seed_previous(env, _layout_commit())
+    (env["tmp"] / "missing").write_text("herdr-collab-edge")
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    previous = _metadata(env)["previous"]
+    assert previous["absent"] == ["collab-edge"] and "collab-edge" not in previous["images"]
+
+
+def test_missing_container_at_deploy_start_is_repaired_by_a_normal_deploy(env):
+    _with_collab(env)
+    _seed_previous(env, _layout_commit())
+    (env["tmp"] / "missing").write_text("herdr-collab-public")
+    r = deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ok:" in r.stdout and "deployment recovery state operation failed" not in r.stderr
+    assert (env["tmp"] / "missing").read_text().split() == []
+
+
+def test_capture_still_fails_on_an_inspect_error_that_is_not_absence(env):
+    _with_collab(env)
+    _seed_previous(env, _layout_commit())
+    env["env"]["STUB_INSPECT_ERROR"] = "herdr-collab-public"
+    r = deploy(env)
+    assert r.returncode != 0
+    assert "deployment recovery state operation failed" in r.stderr
+    assert "permission denied" not in r.stdout + r.stderr
+    assert " up " not in env["log"].read_text()
+
+
+# ------------- fix round: single recreate, deploy-wide lock, tight retry match
+
+def _deploy_lock(e):
+    return e["home"] / ".local/state/herdr-engineering/deploys/deploy.lock"
+
+
+def _public_ups(e):
+    return [ln for ln in e["log"].read_text().splitlines()
+            if ln.startswith("docker compose") and " up " in ln and " collab-public" in ln]
+
+
+def test_changed_slice_recreates_collab_public_exactly_once_and_reloads_the_edge(env):
+    _with_collab(env)
+    _seed_previous(env, _layout_commit(), {"collab_slice_sha256": "0" * 64})
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    ups = _public_ups(env)
+    assert len(ups) == 1 and "--force-recreate collab-public" in ups[0]
+    rest = [ln for ln in env["log"].read_text().splitlines()
+            if ln.startswith("docker compose") and " up " in ln and ln not in ups]
+    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy collab-edge")
+    assert "docker exec herdr-collab-edge nginx -s reload" in env["log"].read_text()
+
+
+def test_unchanged_slice_recreates_collab_public_once_without_forcing(env):
+    _with_collab(env)
+    _seed_previous(env, _layout_commit())
+    first = deploy(env)
+    assert first.returncode == 0, first.stderr
+    env["log"].write_text("")
+    env["env"]["STUB_RUNNING_IMAGE"] = f"herdr-engineering:{_head()}"
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    ups = _public_ups(env)
+    assert len(ups) == 1 and "--force-recreate" not in ups[0]
+
+
+def test_generic_compose_failure_runs_up_exactly_once(env):
+    _with_collab(env)
+    env["env"].update(FAIL_COMPOSE="1", STUB_COMPOSE_STDERR="Error: some other operation is already in progress")
+    r = deploy(env)
+    assert r.returncode == 1
+    ups = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("docker compose") and " up " in ln]
+    assert len(ups) == 1, ups
+    assert "waiting for it, then retrying" not in r.stderr
+
+
+def test_deploy_lock_held_elsewhere_fails_before_changing_anything(env):
+    import time
+    lock = _deploy_lock(env)
+    lock.parent.mkdir(parents=True)
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "60"])
+    try:
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            time.sleep(0.02)
+        r = deploy(env, "--deploy-lock-wait", "1")
+    finally:
+        holder.kill()
+        holder.wait()
+    assert r.returncode == 1
+    assert "another deploy.sh is still running after 1s" in r.stderr and "nothing was changed" in r.stderr
+    assert not env["log"].exists()                       # never reached docker
+    assert not list(lock.parent.glob("attempt-*"))
+
+
+def test_concurrent_deploys_serialize(env):
+    import time
+    lock = _deploy_lock(env)
+    lock.parent.mkdir(parents=True)
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "1"])
+    while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+        time.sleep(0.02)
+    started = time.monotonic()
+    r = deploy(env, "--deploy-lock-wait", "60")
+    holder.wait()
+    assert r.returncode == 0, r.stderr
+    assert time.monotonic() - started >= 0.5                  # it waited for the holder
+    assert subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0
+
+
+def test_second_concurrent_deploy_fails_cleanly_while_the_first_runs(env):
+    import time
+    env["env"].update(STUB_READY_AFTER="100000", HERDR_CP_HEALTH_TRIES="100000",
+                      HERDR_CP_HEALTH_INTERVAL="0.05")
+    first = subprocess.Popen(["bash", str(DEPLOY), "--no-fetch", "--ref", env["ref"],
+                              "--fleet-config", str(env["central"])], env=env["env"], cwd=ROOT,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 90
+        while "api/v1/health" not in (env["log"].read_text() if env["log"].exists() else ""):
+            assert first.poll() is None and time.monotonic() < deadline
+            time.sleep(0.05)
+        before = env["log"].read_text()
+        second = deploy(env, "--deploy-lock-wait", "1")
+        assert second.returncode == 1 and "another deploy.sh is still running" in second.stderr
+        assert "docker build" not in env["log"].read_text()[len(before):]
+    finally:
+        first.kill()
+        first.wait()
+
+
+def test_web_absent_at_capture_aborts_preparation(env):
+    """deploy-state.py prepare: only the WEB is load-bearing; if it vanishes the attempt aborts."""
+    (env["tmp"] / "missing").write_text("herdr-cp-web")
+    env["env"]["STUB_RUNNING_IMAGE"] = "herdr-engineering:" + "0" * 12
+    state = env["tmp"] / "state"
+    r = subprocess.run(["python3", str(ROOT / "deploy/control-plane/deploy-state.py"), "prepare",
+                        str(state), str(env["central"]), env["ref"], "f" * 40,
+                        "herdr-engineering:" + "0" * 12, "1"],
+                       env=env["env"], capture_output=True, text=True)
+    assert r.returncode == 1
+    assert "deployment recovery state operation failed" in r.stderr
+    assert "docker inspect --type container herdr-cp-web" in env["log"].read_text()
+
+
+def test_candidate_without_lock_held_support_warns_and_leaves_refresh_to_the_timer(env):
+    added = _git("log", "--format=%H", "-S", "--lock-held", "--",
+                 "deploy/control-plane/collab-sync.sh").splitlines()[-1]
+    old = _git("rev-parse", f"{added}^")
+    _with_collab(env)
+    r = run(DEPLOY, env, "--no-fetch", "--ref", old, "--fleet-config", str(env["central"]))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "cannot run under the deploy's lock; its refresh is left to the timer" in r.stderr
+    assert "another collab-sync is running" in r.stderr     # the old script saw the held lock
+    assert _lock_is_free(env)
+
+
+# ---------------------------------------------------------------- deployment definitions mount
+
+def _pipes_dir(e):
+    return e["home"] / ".local/share/herdr-engineering/pipelines"
+
+
+def _log_compose_env(e):
+    """Wrap the docker stub so each call also logs HERDR_CP_PIPELINES_DIR (the stub is shared)."""
+    stub = e["tmp"] / "bin" / "docker"
+    real = e["tmp"] / "bin" / "docker-real"
+    stub.rename(real)
+    stub.write_text(f'#!/usr/bin/env bash\n[ "$1" != compose ] || echo "pipelinesdir=${{HERDR_CP_PIPELINES_DIR:-}}" >> {e["log"]}\n'
+                    f'exec {real} "$@"\n')
+    stub.chmod(0o755)
+
+
+def test_compose_mounts_the_pipelines_dir_read_only_into_web_only():
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    mount = "${HERDR_CP_PIPELINES_DIR:?run deploy.sh}:/etc/herdr/pipelines:ro"
+    assert mount in doc["services"]["control-plane-web"]["volumes"]
+    for name, svc in doc["services"].items():
+        if name != "control-plane-web":
+            assert not any("pipelines" in str(v) for v in svc.get("volumes") or []), name
+
+
+def test_dry_run_reports_the_pipelines_mount_and_creates_nothing(env):
+    _log_compose_env(env)
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "/etc/herdr/pipelines" in r.stdout and "a real deploy creates it empty, 0755" in r.stdout
+    assert not _pipes_dir(env).exists()
+    assert not (env["home"] / ".config/systemd/user/herdr-pipelines-sync.timer").exists()
+    assert f"pipelinesdir={_pipes_dir(env)}" in env["log"].read_text()     # compose config -q sees it
+
+
+def test_deploy_creates_the_pipelines_dir_mounts_it_and_installs_the_sync_timer(env):
+    _log_compose_env(env)
+    # a full successful first deploy (health + settle checks): slower than the failing ones
+    r = run(DEPLOY, env, "--no-fetch", "--ref", env["ref"], "--fleet-config", str(env["central"]), timeout=300)
+    assert r.returncode == 0, r.stderr
+    d = _pipes_dir(env)
+    assert d.is_dir() and (d.stat().st_mode & 0o777) == 0o755 and not list(d.iterdir())
+    log = env["log"].read_text()
+    lines = [ln for ln in log.splitlines() if ln.startswith("pipelinesdir=")]
+    assert lines and all(ln == f"pipelinesdir={d}" for ln in lines)
+    assert "systemctl --user enable --now herdr-pipelines-sync.timer" in log
+    share = env["home"] / ".local/share/herdr-engineering"
+    assert (share / "pipelines-sync.sh").exists()
+    assert (share / "pipelines-validator/deployment_definitions.py").exists()
+    service = (env["home"] / ".config/systemd/user/herdr-pipelines-sync.service").read_text()
+    assert f'--dir "{d}"' in service
+
+
+def test_a_failed_deploy_removes_newly_installed_pipelines_units(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    units = env["home"] / ".config/systemd/user"
+    assert not (units / "herdr-pipelines-sync.service").exists()
+    assert not (units / "herdr-pipelines-sync.timer").exists()
+    assert not (env["home"] / ".local/share/herdr-engineering/pipelines-sync.sh").exists()
+
+
+def test_a_valid_pipelines_dir_is_accepted(env):
+    d = _pipes_dir(env)
+    d.mkdir(parents=True, mode=0o755)
+    d.chmod(0o755)
+    (d / "hive-gateway.yaml").write_text("component: hive-gateway\n")
+    (d / "hive-gateway.yaml").chmod(0o644)
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "a real deploy creates it empty, 0755" not in r.stdout
+
+
+@pytest.mark.parametrize("fault,needle", [
+    ("dir_symlink", "must be a real directory"),
+    ("dir_mode", "must not be writable by group or other"),
+    ("non_yaml", "must hold only regular *.yaml"),
+    ("file_symlink", "must hold only regular *.yaml"),
+    ("subdir", "must hold only regular *.yaml"),
+    ("big_file", "must hold only regular *.yaml"),
+    ("file_mode", "must hold only regular *.yaml"),
+    ("too_many", "at most 256"),
+])
+def test_a_bad_pipelines_dir_is_refused_before_anything_runs(env, fault, needle):
+    d = _pipes_dir(env)
+    if fault == "dir_symlink":
+        real = env["tmp"] / "elsewhere"
+        real.mkdir()
+        d.parent.mkdir(parents=True)
+        d.symlink_to(real)
+    else:
+        d.mkdir(parents=True)
+        d.chmod(0o755)
+        if fault == "dir_mode":
+            d.chmod(0o775)
+        elif fault == "non_yaml":
+            (d / "validate.py").write_text("x")
+        elif fault == "file_symlink":
+            target = env["tmp"] / "x.yaml"
+            target.write_text("x")
+            (d / "x.yaml").symlink_to(target)
+        elif fault == "subdir":
+            (d / "nested.yaml").mkdir()
+        elif fault == "big_file":
+            (d / "big.yaml").write_text("x" * (64 * 1024 + 1))
+        elif fault == "file_mode":
+            (d / "x.yaml").write_text("x")
+            (d / "x.yaml").chmod(0o664)
+        elif fault == "too_many":
+            for i in range(257):
+                (d / f"c{i}.yaml").write_text("x")
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0
+    assert needle in r.stderr
+    assert not env["log"].exists()
+
+
+def _apps_dir(e):
+    return e["home"] / ".config/herdr-engineering/apps"
+
+
+def test_compose_mounts_the_apps_dir_read_only_into_web_only():
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    mount = "${HERDR_CP_APPS_DIR:?run deploy.sh}:/etc/herdr/apps:ro"
+    assert mount in doc["services"]["control-plane-web"]["volumes"]
+    for name, svc in doc["services"].items():
+        if name != "control-plane-web":
+            assert not any("/etc/herdr/apps" in str(v) for v in svc.get("volumes") or []), name
+    text = (ROOT / "deploy/control-plane/compose.yaml").read_text()
+    assert "/etc/herdr/google" not in text and "HERDR_CP_GOOGLE_DIR" not in text
+
+
+def test_deploy_creates_an_empty_0700_apps_dir_and_never_the_key(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    deploy(env)
+    d = _apps_dir(env)
+    assert d.is_dir() and (d.stat().st_mode & 0o777) == 0o700 and not list(d.iterdir())
+
+
+def test_a_valid_apps_key_is_accepted_and_never_printed(env):
+    d = _apps_dir(env)
+    d.mkdir(parents=True, mode=0o700)
+    d.chmod(0o700)
+    (d / "apps.key").write_bytes(b"PLACEHOLDERAPPSKEYBYTES_32bytes!")
+    (d / "apps.key").chmod(0o600)
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "PLACEHOLDERAPPSKEYBYTES" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("fault,needle", [
+    ("dir_mode", "must be mode 0700"),
+    ("extra_file", "must hold only apps.key"),
+    ("file_mode", "must be mode 0600"),
+    ("short_key", "must be exactly 32 bytes"),
+    ("long_key", "must be exactly 32 bytes"),
+    ("old_google_file", "must hold only apps.key"),
+])
+def test_a_bad_apps_dir_is_refused_before_anything_runs(env, fault, needle):
+    d = _apps_dir(env)
+    d.mkdir(parents=True, mode=0o700)
+    d.chmod(0o700)
+    key = d / "apps.key"
+    key.write_bytes(b"k" * {"short_key": 31, "long_key": 33}.get(fault, 32))
+    key.chmod(0o644 if fault == "file_mode" else 0o600)
+    if fault == "dir_mode":
+        d.chmod(0o755)
+    if fault == "extra_file":
+        (d / "notes.txt").write_text("x")
+    if fault == "old_google_file":
+        (d / "token.json").write_text("{}")
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0 and needle in r.stderr
+    assert not env["log"].exists()

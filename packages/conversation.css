@@ -8,6 +8,11 @@
 .conversation-suggestions li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; padding: 8px; cursor: pointer; overflow-wrap: anywhere; }
 .conversation-suggestions li[aria-selected=true] { background: var(--surface-hover, #e9eef7); }
 .conversation-suggestions li span { font-size: 12px; color: var(--text-muted, #667085); }
+.conversation-suggestions li.conversation-suggestions-group { display: block; padding: 0; cursor: default; }
+.conversation-suggestions-group > ul { list-style: none; margin: 0; padding: 0; }
+.conversation-suggestions .conversation-suggestions-section { display: block; cursor: default; padding: 8px 8px 2px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted, #667085); }
+.conversation-suggestions li[role=option] b { flex: 1 1 auto; }
+.conversation-suggestions .conversation-suggestion-icon { flex: 0 0 auto; width: 1.4em; text-align: center; font-size: 13px; color: var(--text-muted, #667085); }
 .conversation-attachments { display: flex; flex-wrap: wrap; gap: 8px; }
 .conversation-attachments:empty { display: none; }
 .conversation-attachment { display: flex; align-items: center; max-width: 100%; gap: 8px; padding: 6px 8px; border: 1px solid var(--border, #d8dde5); border-radius: 6px; }
@@ -58,3 +63,15 @@
 .conversation-input-wrap { position: static; }
 .conversation-composer--expanded { position: fixed; }
 .conversation-composer--expanded .conversation-input-wrap { position: relative; }
+.conversation-markdown .md-fabric-actions { display: inline-flex; gap: .25em; margin-left: .35em; opacity: 0; transition: opacity .12s; }
+.conversation-markdown .md-fabric-link:hover + .md-fabric-actions, .conversation-markdown .md-fabric-actions:hover, .conversation-markdown .md-fabric-actions:focus-within { opacity: 1; }
+@media (hover: none) { .conversation-markdown .md-fabric-actions { opacity: 1; } } /* touch devices have no hover */
+.conversation-markdown .md-fabric-copy { font-size: .75em; padding: .1em .45em; border-radius: .6em; border: 1px solid currentColor; background: transparent; color: inherit; cursor: pointer; }
+.conversation-markdown .md-fabric-copy[data-copied="true"]::after { content: " ✓"; }
+.conversation-markdown .md-fabric-copy[data-copied="failed"]::after { content: " ✗"; }
+.conversation-markdown .md-link-unreachable { text-decoration: underline dotted; opacity: .75; cursor: help; }
+/* Everyday formatting stays in the bar; the rest sits behind "More". */
+.conversation-more { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.conversation-more > summary { cursor: pointer; padding: 4px 8px; border: 1px solid var(--border, #d8dde5); border-radius: var(--radius-sm, 4px); font-size: .8125rem; color: var(--text-secondary); list-style: none; }
+.conversation-more > summary::-webkit-details-marker { display: none; }
+.conversation-more-tools { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }

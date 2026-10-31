@@ -23,8 +23,8 @@ dev_fabric:
 # Fabric gateway = the unified dev:<port> front door (spec 0110 component #3).
 # Run `herdr-eng devfabric gateway` on the gateway host (bender today).
 # Registrar commands use it automatically when reachable, and degrade to
-# local mode with a warning when it is not. HERDR_ENGINEERING_FABRIC_URL
-# overrides gateway_url without editing config.
+# local mode with a warning when it is not. There is no env-var override: a
+# central fleet-config.yaml `fabric.url` wins over gateway_url below.
 fabric:
   # full control URL (http://host:port) or bare host/MagicDNS name (given the
   # default control port); empty = local/standalone mode
@@ -39,6 +39,15 @@ fabric:
   # ~/.config/herdr-engineering/fabric-token (never in this file)
   # empty token = control API unauthenticated (fine on a private tailnet;
   # set one before exposing the control port further)
+
+# Host-visible central scheduler settings. Server admission and limits belong
+# in the central control_plane section (scheduler_admission defaults false).
+# See docs/operations/fabric-scheduler.md for effective flags and rollout gates.
+scheduler:
+  telemetry: true
+
+# The lineage merge-gate evidence block (control_plane.graph_merge_gate) lives in the CENTRAL fleet file, not this
+# per-host file: see deploy/control-plane/fleet-config.example.yaml. It is off by default.
 
 tests:
   adapters: [pytest, go, cargo, junit, scala]
@@ -67,3 +76,25 @@ build_cleanup:
   high_water_percent: 85
   low_water_percent: 80
   min_age_hours: 24
+
+# GitHub catalog (control-plane-web). The catalog runs only in the control
+# plane, which reads these keys from the central fleet file's `github` section
+# (next to github.token), live on the next sync pass; they are listed here for
+# reference and validated by the same rules wherever they appear.
+#   github:
+#     values:
+#       token: ...                       # set by `herdr-eng fleet config init`
+#       organizations: [acme, my-login]  # owner allowlist (orgs + your own account),
+#                                        # case-insensitive; empty/absent = every owner.
+#                                        # Excluded owners cost no issue calls and their
+#                                        # stored rows are purged on the next pass.
+#       sync:
+#         interval: 300                  # seconds between sync passes
+#         full_reconcile_interval: 86400 # each repository is read in full once per this
+#                                        # many seconds (staggered), as a drift safety net
+#         point_budget: 400              # GraphQL points (rateLimit.cost) one pass may spend;
+#                                        # repositories that do not fit are deferred to the
+#                                        # next pass (listed as deferred_repos, stale after 2x
+#                                        # interval) and the cached rows keep being served
+# The catalog persists in control_plane.pg_dsn when it is set (migration 0006),
+# otherwise it lives in memory and a restart re-reads GitHub.

@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import urllib.request
+from contextlib import asynccontextmanager
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.bridge import PostgresSource, load_into
@@ -202,6 +203,91 @@ def test_load_into_derives_description_for_legacy_services():
     assert "mac.lan" in svc["description"]
 
 
+def test_load_into_replays_delivery_entities_from_event_log():
+    """Delivery projections (test_run/build/review/pull_request) must be rebuilt
+    from durable events on hydration. The write-through sink persists only
+    fabric_events, so without this replay a restart would silently lose every
+    delivery record (issue #40)."""
+    ts = "2026-01-01T00:00:00+00:00"
+    events = [
+        _row(event_id="e1", sequence=0, event_type="TestRunStarted",
+             entity_type="test_run", entity_id="run1", mission_id="pi:M1",
+             payload='{"mission_id": "pi:M1", "kind": "test", "status": "ok", "passed": 2, "failed": 0, "total": 2}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+        _row(event_id="e2", sequence=1, event_type="BuildStarted",
+             entity_type="build", entity_id="build1", mission_id="pi:M1",
+             payload='{"mission_id": "pi:M1", "status": "ok"}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+        _row(event_id="e3", sequence=2, event_type="ReviewStarted",
+             entity_type="review", entity_id="rev1", mission_id="pi:M1",
+             payload='{"mission_id": "pi:M1", "status": "in_review"}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+        _row(event_id="e4", sequence=3, event_type="ReviewFindingAdded",
+             entity_type="review", entity_id="rev1", mission_id="pi:M1",
+             payload='{"mission_id": "pi:M1", "severity": "medium", "summary": "leak", "status": "open"}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+        _row(event_id="e5", sequence=4, event_type="PullRequestOpened",
+             entity_type="pull_request", entity_id="pr1", mission_id="pi:M1",
+             payload='{"mission_id": "pi:M1", "title": "Fix bug", "url": "https://github.com/o/r/pull/1"}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+    ]
+    src = FakeSource(events=events)
+    repo = ControlPlaneRepo()
+    counts = load_into(repo, src)
+    # Delivery entities survive the restart even with empty structured tables.
+    assert counts["events"] == 5
+    tr = repo.get_test_run("run1")
+    assert tr["mission_id"] == "pi:M1" and tr["passed"] == 2 and tr["status"] == "ok"
+    assert repo.list_test_runs(mission_id="pi:M1")[0]["test_run_id"] == "run1"
+    build = repo.get_test_run("build1")
+    assert build["mission_id"] == "pi:M1" and build["kind"] == "build"
+    assert repo.get_review("rev1")["findings"][0]["summary"] == "leak"
+    assert repo.list_reviews(mission_id="pi:M1")[0]["review_id"] == "rev1"
+    assert repo.get_pull_request("pr1")["url"] == "https://github.com/o/r/pull/1"
+    assert repo.list_pull_requests(mission_id="pi:M1")[0]["pr_id"] == "pr1"
+
+
+def test_load_into_replays_usage_and_stage_analytics():
+    """Usage analytics (#36) and stage analytics (#37) ride the same durable
+    event log, so an event-only reload must rebuild them or they vanish after a
+    restart (issue #40). Replay is idempotent: loading twice yields the same
+    projections."""
+    ts = "2026-01-01T00:00:00+00:00"
+    events = [
+        _row(event_id="e1", sequence=0, event_type="token_usage.recorded",
+             entity_type="token_usage", entity_id="req1", mission_id="pi:M1",
+             payload='{"mission_id": "pi:M1", "model": "gpt", "request_id": "req1", "input_tokens": 5, "output_tokens": 3}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+        _row(event_id="e2", sequence=1, event_type="MissionStageChanged",
+             entity_type="mission", entity_id="pi:M1", mission_id="pi:M1",
+             payload='{"from": "planning", "to": "implementation"}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+        _row(event_id="e3", sequence=2, event_type="MissionStageChanged",
+             entity_type="mission", entity_id="pi:M1", mission_id="pi:M1",
+             payload='{"from": "implementation", "to": "review"}',
+             source_timestamp="2026-01-01T00:00:10+00:00",
+             ingest_timestamp="2026-01-01T00:00:10+00:00", schema_version=1),
+    ]
+    src = FakeSource(events=events)
+    repo = ControlPlaneRepo()
+    load_into(repo, src)
+    ua = repo.usage_analytics(mission_id="pi:M1")
+    assert ua["tokens"]["total"]["input_tokens"] == 5
+    assert ua["tokens"]["by_model"]["gpt"]["output_tokens"] == 3
+    sa = repo.stage_analytics()
+    # planning -> implementation closed a run (~10s); implementation is still open.
+    assert sa["in_progress"]["pi:M1"] == ["review"]
+    assert sa["stages"]["implementation"]["runs"] == 1
+    assert sa["stages"]["implementation"]["p50_ms"] == 10000
+    # Idempotent: reloading the same event log must not double the projections.
+    repo2 = ControlPlaneRepo()
+    load_into(repo2, src)
+    ua2 = repo2.usage_analytics(mission_id="pi:M1")
+    assert ua2["tokens"]["total"]["input_tokens"] == 5
+    sa2 = repo2.stage_analytics()
+    assert sa2["stages"]["implementation"]["runs"] == 1
+
+
 def test_load_into_empty_source():
     repo = ControlPlaneRepo()
     counts = load_into(repo, FakeSource())
@@ -215,6 +301,11 @@ def test_postgres_source_uses_provided_run():
     calls = []
 
     class FakeConn:
+        @asynccontextmanager
+        async def transaction(self, **kwargs):
+            assert kwargs == {"isolation": "repeatable_read", "readonly": True}
+            yield
+
         async def fetch(self, sql, *args):
             if "missions" in sql:
                 return [{"mission_id": "m9", "title": "pg", "status": "active",
@@ -237,3 +328,51 @@ def test_postgres_source_uses_provided_run():
     missions = src.missions()
     assert missions[0]["mission_id"] == "m9"
     assert len(calls) == 1  # cached — fetched once, reused for all resources
+
+
+def test_postgres_source_compacts_snapshots_without_an_entity_allowlist():
+    calls = []
+    rows = [
+        {"event_id": "h0", "entity_type": "host", "entity_id": "observed-host",
+         "event_type": "HostRegistered", "sequence": 0,
+         "source_timestamp": "2026-10-26T12:00:00+00:00",
+         "payload": {"host_name": "Observed host", "status": "healthy"}},
+        {"event_id": "s0", "entity_type": "session", "entity_id": "observed-session",
+         "event_type": "SessionStarted", "sequence": 0,
+         "source_timestamp": "2026-10-26T12:00:00+00:00",
+         "payload": {"host_id": "observed-host", "agent_role": "pi", "status": "active"}},
+        {"event_id": "v0", "entity_type": "service", "entity_id": "observed-service",
+         "event_type": "ServiceRegistered", "sequence": 0,
+         "source_timestamp": "2026-10-26T12:00:00+00:00",
+         "payload": {"host_id": "observed-host", "service_name": "Observed web", "port": 18001}},
+    ]
+
+    class FakeConn:
+        @asynccontextmanager
+        async def transaction(self, **kwargs):
+            assert kwargs == {"isolation": "repeatable_read", "readonly": True}
+            yield
+
+        async def fetch(self, sql, *args):
+            calls.append(sql)
+            if "fabric_events" in sql:
+                assert "LIMIT" not in sql
+                return rows
+            return []
+
+    def fake_run(coro):
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    restored = ControlPlaneRepo()
+    load_into(restored, PostgresSource(FakeConn(), run=fake_run))
+    assert restored.get_host("observed-host")["host_name"] == "Observed host"
+    assert restored.get_session("observed-session")["agent_role"] == "pi"
+    assert restored.get_service("observed-service")["service_name"] == "Observed web"
+    event_sql = next(sql for sql in calls if "fabric_events" in sql)
+    assert "entity_type NOT IN" in event_sql
+    assert "UNION ALL" in event_sql
+    assert "recovery_snapshot IS NULL" in event_sql
+    assert "lag(recovery_snapshot)" in event_sql
+    assert "'session'" in event_sql
+    assert "'service'" in event_sql
+    assert "LIMIT" not in event_sql

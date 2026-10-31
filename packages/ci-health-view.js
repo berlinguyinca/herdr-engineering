@@ -1,5 +1,7 @@
 import {escapeHtml as esc} from './herdr-web-components/util.js';
-import {ciHealthModel,renderCiHeatmap,renderCiTree,ciHealthStyles} from './ci-health.js';
+import {ciHealthModel,renderCiHeatmap,ciHealthStyles} from './ci-health.js';
+import {snapshotText,animateChanges,skeleton} from './motion.js';
+import {morph,handOff,patchText,patchAttr} from './patch.js';
 
 const modes=['hours','runs','7','14','30'];
 const scopes=['default','pr','all'];
@@ -25,12 +27,11 @@ export function ciHealthUnavailable(history={},missingClient=false) {
 }
 
 // Persist user preferences per route context; repository/mission/session never become global filters.
-export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{},onLayout=()=>{},repository='',mission='',session='',search}={}) {
+export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{},onContext=()=>{},repository='',mission='',session='',search}={}) {
   const doc=host.ownerDocument;
-  let context={repository,mission,session},state,expanded,selection=null,selected=null,selectedKey='',layout='split';
+  let context={repository,mission,session},commandProject=null,state,expanded,selection=null,selected=null,selectedKey='';
   let history=null,model=null,orderSignature='',error='',disposed=false,timer=null,pending=null,generation=0;
   const listeners=new AbortController();
-  const treeLimits=new Map();
   const storageKey=()=>`herdr.ci-health.v1:${JSON.stringify([context.repository || '',context.mission || '',context.session || ''])}`;
   function load() {
     let saved;try {saved=JSON.parse(doc.defaultView.localStorage.getItem(storageKey()) || 'null');} catch {saved=null;}
@@ -43,74 +44,97 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   load();
   if(typeof search==='string')state.search=bounded(search);
   host.innerHTML=`<style>${ciHealthStyles}</style><style>
-.ci-health-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:14px 0}.ci-health-controls [data-health-mode]{background:var(--surface);color:var(--text);border:1px solid var(--border);margin-right:3px}.ci-health-controls [data-health-mode][aria-pressed=true]{background:var(--accent);color:#fff;border-color:var(--accent)}.ci-health-controls label{display:flex;flex-direction:column;gap:5px;font-size:12px}.ci-health-controls input,.ci-health-controls select{max-width:100%;padding:8px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm)}.ci-health-controls input[type=checkbox]{margin:0}.ci-health-controls .ci-health-check{flex-direction:row;align-items:center;padding:8px 0}.ci-health-layout{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.ci-health-layout [aria-pressed=true]{outline:2px solid var(--accent)}.ci-health-selection,.ci-health-status{font-size:12px;line-height:1.6;color:var(--text-secondary);overflow-wrap:anywhere}.ci-health-workflows{padding:12px;font-size:12px}.ci-health-workflows button{display:block;margin:6px 0;text-align:left}.ci-health-tree[hidden]{display:none}.ci-health-lower{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;min-width:0}.ci-health-tree,.ci-health-pipeline-slot{min-width:0}.ci-health-pipeline-slot:empty,.ci-health-pipeline-slot:not(:has(.ig-inspector:not([hidden]))){display:none}[data-health-layout=tree]>.ci-health-pipeline-slot{display:none}[data-health-layout=pipeline]>.ci-health-tree{display:none}@media(min-width:1100px){.ci-health-lower[data-health-layout=split]:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(250px,.35fr) minmax(0,1fr)}}
-</style><section aria-label="CI project health"><h2>Project health</h2><div class="ci-health-controls">
+.ci-health-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:var(--radius);background:linear-gradient(135deg,color-mix(in srgb,var(--surface) 92%,var(--accent)),var(--surface))}.ci-health-controls [data-health-mode]{background:var(--surface);color:var(--text);border:1px solid var(--border);margin-right:3px}.ci-health-controls [data-health-mode][aria-pressed=true]{background:var(--accent);color:var(--text-on-accent);border-color:var(--accent)}.ci-health-controls label{display:flex;flex-direction:column;gap:5px;font-size:12px}.ci-health-controls input,.ci-health-controls select{max-width:100%;padding:8px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm)}.ci-health-controls input[type=checkbox]{margin:0}.ci-health-controls .ci-health-check{flex-direction:row;align-items:center;padding:8px 0}@media(max-width:900px){.ci-health-check{min-height:44px}}.ci-health-selection,.ci-health-status{font-size:12px;line-height:1.6;color:var(--text-secondary);overflow-wrap:anywhere}.ci-health-workflows{padding:12px;font-size:12px}.ci-health-workflows button{display:block;margin:6px 0;text-align:left}.ci-health-lower{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;min-width:0}.ci-health-detail,.ci-health-pipeline-slot{min-width:0}.ci-health-pipeline-slot:empty,.ci-health-pipeline-slot:not(:has(.ig-inspector:not([hidden]))){display:none}@media(min-width:1600px){.ci-health-lower:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(250px,.35fr) minmax(0,1fr)}}
+</style><section aria-label="CI project health"><h2>Project health</h2><details class="ci-health-filters" data-health-filters><summary data-health-filters-summary>Map filters</summary><div class="ci-health-controls">
 <div role="group" aria-label="History window"><button type="button" class="hd-btn" data-health-mode="hours">Last 24 hours</button><button type="button" class="hd-btn" data-health-mode="runs">Last 24 runs</button><button type="button" class="hd-btn" data-health-mode="7">7 days</button><button type="button" class="hd-btn" data-health-mode="14">14 days</button><button type="button" class="hd-btn" data-health-mode="30">30 days</button></div>
 <label>Scope<select data-health-scope><option value="default">Default-branch builds</option><option value="pr">Pull requests</option><option value="all">All runs</option></select></label>
 <label>Sort projects<select data-health-sort><option value="name">Project name</option><option value="failures">Failures in selected window</option></select></label>
-<label>Search projects and runs<input type="search" data-health-search maxlength="500"></label><label>Branch<input data-health-branch maxlength="500" placeholder="All branches"></label><label class="ci-health-check"><input type="checkbox" data-health-failures>Projects with failures</label></div>
+<label>Search projects and runs<input type="search" data-health-search maxlength="500"></label><label>Branch<input data-health-branch maxlength="500" placeholder="All branches"></label><label class="ci-health-check"><input type="checkbox" data-health-failures>Projects with failures</label></div></details>
 <p class="ci-health-status" role="status" data-health-status></p><div data-health-map></div><div class="ci-health-selection" data-health-selection></div>
-<div class="ci-health-layout" role="group" aria-label="Health detail layout"><button type="button" class="hd-btn" data-health-layout="split">Tree + pipeline</button><button type="button" class="hd-btn" data-health-layout="tree">Tree only</button><button type="button" class="hd-btn" data-health-layout="pipeline">Pipeline only</button></div><div class="ci-health-lower" data-health-lower><div class="ci-health-tree" data-health-tree></div><div class="ci-health-pipeline-slot" data-health-pipeline-slot></div></div></section>`;
+<div class="ci-health-lower" data-health-lower><div class="ci-health-detail" data-health-detail></div><div class="ci-health-pipeline-slot" data-health-pipeline-slot></div></div></section>`;
   const el=selector=>host.querySelector(selector);
   function syncControls() {
     for(const button of host.querySelectorAll('button[data-health-mode]'))button.setAttribute('aria-pressed',String(button.dataset.healthMode===state.mode));
     for(const name of ['scope','sort','search','branch'])el(`[data-health-${name}]`).value=state[name];
     el('[data-health-failures]').checked=state.failuresOnly;
+    // The bar is folded away by default, so its summary says what is applied.
+    const windows={hours:'Last 24 hours',runs:'Last 24 runs'},scopes={default:'Default branch',pr:'Pull requests',all:'All runs'};
+    const parts=[windows[state.mode]||`${state.mode} days`,scopes[state.scope]||state.scope,state.branch?`branch ${state.branch}`:'',state.search?`“${state.search}”`:'',state.failuresOnly?'failures only':''].filter(Boolean);
+    const label=`Map filters · ${parts.join(' · ')}`,summary=el('[data-health-filters-summary]');
+    if(summary.textContent!==label)summary.textContent=label;
   }
   syncControls();
-  function applyLayout() {
-    host.dataset.healthLayout=layout;el('[data-health-lower]').dataset.healthLayout=layout;
-    for(const button of host.querySelectorAll('button[data-health-layout]'))button.setAttribute('aria-pressed',String(button.dataset.healthLayout===layout));
-    el('[data-health-tree]').hidden=layout==='pipeline';
-    onLayout(layout);
-  }
-  applyLayout();
   function rememberDisclosures() {
     for(const node of host.querySelectorAll('[data-health-disclosure]')) {
       const key=node.dataset.healthDisclosure;if(node.open)expanded.add(key);else expanded.delete(key);
     }
   }
+  // Morphed in place: unchanged markup writes nothing, and the grid's scroll, roving focus and
+  // open disclosures keep their nodes (morph never writes the boolean `open`, so it is re-synced
+  // from `expanded` after each draw). A row the user is in that leaves is handed off to a neighbour.
   function replace(element,html) {
-    const active=doc.activeElement,inside=element.contains(active);
-    const attributes=['data-health-run','data-health-project','data-health-bucket','data-health-step','data-health-tree-more'];
-    const scrollFocus=inside?[...element.querySelectorAll('[data-health-grid-scroll]')].indexOf(active):-1;
-    const focus=inside?attributes.filter(key=>active.hasAttribute(key)).map(key=>[key,active.getAttribute(key)]):[];
-    const summary=inside && active.tagName==='SUMMARY'?active.closest('[data-health-disclosure]')?.dataset.healthDisclosure:null;
-    const scroll=[...element.querySelectorAll('[data-health-grid-scroll]')].map(node=>[node.scrollLeft,node.scrollTop]);
-    element.innerHTML=html;
-    for(const node of element.querySelectorAll('[data-health-disclosure]'))node.open=expanded.has(node.dataset.healthDisclosure);
-    if(focus.length)[...element.querySelectorAll(`[${focus[0][0]}]`)].find(node=>focus.every(([key,value])=>node.getAttribute(key)===value))?.focus({preventScroll:true});
-    if(summary)[...element.querySelectorAll('[data-health-disclosure]')].find(node=>node.dataset.healthDisclosure===summary)?.querySelector('summary')?.focus({preventScroll:true});
-    [...element.querySelectorAll('[data-health-grid-scroll]')].forEach((node,i)=>{if(scrollFocus===i)node.focus({preventScroll:true});if(scroll[i]){node.scrollLeft=scroll[i][0];node.scrollTop=scroll[i][1];}});
+    handOff(morph(element,html));
+    for(const node of element.querySelectorAll('[data-health-disclosure]')) {
+      const open=expanded.has(node.dataset.healthDisclosure);if(node.open!==open)node.open=open;
+    }
+  }
+  // The heatmap's roving tabindex (one cell in the tab order: the focused one, else the first) is
+  // stamped into the markup before the morph, so a quiet refresh does not reset and re-set it.
+  function roving(html) {
+    const t=doc.createElement('template');t.innerHTML=html;
+    const cells=[...t.content.querySelectorAll('[data-health-project][data-health-bucket]')];
+    const active=doc.activeElement,key=active?.matches?.('[data-health-project][data-health-bucket]')?cellKey(active):null;
+    const hit=cells.some(cell=>cellKey(cell)===key);
+    cells.forEach((cell,index)=>cell.setAttribute('tabindex',(hit?cellKey(cell)===key:index===0)?'0':'-1'));
+    return t.innerHTML;
   }
   function contextCoverageUnknown() {
     return rows(history?.pipelines).some(record=>(context.mission && !['mission_key','mission_id','related_missions'].some(key=>Object.hasOwn(record,key))) || (context.session && !['session_id','related_sessions'].some(key=>Object.hasOwn(record,key))));
   }
   function scopedHistory() {
-    if(!context.mission && !context.session)return history || {};
-    return {...history,...(contextCoverageUnknown()?{coverage:{},status:'partial'}:{}),pipelines:rows(history?.pipelines).filter(record=>(!context.mission || (record.mission_key || record.mission_id)===context.mission || rows(record.related_missions).some(row=>(row.mission_key || row.mission_id)===context.mission)) && (!context.session || record.session_id===context.session || rows(record.related_sessions).some(row=>row.session_id===context.session)))};
+    const projected=ciHealthProjectHistory(history||{},commandProject);
+    if(!context.mission && !context.session)return projected;
+    return {...projected,...(contextCoverageUnknown()?{coverage:{},status:'partial'}:{}),pipelines:rows(projected.pipelines).filter(record=>(!context.mission || (record.mission_key || record.mission_id)===context.mission || rows(record.related_missions).some(row=>(row.mission_key || row.mission_id)===context.mission)) && (!context.session || record.session_id===context.session || rows(record.related_sessions).some(row=>row.session_id===context.session)))};
   }
   function selectedSteps() {
     if(!selected || !Array.isArray(selected.tasks))return '';
     const groups=new Map();for(const task of rows(selected.tasks)){const key=String(task.workflow ?? task.workflow_id ?? 'Steps');if(!groups.has(key))groups.set(key,[]);groups.get(key).push(task);}
     return `<section class="ci-health-workflows" aria-label="Selected run workflows"><h3>Run #${esc(String(selected.run_number ?? selected.number ?? ''))} · workflows and steps</h3>${[...groups].map(([name,tasks])=>`<details data-health-disclosure="${esc(JSON.stringify(['workflow',selectedKey,name]))}"><summary>${esc(name)}</summary>${tasks.map(task=>`<button type="button" class="hd-btn" data-health-step="${esc(String(task.id ?? ''))}">${esc(task.name || `Step ${task.id ?? '?'}`)} · ${esc(task.state || task.status || 'Unknown')}</button>`).join('')}</details>`).join('')}</section>`;
   }
+  let slotLimit=100,slotShown='';
+  function selectedSlot() {
+    if(!selection || !model)return '';
+    const project=model.projects.find(p=>p.key===selection.projectKey),cell=project?.cells.find(c=>c.key===selection.bucketKey);
+    if(!project || !cell)return '';
+    const counts=cell.counts||{},runs=Array.isArray(cell.runs)?cell.runs:[];
+    const slotKey=`${selection.projectKey}|${selection.bucketKey}`;if(slotKey!==slotShown){slotShown=slotKey;slotLimit=100;}
+    const runButtons=runs.slice(0,slotLimit).map(run=>`<button type="button" data-health-slot-run="${esc(String(run.runKey||run.run_number||''))}"${run.runKey&&run.runKey===selectedKey?' aria-current="true"':''}><strong>Run #${esc(String(run.run_number??'unknown'))}</strong><br><small>${esc(run.state||run.status||'Unknown')} · ${esc(run.pr?`PR #${run.pr.number}${run.pr.title?` ${run.pr.title}`:''}`:run.branch||'Branch unavailable')} · ${esc(run.revision||'Revision unavailable')}</small></button>`).join('')+(runs.length>slotLimit?`<button type="button" class="hd-btn hd-btn--secondary hd-btn--sm" data-health-slot-more>Show ${Math.min(100,runs.length-slotLimit)} more runs · ${runs.length-slotLimit} remaining</button>`:'');
+    return `<section class="ci-slot-detail" aria-label="Selected CI slot detail"><header><div><h3>${esc(project.identity)}</h3><p class="ci-slot-note">${esc(cell.label||cell.key)} · ${cell.complete?'Complete coverage':'Incomplete coverage'}</p></div><strong>${esc(`${counts.failure||0} failed`)}</strong></header><dl><div><dt>Runs</dt><dd>${esc(counts.total??runs.length)}</dd></div><div><dt>Passed</dt><dd>${esc(counts.success||0)}</dd></div><div><dt>Failed</dt><dd>${esc(counts.failure||0)}</dd></div><div><dt>Active</dt><dd>${esc(counts.active||0)}</dd></div></dl>${runs.length?`<div class="ci-slot-runs">${runButtons}</div><p class="ci-slot-note">Select a run to open its failed steps, tests, logs and provider diagnosis.</p>`:'<p class="ci-slot-note">No run evidence is reported for this slot. Try a wider window or another scope.</p>'}</section>`;
+  }
+  const CELL='[data-health-project][data-health-bucket]';
+  const cellKey=node=>`${node.dataset.healthProject}|${node.dataset.healthBucket}`;
+  let shownCells=null;
   function draw(preserve=true) {
     if(disposed)return;
     if(preserve)rememberDisclosures();
     const previousOrder=new Map((model?.projects || []).map((project,index)=>[project.key,index]));
     const nextOrderSignature=JSON.stringify([state.mode,state.scope,state.sort,state.search,state.branch,state.failuresOnly,context]);
-    const interacting=el('[data-health-map]').contains(doc.activeElement) || el('[data-health-tree]').contains(doc.activeElement) || host.querySelector('[data-health-disclosure][open]');
+    const interacting=el('[data-health-map]').contains(doc.activeElement) || el('[data-health-detail]').contains(doc.activeElement) || host.querySelector('[data-health-disclosure][open]');
     model=ciHealthModel(scopedHistory(),{...state,...context,selection});
     if(preserve && interacting && orderSignature===nextOrderSignature)model.projects.sort((a,b)=>(previousOrder.get(a.key) ?? Infinity)-(previousOrder.get(b.key) ?? Infinity));
     orderSignature=nextOrderSignature;
     const unavailable=history?.available===false;
     const hideHistory=unavailable&&!rows(history?.repos).length;
-    el('[data-health-status]').textContent=error || (!history?'Loading CI history…':unavailable?ciHealthUnavailable(history,history.missingClient):`${history.stale?'Stale history · ':''}${history.refreshing?'Refreshing history · ':''}${model.partial?'Partial history: coverage is incomplete. ':''}${state.mode==='runs'?'Last 24 matching runs per project; no date cutoff. ':'UTC timestamps. '}${contextCoverageUnknown()?'Context associations are unavailable for some runs; counts and coverage for this route are incomplete. ':context.mission || context.session?'Counts are limited to the current route context. ':''}Only completed success and failure outcomes contribute to pass/fail totals.`);
-    replace(el('[data-health-map]'),hideHistory?'':renderCiHeatmap(model));
-    replace(el('[data-health-tree]'),hideHistory?'':renderCiTree(model,{selectedRunKey:selectedKey,expanded,limits:treeLimits})+selectedSteps());
+    patchText(el('[data-health-status]'),error || (!history?'':unavailable?ciHealthUnavailable(history,history.missingClient):`${history.stale?'Stale history · ':''}${history.refreshing?'Refreshing history · ':''}${model.partial?'Partial history: coverage is incomplete. ':''}${state.mode==='runs'?'Last 24 matching runs per project; no date cutoff. ':'UTC timestamps. '}${contextCoverageUnknown()?'Context associations are unavailable for some runs; counts and coverage for this route are incomplete. ':context.mission || context.session?'Counts are limited to the current route context. ':''}Only completed success and failure outcomes contribute to pass/fail totals.`));
+    // The heatmap is rebuilt with innerHTML; a cell whose outcome symbol changed (same project and
+    // bucket) flashes. A mode, scope or filter change re-keys the buckets, so it never flashes.
+    const cellsBefore=nextOrderSignature===shownCells?snapshotText(el('[data-health-map]'),CELL,cellKey):null;
+    replace(el('[data-health-map]'),!history&&!error?skeleton('CI history',{rows:3}):hideHistory?'':roving(renderCiHeatmap(model)));
+    animateChanges(el('[data-health-map]'),CELL,cellsBefore,cellKey,{count:false});
+    shownCells=nextOrderSignature;
+    replace(el('[data-health-detail]'),!history&&!error?skeleton('CI project health',{rows:3,height:40}):hideHistory?'':selectedSlot()+selectedSteps());
     const selectionHtml=selection?`${!model.projects.some(project=>project.key===selection.projectKey && project.cells.some(cell=>cell.key===selection.bucketKey))?'Selected run or bucket is no longer present in this window.':'Selected project and time bucket · latest labels apply within this selection.'} <button type="button" class="hd-btn" data-health-clear>Clear selection</button>`:'';
-    const chip=el('[data-health-selection]');if(chip.innerHTML!==selectionHtml)chip.innerHTML=selectionHtml;
+    morph(el('[data-health-selection]'),selectionHtml);
     const cells=[...host.querySelectorAll('[data-health-project][data-health-bucket]')];
     const focused=cells.find(cell=>cell===doc.activeElement);
     cells.forEach((cell,index)=>cell.tabIndex=focused?cell===focused?0:-1:index===0?0:-1);
@@ -132,12 +156,17 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
       if(history)history={...history,stale:true};error=`CI history unavailable: ${reason?.message || 'Refresh failed'}. ${history?'Showing the last received snapshot.':''}`;draw();
     } finally {clearTimeout(timeout);if(pending===request)pending=null;if(!disposed && version===generation)schedule();}
   }
+  function notifyContext() {
+    const repo=selection?model?.projects.find(p=>p.key===selection.projectKey)?.repo:commandProject;
+    const cell=selection?model?.projects.find(p=>p.key===selection.projectKey)?.cells.find(c=>c.key===selection.bucketKey):null;
+    onContext({...state,run_number:state.mode==='runs'?cell?.runs[0]?.run_number??null:null,start:cell?.start!=null?new Date(cell.start).toISOString():null,end:cell?.end!=null?new Date(cell.end).toISOString():null,project:repo?{...repo,provider_repo_id:repo.provider_repo_id??repo.id}:null});
+  }
   host.addEventListener('change',event=>{
     const target=event.target;
-    for(const name of ['scope','sort'])if(target.matches(`[data-health-${name}]`)){state[name]=target.value;selection=null;state=ciHealthPreferences(state);save();draw();return;}
-    if(target.matches('[data-health-failures]')){state.failuresOnly=target.checked;selection=null;save();draw();}
+    for(const name of ['scope','sort'])if(target.matches(`[data-health-${name}]`)){state[name]=target.value;selection=null;state=ciHealthPreferences(state);save();draw();notifyContext();return;}
+    if(target.matches('[data-health-failures]')){state.failuresOnly=target.checked;selection=null;save();draw();notifyContext();}
   },{signal:listeners.signal});
-  host.addEventListener('input',event=>{for(const name of ['search','branch'])if(event.target.matches(`[data-health-${name}]`)){state[name]=bounded(event.target.value);selection=null;save();draw();}},{signal:listeners.signal});
+  host.addEventListener('input',event=>{for(const name of ['search','branch'])if(event.target.matches(`[data-health-${name}]`)){state[name]=bounded(event.target.value);selection=null;save();draw();notifyContext();}},{signal:listeners.signal});
   host.addEventListener('toggle',event=>{
     const node=event.target;if(disposed || !host.contains(node) || !node.matches('[data-health-disclosure]'))return;
     const key=node.dataset.healthDisclosure;if(expanded.has(key)===node.open)return;
@@ -146,12 +175,11 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   },{capture:true,signal:listeners.signal});
   host.addEventListener('click',event=>{
     const button=event.target.closest('button');if(!button || !host.contains(button))return;
-    if(button.hasAttribute('data-health-mode')){state.mode=button.dataset.healthMode;selection=null;syncControls();save();draw();return;}
-    if(button.hasAttribute('data-health-layout')){layout=button.dataset.healthLayout;applyLayout();return;}
-    if(button.hasAttribute('data-health-clear')){selection=null;save();draw();return;}
-    if(button.hasAttribute('data-health-bucket')){selection={projectKey:button.dataset.healthProject,bucketKey:button.dataset.healthBucket};save();draw();return;}
-    if(button.hasAttribute('data-health-tree-more')){const key=button.dataset.healthTreeMore;treeLimits.set(key,(treeLimits.get(key) || 100)+100);draw();return;}
-    if(button.hasAttribute('data-health-run')){const record=model?.selectedRows.find(row=>row.runKey===button.dataset.healthRun);if(record){selected=record;selectedKey=record.runKey;draw();onSelectRun(record);}return;}
+    if(button.hasAttribute('data-health-mode')){state.mode=button.dataset.healthMode;selection=null;syncControls();save();draw();notifyContext();return;}
+    if(button.hasAttribute('data-health-clear')){selection=null;save();draw();notifyContext();return;}
+    if(button.hasAttribute('data-health-bucket')){if(state.mode==='runs'&&!model?.projects.find(p=>p.key===button.dataset.healthProject)?.cells.find(c=>c.key===button.dataset.healthBucket)?.runs.length)return;selection={projectKey:button.dataset.healthProject,bucketKey:button.dataset.healthBucket};save();draw();notifyContext();return;}
+    if(button.hasAttribute('data-health-slot-more')){slotLimit+=100;draw();return;}
+    if(button.hasAttribute('data-health-slot-run')){const record=model?.selectedRows.find(row=>row.runKey===button.dataset.healthSlotRun)||model?.projects.flatMap(p=>p.cells.flatMap(c=>c.runs||[])).find(row=>row.runKey===button.dataset.healthSlotRun);if(record){selected=record;selectedKey=record.runKey;draw();onSelectRun(record);}return;}
     if(button.hasAttribute('data-health-step') && selected)onSelectStep(selected,button.dataset.healthStep);
   },{signal:listeners.signal});
   host.addEventListener('keydown',event=>{
@@ -166,9 +194,27 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   draw();refresh();
   return {
     refresh,
-    setLayout(value){if(disposed || !['split','tree','pipeline'].includes(value))return;layout=value;applyLayout();},
+    setObservabilityContext(next={}) {
+      if(disposed)return;
+      rememberDisclosures();
+      if(next.start===null&&next.end===null&&next.run_number==null)selection=null;
+      const nextProject=next.project===undefined?commandProject:next.project;
+      if(JSON.stringify(commandProject)!==JSON.stringify(nextProject))selection=null;
+      commandProject=nextProject;
+      const updated={...state,mode:['runs','hours'].includes(next.mode)?next.mode:[7,14,30].includes(Number(next.days))?String(next.days):state.mode};
+      for(const key of ['scope','branch','search','failuresOnly'])if(next[key]!==undefined)updated[key]=next[key];
+      if(['mode','scope','branch','search','failuresOnly'].some(key=>updated[key]!==state[key]))selection=null;
+      state=ciHealthPreferences(updated);syncControls();save();draw();
+    },
     selectedRun(record){if(disposed)return;selected=record;selectedKey=record?runKey(record):'';draw();},
-    setContext(next={}){if(disposed)return;rememberDisclosures();save();context={repository:next.repository || '',mission:next.mission || '',session:next.session || ''};load();for(const name of ['search','branch'])if(typeof next[name]==='string')state[name]=bounded(next[name]);selected=null;selectedKey='';treeLimits.clear();syncControls();draw(false);},
+    setContext(next={}){if(disposed)return;rememberDisclosures();save();context={repository:next.repository || '',mission:next.mission || '',session:next.session || ''};load();for(const name of ['search','branch'])if(typeof next[name]==='string')state[name]=bounded(next[name]);selected=null;selectedKey='';syncControls();draw(false);},
     dispose(){disposed=true;generation++;clearTimeout(timer);pending?.abort();pending=null;listeners.abort();},
   };
+}
+
+
+export function ciHealthProjectHistory(history,project) {
+  if(!project)return history;
+  const same=row=>String(row.provider_url||'').replace(/\/+$/,'')===String(project.provider_url||'').replace(/\/+$/,'') && String(row.provider_repo_id??row.id)===String(project.provider_repo_id) && row.repository===project.repository;
+  return {...history,repos:rows(history.repos).filter(same),pipelines:rows(history.pipelines).filter(same)};
 }

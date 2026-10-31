@@ -23,6 +23,8 @@ class FakeApp:
         self.calls: list[tuple] = []
         self.merge_result = True
         self.fail_open_prs: set[str] = set()
+        self.fresh = None
+        self.pr_state_error = False
 
     def open_prs(self, repo):
         self.calls.append(("open_prs", repo))
@@ -32,6 +34,17 @@ class FakeApp:
 
     def set_status(self, repo, sha, state, description, *, context="herdr/review-gate"):
         self.calls.append(("set_status", repo, sha, state, description, context))
+
+    def pr_state(self, repo, number):
+        """The fresh single-PR read before a merge: ``fresh`` overrides the listing."""
+        self.calls.append(("pr_state", repo, number))
+        if self.pr_state_error:
+            raise GitHubAppError("unavailable", status=503)
+        if self.fresh == "closed":
+            return None
+        if self.fresh is not None:
+            return self.fresh
+        return next((p for p in self.prs.get(repo, []) if p.number == number), None)
 
     def merge_pr(self, repo, number, sha):
         self.calls.append(("merge_pr", repo, number, sha))
@@ -54,9 +67,9 @@ class FakeApp:
         return [c for c in self.calls if c[0] == name]
 
 
-def pr(number=7, sha=A, *, draft=False, ref="feat/x"):
+def pr(number=7, sha=A, *, draft=False, ref="feat/x", base="main"):
     return PrInfo(
-        number=number, head_sha=sha, head_ref=ref, base_ref="main", author_login="bot", draft=draft
+        number=number, head_sha=sha, head_ref=ref, base_ref=base, author_login="bot", draft=draft
     )
 
 
@@ -117,9 +130,9 @@ def make(repos=(REPO,)):
     return svc, app, store, queue, registry, ci
 
 
-def approve(store, key, sha):
+def approve(store, key, sha, base="main"):
     assert store.on_review_started(key, sha, "reviewer-m")
-    assert store.on_verdict(key, Verdict("PASS", sha, (), "reviewer-m"))
+    assert store.on_verdict(key, Verdict("PASS", sha, (), "reviewer-m"), base_ref=base)
 
 
 def test_new_head_sets_pending_status_first():
@@ -676,3 +689,417 @@ def test_tick_counts_a_durable_failure_and_retries_next_tick():
     sink.fail = False
     assert svc.tick()["errors"] == 0
     assert store.snapshot(KEY).head_sha == A
+
+
+class MaterialApp(FakeApp):
+    """FakeApp that also serves review material (``None`` while ``closed``)."""
+
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    def review_material(self, repo, number, expected_head_sha, *, max_bytes):
+        from herdr_engineering.review_gate.github_app import ReviewMaterial
+
+        if self.closed:
+            return None
+        return ReviewMaterial("t", "b", "main", expected_head_sha, (), False)
+
+
+def _coordinator(store, queue, app):
+    from herdr_engineering.review_gate.config import ReviewerConfig
+    from herdr_engineering.review_gate.coordinator import ReviewCoordinator
+
+    return ReviewCoordinator(
+        store=store, queue=queue, app=app, config=ReviewerConfig(), enrolled=(REPO,)
+    )
+
+
+def _live_jobs(queue):
+    return [j for j in queue.snapshot() if j["key"] == str(KEY) and j["sha"] == A]
+
+
+def test_pr_closed_during_review_and_reopened_is_requeued():
+    svc, app, store, queue, _, ci = make()
+    app.__class__ = MaterialApp
+    app.closed = False
+    coord = _coordinator(store, queue, app)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    svc.tick()
+    app.closed = True  # PR closed while the reviewer fetches
+    assert coord.claim("w1", "reviewer-m") is None
+    assert store.snapshot(KEY).state == State.REVIEWING
+    app.prs[REPO] = []
+    svc.tick()  # PR left the open list: job cancelled
+    assert _live_jobs(queue) == []
+    app.prs[REPO] = [pr()]
+    app.closed = False
+    svc.tick()  # reopened at the same sha
+    svc.tick()
+    assert len(_live_jobs(queue)) == 1
+    claim = coord.claim("w2", "reviewer-m")
+    assert claim is not None and claim.sha == A
+    out = '{"verdict": "PASS", "findings": []}'
+    assert coord.submit(claim.job_id, "w2", out, claim_token=claim.claim_token) == "recorded"
+    assert store.snapshot(KEY).state == State.APPROVED
+
+
+def test_reviewing_pr_with_live_job_is_not_rearmed():
+    svc, app, store, queue, _, ci = make()
+    app.__class__ = MaterialApp
+    app.closed = False
+    coord = _coordinator(store, queue, app)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    svc.tick()
+    claim = coord.claim("w1", "reviewer-m")
+    assert store.snapshot(KEY).state == State.REVIEWING
+    before = _live_jobs(queue)
+    summary = svc.tick()
+    assert summary["enqueued"] == 0
+    after = _live_jobs(queue)
+    assert [j["job_id"] for j in after] == [j["job_id"] for j in before] == [claim.job_id]
+    assert after[0]["state"] == "claimed"
+
+
+class RecordingNotifier:
+    def __init__(self, raises=False):
+        self.calls = []
+        self.raises = raises
+
+    def notify(self, key, snap, head_ref, failures=()):
+        self.calls.append((key, snap.state, snap.head_sha, head_ref, tuple(failures)))
+        if self.raises:
+            raise RuntimeError("notice write failed")
+
+
+def make_notified(notifier):
+    svc, app, store, queue, registry, ci = make()
+    svc._notifier = notifier
+    return svc, app, store, queue, registry, ci
+
+
+def test_service_accepts_notifier_argument():
+    cp = ControlPlaneRepo()
+    notifier = RecordingNotifier()
+    svc = GateService(
+        config=ReviewGateConfig(enabled=True, app=None, repos=(RepoEnrollment(repo=REPO),)),
+        app=FakeApp(),
+        store=PipelineStore(cp),
+        queue=ReviewQueue(cp),
+        registry=AuthorRegistry(cp),
+        ci_snapshot=CI(),
+        notifier=notifier,
+    )
+    assert svc._notifier is notifier
+
+
+def test_service_notifies_ci_red_with_failures_then_on_later_ticks():
+    notifier = RecordingNotifier()
+    svc, app, store, _, _, ci = make_notified(notifier)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "failure", n=3))
+    svc.tick()
+    assert len(notifier.calls) == 1
+    key, state, sha, ref, failures = notifier.calls[0]
+    assert (key, state, sha, ref) == (KEY, State.CI_RED, A, "feat/x")
+    assert failures == ("run 3 failure",)
+    assert app.statuses(A)[-1][4] == "CI failed: run 3 failure"
+    svc.tick()
+    assert len(notifier.calls) == 2 and notifier.calls[1][4] == ()
+    assert [s[3] for s in app.statuses(A)] == ["pending", "failure"]
+
+
+def test_service_notifies_changes_requested_and_escalated_only():
+    notifier = RecordingNotifier()
+    svc, app, store, _, _, ci = make_notified(notifier)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    assert notifier.calls == []  # CI_GREEN: no notification
+    assert store.on_review_started(KEY, A, "reviewer-m")
+    svc.tick()
+    assert notifier.calls == []  # REVIEWING
+    bad = Finding("a.py", "bug", "nope", "high", "fix it", 1)
+    assert store.on_verdict(KEY, Verdict("FAIL", A, (bad,), "reviewer-m"))
+    svc.tick()
+    assert [c[1] for c in notifier.calls] == [State.CHANGES_REQUESTED]
+    assert "changes requested" in app.statuses(A)[-1][4]
+
+
+def test_service_notifies_ci_fix_cap_escalation_with_failures():
+    notifier = RecordingNotifier()
+    svc, app, store, _, _, ci = make_notified(notifier)
+    store._ci_fix_cap = 1
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "failure"))
+    svc.tick()
+    assert [c[1] for c in notifier.calls] == [State.ESCALATED]
+    assert notifier.calls[0][4] == ("run 1 failure",)
+    assert "escalated" in app.statuses(A)[-1][4]
+
+
+def test_service_calls_notifier_and_survives_its_exception(caplog):
+    notifier = RecordingNotifier(raises=True)
+    svc, app, store, _, _, ci = make_notified(notifier)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "failure", n=3))
+    summary = svc.tick()
+    assert summary["errors"] == 0
+    assert len(notifier.calls) == 1
+    assert store.snapshot(KEY).state == State.CI_RED
+    assert app.last_status(A) == "failure"
+    assert f"notification failed for {REPO}#7" in caplog.text
+    assert "notice write failed" not in caplog.text
+    svc.tick()  # retried on the next tick
+    assert len(notifier.calls) == 2
+
+
+class CountingRun:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        import subprocess
+
+        self.calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+
+def test_one_external_launch_per_tick_and_backlog_drains():
+    from herdr_engineering.review_gate.config import NotifyConfig
+    from herdr_engineering.review_gate.notifier import ENTITY, AuthorNotifier
+
+    svc, app, store, _, registry, ci = make()
+    run = CountingRun()
+    svc._notifier = AuthorNotifier(
+        store._repo,
+        config=NotifyConfig(fixer_command=("/usr/local/bin/fixer", "{number}")),
+        registry=registry,
+        dispatcher=lambda *a: {"status": "delivered"},
+        run=run,
+    )
+    c = "c" * 40
+    app.prs[REPO] = [pr(7, A), pr(8, B), pr(9, c)]
+    ci.set(ci_row(A, "failure", n=3), ci_row(B, "failure", n=4), ci_row(c, "failure", n=5))
+
+    def channels(number):
+        stream = store._repo.stream(ENTITY, f"{REPO}#{number}")
+        return [e["payload"]["channel"] for e in stream]
+
+    svc.tick()
+    assert run.calls == [["/usr/local/bin/fixer", "7"]]
+    assert channels(7) == ["author", "fixer"]
+    assert channels(8) == ["author"] and channels(9) == ["author"]  # deferred: no notice
+    svc.tick()
+    assert [c[1] for c in run.calls] == ["7", "8"]
+    assert channels(9) == ["author"]
+    svc.tick()
+    svc.tick()
+    svc.tick()
+    assert [c[1] for c in run.calls] == ["7", "8", "9"]
+    for n in (7, 8, 9):
+        assert channels(n) == ["author", "fixer"]
+    for sha in (A, B, c):
+        assert app.last_status(sha) == "failure"
+
+
+# ------------------------------------------------------------ base retarget
+def _approved_on(base, pr_base):
+    svc, app, store, queue, _, ci = make()
+    app.prs[REPO] = [pr(base=pr_base)]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    svc.tick()
+    approve(store, KEY, A, base=base)
+    queue.cancel(KEY)  # the coordinator completes the job when it records the verdict
+    return svc, app, store, queue
+
+
+def test_retargeted_pr_is_not_merged_and_is_reviewed_again():
+    svc, app, store, queue = _approved_on("feature-x", "main")
+    before = len([j for j in queue.snapshot() if j["sha"] == A])
+    svc.tick()
+    assert app.named("merge_pr") == []
+    assert "success" not in [c[3] for c in app.statuses(A)]
+    assert app.statuses(A)[-1][3:5] == ("pending", "review gate: base branch changed, re-reviewing")
+    snap = store.snapshot(KEY)
+    assert snap.state == State.CI_GREEN and snap.approved_sha is None
+    assert snap.reason == "base branch changed"
+    assert [j["state"] for j in queue.snapshot() if j["sha"] == A] == ["queued"]
+    assert before == 0
+    svc.tick()  # stays queued; no second rearm, no merge
+    assert len([j for j in queue.snapshot() if j["sha"] == A]) == 1
+    assert app.named("merge_pr") == []
+
+
+def test_approval_for_the_same_base_merges():
+    svc, app, store, _ = _approved_on("main", "main")
+    svc.tick()
+    assert app.named("merge_pr") == [("merge_pr", REPO, 7, A)]
+
+
+def test_approval_without_a_recorded_base_fails_closed():
+    svc, app, store, queue = _approved_on(None, "main")  # an old or forged approval
+    assert store.snapshot(KEY).approved_base_ref is None
+    svc.tick()
+    assert app.named("merge_pr") == []
+    assert store.snapshot(KEY).state == State.CI_GREEN
+    assert [j["state"] for j in queue.snapshot() if j["sha"] == A] == ["queued"]
+
+
+# ------------------------------------------------- fresh read before the merge
+def _ready_to_merge():
+    return _approved_on("main", "main")
+
+
+def test_happy_path_reads_the_pr_once_then_posts_success_then_merges():
+    svc, app, _, _ = _ready_to_merge()
+    start = len(app.calls)
+    svc.tick()
+    tail = [c[0] if c[0] != "set_status" else ("set_status", c[3]) for c in app.calls[start:]]
+    assert tail == ["open_prs", "pr_state", ("set_status", "success"), "merge_pr"]
+
+
+def test_retarget_after_listing_before_merge_is_not_merged_and_is_rereviewed():
+    svc, app, store, queue = _ready_to_merge()
+    app.fresh = pr(base="feature-x")  # retargeted after the tick listed it as main
+    svc.tick()
+    assert app.named("merge_pr") == []
+    assert "success" not in [c[3] for c in app.statuses(A)]
+    assert app.statuses(A)[-1][3:5] == ("pending", "review gate: base branch changed, re-reviewing")
+    assert store.snapshot(KEY).state == State.CI_GREEN
+    assert [j["state"] for j in queue.snapshot() if j["sha"] == A] == ["queued"]
+
+
+def test_head_moved_after_listing_before_merge_is_not_merged():
+    svc, app, store, _ = _ready_to_merge()
+    app.fresh = pr(sha=B)
+    n = len(app.statuses(A))
+    svc.tick()
+    assert app.named("merge_pr") == []
+    assert len(app.statuses(A)) == n  # no status change; the next tick sees head B
+    assert store.snapshot(KEY).state == State.APPROVED
+    app.prs[REPO] = [pr(sha=B)]
+    app.fresh = None
+    svc.tick()
+    assert store.snapshot(KEY).head_sha == B and app.named("merge_pr") == []
+
+
+def test_draft_or_closed_after_listing_is_not_merged():
+    for fresh in (pr(draft=True), "closed"):
+        svc, app, store, _ = _ready_to_merge()
+        app.fresh = fresh
+        svc.tick()
+        assert app.named("merge_pr") == []
+        assert "success" not in [c[3] for c in app.statuses(A)]
+        assert "retrying at" in app.statuses(A)[-1][4]  # the merge back-off applies
+        assert store.snapshot(KEY).state == State.APPROVED
+
+
+def test_failing_fresh_read_means_no_merge_and_back_off():
+    svc, app, store, _ = _ready_to_merge()
+    clock = svc._now
+    app.pr_state_error = True
+    summary = svc.tick()
+    assert summary["errors"] == 1
+    assert app.named("merge_pr") == []
+    assert "success" not in [c[3] for c in app.statuses(A)]
+    assert "retrying at" in app.statuses(A)[-1][4]
+    app.pr_state_error = False
+    clock.t += 10
+    svc.tick()  # inside the back-off window: no read, no merge
+    assert app.named("merge_pr") == [] and len(app.named("pr_state")) == 1
+    clock.t += 51
+    svc.tick()
+    assert app.named("merge_pr") == [("merge_pr", REPO, 7, A)]
+
+
+class RecordingMain:
+    def __init__(self, raises=False):
+        self.raises = raises
+        self.calls = []
+
+    def observe(self, enrollment, rows, stale):
+        self.calls.append((enrollment.repo, [r["revision"] for r in rows], stale))
+        if self.raises:
+            raise RuntimeError("boom")
+
+
+def test_main_verifier_runs_each_tick_and_a_fault_does_not_stop_pr_handling():
+    svc, app, store, _, _, ci = make(repos=(REPO, OTHER))
+    main = RecordingMain()
+    svc._main_verifier = main
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    counts = svc.tick()
+    assert counts["main_errors"] == 0 and counts["prs"] == 1
+    assert main.calls == [(REPO, [A], False), (OTHER, [], False)]
+    svc.tick()
+    assert len(main.calls) == 4
+    # a fault is counted per repo and never stops PR handling or the other repos
+    main.raises = True
+    app.prs[REPO] = [pr(sha=B)]
+    ci.set(ci_row(B, "success"))
+    counts = svc.tick()
+    assert counts["main_errors"] == 2 and counts["errors"] == 0
+    assert store.snapshot(KEY).head_sha == B
+    # also when listing the PRs failed
+    app.fail_open_prs.add(REPO)
+    counts = svc.tick()
+    assert counts["errors"] == 1 and counts["main_errors"] == 2
+    assert [c[0] for c in main.calls[-2:]] == [REPO, OTHER]
+
+
+# ---- repair-flow policy hook: scoped to herdr-ci-fix/ branches, off by default, fails closed ----------------
+
+def _approved_pr_service(ref, gate=None):
+    svc, app, store, _, _, ci = make()
+    if gate is not None:
+        svc._repair_gate = gate
+    app.prs[REPO] = [pr(ref=ref)]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    approve(store, KEY, A)
+    return svc, app, store
+
+
+def test_repair_branch_merges_as_before_when_no_policy_is_configured():
+    svc, app, _ = _approved_pr_service("herdr-ci-fix/r9-abc1234")
+    assert svc.tick()["merged"] == 1 and app.named("merge_pr")
+
+
+def test_repair_policy_can_withhold_but_only_for_repair_branches():
+    calls = []
+    def deny(enrollment, pr_, checks):
+        calls.append(pr_.head_ref)
+        return "wait", ("human approval required",)
+    svc, app, store = _approved_pr_service("herdr-ci-fix/r9-abc1234", deny)
+    assert svc.tick()["merged"] == 0 and not app.named("merge_pr") and calls
+    assert any(c[0] == "set_status" and c[3] == "pending" and "repair policy" in c[4] for c in app.calls)
+    svc2, app2, _ = _approved_pr_service("feat/ordinary", deny)           # ordinary PRs never see the hook
+    assert svc2.tick()["merged"] == 1 and app2.named("merge_pr")
+
+
+def test_repair_policy_error_or_reject_fails_closed():
+    def boom(*a):
+        raise RuntimeError("policy backend down")
+    svc, app, _ = _approved_pr_service("herdr-ci-fix/r9-abc1234", boom)
+    assert svc.tick()["merged"] == 0 and not app.named("merge_pr")
+    svc2, app2, _ = _approved_pr_service("herdr-ci-fix/r9-abc1234", lambda *a: ("reject", ("critical path",)))
+    svc2.tick()
+    assert not app2.named("merge_pr") and any(c[0] == "set_status" and c[3] == "failure" for c in app2.calls)
+
+
+def test_repair_policy_allow_cannot_override_a_failing_check():
+    svc, app, store = _approved_pr_service("herdr-ci-fix/r9-abc1234", lambda *a: ("allow", ()))
+    svc._ci_snapshot.set(ci_row(A, "failure"))          # CI turns red after approval: decide_merge rejects first
+    assert svc.tick()["merged"] == 0 and not app.named("merge_pr")
+
+
+def test_repair_policy_allow_merges_when_every_existing_gate_passes():
+    svc, app, _ = _approved_pr_service("herdr-ci-fix/r9-abc1234", lambda *a: ("allow", ()))
+    assert svc.tick()["merged"] == 1 and app.named("merge_pr")

@@ -15,10 +15,14 @@
 # Usage: collab-sync.sh once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR]
 #          [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]
 # Unless --certbot is explicit, Certbot is read from the ACME directory's sibling DIR-venv.
+# --lock-held: the caller (deploy.sh) already holds SYNC_DIR.lock for its whole container work,
+# which is what keeps the minute timer's run out of a deploy; without the flag this run would
+# see that lock and skip its own refresh. Never written into a unit.
 set -euo pipefail
-USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]"
+USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME] [--lock-held]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
 CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"
+FLEET="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
 DIR="$HOME/.local/share/herdr-engineering/collab-sync"
 DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
 CERT_DIR="$HOME/.local/share/herdr-engineering/collab-edge-certs"
@@ -26,9 +30,11 @@ CERT_NAME="localdev.mcp.metabolomics.us"
 ACME="$HOME/.local/share/herdr-engineering/collab-acme"
 CERT_SRC=""
 CERTBOT=""
+LOCK_HELD=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
+    --fleet-config) FLEET="${2:?--fleet-config needs a value}"; shift 2 ;;
     --dir) DIR="${2:?--dir needs a value}"; shift 2 ;;
     --data-dir) DATA_DIR="${2:?--data-dir needs a value}"; shift 2 ;;
     --cert-dir) CERT_DIR="${2:?--cert-dir needs a value}"; shift 2 ;;
@@ -36,6 +42,7 @@ while [ $# -gt 0 ]; do
     --acme-dir) ACME="${2:?--acme-dir needs a value}"; shift 2 ;;
     --certbot) CERTBOT="${2:?--certbot needs a value}"; shift 2 ;;
     --cert-name) CERT_NAME="${2:?--cert-name needs a value}"; shift 2 ;;
+    --lock-held) LOCK_HELD=1; shift ;;
     *) echo "$USAGE" >&2; exit 2 ;;
   esac
 done
@@ -44,9 +51,21 @@ CERTBOT="${CERTBOT:-${ACME}-venv/bin/certbot}"
 read -r POOL GROUP OPERATOR < <(python3 - "$CONFIG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["collab"]
-print(c["cognito_pool"], c.get("cognito_group") or "local.dev", c.get("operator_user") or "")
+print(c["cognito_pool"], c.get("cognito_group") or "local.dev", c.get("operator_user") or "-")
 PY
 ) || { echo "cannot read control_plane.collab from $CONFIG (run deploy.sh)" >&2; exit 1; }
+[ "$OPERATOR" = "-" ] && OPERATOR=""
+# The Rakazo bridge's group comes from the CENTRAL file (this job runs on the host that owns it), never from the
+# collab slice: the public container refuses any setting beyond control_plane.collab. Only when sync_dir is set.
+RAKAZO_GROUP="$(python3 - "$FLEET" <<'PY' 2>/dev/null || true
+import sys, yaml
+try:
+    cog = yaml.safe_load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["rakazo_bridge"]["cognito"]
+    print(cog["required_group"] if cog.get("sync_dir") else "")
+except (OSError, KeyError, TypeError):
+    print("")
+PY
+)"
 REGION="${POOL%%_*}"
 
 # People the operator invites are added to the group here, on the host, because the public
@@ -60,7 +79,9 @@ provision() {
 }
 
 once() {
-  exec 9>"${DIR}.lock"; flock -n 9 || { echo "another collab-sync is running" >&2; return 0; }   # no overlapping runs
+  if [ "$LOCK_HELD" = 0 ]; then   # no overlapping runs (deploy.sh holds this same lock while it recreates containers)
+    exec 9>"${DIR}.lock"; flock -n 9 || { echo "another collab-sync is running" >&2; return 0; }
+  fi
   provision
   mkdir -p "$DIR"; chmod 755 "$DIR"
   local tmp; tmp="$(mktemp -d "$DIR/.tmp.XXXXXX")"; trap 'rm -rf "$tmp"' RETURN
@@ -68,10 +89,19 @@ once() {
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["keys"]' "$tmp/jwks.json"
   aws cognito-idp list-users-in-group --region "$REGION" --user-pool-id "$POOL" --group-name "$GROUP" \
     --query 'Users[].Username' --output json > "$tmp/users.json"
-  python3 - "$tmp/users.json" "$tmp/members.json" "$GROUP" <<'PY'
+  # The Rakazo phone bridge's group rides in the same file (its own container re-checks membership from it). Only
+  # ENABLED users are listed, so disabling someone in Cognito ends their app session like removing them does.
+  echo '[]' > "$tmp/rakazo.json"
+  if [ -n "$RAKAZO_GROUP" ]; then
+    aws cognito-idp list-users-in-group --region "$REGION" --user-pool-id "$POOL" --group-name "$RAKAZO_GROUP" \
+      --query 'Users[?Enabled==`true`].Username' --output json > "$tmp/rakazo.json"
+  fi
+  python3 - "$tmp/users.json" "$tmp/members.json" "$GROUP" "$tmp/rakazo.json" "$RAKAZO_GROUP" <<'PY'
 import json, sys, time
-users = json.load(open(sys.argv[1]))
-json.dump({"updated": time.time(), "groups": {sys.argv[3]: users}}, open(sys.argv[2], "w"))
+groups = {sys.argv[3]: json.load(open(sys.argv[1]))}
+if sys.argv[5]:
+    groups[sys.argv[5]] = json.load(open(sys.argv[4]))
+json.dump({"updated": time.time(), "groups": groups}, open(sys.argv[2], "w"))
 PY
   chmod 644 "$tmp"/*.json
   mv -f "$tmp/jwks.json" "$DIR/jwks.json"; mv -f "$tmp/members.json" "$DIR/members.json"   # atomic per file

@@ -77,6 +77,27 @@ Pi Forge is explicitly excluded.
 - **Incremental implementation.** Every numbered spec has entry/exit criteria and leaves the system usable.
 - **Recoverable changes.** Pinned dependencies, safe config merging, health checks, backups, canaries, and rollback are mandatory.
 
+## View generated files on your active device
+
+Install the shared skill for Claude, Codex, Pi, and OpenCode on a harness host:
+
+```bash
+python3 scripts/install-open-skill.py --activate
+```
+
+This adds managed global instructions to baseline task output and offer newly
+created or changed pictures and HTML at completion. Choose all files,
+a subset, or skip. Markdown opens only when explicitly requested. The destination
+is discovered from live HerdR client connections and desktop capabilities, without
+machine or account questions. Unresolved discovery leaves files unopened. Files are
+verified and opened on that device using its existing desktop applications.
+
+Activation uses harness instructions rather than native completion hooks. Existing
+sessions may need to reload instructions; installation applies to the current host,
+not the whole fleet. Keep this checkout available because installed skills link to
+it. Use `--dry-run` to inspect changes or `--harness` to choose a harness. See
+[the skill](skills/herdr-open/SKILL.md) for supported clients and preview limits.
+
 ## Current validation fleet
 
 The initial fleet is:
@@ -223,8 +244,9 @@ herdr-eng devfabric serve lease_xxx            # or --bind <tailscale-ip> for ot
 # ... or run the auto-registration agent so web services that start on this
 #     host appear at a stable dev:<port> (and in the gateway web UI) with zero
 #     manual steps — a per-host service on every fleet host:
-scripts/fabric-agent.sh --gateway http://dev.lan:29999         # Linux (systemd user unit)
-scripts/fabric-agent-macos.sh --gateway http://dev.lan:29999   # macOS (launchd LaunchAgent)
+# (gateway = fabric.url in fleet-config.yaml, else fabric.gateway_url in config.yaml)
+scripts/fabric-agent.sh          # Linux (systemd user unit)
+scripts/fabric-agent-macos.sh    # macOS (launchd LaunchAgent)
 # remove a machine from the fleet (stop agent, close leases, drop from inventory):
 scripts/fabric-offboard.sh
 herdr-eng tests adapters
@@ -321,6 +343,61 @@ Deployed on **bender**, the control-plane stack serves the HerdR UI at
   `tailscale serve --https=443 http://127.0.0.1:8080` on bender (gives an HTTPS
   URL) — the app itself does not do TLS termination.
 
+#### Host telemetry
+
+The **Hosts** page (list cards plus a per-host detail page) shows how each
+fleet machine is doing: CPU, memory, swap, disk and per-mount usage, load,
+uptime, network rates, GPU (NVIDIA, ROCm, Apple), top processes, the number of
+running agents, and an hourly report of pending/security package updates,
+reboot-required, failed systemd units and tool versions (herdr, pi, autospec,
+herdr-eng, pi extensions) with drift against the fleet's pins. A range picker
+(1h / 24h / 7d) switches the sparklines; a host that is registered but has
+never reported says so instead of showing zeros.
+
+- **Source.** The fabric agent on each host samples every 30 s and posts to the
+  control plane; the slow package/unit/version report runs hourly. Both
+  intervals are YAML only: `fabric.host_report_interval` (default `30`) and
+  `fabric.host_slow_interval` (default `3600`) seconds. A package scan that
+  returns no count (timeout, 120 s) is retried after 5 min, then 15 min, then
+  hourly.
+- **Agents running.** The number of agent processes on the host, from the same
+  `ps` call as the top consumers: processes whose name is exactly one of
+  `fabric.agent_binaries` (YAML, default `["pi", "claude", "codex"]`), counted
+  once per agent (a matching child of a matching process is not counted
+  again). An idle agent TUI counts. If `ps` fails the count is omitted, never 0.
+- **Retention.** Raw samples are kept in memory for 48 h. Each closed 5-minute
+  bucket becomes one averaged rollup point, persisted and kept for 7 days
+  (the bucket open at shutdown is lost). A range query returns at most 300 points.
+- **API.** `GET /api/v1/hosts/<id>` returns the host with `latest`, `updates`,
+  `versions`, `pins`, `fleet_update`, `maintenance`, `problems` and
+  `problem_count`. `GET /api/v1/hosts/<id>/telemetry?range=1h|24h|7d` returns
+  `{"samples": [...], "range": ...}` (any other range is a 400); without
+  `range`, `?limit=N` (1..500, default 100) returns the newest raw samples.
+- **Liveness.** Only the fabric agent's (and herdr's) own events refresh a
+  host's last-seen time. State-only sources such as the fleet update post
+  pins, versions and results without making a silent host look alive.
+
+Problems are computed on the server; each has a code and a severity:
+
+| Code | Severity | Raised when |
+|---|---|---|
+| `never_reported` | critical | the host is registered but has no telemetry |
+| `stale` | critical | no report for more than 15 min (not while `maintenance` is set) |
+| `disk_critical` / `disk_warn` | critical / warning | any mount at 95% / 85% or more |
+| `mem_pressure` | warning | memory above 90% for 5 min (swap above 50% is noted) |
+| `gpu_hot` | warning | a GPU above 85 C |
+| `failed_units` | warning | failed systemd units |
+| `security_updates` | warning | security updates pending |
+| `reboot_required` | warning | a reboot is required |
+| `version_drift` | warning | a reported version differs from its pin |
+| `updates_deferred` | warning | fleet update deferred a busy host for over 7 d |
+| `updates_old` | warning | last successful fleet update over 14 d ago |
+| `updates_unknown` | warning | package update status could not be determined |
+
+Joining hosts to the tailnet, the daily fleet update (security-only apt, busy
+host deferral, pins, maintenance flag, forcing one host) and the Ansible Vault
+setup are documented in [`ansible/README.md`](ansible/README.md).
+
 #### Repeatable deploys
 
 Deploys go through scripts, not hand-built compose overrides. The **central
@@ -376,9 +453,27 @@ Note: the web hydrates from Postgres **once at startup**, so it reflects a
 snapshot of durable state; live updates flow over SSE. Restart the web to
 re-hydrate after external writes.
 
-The UI subscribes to `/api/v1/events/stream` (SSE) for live updates — no
-polling. Secrets in event payloads and messages are redacted at the API
-boundary (never stored or rendered).
+The UI subscribes to `/api/v1/events/stream` (SSE) for live updates. Secrets
+in event payloads and messages are redacted at the API boundary (never stored
+or rendered).
+
+Pages update in place:
+
+- A page loads once, behind a skeleton. After that, events (throttled to one
+  refresh per view every 5 s) and a few dashboards' own polls patch only what
+  changed. Focus, open sections and the text selection survive a refresh.
+- Changed values flash or count up.
+- Every page head has a freshness chip: "live · updated Ns ago" when fresh,
+  amber "stale · …" when stale, red "error · <message> · …" when a refresh
+  fails, and "waiting for first update" before any data.
+- The sidebar has Theme (auto, light, dark) and Calm (auto, on, off) controls,
+  stored per browser. Calm, which is on by default when the OS asks for reduced
+  motion, applies every change at once with no animation.
+
+The conventions for writing a view are in
+[`packages/herdr-web-components/README.md`](packages/herdr-web-components/README.md#live-views-conventions):
+the mounted-view contract, the refresh bus, the patcher, motion helpers, calm
+and dark, and the freshness chip.
 
 #### Live-Postgres end-to-end test (opt-in)
 
@@ -472,7 +567,7 @@ macOS convergence is a documented `BLOCKED_EXTERNAL` item pending a fleet run.
 | stale dev port | `herdr-eng devfabric reconcile` expires stale leases |
 | `ci` says offline / stale | set the CI token: it is `ci.token` in the central fleet config (`herdr-eng fleet config init` asks for it); the token is a secret and never lives in the repo. Without it the view is explicitly stale, never guessed |
 | `ci logs` returns no log text | expected on this Woodpecker 3.x instance: logs stream over WebSocket (no REST endpoint) and the OAuth2 proxy doesn't forward a bearer token on the upgrade. Use the `view_in_web_ui` link it prints; `ci debug` still gives the failing tasks + exit codes |
-| `dev:<port>` unreachable from other hosts | is the gateway up? `herdr-eng devfabric gateway` on the gateway host; point commands at it with `HERDR_ENGINEERING_FABRIC_URL=http://<gateway>:29999` (or `fabric.gateway_url` in config); the app must be bound to the tailnet interface or `0.0.0.0` |
+| `dev:<port>` unreachable from other hosts | is the gateway up? `herdr-eng devfabric gateway` on the gateway host; point hosts at it with `fabric.url` in the central `fleet-config.yaml` (or `fabric.gateway_url` in `config.yaml`); the app must be bound to the tailnet interface or `0.0.0.0` |
 
 ## Dev fabric fleet lifecycle (multi-operator)
 
@@ -494,8 +589,8 @@ that expires dead apps and releases their ports. Every lease then gets a
 stable fleet-wide address — `http://<gateway-magicdns>:<port>` — reachable
 from any tailnet device (desktop, phone, iPad) without knowing the physical
 host. Registrar commands (`register`/`heartbeat`/`close`/`list`) use the
-gateway automatically when configured (`fabric.gateway_url` or
-`HERDR_ENGINEERING_FABRIC_URL`) and degrade to local mode with an explicit
+gateway automatically when configured (`fabric.url` in the central
+`fleet-config.yaml`, or `fabric.gateway_url` in `config.yaml`) and degrade to local mode with an explicit
 warning when it is not reachable. The control API is tailnet+loopback only
 and bearer-token protected when a token is configured. Design and live
 evidence: [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).
@@ -531,6 +626,15 @@ Ansible deploys the same unit + script on the designated gateway host
 Design and deployment model:
 [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).
 
+## Lineage continuity, artifact visibility and delivery metrics
+
+The lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) is a read model over stored events; Pi, AutoSpec and
+GitHub stay authoritative. Operator material: [runbook](docs/operations/lineage-continuity-runbook.md) (restart/replay, interrupted
+handoff, rollback, flags and grants), [release checklist](docs/operations/lineage-release-checklist.md), and the
+[contract section](docs/contracts/lineage-events.md) on artifact nodes, the ACL read gate and `delivery` metrics. Everything is
+off or additive by default; configuration is YAML only. Install and test: `pip install -e '.[dev,collab,review-gate,federation]'`, then
+`python3 -m pytest tests/control_plane/test_artifact_scope.py tests/control_plane/test_lineage_metrics.py -q`.
+
 ## Contributing
 
 See `CONTRIBUTING.md`. In short: run `scripts/validate.sh` (lint + tests +
@@ -555,10 +659,19 @@ curl -X POST http://dev.lan/api/v1/llm/keys/<key_id>/revoke
 export OPENAI_BASE_URL=http://dev.lan:8088/v1 OPENAI_API_KEY=hk-...
 ```
 
-Requests are forwarded to `https://llm.metabolomics.us` with the one dedicated lab key
-(`FABRIC_LLM_UPSTREAM_KEY` in `deploy/control-plane/.env`, never given to agents) and the token
+The Usage page can estimate spend from a price table you put in `control_plane.usage.prices`; see
+[docs/usage-spend-estimate.md](docs/usage-spend-estimate.md).
+
+Requests are forwarded to `llm.upstream_url` (e.g. `https://llm.metabolomics.us`) with the one
+dedicated lab key, `llm.upstream_key` in the central fleet file. `deploy/control-plane/deploy.sh`
+renders only the `llm` section and `control_plane.llm_proxy` into the proxy's 0600 slice
+(`herdr-eng fleet config render-llm`, mounted at `/etc/herdr/llm/`); the proxy reads no
+configuration from the environment and the key is never given to agents (see
+`deploy/control-plane/README.md`). The token
 usage (including streaming) is recorded against the project: `GET /api/v1/analytics/tokens`
-(`?project=`, `?since=`) and the **Token usage** page at `#/analytics/tokens`. Custom models
+(`?project=`, `?since=`; `by_session` maps each row's session id to a dashboard session or
+labels it `unmatched:<id>`, see the LLM page spec, Decision 4) and the **Token usage** page at
+`#/analytics/tokens`. Custom models
 (`POST /api/v1/llm/models {"name","base_url","upstream_model"}`) are routed to their own endpoint
 and never receive the lab key. The gateway is not exposed beyond the fabric. It uses the public
 HTTPS API only; the `upstream` link role (specs repo, spec 63) will replace this path.
@@ -596,9 +709,10 @@ when the command exits, however it exits; `project` mode reuses a cached project
 (`~/.config/herdr-engineering/llm-<project>.env`, 0600, ignored if more permissive) and re-mints it
 if it was revoked. The key never appears in argv, logs, stdout or error text. If the control plane is
 unreachable the command still starts, with a warning (`--require-llm-env` makes that an error).
-Opt out with `--no-llm-env`, `llm: {inject: false}` in config or `HERDR_ENGINEERING_LLM_INJECT=0`.
-When the control plane runs with API keys, give the operator key via
-`HERDR_ENGINEERING_CONTROL_PLANE_KEY` or `~/.config/herdr-engineering/control-plane-key` (0600).
+Opt out with `--no-llm-env` or `llm: {inject: false}` in the config (YAML only; no environment
+variable switches it). When the control plane runs with API keys, the operator key comes from the
+host's fleet config (`agent.api_key`) or `~/.config/herdr-engineering/control-plane-key` (0600;
+ignored if group/world readable).
 The session's own processes (and root) can read the key from its environment; that is the
 trade-off for tracking, and the reason a session key is short-lived. A wrapper killed with
 SIGKILL cannot revoke; its key stays labelled `session:<id>` in `GET /api/v1/llm/keys` for cleanup.

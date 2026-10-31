@@ -84,3 +84,16 @@ def test_principals_that_are_not_herdr_keys_are_ignored(tmp_path):
          "inputTokens": 1, "outputTokens": 1}]}, state)
     assert control.events == []
     assert json.loads(state.read_text())["rows"]  # still baselined, so it is not replayed later
+
+
+def test_the_control_plane_keeps_the_gateway_source_and_drops_unknown_ones():
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    repo = ControlPlaneRepo()
+    repo.record_token_usage_row({"project": "p", "model": "m", "input_tokens": 3,
+                                 "output_tokens": 1, "source": "llm-gateway"})
+    repo.record_token_usage_row({"project": "p", "model": "m", "input_tokens": 3,
+                                 "output_tokens": 1, "source": "made-up"})
+    sources = [json.loads(e["payload"])["source"] if isinstance(e["payload"], str)
+               else e["payload"]["source"]
+               for e in repo._events[("token_usage", "p")]]
+    assert sources == ["llm-gateway", "llm-proxy"]

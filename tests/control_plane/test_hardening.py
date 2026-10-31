@@ -313,3 +313,90 @@ def test_rate_ui_burst_does_not_consume_ingest_budget(rate_limited_server):
     assert _rate_request(server, '/api/v1/services')[0] == 200
     assert _rate_request(server, '/api/v1/health')[0] == 429
     assert _rate_request(server, '/api/v1/ingest', _rate_service(0))[0] == 200
+
+
+def test_redact_payload_keeps_author_logins_but_still_redacts_auth_keys():
+    """"author" contains the hint "auth": the PR author's login is not a secret and the review quorum needs it."""
+    out = redact_payload({"author": "octocat", "authors": ["a"], "auth": "x", "auth_token": "y", "Authorization": "z"})
+    assert out["author"] == "octocat" and out["authors"] == ["a"]
+    assert out["auth"] == out["auth_token"] == out["Authorization"] == "[REDACTED]"
+
+
+def test_redact_delivery_preserves_counts_and_urls_but_scans_values():
+    from herdr_engineering.control_plane.redact import redact_delivery
+    # Delivery records must keep numeric counts, urls and status text, while a
+    # leaked secret anywhere in a string value is redacted.
+    rec = {
+        "test_run_id": "tr1", "passed": 4, "failed": 1, "total": 5,
+        "url": "https://example.com/pr/1", "status": "failed",
+        "results": [{"summary": "runner leaked token abc123xyz789"}],
+        "api_key": "sk-abcDEF123456",
+    }
+    out = redact_delivery(rec)
+    assert out["passed"] == 4 and out["failed"] == 1 and out["total"] == 5
+    assert out["url"] == "https://example.com/pr/1" and out["status"] == "failed"
+    assert out["test_run_id"] == "tr1"
+    assert "abc123xyz789" not in out["results"][0]["summary"]
+    # a key whose NAME hints at a secret is still redacted wholesale
+    assert out["api_key"] == "[REDACTED]"
+
+
+def test_redact_delivery_redacts_a_secret_in_a_passed_value():
+    from herdr_engineering.control_plane.redact import redact_delivery
+    # The 'passed' key must not be blanked merely because it contains 'pass',
+    # but a secret string sitting in that value is still scanned and redacted.
+    out = redact_delivery({"passed": "sk-abcDEF123456"})
+    assert "abcDEF123456" not in out["passed"]
+
+
+def test_passed_exception_is_numeric_only_and_never_global():
+    from herdr_engineering.control_plane.redact import redact_delivery, redact_payload
+
+    unclassified = 'unclassified-credential-value'
+    assert redact_payload({'passed': 3})['passed'] == '[REDACTED]'
+    assert redact_delivery({'passed': unclassified})['passed'] == '[REDACTED]'
+    assert redact_delivery({'results': [{'passed': {'value': unclassified}}]})['results'][0]['passed'] == '[REDACTED]'
+    for count in (None, 0, 3, 3.0):
+        assert redact_delivery({'passed': count})['passed'] == count
+
+
+def test_redact_delivery_redacts_a_shared_string_object_on_every_occurrence():
+    from herdr_engineering.control_plane.redact import redact_delivery
+    # The same string object appearing in several places must be redacted on
+    # every occurrence, not skipped because a sibling was already visited.
+    shared = "leak sk-abcDEF123456"
+    out = redact_delivery({"summary": shared, "results": [{"detail": shared}]})
+    assert "abcDEF123456" not in out["summary"]
+    assert "abcDEF123456" not in out["results"][0]["detail"]
+
+
+def test_redact_delivery_redacts_a_shared_container_on_every_occurrence():
+    from herdr_engineering.control_plane.redact import redact_delivery
+    # The same dict/list object reused in several places must be redacted on
+    # every occurrence: the sanitized copy is reused, never the original.
+    shared = {"detail": "sk-abcDEF123456"}
+    out = redact_delivery({"a": shared, "b": shared})
+    assert "abcDEF123456" not in out["a"]["detail"]
+    assert "abcDEF123456" not in out["b"]["detail"]
+    shared_list = ["sk-abcDEF123456"]
+    out2 = redact_delivery({"x": shared_list, "y": shared_list})
+    assert "abcDEF123456" not in out2["x"][0]
+    assert "abcDEF123456" not in out2["y"][0]
+
+
+def test_redact_does_not_eat_ids_that_merely_end_in_sk_dash_but_still_redacts_real_keys():
+    assert redact_text("task-s6lease") == "task-s6lease"
+    assert redact_text("disk-image-1 and risk-profile-high") == "disk-image-1 and risk-profile-high"
+    assert redact_payload({"task_id": "task-s6lease"})["task_id"] == "task-s6lease"
+    for leaked in ("sk-abcDEF123456", "key=sk-abcDEF123456", "OPENAI_API_KEY_sk-abcDEF123456", '"sk-proj-abcDEF123456"', "(sk-abc123)"):
+        assert "abc" not in redact_text(leaked).replace("[REDACTED]", ""), leaked
+
+
+def test_redact_text_catches_a_key_after_an_ansi_colour_code_or_a_url_encoded_equals_but_not_short_ids():
+    key = "sk-" + "A" * 40
+    for leaked in ("\x1b[32m" + key, "api_key%3D" + key, "\x1b[1;31m" + key + "\x1b[0m", "x=" + key):
+        out = redact_text(leaked)
+        assert "AAAA" not in out and "[REDACTED]" in out, leaked
+    assert redact_text("task-sk-ab") == "task-sk-ab"
+    assert redact_text("\x1b[32mtask-sk-ab\x1b[0m") == "\x1b[32mtask-sk-ab\x1b[0m"
+    assert redact_payload({"task_id": "task-sk-ab"})["task_id"] == "task-sk-ab"

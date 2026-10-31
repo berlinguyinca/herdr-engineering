@@ -62,7 +62,10 @@ def test_summary_fabric_policy_is_operator_owned_and_keeps_validated_fields():
         assert repo.llm_config()['custom_models'][0]['context_window'] == 8192
         assert call(server, '/api/v1/llm/models', {**registration, 'context_window': True}, 'write')[0] == 400
         assert repo.list_custom_models()['summaries']['context_window'] == 8192
-        for kind in ('custom_model', 'llm_key', 'token_usage'):
+        # Adapter-owned types can never be forged through generic ingestion.
+        # (token_usage/resource_usage were moved onto the dispatched allow-list by
+        # issue #36, so they are no longer rejected here — see test_t16_security.)
+        for kind in ('custom_model', 'llm_key'):
             assert call(server, '/api/v1/ingest', {'entity_type': kind, 'entity_id': 'forged',
                 'event_type': f'{kind}.upserted', 'payload': registration}, 'capture')[0] == 400
             assert repo.stream(kind, 'forged') == []

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import tempfile
 from typing import Any
 
 
@@ -42,16 +44,111 @@ class RustFSClient:
 
     def put(self, data: bytes) -> tuple[str, str]:
         digest = self._sha(data).hexdigest()
-        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+        key = self._key_for_digest(digest)
         self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
         return key, digest
 
-    def get(self, content_key: str, expected_sha256: str) -> bytes:
+    def put_at(self, key: str, data: bytes) -> str:
+        """Write a mutable staging object (resumable upload parts) under a ``staging/`` key.
+
+        Content-addressed keys are shared between artifacts and must never be rewritten or deleted per upload, so
+        staging data lives under its own prefix and is the only thing an upload may overwrite or delete.
+        """
+        if not key.startswith("staging/") or ".." in key.split("/"):
+            raise ValueError("put_at only writes under the staging/ prefix")
+        self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
+        return key
+
+    @staticmethod
+    def _key_for_digest(digest: str) -> str:
+        return f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+
+    def put_stream(self, stream: Any, *, expected_sha256: str | None = None,
+                   expected_size: int | None = None, media_type: str | None = None,
+                   chunk_size: int = 1024 * 1024, spool_dir: Any = None) -> dict[str, Any]:
+        """Upload a stream with bounded memory and verified content identity.
+
+        The payload is spooled to a temporary file so large uploads never need
+        to be held in RAM. The S3 client receives a seekable file object through
+        ``upload_fileobj`` when available (boto3/MinIO/RustFS); the fallback
+        ``put_object`` path keeps compatibility with small test clients.
+
+        ``spool_dir`` is where the spool file is created (default: the system temp dir); callers streaming very
+        large uploads pass a directory on large storage.
+        """
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
+        digest = self._sha()
+        size = 0
+        with tempfile.NamedTemporaryFile(mode="w+b", dir=spool_dir) as spool:
+            while True:
+                chunk = stream.read(chunk_size)
+                if not chunk:
+                    break
+                if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                    raise TypeError("artifact stream must return bytes")
+                chunk = bytes(chunk)
+                size += len(chunk)
+                if expected_size is not None and size > expected_size:
+                    raise IntegrityError(
+                        f"size mismatch: expected {expected_size}, received at least {size}")
+                spool.write(chunk)
+                digest.update(chunk)
+            actual = digest.hexdigest()
+            if expected_size is not None and size != expected_size:
+                raise IntegrityError(
+                    f"size mismatch: expected {expected_size}, received {size}")
+            if expected_sha256 is not None and actual != expected_sha256:
+                raise IntegrityError(
+                    f"sha256 mismatch: expected {expected_sha256}, received {actual}")
+            key = self._key_for_digest(actual)
+            spool.seek(0)
+            extra = {"ContentType": media_type} if media_type else None
+            upload_fileobj = getattr(self._s3, "upload_fileobj", None)
+            if upload_fileobj is not None:
+                if extra is None:
+                    upload_fileobj(spool, self._bucket, key)
+                else:
+                    upload_fileobj(spool, self._bucket, key, ExtraArgs=extra)
+            else:
+                self._s3.put_object(Bucket=self._bucket, Key=key, Body=spool, **(extra or {}))
+        return {"key": key, "sha256": actual, "size": size,
+                "media_type": media_type}
+
+    def iter_get(self, content_key: str, expected_sha256: str,
+                 *, chunk_size: int = 1024 * 1024):
+        """Yield bounded chunks; verify the digest when fully consumed."""
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
         body = self._s3.get_object(Bucket=self._bucket, Key=content_key)["Body"]
-        data = body.read() if hasattr(body, "read") else bytes(body)
-        if self._sha(data).hexdigest() != expected_sha256:
+        if not hasattr(body, "read") and not hasattr(body, "iter_chunks"):
+            body = io.BytesIO(bytes(body))
+        digest = self._sha()
+        try:
+            iterator = body.iter_chunks(chunk_size=chunk_size) \
+                if hasattr(body, "iter_chunks") else None
+            if iterator is not None:
+                for chunk in iterator:
+                    if chunk:
+                        digest.update(chunk)
+                        yield chunk
+            else:
+                while True:
+                    chunk = body.read(chunk_size)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    yield chunk
+        finally:
+            close = getattr(body, "close", None)
+            if close is not None:
+                close()
+        actual = digest.hexdigest()
+        if actual != expected_sha256:
             raise IntegrityError(f"sha256 mismatch for {content_key}")
-        return data
+
+    def get(self, content_key: str, expected_sha256: str) -> bytes:
+        return b"".join(self.iter_get(content_key, expected_sha256))
 
     def head(self, content_key: str) -> bool:
         try:

@@ -84,6 +84,32 @@ def _seed(repo):
     repo.upsert_pull_request('pr-1', mission_id='pi:MSN-PI1', number=42,
                              url='https://example.com/pr/42', status='merged',
                              branch='ws/x', base='main')
+    # Delivery sections for mission m1 (Alpha): a failing test run, a build, a
+    # review with a blocking finding and an open pull request.
+    repo.upsert_test_run('alpha-run-fail', mission_id=m1, status='failed',
+                         passed=2, failed=1, skipped=0, total=3,
+                         started_at='2026-10-01T10:00:00+00:00',
+                         ended_at='2026-10-01T10:00:42+00:00')
+    repo.upsert_test_run('alpha-build-1', mission_id=m1, status='ok', kind='build',
+                         started_at='2026-10-01T09:55:00+00:00',
+                         ended_at='2026-10-01T09:55:18+00:00')
+    repo.upsert_review('alpha-review-1', mission_id=m1, reviewer='codex',
+                       status='completed', verdict='changes_requested',
+                       started_at='2026-10-01T11:00:00+00:00',
+                       completed_at='2026-10-01T11:05:00+00:00')
+    repo.upsert_review('alpha-review-unknown', mission_id=m1, reviewer='automation',
+                       status='completed', verdict='UNKNOWN',
+                       started_at='2026-10-01T11:10:00+00:00',
+                       completed_at='2026-10-01T11:10:01+00:00')
+    repo.add_review_finding('alpha-review-1', severity='blocker',
+                            summary='Parser crashes on empty input',
+                            detail='Reproduce with an empty spectra file.')
+    repo.upsert_pull_request('alpha-pr-1', mission_id=m1, number=7,
+                             url='https://example.com/pr/7', status='open',
+                             branch='ws/alpha', base='main')
+    repo.upsert_pull_request('alpha-pr-unsafe', mission_id=m1, number=99,
+                             url='javascript:alert(1)', status='open',
+                             branch='unsafe', base='main')
     return m1, m2, s1
 
 
@@ -112,19 +138,131 @@ def _seed_inspector(repo, sid):
     ]})
 
 
+def _seed_llm(repo, session_id):
+    """Usage records for the LLM page: 30 good streams for one dashboard session, a few
+    failures, one request from a session the dashboard does not know, and a v1 record."""
+    base = {"schema": 2, "project": "herdr", "model": "qwen", "route": "fabric", "stream": True,
+            "usage_known": True, "status": 200}
+    for i in range(30):
+        repo.record_token_usage_row({**base, "session_id": session_id, "input_tokens": 50, "output_tokens": 200,
+                                     "ttft_ms": 300 + 10 * i, "gen_ms": 4000, "queue_ms": 0, "duration_ms": 4400})
+    for status, cls in ((429, "upstream_admission"), (429, "upstream_admission"), (502, "upstream_unreachable")):
+        repo.record_token_usage_row({**base, "session_id": session_id, "status": status, "error_class": cls,
+                                     "duration_ms": 50})
+    repo.record_token_usage_row({**base, "session_id": "zz-unknown-1", "output_tokens": 10, "input_tokens": 1,
+                                 "ttft_ms": 100, "gen_ms": 100, "duration_ms": 150})
+    repo.record_token_usage("herdr", "legacy-model", 5, 6)
+
+
+def _seed_attention(repo):
+    """One failed agent: a critical inbox item next to the fleet-drift warning the base seed already causes."""
+    sid = repo.create_session(agent_role="pi", model="gpt-4o")
+    repo._sessions[sid]["status"] = "failed"
+    repo._sessions[sid]["title"] = "Broken parser agent"
+    return sid
+
+
+def _seed_related(repo, session_id, mission_id):
+    """Foreign keys for the Related panel: the dashboard agent gets a repository, branch and host, and
+    the mission gets a review, a pull request and a CI run on the same branch."""
+    repo.upsert_session(session_id, host_id="beast", repository_id="org/app", branch="fix/parser")
+    repo.upsert_review("rev-1", mission_id=mission_id, session_id=session_id, reviewer="codex",
+                       status="done", verdict="approved")
+    repo.upsert_pull_request("pr-rel", mission_id=mission_id, repository="org/app", number=214,
+                             status="open", branch="fix/parser")
+    repo.observe_ci_pipeline({"repository": "org/app", "provider_repo_id": 7, "run_number": 12,
+                              "branch": "fix/parser", "state": "success"})
+
+
+def _seed_missions(repo, m1, s1):
+    """Missions in each state for the story page: Alpha succeeded with an outcome, Gamma failed, Delta ended
+    before outcomes were kept, Beta (the base seed) still running."""
+    from herdr_engineering.control_plane.mission_outcome import MissionOutcomes, missions_config
+    outcomes = MissionOutcomes(repo, missions_config(None))
+    repo.mission_outcomes = outcomes
+    _seed_related(repo, s1, m1)
+    repo.set_mission_stage(m1, "complete")
+    repo.upsert_mission("gamma", title="Gamma", stage="implementation")
+    repo.set_mission_stage("gamma", "failed")
+    repo.upsert_mission("delta", title="Delta", stage="implementation")
+    repo.mission_outcomes = None
+    repo.set_mission_stage("delta", "complete")
+
+
 def main():
     repo = ControlPlaneRepo()
     _m1, _m2, _s1 = _seed(repo)
     if os.environ.get("INSPECTOR_SEED", "1") != "0":
         _seed_inspector(repo, _s1)
+    if os.environ.get("LLM_SEED") == "1":
+        _seed_llm(repo, _s1)
+    if os.environ.get("ATTENTION_SEED") == "1":
+        _seed_attention(repo)
+    if os.environ.get("RELATED_SEED") == "1":
+        _seed_related(repo, _s1, _m1)
+    if os.environ.get("MISSION_STORY_SEED") == "1":
+        _seed_missions(repo, _m1, _s1)
 
-    svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
-                             web_root=_REPO / "packages")
+    # A fixture price table for the Usage page's spend estimate (production reads control_plane.usage.prices from YAML).
+    usage_prices = ([{"model": "qwen*", "input": 100.0, "output": 200.0, "cached": None, "cached_in_input": False}]
+                    if os.environ.get("USAGE_PRICES_SEED") == "1" else None)
+    # No quiet hours: the production default (22:00-07:00 on the browser's clock) would hold notifications back, so
+    # a browser test would pass in the evening and fail at night.
+    svr = ControlPlaneServer(repo, host="127.0.0.1", port=0, usage_prices=usage_prices,
+                             attention={"notify": {"quiet_hours": None}}, web_root=_REPO / "packages")
     # Stricter than the production default (600/min): a throttled live-
     # refreshing dashboard must respect a finite per-IP budget. This makes the
     # rate-limit regression test fast and unambiguous (an un-throttled client
     # re-rendering on every event exceeds even 600/min within ~18s, but trips
     # this 200/min budget in a few seconds).
+    if os.environ.get("ATTENTION_TRIGGER"):
+        # A second failure that appears when the test creates this file, so a notification has something new to announce.
+        def _wait_for_trigger():
+            while not os.path.exists(os.environ["ATTENTION_TRIGGER"]):
+                time.sleep(0.1)
+            _seed_attention(repo)
+        threading.Thread(target=_wait_for_trigger, daemon=True).start()
+    if os.environ.get("PR_TRAIL_SEED") == "1":
+        # org/app#214 (RELATED_SEED) was produced by the dashboard agent; it handed work to a Claude agent, which accepted, and a second
+        # handoff was rejected.
+        actor = {"actor_id": "fixture", "kind": "agent"}
+        base = {"source_harness": "pi", "target_harness": "claude", "source_session_id": _s1, "mission_id": _m1}
+        svr.handoffs.create({**base, "handoff_id": "h-ok", "target_session_id": "s-claude", "goal": "write the parser tests"}, actor)
+        for state in ("claimed", "accepted", "in_progress"):
+            svr.handoffs.transition("h-ok", state, actor)
+        svr.handoffs.create({**base, "handoff_id": "h-no", "target_session_id": "s-other", "goal": "port it to Rust"}, actor)
+        for state in ("claimed", "rejected"):
+            svr.handoffs.transition("h-no", state, actor)
+    if os.environ.get("AGENT_EVOLUTION_SEED") == "1":
+        # The dashboard agent (with RELATED_SEED: org/app, fix/parser) was handed work by a Claude agent, failed once and was restarted;
+        # its tool calls form two runs with a long silence between them, and one failed call was repeated (a retry).
+        from datetime import UTC, datetime, timedelta
+        actor = {"actor_id": "fixture", "kind": "agent"}
+        svr.handoffs.create({"handoff_id": "h-in", "source_harness": "claude", "target_harness": "pi", "source_session_id": "s-claude", "target_session_id": _s1,
+                             "goal": "fix the parser crash on empty input", "completed": ["reproduced the crash"], "remaining": ["patch", "tests"],
+                             "decisions": ["keep the public API"], "mission_id": _m1}, actor)
+        for state in ("claimed", "accepted"):
+            svr.handoffs.transition("h-in", state, actor)
+        for status in ("failed", "running"):
+            repo.upsert_session(_s1, host_id="beast", status=status)
+        now = datetime.now(UTC)
+
+        def at(minutes_ago):
+            return (now - timedelta(minutes=minutes_ago)).isoformat()
+
+        def tool(call, minutes_ago, phase, **kw):
+            return {"kind": "tool", "call_id": call, "phase": phase, "ts": at(minutes_ago), **kw}
+        repo.inspector.ingest(_s1, {"events": [
+            tool("e1", 90, "start", tool="bash", args_preview="pytest -q tests/test_parser.py"),
+            tool("e1", 90, "end", output="1 failed", exit_code=1, is_error=True, duration_ms=1200),
+            tool("e2", 88, "start", tool="bash", args_preview="pytest -q tests/test_parser.py"),
+            tool("e2", 88, "end", output="1 passed", exit_code=0, duration_ms=900),
+            tool("e3", 20, "start", tool="edit", args_preview="src/parser.py"),
+            tool("e3", 20, "end", output="ok", exit_code=0, duration_ms=50),
+        ]})
+    if os.environ.get("CI_OFFLINE") == "1":
+        # The host may have a real Woodpecker token; a hermetic page must not list real runs.
+        svr.ci_monitor._factory = lambda: type("Offline", (), {"available": False})()
     budget = int(os.environ.get("RATE_BUDGET", "200"))
     svr._limiter = _RateLimiter(max_requests=budget, window_seconds=60)
     threading.Thread(target=svr.serve, daemon=True).start()

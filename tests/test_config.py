@@ -2,6 +2,8 @@
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from herdr_engineering.config import (
     DEFAULTS,
     _deep_merge,
@@ -109,3 +111,79 @@ def test_invalid_version_rejected(tmp_path):
         raise AssertionError("expected InvalidError")
     except InvalidError:
         pass
+
+
+def test_github_organizations_default_to_every_owner(tmp_path):
+    from herdr_engineering.config import github_organizations
+    assert DEFAULTS["github"]["organizations"] == []
+    assert github_organizations(None) == [] and github_organizations([]) == []
+    assert github_organizations(["Acme", "acme", " fiehnlab "]) == ["acme", "fiehnlab"]
+    p = _write(tmp_path / "gh.yaml", """
+        version: 1
+        github:
+          organizations: [Acme, fiehnlab]
+    """)
+    assert load_config([p])["github"]["organizations"] == ["Acme", "fiehnlab"]
+
+
+
+@pytest.mark.parametrize("value", ["acme", {"acme": True}, [""], ["  "], ["acme", 3], [None]])
+def test_invalid_github_organizations_are_rejected_with_a_clear_error(tmp_path, value):
+    from herdr_engineering.config import github_organizations
+    with pytest.raises(InvalidError, match="github.organizations"):
+        github_organizations(value)
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"organizations": value}}))
+    with pytest.raises(InvalidError, match="github.organizations"):
+        load_config([p])
+
+
+def test_projects_settings_default_off_and_override():
+    from herdr_engineering.config import github_projects
+    assert DEFAULTS["github"]["projects"] == {"enabled": False, "item_limit": 2000}
+    assert github_projects(None) == {"enabled": False, "item_limit": 2000}
+    assert github_projects({"enabled": True, "item_limit": 50}) == {"enabled": True, "item_limit": 50}
+
+
+@pytest.mark.parametrize(("key", "value"), [("enabled", "yes"), ("enabled", 1), ("item_limit", 0),
+                                            ("item_limit", True), ("item_limit", "many"), ("item_limit", 2.5)])
+def test_invalid_projects_settings_are_rejected(tmp_path, key, value):
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"projects": {key: value}}}))
+    with pytest.raises(InvalidError, match=f"github.projects.{key}"):
+        load_config([p])
+
+
+def test_projects_settings_must_be_a_mapping(tmp_path):
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"projects": ["acme"]}}))
+    with pytest.raises(InvalidError, match="github.projects must be a mapping"):
+        load_config([p])
+
+
+@pytest.mark.parametrize("value", [0, -5, "daily", True])
+def test_invalid_full_reconcile_interval_is_rejected(tmp_path, value):
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"sync": {"full_reconcile_interval": value}}}))
+    with pytest.raises(InvalidError, match="github.sync.full_reconcile_interval"):
+        load_config([p])
+
+
+@pytest.mark.parametrize("key", ["interval", "point_budget"])
+@pytest.mark.parametrize("value", [0, -5, "many", True, 1.5])
+def test_invalid_sync_settings_are_rejected(tmp_path, key, value):
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"sync": {key: value}}}))
+    with pytest.raises(InvalidError, match=f"github.sync.{key}"):
+        load_config([p])
+
+
+def test_sync_settings_default_and_override():
+    from herdr_engineering.config import github_sync
+    assert github_sync(None) == {"interval": 300, "full_reconcile_interval": 86400, "point_budget": 400}
+    assert github_sync({"point_budget": 50})["point_budget"] == 50

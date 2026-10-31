@@ -6,15 +6,28 @@ secrets are not stored or rendered.
 """
 from __future__ import annotations
 
+import functools
+import math
 import re
 from typing import Any
 
 # Ordered so longer/more specific patterns win over generic ones.
 _PATTERNS = [
-    # OpenAI-style keys: sk-...
-    re.compile(r"sk-[A-Za-z0-9\-_]{3,}"),
-    # AWS access key id
-    re.compile(r"AKIA[0-9A-Z]{16}"),
+    # OpenAI-style keys: sk-... (not inside a longer word: "task-s6lease", "disk-image-1" are ids, not keys; found
+    # by the T16 acceptance run, which saw a task id stored as "ta[REDACTED]")
+    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9\-_]{3,}"),
+    # ... but a key-length run is a key wherever it sits: right after an ANSI colour code ("\x1b[32msk-...", the "m" is a word
+    # character) or a URL-encoded "=" ("api_key%3Dsk-..."), which CI logs routinely contain. Ids such as "task-sk-ab" are
+    # far shorter than 20 characters after "sk-" and stay untouched.
+    re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
+    # AWS access key id (and the temporary ASIA form), wherever it sits
+    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    # AWS secret access key: 40 base64 characters after an aws secret label
+    re.compile(r"(?i)aws[_\- ]?secret[_\- ]?(?:access[_\- ]?)?key[\"']?\s*[:=]?\s*[\"']?[A-Za-z0-9/+=]{30,}"),
+    # GitHub tokens (classic, fine-grained, OAuth, app, refresh) and Slack tokens
+    re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])xox[abprse]-[A-Za-z0-9-]{10,}"),
     # generic bearer tokens / JWTs (three base64url dot-separated parts)
     re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
     re.compile(r"eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+"),
@@ -49,6 +62,11 @@ _SECRET_KEY_HINTS = (
 )
 
 
+#: Keys that merely CONTAIN a hint ("author" contains "auth") but carry no secret. The head-bound review quorum
+#: excludes the PR author's own approval by comparing this login (T06), so redacting it to "[REDACTED]" silently let
+#: an author approve their own PR (found by the T16 acceptance run).
+_PLAIN_KEYS = frozenset({"author", "authors", "author_login", "author_name"})
+
 _BEGIN = re.compile(r"-----BEGIN[ A-Z]*PRIVATE KEY-----")
 _END = re.compile(r"-----END[ A-Z]*PRIVATE KEY-----")
 
@@ -72,6 +90,18 @@ def _redact_private_keys(text: str) -> str:
     return "".join(out)
 
 
+#: Bounded size of the ``redact_text`` memoization cache.
+_REDACT_CACHE_MAXSIZE = 8192
+
+# Redaction rules are module-level constants fixed at import (a rules change ships
+# as a new image / process, which starts a fresh cache). redact_text is pure and
+# deterministic, so memoizing it avoids re-running the regex scan over the same
+# message/payload text on every agent-summaries poll. Bounded so unique large
+# payloads (review bodies, github text) cannot grow memory without limit. Strings
+# are immutable, so sharing a cached result is safe. lru_cache is thread-safe,
+# which matters because the control-plane web redacts concurrently from many
+# request-handler threads (this was a GIL-bound hot path pegging a full core).
+@functools.lru_cache(maxsize=_REDACT_CACHE_MAXSIZE)
 def redact_text(text: str) -> str:
     """Replace secret-looking substrings in a string with [REDACTED]."""
     if not text:
@@ -82,25 +112,167 @@ def redact_text(text: str) -> str:
     return out
 
 
-def redact_payload(payload: Any, *, _seen=None) -> Any:
-    """Recursively redact secret values/keys inside an event payload / JSON."""
-    _seen = _seen if _seen is not None else set()
-    if id(payload) in _seen:
+def redact_text_cache_clear() -> None:
+    """Drop the ``redact_text`` memoization cache (tests / future rule hot-reload)."""
+    redact_text.cache_clear()
+
+
+def redact_payload(payload: Any, *, _seen=None, _memo=None) -> Any:
+    """Redact every occurrence, memoizing sanitized containers and masking cycles."""
+    if isinstance(payload, str):
+        return redact_text(payload)
+    if not isinstance(payload, (dict, list, tuple)):
         return payload
-    _seen.add(id(payload))
+    active = _seen if _seen is not None else set()
+    memo = _memo if _memo is not None else {}
+    identity = id(payload)
+    if identity in active:
+        return _REDACTED
+    if identity in memo:
+        return memo[identity]
+    active.add(identity)
+    try:
+        if isinstance(payload, dict):
+            result = {}
+            for key, value in payload.items():
+                lk = str(key).lower()
+                if lk not in _PLAIN_KEYS and any(s in lk for s in _SECRET_KEY_HINTS):
+                    result[key] = _REDACTED
+                else:
+                    result[key] = redact_payload(value, _seen=active, _memo=memo)
+        elif isinstance(payload, list):
+            result = [redact_payload(item, _seen=active, _memo=memo) for item in payload]
+        else:
+            result = tuple(redact_payload(item, _seen=active, _memo=memo) for item in payload)
+        memo[identity] = result
+        return result
+    finally:
+        active.remove(identity)
+
+
+def redact_values(payload: Any) -> Any:
+    """Like ``redact_payload`` but never by key name: only string values are scanned."""
     if isinstance(payload, str):
         return redact_text(payload)
     if isinstance(payload, dict):
+        return {key: redact_values(value) for key, value in payload.items()}
+    if isinstance(payload, (list, tuple)):
+        return type(payload)(redact_values(item) for item in payload)
+    return payload
+
+
+#: Delivery-record keys whose VALUES are scanned for secrets but that never
+#: themselves carry a secret, so key-name redaction must not blank them. This
+#: is delivery-specific (unlike the global ``_PLAIN_KEYS``): the count fields
+#: ``passed``/``failed``/``skipped``/``total`` and ``url`` stay intact, while
+#: other string values are scanned by ``redact_text``. The hint-bearing
+#: ``passed`` exception is limited to nonnegative numeric counts or None.
+_DELIVERY_VALUE_KEYS = frozenset({
+    "passed", "failed", "skipped", "total", "url", "status", "verdict",
+    "reviewer", "repository", "branch", "base", "number", "severity",
+    "summary", "detail", "label", "kind", "test_run_id", "review_id",
+    "pr_id", "finding_id", "mission_id", "session_id", "started_at",
+    "ended_at", "created_at", "updated_at", "completed_at",
+})
+
+
+def redact_delivery(payload: Any, *, _memo=None, _active=None) -> Any:
+    """Redact a delivery record (tests/builds/reviews/pulls) for display.
+
+    Numeric counts and structural fields survive; string values are scanned for
+    leaked secrets via ``redact_text``. Nonnumeric ``passed`` values are masked
+    wholesale so an unrecognized credential cannot bypass key-name redaction.
+    Keys whose names hint at a secret (e.g. a ``token`` or ``api_key`` field)
+    are redacted wholesale. Unlike ``redact_payload`` this never blanks the
+    ``passed`` count key merely because it contains the substring ``pass``.
+
+    A memoized result is returned for a repeated container object (cycle
+    safety), so a shared dict/list never leaks a secret on a later occurrence:
+    the sanitized copy is reused, never the original.
+    """
+    _memo = _memo if _memo is not None else {}
+    _active = _active if _active is not None else set()
+    if isinstance(payload, str):
+        # Redact every occurrence: the same string object may appear more than
+        # once, and a shared string must never bypass scanning because a sibling
+        # occurrence was already visited. Cycle safety is handled per-container.
+        return redact_text(payload)
+    if isinstance(payload, dict):
+        ident = id(payload)
+        if ident in _memo:
+            return _memo[ident]
+        if ident in _active:
+            return payload  # direct cycle; nothing to redact that isn't already
+        _active.add(ident)
         result = {}
         for key, value in payload.items():
             lk = str(key).lower()
-            if any(s in lk for s in _SECRET_KEY_HINTS):
+            if lk == "passed":
+                safe_count = (value is None or type(value) is int and value >= 0
+                              or type(value) is float and value >= 0 and math.isfinite(value))
+                if not safe_count:
+                    result[key] = _REDACTED
+                    continue
+            if any(s in lk for s in _SECRET_KEY_HINTS) and lk not in _DELIVERY_VALUE_KEYS:
                 result[key] = _REDACTED
             else:
-                result[key] = redact_payload(value, _seen=_seen)
+                result[key] = redact_delivery(value, _memo=_memo, _active=_active)
+        _active.discard(ident)
+        _memo[ident] = result
         return result
-    if isinstance(payload, list):
-        return [redact_payload(item, _seen=_seen) for item in payload]
-    if isinstance(payload, tuple):
-        return tuple(redact_payload(item, _seen=_seen) for item in payload)
+    if isinstance(payload, (list, tuple)):
+        ident = id(payload)
+        if ident in _memo:
+            return _memo[ident]
+        if ident in _active:
+            return payload  # direct cycle
+        _active.add(ident)
+        result = type(payload)(redact_delivery(item, _memo=_memo, _active=_active) for item in payload)
+        _active.discard(ident)
+        _memo[ident] = result
+        return result
     return payload
+
+
+#: Host state keys whose dict KEYS are data (package / extension / unit names),
+#: so key-name redaction would turn e.g. a pi extension ``auth-helper`` into
+#: "[REDACTED]" and report permanent version drift. Their values are still scanned.
+HOST_STATE_VALUE_ONLY = ("versions", "pins", "updates", "fleet_update")
+
+
+def redact_ingest_body(body: Any) -> Any:
+    """Redaction for a generic ``/api/v1/ingest`` envelope.
+
+    Host-state envelopes keep their package/unit/extension dict KEYS intact
+    (their values are still scanned). Delivery envelopes (tests/builds/reviews/
+    pulls) go through the delivery-aware redactor so numeric count fields like
+    ``passed`` survive instead of being blanked because their name contains the
+    substring ``pass``; their string values are still scanned for secrets.
+    Everything else uses the global ``redact_payload``.
+    """
+    if not (isinstance(body, dict) and isinstance(body.get("payload"), dict)):
+        return redact_payload(body)
+    entity_type = body.get("entity_type")
+    if entity_type in ("test_run", "build", "review", "review_finding", "pull_request"):
+        return redact_delivery(body)
+    if entity_type != "host":
+        return redact_payload(body)
+    payload = body["payload"]
+    rest = {k: v for k, v in body.items() if k != "payload"}
+    out = redact_payload(rest)
+    out["payload"] = redact_payload(
+        {k: v for k, v in payload.items() if k not in HOST_STATE_VALUE_ONLY})
+    for key in HOST_STATE_VALUE_ONLY:
+        if key in payload:
+            out["payload"][key] = redact_values(payload[key])
+    return out
+
+
+def rules_fingerprint() -> str:
+    """Stable digest of every redaction rule. A stored projection built under different rules is stale."""
+    import hashlib
+    h = hashlib.sha256()
+    for pattern in _PATTERNS:
+        h.update(f"{pattern.flags}:{pattern.pattern}\0".encode())
+    h.update("|".join(_SECRET_KEY_HINTS).encode() + b"\0" + "|".join(sorted(_PLAIN_KEYS)).encode())
+    return h.hexdigest()

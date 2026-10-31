@@ -1,6 +1,7 @@
 // Read-only Pi mission telemetry. Clocks redraw locally; polling never creates
 // activity events, attention notifications, or session control operations.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { skeleton } from './motion.js';
 
 const list = (value) => Array.isArray(value) ? value : [];
 const records = (value) => list(value).filter(item => item && typeof item === 'object' && !Array.isArray(item));
@@ -56,6 +57,19 @@ const shortTitle = value => value.length > 180 ? `${value.slice(0, 177).trimEnd(
 function disclosure(key, title, body, open = false) {
   return `<details class="hd-card ml-disclosure" data-disclosure="${esc(key)}"${open ? ' open' : ''}><summary>${esc(title)}</summary>${body}</details>`;
 }
+// Which model a mission is pinned to and which agents ran elsewhere (Pi `modelUse`); absent on older Pi.
+function modelUseLine(u) {
+  if (!u || typeof u !== 'object' || Array.isArray(u)) return '';
+  const away = records(u.agents).filter(x => x.onPin === false).length;
+  const head = u.pin ? `Pinned to ${text(u.pin)}` : 'Not pinned · models chosen by role';
+  return away ? `${head} · ${away} agent${away === 1 ? '' : 's'} on another model` : head;
+}
+function modelUseAgents(u) {
+  return records(u?.agents).slice(0, 100).map(x => row(
+    [x.role, x.workerId].filter(Boolean).join(' · ') || 'Agent',
+    `${x.model || 'Model not reported'}${x.onPin === true ? ' · on pin' : x.onPin === false ? ` · other model${x.why ? ` (${text(x.why)})` : ''}` : ''}${x.state ? ` · ${human(x.state)}` : ''}`,
+  )).join('');
+}
 function model(w) { return [w.route, w.model].filter(Boolean).join(' → ') || 'Model not reported'; }
 function freshnessLabel(f, health) {
   if (f.state === 'updating') return `Updating telemetry · current details unavailable · last reported ${health}`;
@@ -78,6 +92,7 @@ export function missionCard(p, now = Date.now(), detail = false) {
     ${row('Waiting', human(a.waitingReason))}${a.waitingSince ? `<div class="ml-clocks">${clock('Waiting for', a.waitingSince, now)}</div>` : ''}
     <div class="muted" data-workers-label>${f.state === 'live' ? 'Workers' : 'Last recorded workers'}</div>
     ${detail ? `<div>${workers.length - finished} current · ${finished} ${terminalMission(m) ? 'recorded' : 'finished'}</div>` : records(a.workerDetails).length ? `<div class="ml-workers-summary">${records(a.workerDetails).slice(0, 100).map(w => `<div>${esc(w.workerId)} · ${esc(w.health || w.state || 'unknown')} · ${esc(model(w))}</div>`).join('')}</div>` : '<div class="muted">Worker detail not reported</div>'}
+    ${row('Models', modelUseLine(a.modelUse))}
     ${row('Next action', a.nextAction)}
   </article>`;
 }
@@ -112,6 +127,7 @@ export function missionDetail(p, now = Date.now()) {
   const blocked = ['blocked', 'stalled', 'failed'].includes(health) || health.startsWith('paused:');
   return `${missionCard(p, now, true)}
     ${errors.length || a.reason ? disclosure('blockers', 'Errors and blockers', `${row('Reason', a.reason)}${errors.map(e => row(`${e.count ?? 1} occurrences`, e.example)).join('')}${row('Recovery', a.action)}`, blocked) : ''}
+    ${a.modelUse && records(a.modelUse.agents).length ? disclosure('models', `Models and agents · ${records(a.modelUse.agents).length}`, modelUseAgents(a.modelUse)) : ''}
     ${disclosure('brief', 'Mission brief', `<div class="ml-brief">${row('Full title', m.title || m.id)}${row('Objective', a.currentObjective)}</div>`)}
     <h2 data-detail-workers>${current ? 'Workers' : 'Last recorded workers'}</h2>
     ${currentWorkers.length ? currentWorkers.map(renderWorker).join('') : '<p class="muted">No current worker activity reported.</p>'}
@@ -139,12 +155,13 @@ const styles = `<style>
 .ml-log{border-bottom:1px solid var(--border-subtle);padding:6px 0}.ml-content h3{margin-top:0}.ml-content{min-width:0}.ml-content .hd-grid{align-items:start}
 </style>`;
 
-export function mountMissionActivity(container, client, missionKey) {
+// onStatus(ok, message) reports each poll to the page's freshness chip (the page owns the chip).
+export function mountMissionActivity(container, client, missionKey, { onStatus = () => {} } = {}) {
   let disposed = false, controller = null, pollTimer = null, clockTimer = null, failures = 0;
   let projections = [], received = Date.now(), lastJson = '', fetchError = false;
   const disclosureStates = new Map();
   const explicitlyClosed = new Set();
-  container.innerHTML = `${styles}<div class="ml-connection muted"></div><div class="ml-content"><p>Loading mission activity…</p></div>`;
+  container.innerHTML = `${styles}<div class="ml-connection muted"></div><div class="ml-content">${skeleton('mission activity', { rows: 2, height: 64 })}</div>`;
   const content = container.querySelector('.ml-content'), connection = container.querySelector('.ml-connection');
   const rememberDisclosureChoice = event => {
     const summary = event.target.closest('summary');
@@ -218,11 +235,13 @@ export function mountMissionActivity(container, client, missionKey) {
       if (disposed || activeController.signal.aborted) return;
       projections = missionKey ? (response.activity ? [response.activity] : []) : records(response.activities);
       received = Date.now(); failures = 0; fetchError = false;
+      onStatus(true);
       const json = JSON.stringify(projections);
       if (json !== lastJson) { lastJson = json; redraw(); } else tick();
     } catch (error) {
       if (disposed || (activeController.signal.aborted && !timedOut)) return;
       failures++; fetchError = true;
+      onStatus(false, timedOut ? 'timed out' : error?.message || 'request failed');
       if (!projections.length) content.innerHTML = '<p class="muted">Mission activity unavailable. Retrying automatically.</p>';
       tick();
     } finally {

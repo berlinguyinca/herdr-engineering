@@ -37,7 +37,7 @@ import json
 import logging
 import os
 import re
-import select
+import selectors
 import shutil
 import socket
 import subprocess
@@ -108,6 +108,18 @@ def _apply_listener_pids(result, owners, unknown):
         elif len(pids) > 1 or (pids and port in unknown):
             entry["pid_ambiguous"] = True
     return result
+
+
+def _own_net_namespace() -> str | None:
+    """Identity of this process's network namespace (Linux), e.g. ``net:[4026531840]``; None where unknown.
+
+    The agent scans listeners with ``ss`` in its own namespace, so that namespace is where every loopback port it
+    discovers lives.
+    """
+    try:
+        return os.readlink("/proc/self/ns/net")
+    except OSError:
+        return None
 
 
 def _scan_linux() -> dict[int, dict[str, Any]]:
@@ -391,14 +403,18 @@ class ListenerGitMetadata:
             process = subprocess.Popen([executable, *args], cwd=cwd, env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             raw = bytearray()
-            while len(raw) <= 4096:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
-                    return None
-                chunk = os.read(process.stdout.fileno(), 4097 - len(raw))
-                if not chunk:
-                    break
-                raw.extend(chunk)
+            # epoll/kqueue can watch pipes above select()'s FD_SETSIZE limit on
+            # long-running hosts; the same deadline and byte cap still apply.
+            with selectors.DefaultSelector() as readable:
+                readable.register(process.stdout, selectors.EVENT_READ)
+                while len(raw) <= 4096:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not readable.select(remaining):
+                        return None
+                    chunk = os.read(process.stdout.fileno(), 4097 - len(raw))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
             if len(raw) > 4096 or process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
                 return None
             return raw.decode("utf-8").strip()
@@ -514,7 +530,7 @@ class AgentForwarder:
 
     def __init__(self, bind_host: str, target_port: int,
                  bind_port: int = 0, private_only: bool = True,
-                 fabric_names: frozenset[str] = frozenset()) -> None:
+                 fabric_names: frozenset[str] = frozenset(), fabric_domains: frozenset[str] = frozenset()) -> None:
         self.bind_host = bind_host
         self.target_port = target_port
         # Host names the fabric itself owns (the control-plane host, the
@@ -523,6 +539,7 @@ class AgentForwarder:
         # DNS-rebinding guard accepts, so nobody configures the app with the
         # fabric's names. Any other Host is forwarded untouched.
         self.fabric_names = frozenset(n.lower() for n in fabric_names)
+        self.fabric_domains = frozenset(d.lower().strip(".") for d in fabric_domains)
         # bind_port=0 => OS-allocated ephemeral port; a specific bind_port
         # makes the forwarder reuse the SAME port so port-matching works
         # (localhost:4040 -> dev.lan:4040). Callers fall back to 0 on EADDRINUSE.
@@ -607,7 +624,7 @@ class AgentForwarder:
         One overall deadline, not one per read, so a trickle cannot hold the
         connection. Whatever arrived is returned and forwarded either way.
         """
-        if not self.fabric_names:
+        if not self.fabric_names and not self.fabric_domains:
             return b""
         buf = b""
         deadline = time.monotonic() + self._HEAD_DEADLINE
@@ -669,7 +686,8 @@ class AgentForwarder:
                 host = (v[1:].split("]")[0] if v.startswith("[")
                         else v.split(":")[0])
                 host = host.rstrip(".")
-        if host_at is None or host not in self.fabric_names:
+        if host_at is None or not (host in self.fabric_names or any(
+                host == d or host.endswith("." + d) for d in self.fabric_domains)):
             return data
         lines[host_at] = f"Host: 127.0.0.1:{self.target_port}".encode()
         lines = [ln for ln in lines
@@ -690,6 +708,55 @@ class AgentForwarder:
 # ---------------------------------------------------------------------------
 # The agent
 # ---------------------------------------------------------------------------
+
+def parse_agent_binaries(value: Any) -> tuple[str, ...]:
+    """``fabric.agent_binaries`` from YAML: a list of process names (a single
+    string is one name). ``None`` keeps the default; anything else is an error."""
+    if value is None:
+        return AgentConfig.agent_binaries
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)) or not all(
+            isinstance(v, str) and v.strip() and "/" not in v for v in value):
+        raise ValueError("fabric.agent_binaries must be a list of process names")
+    return tuple(v.strip() for v in value)
+
+
+_SLOW_RETRY_S = (300.0, 900.0)  # then hourly
+
+
+def slow_incomplete(data: dict[str, Any] | None) -> bool:
+    """True when a slow read failed, or a known package manager gave no count."""
+    if not isinstance(data, dict):
+        return True
+    u = data.get("updates")
+    return isinstance(u, dict) and bool(u.get("manager")) and u.get("outdated") is None
+
+
+def slow_retry_delay(failures: int, slow_interval: float) -> float:
+    """Seconds until the next slow read after ``failures`` incomplete reads in a row."""
+    if failures <= 0:
+        return slow_interval
+    step = _SLOW_RETRY_S[failures - 1] if failures <= len(_SLOW_RETRY_S) else 3600.0
+    return min(step, slow_interval)
+
+
+def build_host_report(machine: str, host_name: str, tailnet_ip: str | None,
+                      telemetry: dict[str, Any], slow: dict[str, Any] | None) -> dict[str, Any]:
+    """The ``host.heartbeat`` ingest envelope: fast sample plus optional slow data."""
+    payload: dict[str, Any] = {
+        "host_name": host_name,
+        "tailnet_ip": tailnet_ip or None,
+        "cpu": telemetry.get("cpu"),
+        "mem": telemetry.get("mem"),
+        "disk": telemetry.get("disk"),
+        "telemetry": telemetry,
+    }
+    if slow:
+        payload.update(slow)
+    return {"source": "fabric-agent", "entity_type": "host", "entity_id": machine,
+            "event_type": "host.heartbeat", "payload": payload}
+
 
 @dataclass
 class AgentConfig:
@@ -715,6 +782,15 @@ class AgentConfig:
     # services to, so every dev:<port> lease shows up on the fleet Services
     # page with a clickable route. Empty = reporting disabled.
     control_plane_url: str = ""
+    # Fleet domains (local.metabolomics.us, legacy dev.lan): a Host that is one of them or a subdomain is the
+    # fabric's, so an app behind the forwarder sees 127.0.0.1 and its own rebinding guard accepts the request.
+    fabric_domains: tuple[str, ...] = ()
+    # Host telemetry heartbeat (cpu/mem/disk/gpu/...) cadence, and how often the
+    # slow package-update / tool-version data rides along on it.
+    host_report_interval: float = 30.0
+    host_slow_interval: float = 3600.0
+    # Process names counted as running agents (``fabric.agent_binaries``).
+    agent_binaries: tuple[str, ...] = ("pi", "claude", "codex")
 
     def fabric_names(self) -> frozenset[str]:
         """The host names the fabric owns: its control-plane host and this
@@ -728,6 +804,9 @@ class AgentConfig:
                 names.add(host)
         return frozenset(n.lower() for n in names if n)
 
+    def domains(self) -> frozenset[str]:
+        return frozenset(d.lower().strip(".") for d in self.fabric_domains if d)
+
 
 class FabricAgent:
     """Detects web services on this host and keeps the gateway's lease set in
@@ -740,17 +819,29 @@ class FabricAgent:
         self._machine = socket.gethostname()
         self._ownership = ListenerOwnership(self._machine)
         self._git_metadata = ListenerGitMetadata()
+        self._resource_probe = None
+        self._resource_report_at = 0.0
         self._store: dict[str, dict[str, Any]] = self._load_store()
         self._forwards: dict[int, AgentForwarder] = {}
         self._warned_unleased: set[int] = set()
         self._cp_last_report: dict[str, float] = {}
         self._cp_unavailable: dict[str, dict[str, Any]] = {}
+        self._probe_cache: dict[int, tuple[tuple, bool, float]] = {}
         self._lock = threading.Lock()
+        from .host_metrics import HostSampler, read_updates, read_versions
+        self._sampler = HostSampler(agent_lookup=self._agent_for_pid,
+                                    agent_binaries=config.agent_binaries)
+        self._read_slow = lambda: {"updates": read_updates(), "versions": read_versions()}
+        self._slow_data: dict[str, Any] | None = None
+        self._slow_sent: float | None = None
+        # The slow-data object last posted (or dropped after a 4xx): a new read
+        # is due at once, the same one again only every host_slow_interval.
+        self._slow_handled: dict[str, Any] | None = None
         # Restore forwarders for loopback-only services survived a restart.
         for port_s, entry in self._store.items():
             if entry.get("fwd_port"):
                 fwd = AgentForwarder(config.tailnet_ip, int(port_s),
-                                     fabric_names=config.fabric_names())
+                                     fabric_names=config.fabric_names(), fabric_domains=config.domains())
                 try:
                     fwd.start()
                     # Rebind to the remembered port when still free so the
@@ -833,6 +924,10 @@ class FabricAgent:
         """One detect/register/close cycle. Returns a summary."""
         listeners = scan_listening_ports()
         live_ports = set(listeners)
+        self._probe_cache = {
+            port: cached for port, cached in self._probe_cache.items()
+            if port in live_ports
+        }
         registered: list[str] = []
         closed: list[str] = []
 
@@ -900,7 +995,7 @@ class FabricAgent:
                 if (str(port) in self._store
                         or port in fwd_ports):
                     continue
-            if not probe_web(port, timeout=self.cfg.probe_timeout):
+            if not self._probe_web_cached(port, listeners[port]):
                 continue
             entry = self._adopt(port, listeners[port])
             if entry:
@@ -954,6 +1049,27 @@ class FabricAgent:
         self._save_store()
         return {"registered": registered, "closed": closed,
                 "unleased": [str(p) for p in unleased]}
+
+    def _probe_web_cached(self, port: int, info: dict[str, Any]) -> bool:
+        """Probe a listener once per stable observation window.
+
+        Listener scans run frequently to catch newly-started dev servers, but
+        repeatedly doing an HTTP GET for every unchanged unleased port creates
+        avoidable work. A process/address change invalidates the entry; a
+        short expiry still rechecks a quiet service for recovery.
+        """
+        fingerprint = (
+            tuple(sorted(info.get("addrs") or ())),
+            info.get("process"),
+            info.get("pid"),
+        )
+        now = time.monotonic()
+        prior = self._probe_cache.get(port)
+        if prior and prior[0] == fingerprint and now - prior[2] < 30.0:
+            return prior[1]
+        result = probe_web(port, timeout=self.cfg.probe_timeout)
+        self._probe_cache[port] = (fingerprint, result, now)
+        return result
 
     def _keepalive(self, port_s: str, entry: dict[str, Any]) -> None:
         """Heartbeat a tracked lease; re-register it if the gateway lost it."""
@@ -1029,7 +1145,7 @@ class FabricAgent:
                 try:
                     fwd = AgentForwarder(self.cfg.tailnet_ip, port,
                                          bind_port=bind_port,
-                                         fabric_names=self.cfg.fabric_names()
+                                         fabric_names=self.cfg.fabric_names(), fabric_domains=self.cfg.domains()
                                          ).start()
                     break
                 except OSError:
@@ -1044,7 +1160,9 @@ class FabricAgent:
             result = self._client.register(
                 target_machine_id=self._machine, target_host=target_host,
                 target_port=target_port, protocol="http", label=label,
-                owner_process_id=process or "")
+                owner_process_id=process or "",
+                origin_port=port if target_port != port else None,
+                network_namespace=_own_net_namespace())
         except Exception as exc:  # gateway down / rejected: retry next cycle
             log.warning("register failed for port %d: %s", port, exc)
             if fwd is not None:
@@ -1192,6 +1310,114 @@ class FabricAgent:
                         entry.get("label"), exc)
             return False
 
+    def _agent_for_pid(self, pid: int) -> str | None:
+        """Label of the tracked service whose listener process is ``pid``."""
+        for entry in list(self._store.values()):
+            if (entry.get("ownership") or {}).get("listener_pid") == pid:
+                return entry.get("label") or None
+        return None
+
+    def _report_host(self, telemetry: dict[str, Any], include_slow: bool,
+                     *, timeout: float = 2.0) -> int | None:
+        """Best-effort host heartbeat to the control plane (never raises).
+
+        Returns the HTTP status, or ``None`` when nothing was posted or the
+        control plane could not be reached."""
+        if not self.cfg.control_plane_url:
+            return None
+        try:
+            body = build_host_report(
+                self._machine, self._machine, self.cfg.tailnet_ip, telemetry,
+                self._slow_data if include_slow else None)
+            url = f"{self.cfg.control_plane_url.rstrip('/')}/api/v1/ingest"
+            req = urllib.request.Request(
+                url, data=json.dumps(body, default=str).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return int(resp.status)
+        except urllib.error.HTTPError as exc:
+            log.warning("host telemetry report rejected: HTTP %s", exc.code)
+            return int(exc.code)
+        except Exception as exc:  # control plane down: never break the agent
+            log.warning("host telemetry report failed: %s", exc)
+            return None
+
+    def _report_resources(self):
+        if not self.cfg.control_plane_url or time.monotonic() - self._resource_report_at < 15:
+            return
+        self._resource_report_at = time.monotonic()
+        try:
+            from .host_config import _default_fetch, _read_host_json, host_config
+            from .resource_probe import ResourceProbe
+            if host_config().get("scheduler.telemetry", True) is not True:
+                return
+            host = _read_host_json(Path.home())
+            if self._resource_probe is None:
+                self._resource_probe = ResourceProbe(
+                    self.cfg.store_path.parent / "scheduler-host-identity", Path.home())
+            _default_fetch(host["control_plane_url"] + "/api/v1/fleet/config/telemetry",
+                           token=host["token"], method="POST", body=self._resource_probe.sample(), timeout=2)
+        except Exception:
+            # Metric collection failure must not interrupt service leases.
+            log.debug("resource telemetry unavailable")
+
+    def _host_tick(self, now: float | None = None) -> bool:
+        """One fast sample + post. Slow data rides along when it is new, and
+        again every ``host_slow_interval``. Never raises."""
+        if not self.cfg.control_plane_url:
+            return False
+        now = time.monotonic() if now is None else now
+        try:
+            telemetry = self._sampler.sample()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("host sample failed: %s", exc)
+            return False
+        slow = self._slow_data
+        slow_due = slow is not None and (
+            slow is not self._slow_handled
+            or self._slow_sent is None
+            or now - self._slow_sent >= self.cfg.host_slow_interval)
+        self._report_resources()
+        status = self._report_host(telemetry, slow_due)
+        ok = status is not None and 200 <= status < 300
+        if slow_due and (ok or (status is not None and 400 <= status < 500)):
+            if not ok:
+                # The control plane refused this payload (e.g. an oversize
+                # ``updates``). Resending it would fail every heartbeat and
+                # freeze last_seen, so drop this slow set; the next tick posts
+                # the fast sample alone and the next slow read tries again.
+                log.warning("control plane rejected host slow data (HTTP %s); "
+                            "dropping it until the next slow read", status)
+            self._slow_sent = now
+            self._slow_handled = slow
+        return ok
+
+    def _host_loop(self, stop: threading.Event) -> None:
+        while not stop.is_set():
+            try:
+                self._host_tick()
+            except Exception:  # noqa: BLE001
+                log.exception("host telemetry tick failed")
+            stop.wait(self.cfg.host_report_interval)
+
+    def _slow_loop(self, stop: threading.Event) -> None:
+        """Own thread: read_updates/read_versions may block up to minutes.
+
+        A read whose package count came back unknown (scan timed out or failed)
+        is retried after 5 min, then 15 min, then hourly."""
+        failures = 0
+        while not stop.is_set():
+            if self.cfg.control_plane_url:
+                data = None
+                try:
+                    data = self._slow_data = self._read_slow()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("host slow telemetry failed: %s", exc)
+                failures = failures + 1 if slow_incomplete(data) else 0
+                stop.wait(slow_retry_delay(failures, self.cfg.host_slow_interval))
+            else:
+                stop.wait(min(self.cfg.host_report_interval, 5.0))
+
     def _release(self, port_s: str) -> None:
         entry = self._store.pop(port_s, None)
         port = int(port_s)
@@ -1242,18 +1468,25 @@ class FabricAgent:
         self._cycle_last = time.monotonic()
         threading.Thread(target=self._watchdog, args=(stop, cycle_timeout, poll),
                          daemon=True, name="agent-watchdog").start()
-        while not stop.is_set():
-            try:
-                self.scan_once()
-            except Exception:  # never die on a bad cycle
-                log.exception("agent cycle failed")
-            finally:
-                # Updated even on a raised cycle; NOT updated when scan_once
-                # is itself wedged, so the watchdog can detect the stall.
-                self._cycle_last = time.monotonic()
-            if after_cycle is not None:
-                after_cycle()  # may raise HostConfigUnavailable (revoked): ends the run
-            stop.wait(self.cfg.interval)
+        threading.Thread(target=self._host_loop, args=(stop,), daemon=True,
+                         name="agent-host-report").start()
+        threading.Thread(target=self._slow_loop, args=(stop,), daemon=True,
+                         name="agent-host-slow").start()
+        try:
+            while not stop.is_set():
+                try:
+                    self.scan_once()
+                except Exception:  # never die on a bad cycle
+                    log.exception("agent cycle failed")
+                finally:
+                    # Updated even on a raised cycle; NOT updated when scan_once
+                    # is itself wedged, so the watchdog can detect the stall.
+                    self._cycle_last = time.monotonic()
+                if after_cycle is not None:
+                    after_cycle()  # may raise HostConfigUnavailable (revoked): ends the run
+                stop.wait(self.cfg.interval)
+        finally:
+            stop.set()  # also ends the host-report threads
 
     def _watchdog(self, stop: threading.Event, cycle_timeout: float,
                   poll: float) -> None:

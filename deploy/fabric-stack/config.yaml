@@ -13,7 +13,15 @@
 fabric:
   gateway_url: "http://dev.lan:29999"
   control_port: 29999
-  url_base: "dev.lan"
+  # HTTPS on 443 (see README "HTTPS on 443"): the public name carries a real Let's Encrypt certificate, dev.lan
+  # keeps working through the private CA, and the node's ts.net name replaces its old `tailscale serve` rule.
+  url_base: "local.metabolomics.us"
+  acme_domain: "local.metabolomics.us"
+  url_aliases: ["dev.lan"]
+  ca_dir: /ca
+  tailscale_cert: "bender.tail0c50da.ts.net"
+  tailnet_cert_dir: /tailnet-cert
+  routes: ["bender.tail0c50da.ts.net=127.0.0.1:8787"]
   bind: auto
   probe_interval_seconds: 15
 

@@ -9,7 +9,7 @@ Each cycle this script:
      tells the collab service which ones are up;
   2. asks the service which of them may receive automatic agents (the owner can opt a host out);
   3. claims each waiting fleet request exactly once, creates the agents through the owner's own
-     operator API, then for each agent, round robin across the eligible hosts, writes its credential
+     operator API, then reserves and commits each agent through the shared scheduler before writing its credential
      to a 0600 file on that host and starts a worker in a fresh herdr workspace there. herdr keeps
      the pane alive, so the worker survives this script, the ssh session and the dashboard.
 
@@ -347,6 +347,15 @@ class Failure(Exception):
     pass
 
 
+class PlacementSpec:
+    def __init__(self, request_id: str, family: str, parent_agent_id: str | None,
+                 preferred_host_uid: str | None):
+        self.request_id = request_id
+        self.family = family
+        self.parent_agent_id = parent_agent_id
+        self.preferred_host_uid = preferred_host_uid
+
+
 def label_name(raw) -> str | None:
     """A herdr label as an @name: lowercase letters, digits, hyphens; None when nothing usable is left."""
     if not isinstance(raw, str):
@@ -391,6 +400,7 @@ class Runner:
         self.url, self.state, self.herdr, self.ssh, self.say = url.rstrip("/"), state_dir, herdr, ssh, say
         self.worker_text = worker.read_text(encoding="utf-8")
         self.host_id = host_id
+        self.scheduler_enabled = os.environ.get("HERDR_SCHEDULER_ALL_SPAWNS", "0") == "1"
         self.targets: dict[str, str | None] = {}          # host label -> ssh target (None = this machine)
         self.public_url = ""
         self.cmds = FAMILY_CMD_TOOLS if allow_tools else FAMILY_CMD_TEXT_ONLY
@@ -692,14 +702,14 @@ class Runner:
         names[aid] = target
 
     # ------------------------------------------------------------ one request
-    def pick_host(self, eligible: list[str]) -> str | None:
-        """Next host in the rotation that still accepts automatic agents. The flags are read again for every
-        agent, so un-ticking a host stops placements at once, not at the next cycle. The rotation carries on
-        where the last placement stopped."""
+    def pick_host(self, eligible: list[str], *, preferred: str | None = None) -> str | None:
+        """Rollback-compatible placement used only while scheduler rollout is disabled."""
         flags = {h["host"]: h["auto_agents"] for h in self.ok("GET", "fleet/hosts")["hosts"]}
         live = [h for h in eligible if flags.get(h, True)]
         if not live:
             return None
+        if preferred in live:
+            return preferred
         cursor_file = self.state / "rr"
         try:
             cursor = int(cursor_file.read_text())
@@ -708,6 +718,70 @@ class Runner:
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         cursor_file.write_text(str((cursor + 1) % 1_000_000))
         return live[cursor % len(live)]
+
+    def scheduler_host(self, placement, eligible: list[str]) -> tuple[str, str]:
+        """Reserve/commit one agent through the control-plane scheduler.
+
+        ``eligible`` is only a capability pre-filter. It is never an authority
+        to bypass host policy; the scheduler rechecks ownership, freshness and
+        policy generation at bind.
+        """
+        body = {
+            "request_id": placement.request_id,
+            "agent_family": placement.family,
+            "placement_mode": "automatic",
+            "parent_agent_id": placement.parent_agent_id,
+            "resource_profile": {"class": "coding", "cpu_cores": 1, "memory_gib": 1},
+        }
+        req = urllib.request.Request(
+            f"{self.url}/api/v1/scheduler/reservations",
+            data=json.dumps(body).encode(), method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 (operator-configured URL)
+                reservation = json.loads(resp.read(1_000_000) or b"{}")
+        except (OSError, ValueError, urllib.error.HTTPError) as exc:
+            raise Failure(f"scheduler reservation failed: {trim(exc)}") from None
+        host_uid = reservation.get("host_uid")
+        if reservation.get("state") != "reserved" or not isinstance(host_uid, str):
+            raise Failure("scheduler queued the agent: no eligible host")
+        if host_uid not in eligible:
+            # During identity migration, resolve the stable UID to its display alias.
+            try:
+                with urllib.request.urlopen(f"{self.url}/api/v1/scheduler", timeout=15) as resp:  # noqa: S310
+                    cards = json.loads(resp.read(1_000_000) or b"{}").get("hosts", [])
+                card = next((row for row in cards if row.get("host_uid") == host_uid), None)
+                host = next((alias for alias in (card or {}).get("aliases", []) if alias in eligible), None)
+            except (OSError, ValueError, urllib.error.HTTPError):
+                host = None
+        else:
+            host = host_uid
+        if not host:
+            raise Failure("scheduler selected a host this runner cannot reach")
+        commit = urllib.request.Request(
+            f"{self.url}/api/v1/scheduler/reservations/commit",
+            data=json.dumps({"reservation_id": reservation["reservation_id"]}).encode(), method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(commit, timeout=30):  # noqa: S310
+                pass
+        except (OSError, urllib.error.HTTPError) as exc:
+            raise Failure(f"scheduler commit failed: {trim(exc)}") from None
+        return host, reservation["reservation_id"]
+
+    def scheduler_release(self, reservation_id: str) -> None:
+        req = urllib.request.Request(
+            f"{self.url}/api/v1/scheduler/reservations/release",
+            data=json.dumps({"reservation_id": reservation_id}).encode(), method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15):  # noqa: S310
+                return
+        except (OSError, urllib.error.HTTPError) as exc:
+            raise Failure(f"scheduler release failed: {trim(exc)}") from None
 
     def forget(self, host: str, agent: dict) -> None:
         """An agent that could not be started must not stay alive with a credential nobody holds."""
@@ -760,15 +834,27 @@ class Runner:
             installed: set = set()
             for agent in made["agents"]:
                 host = "-"
+                reservation_id = None
                 try:
                     if time.monotonic() > deadline:
                         raise Failure("ran out of time")
-                    host = parent_host or self.pick_host(eligible) or ""
+                    if self.scheduler_enabled:
+                        placement = PlacementSpec(agent["agent_id"], spec["harness_type"],
+                                                  spec.get("parent_agent_id"), None)
+                        host, reservation_id = self.scheduler_host(placement, eligible)
+                    else:
+                        host = self.pick_host(eligible, preferred=parent_host) or ""
                     if not host:
                         raise Failure("every host opted out meanwhile")
-                    self.place(host, agent, spec["harness_type"], installed, spec["name_prefix"], parent_pane)
+                    pane_parent = parent_pane if host == parent_host else None
+                    self.place(host, agent, spec["harness_type"], installed, spec["name_prefix"], pane_parent)
                     placements.append({"name": agent["name"], "host": host, "status": "started", "error": None})
                 except Exception as exc:                          # noqa: BLE001  (one agent must not strand the rest)
+                    if reservation_id:
+                        try:
+                            self.scheduler_release(reservation_id)
+                        except Failure:
+                            pass
                     self.forget(host, agent)
                     placements.append({"name": str(agent.get("name", "?"))[:32], "host": host if HOST.fullmatch(host) else "none",
                                        "status": "failed", "error": trim(exc)})

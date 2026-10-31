@@ -1,0 +1,265 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { handoffNote, compact, disclosure, ms, pair, percent, rate, renderLlm, renderLlmSession, single, when, pickTotal, handoffChains, money, spendPanel } from '../llm-view.js';
+
+const dist = (n, p50, p95) => ({ n, p50, p95, insufficient: n < 5 });
+const group = (over = {}) => ({
+  key: 'all', source: 'llm-proxy', requests: 120, errors: 6, error_rate: 0.05,
+  tokens: { input: 1000, output: 2_500_000, reasoning: 0, cache_read: 0, lower_bound: false },
+  ttft_ms: dist(40, 600, 2900), queue_ms: dist(40, 0, 10), speed_tps: dist(30, 41, 60), e2e_tps: dist(0, null, null),
+  first_seen: '2026-10-24T10:00:00Z', last_seen: '2026-10-24T11:50:00Z', ...over,
+});
+const pts = (vals) => vals.map((v, i) => ({ t: `2026-10-24T${String(i).padStart(2, '0')}:00:00Z`, v, n: 1 }));
+const data = (over = {}) => ({
+  total: { window: '24h', since: '2026-10-23T12:00:00Z', retained_since: '2026-10-20T00:00:00Z', partial: false, groups: [group()] },
+  models: { groups: [group({ key: 'qwen' })] },
+  agents: { groups: [group({ key: 'herdr:beast:eng:w1:p1', last_seen: '2026-10-24T11:50:00Z' }), group({ key: 'unmatched:zz-9' })] },
+  problems: { problems: [{ class: 'upstream_admission', model: 'qwen', count: 4, last_seen: '2026-10-24T11:00:00Z', sessions: ['herdr:beast:eng:w1:p1'], session_count: 1, statuses: { 429: 4 } }] },
+  series: { requests: { step: '1h', points: pts([3, 5, 0, 7]) }, errors: { points: pts([0, 1, 0, 2]) },
+    ttft: { points: pts([null, 600, null, 700]) }, speed: { points: pts([null, null, null, null]) } },
+  ...over,
+});
+const state = (over = {}) => ({ window: '24h', filters: { project: '', model: '' }, projects: ['p'], modelNames: ['qwen'], names: {}, ...over });
+
+test('number formats keep unknown apart from zero', () => {
+  assert.equal(ms(null), '—'); assert.equal(ms(0), '0 ms'); assert.equal(ms(1500), '1.5 s');
+  assert.equal(rate(undefined), '—'); assert.equal(rate(41.26), '41.3 t/s'); assert.equal(rate(250.4), '250 t/s');
+  assert.equal(percent(0), '0%'); assert.equal(percent(null), '—');
+  assert.equal(compact(2_500_000), '2.5 M'); assert.equal(compact(999), '999');
+  assert.equal(when('2026-10-24T11:50:00Z'), '2026-10-24 11:50 UTC'); assert.equal(when(null), '—');
+});
+
+test('a percentile with fewer than five samples says so instead of showing a number', () => {
+  assert.equal(pair(dist(40, 600, 2900), ms), '600 ms / 2.9 s');
+  assert.equal(pair(dist(3, null, null), ms), 'insufficient data (n=3)');
+  assert.equal(pair(dist(0, null, null), ms), 'not reported');
+  assert.equal(single(dist(30, 41, 60), rate, 'p95'), '60 t/s');
+});
+
+test('tiles show the proxy figures; other sources are named and never added', () => {
+  const d = data();
+  d.total.groups.push(group({ source: 'transcript', requests: 9999 }));
+  const html = renderLlm(state(), d);
+  assert.match(html, /<div class="llm-tile__value">120<\/div>/);
+  assert.doesNotMatch(html, /9,999<\/div>/);
+  assert.match(html, /Other sources \(transcript\)/);
+  assert.equal(pickTotal(d.total).source, 'llm-proxy');
+});
+
+test('an empty window renders placeholders, not zeros', () => {
+  const html = renderLlm(state(), { total: { groups: [], retained_since: null }, models: { groups: [] }, agents: { groups: [] },
+    problems: { problems: [] }, series: { requests: { points: [] }, errors: { points: [] }, ttft: { points: [] }, speed: { points: [] } } });
+  assert.match(html, /No usage has been recorded yet\./);
+  assert.match(html, /No requests recorded in this window\./);
+  assert.match(html, /No problems in this window\./);
+  assert.doesNotMatch(html, /undefined|null|NaN/);
+});
+
+test('partial windows and lower-bound token totals are disclosed', () => {
+  assert.match(disclosure({ since: '2026-10-17T12:00:00Z', retained_since: '2026-10-20T00:00:00Z', partial: true }), /^Partial: records start 2026-10-20 00:00 UTC/);
+  const d = data(); d.total.groups[0].tokens.lower_bound = true;
+  assert.match(renderLlm(state(), d), /≥ 2\.5 M/);
+});
+
+test('latency buckets without enough samples are gaps in the line, and an all-empty chart says so', () => {
+  const html = renderLlm(state(), data());
+  assert.match(html, /aria-labelledby="llm-lat-t llm-lat-d"/);
+  assert.match(html, /<circle /);                        // two isolated points, never joined across the gap
+  assert.match(html, /Not reported in this window, or fewer than 5 samples per bucket\./);   // the speed chart
+});
+
+test('charts carry a title, a description and a table of the same numbers', () => {
+  const html = renderLlm(state(), data());
+  assert.equal((html.match(/<svg /g) || []).length, 2);
+  assert.match(html, /<title id="llm-req-t">Requests over time<\/title>/);
+  assert.match(html, /<details class="llm-data"><summary>Chart data<\/summary>/);
+  assert.match(html, /<td>2026-10-24 01:00 UTC<\/td><td>5<\/td><td>1<\/td>/);
+});
+
+test('agent rows link to the agent, unmatched ids are plain text, names come from the dashboard', () => {
+  const html = renderLlm(state({ names: { 'herdr:beast:eng:w1:p1': 'Amber Swift' } }), data());
+  assert.match(html, /<a href="#\/llm\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1">Amber Swift<\/a>/);
+  assert.match(html, /zz-9 <em>\(unmatched\)<\/em>/);
+  assert.doesNotMatch(html, /href="#\/herd\/session\/unmatched/);
+});
+
+test('every dynamic string is escaped, including names that collide with object properties', () => {
+  const d = data();
+  d.models.groups[0].key = '<img src=x onerror=alert(1)>';
+  d.problems.problems[0].class = '"><script>x</script>';
+  d.problems.problems[0].sessions = ['constructor', '__proto__'];
+  const html = renderLlm(state({ names: { evil: '<b>' }, filters: { project: '"><x', model: '' }, projects: ['"><x'] }), d);
+  assert.doesNotMatch(html, /<img src=x|<script>x|<b>|"><x/);
+  assert.match(html, /<a href="#\/llm\/session\/constructor">constructor<\/a>/);
+});
+
+test('window links keep the filters and mark the current window', () => {
+  const html = renderLlm(state({ window: '7d', filters: { project: 'p', model: 'qwen' } }), data());
+  assert.match(html, /class="llm-window" href="#\/llm\?project=p&amp;model=qwen&amp;window=1h"/);
+  assert.match(html, /href="#\/llm\?project=p&amp;model=qwen&amp;window=7d" aria-current="page"/);
+});
+
+test('the agent page links back to the agent, names the source, and scopes the window links to itself', () => {
+  const html = renderLlmSession({ window: '7d', sessionId: 'herdr:beast:eng:w1:p1', name: 'Amber Swift', known: true }, data());
+  assert.match(html, /<h1>Amber Swift <span class="llm-badge">llm-proxy<\/span><\/h1>/);
+  assert.match(html, /<a class="llm-back" href="#\/herd\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1">Open agent ↗<\/a>/);
+  assert.match(html, /href="#\/llm\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1\?window=1h"/);
+  assert.match(html, /href="#\/llm\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1\?window=7d" aria-current="page"/);
+  assert.doesNotMatch(html, /data-llm-filter|<h2>Agents<\/h2>/);
+});
+
+test('an agent whose path reports no latency says so, and an unknown session has no agent link', () => {
+  const d = data();
+  d.total.groups = [group({ source: 'transcript', ttft_ms: dist(0, null, null), speed_tps: dist(0, null, null) })];
+  const html = renderLlmSession({ window: '24h', sessionId: 'zz-9', name: '', known: false }, d);
+  assert.match(html, /data-llm-latency-note>Latency and speed are not reported by this agent's path\./);
+  assert.match(html, /Not a known dashboard session\./);
+  assert.doesNotMatch(html, /Open agent/);
+  assert.match(html, /<h1>zz-9 /);
+});
+
+test('an agent page with no records says so instead of showing zeros', () => {
+  const html = renderLlmSession({ window: '24h', sessionId: 's', name: 'A', known: true },
+    { total: { groups: [], retained_since: null }, models: { groups: [] }, problems: { problems: [] },
+      series: { requests: { points: [] }, errors: { points: [] }, ttft: { points: [] }, speed: { points: [] } } });
+  assert.match(html, /No usage has been recorded yet\./);
+  assert.doesNotMatch(html, /undefined|null|NaN/);
+});
+
+test('transcript rows show events, not requests, are marked as cross-checks, and never feed the tiles', () => {
+  const d = data();
+  const transcript = group({ key: 'herdr:beast:eng:w1:p1', source: 'transcript', requests: null, errors: null, error_rate: null,
+    events: 7, partial_source: true, cross_check: true, ttft_ms: dist(0, null, null), speed_tps: dist(0, null, null) });
+  d.agents.groups.push(transcript);
+  d.total.groups.push({ ...transcript, key: 'all', cross_check: undefined });
+  const html = renderLlm(state(), d);
+  assert.match(html, /transcript \(cross-check\)<\/td><td>7 events<\/td>/);
+  assert.match(html, /Transcript rows cover only the events still retained/);
+  assert.match(html, /<div class="llm-tile__value">120<\/div>/);       // still the proxy figures
+});
+
+test('with only a transcript the tiles show tokens and say requests are not reported', () => {
+  const d = data();
+  d.total.groups = [group({ source: 'transcript', requests: null, errors: null, error_rate: null, events: 3,
+    partial_source: true, ttft_ms: dist(0, null, null), speed_tps: dist(0, null, null) })];
+  const html = renderLlm(state(), d);
+  assert.match(html, /<div class="llm-tile__value">3 events<\/div><div class="llm-tile__note">tokens only, from the agent&#39;s transcript/);
+  assert.doesNotMatch(html, /<div class="llm-tile__value">not reported<\/div>/, 'a tile with nothing to report is not drawn at full size');
+  assert.match(html, /data-llm-quiet[^>]*>.*TTFT p50 \/ p95: not reported/s);
+});
+
+test('tiles compare counts with the previous window and add input, cache and queue figures after the original five', () => {
+  const d = data();
+  d.total.groups = [group({ requests: 120, errors: 6, tokens: { input: 3000, output: 2000, reasoning: 0, cache_read: 1000, lower_bound: false } })];
+  d.previous = { groups: [group({ requests: 100, errors: 6, tokens: { input: 1000, output: 4000, reasoning: 0, cache_read: 0, lower_bound: false } })] };
+  const html = renderLlm(state(), d);
+  const values = [...html.matchAll(/<div class="llm-tile__label">([^<]*)<\/div>/g)].map((m) => m[1]);
+  assert.deepEqual(values.slice(0, 5), ['Requests', 'Output tokens', 'TTFT p50 / p95', 'Speed p50', 'Errors']);
+  assert.deepEqual(values.slice(5), ['Input tokens', 'Cache hit']);
+  assert.match(html, /queue 0 ms \/ 10 ms waiting in the proxy/);    // queue sits in the TTFT tile, not a tile of its own
+  assert.match(html, /↑ 20% vs previous 24h/);      // requests 100 -> 120
+  assert.match(html, /↓ 50% vs previous 24h/);      // output tokens 4000 -> 2000
+  assert.match(html, /→ 0% vs previous 24h/);       // errors unchanged
+  assert.match(html, /<div class="llm-tile__value">25%<\/div>/);   // 1000 cached of 4000 input-side tokens
+  assert.doesNotMatch(renderLlm(state(), data()), /vs previous/, 'no previous window, no comparison');
+});
+
+test('a mission filter, a missions tab, a queue chart and an open-agent link are offered', () => {
+  const d = data();
+  d.missions = { groups: [group({ key: 'mission-1' })] };
+  d.series.queue = { points: pts([null, 40, null, 90]) };
+  const html = renderLlm(state({ missionNames: ['mission-1'], filters: { project: '', model: '', mission: 'mission-1' } }), d);
+  assert.match(html, /data-llm-filter="mission"/);
+  assert.match(html, /href="#\/missions\/mission-1">mission-1</);
+  assert.match(html, /Queue p95/);
+  assert.match(html, /class="llm-ext" href="#\/herd\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1"/);
+  assert.doesNotMatch(html, /llm-ext" href="#\/herd\/session\/unmatched/);   // an unmatched id is no agent
+  assert.doesNotMatch(renderLlm(state(), data()), /data-llm-filter="mission"/, 'no missions, no filter');
+});
+
+test('handoffChains sums usage over agents joined by recorded handoffs and leaves the rest out', () => {
+  const g = (key, out, requests = 1) => ({ key, source: 'llm-proxy', requests, errors: 0, tokens: { output: out } });
+  const agents = { groups: [g('a', 100), g('b', 50, 2), g('c', 7), g('lone', 9)] };
+  const handoffs = [
+    { source: { session_id: 'a' }, target: { session_id: 'b' }, created_at: 1 },
+    { source: { session_id: 'b' }, target: { session_id: 'c' }, created_at: 2 },
+    { source: { session_id: 'x' }, target: { session_id: 'y' }, created_at: 3 },
+  ];
+  const chains = handoffChains(handoffs, agents);
+  assert.equal(chains.length, 1, 'x→y has no usage so is left out; lone is in no handoff');
+  assert.deepEqual(chains[0].ids, ['a', 'b', 'c']);
+  assert.equal(chains[0].output, 157);
+  assert.equal(chains[0].requests, 4);
+  assert.deepEqual(handoffChains(null, agents), []);
+});
+
+test('the session page links back to Usage, compares with the previous window and says where the agent sits in a handoff', () => {
+  const d = data();
+  d.previous = { groups: [group({ requests: 10 })] };
+  d.handoffs = [{ source: { session_id: 'a' }, target: { session_id: 's1' }, created_at: 1 }, { source: { session_id: 's1' }, target: { session_id: 'b' }, created_at: 2 }];
+  d.agents = { groups: ['a', 's1', 'b'].map((key) => ({ key, source: 'llm-proxy', requests: 2, errors: 0, tokens: { output: 10 } })) };
+  const html = renderLlmSession({ window: '24h', sessionId: 's1', known: true, name: 'Quiet', names: { a: 'Planner' } }, d);
+  assert.match(html, /← Usage/);
+  assert.match(html, /vs previous 24h/);
+  assert.match(html, /data-llm-handoff[^>]*>← from <a[^>]*>Planner<\/a> · → to .*chain total: 30 output tokens in 6 requests/);
+  assert.equal(handoffNote('lone', d.handoffs, d.agents, {}), '', 'an agent in no handoff gets no line');
+});
+
+test('a chart whose data sits at the end of the window is trimmed and says so', () => {
+  const pts = Array.from({ length: 24 }, (_, i) => ({ t: 1700000000 + i * 3600, v: i === 23 ? 5 : 0 }));
+  const html = renderLlm(state(), { ...data(), series: { requests: { points: pts }, errors: { points: pts.map((p) => ({ ...p, v: 0 })) } } });
+  assert.match(html, /data-llm-trim/);
+  assert.match(html, /no requests earlier in this window/);
+});
+
+const spendData = (over = {}) => ({
+  configured: true, estimate: true, currency: 'USD', source: 'llm-proxy', total: 12.5, partial: false,
+  by_model: [{ model: 'qwen-<b>', match: 'qwen*', tokens: { input: 2_000_000, output: 500_000, cache_read: 0, requests: 9 }, cost: 12.5 }],
+  days: [{ day: '2026-10-27', cost: 5, unpriced_tokens: 0, models: [{ model: 'qwen-<b>', tokens: { input: 1, output: 2, cache_read: 0 }, cost: 5 }] },
+    { day: '2026-10-28', cost: 7.5, unpriced_tokens: 10, models: [{ model: 'mystery', tokens: { input: 7, output: 3, cache_read: 0 }, cost: null }] }],
+  unpriced: [{ model: 'mystery', tokens: { input: 7, output: 3, cache_read: 0 } }], ...over,
+});
+const pageState = { window: '24h', filters: {}, projects: [], modelNames: [], missionNames: [], names: {} };
+
+test('money formats dollars, keeps a deliberate zero and says when a cost is under a cent', () => {
+  assert.equal(money(12.5), '$12.50');
+  assert.equal(money(1234.5), '$1,234.50');
+  assert.equal(money(0), '$0.00');
+  assert.equal(money(0.004), '< $0.01');
+  assert.equal(money(null), '—');
+});
+
+test('without a price table the spend tab says how to enable it and shows no figure', () => {
+  for (const spend of [null, { configured: false }]) {
+    const html = spendPanel(spend);
+    assert.match(html, /data-llm-spend="off"/);
+    assert.match(html, /control_plane:/);
+    assert.match(html, /prices:/);
+    assert.doesNotMatch(html, /\$\d/);
+  }
+});
+
+test('the spend tab is labelled an estimate, lists models and days, and names unpriced models without pricing them', () => {
+  const html = spendPanel(spendData());
+  assert.match(html, /Estimate, not a bill/);
+  assert.match(html, /Estimated total: <strong>\$12\.50<\/strong>/);
+  assert.match(html, /data-llm-unpriced[^>]*>No price entry matches <code>mystery<\/code>/);
+  assert.match(html, /By day/);
+  assert.match(html, /<td>unpriced<\/td>/);
+  assert.doesNotMatch(html, /qwen-<b>/);
+  assert.match(html, /qwen-&lt;b&gt;/);
+});
+
+test('a partial window is said, and the whole page carries the tab with or without a table', () => {
+  assert.match(spendPanel(spendData({ partial: true })), /earlier spend is missing/);
+  const page = renderLlm(pageState, { total: { groups: [group()] }, spend: spendData() });
+  assert.match(page, /Spend \(est\.\)/);
+  assert.match(page, /data-llm-spend="on"/);
+  assert.match(renderLlm(pageState, { total: { groups: [group()] } }), /data-llm-spend="off"/);
+});
+
+test('every tab of the page has its show/hide rule, so a tab added later cannot render hidden', () => {
+  const html = renderLlm(pageState, { total: { groups: [group()] }, spend: spendData() });
+  const tabs = (html.match(/name="llm-tab" id="llm-tab-\d+"/g) || []).length;
+  for (let i = 0; i < tabs; i += 1) assert.ok(html.includes(`#llm-tab-${i}:checked`), `tab ${i} has a rule`);
+});

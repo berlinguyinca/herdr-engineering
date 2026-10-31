@@ -57,15 +57,15 @@ def _now_iso() -> str:
 
 
 def _default_slots() -> int:
-    """Adaptive build-slot count: ``max(2, cores - 4)``.
+    """Conservative interactive build-slot count.
 
-    On small hosts this floors at 2 (enough to keep ordinary iteration
-    responsive while still bounding the storm). On high-performance hosts it
-    scales with core count so legitimate parallel builds aren't throttled. It
-    is always overridable via ``--slots`` / ``HERDR_BUILD_GATE_SLOTS``.
+    Two slots are enough on small hosts and four is the upper default on large
+    hosts. Full-workspace builds are already internally parallel, so scaling
+    slots linearly with CPU count lets many agents multiply compiler fan-out.
+    The policy remains overridable via ``--slots`` / ``HERDR_BUILD_GATE_SLOTS``.
     """
     cores = os.cpu_count() or 4
-    return max(2, cores - 4)
+    return max(2, min(4, cores - 4))
 
 
 def _load_per_core() -> float:

@@ -1,0 +1,27 @@
+# Opt-in only. This file is deliberately separate from the private control-plane
+# compose project. Do not enable it until the operator has approved public edge
+# exposure and configured a real edge transport in front of this listener.
+services:
+  public-gateway:
+    image: ${HERDR_CP_IMAGE_TAG:-herdr-engineering:artifact-current}
+    restart: unless-stopped
+    command:
+      - control-plane
+      - public-gateway
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${HERDR_PUBLIC_GATEWAY_PORT:-8085}"
+      - --fleet-config
+      - /etc/herdr/fleet/fleet-config.yaml
+    volumes:
+      - ${HERDR_CP_FLEET_DIR:?set HERDR_CP_FLEET_DIR}:/etc/herdr/fleet:ro
+    networks:
+      - herdr-control-plane
+    expose:
+      - "${HERDR_PUBLIC_GATEWAY_PORT:-8085}"
+
+networks:
+  herdr-control-plane:
+    external: true
+    name: ${HERDR_CONTROL_PLANE_NETWORK:-herdr-control-plane_default}

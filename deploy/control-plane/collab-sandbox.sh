@@ -24,6 +24,13 @@ set -euo pipefail
 WORK="${1:?usage: collab-sandbox.sh WORKDIR COMMAND}"
 CMD="${2:?usage: collab-sandbox.sh WORKDIR COMMAND}"
 BWRAP="$(command -v bwrap)" || { echo "collab-sandbox: bubblewrap (bwrap) is not installed; refusing to run unboxed" >&2; exit 126; }
+CPU_QUOTA="${HERDR_SANDBOX_CPU_QUOTA:-200%}"
+case "$CPU_QUOTA" in
+  ''|*[!0-9%]*|*%*%|%*) echo "collab-sandbox: HERDR_SANDBOX_CPU_QUOTA must be a positive systemd percentage" >&2; exit 126 ;;
+esac
+case "$CPU_QUOTA" in
+  0%|00%|000%) echo "collab-sandbox: HERDR_SANDBOX_CPU_QUOTA must be positive" >&2; exit 126 ;;
+esac
 AREA="$HOME/herdr-agents/work"
 case "/$WORK/" in */../*) echo "collab-sandbox: workdir must not contain .." >&2; exit 126 ;; esac
 case "$WORK" in "$AREA"/*) ;; *) echo "collab-sandbox: workdir must be under ~/herdr-agents/work/" >&2; exit 126 ;; esac
@@ -65,6 +72,16 @@ for n in claude codex pi node; do
     h="$t"
   done
   case "$r" in "$HOME"/*) bindro "$(dirname "$r")" ;; esac
+  # a managed launcher (for example pi's session-auto-resume wrapper) is a shell script that `exec`s node on files
+  # elsewhere under $HOME; without them the harness dies at once with "Cannot find module". Expose the directories of
+  # the absolute $HOME paths on its exec line, read-only (never the whole home, never anything not named there).
+  case "$r" in "$HOME"/*)
+    if [ -f "$r" ] && [ "$(head -c 2 "$r" 2>/dev/null)" = "#!" ] && [ "$(wc -c < "$r")" -lt 65536 ]; then
+      while IFS= read -r dep; do
+        case "$dep" in "$HOME"/*) [ -e "$dep" ] && bindro "$(dirname "$(readlink -f "$dep")")" ;; esac
+      done < <(grep -E '^[[:space:]]*exec[[:space:]]' "$r" | grep -oE "[\"'][^\"' ]+[\"']" | tr -d "\"'")
+    fi ;;
+  esac
 done
 # Helpers only (set by the runner, never by a task), each fails closed when it does not check out:
 #   HERDR_SANDBOX_RO_BINDS     newline-separated directories under ~/herdr-agents/work/ (a reviewer's view of its
@@ -164,8 +181,14 @@ if [ -n "${HERDR_EGRESS_SOCK+x}" ]; then   # set but empty is a runner bug: fail
     exit 126' collab-sandbox "$PORT" "$CMD")
 fi
 run=("$BWRAP" "${args[@]}" -- "${inner[@]}")
-if systemd-run --user --scope -q -p TasksMax=1000 true 2>/dev/null; then
-  exec systemd-run --user --scope -q -p TasksMax="${HERDR_SANDBOX_TASKS:-512}" -p MemoryMax="${HERDR_SANDBOX_MEM:-8G}" -- "${run[@]}"
+if [ "${HERDR_SANDBOX_EXTERNAL_SCOPE:-0}" = 1 ]; then
+  exec "${run[@]}"
 fi
-echo "collab-sandbox: no systemd user scope; running without a process/memory cap" >&2
+if systemd-run --user --scope -q -p TasksMax=1000 true 2>/dev/null; then
+  exec systemd-run --user --scope --collect -q \
+    -p TasksMax="${HERDR_SANDBOX_TASKS:-512}" \
+    -p MemoryMax="${HERDR_SANDBOX_MEM:-8G}" \
+    -p CPUQuota="$CPU_QUOTA" -- "${run[@]}"
+fi
+echo "collab-sandbox: no systemd user scope; running without process/memory/CPU containment" >&2
 exec "${run[@]}"

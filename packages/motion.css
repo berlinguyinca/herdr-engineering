@@ -1,0 +1,72 @@
+/* Motion rules. All durations come from --motion-fast / --motion-normal.
+ * Calm mode (html[data-calm="on"]) and OS reduced-motion switch every rule off. */
+@keyframes hd-enter { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@keyframes hd-flash { from { background-color: var(--accent-weak); } to { background-color: transparent; } }
+@keyframes hd-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+/* Draw-in reveals the line left to right with a clip. No dash state exists outside the animation:
+ * with vector-effect: non-scaling-stroke Chromium ignores pathLength, so a stroke-dasharray would
+ * leave the line in dash fragments at any scale other than 1x. */
+@keyframes hd-draw { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
+@keyframes hd-grow { from { transform: scaleY(0); } to { transform: none; } }
+@keyframes hd-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes hd-skeleton { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
+
+[data-entering] { animation: hd-enter var(--motion-normal) ease-out; }
+[data-leaving] { opacity: 0; max-height: 0; overflow: hidden; transition: opacity var(--motion-normal), max-height var(--motion-normal); }
+[data-flash] { animation: hd-flash 600ms ease-out; transition: background-color 600ms; }
+[data-pulse] { animation: hd-pulse 2s ease-in-out infinite; }
+/* A finite pulse for "this just appeared" (a new critical item): three beats, then still. */
+[data-pulse="once"] { animation: hd-pulse 2s ease-in-out 3; }
+/* Sparkline draw-in: the base state is the whole line; only the animation clips it, so calm
+ * (animation: none) shows the whole line. */
+.hv-spark__line[data-drawn] { animation: hd-draw 600ms ease-out; }
+/* Running CI rows pulse their state label. */
+.ig-row[data-state="running"] .ig-state strong { animation: hd-pulse 2s ease-in-out infinite; }
+/* CI charts draw in on their first paint only (data-drawn is set once by the view). */
+.ci-chart-card svg polyline[data-drawn] { animation: hd-draw 600ms ease-out; }
+.ci-chart-card svg rect[data-drawn] { transform-box: fill-box; transform-origin: bottom; animation: hd-grow 600ms ease-out; }
+.ci-chart-card svg circle[data-drawn] { animation: hd-fade 600ms ease-out; }
+progress, .hd-meter > *, .hd-stage-bar > *, .hv-meter__bar > i { transition: width var(--motion-normal), inline-size var(--motion-normal); }
+
+.hd-skeleton {
+  min-height: 1em; border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-hover) 50%, var(--surface-2) 75%);
+  background-size: 200% 100%; animation: hd-skeleton 1.4s linear infinite;
+}
+
+.hd-skeleton-group { display: grid; gap: 10px; margin: 12px 0; }
+.hd-skeleton--title { height: 1.875rem; width: min(14em, 60%); margin: 0 0 .5rem; }
+.hd-skeleton--line { height: 1em; width: 8em; }
+
+herdr-loading-progress { display: grid; gap: 4px; min-width: 0; font-size: 12px; color: var(--text-secondary); }
+herdr-loading-progress[hidden] { display: none; }
+/* Static stripes express activity without a fabricated completion percentage or
+ * a native indeterminate animation that could bypass calm/reduced-motion rules. */
+.hd-load-progress { appearance: none; border: 0; border-radius: var(--radius-sm); width: 100%; height: 7px; background: repeating-linear-gradient(135deg,var(--accent) 0 6px,var(--surface-2) 6px 12px); }
+.hd-load-progress::-webkit-progress-bar { background: inherit; border-radius: inherit; }
+.hd-load-progress::-moz-progress-bar { background: inherit; }
+
+/* A page head: the title with its freshness chip beside it (wraps below on narrow screens). */
+.hd-live-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.hd-live-head > h1 { min-width: 0; }
+herdr-freshness { display: inline-block; font-size: var(--text-sm); color: var(--text-secondary); }
+/* A healthy page needs no sentence: it is a small dot, and the text (still in the DOM for assistive tech) shows on hover. Only a stale or failed page says so. */
+herdr-freshness[data-state="fresh"] { width: 8px; height: 8px; margin: 0 4px; border-radius: 50%; background: var(--status-active); overflow: hidden; text-indent: -9999px; white-space: nowrap; vertical-align: middle; cursor: help; }
+herdr-freshness[data-state="stale"] { color: var(--freshness-warn); }
+herdr-freshness[data-state="error"] { color: var(--status-failed); }
+
+.hd-controls { display: flex; flex-wrap: wrap; gap: 6px 10px; padding: 0; font-size: .75rem; color: var(--text-secondary); }
+.hd-controls label { display: flex; align-items: center; gap: 6px; }
+.hd-controls select { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px; }
+
+html[data-calm="on"] *, html[data-calm="on"] *::before, html[data-calm="on"] *::after {
+  animation: none !important; transition-duration: 0s !important; transition-delay: 0s !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-calm="off"]) *, html:not([data-calm="off"]) *::before, html:not([data-calm="off"]) *::after {
+    animation: none !important; transition-duration: 0s !important; transition-delay: 0s !important;
+  }
+}
+.hd-icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
+.hd-icon-btn:hover { background: var(--surface-hover); color: var(--text); }
+@media (max-width: 900px) { .hd-icon-btn { width: 44px; height: 44px; } }

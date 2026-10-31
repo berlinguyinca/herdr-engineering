@@ -26,7 +26,7 @@ runs the service.
 The per-host **auto-registration agent** is intentionally *not* containerized:
 it must see host listeners via `ss`/`lsof`, so it stays a host service on
 every fleet host (systemd user unit on Linux, launchd LaunchAgent on macOS),
-pointing at the gateway via `HERDR_ENGINEERING_FABRIC_URL=http://dev.lan:29999`.
+pointing at the gateway via `fabric.url` in `fleet-config.yaml` (or `fabric.gateway_url` in `config.yaml`), e.g. `http://dev.lan:29999`.
 Join a machine with `scripts/fabric-agent.sh` (Linux) or
 `scripts/fabric-agent-macos.sh` (macOS); leave with `scripts/fabric-offboard.sh`.
 See [`docs/operations/fleet-lifecycle.md`](../../docs/operations/fleet-lifecycle.md)
@@ -147,3 +147,20 @@ curl http://dev.lan:18052                # reaches the leased service
   may not route `dev.lan` to CoreDNS; query CoreDNS directly with
   `dig @127.0.0.1 dev.lan`, and confirm the admin-console nameserver is
   restricted to `dev.lan`.
+
+## HTTPS on 443
+
+The gateway serves `https://dev.lan`, `https://local.metabolomics.us`, `https://<service>.local.metabolomics.us` and the
+node's `ts.net` name on port 443 (it replaces the old `tailscale serve --https=443` rule). Design and flags:
+[`docs/operations/fabric-public-names.md`](../../docs/operations/fabric-public-names.md).
+
+The container cannot issue or renew certificates, so the host does it and the gateway reloads changed files on its own:
+
+```bash
+deploy/fabric-stack/certs-sync.sh install     # one-time: private CA, first certificates, hourly user timer
+deploy/fabric-stack/certs-sync.sh renew       # what the timer runs (certbot renew if due + tailscale cert)
+```
+
+Order for the switch-over: `certs-sync.sh install`, `tailscale serve --https=443 off`, `docker compose up -d fabric-gateway`.
+The `:9447` serve rule is unaffected. Roll back with `tailscale serve --bg --https=443 http://127.0.0.1:8787` and the
+previous gateway command.

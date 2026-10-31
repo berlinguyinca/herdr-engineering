@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import HTTPSHandler, build_opener
@@ -25,10 +26,37 @@ RUNS = [dict(id=i, number=i, status=status, branch=branch, commit='a' * 40,
         [(1, 'success', 'main'), (2, 'failure', 'main'), (3, 'failure', 'main'),
          (4, 'success', 'feature')]]
 
+if '--selection-contract' in sys.argv:
+    for row in RUNS:
+        row['event'] = 'push' if row['number'] == 2 else 'pull_request'
+        if row['number'] == 1:
+            row['status'] = 'failure'
+
+if '--old-selection-run' in sys.argv:
+    for row in RUNS:
+        if row['number'] in (2, 3):
+            for key in ('created', 'started', 'finished'):
+                row[key] -= 60 * 86400
+
+
+# --log-tests: the unit-test step prints go -v output and the browser step only karma totals, like real projects do.
+LOGS = {12: '\n'.join(['go: downloading modules', '=== RUN   TestAlpha', '--- PASS: TestAlpha (0.01s)', '=== RUN   TestBeta',
+                       '    beta_test.go:12: expected 200, got 500', '--- FAIL: TestBeta (0.20s)', 'FAIL',
+                       'FAIL\texample.org/app/pkg\t0.3s', '']),
+        13: 'Chrome Headless 1.0 (Linux): Executed 5 of 5 SUCCESS (0.1 secs / 0.1 secs)\nTOTAL: 5 SUCCESS\n'}
+
 
 class ProviderHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?')[0]
+        if '--log-tests' in sys.argv and path.startswith('/api/repos/17/logs/') and path.endswith('/download'):
+            text = LOGS.get(int(path.split('/')[-2]), 'compiling\n').encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(text)))
+            self.end_headers()
+            self.wfile.write(text)
+            return
         if path == '/api/user/repos':
             body = [dict(id=17, full_name='org/app', owner='org', name='app')]
         elif path == '/api/agents':
@@ -78,8 +106,24 @@ with tempfile.TemporaryDirectory() as tmp:
     repo = ControlPlaneRepo()
     server = ControlPlaneServer(repo, web_root=ROOT/'packages')
     server.ci_monitor.close()
-    server.ci_monitor = CIMonitor(provider_factory=factory, on_observation=repo.observe_ci_pipeline)
+    logs = dict(on_log_report=repo.ingest_ci_log_report, log_known=repo.ci_log_analysis) if '--log-tests' in sys.argv else {}
+    server.ci_monitor = CIMonitor(provider_factory=factory, on_observation=repo.observe_ci_pipeline, **logs)
     server.ci_monitor.refresh()
+    server.ci_monitor._analyse_logs()      # the log reader has its own thread once started; this harness never starts the monitor
+    # Opt-in scale fixture: retained observations only, never extra provider I/O.
+    if '--117-projects' in sys.argv:
+        for project in range(116):
+            for number in range(1, 8):
+                started = NOW - number * 86400
+                repo.observe_ci_pipeline(dict(
+                    provider_url=f'https://127.0.0.1:{upstream.server_port}',
+                    provider_repo_id=1000 + project,
+                    repository=f'synthetic/project-{project:03d}', run_number=number,
+                    revision='b' * 40, branch='main', event='push',
+                    state='failure' if number % 3 == 0 else 'success',
+                    created_at=datetime.fromtimestamp(started, UTC).isoformat(),
+                    started_at=datetime.fromtimestamp(started, UTC).isoformat(),
+                    finished_at=datetime.fromtimestamp(started + 60, UTC).isoformat()))
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
     print(f'PORT={server.port}', flush=True)

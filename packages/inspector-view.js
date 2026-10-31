@@ -8,6 +8,7 @@
 // and scroll position survive streaming.
 import { connectEvents } from './herdr-web-client/events.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { skeleton } from './motion.js';
 import {
   CLIENT_BUFFER, CLIENT_BUFFER_MAX, INSPECTOR_VIEWS, PAGE_SIZE, mergeEntry, pickLayout,
   renderAssociations, renderPrefsForm, renderSummaryBar, renderView,
@@ -124,7 +125,7 @@ export function mountInspector(host, client, sessionId) {
     const prevHeight = listEl.scrollHeight;
     listEl.innerHTML = st.error
       ? `<herdr-error message="${esc(st.error)}"></herdr-error>`
-      : !d ? '<herdr-spinner></herdr-spinner>' : renderView(st.view, d, p, st.limit);
+      : !d ? skeleton('inspection', { rows: 3 }) : renderView(st.view, d, p, st.limit);
     if (prevTop > 4) listEl.scrollTop = prevTop + (listEl.scrollHeight - prevHeight);
     $('ins-aside').innerHTML = d ? renderAssociations(d) : '';
   }

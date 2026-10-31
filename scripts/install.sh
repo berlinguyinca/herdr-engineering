@@ -10,14 +10,16 @@
 # What it does (idempotent):
 #   1. verifies herdr is present (assumption)
 #   2. creates a project .venv and installs herdr-engineering (editable + dev)
-#   3. creates the machine-local state + artifact directories
-#   4. writes a safe private-by-default machine-local config (if absent)
-#   5. enrolls THIS machine (detected host + OS) into the private fleet inventory
+#   3. installs the pinned handoff/artifact skills and all four harness integrations,
+#      plus the canonical `summary` skill (/summary in Pi, Claude Code, OpenCode; $summary in Codex)
+#   4. creates the machine-local state + artifact directories
+#   5. writes a safe private-by-default machine-local config (if absent)
+#   6. enrolls THIS machine (detected host + OS) into the private fleet inventory
 #      and brings it onto the Tailscale tailnet (auto only if you provide a
 #      key via $TS_AUTH_KEY or ~/.config/herdr-engineering/tailscale-auth.key;
 #      otherwise it prints the command and continues)
-#   6. puts `herdr-eng` on PATH (~/.local/bin) when that directory is writable
-#   7. runs `herdr-eng doctor` and prints a summary
+#   7. puts `herdr-eng` and `herdr-handoff` on PATH (~/.local/bin) when writable
+#   8. runs `herdr-eng doctor` and prints a summary
 #
 # Re-running produces no unexpected changes. No secrets are written anywhere.
 #
@@ -29,6 +31,12 @@ cd "$REPO_ROOT"
 VENV="$REPO_ROOT/.venv"
 PY="$VENV/bin/python"
 HERDR_BIN="${HERDR_BIN:-herdr}"
+HANDOFF_REF="${HERDR_HANDOFF_REF:-3051d8c}"
+HANDOFF_REPO="${HERDR_HANDOFF_REPO:-$REPO_ROOT/../herdr-handoff}"
+HANDOFF_CACHE="${HERDR_HANDOFF_CACHE:-$HOME/.local/share/herdr-handoff/$HANDOFF_REF}"
+ARTIFACT_REF="${HERDR_ARTIFACT_REF:-c6156ea}"
+ARTIFACT_REPO="${HERDR_ARTIFACT_REPO:-$REPO_ROOT/../herdr-artifacts}"
+ARTIFACT_CACHE="${HERDR_ARTIFACT_CACHE:-$HOME/.local/share/herdr-artifacts/$ARTIFACT_REF}"
 
 STATE_DIR="${HERDR_ENGINEERING_STATE:-$HOME/.local/share/herdr-engineering/state}"
 ARTIFACT_DIR="${HERDR_ENGINEERING_ARTIFACT_ROOT:-$HOME/.local/share/herdr-engineering/artifacts}"
@@ -60,14 +68,46 @@ fi
 "$PY" -m pip install --quiet -e "$REPO_ROOT[dev]"
 printf '  installed herdr-engineering into %s\n' "$VENV"
 
-# --- 3. state + artifact directories --------------------------------------
-step "3/7 machine-local state + artifact directories"
+# --- 3. required cross-harness handoff ------------------------------------
+step "3/8 installing required herdr-handoff integration"
+if [ ! -f "$HANDOFF_REPO/pyproject.toml" ]; then
+  command -v git >/dev/null 2>&1 || die "git is required to install herdr-handoff"
+  mkdir -p "$(dirname "$HANDOFF_CACHE")"
+  if [ ! -d "$HANDOFF_CACHE/.git" ]; then
+    git clone --quiet https://github.com/berlinguyinca/herdr-handoff.git "$HANDOFF_CACHE"
+  fi
+  git -C "$HANDOFF_CACHE" fetch --quiet --depth 1 origin "$HANDOFF_REF" || true
+  git -C "$HANDOFF_CACHE" checkout --quiet --detach "$HANDOFF_REF"
+  HANDOFF_REPO="$HANDOFF_CACHE"
+fi
+"$PY" -m pip install --quiet -e "$HANDOFF_REPO"
+"$HANDOFF_REPO/install/install.sh"
+printf '  herdr-handoff %s installed from %s\n' "$HANDOFF_REF" "$HANDOFF_REPO"
+
+if [ ! -f "$ARTIFACT_REPO/install/install.sh" ]; then
+  command -v git >/dev/null 2>&1 || die "git is required to install herdr-artifacts"
+  mkdir -p "$(dirname "$ARTIFACT_CACHE")"
+  if [ ! -d "$ARTIFACT_CACHE/.git" ]; then
+    git clone --quiet https://github.com/berlinguyinca/herdr-artifacts.git "$ARTIFACT_CACHE"
+  fi
+  git -C "$ARTIFACT_CACHE" fetch --quiet --depth 1 origin "$ARTIFACT_REF" || true
+  git -C "$ARTIFACT_CACHE" checkout --quiet --detach "$ARTIFACT_REF"
+  ARTIFACT_REPO="$ARTIFACT_CACHE"
+fi
+"$ARTIFACT_REPO/install/install.sh"
+printf '  herdr-artifacts %s installed from %s\n' "$ARTIFACT_REF" "$ARTIFACT_REPO"
+
+# Idempotent; never overwrites a customized summary skill or command.
+"$PY" -m herdr_engineering.cli summary install || warn "summary skill install reported a problem (see above)"
+
+# --- 4. state + artifact directories --------------------------------------
+step "4/8 machine-local state + artifact directories"
 mkdir -p "$STATE_DIR" "$ARTIFACT_DIR"
 printf '  state:    %s\n' "$STATE_DIR"
 printf '  artifacts: %s\n' "$ARTIFACT_DIR"
 
 # --- 4. machine-local config (safe defaults) ------------------------------
-step "4/7 machine-local config (private-by-default; preserved if present)"
+step "5/8 machine-local config (private-by-default; preserved if present)"
 mkdir -p "$CONFIG_DIR"
 if [ -f "$CONFIG_FILE" ]; then
   printf '  config already present, leaving untouched: %s\n' "$CONFIG_FILE"
@@ -109,7 +149,7 @@ YAML
 fi
 
 # --- 5. enroll this machine into the private fleet inventory --------------
-step "5/7 enrolling this machine into the private fleet inventory"
+step "6/8 enrolling this machine into the private fleet inventory"
 "$PY" - "$INVENTORY" "$INVENTORY_EXAMPLE" <<'PYCODE'
 import socket, sys
 from pathlib import Path
@@ -150,7 +190,7 @@ PYCODE
 #   - the file ~/.config/herdr-engineering/tailscale-auth.key  (gitignored)
 # Otherwise it prints the exact command and continues (never blocks, never
 # writes a secret to the repo). Requires sudo when not running as root.
-step "5b/7 Tailscale (private tailnet reachability)"
+step "6b/8 Tailscale (private tailnet reachability)"
 TS_KEY_FILE="$HOME/.config/herdr-engineering/tailscale-auth.key"
 if command -v tailscale >/dev/null 2>&1; then
   if tailscale status >/dev/null 2>&1; then
@@ -193,13 +233,15 @@ else
   warn "  macOS:         brew install --cask tailscale"
 fi
 
-# --- 6. put herdr-eng on PATH ---------------------------------------------
-step "6/7 making herdr-eng available on PATH"
+# --- 7. put herdr tools on PATH -------------------------------------------
+step "7/8 making herdr-eng and herdr-handoff available on PATH"
 LINK_DIR="$HOME/.local/bin"
 if [ -d "$LINK_DIR" ] || mkdir -p "$LINK_DIR" 2>/dev/null; then
   if command -v python3 >/dev/null 2>&1 && case "$PATH" in *"$LINK_DIR"*) true;; *) false;; esac; then
     ln -sf "$VENV/bin/herdr-eng" "$LINK_DIR/herdr-eng"
     printf '  linked %s -> %s\n' "$LINK_DIR/herdr-eng" "$VENV/bin/herdr-eng"
+    ln -sf "$VENV/bin/herdr-handoff" "$LINK_DIR/herdr-handoff"
+    printf '  linked %s -> %s\n' "$LINK_DIR/herdr-handoff" "$VENV/bin/herdr-handoff"
   else
     warn "$LINK_DIR is not on PATH; activate the venv instead: source $VENV/bin/activate"
   fi
@@ -207,8 +249,8 @@ else
   warn "could not create $LINK_DIR; use: source $VENV/bin/activate"
 fi
 
-# --- 7. doctor ------------------------------------------------------------
-step "7/7 running herdr-eng doctor"
+# --- 8. doctor ------------------------------------------------------------
+step "8/8 running herdr-eng doctor"
 "$PY" -m herdr_engineering.cli doctor || warn "doctor reported warnings (see above)"
 
 step "Done."

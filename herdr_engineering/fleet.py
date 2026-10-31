@@ -163,9 +163,25 @@ def _parity(status: dict, expected: list[str], revision: str,
             "invalid_hosts": invalid}
 
 
+DEFAULT_GATEWAY = "http://dev.lan:29999"
+GATEWAY_IGNORED_MSG = (
+    "--gateway is IGNORED for the fabric agent: it no longer reads a gateway from the "
+    "command line or fabric.env. Set fabric.url in fleet-config.yaml (or "
+    "fabric.gateway_url in config.yaml) instead."
+)
+
+
+def warn_gateway_ignored(gateway: str | None) -> bool:
+    """Loudly tell the operator an explicit --gateway has no effect on the fabric agent."""
+    if gateway is None:
+        return False
+    print(f"warning: {GATEWAY_IGNORED_MSG}", file=sys.stderr)
+    return True
+
+
 def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "linux",
                user: str | None = None, ansible_host: str | None = None,
-               gateway: str = "http://dev.lan:29999", herdr_bin: str = "herdr",
+               gateway: str = DEFAULT_GATEWAY, herdr_bin: str = "herdr",
                attach: bool = True, provision: bool = True,
                inventory: Path | None = None, host_vars_dir: Path | None = None,
                fleet_config: Path | None = None, roles: list[str] | None = None,
@@ -254,7 +270,7 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
     return report
 
 
-def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:29999",
+def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                  inventory: Path | None = None, pull_controller: bool = True,
                  reinstall_local: bool = True, revision: str | None = None,
                  pi_revision: str | None = None) -> dict:
@@ -422,8 +438,25 @@ def fleet_status(*, inventory: Path | None = None, host: str | None = None) -> d
                           "revision": _clean(parts[4]).removeprefix("revision=") if len(parts) > 4 else "unknown",
                           "cleanup": _clean(parts[5]).removeprefix("cleanup=") if len(parts) > 5 else "unknown",
                           "pi_revision": _clean(parts[6]).removeprefix("pi-revision=") if len(parts) > 6 else "unknown",
-                          "pi_path": _clean(parts[7]).removeprefix("pi-path=") if len(parts) > 7 else ""})
+                          "pi_path": _clean(parts[7]).removeprefix("pi-path=") if len(parts) > 7 else "",
+                          "summary": _summary_state(parts, root)})
     return {"rc": rc, "hosts": hosts, "stderr": err.strip()[-300:] or None}
+
+
+def _summary_state(parts: list[str], root: Path) -> str:
+    """Informational: is the host's /summary skill the controller's? Never gates parity,
+    because a customized skill is deliberately preserved. Old fingerprints report 'unknown'."""
+    raw = next((p.strip().rstrip('"').strip() for p in parts if p.strip().startswith("summary=")), None)
+    if raw is None:
+        return "unknown"
+    sha = raw.removeprefix("summary=")
+    if sha == "MISSING":
+        return "MISSING"
+    try:
+        want = hashlib.sha256((root / "skills" / "summary" / "SKILL.md").read_bytes()).hexdigest()
+    except OSError:
+        return "unknown"
+    return "current" if sha == want else "differs"
 
 
 def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None) -> dict:

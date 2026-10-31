@@ -7,7 +7,15 @@ record, so task methods answer with the protocol's standard "no such task / unsu
 errors. Remote content is never echoed back: replies carry only our own sequence number.
 
 Scope on purpose: send-only text. Reading a room stays on MCP/REST, where it is wrapped as
-untrusted data. No files, URLs, push-notification callbacks or streaming exist here."""
+untrusted data. No files, URLs, push-notification callbacks or streaming exist here.
+
+Bounded delegation (T11), only while the operator's kill switch is on: a coworker agent's *bounded task*
+(the same HCN task store, never a second one) is an A2A Task. ``tasks/get`` and ``tasks/cancel`` read and
+cancel it, ``tasks/list`` (an extension, A2A 0.3 has none) lists the open ones, and ``message/send`` with a
+``taskId`` and ONE ``data`` part answers it (``accept``/``decline``/``progress``/``complete``/``fail``/``cancel``)
+or submits an artifact proposal (``propose``). Each of these calls the very same CollabService method as the
+MCP tool and the REST route, so the checks cannot differ by protocol. Deciding a proposal is not offered here:
+that is a person, over REST."""
 from __future__ import annotations
 
 import hashlib
@@ -23,10 +31,10 @@ _CONTENT_TYPE = -32005
 _NO_CARD = -32007
 
 
-def agent_card(public_url: str) -> dict:
+def agent_card(public_url: str, delegation: bool = False) -> dict:
     """Public, static, non-secret description of this service (A2A discovery document)."""
     base = public_url.rstrip("/")
-    return {
+    card = {
         "protocolVersion": PROTOCOL,
         "name": "HerdR Collaboration Network",
         "description": ("Post plain-text messages into HerdR collaboration rooms you have been "
@@ -48,20 +56,83 @@ def agent_card(public_url: str) -> dict:
                     "outputModes": ["text/plain"]}],
         "supportsAuthenticatedExtendedCard": False,
     }
+    if delegation:
+        card["description"] += (" Coworker agents can also answer bounded tasks and propose artifacts "
+                                "(quarantined until a person accepts them; never applied).")
+        card["skills"].append({
+            "id": "bounded-task", "name": "Answer a bounded task with an artifact proposal",
+            "description": "tasks/list, tasks/get and tasks/cancel work on bounded tasks. message/send with the "
+                           "message taskId and one data part {action: accept|decline|progress|complete|fail|cancel|propose, "
+                           "expected_version, ...} answers one. A proposal is quarantined and never applied.",
+            "tags": ["delegation", "proposal"], "inputModes": ["application/json"], "outputModes": ["application/json"]})
+    return card
 
 
 def _result(rid: Any, result: dict) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "result": result}
 
 
-def _error(rid: Any, code: int, message: str) -> dict:
-    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+def _error(rid: Any, code: int, message: str, data: Any = None) -> dict:
+    err = {"code": code, "message": message}
+    if data:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": rid, "error": err}
+
+
+_STATE = {"pending": "submitted", "accepted": "working", "done": "completed", "failed": "failed",
+          "declined": "rejected", "cancelled": "canceled", "expired": "failed"}
+
+
+def _task(view: dict) -> dict:
+    """A bounded task as an A2A Task. The proposals appear as artifact stubs (id, digest, state): the content
+    the delegate itself wrote is never echoed back."""
+    return {"kind": "task", "id": view["task_id"], "contextId": view["room_id"],
+            "status": {"state": _STATE.get(view["status"], "unknown")},
+            "artifacts": [{"artifactId": p["proposal_id"], "name": p["kind"],
+                           "metadata": {"state": p["state"], "digest": p["digest"]}} for p in view["proposals"]],
+            "metadata": {"herdr": {"version": view["version"], "text": view["text"], "bounds": view["bounds"],
+                                   "usage": view["usage"], "status": view["status"]}}}
+
+
+def _fail(rid: Any, exc: CollabError):
+    data = {"status": exc.status, **({"code": exc.code} if exc.code else {})}
+    return 200, _error(rid, -32000 if exc.status < 500 else -32603, exc.message, data)
+
+
+def _delegation_send(service: CollabService, pr, rid: Any, msg: dict):
+    parts = msg.get("parts")
+    if (not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], dict)
+            or parts[0].get("kind") != "data" or not isinstance(parts[0].get("data"), dict)):
+        return 200, _error(rid, _CONTENT_TYPE, "a task answer is exactly one data part")
+    data = dict(parts[0]["data"])
+    action = data.pop("action", None)
+    try:
+        if action == "propose":
+            out = service.submit_proposal(pr, msg["taskId"], data)
+        elif isinstance(action, str):
+            out = service.delegation_respond(pr, msg["taskId"], {"action": action, **data})
+        else:
+            return 200, _error(rid, -32602, "action is required")
+        view = service.delegation_status(pr, msg["taskId"])
+    except CollabError as exc:
+        return _fail(rid, exc)
+    task = _task(view)
+    task["metadata"]["herdr"]["result"] = {k: v for k, v in out.items() if k != "event"}
+    return 200, _result(rid, task)
 
 
 def _send(service: CollabService, pr, rid: Any, params: Any):
     msg = params.get("message") if isinstance(params, dict) else None
     if not isinstance(msg, dict):
         return 200, _error(rid, -32602, "message is required")
+    # A message with a taskId and a data part is a task answer, but only while delegation is switched on. Otherwise
+    # (the default) this is the old text-only send and a taskId, which many A2A clients set on follow-ups, is ignored.
+    parts_ = msg.get("parts")
+    if (service.delegation_enabled and msg.get("taskId") is not None and isinstance(parts_, list)
+            and any(isinstance(p, dict) and p.get("kind") == "data" for p in parts_)):
+        if not isinstance(msg["taskId"], str):
+            return 200, _error(rid, -32602, "taskId must be a string")
+        return _delegation_send(service, pr, rid, msg)
     room = msg.get("contextId")
     if not isinstance(room, str) or not room:
         return 200, _error(rid, -32602, "contextId must be the room id")
@@ -85,10 +156,26 @@ def _send(service: CollabService, pr, rid: Any, params: Any):
     try:
         _, out = service.post_message(pr, room, body)
     except CollabError as exc:
-        return 200, _error(rid, -32000 if exc.status < 500 else -32603, exc.message)
+        return _fail(rid, exc)
     note = f"posted at sequence {out['event']['sequence']}" + (" (replayed)" if out.get("replayed") else "")
     return 200, _result(rid, {"kind": "message", "role": "agent", "messageId": secrets.token_hex(12),
                               "contextId": room, "parts": [{"kind": "text", "text": note}]})
+
+
+def _tasks(service: CollabService, pr, rid: Any, method: str, params: Any):
+    tid = params.get("id") if isinstance(params, dict) else None
+    try:
+        if method == "tasks/list":
+            return 200, _result(rid, {"tasks": [_task(v) for v in service.delegations_inbox(pr)["delegations"]]})
+        if not isinstance(tid, str):
+            return 200, _error(rid, -32602, "id is required")
+        if method == "tasks/cancel":
+            service.delegation_respond(pr, tid, {"action": "cancel"})
+        return 200, _result(rid, _task(service.delegation_status(pr, tid)))
+    except CollabError as exc:
+        if exc.status == 404:           # not yours, not a task, not an agent that takes tasks: one answer
+            return 200, _error(rid, _TASK_NOT_FOUND, "no such task")
+        return _fail(rid, exc)
 
 
 def handle(service: CollabService, message: Any, authorization: str, device: str | None):
@@ -106,6 +193,8 @@ def handle(service: CollabService, message: Any, authorization: str, device: str
         return 403, _error(rid, -32002, "use an agent credential, not a user token")
     if method == "message/send":
         return _send(service, pr, rid, message.get("params"))
+    if method in ("tasks/get", "tasks/cancel", "tasks/list") and service.delegation_enabled:
+        return _tasks(service, pr, rid, method, message.get("params"))
     if method in ("tasks/get", "tasks/cancel", "tasks/pushNotificationConfig/set",
                   "tasks/pushNotificationConfig/get"):
         return 200, _error(rid, _TASK_NOT_FOUND, "no such task: this service keeps no task state")

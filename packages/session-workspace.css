@@ -2,3 +2,39 @@
 @media(max-width:800px){.sw-mobile-tabs{display:flex;gap:8px;margin:10px 0}.sw-mobile-tabs [aria-selected=true]{font-weight:700;border-bottom:2px solid var(--accent)}.sw-panes{display:block;height:75vh;min-height:400px}.sw-conversation,.sw-activity{height:100%;box-sizing:border-box}.sw-splitter{display:none}.sw-panes[data-mobile-pane=conversation] .sw-activity,.sw-panes[data-mobile-pane=activity] .sw-conversation{display:none}.sw-filters input[type=search]{max-width:170px}}
 .sw-workspace-heading,.sw-summary-heading{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px}.sw-workspace-heading [data-fullscreen]{margin-left:auto}.sw-summary-card{padding:14px 16px;margin:12px 0;border:1px solid var(--border-color,#ddd);border-radius:10px;background:var(--surface-card,transparent)}.sw-summary-card h3{margin:0}.sw-summary-card h4{margin:12px 0 5px}.sw-summary-card p{margin:6px 0}.sw-summary-heading button{margin-left:auto}.sw-summary-state,.sw-summary-provenance{font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}.sw-summary-card details summary{cursor:pointer}.sw [data-rename-form]{padding:12px;border:1px solid var(--border-color,#ddd);border-radius:8px}.sw [data-rename-form] input{padding:6px;background:var(--surface-card,#fff);color:var(--text-primary);border:1px solid var(--border-color,#ddd)}.sw [data-rename-status][role=alert]{color:var(--status-failed,#b42318)}.sw--fullscreen{position:fixed;inset:0;z-index:5000;box-sizing:border-box;margin:0;padding:20px;overflow:auto;background:var(--surface,#fff);color:var(--text-primary);}.sw--fullscreen .sw-panes{height:calc(100dvh - 40px);min-height:400px}.sw--fullscreen .conversation-composer--expanded{z-index:10000}
 .sw-summary-fix{margin-left:6px;font-size:12px}.sw-summary-fix-status{display:block;font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}.sw-summary-fix-status[role=alert]{color:var(--status-failed,#b42318)}
+.sw-workspace-heading [data-agent-name]{min-width:0;overflow-wrap:anywhere}
+
+/* Full /summary report: a bounded block in the summary card, so a long report never pushes the conversation off screen. */
+.sw-report{margin-top:12px;padding-top:10px;border-top:1px solid var(--border-color,#ddd)}.sw-report-status{font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}.sw-report-status[role=alert]{color:var(--status-failed,#b42318)}.sw-report summary{cursor:pointer;font-weight:600}.sw-report-body{max-height:min(55vh,480px);overflow:auto;overflow-wrap:anywhere;padding:8px 10px;margin-top:8px;border:1px solid var(--border-color,#ddd);border-radius:8px}.sw-report-body h1{font-size:1.1em}.sw-report-body h2,.sw-report-body h3{font-size:1em}
+/* Fullscreen workspace: the summary and report sit in their own column beside the conversation and activity panes. */
+@media (min-width:1000px){
+.sw--fullscreen{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,38%);column-gap:16px;align-content:start}
+.sw--fullscreen>*{grid-column:1;min-width:0}
+.sw--fullscreen>.sw-workspace-heading{grid-column:1/-1}
+.sw--fullscreen>.sw-summary-card{grid-column:2;grid-row:2/span 8;align-self:start;margin:0;max-height:calc(100dvh - 100px);overflow:auto}
+.sw--fullscreen .sw-panes{height:calc(100dvh - 220px);min-height:360px}
+.sw--fullscreen .sw-report-body{max-height:none;overflow:visible;border:0;padding:8px 0}
+}
+
+.sw-summary--quiet{font-size:12px;color:var(--text-secondary)}
+.sw-summary--quiet .sw-summary-provenance{display:none}
+.sw-report-strip{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0}
+.sw-badge{display:inline-flex;gap:6px;align-items:center;padding:2px 9px;border-radius:999px;border:1px solid var(--border-color,#ddd);font-size:12px;font-weight:600;text-transform:capitalize}
+.sw-badge--complete{border-color:var(--status-ok,#067647);color:var(--status-ok,#067647)}
+.sw-badge--partial,.sw-badge--stale{border-color:var(--status-attention);color:var(--status-attention);text-transform:none}
+.sw-badge--limited{border-color:var(--status-failed,#b42318);color:var(--status-failed,#b42318)}
+.sw-badge button{font-size:12px;padding:0 6px}
+.sw-report-resume{margin:6px 0;padding:8px 10px;border-left:3px solid var(--accent,#2563eb);background:var(--surface-hover);border-radius:4px}
+.sw-report-resume .conversation-markdown{margin-top:2px}
+.sw-report-actions{display:flex;gap:8px;margin:8px 0}
+.sw-report-section{margin:4px 0}
+.sw-report-section>summary{font-weight:600}
+.sw-ts{all:unset;cursor:pointer;color:var(--accent,#2563eb);text-decoration:underline dotted}
+.sw-ts:focus-visible{outline:2px solid var(--accent,#2563eb)}
+.sw-message--flash{outline:2px solid var(--accent,#2563eb);outline-offset:2px}
+.sw-usage-toggle{display:none}
+.sw--fullscreen .sw-usage-toggle{display:inline}
+.sw-activity-collapse{display:none}
+.sw--fullscreen .sw-activity-collapse{display:inline}
+.sw--fullscreen .sw-panes--solo{grid-template-columns:minmax(0,1fr) 0 0}
+.sw--fullscreen .sw-panes--solo .sw-activity,.sw--fullscreen .sw-panes--solo .sw-splitter{display:none}

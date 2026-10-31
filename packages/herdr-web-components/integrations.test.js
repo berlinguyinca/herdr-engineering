@@ -130,3 +130,37 @@ test('active run reports never cross provider collisions and unidentified report
  assert.deepEqual(ciSelectedRunReports([unscoped],[active],unscoped),[]);
  assert.deepEqual(ciSelectedRunReports([unscoped],[active,unscoped],active),[]);
 });
+
+test('a failed run offers Fix with Pi next to Send to Pi, disabled until an agent is chosen, and marks agents on its branch',()=>{
+  const sessions=[{session_id:'a',display_name:'Amber',branch:'feat/x',host_id:'beast'},{session_id:'b',display_name:'Birch',branch:'main'}];
+  const failed={state:'failure',branch:'feat/x'};
+  const none=renderPipeline(failed,{debugSessions:sessions,debugSessionId:''});
+  assert.match(none,/<button type="button" class="hd-btn" data-debug-fix disabled>Fix with Pi<\/button>/);
+  assert.match(none,/never merges/);
+  assert.match(none,/Amber · beast · on this branch/);
+  assert.doesNotMatch(none,/Birch · on this branch/);
+  assert.match(renderPipeline(failed,{debugSessions:sessions,debugSessionId:'a'}),/data-debug-fix >Fix with Pi/);
+  assert.doesNotMatch(renderPipeline({state:'running'}),/Fix with Pi/);
+});
+
+test('a selected CI run shows its related items above the steps',()=>{
+  const related=renderPipeline({run_number:12,repository:'org/app',state:'success',tasks:[]},{relatedHtml:'<section class="rel">RELATED-HERE</section>'});
+  assert.match(related,/RELATED-HERE/);
+  assert.ok(related.indexOf('RELATED-HERE')<related.indexOf('Pipeline')||!related.includes('Pipeline'));
+  assert.doesNotMatch(renderPipeline({run_number:12,tasks:[]}),/RELATED-HERE|class="rel"/);
+});
+
+test('inspector includes API diagnosis even when provider supplies no steps',()=>{
+ const html=renderPipeline({run_number:7,state:'failure',event:'push',revision:'abc',created_at:'2026-10-25T10:00:00Z',diagnosis:{evidence_availability:'unavailable',reason:'No validated report matches this exact run.',failed_steps:[],failed_tests:[]}});
+ assert.match(html,/Failure diagnosis/);assert.match(html,/No validated report/);assert.match(html,/push/);assert.match(html,/2026-10-25T10:00:00Z/);
+});
+
+test('selected project filters retain repository name as well as provider and ID after a rename',async()=>{
+ const project={provider_url:'https://ci.example',provider_repo_id:'17',repository:'org/current'};
+ const records=[{...project,run_number:1,state:'failure'},{...project,repository:'org/former',run_number:2,state:'failure'},{...project,provider_url:'https://other.example',run_number:3,state:'failure'}];
+ const entries=integrationEntries({pipelines:{history:records}});
+ assert.deepEqual(selectIntegrations(entries,{tab:'all',project}).map(e=>e.record.run_number),[1]);
+ const {ciSelectedRunReports}=await import('../integrations-view.js');
+ const active={...project,run_number:1};
+ assert.deepEqual(ciSelectedRunReports([{...active,report_id:'exact'},{...active,repository:'org/former',report_id:'renamed'}],records,active).map(r=>r.report_id),['exact']);
+});

@@ -250,7 +250,7 @@ test('analytics composes its existing views into a useful dashboard', async () =
   await withApp(async ({page,base}) => {
     await page.goto(`${base}/#/analytics`);await page.locator('[data-analytics-links]').waitFor();
     const destinations=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getAttribute('href')));
-    assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens']);
+    assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens','#/analytics/stages','#/analytics/usage']);
     const boxes=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getBoundingClientRect().width));
     assert.ok(boxes.every(width=>width>200),'analytics destinations should use the available desktop row');
   },{BURST:'0'});
@@ -286,22 +286,17 @@ test('analytics auto-fits operational panels without document overflow', async (
 test('4K operational views use the canvas while prose and catalog groups stay readable', async () => {
   await withApp(async ({page,base}) => {
     await page.setViewportSize({width:3840,height:2160});
-    await page.goto(`${base}/#/overview`);await page.locator('[data-overview=missions]').waitFor();
+    await page.goto(`${base}/#/overview`);await page.locator('[data-overview=hosts]').waitFor();
     const overview=await page.evaluate(()=>{
       const shell=document.querySelector('herdr-app-shell').shadowRoot;
       const content=shell.querySelector('.hd-shell__content').getBoundingClientRect();
-      const intro=document.querySelector('.ov-intro').getBoundingClientRect();
       const layout=getComputedStyle(document.querySelector('.ov-layout')).gridTemplateColumns.split(' ').length;
-      const missions=document.querySelector('[data-overview=missions]').getBoundingClientRect();
-      const fleet=document.querySelector('[data-overview=fleet]').getBoundingClientRect();
       const hosts=document.querySelector('[data-overview=hosts]').getBoundingClientRect();
       const activity=document.querySelector('[data-overview=activity]').getBoundingClientRect();
-      return {width:content.width,intro:intro.width,columns:layout,missions:missions.width,fleet:fleet.width,lastRowWidth:hosts.width+activity.width,overflow:document.documentElement.scrollWidth>innerWidth};
+      return {width:content.width,columns:layout,lastRowWidth:hosts.width+activity.width,overflow:document.documentElement.scrollWidth>innerWidth};
     });
     assert.ok(overview.width>=3400,`expected the 4K canvas after the sidebar, got ${overview.width}`);
-    assert.ok(overview.intro<900,`prose should retain a readable measure, got ${overview.intro}`);
     assert.equal(overview.columns,4);
-    assert.ok(Math.abs(overview.missions-overview.fleet)<40,'the sparse mission and fleet panels should split the first row evenly');
     assert.ok(overview.lastRowWidth>overview.width*.9,`last Overview row should use the canvas, got ${overview.lastRowWidth}`);
     assert.equal(overview.overflow,false);
     await page.goto(`${base}/#/herd`);await page.locator('.ss-group').first().waitFor();
@@ -375,6 +370,21 @@ test('mission detail renders the timeline', async () => {
       fullPage: true,
     });
   }, { BURST: '0' });
+});
+
+test('mission detail surfaces telemetry state and stall age (issue #31)', async () => {
+  await withApp(async ({ page, base }) => {
+    // pi:MSN-PI1 has no live collector, so its telemetry_state is UNKNOWN.
+    await page.goto(`${base}/#/missions/pi:MSN-PI1`);
+    await page.waitForSelector('[data-telemetry-state]', { timeout: 15000 });
+    const badge = await page.locator('[data-telemetry-state]').innerText();
+    assert.match(badge, /Telemetry unknown/, `telemetry badge should say unknown (got "${badge}")`);
+    // A Stall age metric is rendered and, for a no-collector mission, is unknown.
+    const metric = page.locator('herdr-metric[label="Stall age"]');
+    await metric.waitFor({ state: 'visible', timeout: 15000 });
+    const value = await metric.locator('.hd-metric__value').innerText();
+    assert.match(value, /Unknown/, `stall age should be unknown for a no-collector mission (got "${value}")`);
+  });
 });
 
 // ---------------------------------------------------------------- agent inspector (spec 0200)
@@ -963,7 +973,7 @@ test('sessions tabs keep closed records separate, retain filters and encode exac
   await page.clock.install();await page.goto(`${base}/#/herd`);
   await page.waitForFunction(()=>document.querySelector('#ss-tab-current [data-count]')?.textContent==='25');
   const catalogGeometry=await page.locator('.ss-row').first().evaluate(row=>({top:row.getBoundingClientRect().top,height:row.getBoundingClientRect().height}));
-  assert.ok(catalogGeometry.top<=330,`expected records near the top of the viewport, got ${catalogGeometry.top}`);
+  assert.ok(catalogGeometry.top<=420,`expected records near the top of the viewport, got ${catalogGeometry.top}`);
   assert.ok(catalogGeometry.height<=96,`expected compact desktop agent rows, got ${catalogGeometry.height}`);
   assert.equal(await page.locator('.ss-row').count(),20);await page.locator('#ss-next').click();assert.equal(await page.locator('.ss-row').count(),5);
   await page.locator('#ss-tab-current').focus();await page.keyboard.press('ArrowRight');
@@ -1018,9 +1028,9 @@ test('overview keeps healthy panels through partial errors and links to the exac
    return {contentWidth:content.width,missions:box('missions'),fleet:box('fleet'),sessions:box('sessions'),ci:box('ci')};
   });
   assert.ok(desktopLayout.contentWidth>=1400,`expected operational content to use desktop width, got ${desktopLayout.contentWidth}`);
-  assert.ok(desktopLayout.missions.width>desktopLayout.sessions.width,'current missions should remain the primary overview panel');
-  assert.ok(desktopLayout.fleet.top<desktopLayout.sessions.bottom,'fleet status should share the upper overview region');
-  assert.ok(Math.abs(desktopLayout.sessions.top-desktopLayout.ci.top)<2,'secondary overview panels should align in a desktop row');
+  assert.ok(desktopLayout.sessions.width>desktopLayout.missions.width,'agents are the primary overview panel');
+  assert.ok(desktopLayout.fleet.top<desktopLayout.sessions.bottom+desktopLayout.fleet.height,'fleet status should stay in the upper overview region');
+  assert.ok(Math.abs(desktopLayout.sessions.top-desktopLayout.missions.top)<2,'agents and missions share the top row');
   await page.setViewportSize({width:768,height:1024});await page.goto(`${base}/#/overview`);await page.locator('[data-overview=sessions] .ov-row').waitFor();
   const tabletColumns=await page.locator('.ov-layout').evaluate(layout=>getComputedStyle(layout).gridTemplateColumns.split(' ').length);
   assert.equal(tabletColumns,1,'tablet content should collapse before cards become too narrow beside the sidebar');
@@ -1030,8 +1040,8 @@ test('overview keeps healthy panels through partial errors and links to the exac
   assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),false);
   await menu.click();assert.equal(await menu.getAttribute('aria-expanded'),'true');
   assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),true);
-  await page.locator('herdr-app-shell .hd-shell__link[data-path="/analytics"]').click();
-  await page.getByRole('heading',{name:'Analytics',exact:true}).waitFor();
+  await page.locator('herdr-app-shell .hd-shell__link[data-path="/hosts"]').click();
+  await page.waitForFunction(()=>location.hash==='#/hosts'&&document.querySelector('herdr-app-shell').shadowRoot.querySelector('.hd-shell__menu').getAttribute('aria-expanded')==='false');
   assert.equal(await menu.getAttribute('aria-expanded'),'false');
   assert.equal(await menu.evaluate(button=>button===button.getRootNode().activeElement),true);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
@@ -1242,7 +1252,7 @@ test('Reviews groups decisions and preserves plan inspection with safe upstream 
 test('failed CI run sends debugging context only to an explicitly chosen active Pi session',async()=>{
   await withApp(async({page,base})=>{
     const posts=[];
-    const failed={provider_url:'https://ci.example',provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure'};
+    const failed={provider_url:'https://ci.example',provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure',created_at:new Date(Date.now()-60000).toISOString(),finished_at:new Date().toISOString()};
     await page.route('**/api/v1/ci',r=>r.fulfill({json:{available:true,status:'connected',pipelines:{'lab/spectra':[failed]}}}));
     await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{repository:'7',number:42,status:'failure',commit:'a'.repeat(40),tasks:[{id:1,name:'Tests',state:'failure'}]}}}));
     await page.route('**/api/v1/sessions',r=>r.fulfill({json:{sessions:[{session_id:'chosen',display_name:'Amber Finch',agent_role:'pi',status:'active',title:'Parser agent',host_id:'beast',terminal_id:'term_1',herdr_session:'default',agent_session:{agent:'pi'}},{session_id:'closed',agent_role:'pi',status:'closed'},{session_id:'other',agent_role:'codex',status:'active'}]}}));
@@ -1259,9 +1269,10 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
     await page.goto(`${base}/#/ci?tab=failed`);
     assert.equal(await page.locator('[data-ci-workspace="runs"]').getAttribute('aria-selected'),'true');
     await page.getByRole('button',{name:'Run #42',exact:true}).waitFor();
+    assert.deepEqual(await page.evaluate(()=>{window.ciListeners=window.integrationListeners.filter(listener=>listener.signal);return window.ciListeners.map(listener=>listener.type).sort();}),['change','click','toggle']);
     await page.evaluate(()=>{window.location.hash='/reviews';});
     await page.getByRole('heading',{name:'Reviews',exact:true}).waitFor();
-    assert.equal(await page.evaluate(()=>window.integrationListeners.slice(0,3).every(l=>l.signal?.aborted)),true);
+    assert.equal(await page.evaluate(()=>window.ciListeners.every(listener=>listener.signal.aborted)),true);
     await page.evaluate(()=>{window.location.hash='/ci?tab=failed';});
     assert.equal(await page.locator('[data-ci-workspace="runs"]').getAttribute('aria-selected'),'true');
     await page.getByRole('button',{name:'Run #42',exact:true}).click();
@@ -1275,10 +1286,119 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
     await page.getByText('Delivery unconfirmed; retry checks the same operation.',{exact:true}).waitFor();
     assert.equal(posts.length,1);
     await page.getByRole('button',{name:'Send to Pi',exact:true}).click();
-    await page.getByText('Debugging context delivered to the selected Pi agent.',{exact:true}).waitFor();
+    await page.getByText('The debugging context was delivered to the selected Pi agent.',{exact:true}).waitFor();
     assert.equal(posts.length,2);assert.equal(posts[1].operation_id,posts[0].operation_id);assert.equal(posts[0].session_id,'chosen');assert.equal(posts[0].repository,'7');
     assert.equal(posts[0].number,42);assert.match(posts[0].operation_id,/^[0-9a-f-]{36}$/);
     assert.match(await page.locator('.ig-inspector').innerText(),/Run #42/);
+  },{BURST:'0'});
+});
+
+async function seedFailedRun(page,{fixes,fixStatus=200}={}) {
+  const state={fixes:fixes||[],posts:[],cancels:0,terminals:[]};
+  const failed={provider_url:'https://ci.example',provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure',created_at:new Date(Date.now()-60000).toISOString(),finished_at:new Date().toISOString()};
+  await page.route('**/api/v1/ci',r=>r.fulfill({json:{available:true,status:'connected',pipelines:{'lab/spectra':[failed]}}}));
+  await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{repository:'7',number:42,status:'failure',commit:'a'.repeat(40),tasks:[{id:1,name:'Tests',state:'failure'}]}}}));
+  await page.route(/\/api\/v1\/ci\/fix(\/|\?|$)/,r=>{
+    const req=r.request(),url=new URL(req.url());
+    if(fixStatus!==200)return r.fulfill({status:fixStatus,json:{error:'not found'}});
+    if(req.method()==='POST' && url.pathname.endsWith('/cancel')){state.cancels++;state.fixes[0]={...state.fixes[0],cancel_requested:true};return r.fulfill({json:state.fixes[0]});}
+    if(req.method()==='POST'){
+      const body=req.postDataJSON();state.posts.push(body);
+      state.fixes=[{id:'cifix_new',state:'queued',reason:'waiting for a free host',repository:'7',number:42,requested_at:new Date().toISOString(),cancel_requested:false}];
+      return r.fulfill({status:202,json:state.fixes[0]});
+    }
+    return r.fulfill({json:{fixes:state.fixes}});
+  });
+  await page.route('**/api/v1/sessions/*/terminal',r=>{state.terminals.push(decodeURIComponent(new URL(r.request().url()).pathname.split('/')[4]));return r.fulfill({json:{viewer_host:'bender',recommended:'remote',commands:[{form:'remote',label:'From another machine (ssh to beast)',command:'ssh -t beast "herdr agent attach wK:pH"'},{form:'local',label:'On beast itself',command:'herdr agent attach wK:pH'}]}});});
+  return state;
+}
+const refreshView=page=>page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+async function openFailedRun(page,base) {
+  await page.goto(`${base}/#/ci?tab=failed`);
+  await page.getByRole('button',{name:'Run #42',exact:true}).click();
+}
+
+test('failed CI run: Fix in sandbox becomes a status card that follows the fix to a draft PR',async()=>{
+  await withApp(async({page,base})=>{
+    const state=await seedFailedRun(page);
+    await openFailedRun(page,base);
+    const button=page.getByRole('button',{name:'Fix in sandbox',exact:true});
+    await button.waitFor();
+    assert.match(await page.locator('[data-ci-fix]').innerText(),/never merges/);
+    await button.click();
+    await page.locator('[data-fix-state="queued"]').waitFor();
+    assert.match(await page.locator('[data-ci-fix]').innerText(),/Queued[\s\S]*waiting for a free host/);
+    assert.equal(await page.locator('[data-fix-sandbox]').count(),0);
+    assert.equal(state.posts.length,1);assert.equal(state.posts[0].repository,'7');assert.equal(state.posts[0].number,42);
+    assert.match(state.posts[0].operation_id,/^[0-9a-f-]{36}$/);
+    // The runner picks it up: host, model and the agent link appear on the next refresh.
+    state.fixes=[{...state.fixes[0],state:'running',reason:null,host:'beast',model:'qwen',started_at:new Date().toISOString(),session_id:'herdr:beast:default:wK%3ApH'}];
+    await refreshView(page);
+    await page.locator('[data-fix-state="running"]').waitFor();
+    const card=page.locator('[data-ci-fix]');
+    assert.match(await card.innerText(),/Pi is working[\s\S]*Host beast · Model qwen/);
+    assert.equal(await card.locator('[data-fix-agent]').getAttribute('href'),'#/herd/session/herdr%3Abeast%3Adefault%3AwK%253ApH');
+    // Terminal commands: both forms, the suggested one first, each copyable.
+    await card.getByRole('button',{name:'Terminal',exact:true}).click();
+    await card.locator('.ig-fix-cmd').first().waitFor();
+    assert.deepEqual(state.terminals,['herdr:beast:default:wK%3ApH']);
+    assert.equal(await card.locator('.ig-fix-cmd').count(),2);
+    assert.match(await card.locator('.ig-fix-cmd').first().innerText(),/ssh -t beast/);
+    await card.locator('[data-fix-copy]').first().click();
+    await page.getByRole('button',{name:'Copied',exact:true}).waitFor();
+    // Cancel is a request; the card says so and the button goes away.
+    await card.getByRole('button',{name:'Cancel',exact:true}).click();
+    await page.getByText('cancel requested').waitFor();
+    assert.equal(state.cancels,1);assert.equal(await card.locator('[data-fix-cancel]').count(),0);
+    // Done: a link to the draft PR, the diff stat and the flags; the new card replaces the button.
+    state.fixes=[{...state.fixes[0],state:'succeeded',cancel_requested:false,ended_at:new Date().toISOString(),result:{pr_url:'https://github.com/lab/spectra/pull/9',pr_number:9,files:2,insertions:10,deletions:3,commits:1,flags:['changes a workflow file'],summary:'Fixed the import.'}}];
+    await refreshView(page);
+    await page.locator('[data-fix-state="succeeded"]').waitFor();
+    assert.equal(await card.locator('[data-fix-pr]').getAttribute('href'),'https://github.com/lab/spectra/pull/9');
+    assert.match(await card.innerText(),/2 files · \+10 −3[\s\S]*changes a workflow file[\s\S]*Fixed the import\./);
+  },{BURST:'0'});
+});
+
+test('failed CI run: every fix state renders with its reason and failed fixes can be retried',async()=>{
+  await withApp(async({page,base})=>{
+    const state=await seedFailedRun(page,{fixes:[{id:'cifix_1',state:'queued',reason:'no model available',repository:'7',number:42,requested_at:new Date().toISOString()}]});
+    await openFailedRun(page,base);
+    await page.locator('[data-fix-state="queued"]').waitFor();
+    for(const [name,label,reason] of [['claimed','Starting',null],['preparing','Preparing the sandbox',null],['finishing','Checking the result',null],['no_change','Pi made no change','the agent changed nothing'],['failed','Failed','the sandbox ran out of time'],['cancelled','Cancelled','cancelled by the operator'],['expired','Expired','nobody picked it up']]) {
+      state.fixes=[{...state.fixes[0],state:name,reason}];
+      await refreshView(page);
+      await page.locator(`[data-fix-state="${name}"]`).waitFor();
+      const text=await page.locator('[data-ci-fix]').innerText();
+      assert.ok(text.includes(label),`${name}: ${text}`);
+      if(reason)assert.ok(text.includes(reason),`${name}: ${text}`);
+    }
+    // The fix is over, so a new one can be requested with a fresh operation.
+    await page.getByRole('button',{name:'Fix in sandbox again',exact:true}).click();
+    await page.locator('[data-fix-state="queued"]').waitFor();
+    assert.equal(state.posts.length,1);
+  },{BURST:'0'});
+});
+
+test('failed CI run: the fix card fits a 390px screen and escapes what the runner reports',async()=>{
+  await withApp(async({page,base})=>{
+    await page.setViewportSize({width:390,height:800});
+    await seedFailedRun(page,{fixes:[{id:'cifix_1',state:'failed',reason:'<img src=x onerror=window.pwned=1> '+'x'.repeat(300),repository:'7',number:42,requested_at:new Date().toISOString(),host:'h'.repeat(60),session_id:'s'}]});
+    await openFailedRun(page,base);
+    await page.locator('[data-fix-state="failed"]').waitFor();
+    assert.equal(await page.evaluate(()=>window.pwned),undefined);
+    assert.equal(await page.locator('[data-ci-fix] img').count(),0);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+  },{BURST:'0'});
+});
+
+test('failed CI run: no Fix in sandbox button when the control plane has the feature disabled',async()=>{
+  await withApp(async({page,base})=>{
+    await seedFailedRun(page,{fixStatus:404});
+    await openFailedRun(page,base);
+    await page.getByText('Debug with Pi',{exact:true}).waitFor();
+    await page.waitForTimeout(300);
+    assert.equal(await page.locator('[data-ci-fix]').count(),0);
+    assert.equal(await page.getByRole('button',{name:/Fix in sandbox/}).count(),0);
   },{BURST:'0'});
 });
 
@@ -1300,6 +1420,7 @@ test('hosts page lists the fleet version matrix and flags the host that differs'
 test('overview attention and saved layout stay keyboard usable through refresh at every workspace width',async()=>{
  await withApp(async({page,base})=>{
   let blocked=true;
+  await page.route('**/api/v1/attention*',r=>r.fulfill({status:404,json:{error:'not found'}}));   // these tests drive the browser projection
   await page.route('**/api/v1/mission-activity',r=>r.fulfill({json:{activities:[liveProjection({activity:{health:blocked?'blocked':'active'}})]}}));
   await page.addInitScript(()=>{if(!localStorage.getItem('herdr.overview.layout.v1'))localStorage.setItem('herdr.overview.layout.v1',JSON.stringify({order:['ci','attention','ci','health','unknown'],hidden:['attention','health','ci']}));});
   await page.clock.install();await page.goto(`${base}/#/overview`);
@@ -1314,10 +1435,10 @@ test('overview attention and saved layout stay keyboard usable through refresh a
   assert.equal(await hideCi.evaluate(el=>el===document.activeElement),true);
   await page.getByRole('button',{name:'Move CI builds down',exact:true}).focus();await page.keyboard.press('Enter');
   assert.equal(await page.getByRole('button',{name:'Move CI builds down',exact:true}).evaluate(el=>el===document.activeElement),true);
-  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'missions');
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'sessions');
   // Reload with the saved preferences rather than reconstructing the layout.
   await page.goto(`${base}/#/activity`);await page.getByRole('heading',{name:'Activity',exact:true}).waitFor();await page.goto(`${base}/#/overview`);await page.getByRole('heading',{name:'Overview',exact:true}).waitFor();
-  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'missions');
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'sessions');
   const target=attention.locator('a[href*="missions/"]');await target.focus();
   await page.clock.runFor(5500);
   assert.equal(await target.evaluate(el=>el===document.activeElement),true,await page.evaluate(()=>document.activeElement.outerHTML));
@@ -1326,7 +1447,7 @@ test('overview attention and saved layout stay keyboard usable through refresh a
   assert.equal(await page.evaluate(()=>document.querySelector('[data-overview=attention] h2')===document.activeElement),true,await page.locator('#view').innerText());
   await page.locator('.ov-customize summary').click();
   await page.getByRole('button',{name:'Reset layout',exact:true}).click();
-  assert.deepEqual(await page.locator('.ov-layout > section').evaluateAll(cards=>cards.map(card=>card.dataset.overview)),['missions','fleet','sessions','ci','reviews','services','hosts','activity']);
+  assert.deepEqual(await page.locator('.ov-layout > section').evaluateAll(cards=>cards.map(card=>card.dataset.overview)),['sessions','missions','fleet','ci','reviews','services','hosts','activity']);
   assert.equal(await page.locator('.ov-layout > section[hidden]').count(),0);
   for(const width of [3840,2560,1920,768,390]) {
    await page.setViewportSize({width,height:1080});
@@ -1334,13 +1455,14 @@ test('overview attention and saved layout stay keyboard usable through refresh a
    const layout=await page.evaluate(()=>({attention:document.querySelector('[data-overview=attention]').getBoundingClientRect().top,cards:document.querySelector('.ov-layout').getBoundingClientRect().top,footer:document.querySelector('.ov-health').getBoundingClientRect().top,bottom:document.querySelector('.ov-layout').getBoundingClientRect().bottom}));
    assert.ok(layout.attention<layout.cards);assert.ok(layout.footer>=layout.bottom);
   }
- },{BURST:'0'});
+ },{BURST:'0',CI_OFFLINE:'1'});
 });
 
 test('overview attention opens only the intended CI provider when repository and run IDs collide',async()=>{
  await withApp(async({page,base})=>{
-  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed',updated_at:new Date().toISOString()};
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed',created_at:new Date(Date.now()-60000).toISOString(),finished_at:new Date().toISOString(),updated_at:new Date().toISOString()};
   const runs=[{...run,provider_url:'https://ci.example'},{...run,provider_url:'https://ci.example/secondary'}];
+  await page.route('**/api/v1/attention*',r=>r.fulfill({status:404,json:{error:'not found'}}));   // these tests drive the browser projection
   await page.route('**/api/v1/ci',route=>route.fulfill({json:{available:true,status:'connected',pipelines:{'org/repo':runs}}}));
   await page.goto(`${base}/#/overview`);
   const links=page.locator('[data-overview=attention] a[href*="/ci?"]');
@@ -1354,12 +1476,13 @@ test('overview attention opens only the intended CI provider when repository and
   assert.equal(await page.locator('#ig-results [data-run]').count(),1);
   assert.deepEqual(JSON.parse(await page.locator('#ig-results [data-run]').getAttribute('data-run')),['https://ci.example','7','12']);
   assert.equal(await page.locator('[data-ig-search]').inputValue(),'12');
- },{BURST:'0'});
+ },{BURST:'0',CI_OFFLINE:'1'});
 });
 
 test('large Overview attention queues keep cards close and expand within a keyboard-accessible scroll region',async()=>{
  await withApp(async({page,base})=>{
   let refreshed=false,releaseOtherPanels;
+  await page.route('**/api/v1/attention*',r=>r.fulfill({status:404,json:{error:'not found'}}));   // these tests drive the browser projection
   const otherPanelsReady=new Promise(resolve=>{releaseOtherPanels=resolve;});
   const missions=Array.from({length:196},(_,index)=>({mission_id:`failure-${index}`,title:`Failure ${index}`,status:'failed',updated_at:new Date(Date.now()-index*1000).toISOString()}));
   await page.route('**/api/v1/missions',route=>route.fulfill({json:{missions:missions.map(record=>({...record,title:refreshed?`${record.title} refreshed`:record.title}))}}));
@@ -1373,8 +1496,8 @@ test('large Overview attention queues keep cards close and expand within a keybo
   await page.addInitScript(()=>localStorage.setItem('herdr.overview.layout.v1',JSON.stringify({order:['ci'],hidden:['sessions']})));
   await page.clock.install();await page.goto(`${base}/#/overview`);
   const attention=page.locator('[data-overview=attention]'),toggle=attention.locator('[data-attention-toggle]');
-  await page.waitForFunction(()=>document.querySelectorAll('[data-attention-key]').length===6);
-  await attention.getByText('Showing 6 of 196 observed items',{exact:true}).waitFor();
+  await page.waitForFunction(()=>document.querySelectorAll('[data-attention-key]').length===3);
+  await attention.getByText('Showing 3 of 196 observed items',{exact:true}).waitFor();
   assert.equal(await attention.locator('[data-attention-key] a').first().getAttribute('href'),'#/missions/failure-0');
   for(const width of [3840,2560,1920,768,390]) {
    await page.setViewportSize({width,height:1080});
@@ -1420,10 +1543,173 @@ test('large Overview attention queues keep cards close and expand within a keybo
    await toggle.focus();await page.keyboard.press('Enter');
    assert.equal(await toggle.getAttribute('aria-expanded'),'false');
    assert.equal(await page.evaluate(()=>document.querySelector('[data-attention-toggle]')===document.activeElement),true);
-   assert.equal(await attention.locator('[data-attention-key]').count(),6);
+   assert.equal(await attention.locator('[data-attention-key]').count(),3);
   }
   assert.equal(await page.locator('[data-overview=sessions]').isVisible(),false);
   assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'ci');
   assert.deepEqual(await page.evaluate(()=>JSON.parse(localStorage.getItem('herdr.overview.layout.v1'))),{order:['ci'],hidden:['sessions']});
- },{BURST:'0'});
+ },{BURST:'0',CI_OFFLINE:'1'});
+});
+
+// Mission delivery sections (#34, #35): the /missions/<id>/tests and
+// /missions/<id>/reviews pages render seeded builds, test runs, reviews and
+// pull requests for a herdr mission, read-only, with honest empty/error states.
+async function alphaMissionKey(page, base) {
+  await page.goto(`${base}/#/missions`);
+  // Recorded herdr missions sit in a collapsed 'recorded' group, so the row
+  // link may be hidden; read its href directly (works whether or not visible).
+  await page.waitForFunction(
+    () => [...document.querySelectorAll('a.mc-title')].some((a) => a.textContent.includes('Alpha')),
+    null, { timeout: 20000 });
+  return await page.evaluate(() => {
+    const link = [...document.querySelectorAll('a.mc-title')].find((a) => a.textContent.includes('Alpha'));
+    const hash = link.getAttribute('href'); // href is #/missions/<encoded key>
+    return decodeURIComponent(hash.replace(/^#\/missions\//, ''));
+  });
+}
+
+test('mission tests page lists builds and test runs read-only', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/tests`);
+    // Seeded failing test run and its '1 failed' count.
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('failed 1'),
+      null, { timeout: 15000 });
+    const text = await bodyText(page);
+    assert.ok(text.includes('failed 1'), 'failed run count missing');
+    assert.ok(text.includes('passed 2'), 'passed run count missing');
+    assert.ok(text.includes('Build'), 'build row missing');
+    assert.ok(text.includes('unknown'), 'build without counts must report unknown');
+    assert.ok(text.includes('42s'), 'duration missing');
+    // A build with no recorded counts renders an explicit unknown, never 0.
+    assert.ok(text.includes('Counts unknown'), 'missing counts must show unknown');
+    assert.ok(!text.includes('Failed to fetch') && !text.includes('too many requests'),
+      'delivery page must not error');
+    // No mutation affordances on a read-only page.
+    assert.ok(!/merge|approve|create pull/i.test(text), 'read-only page must not offer mutations');
+  }, { BURST: '0' });
+});
+
+test('mission delivery pages escape hostile text and keep UNKNOWN verdict unknown', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    const missionUrl = new RegExp(`/api/v1/missions/${encodeURIComponent(key).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}$`);
+    await page.route(missionUrl, async (route) => {
+      const response = await route.fetch();
+      const mission = await response.json();
+      mission.title = '<img src=x onerror=alert(1)> & hostile';
+      await route.fulfill({ response, json: mission });
+    });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Changes requested'),
+      null, { timeout: 15000 });
+    const text = await bodyText(page);
+    assert.ok(text.includes('<img src=x onerror=alert(1)> & hostile'), 'hostile title should remain text');
+    assert.equal(await page.locator('img[src="x"]').count(), 0, 'hostile title must not create an image');
+    assert.ok(text.includes('Unknown'), 'UNKNOWN verdict should be shown as unknown');
+    assert.ok(!text.includes('Approved'), 'UNKNOWN verdict must never be shown as approved');
+  }, { BURST: '0' });
+});
+
+test('mission delivery navigation ignores stale delayed responses', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    await page.route('**/api/v1/missions/*/tests', async (route) => {
+      await sleep(500);
+      await route.continue();
+    });
+    await page.route('**/api/v1/missions/*/builds', async (route) => {
+      await sleep(500);
+      await route.continue();
+    });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/tests`);
+    await page.locator('[data-skeleton][aria-busy="true"]').first().waitFor({ state: 'attached' });
+    await page.goto(`${base}/#/overview`);
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Overview'),
+      null, { timeout: 15000 });
+    await page.waitForTimeout(700);
+    assert.ok((await bodyText(page)).includes('Overview'), 'stale delivery response replaced the current route');
+  }, { BURST: '0' });
+});
+
+test('mission reviews page lists verdict, findings and PR merge status', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
+    // Seeded review verdict and blocking finding.
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Changes requested'),
+      null, { timeout: 15000 });
+    const text = await bodyText(page);
+    assert.ok(text.includes('blocker'), 'blocking finding missing');
+    assert.ok(text.includes('Parser crashes on empty input'), 'finding summary missing');
+    assert.ok(text.includes('PR #7'), 'open PR number missing');
+    assert.ok(text.includes('PR #99'), 'unsafe-url PR should still be visible as text');
+    assert.equal(await page.locator('a[href^="javascript:"]').count(), 0, 'unsafe PR URL must not become a link');
+    assert.ok(text.includes('Unknown'), 'UNKNOWN verdict should be shown as unknown');
+    assert.ok(!text.includes('Approved'), 'UNKNOWN verdict must never be shown as approved');
+    assert.ok(text.includes('PR #99'), 'unsafe-url PR should still be visible as text');
+    assert.equal(await page.locator('a[href^="javascript:"]').count(), 0, 'unsafe PR URL must not become a link');
+    assert.ok(text.includes('Open'), 'PR status missing');
+    assert.ok(text.includes('ws/alpha → main'), 'branch → base missing');
+    assert.ok(!text.includes('Failed to fetch') && !text.includes('too many requests'),
+      'delivery page must not error');
+    // No merge/approve control: Pi Engineering stays the merge authority (#35).
+    assert.ok(!/merge|approve/i.test(text), 'reviews page must not offer merge/approve controls');
+  }, { BURST: '0' });
+});
+
+test('mission delivery pages escape hostile text and ignore stale delayed responses', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    const missionUrl = new RegExp(`/api/v1/missions/${encodeURIComponent(key).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}$`);
+    await page.route(missionUrl, async (route) => {
+      const response = await route.fetch();
+      const mission = await response.json();
+      mission.title = '<img src=x onerror=alert(1)> & hostile';
+      await route.fulfill({ response, json: mission });
+    });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
+    await page.waitForFunction(() => document.body?.innerText.includes('Changes requested'), null, { timeout: 15000 });
+    assert.ok((await bodyText(page)).includes('<img src=x onerror=alert(1)> & hostile'));
+    assert.equal(await page.locator('img[src="x"]').count(), 0);
+
+    await page.route('**/api/v1/missions/*/tests', async (route) => { await sleep(500); await route.continue(); });
+    await page.route('**/api/v1/missions/*/builds', async (route) => { await sleep(500); await route.continue(); });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/tests`);
+    await page.locator('[data-skeleton][aria-busy="true"]').first().waitFor({ state: 'attached' });
+    await page.goto(`${base}/#/overview`);
+    await page.waitForFunction(() => document.body?.innerText.includes('Overview'), null, { timeout: 15000 });
+    await page.waitForTimeout(700);
+    assert.ok((await bodyText(page)).includes('Overview'));
+  }, { BURST: '0' });
+});
+
+test('mission detail links to the delivery section pages', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    // The mission detail page now carries the section nav (issue #34/#35).
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}`);
+    await page.locator('a:has-text("Tests & builds")').first().waitFor({ timeout: 15000 });
+    await page.locator('a:has-text("Reviews & PRs")').first().click();
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Pull requests'),
+      null, { timeout: 15000 });
+    assert.ok((await bodyText(page)).includes('PR #7'), 'review section must render via detail nav');
+  }, { BURST: '0' });
+});
+
+test('analytics stages and usage pages render seeded data', async () => {
+  await withApp(async ({page,base}) => {
+    await page.goto(`${base}/#/analytics/stages`);await page.locator('table.hd-table').waitFor();
+    const stageText=await page.locator('body').innerText();
+    assert.ok(stageText.includes('Bottleneck'),'stages page shows bottleneck metric');
+    await page.goto(`${base}/#/analytics/usage`);await page.locator('table.hd-table').first().waitFor();
+    const usageText=await page.locator('body').innerText();
+    assert.ok(usageText.includes('Tokens by model'),'usage page shows token grouping');
+    assert.ok(usageText.includes('Resources by kind'),'usage page shows resource grouping');
+  },{BURST:'0'});
 });

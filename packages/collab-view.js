@@ -1,12 +1,24 @@
 // Collaboration rooms: sign in with the BinView user pool, create rooms, chat, and invite
 // people by email. Remote messages use the shared safe Markdown renderer.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { enter, isCalm } from './motion.js';
+import { morph, handOff, patchText, patchAttr } from './patch.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
+import { renderLinks } from './collab-links.js';
+import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
+import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
+import {
+  VIEW_H, minimapTarget, workspaceLinkFor, viewportSize, centerOn, clampView, filterGraph, fitView, focusKey, focusSelector, focusSubgraph, focusSuccessor, isVisible, layoutCached, mergePages, nextNode, panBy, zoomAt, pagesTruncated, renderLineage, replayTarget,
+} from './collab-lineage.js';
+import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
+import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
+import { commentBody, freshDraft, proposalBody, renderWorkbench } from './collab-workbench.js';
 import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
+import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, resolveToken } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
@@ -20,8 +32,12 @@ const PERMS = [['read', 'Read messages'], ['post', 'Write messages'], ['execute'
 const PERM_SHORT = { read: 'Read', post: 'Write', execute: 'Receive tasks', instruct: 'Send tasks', spawn_helpers: 'Start helpers' };
 const ROLE_LABEL = { owner: 'Owner', contributor: 'Can chat', viewer: 'Read only', guest: 'Guest' };
 
-async function loadConfig() {
-  const res = await fetch('/api/v1/collab/config');
+// onStatus(ok, message): a server error (5xx or no answer) is a failed refresh; a 404 or an
+// incomplete config means collaboration is simply not enabled, which is not an error.
+async function loadConfig(onStatus = () => {}) {
+  let res;
+  try { res = await fetch('/api/v1/collab/config', { signal: AbortSignal.timeout(15000) }); } catch (e) { onStatus(false, e.message || 'request failed'); throw e; }
+  onStatus(res.status < 500, `HTTP ${res.status}`);
   if (!res.ok) return null;
   const cfg = await res.json();
   return cfg && cfg.client_id && cfg.hosted_ui_domain && cfg.public_url ? cfg : null;
@@ -84,7 +100,28 @@ const GUIDE = `<div class="hd-card">
     <li><b>Revoke</b> it here any time; it stops working immediately. Credentials expire after 30 days.</li>
   </ol></div>`;
 
-export function mountCollab(root, { fabricSessions = null } = {}) {
+// Replacing a container's markup drops keyboard focus to <body> when the focused control is rebuilt (WCAG 2.4.3, 3.2.1).
+// stableSelector() names the control by id / data attribute; refocus() finds its replacement, or parks focus on the
+// container itself so a keyboard user keeps their place instead of restarting from the top of the page.
+export function stableSelector(el) {
+  if (!el || !el.tagName) return null;
+  const q = (v) => String(v).replace(/["\\]/g, '\\$&');
+  if (el.id) return `#${CSS.escape(el.id)}`;
+  // Every data-* attribute together: a row's control is told apart from its siblings by its own id (data-pid, data-wb-id, ...),
+  // not just by the shared action name, so focus returns to THE control and not to the first one with the same action.
+  const data = [...el.attributes].filter((a) => a.name.startsWith('data-') && a.name !== 'data-h');
+  if (data.length) return `${el.tagName.toLowerCase()}${data.map((a) => `[${a.name}="${q(a.value)}"]`).join('')}`;
+  if (el.type === 'submit' && el.closest('form')) { const f = el.closest('form'); const fd = [...f.attributes].find((a) => a.name.startsWith('data-')); if (fd) return `form[${fd.name}="${q(fd.value)}"] button[type="submit"]`; }
+  return null;
+}
+export function refocus(container, selector) {
+  let target = null;
+  try { target = selector ? container.querySelector(selector) : null; } catch { target = null; }
+  if (!target) { if (!container.hasAttribute('tabindex')) container.setAttribute('tabindex', '-1'); target = container; }
+  target.focus({ preventScroll: true });
+}
+
+export function mountCollab(root, { fabricSessions = null, onFreshness = () => {} } = {}) {
   ensureConversationStyles(root.ownerDocument);
   let teardown = null;      // stops the open room's live loop
   let cursor = 0;
@@ -140,7 +177,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   }
 
   async function start() {
-    const cfg = await loadConfig();
+    const cfg = await loadConfig(onFreshness);
     lastCfg = cfg;
     if (!cfg) {
       centered('<h1>Collaboration</h1><p role="status">The collaboration network is not enabled on this server, or this address is not allowed for the dashboard. Try the dashboard by its IP address.</p>');
@@ -217,9 +254,9 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           <span class="cx-row cx-row--between">${pill(roleLabel(r.role), r.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}<span class="hd-card__sub">Open →</span></span></button>`).join('')}</div>`
         : '<div class="hd-empty">No rooms yet. Create your first one below.</div>'}
       ${operator ? '<div id="hcn-helpers-panel"></div>' : ''}
-      <section class="cx-section"><h2>New room</h2>
+      <details class="cx-section cx-newroom"${rooms.length ? '' : ' open'}><summary>New room</summary>
         <form id="hcn-new" class="hd-card cx-form"><label class="cx-field">Room name<input name="name" required maxlength="120" placeholder="e.g. Metabolomics review"></label>
-          <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></section>`, strip);
+          <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></details>`, strip);
     document.querySelectorAll('#hcn-rooms [data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
     if (operator && $('hcn-helpers-panel')) {   // all rooms' host requests, helpers and the panic switch; the operator is rarely a member of the rooms asking
       const panel = createHelpersPanel({ container: $('hcn-helpers-panel'), api, operator, getRooms: async () => (await api.rooms()).rooms || [], go, hidden: () => document.hidden });
@@ -324,7 +361,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     frame('/agents', `<div class="cx-head"><div><h1>AI agents</h1><p class="cx-sub">Connect Claude Code, Codex, Pi or any MCP client so it can work in your rooms.</p></div>
         <div class="cx-row"><input id="hcn-agent-name" class="cx-input" maxlength="32" pattern="[a-z0-9]+(-[a-z0-9]+)*" placeholder="name (optional)" aria-label="Agent name" autocomplete="off"><button id="hcn-connect" class="hd-btn" type="button">Connect an AI agent</button></div></div>
       <div id="hcn-connect-out"></div>
-      <section class="cx-section"><h2>Add a fleet of agents</h2><div id="hcn-fleet"></div><div id="hcn-fleet-out"></div><div id="hcn-spawns"></div></section>
+      <details class="cx-section cx-fleet-details"><summary>Add a fleet of agents</summary><div id="hcn-fleet"></div><div id="hcn-fleet-out"></div><div id="hcn-spawns"></div></details>
       ${operator ? '<section class="cx-section"><h2>Hosts</h2><p class="cx-sub">Fleets started from here are spread over these hosts in turn. Untick a host to keep automatic agents off it.</p><div id="hcn-hosts"></div></section>' : ''}
       <section class="cx-section"><h2>Your agents</h2><div id="hcn-agents"></div></section>
       <section class="cx-section">${GUIDE}</section>`, strip);
@@ -416,7 +453,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     try { hosts = (await api.fleetHosts()).hosts; } catch { return; }
     const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}${h.online ? ` <span class="hd-ident">${h.families && h.families.length ? esc(h.families.join(', ')) : 'no agent CLIs found'}</span>` : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
     if (box.dataset.h === html) return;
-    box.dataset.h = html; box.innerHTML = html;
+    box.dataset.h = html; morph(box, html);
     box.querySelectorAll('[data-auto]').forEach((c) => { c.onchange = async () => { try { await api.setFleetHost(c.dataset.auto, c.checked); } catch (e) { alert(e.message); } renderHosts(); }; });
   }
   async function renderSpawns() {
@@ -427,7 +464,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const busy = list.some((s) => ['requested', 'claimed'].includes(s.status));
     const colour = { requested: 'var(--status-attention)', claimed: 'var(--accent)', done: 'var(--status-ok)', stalled: 'var(--status-failed)', expired: 'var(--text-muted)' };
     const html = list.length ? `<h3>Recent fleet starts</h3><ul class="cx-list">${list.map((s) => `<li><span class="grow"><b>${esc(s.name_prefix)}-N</b> ${esc(s.harness_type)} × ${s.count}${s.error ? `<br><span class="cx-msg" role="alert">${esc(s.error)}</span>` : ''}${s.placements.length ? `<br>${s.placements.map((p) => `<span class="hd-ident" title="${esc(p.error || '')}">${esc(p.name)} → ${esc(p.host)}${p.status === 'failed' ? ' ✗' : ''}</span>`).join(' ')}` : ''}</span>${pill(s.status === 'done' && s.placements.some((p) => p.status === 'failed') ? 'partly started' : s.status, colour[s.status] || 'var(--text-muted)')}</li>`).join('')}</ul>` : '';
-    if (box.dataset.h !== html) { box.dataset.h = html; box.innerHTML = html; }
+    if (box.dataset.h !== html) { box.dataset.h = html; morph(box, html); }
     return busy;
   }
 
@@ -514,14 +551,16 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       return list.map((x) => `<option value="${esc(x.session_id)}"${x.session_id === cur ? ' selected' : ''}>${esc(`${x.display_name || x.agent_role || 'agent'} · ${x.host_id || ''} · ${String(x.cwd || x.session_id).split('/').filter(Boolean).pop()}`)}</option>`).join('');
     };
     const knownSessions = new Set((sessions || []).map((session) => session.session_id));
-    box.innerHTML = live.length ? `<div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack cx-agentcard" data-agent-card="${esc(a.agent_id)}" tabindex="-1"${a.agent_id === linkedAgent ? ' style="outline:2px solid var(--accent);outline-offset:2px"' : ''}>
+    const families=[...new Set(live.map(a=>a.harness_type).filter(Boolean))].sort();
+    box.innerHTML = live.length ? `<div class="cx-agent-toolbar" aria-label="Agent bulk controls"><strong>${live.length} active agents</strong><label class="cx-msg">Group <select data-agent-family-filter><option value="">All families</option>${families.map(f=>`<option value="${esc(f)}">${esc(f)}</option>`).join('')}</select></label><span class="cx-msg" data-agent-selected-count>0 selected</span><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-agent-stop-selected disabled>Stop selected</button><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-agent-stop-all>Stop all active</button></div><div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack cx-agentcard" data-agent-family="${esc(a.harness_type || '')}" data-agent-card="${esc(a.agent_id)}" tabindex="-1"${a.agent_id === linkedAgent ? ' style="outline:2px solid var(--accent);outline-offset:2px"' : ''}>
+        <input class="cx-agent-select" type="checkbox" data-agent-select="${esc(a.agent_id)}" aria-label="Select ${esc(a.name || a.agent_id)}">
         <div class="cx-row cx-row--between"><span class="hd-card__title">${agentTitle({ ...a, name: a.name || a.harness_type, display_name: sessions?.find(s=>s.session_id===a.instance_id)?.display_name }, true)}</span>${pill('Active', 'var(--status-ok)')}</div>
         <span class="hd-ident">${esc(a.harness_type)} · ${esc(a.agent_id)}</span>
         ${a.instance_id ? '<span class="hd-card__sub">Linked to a HerdR agent. The readable name is shared; the @ handle routes Collaboration tasks.</span>' : ''}
         ${knownSessions.has(a.instance_id) ? nativeSessionLink(a.instance_id) : ''}
         <span class="hd-card__sub">Expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</span>
         ${sessions ? `<label class="cx-msg">Fabric agent <select data-link="${esc(a.agent_id)}"><option value="">not linked</option>${sessionOptions(a.instance_id)}</select></label>` : ''}
-        <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Revoke</button></div></div>`).join('')}</div>`
+        <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Stop access</button></div></div>`).join('')}</div>`
       : '<div class="hd-empty">No connected agents yet.</div>';
     if (focusLinkedAgent) {
       const selected = [...box.querySelectorAll('[data-agent-card]')].find((card) => card.dataset.agentCard === linkedAgent);
@@ -529,17 +568,46 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     }
     wireRename(box, renderAgents);
     box.querySelectorAll('[data-link]').forEach((sel) => { sel.onchange = async () => { try { await api.linkAgent(sel.dataset.link, sel.value); } catch (e) { alert(e.message); } }; });
-    box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { await api.revokeAgent(b.dataset.revoke); renderAgents(); }; });
+    box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { if (!window.confirm('Revoke this agent access and stop it?')) return; await api.revokeAgent(b.dataset.revoke); renderAgents(); }; });
+    const filter=box.querySelector('[data-agent-family-filter]'),countBox=box.querySelector('[data-agent-selected-count]'),selectedButton=box.querySelector('[data-agent-stop-selected]');
+    const syncBulk=()=>{const chosen=[...box.querySelectorAll('[data-agent-select]:checked')];if(countBox)countBox.textContent=`${chosen.length} selected`;if(selectedButton)selectedButton.disabled=!chosen.length;box.querySelectorAll('[data-agent-card]').forEach(card=>{card.hidden=!!(filter?.value&&card.dataset.agentFamily!==filter.value);});};
+    filter?.addEventListener('change',syncBulk);box.querySelectorAll('[data-agent-select]').forEach(input=>input.addEventListener('change',()=>{input.closest('[data-agent-card]')?.classList.toggle('cx-agent-card--selected',input.checked);syncBulk();}));
+    let stopping = false;
+    const stop = async ids => {
+      if (stopping || !ids.length || !window.confirm(`Revoke access and stop ${ids.length} agent${ids.length === 1 ? '' : 's'}?`)) return;
+      stopping = true;
+      const controls = [...box.querySelectorAll('button,input,select')];
+      controls.forEach(control => { control.disabled = true; });
+      countBox.setAttribute('role', 'status');
+      let completed = 0;
+      const failures = [];
+      for (const id of ids) {
+        if (!box.isConnected) break;
+        countBox.textContent = `Stopping ${completed + failures.length + 1} of ${ids.length}…`;
+        try { await api.revokeAgent(id); completed++; }
+        catch (error) { failures.push(`${id}: ${error.message}`); }
+      }
+      if (!box.isConnected) return;
+      try { await renderAgents(); }
+      catch (error) { failures.push(`Agent list: ${error.message}`); controls.forEach(control => { control.disabled = false; }); syncBulk(); }
+      stopping = false;
+      const status = box.querySelector('[data-agent-selected-count]') || countBox;
+      status.setAttribute('role', 'status');
+      status.textContent = `${completed} stopped${failures.length ? ` · Could not stop: ${failures.join('; ')}. Select remaining agents to retry.` : ''}`;
+    };
+    selectedButton?.addEventListener('click',()=>stop([...box.querySelectorAll('[data-agent-select]:checked')].map(i=>i.dataset.agentSelect)));
+    box.querySelector('[data-agent-stop-all]')?.addEventListener('click',()=>stop(live.map(a=>a.agent_id)));
+    syncBulk();
   }
 
   // ---- one tab per room, then the AI agents page
   let roomsCache = [];
   async function tabsStrip(activeRoom, activePage) {
-    try { roomsCache = (await api.rooms()).rooms; } catch { /* keep the last list */ }
+    try { roomsCache = (await api.rooms()).rooms; onFreshness(true); } catch (e) { onFreshness(false, `Rooms: ${e.message || 'request failed'}`); /* keep the last list */ }
     let waitingCount = 0;
     if (canManagePeople()) { try { waitingCount = (await api.users('pending')).users.length; } catch { /* not an approver */ } }
     const t = (to, label, on, extra = '') => `<button type="button" class="cx-rtab${extra}" role="tab" data-go="${to}" aria-selected="${on}">${label}</button>`;
-    return `<div class="cx-rtabs" role="tablist" aria-label="Rooms">${roomsCache.map((r) => t(`/room/${encodeURIComponent(r.room_id)}`, esc(r.name), r.room_id === activeRoom)).join('')}${t('/rooms', '＋ New room', activePage === '/rooms', ' cx-rtab--new')}<span class="grow"></span>${canManagePeople() ? t('/people', `People${waitingCount ? ` <span class="cx-badge" title="waiting for approval">${waitingCount}</span>` : ''}`, activePage === '/people') : ''}${t('/agents', 'AI agents', activePage === '/agents')}</div>`;
+    return `<div class="cx-rtabs" role="tablist" aria-label="Rooms">${roomsCache.map((r) => t(`/room/${encodeURIComponent(r.room_id)}`, esc(r.name), r.room_id === activeRoom)).join('')}${t('/rooms', '+ New room', activePage === '/rooms', ' cx-rtab--new')}<span class="grow"></span>${canManagePeople() ? t('/people', `People${waitingCount ? ` <span class="cx-badge" title="waiting for approval">${waitingCount}</span>` : ''}`, activePage === '/people') : ''}${t('/agents', 'AI agents', activePage === '/agents')}</div>`;
   }
 
   const hueOf = (s) => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
@@ -556,20 +624,28 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents']]), ...(canInvite ? [['people', 'People']] : [])];
+    const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
+    // Collaboration is where people and agents talk and where work is assigned to agents: those four tabs lead, the rest are
+    // supporting views shown quieter (still reachable, still tabs).
+    const MAJOR_SUBS = ['chat', 'tasks', 'agents', 'lineage'];
+    const SUB_USE = { chat: 'Talk with the people and agents in this room', tasks: 'Assign work to an agent and follow it', agents: 'Who is in the room and what they may do',
+      lineage: 'How work started and moved between agents', flow: 'Who is handing work to whom, as a graph', tabs: 'Agents by terminal tab, and remote-agent invites',
+      attention: 'Items in this room that need a person', progress: 'How far assigned work has come', links: 'Workspaces linked to this room',
+      proposals: 'Changes agents propose, held until reviewed', people: 'Members and invitations' };
+    const order = (list) => [...list.filter(([k]) => MAJOR_SUBS.includes(k)), ...list.filter(([k]) => !MAJOR_SUBS.includes(k))];
+    const tabs = order([['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])]);
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
     frame('/rooms', `<div class="cx-roomhead"><h1>${esc(info.name)}</h1>${pill(roleLabel(info.role), 'var(--accent)')}</div>
-      <div class="cx-stabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab" role="tab" data-sub="${k}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" hidden></span></button>`).join('')}</div>
+      <div class="cx-stabs hd-tabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab${MAJOR_SUBS.includes(k) ? '' : ' cx-stab--minor'}" title="${esc(SUB_USE[k] || '')}" role="tab" id="hcn-st-${k}" aria-controls="hcn-p-${k}" data-sub="${k}" data-label="${l}" aria-label="${l}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" aria-hidden="true" hidden></span></button>`).join('')}</div>
       <section class="hd-card cx-chat cx-panel" id="hcn-p-chat" aria-label="Conversation">
         <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
         <button type="button" id="hcn-jump" class="hd-btn hd-btn--sm cx-jump" hidden>↓ New messages</button>
-        ${canPost ? '<div id="hcn-composer"></div>'
+        ${canPost ? '<div id="hcn-ctx-attached" class="ctx-attached" aria-live="polite"></div><div id="hcn-composer"></div>'
         : '<div class="cx-msg" style="padding:12px">Read-only access.</div>'}
       </section>
-      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
+      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span><button type="button" id="hcn-flow-still" class="hd-btn hd-btn--ghost hd-btn--sm" aria-pressed="false">Pause motion</button></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
       <section class="cx-panel cx-cols" id="hcn-p-tasks" hidden>
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Give a task</div><form id="hcn-task" class="cx-stack"><label class="cx-field">To<select name="target" id="hcn-task-target"></select></label><label class="cx-field">What should it do?<textarea class="cx-input" name="text" required maxlength="4000" rows="4"></textarea></label><button class="hd-btn" type="submit">Send task</button><span id="hcn-task-msg" class="cx-msg" role="alert"></span></form></div>' : ''}
         <div class="hd-card cx-stack"><div class="hd-card__title">Tasks</div><div id="hcn-tasks"></div></div></section>
@@ -579,11 +655,64 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}
         ${operator ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helpers</div><div id="hcn-panic"></div><div class="hd-card__title">Host access requests</div><div id="hcn-egress"></div><div class="hd-card__title">External hosts</div><div id="hcn-hosts-table"></div></div>' : ''}
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helper profile</div><div id="hcn-profile-box"></div></div>' : ''}</section>`}
+      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-tabs" hidden aria-label="Primary agents and their subagents"><h2 class="cx-sr">Agents by tab</h2>
+        ${canInvite ? `<details class="cx-stack" id="hcn-ext"><summary>Invite a remote agent</summary>
+          <form id="hcn-ext-form" class="cx-stack">
+            <label class="cx-field">Name shown on its tab<input name="label" required maxlength="40" placeholder="Dana's Claude"></label>
+            <fieldset class="cx-stack"><legend class="cx-msg">It may</legend>
+              <label><input type="checkbox" checked disabled> read this room's chat</label>
+              <label><input type="checkbox" name="post"> post messages</label>
+              <label><input type="checkbox" name="lineage"> report its own lineage to the graph</label>
+              <label><input type="checkbox" name="proposals"> be given bounded tasks and send artifact proposals (held in quarantine; nothing is applied)</label></fieldset>
+            <label class="cx-field">Invite valid for<select name="ttl"><option value="900">15 minutes</option><option value="3600" selected>1 hour</option><option value="86400">1 day</option></select></label>
+            <label class="cx-field">Credential lasts<select name="cred"><option value="3600">1 hour</option><option value="86400" selected>1 day</option><option value="604800">7 days</option></select></label>
+            <div class="cx-msg">A remote agent never gets a terminal, a shell or any right to give or take tasks. You can revoke it at any time.</div>
+            <button class="hd-btn" type="submit">Create invite</button><span id="hcn-ext-msg" class="cx-msg" role="status"></span></form>
+          <div id="hcn-ext-code" class="cx-stack" role="status"></div></details>` : ''}
+        <div id="hcn-ext-invites"></div>
+        <div id="hcn-tabs" aria-live="polite"></div></section>`}
+      ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-proposals" hidden aria-label="Bounded tasks and proposals">
+        <div class="hd-card cx-stack"><div class="hd-card__title">Delegate a bounded task</div>
+          <form id="hcn-deleg" class="cx-stack">
+            <label class="cx-field">To<select name="target" id="hcn-deleg-target" required></select></label>
+            <label class="cx-field">What should it look at?<textarea class="cx-input" name="text" required maxlength="4000" rows="3"></textarea></label>
+            <label class="cx-field">Repository paths it may write (one per line, <code>dir/</code> for a folder)<textarea class="cx-input" name="paths" rows="2"></textarea></label>
+            <label class="cx-field">Graph nodes it may refer to (one per line, like <code>commit:abc123</code>)<textarea class="cx-input" name="nodes" rows="2"></textarea></label>
+            <label class="cx-field">Questions (one per line, <code>id: text</code>)<textarea class="cx-input" name="questions" rows="2"></textarea></label>
+            <fieldset class="cx-stack"><legend class="cx-msg">It may answer with</legend>
+              <label><input type="checkbox" name="kind" value="doc" checked> a document</label><label><input type="checkbox" name="kind" value="analysis"> an analysis</label>
+              <label><input type="checkbox" name="kind" value="patch"> a patch</label><label><input type="checkbox" name="kind" value="link"> a link</label></fieldset>
+            <div class="cx-row"><label class="cx-field">Proposals<input name="maxProposals" type="number" min="1" max="5" value="1"></label>
+              <label class="cx-field">Steps<input name="maxSteps" type="number" min="1" max="200" value="20"></label>
+              <label class="cx-field">Max bytes<input name="maxBytes" type="number" min="256" max="32768" value="16384"></label>
+              <label class="cx-field">Expires<select name="expires"><option value="1800">30 minutes</option><option value="3600" selected>1 hour</option><option value="21600">6 hours</option><option value="86400">1 day</option></select></label></div>
+            <div class="cx-msg">The agent can only answer with a proposal. It goes to quarantine below; nothing is applied and no command runs. Token limits are advisory: the server cannot measure them.</div>
+            <button class="hd-btn" type="submit">Delegate</button><span id="hcn-deleg-msg" class="cx-msg" role="alert"></span></form>
+          <div id="hcn-delegs"></div></div>
+        <div class="hd-card cx-stack"><div class="hd-card__title">Quarantine</div><div id="hcn-props"></div><div id="hcn-review" aria-live="polite"></div></div></section>` : ''}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-attention" hidden aria-label="Attention inbox"><div id="hcn-attention" class="cx-stack"></div></section><section class="hd-card cx-stack cx-panel" id="hcn-p-progress" hidden aria-label="Progress and analytics"><h2 class="cx-sr">Progress and analytics</h2><div id="hcn-progress" class="cx-stack"></div><div id="hcn-analytics" class="cx-stack"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><h2 class="cx-sr">Lineage</h2><div id="hcn-consults" class="cx-stack"></div><div id="hcn-lineage" class="cx-stack"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><h2 class="cx-sr">Linked workspaces and missions</h2><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
           <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div></section>` : ''}`, strip);
 
+    const stillBtn = $('hcn-flow-still');      // WCAG 2.2.2: moving lines run for longer than 5 s, so they can be paused
+    if (stillBtn) {
+      // A toggle button keeps ONE label and states its state with aria-pressed; changing the label as well would be read twice
+      // ("Resume motion, pressed"). The choice is remembered per browser; storage may be blocked, so every access is guarded.
+      const KEY = 'hcn.flow.still';
+      const apply = (on, save) => {
+        stillBtn.setAttribute('aria-pressed', String(on));
+        $('hcn-p-flow').classList.toggle('cx-still', on);
+        if (save) { try { if (on) window.localStorage.setItem(KEY, '1'); else window.localStorage.removeItem(KEY); } catch { /* storage blocked: the choice lasts until reload */ } }
+      };
+      let saved = false;
+      try { saved = window.localStorage.getItem(KEY) === '1'; } catch { saved = false; }
+      if (saved) apply(true, false);
+      stillBtn.onclick = () => apply(stillBtn.getAttribute('aria-pressed') !== 'true', true);
+    }
     const log = $('hcn-log');
     let alive = true;
     let composer = null;
@@ -602,7 +731,19 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       const el = $(id);
       if (!el || el.dataset.h === html) return false;
       if (el.contains(document.activeElement) && document.activeElement.matches('input,textarea,select')) { stale.add(id); return false; }
-      el.dataset.h = html; el.innerHTML = html; stale.delete(id);
+      const had = el.contains(document.activeElement) && document.activeElement !== el ? document.activeElement : null;
+      const again = had ? stableSelector(had) : null;
+      el.dataset.h = html; stale.delete(id);
+      // Morphed in place: unchanged controls keep their nodes (and any focus/scroll); a focused
+      // control that left the new markup is handed to its equivalent (stable selector) or parked on
+      // the panel, so focus never drops to <body>.
+      const stranded = morph(el, html);
+      handOff(stranded, (node) => {
+        if (!(had && node.contains(had))) return null;
+        let target = again ? el.querySelector(again) : null;
+        if (!target) { if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '-1'); target = el; }
+        return target;
+      });
       return true;
     };
     root.addEventListener('focusout', () => setTimeout(() => { if (stale.size && alive) paint(); }, 0));
@@ -620,15 +761,17 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       const at = new Date(e.created_at);
       const time = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       if (e.event_type === 'message') {
-        const agent = e.sender.type === 'agent';
+        const remote = e.sender.type === 'external';
+        const agent = e.sender.type === 'agent' || remote;
         const mine = !agent && e.sender.id === me.user_id;
-        const who = agent ? (agentName.has(e.sender.id) ? `@${agentName.get(e.sender.id)}` : `Agent of ${names.get(e.sender.owner_user_id) || shortId(e.sender.owner_user_id)}`)
+        const remoteRow = remote ? ((S.externals && S.externals.externals) || []).find((r) => r.agent_id === e.sender.id) : null;
+        const who = remote ? `Remote: ${remoteRow ? remoteRow.label : 'agent invited by ' + (names.get(e.sender.owner_user_id) || shortId(e.sender.owner_user_id))}` : agent ? (agentName.has(e.sender.id) ? `@${agentName.get(e.sender.id)}` : `Agent of ${names.get(e.sender.owner_user_id) || shortId(e.sender.owner_user_id)}`)
           : (mine ? 'You' : (names.get(e.sender.id) || shortId(e.sender.id)));
         const key = `${e.sender.type}:${e.sender.id}`;
         const cont = key === lastKey && at - lastAt < 5 * 60000;
         lastKey = key; lastAt = at.getTime();
         row.className = `cx-m${mine ? ' cx-m--mine' : ''}${agent ? ' cx-m--agent' : ''}${cont ? ' cx-m--cont' : ''}`;
-        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${renderMarkdown(e.text)}</div></div>`;
+        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${mentionChips(renderMarkdown(e.text), e.mentions, mentionCtx())}</div>${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
         return row;
       }
       lastKey = null;
@@ -648,9 +791,18 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (!shown.length) return;
       $('hcn-empty')?.remove();
       const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 60;
+      // The first batch is history and appears at once; later rows arrived live and slide in. A task
+      // status change reuses the flow graph's one-shot cx-flow-pulse glow. Calm mode: neither.
+      const live = !!log.querySelector('.cx-m, .cx-taskcard, .cx-event');
       const frag = document.createDocumentFragment();
-      for (const e of shown) frag.appendChild(eventRow(e));
+      const rows = shown.map((e) => {
+        const row = eventRow(e);
+        if (live && e.event_type === 'task_updated' && !isCalm()) row.classList.add('cx-flow-pulse');
+        frag.appendChild(row);
+        return row;
+      });
       log.appendChild(frag);
+      if (live) rows.forEach(enter);
       if (stick) log.scrollTop = log.scrollHeight; else $('hcn-jump').hidden = false;
     };
     log.addEventListener('scroll', () => { if (log.scrollTop + log.clientHeight >= log.scrollHeight - 60) $('hcn-jump').hidden = true; });
@@ -796,13 +948,644 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       } catch { /* keep what is shown */ } finally { peopleBusy = false; }
     };
 
-    const setBadge = (k, n) => { const b = $(`hcn-b-${k}`); if (!b) return; b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n); };
-    const loadMine = async () => { try { S.mine = (await api.agents()).agents; } catch { /* keep the old list */ } };
+    // Tabs and panes come from recorded spawn lineage the server lets this person read in THIS room (room scope
+    // plus its linked missions). A failed or empty read just shows the empty state; nothing is guessed.
+    let tabsBusy = false;
+    const loadTabs = async () => {
+      if (tabsBusy || Date.now() - S.tabsAt < 8000) return;
+      tabsBusy = true;
+      try {
+        const none = { nodes: [], edges: [] };
+        const [agents, tabNodes, paneNodes] = await Promise.all([
+          api.graphList(roomId, 'agent', 'spawn'), api.graphList(roomId, 'tab'), api.graphList(roomId, 'pane')].map((p) => p.catch(() => none)));
+        // The remote-agent roster comes from the collaboration service itself (so it works where the graph is
+        // not served); a failed read keeps the last roster rather than inventing one.
+        try { S.externals = await api.externals(roomId); } catch { /* keep the last roster */ }
+        S.tabs = buildTabsPanes([agents, tabNodes, paneNodes], S.links || [], S.externals ? S.externals.externals : null);
+      } finally { S.tabsAt = Date.now(); tabsBusy = false; }
+    };
+    function drawTabs() {
+      const show = () => {
+        const box = $('hcn-tabs');
+        if (!box) return;
+        const pend = (S.externals && S.externals.invites) || [];
+        put('hcn-ext-invites', pend.length ? `<ul class="cx-list" aria-label="Open remote-agent invites">${pend.map((i) => `<li><span class="grow"><b>${esc(i.label)}</b> <span class="cx-msg">invited, not yet used · may ${esc((i.actions || []).join(', '))}${i.lineage ? ', report lineage' : ''}</span></span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel-ext="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>` : '');
+        $('hcn-ext-invites')?.querySelectorAll('[data-cancel-ext]').forEach((b) => { b.onclick = () => act(async () => { await api.revokeExternalInvite(roomId, b.dataset.cancelExt); S.tabsAt = 0; $('hcn-ext-invites').dataset.h = ''; }); });
+        if (put('hcn-tabs', renderTabsPanes(S.tabs || { tabs: [], hidden_by_grant: 0 }, S.tabSel, { canManage: canInvite }))) {
+          const ids = (S.tabs?.tabs || []).map((t) => t.agent_id);
+          box.querySelectorAll('[data-revoke]').forEach((b) => {
+            b.onclick = () => {
+              if (!window.confirm('Revoke this remote agent? It is cut off at once; what it already did stays visible.')) return;
+              act(async () => { await api.revokeExternal(roomId, b.dataset.revoke); S.tabsAt = 0; box.dataset.h = ''; });
+            };
+          });
+          box.querySelectorAll('[data-tab]').forEach((b) => {
+            b.onclick = () => { S.tabSel = b.dataset.tab; box.dataset.h = ''; drawTabs(); };
+            b.onkeydown = (e) => {
+              const to = nextTab(ids, b.dataset.tab, e.key);
+              if (to) { e.preventDefault(); S.tabSel = to; box.dataset.h = ''; drawTabs(); box.querySelector(`[data-tab="${CSS.escape(to)}"]`)?.focus(); }
+            };
+          });
+        }
+      };
+      show();
+      loadTabs().then(show);
+    }
+    // Bounded tasks and proposals (T11): the owner's quarantine view. Content is untrusted text; see collab-proposals.js.
+    let propBusy = false;
+    const loadProposals = async () => {
+      if (propBusy) return;
+      propBusy = true;
+      try {
+        const [d, p] = await Promise.all([api.delegations(roomId), api.proposals(roomId)]);
+        S.deleg = d; S.props = p;
+        if (S.propSel) { try { S.propOne = await api.proposal(roomId, S.propSel); } catch { S.propOne = null; } }
+      } catch { /* keep what is shown; a service with delegation off answers 403 */ } finally { propBusy = false; }
+    };
+    function drawProposals() {
+      const show = () => {
+        const targets = ((S.externals && S.externals.externals) || []).filter((x) => x.proposals && x.state === 'active');
+        put('hcn-deleg-target', targets.length ? targets.map((x) => `<option value="${esc(x.agent_id)}">${esc(x.label)}</option>`).join('') : '<option value="">No remote agent was invited for bounded tasks</option>');
+        if (put('hcn-delegs', renderDelegations(S.deleg))) {
+          $('hcn-delegs').querySelectorAll('[data-cancel-deleg]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelDelegation(roomId, b.dataset.cancelDeleg); $('hcn-delegs').dataset.h = ''; }); });
+        }
+        if (put('hcn-props', renderProposalList(S.props, S.propSel))) {
+          $('hcn-props').querySelectorAll('[data-proposal]').forEach((b) => { b.onclick = () => { S.propSel = b.dataset.proposal; $('hcn-props').dataset.h = ''; $('hcn-review').dataset.h = ''; loadProposals().then(show); }; });
+        }
+        if (put('hcn-review', renderReview(S.propOne))) {
+          $('hcn-review').querySelectorAll('[data-decide]').forEach((b) => {
+            b.onclick = () => act(async () => {
+              const ask = b.dataset.decide === 'accept' ? 'Record this proposal in the graph as accepted? Nothing is applied or run.' : 'Reject this proposal?';
+              if (!window.confirm(ask)) return;
+              await api.decideProposal(roomId, b.dataset.pid, decisionBody(b.dataset.decide, b.dataset.digest, ($('hcn-prop-reason') || {}).value));
+              ['hcn-props', 'hcn-review', 'hcn-delegs'].forEach((id) => { $(id).dataset.h = ''; });
+              S.focusProposal = b.dataset.pid;          // the decide buttons go away: focus moves on to this proposal's row, not to <body>
+              await loadProposals();
+            });
+          });
+        }
+        landOnDecided();
+      };
+      show();
+      loadTabs().then(() => loadProposals()).then(show);
+    }
+    // After a decision the review buttons are gone: land on the decided proposal's own row (its logical successor).
+    const landOnDecided = () => {
+      if (!S.focusProposal) return;
+      const row = $('hcn-props') && $('hcn-props').querySelector(`[data-proposal="${CSS.escape(S.focusProposal)}"]`);
+      if (row) { row.focus({ preventScroll: true }); S.focusProposal = null; }
+    };
+
+    // ---- Lineage: graph, Gantt, replay and inspector. Read-only; the server filters every read by your CURRENT
+    // membership. Live = the head of your ledger (refreshed while open); a replay position is static.
+    // Comments and steering for the selected node (collab-workbench.js). The server checks every one of these again.
+    const WB = { at: 0, edge: null, nodeId: null, comments: [], target: null, forks: null, forksError: null, steers: [], error: null, steerError: null, notice: null, draft: freshDraft(),
+      editing: null, history: null, confirming: null, busy: false, seq: 0 };
+    const wbModel = () => ({ ...WB, me: me.user_id, isOwner: info.role === 'owner',
+      writable: canPost && (LIN.step === null || !!(LIN.asOf && LIN.asOf.head)),
+      readOnlyReason: canPost ? 'A replay shows a past state. Choose Live to comment or propose a change.' : 'Your role in this room is read only.' });
+    // ---- T14: contextual chat, questions to a person or remote agent, and links across workspaces. Every one of these
+    // is checked again by the server; a hidden reference is shown as one fixed phrase and carries nothing.
+    const CTX = { attach: null, consults: [], links: [], targets: [], features: { context_refs: false, consultation: false, cross_links: false },
+      at: 0, busy: false, error: null, notice: null, askDraft: { target: '', question: '' }, seq: 0 };
+    const ctxModel = () => {
+      const f = CTX.features;
+      return { nodeId: LIN.sel, enabled: f.context_refs || f.consultation || f.cross_links, chat: f.context_refs, consult: f.consultation, crossLinks: f.cross_links,
+        canPost, me: me.user_id, isOwner: info.role === 'owner', consults: CTX.consults, links: CTX.links, busy: CTX.busy, error: CTX.error, notice: CTX.notice,
+        people: CTX.targets.map((t) => ({ kind: t.kind, id: t.id, label: t.kind === 'agent' ? t.label : (names.get(t.id) || shortId(t.id)) })),
+        otherNodes: mergePages(LIN.pages).nodes.map((n) => ({ id: n.id, label: n.label })),
+        askDraft: CTX.askDraft };
+    };
+    function drawAttach() {
+      const h = $('hcn-ctx-attached');
+      if (!h) return;
+      morph(h, CTX.attach ? `<span class="ctx-chip"><span aria-hidden="true">◆</span> The next message refers to ${esc(CTX.attach)} <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-ctx-act="detach">Remove</button></span>` : '');
+      h.onclick = (e) => { if (e.target.closest('[data-ctx-act="detach"]')) { CTX.attach = null; drawAttach(); } };
+    }
+    async function loadContext() {
+      if (CTX.busy) return;
+      const my = ++CTX.seq;
+      const [c, l] = await Promise.allSettled([api.consultations(roomId), api.xlinks(roomId)]);
+      if (my !== CTX.seq || !alive) return;
+      CTX.at = Date.now();
+      if (c.status === 'fulfilled') { CTX.consults = Array.isArray(c.value.consultations) ? c.value.consultations : []; CTX.targets = Array.isArray(c.value.targets) ? c.value.targets : []; if (c.value.features) CTX.features = c.value.features; }
+      if (l.status === 'fulfilled') { CTX.links = Array.isArray(l.value.links) ? l.value.links : []; if (l.value.features) CTX.features = l.value.features; }
+      drawLineage(true);
+    }
+    async function ctxRun(fn, done) {
+      CTX.busy = true; CTX.error = null; CTX.notice = null; drawLineage(true);
+      try { await fn(); CTX.notice = done || null; } catch (e) { CTX.error = e instanceof AuthError ? 'Your session expired. Sign in again.' : (e && e.message) || 'The request failed.'; }
+      CTX.busy = false; CTX.at = 0; await loadContext();
+    }
+    const ctxKey = () => `web-ctx-${Date.now().toString(36)}-${randomString(9)}`;
+    function ctxAct(act, id) {
+      if (act === 'attach' && LIN.sel) { CTX.attach = LIN.sel; CTX.notice = 'The next message you send in the Chat tab refers to this item.'; drawAttach(); drawLineage(true); }
+      else if (act === 'cancel') ctxRun(() => api.cancelConsultation(roomId, id), 'Question cancelled.');
+      else if (act === 'decline') ctxRun(() => api.answerConsultation(roomId, id, declineBody()), 'Declined.');
+      else if (act === 'revoke') ctxRun(() => api.revokeLink(roomId, id), 'Link revoked.');
+    }
+    function ctxSubmit(kind, id, form) {
+      const node = LIN.sel;
+      if (kind === 'ask' && node) {
+        const q = String(form.get('question') || '').trim(); const t = String(form.get('target') || '');
+        if (q && t) ctxRun(async () => { await api.askConsultation(roomId, askBody(node, t, q, ctxKey())); CTX.askDraft = { target: t, question: '' }; }, 'Asked. You will see the answer here.');
+      } else if (kind === 'answer') {
+        const a = String(form.get('answer') || '').trim();
+        if (a) ctxRun(() => api.answerConsultation(roomId, id, answerBody(a)), 'Answered.');
+      } else if (kind === 'link' && node) {
+        const to = String(form.get('to') || '').trim();
+        if (to) ctxRun(() => api.createLink(roomId, linkBody(node, to, form.get('note'), ctxKey())), 'Linked.');
+      }
+    }
+    function drawConsults() {
+      const h = $('hcn-consults');
+      if (!h) return;
+      if (!h.dataset.bound) {                                     // the inbox sits outside the lineage box: bind it once
+        h.dataset.bound = '1';
+        h.addEventListener('click', (e) => {
+          const open = e.target.closest('[data-ctx-open]');
+          if (open) { pickNode(open.dataset.ctxOpen); drawLineage(true); return; }
+          const cx = e.target.closest('[data-ctx-act]');
+          if (cx) ctxAct(cx.dataset.ctxAct, cx.dataset.ctxId);
+        });
+        h.addEventListener('submit', (e) => {
+          e.preventDefault();
+          const cf = e.target.closest && e.target.closest('[data-ctx-form]');
+          if (cf && !CTX.busy) ctxSubmit(cf.dataset.ctxForm, cf.dataset.ctxId, new FormData(cf));
+        });
+      }
+      const html = renderInbox({ ...ctxModel(), enabled: CTX.features.consultation });
+      if (h.dataset.h !== html) { h.dataset.h = html; handOff(morph(h, html), () => null); }
+    }
+    // layout preferences (view, mode, clock) live in this browser only, apart from anything the server holds about the mission
+    const PREF_KEY = 'hcn.lineage.prefs';
+    const readPrefs = () => { try { const p = JSON.parse(window.localStorage.getItem(PREF_KEY) || '{}'); return { view: p.view === 'gantt' ? 'gantt' : 'graph', mode: p.mode === 'table' ? 'table' : 'visual', clock: p.clock === 'reported' ? 'reported' : 'recorded' }; } catch { return {}; } };
+    const savePrefs = () => { try { window.localStorage.setItem(PREF_KEY, JSON.stringify({ view: LIN.view, mode: LIN.mode, clock: LIN.clock })); } catch { /* storage may be off: the layout is just not remembered */ } };
+    const LIN = { vp: null, focusId: null, vpW: 0, vpH: 0, step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
+      truncated: null, asOf: null, timeline: null, error: null, timelineError: null, html: '', pending: null, fails: 0, notice: null, busy: false, at: 0, seq: 0, bound: false, layout: null,
+      filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' } };
+    Object.assign(LIN, readPrefs());
+    // The terminal link: only the operator on the dashboard, only for a session the dashboard itself lists. It goes to the dashboard's
+    // session page, whose Terminal button is the existing authorized route; nothing here builds or sends a command.
+    const SESS = { ids: null, at: 0 };
+    const refreshSessions = () => {
+      if (!operator || standalone || !fabricSessions || Date.now() - SESS.at < 30000) return;
+      SESS.at = Date.now();
+      Promise.resolve().then(fabricSessions).then((r) => { SESS.ids = new Set((Array.isArray(r) ? r : (r && r.sessions) || []).map((x) => x.session_id)); if (alive && LIN.sel) drawLineage(true); }).catch(() => { SESS.ids = null; });
+    };
+    const terminalFor = (id) => {
+      const tail = typeof id === 'string' && id.startsWith('session:') ? id.slice(8) : null;
+      return tail && SESS.ids && SESS.ids.has(tail) ? { href: `/#/herd/session/${encodeURIComponent(tail)}` } : null;
+    };
+    // Operator-only: the server is asked (the real authorize route) whether the operator may use the terminal of the workspace this node belongs to.
+    // Nothing is rendered for anyone else, so there is also no handler to reach: the click path re-checks the same condition.
+    const TERM = { result: null, busy: false };
+    const termAuthFor = (id) => {
+      if (!operator || standalone || !id) return null;
+      const node = mergePages(LIN.pages).nodes.find((n) => n.id === id);
+      const link = workspaceLinkFor(S.links, node);
+      return link && link.can_terminal === true ? { link, result: TERM.result, busy: TERM.busy } : null;
+    };
+    async function termAuth(linkId) {
+      const t = termAuthFor(LIN.sel);
+      if (!t || t.link.link_id !== linkId || TERM.busy) return;                  // only the control that is on screen, only for the operator
+      TERM.busy = true; TERM.result = null; drawLineage(true);
+      try { await api.authorizeWorkspace(roomId, linkId, 'terminal'); TERM.result = { link_id: linkId, ok: true }; }
+      catch (e) { TERM.result = { link_id: linkId, ok: false, reason: e && e.status ? `HTTP ${e.status}` : 'forbidden' }; }
+      TERM.busy = false;
+      if (alive) drawLineage(true);
+    }
+    const vpSize = () => {
+      const box = $('hcn-lineage');
+      // a hidden panel measures 0: fall back to the window, never to a desktop width on a phone
+      const total = (box && box.clientWidth) || Math.max(280, window.innerWidth - 32);
+      const side = total >= 760 ? 336 : 0;            // the inspector sits beside the graph from 761px (collab.css), below it under 760
+      const w = Math.min(1200, Math.max(280, Math.floor((total || 960) - side)));
+      return { w, h: w < 520 ? 360 : VIEW_H };
+    };
+    const linModel = () => {
+      const graphAll = mergePages(LIN.pages);
+      const found = filterGraph(graphAll, LIN.filters);
+      const filtered = LIN.focusId && found.nodes.some((n) => n.id === LIN.focusId) ? { ...found, ...focusSubgraph(found, LIN.focusId) } : found;
+      const layout = LIN.mode !== 'table' ? layoutCached(filtered) : null;
+      const max = vpSize();
+      const sz = viewportSize(layout, max.w, max.h);
+      LIN.vpW = sz.w; LIN.vpH = sz.h;
+      if (LIN.vp && layout) LIN.vp = clampView(LIN.vp, layout, sz.w, sz.h);
+      return { graphAll, filtered, vp: LIN.vp, focusId: LIN.focusId, vpW: sz.w, vpH: sz.h, terminal: terminalFor(LIN.sel), termAuth: termAuthFor(LIN.sel), asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
+        mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, filtersOpen: LIN.filtersOpen ?? window.innerWidth > 760, total: LIN.total,
+        workbench: LIN.sel ? renderWorkbench(wbModel()) + renderContextPanel(ctxModel()) : '',
+        graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : (LIN.truncated || null), graphMore: LIN.next !== null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
+    };
+    async function loadWorkbench(keep = false) {
+      const node = LIN.sel;
+      if (!node) { WB.nodeId = null; return; }
+      const my = ++WB.seq;
+      WB.nodeId = node; WB.at = Date.now();
+      const forkable = /^(attempt|agent|task|approach):/.test(node);
+      const [c, t, st, fk] = await Promise.allSettled([api.comments(roomId, { anchor: WB.edge ? { kind: 'edge', ...WB.edge } : { kind: 'node', node_id: node } }), api.steeringTarget(roomId, node), api.steeringList(roomId, node),
+        forkable ? api.forks(roomId, node) : Promise.reject(new Error('not forkable'))]);
+      if (my !== WB.seq || !alive || LIN.sel !== node) return;
+      WB.comments = c.status === 'fulfilled' && Array.isArray(c.value.comments) ? c.value.comments : [];
+      if (c.status === 'rejected') WB.error = 'Comments could not be loaded for this item.'; else if (!keep) WB.error = null;
+      WB.target = t.status === 'fulfilled' && t.value && typeof t.value.fence === 'string' ? t.value : null;
+      WB.steers = st.status === 'fulfilled' && Array.isArray(st.value.steering) ? st.value.steering : [];
+      WB.forks = fk.status === 'fulfilled' && fk.value && Array.isArray(fk.value.forks) ? fk.value : null;       // 403 forks_disabled / 404 simply show nothing
+      WB.forksError = forkable && fk.status === 'rejected' && fk.reason && fk.reason.status && ![403, 404].includes(fk.reason.status) ? 'Forks could not be loaded for this item.' : null;
+      const mine = WB.forks && WB.forks.forks.find((x) => x.approach_id === node);
+      if (mine && mine.head_sha) WB.draft.expected_head = mine.head_sha;
+      const bc = WB.target && WB.target.fork ? Object.keys(WB.target.fork.base_candidates || {}) : [];
+      if (bc.length && !bc.includes(WB.draft.base_sha)) WB.draft.base_sha = bc[0];
+      if (t.status === 'rejected') WB.steerError = 'Steering details could not be loaded for this item.'; else if (!keep) WB.steerError = null;
+      drawLineage(true);
+    }
+    function pickNode(id) {
+      LIN.sel = id; LIN.focus = id;
+      if (!id) { WB.nodeId = null; WB.seq += 1; return; }
+      if (WB.nodeId !== id) {
+        Object.assign(WB, { nodeId: id, edge: null, comments: [], target: null, forks: null, forksError: null, steers: [], error: null, steerError: null, notice: null, editing: null, history: null, confirming: null, draft: freshDraft() });
+        loadWorkbench();
+      }
+    }
+    const wbWhy = (e, fallback) => (e instanceof AuthError ? 'Your session expired. Sign in again.' : e && e.code === 'stale_fence' ? 'That item changed since you read it. It was reloaded: check it and try again.' : (e && e.message) || fallback);
+    async function wbRun(fn, { steer = false, done = null } = {}) {
+      WB.busy = true; WB.error = null; WB.steerError = null; WB.notice = null; drawLineage(true);
+      try { await fn(); if (done) WB.notice = done; } catch (e) {
+        if (steer) WB.steerError = wbWhy(e, 'The request failed.'); else WB.error = wbWhy(e, 'The request failed.');
+      } finally { WB.busy = false; if (alive) drawLineage(true); }
+      await loadWorkbench(true);                                      // refresh the lists but keep the message just shown
+    }
+    const wbKey = () => `web-wb-${Date.now().toString(36)}-${randomString(9)}`;
+    function wbAct(act, id) {
+      const c = WB.comments.find((x) => x.comment_id === id);
+      const s = WB.steers.find((x) => x.steering_id === id);
+      if (act === 'pick-fork' && id) { pickNode(id); drawLineage(true); return; }
+      if (act === 'promote-start' && id) { pickNode(id); WB.draft.action = 'promote'; drawLineage(true); return; }
+      if (act === 'edge-clear') { WB.edge = null; WB.editing = null; WB.history = null; loadWorkbench(); return; }
+      if (act === 'edit' && c) { WB.editing = { id, text: c.text || '' }; drawLineage(true); }
+      else if (act === 'edit-cancel') { WB.editing = null; drawLineage(true); }
+      else if (act === 'retract' && c) wbRun(() => api.retractComment(roomId, id, c.revision), { done: 'Comment retracted. Its history is kept.' });
+      else if (act === 'history' && c) {
+        if (WB.history && WB.history.id === id) { WB.history = null; drawLineage(true); return; }
+        api.commentHistory(roomId, id).then((h) => { WB.history = { id, items: h.comment.history }; drawLineage(true); }).catch((e) => { WB.error = wbWhy(e, 'History could not be loaded.'); drawLineage(true); });
+      } else if (act === 'confirm' && s) { WB.confirming = id; WB.steerError = null; drawLineage(true); }
+      else if (act === 'confirm-cancel') { WB.confirming = null; drawLineage(true); }
+      else if (act === 'confirm-go' && s) {
+        wbRun(async () => {
+          const fresh = await api.steeringTarget(roomId, s.target.node_id);      // confirm only against what you can see NOW
+          if (fresh.fence !== s.target.fence) { const err = new Error('The target changed after this was proposed, so nothing was sent. Ask for a new proposal.'); err.code = 'stale_fence'; throw err; }
+          await api.confirmSteering(roomId, id, { digest: s.digest, expected_fence: fresh.fence });
+          WB.confirming = null;
+        }, { steer: true, done: 'Confirmed. It is delivered once, to the source that reported this item.' });
+      } else if (act === 'reject' && s) wbRun(() => api.rejectSteering(roomId, id), { steer: true, done: 'Request closed.' });
+    }
+    function wbSubmit(kind, id, form) {
+      const node = WB.nodeId;
+      if (!node) return;
+      if (kind === 'comment') {
+        const t = String(form.get('text') || '').trim();
+        if (t) wbRun(async () => { await api.addComment(roomId, commentBody(WB.edge ? { kind: 'edge', ...WB.edge } : { kind: 'node', node_id: node }, t, wbKey())); WB.draft.comment = ''; }, { done: 'Comment posted.' });
+      } else if (kind === 'edit' && WB.editing) {
+        const c = WB.comments.find((x) => x.comment_id === id);
+        const t = String(form.get('text') || '').trim();
+        if (c && t) wbRun(async () => { await api.editComment(roomId, id, t, c.revision); WB.editing = null; }, { done: 'Comment updated. The earlier text stays in its history.' });
+      } else if (kind === 'propose' && WB.target) {
+        wbRun(async () => { await api.proposeSteering(roomId, proposalBody(node, WB.draft, WB.target, wbKey())); WB.draft = freshDraft(); },
+          { steer: true, done: 'Proposed. A room owner must confirm it before anything is sent.' });
+      }
+    }
+    const linFail = (e) => (/failed|404|not found/i.test(String(e && e.message)) ? 'No lineage is available for this room.' : 'Could not load the lineage. Press Retry, or choose Live.');
+    async function loadLineage(more = false) {
+      const my = ++LIN.seq;
+      let again = false;
+      LIN.busy = true; drawLineage(true);
+      try {
+        const g = await api.lineage(roomId, { step: LIN.step, offset: more ? LIN.next : 0 });
+        if (my !== LIN.seq || !alive) return;
+        let t = null;
+        LIN.timelineError = null;
+        if (LIN.view === 'gantt' || LIN.timeline) {
+          // the timeline is read at the position the graph answered for, so the two never disagree
+          try { t = await api.lineageTimeline(roomId, { step: g.as_of.head ? null : g.as_of.step }); } catch (e) { LIN.timelineError = 'The timeline could not be loaded.'; }
+          if (my !== LIN.seq || !alive) return;
+        }
+        LIN.pages = more ? [...LIN.pages, g] : [g];
+        LIN.total = g.total_nodes; LIN.next = g.next_offset; LIN.truncated = pagesTruncated(LIN.pages); LIN.asOf = g.as_of;
+        if (t) LIN.timeline = t;
+        LIN.error = null;
+        LIN.fails = 0;
+      } catch (e) {
+        if (my === LIN.seq) {
+          LIN.error = linFail(e);
+          LIN.fails += 1;
+          // a second failure at the same position falls back to Live instead of leaving the panel stuck
+          if (LIN.fails >= 2 && LIN.step !== null) { LIN.step = null; LIN.fails = 0; LIN.pages = []; LIN.notice = 'That position could not be loaded, so Live is shown.'; again = true; }
+        }
+      } finally { if (my === LIN.seq) { LIN.busy = false; LIN.at = Date.now(); } }
+      if (!alive || my !== LIN.seq) return;
+      const next = LIN.pending;
+      LIN.pending = null;
+      if (next) { LIN.step = next.step; LIN.notice = null; loadLineage(); return; }   // the latest choice made while busy
+      drawLineage(true);
+      if (again) loadLineage();
+      else if (LIN.sel && !WB.busy && !WB.editing && !WB.confirming && Date.now() - WB.at > 7000) loadWorkbench();   // keep the side panel as fresh as the graph
+    }
+    function drawLineage(force = false) {
+      const box = $('hcn-lineage');
+      if (!box) return;
+      if (!LIN.bound) bindLineage(box);
+      // live refresh only at the head of page one: a replay is static and "Load more" pages must survive
+      if (!force && LIN.step === null && !LIN.busy && LIN.pages.length <= 1 && Date.now() - LIN.at > 8000) { loadLineage(); }
+      else if (!force && !LIN.at && !LIN.busy) { loadLineage(); return; }
+      if (!CTX.busy && Date.now() - CTX.at > 15000) { CTX.at = Date.now(); loadContext(); }
+      const m = linModel();
+      // the layout feeds the SVG's arrow-key navigation only; above the draw cap there is no SVG, and laying out thousands of
+      // nodes on every keystroke of the filter box cost 0.5-2.4 s per key (T16 large-graph gate)
+      LIN.layout = LIN.mode !== 'table' ? layoutCached(m.filtered) : null;
+      refreshSessions();
+      const html = renderLineage(m);
+      drawConsults();
+      if (LIN.html === html && box.innerHTML !== '') return;
+      const a = document.activeElement;
+      let key = a && box.contains(a) ? focusKey(a) : null;
+      // While a request is in flight the controls are drawn disabled and a disabled control cannot keep focus, so remember
+      // where focus was when the wait began and give it back when the answer is drawn (keyboard users keep their place).
+      const waiting = Boolean(WB.busy || LIN.busy);
+      if (waiting && !LIN.wasWaiting) LIN.waitFocus = key;
+      if (!waiting && LIN.wasWaiting && !key && (!a || a === document.body) && LIN.waitFocus) key = LIN.waitFocus;
+      if (!waiting) LIN.waitFocus = null;
+      LIN.wasWaiting = waiting;
+      const pos = key && a && box.contains(a) && typeof a.selectionStart === 'number' ? a.selectionStart : null;
+      LIN.html = html;
+      // Morphed in place: unchanged nodes (the SVG, table rows, replay controls, workbench form) keep
+      // their nodes and any focus/scroll; a focused control that left is handed to its equivalent via
+      // the focusKey/focusSelector/successor logic below, so keyboard users keep their place.
+      const stranded = morph(box, html);
+      handOff(stranded, () => null);
+      const sel = key && focusSelector(key);
+      const el = sel && box.querySelector(sel);
+      if (key && !el) {                                                    // the control is gone: its logical successor, else the panel
+        const next = focusSuccessor(key).map((q) => box.querySelector(q)).find(Boolean);
+        if (next) { if (!next.matches('button,a[href],input,select,textarea,[tabindex]')) next.setAttribute('tabindex', '-1'); next.focus({ preventScroll: true }); } else refocus(box, null);
+      }
+      if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && (el.type === 'search' || el.type === 'textarea' || el.type === 'text')) try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
+    }
+    // ---- pan / zoom of the graph viewport. The view is plain state; every change re-draws only the nodes now in view.
+    const curView = () => LIN.vp || (LIN.layout ? fitView(LIN.layout, LIN.vpW, LIN.vpH) : null);
+    const setView = (v) => { if (!LIN.layout || !v) return; LIN.vp = clampView(v, LIN.layout, LIN.vpW, LIN.vpH); drawLineage(true); };
+    const revealNode = (id) => {
+      const p = LIN.layout && LIN.layout.placed.get(id);
+      const v = curView();
+      if (p && v && !isVisible(v, p, LIN.vpW, LIN.vpH)) LIN.vp = clampView(centerOn(v, p, LIN.vpW, LIN.vpH), LIN.layout, LIN.vpW, LIN.vpH);
+    };
+    function vpAct(act) {
+      const v = curView();
+      // After a focus change the selected node is centred in the new layout, so it is never left off-screen
+      const recentre = () => {
+        const m = linModel(); const lay = layoutCached(m.filtered); const p = LIN.sel && lay.placed.get(LIN.sel);
+        const base = fitView(lay, LIN.vpW, LIN.vpH);
+        LIN.vp = p ? clampView(centerOn(base, p, LIN.vpW, LIN.vpH), lay, LIN.vpW, LIN.vpH) : null;
+      };
+      if (act === 'focus') { if (LIN.sel) { LIN.focusId = LIN.sel; recentre(); drawLineage(true); } return; }
+      if (act === 'unfocus') { LIN.focusId = null; recentre(); drawLineage(true); return; }
+      if (!v) return;
+      if (act === 'fit') { LIN.vp = null; drawLineage(true); }
+      else if (act === 'end') { const last = LIN.layout && LIN.layout.columns.at(-1); const p = last && LIN.layout.placed.get(last[0]); if (p) setView(centerOn(v, p, LIN.vpW, LIN.vpH)); }
+      else if (act === 'in') setView(zoomAt(v, 1.25, LIN.vpW / 2, LIN.vpH / 2));
+      else if (act === 'out') setView(zoomAt(v, 1 / 1.25, LIN.vpW / 2, LIN.vpH / 2));
+    }
+    function bindViewport(box) {
+      // The pointer and the wheel act on the viewport; nodes keep their own click. A drag that starts on a node is a click.
+      let drag = null;
+      let lastDraw = 0;
+      const scaleOf = (svg) => { const r = svg.getBoundingClientRect(); return r.width && LIN.vpW ? r.width / LIN.vpW : 1; };
+      box.addEventListener('pointerdown', (e) => {
+        const vpEl = e.target.closest && e.target.closest('[data-viewport]');
+        if (!vpEl || e.button !== 0) return;
+        const svg = vpEl.querySelector('svg.lin-svg'); const v = curView();
+        if (!svg || !v) return;
+        drag = { x: e.clientX, y: e.clientY, v, s: scaleOf(svg), svg, id: e.pointerId, moved: false, el: vpEl };
+      });
+      box.addEventListener('pointermove', (e) => {
+        if (!drag || e.pointerId !== drag.id) return;
+        if (e.buttons === 0) { drag = null; return; }       // released outside the page: never keep panning
+        const dx = (e.clientX - drag.x) / drag.s; const dy = (e.clientY - drag.y) / drag.s;
+        if (!drag.moved && Math.hypot(dx, dy) < 3) return;
+        if (!drag.moved) {
+          // Capture only once it is a drag: capturing at pointerdown would send a plain click on a node to the viewport instead of the node.
+          try { drag.el.setPointerCapture(e.pointerId); } catch { /* capture is a nicety */ }
+          drag.el.classList.add('lin-viewport--drag');
+        }
+        drag.moved = true;
+        LIN.vp = clampView(panBy(drag.v, -dx, -dy), LIN.layout, LIN.vpW, LIN.vpH);
+        drag.svg.setAttribute('viewBox', `${LIN.vp.x} ${LIN.vp.y} ${LIN.vpW / LIN.vp.k} ${LIN.vpH / LIN.vp.k}`);
+        if (Date.now() - lastDraw > 120) { lastDraw = Date.now(); drawLineage(true); drag.svg = box.querySelector('[data-viewport] svg.lin-svg') || drag.svg; }
+      });
+      const end = (e) => {
+        if (!drag || e.pointerId !== drag.id) return;
+        const was = drag; drag = null;
+        const vpEl = box.querySelector('[data-viewport]'); if (vpEl) vpEl.classList.remove('lin-viewport--drag');
+        if (was.moved) drawLineage(true);
+      };
+      box.addEventListener('pointerup', end); box.addEventListener('pointercancel', end);
+      // Plain wheel scrolls the page; the wheel with Ctrl, Cmd or Alt zooms around the pointer.
+      box.addEventListener('wheel', (e) => {
+        const vpEl = e.target.closest && e.target.closest('[data-viewport]');
+        if (!vpEl || !(e.ctrlKey || e.metaKey || e.altKey)) return;
+        const svg = vpEl.querySelector('svg.lin-svg'); const v = curView();
+        if (!svg || !v) return;
+        e.preventDefault();
+        const r = svg.getBoundingClientRect(); const s = scaleOf(svg);
+        setView(zoomAt(v, e.deltaY < 0 ? 1.15 : 1 / 1.15, (e.clientX - r.left) / s, (e.clientY - r.top) / s));
+      }, { passive: false });
+    }
+    function bindLineage(box) {
+      LIN.bound = true;
+      if (typeof ResizeObserver === 'function') {            // the viewport follows the panel: a rotated phone or a resized window redraws at its new width
+        let lastW = box.clientWidth; let timer = 0;
+        new ResizeObserver(() => { if (Math.abs(box.clientWidth - lastW) < 8 || !box.clientWidth) return; lastW = box.clientWidth; clearTimeout(timer); timer = setTimeout(() => { if (alive) drawLineage(true); }, 120); }).observe(box);
+      }
+      bindViewport(box);
+      let slide = 0;
+      // A node that takes focus (Tab into the single tab stop, a click on a list) is brought into view first: focus is never off screen.
+      box.addEventListener('focusin', (e) => {
+        const n = e.target.closest && e.target.closest('g[data-node]');
+        const p = n && LIN.layout && LIN.layout.placed.get(n.dataset.node);
+        const v = p && curView();
+        if (p && v && !isVisible(v, p, LIN.vpW, LIN.vpH)) {
+          // move the window now (the focused node is already in the DOM, so nothing is replaced under focus), re-cull a moment later
+          revealNode(n.dataset.node);
+          const svg = n.closest('svg'); if (svg && LIN.vp) svg.setAttribute('viewBox', `${LIN.vp.x} ${LIN.vp.y} ${LIN.vpW / LIN.vp.k} ${LIN.vpH / LIN.vp.k}`);
+          clearTimeout(LIN.revealTimer); LIN.revealTimer = setTimeout(() => { if (alive) drawLineage(true); }, 200);
+        }
+      });
+      const goStep = (t) => {
+        const step = t === 'live' ? null : t;
+        if (LIN.busy) { LIN.pending = { step }; drawLineage(true); return; }      // keep the LATEST choice, apply it next
+        LIN.step = step; LIN.notice = null; LIN.error = null; if (step === null) LIN.pages = []; loadLineage();
+      };
+      box.addEventListener('click', (e) => {
+        const open = e.target.closest('[data-ctx-open]');
+        if (open) { pickNode(open.dataset.ctxOpen); drawLineage(true); return; }
+        const cx = e.target.closest('[data-ctx-act]');
+        if (cx) { ctxAct(cx.dataset.ctxAct, cx.dataset.ctxId); return; }
+        const wb = e.target.closest('[data-wb-act]');
+        if (wb && wb.dataset.wbAct === 'edge') {
+          WB.edge = { edge_type: wb.dataset.wbEdgeType, from_id: wb.dataset.wbFrom, to_id: wb.dataset.wbTo };
+          WB.editing = null; WB.history = null; loadWorkbench();
+          return;
+        }
+        if (wb) { wbAct(wb.dataset.wbAct, wb.dataset.wbId); return; }
+        const ta = e.target.closest('[data-term-auth]');
+        if (ta) { termAuth(ta.dataset.termAuth); return; }
+        const mm = e.target.closest('svg.lin-mm');
+        if (mm && LIN.layout) {
+          const r = mm.getBoundingClientRect(); const v = curView();
+          if (r.width && r.height && v) { const t = minimapTarget(LIN.layout, (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height); setView({ ...v, x: t.x - LIN.vpW / v.k / 2, y: t.y - LIN.vpH / v.k / 2 }); }
+          return;
+        }
+        const vpb = e.target.closest('[data-vp]');
+        if (vpb) { vpAct(vpb.dataset.vp); return; }
+        const n = e.target.closest('[data-node]');
+        if (n) { pickNode(n.dataset.node); if (!n.closest('svg')) revealNode(n.dataset.node); drawLineage(true); return; }
+        const r = e.target.closest('[data-replay]');
+        if (e.target.closest('[data-retry]')) { loadLineage(); return; }
+        if (r && r.dataset.replay !== 'slider') { goStep(replayTarget(LIN.asOf, r.dataset.replay)); return; }
+        const v = e.target.closest('[data-view]');
+        if (v) { LIN.view = v.dataset.view; savePrefs(); if (LIN.view === 'gantt' && !LIN.timeline) loadLineage(); else drawLineage(true); return; }
+        const md = e.target.closest('[data-mode]');
+        if (md) { LIN.mode = md.dataset.mode; savePrefs(); drawLineage(true); return; }
+        if (e.target.closest('[data-more]') && !LIN.busy) loadLineage(true);
+      });
+      // `toggle` does not bubble: capture it, so the person's choice survives every redraw
+      box.addEventListener('toggle', (e) => { if (e.target.matches && e.target.matches('details[data-filterbox]')) LIN.filtersOpen = e.target.open; }, true);
+      box.addEventListener('submit', (e) => {
+        e.preventDefault();                                              // Enter in the search box filters; it never navigates
+        const cf = e.target.closest && e.target.closest('[data-ctx-form]');
+        if (cf && !CTX.busy) { ctxSubmit(cf.dataset.ctxForm, cf.dataset.ctxId, new FormData(cf)); return; }
+        const f = e.target.closest && e.target.closest('[data-wb-form]');
+        if (f && !WB.busy) wbSubmit(f.dataset.wbForm, f.dataset.wbId, new FormData(f));
+      });
+      box.addEventListener('input', (e) => {
+        const cfld = e.target.dataset.ctxField;
+        if (cfld) { CTX.askDraft[cfld] = e.target.value; return; }
+        const wf = e.target.dataset.wbField;
+        if (wf) {                                                       // drafts live in memory so a refresh never eats typing
+          if (wf === 'edit' && WB.editing) WB.editing.text = e.target.value;
+          else if (wf in WB.draft) WB.draft[wf] = e.target.value;
+          return;
+        }
+        const f = e.target.dataset.filter;
+        if (f === 'q') {
+          LIN.filters.q = e.target.value; LIN.vp = null;      // a different set of nodes: start from the fitted view
+          // Above the draw cap one redraw rebuilds thousands of table rows: coalesce a burst of keystrokes into one redraw so
+          // typing itself stays responsive. Small graphs redraw at once, as before.
+          const loaded = LIN.pages.reduce((n, p) => n + ((p && p.nodes) || []).length, 0);
+          if (loaded > 300) { clearTimeout(LIN.qTimer); LIN.qTimer = setTimeout(() => { if (alive) drawLineage(true); }, 250); } else drawLineage(true);
+        }
+        else if (e.target.dataset.replay === 'slider') {
+          const out = box.querySelector('.lin-replay__status');
+          if (out) out.textContent = `Position ${e.target.value} of ${e.target.max}. Release to load.`;
+        }
+      });
+      box.addEventListener('change', (e) => {
+        const t = e.target;
+        if (t.dataset.wbField === 'action') { WB.draft.action = t.value; drawLineage(true); return; }
+        if (t.dataset.replay === 'slider') { clearTimeout(slide); const v = t.value; slide = setTimeout(() => goStep(replayTarget(LIN.asOf, 'slider', v)), 150); return; }
+        if (t.dataset.clock !== undefined) { LIN.clock = t.value; savePrefs(); drawLineage(true); return; }
+        const f = t.dataset.filter;
+        if (f === 'type' || f === 'etype') {
+          const set = f === 'type' ? LIN.filters.types : LIN.filters.edgeTypes;
+          if (t.checked) set.add(t.value); else set.delete(t.value);
+          LIN.vp = null; drawLineage(true);
+        } else if (f === 'state') { LIN.filters.state = t.value; LIN.vp = null; drawLineage(true); }
+      });
+      box.addEventListener('keydown', (e) => {
+        const n = e.target.closest && e.target.closest('g[data-node]');
+        const inVp = e.target.closest && e.target.closest('[data-viewport]');
+        if (inVp && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          const v = curView();
+          const step = 80;
+          const pan = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
+          if (v && (e.key === '+' || e.key === '=')) { e.preventDefault(); setView(zoomAt(v, 1.25, LIN.vpW / 2, LIN.vpH / 2)); return; }
+          if (v && (e.key === '-' || e.key === '_')) { e.preventDefault(); setView(zoomAt(v, 1 / 1.25, LIN.vpW / 2, LIN.vpH / 2)); return; }
+          if (e.key === '0') { e.preventDefault(); LIN.vp = null; drawLineage(true); return; }
+          if (v && pan && (e.shiftKey || !n)) { e.preventDefault(); setView(panBy(v, pan[0], pan[1])); return; }
+        }
+        if (n) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pickNode(n.dataset.node); drawLineage(true); return; }
+          if (e.key === 'Escape') { pickNode(null); drawLineage(true); return; }
+          const to = LIN.layout && nextNode(LIN.layout, n.dataset.node, e.key);
+          if (to) { e.preventDefault(); LIN.focus = to; revealNode(to); drawLineage(true); box.querySelector(`g[data-node="${CSS.escape(to)}"]`)?.focus(); }
+          return;
+        }
+        const tab = e.target.closest && e.target.closest('[data-view]');
+        if (tab && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
+          e.preventDefault(); LIN.view = tab.dataset.view === 'graph' ? 'gantt' : 'graph';
+          if (LIN.view === 'gantt' && !LIN.timeline) loadLineage(); else drawLineage(true);
+          box.querySelector(`[data-view="${LIN.view}"]`)?.focus();
+        }
+      });
+    }
+    // ---- T15: attention inbox, evidence-based progress, analytics (server-derived; the page only shows them)
+    const ATT = { data: null, error: null, notice: null, showQuiet: false, at: 0, prog: null, progError: null, stats: null, statsError: null, pat: 0 };
+    const attErr = (e) => (e && e.status === 403 ? 'The attention inbox, progress and analytics are not enabled for this room.' : 'Could not load this view. It will retry.');
+    async function loadAttention(force) {
+      if (!force && Date.now() - ATT.at < 15000) { drawAttention(); return; }
+      ATT.at = Date.now();
+      try { ATT.data = await api.attention(roomId, ATT.showQuiet); ATT.error = null; setBadge('attention', (ATT.data.items || []).length); }
+      catch (e) { ATT.error = attErr(e); }
+      drawAttention();
+    }
+    function drawAttention() {
+      const h = $('hcn-attention');
+      if (!h) return;
+      if (!h.dataset.bound) {
+        h.dataset.bound = '1';
+        const act = async (fn) => { try { await fn(); ATT.notice = null; } catch (e) { ATT.notice = e && e.status === 429 ? 'Too many changes; try again in a minute.' : 'That did not work.'; } await loadAttention(true); };
+        h.addEventListener('click', (e) => {
+          const b = e.target.closest('[data-attn-act]');
+          if (!b) return;
+          const a = b.dataset.attnAct;
+          if (a === 'toggle-quiet') { ATT.showQuiet = !ATT.showQuiet; loadAttention(true); return; }
+          if (a === 'ack') act(() => api.attentionAck(roomId, ackBody(b.dataset.attnKey, b.dataset.attnFp)));
+          else if (a === 'restore') act(() => api.attentionRestore(roomId, restoreBody(b.dataset.attnKey)));
+        });
+        h.addEventListener('change', (e) => {
+          const sel = e.target.closest('[data-attn-snooze]');
+          if (sel && sel.value) act(() => api.attentionSnooze(roomId, snoozeBody(sel.dataset.attnKey, sel.dataset.attnFp, sel.value)));
+        });
+      }
+      put('hcn-attention', renderAttention({ data: ATT.data, error: ATT.error, notice: ATT.notice, showQuiet: ATT.showQuiet }));
+    }
+    async function loadProgress(force) {
+      if (!force && Date.now() - ATT.pat < 30000) return;
+      ATT.pat = Date.now();
+      const [p, a] = await Promise.allSettled([api.progress(roomId), api.analytics(roomId)]);
+      ATT.prog = p.status === 'fulfilled' ? p.value : ATT.prog; ATT.progError = p.status === 'rejected' ? attErr(p.reason) : null;
+      ATT.stats = a.status === 'fulfilled' ? a.value : ATT.stats; ATT.statsError = a.status === 'rejected' ? attErr(a.reason) : null;
+      put('hcn-progress', renderProgress({ data: ATT.prog, error: ATT.progError }));
+      put('hcn-analytics', renderAnalytics({ data: ATT.stats, error: ATT.statsError }));
+    }
+    // the count is painted (aria-hidden) and spoken as "Tasks, 3 waiting": the button's own name never glues a number onto the word ("Tasks3")
+    const setBadge = (k, n) => {
+      const b = $(`hcn-b-${k}`); if (!b) return;
+      b.hidden = !n; patchText(b, n > 99 ? '99+' : String(n));
+      const tab = b.closest('[role="tab"]'); if (tab) tab.setAttribute('aria-label', n ? `${tab.dataset.label}, ${n > 99 ? 'more than 99' : n} waiting` : tab.dataset.label);
+    };
+    const loadMine = async () => { try { S.mine = (await api.agents()).agents.filter((x) => !x.external); }   // a remote agent is bound to its invite: nothing to grant
+       catch { /* keep the old list */ } };
     function paint() {
       setBadge('agents', (S.requests || []).length);
       setBadge('tasks', S.tasks.filter((t) => ['pending', 'accepted'].includes(t.status)).length);
       if (sub === 'tasks') drawTasks();
       else if (sub === 'flow') drawFlow();
+      else if (sub === 'links') put('hcn-links', renderLinks(S.links, S.missions));
+      else if (sub === 'tabs') drawTabs();
+      else if (sub === 'proposals') drawProposals();
+      else if (sub === 'lineage') drawLineage();
+      else if (sub === 'attention') loadAttention(false);
+      else if (sub === 'progress') loadProgress(false);
       else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
     }
     const paintPanel = async () => {
@@ -818,12 +1601,20 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (k === 'chat') { log.scrollTop = log.scrollHeight; composer?.focus(); }
       paintPanel();
     };
+    // each sub-tab controls one panel, and the panel says which tab labels it (WAI-ARIA tabs pattern)
+    root.querySelectorAll('[role="tab"][data-sub]').forEach((b) => { const p = $(`hcn-p-${b.dataset.sub}`); if (p) { p.setAttribute('role', 'tabpanel'); p.setAttribute('aria-labelledby', b.id); p.removeAttribute('aria-label'); } });
     root.querySelectorAll('[data-sub]').forEach((b) => { b.onclick = () => showSub(b.dataset.sub); });
     root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${sub}`; });
 
+    function mentionCtx() {
+      return { people: S.people, commands: ROOM_COMMANDS,
+        agents: S.agents.map((a) => ({ ...a, label: namedAgent(a).display_name || '' })) };
+    }
     // ---- one long-poll feeds every panel (replaces five timers); it sleeps while the tab is hidden
     const apply = (s) => {
       if (s.agents) { S.agents = s.agents; S.agents.forEach((a) => agentName.set(a.agent_id, a.name)); }
+      if (s.people) S.people = s.people;
+      S.links = s.links ?? null; S.missions = s.missions ?? null;
       S.tasks = s.tasks || []; S.flow = s.flow || null; S.requests = s.requests || null;
       S.agents.forEach(a=>agentName.set(a.agent_id,namedAgent(a).display_name || a.name));
       addEvents(s.events || []);
@@ -839,12 +1630,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           const s = await api.state(roomId, since, cursor, 8, ctl.signal);
           if (!alive) return;
           backoff = 1000;
+          onFreshness(true);
           if (s.changed) { apply(s); since = s.has_more ? -1 : s.seq; } else since = s.seq;
         } catch (e) {
           if (!alive) return;
           if (e.name === 'AbortError') continue;
           if (e instanceof AuthError) { dispose(); store.clear(); start(); return; }
           if (/not found/.test(e.message)) { dispose(); go('/rooms'); return; }
+          onFreshness(false, `Room: ${e.message || 'request failed'}`);
           await sleep(backoff); backoff = Math.min(backoff * 2, 15000);
         }
       }
@@ -862,22 +1655,35 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         } catch (e) { $('hcn-task-msg').textContent = e.message; }
       };
     }
+    log.addEventListener('click', (ev) => {                       // a reference chip opens the item in the Lineage tab
+      const open = ev.target.closest && ev.target.closest('[data-ctx-open]');
+      if (open && !guest) { showSub('lineage'); pickNode(open.dataset.ctxOpen); drawLineage(true); }
+    });
     if ($('hcn-composer')) {
       composer = mountComposer($('hcn-composer'), {
         draftKey: `collab:${me.user_id}:${roomId}`,
-        placeholder: 'Message the room… type @ to hand an agent a task',
-        hint: 'Enter sends · Shift+Enter adds a line · @agent … gives that agent a task',
-        suggestions: () => S.agents.filter((a) => a.actions.includes('execute')).map((a) => ({
-          id: a.agent_id, label: namedAgent(a).display_name || `@${a.name}`, insertText: `@${a.name}`,
-          detail: `${a.harness_type} · ${names.get(a.owner_user_id) || shortId(a.owner_user_id)}`,
-        })),
+        placeholder: 'Message the room… @ people, agents and files · / commands',
+        hint: 'Enter sends · Shift+Enter adds a line · @gert.pi … gives that agent a task',
+        providers, context: mentionCtx,
+        check: (text) => {
+          const ctx = mentionCtx(), notes = [];
+          for (const a of ambiguousMentions(text, ctx)) notes.push(`@${a.name} is ambiguous — use ${a.forms.length ? a.forms.join(' or ') : '@owner.harness'}.`);
+          const missing = unresolvedMentions(text, ctx);
+          if (missing.length) notes.push(`${missing.map((n) => `@${n}`).join(', ')} addresses nobody here; it will be sent as plain text.`);
+          return notes.join(' ');
+        },
         onSend: async (text) => {
-          const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
-          if (mention) { // Preserve the room's authenticated leading-agent task contract.
-            const hits = S.agents.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
-            if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks tab` : `No agent named @${mention[1]} in this room accepts tasks`);
-            await api.createTask(roomId, hits[0].agent_id, mention[2]);
-          } else await api.say(roomId, text);
+          // The text goes out exactly as typed: the server derives mentions, and a harness reads what was written.
+          const lead = /^@([a-z0-9._-]{1,48})\s+\S/i.exec(text.trim());
+          // the same precedence as the server: a group or a person handle is never an agent's task
+          const found = lead && resolveToken(lead[1].toLowerCase(), mentionCtx());
+          if (found?.ambiguous) throw new Error(`More than one agent or person is called @${lead[1]}; use ${found.ambiguous.length ? found.ambiguous.join(' or ') : '@owner.harness'}`);
+          const hit = found?.hit;
+          const target = hit && hit.kind === 'agent' && S.agents.find((a) => a.agent_id === hit.id);
+          const mention = target && target.actions.includes('execute');
+          if (mention) { // the room's authenticated leading-agent task contract, now with the verbatim text
+            await api.createTask(roomId, target.agent_id, text);
+          } else { await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined); CTX.attach = null; drawAttach(); }
           if (alive) { kick(); log.scrollTop = log.scrollHeight; }
           return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };
         },
@@ -893,6 +1699,41 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           await api.invite(roomId, f.get('email'), f.get('role'));
           msg.textContent = 'Invited. They get access when they sign in here.';
           ev.target.reset(); $('hcn-people').dataset.h = ''; paintPanel();
+        } catch (e) { msg.textContent = e.message; }
+      };
+    }
+    const extForm = $('hcn-ext-form');
+    if (extForm) {
+      extForm.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const f = new FormData(ev.target);
+        const msg = $('hcn-ext-msg');
+        const box = $('hcn-ext-code');
+        try {
+          const out = await api.inviteExternal(roomId, {
+            label: String(f.get('label') || ''), actions: f.get('post') ? ['read', 'post'] : ['read'],
+            lineage: !!f.get('lineage'), proposals: !!f.get('proposals'), ttl_seconds: Number(f.get('ttl')), credential_ttl_seconds: Number(f.get('cred')) });
+          msg.textContent = '';
+          // shown once: the server keeps only a digest of the code
+          box.innerHTML = `<div class="cx-msg">Give this one-time code to your coworker. It is shown only now, works once and expires ${esc(new Date(out.expires_at * 1000).toISOString())}.</div>`
+            + `<code class="cx-code" id="hcn-ext-codeval" tabindex="0">${esc(out.code)}</code>`
+            + `<div class="cx-msg">Their bridge redeems it with <code>POST /api/v1/collab/agents/join</code> (<code>{"token": "…"}</code>) and then reports with the credential it receives. See docs/operations/external-agents.md.</div>`;
+          ev.target.reset(); S.tabsAt = 0; $('hcn-ext-invites').dataset.h = ''; drawTabs();
+        } catch (e) { msg.textContent = e.message; box.textContent = ''; }
+      };
+    }
+    const delegForm = $('hcn-deleg');
+    if (delegForm) {
+      delegForm.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const f = new FormData(ev.target);
+        const msg = $('hcn-deleg-msg');
+        try {
+          await api.delegate(roomId, delegationBody({
+            target: f.get('target'), text: f.get('text'), paths: f.get('paths'), nodes: f.get('nodes'), questions: f.get('questions'),
+            kinds: f.getAll('kind'), maxProposals: f.get('maxProposals'), maxSteps: f.get('maxSteps'), maxBytes: f.get('maxBytes'), expires: f.get('expires') }));
+          msg.textContent = 'Delegated.';
+          ev.target.reset(); $('hcn-delegs').dataset.h = ''; drawProposals();
         } catch (e) { msg.textContent = e.message; }
       };
     }

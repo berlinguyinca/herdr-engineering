@@ -6,16 +6,137 @@ import binascii
 import json
 import re
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, wait
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from .control_plane.project_links import repository_language
 from .errors import InvalidError, PermissionError_Engineering, UnreachableError
+
+_READ_DEADLINE = ContextVar('ci_read_deadline', default=None)
+
+
+def _read_allowance(value):
+    if type(value) is not int or value < 0:
+        raise ValueError('max_reads_per_refresh must be a nonnegative integer')
+    return min(2400, value)
+
+
+class _ReadBudgetExceeded(TimeoutError):
+    """A read could not be started within this refresh's limits."""
+
+
+class _ProviderReadScheduler:
+    """Shared capacity survives refresh timeouts; late reads never publish state.
+
+    Workers are daemon threads because arbitrary injected providers cannot be
+    interrupted. There is no unbounded executor queue: every started read owns a
+    slot until the actual call finishes, including after a refresh has returned.
+    """
+
+    def __init__(self, max_in_flight=4):
+        if type(max_in_flight) is not int or not 1 <= max_in_flight <= 32:
+            raise ValueError('max_in_flight must be between 1 and 32')
+        self.max_in_flight = max_in_flight
+        self._slots = threading.BoundedSemaphore(max_in_flight)
+        self._closed = threading.Event()
+
+    def refresh(self, *, budget, max_reads, now, measurements):
+        return _ProviderReadBatch(self, budget, max_reads, now, measurements)
+
+    def close(self):
+        self._closed.set()
+
+
+class _ProviderReadBatch:
+    def __init__(self, scheduler, budget, max_reads, now, measurements):
+        self.scheduler = scheduler
+        self.deadline = time.monotonic() + max(0, budget)
+        self._now = now
+        self._logical_deadline = now() + max(0, budget)
+        self._remaining_reads = _read_allowance(max_reads)
+        self._measurements = measurements
+
+    def remaining(self):
+        return max(0, min(self.deadline - time.monotonic(), self._logical_deadline - self._now()))
+
+    def submit(self, callback, *args, **kwargs):
+        if (self._remaining_reads <= 0 or not self.remaining() or self.scheduler._closed.is_set()
+                or not self.scheduler._slots.acquire(timeout=self.remaining())):
+            raise _ReadBudgetExceeded('CI provider refresh budget exceeded')
+        if not self.remaining() or self.scheduler._closed.is_set():
+            self.scheduler._slots.release()
+            raise _ReadBudgetExceeded('CI provider refresh budget exceeded')
+        self._remaining_reads -= 1
+        future = Future()
+
+        def read():
+            token = _READ_DEADLINE.set(self.deadline)
+            try:
+                self._measurements.provider_call()
+                future.set_result(callback(*args, **kwargs))
+            except Exception as exc:
+                future.set_exception(exc)
+            finally:
+                _READ_DEADLINE.reset(token)
+                self.scheduler._slots.release()
+
+        threading.Thread(target=read, name='herdr-ci-read', daemon=True).start()
+        return future
+
+    def call(self, callback, *args, **kwargs):
+        return self.submit(callback, *args, **kwargs).result(timeout=self.remaining())
+
+    def map(self, callback, items):
+        """Yield completed heads before refilling a bounded submission window."""
+        iterator, pending = iter(items), {}
+        exhausted = False
+        while pending or not exhausted:
+            while not exhausted and len(pending) < self.scheduler.max_in_flight:
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                try:
+                    pending[self.submit(callback, item)] = item
+                except TimeoutError as exc:
+                    yield item, None, exc
+                    for item in iterator:
+                        yield item, None, exc
+                    exhausted = True
+            if not pending:
+                continue
+            done, _ = wait(pending, timeout=self.remaining(), return_when=FIRST_COMPLETED)
+            if not done:
+                for item in pending.values():
+                    yield item, None, TimeoutError('CI provider refresh budget exceeded')
+                pending.clear()
+                continue
+            while done:
+                future = done.pop()
+                item = pending.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    # Collectors retain safe error classifications, not provider
+                    # response frames (which may hold a whole decoded page).
+                    exc.__traceback__ = None
+                    exc.__cause__ = None
+                    exc.__context__ = None
+                    yield item, None, exc
+                else:
+                    yield item, result, None
+                    del result
+                del future
 
 
 @dataclass
@@ -131,16 +252,27 @@ class WoodpeckerProvider:
                 and not url.username and not url.password and not url.query and not url.fragment)
 
     def _request(self, path: str, *, method: str = "GET", raw: bool = False,
-                 log_preview: bool = False):
+                 log_preview: bool = False, text_limit: int | None = None):
         if not self.available:
             return None
         req = urllib.request.Request(self.base_url + path, method=method, headers={
             "Authorization": f"Bearer {self.token}", "Accept": "application/json"})
         try:
             opener = getattr(self._client, "urlopen", None) or self._client.open
-            with opener(req, timeout=15) as resp:
+            deadline = _READ_DEADLINE.get()
+            timeout = 15 if deadline is None else min(15, deadline - time.monotonic())
+            if timeout <= 0:
+                raise CIProviderError("timeout")
+            with opener(req, timeout=timeout) as resp:
                 # Read enough overlap to redact a credential crossing the preview
                 # boundary, while keeping download reads independent of log size.
+                if text_limit is not None:
+                    # Bounded whole-log read: (redacted text, truncated?), no marker appended.
+                    body = resp.read(text_limit + len(self.token or "") + 1)
+                    if "text/html" in getattr(resp, "headers", {}).get("Content-Type", "").lower():
+                        raise CIProviderError("invalid_response")
+                    text = self._redact(body.decode("utf-8", "replace"))
+                    return text[:text_limit], len(body) > text_limit + len(self.token or "") or len(text) > text_limit
                 limit = _MAX_LOG_CHARS + len(self.token or "") if log_preview else _MAX_RESPONSE_BYTES
                 body = resp.read(limit + 1)
                 if log_preview:
@@ -303,6 +435,9 @@ class WoodpeckerProvider:
                 "title", "created", "started", "finished", "ref", "forge_url")
         return {
             **{key: data.get(key) for key in keys}, "repository": repository, "tasks": tasks, "workflows": workflows,
+            # This is the ID actually used in the detail request, not a cached
+            # name attribution supplied by a later consumer.
+            "provider_repo_id": rid,
             "created_at": _timestamp(data.get("created")),
             "started_at": _timestamp(data.get("started")),
             "finished_at": _timestamp(data.get("finished")),
@@ -354,6 +489,22 @@ class WoodpeckerProvider:
                 break
         output = "\n".join(parts)
         return output + ("\n[log truncated; open CI for the full log]" if truncated else "")
+
+    def step_log_text(self, repository: str, number: int, step: str, *, max_chars: int) -> tuple[str, bool] | None:
+        """The whole stored log of one step as redacted text, and whether it was cut at `max_chars`.
+
+        Unlike `step_log`, which keeps the START of a log for display, test summaries sit at the END, so a cut log is
+        reported as truncated for the caller to refuse rather than to parse. Lines are the text split on newlines.
+        """
+        if not self.available:
+            return None
+        rid = self._repo_id(repository)
+        number = _positive_id(number)
+        step_id = str(step)
+        if not step_id.isascii() or not step_id.isdigit():
+            raise InvalidError("Use a numeric CI step ID")
+        path = f"/api/repos/{rid}/logs/{number}/{_positive_id(step_id)}/download"
+        return self._request(path, raw=True, text_limit=max(1, int(max_chars)))
 
     def retry(self, repository: str, pipeline_id: str, authorized: bool = False) -> bool:
         """Restart a pipeline by its run number (legacy parameter name retained)."""

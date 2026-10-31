@@ -1,6 +1,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import { parseJson, mountJsonViewer } from './conversation-json.js';
+import { completionAt as sigilAt, applyCompletion } from './collab-mention.js';
 
 let nextId = 0;
 
@@ -17,8 +18,11 @@ export function completionAt(text, caret) {
   return match ? { start: caret - match[1].length, query: match[1].slice(1).toLowerCase(), trigger: match[1][0] } : null;
 }
 
+const ICONS = { person: '👤', group: '👥', robot: '🤖', file: '📄', issue: '#', command: '/', skill: '✦' };
+
 // The caller owns authentication and delivery. Only its upload adapter can turn
 // a local File into an artifact that onSend is allowed to hand to the runtime.
+// options.urls: a fabric URL resolver ({resolver, prefetch}); the preview then links agent-reachable addresses. The draft itself is never changed.
 export function mountComposer(host, options = {}) {
   const doc = host.ownerDocument;
   ensureConversationStyles(doc);
@@ -31,10 +35,12 @@ export function mountComposer(host, options = {}) {
   host.innerHTML = `<form class="conversation-composer">
     <div class="conversation-editor-toolbar" aria-label="Message editor tools">
       <button type="button" data-expand aria-label="Expand editor" aria-expanded="false">Expand editor</button>
-      <button type="button" data-mode="edit" aria-pressed="true">Edit</button><button type="button" data-mode="preview" aria-pressed="false">Preview</button><button type="button" data-mode="split" aria-pressed="false">Split preview</button>
+      <button type="button" data-mode="edit" aria-pressed="true">Edit</button><button type="button" data-mode="preview" aria-pressed="false">Preview</button>
       <button type="button" data-edit="bold" aria-label="Bold">Bold</button><button type="button" data-edit="list" aria-label="Bulleted list">List</button><button type="button" data-edit="code" aria-label="Code block">Code</button>
-      <button type="button" data-edit="indent">Indent</button><button type="button" data-edit="outdent">Outdent</button><button type="button" data-edit="undo">Undo</button><button type="button" data-edit="redo">Redo</button>
-      <button type="button" data-find>Find and replace</button><button type="button" data-edit="json">Format JSON</button><button type="button" data-wrap aria-pressed="true">Wrap</button>
+      <details class="conversation-more"><summary>More</summary><span class="conversation-more-tools">
+        <button type="button" data-mode="split" aria-pressed="false">Split preview</button>
+        <button type="button" data-edit="indent">Indent</button><button type="button" data-edit="outdent">Outdent</button><button type="button" data-edit="undo">Undo</button><button type="button" data-edit="redo">Redo</button>
+        <button type="button" data-find>Find and replace</button><button type="button" data-edit="json">Format JSON</button><button type="button" data-wrap aria-pressed="true">Wrap</button></span></details>
     </div>
     <div class="conversation-find" hidden><label>Find text <input type="text" aria-label="Find text"></label><label>Replace with <input type="text" aria-label="Replace with"></label><button type="button" data-find-next>Find next</button><button type="button" data-replace>Replace all</button><button type="button" data-close-find>Close find</button></div>
     <div class="conversation-editor-body" data-mode="edit"><div class="conversation-input-wrap"><ul id="${id}-suggestions" class="conversation-suggestions" role="listbox" aria-label="References" hidden></ul>
@@ -69,12 +75,35 @@ export function mountComposer(host, options = {}) {
   };
   const close = () => { items = []; popup.hidden = true; input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); };
   const drawSuggestions = () => {
-    popup.innerHTML = items.map((item, i) => `<li role="option" id="${id}-option-${i}" data-index="${i}" aria-selected="${i === selection}"><b>${esc(item.label)}</b>${item.detail ? `<span>${esc(item.detail)}</span>` : ''}</li>`).join('');
+    const option = (item, i) => {
+      const icon = item.icon ? `<span class="conversation-suggestion-icon" data-icon="${esc(item.icon)}" aria-hidden="true">${ICONS[item.icon] || ''}</span>` : '';
+      return `<li role="option" id="${id}-option-${i}" data-index="${i}" aria-selected="${i === selection}"${item.section ? ` data-section="${esc(item.section)}"` : ''}>${icon}<b>${esc(item.label)}</b>${item.detail ? `<span>${esc(item.detail)}</span>` : ''}</li>`;
+    };
+    // sectioned items (People / Agents / Files …) are listbox groups, each named by its heading
+    const runs = [];
+    items.forEach((item, i) => { if (!runs.length || runs.at(-1).section !== item.section) runs.push({ section: item.section, rows: [] }); runs.at(-1).rows.push(option(item, i)); });
+    popup.innerHTML = runs.map((run) => (run.section
+      ? `<li role="group" class="conversation-suggestions-group" aria-label="${esc(run.section)}"><span class="conversation-suggestions-section" aria-hidden="true">${esc(run.section)}</span><ul role="none">${run.rows.join('')}</ul></li>`
+      : run.rows.join(''))).join('');
     popup.hidden = false; input.setAttribute('aria-expanded', 'true'); input.setAttribute('aria-activedescendant', `${id}-option-${selection}`);
-    popup.children[selection]?.scrollIntoView({ block: 'nearest' });
+    popup.querySelector(`#${id}-option-${selection}`)?.scrollIntoView({ block: 'nearest' });
+  };
+  // Sigil providers (`@`, `#`, `/`): one function per sigil, given the typed query and the caller's context.
+  const providerItems = () => {
+    const token = sigilAt(input.value, input.selectionStart);
+    const provide = token && options.providers[token.sigil];
+    if (!provide) return [];
+    const ctx = typeof options.context === 'function' ? options.context() : options.context || {};
+    return provide(token.query, { ...ctx, agent: token.agent }).slice(0, 12).map((item) => ({ id: `${item.section}:${item.insert}`, ...item }));
   };
   const suggest = () => {
     if (disabled || sending || composing) return close();
+    if (options.providers) {
+      const found = providerItems();
+      if (!found.length) return close();
+      if (found.length !== items.length || found.some((item, i) => item.id !== items[i]?.id)) selection = 0;
+      items = found; drawSuggestions(); return;
+    }
     const token = completionAt(input.value, input.selectionStart);
     if (!token) return close();
     const candidates = typeof options.suggestions === 'function' ? options.suggestions(token.query, token.trigger) : options.suggestions || [];
@@ -95,13 +124,21 @@ export function mountComposer(host, options = {}) {
     if (mode === 'edit') return;
     const text = input.value.trim();
     if (/^[{[]/.test(text) && parseJson(text).ok) jsonViewer = mountJsonViewer(preview, text);
-    else preview.innerHTML = renderMarkdown(input.value);
+    else { options.urls?.prefetch?.(input.value); preview.innerHTML = renderMarkdown(input.value, { urls: options.urls?.resolver || null }); }
   };
   const updateInfo = () => {
     const before = input.value.slice(0, input.selectionStart), lines = before.split('\n');
     info.textContent = `Line ${lines.length}, column ${lines.at(-1).length + 1} · ${input.value.length} characters`;
   };
-  const changed = () => { save(); grow(); updateInfo(); updatePreview(); };
+  // options.check(text) -> a note or '' (e.g. "@zzz addresses nobody"). It flags; it never blocks a send.
+  let flagged = false;
+  const flag = () => {
+    if (typeof options.check !== 'function' || sending) return;
+    const note = options.check(input.value) || '';
+    if (note) message(note); else if (flagged) message(expanded ? 'Enter adds a line · Use Send to deliver · Escape closes the editor' : hint);
+    flagged = Boolean(note);
+  };
+  const changed = () => { save(); grow(); updateInfo(); updatePreview(); flag(); };
   const apply = (value, start, end = start) => {
     if (disabled || sending || composing) return false;
     if (value.length > input.maxLength) { message(`Message exceeds ${input.maxLength} characters.`, true); return false; }
@@ -155,6 +192,12 @@ export function mountComposer(host, options = {}) {
     apply(text.slice(0, start) + before + body + after + text.slice(end), start + before.length, start + before.length + body.length);
   };
   const choose = (index) => {
+    if (options.providers) {             // the item's literal text, nothing else: what a harness reads is what was typed
+      const token = sigilAt(input.value, input.selectionStart), item = items[index];
+      if (!token || !item) return close();
+      const next = applyCompletion(input.value, input.selectionStart, token.start, item);
+      apply(next.text, next.caret); return;
+    }
     const token = completionAt(input.value, input.selectionStart), item = items[index];
     if (!token || !item) return close();
     const head = input.value.slice(0, token.start) + item.insertText + ' ';
@@ -273,7 +316,7 @@ export function mountComposer(host, options = {}) {
       const receipt = await options.onSend(text, attachments.map((a) => a.artifact));
       if (receipt?.status === 'failed' || receipt?.status === 'error') throw new Error(receipt.error || 'Delivery failed');
       if (disposed) return;
-      input.value = ''; undo = []; redo = []; current = snapshot(); changed(); attachments.forEach(revoke); attachments = [];
+      input.value = ''; undo = []; redo = []; current = snapshot(); changed(); flagged = false; attachments.forEach(revoke); attachments = [];
       message(receipt?.message || (receipt?.status === 'delivered' ? 'Delivered' : receipt?.status === 'accepted' ? 'Accepted; waiting for delivery.' : 'Sent'));
     } catch (error) { if (!disposed) message(error.message || 'Send failed. Your draft is saved.', true); }
     finally { sending = false; if (!disposed) { drawAttachments(); input.focus(); } }

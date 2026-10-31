@@ -3,7 +3,9 @@ import pytest
 from herdr_engineering.fleet_config import FleetConfigError, load_fleet_config
 from herdr_engineering.review_gate.config import (
     AppConfig,
+    NotifyConfig,
     RepoEnrollment,
+    ReviewerConfig,
     ReviewGateConfig,
     load_review_gate_config,
 )
@@ -188,3 +190,91 @@ def test_null_app_and_repos_are_absent(tmp_path):
     assert got.app is None and got.repos == () and not got.enabled
     with pytest.raises(ValueError, match="requires app"):
         load_review_gate_config(section(tmp_path, app=None, repos=None))
+
+
+def test_reviewer_defaults(tmp_path):
+    got = load_review_gate_config(section(tmp_path))
+    assert got.reviewer == ReviewerConfig(900, 400_000, 50, 3, 200_000)
+    assert got.notify == NotifyConfig((), ())
+
+
+def test_reviewer_overrides_parse(tmp_path):
+    rev = {
+        "lease_seconds": 600,
+        "max_diff_bytes": 100000,
+        "max_findings": 20,
+        "max_attempts": 2,
+        "max_output_bytes": 50000,
+    }
+    got = load_review_gate_config(section(tmp_path, reviewer=rev))
+    assert got.reviewer == ReviewerConfig(600, 100000, 20, 2, 50000)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"lease_seconds": 0},
+        {"lease_seconds": 29},
+        {"lease_seconds": 86401},
+        {"max_output_bytes": 999},
+        {"max_output_bytes": 2_000_001},
+        {"max_diff_bytes": 999},
+        {"max_diff_bytes": 5_000_001},
+        {"max_attempts": 0},
+        {"max_diff_bytes": True},
+        {"max_findings": "5"},
+        {"foo": 1},
+    ],
+)
+def test_reviewer_rejects_bad_values(tmp_path, bad):
+    with pytest.raises(ValueError):
+        load_review_gate_config(section(tmp_path, reviewer=bad))
+
+
+def test_reviewer_bounds_are_inclusive(tmp_path):
+    for rev in (
+        {"lease_seconds": 30, "max_output_bytes": 1000, "max_diff_bytes": 1000},
+        {"lease_seconds": 86400, "max_output_bytes": 2_000_000, "max_diff_bytes": 5_000_000},
+    ):
+        got = load_review_gate_config(section(tmp_path, reviewer=rev)).reviewer
+        assert (got.lease_seconds, got.max_output_bytes, got.max_diff_bytes) == tuple(rev.values())
+
+
+def test_notify_commands_are_argv_lists(tmp_path):
+    cmd = ["/usr/local/bin/spawn-fixer", "--repo", "{repo}", "--pr", "{number}"]
+    got = load_review_gate_config(section(tmp_path, notify={"fixer_command": cmd}))
+    assert got.notify.fixer_command == tuple(cmd)
+    assert got.notify.notify_command == ()
+    ok = ["/bin/x", "{branch}", "{sha}"]
+    got = load_review_gate_config(section(tmp_path, notify={"notify_command": ok}))
+    assert got.notify.notify_command == tuple(ok)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "/usr/bin/x --repo {repo}",
+        [],
+        ["/bin/x", ""],
+        ["/bin/x", 5],
+        ["relative/x"],
+        ["/bin/x", "{password}"],
+        ["/bin/x", "{repo.x}"],
+        ["/bin/x", "{repo[0]}"],
+        ["/bin/x", "{}"],
+        ["/bin/x", "{0}"],
+        ["/bin/x", "{repo"],
+        ["/bin/x", "{repo!r}"],
+        ["/bin/x", "{repo:>10}"],
+        ["/opt/{repo}/fix"],
+        ["/bin/{sha}", "x"],
+    ],
+)
+def test_notify_rejects_bad_commands(tmp_path, bad):
+    with pytest.raises(ValueError):
+        load_review_gate_config(section(tmp_path, notify={"fixer_command": bad}))
+
+
+def test_notify_unknown_key_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        load_review_gate_config(section(tmp_path, notify={"foo": ["/bin/x"]}))

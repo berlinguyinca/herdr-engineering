@@ -214,3 +214,14 @@ def test_inferweave_gateway_address_is_injected_only_when_configured(cp, tmp_pat
     assert env["OPENAI_API_KEY"] == f"{SECRET}-1"          # the one key serves both addresses
     se.run_session(_cfg(cp), project="p", command=[sys.executable, "-c", code])
     assert "INFERWEAVE_BASE_URL" not in json.loads(out.read_text())
+
+
+def test_dashboard_session_id_is_labelled_in_header_form(cp, tmp_path):
+    # The dashboard id carries %3A (emit.js encodes each part); '%' is outside the gateway
+    # metadata charset, so the proxy would drop a label carrying it. The label holds the
+    # decoded form, which the control plane maps back to the dashboard session.
+    rc = se.run_session(_cfg(cp), project="proj", command=_dump_env_cmd(tmp_path / "e.json"),
+                        session="herdr:beast:eng:w1%3Ap1")
+    assert rc == 0
+    mint = [c for c in cp.calls if c[1] == "/api/v1/llm/keys" and c[0] == "POST"][0]
+    assert mint[2] == {"project": "proj", "label": "session:herdr:beast:eng:w1:p1"}

@@ -9,11 +9,20 @@ overwrite).
 from __future__ import annotations
 
 import copy
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 from .errors import InvalidError
+
+# github.sync (control-plane-web, read live from the fleet file's github section):
+# seconds between passes, seconds between scheduled full reads of one repository, and
+# the GraphQL points (rateLimit.cost) one pass may spend before deferring the rest.
+# 400 points every 300 s stays under GitHub's 5000/hour even when every pass spends it.
+GITHUB_POINTS_PER_HOUR = 5000  # GitHub GraphQL primary rate limit
+GITHUB_SYNC_DEFAULTS = {"interval": 300, "full_reconcile_interval": 86400, "point_budget": 400}
+GITHUB_PROJECTS_DEFAULTS = {"enabled": False, "item_limit": 2000}
 
 DEFAULTS: dict[str, Any] = {
     "version": 1,
@@ -79,7 +88,82 @@ DEFAULTS: dict[str, Any] = {
     "notifications": {"enabled": True, "minimum_severity": "notice",
                       "quiet_hours": None, "dedupe_window_seconds": 300},
     "security": {"allow_public_listeners": False, "persist_hidden_reasoning": False},
+    # GitHub catalog (control-plane-web). organizations: allowlist of owner
+    # logins (organizations and your own account); empty = every owner the
+    # token sees. Excluded owners cost no issue calls and are purged from the
+    # stored catalog on the next pass.
+    # sync: interval between passes and between scheduled full reads (seconds).
+    # projects: read-only Projects v2 boards of the in-scope owners (off by default).
+    "github": {"organizations": [], "sync": dict(GITHUB_SYNC_DEFAULTS),
+               "projects": dict(GITHUB_PROJECTS_DEFAULTS)},
 }
+
+
+def github_sync(value: Any) -> dict[str, int]:
+    """Validate ``github.sync``; the settings with defaults filled in."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise InvalidError("github.sync must be a mapping")
+    settings = dict(GITHUB_SYNC_DEFAULTS)
+    for key in GITHUB_SYNC_DEFAULTS:
+        item = value.get(key)
+        if item is None:
+            continue
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise InvalidError(f"github.sync.{key} must be a positive whole number")
+        settings[key] = item
+    hourly = settings["point_budget"] * 3600 / max(30, settings["interval"])
+    if hourly > GITHUB_POINTS_PER_HOUR:
+        raise InvalidError(
+            f"github.sync.point_budget is spent once per pass: {settings['point_budget']} points every "
+            f"{settings['interval']}s is {hourly:.0f} points per hour, over GitHub's {GITHUB_POINTS_PER_HOUR} "
+            "per-hour GraphQL limit; lower point_budget or raise interval")
+    return settings
+
+
+def github_projects(value: Any) -> dict[str, Any]:
+    """Validate ``github.projects``; the settings with defaults filled in."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise InvalidError("github.projects must be a mapping")
+    settings = dict(GITHUB_PROJECTS_DEFAULTS)
+    enabled = value.get("enabled")
+    if enabled is not None:
+        if not isinstance(enabled, bool):
+            raise InvalidError("github.projects.enabled must be true or false")
+        settings["enabled"] = enabled
+    limit = value.get("item_limit")
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise InvalidError("github.projects.item_limit must be a positive whole number")
+        settings["item_limit"] = limit
+    return settings
+
+
+def github_organizations(value: Any) -> list[str]:
+    """Validate ``github.organizations``; the normalised (lower-case, unique) allowlist.
+
+    ``None`` or ``[]`` means every owner. GitHub logins are case-insensitive.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise InvalidError("github.organizations must be a list of non-empty GitHub owner logins "
+                           "(organizations or your own account); leave it empty for every owner")
+    return sorted({item.strip().lower() for item in value})
+
+
+def validate_github(section: Any) -> None:
+    """Reject an invalid ``github`` section with a message naming the key."""
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise InvalidError("github must be a mapping")
+    github_organizations(section.get("organizations"))
+    github_sync(section.get("sync"))
+    github_projects(section.get("projects"))
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -152,7 +236,13 @@ def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
         # supported schema (1). Only an explicitly wrong version is rejected.
         if "version" in data and data["version"] != 1:
             raise InvalidError(f"config file {path} has unsupported version")
+        if data.get("github"):
+            logging.getLogger(__name__).warning(
+                "%s: github.* is validated but not read from this file; control-plane-web reads "
+                "github.organizations and github.sync from the central fleet config (control_plane "
+                "fleet file), so this section has no effect", path)
         cfg = _deep_merge(cfg, data)
+    validate_github(cfg.get("github"))
     return _expand_env(cfg)
 
 

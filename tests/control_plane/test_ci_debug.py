@@ -216,3 +216,97 @@ def test_numeric_repo_id_selects_correct_forge_when_names_collide():
     with pytest.raises(ValueError, match="ambiguous"):
         debug_ci(SimpleNamespace(_factory=lambda: provider), repo, None,
                  "org/frontend", 12, "session", "other-operation")
+
+
+def test_fix_mode_sends_the_fix_instructions_with_the_same_untrusted_context(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native_session(repo)
+    provider = Provider()
+    seen = []
+    def dispatch(session, message, artifacts):
+        seen.append(message)
+        return {"status": "delivered"}
+    result = debug_ci(SimpleNamespace(_factory=lambda: provider), repo, dispatch, "17", 12, "session", "op-fix",
+                      mode="fix")
+    assert result["ok"] is True and result["handoff_type"] == "fix-with-pi"
+    message = seen[0]
+    assert message.startswith("Fix this failing CI run.")
+    assert "NEW git worktree" in message and "Do not merge" in message and "never in a shared checkout" in message
+    context = json.loads(message.split("CI_CONTEXT_JSON:\n", 1)[1])
+    assert context["revision"] == SHA and context["request"]["mode"] == "fix"
+    assert "untrusted CI data" in message and "FAILED build" in message
+    assert "private-ci-token" not in message
+
+
+def test_debug_requests_keep_their_shape_and_the_modes_do_not_share_an_operation_id(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native_session(repo)
+    provider = Provider()
+    calls = []
+    def dispatch(*args):
+        calls.append(args)
+        return {"status": "delivered"}
+    monitor = SimpleNamespace(_factory=lambda: provider)
+    first = debug_ci(monitor, repo, dispatch, "17", 12, "session", "operation")
+    assert first["handoff_type"] == "debug-with-pi"
+    assert "mode" not in json.loads(calls[0][1].split("CI_CONTEXT_JSON:\n", 1)[1])["request"]
+    with pytest.raises(ValueError, match="operation_id"):
+        debug_ci(monitor, repo, dispatch, "17", 12, "session", "operation", mode="fix")
+    again = debug_ci(monitor, repo, dispatch, "17", 12, "session", "op-2", mode="fix")
+    replay = debug_ci(monitor, repo, dispatch, "17", 12, "session", "op-2", mode="fix")
+    assert again == replay and replay["handoff_type"] == "fix-with-pi" and len(calls) == 2
+
+
+def test_unknown_mode_is_rejected_before_any_read():
+    repo = ControlPlaneRepo()
+    native_session(repo)
+    provider = Provider()
+    for mode in ("deploy", "", None, "FIX"):
+        with pytest.raises(ValueError, match="mode"):
+            debug_ci(SimpleNamespace(_factory=lambda: provider), repo, None, "17", 12, "session", "o", mode=mode)
+    assert provider.reads == 0
+
+
+TEST = {"name": "tests/test_x.py::test_a", "step_id": "5", "line_start": 10, "line_end": 12, "suite": "tests.test_x"}
+
+
+class SliceMonitor(SimpleNamespace):
+    def log_slice(self, repository, number, step, start, end, **kwargs):
+        self.asked = (repository, number, step, start, end, kwargs.get("expect"))
+        return self.result
+
+
+def test_test_handoff_carries_the_server_read_excerpt_and_the_test(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native_session(repo)
+    monitor = SliceMonitor(_factory=Provider, result={"slice": {"lines": ["E   assert 1 == 2", "FAILED tests/test_x.py::test_a"]}})
+    sent = []
+    def dispatch(session, message, artifacts):
+        sent.append(message)
+        return {"status": "delivered"}
+    result = debug_ci(monitor, repo, dispatch, "17", 12, "session", "op-t", mode="test", test=TEST)
+    assert result["ok"] is True and result["handoff_type"] == "test-with-pi"
+    assert monitor.asked == ("17", 12, "5", 10, 12, "tests/test_x.py::test_a")
+    assert "failing test" in sent[0] and "untrusted" in sent[0]
+    context = json.loads(sent[0].split("CI_CONTEXT_JSON:\n", 1)[1])
+    assert context["failing_test"]["name"] == TEST["name"]
+    assert "assert 1 == 2" in context["log_excerpt"]
+    assert context["request"]["mode"] == "test"
+
+
+def test_test_handoff_refuses_when_the_excerpt_is_unavailable_and_sends_nothing():
+    repo = ControlPlaneRepo()
+    native_session(repo)
+    monitor = SliceMonitor(_factory=Provider, result={"slice": None, "reason": "The log no longer matches."})
+    with pytest.raises(ValueError, match="no longer matches"):
+        debug_ci(monitor, repo, None, "17", 12, "session", "op-t", mode="test", test=TEST)
+
+
+@pytest.mark.parametrize("bad", [None, {}, {**TEST, "step_id": "x"}, {**TEST, "line_start": 0}, {**TEST, "line_end": True}, {**TEST, "name": ""}, {**TEST, "line_end": 5}, {**TEST, "line_end": 5000}])
+def test_test_handoff_validates_the_test_before_reading_anything(bad):
+    repo = ControlPlaneRepo()
+    native_session(repo)
+    provider = Provider()
+    with pytest.raises(ValueError):
+        debug_ci(SliceMonitor(_factory=lambda: provider, result={}), repo, None, "17", 12, "session", "op-t", mode="test", test=bad)
+    assert provider.reads == 0

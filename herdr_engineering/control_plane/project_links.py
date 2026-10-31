@@ -263,3 +263,28 @@ def annotate_ci(view, repo, *, repository_languages=None):
     result["projects"] = [{"project_id": project, "repositories": sorted(identities)}
                           for project, identities in sorted(projects.items())]
     return result
+
+
+_PULL_REF = re.compile(r"^refs/pull/(\d+)/")
+
+
+def mark_merged_pull_requests(view, gate_store):
+    """Set ``pr_merged`` on each CI run whose pull request the review gate recorded as merged.
+
+    The link is exact: the run's ``refs/pull/<n>/...`` ref and repository against the gate's (repository, number) key. A run
+    without such a ref, or with no gate record, is left unmarked, so the flag never claims a merge that was not recorded.
+    """
+    if gate_store is None:
+        return view
+    try:
+        merged = {(snap.key.repo, snap.key.number) for snap in gate_store.snapshots() if getattr(snap.state, "name", "") == "MERGED"}
+    except Exception:  # noqa: BLE001 - an unreadable gate store must not break the CI page
+        return view
+    if not merged:
+        return view
+    for rows in view.get("pipelines", {}).values():
+        for row in rows:
+            match = _PULL_REF.match(str(row.get("ref") or ""))
+            if match and (row.get("repository"), int(match.group(1))) in merged:
+                row["pr_merged"] = True
+    return view

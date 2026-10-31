@@ -1,0 +1,5 @@
+# Where a CI gate keeps a durable copy of its own output, so a step the agent kills or cancels still leaves its last lines on disk.
+# The first directory whose parent exists and is writable wins; none usable means the run keeps only its node-local journal.
+# One file per run: <directory>/<owner>_<repo>/<pipeline>-<gate>.log. Nothing prunes these; each is about 0.1-0.3 MB.
+directories:
+  - /quobyte/metabolomicsgrp/it/server/woodpecker/ci-logs

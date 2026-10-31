@@ -97,8 +97,10 @@ def api(capable=True, acknowledgement=None):
             posts.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
             self.send_response(200)
             self.end_headers()
+            accepted = ({'ok': True, 'entities': [{'accepted': True} for _ in posts[-1]['events']]}
+                        if 'events' in posts[-1] else {'ok': True, 'entity': {'accepted': True}})
             self.wfile.write(json.dumps(acknowledgement if acknowledgement is not None else
-                                       {'ok': True, 'entity': {'accepted': True}}).encode())
+                                       accepted).encode())
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -110,11 +112,77 @@ def api(capable=True, acknowledgement=None):
         thread.join()
 
 
+def test_multiple_owned_missions_use_one_acknowledged_batch(tmp_path):
+    with native_session(tmp_path) as (root, _, status, _, _), api() as (url, posts):
+        status['missionIds'].append('MSN-other')
+        status['missions'].append(dict(id='MSN-other', status='RUNNING', revision=7))
+        collector = feed.MissionActivityFeed(url, host_id='host', control_dir=root)
+        result = collector.run_once()
+        assert result['posted'] == 2
+        assert result['errors'] == 0
+        assert len(posts) == 1
+        assert {event['entity_id'] for event in posts[0]['events']} == {'pi:MSN-1', 'pi:MSN-other'}
+        assert collector.run_once()['posted'] == 0
+        assert len(posts) == 1
+
+
+def test_mission_batches_respect_ingest_envelope_limit(tmp_path):
+    with api() as (url, posts):
+        collector = feed.MissionActivityFeed(url, host_id='host', control_dir=tmp_path)
+        payloads = [{'mission': {'id': f'MSN-{i}'}} for i in range(65)]
+        assert collector._publish_many(payloads) == 65
+        assert [len(post['events']) for post in posts] == [64, 1]
+        assert len(collector.sent) == 65
+        assert collector._publish_many(payloads) == 0
+        assert len(posts) == 2
+
+
+def test_batch_failure_keeps_only_previously_acknowledged_missions(tmp_path, monkeypatch):
+    collector = feed.MissionActivityFeed('http://127.0.0.1', host_id='host', control_dir=tmp_path)
+    batches = []
+
+    def publish(path, body):
+        batches.append(body['events'])
+        return {'ok': True, 'entities': [{'accepted': len(batches) == 1}
+                                         for _ in body['events']]}
+
+    monkeypatch.setattr(collector, '_http_json', publish)
+    payloads = [{'mission': {'id': f'MSN-{i}'}} for i in range(65)]
+    with pytest.raises(feed.PublicationRejected):
+        collector._publish_many(payloads)
+    assert len(collector.sent) == len(collector.known) == 64
+    assert 'MSN-64' not in collector.sent
+    batches.clear()
+    assert collector._publish_many(payloads) == 1
+    assert len(batches[0]) == 1
+    assert batches[0][0]['entity_id'] == 'pi:MSN-64'
+
+
+@pytest.mark.parametrize('acknowledgement', [
+    {'ok': False, 'entities': [{'accepted': True}, {'accepted': True}]},
+    {'ok': True, 'entities': [{'accepted': True}]},
+    {'ok': True, 'entities': [{'accepted': True}, {'accepted': False}]},
+    {'ok': True, 'entities': [{'accepted': True}, None]},
+    {'ok': True, 'entity': {'accepted': True}},
+])
+def test_rejected_batch_does_not_mark_missions_as_sent(tmp_path, acknowledgement):
+    with api(acknowledgement=acknowledgement) as (url, posts):
+        collector = feed.MissionActivityFeed(url, host_id='host', control_dir=tmp_path)
+        payloads = [{'mission': {'id': mid}} for mid in ('MSN-1', 'MSN-2')]
+        with pytest.raises(feed.PublicationRejected):
+            collector._publish_many(payloads)
+        assert len(posts) == 1
+        assert collector.sent == {}
+        assert collector.known == {}
+
+
 def test_collects_only_proven_owned_revision_and_redacts_before_transport(tmp_path):
     with native_session(tmp_path) as (root, _, _, _, operations), api() as (url, posts):
         collector = feed.MissionActivityFeed(url, host_id='host', control_dir=root)
         result = collector.run_once()
         assert result['posted'] == 1
+        assert result['snapshot_reads'] == 1
+        assert result['snapshot_cache_hits'] == 0
         assert operations == ['ping', 'status']
         assert len(posts) == 1
         body = posts[0]
@@ -193,6 +261,32 @@ def test_unchanged_projection_is_throttled_but_real_changes_publish(tmp_path):
         (project / '.pi-eng/orchestration-snapshot.json').chmod(0o600)
         collector.run_once()
         assert len(posts) == 2
+
+
+def test_snapshot_cache_reuses_unchanged_file_and_invalidates_on_change(tmp_path, monkeypatch):
+    with native_session(tmp_path) as (root, project, _, snapshot, _):
+        collector = feed.MissionActivityFeed('http://127.0.0.1:1', host_id='host', control_dir=root)
+        original = feed._read_json
+        reads = 0
+
+        def counted_read(path, limit, private=False):
+            nonlocal reads
+            reads += 1
+            return original(path, limit, private)
+
+        monkeypatch.setattr(feed, '_read_json', counted_read)
+        first = collector._load_snapshot(str(project))
+        second = collector._load_snapshot(str(project))
+        assert first == second
+        assert reads == 1
+
+        snapshot['missions'][0]['revision'] = 8
+        path = project / '.pi-eng/orchestration-snapshot.json'
+        path.write_text(json.dumps(snapshot))
+        path.chmod(0o600)
+        refreshed = collector._load_snapshot(str(project))
+        assert refreshed['missions'][0]['revision'] == 8
+        assert reads == 2
 
 
 def test_normal_group_writable_snapshot_is_display_data_not_control_authority(tmp_path):
@@ -415,3 +509,22 @@ def test_unknown_platform_fails_closed_without_peer_credentials(monkeypatch):
         stack.enter_context(peer)
         with pytest.raises(ValueError, match='peer proof unavailable'):
             feed._verify_peer(client, os.getpid())
+
+
+def test_model_use_crosses_the_allowlist_and_unknown_fields_do_not():
+    from herdr_engineering.mission_activity_feed import _sanitize
+
+    clean = _sanitize({
+        'health': 'active',
+        'modelUse': {
+            'pin': 'gw/qwen3.8-27b', 'pinnedAt': '2026-10-30T00:00:00Z', 'elsewhere': 1,
+            'agents': [{'workerId': 'W2', 'taskId': 'T2', 'role': 'reviewer', 'model': 'gw/deepseek',
+                        'state': 'running', 'onPin': False, 'why': 'separation of duties', 'rawPrompt': 'must not cross'}],
+        },
+        'hiddenReasoning': 'must not cross',
+    })
+    use = clean['modelUse']
+    assert use['pin'] == 'gw/qwen3.8-27b' and use['elsewhere'] == 1
+    assert use['agents'][0]['role'] == 'reviewer' and use['agents'][0]['onPin'] is False
+    assert use['agents'][0]['why'] == 'separation of duties'
+    assert 'rawPrompt' not in use['agents'][0] and 'hiddenReasoning' not in clean

@@ -13,7 +13,6 @@
 //
 // `mergeDetail` is pure and node-testable; the fetch helpers wrap subprocesses.
 
-import os from "node:os";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize } from "node:path";
 import { execFile } from "node:child_process";
@@ -123,13 +122,20 @@ export async function branchDetail(env, cwd) {
   return [branch || null, commit ? `@${commit}` : null].filter(Boolean).join("") || null;
 }
 
-// Command to attach to this session on the host that owns it.
-//   local host -> "herdr workspace focus <ws>"
-//   remote host -> "ssh <host> && herdr workspace focus <ws>"
-export function attachCommand(env, host, ws) {
-  const cmd = `herdr workspace focus ${ws}`;
-  const local = (host || "") === (env?.HOSTNAME || os.hostname());
-  return local ? cmd : `ssh ${host} && ${cmd}`;
+// Command that attaches a terminal to this session's pane from any other machine.
+// Same "remote" form as herdr_engineering/control_plane/terminal_attach.py (the dashboard's
+// Terminal button, docs/operations/terminal-attach.md): ONE ssh invocation whose remote side
+// runs herdr, under a login shell because herdr lives in ~/.local/bin. Never
+// "ssh host && herdr ..." - the && half would run on the viewer's machine.
+// Values that fail the same charsets terminal_attach.py enforces yield null (no command).
+const ATTACH_HOST = /^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$/;
+const ATTACH_SERVER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const ATTACH_PANE = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$/;
+export function attachCommand(host, server, pane) {
+  if (typeof host !== "string" || !ATTACH_HOST.test(host)) return null;
+  if (typeof server !== "string" || !ATTACH_SERVER.test(server)) return null;
+  if (typeof pane !== "string" || !ATTACH_PANE.test(pane)) return null;
+  return `ssh -t ${host} "bash -lc 'herdr --session ${server} agent attach ${pane}'"`;
 }
 
 // Pure: merge a fetched detail object into a session envelope's payload.
@@ -137,7 +143,7 @@ export function attachCommand(env, host, ws) {
 export function mergeDetail(envelope, detail) {
   if (!envelope || envelope.entity_type !== "session" || !detail) return envelope;
   const payload = { ...(envelope.payload || {}) };
-  for (const k of ["agent_role", "cwd", "branch", "pid", "cmdline", "summary", "attach", "terminal_id", "agent_session", "revision", "interactive_ready", "launch_pending", "state_change_seq", "repository_id", "commit_sha"]) {
+  for (const k of ["agent_role", "workspace_id", "cwd", "branch", "pid", "cmdline", "summary", "attach", "terminal_id", "agent_session", "revision", "interactive_ready", "launch_pending", "state_change_seq", "repository_id", "commit_sha"]) {
     const v = detail[k];
     if (v !== undefined && v !== null && v !== "") {
       if (k === "agent_role" && payload.agent_role) continue; // prefer existing
@@ -145,6 +151,11 @@ export function mergeDetail(envelope, detail) {
     }
   }
   return { ...envelope, payload };
+}
+
+// Keep native workspace identifiers separate from control-plane mission IDs.
+export function rawWorkspace(missionId) {
+  return typeof missionId === "string" ? missionId.replace(/^herdr-ws:/, "") : undefined;
 }
 
 // Fetch live detail for a session envelope and merge it in. Best-effort.
@@ -155,7 +166,6 @@ export async function enrichSession(env, envelope) {
   // New namespaced records with unknown server routing are telemetry-only.
   if (envelope.entity_id.startsWith("herdr:") && !server) return envelope;
   const routedEnv = server ? { ...env, HERDR_SESSION_NAME: server } : env;
-  const ws = envelope.payload?.mission_id;
   const host = envelope.payload?.host_id;
   const [pane, proc] = await Promise.all([
     paneDetail(routedEnv, paneId).catch(() => null),
@@ -168,6 +178,7 @@ export async function enrichSession(env, envelope) {
   ]);
   const detail = {
     ...repository,
+    workspace_id: rawWorkspace(envelope.payload?.mission_id),
     agent_role: pane?.agent,
     terminal_id: pane?.terminal_id,
     agent_session: pane?.agent_session,
@@ -180,7 +191,7 @@ export async function enrichSession(env, envelope) {
     pid: proc?.pid,
     cmdline: proc?.cmdline,
     branch,
-    attach: attachCommand(env, host, ws),
+    attach: attachCommand(host, server, envelope.payload?.pane_id),
   };
   return mergeDetail(envelope, detail);
 }

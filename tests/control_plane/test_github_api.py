@@ -1,4 +1,5 @@
 """Read-only GitHub routes validate and bound queries before using the monitor."""
+import time
 import json
 import threading
 import urllib.error
@@ -154,3 +155,41 @@ def test_real_monitor_without_credentials_serves_bounded_empty_pages(server):
         real.close()
         server.github_monitor = original
     assert not real._thread.is_alive()
+
+
+def test_real_monitor_surfaces_scope_and_invalid_config_in_the_list_bodies(server):
+    import importlib.util
+    from pathlib import Path
+
+    from herdr_engineering.github import GitHubMonitor
+    spec = importlib.util.spec_from_file_location(
+        "_github_incremental_fakes", Path(__file__).parents[1] / "test_github_incremental.py")
+    fakes = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fakes)
+    FakeGitHub = fakes.FakeGitHub
+    fake, allow = FakeGitHub(page_size=100), [["acme"]]
+    fake.add_issue("acme/app")
+    fake.add_issue("other/tool")
+    real = GitHubMonitor(provider_factory=lambda: fake, organizations=lambda: allow[0])
+    original, server.github_monitor = server.github_monitor, real
+    try:
+        real.refresh()
+        for path in ("github", "github/issues"):
+            # the first GET starts the monitor's background loop, whose own pass reports "syncing" for a moment
+            deadline = time.monotonic() + 10
+            status, body = request(server, path)
+            while body.get("status") == "syncing" and time.monotonic() < deadline:
+                time.sleep(0.05)
+                status, body = request(server, path)
+            assert status == 200 and body["status"] == "ready"
+            assert body["scope"] == {"owners": ["acme"], "excluded_repositories": 1, "restricted": True}
+        allow[0] = "acme"  # not a list
+        real._retry_at = 0
+        real.refresh()
+        status, body = request(server, "github")
+        assert status == 200  # the list shape is unchanged; the status says what is wrong
+        assert body["status"] == "invalid_config" and "github.organizations" in body["error"]
+        assert "repositories" in body and "scope" in body
+    finally:
+        real.close()
+        server.github_monitor = original

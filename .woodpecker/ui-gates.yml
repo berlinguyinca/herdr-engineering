@@ -1,0 +1,44 @@
+# Woodpecker CI (ci.metabolomics.us) -- the UI gates of the collaboration page (docs/operations/ui-gates.md).
+#
+# Written to the conventions of the organisation's other pipelines (iw-console-aliases, fsc-chemlake-mcp), read, not run:
+#
+#  * `image:` names an EXECUTABLE on the agent, not a container to pull (`bash`); exec hosts are Slurm jobs, so there is no docker, no
+#    apt and no sudo. The step logic lives in scripts/ci/ui-gates.sh so `bash scripts/ci/ui-gates.sh` reproduces CI from a clean
+#    checkout.
+#  * the clone plugin fails invisibly on this backend: skip_clone plus a plain git checkout with the credential the agent stages.
+#  * pull_request and manual only, filtered to what can change the result, so it does not build twice for a push to a PR branch.
+#
+# STATUS: the first run failed the pixel compare on all 88 pages because the exec host's fontconfig rendering settings differed from
+# the workstation's. The browser now runs under its own pinned fontconfig (tests/playwright/ui-gates-lib.mjs), so a host difference in
+# fonts or rendering settings no longer reaches a screenshot. GitHub Actions is disabled organisation-wide and is not used.
+when:
+  - event: manual
+  - event: pull_request
+    path:
+      include: ['packages/**', 'tests/playwright/**', 'tests/visual/**', 'docs/assets/screenshots/**', 'scripts/ci/ui-gates.sh', 'package.json', 'package-lock.json', 'herdr_engineering/control_plane/**']
+
+# Only the hive `large` pool (metabolomicsgrp/high, 16 dedicated CPUs and 64 GB per agent) runs this. The gate renders ~270 pages in
+# Chromium and a shared 4-8 CPU agent host timed out under load (pipelines 113, 115, 121, 125); network/services/woodpecker-slurm
+# hive.env matches `label:cluster=hive` to that pool, the same way rust.yaml does.
+labels:
+  cluster: hive
+
+skip_clone: true
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
+      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      - 'git fetch --no-tags --depth=200 origin "$CI_COMMIT_SHA"   # enough history for the stale-base notice in ui-gates.sh to find the fork point'
+      - 'git checkout -q FETCH_HEAD'
+      - 'git --no-pager log --oneline -1'
+
+  - name: ui-gates
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci/ui-gates.sh'
