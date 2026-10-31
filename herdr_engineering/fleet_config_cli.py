@@ -39,6 +39,7 @@ from .fleet_config import (
     _parse,
     load_fleet_config,
 )
+from .https_origin import https_origin, origin_hostname
 
 DEFAULT_CONFIG_PATH = Path("~/.config/herdr-engineering/fleet/fleet-config.yaml")
 # Where the file lived before it got its own directory: init leaves a symlink here.
@@ -314,6 +315,17 @@ def share_enabled(cfg: FleetConfig) -> bool:
     return _share_mapping(cfg)[0].get("enabled") is True
 
 
+def _loose_hostname(value: object) -> str | None:
+    """Lowercase hostname of whatever the collab URL is (port, userinfo, trailing dot ignored); None if unparsable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        host = urllib.parse.urlsplit(value.strip()).hostname
+    except ValueError:
+        return None
+    return host.rstrip(".") if host else None
+
+
 def share_values(cfg: FleetConfig) -> dict:
     """The validated share slice values ``{collab: {...}, share: {...}}``.
 
@@ -341,16 +353,16 @@ def share_values(cfg: FleetConfig) -> dict:
     if not isinstance(secret, str) or len(secret.encode("utf-8")) < MIN_SECRET_BYTES:
         raise FleetConfigError(f"control_plane.share.enabled is true but control_plane.share.signing_secret is "
                                f"missing or shorter than {MIN_SECRET_BYTES} bytes: {_SECRET_HINT}")
-    public_url = share.get("public_url")
-    parts = urllib.parse.urlsplit(public_url.strip()) if isinstance(public_url, str) else None
-    mcp_url = collab.get("public_url")
-    mcp_netloc = urllib.parse.urlsplit(mcp_url.strip()).netloc.lower() if isinstance(mcp_url, str) else None
-    if (parts is None or parts.scheme != "https" or not parts.netloc or parts.path not in ("", "/")
-            or parts.query or parts.fragment or parts.netloc.lower() == mcp_netloc):
-        raise FleetConfigError("control_plane.share.public_url must be an https origin (empty path or '/', no query "
-                               "or fragment) on a host other than control_plane.collab.public_url: share links and "
-                               "the lab sign-in callback /s/callback live at the root of the share host; MCP stays "
-                               "on control_plane.collab.public_url")
+    origin = https_origin(share.get("public_url"))
+    # Stricter than the server's parser on purpose: the lab redirect_uri is built from the raw value, and Cognito
+    # matches callback URLs exactly, so the authored value must already be the lowercase origin.
+    if (origin is None or share["public_url"].strip().rstrip("/") != origin
+            or origin_hostname(origin) == _loose_hostname(collab.get("public_url"))):
+        raise FleetConfigError("control_plane.share.public_url must be a bare https origin (lowercase ASCII host, "
+                               "optional port, empty path or '/', no userinfo, query or fragment) on a host other "
+                               "than control_plane.collab.public_url's: share links and the lab sign-in callback "
+                               "/s/callback live at the root of the share host; MCP stays on "
+                               "control_plane.collab.public_url")
     if not isinstance(collab.get("cognito_pool"), str) or not collab.get("cognito_pool"):
         raise FleetConfigError("control_plane.share needs control_plane.collab.cognito_pool")
     # The caps the control plane enforces (artifact_share_api.DEFAULTS; a test keeps the two in step). Not imported:

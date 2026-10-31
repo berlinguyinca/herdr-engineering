@@ -49,6 +49,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote_to_bytes, urlsplit
 
+from ..https_origin import HOST_PORT as _HOST
+from ..https_origin import https_origin as _https_origin
 from .collab_bridge_files import _open_beneath
 from .collab_cognito import CognitoAuthenticator, SyncedDirectory
 from .share_bundle import ShareBundleError, content_type_for, normalise_name
@@ -81,7 +83,6 @@ _RAW_PATH_OK = re.compile(r"[\x21-\x5b\x5d-\x7e]*")   # printable ASCII without 
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _RANGE_SPEC = re.compile(r"(\d{0,19})-(\d{0,19})")
 _SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,512}")
-_HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::[0-9]{1,5})?")
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 _CSP_TEMPLATE = ("sandbox allow-scripts allow-downloads; default-src {self}; script-src {self} 'unsafe-inline' "
@@ -133,17 +134,6 @@ class LabSettings:
     static_dir: Path
     viewer_csp: str
     config_json: bytes
-
-
-def _https_origin(value) -> str | None:
-    """``https://host[:port]`` for a bare https origin (a trailing ``/`` allowed), else None."""
-    if not isinstance(value, str) or not value.isascii():
-        return None
-    parts = urlsplit(value.strip())
-    if (parts.scheme != "https" or parts.username or parts.password or parts.query or parts.fragment
-            or parts.path not in ("", "/") or not _HOST.fullmatch(parts.netloc.lower())):
-        return None
-    return "https://" + parts.netloc.lower()
 
 
 def sandbox_csp(public_origin: str | None, token: str | None) -> str:

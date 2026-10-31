@@ -64,7 +64,8 @@ These were applied by hand on bender; reapply them on a new host.
 ## Share links (`/s/`)
 
 Artifact share links are served by `herdr-share-public` behind the same edge, under
-`control_plane.collab.public_url` (`https://localdev.mcp.metabolomics.us/s/<token>/`). Off unless
+`control_plane.share.public_url`, a host of its own (`https://<share host>/s/<token>/`); MCP stays on
+`control_plane.collab.public_url`. Off unless
 `control_plane.share.enabled: true` in the central fleet config; enabling them needs the collab marker.
 
 ```
@@ -74,13 +75,16 @@ edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, 
 
 - Config: `deploy.sh` renders `herdr-eng fleet config render-share` to
   `~/.config/herdr-engineering/share/share-config.json` (0600): only `control_plane.share`'s serving keys
-  and collab's `cognito_pool`, `cognito_clients`, `cognito_web_client`, `cognito_domain`, `public_url`.
+  and collab's `cognito_pool`, `cognito_clients`, `cognito_web_client`, `cognito_domain`, `public_url`
+  (the collab URL is carried but share links no longer use it).
   share-public refuses any file carrying more.
 - Signing secret: `enabled: true` without `control_plane.share.signing_secret` (at least 32 bytes) is refused
   before anything is built. Generate it on the control-plane host and paste it into the fleet YAML yourself:
   `openssl rand -hex 32`. Never commit it, print it, or pass it as a flag or environment variable. Rotating it
   ends every open lab session.
-- `public_url` must be a bare origin (empty path or `/`): the viewer's sign-in redirect is fixed at `/s/callback`.
+- `control_plane.share.public_url` must be a bare lowercase https origin (empty path or `/`; no userinfo, query,
+  fragment, non-ASCII or trailing-dot host) on a host other than `control_plane.collab.public_url`'s: the viewer's
+  sign-in redirect is fixed at `/s/callback` at its root. `deploy.sh` refuses anything else.
 - Lab session lifetime: `control_plane.share.session_seconds` (default 14400 = 4 h) is only a cap. A session
   also ends at the share's expiry and at the Cognito access token's `exp` (about 1 h with the pool's default
   token validity), so recipients sign in again after ~1 h unless the app client's access-token validity is raised.
@@ -130,7 +134,7 @@ real share server over the bundles in `tests/share-fixtures/` (see its README) a
 reads, the sandbox, CSP blocking, PDF display, revoke and lab sign-in against a fake Cognito.
 
 Operator step, once, before sending lab links (not done by `deploy.sh`): add
-`https://localdev.mcp.metabolomics.us/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
+`<control_plane.share.public_url>/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
 `herdr-collab-web` app client (`aws cognito-idp update-user-pool-client` replaces the whole client: read it
 first with `describe-user-pool-client` and send every existing attribute back with the new URL added). Public
 links need no Cognito change.

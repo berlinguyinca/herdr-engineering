@@ -3924,8 +3924,9 @@ def _share_lab_problems(collab: dict, share: dict) -> list[str]:
     for key in ("cognito_web_client", "cognito_domain", "cognito_pool"):
         if not isinstance(collab.get(key), str) or not collab.get(key):
             problems.append(f"control_plane.collab.{key}")
-    if not isinstance(share.get("public_url"), str) or not share.get("public_url"):
-        problems.append("control_plane.share.public_url")
+    from .https_origin import https_origin
+    if https_origin(share.get("public_url")) is None:
+        problems.append("control_plane.share.public_url (a bare https origin)")
     return problems
 
 

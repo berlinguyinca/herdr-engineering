@@ -110,7 +110,13 @@ def test_enabled_share_needs_a_long_signing_secret_and_says_how(tmp_path, secret
 
 @pytest.mark.parametrize("url", ["https://artifacts.example.test/x/", "https://artifacts.example.test/x",
                                  "http://artifacts.example.test/", "https://artifacts.example.test/?a=1",
-                                 "https://artifacts.example.test/#f", "https://mcp.example.test/", "", None])
+                                 "https://artifacts.example.test/#f", "https://mcp.example.test/", "", None,
+                                 "https://mcp.example.test:443/", "https://mcp.example.test:8443", "https://MCP.Example.Test/",
+                                 "https://mcp.example.test./", "https://user@artifacts.example.test/",
+                                 "https://user:pw@mcp.example.test/", "https://artifacts.example.test./",
+                                 "https://Artifacts.example.test/", "https://artifacts.example.test:99999x/",
+                                 "https://ärtifacts.example.test/", "https://artifacts.exämple.test/", 7,
+                                 "https://[::1]/", "https://artifacts .example.test/"])
 def test_enabled_share_refuses_a_bad_share_public_url(tmp_path, url):
     share = {"enabled": True, "signing_secret": SECRET}
     if url is not None:
@@ -120,6 +126,29 @@ def test_enabled_share_refuses_a_bad_share_public_url(tmp_path, url):
         fcc.render_share(load_fleet_config(central), tmp_path / "out.json")
     assert "/s/callback" in str(info.value) and "control_plane.collab.public_url" in str(info.value)
     assert not (tmp_path / "out.json").exists()
+
+
+@pytest.mark.parametrize("collab_url", [None, 5, "", "not a url"])
+def test_a_missing_or_odd_collab_url_does_not_block_a_valid_share_host(tmp_path, collab_url):
+    collab = {k: v for k, v in COLLAB.items() if k != "public_url"}
+    if collab_url is not None:
+        collab["public_url"] = collab_url
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL},
+                       collab=collab)
+    fcc.render_share(load_fleet_config(central), tmp_path / "out.json")
+
+
+def test_share_host_may_be_a_subdomain_or_have_its_own_port(tmp_path):
+    for url in ("https://share.mcp.example.test/", "https://artifacts.example.test:8443"):
+        central = _central(tmp_path / url[8:12], share={"enabled": True, "signing_secret": SECRET, "public_url": url})
+        fcc.render_share(load_fleet_config(central), tmp_path / "out.json")
+
+
+def test_every_accepted_public_url_is_also_accepted_by_the_share_server():
+    from herdr_engineering.https_origin import https_origin
+    assert https_origin("https://Artifacts.Example.test:8443/") == "https://artifacts.example.test:8443"
+    for bad in ("https://a.test./", "https://u@a.test/", "http://a.test/", "https://ä.test/", "https://a.test/x"):
+        assert https_origin(bad) is None
 
 
 def test_disabled_share_needs_no_share_public_url(tmp_path):
@@ -629,3 +658,11 @@ def test_invalid_owner_emails_are_refused(tmp_path, owners):
     central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL, "owner_emails": owners})
     with pytest.raises(FleetConfigError, match="owner_emails"):
         fcc.share_values(load_fleet_config(central))
+
+
+@pytest.mark.parametrize("url", ["https://u@artifacts.example.test/", "http://artifacts.example.test/", None, "x"])
+def test_lab_problems_names_a_share_url_the_server_would_reject(url):
+    from herdr_engineering.cli import _share_lab_problems
+    share = {"signing_secret": SECRET, "public_url": url}
+    assert any("control_plane.share.public_url" in p for p in _share_lab_problems(COLLAB, share))
+    assert not any("public_url" in p for p in _share_lab_problems(COLLAB, {**share, "public_url": SHARE_URL}))
