@@ -68,7 +68,7 @@ VERIFIED_MARKER = "verified"
 AUDITED_MARKER = "audited"
 META_MAX_BYTES = 65_536
 MAX_TREE_DEPTH = 4  # remove_tree_beneath: an upload dir is flat; anything deeper is hostile (and cannot be swept)
-MAX_DIR_ENTRIES = MAX_CHUNK_INDEX + 1 + 64  # every part index plus meta, markers and a little slack
+ENTRY_SLACK = 64  # non-part entries an upload dir may hold besides its parts (meta, markers, a few stale tmps)
 
 _TICKET = re.compile(TICKET_RE)
 _UPLOAD = re.compile(UPLOAD_RE)
@@ -367,8 +367,11 @@ _TMPFILE_FALLBACK = (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL)
 
 
 def _open_tmpfile(dfd: int) -> int:
-    """An unnamed ``O_TMPFILE`` in the directory ``dfd`` (raises ``OSError`` where unsupported)."""
-    return os.open(".", os.O_TMPFILE | os.O_WRONLY | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    """An unnamed ``O_TMPFILE`` in the directory ``dfd`` (raises ``OSError`` where unsupported, e.g. non-Linux)."""
+    flag = getattr(os, "O_TMPFILE", None)
+    if flag is None:
+        raise OSError(errno.EOPNOTSUPP, "O_TMPFILE is not available")
+    return os.open(".", flag | os.O_WRONLY | os.O_CLOEXEC, 0o600, dir_fd=dfd)
 
 
 def _link_tmpfile(dfd: int, name: str, data: bytes, mode: int) -> bool | None:
@@ -449,7 +452,8 @@ def _walk_dirs(root: Path, parts: list[str]) -> int | None:
 
 
 def _scan_names(dfd: int, cap: int) -> list[str]:
-    """The entry names of the directory ``dfd``; ``BridgeError`` if there are more than ``cap``."""
+    """The entry names of the directory ``dfd``; ``BridgeError`` as soon as there are more than ``cap`` (the scan
+    stops there, so a directory flooded with empty files costs at most ``cap`` names of memory)."""
     names = []
     with os.scandir(dfd) as it:
         for entry in it:
@@ -464,7 +468,13 @@ def list_beneath(root: Path, parts: list[str], *, max_entries: int) -> list[tupl
 
     Symlinks, FIFOs and the like are reported as such (``S_ISLNK``/``S_ISFIFO``) so callers can skip them; an entry that
     vanishes while listing is left out. None if any component is unsafe, a symlink or not a directory;
-    ``BridgeError("too many entries")`` past ``max_entries``.
+    ``BridgeError("too many entries")`` past ``max_entries`` (fail closed: the scan stops there).
+
+    Empty files cost no quota bytes, so ``max_entries`` is the only bound on what a hostile writer can make the worker
+    hold; callers derive it from their own limits, for example ``intents/``: a few thousand (agents ×
+    ``max_pending_intents_per_agent`` plus slack); ``staging/``: the number of staging owners plus slack;
+    ``staging/<owner>/``: the uploads one owner can have within ``staging_bytes_per_agent`` (a few thousand).
+    An upload dir is listed with ``list_parts``, which is bounded by the upload's own part count.
     """
     dfd = _walk_dirs(root, parts)
     if dfd is None:
@@ -536,15 +546,21 @@ def unlink_beneath(root: Path, parts: list[str], name: str) -> bool:
         os.close(dfd)
 
 
-def _empty_dir(dfd: int, depth: int) -> bool:
-    """Remove everything inside the directory ``dfd``; recursion goes only through fds opened no-follow."""
-    if depth > MAX_TREE_DEPTH:  # an over-deep tree is never swept; it stays (inside the volume) and returns False
+def _empty_dir(dfd: int, depth: int, budget: list[int]) -> bool:
+    """Remove everything inside the directory ``dfd``; recursion goes only through fds opened no-follow.
+
+    ``budget`` (a one-item list) is the number of entries the whole walk may still scan; past it the walk stops and
+    the directory counts as not emptied (False). An over-deep or over-full tree is never swept: it stays, inside the
+    volume, and the sweep reports False.
+    """
+    if depth > MAX_TREE_DEPTH:
         return False
     ok = True
     try:
-        names = _scan_names(dfd, MAX_DIR_ENTRIES)
-    except BridgeError:  # too many entries: treated as not emptied
+        names = _scan_names(dfd, budget[0])
+    except BridgeError:
         return False
+    budget[0] -= len(names)
     for child in names:
         try:
             st = os.stat(child, dir_fd=dfd, follow_symlinks=False)
@@ -563,7 +579,7 @@ def _empty_dir(dfd: int, depth: int) -> bool:
                     ok = False
                 continue
             try:
-                inner = _empty_dir(cfd, depth + 1)
+                inner = _empty_dir(cfd, depth + 1, budget)
             finally:
                 os.close(cfd)
             if not inner:
@@ -583,12 +599,25 @@ def _empty_dir(dfd: int, depth: int) -> bool:
     return ok
 
 
-def remove_tree_beneath(root: Path, parts: list[str]) -> bool:
+def max_parts_for(limits: BridgeLimits) -> int:
+    """The most parts a valid upload can have under ``limits``."""
+    return min(_total_for(limits.max_file_bytes), MAX_CHUNK_INDEX + 1)
+
+
+def tree_entry_cap(limits: BridgeLimits) -> int:
+    """The entry budget for sweeping one upload dir under ``limits``: its largest part count plus ``ENTRY_SLACK``."""
+    return max_parts_for(limits) + ENTRY_SLACK
+
+
+def remove_tree_beneath(root: Path, parts: list[str], *, max_entries: int | None = None) -> bool:
     """Delete the real directory ``root/parts...`` and everything in it, never following a link.
 
     False (with whatever could be removed safely removed) if any component is unsafe, a symlink or not a directory,
-    the tree is deeper than ``MAX_TREE_DEPTH``, or something could not be removed. Links inside are removed as links.
+    the tree is deeper than ``MAX_TREE_DEPTH``, holds more than ``max_entries`` entries in all (default:
+    ``tree_entry_cap`` of the default limits; callers pass ``tree_entry_cap(limits)`` or a bound of their own), or
+    something could not be removed. Links inside are removed as links.
     """
+    budget = [tree_entry_cap(BridgeLimits()) if max_entries is None else max_entries]
     if not _safe_parts(parts) or not parts:
         return False
     parent = _walk_dirs(root, parts[:-1])
@@ -600,7 +629,7 @@ def remove_tree_beneath(root: Path, parts: list[str]) -> bool:
         except OSError:
             return False
         try:
-            ok = _empty_dir(dfd, 1)
+            ok = _empty_dir(dfd, 1, budget)
         except (OSError, RecursionError):
             ok = False
         finally:
@@ -730,18 +759,46 @@ def read_staged_meta(root: Path, owner_key: str, upload_id: str) -> StagedUpload
     return meta
 
 
-def list_parts(root: Path, owner_key: str, upload_id: str) -> list[int]:
-    """The sorted indices of the regular, single-linked part files in an upload dir (no symlink, dir, FIFO or stale
-    ``.tmp-*`` counts). ``BridgeError("too many entries")`` past ``MAX_DIR_ENTRIES``."""
+def list_parts(root: Path, owner_key: str, upload_id: str, *, max_parts: int) -> list[int]:
+    """The sorted indices below ``max_parts`` of the regular, single-linked part files in an upload dir (no symlink,
+    dir, FIFO or stale ``.tmp-*`` counts).
+
+    ``max_parts`` is the upload's validated ``meta.total`` (or ``max_parts_for(limits)``). The scan stops with
+    ``BridgeError("too many entries")`` once the dir holds more than ``max_parts + ENTRY_SLACK`` entries; only names
+    shaped like a part are stat'ed and only their integer indices are kept.
+    """
     try:
         parts = staging_parts(owner_key, upload_id)
     except BridgeError:
         return []
-    entries = list_beneath(root, parts, max_entries=MAX_DIR_ENTRIES)
-    if entries is None:
+    if isinstance(max_parts, bool) or not isinstance(max_parts, int) or max_parts < 0:
+        raise BridgeError("invalid part bound")
+    dfd = _walk_dirs(root, parts)
+    if dfd is None:
         return []
-    return sorted(int(name) for name, st in entries
-                  if _PART.match(name) and stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
+    cap = max_parts + ENTRY_SLACK
+    try:
+        seen, out = 0, []
+        with os.scandir(dfd) as it:
+            for entry in it:
+                seen += 1
+                if seen > cap:
+                    raise BridgeError("too many entries")
+                name = entry.name
+                if not _PART.match(name) or int(name) >= max_parts:
+                    continue
+                try:
+                    st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+                    out.append(int(name))
+        out.sort()
+        return out
+    except OSError:
+        return []
+    finally:
+        os.close(dfd)
 
 
 def upload_complete(root: Path, owner_key: str, upload_id: str) -> bool:
@@ -761,7 +818,7 @@ def upload_complete(root: Path, owner_key: str, upload_id: str) -> bool:
     if meta is None:
         return False
     try:
-        present = set(list_parts(root, owner_key, upload_id))
+        present = set(list_parts(root, owner_key, upload_id, max_parts=meta.total))
     except BridgeError:
         return False
     return all(i in present for i in range(meta.total))
@@ -1032,12 +1089,13 @@ def validate_commit_payload(payload: dict, limits: BridgeLimits) -> CommitPayloa
 register_intent_kind("commit", validate_commit_payload, actors=frozenset({"agent"}), requires_artifact=True)
 
 __all__ = [
-    "AUDITED_MARKER", "Actor", "BridgeError", "BridgeLimits", "CHUNK_BYTES", "Change", "Chunk", "CommitPayload",
-    "FEED_MAX_AGE", "INTENT_MAX_AGE", "Intent", "IntentError", "MAX_CHUNK_INDEX", "MAX_MESSAGE", "MAX_TREE_DEPTH",
-    "MCP_UPLOAD_MAX_BODY", "META_MAX_BYTES", "META_NAME", "SHA_RE", "StagedUpload", "TICKET_RE", "UPLOAD_RE",
-    "VERIFIED_MARKER", "agent_owner_key", "atomic_write_bytes", "atomic_write_json", "link_new_bytes", "list_parts",
+    "Actor", "agent_owner_key", "atomic_write_bytes", "atomic_write_json", "AUDITED_MARKER", "BridgeError",
+    "BridgeLimits", "Change", "Chunk", "CHUNK_BYTES", "CommitPayload", "ENTRY_SLACK", "FEED_MAX_AGE", "Intent",
+    "INTENT_MAX_AGE", "IntentError", "link_new_bytes", "list_beneath", "list_parts", "MAX_CHUNK_INDEX",
+    "MAX_MESSAGE", "max_parts_for", "MAX_TREE_DEPTH", "MCP_UPLOAD_MAX_BODY", "META_MAX_BYTES", "META_NAME",
     "new_ticket", "open_beneath", "read_bytes_beneath", "read_json_beneath", "read_staged_meta",
-    "register_intent_kind", "list_beneath", "MAX_DIR_ENTRIES", "remove_tree_beneath", "request_digest", "staging_parts", "staging_path",
-    "unlink_beneath", "upload_complete", "upload_id_for", "validate_changes", "validate_chunk",
-    "validate_commit_payload", "validate_intent", "write_marker_beneath",
+    "register_intent_kind", "remove_tree_beneath", "request_digest", "SHA_RE", "StagedUpload", "staging_parts",
+    "staging_path", "TICKET_RE", "tree_entry_cap", "unlink_beneath", "upload_complete", "upload_id_for",
+    "UPLOAD_RE", "validate_changes", "validate_chunk", "validate_commit_payload", "validate_intent",
+    "VERIFIED_MARKER", "write_marker_beneath",
 ]

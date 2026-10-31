@@ -291,15 +291,16 @@ Standing operator orders that apply throughout: YAML configuration only (no envi
   * `_open_beneath` is **moved** (extracted, never copied) from `share_public.py:302` into this module, keeping its signature and `(fd, stat)` return with `max_size`; `share_public` imports it from here.
   * `read_json_beneath(root: Path, parts: list[str], *, max_bytes: int) -> dict | None`. It opens each component with `O_NOFOLLOW` through `dir_fd` (via `_open_beneath`). It accepts regular files only, enforces the size cap before parsing and returns None on any failure.
   * `read_bytes_beneath(...) -> bytes | None` is the same check for blobs and parts.
-  * `open_beneath(root, parts) -> BinaryIO | None` is the streaming variant used by assembly.
+  * `open_beneath(root, parts, *, max_bytes=None) -> BinaryIO | None` is the streaming variant used by assembly. With `max_bytes` it returns a bounded reader that raises `BridgeError` once more than `max_bytes` bytes come out, even if the file grows after the open.
 * Writes by the owning side (mirror for the worker, outbox for collab-public):
   * `atomic_write_json(dir: Path, name: str, obj: dict, *, mode=0o644)` serializes with `ensure_ascii=False`, writes `.tmp-<rand>`, fsyncs and `os.replace`s. It uses the share-bundle modes (files 0644, dirs 0755), so the reader container's uid can read what the other container's uid wrote. It is for trees the writer controls; the worker never uses it inside the outbox.
   * `atomic_write_bytes(dir, name, data)` does the same for bytes.
-  * `link_new_bytes(dir, name, data, *, mode=0o600) -> bool`. It writes `.tmp-<rand>`, fsyncs and `os.link`s it to `name`, then removes the tmp. It returns False if `name` already exists and never replaces it.
+  * `link_new_bytes(dir, name, data, *, mode=0o600) -> bool`. It writes an unnamed `O_TMPFILE` in the dir fd (write, `fchmod`, fsync) and `linkat`s it to `name` via `/proc/self/fd/<fd>`, so there is never a `.tmp-*` file or an `nlink == 2` moment. Only where `O_TMPFILE` or `/proc` is unavailable does it fall back to writing `.tmp-<rand>`, linking it and removing the tmp; a stale fallback tmp is ignored by `list_parts` and removed by the sweep. It returns False if `name` already exists and never replaces it.
 * Root-safe mutation inside a hostile tree (the worker's only way to touch the outbox):
   * `write_marker_beneath(root: Path, parts: list[str], name: str, data: bytes = b"", *, mode=0o644) -> bool`: opens each component of `parts` with `O_DIRECTORY|O_NOFOLLOW` relative to the previous fd (starting from `root`), then creates `name` with `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY` via `dir_fd`. Returns False if `name` exists; returns False (never raises) if any component is a symlink or not a directory.
   * `unlink_beneath(root, parts, name) -> bool`: fd-relative `os.unlink(name, dir_fd=…)` after the same no-follow walk; refuses a non-regular target.
-  * `remove_tree_beneath(root, parts) -> bool`: walks with `O_DIRECTORY|O_NOFOLLOW`, enumerates with `os.scandir(fd)`, `unlink`s files and symlinks (removing the link itself, never its target) and `rmdir`s subdirectories with `dir_fd`, recursing only into real directories opened no-follow. It never follows a link.
+  * `remove_tree_beneath(root, parts, *, max_entries=None) -> bool`: walks with `O_DIRECTORY|O_NOFOLLOW`, enumerates with `os.scandir(fd)`, `unlink`s files and symlinks (removing the link itself, never its target) and `rmdir`s subdirectories with `dir_fd`, recursing only into real directories opened no-follow. It never follows a link. It fails closed (False, tree kept) past `max_entries` entries in all (callers pass `tree_entry_cap(limits)`) or `MAX_TREE_DEPTH`.
+  * `list_beneath(root, parts, *, max_entries) -> list[tuple[str, os.stat_result]] | None`: the no-follow walk, then `os.scandir(dir_fd)` and `fstatat` no-follow per entry (symlinks and FIFOs reported as such so callers skip them). None for an unsafe or symlinked component; `BridgeError("too many entries")` past `max_entries`, which callers derive from their limits (empty files cost no quota bytes). Used by Tasks 5a/5d for `intents/` and `staging/`.
 * Staging:
   * `@dataclass(frozen=True) class Actor: kind: Literal['agent','user']; id: str`.
   * `agent_owner_key(agent_id) -> str` returns the agent id. It refuses an id starting with `m_`, which is reserved for plan 5's member owner keys; agent ids come from `ids.new_id("agent")` and never have that prefix.
@@ -316,7 +317,7 @@ Standing operator orders that apply throughout: YAML configuration only (no envi
     * `1 ≤ size_bytes ≤ limits.max_file_bytes`;
     * the name passes `normalise_name`/`check_names`.
   * `upload_complete(root, owner_key, upload_id) -> bool` holds when the indices `0..total-1` are all present, or when the worker's `verified` marker is present. The marker is a hint for collab-public only; the worker never trusts it.
-  * `list_parts(...)` returns the present indices.
+  * `list_parts(root, owner_key, upload_id, *, max_parts)` returns the present indices below `max_parts` (the validated `meta.total`, or `max_parts_for(limits)`), stat'ing only part-shaped names and failing closed with `BridgeError` past `max_parts + ENTRY_SLACK` entries.
 * Intent kinds:
   * `register_intent_kind(kind: str, validate_payload: Callable[[dict, BridgeLimits], object], *, actors: frozenset[str]) -> None`. `kind` must match `^[a-z][a-z0-9_.]{0,47}\Z`. Registering a kind twice raises. `actors` is the set of actor kinds allowed to send it.
   * Plan 3 registers only `commit` (`validate_commit_payload`, `actors={"agent"}`), at import of `collab_bridge_files`. Plan 4 (`annotation_resolve`) and plan 5 (`member.*`) register theirs from their own modules.

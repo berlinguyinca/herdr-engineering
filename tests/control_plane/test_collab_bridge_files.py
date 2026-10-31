@@ -486,10 +486,10 @@ def _stage(root: Path, *, size: int, parts: list[int], verified: bool = False):
 def test_upload_complete_and_list_parts(tree):
     root, outside = tree
     upl, d = _stage(root, size=3 * CHUNK_BYTES, parts=[0, 2])
-    assert cbf.list_parts(root, AGENT, upl) == [0, 2]
+    assert cbf.list_parts(root, AGENT, upl, max_parts=3) == [0, 2]
     assert cbf.upload_complete(root, AGENT, upl) is False
     (d / "0000001").symlink_to(outside / "sentinel")
-    assert cbf.list_parts(root, AGENT, upl) == [0, 2]
+    assert cbf.list_parts(root, AGENT, upl, max_parts=3) == [0, 2]
     assert cbf.upload_complete(root, AGENT, upl) is False
     os.unlink(d / "0000001")
     cbf.link_new_bytes(d, "0000001", b"x")
@@ -505,7 +505,7 @@ def test_upload_complete_by_verified_marker_and_symlinked_dirs(tree):
     other = cbf.upload_id_for(AGENT, ART, "y.bin", "d" * 64, 1)
     (root / "staging" / AGENT / other).symlink_to(d)
     assert cbf.upload_complete(root, AGENT, other) is False
-    assert cbf.list_parts(root, AGENT, other) == []
+    assert cbf.list_parts(root, AGENT, other, max_parts=3) == []
 
 
 # ----------------------------------------------------------------------------- chunks
@@ -799,7 +799,7 @@ def test_list_parts_leaves_out_a_hardlinked_part(tree):
     root, outside = tree
     upl, d = _stage(root, size=2 * CHUNK_BYTES, parts=[0])
     os.link(outside / "sentinel", d / "0000001")
-    assert cbf.list_parts(root, AGENT, upl) == [0]
+    assert cbf.list_parts(root, AGENT, upl, max_parts=2) == [0]
     assert cbf.upload_complete(root, AGENT, upl) is False
 
 
@@ -864,7 +864,7 @@ def test_stale_fallback_tmp_is_ignored_and_swept(tree):
     root, _ = tree
     upl, d = _stage(root, size=CHUNK_BYTES + 1, parts=[0])
     (d / ".tmp-deadbeef00000000").write_bytes(b"partial")
-    assert cbf.list_parts(root, AGENT, upl) == [0]
+    assert cbf.list_parts(root, AGENT, upl, max_parts=2) == [0]
     assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl)) is True
     assert not os.path.lexists(d)
 
@@ -890,15 +890,88 @@ def test_list_beneath(tree, no_hang):
     assert cbf.list_beneath(root, ["intents", "b.json"], max_entries=10) is None
 
 
-def test_directory_entry_caps(tree, monkeypatch):
+def test_list_parts_fails_closed_past_its_bound(tree):
     root, _ = tree
     upl, d = _stage(root, size=3 * CHUNK_BYTES, parts=[0, 1, 2])
-    monkeypatch.setattr(cbf, "MAX_DIR_ENTRIES", 3)  # meta.json + three parts = 4 entries
+    for i in range(cbf.ENTRY_SLACK):  # meta + 3 parts + ENTRY_SLACK empty files > 3 + ENTRY_SLACK
+        (d / f"junk{i}").write_bytes(b"")
     with pytest.raises(BridgeError):
-        cbf.list_parts(root, AGENT, upl)
+        cbf.list_parts(root, AGENT, upl, max_parts=3)
     assert cbf.upload_complete(root, AGENT, upl) is False
-    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl)) is False
+    os.unlink(d / "junk0")  # exactly at the bound: still listed
+    assert cbf.list_parts(root, AGENT, upl, max_parts=3) == [0, 1, 2]
+    os.unlink(d / "junk1")
+    assert cbf.list_parts(root, AGENT, upl, max_parts=2) == [0, 1]  # indices past the bound are never kept
+    with pytest.raises(BridgeError):
+        cbf.list_parts(root, AGENT, upl, max_parts=-1)
+
+
+def test_a_max_size_upload_part_count_still_works(tree):
+    root, _ = tree
+    limits = BridgeLimits.from_mapping({"max_file_bytes": 3 * CHUNK_BYTES})
+    assert cbf.max_parts_for(limits) == 3
+    assert cbf.tree_entry_cap(limits) == 3 + cbf.ENTRY_SLACK
+    upl, d = _stage(root, size=3 * CHUNK_BYTES, parts=[0, 1, 2], verified=True)
+    cbf.link_new_bytes(d, cbf.AUDITED_MARKER, b"")
+    assert cbf.list_parts(root, AGENT, upl, max_parts=cbf.max_parts_for(limits)) == [0, 1, 2]
+    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl), max_entries=cbf.tree_entry_cap(limits))
+    assert cbf.max_parts_for(BridgeLimits()) == math.ceil(100_000_000_000 / CHUNK_BYTES)
+
+
+def test_remove_tree_fails_closed_past_its_entry_budget(tree):
+    root, _ = tree
+    upl, d = _stage(root, size=3 * CHUNK_BYTES, parts=[0, 1, 2])  # 4 entries
+    (d / "nested").mkdir()
+    (d / "nested" / "f").write_bytes(b"")  # 6 entries in all
+    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl), max_entries=5) is False
     assert d.is_dir()
-    monkeypatch.setattr(cbf, "MAX_DIR_ENTRIES", 4)
-    assert cbf.list_parts(root, AGENT, upl) == [0, 1, 2]
-    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl)) is True
+    assert cbf.remove_tree_beneath(root, cbf.staging_parts(AGENT, upl), max_entries=6) is True
+    assert not os.path.lexists(d)
+
+
+def test_empty_dir_returns_false_past_its_budget(tree):
+    root, _ = tree
+    for i in range(3):
+        (root / f"f{i}").write_bytes(b"")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert cbf._empty_dir(fd, 1, [2]) is False
+        assert len(list(root.iterdir())) == 3  # nothing removed once over budget
+        budget = [3]
+        assert cbf._empty_dir(fd, 1, budget) is True
+        assert budget == [0]
+    finally:
+        os.close(fd)
+
+
+def test_link_new_bytes_applies_mode_on_the_tmpfile_path(tree, monkeypatch):
+    root, _ = tree
+    used = []
+    real = cbf._open_tmpfile
+    monkeypatch.setattr(cbf, "_open_tmpfile", lambda dfd: used.append(1) or real(dfd))
+    assert cbf.link_new_bytes(root, "m", b"x", mode=0o640) is True
+    assert used
+    assert stat.S_IMODE(os.stat(root / "m").st_mode) == 0o640
+
+
+def test_link_new_bytes_propagates_a_tmpfile_permission_error(tree, monkeypatch):
+    root, _ = tree
+    real_open = os.open
+
+    def deny(path, flags, mode=0o777, *, dir_fd=None):
+        if flags & getattr(os, "O_TMPFILE", 0) == getattr(os, "O_TMPFILE", -1):
+            raise PermissionError(errno.EACCES, "denied")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+    monkeypatch.setattr(cbf.os, "open", deny)
+    with pytest.raises(PermissionError):
+        cbf.link_new_bytes(root, "p", b"x")
+    monkeypatch.undo()
+    assert list(root.iterdir()) == []
+
+
+def test_link_new_bytes_falls_back_without_o_tmpfile_constant(tree, monkeypatch):
+    root, _ = tree
+    monkeypatch.delattr(cbf.os, "O_TMPFILE", raising=False)
+    assert cbf.link_new_bytes(root, "p", b"x") is True
+    monkeypatch.undo()
+    assert sorted(p.name for p in root.iterdir()) == ["p"]
