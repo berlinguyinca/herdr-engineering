@@ -100,8 +100,16 @@ def resolve_path(token: str, cwd: str | None) -> str | None:
         if cwd is None:
             return None
         token = cwd + "/" + token
-    norm = os.path.normpath(token)
-    return "/" + norm.lstrip("/")
+    norm = "/" + os.path.normpath(token).lstrip("/")
+    for _ in range(4):
+        parts = [c for c in norm.split("/") if c]
+        if len(parts) >= 3 and parts[0] == "proc" and parts[2] in ("root", "cwd"):
+            if parts[2] == "cwd":
+                return None  # the target's working directory is unknown to the hub
+            norm = "/" + os.path.normpath("/" + "/".join(parts[3:])).lstrip("/")
+        else:
+            break
+    return norm
 
 
 def split_git(argv: tuple[str, ...] | list[str]) -> tuple[str, list[str], bool] | None:
@@ -156,10 +164,10 @@ def git_push_facts(argv: tuple[str, ...] | list[str]) -> PushFacts | None:
             delete = delete or "d" in a[1:]
         else:
             positional.append(a)
-    for ref in positional[1:]:
+    for n, ref in enumerate(positional):
         if ref.startswith("+"):
             force = True
-        elif ref.startswith(":"):
+        elif ref.startswith(":") and n > 0:
             force = delete = True
     return PushFacts(force, delete, unsafe, positional[0] if positional else "")
 
@@ -179,40 +187,89 @@ def repo_from_url(text: str) -> str:
     return "/".join(parts[-2:]) if len(parts) >= 2 else ""
 
 
+class _Overflow(Exception):
+    pass
+
+
+def _split_top(inner: str) -> list[str]:
+    parts, depth, start = [], 0, 0
+    for i, c in enumerate(inner):
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append(inner[start:i])
+            start = i + 1
+    parts.append(inner[start:])
+    return parts
+
+
+def _range(inner: str, limit: int) -> list[str] | None:
+    bounds = inner.split("..")
+    if len(bounds) != 2:
+        return None
+    lo, hi = bounds
+    if lo.lstrip("-").isdigit() and hi.lstrip("-").isdigit():
+        a, b = int(lo), int(hi)
+        if abs(b - a) >= limit:
+            raise _Overflow
+        step = 1 if b >= a else -1
+        return [str(n) for n in range(a, b + step, step)]
+    if len(lo) == 1 and len(hi) == 1 and lo.isalpha() and hi.isalpha():
+        a, b = ord(lo), ord(hi)
+        step = 1 if b >= a else -1
+        return [chr(n) for n in range(a, b + step, step)]
+    return None
+
+
+def _expand(text: str, limit: int) -> list[str]:
+    result, pos = [""], 0
+    while True:
+        i = text.find("{", pos)
+        if i == -1:
+            return [r + text[pos:] for r in result]
+        depth, end = 0, -1
+        for j in range(i, len(text)):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end == -1:
+            return [r + text[pos:] for r in result]
+        inner = text[i + 1:end]
+        pieces = _split_top(inner)
+        if len(pieces) > 1:
+            alts = [x for piece in pieces for x in _expand(piece, limit)]
+        else:
+            ranged = _range(inner, limit)
+            # Not a bash expansion, but fail closed: consider both the literal and the unwrapped text.
+            alts = ranged if ranged is not None else ["{" + inner + "}", *(_expand(inner, limit) if inner else []),
+                                                      *(inner.split("..") if ".." in inner else [])]
+        result = [r + text[pos:i] + alt for r in result for alt in alts]
+        if len(result) > limit:
+            raise _Overflow
+        pos = end + 1
+
+
+def expand_word(token: str, limit: int = 64) -> tuple[list[str], bool]:
+    """Brace-expand ``token`` (lists, nesting, numeric/alpha ranges); (words, overflowed). Overflow returns [token]."""
+    try:
+        return _expand(token, limit), False
+    except _Overflow:
+        return [token], True
+
+
 def expand_braces(token: str, limit: int = 64) -> list[str]:
-    """Expand ``{a,b}`` lists (bounded); unexpandable text is left as is."""
-    out = [token]
-    for _ in range(8):
-        nxt: list[str] = []
-        changed = False
-        for t in out:
-            opened = t.find("{")
-            if opened == -1:
-                nxt.append(t)
-                continue
-            depth, parts, start, end = 0, [], opened + 1, -1
-            for i in range(opened, len(t)):
-                c = t[i]
-                if c == "{":
-                    depth += 1
-                elif c == "}":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-                elif c == "," and depth == 1:
-                    parts.append(t[start:i])
-                    start = i + 1
-            if end == -1 or not parts:
-                nxt.append(t)
-                continue
-            parts.append(t[start:end])
-            changed = True
-            nxt.extend(t[:opened] + p + t[end + 1:] for p in parts)
-        out = nxt[:limit]
-        if not changed:
-            break
-    return out[:limit]
+    return expand_word(token, limit)[0]
+
+
+def normalize_text(text: str) -> str:
+    """Join line continuations, drop backslashes and quotes (over-approximate shell word assembly)."""
+    return text.replace("\\\n", "").replace("\\", "").replace("$'", "'").replace('$"', '"').replace("'", "").replace('"', "")
 
 
 SCAN_HEADS = frozenset({
@@ -221,14 +278,16 @@ SCAN_HEADS = frozenset({
     "micromamba", "cargo", "npm", "crontab", "systemctl", "apptainer", "singularity", "make", "gem", "go", "spack",
     "poetry", "uv", "pipx", "yarn", "pnpm", "brew", "nix-env", "python", "python3", "cat", "head", "tail", "less",
     "more", "grep", "rg", "base64", "xxd", "od", "strings", "echo", "printenv", "env", "ssh", "scp", "sftp",
-    "install", "chmod", "chown", "ln", "touch", "mkdir", "tar", "unzip", "zip", "nc",
+    "install", "chmod", "chown", "ln", "touch", "mkdir", "tar", "unzip", "zip", "nc", "printf", "kubectl", "declare",
+    "compgen", "export", "perl", "ruby", "node", "awk", "make", "docker", "podman", "mount", "R", "Rscript",
+    "easy_install", "cpan", "busybox",
 })
 _SCAN_SEPARATORS = ";&|\n()`"
 
 
 def scan_elements(text: str, on_cluster: bool, cwd: str | None, only: frozenset[str] | None = None) -> list[Element]:
     """Best-effort, over-approximate inspection records from raw text (quotes and wrappers ignored)."""
-    cleaned = text.replace("\\", "").replace("'", "").replace('"', "")
+    cleaned = normalize_text(text)
     for sep in _SCAN_SEPARATORS:
         cleaned = cleaned.replace(sep, "\n")
     out: list[Element] = []
@@ -481,6 +540,8 @@ def _emit(st: _State, cmd: SimpleCommand, argv: list[str], cls: _Cls, on_cluster
     if dynamic or xargs:
         owner = True
     reason = cls.reason or ("dynamic words" if dynamic else "xargs" if xargs else "")
+    if any("{" in a and expand_word(a)[1] for a in argv):
+        owner, reason = True, "brace overflow"
     scope = cls.scope or scope_default
     head = std_name(argv[0])
     family = ("cluster" if verb in (Verb.CLUSTER_READ_ONLY, Verb.CLUSTER_MUTATING) else
@@ -521,6 +582,57 @@ def _walk(st: _State, cmds: list[SimpleCommand], on_cluster: bool, cwd: str | No
             continue
         cls = classify_head(argv, st.raw.repo)
         _emit(st, cmd, argv, cls, on_cluster, cwd, scope_default, xargs)
+        if head in _DELEGATORS or (head == "find" and any(a in _FIND_EXEC for a in argv)):
+            _delegate(st, cmd, argv, head, on_cluster, cwd, depth, scope_default)
+
+
+_DELEGATORS = frozenset({"setsid", "flock", "watch", "script", "busybox", "su", "doas", "chroot", "unshare",
+                         "nsenter", "strace", "ltrace", "parallel", "nohup", "sg", "runuser"})
+_FIND_EXEC = ("-exec", "-execdir", "-ok", "-okdir")
+_SKIP_POSITIONAL = frozenset({"flock", "chroot"})
+
+
+def _delegated(head: str, argv: list[str]) -> tuple[list[str] | None, str | None]:
+    """(argv of the command a wrapper runs, or a command string) - best effort; scanning backs it up."""
+    args = argv[1:]
+    if head == "find":
+        for i, a in enumerate(args):
+            if a in _FIND_EXEC:
+                words = []
+                for w in args[i + 1:]:
+                    if w in (";", "+"):
+                        break
+                    words.append("x" if w == "{}" else w)
+                return words, None
+        return None, None
+    for flag in ("-c", "--command"):
+        if flag in args and args.index(flag) + 1 < len(args):
+            return None, args[args.index(flag) + 1]
+    if head == "busybox":
+        return args, None
+    if head == "parallel":
+        return (args[:args.index(":::")] if ":::" in args else args), None
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 1
+    if head in _SKIP_POSITIONAL:
+        i += 1
+    return args[i:], None
+
+
+def _delegate(st: _State, cmd: SimpleCommand, argv: list[str], head: str, on_cluster: bool, cwd: str | None,
+              depth: int, scope: str) -> None:
+    words, string = _delegated(head, argv)
+    text = string if string is not None else (shlex.join(words) if words else "")
+    st.out.extend(scan_elements(" ".join(argv[1:]), on_cluster, cwd))
+    if not text or depth >= _MAX_REMOTE_DEPTH:
+        return
+    try:
+        inner = parse(text)
+    except Unparseable:
+        return
+    del cmd
+    _walk(st, inner, on_cluster, cwd, depth + 1, scope)
 
 
 def _remote_cmds(st: _State, text: str, cmd: SimpleCommand, cwd: str | None, depth: int, scope: str,

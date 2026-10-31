@@ -105,7 +105,7 @@ VETOED = [
     ("secret_print", "cat .env"),
     ("secret_print", "cat .ENV"),
     ("secret_print", "head -3 /home/u/.aws/credentials"),
-    ("secret_print", "tail api_token.txt"),
+    ("secret_print", "tail api_token.json"),
     ("secret_print", "less server.PEM"),
     ("secret_print", "base64 my_secret.bin"),
     ("secret_print", "xxd id_rsa"),
@@ -192,7 +192,7 @@ def test_hint_cwd_is_recorded_as_worker_attested():
 
 
 @pytest.mark.parametrize("command", [
-    "cat ~/.ssh/id_ed25519", "cat .ENV", "cat ~/.SSH/ID_RSA", "cat Prod.Token", "cat MY_KEY.txt", "cat server.Pem",
+    "cat ~/.ssh/id_ed25519", "cat .ENV", "cat ~/.SSH/ID_RSA", "cat Prod.Token", "cat MY_KEY.json", "cat server.Pem",
     "cat Credentials.json", "cat .NETRC", "cat .env.production", "cat ./a/.aws/config",
 ])
 def test_secret_name_variants(command):

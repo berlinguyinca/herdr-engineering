@@ -10,8 +10,9 @@ Codes: force_push, protection_disable, quobyte_delete, fry_route, cluster_instal
 from __future__ import annotations
 
 import os
+import unicodedata
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
 
 from .canonical import (
@@ -20,7 +21,9 @@ from .canonical import (
     api_method,
     classify_head,
     expand_braces,
+    expand_word,
     git_push_facts,
+    normalize_text,
     resolve_path,
     split_git,
     std_name,
@@ -85,7 +88,8 @@ def _protection(el: Element) -> Veto | None:
 _COPY_HEADS = frozenset({"cp", "install", "scp", "rsync", "ln"})
 _WRITE_HEADS = frozenset({"cp", "install", "scp", "rsync", "ln", "curl", "wget", "unzip", "zip", "touch", "mkdir",
                           "chmod", "chown", "chgrp", "tee", "dd", "mv", "rm", "rmdir", "truncate", "shred", "unlink",
-                          "patch"})
+                          "patch", "make", "docker", "podman", "apptainer", "singularity", "mount", "umount"})
+_GIT_READ_SUBS = frozenset({"status", "log", "diff", "show", "rev-parse", "ls-files", "blame", "describe", "push"})
 _ROOT_HEADS = frozenset({"mv", "chmod", "chown", "chgrp", "truncate", "shred", "unlink", "rm", "rmdir"})
 _RSYNC_DELETE = ("--delete", "--del", "--remove-source-files")
 _GLOB = "*?["
@@ -108,8 +112,24 @@ def _in_place(args: list[str]) -> bool:
                or (a.startswith("-") and not a.startswith("--") and "i" in a) for a in args)
 
 
+def _inline_script(head: str, args: list[str]) -> bool:
+    """Interpreter invocations that carry code or edit files in place (``python -c``, ``perl -e/-pi``...)."""
+    flags = [a for a in args if a.startswith("-")]
+    if head.startswith("python"):
+        return "-c" in flags
+    if head in ("perl", "ruby", "node", "php"):
+        return any(not f.startswith("--") and any(c in f[1:] for c in "eEi") for f in flags)
+    return head in ("awk", "gawk") and "-i" in args
+
+
 def _mutating(el: Element) -> bool:
     head, args = std_name(el.argv[0]), list(el.argv[1:])
+    if head == "git":
+        parts = split_git(el.argv)
+        if parts is not None and parts[2]:
+            return parts[0] not in _GIT_READ_SUBS
+    if _inline_script(head, args):
+        return True
     if head == "tar":
         return _tar_writes(args)
     if head == "sed":
@@ -123,14 +143,18 @@ def _mutating(el: Element) -> bool:
 
 
 def _candidates(tok: str) -> list[str]:
-    """Path-like values inside a token: the token, ``opt=value``, attached ``-tVALUE`` and ``host:path``."""
-    out = [] if tok.startswith("-") and "=" not in tok and not (len(tok) > 2 and tok[2:3] == "/") else [tok]
-    if "=" in tok:
-        out.append(tok.split("=", 1)[1])
+    """Path-like values inside a token: the token, ``opt=value``, attached ``-tVALUE``, ``host:path``, ``a:b``, ``a,b``."""
+    pieces = [] if tok.startswith("-") and not (len(tok) > 2 and tok[2:3] == "/") else [tok]
     if tok.startswith("-") and not tok.startswith("--") and len(tok) > 2:
-        out.append(tok[2:])
-    if ":" in tok and not tok.startswith(("/", "-")):
-        out.append(tok.split(":", 1)[1])
+        pieces.append(tok[2:])
+    if tok.startswith("-") and "=" in tok:
+        pieces.append(tok.split("=", 1)[1])
+    out: list[str] = []
+    for piece in pieces:
+        out.append(piece)
+        for sep in (",", ":", "="):
+            if sep in piece:
+                out.extend(p for p in piece.replace(",", sep).replace(":", sep).split(sep) if p)
     return out
 
 
@@ -143,7 +167,7 @@ def _token_hits(tok: str, cwd: str | None) -> tuple[bool, bool]:
             if "$" in exp and static.startswith(QUOBYTE):
                 quobyte = True
             resolved = resolve_path(exp, cwd)
-            if resolved is None and cwd is None:
+            if resolved is None and (cwd is None or exp.startswith("~")):
                 resolved = _dotdot_into_quobyte(exp)
             if _under_quobyte(resolved):
                 quobyte = True
@@ -158,14 +182,19 @@ def _token_hits(tok: str, cwd: str | None) -> tuple[bool, bool]:
 
 
 def _dotdot_into_quobyte(token: str) -> str | None:
-    """Unknown cwd: ``../quobyte/x`` may be anywhere, but could be /quobyte; treat it as /quobyte (fail closed)."""
-    if token.startswith(("/", "~")):
+    """Unknown base (cwd or ``~``): ``../quobyte/x`` may be anywhere but could be /quobyte; fail closed."""
+    if token.startswith("/"):
         return None
-    norm = os.path.normpath(token)
+    tilde = token.startswith("~")
+    if tilde:
+        token = token.split("/", 1)[1] if "/" in token else ""
+    norm = os.path.normpath(token) if token else "."
     parts = norm.split("/")
+    ups = 0
     while parts and parts[0] == "..":
         parts.pop(0)
-    if len(parts) < len(norm.split("/")) and parts[:1] == ["quobyte"]:
+        ups += 1
+    if ups >= (2 if tilde else 1) and parts[:1] == ["quobyte"]:
         return "/" + "/".join(parts)
     return None
 
@@ -188,13 +217,21 @@ def _touches_quobyte(el: Element) -> bool:
     return any(hits)
 
 
-def _quobyte(el: Element, anywhere: bool) -> Veto | None:
+def _quobyte(el: Element, anywhere: bool, raw_text: str = "", overflow: bool = False) -> Veto | None:
     head, args = std_name(el.argv[0]), list(el.argv[1:])
     veto = Veto("quobyte_delete", "deleting or modifying anything under /quobyte is never allowed")
     if any(_token_hits(r, el.cwd)[0] for r in el.redirects):
         return veto
+    writes = _mutating(el) or bool(el.redirects)
+    if writes and "quobyte" in normalize_text(raw_text).lower() and any(
+            "$" in w for w in [*el.argv[1:], *el.redirects]):
+        return veto  # variable indirection somewhere in a text that mentions quobyte
     if not _mutating(el):
         return None
+    if overflow:
+        return veto
+    if _inline_script(head, args) and any("/quobyte" in a.lower() for a in args):
+        return veto
     deleting = head == "rsync" and any(a.startswith(_RSYNC_DELETE) for a in args)
     if head == "dd":
         values = [a[3:] for a in args if a.startswith("of=")]
@@ -222,7 +259,7 @@ def _words(text: str) -> list[str]:
 
 def _text_scan(derived: Derived) -> Veto | None:
     """Over-approximate rules for text the parser could not handle (documented over-veto)."""
-    text = derived.raw_text.lower()
+    text = normalize_text(derived.raw_text).lower()
     words = _words(text)
     if "/quobyte" in text and (">" in text or _TEXT_DESTRUCTIVE & set(words)):
         return Veto("quobyte_delete", "unparseable command mentions /quobyte with a modifying word")
@@ -269,7 +306,11 @@ def _is_installer(argv: tuple[str, ...]) -> bool:
         idx = args.index("-m")
         return args[idx + 1:idx + 2] in (["pip"], ["pip3"]) and "install" in args[idx + 2:]
     if head.startswith("pip") or head == "pipx":
-        return sub == "install"
+        return sub in ("install", "download")
+    if head in ("easy_install", "cpan"):
+        return True
+    if head in ("R", "Rscript"):
+        return any("install.packages" in a or "install_github" in a or "::install" in a for a in args)
     if head == "uv":
         return sub in ("add", "sync") or (sub == "pip" and "install" in pos) or (sub == "tool" and "install" in pos)
     if head == "poetry":
@@ -281,8 +322,10 @@ def _is_installer(argv: tuple[str, ...]) -> bool:
     if head in ("conda", "mamba", "micromamba"):
         return sub in _CONDA_SUBS
     if head in ("cargo", "go", "spack"):
-        return sub == "install"
-    if head in ("npm", "pnpm"):
+        return sub == "install" or (head == "cargo" and sub == "add")
+    if head == "npm":
+        return sub in _NPM_SUBS
+    if head == "pnpm":
         glob = any(a in ("-g", "--global") or a == "--location=global" for a in args)
         return sub in _NPM_SUBS and glob
     if head == "yarn":
@@ -309,19 +352,42 @@ def _cluster_install(el: Element, hint_host: str) -> Veto | None:
 
 # ---------------------------------------------------------------- 5. secrets
 
-_SECRET_HEADS = frozenset({"cat", "echo", "printenv", "env", "head", "tail", "less", "more", "grep", "rg", "base64",
-                           "xxd", "od", "strings", "cp", "mv", "scp", "rsync", "ln", "tar", "zip", "curl", "nc",
-                           "wget", "sftp", "sed", "awk"})
-_SECRET_BASENAMES = ("*key*", "*token*", "*secret*", "*.pem", "id_rsa*", "id_ed25519*", ".env*", "credentials*",
-                     ".netrc", ".git-credentials", ".pgpass", ".npmrc", ".pypirc")
+_SECRET_HEADS = frozenset({"cat", "echo", "printenv", "env", "printf", "head", "tail", "less", "more", "grep", "rg",
+                           "base64", "xxd", "od", "strings", "cp", "mv", "scp", "rsync", "ln", "tar", "zip", "curl",
+                           "nc", "wget", "sftp", "sed", "awk"})
+_SECRET_EXACT = ("*.pem", "*.p12", "*.pfx", "*.jks", "id_rsa*", "id_ed25519*", ".env*", "credentials*", ".netrc",
+                 ".npmrc", ".pypirc", ".git-credentials", ".pgpass")
+_SECRET_WORDS = frozenset({"key", "keys", "token", "tokens", "secret", "secrets", "password", "passwd", "pass",
+                           "credential", "credentials", "apikey", "privatekey"})
+_PLAIN_EXTENSIONS = frozenset({".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".go", ".java", ".scala", ".kt", ".c",
+                               ".h", ".cc", ".cpp", ".hpp", ".md", ".rst", ".txt", ".log", ".html", ".css", ".sh"})
 _SAMPLE_SECRET_NAMES = (".env", ".env.local", "id_rsa", "id_rsa.pub", "id_ed25519", "credentials",
                         "credentials.json", ".netrc", "server.pem", "secret", "token", "key", ".git-credentials",
-                        ".pgpass", ".npmrc", ".pypirc", "environ")
-_SECRET_VARS = ("*key*", "*token*", "*secret*", "*password*", "*passwd*", "*credential*")
+                        ".pgpass", ".npmrc", ".pypirc", "environ", "api_key.json", "secrets.yaml")
 _SECRET_DIRS = ("/.aws/", "/.ssh/", "/.docker/", "/.kube/", "/.gnupg/", "/.config/gh/")
 _SECRET_DIR_NAMES = (".aws", ".ssh", ".docker", ".kube", ".gnupg")
 _PATTERN_HEADS = frozenset({"grep", "rg", "sed", "awk"})
 _GIT_FILE_SUBS = frozenset({"diff", "show", "blame", "log", "grep", "cat-file"})
+_SYSTEM_SECRETS = ("/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/ssh/ssh_host_")
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Lower-case words of a file or variable name, split on ``._-`` and camelCase boundaries."""
+    tokens: list[str] = []
+    current = ""
+    for i, ch in enumerate(name):
+        if ch in "._-":
+            if current:
+                tokens.append(current)
+            current = ""
+            continue
+        if current and ch.isupper() and (name[i - 1].islower() or name[i - 1].isdigit()):
+            tokens.append(current)
+            current = ""
+        current += ch
+    if current:
+        tokens.append(current)
+    return [t.lower() for t in tokens]
 
 
 def _pure_wildcard(comp: str) -> bool:
@@ -329,17 +395,24 @@ def _pure_wildcard(comp: str) -> bool:
 
 
 def _secret_one(tok: str) -> bool:
-    low = tok.strip().lower().lstrip("@")
+    orig = tok.strip().lstrip("@")
+    low = orig.lower()
     if not low or low == "/":
         return False
     comps = [c for c in low.split("/") if c]
     base = comps[-1] if comps else ""
-    wrapped = "/" + "/".join(comps) + "/"
+    base_orig = [c for c in orig.split("/") if c][-1] if comps else ""
+    full = "/" + "/".join(comps)
+    wrapped = full + "/"
     if any(d in wrapped for d in _SECRET_DIRS):
         return True
     if base == "environ" and "/proc/" in wrapped:
         return True
-    if any(fnmatchcase(base, pat) for pat in _SECRET_BASENAMES):
+    if any(full == p or full.startswith(p) and p.endswith(("sudoers", "ssh_host_")) for p in _SYSTEM_SECRETS):
+        return True
+    if any(fnmatchcase(base, pat) for pat in _SECRET_EXACT):
+        return True
+    if _SECRET_WORDS & set(_name_tokens(base_orig)) and os.path.splitext(base)[1] not in _PLAIN_EXTENSIONS:
         return True
     for comp in comps[:-1]:
         if any(c in comp for c in _GLOB) and not _pure_wildcard(comp) and any(
@@ -375,7 +448,7 @@ def _var_names(token: str) -> list[str]:
 
 
 def _secret_var(name: str) -> bool:
-    return any(fnmatchcase(name.lower(), pat) for pat in _SECRET_VARS)
+    return bool(_SECRET_WORDS & set(_name_tokens(name)))
 
 
 def _file_candidates(args: list[str]) -> list[str]:
@@ -398,19 +471,27 @@ def _secret(el: Element) -> Veto | None:
         return veto
     if head == "gh" and args[:2] == ["auth", "status"] and any(a in ("-t", "--show-token") for a in args):
         return veto
+    if head == "kubectl" and "get" in args and any(a.lower().startswith("secret") for a in args):
+        return veto
+    if head == "declare" and "-p" in args or head == "compgen" and any(a in ("-v", "-e") for a in args):
+        return veto
+    if head == "export" and "-p" in args:
+        return veto
     if head in ("env", "printenv"):
         names = [a for a in args if not a.startswith("-") and "=" not in a]
         if not names and head == "printenv" or not names and head == "env":
             return veto
     if head == "git":
         parts = split_git(el.argv)
+        if parts is not None and parts[0] == "credential" and parts[1][:1] in (["fill"], ["approve"]):
+            return veto
         if parts is not None and parts[0] in _GIT_FILE_SUBS:
             if any(_secret_path(c) for c in _file_candidates(parts[1])):
                 return veto
         return None
     if head not in _SECRET_HEADS:
         return None
-    if head in ("echo", "printenv", "env"):
+    if head in ("echo", "printenv", "env", "printf"):
         for tok in args:
             if any(_secret_var(n) for n in _var_names(tok)):
                 return veto
@@ -429,24 +510,41 @@ def _secret(el: Element) -> Veto | None:
 
 # ---------------------------------------------------------------- driver
 
+def _flatten(el: Element) -> tuple[Element, bool]:
+    """Brace-expand and NFKC-normalize every word (bash expands braces into separate words).
+
+    Returns the flattened element and whether some word overflowed the expansion cap AND hints at /quobyte."""
+    words: list[str] = []
+    risky = False
+    for word in el.argv:
+        expanded, overflow = expand_word(unicodedata.normalize("NFKC", word))
+        words.extend(expanded)
+        low = word.lower()
+        risky = risky or (overflow and ("quobyte" in low or "/q" in low or "{q" in low or ",q" in low))
+    redirects = tuple(w for r in el.redirects for w in expand_word(unicodedata.normalize("NFKC", r))[0])
+    return replace(el, argv=tuple(words), redirects=redirects), risky
+
+
 def _fixed(derived: Derived) -> Veto | None:
     fry = Veto("fry_route", "routing through the retired Fry host is never allowed")
-    if _fry_in([derived.raw_text, derived.hint_host]) or derived.hint_host.strip().lower() == "fry":
+    text = normalize_text(derived.raw_text)
+    if _fry_in([derived.raw_text, text, derived.hint_host]) or derived.hint_host.strip().lower() == "fry":
         return fry
     if derived.unparsed:
         found = _text_scan(derived)
         if found is not None:
             return found
-    anywhere = any(_touches_quobyte(e) for e in derived.details)
-    for el in derived.details:
+    elements = [_flatten(e) for e in derived.details]
+    anywhere = any(_touches_quobyte(e) for e, _ in elements)
+    for el, risky in elements:
         if _fry_in([*el.argv, *el.redirects, *(v for _, v in el.env)]) or _fry_bare(el):
             return fry
-        for found in (_force_push(el), _protection(el), _quobyte(el, anywhere),
+        for found in (_force_push(el), _protection(el), _quobyte(el, anywhere, derived.raw_text, risky),
                       _cluster_install(el, derived.hint_host), _secret(el)):
             if found is not None:
                 return found
     unknown_cwd = bool(derived.hint_cwd) and resolve_path(derived.hint_cwd, None) is None
-    if unknown_cwd and "quobyte" in derived.hint_cwd.lower() and any(_mutating(e) for e in derived.details):
+    if unknown_cwd and "quobyte" in derived.hint_cwd.lower() and any(_mutating(e) for e, _ in elements):
         return Veto("quobyte_delete", "the attested working directory mentions /quobyte and the command modifies")
     return None
 
