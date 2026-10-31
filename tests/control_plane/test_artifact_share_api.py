@@ -212,7 +212,7 @@ class Shares:
 
 
 @contextmanager
-def share_server(tmp_path, *, enabled=True, **settings):
+def share_server(tmp_path, *, enabled=True, collab=None, **settings):
     blobs = Bytes()
     registry, shares = Registry(blobs), Shares()
     config = {"public_url": "https://share.example/", "max_share_bytes": 512 * MIB, "max_files": 20000,
@@ -225,6 +225,8 @@ def share_server(tmp_path, *, enabled=True, **settings):
     thread = threading.Thread(target=server.serve, daemon=True)
     thread.start()
     server.wait_until_ready()
+    if collab is not None:
+        server.collab = collab                      # a room-membership stand-in (set after start: serve() drives a real one)
     try:
         yield f"http://127.0.0.1:{server.port}", registry, shares, blobs, root
     finally:
@@ -739,3 +741,39 @@ def test_mark_live_expiry_maps_to_410_by_code_not_message(env):
     shares.mark_live_error = ShareError("token hash already in use")
     assert approve(base, share_id)[0] == 409
     assert list((root / "by-token").iterdir()) == [] and not (root / share_id).exists()
+
+
+# ----------------------------------------------------------------------------------------------- share with a room
+
+
+class Rooms:
+    def __init__(self, rooms):
+        self.rooms = rooms
+
+    def room_member_emails(self, room_id):
+        return list(self.rooms.get(room_id, []))
+
+
+def test_a_lab_share_to_a_room_allows_the_rooms_people_and_only_those(tmp_path):
+    with share_server(tmp_path, collab=Rooms({"r1": ["bob@x.org", "carol@x.org"]})) as (base, _, shares, _b, _r):
+        status, body = create(base, audience="lab", room_id="r1", allow_emails=["dave@x.org", "bob@x.org"])
+        assert status == 201, body
+        assert sorted(body["share"]["allow_emails"]) == ["bob@x.org", "carol@x.org", "dave@x.org"]
+        status, body = create(base, audience="lab", room_id="r1")
+        assert status == 201 and sorted(body["share"]["allow_emails"]) == ["bob@x.org", "carol@x.org"]
+        assert "room_id" not in str(list(shares.rows.values())[-1])               # the room is not stored; the emails are
+
+
+def test_a_room_share_is_refused_for_public_unknown_rooms_and_bad_ids(tmp_path):
+    with share_server(tmp_path, collab=Rooms({"r1": ["bob@x.org"], "empty": []})) as (base, *_):
+        assert create(base, audience="public", room_id="r1")[0] == 400
+        assert create(base, audience="lab", room_id="nope")[0] == 400
+        assert create(base, audience="lab", room_id="empty")[0] == 400
+        assert create(base, audience="lab", room_id="")[0] == 400
+        assert create(base, audience="lab", room_id=5)[0] == 400
+        assert create(base, audience="lab", room_id="r1", allow_emails="x@x.org")[0] == 400
+
+
+def test_a_room_share_without_collaboration_is_refused(env):
+    base, *_ = env
+    assert create(base, audience="lab", room_id="r1")[0] == 400

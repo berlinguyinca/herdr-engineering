@@ -183,6 +183,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     "for control_plane.rakazo_bridge.accounts[].password_scrypt; the password is never an argument"
                     ).set_defaults(func=_cmd_bridge_hash_password)
 
+    # google ---------------------------------------------------------------
+    from .google_setup_cli import register as _register_google
+    _register_google(sub)
+
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
     fsub = p.add_subparsers(dest="fleet_command", required=True)
@@ -334,6 +338,10 @@ def _build_parser() -> argparse.ArgumentParser:
     add_collab_subparser(asub)
     from .artifact_browse_client import add_browse_subparsers
     add_browse_subparsers(asub)
+    from .teams_client import add_teams_subparser
+    add_teams_subparser(sub)
+    from .rooms_client import add_rooms_subparser
+    add_rooms_subparser(sub)
     # system-graph artifact (P5): deterministic sanitized snapshot renderer.
     ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
     gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
@@ -669,6 +677,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--include-gap-tail", action="store_true",
                     help="also set aside every row after the first missing sequence (may drop genuine events)")
     p2.set_defaults(func=_cmd_cp_collab_repair)
+    p2 = csub.add_parser("revoke-room-grants", help="remove every room-derived artifact read grant (granted_by room:*) "
+                         "after unified_workspace.room_artifact_access was turned off; dry run by default, "
+                         "grants of any other source are never touched, safe to repeat")
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file; control_plane.pg_dsn names the database")
+    p2.add_argument("--apply", action="store_true", help="really delete the rows (default: only count them)")
+    p2.set_defaults(func=_cmd_cp_revoke_room_grants)
     p2 = csub.add_parser("assistant-audit", help="anchor the assistant audit head off the event store, or "
                          "verify the stored chain against the last anchor (detects truncation/rollback)")
     p2.add_argument("action", choices=["anchor", "verify"])
@@ -678,6 +693,38 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--api-key-file", required=True,
                     help="PATH to a file holding the API key of a principal in the tenant to anchor (never the key itself)")
     p2.set_defaults(func=_cmd_cp_assistant_audit)
+    p2 = csub.add_parser("assistant-worker", help="enroll, list or revoke tailnet-hub workers (owner API)")
+    p2.add_argument("action", choices=["enroll", "list", "revoke", "scopes", "redeem", "install-hooks"])
+    p2.add_argument("worker_id", nargs="?", default=None, help="the worker to revoke or change scopes of (revoke|scopes)")
+    p2.add_argument("--scopes", default=None, help="comma-separated scopes from ask,report,read,act (enroll|scopes)")
+    p2.add_argument("--name", default=None, help="a label for the worker (enroll)")
+    p2.add_argument("--harness", default=None, help="claude | pi | codex | opencode (enroll)")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None,
+                    help="PATH to a file holding an operator API key (never the key itself); enroll|list|revoke")
+    p2.add_argument("--url", default=None, help="hub base URL, e.g. http://100.x.y.z:8765 (redeem)")
+    p2.add_argument("--code", default=None, help="the single-use enrollment code (redeem); visible in `ps` - prefer `--code -` to read stdin "
+                    "or the HERDR_ASSISTANT_ENROLL_CODE env var")
+    p2.add_argument("--device-id", default=None, help="a stable id for this device (redeem)")
+    p2.add_argument("--out", default=None,
+                    help="where redeem stores the 0600 worker file (default ~/.config/herdr/assistant-worker.json)")
+    p2.add_argument("--force", action="store_true", help="redeem: overwrite an existing worker file")
+    p2.add_argument("--settings", default=None, help="install-hooks: the Claude Code settings.json to edit")
+    p2.add_argument("--yes", action="store_true", help="install-hooks: apply without the confirmation prompt")
+    p2.set_defaults(func=_cmd_cp_assistant_worker)
+    p2 = csub.add_parser("assistant-action", help="list, approve or deny hub workers' action requests (owner API)")
+    p2.add_argument("action", choices=["list", "approve", "deny"])
+    p2.add_argument("request_id", nargs="?", default=None, help="the request to decide (approve|deny)")
+    p2.add_argument("--status", default=None, choices=["pending", "approved", "denied", "vetoed"], help="list filter")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
+    p2.set_defaults(func=_cmd_cp_assistant_hub_owner, command_group_kind="action")
+    p2 = csub.add_parser("assistant-grant", help="list, revoke or activate hub action grants (owner API)")
+    p2.add_argument("action", choices=["list", "revoke", "activate"])
+    p2.add_argument("grant_id", nargs="?", default=None, help="the grant (revoke|activate)")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
+    p2.set_defaults(func=_cmd_cp_assistant_hub_owner, command_group_kind="grant")
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -3060,6 +3107,296 @@ def _cmd_cp_assistant_audit(args) -> int:
         return 1
 
 
+def _cmd_cp_assistant_worker(args) -> int:
+    """``control-plane assistant-worker enroll|list|revoke``: 0 on success, else a one-line stderr message (never the key)."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import quote
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    if args.action == "redeem":
+        return _assistant_worker_redeem(args)
+    if args.action == "install-hooks":
+        return _assistant_worker_install_hooks(args)
+    if not args.api_key_file:
+        print(f"{args.action} needs --api-key-file", file=sys.stderr)
+        return 2
+    if args.action == "enroll" and not (args.name and args.harness):
+        print("enroll needs --name and --harness", file=sys.stderr)
+        return 2
+    if args.action in ("revoke", "scopes") and not args.worker_id:
+        print(f"{args.action} needs a WORKER_ID", file=sys.stderr)
+        return 2
+    if args.action == "scopes" and not args.scopes:
+        print("scopes needs --scopes a,b", file=sys.stderr)
+        return 2
+    scopes = [x.strip() for x in args.scopes.split(",")] if args.scopes else None
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+    except ValueError:
+        print("cannot read --api-key-file: not a text file", file=sys.stderr)
+        return 2
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(f"{base}{path}", method=method, headers={
+            "X-API-Key": key, "Content-Type": "application/json"},
+            data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read(1024 * 1024))
+    try:
+        if args.action == "enroll":
+            payload = {"name": args.name, "harness": args.harness}
+            if scopes is not None:
+                payload["scopes"] = scopes
+            out = call("POST", "/api/v1/assistant-workers", payload)
+            print(f"enrollment: {out['enrollment_id']}\ncode: {out['code']}\nexpires_at: {out['expires_at']}")
+            print(f"scopes: {','.join(out.get('scopes', []))}")
+            print("This code will not be shown again; it is single-use. Redeem it on the worker's device.")
+            setup = out.get("setup") or {}
+            if not setup.get("supported"):
+                print(f"setup: the {setup.get('harness', args.harness)} harness is not supported yet")
+            else:
+                if setup.get("host_is_placeholder"):
+                    print("warning: replace <HUB_HOST> with this machine's tailnet name or address")
+                print(f"redeem: {json.dumps(setup['redeem'])}")
+                print(f"then run: {setup['mcp_add']}")
+        elif args.action == "list":
+            rows = call("GET", "/api/v1/assistant-workers")["workers"]
+            print(f"{'WORKER_ID':<34} {'NAME':<20} {'HARNESS':<9} {'STATUS':<8} {'DEVICE':<16} EXPIRES")
+            for w in rows:
+                print(f"{w['worker_id']:<34} {w['name']:<20} {w['harness']:<9} {w['status']:<8} "
+                      f"{w['device_id']:<16} {w['expires_at']}")
+        elif args.action == "scopes":
+            out = call("POST", f"/api/v1/assistant-workers/{quote(args.worker_id, safe='')}/scopes", {"scopes": scopes})
+            print(_tty_safe(f"{out['worker_id']}: scopes {','.join(out['scopes'])}"))
+        else:
+            out = call("DELETE", f"/api/v1/assistant-workers/{quote(args.worker_id, safe='')}")
+            print(f"{out['worker_id']}: {out['status']}")
+        return 0
+    except urllib.error.HTTPError as exc:
+        print(f"assistant-worker {args.action} failed: HTTP {exc.code}", file=sys.stderr)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"assistant-worker {args.action} failed: {type(exc).__name__}", file=sys.stderr)
+    return 1
+
+
+def _tty_safe(value) -> str:
+    """Server-provided text with every ESC/C0/C1 control character removed (space kept), safe to print to a terminal."""
+    return "".join(c for c in str(value) if c == " " or not (ord(c) < 32 or 0x7F <= ord(c) <= 0x9F))
+
+
+def _cmd_cp_assistant_hub_owner(args) -> int:
+    """``control-plane assistant-action list|approve|deny`` and ``assistant-grant list|revoke|activate``.
+
+    0 on success, 1 on a refusal or failure (one stderr line; an activation refusal prints its code), 2 on usage."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import quote
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    kind = "assistant-action" if args.command_group_kind == "action" else "assistant-grant"
+    target = getattr(args, "request_id", None) or getattr(args, "grant_id", None)
+    if not args.api_key_file:
+        print(f"{kind} {args.action} needs --api-key-file", file=sys.stderr)
+        return 2
+    if args.action != "list" and not target:
+        print(f"{kind} {args.action} needs an ID", file=sys.stderr)
+        return 2
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+    except ValueError:
+        print("cannot read --api-key-file: not a text file", file=sys.stderr)
+        return 2
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(f"{base}{path}", method=method, headers={
+            "X-API-Key": key, "Content-Type": "application/json"},
+            data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read(1024 * 1024))
+    quoted = quote(target, safe="") if target else ""
+    try:
+        if kind == "assistant-action":
+            if args.action == "list":
+                query = f"?status={quote(args.status, safe='')}" if args.status else ""
+                rows = call("GET", f"/api/v1/assistant-action-requests{query}")["requests"]
+                print(f"{'REQUEST_ID':<20} {'STATUS':<9} {'VERB':<14} {'WORKER':<22} DISPLAY")
+                for r in rows:
+                    display = _tty_safe(r["display"])[:120]
+                    print(_tty_safe(f"{r['request_id']:<20} {r['status']:<9} {r['verb']:<14} {r['worker_id']:<22} ")
+                          + display)
+            else:
+                out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision",
+                           {"approve": args.action == "approve"})
+                print(_tty_safe(f"{out['request_id']}: {out['status']}"))
+        elif args.action == "list":
+            rows = call("GET", "/api/v1/assistant-grants")["grants"]
+            print(f"{'GRANT_ID':<24} {'STATE':<9} {'VERB':<14} {'WORKER':<22} EXPIRES")
+            for g in rows:
+                print(_tty_safe(f"{g['grant_id']:<24} {g['state']:<9} {g['verb']:<14} {g['worker_id']:<22} "
+                                f"{g['expires_at'] or '-'}"))
+        elif args.action == "revoke":
+            out = call("DELETE", f"/api/v1/assistant-grants/{quoted}")
+            print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
+        else:
+            out = call("POST", f"/api/v1/assistant-grants/{quoted}/activate", {"confirm": True})
+            print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
+        return 0
+    except urllib.error.HTTPError as exc:
+        code = ""
+        try:
+            code = str(json.loads(exc.read(65536)).get("code") or "")
+        except (OSError, ValueError, AttributeError):
+            pass
+        suffix = f" ({code})" if code and code.replace("_", "").isalnum() else ""
+        print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}", file=sys.stderr)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"{kind} {args.action} failed: {type(exc).__name__}", file=sys.stderr)
+    return 1
+
+
+_REDEEM_SAFE = re.compile(r"[A-Za-z0-9._~:/\-]+")
+
+
+def _assistant_worker_redeem(args) -> int:
+    """Redeem an enrollment code: store the 0600 worker file, print the ``claude mcp add`` line exactly once."""
+    import urllib.error
+    import urllib.request
+
+    from .control_plane.assistant_hub.hook_relay import (
+        DEFAULT_FILE,
+        RelayConfigError,
+        make_opener,
+        plain_http_warning,
+        validate_hub_url,
+    )
+
+    # A --code value is visible to other local users in `ps`; prefer `--code -` (stdin) or the env var.
+    code = args.code
+    if code == "-":
+        code = sys.stdin.read().strip()
+    elif not code:
+        code = os.environ.get("HERDR_ASSISTANT_ENROLL_CODE", "").strip()
+    if not (args.url and code and args.device_id):
+        print("redeem needs --url, a code (HERDR_ASSISTANT_ENROLL_CODE, --code - for stdin, or --code) "
+              "and --device-id", file=sys.stderr)
+        return 2
+    try:
+        base = validate_hub_url(args.url)
+    except RelayConfigError as exc:
+        print(f"assistant-worker redeem failed: {exc}", file=sys.stderr)
+        return 2
+    if not _REDEEM_SAFE.fullmatch(base) or not _REDEEM_SAFE.fullmatch(args.device_id):
+        print("assistant-worker redeem failed: url/device-id contain unsupported characters", file=sys.stderr)
+        return 2
+    dest = Path(args.out or DEFAULT_FILE).expanduser()
+    if os.path.lexists(dest) and not args.force:
+        print(f"assistant-worker redeem failed: {dest} exists (use --force to replace it)", file=sys.stderr)
+        return 1
+    warning = plain_http_warning(base)
+    if warning:
+        print(warning, file=sys.stderr)
+    try:
+        req = urllib.request.Request(f"{base}/assistant/enroll", method="POST",
+                                     headers={"Content-Type": "application/json"},
+                                     data=json.dumps({"code": code, "device_id": args.device_id}).encode())
+        with make_opener().open(req, timeout=15) as response:
+            out = json.loads(response.read(1024 * 1024))
+        cred, device = out["credential"], out["device_id"]
+        if not (isinstance(cred, str) and isinstance(device, str)
+                and _REDEEM_SAFE.fullmatch(cred) and _REDEEM_SAFE.fullmatch(device)):
+            raise ValueError("unexpected enrollment response")
+    except urllib.error.HTTPError as exc:
+        print(f"assistant-worker redeem failed: HTTP {exc.code}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"assistant-worker redeem failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    payload = json.dumps({"url": base, "credential": cred, "device_id": device}).encode()
+    try:
+        if not dest.parent.exists():
+            dest.parent.mkdir(parents=True, mode=0o700)
+            os.chmod(dest.parent, 0o700)
+        if args.force:
+            tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(payload)
+                os.replace(tmp, dest)
+            except BaseException:
+                if os.path.lexists(tmp):
+                    os.unlink(tmp)
+                raise
+        else:
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+    except OSError as exc:
+        print(f"assistant-worker redeem failed: cannot write {dest}: {exc.strerror}", file=sys.stderr)
+        return 1
+    print(f"worker credential stored in {dest} (mode 0600). It will not be shown again except in the line below.")
+    print("Run this once to give Claude Code the hub (the credential is shown only now):")
+    print(f'claude mcp add --transport http herdr-assistant {base}/assistant/mcp '
+          f'--header "Authorization: Worker {cred}" --header "X-Herdr-Device: {device}"')
+    return 0
+
+
+def _assistant_worker_install_hooks(args) -> int:
+    """Install the observe-only Claude Code hooks into an explicit settings file (diff + confirmation)."""
+    from .control_plane.assistant_hub import hook_relay
+
+    if args.harness != "claude":
+        print("install-hooks supports only --harness claude", file=sys.stderr)
+        return 1
+    if not args.settings:
+        print("install-hooks needs --settings PATH", file=sys.stderr)
+        return 2
+    command = hook_relay.build_hook_command(sys.executable, hook_relay.__file__)
+    applied: list[bool] = []
+
+    def confirm(diff: str) -> bool:
+        print(diff, end="")
+        if args.yes:
+            ok = True
+        elif not sys.stdin.isatty():
+            print("not a terminal: re-run with --yes to apply", file=sys.stderr)
+            ok = False
+        else:
+            ok = input("Apply this change? [y/N] ").strip().lower() in ("y", "yes")
+        applied.append(ok)
+        return ok
+    try:
+        diff = hook_relay.install_hooks(Path(args.settings).expanduser(), command=command, confirm=confirm)
+    except (OSError, ValueError) as exc:
+        print(f"install-hooks failed: {exc}", file=sys.stderr)
+        return 1
+    if not diff:
+        print("hooks already installed")
+    elif applied and applied[0]:
+        print("hooks installed")
+    else:
+        print("no changes written", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _cmd_cp_collab_repair(args) -> int:
     import asyncio
 
@@ -3079,6 +3416,24 @@ def _cmd_cp_collab_repair(args) -> int:
             report = asyncio.run(_run())
     except (PermissionError, collab_repair.LogInUseError, collab_repair.SchemaTooOldError) as exc:
         raise SystemExit(str(exc)) from None
+    _print_json({"ok": True, **report})
+    return 0
+
+
+def _cmd_cp_revoke_room_grants(args) -> int:
+    import asyncio
+
+    from .control_plane.artifact_room_access import revoke_room_grants_pg
+
+    async def _run():
+        conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
+        try:
+            return await revoke_room_grants_pg(conn, apply=args.apply)
+        finally:
+            await conn.close()
+    report = asyncio.run(_run())
+    if report["found"] and not args.apply:
+        print("dry run: nothing deleted; repeat with --apply, then restart the control plane", file=sys.stderr)
     _print_json({"ok": True, **report})
     return 0
 
@@ -3436,6 +3791,8 @@ def _cmd_cp_web(args) -> int:
         collab.steering = normalize_steering(getattr(args, "collab_steering", None))
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
+        from .control_plane.collab_team_rooms import normalize_team_rooms
+        collab.team_rooms = normalize_team_rooms(getattr(args, "collab_team_rooms", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
     from .control_plane.rakazo_bridge import rakazo_bridge_config
     try:
@@ -3496,6 +3853,9 @@ def _cmd_cp_web(args) -> int:
             )
     except Exception:
         logging.exception("self-report of stack services failed")
+    hub_server = _wire_assistant_hub(svr)
+    if hub_server is not None:
+        logging.info("assistant hub listening on %s:%s", hub_server.host, hub_server.port)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
@@ -3504,6 +3864,8 @@ def _cmd_cp_web(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if hub_server is not None:
+            hub_server.shutdown()
         svr.shutdown()
         if artifact_bridge is not None:
             artifact_bridge.stop()
@@ -3657,6 +4019,8 @@ COLLAB_CONFIG_KEYS = {
     "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
     "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
     "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
+    # team collaboration slice 1: attach a team to a room, per-room guest level, the Suggest queue; YAML only, off by default
+    "team_rooms": ("collab_team_rooms", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
@@ -3692,9 +4056,11 @@ def _apply_collab_config(args, cp) -> None:
         elif kind is dict:
             from .control_plane.collab_attention import normalize_insights
             from .control_plane.collab_context import normalize_contextual
+            from .control_plane.collab_team_rooms import normalize_team_rooms
             from .control_plane.collab_workbench import normalize_steering
             try:
-                {"contextual": normalize_contextual, "insights": normalize_insights}.get(key, normalize_steering)(value)
+                {"contextual": normalize_contextual, "insights": normalize_insights,
+                 "team_rooms": normalize_team_rooms}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
@@ -3719,6 +4085,7 @@ HOT_COLLAB_SWITCHES = {
     "steering": ("steering_source", "dict"),
     "contextual": ("contextual_source", "dict"),
     "insights": ("insights_source", "dict"),
+    "team_rooms": ("team_rooms_source", "dict"),
     "delegation_enabled": ("delegation_source", "bool"),
     "replay_history": ("replay_history_source", "str"),
 }
@@ -3745,7 +4112,9 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
     from .control_plane.collab_attention import normalize_insights
     from .control_plane.collab_context import normalize_contextual
     from .control_plane.collab_workbench import normalize_steering
-    normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights}
+    from .control_plane.collab_team_rooms import normalize_team_rooms
+    normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights,
+                   "team_rooms": normalize_team_rooms}
 
     def check(key, value):
         return normalizers[key](value) if key in normalizers else value
@@ -3925,6 +4294,42 @@ def _cmd_bridge_hash_password(args):
         return 1
     print(hash_password(password))
     return 0
+
+
+def _start_assistant_hub(service):
+    """Start the tailnet-only assistant hub when both the assistant and ``personal_assistant.hub`` are enabled.
+
+    Returns ``(HubServer, WorkerRegistry)``, or ``(None, None)`` when off. ONE registry is built here so the owner API
+    can share it. A bind outside ``allowed_networks`` (or a busy port) stops startup with a clear message.
+    """
+    hub_cfg = service.config.get("hub") or {}
+    if not (service.is_enabled() and hub_cfg.get("enabled") is True):
+        return None, None
+    from datetime import timedelta
+
+    from .control_plane.assistant_hub.mcp import Hub
+    from .control_plane.assistant_hub.server import HubServer
+    from .control_plane.assistant_hub.workers import WorkerRegistry
+    registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
+                              worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
+    try:
+        server = HubServer(Hub(registry=registry, service=service, store=service.store), host=hub_cfg["host"],
+                           port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
+                           allowed_hosts=hub_cfg["allowed_hosts"])
+    except (ValueError, OSError) as exc:
+        raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
+    server.start()
+    return server, registry
+
+
+def _wire_assistant_hub(svr):
+    """Start the hub (when enabled) and hand the owner API the SAME registry the hub authenticates against."""
+    service = getattr(svr, "assistant", None)
+    if service is None:   # a server built without the assistant has no hub to start
+        return None
+    hub_server, registry = _start_assistant_hub(service)
+    svr.assistant_workers = registry
+    return hub_server
 
 
 def _assistant_config(cp):

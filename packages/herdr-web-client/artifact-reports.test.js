@@ -115,3 +115,23 @@ test('context lookup and link reads encode ids and send only the named filters',
     '/api/v1/artifacts/a%2F1/links',
   ]);
 });
+
+test('work graph reads and layout saves use the graph routes and send only what was named', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, options) => { calls.push({ url, options }); return response({}); } });
+  await client.workGraphSnapshot('project:p', { depth: 3, maxNodes: 500, asOf: '2026-10-30T00:00:00Z' });
+  await client.workGraphLayout('project:p', { which: 'personal' });
+  await client.saveWorkGraphLayout('project:p', { nodes: {} }, { shared: true, ifMatch: '"e1"' });
+  assert.equal(calls[0].url, '/api/v1/graph/work/snapshot?root=project%3Ap&depth=3&max_nodes=500&as_of=2026-10-30T00%3A00%3A00Z');
+  assert.equal(calls[1].url, '/api/v1/graph/work/layout?ref=project%3Ap&which=personal');
+  assert.equal(calls[2].options.method, 'PUT');
+  assert.deepEqual(JSON.parse(calls[2].options.body), { ref: 'project:p', document: { nodes: {} }, shared: true, if_match: '"e1"' });
+});
+
+test('the teams list asks only for what was named', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url) => { calls.push(url); return response({ items: [] }); } });
+  await client.workGraphTeams();
+  await client.workGraphTeams({ status: 'all', limit: 20, cursor: 'c 1' });
+  assert.deepEqual(calls, ['/api/v1/graph/work/teams', '/api/v1/graph/work/teams?status=all&limit=20&cursor=c+1']);
+});

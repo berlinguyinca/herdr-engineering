@@ -37,6 +37,8 @@ import { noteStreamContact, freshnessSources } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountFabricServices } from './fabric-services-view.js';
 import { mountPrTrail } from './pr-trail-view.js';
+import { mountTeamMap } from './team-map-view.js';
+import { mountTeams } from './teams-view.js';
 import { mountAgentEvolution, tabsHtml, TABS_STYLE, wireTabs } from './agent-evolution-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
@@ -83,6 +85,8 @@ const NAV = [
   { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
   { group: 'Agents', path: '/collab', label: 'Collaboration' },
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
+  { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
+  { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
   { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
@@ -225,6 +229,8 @@ const ROUTES = {
   '/local-services': viewServices,
   '/fabric-services': viewFabricServices,
   '/pr/:owner/:repo/:number': viewPrTrail,
+  '/teams': viewTeams,
+  '/team-map': viewTeamMap,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/personal-assistant': viewPersonalAssistant,
@@ -421,6 +427,18 @@ async function viewPrTrail(parts) {
   const [, owner, repo, number] = parts.map((p) => safeDecode(p) || '');
   root.innerHTML = `<p style="font-size:13px"><a href="#/github">← Projects</a></p>${liveHead('<h1>How this pull request got here</h1>')}<div id="pr-trail"></div>`;
   return mountPrTrail(root.querySelector('#pr-trail'), client, { owner, repo, number, host: route().query.get('host') || '', freshness: chipIn(root) });
+}
+
+async function viewTeams() {
+  root.innerHTML = `${liveHead('<h1>Your teams</h1>')}<div id="teams"></div>`;
+  return mountTeams(root.querySelector('#teams'), client, { freshness: chipIn(root) });
+}
+
+async function viewTeamMap() {
+  root.innerHTML = `${liveHead('<h1>Team map</h1>')}<div id="team-map"></div>`;
+  const view = mountTeamMap(root.querySelector('#team-map'), client, { root: route().query.get('root') || '', freshness: chipIn(root),
+    onRoot: (r) => history.replaceState(null, '', `#/team-map${r ? `?root=${encodeURIComponent(r)}` : ''}`) });
+  return ownPolling(view);   // positions the person moved must survive a live event, so only the Open button reloads
 }
 
 async function viewHandoffs() {

@@ -41,6 +41,7 @@ def route_registry(handler, server, parts, resource):
     scoped = len(parts) >= 6 and parts[4] not in {"for", "reconcile"}
     action = parts[5] if scoped else None
     links = scoped and len(parts) == 6 and action == "links" and method in {"GET", "POST"}
+    unlink = scoped and len(parts) == 7 and action == "links" and parts[6] == "remove" and method == "POST"
     lifecycle = (scoped and len(parts) == 6 and method == "POST"
                  and action in {"archive", "restore", "tombstone"})
     history = scoped and len(parts) == 6 and action == "lifecycle" and method == "GET"
@@ -49,7 +50,7 @@ def route_registry(handler, server, parts, resource):
         or (len(parts) == 7 and method == "GET")
         or (len(parts) == 8 and method == "POST" and parts[7] in {"complete", "abort"})
         or (len(parts) == 9 and method == "POST" and parts[7] == "parts" and _NUMBER.match(parts[8])))
-    if not any((lookup, reconcile, links, lifecycle, history, uploads)):
+    if not any((lookup, reconcile, links, unlink, lifecycle, history, uploads)):
         return False
     if server.artifact_store is None:
         handler._json({"error": "versioned artifact registry is unavailable"}, 503)
@@ -98,8 +99,35 @@ def route_registry(handler, server, parts, resource):
             handler._json({"artifact_id": artifact_id, "links": handler._artifact_call("list_links", artifact_id)})
         else:
             body = _json_body(handler, _LINK_FIELDS)
-            result = handler._artifact_call("link_context", artifact_id, created_by=principal, **body)
+            collab = getattr(server, "collab", None)
+            # R-ART3/R-RA3: a link to a room is exposure to its people, so the room must exist. An API key has no room
+            # membership to test, so existence is all there is to check; an unknown room gets the answer of any missing thing.
+            if body.get("room_id") and collab is not None and not collab.room_exists(body["room_id"]):
+                handler._deny(404, "not found")
+                return True
+            result =handler._artifact_call("link_context", artifact_id, created_by=principal, **body)
+            access = getattr(server, "room_artifact_access", None)
+            if access is not None and body.get("room_id") and result["linked"]:
+                try:
+                    access.sync_artifact(artifact_id)          # the room's people can read it now, not at the next change
+                except Exception:                              # noqa: BLE001 - the link stands; the next sync retries
+                    pass
             handler._json({"artifact_id": artifact_id, **result}, 201 if result["linked"] else 200)
+        return True
+
+    if unlink:
+        body = _json_body(handler, {"room_id"})
+        room_id = body.get("room_id")
+        if not isinstance(room_id, str) or not room_id.strip():
+            raise ValueError("room_id is required")
+        removed = handler._artifact_call("unlink_room", artifact_id, room_id)
+        access = getattr(server, "room_artifact_access", None)
+        if access is not None and removed:
+            try:
+                access.unlink(artifact_id, room_id)            # that room's people lose the derived read now
+            except Exception:                                  # noqa: BLE001 - the link is gone; the next sync or repair finishes
+                pass
+        handler._json({"artifact_id": artifact_id, "unlinked": removed})
         return True
 
     if history:

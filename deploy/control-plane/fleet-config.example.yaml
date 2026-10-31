@@ -189,6 +189,32 @@ sections:
       # are redacted from prompts, logs and events. Copy only what you need.
       # personal_assistant:
       #   enabled: false                 # master kill-switch (also gates the capability flag)
+      #   # OPTIONAL: tailnet-only MCP hub for coding agents (Claude Code). Off by default; records asks, reports and
+      #   # hook observations only (answers nothing, approves nothing). Bind loopback or the tailnet address, NEVER
+      #   # 0.0.0.0 and never behind the nginx edge. See docs/operations/assistant-hub.md.
+      #   hub:
+      #     enabled: false
+      #     host: "127.0.0.1"            # bind address; use your tailnet address (100.x) to serve other machines
+      #     port: 9483
+      #     allowed_networks: ["127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+      #     allowed_hosts: []            # extra accepted Host names, e.g. ["assistant.tailnet-name.ts.net"]
+      #     enrollment_ttl_seconds: 900  # one-time enrollment code lifetime
+      #     worker_ttl_days: 90          # redeemed worker credential lifetime
+      #     # tenant: default            # defaults to the assistant's default tenant
+      #   # OPTIONAL: earned action grants for hub workers with the `act` scope (docs/operations/assistant-hub.md).
+      #   # Nothing is autonomous yet: activation answers 409 until the Phase 3 judge gate exists.
+      #   grants:
+      #     shadow_days: 14              # global shadow period before any grant can be activated or honoured
+      #     shadow_started_at: null      # ISO-8601 with offset; null = stamped on first start
+      #     required_approvals:          # owner approvals of the exact action needed, per risk class
+      #       local_reversible: 5
+      #       remote_reversible: 10
+      #       outward: 30
+      #     min_sessions: 3              # distinct session ids among the counted approvals
+      #     min_tasks: 2                 # distinct task ids among the counted approvals
+      #     grant_ttl_days: 30           # lifetime of a proposed grant, and of an active one from activation
+      #     extra_vetoes: []             # extra hard denies: [{code: no_prod, reason: "...", argv_contains: "prod"}]
+      #     policy_version: 1            # bump to invalidate every existing grant
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)
@@ -214,12 +240,15 @@ sections:
       #   # Real inference. When `endpoint` is set the service uses an HTTP
       #   # chat-completions runner (OpenAI-compatible, incl. tool-calling); when
       #   # empty it falls back to a deterministic local runner (skeleton only).
-      #   # `api_key` is the llm-proxy PROJECT key and is never logged. `model` must
-      #   # be one the proxy actually serves (check GET /v1/models) or every call
-      #   # returns capacity_unavailable.
+      #   # `api_key` is the llm-proxy PROJECT key and is never logged. The model is
+      #   # chosen from what the proxy serves now (GET /v1/models, cached a minute):
+      #   # `model` is tried first while the proxy still serves it, or set `auto`;
+      #   # otherwise the first match in `preferred_models` (ids or * patterns) wins,
+      #   # then any served text model. A 429/404/502/503 moves on to the next one.
       #   inference:
       #     endpoint: "http://llm-proxy:8088/v1/chat/completions"
-      #     model: "REDACTED_MODEL_ID"   # e.g. a qwen* id present in the proxy's /v1/models
+      #     model: auto
+      #     preferred_models: ["qwen3.8-flash_next-*", "qwen3.8-text"]
       #     timeout: 60
       #     api_key: "REDACTED"          # llm-proxy project key (never logged)
       #   # Optional durable store. When set, the assistant snapshots its store to

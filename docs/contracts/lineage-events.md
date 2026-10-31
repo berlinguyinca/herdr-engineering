@@ -1056,3 +1056,12 @@ Times are server receipt times. No per-person or per-agent breakdown. Nothing is
 version of a (new or given) logical artifact, grants `read` to the named mail audience only, records original message metadata as
 artifact provenance (inside the ACL boundary), writes a private `thread:` node plus a `produced` edge to the artifact, and writes an
 `issue_link` only for a project-intelligence relationship that a person confirmed (`confirmed` and `human_verified`).
+
+### Assistant `read_lineage` operation `task` (2026-10-30)
+
+Read-only, through the same `read_graph` front door and the caller's principal as `node`/`neighborhood`/`list` (hidden, unknown and
+non-task ids are one `not found`; no flag-gated Work Graph route is used). It returns a FIXED-FIELD projection: `task_id`, `state`,
+`plan_digest`, `pull_requests[{id,state}]`, `ci[{id,state}]`, `verification{state,current,stale}`, `owner`, `host`, `partial`, `open`.
+States are an enum (anything else is `other`); digest, owner and host are pattern-validated tokens or dropped. No label, summary,
+reason or other attr text is copied, so mail- or model-written text cannot ride this path. Code: `assistant_lineage.py`
+(`project_task`); tests: `tests/control_plane/test_assistant_lineage.py`.

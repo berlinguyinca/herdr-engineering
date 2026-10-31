@@ -190,7 +190,7 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
-                         "contextual", "insights",
+                         "contextual", "insights", "team_rooms",
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled",
@@ -236,24 +236,17 @@ def collab_values(cfg: FleetConfig) -> dict:
         normalize_contextual(collab.get("contextual"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_team_rooms import normalize_team_rooms
+    try:
+        normalize_team_rooms(collab.get("team_rooms"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
     from .control_plane.collab import summary_fix_config
     try:
         summary_fix_config(collab.get("summary_fix"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
     return dict(collab)
-
-
-def _rakazo_slice(cfg: FleetConfig) -> dict:
-    """The Rakazo Cognito group collab-sync should mirror (only when it reads membership from files)."""
-    try:
-        bridge = cfg.section(CONTROL_PLANE_SECTION).get("rakazo_bridge")
-    except FleetConfigError:
-        return {}
-    cog = bridge.get("cognito") if isinstance(bridge, dict) else None
-    if isinstance(cog, dict) and cog.get("sync_dir") and cog.get("required_group"):
-        return {"rakazo_cognito_group": cog["required_group"]}
-    return {}
 
 
 def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
@@ -273,8 +266,7 @@ def render_collab(cfg: FleetConfig, out: Path) -> None:
     ``collab_artifacts: {enabled: <bool>}`` switch."""
     data = {"version": SCHEMA_VERSION,
             "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
-                                                 "values": {"collab": collab_values(cfg), **_collab_artifacts_slice(cfg),
-                                                            **_rakazo_slice(cfg)}}},
+                                                 "values": {"collab": collab_values(cfg), **_collab_artifacts_slice(cfg)}}},
             "hosts": {}}
     _parse(data)
     write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")

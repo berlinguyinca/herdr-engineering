@@ -43,9 +43,10 @@ testpaths = ["tests"]
 # The T16 end-to-end acceptance suite (tests/e2e, marker ``e2e``) spawns real servers and needs sibling checkouts, so a
 # plain ``pytest`` / scripts/validate.sh deselects it. Opt in with ``-m e2e`` (scripts/run_acceptance.py does).
 addopts = "--import-mode=importlib -m 'not e2e and not integration'"
+markers = [
+    "integration: needs an external dependency (a live Postgres via PA_PG_DSN, or a real CLI such as claude); deselected by default, opt in with -m integration",
+]
 
-[tool.pytest.ini_options.markers]
-integration = "requires a live Postgres (PA_PG_DSN); skipped by default"
 
 [tool.setuptools.package-data]
 herdr_engineering = ["control_plane/rakazo_defaults.json", "*.mjs", "skill_data/summary/*.md", "skill_data/summary/adapters/*.md",

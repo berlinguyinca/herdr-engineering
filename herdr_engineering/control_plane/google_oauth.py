@@ -13,13 +13,13 @@ from collections.abc import Callable
 
 from herdr_engineering.control_plane.google_workspace import (
     AUTH_URL,
-    GMAIL,
     MAX_RESPONSE,
     TIMEOUT,
     TOKEN_URL,
     GoogleError,
     _post_form,
     _urlopen,
+    error_detail,
     new_pkce,
 )
 
@@ -28,10 +28,21 @@ def default_opener(req, timeout):
     return _urlopen(req, timeout)
 
 
-__all__ = ["SCOPES", "REVOKE_URL", "new_pkce", "authorization_url", "exchange_authorization_code", "account_address", "revoke", "default_opener"]
+__all__ = ["SCOPES", "GMAIL_SCOPES", "CALENDAR_SCOPES", "IDENTITY_SCOPES", "normalize_scopes", "REVOKE_URL", "new_pkce", "authorization_url", "exchange_authorization_code", "account_address", "revoke", "default_opener"]
 
-SCOPES = ("https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose",
-          "https://www.googleapis.com/auth/calendar.readonly", "https://www.googleapis.com/auth/calendar.events")
+# Requested scopes: who signed in (OpenID email), the calendar, and Gmail read + compose (compose also allows sending, which the
+# assistant only does after a person approved the exact message). gmail.* are RESTRICTED scopes: the OAuth client stays
+# unverified (up to 100 users, a one-time warning screen) rather than paying for Google's annual security assessment.
+IDENTITY_SCOPES = ("openid", "https://www.googleapis.com/auth/userinfo.email")
+CALENDAR_SCOPES = ("https://www.googleapis.com/auth/calendar.readonly", "https://www.googleapis.com/auth/calendar.events")
+GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose")
+SCOPES = IDENTITY_SCOPES + CALENDAR_SCOPES + GMAIL_SCOPES
+USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+
+
+def normalize_scopes(granted) -> set[str]:
+    """Google may report the short form 'email' for the userinfo.email scope."""
+    return {"https://www.googleapis.com/auth/userinfo.email" if x == "email" else x for x in granted}
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
 
@@ -51,17 +62,18 @@ def exchange_authorization_code(opener: Callable, client: tuple[str, str], code:
 
 
 def account_address(opener: Callable, access_token: str) -> str:
-    req = urllib.request.Request(f"{GMAIL}/profile", method="GET",     # noqa: S310
+    req = urllib.request.Request(USERINFO_URL, method="GET",     # noqa: S310
                                  headers={"authorization": f"Bearer {access_token}", "accept": "application/json"})
     try:
         with opener(req, TIMEOUT) as resp:
             data = json.loads(resp.read(MAX_RESPONSE))
     except urllib.error.HTTPError as exc:
+        detail = error_detail(exc)
         exc.close()
-        raise GoogleError("unavailable") from None
+        raise GoogleError("unavailable", detail) from None
     except (urllib.error.URLError, OSError, ValueError):
-        raise GoogleError("unavailable") from None
-    address = data.get("emailAddress") if isinstance(data, dict) else None
+        raise GoogleError("unavailable", "network") from None
+    address = data.get("email") if isinstance(data, dict) and data.get("email_verified") is not False else None
     if not isinstance(address, str) or not address:
         raise GoogleError("unavailable")
     return address

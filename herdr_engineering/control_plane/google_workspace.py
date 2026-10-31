@@ -31,8 +31,8 @@ log = logging.getLogger(__name__)
 # legitimately include compose and event-writing now. Safety instead comes from the request surface. READ methods issue
 # only GET requests to read URLs; the two POSTs they use are the token endpoint and Calendar freeBusy, which only READS busy
 # intervals (a test allows exactly those two URLs as POST). WRITES (a Gmail DRAFT, a Calendar event, discarding a draft) live
-# behind ``write`` / ``create_*`` / ``delete_draft`` and the allow-listed ``_write``; nothing here can deliver mail, and
-# the module has no function for it. The assistant reaches ``write`` only after a person approved the exact content.
+# behind ``write`` / ``create_*`` / ``send_message`` / ``delete_draft`` and the allow-listed ``_write``; only ``send_message`` can
+# deliver mail, and only ``write`` reaches it (after a person approved the exact message). The assistant reaches ``write`` only after a person approved the exact content.
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -50,6 +50,8 @@ _BAD_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})    # con
 DRAFT_ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 MAX_ADDRESSES, MAX_TO, MAX_SUBJECT, MAX_DRAFT_BODY = 10, 300, 200, 800
 MAX_SUMMARY, MAX_LOCATION, MAX_REMINDER = 200, 200, 40320
+THREAD_ID = DRAFT_ID
+MESSAGE_ID_HEADER = re.compile(r"<[^<>\s\x00-\x1f\x7f]{1,200}>\Z")
 _ADDRESS = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~\-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,253}[A-Za-z0-9])?\Z")
 _RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})\Z")
 _EVENTS_URL = re.compile(re.escape(CALENDAR_API) + r"/calendars/[^/?#]{1,300}/events\Z")
@@ -59,9 +61,28 @@ _TIME = re.compile(r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})?
 class GoogleError(Exception):
     """A fixed, credential-free reason (``not_connected``, ``unauthorized``, ``unavailable`` ...)."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, detail: str = ""):
         super().__init__(reason)
         self.reason = reason
+        self.detail = detail      # "http_403:accessNotConfigured": status plus Google's short error code, for the log only
+
+
+_CODE = re.compile(r"[A-Za-z0-9_.-]{1,60}")
+
+
+def error_detail(exc: urllib.error.HTTPError) -> str:
+    """``http_<status>[:<code>]`` from a Google error response. Only Google's short machine code is kept, never the
+    description, so no credential or account text can reach a log."""
+    code = ""
+    try:
+        body = json.loads(exc.read(MAX_RESPONSE))
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            err = (err.get("errors") or [{}])[0].get("reason") or err.get("status")
+        code = err if isinstance(err, str) and _CODE.fullmatch(err) else ""
+    except (ValueError, OSError, AttributeError, IndexError, TypeError):
+        pass
+    return f"http_{exc.code}" + (f":{code}" if code else "")
 
 
 def _b64(raw: bytes) -> str:
@@ -81,10 +102,11 @@ def _post_form(opener: Callable, url: str, form: dict[str, str]) -> dict:
         with opener(req, TIMEOUT) as resp:
             return json.loads(resp.read(MAX_RESPONSE))
     except urllib.error.HTTPError as exc:
+        detail = error_detail(exc)
         exc.close()
-        raise GoogleError("unauthorized" if exc.code in (400, 401) else "unavailable") from None
+        raise GoogleError("unauthorized" if exc.code in (400, 401) else "unavailable", detail) from None
     except (urllib.error.URLError, OSError, ValueError):
-        raise GoogleError("unavailable") from None
+        raise GoogleError("unavailable", "network") from None
 
 
 def validate_write(tool_id: str, payload: Any) -> None:
@@ -93,6 +115,8 @@ def validate_write(tool_id: str, payload: Any) -> None:
     p = payload if isinstance(payload, dict) else {}
     if tool_id == "create_email_draft":
         GoogleWorkspace.validate_draft(p.get("to"), p.get("subject"), p.get("body"))
+    elif tool_id == "send_email":
+        GoogleWorkspace.validate_send(p.get("to"), p.get("subject"), p.get("body"), p.get("thread_id"), p.get("in_reply_to"))
     elif tool_id == "create_calendar_event":
         GoogleWorkspace.validate_event(p.get("summary"), p.get("start"), p.get("end"), p.get("location"), p.get("reminder_minutes"))
         if p.get("calendar_id") is not None:
@@ -124,6 +148,14 @@ class GoogleWorkspace:
             raise GoogleError("not_connected")
         if conn.status != "connected":
             raise GoogleError("needs_attention")
+
+    def _require_gmail(self, tenant: str, user: str) -> None:
+        """Gmail is a restricted scope this deployment does not request; without it the tools fail here, before any call."""
+        from .google_oauth import GMAIL_SCOPES
+        self._connection(tenant, user)
+        conn = self._store.get_connection(tenant, user, "google")
+        if conn is None or not set(GMAIL_SCOPES) <= set(conn.scopes):
+            raise GoogleError("forbidden")
 
     def invalidate(self, tenant: str, user: str) -> None:
         """Forget this person's cached access token, policy and resolved primary id (reconnect, disconnect, revoke)."""
@@ -282,6 +314,7 @@ class GoogleWorkspace:
                 for h in (msg.get("payload") or {}).get("headers") or [] if isinstance(h, dict)}
 
     def search_email(self, tenant: str, user: str, query: str, max_results: int = 5) -> list[dict]:
+        self._require_gmail(tenant, user)
         n = max(1, min(int(max_results), MAX_SEARCH))
         listing = self._get(tenant, user, f"{GMAIL}/messages", {"q": str(query)[:300], "maxResults": n})
         out = []
@@ -289,13 +322,17 @@ class GoogleWorkspace:
             mid = ref.get("id") if isinstance(ref, dict) else None
             if not isinstance(mid, str) or not _ID.fullmatch(mid):
                 continue
-            msg = self._get(tenant, user, f"{GMAIL}/messages/{mid}", {"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]})
+            msg = self._get(tenant, user, f"{GMAIL}/messages/{mid}", {"format": "metadata", "metadataHeaders": ["From", "Subject", "Date", "Message-ID"]})
             h = self._headers(msg)
-            out.append({"id": mid, "from": h.get("from", ""), "subject": h.get("subject", ""), "date": h.get("date", ""),
+            tid, header_id = msg.get("threadId"), h.get("message-id", "")
+            out.append({"id": mid, "thread_id": tid if isinstance(tid, str) and THREAD_ID.fullmatch(tid) else "",
+                        "message_id": header_id if MESSAGE_ID_HEADER.match(header_id) else "",
+                        "from": h.get("from", ""), "subject": h.get("subject", ""), "date": h.get("date", ""),
                         "snippet": str(msg.get("snippet", ""))[:200]})
         return out
 
     def read_email(self, tenant: str, user: str, message_id: str) -> dict:
+        self._require_gmail(tenant, user)
         if not isinstance(message_id, str) or not _ID.fullmatch(message_id):
             raise GoogleError("bad_request")
         msg = self._get(tenant, user, f"{GMAIL}/messages/{message_id}", {"format": "full"})
@@ -471,6 +508,16 @@ class GoogleWorkspace:
         return addrs, subj, body
 
     @classmethod
+    def validate_send(cls, to: Any, subject: Any, body: Any, thread_id: Any = None, in_reply_to: Any = None):
+        """The draft rules plus optional reply threading: a Gmail thread id and the Message-ID header being answered."""
+        addrs, subj, text = cls.validate_draft(to, subject, body)
+        if thread_id is not None and not (isinstance(thread_id, str) and THREAD_ID.fullmatch(thread_id)):
+            raise GoogleError("bad_request")
+        if in_reply_to is not None and not (isinstance(in_reply_to, str) and MESSAGE_ID_HEADER.match(in_reply_to)):
+            raise GoogleError("bad_request")
+        return addrs, subj, text, thread_id, in_reply_to
+
+    @classmethod
     def validate_event(cls, summary: Any, start: Any, end: Any, location: Any = None, reminder_minutes: Any = None) -> dict:
         title = cls._plain(summary, MAX_SUMMARY, "summary")
         times = []
@@ -494,8 +541,8 @@ class GoogleWorkspace:
         return event
 
     def _write(self, tenant: str, user: str, method: str, url: str, body: dict | None = None) -> dict:
-        """The ONLY non-read request path. Allow-listed: create a draft, create an event, discard a draft."""
-        ok = ((method == "POST" and (url == f"{GMAIL}/drafts" or _EVENTS_URL.match(url)))
+        """The ONLY non-read request path. Allow-listed: create a draft, send a message, create an event, discard a draft."""
+        ok = ((method == "POST" and (url in (f"{GMAIL}/drafts", f"{GMAIL}/messages/send") or _EVENTS_URL.match(url)))
               or (method == "DELETE" and url.startswith(f"{GMAIL}/drafts/") and DRAFT_ID.fullmatch(url[len(f"{GMAIL}/drafts/"):])))
         if not ok:
             raise GoogleError("bad_request")
@@ -513,6 +560,7 @@ class GoogleWorkspace:
 
     def create_draft(self, tenant: str, user: str, to: Any, subject: Any, body: Any) -> dict:
         """Save a Gmail DRAFT in the person's own account. It is never delivered; the person reviews it in Gmail."""
+        self._require_gmail(tenant, user)
         from email.message import EmailMessage
         addrs, subj, text = self.validate_draft(to, subject, body)
         try:
@@ -529,6 +577,7 @@ class GoogleWorkspace:
         return {"id": did}
 
     def list_drafts(self, tenant: str, user: str, max_results: int = 20) -> list[dict]:
+        self._require_gmail(tenant, user)
         n = max(1, min(int(max_results), 25))
         listing = self._get(tenant, user, f"{GMAIL}/drafts", {"maxResults": n})
         out = []
@@ -545,10 +594,33 @@ class GoogleWorkspace:
         return out
 
     def delete_draft(self, tenant: str, user: str, draft_id: Any) -> dict:
+        self._require_gmail(tenant, user)
         if not isinstance(draft_id, str) or not DRAFT_ID.fullmatch(draft_id):
             raise GoogleError("bad_request")
         self._write(tenant, user, "DELETE", f"{GMAIL}/drafts/{draft_id}")
         return {"id": draft_id, "discarded": True}
+
+    def send_message(self, tenant: str, user: str, to: Any, subject: Any, body: Any, thread_id: Any = None,
+                     in_reply_to: Any = None) -> dict:
+        """DELIVER one message from the person's own account. Only ``write`` calls this, after an approval of this exact
+        recipient, subject and body. A reply keeps its thread (threadId plus In-Reply-To / References)."""
+        self._require_gmail(tenant, user)
+        from email.message import EmailMessage
+        addrs, subj, text, tid, reply_to = self.validate_send(to, subject, body, thread_id, in_reply_to)
+        try:
+            msg = EmailMessage()
+            msg["To"], msg["Subject"] = ", ".join(addrs), subj
+            if reply_to:
+                msg["In-Reply-To"], msg["References"] = reply_to, reply_to
+            msg.set_content(text)
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        except (ValueError, TypeError, UnicodeError):
+            raise GoogleError("bad_request") from None
+        data = self._write(tenant, user, "POST", f"{GMAIL}/messages/send", {"raw": raw, **({"threadId": tid} if tid else {})})
+        mid = data.get("id")
+        if not isinstance(mid, str) or not DRAFT_ID.fullmatch(mid):
+            raise GoogleError("unavailable")
+        return {"id": mid, "thread_id": data.get("threadId") if isinstance(data.get("threadId"), str) else ""}
 
     def create_event(self, tenant: str, user: str, summary: Any, start: Any, end: Any, calendar_id: Any = None,
                      location: Any = None, reminder_minutes: Any = None) -> dict:
@@ -571,6 +643,10 @@ class GoogleWorkspace:
         if tool_id == "create_email_draft":
             return {"ok": True, "draft": self.create_draft(t, u, payload.get("to"), payload.get("subject"), payload.get("body")),
                     "note": "Saved as a draft in Gmail. Nothing was delivered."}
+        if tool_id == "send_email":
+            return {"ok": True, "sent": self.send_message(t, u, payload.get("to"), payload.get("subject"), payload.get("body"),
+                                                          payload.get("thread_id"), payload.get("in_reply_to")),
+                    "note": "Sent from your Gmail account."}
         if tool_id == "create_calendar_event":
             return {"ok": True, "event": self.create_event(t, u, payload.get("summary"), payload.get("start"), payload.get("end"),
                                                            payload.get("calendar_id"), payload.get("location"),

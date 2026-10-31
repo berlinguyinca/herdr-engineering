@@ -759,6 +759,27 @@ def test_insights_settings_are_yaml_only_validated_and_off_by_default(tmp_path, 
         cli._apply_collab_config(argparse.Namespace(), {"collab": {"insights": {"kill_switch": "no"}}})
 
 
+def test_team_rooms_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    import pytest as _pytest
+
+    from herdr_engineering.control_plane.collab_team_rooms import normalize_team_rooms
+    assert "team_rooms" in fcc.COLLAB_KEYS and "team_rooms" in cli.COLLAB_CONFIG_KEYS
+    assert "team_rooms" in cli.HOT_COLLAB_SWITCHES                                  # read per request, fail closed
+    assert normalize_team_rooms(None)["enabled"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, team_rooms={"enabled": True, "default_guest_level": "read_only"}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["team_rooms"]["default_guest_level"] == "read_only"
+    args = argparse.Namespace(collab_team_rooms=None)
+    cli._apply_collab_config(args, {"collab": {"team_rooms": {"enabled": True}}})
+    assert args.collab_team_rooms == {"enabled": True}
+    for bad in ({"default_guest_level": "direct"}, {"kill_switch": "no"}, {"unknown": 1}):
+        with _pytest.raises(SystemExit):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"team_rooms": bad}})
+        with _pytest.raises(fcc.FleetConfigError):
+            fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, team_rooms=bad))))
+
+
 def test_collab_skills_slice_is_accepted_and_forwarded(tmp_path):
     central = make_file(tmp_path, collab=dict(COLLAB, skills={"enabled": True}))
     values = fcc.collab_values(fcc.load_fleet_config(central))
@@ -915,16 +936,12 @@ def test_task_lease_is_a_validated_startup_collab_key_and_off_by_default():
             cli._task_lease(argparse.Namespace(), {"collab": {"task_lease_seconds": bad}})
 
 
-def test_render_collab_slice_carries_the_rakazo_group_only_for_file_membership(tmp_path):
-    def slice_for(cognito, n=[0]):
-        n[0] += 1
-        d = tmp_path / f"c{n[0]}"
-        d.mkdir()
-        central = make_file(d, collab=dict(COLLAB), rakazo_bridge={"enabled": True, "cognito": cognito})
-        out = d / "s" / "collab-config.json"
-        fcc.render_collab(fcc.load_fleet_config(central), out)
-        return yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"]
-
-    base = {"pool_id": "us-west-2_TESTPOOL", "client_ids": ["clientabc123456"], "required_group": "rakazo-users"}
-    assert slice_for({**base, "sync_dir": "/etc/herdr/collab-sync"})["rakazo_cognito_group"] == "rakazo-users"
-    assert "rakazo_cognito_group" not in slice_for(base)
+def test_render_collab_slice_never_carries_rakazo_settings(tmp_path):
+    # The public --collab-only container refuses any setting beyond control_plane.collab: a Rakazo key in the slice
+    # crash-loops it (seen on the 2026-10-30 deploy).
+    central = make_file(tmp_path, collab=dict(COLLAB), rakazo_bridge={"enabled": True, "cognito": {
+        "pool_id": "us-west-2_TESTPOOL", "client_ids": ["clientabc123456"], "required_group": "rakazo-users",
+        "sync_dir": "/etc/herdr/collab-sync"}})
+    out = tmp_path / "s" / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(central), out)
+    assert yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"] == {"collab": COLLAB}

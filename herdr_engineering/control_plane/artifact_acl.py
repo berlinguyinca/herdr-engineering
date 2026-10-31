@@ -15,7 +15,7 @@ class ArtifactAcl:
         self._holders: dict[str, set] = {}      # artifact id -> principals with a stored grant (read-time gate index)
 
     def grant(self, artifact_id: str, principal_id: str, permissions: set[str],
-              *, expires_at: float | None = None) -> dict:
+              *, expires_at: float | None = None, granted_by: str | None = None) -> dict:
         if principal_id.startswith(COLLAB_PREFIXES):
             raise ValueError("collaborator grants use the collaborators route")
         allowed = {"read", "edit", "review", "share", "admin"}
@@ -23,6 +23,8 @@ class ArtifactAcl:
             raise ValueError("invalid artifact ACL grant")
         grant = {"artifact_id": artifact_id, "principal_id": principal_id,
                  "permissions": sorted(permissions), "expires_at": expires_at}
+        if granted_by is not None:          # who wrote it; room-derived grants say "room:<id>" so they can be revoked as a set
+            grant["granted_by"] = granted_by
         self._grants[(artifact_id, principal_id)] = grant
         self._holders.setdefault(artifact_id, set()).add(principal_id)
         if self.on_change:
@@ -54,6 +56,21 @@ class ArtifactAcl:
         """Principal ids holding a live ``permission`` on the artifact (expired grants are dropped on the way)."""
         return [pid for pid in sorted(self._holders.get(artifact_id, ())) if self.can(artifact_id, pid, permission)]
 
+    def grants_by(self, granted_by: str) -> list[dict]:
+        """Stored grants written by ``granted_by`` (copies), for revoking a source's grants as a set."""
+        return [dict(g) for g in self._grants.values() if g.get("granted_by") == granted_by]
+
+    def held(self, artifact_id: str, principal_id: str) -> dict | None:
+        """The live stored grant (a copy) whatever its source, or None. Unlike ``can`` it does not decide a permission."""
+        grant = self._grants.get((artifact_id, principal_id))
+        if not grant or (grant["expires_at"] is not None and grant["expires_at"] <= self.now()):
+            return None
+        return dict(grant)
+
+    def grants_with_source_prefix(self, prefix: str) -> list[dict]:
+        """Stored grants whose ``granted_by`` starts with ``prefix`` (copies), e.g. every ``room:`` grant."""
+        return [dict(g) for g in self._grants.values() if str(g.get("granted_by") or "").startswith(prefix)]
+
     def has_grants(self, artifact_id: str) -> bool:
         return any(aid == artifact_id for aid, _ in self._grants)
 
@@ -67,5 +84,6 @@ class ArtifactAcl:
                 "principal_id": grant["principal_id"],
                 "permissions": list(grant.get("permissions") or []),
                 "expires_at": grant.get("expires_at"),
+                **({"granted_by": grant["granted_by"]} if grant.get("granted_by") else {}),
             }
 

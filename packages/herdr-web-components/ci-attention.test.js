@@ -79,3 +79,32 @@ test('the opened row shows the commit, failing steps, log excerpt, and says when
   assert.match(html, /no agent session is linked/);
   assert.match(renderCiDetail(f, null, {}), /Loading the failing step/);
 });
+
+const pr = (n, runNo, minAgo, over = {}) => run({ run_number: runNo, state: 'failure', event: 'pull_request', ref: `refs/pull/${n}/merge`, branch: `pr-${n}`, created_at: iso(minAgo + 10), finished_at: iso(minAgo), ...over });
+
+test('unfixed failures of one repository are one row: the newest leads and the others are listed inside it', () => {
+  const m = model([pr(1421, 2632, 18), pr(1420, 2624, 500), pr(1419, 2621, 510),
+    run({ run_number: 2625, state: 'failure', created_at: iso(540), finished_at: iso(530) })]);
+  assert.equal(m.failures.length, 1, 'one attention item for the repository');
+  assert.equal(m.failures[0].label, 'PR #1421');
+  assert.equal(m.failures[0].repository, 'o/r');
+  assert.deepEqual(m.failures[0].refs.map((x) => x.label), ['PR #1421', 'PR #1420', 'PR #1419', 'main']);
+  assert.equal(m.refFailures.length, 4, 'every ref is still judged on its own');
+  const html = renderCiAttention(m);
+  assert.match(html, /4 branches or PRs failing/);
+  assert.equal((html.match(/data-cia-row=/g) || []).length, 1);
+  assert.match(renderCiDetail(m.failures[0], null, {}), /Also failing in o\/r[\s\S]*PR #1420[\s\S]*PR #1419[\s\S]*main/);
+});
+
+test('a ref that was fixed drops out of the combined row, and a repository with nothing failing leaves it', () => {
+  const m = model([pr(1421, 5, 10), pr(1420, 4, 400), pr(1420, 6, 20, { state: 'success' })]);
+  assert.deepEqual(m.failures[0].refs.map((x) => x.label), ['PR #1421']);
+  assert.equal(m.failures[0].refs.length, 1);
+  assert.doesNotMatch(renderCiAttention(m), /branches or PRs failing/);
+  assert.equal(model([run({ state: 'success' })]).failures.length, 0);
+});
+
+test('different repositories stay separate rows', () => {
+  const m = ciAttentionModel({ pipelines: { 'a/a': [run({ repository: 'a/a', state: 'failure' })], 'b/b': [run({ repository: 'b/b', state: 'failure' })] } }, NOW);
+  assert.deepEqual(m.failures.map((f) => f.repository).sort(), ['a/a', 'b/b']);
+});

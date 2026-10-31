@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -42,6 +43,12 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
+from .assistant_hub.events import WorkerEvent, event_size
+from .assistant_hub.verbs import Verb
+from .assistant_hub.vetoes import FIXED_VETOES
+from .assistant_hub.workers import Enrollment, Worker
+from .inference_models import RETRY_CODES, ModelResolver
 from .reminders import REMINDER_TOOLS, ReminderError
 from .reminders import run_tool as run_reminder_tool
 
@@ -87,6 +94,12 @@ _FEATURE_FLAG_KEY = "personal_assistant"
 
 
 _TENANT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}\Z")
+
+
+def _model_preferences(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ValueError("control_plane.personal_assistant.inference.preferred_models must be a list of model ids or patterns")
+    return list(value)
 
 
 def _tenant_id(value: Any, where: str) -> str:
@@ -174,6 +187,7 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "endpoint": str(inference.get("endpoint", "")),
             "timeout": int(inference.get("timeout", 60)),
             "model": str(inference.get("model", "")),
+            "preferred_models": _model_preferences(inference.get("preferred_models") or []),
             "api_key": str(inference.get("api_key", "")),  # never logged
         },
         # optional durable Postgres persistence (herdr_pa). When ``dsn`` is set,
@@ -233,8 +247,145 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
         # Scheduled CI watch (ci_watch.py): a deterministic server-side loop, off unless enabled; YAML only.
         "ci_watch": ci_watch_config(section.get("ci_watch")),
+        # Scheduled inbox watch (inbox_watch.py): new mail goes to the assistant as one triage turn; off unless enabled.
+        "inbox_watch": inbox_watch_config(section.get("inbox_watch")),
         # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
         "apps": apps_config(section.get("apps")),
+        # Tailnet-only MCP hub: off unless enabled; the tenant defaults to the section's default tenant.
+        "hub": _hub_config(section.get("hub"), default_tenant),
+        # Earned per-user action grants for hub workers (shadow period, approval thresholds, extra vetoes).
+        "grants": _grants_config(section.get("grants")),
+    }
+
+
+_HUB_KEYS = {"enabled", "host", "port", "allowed_networks", "allowed_hosts", "enrollment_ttl_seconds",
+             "worker_ttl_days", "tenant"}
+_HUB_DEFAULT_NETWORKS = ["127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+
+
+def _hub_str_list(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ValueError(f"{where} must be a list of non-empty strings")
+    return [v.strip() for v in value]
+
+
+def _hub_pos_int(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{where} must be a positive integer")
+    return value
+
+
+def _hub_config(raw: Any, default_tenant: str) -> dict[str, Any]:
+    """``personal_assistant.hub``. Off by default. Unknown keys or malformed values stop startup."""
+    where = "control_plane.personal_assistant.hub"
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - _HUB_KEYS
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{where}.enabled must be true or false (not a string)")
+    host = raw.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError(f"{where}.host must be a non-empty string")
+    port = raw.get("port", 9483)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(f"{where}.port must be an integer between 1 and 65535")
+    networks = _hub_str_list(raw.get("allowed_networks", list(_HUB_DEFAULT_NETWORKS)), f"{where}.allowed_networks")
+    for net in networks:
+        try:
+            ipaddress.ip_network(net, strict=True)
+        except ValueError as exc:
+            raise ValueError(f"{where}.allowed_networks has an invalid CIDR {net!r}: {exc}") from exc
+    return {
+        "enabled": enabled,
+        "host": host.strip(),
+        "port": port,
+        "allowed_networks": networks,
+        "allowed_hosts": _hub_str_list(raw.get("allowed_hosts", []), f"{where}.allowed_hosts"),
+        "enrollment_ttl_seconds": _hub_pos_int(raw.get("enrollment_ttl_seconds", 900), f"{where}.enrollment_ttl_seconds"),
+        "worker_ttl_days": _hub_pos_int(raw.get("worker_ttl_days", 90), f"{where}.worker_ttl_days"),
+        "tenant": _tenant_id(raw.get("tenant", default_tenant), "hub.tenant"),
+    }
+
+
+_GRANTS_KEYS = {"shadow_days", "shadow_started_at", "required_approvals", "min_sessions", "min_tasks",
+                "grant_ttl_days", "extra_vetoes", "policy_version"}
+_GRANTS_RISKS = ("local_reversible", "remote_reversible", "outward")
+_GRANTS_APPROVALS = {"local_reversible": 5, "remote_reversible": 10, "outward": 30}
+
+
+def _grants_str(value: Any, where: str, limit: int) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+        raise ValueError(f"{where} must be a non-empty string of at most {limit} characters")
+    return value
+
+
+def _grants_extra_vetoes(value: Any, where: str) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{where} must be a list of mappings")
+    out: list[dict[str, str]] = []
+    for i, item in enumerate(value):
+        at = f"{where}[{i}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{at} must be a mapping")
+        unknown = set(item) - {"code", "reason", "verb", "argv_contains"}
+        if unknown:
+            raise ValueError(f"{at} has unknown keys: {sorted(unknown)}")
+        entry = {"code": _grants_str(item.get("code"), f"{at}.code", 64),
+                 "reason": _grants_str(item.get("reason"), f"{at}.reason", 200)}
+        if entry["code"] in FIXED_VETOES:
+            raise ValueError(f"{at}.code must not reuse the fixed veto code {entry['code']!r}")
+        if "verb" in item:
+            verb = _grants_str(item["verb"], f"{at}.verb", 64)
+            if verb not in {v.value for v in Verb}:
+                raise ValueError(f"{at}.verb is not a known verb: {verb!r}")
+            entry["verb"] = verb
+        if "argv_contains" in item:
+            entry["argv_contains"] = _grants_str(item["argv_contains"], f"{at}.argv_contains", 200)
+        if "verb" not in entry and "argv_contains" not in entry:
+            raise ValueError(f"{at} needs verb or argv_contains")
+        out.append(entry)
+    return out
+
+
+def _grants_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.grants``. ``shadow_started_at`` null means the hub stamps it on first start."""
+    where = "control_plane.personal_assistant.grants"
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - _GRANTS_KEYS
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    started = raw.get("shadow_started_at")
+    if started is not None:
+        try:
+            if not isinstance(started, str):
+                raise ValueError("not a string")
+            parsed = datetime.fromisoformat(started)
+        except ValueError as exc:
+            raise ValueError(f"{where}.shadow_started_at must be an ISO-8601 string or null") from exc
+        if parsed.tzinfo is None:
+            raise ValueError(f"{where}.shadow_started_at must include a UTC offset")
+    approvals = raw.get("required_approvals", {})
+    if not isinstance(approvals, dict):
+        raise ValueError(f"{where}.required_approvals must be a mapping")
+    bad = set(approvals) - set(_GRANTS_RISKS)
+    if bad:
+        raise ValueError(f"{where}.required_approvals has unknown keys: {sorted(bad)}")
+    merged = {**_GRANTS_APPROVALS, **approvals}
+    return {
+        "shadow_days": _hub_pos_int(raw.get("shadow_days", 14), f"{where}.shadow_days"),
+        "shadow_started_at": started,
+        "required_approvals": {k: _hub_pos_int(merged[k], f"{where}.required_approvals.{k}") for k in _GRANTS_RISKS},
+        "min_sessions": _hub_pos_int(raw.get("min_sessions", 3), f"{where}.min_sessions"),
+        "min_tasks": _hub_pos_int(raw.get("min_tasks", 2), f"{where}.min_tasks"),
+        "grant_ttl_days": _hub_pos_int(raw.get("grant_ttl_days", 30), f"{where}.grant_ttl_days"),
+        "extra_vetoes": _grants_extra_vetoes(raw.get("extra_vetoes", []), f"{where}.extra_vetoes"),
+        "policy_version": _hub_pos_int(raw.get("policy_version", 1), f"{where}.policy_version"),
     }
 
 
@@ -293,6 +444,50 @@ def ci_watch_config(raw: Any) -> dict[str, Any]:
         "source": source,
         "max_age_seconds": max(60, int(raw.get("max_age_seconds", 6 * 3600))),
         "tick_budget_seconds": max(5, int(raw.get("tick_budget_seconds", 60))),
+        "users": users,
+    }
+
+
+def inbox_watch_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.inbox_watch``. Off by default. A malformed section stops startup rather than guessing."""
+    raw = raw if isinstance(raw, dict) else {}
+    where = "control_plane.personal_assistant.inbox_watch"
+    unknown = set(raw) - {"enabled", "interval_seconds", "users", "query", "lookback_minutes", "tick_budget_seconds",
+                          "max_new_per_tick", "renew_grants", "renew_within_days"}
+    if not isinstance(raw.get("renew_grants", False), bool):
+        raise ValueError(f"{where}.renew_grants must be true or false")
+    days = raw.get("renew_within_days", 7)
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 29:
+        raise ValueError(f"{where}.renew_within_days must be a whole number of days from 1 to 29")
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    query = raw.get("query", "in:inbox -category:promotions -category:social -category:forums")
+    if not isinstance(query, str) or not query.strip() or len(query) > 200 or "after:" in query or "\n" in query:
+        raise ValueError(f"{where}.query must be a Gmail search of up to 200 characters without 'after:' (the loop adds it)")
+    users: list[dict[str, str]] = []
+    for i, row in enumerate(raw.get("users") or []):
+        if not isinstance(row, dict) or set(row) - {"tenant_id", "user_id", "assistant_id"}:
+            raise ValueError(f"{where}.users[{i}] must be a mapping with tenant_id, user_id and optional assistant_id")
+        uid = row.get("user_id")
+        if not isinstance(uid, str) or not uid.strip() or len(uid) > 200:
+            raise ValueError(f"{where}.users[{i}].user_id must be a non-empty string")
+        aid = row.get("assistant_id") or ""
+        if not isinstance(aid, str) or len(aid) > 100:
+            raise ValueError(f"{where}.users[{i}].assistant_id must be a string")
+        users.append({"tenant_id": _tenant_id(row.get("tenant_id", "default"), f"{where}.users[{i}].tenant_id"),
+                      "user_id": uid.strip(), "assistant_id": aid})
+    if len(users) > 20:
+        raise ValueError(f"{where}.users lists at most 20 users")
+    return {
+        "enabled": raw.get("enabled", False) is True,
+        "interval_seconds": max(60, int(raw.get("interval_seconds", 300))),
+        "max_new_per_tick": min(10, max(1, int(raw.get("max_new_per_tick", 10)))),       # Gmail search returns at most 10
+        "lookback_minutes": min(2880, max(30, int(raw.get("lookback_minutes", 360)))),
+        "tick_budget_seconds": max(5, int(raw.get("tick_budget_seconds", 120))),
+        # keep the watched assistant's read-only mail/calendar grants from lapsing (see AssistantService.renew_read_grants)
+        "renew_grants": raw.get("renew_grants", False),
+        "renew_within_seconds": days * 24 * 3600,
+        "query": query.strip(),
         "users": users,
     }
 
@@ -873,6 +1068,17 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
             "to": {"type": "string", "description": "One or more plain addresses, comma separated (at most 10)."},
             "subject": {"type": "string"}, "body": {"type": "string", "description": "Plain text, at most 800 characters."}},
             "required": ["to", "subject", "body"]}},
+    "send_email": {
+        "sensitive": True,
+        "description": "SEND an email from the user's Gmail. A person must approve the exact recipient, subject and body "
+                       "first; nothing is delivered before that. For a reply give thread_id and in_reply_to (the Message-ID "
+                       "of the mail being answered) so it stays in the thread.",
+        "parameters": {"type": "object", "properties": {
+            "to": {"type": "string", "description": "One or more plain addresses, comma separated (at most 10)."},
+            "subject": {"type": "string"}, "body": {"type": "string", "description": "Plain text, at most 800 characters."},
+            "thread_id": {"type": "string", "description": "Gmail thread id of the mail being answered (optional)."},
+            "in_reply_to": {"type": "string", "description": "Message-ID header of that mail, e.g. <abc@mail.x> (optional)."}},
+            "required": ["to", "subject", "body"]}},
     "create_calendar_event": {
         "sensitive": True,
         "description": "Create a Google Calendar event (no attendees, no invitations) after a person approves its exact "
@@ -935,9 +1141,11 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
     "read_lineage": {
         "sensitive": False,
         "description": "Read the mission/agent lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) "
-                       "as the calling user may see it. Read-only; returns freshness and source.",
+                       "as the calling user may see it. Read-only; returns freshness and source. operation=task (node_id=task:...) "
+                       "returns a fixed-field status card (state, plan digest, PR/CI/verification state, owner, host) with no "
+                       "free text.",
         "parameters": {"type": "object", "properties": {
-            "operation": {"type": "string", "enum": ["node", "neighborhood", "list"]},
+            "operation": {"type": "string", "enum": ["node", "neighborhood", "list", "task"]},
             "node_id": {"type": "string"}, "node_type": {"type": "string"},
             "depth": {"type": "integer"}, "limit": {"type": "integer"}},
             "required": ["operation"]}},
@@ -950,18 +1158,22 @@ def tool_sensitive(tool_id: str) -> bool:
 
 
 # Tools whose every use needs an explicit approval: a grant may never carry ``preauthorized`` for them.
-NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell", "create_email_draft", "create_calendar_event"})
+NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell", "create_email_draft", "send_email", "create_calendar_event"})
 
 # Google writes: run through ``google_write`` only after approval. They are requested by the assistant (not the person), so
 # the person whose mailbox or calendar it is can approve them; ``send_message``/``run_shell`` still need a distinct approver.
-GOOGLE_WRITE_TOOLS = frozenset({"create_email_draft", "create_calendar_event"})
+GOOGLE_WRITE_TOOLS = frozenset({"create_email_draft", "send_email", "create_calendar_event"})
+
+# The only grants a scheduled job may extend: reads of the person's own mail and calendar. A write grant is never renewed
+# automatically, and neither is one that was revoked or has already lapsed (a person grants those again).
+RENEWABLE_READ_TOOLS = frozenset({"search_email", "read_email", "list_calendar_events", "find_free_time"})
 
 # Tools the post-approval executor can run. Everything else (send_message, run_shell, edit_shared) is NOT here: an
 # approval for those stays a record, and ``execute_approved_action`` refuses them (fail closed). ``draft_email`` only
 # ever saves a draft; nothing in this set sends.
 EXECUTABLE_AFTER_APPROVAL = frozenset({"request_review", "propose_branch", "request_mission", "comment_on_node",
                                        "draft_email", "delegate", "connector_request",
-                                       "create_email_draft", "create_calendar_event"})
+                                       "create_email_draft", "send_email", "create_calendar_event"})
 
 
 def _validate_google_write(tool_id: str, payload: Any) -> None:
@@ -1028,6 +1240,9 @@ def describe_action(tool_id: str, scope: str, payload: dict[str, Any] | None) ->
     elif tool_id == "create_email_draft":
         return (f"Save a Gmail DRAFT (nothing is delivered) to {v('to', 300)} with subject {v('subject', 200)} and this "
                 f"body: {v('body', 800)}")[:_DRY_RUN_MAX_GOOGLE]
+    elif tool_id == "send_email":
+        return (f"SEND an email NOW from your Gmail account to {v('to', 300)} with subject {v('subject', 200)}"
+                + (" (a reply in its thread)" if p.get("thread_id") else "") + f" and this body: {v('body', 800)}")[:_DRY_RUN_MAX_GOOGLE]
     elif tool_id == "create_calendar_event":
         return (f"Create a calendar event \"{v('summary', 200)}\" from {v('start', 40)} to {v('end', 40)} on calendar "
                 f"{v('calendar_id', 256) if p.get('calendar_id') else 'primary'}"
@@ -1187,7 +1402,7 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
     def __init__(self, store: AssistantStore, *, endpoint: str, timeout: int = 60,
                  model: str = "", api_key: str = "", context_provider: Any | None = None,
                  context_gate: Callable[[AssistantRun], bool] | None = None,
-                 urlopen: Callable | None = None):
+                 urlopen: Callable | None = None, resolver: ModelResolver | None = None):
         self.store = store
         self.endpoint = endpoint
         self.timeout = timeout
@@ -1196,6 +1411,7 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         self.context_provider = context_provider
         self.context_gate = context_gate
         self._urlopen = urlopen
+        self.resolver = resolver  # picks among the models the gateway serves; None sends ``model`` as configured
         # callables (run) -> text appended to the bot's own instructions, e.g. the app's agent skills; never raise
         self.prompt_extras: list[Callable[[AssistantRun], str]] = []
 
@@ -1230,8 +1446,34 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         return {"role": "system", "content": ctx} if ctx else None
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Send one chat-completions request and return the parsed body.
-        Raises on transport failure; callers degrade to a safe reply."""
+        """Send one chat-completions request and return the parsed body. A gateway that has no capacity for (or no longer
+        serves) the model sends the request on to the next candidate. Raises on transport failure; callers degrade to a safe
+        reply."""
+        wanted = str(payload.get("model", ""))
+        # a bot's own ``manual:`` model is the person's choice and is sent as it is; only the configured default is resolved
+        if self.resolver is None or (wanted not in ("", "auto") and wanted != self.model):
+            return self._post_one(payload)
+        candidates = self.resolver.candidates(wanted)
+        if not candidates:
+            raise RuntimeError("no model available: the gateway lists none and none is pinned")
+        last: Exception | None = None
+        for model in candidates:
+            try:
+                if model != wanted:
+                    _log.warning("assistant model %r not used; asking %r", wanted or "auto", model)
+                return self._post_one({**payload, "model": model})
+            except Exception as exc:  # noqa: BLE001
+                code = getattr(exc, "code", None)
+                if code is None and not isinstance(exc, OSError):      # timeouts and resets are OSErrors; a bug is not
+                    raise
+                if code is not None and code not in RETRY_CODES:
+                    raise
+                _log.warning("assistant model %r failed (%s); trying the next", model,
+                             code if code is not None else type(exc).__name__)
+                last = exc
+        raise last  # type: ignore[misc]
+
+    def _post_one(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._urlopen:
             return self._urlopen(self.endpoint, payload, timeout=self.timeout)
         from urllib.request import Request, urlopen
@@ -1286,7 +1528,8 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
     def execute(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
         try:
             return self._parse_reply(self._post(self._payload(run, messages)))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._log_failure(exc)
             return "[http-model runner] inference unavailable"
 
     def step(self, run: AssistantRun, messages: list[dict],
@@ -1304,8 +1547,14 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
                    "tool_choice": "auto"}
         try:
             return self._parse_step(self._post(payload))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._log_failure(exc)
             return {"content": "[http-model runner] inference unavailable", "tool_calls": []}
+
+    @staticmethod
+    def _log_failure(exc: Exception) -> None:
+        """Why a reply degraded: the exception class and HTTP status only, never its text (it could carry a URL or key)."""
+        _log.warning("assistant inference unavailable: %s (status %s)", type(exc).__name__, getattr(exc, "code", None))
 
 
 def _urllib_transport(url: str, method: str, headers: dict[str, str],
@@ -1519,6 +1768,21 @@ class AssistantStore:
         self.delegations: dict[str, DelegationRequest] = {}
         self.proposals: dict[str, AssistantProposal] = {}
         self.notifications: dict[str, AssistantNotification] = {}
+        self.workers: dict[str, Worker] = {}
+        self.enrollments: dict[str, Enrollment] = {}
+        self.worker_events: dict[str, WorkerEvent] = {}   # insertion order == oldest first
+        self.action_grants: dict[str, ActionGrant] = {}
+        self.action_requests: dict[str, ActionRequestRow] = {}      # insertion order == oldest first
+        self.action_evidence: dict[str, ActionEvidence] = {}        # insertion order == oldest first
+        self.max_action_rows_per_tenant = 5000
+        self.max_action_grants_per_tenant = 2000
+        self._request_index: dict[str, dict[str, None]] = {}        # tenant -> request ids, oldest first
+        self._evidence_index: dict[str, dict[str, None]] = {}
+        self.policy_state: dict[str, Any] = {}                      # small durable policy facts (shadow start)
+        self.max_events_per_tenant = 1000
+        self.max_event_bytes_per_tenant = 4 * 1024 * 1024
+        self._event_index: dict[str, dict[str, int]] = {}   # tenant -> {event_id: size}, oldest first
+        self._event_bytes: dict[str, int] = {}
         self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
         self._audit: list[dict[str, Any]] = []
         # (entry) -> None. Wired by the control plane to the repo event store so every entry is durable BEFORE it is
@@ -1577,6 +1841,13 @@ class AssistantStore:
                 "delegations": [self._e_to_dict(d) for d in self.delegations.values()],
                 "proposals": [self._e_to_dict(x) for x in self.proposals.values()],
                 "notifications": [self._e_to_dict(x) for x in self.notifications.values()],
+                "workers": [self._e_to_dict(x) for x in self.workers.values()],
+                "enrollments": [self._e_to_dict(x) for x in self.enrollments.values()],
+                "worker_events": [self._e_to_dict(x) for x in self.worker_events.values()],
+                "action_grants": [self._e_to_dict(x) for x in self.action_grants.values()],
+                "action_requests": [self._e_to_dict(x) for x in self.action_requests.values()],
+                "action_evidence": [self._e_to_dict(x) for x in self.action_evidence.values()],
+                "policy_state": dict(self.policy_state),
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
             }
@@ -1610,6 +1881,33 @@ class AssistantStore:
             self.notifications = {x.notification_id: x for x in
                                   (self._e_from_dict(AssistantNotification, d)
                                    for d in snap.get("notifications", []))}
+            self.workers = {x.worker_id: x for x in
+                            (self._e_from_dict(Worker, d) for d in snap.get("workers", []))}
+            self.enrollments = {x.enrollment_id: x for x in
+                                (self._e_from_dict(Enrollment, d) for d in snap.get("enrollments", []))}
+            self.worker_events = {x.event_id: x for x in
+                                  (self._e_from_dict(WorkerEvent, d) for d in snap.get("worker_events", []))}
+            self._event_index, self._event_bytes = {}, {}
+            for x in self.worker_events.values():
+                self._index_event(x)
+            self.action_grants = {x.grant_id: x for x in
+                                  (self._e_from_dict(ActionGrant, d) for d in snap.get("action_grants", []))}
+            self.action_requests = {x.request_id: x for x in
+                                    (self._e_from_dict(ActionRequestRow, d) for d in snap.get("action_requests", []))}
+            self.action_evidence = {x.evidence_id: x for x in
+                                    (self._e_from_dict(ActionEvidence, d) for d in snap.get("action_evidence", []))}
+            self._request_index, self._evidence_index = {}, {}
+            for r in self.action_requests.values():
+                self._request_index.setdefault(r.tenant_id, {})[r.request_id] = None
+            for ev in self.action_evidence.values():
+                self._evidence_index.setdefault(ev.tenant_id, {})[ev.evidence_id] = None
+            self.policy_state = dict(snap.get("policy_state", {}))
+            for rows, index in ((self.action_requests, self._request_index),
+                                (self.action_evidence, self._evidence_index)):
+                for idx in index.values():           # an oversized snapshot must not stay over the cap
+                    while len(idx) > self.max_action_rows_per_tenant:
+                        rows.pop(next(iter(idx)), None)
+                        del idx[next(iter(idx))]
             self._routine_fired = set(snap.get("routine_fired", []))
             kept = {e.get("event_id") for e in snap.get("audit", [])}
             merged = [dict(e) for e in snap.get("audit", [])]
@@ -1617,14 +1915,123 @@ class AssistantStore:
             merged.sort(key=lambda e: (str(e.get("timestamp", "")), str(e.get("tenant_id", "")), int(e.get("seq", 0))))
             self._audit = merged
 
+    def _index_event(self, event: WorkerEvent) -> None:
+        size = event_size(event.payload)
+        self._event_index.setdefault(event.tenant_id, {})[event.event_id] = size
+        self._event_bytes[event.tenant_id] = self._event_bytes.get(event.tenant_id, 0) + size
+
+    def add_worker_event(self, event: WorkerEvent) -> None:
+        """Insert, then drop the tenant's oldest events until both the count and byte budgets hold."""
+        with self._lock:
+            self.worker_events[event.event_id] = event
+            self._index_event(event)
+            idx = self._event_index[event.tenant_id]
+            while len(idx) > 1 and (len(idx) > self.max_events_per_tenant
+                                    or self._event_bytes[event.tenant_id] > self.max_event_bytes_per_tenant):
+                old = next(iter(idx))
+                self._event_bytes[event.tenant_id] -= idx.pop(old)
+                del self.worker_events[old]
+            self._after_mutation()
+
+    # -- action grants, requests and evidence (assistant hub) -------------------
+    def _bounded_put(self, rows: dict[str, Any], index: dict[str, dict[str, None]], tenant_id: str, row_id: str,
+                     row: Any) -> None:
+        existing = rows.get(row_id)
+        if existing is not None and existing.tenant_id != tenant_id:
+            raise ValueError(f"id {row_id!r} already belongs to another tenant")     # ids are immutable per tenant
+        rows[row_id] = row
+        idx = index.setdefault(tenant_id, {})
+        idx[row_id] = None                  # re-putting an id keeps its original position
+        while len(idx) > self.max_action_rows_per_tenant:
+            # decided rows go first, so a flood of vetoed or decided requests never pushes out a pending one
+            old = next((k for k in idx if getattr(rows.get(k), "status", "") in ("vetoed", "denied", "approved")),
+                       None) or next(iter(idx))
+            del idx[old]
+            rows.pop(old, None)
+
+    @staticmethod
+    def _sorted_copies(rows: list[Any]) -> list[Any]:
+        return [replace(r) for r in sorted(rows, key=lambda r: r.created_at)]
+
+    def put_action_grant(self, grant: ActionGrant) -> None:
+        with self._lock:
+            if grant.grant_id not in self.action_grants:
+                held = sum(1 for g in self.action_grants.values() if g.tenant_id == grant.tenant_id)
+                if held >= self.max_action_grants_per_tenant:
+                    raise ValueError(f"tenant {grant.tenant_id!r} already holds {held} action grants")
+            self.action_grants[grant.grant_id] = replace(grant)
+            self._after_mutation()
+
+    def get_action_grant(self, grant_id: str, *, tenant_id: str, user_id: str) -> ActionGrant | None:
+        with self._lock:
+            g = self.action_grants.get(grant_id)
+            return replace(g) if g and g.tenant_id == tenant_id and g.user_id == user_id else None
+
+    def list_action_grants(self, tenant_id: str, user_id: str) -> list[ActionGrant]:
+        with self._lock:
+            return self._sorted_copies([g for g in self.action_grants.values()
+                                        if g.tenant_id == tenant_id and g.user_id == user_id])
+
+    def put_action_request(self, request: ActionRequestRow) -> None:
+        with self._lock:
+            self._bounded_put(self.action_requests, self._request_index, request.tenant_id, request.request_id,
+                              replace(request))
+            self._after_mutation()
+
+    def get_action_request(self, request_id: str, *, tenant_id: str, user_id: str) -> ActionRequestRow | None:
+        with self._lock:
+            r = self.action_requests.get(request_id)
+            return replace(r) if r and r.tenant_id == tenant_id and r.user_id == user_id else None
+
+    def list_action_requests(self, tenant_id: str, user_id: str, status: str | None = None) -> list[ActionRequestRow]:
+        with self._lock:
+            return self._sorted_copies([r for r in self.action_requests.values()
+                                        if r.tenant_id == tenant_id and r.user_id == user_id
+                                        and (status is None or r.status == status)])
+
+    def add_action_evidence(self, evidence: ActionEvidence) -> None:
+        with self._lock:
+            self._bounded_put(self.action_evidence, self._evidence_index, evidence.tenant_id, evidence.evidence_id,
+                              replace(evidence))
+            self._after_mutation()
+
+    def list_action_evidence(self, tenant_id: str, user_id: str, key_id: str | None = None) -> list[ActionEvidence]:
+        with self._lock:
+            return self._sorted_copies([e for e in self.action_evidence.values()
+                                        if e.tenant_id == tenant_id and e.user_id == user_id
+                                        and (key_id is None or e.key_id == key_id)])
+
+    def ensure_shadow_started(self, now: datetime, configured: datetime | None = None) -> datetime:
+        """The shadow period's start: the configured time if set, else the first time seen (persisted)."""
+        if configured is not None:
+            return as_utc(configured)
+        now = as_utc(now)
+        with self._lock:
+            stored = self.policy_state.get("shadow_started_at")
+            if stored:
+                return as_utc(datetime.fromisoformat(stored))
+            self.policy_state["shadow_started_at"] = now.isoformat()
+            self._after_mutation()
+            return now
+
     def persist(self) -> None:
         if not self._persist_path:
             return
         path = self._persist_path
         tmp = path + ".tmp"
         data = self.snapshot()
-        with open(tmp, "w") as f:
-            json.dump(data, f)
+        # The snapshot holds the owner's private data: create the temp file 0600 (a stale tmp is chmodded too).
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
         os.replace(tmp, path)
 
     def load_persisted(self) -> None:
@@ -1808,6 +2215,16 @@ class AssistantStore:
         with self._lock:
             self.grants[g.grant_id] = g
         self._after_mutation()
+
+    def extend_grant(self, grant_id: str, expires_at: datetime) -> bool:
+        """Move a grant's expiry later, atomically with the check that it is still not revoked (a concurrent revoke wins)."""
+        with self._lock:
+            g = self.grants.get(grant_id)
+            if g is None or g.revoked_at is not None or expires_at <= g.expires_at:
+                return False
+            g.expires_at = expires_at
+        self._after_mutation()
+        return True
 
     def list_grants(self, *, tenant_id: str, user_id: str,
                     assistant_id: str | None = None) -> list[AssistantGrant]:
@@ -2027,6 +2444,7 @@ class AssistantService:
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
         self.google_write = None      # (tenant, user, tool_id, payload) -> dict; runs ONLY an approved Google draft/event
+        self.canonical_person = lambda tenant, user: (tenant, user)   # single-operator rule hook (see RakazoBridge.canonical_person); identity until api.py wires it
         self.reminders = None         # ReminderStore, set by the server; reminders need no Google account
         self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.apps is set up
         self.lineage_read = None
@@ -2051,6 +2469,8 @@ class AssistantService:
                     timeout=int(inf.get("timeout", 60)),
                     model=str(inf.get("model", "")),
                     api_key=str(inf.get("api_key", "")),
+                    resolver=ModelResolver(inf["endpoint"], str(inf.get("api_key", "")),
+                                           list(inf.get("preferred_models") or [])),
                     context_provider=self.fleet_context,
                     context_gate=lambda run: self.fleet_allowed(run.user_id))
             else:
@@ -2090,6 +2510,9 @@ class AssistantService:
         return user_id in allowed or "*" in allowed
 
     # -- feature flag gate -----------------------------------------------------
+    def is_enabled(self) -> bool:
+        return bool(self.config.get("enabled"))
+
     def _require_enabled(self) -> None:
         if not self.config.get("enabled"):
             raise AssistantUnavailable("personal assistant is disabled")
@@ -2307,6 +2730,28 @@ class AssistantService:
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.grant.created", subject_id=g.grant_id)
         return g
+
+    def renew_read_grants(self, *, tenant_id: str, user_id: str, assistant_id: str, within_seconds: int,
+                          actor: str) -> int:
+        """Extend this assistant's still-active read-only Google grants that expire within ``within_seconds`` to the full
+        grant lifetime. Skips write tools, preauthorized grants, revoked grants and grants that already lapsed. Each
+        renewal is audited. Returns how many were renewed."""
+        self._require_enabled()
+        now = self.now()
+        ttl = self.config["grant_max_ttl_seconds"]
+        within = timedelta(seconds=min(within_seconds, ttl // 2))     # a window as long as the lifetime would renew every tick
+        renewed = 0
+        for g in self.store.list_grants(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id):
+            if (g.tool_id not in RENEWABLE_READ_TOOLS or not g.active(now) or g.constraints.get("preauthorized")
+                    or g.expires_at - now > within):
+                continue
+            if not self.store.extend_grant(g.grant_id, now + timedelta(seconds=ttl)):
+                continue
+            self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,
+                                    action="assistant.grant.renewed", subject_id=g.grant_id,
+                                    detail=f"{g.tool_id} until {(now + timedelta(seconds=ttl)).isoformat(timespec='seconds')}")
+            renewed += 1
+        return renewed
 
     def revoke_grant(self, grant_id: str, *, tenant_id: str, user_id: str) -> None:
         self._require_enabled()
@@ -4024,7 +4469,8 @@ class AssistantService:
             if self.reminders is None:
                 raise AssistantError("reminders are not enabled")
             try:
-                return run_reminder_tool(self.reminders, tool_id, tenant_id, user_id, payload, self.now(),
+                r_tenant, r_user = self.canonical_person(tenant_id, user_id)   # data key only; the run keeps the real principal
+                return run_reminder_tool(self.reminders, tool_id, r_tenant, r_user, payload, self.now(),
                                          self.config["notifications"]["timezone"])
             except ReminderError as exc:
                 raise AssistantError(str(exc)) from None

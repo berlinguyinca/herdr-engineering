@@ -267,6 +267,29 @@ def _collab_ops(ev: dict) -> list[dict]:
         status = _text(p.get("status"), 64) if t == "task_updated" else None
         ops.append(ent("task", tid, status=status, **sc,
                        attrs={"last_update": t, "result_chars": len(str(p.get("result") or "")) or None}))
+    elif t in ("team_attached", "team_detached") and rid and _text(p.get("team_id")):
+        # Team collaboration slice 1.  A team's membership is its own data: the AGENTS the owner attached carry a
+        # ``team_role`` fact on the team, the attach is a live ``references`` edge team -> room, and NOTHING here reads the
+        # room's people (design contradiction 1).  No entity upsert, so an attach cannot widen the visibility of a team that
+        # was made without a room.
+        tid = _text(p["team_id"])
+        sc = _scope("room", rooms=[rid], project=pid)
+        mode = "add" if t == "team_attached" else "remove"
+        ops.append(edge("references", ("team", tid), ("room", rid), mode, **sc))
+        agents = p.get("agents") or {}
+        for aid in sorted(agents if isinstance(agents, dict) else agents):
+            aid = _text(aid)
+            if not aid:
+                continue
+            role = _text(agents.get(aid), 64) if isinstance(agents, dict) else None
+            if t == "team_attached":
+                ops.append(ent("agent", aid, "scope", **_scope(None, rooms=[rid])))
+                ops.append(fact("team_role", f"agent:{aid}", ("team", tid), "open", role=role, **sc))
+                ops.append(fact("agent_grant", f"agent:{aid}", ("room", rid), "open",
+                                actions=sorted((p.get("actions") or {}).get(aid) or []), expires_at=None, team_id=tid, **sc))
+            else:
+                ops.append(fact("team_role", f"agent:{aid}", ("team", tid), "close", **sc))
+                ops.append(fact("agent_grant", f"agent:{aid}", ("room", rid), "close", **sc))
     elif t == "mission_linked" and rid and _text(p.get("mission_id")):
         mid = _text(p["mission_id"])
         sc = _scope("room", rooms=[rid], project=pid)
@@ -394,10 +417,41 @@ def _artifact_ops(ev: dict) -> list[dict]:
     return artifact_ops(art, ver, bindings, parent_version_id=_text(p.get("parent_version_id")))
 
 
+TEAM_ORIGIN = "explicit"          # attrs.origin of a team somebody created on purpose (the per-project team says "project")
+
+
+def _team_ops(ev: dict) -> list[dict]:
+    """Explicit teams (operator action; see ``WorkGraphStore.team_command``).  A team linked to a room is visible to that
+    room's non-guest members -- the room's members ARE the team's members; one with no room is visible to operators only
+    (``room`` visibility with no rooms), so a team is never named to people it does not list."""
+    t, p, native = ev["event_type"], ev["payload"], ev["entity_id"]
+    if not native:
+        return []
+    if t == "team_created":
+        name, pid, rid = _text(p.get("name"), 120), _text(p.get("project_id")), _text(p.get("room_id"))
+        if not name:
+            return []
+        sc = _scope("room", rooms=[rid] if rid else (), project=pid)
+        ops = [ent("team", native, display_name=name, status="active", **sc,
+                   attrs={"origin": TEAM_ORIGIN}, aliases=[("team_explicit", native)])]
+        if pid:
+            ops.append(edge("references", ("project", pid), ("team", native), **sc))
+        if rid:
+            ops.append(edge("contains", ("team", native), ("room", rid), **sc))
+        return ops
+    if t == "team_renamed" and _text(p.get("name"), 120):
+        return [ent("team", native, display_name=_text(p.get("name"), 120))]
+    if t == "team_archived":
+        return [ent("team", native, status="archived")]
+    return []
+
+
 def ops_for_event(ev: dict) -> list[dict]:
     et = ev["entity_type"]
     if et == "collab":
         return _collab_ops(ev)
+    if et == "team":
+        return _team_ops(ev)
     if et == "session":
         return _session_ops(ev)
     if et == "artifact":
@@ -405,7 +459,7 @@ def ops_for_event(ev: dict) -> list[dict]:
     return []
 
 
-HANDLED_ENTITY_TYPES = ("collab", "session", "artifact")
+HANDLED_ENTITY_TYPES = ("collab", "session", "artifact", "team")
 
 
 def assertions_for_event(ev: dict, ops: list[dict] | None = None) -> list[dict]:

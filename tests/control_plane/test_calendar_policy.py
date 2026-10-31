@@ -7,7 +7,7 @@ import pytest
 from herdr_engineering.control_plane import google_workspace as gw
 from herdr_engineering.control_plane.app_credentials import CredentialStore, SecretBox
 from herdr_engineering.control_plane.calendar_policy import CalendarPolicy
-from herdr_engineering.control_plane.google_oauth import SCOPES
+from herdr_engineering.control_plane.google_oauth import GMAIL_SCOPES, SCOPES
 
 from .test_google_workspace import REFRESH, SECRET, ws
 
@@ -18,8 +18,8 @@ def store(tmp_path):
     key.write_bytes(os.urandom(32))
     st = CredentialStore(SecretBox(str(key)))
     st.put_client("google", "cid", SECRET)
-    st.put_connection("default", "u1", "google", account="u1@x.org", scopes=list(SCOPES), refresh_token=REFRESH)
-    st.put_connection("default", "u2", "google", account="u2@x.org", scopes=list(SCOPES), refresh_token="2//other-refresh")
+    st.put_connection("default", "u1", "google", account="u1@x.org", scopes=list(SCOPES + GMAIL_SCOPES), refresh_token=REFRESH)
+    st.put_connection("default", "u2", "google", account="u2@x.org", scopes=list(SCOPES + GMAIL_SCOPES), refresh_token="2//other-refresh")
     return st
 
 
@@ -96,7 +96,7 @@ def test_case_variants_are_refused_on_list_and_read_paths(store):
 def test_reconnect_with_a_different_account_reresolves_primary(store):
     w, g = ws(store, blocked={("default", "u1"): ["new@x.org"]})
     w.list_events("default", "u1")                       # primary resolves to ann@x.org: allowed, and cached
-    store.put_connection("default", "u1", "google", account="new@x.org", scopes=list(SCOPES), refresh_token=REFRESH)
+    store.put_connection("default", "u1", "google", account="new@x.org", scopes=list(SCOPES + GMAIL_SCOPES), refresh_token=REFRESH)
     g.primary = "new@x.org"
     refuses(w.list_events, "default", "u1")              # even without invalidate(): the account changed
     w2, g2 = ws(store, blocked={("default", "u1"): ["new@x.org"]})

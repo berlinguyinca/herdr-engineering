@@ -88,11 +88,26 @@ class ArtifactContextMixin:
             ctx_key(link_kind, task_id=task_id, project_id=project_id, issue_ref=issue_ref, room_id=room_id))
         return result == "INSERT 0 1" if isinstance(result, str) else True
 
+    async def unlink_room(self, artifact_id: str, room_id: str) -> int:
+        """Remove every binding between an artifact and a room (all link kinds). Returns how many were removed; none is fine."""
+        _, room_id = validate_context("room", room_id)
+        rows = await self._conn.fetch(
+            "DELETE FROM artifact_bindings WHERE artifact_id=$1 AND room_id=$2 RETURNING 1", artifact_id, room_id)
+        return len(rows)
+
     async def list_links(self, artifact_id: str) -> list[dict]:
         rows = await self._conn.fetch(
             "SELECT task_id, project_id, issue_ref, room_id, link_kind, version_id, created_at "
             "FROM artifact_bindings WHERE artifact_id=$1 AND ctx_key IS NOT NULL ORDER BY binding_id", artifact_id)
         return [self._jsonable(dict(row)) for row in rows]
+
+    async def room_artifact_ids(self, room_id: str) -> list[str]:
+        """Active artifacts bound to a room, for the room-membership grant sync (no principal filter: it only feeds grants)."""
+        _, room_id = validate_context("room", room_id)
+        rows = await self._conn.fetch(
+            "SELECT DISTINCT a.artifact_id FROM artifacts a JOIN artifact_bindings b ON b.artifact_id=a.artifact_id "
+            "WHERE b.room_id=$1 AND b.ctx_key IS NOT NULL AND a.lifecycle='active' ORDER BY a.artifact_id", room_id)
+        return [row["artifact_id"] for row in rows]
 
     async def list_by_context(self, *, principal_id: str, kind: str, ref: str, query: str | None = None,
                               media_type: str | None = None, limit: int = 50,

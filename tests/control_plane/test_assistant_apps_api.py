@@ -42,8 +42,8 @@ class Resp:
 def fake_google(req, timeout):
     if req.full_url.endswith("/token"):
         return Resp({"refresh_token": "r-tok", "access_token": "a-tok", "scope": " ".join(SCOPES)})
-    if req.full_url.endswith("/profile"):
-        return Resp({"emailAddress": "ann@example.com"})
+    if req.full_url.endswith("/userinfo"):
+        return Resp({"email": "ann@example.com", "email_verified": True})
     return Resp({})
 
 
@@ -148,10 +148,10 @@ def test_callback_redirects_and_a_bad_state_redirects_with_error_not_500(ready):
     url = call(ready, BASE + "/google/connect", {}, "POST")[1]["url"]
     state = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["state"][0]
     assert raw_get(ready, cb + f"?state={state}&code=thecode") == (302, "/#/personal-assistant?connected=google")
-    google = next(p for p in call(ready, BASE)[1]["providers"] if p["id"] == "gmail")
+    google = next(p for p in call(ready, BASE)[1]["providers"] if p["id"] == "calendar")
     assert google["connected"] is True and google["account"] == "ann@example.com"
     # the person who started it, not the caller (the callback has no caller), got the connection
-    other = next(p for p in call(ready, BASE, key=OTHER)[1]["providers"] if p["id"] == "gmail")
+    other = next(p for p in call(ready, BASE, key=OTHER)[1]["providers"] if p["id"] == "calendar")
     assert other["connected"] is False
     # state is single use
     assert raw_get(ready, cb + f"?state={state}&code=thecode")[1].endswith("error=bad_state")
@@ -232,7 +232,7 @@ def test_a_second_key_cannot_touch_another_persons_connection(ready):
     call(ready, BASE + "/google/blocked-calendars", {"ids": ["mine"]}, "PUT")
     assert call(ready, BASE + "/google", None, "DELETE", key=OTHER)[0] == 200      # deletes OTHER's (nonexistent) own
     call(ready, BASE + "/google/blocked-calendars", {"ids": ["theirs"]}, "PUT", key=OTHER)
-    mine = next(p for p in call(ready, BASE)[1]["providers"] if p["id"] == "gmail")
+    mine = next(p for p in call(ready, BASE)[1]["providers"] if p["id"] == "calendar")
     assert mine["connected"] is True
     assert call(ready, BASE + "/google/blocked-calendars")[1] == {"ids": ["mine"]}
 

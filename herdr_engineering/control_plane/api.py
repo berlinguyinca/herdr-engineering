@@ -304,7 +304,8 @@ class ControlPlaneServer:
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None,
-                 collab_grant_store=None, collab_artifacts_enabled: bool = False):
+                 collab_grant_store=None, collab_artifacts_enabled: bool = False,
+                 assistant_workers=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -484,6 +485,9 @@ class ControlPlaneServer:
                 config=_build_assistant_config(assistant_config or {}), repo=repo)
         else:
             self.assistant = assistant_service
+        # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
+        # The owner routes /api/v1/assistant-workers read it at request time, so it may be attached after startup.
+        self.assistant_workers = assistant_workers
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
         from .rakazo_artifacts import RegistryBackend
@@ -506,7 +510,10 @@ class ControlPlaneServer:
                                     collab=collab, artifacts_fn=lambda: RegistryBackend(self))
                        if _bridge_cfg["enabled"] else None)
         self._build_assistant_apps(assistant_apps_dsn)
+        if self.rakazo is not None:
+            self.rakazo.single_operator_fn = lambda: self.single_operator
         self._build_reminders(assistant_apps_dsn)
+        self.assistant.canonical_person = self._canonical_person
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
         scopes = {}
@@ -567,6 +574,8 @@ class ControlPlaneServer:
         from .review_quorum import RereviewLedger
         self.rereview = RereviewLedger(repo)
         self._refusal_logged: dict = {}    # T16 gap C: durable re-review requests (the route 404s when the quorum is off)
+        from .single_flight_cache import SingleFlightCache
+        self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
         self.collab_require_https = collab_require_https
         # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
@@ -614,6 +623,7 @@ class ControlPlaneServer:
                 self.ingest.reserved_node = collab.is_external_node
                 self.ingest.service_node = collab.is_hcn_node
                 collab.lineage_sink = self._external_lineage
+                self._wire_room_artifact_access(collab, artifact_store, artifact_acl, unified_workspace_config)
                 collab.quorum_config = review_quorum        # T15: review items and the "reviewed at head" evidence use the T06 policy
         self.host = host
         self.port = port
@@ -675,8 +685,9 @@ class ControlPlaneServer:
                 from .google_workspace import GoogleWorkspace
                 _gw = GoogleWorkspace(apps=self.apps)
                 self.apps.on_change = _gw.invalidate
-                self.assistant.google_read = _gw.run
-                self.assistant.google_write = _gw.write
+                # Single-operator rule: map the data key (never the approval actor) through the bridge when there is one.
+                self.assistant.google_read = lambda t, u, tool, payload: _gw.run(*self._canonical_person(t, u), tool, payload)
+                self.assistant.google_write = lambda t, u, tool, payload: _gw.write(*self._canonical_person(t, u), tool, payload)
                 self.google = _gw
             from .assistant_lineage import LineageReader, principal_resolver
             self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
@@ -701,6 +712,15 @@ class ControlPlaneServer:
                         log.warning("ci_watch: user %s is in tenant %s per personal_assistant.tenancy, not %s; "
                                     "the watch will find no assistant for it", _u["user_id"],
                                     self.assistant.tenant_for(_u["user_id"]), _u["tenant_id"])
+            from .assistant import inbox_watch_config
+            from .inbox_watch import InboxWatchRunner
+            _iw = self.assistant.config.get("inbox_watch") or inbox_watch_config(None)
+            self.inbox_watch = InboxWatchRunner(self.assistant, lambda: getattr(self, "google", None), _iw)
+            for _u in (_iw["users"] if _iw["enabled"] else []):
+                if _u["tenant_id"] != self.assistant.tenant_for(_u["user_id"]):
+                    log.warning("inbox_watch: user %s is in tenant %s per personal_assistant.tenancy, not %s; "
+                                "the watch will find no assistant for it", _u["user_id"],
+                                self.assistant.tenant_for(_u["user_id"]), _u["tenant_id"])
             from .assistant_dispatch import DelegationConsumer
             self.delegation_consumer = DelegationConsumer(
                 self.assistant, self.handoffs,
@@ -1224,6 +1244,36 @@ class ControlPlaneServer:
             except OSError as exc:
                 raise ValueError(f"control_plane.architecture.explain.api_key_file is unreadable: {exc.strerror}") from exc
 
+    def _wire_room_artifact_access(self, collab, artifact_store, artifact_acl, config) -> None:
+        """P03 room-derived read access: people in a room read the artifacts linked to it, as ordinary read grants
+        (artifact_room_access.py). Only with control_plane.unified_workspace.room_artifact_access: true (default off)."""
+        self.room_artifact_access = None
+        enabled = (self.unified_workspace_enabled and isinstance(config, dict)
+                   and config.get("room_artifact_access") is True)
+        if not enabled or artifact_store is None or artifact_acl is None:
+            return
+        from .artifact_room_access import RoomArtifactAccess, principal_for
+        from .collab import CollabError
+
+        def call(method, *args, **kwargs):
+            runner = getattr(artifact_store, "sync_call", None) or (artifact_store if callable(artifact_store) else None)
+            if runner is None:
+                raise RuntimeError("versioned artifact registry adapter is unavailable")
+            return runner(method, *args, **kwargs)
+        access = RoomArtifactAccess(artifact_acl, call, collab.room_readers, now=time.time)
+        self.room_artifact_access = access
+        collab.on_room_members_changed = access.notify
+
+        def page(user_id, room_id, query):
+            try:
+                limit = int(query.get("limit", "50"))
+            except ValueError:
+                raise CollabError(400, "limit must be an integer") from None
+            return call("list_by_context", principal_id=principal_for(user_id), kind="room", ref=room_id,
+                        query=query.get("q"), media_type=query.get("media_type"), limit=limit, cursor=query.get("cursor"))
+        collab.artifact_room_handle = page
+        access.start(collab.room_ids)
+
     def _external_lineage(self, envelope, principal, valid=None):
         """Ingest one envelope the HCN service built for an external agent. The principal's allowed room is
         registered from the envelope's own room (which the service took from the enrollment), so the
@@ -1424,6 +1474,11 @@ class ControlPlaneServer:
             raise InvalidError("native agent is not ready for prompt delivery")
         return adapter.send_input(target, message, machine=machine, session=server)
 
+    def _canonical_person(self, tenant, user):
+        """Single-operator rule (RakazoBridge.canonical_person); identity when there is no bridge."""
+        rakazo = getattr(self, "rakazo", None)
+        return rakazo.canonical_person(tenant, user) if rakazo is not None else (tenant, user)
+
     def _build_reminders(self, dsn):
         """Reminders need an assistant and nothing else (no Google). Without an assistant there is no store and no scheduler."""
         from .reminders import PostgresReminderPersistence, ReminderScheduler, ReminderStore
@@ -1611,6 +1666,8 @@ class ControlPlaneServer:
         self._start_background_thread(self._deployments_loop)
         if getattr(self, "ci_watch", None) is not None and self.ci_watch.config["enabled"]:
             self._start_background_thread(self.ci_watch.run)
+        if getattr(self, "inbox_watch", None) is not None and self.inbox_watch.config["enabled"]:
+            self._start_background_thread(self.inbox_watch.run)
         if getattr(self, "reminder_scheduler", None) is not None:
             self.reminder_scheduler.start()
         if self.collab is not None and self.collab.lineage_sink is not None:
@@ -1701,6 +1758,8 @@ class ControlPlaneServer:
         self._deployments_stop.set()
         if getattr(self, "ci_watch", None) is not None:
             self.ci_watch.stop()
+        if getattr(self, "inbox_watch", None) is not None:
+            self.inbox_watch.stop()
         if getattr(self, "reminder_scheduler", None) is not None:
             self.reminder_scheduler.stop()
         if self._summary_scanner and self._summary_scanner.ident is not None:
@@ -2342,7 +2401,8 @@ def _make_handler(server, public=False, operator=False):
             # segment (the router keeps ``a/b`` as ONE part), so it is masked and ``[^/]+`` still matches it.
             dpath = "/".join(seg.replace("/", "\x00") for seg in segs)
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps"}
+            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
+                                    "assistant-action-requests", "assistant-grants"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _STEER_ACK.match(dpath) or _is_rereview(path)):
@@ -2447,7 +2507,8 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-routines", "assistant-connectors",
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
-                                        "assistant-reminders"}
+                                        "assistant-reminders", "assistant-workers",
+                                        "assistant-action-requests", "assistant-grants"}
 
         def _mutate_verb(self):
             if operator:
@@ -2477,7 +2538,8 @@ def _make_handler(server, public=False, operator=False):
             err = self._require("operator")
             if err:
                 return err
-            if resource in ("assistant-apps", "assistant-reminders"):
+            if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
+                            "assistant-action-requests", "assistant-grants"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3663,10 +3725,14 @@ def _make_handler(server, public=False, operator=False):
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
                     filters = _ci_reports_query(self.path)
-                    view = {**r.ci_reports(**filters), "repos": server.ci_monitor.snapshot().get("repos", [])}
-                    view = annotate_ci_history(view, r,
-                        repository_languages=cached_github_languages(server.github_monitor))
-                    return self._json(server.ci_monitor.report_redactor()(view))
+
+                    def build_reports():
+                        view = {**r.ci_reports(**filters), "repos": server.ci_monitor.snapshot().get("repos", [])}
+                        view = annotate_ci_history(view, r,
+                            repository_languages=cached_github_languages(server.github_monitor))
+                        return server.ci_monitor.report_redactor()(view)
+                    # Several seconds to build, asked for by every open CI page: one build per key per few seconds.
+                    return self._json(server.ci_reports_cache.get((self.path, r.ci_reports_version()), build_reports))
                 if what == "pipeline":
                     view = server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number"),
@@ -3722,6 +3788,10 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_apps(parts, None)
             if resource == "assistant-reminders":
                 return self._assistant_reminders(parts)
+            if resource == "assistant-workers":
+                return self._assistant_workers(parts)
+            if resource in ("assistant-action-requests", "assistant-grants"):
+                return self._assistant_hub_owner(parts, resource)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -4194,6 +4264,10 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_apps(parts, body)
             if resource == "assistant-reminders":
                 return self._assistant_reminders(parts)
+            if resource == "assistant-workers":
+                return self._assistant_workers(parts, body)     # body was read above; never read it twice
+            if resource in ("assistant-action-requests", "assistant-grants"):
+                return self._assistant_hub_owner(parts, resource, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4272,6 +4346,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "rate_limited"}, 429)
             if store is None:
                 return self._json({"error": "not_set_up"}, 409)
+            tenant, user = server._canonical_person(tenant, user)
             tz = zone(server.assistant.config["notifications"]["timezone"])
             if self.command == "GET" and len(parts) == 4:
                 return self._json({"reminders": [r.as_dict(tz) for r in store.list(tenant, user)], "timezone": str(tz)})
@@ -4293,6 +4368,7 @@ def _make_handler(server, public=False, operator=False):
                 server.assistant.check_rate_limit(key=f"{tenant}:{user}")
             except RateLimited:
                 return self._json({"error": "rate_limited"}, 429)
+            tenant, user = server._canonical_person(tenant, user)
             apps, command = server.apps, self.command
             tail = parts[4:]
             if tail == [] and command == "GET":
@@ -4372,6 +4448,182 @@ def _make_handler(server, public=False, operator=False):
                 status = {"not_connected": 409, "needs_attention": 409, "reconnect_needed": 409, "not_set_up": 409, "bad_request": 400,
                           "not_found": 404, "rate_limited": 429}.get(exc.reason, 502)
                 return self._json({"error": exc.reason if exc.reason in {"not_connected", "needs_attention", "reconnect_needed", "not_set_up", "bad_request", "not_found", "rate_limited"} else "unavailable"}, status)
+
+        _SETUP_SUPPORTED = frozenset({"claude"})        # harnesses with a connection snippet in Phase 1
+
+        @staticmethod
+        def _worker_hub_host(hub):
+            """(host, is_placeholder): a host a worker's device can reach, safe to paste into a shell. Every candidate is
+            normalised like the hub's Host check (port stripped, junk skipped); wildcard/loopback results are unusable,
+            so the first usable ``allowed_hosts`` entry is used, else the literal <HUB_HOST>. IPv6 is bracketed."""
+            import ipaddress
+            import re
+
+            from .assistant_hub.netguard import normalize_host_entry
+
+            def usable(entry):
+                host = normalize_host_entry(entry) if isinstance(entry, str) else None
+                if not host:
+                    return None
+                try:
+                    ip = ipaddress.ip_address(host)
+                except ValueError:
+                    if host == "localhost" or not re.fullmatch(r"[a-z0-9.-]+", host):
+                        return None
+                    return host
+                if ip.is_unspecified or ip.is_loopback:
+                    return None
+                return f"[{ip}]" if ip.version == 6 else str(ip)
+
+            for candidate in [hub.get("host"), *(hub.get("allowed_hosts") or [])]:
+                found = usable(candidate)
+                if found:
+                    return found, False
+            return "<HUB_HOST>", True
+
+        def _worker_setup(self, harness):
+            """The harness-specific connection snippet. Placeholders stay literal; the one-time code is never in it."""
+            if harness not in self._SETUP_SUPPORTED:
+                return {"supported": False, "harness": harness}
+            hub = server.assistant.config.get("hub") or {}
+            host, placeholder = self._worker_hub_host(hub)
+            url = f"http://{host}:{hub.get('port')}/assistant/mcp"
+            return {"supported": True, "harness": "claude", "host_is_placeholder": placeholder,
+                    "redeem": {"method": "POST", "path": "/assistant/enroll",
+                               "body": {"code": "<CODE>", "device_id": "<DEVICE>"}},
+                    "mcp_add": f'claude mcp add --transport http herdr-assistant {url} '
+                               '--header "Authorization: Worker <CREDENTIAL>" --header "X-Herdr-Device: <DEVICE>"'}
+
+        def _assistant_workers(self, parts, body=None):
+            """Owner-only enrollment of hub workers: POST creates a one-time code, GET lists, DELETE/<id> revokes.
+            Operator API key only (a Worker credential is not one); the registry is the hub's own instance."""
+            from .assistant import AssistantNotFound, AssistantUnavailable
+            if self._require("operator"):
+                return None
+            try:
+                registry = server.assistant_workers
+                server.assistant._require_enabled()
+                if registry is None:
+                    raise AssistantUnavailable("the assistant hub is not enabled")
+                tenant_id, user_id = self._assistant_scope()
+                if len(parts) == 4 and self.command == "GET":
+                    return self._json({"workers": [w.as_dict() for w in
+                                                   registry.list_workers(tenant_id=tenant_id, user_id=user_id)]})
+                if len(parts) == 4 and self.command == "POST":
+                    body = body or {}
+                    if not isinstance(body, dict):
+                        return self._json({"error": "body must be a JSON object"}, 400)
+                    name, harness = body.get("name"), body.get("harness")
+                    if not isinstance(name, str) or not isinstance(harness, str):
+                        return self._json({"error": "name and harness are required strings"}, 400)
+                    from .assistant_dispatch import HARNESSES
+                    if harness not in HARNESSES:
+                        return self._json({"error": f"unknown harness: {harness!r}"}, 400)
+                    enrollment, code = registry.create_enrollment(tenant_id=tenant_id, user_id=user_id,
+                                                                  name=name, harness=harness,
+                                                                  scopes=body.get("scopes"))
+                    return self._json({"enrollment_id": enrollment.enrollment_id, "code": code,
+                                       "expires_at": enrollment.expires_at.isoformat(),
+                                       "scopes": list(enrollment.scopes),
+                                       "setup": self._worker_setup(harness)}, 201)
+                if len(parts) == 6 and parts[5] == "scopes" and self.command == "POST":
+                    if not isinstance(body, dict) or set(body) != {"scopes"}:
+                        return self._json({"error": 'body must be exactly {"scopes": [...]}'}, 400)
+                    return self._json(registry.set_scopes(tenant_id, user_id, parts[4], body["scopes"]).as_dict())
+                if len(parts) == 5 and self.command == "DELETE":
+                    return self._json(registry.revoke(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+
+        @staticmethod
+        def _iso(value):
+            return value.isoformat() if value is not None else None
+
+        def _assistant_hub_owner(self, parts, resource, body=None):
+            """Owner-only views and decisions over the hub's action requests and grants (operator API key only; a
+            Worker credential is not one). ``display`` is returned here and nowhere a worker can read."""
+            from .assistant import AssistantNotFound, AssistantUnavailable
+            from .assistant_hub.policy import (
+                ActivationRefused,
+                activate_grant,
+                record_owner_decision,
+                revoke_action_grant,
+            )
+            if self._require("operator"):
+                return None
+            iso = self._iso
+            try:
+                server.assistant._require_enabled()
+                if server.assistant_workers is None:
+                    raise AssistantUnavailable("the assistant hub is not enabled")
+                tenant_id, user_id = self._assistant_scope()
+                svc, store = server.assistant, server.assistant.store
+                cfg = svc.config["grants"]
+
+                def request_view(r):
+                    return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
+                            "task_id": r.task_id, "verb": r.verb, "risk_class": r.risk_class, "status": r.status,
+                            "reason": r.reason, "display": r.display, "created_at": iso(r.created_at),
+                            "decided_at": iso(r.decided_at), "decided_by": r.decided_by, "key_id": r.key_id}
+
+                def grant_view(g):
+                    return {"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb,
+                            "resource_scope": g.resource_scope, "key_id": g.key_id,
+                            "state": g.effective_state(svc.now(), int(cfg["policy_version"])).value,
+                            "policy_version": g.policy_version, "created_at": iso(g.created_at),
+                            "proposed_at": iso(g.proposed_at), "activated_at": iso(g.activated_at),
+                            "expires_at": iso(g.expires_at), "revoked_at": iso(g.revoked_at),
+                            "confirmed_by": g.confirmed_by}
+
+                def exact(keys):
+                    return isinstance(body, dict) and set(body) == keys
+
+                if resource == "assistant-action-requests":
+                    if len(parts) == 4 and self.command == "GET":
+                        status = _q(self.path, "status")
+                        if status not in (None, "", "pending", "approved", "denied", "vetoed"):
+                            return self._json({"error": "status must be pending, approved, denied or vetoed"}, 400)
+                        rows = store.list_action_requests(tenant_id, user_id, status or None)
+                        return self._json({"requests": [request_view(r) for r in rows]})
+                    if len(parts) == 6 and parts[5] == "decision" and self.command == "POST":
+                        if not exact({"approve"}) or not isinstance(body["approve"], bool):
+                            return self._json({"error": 'body must be exactly {"approve": true|false}'}, 400)
+                        try:
+                            row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
+                                                        body["approve"], decided_by=user_id)
+                        except ValueError as exc:       # already decided, or vetoed (a veto is final)
+                            return self._json({"error": str(exc), "code": "conflict"}, 409)
+                        return self._json(request_view(row))
+                else:
+                    if len(parts) == 4 and self.command == "GET":
+                        return self._json({"grants": [grant_view(g) for g in store.list_action_grants(tenant_id, user_id)]})
+                    if len(parts) == 5 and self.command == "DELETE":
+                        return self._json(grant_view(revoke_action_grant(store, svc.now(), tenant_id, user_id,
+                                                                          parts[4], revoked_by=user_id)))
+                    if len(parts) == 6 and parts[5] == "activate" and self.command == "POST":
+                        if not exact({"confirm"}) or body["confirm"] is not True:
+                            return self._json({"error": 'body must be exactly {"confirm": true}'}, 400)
+                        try:
+                            # The judge gate is hard-coded unsatisfied this phase: Phase 3 wires the real judge gate.
+                            grant = activate_grant(store, cfg, svc.now(), tenant_id, user_id, parts[4],
+                                                   confirmed_by=user_id, judge_gate_satisfied=False)
+                        except ActivationRefused as exc:
+                            if exc.code == "not_found":
+                                return self._json({"error": "not found"}, 404)
+                            return self._json({"error": str(exc), "code": exc.code}, 409)
+                        return self._json(grant_view(grant))
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited

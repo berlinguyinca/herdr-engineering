@@ -64,9 +64,11 @@ class AppsService:
         configured = self.client_configured(GOOGLE)
         out = []
         for card_id, name in CARDS:
-            out.append({"id": card_id, "name": name, "kind": "oauth", "provider": GOOGLE, "connected": conn is not None,
-                        "account": conn.account if conn else "", "status": conn.status if conn else ("unavailable" if down else "not_connected"),
-                        "scopes": list(conn.scopes) if conn else [], "client_configured": configured})
+            # A card is connected only for the access it really has: the Gmail card needs the (restricted) Gmail scopes.
+            has = conn is not None and (card_id != "gmail" or set(google_oauth.GMAIL_SCOPES) <= set(conn.scopes))
+            out.append({"id": card_id, "name": name, "kind": "oauth", "provider": GOOGLE, "connected": has,
+                        "account": conn.account if has else "", "status": conn.status if has else ("unavailable" if down else "not_connected"),
+                        "scopes": list(conn.scopes) if has else [], "client_configured": configured})
         gh: dict = {}
         if self._github is not None:
             try:
@@ -146,17 +148,19 @@ class AppsService:
         verifier = self._store.open_pending(sealed)
         try:
             data = google_oauth.exchange_authorization_code(self._open, client, code, verifier, self._redirect)
-        except GoogleError:
+        except GoogleError as exc:
+            log.warning("assistant apps: Google token exchange failed (%s)", exc.detail or exc.reason)
             raise AppsError("exchange_failed") from None
-        granted = set(str(data.get("scope", "")).split())
-        if not granted or granted - set(google_oauth.SCOPES) or set(google_oauth.SCOPES) - granted:
+        granted = google_oauth.normalize_scopes(str(data.get("scope", "")).split())
+        if not granted or granted != set(google_oauth.SCOPES):
             raise AppsError("unexpected_scope")
         refresh, access = data.get("refresh_token"), data.get("access_token")
         if not isinstance(refresh, str) or not refresh or not isinstance(access, str) or not access:
             raise AppsError("no_refresh_token")
         try:
             account = google_oauth.account_address(self._open, access)
-        except GoogleError:
+        except GoogleError as exc:
+            log.warning("assistant apps: Google account lookup failed (%s)", exc.detail or exc.reason)
             raise AppsError("exchange_failed") from None
         self._store.put_connection(tenant, user, GOOGLE, account=account, scopes=sorted(granted), refresh_token=refresh)
         self._changed(tenant, user)
