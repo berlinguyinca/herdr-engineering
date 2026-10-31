@@ -8,6 +8,10 @@ The parser feeds an allowlist, so a construct it misreads is a bypass. Anything 
 (unbalanced quoting, heredocs, process substitution, arithmetic, ANSI-C quoting, ``eval``/``source``, shell keywords,
 variable command names, unknown wrapper options, oversized or NUL input) raises ``Unparseable`` and the caller must
 fall back to the owner. Nothing here executes or evaluates the input.
+
+``parse`` may return an empty list (``x=1``, ``()``, ``bash -c ''``): callers must treat an empty result as
+"owner decides", never as "nothing to veto". Commands carry ``dynamic=True`` when a word's value is only known at
+run time (``$VAR``, globs, brace expansion, ``~``); callers must not auto-approve those.
 """
 
 from __future__ import annotations
@@ -27,11 +31,15 @@ _STD_DIRS = ("/usr/bin/", "/bin/", "/usr/local/bin/", "/usr/sbin/", "/sbin/")
 _FORBIDDEN = frozenset({
     "eval", "source", ".", "trap", "[[", "[", "test", "let", "declare", "typeset", "local", "printf", "read",
     "unset", "set", "shopt", "alias", "export", "readonly", "mapfile", "readarray", "getopts", "hash", "enable",
+    "fc", "history", "bind", "compgen", "complete", "compopt", "caller",
 })
 _FORBIDDEN_ENV = frozenset({
     "PS4", "BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "PROMPT_COMMAND", "IFS", "SHELLOPTS",
-    "BASHOPTS",
+    "BASHOPTS", "LD_AUDIT", "LD_DEBUG_OUTPUT", "NODE_OPTIONS", "NODE_PATH", "PYTHONSTARTUP", "PYTHONPATH",
+    "PYTHONHOME", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB", "PAGER", "EDITOR", "VISUAL", "SSH_ASKPASS",
 })
+_FORBIDDEN_ENV_PREFIXES = ("GIT_", "BASH_FUNC_")
+_ARRAY_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\[.*\]\+?=")
 _BRACE_EXPANSION = re.compile(r"\{[^{}]*(?:,|\.\.)[^{}]*\}")
 _DYNAMIC_DOLLAR = frozenset("{@*?#$!-_")
 _RESERVED = frozenset({
@@ -130,16 +138,32 @@ class _Text(str):
 
     assignable: bool
     danger: bool
+    dynamic: bool
 
-    def __new__(cls, text: str, assignable: bool, danger: bool) -> _Text:
+    def __new__(cls, text: str, assignable: bool, danger: bool, dynamic: bool) -> _Text:
         obj = super().__new__(cls, text)
         obj.assignable = assignable
         obj.danger = danger
+        obj.dynamic = dynamic
         return obj
 
 
 def _is_assignment(word: str) -> bool:
-    return bool(_ASSIGN.match(word)) and getattr(word, "assignable", True)
+    if not getattr(word, "assignable", True):
+        return False
+    if _ARRAY_ASSIGN.match(word):
+        raise Unparseable("array element assignment")
+    match = _ASSIGN.match(word)
+    if match and match.group(0).endswith("+="):
+        raise Unparseable("append assignment")
+    return bool(match)
+
+
+def _is_env_word(word: str) -> bool:
+    """``env`` and ``sudo`` treat any ``NAME=value`` argument (even quoted, even odd names) as an assignment."""
+    if _is_assignment(word):
+        return True
+    return "=" in word and not word.startswith(("=", "-"))
 
 
 @dataclass
@@ -256,7 +280,11 @@ class _Scanner:
         literal = "".join(self.lit)
         danger = "$(" in literal or "`" in literal
         uq = "".join(self.uq)
-        if self.dyn or any(ch in uq for ch in "*?[") or _BRACE_EXPANSION.search(uq):
+        dynamic = self.dyn or any(ch in uq for ch in "*?[") or bool(_BRACE_EXPANSION.search(uq))
+        if _ASSIGN.match(uq):
+            value = uq.partition("=")[2]
+            dynamic = dynamic or value.startswith("~") or ":~" in value
+        if dynamic:
             self.cur.dynamic = True
         assignable = not self.pre_eq_quoted
         self._reset_word()
@@ -277,7 +305,7 @@ class _Scanner:
                     raise Unparseable("unbalanced brace")
                 self.braces -= 1
                 return
-        self.cur.words.append(_Text(text, assignable, danger))
+        self.cur.words.append(_Text(text, assignable, danger, dynamic))
 
     def _end(self) -> None:
         self._flush()
@@ -589,7 +617,7 @@ def _null_command(
 
 def _add_env(env: list[tuple[str, str]], word: str) -> None:
     key, _, value = word.partition("=")
-    if key.rstrip("+") in _FORBIDDEN_ENV:
+    if key.rstrip("+") in _FORBIDDEN_ENV or key.startswith(_FORBIDDEN_ENV_PREFIXES):
         raise Unparseable(f"assignment to {key} is not allowed")
     env.append((key, value))
 
@@ -608,6 +636,10 @@ def _resolve(
 
 
 def _check_head(head: str) -> None:
+    if getattr(head, "dynamic", False):
+        raise Unparseable("command name is dynamic")
+    if _ARRAY_ASSIGN.match(head):
+        raise Unparseable("array element assignment")
     if head in _FORBIDDEN or head in _RESERVED:
         raise Unparseable(f"unsupported construct {head!r}")
 
@@ -632,7 +664,7 @@ def _unwrap(
             break
         idx = _skip_options(rest, _SPECS[name])
         if name in ("env", "sudo"):
-            while idx < len(rest) and _is_assignment(rest[idx]):
+            while idx < len(rest) and _is_env_word(rest[idx]):
                 _add_env(env, rest[idx])
                 idx += 1
         if name == "timeout":

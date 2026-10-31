@@ -312,7 +312,7 @@ def test_sh_dash_c_string_with_substitution_still_recursed():
 
 @pytest.mark.parametrize(
     "command",
-    ["g{i,}t push -f", "git push {,--force}", "git $X", "git ${X}", "rm *", "rm -rf $HOME/..", "~/x",
+    ["echo g{i,}t push -f", "git push {,--force}", "git $X", "git ${X}", "rm *", "rm -rf $HOME/..", "ls ~/x",
      "ls a?", "ls [ab]", "echo \"$X\"", "git $(echo push)", "git {1..3}", "echo $1", "echo $@",
      "echo hi > $F"],
 )
@@ -347,7 +347,7 @@ def test_quoted_assignment_lookalike_is_a_command_head():
     assert parse("'A'=1 x")[0].argv == ("A=1", "x")
     assert parse("A=1 x")[0].env == (("A", "1"),)
     assert parse('A="b c" x')[0].env == (("A", "b c"),)
-    assert parse('env "A=1" x')[0].argv == ("A=1", "x")
+    assert parse('env "A=1" x')[0].env == (("A", "1"),)
 
 
 def test_fuzz_only_parses_or_raises_unparseable():
@@ -368,3 +368,70 @@ def test_fuzz_only_parses_or_raises_unparseable():
             parse(text)
         except Unparseable:
             pass
+
+
+# ---- fix round 2 ----
+
+@pytest.mark.parametrize("head", ["fc", "history", "bind", "compgen", "complete", "compopt", "caller", "enable"])
+@pytest.mark.parametrize("prefix", ["", "builtin ", "command ", "sudo ", "env ", "nice "])
+def test_fix2_more_late_evaluation_heads(head, prefix):
+    with pytest.raises(Unparseable):
+        parse(f"{prefix}{head} -s x")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "history -s 'git push -f'; fc -s",
+        'x=$; y="(touch Z)"; compgen -W "$x$y" a',
+        "$CMD push",
+        "${CMD} push",
+        "g{i,}t push -f",
+        "~/bin/x",
+        "~root/x",
+        "*",
+        "git* push",
+        "sudo $CMD",
+        "env ~/bin/x",
+        "a[1]=2",
+        "a[$i]=2 ls",
+        "command a[1]=2",
+        "a+=1",
+        "a+=1 ls",
+        "env a[1]=2 ls",
+    ],
+)
+def test_fix2_dynamic_heads_and_odd_assignments_raise(command):
+    with pytest.raises(Unparseable):
+        parse(command)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["LD_AUDIT", "LD_DEBUG_OUTPUT", "NODE_OPTIONS", "NODE_PATH", "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME",
+     "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB", "PAGER", "EDITOR", "VISUAL", "SSH_ASKPASS", "GIT_ASKPASS",
+     "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EXTERNAL_DIFF", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR",
+     "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_PROXY_COMMAND", "GIT_ANYTHING", "BASH_FUNC_x%%"],
+)
+@pytest.mark.parametrize("form", ["{k}=x ls", "env {k}=x ls", "sudo {k}=x ls", "env -i A=1 {k}=x ls"])
+def test_fix2_forbidden_env_keys(key, form):
+    if "%" in key and form.startswith("{k}"):
+        pytest.skip("not a shell assignment; bash treats it as a command name")
+    with pytest.raises(Unparseable):
+        parse(form.format(k=key))
+
+
+def test_ssh_auth_sock_and_ordinary_env_still_allowed():
+    assert parse("SSH_AUTH_SOCK=/s FOO=1 ls")[0].env == (("SSH_AUTH_SOCK", "/s"), ("FOO", "1"))
+
+
+def test_tilde_in_assignment_value_is_dynamic():
+    assert parse("A=~/x ls")[0].dynamic is True
+    assert parse("A=/a:~/b ls")[0].dynamic is True
+    assert parse("A='~/x' ls")[0].dynamic is False
+    assert parse("A=b~c ls")[0].dynamic is False
+
+
+def test_empty_results_are_possible():
+    assert parse("x=1") == []
+    assert parse("()") == []
