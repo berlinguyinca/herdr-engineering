@@ -82,7 +82,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _RAW_PATH_OK = re.compile(r"[\x21-\x5b\x5d-\x7e]*")   # printable ASCII without space and backslash
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _RANGE_SPEC = re.compile(r"(\d{0,19})-(\d{0,19})")
-_SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,512}")
+_SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,768}")
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 _CSP_TEMPLATE = ("sandbox allow-scripts allow-downloads; default-src {self}; script-src {self} 'unsafe-inline' "
@@ -879,11 +879,15 @@ class ShareHandler(BaseHTTPRequestHandler):
         if exp_int <= now:
             return deny(self, state, "token_expired", grant["identity"])
         try:
-            session = mint_session(lab.secret, share_id, grant["identity"], exp_int)
+            session = mint_session(lab.secret, share_id, grant["identity"], exp_int, email=grant["email"])
         except ValueError:
             return deny(self, state, "bad_identity", grant["identity"])
-        body = json.dumps({"base": f"/s/{token}/k/{session}/f/", "entry": state["entry"],
-                           "expires_at": exp_int}, sort_keys=True, ensure_ascii=True).encode("ascii")
+        entry = state["entry"]
+        base = f"/s/{token}/k/{session}/f/"
+        kind = "f" if content_type_for(entry).split(";")[0].strip() == "text/html" else "v"
+        landing = f"/s/{token}/k/{session}/{kind}/{quote(entry, safe='/')}"
+        body = json.dumps({"base": base, "entry": entry, "landing": landing, "expires_at": exp_int},
+                          sort_keys=True, ensure_ascii=True).encode("ascii")
         _send_headers(self, 200, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
                                   ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
                                   ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),

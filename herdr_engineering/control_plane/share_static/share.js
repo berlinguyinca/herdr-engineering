@@ -10,7 +10,7 @@
   "use strict";
 
   var SHARE_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/$/;
-  var BASE_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/k\/[A-Za-z0-9_.-]{1,512}\/f\/$/;
+  var LANDING_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/k\/[A-Za-z0-9_.-]{1,768}\/[fv]\//;
   var ORIGIN = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?$/;
   var PENDING_KEY = "herdr-share-pkce";
   var TOKENS_KEY = "herdr-share-tokens";
@@ -113,12 +113,11 @@
     forget(); // the session path replaces the tokens; nothing is kept either way
     if (!r.ok) throw new Error("session");
     var got = await r.json();
-    if (!got || typeof got.base !== "string" || typeof got.entry !== "string" || !got.entry
-        || !BASE_PATH.test(got.base) || got.base.indexOf(sharePath) !== 0) {
+    if (!got || typeof got.landing !== "string" || !LANDING_PATH.test(got.landing)
+        || got.landing.indexOf(sharePath) !== 0) {
       throw new Error("session");
     }
-    var entry = got.entry.split("/").map(encodeURIComponent).join("/");
-    location.replace(got.base + entry);
+    location.replace(got.landing);
   }
 
   async function callback() {
