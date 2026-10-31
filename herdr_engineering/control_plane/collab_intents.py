@@ -41,9 +41,12 @@ blocking file I/O runs in worker threads. Log lines carry only ticket, kind, act
 
 The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:<agent_id>``:
 
-5b. A version already committed for ``(collab:<agent_id>, key)`` (``merge_commit_for_key``) decides the ticket before
-   any check below: a crash between ``merge_commit`` and ``record_outcome`` must report that one version, even if
-   the grant was revoked, the head moved or the quota filled since. It is replayed (``created`` / ``merged``) when the
+5b. A version already committed for ``(collab:<agent_id>, key)`` (``merge_commit_for_key``; the kind's
+   ``early_replay``) decides the ticket before step 5 and every check below. It runs at scan time for a ticket that
+   already has a ``received`` row (a rediscovery after a restart) and in the lane right after step 3: a crash between
+   ``merge_commit`` and ``record_outcome`` must report that one version, even if the feed went stale, the agent was
+   deactivated, the grant was revoked, the head moved or the quota filled since. Only the actor's own principal is
+   looked up, so it never reports another agent's work. It is replayed (``created`` / ``merged``) when the
    ledger row of the ticket it was committed for has this ticket's ``request_sha256``, else ``rejected`` "idempotency
    key was reused for a different request".
 6. ``grant_for`` must show ``write``, unexpired, re-read now (a grant revoked after the intent was written is "no write
@@ -66,7 +69,8 @@ The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:
     refresher (the lane never waits behind the mirror's lock; a failed refresh is kept for ``take_mirror_force``,
     which the mirror task passes to ``sync(force=...)``) and the version to a background lineage task (its poster may
     take minutes; the queue keeps at most ``LINEAGE_QUEUE_MAX`` versions, dropping the oldest). Neither can fail the
-    tick, and neither holds the lane's semaphore slot, connection or advisory locks.
+    tick, and neither holds the lane's semaphore slot, connection or advisory locks. Lineage is emitted for the
+    version as committed; Task 9's ``lineage`` wiring should skip a version the gate marks retracted by then.
 
 Wiring (Task 9): the scan must never wait for a lane's connection, or fresh intents stop being received while every
 lane is busy and then expire. The mirror refresher takes one connection from the lanes' ``acquire`` (the latest
@@ -164,7 +168,6 @@ REASON_MAX = 300                    # an ArtifactError message on a result is cu
 COMMIT_OUTCOMES = frozenset({"created", "merged"})
 GATE_RELOAD = 30.0                  # the worker-local retraction gate is reloaded at least this often (seconds)
 LINEAGE_QUEUE_MAX = 1000            # versions waiting for lineage emission; the oldest is dropped beyond this
-REASON_KEY_REUSED = "idempotency key was reused for a different request"
 
 _RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason")
 _STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id")
@@ -196,6 +199,7 @@ class _Kind:
     lane_key: Callable[[Intent, dict | None], str] | None
     replay_outcomes: frozenset[str]
     after: Callable[[IntentContext, Intent, dict, dict], Awaitable[None]] | None = None
+    early_replay: Callable[[IntentContext, Intent], Awaitable[dict | None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -278,7 +282,8 @@ class CollabIntentApplier:
     def register(self, kind: str, handler: Callable[[IntentContext, Intent], Awaitable[dict]], *,
                  lane_key: Callable[[Intent, dict | None], str] | None = None,
                  replay_outcomes: frozenset[str] = frozenset(),
-                 after: Callable[[IntentContext, Intent, dict, dict], Awaitable[None]] | None = None) -> None:
+                 after: Callable[[IntentContext, Intent, dict, dict], Awaitable[None]] | None = None,
+                 early_replay: Callable[[IntentContext, Intent], Awaitable[dict | None]] | None = None) -> None:
         """Attach the handler of an intent kind (its validator is registered with ``register_intent_kind``).
 
         A handler must be idempotent on ``(actor, kind, idempotency key)``: a crash between its return and
@@ -289,21 +294,27 @@ class CollabIntentApplier:
         (``_zero_bytes: True`` records the ticket with 0 inline bytes), and are handed to
         ``after(ctx, intent, out, private)``, which runs only once this call decided the ticket and
         its result is written. Errors in ``after`` are logged (type only) and never change the outcome.
+
+        ``early_replay(ctx, intent)`` (``ctx.agent`` is None) runs before the step-5 agent check, at scan time for a
+        ticket that already has a ``received`` row and again in the lane: an outcome it returns (same shape as the
+        handler's) decides the ticket, None continues. It must only report what this actor's own earlier request
+        already did, so a crash-retry is not refused by a feed that went stale or an agent deactivated since.
         """
         if not isinstance(kind, str) or not _KIND_NAME.match(kind):
             raise ValueError("invalid intent kind name")
         if kind in self._kinds:
             raise ValueError("intent kind already has a handler")
-        if not callable(handler) or any(f is not None and not callable(f) for f in (lane_key, after)):
-            raise ValueError("handler, lane_key and after must be callable")
+        if not callable(handler) or any(f is not None and not callable(f) for f in (lane_key, after, early_replay)):
+            raise ValueError("handler, lane_key, after and early_replay must be callable")
         outcomes = frozenset(replay_outcomes)
         if not all(isinstance(o, str) and _OUTCOME.match(o) for o in outcomes):
             raise ValueError("invalid replay outcome")
-        self._kinds[kind] = _Kind(handler, lane_key, outcomes, after)
+        self._kinds[kind] = _Kind(handler, lane_key, outcomes, after, early_replay)
 
     def register_commit(self) -> None:
         """Register plan 3's ``commit`` kind (steps 6-12; replays ``created`` / ``merged``)."""
-        self.register("commit", self._commit, replay_outcomes=COMMIT_OUTCOMES, after=self._after_commit)
+        self.register("commit", self._commit, replay_outcomes=COMMIT_OUTCOMES, after=self._after_commit,
+                      early_replay=self._commit_replay)
 
     def take_mirror_force(self) -> set[str]:
         """Artifact ids whose post-commit mirror refresh failed; the mirror task passes them to ``sync(force=...)``."""
@@ -399,6 +410,9 @@ class CollabIntentApplier:
         await self.drain(timeout)
         tasks = list(self._busy.values())
         tasks += [t for t in (self._refresher, self._lineage_task) if t is not None and not t.done()]
+        if self._lineage_task is not None and not self._lineage_task.done():
+            log.warning("collab intents: closing with lineage still running, %d more queued (not emitted)",
+                        len(self._lineage_due))
         for task in tasks:
             task.cancel()
         if tasks:
@@ -507,6 +521,8 @@ class CollabIntentApplier:
                 intent.request_sha256, _inline_bytes(intent))
             if existing is not None:                       # another worker received it first: start over next tick
                 return None
+        elif await self._early_replayed(conn, name, intent, spec):                                  # step 5b, early
+            return None
         agent, reason = self._agent_for(intent)                                                      # step 5
         if reason is not None:
             await self._finish(conn, name, intent, {"result": "rejected", "reason": reason})
@@ -645,25 +661,50 @@ class CollabIntentApplier:
             return
         if await self._replayed(conn, name, intent, spec, row):
             return
+        if await self._early_replayed(conn, name, intent, spec):
+            return
         agent, reason = self._agent_for(intent)            # the newest feed: revoked while queued is still refused
         if reason is not None:
             await self._finish(conn, name, intent, {"result": "rejected", "reason": reason})
             return
-        ctx = IntentContext(actor=intent.actor, agent=agent, conn=conn, store=ArtifactStore(conn, self.rustfs),
-                            grants=CollabGrantStore(conn), limits=self.limits, assemble=self.assemble,
-                            extras=self.extras)
-        private: dict = {}
+        ctx = self._context(conn, intent, agent)
         try:
-            out = await spec.handler(ctx, intent)
-            if isinstance(out, dict):
-                private = {k: out[k] for k in out if isinstance(k, str) and k.startswith("_")}
-                out = {k: v for k, v in out.items() if k not in private}
-            _check_outcome(out)
+            out, private = _split(await spec.handler(ctx, intent))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.error("collab intent %s (%s): handler failed (%s)", intent.ticket, intent.kind, type(exc).__name__)
             out, private = {"result": "rejected", "reason": REASON_INTERNAL}, {}
+        await self._conclude(conn, name, intent, spec, ctx, out, private)
+
+    def _context(self, conn, intent: Intent, agent: dict | None) -> IntentContext:
+        return IntentContext(actor=intent.actor, agent=agent, conn=conn, store=ArtifactStore(conn, self.rustfs),
+                             grants=CollabGrantStore(conn), limits=self.limits, assemble=self.assemble,
+                             extras=self.extras)
+
+    async def _early_replayed(self, conn, name: str, intent: Intent, spec: _Kind) -> bool:
+        """The kind's ``early_replay``, before the agent check; True when it decided the ticket. A failure is logged
+        and the normal steps continue."""
+        if spec.early_replay is None:
+            return False
+        ctx = self._context(conn, intent, None)
+        try:
+            found = await spec.early_replay(ctx, intent)
+            if found is None:
+                return False
+            out, private = _split(found)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("collab intent %s (%s): early replay failed (%s)", intent.ticket, intent.kind,
+                      type(exc).__name__)
+            return False
+        await self._conclude(conn, name, intent, spec, ctx, out, private)
+        return True
+
+    async def _conclude(self, conn, name: str, intent: Intent, spec: _Kind, ctx: IntentContext, out: dict,
+                        private: dict) -> None:
+        """Record and publish a checked outcome, then run the kind's after-hook if this call decided the ticket."""
         if await self._finish(conn, name, intent, out, zero_bytes=private.get("_zero_bytes") is True) \
                 and spec.after is not None:
             try:
@@ -782,12 +823,10 @@ class CollabIntentApplier:
 
     # -- the commit kind (Task 5b) -----------------------------------------------------------------------------
     async def _commit(self, ctx: IntentContext, intent: Intent) -> dict:
-        """Steps 5b-11. Every refusal before ``merge_commit`` stores nothing (no blob, no scoped row)."""
+        """Steps 6-11 (5b ran as ``_commit_replay`` before the agent check). Every refusal before ``merge_commit``
+        stores nothing (no blob, no scoped row)."""
         agent_id, aid, payload = intent.actor.id, intent.artifact_id, intent.payload
         store = ctx.store
-        prior = await store.merge_commit_for_key(f"collab:{agent_id}", self._key(intent))           # step 5b
-        if prior is not None and prior["ticket_id"] is not None:   # one with no ticket: merge_commit replays it
-            return await self._replay_commit(ctx, intent, prior)
         grant = await ctx.grants.grant_for(aid, agent_id)                                           # step 6
         expires = _epoch(grant["expires_at"]) if grant is not None else None
         if grant is None or grant["permission"] != "write" or expires is None or expires <= self.clock():
@@ -839,6 +878,14 @@ class CollabIntentApplier:
         except ArtifactError as exc:
             return _rejected(str(exc)[:REASON_MAX] or "commit refused")
         return _committed(out)
+
+    async def _commit_replay(self, ctx: IntentContext, intent: Intent) -> dict | None:
+        """Step 5b: the version already committed for ``(collab:<actor>, key)``, or None. Only the actor's own
+        principal is looked up; a version with no ``collab_ticket_id`` is left to ``merge_commit``'s own replay."""
+        prior = await ctx.store.merge_commit_for_key(f"collab:{intent.actor.id}", self._key(intent))
+        if prior is None or prior["ticket_id"] is None:
+            return None
+        return await self._replay_commit(ctx, intent, prior)
 
     async def _replay_commit(self, ctx: IntentContext, intent: Intent, prior: dict) -> dict:
         """Step 5b: the version this key already committed, if it was committed for this same request. Another
@@ -996,6 +1043,15 @@ def _names_fit(changes, base_files: dict, head_files: dict) -> bool:
     except ShareBundleError:
         return False
     return True
+
+
+def _split(out) -> tuple[dict, dict]:
+    """A handler's return value as ``(outcome, private)`` (keys starting with ``_``); ``TypeError`` if invalid."""
+    private = {k: out[k] for k in out if isinstance(k, str) and k.startswith("_")} if isinstance(out, dict) else {}
+    if isinstance(out, dict):
+        out = {k: v for k, v in out.items() if k not in private}
+    _check_outcome(out)
+    return out, private
 
 
 def _committed(out: dict) -> dict:

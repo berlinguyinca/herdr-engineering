@@ -1934,7 +1934,38 @@ async def crash_before_outcome(env, raw):
     (env.outbox / "intents" / f"{raw['ticket']}.json").write_text(json.dumps(raw))
 
 
-@pytest.mark.parametrize("case", ["revoked", "names", "quota", "retracted"])
+FEED_CASES = ("feed_stale_scan", "feed_stale_lane", "deactivated_scan", "deactivated_lane")
+
+
+def break_feed(env, a, case):
+    if case.startswith("feed_stale"):
+        env.feed({a: "active"}, age=cbf.FEED_MAX_AGE + 60)
+    else:
+        env.feed({a: "suspended"})
+
+
+async def retry_through_the_lane(env, raw, a, case):
+    """A rediscovered ticket is settled by the scan's early replay, so the lane's check is reached by a new ticket
+    for the same request and key (the crashed one withdrawn): received while its key lock is held elsewhere, then
+    the feed breaks and the lane runs. Returns the new ticket."""
+    (env.outbox / "intents" / f"{raw['ticket']}.json").unlink()
+    same = commit(env, a, raw["artifact_id"], raw["payload"]["base_version_id"], raw["payload"]["changes"],
+                  key=raw["idempotency_key"])
+    other = await asyncpg.connect(env.dsn)
+    lock = _LOCK_SALT + f"key:agent:{a}:commit:{raw['idempotency_key']}"
+    try:
+        assert await other.fetchval("SELECT pg_try_advisory_lock(hashtextextended($1, 0))", lock)
+        counts = await env.tick(wait=5)
+        await env.applier.drain(timeout=10)
+        assert counts["skipped"] >= 1 and env.result(same["ticket"]) is None
+        break_feed(env, a, case)
+        await other.fetchval("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock)
+    finally:
+        await other.close()
+    return same
+
+
+@pytest.mark.parametrize("case", ["revoked", "names", "quota", "retracted", *FEED_CASES])
 def test_a_crash_retry_reports_the_existing_version_whatever_would_now_refuse_it(registry_pg, tmp_path, case):
     text = edit(BASE_DOC, 4, "once")
     limits = BridgeLimits(daily_bytes_per_agent=len(text.encode()) + 10)
@@ -1942,11 +1973,12 @@ def test_a_crash_retry_reports_the_existing_version_whatever_would_now_refuse_it
     async def body(env, a):
         aid, v1 = await seed(env)
         await grant(env, aid, a)
-        raw = commit(env, a, aid, v1, [put("doc.md", text)])
+        raw = commit(env, a, aid, v1, [put("doc.md", text)], key="k-" + case if case.endswith("_lane") else None)
         await settle(env)
         doc = env.result(raw["ticket"])
         assert doc["result"] == "created"
         env.mirror.refreshed.clear()
+        retry = raw
         await crash_before_outcome(env, raw)
         if case == "revoked":
             async with env.pool.acquire() as conn:
@@ -1957,13 +1989,20 @@ def test_a_crash_retry_reports_the_existing_version_whatever_would_now_refuse_it
             async with env.pool.acquire() as conn:
                 await CollabGrantStore(conn).record_received(
                     new_ticket(), "commit", Actor("agent", a), aid, v1, None, "0" * 64, 1000)
-        else:
+        elif case == "retracted":
             async with env.pool.acquire() as conn:
                 await ArtifactStore(conn, env.applier.rustfs).record_retraction(aid, doc["version_id"])
+        elif case.endswith("_scan"):
+            break_feed(env, a, case)
+        else:
+            env.dsn = registry_pg["dsn"]
+            retry = await retry_through_the_lane(env, raw, a, case)
         await settle(env)
-        again = env.result(raw["ticket"])
+        again = env.result(retry["ticket"])
         assert again["result"] == "created" and again["version_id"] == doc["version_id"]
-        assert (await ledger(env, raw["ticket"]))["version_id"] == doc["version_id"]
+        row = await ledger(env, retry["ticket"])
+        assert row["version_id"] == doc["version_id"]
+        assert row["bytes"] == (0 if retry is not raw else len(text.encode()))
         versions = await sql(env, "SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)
         assert len(versions) == (3 if case == "names" else 2)
         assert env.mirror.refreshed == [aid]            # the after-hook the crash skipped runs now
