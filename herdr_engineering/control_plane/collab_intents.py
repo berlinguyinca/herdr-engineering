@@ -133,6 +133,7 @@ from .collab_bridge_files import (
     list_beneath,
     list_parts,
     open_beneath,
+    read_bytes_beneath,
     read_json_beneath,
     read_staged_meta,
     remove_tree_beneath,
@@ -172,7 +173,7 @@ RECEIVED_PER_AGENT = 8
 # links meta.json), and the no-follow listings of staging/ are bounded (fail closed past the cap, per owner).
 STAGING_META_GRACE = 60.0
 STAGING_MIN_OWNERS = 4096
-STAGING_MAX_UPLOADS = 8192
+STAGING_SCAN_ENTRIES = 50_000       # entries of one owner dir read per sweep
 _STAGING_PREFIX = re.compile(r"m_[A-Za-z0-9_.@-]{0,126}\Z")
 
 REASON_UNREADABLE = "intent is not readable"
@@ -312,6 +313,7 @@ class CollabIntentApplier:
         self._lineage_due: collections.deque[tuple[str, str, dict]] = collections.deque()
         self._lineage_task: asyncio.Task | None = None
         self._staging_owners: dict[str, Callable[[str, StagedUpload], Awaitable[bool]]] = {}
+        self.staging_scan_entries = STAGING_SCAN_ENTRIES
 
     # -- registry ---------------------------------------------------------------------------------------------
     def register(self, kind: str, handler: Callable[[IntentContext, Intent], Awaitable[dict]], *,
@@ -1123,30 +1125,39 @@ class CollabIntentApplier:
         * it is older than ``limits.staging_ttl_seconds`` by its newest regular file (parts, ``meta.json``, markers);
         * its ``meta.json`` is missing or invalid and the dir is older than ``STAGING_META_GRACE`` (collab-public
           creates the dir before it links ``meta.json``);
-        * (agent owner dirs only) the agent is not ``active`` in ``agents`` (the ``agents.json`` mapping), or has no
-          live ``write`` grant on the upload's ``artifact_id`` in ``grants`` (``CollabGrantStore.live_grants()``);
+        * (agent owner dirs only) the agent is not ``active`` in ``agents``, or has no live ``write`` grant on the
+          upload's ``artifact_id`` in ``grants`` (``CollabGrantStore.live_grants()``);
         * (registered-prefix owner dirs only, ``register_staging_owner``) ``keep`` returns False. A ``keep`` that
           raises keeps the upload.
 
-        It never deletes an upload that a pending intent file in ``intents/`` names (whatever rule matched), skips
-        (never follows) a symlinked or non-directory owner or upload entry, and a broken entry (``BridgeError``,
-        ``OSError``) is logged by its ids only and left, never aborting the sweep. A listing past its cap fails
-        closed for that owner. The caller must pass ``agents`` from a fresh ``agents.json``: with a stale or missing
-        feed, skip the sweep, or every agent's staging would count as revoked. ``conn`` is unused (kept for the
-        plan's signature). Logs carry owner keys, upload ids and counts only.
+        **The agent and grant rules apply only when they are proven current**: ``agents.json`` is read here and must
+        be fresh (``FEED_MAX_AGE``, the check ``_agent_for`` makes), ``agents`` a mapping and ``grants`` a list;
+        otherwise (stale or missing feed, a bad argument) only the TTL and grace rules run, so a forgotten or failed
+        feed refresh can never make every agent's staging look revoked. Before an owner's deletions, the pending
+        intents are read again (an upload one names is kept, whatever rule matched), a "no grant" verdict is
+        re-confirmed with ``grant_for`` on ``conn`` and an "agent not active" verdict with a fresh read of
+        ``agents.json``, so a commit that arrived, or a grant or agent restored, since the snapshot keeps its upload.
+        If ``intents/`` or any intent file in it cannot be listed or read right now (not merely malformed or
+        oversize), nothing more is deleted. An inactive agent's owner dir is removed once empty.
+
+        Symlinked or non-directory owner and upload entries are skipped, never followed. A broken entry
+        (``BridgeError``, ``OSError``) is logged by its ids and left; a listing past its cap fails closed. An owner
+        dir is read up to ``staging_scan_entries`` entries per sweep (a huge one drains over successive sweeps, like
+        ``_sweep_strays``). Logs carry owner keys, upload ids and counts only.
         """
-        if not isinstance(agents, Mapping):
-            log.warning("collab staging sweep skipped: no agent feed")
-            return 0
-        live = self._live_write_grants(grants)
+        n_agents = len(agents) if isinstance(agents, Mapping) else 0
+        rules = (isinstance(agents, Mapping) and isinstance(grants, list)
+                 and await asyncio.to_thread(self._fresh_feed_agents) is not None)
+        if not rules:
+            log.warning("collab staging sweep: no fresh agent feed or bad arguments; agent and grant rules skipped")
+        live = self._live_write_grants(grants) if rules else set()
         prefixes = sorted(self._staging_owners.items(), key=lambda item: -len(item[0]))
         try:
             owners = await asyncio.to_thread(
-                list_beneath, self.outbox, ["staging"], max_entries=max(STAGING_MIN_OWNERS, len(agents) * 4))
+                list_beneath, self.outbox, ["staging"], max_entries=max(STAGING_MIN_OWNERS, n_agents * 4))
         except BridgeError:
             log.warning("collab staging sweep: staging dir has too many entries; skipped")
             return 0
-        refs: set[str] | None = None
         removed = 0
         for owner, st in owners or []:
             if not stat.S_ISDIR(st.st_mode):
@@ -1157,32 +1168,70 @@ class CollabIntentApplier:
             except (BridgeError, OSError):
                 log.warning("collab staging sweep: owner=%s unreadable, left", owner)
                 continue
-            doomed = []
+            doomed: list[tuple[str, str, StagedUpload | None]] = []
             for upload_id, meta, age in found:
                 try:
-                    if await self._stage_doomed(owner, meta, age, keep, agents, live):
-                        doomed.append(upload_id)
+                    reason = await self._stage_doomed(owner, meta, age, keep, agents if rules else None, live)
                 except Exception as exc:
                     log.warning("collab staging sweep: owner=%s upload=%s check failed (%s)", owner, upload_id,
                                 type(exc).__name__)
-            if doomed and refs is None:
-                try:
-                    refs = await asyncio.to_thread(self._pending_upload_ids, len(agents))
-                except BridgeError:
-                    log.warning("collab staging sweep: intents dir has too many entries; skipped")
-                    return removed
-            for upload_id in doomed:
-                if upload_id in (refs or ()):
                     continue
-                if await asyncio.to_thread(self._remove_upload, owner, upload_id):
-                    removed += 1
+                if reason:
+                    doomed.append((upload_id, reason, meta))
+            inactive = rules and keep is None and not self._agent_active(agents, owner)
+            if doomed:
+                try:
+                    refs = await asyncio.to_thread(self._pending_upload_ids, n_agents)
+                except BridgeError:
+                    log.warning("collab staging sweep: intents unreadable or over cap; nothing more deleted")
+                    return removed
+                for upload_id, reason, meta in doomed:
+                    if upload_id in refs or not await self._still_doomed(conn, owner, reason, meta):
+                        continue
+                    if await asyncio.to_thread(self._remove_upload, owner, upload_id):
+                        removed += 1
+            if inactive and await asyncio.to_thread(self._agent_inactive_now, owner):
+                await asyncio.to_thread(self._remove_if_empty, owner)
         if removed:
             log.info("collab staging sweep: removed=%d", removed)
         return removed
 
-    def _live_write_grants(self, grants) -> set[tuple[str, str]]:
+    @staticmethod
+    def _agent_active(agents, owner: str) -> bool:
+        row = agents.get(owner) if isinstance(agents, Mapping) else None
+        return isinstance(row, Mapping) and row.get("status") == "active"
+
+    def _fresh_feed_agents(self) -> dict | None:
+        """The ``agents`` of ``agents.json`` if it is fresh (the ``_agent_for`` check), else None; blocking."""
+        feed = read_json_beneath(self.outbox, [AGENTS_FEED], max_bytes=AGENTS_FEED_MAX_BYTES)
+        generated = feed.get("generated_at") if isinstance(feed, dict) else None
+        agents = feed.get("agents") if isinstance(feed, dict) else None
+        if not _finite(generated) or self.clock() - generated > FEED_MAX_AGE or not isinstance(agents, dict):
+            return None
+        return agents
+
+    def _agent_inactive_now(self, owner: str) -> bool:
+        """True only when a fresh ``agents.json`` read now shows the agent not active; blocking."""
+        agents = self._fresh_feed_agents()
+        return agents is not None and not self._agent_active(agents, owner)
+
+    async def _still_doomed(self, conn, owner: str, reason: str, meta: StagedUpload | None) -> bool:
+        """Re-confirm a snapshot-based verdict just before deleting; False keeps the upload."""
+        if reason == "agent":
+            return await asyncio.to_thread(self._agent_inactive_now, owner)
+        if reason == "grant":
+            if conn is None or meta is None:
+                return False
+            grant = await CollabGrantStore(conn).grant_for(meta.artifact_id, owner)
+            expires = _epoch(grant["expires_at"]) if grant is not None else None
+            live = (grant is not None and grant["permission"] == "write" and expires is not None
+                    and expires > self.clock())
+            return not live
+        return True
+
+    def _live_write_grants(self, grants: list) -> set[tuple[str, str]]:
         now, out = self.clock(), set()
-        for g in grants if isinstance(grants, list) else ():
+        for g in grants:
             if not isinstance(g, dict) or g.get("permission") != "write":
                 continue
             if "expires_at" in g:
@@ -1193,20 +1242,31 @@ class CollabIntentApplier:
         return out
 
     def _scan_owner_staging(self, owner: str) -> list[tuple[str, StagedUpload | None, float]]:
-        """``(upload_id, meta or None, age)`` for each real upload dir of ``staging/<owner>/``; blocking. A symlink or
-        non-directory is skipped; one broken entry is logged and left (``BridgeError`` / ``OSError``)."""
-        listing = list_beneath(self.outbox, ["staging", owner], max_entries=STAGING_MAX_UPLOADS)
+        """``(upload_id, meta or None, age)`` for the real upload dirs of ``staging/<owner>/`` (at most
+        ``staging_scan_entries`` entries are read); blocking. Age is by the newest regular file, streamed, never
+        sorted. A symlink or non-directory is skipped; one broken entry is logged and left."""
+        dfd = _walk_dirs(self.outbox, ["staging", owner])
+        if dfd is None:
+            return []
+        names: list[str] = []
+        try:
+            with os.scandir(dfd) as it:
+                for seen, entry in enumerate(it):
+                    if seen >= self.staging_scan_entries:
+                        break
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            names.append(entry.name)
+                    except OSError:
+                        continue
+        finally:
+            os.close(dfd)
         now, out = self.clock(), []
-        for upload_id, st in listing or []:
-            if not stat.S_ISDIR(st.st_mode):
-                continue
+        for upload_id in names:
             try:
-                newest = st.st_mtime
-                files = list_beneath(self.outbox, ["staging", owner, upload_id],
-                                     max_entries=tree_entry_cap(self.limits)) or []
-                regular = [s.st_mtime for _, s in files if stat.S_ISREG(s.st_mode)]
-                if regular:
-                    newest = max(regular)
+                newest = self._newest_mtime(owner, upload_id)
+                if newest is None:
+                    continue
                 meta = read_staged_meta(self.outbox, owner, upload_id, self.limits)
             except (BridgeError, OSError):
                 log.warning("collab staging sweep: owner=%s upload=%s unreadable, left", owner, upload_id)
@@ -1214,28 +1274,74 @@ class CollabIntentApplier:
             out.append((upload_id, meta, now - newest))
         return out
 
-    async def _stage_doomed(self, owner: str, meta: StagedUpload | None, age: float, keep, agents, live) -> bool:
+    def _newest_mtime(self, owner: str, upload_id: str) -> float | None:
+        """The newest mtime among the regular files of the upload dir (its own mtime if it has none), streamed;
+        None if the dir is gone or unsafe. ``BridgeError`` past ``tree_entry_cap`` entries."""
+        ufd = _walk_dirs(self.outbox, ["staging", owner, upload_id])
+        if ufd is None:
+            return None
+        cap = tree_entry_cap(self.limits)
+        try:
+            newest = os.fstat(ufd).st_mtime
+            seen_file = False
+            with os.scandir(ufd) as it:
+                for seen, entry in enumerate(it):
+                    if seen >= cap:
+                        raise BridgeError("too many entries")
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(st.st_mode):
+                        newest = st.st_mtime if not seen_file else max(newest, st.st_mtime)
+                        seen_file = True
+            return newest
+        finally:
+            os.close(ufd)
+
+    async def _stage_doomed(self, owner: str, meta: StagedUpload | None, age: float, keep, agents, live) -> str | None:
+        """Why this upload should go (``ttl``, ``agent``, ``grace``, ``grant``, ``keep``), or None. ``agents`` is
+        None when the agent and grant rules are off."""
         if age > self.limits.staging_ttl_seconds:
-            return True
-        if keep is None:
-            row = agents.get(owner)
-            if not isinstance(row, Mapping) or row.get("status") != "active":
-                return True
+            return "ttl"
+        if keep is None and agents is not None and not self._agent_active(agents, owner):
+            return "agent"
         if meta is None:
-            return age > STAGING_META_GRACE
-        if keep is None:
-            return (owner, meta.artifact_id) not in live
-        return not await keep(owner, meta)
+            return "grace" if age > STAGING_META_GRACE else None
+        if keep is not None:
+            return None if await keep(owner, meta) else "keep"
+        if agents is not None and (owner, meta.artifact_id) not in live:
+            return "grant"
+        return None
 
     def _pending_upload_ids(self, n_agents: int) -> set[str]:
         """The ``upload_id`` of every put in every intent file still in ``intents/`` (any actor, any kind); blocking.
-        ``BridgeError`` if the dir is over its cap (the caller then deletes nothing)."""
+        ``BridgeError`` (so the caller deletes nothing) if the dir is over its cap, exists but cannot be listed, or
+        an intent file within the size limit cannot be read right now. Malformed and oversize files are skipped."""
         cap = max(INTENTS_MIN_ENTRIES, n_agents * self.limits.max_pending_intents_per_agent * 2)
+        listing = list_beneath(self.outbox, [INTENTS_DIR], max_entries=cap)
+        if listing is None:
+            if os.path.lexists(self.outbox / INTENTS_DIR):
+                raise BridgeError("intents dir cannot be listed")
+            return set()
         out: set[str] = set()
-        for name, st in list_beneath(self.outbox, [INTENTS_DIR], max_entries=cap) or []:
-            if not stat.S_ISREG(st.st_mode) or not _INTENT_FILE.match(name):
+        for name, st in listing:
+            if (not stat.S_ISREG(st.st_mode) or not _INTENT_FILE.match(name) or st.st_size > INTENT_MAX_BYTES
+                    or st.st_nlink != 1):                   # the applier cannot read these either
                 continue
-            raw = read_json_beneath(self.outbox, [INTENTS_DIR, name], max_bytes=INTENT_MAX_BYTES)
+            data = read_bytes_beneath(self.outbox, [INTENTS_DIR, name], max_bytes=INTENT_MAX_BYTES)
+            if data is None:
+                try:
+                    os.stat(self.outbox / INTENTS_DIR / name, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue                                # withdrawn since the listing
+                except OSError:
+                    pass
+                raise BridgeError("intent cannot be read")
+            try:
+                raw = json.loads(data)
+            except ValueError:
+                continue
             payload = raw.get("payload") if isinstance(raw, dict) else None
             changes = payload.get("changes") if isinstance(payload, dict) else None
             for change in changes if isinstance(changes, list) else ():
@@ -1253,6 +1359,13 @@ class CollabIntentApplier:
         if not ok:
             log.warning("collab staging sweep: owner=%s upload=%s could not be removed", owner, upload_id)
         return ok
+
+    def _remove_if_empty(self, owner: str) -> None:
+        """Remove ``staging/<owner>`` if it holds nothing (``max_entries=0`` fails on any entry)."""
+        try:
+            remove_tree_beneath(self.outbox, ["staging", owner], max_entries=0)
+        except (BridgeError, OSError):
+            pass
 
     # -- results sweep ----------------------------------------------------------------------------------------
     async def sweep_results(self, max_age: float = 3600) -> int:

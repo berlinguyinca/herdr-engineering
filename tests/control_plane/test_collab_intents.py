@@ -2463,8 +2463,14 @@ def active(*ids):
     return {i: {"status": "active"} for i in ids}
 
 
-def swept(env, agents, grants):
-    return env.applier.sweep_staging(None, agents=agents, grants=grants)
+async def swept(env, agents, grants, *, feed_age=0.0):
+    """One sweep over the pool's connection; ``agents.json`` is written fresh (``feed_age`` seconds old) unless
+    ``feed_age`` is None (no feed at all)."""
+    if feed_age is not None:
+        (env.outbox / "agents.json").write_text(json.dumps(
+            {"generated_at": env.clock() - feed_age, "agents": agents if isinstance(agents, dict) else {}}))
+    async with env.pool.acquire() as conn:
+        return await env.applier.sweep_staging(conn, agents=agents, grants=grants)
 
 
 def sweeping(pg, tmp_path, body, **kw):
@@ -2657,4 +2663,206 @@ def test_a_verified_upload_dir_is_swept_by_the_ttl_like_any_other(registry_pg, t
         (d / "verified").write_bytes(b"")
         age_dir(env, d, TTL + 1)
         assert await swept(env, active(a), [live_grant("art1", a)]) == 1 and not d.exists()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def seed_mixed(env, a):
+    """Four uploads of ``a``: a fresh one without a grant, an old one, an old metaless one, a fresh one with a grant."""
+    _, no_grant = stage(env, a, "art_no_grant", "n.bin", BLOB[:50])
+    _, old = stage(env, a, "art_ok", "o.bin", BLOB[:60])
+    _, ok = stage(env, a, "art_ok", "k.bin", BLOB[:70])
+    nometa = env.outbox / "staging" / a / cbf.upload_id_for(a, "art_ok", "m.bin", "6" * 64, 5)
+    nometa.mkdir()
+    age_dir(env, old, TTL + 1)
+    age_dir(env, nometa, 100)
+    return no_grant, old, ok, nometa
+
+
+@pytest.mark.parametrize("case", ["stale", "missing", "grants_not_a_list", "agents_not_a_mapping"])
+def test_without_a_proven_fresh_feed_only_the_ttl_and_grace_rules_apply(registry_pg, tmp_path, case):
+    async def body(env, a):
+        no_grant, old, ok, nometa = seed_mixed(env, a)
+        agents, grants, kw = active(a), [live_grant("art_ok", a)], {}
+        if case == "stale":
+            kw = {"feed_age": cbf.FEED_MAX_AGE + 5}
+        elif case == "missing":
+            kw = {"feed_age": None}
+        elif case == "grants_not_a_list":
+            grants = None
+        else:
+            agents = None
+        n = await swept(env, agents, grants, **kw)
+        assert n == 2 and not old.exists() and not nometa.exists() and no_grant.is_dir() and ok.is_dir()
+        # revoked and grantless, but nothing is proven: even then they stay
+        agents = None if case == "agents_not_a_mapping" else {a: {"status": "revoked"}}
+        grants = None if case == "grants_not_a_list" else []
+        assert await swept(env, agents, grants, **kw) == 0 and no_grant.is_dir() and ok.is_dir()
+        assert await swept(env, {a: {"status": "revoked"}}, []) == 2          # a fresh feed: now they go
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_an_intent_written_after_the_sweep_started_protects_its_upload(registry_pg, tmp_path):
+    async def body(env, a):
+        upl, d = stage(env, a, "art1", "blob.bin", BLOB)
+        age_dir(env, d, TTL + 1)
+        verdict = env.applier._stage_doomed
+
+        async def doomed_then_intent(*args, **kw):
+            out = await verdict(*args, **kw)
+            assert out                              # doomed by the TTL when the verdict was taken
+            env.intent(agent(a), kind="commit", artifact_id="art1",
+                       payload={"base_version_id": "v", "message": "m", "changes": [staged("blob.bin", upl)]})
+            return out
+        env.applier._stage_doomed = doomed_then_intent
+        assert await swept(env, active(a), [live_grant("art1", a)]) == 0 and d.is_dir()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_a_grant_restored_after_the_snapshot_protects_the_upload(registry_pg, tmp_path):
+    async def body(env, a):
+        aid, _ = await seed(env)
+        _, d = stage(env, a, aid, "blob.bin", BLOB[:50])
+        verdict = env.applier._stage_doomed
+
+        async def doomed_then_grant(*args, **kw):
+            out = await verdict(*args, **kw)
+            assert out                              # the stale snapshot says: no grant
+            await grant(env, aid, a)
+            return out
+        env.applier._stage_doomed = doomed_then_grant
+        assert await swept(env, active(a), []) == 0 and d.is_dir()
+        env.applier._stage_doomed = verdict
+        async with env.pool.acquire() as conn:
+            await CollabGrantStore(conn).revoke(aid, a)
+        assert await swept(env, active(a), []) == 1 and not d.exists()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_an_agent_reactivated_after_the_snapshot_keeps_its_upload(registry_pg, tmp_path):
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "blob.bin", BLOB[:50])
+        verdict = env.applier._stage_doomed
+
+        async def doomed_then_feed(*args, **kw):
+            out = await verdict(*args, **kw)
+            (env.outbox / "agents.json").write_text(json.dumps(
+                {"generated_at": env.clock(), "agents": active(a)}))
+            return out
+        env.applier._stage_doomed = doomed_then_feed
+        assert await swept(env, {a: {"status": "revoked"}}, [live_grant("art1", a)]) == 0 and d.is_dir()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_an_intents_dir_over_its_cap_deletes_nothing(registry_pg, tmp_path, monkeypatch):
+    monkeypatch.setattr("herdr_engineering.control_plane.collab_intents.INTENTS_MIN_ENTRIES", 3)
+
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "blob.bin", BLOB[:50])
+        age_dir(env, d, TTL + 1)
+        for _ in range(12):
+            env.intent(agent(uid("agent")))
+        assert await swept(env, active(a), [live_grant("art1", a)]) == 0 and d.is_dir()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_the_staging_owner_listing_over_its_cap_deletes_nothing(registry_pg, tmp_path, monkeypatch):
+    monkeypatch.setattr("herdr_engineering.control_plane.collab_intents.STAGING_MIN_OWNERS", 2)
+
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "blob.bin", BLOB[:50])
+        age_dir(env, d, TTL + 1)
+        for i in range(4):
+            (env.outbox / "staging" / f"other{i}").mkdir()
+        assert await swept(env, active(a), [live_grant("art1", a)]) == 0 and d.is_dir()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_a_malformed_intent_file_is_ignored_next_to_a_valid_one(registry_pg, tmp_path):
+    async def body(env, a):
+        upl, d = stage(env, a, "art1", "keep.bin", BLOB[:50])
+        _, gone = stage(env, a, "art1", "gone.bin", BLOB[:60])
+        age_dir(env, d, TTL + 1)
+        age_dir(env, gone, TTL + 1)
+        (env.outbox / "intents" / (new_ticket() + ".json")).write_text("{not json")
+        (env.outbox / "intents" / (new_ticket() + ".json")).write_bytes(b"x" * (2 * 1024 * 1024))      # oversize
+        env.intent(agent(a), kind="commit", artifact_id="art1",
+                   payload={"base_version_id": "v", "message": "m", "changes": [staged("keep.bin", upl)]})
+        assert await swept(env, active(a), [live_grant("art1", a)]) == 1 and d.is_dir() and not gone.exists()
+    sweeping(registry_pg, tmp_path, body)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads files whatever their mode")
+@pytest.mark.parametrize("what", ["intent_file", "intents_dir"])
+def test_an_intent_that_cannot_be_read_right_now_deletes_nothing(registry_pg, tmp_path, what):
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "blob.bin", BLOB[:50])
+        age_dir(env, d, TTL + 1)
+        raw = env.intent(agent(a))
+        target = env.outbox / "intents" / (raw["ticket"] + ".json") if what == "intent_file" else env.outbox / "intents"
+        mode = target.stat().st_mode
+        os.chmod(target, 0)
+        try:
+            assert await swept(env, active(a), [live_grant("art1", a)]) == 0 and d.is_dir()
+        finally:
+            os.chmod(target, mode)
+        assert await swept(env, active(a), [live_grant("art1", a)]) == 1
+    sweeping(registry_pg, tmp_path, body)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads files whatever their mode")
+def test_a_meta_json_that_cannot_be_read_counts_as_invalid_after_the_grace(registry_pg, tmp_path):
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "blob.bin", BLOB[:50])
+        os.chmod(d / "meta.json", 0)
+        age_dir(env, d, 30)
+        assert await swept(env, active(a), [live_grant("art1", a)]) == 0 and d.is_dir()
+        age_dir(env, d, 100)
+        assert await swept(env, active(a), [live_grant("art1", a)]) == 1 and not d.exists()
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_a_symlinked_staging_root_is_not_followed(registry_pg, tmp_path):
+    async def body(env, a):
+        _, d = stage(env, a, "art1", "blob.bin", BLOB[:50])
+        age_dir(env, d, TTL + 1)
+        outside = tmp_path / "outside"
+        (env.outbox / "staging").rename(outside)
+        (env.outbox / "staging").symlink_to(outside, target_is_directory=True)
+        before = tree(outside)
+        assert await swept(env, {}, []) == 0 and tree(outside) == before
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_a_revoked_agents_empty_owner_dir_is_removed_too(registry_pg, tmp_path):
+    async def body(env, a):
+        b, c = uid("agent"), uid("agent")
+        _, d_a = stage(env, a, "art1", "a.bin", BLOB[:50])
+        _, d_b = stage(env, b, "art1", "b.bin", BLOB[:50])
+        (env.outbox / "staging" / c).mkdir()
+        upl, d_pend = stage(env, "pend", "art1", "p.bin", BLOB[:50])
+        env.intent(agent("pend"), kind="commit", artifact_id="art1",
+                   payload={"base_version_id": "v", "message": "m", "changes": [staged("p.bin", upl)]})
+        n = await swept(env, active(b), [live_grant("art1", b)])
+        staging = env.outbox / "staging"
+        assert n == 1 and not d_a.exists() and not (staging / a).exists()           # revoked: upload and dir go
+        assert d_b.is_dir() and (staging / b).is_dir()                              # active
+        assert not (staging / c).exists()                                           # revoked and already empty
+        assert d_pend.is_dir() and (staging / "pend").is_dir()                      # pinned by a pending intent
+    sweeping(registry_pg, tmp_path, body)
+
+
+def test_an_owner_with_more_uploads_than_the_scan_budget_is_still_swept(registry_pg, tmp_path):
+    async def body(env, a):
+        env.applier.staging_scan_entries = 4
+        dirs = []
+        for i in range(10):
+            _, d = stage(env, a, "art1", f"f{i}.bin", BLOB[:50 + i])
+            age_dir(env, d, TTL + 1)
+            dirs.append(d)
+        total = 0
+        for _ in range(5):
+            n = await swept(env, active(a), [live_grant("art1", a)])
+            assert n <= 4
+            total += n
+        assert total == 10 and not any(d.exists() for d in dirs)
     sweeping(registry_pg, tmp_path, body)
