@@ -129,6 +129,14 @@ def _measure(server, item, budget: int) -> int:
     return size
 
 
+def _output_name(output: object) -> str:
+    """The normalised name of one manifest entry (the single normalisation); ``ShareBundleError`` when it has none."""
+    name = output.get("name") if isinstance(output, dict) else None
+    if not isinstance(name, str):
+        raise ShareBundleError("output has no name")
+    return normalise_name(name)
+
+
 def shared_file_names(version: dict) -> frozenset[str]:
     """The file names a share of this version exposes; depends only on the version row.
 
@@ -139,12 +147,10 @@ def shared_file_names(version: dict) -> frozenset[str]:
         return frozenset({PREVIEW_NAME})
     names: set[str] = set()
     for output in version.get("output_manifest") or []:
-        name = output.get("name") if isinstance(output, dict) else None
-        if isinstance(name, str):
-            try:
-                names.add(normalise_name(name))
-            except ShareBundleError:
-                continue
+        try:
+            names.add(_output_name(output))
+        except ShareBundleError:
+            continue
     return frozenset(names)
 
 
@@ -176,13 +182,11 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None) -> tuple
             pinned = pinned_output(output, require_size=False)
         except PinnedOutputError as exc:
             raise ShareHTTPError(400, f"output {position}: {exc}; a share needs hash-verifiable outputs") from None
-        name = output.get("name")
-        if not isinstance(name, str):
-            raise ShareHTTPError(400, f"output {position} has no name")
         try:
-            name = normalise_name(name)
+            name = _output_name(output)
         except ShareBundleError as exc:
-            raise ShareHTTPError(400, f"output {position}: {exc}") from None
+            raise ShareHTTPError(400, f"output {position}: {exc}" if output.get("name") is not None
+                                 else f"output {position} has no name") from None
         files.append({**pinned, "name": name})
     names = [f["name"] for f in files]
     try:

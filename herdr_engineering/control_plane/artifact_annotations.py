@@ -10,6 +10,12 @@ the owner and agents read and resolve them through the other methods.
 * The artifact and version of a new annotation come from the share row, never from the line.  The share must be a lab
   share that was live at the line's (clamped) time, and ``file`` must be one the share exposes.
 * ``create`` is idempotent on ``artifact_annotations.ingest_key``; ``edit`` / ``delete`` on ``artifact_annotation_ops``.
+* ``owner_emails`` must arrive lowercased.  An author email must be printable ASCII (the share store's rule), so a
+  look-alike such as a Kelvin sign can never lower-case into an owner address.
+* A refused line's ``denied`` event carries ``<ingest_key>:denied``, so a later accepted replay of the same line still
+  records its own success event.
+* ``touched_since`` filters on ``updated_at = now()``, which is the START of the writing transaction: a caller must
+  read with an overlap margin (e.g. ``since`` minus a minute) and treat the result as a superset.
 * ``parse_line`` and ``ingest`` raise only ``ValueError`` / ``asyncpg.PostgresError`` (what ``JsonlIngestor`` swallows).
 """
 from __future__ import annotations
@@ -20,7 +26,7 @@ from typing import Any, Final
 
 from .annotation_anchor import ANNOTATION_ID_RE, AnnotationInputError, clean_anchor, clean_comment
 from .artifact_share_api import shared_file_names
-from .artifact_shares import ShareStore
+from .artifact_shares import _EMAIL, ShareStore
 from .jsonl_ingest import transaction as _transaction
 
 __all__ = ["AnnotationStore", "AnnotationError"]
@@ -29,6 +35,7 @@ STATUSES: Final = ("open", "addressed", "dismissed", "withdrawn")
 MAX_FUTURE: Final = timedelta(minutes=5)
 MAX_IDENTITY_CHARS: Final = 200
 MAX_LIST: Final = 500
+MAX_RESOLVE: Final = 50
 
 _ROW_COLUMNS = (
     "a.annotation_id, a.artifact_id, a.version_id, a.share_id, a.file_name AS file, a.anchor::text AS anchor, a.body, "
@@ -120,7 +127,7 @@ class AnnotationStore:
             if code in ("inserted", "edited", "withdrawn", "duplicate"):
                 return code
             await ShareStore(conn)._event(conn, share_id, "denied", _text(record.get("author_identity"), 200) or "unknown",
-                                          {"reason": "annotation_" + code}, None, ingest_key)
+                                          {"reason": "annotation_" + code}, None, ingest_key + ":denied")
             return code
 
     async def _create(self, conn: Any, share: Any, record: dict, key: str, owner_emails: frozenset[str],
@@ -133,7 +140,7 @@ class AnnotationStore:
         identity = _text(record.get("author_identity"), MAX_IDENTITY_CHARS)
         email = _text(record.get("author_email"), MAX_IDENTITY_CHARS)
         annotation_id, at = record.get("annotation_id"), _when(record.get("at"), now)
-        if (identity is None or email is None or "@" not in email or at is None
+        if (identity is None or email is None or not _EMAIL.match(email) or at is None
                 or not isinstance(annotation_id, str) or not ANNOTATION_ID_RE.fullmatch(annotation_id)):
             return "invalid"
         try:
@@ -150,6 +157,7 @@ class AnnotationStore:
                    "report_descriptor": json.loads(share["report_descriptor"]) if share["report_descriptor"] else None}
         if file not in shared_file_names(version):
             return "file_not_in_version"
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", identity)   # serialises the cap per author
         if await conn.fetchval("SELECT count(*) FROM artifact_annotations WHERE author_identity = $1 "
                                "AND ingested_at > now() - interval '1 day'", identity) >= per_user_per_day:
             return "quota_user_day"
@@ -308,12 +316,17 @@ class AnnotationStore:
         """Mark open annotations addressed in ``version_id`` (a strictly newer version of the same artifact)."""
         resolved: list[str] = []
         skipped: list[dict] = []
+        if not isinstance(annotation_ids, list) or len(annotation_ids) > MAX_RESOLVE:
+            return {"resolved": [], "skipped": [{"annotation_id": None, "reason": "invalid"}]}
+        valid = [a for a in annotation_ids if isinstance(a, str) and ANNOTATION_ID_RE.fullmatch(a)]
+        skipped.extend({"annotation_id": a if isinstance(a, str) and a.isprintable() else None, "reason": "invalid"}
+                       for a in annotation_ids if a not in valid)
         async with _transaction(self._conn) as conn:
             number = await conn.fetchval("SELECT version_number FROM artifact_versions "
                                          "WHERE version_id = $1 AND artifact_id = $2", version_id, artifact_id)
             if number is None:
                 raise AnnotationError("bad_version")
-            for annotation_id in dict.fromkeys(annotation_ids):
+            for annotation_id in dict.fromkeys(valid):
                 row = await self._locked(conn, artifact_id, annotation_id)
                 reason = ("not_found" if row is None else "not_open" if row["status"] != "open"
                           else "version_not_newer" if row["version_number"] >= number else None)

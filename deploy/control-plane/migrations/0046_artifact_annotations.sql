@@ -37,6 +37,8 @@ CREATE INDEX IF NOT EXISTS ix_artifact_annotations_author
   ON artifact_annotations (share_id, author_identity, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_artifact_annotations_updated ON artifact_annotations (updated_at);
 
+CREATE INDEX IF NOT EXISTS ix_artifact_annotations_author_day ON artifact_annotations (author_identity, ingested_at);
+
 CREATE TABLE IF NOT EXISTS artifact_annotation_ops (
   ingest_key    text PRIMARY KEY,
   annotation_id text NOT NULL,

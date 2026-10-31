@@ -360,3 +360,75 @@ def test_parse_line_and_jsonl_ingestor_wiring(registry_pg, tmp_path):
         assert await ingestor.ingest_file(path, tmp_path / "m") == 2
         assert await conn.fetchval("SELECT count(*) FROM artifact_annotations") == 2
     run(registry_pg, body)
+
+
+def test_taken_annotation_id_with_new_key_is_invalid_and_denied(registry_pg):
+    async def body(store, conn):
+        _, _, sid = await seed(conn)
+        assert await store.ingest(conn, create(sid, 1), "t1", **KW) == "inserted"
+        assert await store.ingest(conn, create(sid, 1, body="other"), "t2", **KW) == "invalid"
+        assert await denied_reasons(conn, sid) == ["annotation_invalid"]
+        assert await conn.fetchval("SELECT body FROM artifact_annotations WHERE annotation_id=$1", ann_id(1)) == "note"
+    run(registry_pg, body)
+
+
+def test_look_alike_email_never_becomes_owner(registry_pg):
+    async def body(store, conn):
+        _, _, sid = await seed(conn)
+        kelvin = create(sid, 1, author_email="Kim@x.org")
+        assert await store.ingest(conn, kelvin, "k1", **{**KW, "owner_emails": frozenset({"kim@x.org"})}) == "invalid"
+        assert await conn.fetchval("SELECT count(*) FROM artifact_annotations") == 0
+    run(registry_pg, body)
+
+
+def test_refused_then_accepted_replay_keeps_both_events(registry_pg):
+    async def body(store, conn):
+        _, _, sid = await seed(conn)
+        rec = create(sid, 1)
+        assert await store.ingest(conn, rec, "same", **{**KW, "per_user_per_day": 0}) == "quota_user_day"
+        assert await store.ingest(conn, rec, "same", **KW) == "inserted"
+        assert await denied_reasons(conn, sid) == ["annotation_quota_user_day"]
+        assert "annotated" in await kinds(conn, sid)
+    run(registry_pg, body)
+
+
+def test_resolve_rejects_bad_ids_without_database_errors(registry_pg):
+    async def body(store, conn):
+        aid, vid, sid = await seed(conn)
+        v2 = await add_version(conn, aid, 2)
+        await store.ingest(conn, create(sid, 1), "c1", **KW)
+        out = await store.resolve(aid, [ann_id(1), 5, None, "x" * 5000], version_id=v2, actor="a")
+        assert out["resolved"] == [ann_id(1)]
+        assert [s["reason"] for s in out["skipped"]] == ["invalid"] * 3
+        out = await store.resolve(aid, [ann_id(1)] * 51, version_id=v2, actor="a")
+        assert out == {"resolved": [], "skipped": [{"annotation_id": None, "reason": "invalid"}]}
+    run(registry_pg, body)
+
+
+def test_concurrent_change_waits_for_the_row_lock(registry_pg):
+    """A withdraw holding the row (uncommitted) must make a racing edit or second withdraw wait, then see 'not_open'."""
+    async def go():
+        a = await asyncpg.connect(registry_pg["dsn"])
+        b = await asyncpg.connect(registry_pg["dsn"])
+        try:
+            await a.execute("DELETE FROM artifact_annotation_ops; DELETE FROM artifact_annotations")
+            _, _, sid = await seed(a)
+            store = AnnotationStore(a)
+            await store.ingest(a, create(sid, 1), "c1", **KW)
+            await store.ingest(a, create(sid, 2), "c2", **KW)
+            for n, op in ((1, "edit"), (2, "delete")):
+                line = {"op": op, "share_id": sid, "annotation_id": ann_id(n), "author_identity": "u1", "body": "x",
+                        "at": datetime.now(UTC).isoformat()}
+                tx = a.transaction()
+                await tx.start()
+                assert await store.ingest(a, {**line, "op": "delete"}, f"w{n}", **KW) == "withdrawn"
+                racer = asyncio.create_task(AnnotationStore(b).ingest(b, line, f"r{n}", **KW))
+                await asyncio.sleep(0.5)
+                assert not racer.done()                      # blocked on the row, not yet decided
+                await tx.commit()
+                assert await asyncio.wait_for(racer, 10) == "not_open"
+            assert [r["status"] for r in await a.fetch("SELECT status FROM artifact_annotations")] == ["withdrawn"] * 2
+        finally:
+            await a.close()
+            await b.close()
+    asyncio.run(go())
