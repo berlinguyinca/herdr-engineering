@@ -118,9 +118,6 @@ class InboxWatchRunner:
         assistant_id = self._assistant_id(u)
         if assistant_id is None:
             return "no_assistant", 0, False
-        if self.config.get("renew_grants"):
-            svc.renew_read_grants(tenant_id=tenant, user_id=user, assistant_id=assistant_id,
-                                  within_seconds=self.config["renew_within_seconds"], actor=ACTOR)
         from .google_workspace import GoogleError
         after = int(self._now() - self.config["lookback_minutes"] * 60)
         try:
@@ -128,6 +125,7 @@ class InboxWatchRunner:
         except GoogleError as exc:
             return ("not_connected" if exc.reason in ("not_connected", "needs_attention", "forbidden", "reconnect_needed")
                     else "google_unavailable"), 0, False
+        self._renew(tenant, user, assistant_id)      # only while the mailbox is connected and answering
         fresh = []
         for mail in found:
             _, verdict = svc.notify(tenant_id=tenant, user_id=user, key=f"inbox:{mail['id']}", priority="normal",
@@ -143,6 +141,19 @@ class InboxWatchRunner:
         svc.send_message(tenant_id=tenant, user_id=user, assistant_id=assistant_id, thread_id=thread.thread_id,
                          content=self.prompt(fresh))
         return "ok", len(fresh), True
+
+    def _renew(self, tenant: str, user: str, assistant_id: str) -> None:
+        if not self.config.get("renew_grants"):
+            return
+        try:
+            n = self.assistant.renew_read_grants(tenant_id=tenant, user_id=user, assistant_id=assistant_id,
+                                                 within_seconds=self.config["renew_within_seconds"], actor=ACTOR)
+        except Exception as exc:  # noqa: BLE001 - a renewal problem must never stop triage
+            log.warning("inbox_watch: grant renewal for %s/%s failed (%s)", tenant, user, type(exc).__name__)
+            return
+        if n:
+            with self._lock:
+                self._status["renewed"] = self._status.get("renewed", 0) + n
 
     @staticmethod
     def prompt(mails: list[dict[str, Any]]) -> str:

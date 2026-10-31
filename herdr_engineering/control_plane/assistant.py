@@ -307,6 +307,9 @@ def inbox_watch_config(raw: Any) -> dict[str, Any]:
                           "max_new_per_tick", "renew_grants", "renew_within_days"}
     if not isinstance(raw.get("renew_grants", False), bool):
         raise ValueError(f"{where}.renew_grants must be true or false")
+    days = raw.get("renew_within_days", 7)
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 29:
+        raise ValueError(f"{where}.renew_within_days must be a whole number of days from 1 to 29")
     if unknown:
         raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
     query = raw.get("query", "in:inbox -category:promotions -category:social -category:forums")
@@ -334,7 +337,7 @@ def inbox_watch_config(raw: Any) -> dict[str, Any]:
         "tick_budget_seconds": max(5, int(raw.get("tick_budget_seconds", 120))),
         # keep the watched assistant's read-only mail/calendar grants from lapsing (see AssistantService.renew_read_grants)
         "renew_grants": raw.get("renew_grants", False),
-        "renew_within_seconds": min(30, max(1, int(raw.get("renew_within_days", 7)))) * 24 * 3600,
+        "renew_within_seconds": days * 24 * 3600,
         "query": query.strip(),
         "users": users,
     }
@@ -1872,6 +1875,16 @@ class AssistantStore:
             self.grants[g.grant_id] = g
         self._after_mutation()
 
+    def extend_grant(self, grant_id: str, expires_at: datetime) -> bool:
+        """Move a grant's expiry later, atomically with the check that it is still not revoked (a concurrent revoke wins)."""
+        with self._lock:
+            g = self.grants.get(grant_id)
+            if g is None or g.revoked_at is not None or expires_at <= g.expires_at:
+                return False
+            g.expires_at = expires_at
+        self._after_mutation()
+        return True
+
     def list_grants(self, *, tenant_id: str, user_id: str,
                     assistant_id: str | None = None) -> list[AssistantGrant]:
         return sorted(
@@ -2379,16 +2392,18 @@ class AssistantService:
         renewal is audited. Returns how many were renewed."""
         self._require_enabled()
         now = self.now()
+        ttl = self.config["grant_max_ttl_seconds"]
+        within = timedelta(seconds=min(within_seconds, ttl // 2))     # a window as long as the lifetime would renew every tick
         renewed = 0
         for g in self.store.list_grants(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id):
             if (g.tool_id not in RENEWABLE_READ_TOOLS or not g.active(now) or g.constraints.get("preauthorized")
-                    or g.expires_at - now > timedelta(seconds=within_seconds)):
+                    or g.expires_at - now > within):
                 continue
-            g.expires_at = now + timedelta(seconds=self.config["grant_max_ttl_seconds"])
-            self.store.put_grant(g)
+            if not self.store.extend_grant(g.grant_id, now + timedelta(seconds=ttl)):
+                continue
             self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,
                                     action="assistant.grant.renewed", subject_id=g.grant_id,
-                                    detail=f"{g.tool_id} until {g.expires_at.isoformat(timespec='seconds')}")
+                                    detail=f"{g.tool_id} until {(now + timedelta(seconds=ttl)).isoformat(timespec='seconds')}")
             renewed += 1
         return renewed
 
