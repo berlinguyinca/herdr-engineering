@@ -45,7 +45,8 @@ from .share_bundle import BundleIndex
 __all__ = ["ShareStore", "ShareError", "new_token"]
 
 AUDIENCES = ("lab", "public")
-EVENT_KINDS = ("created", "approved", "opened", "denied", "revoked", "expired")
+EVENT_KINDS = ("created", "approved", "opened", "denied", "revoked", "expired", "annotated", "annotation_edited",
+               "annotation_withdrawn", "annotation_dismissed", "annotation_addressed")
 PUBLIC_MIN_DAYS, PUBLIC_MAX_DAYS = 1, 90
 # Callers compute "now + N days" slightly before create() reads the clock; tolerate that skew on the lower bound.
 _SKEW = timedelta(minutes=5)

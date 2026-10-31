@@ -129,6 +129,25 @@ def _measure(server, item, budget: int) -> int:
     return size
 
 
+def shared_file_names(version: dict) -> frozenset[str]:
+    """The file names a share of this version exposes; depends only on the version row.
+
+    A report version exposes its generated ``PREVIEW_NAME``; any other version its normalised ``output_manifest`` names
+    (an unnamed or unnormalisable entry exposes nothing).
+    """
+    if version.get("report_descriptor"):
+        return frozenset({PREVIEW_NAME})
+    names: set[str] = set()
+    for output in version.get("output_manifest") or []:
+        name = output.get("name") if isinstance(output, dict) else None
+        if isinstance(name, str):
+            try:
+                names.add(normalise_name(name))
+            except ShareBundleError:
+                continue
+    return frozenset(names)
+
+
 def _plan(server, artifact_id: str, version_id: str, entry: str | None) -> tuple[list[dict], str, list[str]]:
     """Dry run: the files a bundle of this version holds, its entry and warnings. No object bytes are read."""
     registry = server.artifact_store
@@ -147,7 +166,8 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None) -> tuple
         if entry not in (None, PREVIEW_NAME):
             raise ShareHTTPError(400, f"a report share's entry is its generated {PREVIEW_NAME}")
         page = _report_preview(_call(registry, "get_report_descriptor", artifact_id, version_id))
-        files = [{"name": PREVIEW_NAME, "sha256": hashlib.sha256(page).hexdigest(), "size_bytes": len(page),
+        (preview_name,) = shared_file_names(version)
+        files = [{"name": preview_name, "sha256": hashlib.sha256(page).hexdigest(), "size_bytes": len(page),
                   "data": page}]
         return files, PREVIEW_NAME, ["report evidence files are not included; the preview lists them as text"]
     files = []
