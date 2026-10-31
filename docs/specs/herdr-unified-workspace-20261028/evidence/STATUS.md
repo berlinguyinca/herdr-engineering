@@ -16,6 +16,8 @@ Deploys are the operator's step.
 | P08 Subscriptions, attention and automations | Not started | | activity subscriptions, one attention/approval surface over the existing mechanisms, automations |
 | P09 Reliability, threat model, accessibility and rollout | Partial (docs only) | `security/THREAT_MODEL.md` (implementation section, read from code, nothing run), per-flag rollout/rollback table, accessibility checklist; `evidence/P09-RESULT.md` | E2E, chaos, load, tracing, security tests, per-user flags, repair command, accessibility audit |
 
+Team, room and assistant collaboration (design only, approved 2026-10-31, nothing built): `design/TEAM_COLLABORATION.md` (attach a team to a room, guest levels, coordinators, assistant briefs; build order, flags and three open questions; no phase state changes).
+
 ## Decisions
 - One artifact registry. The registry owns ids, versions, ACLs and sharing; RustFS owns bytes. #366's separate storage, archive and previews are re-expressed as registry features and #366 is not merged. See `design/ARTIFACT_INTEGRATION.md`.
 - `project`, `team`, `artifact_version`, `external_action` are owned graph kinds (P02). Only the account owner approves `send_email`.
