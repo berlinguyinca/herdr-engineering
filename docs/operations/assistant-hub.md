@@ -77,7 +77,7 @@ A redeemed worker gets the default scopes `ask`, `report` and `read`. The `read`
 owner's assistant memory (`memory_search`) and to the owner's grants, approvals, routines, connector metadata (never
 credentials), delegations and proposals. That is a lot of private context for one credential, so **enroll only
 harnesses you trust, and consider narrowing a worker's scopes** (a worker without `read` cannot use the list or search
-tools). Scope opt-in at enrollment time (default no `read`) is planned for Phase 2.
+tools). 
 
 ## Provenance
 
@@ -122,9 +122,142 @@ credential or the enrollment code.
 - At most 8 concurrent connections per peer; a request must finish within 15 s (slow clients are cut off).
 - Request bodies over 64 KiB are refused (413).
 
+## Phase 2: action requests, vetoes and earned grants
+
+Phase 2 adds one worker tool, `action_request`, and the owner-side machinery behind it. A worker asks "may I run this?"
+before it acts and gets a **decision with a reason** (`authorized`, `denied` or `pending`), never an instruction.
+**Nothing is autonomous yet**: in this phase no request can come back `authorized` through the owner routes, because
+activation is gated (see "Why nothing is autonomous yet").
+
+### Verbs and what an ActionKey binds
+
+A request (`tool`, `command`, `operation`, `recipients`, `repo`, `environment`, optional `hint`, plus `session_id` and
+`task_id`) is canonicalized into an **ActionKey**: a verb (for example `git.push`, `pr.merge`, `deploy.prod`,
+`email.send`), a resource scope, a risk class (`local_reversible`, `remote_reversible`, `outward`) and a flag class.
+The key id is a hash of the canonical form, and a grant matches on that exact id, tenant, user and worker.
+
+- Only a **single plain command** gets a known key. The key binds the **full argv** (as a digest), so
+  `git push origin main` and `git push -u origin feature` are different keys.
+- **Chains** (`&&`, `;`, pipes), **redirects**, **env prefixes**, **wrappers** (`env`, `nohup`, `ssh host cmd`, `sh -c`),
+  `sudo`, **dynamic words** (`$VAR`, `$(...)`, globs) and **unknown heads** always go to the owner (`pending`, source
+  `unknown`). The canonicalizer is an allowlist of known heads; everything else is unknown and fails closed.
+- Unknown verbs are always `outward` risk.
+
+### The fixed veto list
+
+A veto is evaluated first, over every element of the command, and wins over any grant. The response carries
+`outcome: denied`, `source: veto` and a `veto_code`; the row is stored with status `vetoed`, cannot be decided by
+anyone (409), and the audit log gets `assistant.action.vetoed`.
+
+| Code | Blocks |
+|---|---|
+| `force_push` | force push (`--force*`, `-f`, `+refspec`), mirror push, remote ref deletion (`--delete`, `:ref`) |
+| `protection_disable` | changing branch protection or rulesets (for example via `gh api` or GraphQL mutations) |
+| `quobyte_delete` | deleting or modifying anything under `/quobyte` |
+| `fry_route` | routing through the retired Fry host |
+| `cluster_install` | installing software or editing services on a cluster |
+| `secret_print` | printing secrets, keys or tokens (for example `gh auth token`, `kubectl get secret`, secret variables) |
+
+`grants.extra_vetoes` can add rules (`code`, `reason`, and `verb` and/or `argv_contains`); it can never relax or reuse a
+fixed code.
+
+**Vetoes are a best-effort backstop, not a sandbox.** The real control is that nothing unlisted is ever authorized
+without an owner-confirmed grant. Known residual gaps: commands embedded in `python -c` or other interpreter strings,
+the body of an `sbatch` script, variable indirection with no literal `quobyte` in the text, `rsync host::module`
+targets, and `cat $(...)` style substitutions. Most of these are also `pending` (unknown head or dynamic word), so
+the owner still decides; a veto simply cannot catch them on its own.
+
+### Grant states and defaults
+
+States: `shadow` (proposed or activated inside the global shadow period or a policy-version mismatch), `proposed`
+(evidence suffices, waiting for the owner), `active`, `expired`, `revoked`. The state shown is always the effective
+state computed now.
+
+| Key (`personal_assistant.grants`) | Default | Meaning |
+|---|---|---|
+| `shadow_days` | `14` | Global shadow period; no grant is honoured and none can be activated before it ends. |
+| `shadow_started_at` | `null` | ISO-8601 with offset. `null` = the hub stamps it on first start. |
+| `required_approvals` | `local_reversible 5`, `remote_reversible 10`, `outward 30` | Owner approvals of the exact key needed per risk class. A new scope for an already confirmed verb needs `max(3, n/3)`. |
+| `min_sessions` | `3` | Distinct `session_id` values among the counted approvals. |
+| `min_tasks` | `2` | Distinct `task_id` values among the counted approvals. |
+| `grant_ttl_days` | `30` | Lifetime of a proposed grant, and of an active one from activation. |
+| `extra_vetoes` | `[]` | Extra hard-deny rules (see above). |
+| `policy_version` | `1` | Bump to invalidate every existing grant (they show as `shadow` until re-earned). |
+
+### Evidence rules (exact)
+
+- Only **the owner's decisions made through the owner API** (`provenance owner_api`) count. A worker's `report`,
+  `assistant_ask` and hook events count for nothing, however many it sends.
+- Evidence is per (worker, key). A **denial restarts the streak**: approvals before the latest denial are ignored.
+- Approvals must come from enough distinct sessions and tasks. **Known limit:** a worker can invent session and task ids,
+  so diversity only protects against one agent repeating itself; every counted approval is still the owner's own.
+- A vetoed or unknown-verb action never earns a proposal. Evidence older than a revoked or expired grant does not count
+  towards the next proposal.
+- Meeting the thresholds only creates a `proposed` grant. It is not usable.
+
+### Why nothing is autonomous yet
+
+- **Phase 3** adds the Jev judge and its calibration gate. Until it exists, `POST /api/v1/assistant-grants/<id>/activate`
+  always answers **409 `judge_gate_not_satisfied`** and writes `assistant.grant.activate_refused`.
+- **Phase 4** adds hook-attested evidence (so tool outcomes the harness saw can count) and the in-session first-grant
+  confirmation. The Phase 1 known limit above (a model with shell access can post `harness_attested` events) must be
+  closed before attested evidence counts.
+- Even an active grant is ignored during the global shadow period (`pending`, source `shadow`).
+
+### Scopes
+
+| Scope | Gives |
+|---|---|
+| `ask` | `assistant_ask` |
+| `report` | `report` |
+| `read` | memory search and the read-only lists, plus `action_grants_list` |
+| `act` | `action_request` |
+
+New workers get **`ask` + `report` only**; `read` and `act` are opt-in. Set them at enrollment
+(`POST /api/v1/assistant-workers` with `"scopes": ["ask","report","read","act"]`, or
+`herdr-eng control-plane assistant-worker enroll ... --scopes ask,report,read,act`) and change them later with
+`POST /api/v1/assistant-workers/<id>/scopes` (`herdr-eng control-plane assistant-worker scopes WORKER_ID --scopes ...`).
+The new set applies to the very next `tools/list` and `tools/call`.
+
+### Owner routes and CLI (operator API key only)
+
+A worker credential gets 401/403 on all of these, a viewer key gets 403, and cross-origin mutations are refused.
+
+| Route | CLI (`herdr-eng control-plane ...`) | Purpose |
+|---|---|---|
+| `GET /api/v1/assistant-action-requests[?status=pending\|approved\|denied\|vetoed]` | `assistant-action list [--status S]` | Requests, including `display`. |
+| `POST /api/v1/assistant-action-requests/<id>/decision` `{"approve": true\|false}` | `assistant-action approve\|deny ID` | Record the owner decision (counts as evidence). 409 if already decided or vetoed. |
+| `GET /api/v1/assistant-grants` | `assistant-grant list` | Grants with their effective state. |
+| `POST /api/v1/assistant-grants/<id>/activate` `{"confirm": true}` | `assistant-grant activate ID` | Currently always 409 (judge gate). |
+| `DELETE /api/v1/assistant-grants/<id>` | `assistant-grant revoke ID` | Revoke; the next request is `pending`. Idempotent. |
+| `POST /api/v1/assistant-workers/<id>/scopes` `{"scopes": [...]}` | `assistant-worker scopes ID --scopes ...` | Change a worker's scopes. |
+
+### The `display` field
+
+`display` is what lets you recognise a request. It is returned **only** on these owner routes (and held in the owner's
+request row and store snapshot); it is never in the MCP response, the audit log, grants, evidence or events. It is
+**masked best effort** (URL userinfo, secret-named options and `NAME=value` pairs, Bearer headers, token shapes), then
+truncated to 300 characters with control characters removed. A scrubber cannot recognise an arbitrary secret word
+(`mysql -pSomething`-style variants and bare passwords can slip through), so treat the owner request list as sensitive
+and keep it off shared screens.
+
+### Hint trust rule
+
+`hint` (`cwd`, `repo`, `recipient`, `host`) is worker-supplied and never trusted to widen anything. A hint fact that the
+canonicalizer actually used is recorded as worker-attested, and **a hint that disagrees with what the command itself
+says makes the owner decide**. A hint is ignored once the command redirects git elsewhere (`cd`, `git -C`, `--git-dir`).
+Hints can make a request stricter, never more permissive; they cannot clear a veto.
+
+### Audit action names
+
+`assistant.action.requested`, `assistant.action.vetoed`, `assistant.action.authorized`, `assistant.action.decided`,
+`assistant.grant.activated`, `assistant.grant.activate_refused`, `assistant.grant.revoked`, plus the Phase 1 worker
+entries. Entries carry the key id and ids only: no command text, credentials or enrollment codes. The chain verifies with
+`herdr-eng control-plane assistant-audit verify`.
+
 ## Testing notes
 
-The end-to-end flow is `tests/control_plane/test_assistant_hub_e2e.py` (real control plane and hub on 127.0.0.1, port 0).
+The end-to-end flows are `tests/control_plane/test_assistant_hub_e2e.py` (Phase 1) and `tests/control_plane/test_assistant_hub_phase2_e2e.py` (Phase 2), each with a real control plane and hub on 127.0.0.1, port 0.
 Tests use a throwaway `HOME`; never point a test at your real `~/.claude`, `~/.codex` or `~/.config/herdr`.
 `@pytest.mark.integration` smoke runs the real `claude mcp add` line (skipped when `claude` is not on PATH):
 `python3 -m pytest tests/control_plane/test_assistant_hub_e2e.py -m integration`.

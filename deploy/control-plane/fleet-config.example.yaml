@@ -171,6 +171,20 @@ sections:
       #     enrollment_ttl_seconds: 900  # one-time enrollment code lifetime
       #     worker_ttl_days: 90          # redeemed worker credential lifetime
       #     # tenant: default            # defaults to the assistant's default tenant
+      #   # OPTIONAL: earned action grants for hub workers with the `act` scope (docs/operations/assistant-hub.md).
+      #   # Nothing is autonomous yet: activation answers 409 until the Phase 3 judge gate exists.
+      #   grants:
+      #     shadow_days: 14              # global shadow period before any grant can be activated or honoured
+      #     shadow_started_at: null      # ISO-8601 with offset; null = stamped on first start
+      #     required_approvals:          # owner approvals of the exact action needed, per risk class
+      #       local_reversible: 5
+      #       remote_reversible: 10
+      #       outward: 30
+      #     min_sessions: 3              # distinct session ids among the counted approvals
+      #     min_tasks: 2                 # distinct task ids among the counted approvals
+      #     grant_ttl_days: 30           # lifetime of a proposed grant, and of an active one from activation
+      #     extra_vetoes: []             # extra hard denies: [{code: no_prod, reason: "...", argv_contains: "prod"}]
+      #     policy_version: 1            # bump to invalidate every existing grant
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)
