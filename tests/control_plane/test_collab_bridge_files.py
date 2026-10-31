@@ -218,6 +218,36 @@ def test_link_new_bytes_refuses_a_dangling_symlink_name(tree):
     assert not (outside / "new").exists()
 
 
+def test_link_new_beneath_creates_dirs_no_follow_and_never_replaces(tree):
+    root, _ = tree
+    parts = ["staging", AGENT, "upl_" + "1" * 24]
+    with pytest.raises(BridgeError):                         # without create_dirs a missing dir is refused
+        cbf.link_new_beneath(root, parts, "meta.json", b"{}")
+    assert not (root / "staging").exists()
+    assert cbf.link_new_beneath(root, parts, "meta.json", b"{}", create_dirs=True) is True
+    d = root.joinpath(*parts)
+    assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(d / "meta.json").st_mode) == 0o600 and os.stat(d / "meta.json").st_nlink == 1
+    assert cbf.link_new_beneath(root, parts, "0000000", b"part") is True
+    assert cbf.link_new_beneath(root, parts, "0000000", b"other") is False
+    assert (d / "0000000").read_bytes() == b"part"
+    for bad in ("", ".tmp-x", "../x", "a/b"):
+        with pytest.raises(BridgeError):
+            cbf.link_new_beneath(root, parts, bad, b"x")
+
+
+@pytest.mark.parametrize("create_dirs", [False, True])
+def test_link_new_beneath_never_follows_a_symlinked_component(tree, create_dirs):
+    root, outside = tree
+    (root / "staging").mkdir()
+    (outside / UPL).mkdir()
+    (root / "staging" / AGENT).symlink_to(outside)
+    before = _snapshot(outside)
+    with pytest.raises((BridgeError, OSError)):
+        cbf.link_new_beneath(root, ["staging", AGENT, UPL], "0000000", b"x", create_dirs=create_dirs)
+    assert _snapshot(outside) == before
+
+
 # ----------------------------------------------------------------------------- root-safe mutation in a hostile tree
 
 UPL = "upl_" + "0" * 24

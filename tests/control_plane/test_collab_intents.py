@@ -2147,6 +2147,51 @@ def test_a_three_chunk_staged_binary_file_is_assembled_verified_and_only_meta_an
     committing(registry_pg, tmp_path, body)
 
 
+def test_an_upload_staged_by_collab_public_is_consumable_by_the_assembly(registry_pg, tmp_path):
+    """Task 7b's ``stage_chunk_for`` (the real collab-public writer, out of order) produces exactly the layout the
+    5c assembly consumes; afterwards a re-sent chunk is a complete replay that writes nothing."""
+    import base64
+
+    from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
+    from herdr_engineering.control_plane.collab_artifacts import CollabArtifactBridge
+
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        service = CollabService(StaticTokenAuthenticator({}), now=env.clock)
+        bridge = CollabArtifactBridge(service, tmp_path / "mirror", env.outbox, clock=env.clock, feed_interval=3600.0)
+        sha = hashlib.sha256(BLOB).hexdigest()
+
+        def chunk(i):
+            piece = BLOB[i * CHUNK:(i + 1) * CHUNK]
+            return cbf.validate_chunk({"artifact_id": aid, "name": "blob.bin", "size_bytes": len(BLOB),
+                                       "file_sha256": sha, "total": 3, "index": i,
+                                       "data": base64.b64encode(piece).decode(),
+                                       "sha256": hashlib.sha256(piece).hexdigest()}, env.applier.limits)
+        outs = [await asyncio.to_thread(bridge.stage_chunk_for, a, chunk(i), limits=env.applier.limits,
+                                        staging_cap=env.applier.limits.staging_bytes_per_agent) for i in (2, 0, 1)]
+        upl = outs[0]["upload_id"]
+        assert outs[0]["complete"] is False and outs[0]["missing"] == [0, 1]
+        replay = await asyncio.to_thread(bridge.stage_chunk_for, a, chunk(2), limits=env.applier.limits,
+                                         staging_cap=env.applier.limits.staging_bytes_per_agent)
+        assert replay["complete"] is True
+        d = env.outbox / "staging" / a / upl
+        assert sorted(p.name for p in d.iterdir()) == ["0000000", "0000001", "0000002", "audited", "meta.json"]
+        raw = commit(env, a, aid, v1, [staged("blob.bin", upl)])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "created", doc
+        (entry,) = [e for e in (await version_of(env, doc["version_id"]))["output_manifest"] if e["name"] == "blob.bin"]
+        assert entry["sha256"] == sha and env.applier.rustfs.get(entry["storage_key"], entry["sha256"]) == BLOB
+        assert sorted(p.name for p in d.iterdir()) == ["audited", "meta.json", "verified"]
+        after = await asyncio.to_thread(bridge.stage_chunk_for, a, chunk(0), limits=env.applier.limits,
+                                        staging_cap=env.applier.limits.staging_bytes_per_agent)
+        assert after["stored"] is False and after["complete"] is True
+        assert sorted(p.name for p in d.iterdir()) == ["audited", "meta.json", "verified"]
+        assert [e["event_type"] for e in service._log].count("artifact_upload_staged") == 1
+    committing(registry_pg, tmp_path, body)
+
+
 BIG = "".join(f"big line {i}\n" for i in range(40))
 
 

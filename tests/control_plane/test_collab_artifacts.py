@@ -1,14 +1,18 @@
 # ruff: noqa: F811  (pytest fixtures are imported by name from the sibling test modules)
-"""Plan 3, Task 7a: the collab-public artifact bridge reads (list / head / read / history), the ``agents.json``
-feed and the audit trail.
+"""Plan 3, Tasks 7a/7b: the collab-public artifact bridge reads (list / head / read / history), the ``agents.json``
+feed, the audit trail and resumable chunk staging (``stage_chunk`` / ``stage_chunk_for``).
 
 A real ``CollabService`` with two agents: alice's agent A holds a write grant on X, bob's agent B a read grant on Y.
 The mirror is hand-written the way the worker writes it (``grants.json`` with ``limits``, ``head.json``, blobs named
 by sha256); the outbox is a temp dir. One fake clock drives both the service and the bridge."""
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
+import stat
+import threading
 import time
 
 import pytest
@@ -28,11 +32,16 @@ from herdr_engineering.control_plane.collab_artifacts import (
     CollabArtifactBridge,
 )
 from herdr_engineering.control_plane.collab_bridge_files import (
+    CHUNK_BYTES,
     FEED_MAX_AGE,
     BridgeLimits,
     atomic_write_bytes,
     atomic_write_json,
     read_json_beneath,
+    read_staged_meta,
+    upload_complete,
+    upload_id_for,
+    validate_chunk,
 )
 from herdr_engineering.control_plane.collab_intents import AGENTS_FEED as WORKER_FEED
 from herdr_engineering.control_plane.collab_intents import AGENTS_FEED_MAX_BYTES
@@ -526,3 +535,293 @@ def test_a_failing_feed_write_never_raises_and_leaves_no_partial_file(world, cap
     br.write_agents_feed()
     assert not [p for p in world.outbox.iterdir() if p.name.startswith(".tmp-")]
     br.stop()
+
+
+# ------------------------------------------------------------------------------ chunk staging (Task 7b)
+CHUNK = CHUNK_BYTES
+BIG = bytes((i * 7 + 3) % 256 for i in range(2 * CHUNK + 1000)) + b"SENTINEL-CHUNK-BYTES-91c2"   # 3 chunks
+
+
+def chunk_args(artifact_id, data, index, *, name="big.bin", body=None, sha256=None):
+    piece = data[index * CHUNK:(index + 1) * CHUNK] if body is None else body
+    return {"artifact_id": artifact_id, "name": name, "size_bytes": len(data), "file_sha256": sha(data),
+            "total": -(-len(data) // CHUNK), "index": index, "data": base64.b64encode(piece).decode(),
+            "sha256": sha(piece) if sha256 is None else sha256}
+
+
+def as_chunk(artifact_id, data, index, **kw):
+    return validate_chunk(chunk_args(artifact_id, data, index, **kw), BridgeLimits())
+
+
+def upload_dir(world, owner, artifact_id, data, name="big.bin"):
+    return world.outbox / "staging" / owner / upload_id_for(owner, artifact_id, name, sha(data), len(data))
+
+
+def staged_events(world):
+    return world.events("artifact_upload_staged")
+
+
+def test_chunks_stage_resumably_and_only_the_last_or_a_replay_reports_progress(world):
+    br, a = world.bridge, world.a
+    upl = upload_id_for(a.id, X, "big.bin", sha(BIG), len(BIG))
+    first = br.stage_chunk(a, chunk_args(X, BIG, 0))
+    assert first == {"upload_id": upl, "index": 0, "stored": True}               # a plain chunk: no progress
+    assert br.stats["progress_scans"] == 0                                      # ... and no upload-dir scan
+    assert br.stats["reservation_scans"] == 1                                   # the first chunk reserves once
+    last = br.stage_chunk(a, chunk_args(X, BIG, 2))
+    assert last == {"upload_id": upl, "index": 2, "stored": True, "complete": False, "received": 2,
+                    "missing": [1]}
+    assert not staged_events(world)
+    middle = br.stage_chunk(a, chunk_args(X, BIG, 1))
+    assert middle == {"upload_id": upl, "index": 1, "stored": True}
+    assert br.stats["progress_scans"] == 1 and br.stats["reservation_scans"] == 1   # a plain chunk scans nothing
+    again = br.stage_chunk(a, chunk_args(X, BIG, 2))
+    assert again == {"upload_id": upl, "index": 2, "stored": False, "complete": True, "received": 3, "missing": []}
+    d = upload_dir(world, a.id, X, BIG)
+    assert d.parent.name == a.id and d.name == upl
+    assert sorted(p.name for p in d.iterdir()) == ["0000000", "0000001", "0000002", "audited", "meta.json"]
+    for i in range(3):
+        part = d / f"{i:07d}"
+        assert stat.S_IMODE(os.stat(part).st_mode) == 0o600 and os.stat(part).st_nlink == 1
+        assert part.read_bytes() == BIG[i * CHUNK:(i + 1) * CHUNK]
+    meta = json.loads((d / "meta.json").read_text())
+    assert meta["owner_key"] == a.id and meta["upload_id"] == upl and meta["artifact_id"] == X
+    assert meta["size_bytes"] == len(BIG) and meta["total"] == 3 and meta["file_sha256"] == sha(BIG)
+    assert stat.S_IMODE(os.stat(d / "meta.json").st_mode) == 0o600
+    assert read_staged_meta(world.outbox, a.id, upl, BridgeLimits()) is not None     # the worker accepts it
+    assert upload_complete(world.outbox, a.id, upl, BridgeLimits())
+
+
+def test_a_replay_is_idempotent_and_different_bytes_at_a_staged_index_are_409(world):
+    br, a = world.bridge, world.a
+    br.stage_chunk(a, chunk_args(X, BIG, 0))
+    br.stage_chunk(a, chunk_args(X, BIG, 1))
+    replay = br.stage_chunk(a, chunk_args(X, BIG, 1))
+    assert replay["stored"] is False and replay["complete"] is False and replay["missing"] == [2]
+    other = bytes(CHUNK)
+    assert status(br.stage_chunk, a, chunk_args(X, BIG, 1, body=other)) == (
+        409, "chunk already staged with different content")
+    assert (upload_dir(world, a.id, X, BIG) / "0000001").read_bytes() == BIG[CHUNK:2 * CHUNK]
+
+
+@pytest.mark.parametrize("case", ["base64", "sha", "oversize", "short", "unknown_key"])
+def test_an_invalid_chunk_is_400_and_stages_nothing(world, case):
+    args = chunk_args(X, BIG, 0)
+    if case == "base64":
+        args["data"] = args["data"][:-4] + "@@@@"
+    elif case == "sha":
+        args["sha256"] = sha(b"something else")
+    elif case == "oversize":
+        piece = BIG[:CHUNK + 1]
+        args.update(data=base64.b64encode(piece).decode(), sha256=sha(piece))
+    elif case == "short":
+        piece = BIG[:CHUNK - 1]
+        args.update(data=base64.b64encode(piece).decode(), sha256=sha(piece))
+    else:
+        args["extra"] = 1
+    assert status(world.bridge.stage_chunk, world.a, args)[0] == 400
+    assert not (world.outbox / "staging").exists()
+
+
+def test_a_read_grant_is_403_and_an_unwritable_artifact_is_403_and_both_are_audited(world):
+    br = world.bridge
+    assert status(br.stage_chunk, world.b, chunk_args(Y, BIG, 0)) == (403, "read-only grant")
+    world.mirror.grant(world.a.id, "art_z", "write")
+    world.mirror.head("art_z", [version("v_z1", 1, [file_entry("z.txt", b"z\n")])], writable=False)
+    world.mirror.grants()
+    assert status(br.stage_chunk, world.a, chunk_args("art_z", BIG, 0)) == (
+        403, "artifact is not writable through collaboration")
+    denied = {(e["payload"]["action"], e["payload"]["reason"]) for e in world.events("audit_denied")}
+    assert denied == {("artifact.stage_chunk", "read_only"), ("artifact.stage_chunk", "not_writable")}
+    assert not (world.outbox / "staging").exists()
+
+
+def test_an_ungranted_or_unknown_artifact_is_the_audited_404(world):
+    for aid in (Y, "art_unknown"):
+        world.clock.t += 61
+        world.mirror.grants()
+        assert status(world.bridge.stage_chunk, world.a, chunk_args(aid, BIG, 0)) == (404, "not found")
+    assert {e["payload"]["reason"] for e in world.events("audit_denied")} == {"no_grant"}
+    assert status(world.bridge.stage_chunk, world.a, "not a dict")[0] == 400
+    assert not (world.outbox / "staging").exists()
+
+
+def test_a_first_chunk_over_the_per_agent_staging_cap_is_429(world):
+    small = b"s" * 600
+    world.mirror.grants(limits={"staging_bytes_per_agent": 1000})
+    br, a = world.bridge, world.a
+    assert br.stage_chunk(a, chunk_args(X, small, 0, name="one.bin"))["complete"] is True
+    assert status(br.stage_chunk, a, chunk_args(X, small, 0, name="two.bin")) == (
+        429, "staging space full; commit or wait")
+    assert status(br.stage_chunk, a, chunk_args(X, BIG, 0)) == (429, "staging space full; commit or wait")
+    assert not upload_dir(world, a.id, X, small, "two.bin").exists()
+    assert br.stage_chunk(a, chunk_args(X, small, 0, name="one.bin"))["stored"] is False   # a replay is no new reservation
+    (upload_dir(world, a.id, X, small, "one.bin") / "verified").write_bytes(b"")          # the worker consumed it
+    assert br.stage_chunk(a, chunk_args(X, small, 0, name="two.bin"))["stored"] is True
+
+
+def test_the_chunks_per_minute_limit_is_429_and_resets_after_the_window(world):
+    world.mirror.grants(limits={"chunks_per_minute": 3})
+    br, a = world.bridge, world.a
+    for i in (0, 1, 0):
+        br.stage_chunk(a, chunk_args(X, BIG, i))
+    assert status(br.stage_chunk, a, chunk_args(X, BIG, 2)) == (429, "chunk rate limit exceeded")
+    assert not (upload_dir(world, a.id, X, BIG) / "0000002").exists()
+    world.clock.t += 60
+    world.mirror.grants(limits={"chunks_per_minute": 3})
+    assert br.stage_chunk(a, chunk_args(X, BIG, 2))["complete"] is True
+
+
+def test_stage_chunk_for_stages_under_any_owner_key_with_no_principal_and_respects_both_caps(world):
+    br = world.bridge
+    small = b"m" * 600
+    lim = BridgeLimits(staging_bytes_total=1000)
+    out = br.stage_chunk_for("m_test", as_chunk(X, small, 0), limits=lim, staging_cap=10_000)
+    assert out["stored"] is True and out["complete"] is True
+    assert upload_dir(world, "m_test", X, small).is_dir()
+    again = br.stage_chunk_for("m_test", as_chunk(X, small, 0), limits=lim, staging_cap=10_000)
+    assert again["stored"] is False and again["complete"] is True and again["upload_id"] == out["upload_id"]
+    # the whole-volume cap counts every owner
+    assert status(br.stage_chunk_for, "m_other", as_chunk(X, small, 0, name="o.bin"), limits=lim,
+                  staging_cap=10_000) == (429, "staging space full; commit or wait")
+    # the per-owner cap counts only this owner's uploads
+    assert status(br.stage_chunk_for, "m_test", as_chunk(X, small, 0, name="p.bin"), limits=BridgeLimits(),
+                  staging_cap=1000) == (429, "staging space full; commit or wait")
+    assert br.stage_chunk_for("m_other", as_chunk(X, small, 0, name="o.bin"), limits=BridgeLimits(),
+                              staging_cap=1000)["stored"] is True
+    assert not world.events("audit_denied")
+
+
+def test_a_later_chunk_must_match_the_staged_metadata(world):
+    br, a = world.bridge, world.a
+    br.stage_chunk(a, chunk_args(X, BIG, 0))
+    d = upload_dir(world, a.id, X, BIG)
+    meta = json.loads((d / "meta.json").read_text())
+    os.unlink(d / "meta.json")
+    (d / "meta.json").write_text(json.dumps({**meta, "created_at": "yesterday"}))       # corrupt: never relinked
+    assert status(br.stage_chunk, a, chunk_args(X, BIG, 1)) == (409, "staged upload metadata does not match")
+    assert not (d / "0000001").exists()
+
+
+def test_a_verified_upload_replays_complete_without_writing(world):
+    br, a = world.bridge, world.a
+    small = b"v" * 700
+    br.stage_chunk(a, chunk_args(X, small, 0, name="v.bin"))
+    d = upload_dir(world, a.id, X, small, "v.bin")
+    os.unlink(d / "0000000")                                                           # what the worker leaves
+    (d / "verified").write_bytes(b"")
+    out = br.stage_chunk(a, chunk_args(X, small, 0, name="v.bin"))
+    assert out["stored"] is False and out["complete"] is True and out["missing"] == []
+    assert sorted(p.name for p in d.iterdir()) == ["audited", "meta.json", "verified"]
+
+
+def test_a_part_dir_swept_between_chunks_is_not_resurrected_without_meta(world):
+    br, a = world.bridge, world.a
+    br.stage_chunk(a, chunk_args(X, BIG, 0))
+    d = upload_dir(world, a.id, X, BIG)
+    for p in d.iterdir():
+        os.unlink(p)
+    os.rmdir(d)                                                                        # the worker's sweep
+    out = br.stage_chunk(a, chunk_args(X, BIG, 1))                                     # starts over: meta first
+    assert out["stored"] is True
+    assert sorted(p.name for p in d.iterdir()) == ["0000001", "meta.json"]
+
+
+def test_a_symlinked_owner_dir_is_never_followed(world, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (world.outbox / "staging").mkdir()
+    (world.outbox / "staging" / world.a.id).symlink_to(outside)
+    assert status(world.bridge.stage_chunk, world.a, chunk_args(X, BIG, 0))[0] in (409, 503)
+    assert list(outside.iterdir()) == []
+
+
+def test_a_completed_upload_is_audited_exactly_once_with_no_content_even_across_restarts(world, caplog):
+    br, a = world.bridge, world.a
+    for i in range(3):
+        br.stage_chunk(a, chunk_args(X, BIG, i))
+    for i in range(3):
+        br.stage_chunk(a, chunk_args(X, BIG, i))                                       # replays scan again
+    restarted = CollabArtifactBridge(world.s, world.mirror.root, world.outbox, clock=world.clock,
+                                     feed_interval=3600.0)
+    assert restarted.stage_chunk(a, chunk_args(X, BIG, 2))["complete"] is True
+    (ev,) = staged_events(world)
+    p = ev["payload"]
+    upl = upload_id_for(a.id, X, "big.bin", sha(BIG), len(BIG))
+    assert p["upload_id"] == upl and p["artifact_id"] == X and p["size_bytes"] == len(BIG)
+    assert p["actor_agent_id"] == a.id and p["owner_key"] == a.id
+    blob = json.dumps(ev)
+    for secret in ("SENTINEL-CHUNK-BYTES", "big.bin", chunk_args(X, BIG, 2)["data"][:40]):
+        assert secret not in blob
+    assert "SENTINEL-CHUNK-BYTES" not in caplog.text and chunk_args(X, BIG, 2)["data"][:40] not in caplog.text
+
+
+def test_a_failed_audit_write_keeps_the_upload_unaudited_for_a_retry(world):
+    br, a = world.bridge, world.a
+    small = b"q" * 500
+    world.s.max_log_events = len(world.s._log)
+    assert status(br.stage_chunk, a, chunk_args(X, small, 0, name="q.bin"))[0] == 503
+    assert not (upload_dir(world, a.id, X, small, "q.bin") / "audited").exists()
+    world.s.max_log_events = 200_000
+    assert br.stage_chunk(a, chunk_args(X, small, 0, name="q.bin"))["complete"] is True
+    assert len(staged_events(world)) == 1
+
+
+def test_the_upload_id_is_deterministic_across_a_restart(world):
+    a = world.a
+    out = world.bridge.stage_chunk(a, chunk_args(X, BIG, 0))
+    restarted = CollabArtifactBridge(world.s, world.mirror.root, world.outbox, clock=world.clock,
+                                     feed_interval=3600.0)
+    again = restarted.stage_chunk(a, chunk_args(X, BIG, 0))
+    assert again["upload_id"] == out["upload_id"] == upload_id_for(a.id, X, "big.bin", sha(BIG), len(BIG))
+    assert again["stored"] is False
+
+
+def _race(fn, n=2):
+    barrier = threading.Barrier(n)
+    results: list = [None] * n
+
+    def go(i):
+        barrier.wait()
+        try:
+            results[i] = ("ok", fn(i))
+        except CollabError as exc:
+            results[i] = ("err", exc.status)
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    return results
+
+
+def test_concurrent_identical_first_chunks_stage_once(world):
+    br = world.bridge
+    chunk = as_chunk(X, BIG, 0)
+    for _ in range(5):
+        owner = f"m_race{_}"
+        results = _race(lambda i: br.stage_chunk_for(owner, chunk, limits=BridgeLimits(), staging_cap=len(BIG)))
+        assert sorted(r[1]["stored"] for r in results) == [False, True], results
+        d = upload_dir(world, owner, X, BIG)
+        assert sorted(p.name for p in d.iterdir()) == ["0000000", "meta.json"]
+
+
+def test_concurrent_first_chunks_of_different_uploads_cannot_both_reserve_the_cap(world):
+    br = world.bridge
+    for round_ in range(5):
+        owner = f"m_cap{round_}"
+        chunks = [as_chunk(X, BIG, 0, name=f"f{i}.bin") for i in range(2)]
+        results = _race(lambda i: br.stage_chunk_for(owner, chunks[i], limits=BridgeLimits(),
+                                                     staging_cap=len(BIG)))
+        assert sorted(r[0] for r in results) == ["err", "ok"], results
+        assert [r[1] for r in results if r[0] == "err"] == [429]
+
+
+def test_stage_chunk_for_refuses_a_hand_built_chunk_that_breaks_the_reservation_bound(world):
+    import dataclasses
+    good = as_chunk(X, BIG, 0)
+    for bad in (dataclasses.replace(good, data=good.data + b"x"), dataclasses.replace(good, index=3),
+                dataclasses.replace(good, total=99), dataclasses.replace(good, size_bytes=10)):
+        assert status(world.bridge.stage_chunk_for, "m_hand", bad, limits=BridgeLimits(),
+                      staging_cap=10 ** 9)[0] == 400
+    assert not (world.outbox / "staging").exists()

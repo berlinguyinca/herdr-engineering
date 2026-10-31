@@ -442,21 +442,48 @@ def link_new_bytes(dir: Path, name: str, data: bytes, *, mode: int = 0o600) -> b
     """
     if not _safe_part(name) or name.startswith(".tmp-"):
         raise BridgeError("unsafe file name")
-    data = bytes(data)
     dfd = _ensure_dir(dir)
     try:
-        linked = _link_tmpfile(dfd, name, data, mode)
-        if linked is not None:
-            return linked
-        tmp = _create_tmp(dfd, data, mode)
-        try:
-            os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
-        except FileExistsError:
-            return False
-        finally:
-            _unlink_quiet(tmp, dfd)
-        os.fsync(dfd)
-        return True
+        return _link_new_at(dfd, name, bytes(data), mode)
+    finally:
+        os.close(dfd)
+
+
+def _link_new_at(dfd: int, name: str, data: bytes, mode: int) -> bool:
+    """The body of ``link_new_bytes`` on an already opened directory fd."""
+    linked = _link_tmpfile(dfd, name, data, mode)
+    if linked is not None:
+        return linked
+    tmp = _create_tmp(dfd, data, mode)
+    try:
+        os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+    except FileExistsError:
+        return False
+    finally:
+        _unlink_quiet(tmp, dfd)
+    os.fsync(dfd)
+    return True
+
+
+def link_new_beneath(root: Path, parts: list[str], name: str, data: bytes, *, mode: int = 0o600,
+                     create_dirs: bool = False, dir_mode: int = 0o700) -> bool:
+    """``link_new_bytes`` at ``root/parts.../name`` with every component opened no-follow from the trusted ``root``.
+
+    With ``create_dirs`` missing directories are created (``mkdirat``, ``dir_mode``) as ``make_dirs_beneath`` does;
+    without it a missing directory is refused, so a write never resurrects a directory someone else removed.
+    ``BridgeError`` for an unsafe name or a missing, symlinked or non-directory component (``OSError`` from the
+    creating walk). True when written now, False when ``name`` already exists (never replaced, never partial).
+    """
+    if not _safe_part(name) or name.startswith(".tmp-"):
+        raise BridgeError("unsafe file name")
+    if create_dirs:
+        dfd = _make_dirs_beneath(root, parts, dir_mode)
+    else:
+        dfd = _walk_dirs(root, parts)
+        if dfd is None:
+            raise BridgeError("directory is missing or unsafe")
+    try:
+        return _link_new_at(dfd, name, bytes(data), mode)
     finally:
         os.close(dfd)
 
@@ -1321,7 +1348,7 @@ register_intent_kind("commit", validate_commit_payload, actors=frozenset({"agent
 __all__ = [
     "Actor", "agent_owner_key", "DIR_MODE", "ensure_dir", "file_exists_beneath", "make_dirs_beneath", "stream_new_beneath", "utf8_accept", "atomic_write_bytes", "atomic_write_json", "AUDITED_MARKER", "BridgeError",
     "BridgeLimits", "Change", "Chunk", "CHUNK_BYTES", "CommitPayload", "ENTRY_SLACK", "FEED_MAX_AGE", "Intent",
-    "INTENT_MAX_AGE", "IntentError", "link_new_bytes", "list_beneath", "list_parts", "MAX_CHUNK_INDEX",
+    "INTENT_MAX_AGE", "IntentError", "link_new_beneath", "link_new_bytes", "list_beneath", "list_parts", "MAX_CHUNK_INDEX",
     "MAX_MESSAGE", "max_parts_for", "MAX_TREE_DEPTH", "MCP_UPLOAD_MAX_BODY", "META_MAX_BYTES", "META_NAME",
     "new_ticket", "open_beneath", "read_bytes_beneath", "read_json_beneath", "read_staged_meta",
     "register_intent_kind", "remove_tree_beneath", "request_digest", "SHA_RE", "StagedUpload", "staging_parts",
