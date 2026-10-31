@@ -111,3 +111,20 @@ LSP/AST diagnostic transports remain unavailable; no such analysis result is cla
 Final independent re-review confirmed query source/target rejection and reported no
 remaining code/spec/security blocker in the reviewed contact-extension slice. The
 reviewer independently reran all 77 focused tests, Ruff, compilation and diff checks.
+
+## Screenshot request regression
+
+The reported UI request (eight adults, ten children, everyone pays their own bill)
+was reproduced at the main-lane request parser: parseDinnerRequest returns
+INVALID_REQUEST because it only accepts a guest count plus explicit dollar budget.
+That rejection occurs before delegation; UI catches it as a generic failed request.
+The integration adapter independently restricts children to zero and requires budget.
+These files belong to main; root cause and exact reproduction were handed to that
+owner, who accepted the bounded parser/adapter/UI fix. They were not edited here.
+
+A new event API characterization test proves eight adults, ten children and null
+budget/currency produce a reviewable scoped local draft with explicit missing values,
+unknown costs, separate-tabs question still open, and no recipient/outreach. The
+focused event/artifact/contracts suite passes 78 tests; Ruff and diff check pass.
+This test does not claim the request parser preserves billing preference: that
+request interpretation and clarification work remains main-lane ownership.

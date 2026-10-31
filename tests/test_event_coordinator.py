@@ -302,3 +302,26 @@ def test_fixture_cli_preserves_explicit_scope(tmp_path):
     report = json.loads(next(tmp_path.rglob("report.json")).read_text())
     assert report["browser"]["request"]["scope"]["user_ref"] == "user:cli"
     assert Coordinator.loads(report["checkpoint"]).task_id == "task:cli-dinner"
+
+
+def test_partial_dinner_with_children_and_no_budget_remains_a_reviewable_draft(tmp_path):
+    from herdr_engineering.artifacts import FilesystemArtifactWorkspace
+    from herdr_engineering.event_fixture import prepare_fixture
+
+    fixture = Path(__file__).parent / "fixtures/event_coordinator/dinner-eight-under-400.json"
+    data = json.loads(fixture.read_text())
+    data["requirements"].update(adults=8, children=10, budget=None, currency=None)
+    ws = FilesystemArtifactWorkspace(root=tmp_path)
+    result = prepare_fixture(data, ws, user_id="user:partial", task_id="task:children-separate-tabs")
+    assert result.ok
+    report = json.loads(ws.read(result.artifact))
+    assert report["requirements"]["children"] == 10
+    assert report["requirements"]["budget"] is None and report["requirements"]["currency"] is None
+    assert set(report["missing_requirements"]) == {"date_time", "timezone", "budget", "currency"}
+    for row in report["venues"]:
+        assert "8 adults and 10 children" in row["draft"]["body"]
+        assert "[budget required] [currency required]" in row["draft"]["body"]
+        assert "400 USD" not in row["draft"]["body"]
+        assert row["comparison"]["costs"]["status"] == "unknown"
+        assert "tabs" in row["unanswered"] and "requirements_missing" in row["blockers"]
+        assert row["draft"]["recipient"] is None
