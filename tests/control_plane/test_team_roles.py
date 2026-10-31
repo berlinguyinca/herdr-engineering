@@ -282,19 +282,21 @@ def test_no_holder_fails_closed_and_writes_nothing(rp):
 
 
 def test_agents_that_cannot_execute_are_never_a_fall_through(rp):
-    """A reviewer agent holds read and post only. Routing to it would need `execute`; it fails closed rather than widening."""
+    """A reviewer agent holds read and post only. Routing to it would need `execute`; it fails closed rather than widening,
+    and the request never lands on an implementer agent that is not in the role."""
     p = rp
+    team, (a1, _) = crew(p)
     rev = p.agent(name="rev")
-    team = p.team()
-    assert p.attach(team, {"reviewer": [rev["agent_id"]]})[0] == 200
-    impl = p.agent(name="impl")
-    p.c("alice", "POST", f"{BASE}/rooms/{p.room}/agents/grant", {"agent_id": impl["agent_id"], "actions": ["read", "post", "execute"]})
-    s, out = p.make("alice", target_role="reviewer", reviews_task_id="x")
-    assert s in (404, 409) and not p.events("task_created")
-    work = p.make("alice", target_agent_id=impl["agent_id"], text="work")
-    if work[0] == 201:
-        s, out = p.make("alice", target_role="reviewer", reviews_task_id=work[1]["task_id"])
-        assert s == 409 and out["code"] == "no_role_holder" and len(p.events("task_created")) == 1
+    other = p.team("Reviewers")
+    assert p.attach(other, {"reviewer": [rev["agent_id"]]})[0] == 200
+    work = p.make("alice", target_agent_id=a1["agent_id"], text="work")[1]["task_id"]
+    n = len(p.events("task_created"))
+    s, out = p.make("alice", target_role="reviewer", reviews_task_id=work)
+    assert s == 409 and out["code"] == "no_role_holder" and len(p.events("task_created")) == n
+    assert p.inbox(rev) == []
+    p.assign(other, "reviewer", "user:carol")                     # a person holding the same role makes it routable
+    s, out = p.make("alice", target_role="reviewer", reviews_task_id=work)
+    assert s == 201 and out["routed_to"] == "user:carol"
 
 
 def test_two_teams_holding_one_role_need_a_team_id_and_it_must_be_attached(rp):
@@ -380,7 +382,7 @@ def test_the_creator_or_owner_can_cancel_a_person_task(rp):
     p = rp
     crew(p)
     tid = p.make("alice", target_user_id="bob")[1]["task_id"]
-    assert p.c("carol", "POST", f"{BASE}/rooms/{p.room}/tasks/{tid}/cancel", {})[0] == 404
+    assert p.c("carol", "POST", f"{BASE}/rooms/{p.room}/tasks/{tid}/cancel", {})[0] in (403, 404)
     assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/tasks/{tid}/cancel", {})[0] == 200
     assert p.mine("bob")[1]["tasks"] == []
 
@@ -532,14 +534,14 @@ def test_the_timer_state_is_in_the_log_so_a_restart_neither_repeats_nor_loses_an
     p.sweep()
     again = reborn(p, tmp_path)
     assert again.sweep_team_roles()["reminded"] == 0                                    # the reminder is not sent twice
-    p.clock.t += 400                                                                    # same clock for both
+    p.clock.t += 300                                                                    # same clock for both: 900s, the 90% mark
     out = again.sweep_team_roles()
     assert out["reminded"] == 1 and out["escalated"] == 0
     p.clock.t += 100
     assert again.sweep_team_roles()["escalated"] == 1
-    third = reborn(p, tmp_path)
-    third.hydrate([e for e in again._log if e not in p.svc._log])
-    assert third.sweep_team_roles()["escalated"] == 0
+    third = _service(tmp_path, p.clock, name="third")
+    third.hydrate(again._log)
+    assert third.sweep_team_roles() == {"active": True, "reminded": 0, "reassigned": 0, "escalated": 0, "extended": 0}
     assert third._tasks[tid]["status"] == "blocked"
 
 

@@ -244,6 +244,8 @@ def _collab_ops(ev: dict) -> list[dict]:
         tid = _text(p["task_id"])
         sc = _scope("room", rooms=[rid], project=pid)
         text = _text(p.get("text"), 4000) or ""
+        if p.get("target_kind") == "user":      # a task for a person: its words and its assignee stay in the collab service
+            text = ""
         ops.append(ent("task", tid, display_name=(text.splitlines() or [tid])[0][:120] or tid, status="pending", **sc,
                        aliases=[("collab_task", tid)],
                        attrs={"room_task_id": tid, "room_id": rid, "target_agent_id": _text(p.get("target_agent_id")),

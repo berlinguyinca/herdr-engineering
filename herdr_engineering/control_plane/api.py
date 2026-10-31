@@ -1663,6 +1663,7 @@ class ControlPlaneServer:
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
             self._summary_scanner.start()
         self._start_background_thread(self._sweep_loop)
+        self._start_background_thread(self._team_roles_loop)
         self._start_background_thread(self._deployments_loop)
         if getattr(self, "ci_watch", None) is not None and self.ci_watch.config["enabled"]:
             self._start_background_thread(self.ci_watch.run)
@@ -1674,6 +1675,20 @@ class ControlPlaneServer:
             self._start_background_thread(self._link_flush_loop)
         self._ready.set()
         return self._httpd
+
+    def _team_roles_loop(self):
+        """Team collaboration slice 2: the server-side clock for tasks held by people. It evaluates leases whether or not the
+        assignee ever polls; the sweep is idempotent, crash-safe (state is replayed from the log) and a no-op while the flag is off."""
+        while not self._maintenance_stop.is_set():
+            interval = 30
+            collab = self.collab
+            if collab is not None:
+                try:
+                    collab.sweep_team_roles()
+                    interval = collab.team_roles_cfg()["sweep_interval_seconds"]
+                except Exception as exc:                        # noqa: BLE001 - a sweep failure must never stop the loop
+                    log.warning("team roles sweep failed: %s", type(exc).__name__)
+            self._maintenance_stop.wait(interval)
 
     def _sweep_loop(self, interval=300):
         """Periodic retention, starting at once so re-hydrated expired rows do not linger."""
