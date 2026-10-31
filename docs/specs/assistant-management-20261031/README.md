@@ -40,7 +40,9 @@ Audit of the conventions already in `herdr-eng`, and what this contract does wit
 herdr-eng assistant types
 herdr-eng assistant list [--type TYPE] [--parent REF] [--json]
 herdr-eng assistant inspect REF [--json]
-herdr-eng assistant create NAME --type TYPE [--parent REF] [--idempotency-key KEY]
+herdr-eng assistant create NAME --type TYPE [--parent REF] [--require CAPS] [--host HOST_ID] [--dry-run] [--idempotency-key KEY]
+herdr-eng assistant place --type TYPE [--require CAPS] [--json]
+herdr-eng assistant hosts list [--require CAPS] [--room ROOM_ID]
 herdr-eng assistant link CHILD --parent PARENT [--idempotency-key KEY]
 herdr-eng assistant unlink CHILD
 herdr-eng assistant archive REF
@@ -66,6 +68,9 @@ text, plus the built-in `rakazo`:
 | `rakazo` | A personal assistant: chat, connections, approvals | yes | none |
 | `pi-secretary` | Specialist with the digest-pinned Secretary role, no tools | no | a bound runtime (see Specialist setup) |
 | `pi` | Engineering handoff through the existing consumer | no | none |
+| `browser` | Specialist that drives a real browser | no | a host with `display` and `internet`, and a sandbox profile that allows both (none exists yet) |
+
+Each specialist type declares the capabilities it **requires**. `types` prints them.
 
 ### `create`
 
@@ -108,6 +113,11 @@ Additive; existing assistants and clients are unaffected.
   increments on link/unlink.
 - `POST /api/v1/assistants` accepts optional `type`, `parent_id`, `idempotency_key`.
 - `POST /api/v1/assistants/{id}/link` with `{"parent_id": ...}`, and `POST /api/v1/assistants/{id}/unlink` with `{}`.
+- The host attestation gains `capabilities` (closed vocabulary above); `_assistant_runtime_host_json` returns it.
+- Specialist type definitions in `personal_assistant.delegation.targets` gain an optional `requires` list.
+- `POST` runtime creation keeps taking an explicit `host_id`; the resolver runs in the CLI and in a server-side
+  `GET /api/v1/assistant-placement?type=...&require=...`, so the dashboard and CLI choose identically. The server
+  re-checks the pinned host when the runtime is created and does not trust the client's choice.
 - Every mutation writes the existing audit entries: `assistant.created`, `assistant.linked`, `assistant.unlinked`.
 - The graph gains an edge `{"from": parent, "to": child, "kind": "linked"}` and each assistant node gains `type` and
   `parent_id`. Edge kinds are then: `owns` (derived), `linked` (explicit), `delegated`, `runs_on` (runtime facts).
@@ -120,6 +130,83 @@ The dashboard stays a projection of the same API and adds no state of its own.
   configured association is distinguishable from something that actually ran.
 - "+ New" gains a type selector fed by `GET /api/v1/assistant-types`; choosing a parent calls the same link route.
 - Each assistant shows the equivalent command (`herdr-eng assistant link ...`) so the two surfaces teach each other.
+
+## Placement
+
+Some specialists run remotely inside the fabric on hosts that differ in what they can offer: a browsing agent needs a
+display, a desktop agent a desktop session, others an internet path or a VM boundary. Creating an assistant locates a
+host from what it needs; nobody types a host id unless they want to pin one.
+
+### Capabilities
+
+A closed, versioned vocabulary. A host **attests** the ones it can provide; a type or the caller **requires** them.
+
+| Capability | Meaning |
+|---|---|
+| `display` | A display the agent can render to without a person present (for example a virtual framebuffer) |
+| `desktop` | An interactive desktop session; implies `display` |
+| `internet` | Outbound access, always through the operator egress broker; never direct |
+| `vm` | The runtime executes inside a VM isolation boundary |
+| `gpu` | A usable GPU |
+| `os:linux`, `os:macos` | Host operating system |
+| `arch:x86_64`, `arch:arm64` | CPU architecture |
+
+Unknown capability names are rejected, so a typo cannot silently match nothing or everything.
+
+### Capabilities are constraints, never grants
+
+This is the rule the rest depends on. A host attesting `internet` does not give any agent internet: the sandbox profile
+the runtime runs under decides what the agent can reach, and the existing `task-restricted-v1` profile has no network
+and no display. Placement only answers "which host can carry this", and never widens a profile, grants a tool, or
+opens egress. A type that needs `display` and `internet` therefore also needs a reviewed profile that permits them. That
+profile is separate security work and is a precondition to creating a `browser` specialist, not something this
+resolver can supply.
+
+### Where capabilities come from
+
+The operator-side runner reports them in its host attestation, through the same signed channel that already reports
+`supported_runtime_kinds`, `sandbox_profiles` and `models`. The attestation gains a `capabilities` list. A request, a
+package or an agent can never assert a host's capabilities. Fleet inventory may be shown as a hint, but only what the
+runner attests counts for placement.
+
+### Resolution
+
+`create` computes requirements as `type.requires` plus any `--require`. `--require` can only add to a type's minimum,
+never relax it, so a browser specialist cannot be placed on a host without a display.
+
+A host is a candidate when all of these hold:
+
+1. Its attestation is fresh and unused (`status: ready`), and the operator has not disabled it.
+2. It supports the runtime kind and a sandbox profile the type permits.
+3. Its attested capabilities contain every requirement.
+4. It carries the type's role binding and approved model, where the type has them.
+
+Candidates are ordered by freshest attestation, then `host_id`, so the same inputs choose the same host. With
+`--host HOST_ID` the host is pinned, and it must still pass the checks above; pinning is never a way around a
+requirement. If no host qualifies, `create` fails before anything is created and says which requirement eliminated
+which host.
+
+The chosen `host_id` is recorded on the runtime and returned in the result. It is not re-chosen silently: a running
+runtime stays where it is, and if its host goes stale the existing lease logic fails it. Creating again places again,
+with the requirements part of the idempotency fingerprint. The assistant's identity does not depend on the host.
+
+### CLI
+
+```sh
+herdr-eng assistant hosts list --require display,internet
+herdr-eng assistant place --type browser                 # ranked candidates, and why each rejected host was rejected
+herdr-eng assistant create "Web scout" --type browser --parent "Fleet PA" --dry-run
+herdr-eng assistant create "Web scout" --type browser --parent "Fleet PA" --require vm
+```
+
+`place` and `--dry-run` change nothing. `hosts list` stays the existing room-scoped owner view, with capabilities added
+to each host and `--require` as a filter. Output follows the existing envelope.
+
+### Graph and dashboard
+
+The graph gains `host` nodes (status, capabilities) and a `placed_on` edge from a specialist to its host. A specialist
+with unmet requirements shows what is missing, for example "needs display and internet: no host qualifies", rather than
+a bare "not set up". The dashboard shows capability chips on hosts and the same reason text.
 
 ## Specialist setup
 
@@ -138,6 +225,9 @@ for that person. Two stages, deliberately separate:
 - Parity test: whatever `create`/`link` do through the CLI appears in `GET /api/v1/assistant-graph` and in
   `renderAssistantGraph` output.
 - Negative tests: no grant, approval or connection is created or changed by any verb; a second user sees nothing.
+- Placement tests: capability superset match, unknown capability rejected, `--require` cannot relax a type minimum,
+  stale/used/disabled hosts excluded, deterministic tie-break, pinned host that fails a requirement is refused, no
+  candidate reports the eliminating requirement per host, and a host attesting `internet` never changes a profile.
 - Replay test: repeating a command with the same (or derived) key creates one assistant and one audit entry.
 
 ## Open decisions (defaults chosen)
@@ -147,3 +237,7 @@ for that person. Two stages, deliberately separate:
 - **`link` direction:** `link CHILD --parent PARENT`, so the subject being changed is the first argument.
 - **Parent type:** only `rakazo`. Rakazo-to-Rakazo links are allowed (for example `Mail assistant` under `Fleet PA`).
 - **Output:** JSON default, as the `assistant` group does today.
+- **Capability source:** runner attestation only; fleet inventory is a hint.
+- **Browsing precondition:** no `browser` specialist can be created until a sandbox profile that permits `display` and
+  brokered `internet` is designed and reviewed. Until then `place --type browser` reports no host qualifies, which is
+  the correct answer.
