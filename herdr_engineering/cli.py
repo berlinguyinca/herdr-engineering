@@ -3468,6 +3468,9 @@ def _cmd_cp_web(args) -> int:
             )
     except Exception:
         logging.exception("self-report of stack services failed")
+    hub_server, hub_registry = _start_assistant_hub(svr.assistant)   # hub_registry: shared with the owner API (later task)
+    if hub_server is not None:
+        logging.info("assistant hub listening on %s:%s", hub_server.host, hub_server.port)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
@@ -3476,6 +3479,8 @@ def _cmd_cp_web(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if hub_server is not None:
+            hub_server.shutdown()
         svr.shutdown()
         if artifact_adapter is not None:
             artifact_adapter.close()
@@ -3893,6 +3898,32 @@ def _cmd_bridge_hash_password(args):
         return 1
     print(hash_password(password))
     return 0
+
+
+def _start_assistant_hub(service):
+    """Start the tailnet-only assistant hub when both the assistant and ``personal_assistant.hub`` are enabled.
+
+    Returns ``(HubServer, WorkerRegistry)``, or ``(None, None)`` when off. ONE registry is built here so the owner API
+    can share it. A bind outside ``allowed_networks`` (or a busy port) stops startup with a clear message.
+    """
+    hub_cfg = service.config.get("hub") or {}
+    if not (service.is_enabled() and hub_cfg.get("enabled") is True):
+        return None, None
+    from datetime import timedelta
+
+    from .control_plane.assistant_hub.mcp import Hub
+    from .control_plane.assistant_hub.server import HubServer
+    from .control_plane.assistant_hub.workers import WorkerRegistry
+    registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
+                              worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
+    try:
+        server = HubServer(Hub(registry=registry, service=service, store=service.store), host=hub_cfg["host"],
+                           port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
+                           allowed_hosts=hub_cfg["allowed_hosts"])
+    except (ValueError, OSError) as exc:
+        raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
+    server.start()
+    return server, registry
 
 
 def _assistant_config(cp):
