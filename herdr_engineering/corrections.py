@@ -38,7 +38,8 @@ _INTERRUPT = re.compile(r"\[?request interrupted by user|interrupted by user|tur
 _REJECTED = re.compile(r"doesn'?t want to proceed|user (rejected|denied|declined)|tool use was rejected|permission denied by user",
                        re.IGNORECASE)
 # Turns that arrive in the user role but were not typed by you: harness gates, task notifications, agent-to-agent messages.
-_AUTOMATED = re.compile(r"^\s*(<|\[harness\]|another \w+ session sent a message|this session is being continued)",
+_AUTOMATED = re.compile(r"^\s*(<|\[harness\]|another \w+ session sent a message|this session is being continued|"
+                        r"[\w-]+ hook (feedback|blocked|error))",
                         re.IGNORECASE)
 _WORD = re.compile(r"[a-z0-9']+")
 

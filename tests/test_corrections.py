@@ -36,6 +36,8 @@ def test_injected_turns_are_not_corrections_and_a_turn_logged_twice_counts_once(
     assert kinds([ev("assistant", "x"), ev("user", gate), ev("assistant", "y"), ev("user", gate)]) == []
     assert kinds([ev("assistant", "x"), ev("user", note), ev("assistant", "y"), ev("user", note)]) == []
     assert kinds([ev("assistant", "x"), ev("user", "Another Claude session sent a message: no do it")]) == []
+    assert kinds([ev("assistant", "x"), ev("user", "Stop hook feedback: [finish the spec]: keep going")]) == []
+    assert kinds([ev("assistant", "x"), ev("user", "Stop, that is the wrong file")]) == ["negation"]      # a person saying stop
     assert kinds([ev("assistant", "x"), ev("user", "no, redo it"), ev("user", "no, redo it")]) == ["negation"]
 
 

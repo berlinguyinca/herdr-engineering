@@ -28,3 +28,20 @@ notifications, agent-to-agent messages). The extractor now ignores injected turn
 found 17 (9 Claude, 7 Codex, 1 Pi): 8 negations, 6 interrupts, 3 rejected tool calls, and no re-asks. Lessons: most traffic in
 the user role is not from a person, so any later learning must filter on who wrote a turn before it counts anything; `reask`
 may be too strict or genuinely rare and needs more data before it is trusted.
+
+## Daily scan across the fabric
+
+`scripts/corrections-daily.sh [RECENT]` scans this machine and every machine `herdr-eng machines --json` lists as enabled
+(today: bender, beast). For each host it syncs seven files (the scan, the session reader, the redactor) to
+`~/.cache/herdr-corrections/`, enables corrections there and runs the stdlib-only `scripts/corrections-scan.py`. Transcripts are
+read in place and never leave their host; each host keeps its own log (0600) beside them; only counts come back to
+`~/.local/share/herdr-engineering/state/corrections/daily.log`. `--install` copies the files to a stable directory and schedules the
+script daily at 03:30 with launchd (macOS) or prints the cron line. `HERDR_CORRECTIONS_RESET=1` deletes each host's kept
+corrections first (use after the extractor changes). The first run scans 400 records per harness per host (about 9 minutes).
+
+### Second lesson (2026-11-01)
+
+The first fabric scan found 609 corrections on bender, 527 of them "negations": almost all were `Stop hook feedback: [...]`, a
+harness hook injecting text in the user role, which the `stop` pattern matched. Hook feedback is now ignored. The user role carries
+at least four kinds of non-human turns (harness gates, task notifications, agent messages, hook feedback); expect more, and read the
+most frequent excerpts of each scan before trusting its counts.
