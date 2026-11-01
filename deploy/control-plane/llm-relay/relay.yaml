@@ -1,0 +1,16 @@
+# The herdr fabric's shared InferWeave entrypoint: agents and the dashboard call this relay with
+# their project key; it forwards every /v1/* request (chat, embeddings, System One, speech, ...)
+# to the gateway below and counts tokens per key.
+# Project keys are not written here. `control-plane llm-gateway-sync` renders them as sha256-only
+# principals into /var/lib/herdr-llm-gateway/principals.json, which the relay follows live.
+# base_url is not templated: edit it (or mount your own file with HERDR_LLM_RELAY_CONFIG).
+listen: {host: 0.0.0.0, port: 8080, trusted_loopback: false}
+gateways:
+  - {id: upstream, base_url: "https://llm.metabolomics.us", credential: upstream, weight: 100}
+credentials:
+  upstream: {file: /var/lib/herdr-llm-gateway/secrets/upstream-token}
+identity:
+  principals_file: /var/lib/herdr-llm-gateway/principals.json
+  admin_secret_file: /var/lib/herdr-llm-gateway/secrets/admin
+admission: {global_concurrency: 256, queue_depth: 1024, queue_timeout: 30s}
+storage: {sqlite: /var/lib/herdr-llm-gateway/relay.db}

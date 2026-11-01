@@ -31,8 +31,14 @@ _FIELDS = ("requests", "completed", "inputTokens", "outputTokens")
 _BATCH = 500
 
 
-def fetch_usage(gateway_url: str, admin_secret: str, timeout: float = 5.0) -> dict:
-    req = urllib.request.Request(gateway_url.rstrip("/") + "/v1/admin/usage",
+GATEWAY_USAGE_PATH = "/v1/admin/usage"
+RELAY_USAGE_PATH = "/api/usage"
+
+
+def fetch_usage(gateway_url: str, admin_secret: str, timeout: float = 5.0,
+                path: str = GATEWAY_USAGE_PATH) -> dict:
+    """The gateway (``/v1/admin/usage``) and the relay (``/api/usage``) serve the same shape."""
+    req = urllib.request.Request(gateway_url.rstrip("/") + path,
                                  headers={"x-inferweave-admin": admin_secret})
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         return json.loads(resp.read())

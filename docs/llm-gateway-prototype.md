@@ -1,5 +1,41 @@
 # Prototype: InferWeave gateway behind the fabric LLM endpoint
 
+> **Direction (2026-11-01): the shared entrypoint is the embedded relay, see the next section.**
+> The gateway profile below stays as the way to run a gateway of our own; the relay profile is
+> how the fabric reaches the InferWeave network.
+
+## The shared entrypoint: an embedded inferweave relay (`--profile llm-relay`)
+The dashboard and every fabric member send llm, embedding, System One, speech and any other `/v1/*`
+request to ONE `inferweave relay` with their `hk-` project key. The relay holds the upstream
+credential, forwards to the gateway in `llm-relay/relay.yaml`, and counts tokens per key. It is the
+same binary as the gateway image, so there is no new codebase and no second image.
+
+```
+agents / dashboard --hk- key--> relay (herdr-llm-relay) --upstream credential--> gateway --> nodes
+        control plane: mints/revokes keys (llm-gateway-sync writes the digests the relay follows)
+                       reads usage        (llm-relay-usage polls /api/usage)
+```
+Requires inferweave with the shared-entrypoint relay (InferWeave/inferweave#1441): `principals_file`,
+`admin_secret_file`, `GET /api/usage`, streamed-usage counting.
+
+Measured with the real relay binary against a stub upstream and the real herdr sync and usage
+commands: chat (JSON and streamed, 21 in / 8 out from the final `usage` event), embeddings, System
+One and binary speech all pass through; the upstream sees only the relay's credential, never the
+caller's key (0 occurrences); no key, a bad key and a revoked key are 401 (revocation within the 2 s
+poll); `/api/usage` and `/metrics` are 401 without the operator secret; usage reached the control
+plane's analytics per project and model.
+
+Deploy notes: `HERDR_LLM_GATEWAY_DIR` holds `secrets/admin` (operator secret) and
+`secrets/upstream-token` (the credential the relay presents upstream; for llm.metabolomics.us an
+access key created in the console). On the gateway's own host the public name does not resolve from a container (hairpin NAT), and
+`extra_hosts: ["llm.metabolomics.us:host-gateway"]` is not enough on zapp: ufw drops container-to-host
+traffic on 443 (only 22 and 9100 from 10/8 are allowed; published ports like 8290 are reachable but
+are plain HTTP, which the relay refuses to a non-loopback host). Either allow the compose bridge to
+reach 443 on the host (`ufw allow from 172.16.0.0/12 to any port 443 proto tcp`) or run the relay on a
+different host from the gateway. Verified on zapp with a stand-in key: relay health, key auth, bogus and
+revoked keys (401), operator routes gated, usage reporter running; only the upstream hop was blocked. Token counts cover chat and embeddings; System One and speech count requests per
+model but the upstream reports no tokens for them. Custom models stay on `llm-proxy`.
+
 Status: prototype, opt-in (`--profile llm-gateway`). The python `llm-proxy` stays the default.
 
 ## What it proves

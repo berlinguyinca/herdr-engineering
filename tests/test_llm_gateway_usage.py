@@ -97,3 +97,28 @@ def test_the_control_plane_keeps_the_gateway_source_and_drops_unknown_ones():
                else e["payload"]["source"]
                for e in repo._events[("token_usage", "p")]]
     assert sources == ["llm-gateway", "llm-proxy"]
+
+
+def test_fetch_usage_asks_the_route_it_is_given_and_sends_only_the_admin_header(monkeypatch):
+    seen = {}
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"startedAt": 1, "usage": []}'
+
+    def fake_urlopen(req, timeout):
+        seen["url"], seen["headers"] = req.full_url, dict(req.header_items())
+        return Resp()
+
+    monkeypatch.setattr(u.urllib.request, "urlopen", fake_urlopen)
+    u.fetch_usage("http://relay:8080/", "s3cret", path=u.RELAY_USAGE_PATH)
+    assert seen["url"] == "http://relay:8080/api/usage"
+    assert seen["headers"] == {"X-inferweave-admin": "s3cret"}
+    u.fetch_usage("http://gw:8089", "s3cret")
+    assert seen["url"] == "http://gw:8089/v1/admin/usage"
