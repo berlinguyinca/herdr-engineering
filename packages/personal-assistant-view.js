@@ -7,6 +7,7 @@ import { mountKeys, roveIndex, TABS } from './personal-assistant-keys.js';
 import { loadAssistantGraph, renderAssistantGraph } from './assistant-graph-view.js';
 import { loadTypes, renderCreateForm, createBody, createCommand } from './assistant-create-form.js';
 import { renderInactive, deleteConfirmed } from './assistant-manage-controls.js';
+import { renderTabs } from './assistant-tabs.js';
 
 function statusClass(status) {
   return { ready: 'pa-status--ready', running: 'pa-status--running', disabled: 'pa-status--disabled',
@@ -98,7 +99,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   const focusKey = () => {
     const el = container.ownerDocument.activeElement;
     if (!el || !container.contains(el)) return null;
-    for (const attr of ['data-tab', 'data-select', 'data-config', 'data-keys', 'data-showall', 'data-msg', 'data-new', 'data-newthread']) {
+    for (const attr of ['data-tab', 'data-atab', 'data-select', 'data-config', 'data-keys', 'data-showall', 'data-msg', 'data-new', 'data-newthread']) {
       if (el.hasAttribute(attr)) return { attr, value: el.getAttribute(attr), draft: el.value };
     }
     return null;
@@ -149,8 +150,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     const more = Math.max(0, active - list.filter(isActive).length);
     container.innerHTML = `
       <div class="pa-bar">
-        <label class="pa-pick">Assistant
-          <select data-select aria-label="Assistant">${list.map(a => `<option value="${esc(a.assistant_id)}" ${a.assistant_id === state.selectedId ? 'selected' : ''}>${esc(a.name)} · ${esc(statusLabel(a.status))}</option>`).join('')}</select></label>
+        ${renderTabs(list, state.selectedId, statusLabel)}
         ${more > 0 || showAll && active > 3 ? `<button class="hd-linkbtn" data-showall>${showAll ? 'Show recent only' : `Show all ${active}`}</button>` : ''}
         <span class="pa-grow"></span>
         <button class="hd-btn hd-btn--ghost" data-keys aria-haspopup="dialog" title="Keyboard shortcuts (?)">Keys <kbd>?</kbd></button>
@@ -168,7 +168,17 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
           `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" role="tab" id="pa-tab-${t}" aria-selected="${state.tab === t}" aria-controls="pa-panel" tabindex="${state.tab === t ? 0 : -1}" data-tab="${t}">${t}</button>`).join('')}</div>
         <div id="pa-panel" role="tabpanel" aria-labelledby="pa-tab-${state.tab}">${renderPanel(selected)}</div></section>` : ''}
       <section class="hd-card pa-graph-card" aria-label="Assistant graph"><h2 class="pa-graph-heading">Assistant graph</h2><div id="pa-graph">${renderAssistantGraph(graphState)}</div></section>`;
-    container.querySelector('[data-select]')?.addEventListener('change', e => { state.selectedId = e.target.value; draw(); });
+    container.querySelectorAll('[data-atab]').forEach(el => {
+      el.addEventListener('click', () => { state.selectedId = el.dataset.atab; draw(); });
+      el.addEventListener('keydown', e => {                      // roving focus across every tab, groups included
+        const tabs = [...container.querySelectorAll('[data-atab]')];
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.ctrlKey || e.metaKey || e.altKey) return;
+        const next = roveIndex(e.key, tabs.indexOf(el), tabs.length);
+        if (next === null) return;
+        e.preventDefault(); state.selectedId = tabs[next].dataset.atab; draw();
+        container.querySelector(`[data-atab="${state.selectedId}"]`)?.focus();
+      });
+    });
     container.querySelector('[data-showall]')?.addEventListener('click', () => { showAll = !showAll; draw(); });
     container.querySelector('[data-config]')?.addEventListener('click', () => { configOpen = !configOpen; draw(); });
     refreshGraph();
