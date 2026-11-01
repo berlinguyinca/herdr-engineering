@@ -58,6 +58,20 @@ peer, so the proof ran without it. Real traffic arrives through peering.
 - `llm-proxy` stays: chat, token accounting, custom models. One `hk-` key works on both;
   sessions get `INFERWEAVE_BASE_URL` when `llm.inferweave_url` is set.
 
+## Bring-up on an amd64 host (zapp, 2026-11-01)
+Ran as an isolated compose project (`-p herdrgw`, loopback ports 18480 web and 8089 gateway)
+beside the production gateway, with image `herdr-llm-gateway` built from the verified
+`node-ci-latest` binary (commit `5d60af17`; `/health` reports that revision). What it took:
+- `docker build` without BuildKit: drop `--chmod` from the `COPY` and `chmod 755` the binary first.
+- `secrets/kek` is **64 hex characters** (`openssl rand -hex 32`); anything else is refused.
+- `nodes.json` is an object, `{"nodes":[]}` for an edge with no static nodes, not `[]`.
+- `control-plane migrate` once before the web service answers (the worker normally does it).
+- The sync and usage services now run as `1000:1000`: the gateway image runs as that user and
+  could not read a root-owned 0600 `principals.json`.
+Checked live: a minted `hk-` key is accepted by the gateway within a poll interval (404 for an
+unknown model, not 401), a wrong key gets 401, `/v1/admin/usage` is 401 without the admin
+secret, and a revoked key returns 401 and leaves `principals.json` within a poll interval.
+
 ## Not done, and why
 - **Peering to llm.metabolomics.us.** Needs a gateway-kind enrollment code minted on the
   production gateway and a preserved identity (as on Whiteale), and something persistent running
