@@ -489,7 +489,7 @@ class InspectorStore:
         """Return (redacted+truncated text, truncated, redacted)."""
         if value is None:
             return None, False, False
-        raw = value if isinstance(value, str) else str(value)
+        raw = (value if isinstance(value, str) else str(value)).replace("\x00", "")     # Postgres jsonb refuses \u0000
         cap = max_bytes or self.limits["max_body_bytes"]
         # Bound the work redaction does (and the lock hold time) before scanning.
         pre, pre_trunc = truncate_text(raw, cap * 2)

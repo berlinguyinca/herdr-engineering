@@ -61,6 +61,14 @@ def test_all_kinds_roundtrip(store):
     assert q["capabilities"]["reasoning"] == "summary"
 
 
+def test_nul_bytes_never_reach_storage(store):
+    """Postgres jsonb refuses \\u0000, so a binary tool output once failed the whole batch with a 500."""
+    r = feed(store, {"kind": "message", "role": "assistant", "text": "a\x00b"},
+             tool("c1", "end", output="x\x00y\x00"),
+             {"kind": "file", "path": "a.py", "op": "edit", "diff": "+q\x00r"})
+    assert r["accepted"] == 3 and "\\u0000" not in json.dumps(store.query(SID, "operator"))
+
+
 def test_rejects_bad_events_without_dropping_good_ones(store):
     r = feed(store, {"kind": "nope"}, "str", {"kind": "tool", "phase": "start"},
              {"kind": "message", "text": "ok"})
