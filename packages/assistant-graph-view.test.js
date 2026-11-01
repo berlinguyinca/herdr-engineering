@@ -129,3 +129,14 @@ test('hosts are listed with status, backend, capabilities and free resources', (
   assert.match(html, /data-graph-id="slurm:hive:low"[\s\S]*slurm/);
   assert.ok(!renderAssistantGraph({ phase: 'ready', nodes: [{ id: 'you', kind: 'you' }], edges: [] }).includes('Where agents run'));
 });
+
+test('a specialist lists only the setup steps still open, escaped', () => {
+  const html = renderAssistantGraph({ status: 'ok', edges: [], nodes: [
+    { id: 'you', kind: 'you', name: 'You' },
+    { id: 's1', kind: 'assistant', name: 'Sec', type: 'pi-secretary', status: 'needs_setup', enabled: true, setup: [
+      { id: 'binding', state: 'done', detail: 'bound' },
+      { id: 'placement', state: 'blocked', detail: 'no host: <img src=x>' }] }] });
+  assert.match(html, /data-setup-step="placement"/);
+  assert.ok(!html.includes('data-setup-step="binding"'));
+  assert.ok(!html.includes('<img src=x>'));
+});

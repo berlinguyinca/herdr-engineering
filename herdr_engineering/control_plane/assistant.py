@@ -4035,6 +4035,28 @@ class AssistantService:
         decision["type"] = type_name
         return decision
 
+    def specialist_setup(self, a: Assistant, *, tenant_id: str, user_id: str) -> list[dict[str, str]]:
+        """What a specialist still needs before delegation can use it, as ordered steps (``done`` | ``todo`` | ``blocked``).
+        Read-only: it reports, it never binds, places or grants anything."""
+        steps: list[dict[str, str]] = []
+        try:
+            bound = self._delegation_adapter_for_scope(tenant_id, user_id, a.type) is not None
+        except Exception:  # noqa: BLE001 - an unreadable binding is simply "not bound"
+            bound = False
+        steps.append({"id": "binding", "state": "done" if bound else "todo",
+                      "detail": "bound to your room and agent" if bound
+                      else "no room and agent are bound for you yet; Rakazo sets this up once approved"})
+        try:
+            decision = self.resolve_placement(a.type)
+            chosen = next((c for c in decision["candidates"] if c["id"] == decision["chosen"]), None)
+            reasons = sorted({r for rej in decision["rejected"] for r in rej["reasons"]})
+            steps.append({"id": "placement", "state": "done" if chosen else "blocked",
+                          "detail": f"would run on {chosen['label']}" if chosen
+                          else "no host can carry it: " + (", ".join(reasons[:4]) or "none attested")})
+        except AssistantError as exc:
+            steps.append({"id": "placement", "state": "blocked", "detail": str(exc)})
+        return steps
+
     def _graph_placement(self, nodes: list[dict[str, Any]], edges: list[dict[str, str]],
                          node: dict[str, Any], a: Assistant) -> None:
         """Current plan for a specialist: ``planned`` is where the resolver would run it now, never a claim that it
@@ -4080,6 +4102,9 @@ class AssistantService:
             if a.parent_id:
                 edges.append({"from": a.parent_id, "to": a.assistant_id, "kind": "linked"})
             if a.type != "rakazo" and a.enabled:
+                setup = self.specialist_setup(a, tenant_id=tenant_id, user_id=user_id)
+                nodes[-1]["setup"] = setup
+                nodes[-1]["status"] = "ready" if all(st["state"] == "done" for st in setup) else "needs_setup"
                 self._graph_placement(nodes, edges, nodes[-1], a)
         consumer_on = bool(self.config.get("delegation_consumer", {}).get("enabled"))
         for target, spec in self.config["delegation"]["targets"].items():

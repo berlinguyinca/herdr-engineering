@@ -84,6 +84,9 @@ def render_tree(graph: dict) -> str:
                 bits.append(f"on {where}")
             if n.get("can_delegate"):
                 bits.append("can delegate")
+            todo = next((st for st in n.get("setup", []) if isinstance(st, dict) and st.get("state") != "done"), None)
+            if todo:
+                bits.append(f"next: {_safe(todo.get('detail'))}")
             return f"{_safe(n.get('name'))} ({', '.join(b for b in bits if b)})  {n['id']}"
         if kind == "delegation":
             target = nodes.get(runs_on.get(n["id"], ""), {}).get("name")

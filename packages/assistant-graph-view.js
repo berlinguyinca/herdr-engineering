@@ -39,6 +39,14 @@ function renderPlacement(node, byId) {
   return ` ${chip('failed', "can't be placed")}${reasons ? ` <span class="pa-muted" data-graph-reasons>${reasons}</span>` : ''}`;
 }
 
+// What a specialist still needs, step by step; nothing is shown for a finished or non-specialist assistant.
+function renderSetup(node) {
+  const open = list(node.setup).filter((st) => st && st.state !== 'done');
+  if (!open.length) return '';
+  return `<ul class="pa-graph-setup" data-graph-setup>${open.map((st) =>
+    `<li data-setup-step="${esc(text(st.id))}">${chip(st.state === 'blocked' ? 'error' : 'off', text(st.state))} ${esc(text(st.detail))}</li>`).join('')}</ul>`;
+}
+
 function renderAssistant(node, inner, byId) {
   const scopes = list(node.delegate_scopes);
   const can = node.can_delegate
@@ -47,6 +55,7 @@ function renderAssistant(node, inner, byId) {
   const kind = text(node.type) && node.type !== 'rakazo' ? ` ${chip('off', text(node.type))}` : '';
   return `<li class="pa-graph-node" data-graph-kind="assistant" data-graph-id="${esc(node.id)}">`
     + `<strong>${esc(text(node.name))}</strong>${kind} ${chip(text(node.status) || 'unknown', text(node.status) || 'unknown')} ${can}`
+    + renderSetup(node)
     + renderPlacement(node, byId)
     + (inner.length ? `<ul class="pa-graph-list">${inner.join('')}</ul>` : '') + '</li>';
 }

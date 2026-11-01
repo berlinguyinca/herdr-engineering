@@ -135,3 +135,16 @@ def test_graph_reflects_type_parent_and_linked_edges(hz):
     assert nodes[child["assistant_id"]]["parent_id"] == parent["assistant_id"]
     edges = {(e["from"], e["to"], e["kind"]) for e in g["edges"]}
     assert (parent["assistant_id"], child["assistant_id"], "linked") in edges
+
+
+def test_specialist_setup_steps_report_binding_and_placement_and_change_nothing(hz):
+    h, svc = hz
+    _, s = make(h, "Secretary", type="pi-secretary")
+    before = (len(svc.store.grants), len(svc.store.delegations), len(svc.store.audit))
+    st, g = h.call("alice", "GET", "/api/v1/assistant-graph")
+    node = next(n for n in g["nodes"] if n["id"] == s["assistant_id"])
+    steps = {x["id"]: x for x in node["setup"]}
+    assert st == 200 and node["status"] == "needs_setup"
+    assert steps["binding"]["state"] == "todo"
+    assert steps["placement"]["state"] == "blocked" and "no host can carry it" in steps["placement"]["detail"]
+    assert (len(svc.store.grants), len(svc.store.delegations), len(svc.store.audit)) == before
