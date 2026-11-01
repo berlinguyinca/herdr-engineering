@@ -903,9 +903,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("llm-gateway-usage",
                          help="report the gateway's per-key token usage to the control plane")
     p2.add_argument("--control-plane", default="http://control-plane-web:8080")
-    p2.add_argument("--gateway", required=True, help="gateway base URL")
+    p2.add_argument("--gateway", required=True, help="gateway or relay base URL")
+    p2.add_argument("--usage-path", default="/v1/admin/usage",
+                    help="usage route: /v1/admin/usage on a gateway, /api/usage on a relay")
     p2.add_argument("--admin-secret-file", required=True,
-                    help="file holding the gateway admin secret (never printed)")
+                    help="file holding the gateway or relay admin secret (never printed)")
     p2.add_argument("--state-file", required=True, help="where the reported baseline is kept")
     p2.add_argument("--interval", type=float, default=30.0)
     p2.add_argument("--once", action="store_true", help="report once and exit")
@@ -1056,7 +1058,7 @@ def _cmd_cp_llm_gateway_usage(args) -> int:
     secret_path = Path(args.admin_secret_file).expanduser()
 
     def fetch():  # re-read each pass so a rotated secret is picked up
-        return fetch_usage(args.gateway, secret_path.read_text().strip())
+        return fetch_usage(args.gateway, secret_path.read_text().strip(), path=args.usage_path)
 
     state = Path(args.state_file).expanduser()
     if args.once:

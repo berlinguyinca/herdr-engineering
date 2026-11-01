@@ -249,7 +249,7 @@ services:
   # HERDR_LLM_GATEWAY_DIR must be a 0700 directory holding secrets/kek, secrets/admin and
   # secrets/client-token. Defaults, not `:?` guards: compose interpolates every service.
   llm-gateway-sync:
-    profiles: ["llm-gateway"]
+    profiles: ["llm-gateway", "llm-relay"]
     image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-unset}
     container_name: herdr-llm-gateway-sync
     restart: unless-stopped
@@ -329,6 +329,60 @@ services:
       - "/var/lib/herdr-llm-gateway/secrets/admin"
       - "--state-file"
       - "/var/lib/herdr-llm-gateway/usage-state.json"
+
+  # ---- shared InferWeave entrypoint: an embedded inferweave relay node ------------------
+  # Opt-in: `docker compose --profile llm-relay up` (instead of, not beside, the llm-gateway
+  # profile: both use llm-gateway-sync's principals file). Every fabric member sends its
+  # llm/embedding/System One/speech request here with its hk- project key; the relay holds the
+  # upstream credential and forwards to the gateway named in llm-relay/relay.yaml. Same
+  # HERDR_LLM_GATEWAY_DIR as the gateway profile, with secrets/admin and secrets/upstream-token.
+  llm-relay:
+    profiles: ["llm-relay"]
+    # The relay is a subcommand of the same `inferweave` binary as the gateway, so it runs from the
+    # same reviewed image (llm-gateway/Dockerfile); there is no second image to build or review.
+    image: herdr-llm-gateway:${HERDR_LLM_GATEWAY_TAG:-unset}
+    container_name: herdr-llm-relay
+    restart: unless-stopped
+    depends_on:
+      llm-gateway-sync:
+        condition: service_healthy
+    volumes:
+      - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+      - ${HERDR_LLM_RELAY_CONFIG:-./llm-relay/relay.yaml}:/etc/herdr/llm-relay/relay.yaml:ro
+    ports:
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_RELAY_PORT:-8088}:8080"
+    command: ["relay", "--config", "/etc/herdr/llm-relay/relay.yaml", "run"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/inferweave-bin", "relay", "healthcheck", "--url", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  llm-relay-usage:
+    profiles: ["llm-relay"]
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-unset}
+    container_name: herdr-llm-relay-usage
+    restart: unless-stopped
+    # The relay image runs as 1000:1000 and the secrets are 0600 files owned by that user.
+    user: "1000:1000"
+    depends_on:
+      llm-relay:
+        condition: service_healthy
+    volumes:
+      - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+    command:
+      - "control-plane"
+      - "llm-gateway-usage"
+      - "--control-plane"
+      - "http://control-plane-web:8080"
+      - "--gateway"
+      - "http://llm-relay:8080"
+      - "--usage-path"
+      - "/api/usage"
+      - "--admin-secret-file"
+      - "/var/lib/herdr-llm-gateway/secrets/admin"
+      - "--state-file"
+      - "/var/lib/herdr-llm-gateway/relay-usage-state.json"
 
   # ---- dev.lan front door (host network; was deploy/fabric-stack) -------------
   # The worker mounts ./config.yaml (control plane); the fabric services mount
