@@ -847,6 +847,7 @@ def test_remove_tree_removes_a_dangling_link_without_following(tree):
     assert _snapshot(outside) == before
 
 
+@pytest.mark.skipif(not hasattr(os, "O_TMPFILE"), reason="O_TMPFILE is Linux-only; other platforms use the named-temp fallback")
 def test_link_new_bytes_uses_o_tmpfile_and_never_leaves_a_tmp(tree, monkeypatch):
     root, _ = tree
     calls = []
@@ -986,6 +987,7 @@ def test_link_new_bytes_applies_mode_on_the_tmpfile_path(tree, monkeypatch):
     assert stat.S_IMODE(os.stat(root / "m").st_mode) == 0o640
 
 
+@pytest.mark.skipif(not hasattr(os, "O_TMPFILE"), reason="O_TMPFILE is Linux-only; other platforms use the named-temp fallback")
 def test_link_new_bytes_propagates_a_tmpfile_permission_error(tree, monkeypatch):
     root, _ = tree
     real_open = os.open

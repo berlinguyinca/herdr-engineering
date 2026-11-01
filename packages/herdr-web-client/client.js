@@ -909,6 +909,25 @@ export class HerdrClient {
   connectorRequest(connectorId, body) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/request`, { method: 'POST', body });
   }
+  // Read-only graph of the caller's assistants, delegations and the specialists they run on.
+  assistantGraph({ signal } = {}) {
+    return this.request('/api/v1/assistant-graph', { signal });
+  }
+  assistantTypes({ signal } = {}) {
+    return this.request('/api/v1/assistant-types', { signal });
+  }
+  linkAssistant(id, parentId) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/link`, { method: 'POST', body: { parent_id: parentId } });
+  }
+  unlinkAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/unlink`, { method: 'POST', body: {} });
+  }
+  deleteAssistant(id, confirmName) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/delete`, { method: 'POST', body: { confirm_name: confirmName } });
+  }
+  setupAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/setup`, { method: 'POST', body: {} });
+  }
   listDelegations() {
     return this.request('/api/v1/assistant-delegations');
   }

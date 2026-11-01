@@ -30,10 +30,11 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from ..assistant_packages import ManifestError, agent_package_record
 from . import collab_delegation as dlg
 from . import collab_external as ext
 from . import collab_mentions as mentions
-from . import collab_models, ids, logfile_lock
+from . import collab_models, ids, logfile_lock, placement
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_federation import FederationMixin
@@ -154,6 +155,21 @@ TASK_TTL = 24 * 3600.0           # a task nobody finished in a day is expired
 MAX_TASK_DEPTH = 3               # human -> agent -> agent -> agent
 TASK_RATE = 20                   # new tasks per creator per 10 minutes
 MAX_OPEN_TASKS_PER_AGENT = 10
+MAX_APPROVAL_PROPOSALS_PER_OWNER = 100
+APPROVAL_PROPOSAL_RATE = 20       # per requester per 10 minutes
+MAX_APPROVAL_SUMMARY = 500
+MAX_APPROVAL_DETAILS = 8 * 1024
+MAX_ASSISTANT_PACKAGES_PER_OWNER_ROOM = 100
+ASSISTANT_PACKAGE_RATE = 20       # immutable definitions per owner per 10 minutes
+ASSISTANT_RUNTIME_ATTEST_TTL = 300.0
+ASSISTANT_RUNTIME_LEASE = 120.0
+MAX_ASSISTANT_RUNTIME_HOSTS = 50
+MAX_ASSISTANT_RUNTIMES_PER_OWNER = 20
+ASSISTANT_RUNTIME_RATE = 12       # activation requests per owner per hour
+_RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_RUNTIME_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
+_RUNTIME_LIVE = frozenset({"claimed", "starting", "ready"})
+_RUNTIME_TERMINAL = frozenset({"failed", "cancelled"})
 MAX_PENDING_REQUESTS = 120       # open access requests per room (one family of agents fits)
 SPAWN_FAMILIES = ("claude-code", "codex", "pi", "agent")   # what the host runner knows how to start
 PROFILE_LIMIT_DEFAULTS = {"live_per_agent": 3, "depth": 2, "per_hour": 20}   # a room profile may only lower these
@@ -462,6 +478,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._proposals_by_task: dict[str, list[str]] = defaultdict(list)
         self._proposals_by_room: dict[str, list[str]] = defaultdict(list)
         self._proposals_by_agent: dict[str, list[str]] = defaultdict(list)
+        self._approval_proposals: dict[str, dict] = {}
+        self._approval_proposal_idem: dict[tuple[str, str, str], tuple[str, str]] = {}
+        self._assistant_packages: dict[tuple[str, str, str], dict] = {}
+        self._assistant_package_versions: dict[tuple[str, str, str, str], str] = {}
+        self._assistant_runtime_hosts: dict[str, dict] = {}
+        self._assistant_runtimes: dict[str, dict] = {}
+        self._assistant_runtime_idem: dict[tuple[str, str, str], tuple[str, str]] = {}
         self._requests: dict[str, dict] = {}                 # open agent-access requests
         # Indexes kept only by _apply (so hydrate rebuilds them): they replace whole-state scans.
         self._agents_by_owner: dict[str, set] = defaultdict(set)
@@ -679,6 +702,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def _touch_rooms(self, p: dict, seq: int, event_type: str = "") -> None:
         """Remember which rooms an event changed, so a room's long-poll wakes only for its own news."""
+        if p.get("room_notify") is False:
+            return
         rooms = set()
         if isinstance(p.get("room_id"), str):
             rooms.add(p["room_id"])
@@ -909,6 +934,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                                 "deleg:" + p["idempotency_key"])] = (p["fingerprint"], p["task_id"])
             if p["target_agent_id"]:                # a task for a person (slice 2) has no agent target
                 self._tasks_by_target[p["target_agent_id"]].append(p["task_id"])
+            if p.get("idempotency_key") and p.get("fingerprint") and p.get("requester_key"):
+                self._idem[(p["requester_key"], p["room_id"],
+                            "task:" + p["idempotency_key"])] = (
+                    p["fingerprint"], p["task_id"])
         elif t == "task_updated":
             tk = self._tasks.get(p["task_id"])
             if tk:
@@ -963,6 +992,108 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             pr_ = self._proposals.get(p["proposal_id"])
             if pr_:
                 pr_["promoted"] = True
+        elif t == "approval_proposal_created":
+            requester_key = f"{p['requester_kind']}:{p['requester_id']}"
+            self._approval_proposals[p["proposal_id"]] = {
+                "proposal_id": p["proposal_id"], "room_id": p["room_id"],
+                "task_id": p["task_id"], "kind": p["kind"], "summary": p["summary"],
+                "details": p["details"], "state": "pending", "owner": p["actor_user_id"],
+                "requester_kind": p["requester_kind"], "requester_id": p["requester_id"],
+                "created_at": p["created_at"], "sequence": ev["sequence"],
+            }
+            self._approval_proposal_idem[(requester_key, p["room_id"], p["idempotency_key"])] = (
+                p["fingerprint"], p["proposal_id"])
+        elif t == "assistant_package_registered":
+            package = copy.deepcopy(p["package"])
+            key = (p["room_id"], p["actor_user_id"], package["package_id"])
+            version_key = (p["room_id"], p["actor_user_id"],
+                           package["manifest"]["name"], package["manifest"]["version"])
+            self._assistant_packages[key] = package
+            self._assistant_package_versions[version_key] = package["package_id"]
+        elif t == "assistant_runtime_host_attested":
+            record = copy.deepcopy(p["attestation"])
+            record["used"] = False
+            self._assistant_runtime_hosts[record["host_id"]] = record
+        elif t == "assistant_runtime_requested":
+            runtime = {
+                "runtime_id": p["runtime_id"], "room_id": p["room_id"],
+                "project_id": p["project_id"], "owner": p["actor_user_id"],
+                "package_id": p["package_id"], "package_digest": p["package_digest"],
+                "host_id": p["host_id"], "name": p["name"],
+                "selected_model": p["selected_model"], "attestation_nonce": p["attestation_nonce"],
+                "access": ["execute", "read"], "status": "queued", "agent_id": None,
+                "device_id": None, "claim_digest": None, "lease_expires_at": None,
+                "checkpoint": None, "launch_attestation": None, "error_code": None,
+                "cancel_requested": False, "cancel_reason": None,
+                "created_at": p["created_at"], "updated_at": p["created_at"],
+                "created_epoch": p["created_epoch"], "updated_epoch": p["created_epoch"],
+                "attestation": copy.deepcopy(p["attestation"]),
+            }
+            self._assistant_runtimes[p["runtime_id"]] = runtime
+            self._assistant_runtime_idem[(p["actor_user_id"], p["room_id"], p["idempotency_key"])] = (
+                p["fingerprint"], p["runtime_id"])
+        elif t == "assistant_runtime_claimed":
+            runtime = self._assistant_runtimes[p["runtime_id"]]
+            runtime.update(status="claimed", agent_id=p["agent_id"], device_id=p["device_id"],
+                           claim_digest=p["claim_digest"], lease_expires_at=p["lease_expires_at"],
+                           updated_at=p["created_at"], updated_epoch=p["claimed_epoch"])
+            host = self._assistant_runtime_hosts.get(runtime["host_id"])
+            if host and host["nonce"] == runtime["attestation_nonce"]:
+                host["used"] = True
+            self._agents[p["agent_id"]] = {
+                "owner": runtime["owner"], "device_id": p["device_id"], "harness_type": "pi",
+                "instance_id": None, "status": "active", "name": runtime["name"],
+                "parent": None, "join": None, "cred_digest": p["secret_digest"],
+                "expires_at": p["credential_expires_at"],
+            }
+            self._by_cred[p["secret_digest"]] = p["agent_id"]
+            self._agents_by_owner[runtime["owner"]].add(p["agent_id"])
+            self._rooms[runtime["room_id"]]["grants"][p["agent_id"]] = {
+                "actions": ["execute", "read"], "expires_at": p["lease_expires_at"],
+                "granted_seq": seq,
+            }
+            self._rooms_by_agent[p["agent_id"]].add(runtime["room_id"])
+            self._agent_projects[p["agent_id"]].add(runtime["project_id"])
+        elif t in ("assistant_runtime_heartbeat", "assistant_runtime_reported"):
+            runtime = self._assistant_runtimes[p["runtime_id"]]
+            runtime.update(checkpoint=copy.deepcopy(p["checkpoint"]),
+                           lease_expires_at=p.get("lease_expires_at", runtime["lease_expires_at"]),
+                           updated_at=p["created_at"], updated_epoch=p["reported_epoch"])
+            aid = runtime["agent_id"]
+            grant = self._rooms[runtime["room_id"]]["grants"].get(aid)
+            if grant and p.get("lease_expires_at") is not None:
+                grant["expires_at"] = p["lease_expires_at"]
+            if t == "assistant_runtime_reported":
+                runtime.update(status=p["status"], error_code=p.get("error_code"),
+                               launch_attestation=copy.deepcopy(p.get("launch_attestation")))
+                if p.get("instance_id"):
+                    self._agents[runtime["agent_id"]]["instance_id"] = p["instance_id"]
+                if p["status"] in _RUNTIME_TERMINAL:
+                    aid = runtime["agent_id"]
+                    if aid and aid in self._agents:
+                        self._agents[aid]["status"] = "revoked"
+                        self._by_cred.pop(self._agents[aid]["cred_digest"], None)
+                        self._rooms[runtime["room_id"]]["grants"].pop(aid, None)
+                        self._rooms_by_agent[aid].discard(runtime["room_id"])
+        elif t == "assistant_runtime_cancel_requested":
+            runtime = self._assistant_runtimes[p["runtime_id"]]
+            runtime.update(cancel_requested=True, cancel_reason="owner_requested",
+                           updated_at=p["created_at"], updated_epoch=p["requested_epoch"])
+            if runtime["status"] == "queued":
+                runtime.update(status="cancelled", error_code=None)
+            elif runtime["agent_id"]:
+                self._rooms[runtime["room_id"]]["grants"].pop(runtime["agent_id"], None)
+                self._rooms_by_agent[runtime["agent_id"]].discard(runtime["room_id"])
+        elif t == "assistant_runtime_expired":
+            runtime = self._assistant_runtimes[p["runtime_id"]]
+            runtime.update(status="failed", error_code=p["error_code"],
+                           updated_at=p["created_at"], updated_epoch=p["expired_epoch"])
+            aid = runtime["agent_id"]
+            if aid and aid in self._agents:
+                self._agents[aid]["status"] = "revoked"
+                self._by_cred.pop(self._agents[aid]["cred_digest"], None)
+                self._rooms[runtime["room_id"]]["grants"].pop(aid, None)
+                self._rooms_by_agent[aid].discard(runtime["room_id"])
         elif t == "agent_granted":
             self._rooms[p["room_id"]]["grants"][p["agent_id"]] = {
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
@@ -4390,7 +4521,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         """A person with the room's "task" right, or an agent the owner approved with "instruct",
         gives work to ONE agent that the owner approved with "execute"."""
         with self._lock:
-            room, _ = self._authorize(pr, room_id, "instruct" if pr.is_agent else "task", "task.create")
+            room, first = self._authorize(pr, room_id, "instruct" if pr.is_agent else "task", "task.create")
             roles_on = self.team_roles_active()
             bad = [k for k in body if k not in ("target_agent_id", "text", "parent_task_id", "idempotency_key",
                                                 "reviews_task_id") and not (roles_on and k in ROLE_FIELDS)]
@@ -4412,19 +4543,14 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             ikey = body.get("idempotency_key")
             if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
                 raise CollabError(400, "invalid idempotency_key")
-            # the digest is unchanged for a task that reviews nothing, so existing keys keep their meaning
-            fp = _digest(json.dumps([room_id, tid_, text] + ([reviews] if reviews is not None else [])))
-            if ikey is not None and (prior := self._idem.get((pr.key, room_id, "task:" + ikey))):
-                if prior[0] != fp:
-                    raise CollabError(409, "idempotency_key already used for a different task")
-                return {"task_id": prior[1], "status": "pending", "replayed": True}
             depth, parent, root = 0, body.get("parent_task_id"), pr.owner
             if pr.is_agent:
                 # Agents only delegate: every agent-made task traces to a task that someone gave
                 # this agent and it accepted, so a chain always starts with a person.
                 pt = self._tasks.get(parent) if isinstance(parent, str) else None
                 if (not pt or pt["room_id"] != room_id or pt["target"] != pr.id
-                        or self._task_status(pt) != "accepted"):
+                        or pt["seq"] < first or self._task_status(pt) != "accepted"
+                        or not self._creator_valid(pt, room)):
                     raise CollabError(400, "agents delegate: parent_task_id must be a task you accepted in this room")
                 if pt["by_kind"] == "agent" and pt["by_id"] == tid_:
                     raise CollabError(400, "cannot hand a task straight back to the agent that gave it")
@@ -4433,6 +4559,16 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     raise CollabError(400, "task chain is too deep")
             elif parent is not None:
                 raise CollabError(400, "parent_task_id is for agents delegating a task")
+            fingerprint_parts = [room_id, tid_, text]
+            if parent is not None:
+                fingerprint_parts.append(parent)
+            if reviews is not None:
+                fingerprint_parts.append(reviews)
+            fingerprint = _digest(json.dumps(fingerprint_parts))
+            if ikey is not None and (prior := self._idem.get((pr.key, room_id, "task:" + ikey))):
+                if prior[0] != fingerprint:
+                    raise CollabError(409, "idempotency_key already used for a different task")
+                return {"task_id": prior[1], "status": "pending", "replayed": True}
             self._prune()
             now = self._now()
             open_for_target = sum(1 for tid2 in self._tasks_by_target.get(tid_, ())
@@ -4446,11 +4582,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 pr, project_id=room["project_id"], room_id=room_id, task_id=task_id,
                 target_agent_id=tid_, text=text, depth=depth, parent_task_id=parent,
                 created_by_kind=pr.kind, created_by_id=pr.id, created_epoch=now, root_user_id=root,
+                idempotency_key=ikey, fingerprint=fingerprint, requester_key=pr.key,
                 visibility_scope="room", action="task.create", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=task_id,
                 **({"reviews_task_id": reviews} if reviews is not None else {})))
             if ikey is not None:
-                self._idem[(pr.key, room_id, "task:" + ikey)] = (fp, task_id)
+                self._idem[(pr.key, room_id, "task:" + ikey)] = (fingerprint, task_id)
         return {"task_id": task_id, "status": "pending", "event": self._view(ev)}
 
     def _check_independent_review(self, pr: Principal, room_id: str, reviewer_id: str | None, reviews: Any) -> None:
@@ -4465,6 +4602,771 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             raise CollabError(400, "a reviewer must not be the agent that handed out the work")
         if pr.is_agent and pr.id == work["target"]:
             raise CollabError(400, "an agent cannot choose the reviewer of its own work")
+
+    # -- task-scoped requests for human approval (requests only; never grants)
+    @staticmethod
+    def _approval_proposal_json(proposal: dict) -> dict:
+        return {
+            "proposal_id": proposal["proposal_id"], "room_id": proposal["room_id"],
+            "task_id": proposal["task_id"], "kind": proposal["kind"],
+            "summary": proposal["summary"],
+            "details": json.loads(json.dumps(proposal["details"], ensure_ascii=False)),
+            "state": "pending", "created_at": proposal["created_at"],
+            "requester": {"type": proposal["requester_kind"], "id": proposal["requester_id"],
+                          "owner_user_id": proposal["owner"]},
+        }
+
+    def _approval_relationship(self, pr: Principal, room: dict, task: dict) -> bool:
+        """A proposal stays inside the user who owns the task's assigned agent."""
+        target = self._agents.get(task["target"])
+        if not target or target["owner"] != pr.owner:
+            return False
+        effective = self._effective(Principal("agent", task["target"], target["owner"]), room)
+        if not effective or "execute" not in effective[0] or task["seq"] < effective[1]:
+            return False
+        if pr.is_agent:
+            return task["target"] == pr.id
+        return self._member(room, pr.id) is not None
+
+    def create_approval_proposal(self, pr: Principal, room_id: str, body: dict) -> tuple[int, dict]:
+        """Record a pending request for approval without creating executable authority."""
+        with self._lock:
+            room, first = self._authorize(pr, room_id, "read", "approval_proposal.create")
+            allowed = {"task_id", "kind", "summary", "details", "idempotency_key"}
+            if not isinstance(body, dict) or set(body) - allowed:
+                raise CollabError(400, "unknown field")
+            task_id = body.get("task_id")
+            task = self._tasks.get(task_id) if isinstance(task_id, str) else None
+            if (not task or task["room_id"] != room_id or task["seq"] < first
+                    or self._task_status(task) not in ("pending", "accepted")
+                    or not self._approval_relationship(pr, room, task)):
+                raise CollabError(404, "not found")
+            if pr.is_agent:
+                effective = self._effective(pr, room)
+                if not effective or "execute" not in effective[0] or task["seq"] < effective[1]:
+                    raise CollabError(404, "not found")
+            else:
+                member = self._member(room, pr.id)
+                if not member or not (member["role"] == "owner" or task["root"] == pr.id
+                                      or task["by_owner"] == pr.id):
+                    raise CollabError(404, "not found")
+
+            kind, summary = body.get("kind"), body.get("summary")
+            if not isinstance(kind, str) or not _KEY_RE.fullmatch(kind) or len(kind) > 64:
+                raise CollabError(400, "invalid kind")
+            if not isinstance(summary, str):
+                raise CollabError(400, "summary must be a string")
+            summary = redact_text(_CONTROL.sub("", summary)).strip()
+            if not summary or len(summary) > MAX_APPROVAL_SUMMARY:
+                raise CollabError(400, f"summary must be 1-{MAX_APPROVAL_SUMMARY} characters")
+            details = body.get("details")
+            if not isinstance(details, dict):
+                raise CollabError(400, "details must be an object")
+            try:
+                details_json = json.dumps(details, ensure_ascii=False, sort_keys=True,
+                                          separators=(",", ":"), allow_nan=False)
+            except (TypeError, ValueError):
+                raise CollabError(400, "details must be a JSON object") from None
+            if len(details_json.encode()) > MAX_APPROVAL_DETAILS:
+                raise CollabError(400, "details are too large")
+            details = json.loads(details_json)
+
+            ikey = body.get("idempotency_key")
+            if not isinstance(ikey, str) or not _KEY_RE.fullmatch(ikey):
+                raise CollabError(400, "invalid idempotency_key")
+            requester_key = pr.key
+            fingerprint = _digest(json.dumps(
+                [room_id, task_id, kind, summary, details], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":")))
+            prior = self._approval_proposal_idem.get((requester_key, room_id, ikey))
+            if prior:
+                if prior[0] != fingerprint:
+                    raise CollabError(409, "idempotency_key already used for a different proposal")
+                proposal = self._approval_proposals[prior[1]]
+                # Replay never bypasses current room, task or agent authority.
+                if not self._approval_relationship(pr, room, task):
+                    raise CollabError(404, "not found")
+                return 200, {"proposal": self._approval_proposal_json(proposal), "replayed": True}
+
+            count = sum(1 for p in self._approval_proposals.values()
+                        if p["room_id"] == room_id and p["owner"] == pr.owner)
+            if count >= MAX_APPROVAL_PROPOSALS_PER_OWNER:
+                raise CollabError(429, "approval proposal limit reached")
+            self._throttle("approval-proposal:" + requester_key,
+                           APPROVAL_PROPOSAL_RATE, 600.0, "approval proposal")
+            proposal_id = ids.new_id("proposal")
+            ev = self._commit("approval_proposal_created", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id,
+                proposal_id=proposal_id, task_id=task_id, kind=kind, summary=summary,
+                details=details, requester_kind=pr.kind, requester_id=pr.id,
+                idempotency_key=ikey, fingerprint=fingerprint, visibility_scope="owner",
+                room_notify=False,
+                action="approval_proposal.create", outcome="allowed",
+                project_ids=[room["project_id"]], resource_id=proposal_id))
+            proposal = self._approval_proposals[proposal_id]
+        return 201, {"proposal": self._approval_proposal_json(proposal),
+                     "event_id": ev["event_id"]}
+
+    def list_approval_proposals(self, pr: Principal, room_id: str) -> dict:
+        with self._lock:
+            room, first = self._authorize(pr, room_id, "read", "approval_proposal.list")
+            if pr.is_agent:
+                effective = self._effective(pr, room)
+                if not effective or "execute" not in effective[0]:
+                    raise CollabError(404, "not found")
+            rows = []
+            for proposal in self._approval_proposals.values():
+                if (proposal["room_id"] != room_id or proposal["owner"] != pr.owner
+                        or proposal["sequence"] < first):
+                    continue
+                task = self._tasks.get(proposal["task_id"])
+                if not task or not self._approval_relationship(pr, room, task):
+                    continue
+                if pr.is_agent and proposal["requester_id"] != pr.id:
+                    continue
+                rows.append(proposal)
+            rows.sort(key=lambda p: p["sequence"], reverse=True)
+        return {"proposals": [self._approval_proposal_json(p) for p in rows]}
+
+    # -- immutable assistant package definitions (definitions only; never authority)
+    def _assistant_package_owner(self, pr: Principal, room_id: str, action: str) -> dict:
+        self._require_user(pr)
+        if not self._ok(pr.id):
+            raise CollabError(404, "not found")
+        room, _ = self._authorize(pr, room_id, "read", action)
+        member = self._member(room, pr.id)
+        if not member or member["role"] != "owner":
+            self._audit_denied(pr, action, "not_owner", room_id=room_id,
+                               project_ids=[room["project_id"]])
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden")
+        return room
+
+    @staticmethod
+    def _assistant_package_json(package: dict) -> dict:
+        return copy.deepcopy(package)
+
+    def create_assistant_package(self, pr: Principal, room_id: str,
+                                 body: dict) -> tuple[int, dict]:
+        """Register one private immutable definition; this cannot launch or grant capabilities."""
+        with self._lock:
+            room = self._assistant_package_owner(pr, room_id, "assistant_package.create")
+            if not isinstance(body, dict) or set(body) != {"manifest"}:
+                raise CollabError(400, "request must contain exactly manifest")
+            try:
+                record = agent_package_record(body["manifest"])
+            except ManifestError:
+                raise CollabError(400, "invalid assistant package manifest") from None
+            manifest = record["manifest"]
+            version_key = (room_id, pr.id, manifest["name"], manifest["version"])
+            prior_id = self._assistant_package_versions.get(version_key)
+            if prior_id is not None:
+                prior = self._assistant_packages[(room_id, pr.id, prior_id)]
+                if prior["digest"] != record["digest"]:
+                    raise CollabError(409, "assistant package name and version are immutable")
+                return 200, {"package": self._assistant_package_json(prior), "replayed": True}
+            count = sum(1 for rid, owner, _ in self._assistant_packages
+                        if rid == room_id and owner == pr.id)
+            if count >= MAX_ASSISTANT_PACKAGES_PER_OWNER_ROOM:
+                raise CollabError(429, "assistant package limit reached")
+            self._throttle("assistant-package:" + pr.id,
+                           ASSISTANT_PACKAGE_RATE, 600.0, "assistant package")
+            digest_hex = record["digest"].removeprefix("sha256:")
+            package = {
+                "package_id": "package_" + digest_hex,
+                **record,
+                "status": "definition-only",
+                "created_at": self._iso(),
+            }
+            self._commit("assistant_package_registered", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id,
+                package=copy.deepcopy(package), visibility_scope="owner", room_notify=False,
+                action="assistant_package.register", outcome="allowed",
+                project_ids=[room["project_id"]], resource_id=room_id))
+        return 201, {"package": self._assistant_package_json(package)}
+
+    def list_assistant_packages(self, pr: Principal, room_id: str) -> dict:
+        with self._lock:
+            self._assistant_package_owner(pr, room_id, "assistant_package.list")
+            rows = [package for (rid, owner, _), package in self._assistant_packages.items()
+                    if rid == room_id and owner == pr.id]
+            rows.sort(key=lambda p: (p["manifest"]["name"], p["manifest"]["version"],
+                                     p["package_id"]))
+        return {"packages": [self._assistant_package_json(p) for p in rows]}
+
+    def get_assistant_package(self, pr: Principal, room_id: str,
+                              package_id: str) -> dict:
+        with self._lock:
+            self._assistant_package_owner(pr, room_id, "assistant_package.get")
+            package = self._assistant_packages.get((room_id, pr.id, package_id))
+            if package is None:
+                raise CollabError(404, "not found")
+        return {"package": self._assistant_package_json(package)}
+
+    # -- attested Pi package activation
+    @staticmethod
+    def _assistant_runtime_limits(value: Any) -> dict:
+        fields = {"cpu_quota_percent", "memory_bytes", "process_count", "wall_time_seconds"}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise CollabError(400, "invalid runtime limits")
+        ranges = {
+            "cpu_quota_percent": (10, 800), "memory_bytes": (268_435_456, 17_179_869_184),
+            "process_count": (16, 1024), "wall_time_seconds": (30, 86_400),
+        }
+        out = {}
+        for key, (minimum, maximum) in ranges.items():
+            got = value.get(key)
+            if not isinstance(got, int) or isinstance(got, bool) or not minimum <= got <= maximum:
+                raise CollabError(400, "invalid runtime limits")
+            out[key] = got
+        return out
+
+    @staticmethod
+    def _assistant_role_bindings(value: Any, limit: int = 32) -> list[dict]:
+        if not isinstance(value, list) or len(value) > limit:
+            raise CollabError(400, "invalid role bindings")
+        out, seen = [], set()
+        for item in value:
+            if (not isinstance(item, dict) or set(item) != {"id", "version", "digest"}
+                    or not isinstance(item.get("id"), str) or not item["id"].startswith("procedure:")
+                    or not _KEY_RE.fullmatch(item["id"])
+                    or not isinstance(item.get("version"), str)
+                    or not _RUNTIME_VERSION.fullmatch(item["version"])
+                    or not isinstance(item.get("digest"), str)
+                    or not _RUNTIME_DIGEST.fullmatch(item["digest"])):
+                raise CollabError(400, "invalid role binding")
+            key = (item["id"], item["version"])
+            if key in seen:
+                raise CollabError(400, "role bindings must be unique")
+            seen.add(key)
+            out.append({"id": item["id"], "version": item["version"], "digest": item["digest"]})
+        out.sort(key=lambda item: (item["id"], item["version"], item["digest"]))
+        return out
+
+    def _normalize_assistant_runtime_attestation(self, body: Any) -> dict:
+        fields = {"schema_version", "host_id", "profile", "profile_digest", "runtime",
+                  "enforcement", "approved_models", "issued_at", "expires_at", "nonce",
+                  "role_bindings"}
+        optional = {"capabilities", "resources"}          # older runners that do not report them keep attesting
+        if (not isinstance(body, dict) or not fields <= set(body) or set(body) - fields - optional
+                or body.get("schema_version") != 1):
+            raise CollabError(400, "invalid runtime host attestation")
+        try:
+            capabilities = placement.normalize_capabilities(body.get("capabilities"))
+            resources = placement.normalize_resources(body.get("resources"))
+        except placement.PlacementError:
+            raise CollabError(400, "invalid runtime host capabilities") from None
+        host_id = self._require_host(body.get("host_id"))
+        profile, profile_digest = body.get("profile"), body.get("profile_digest")
+        runtime, enforcement = body.get("runtime"), body.get("enforcement")
+        if profile != "task-restricted-v1" or not isinstance(profile_digest, str) \
+                or not _RUNTIME_DIGEST.fullmatch(profile_digest):
+            raise CollabError(400, "invalid runtime host attestation")
+        if (not isinstance(runtime, dict)
+                or set(runtime) != {"kind", "artifact_digest", "entrypoint_id"}
+                or runtime.get("kind") != "pi" or runtime.get("entrypoint_id") != "pi-fixed-v1"
+                or not isinstance(runtime.get("artifact_digest"), str)
+                or not _RUNTIME_DIGEST.fullmatch(runtime["artifact_digest"])):
+            raise CollabError(400, "invalid runtime host attestation")
+        enforcement_fields = {"bubblewrap", "cgroup_v2", "broker_only", "task_only",
+                              "no_new_privileges", "limits"}
+        if (not isinstance(enforcement, dict) or set(enforcement) != enforcement_fields
+                or any(enforcement.get(key) is not True for key in enforcement_fields - {"limits"})):
+            raise CollabError(400, "invalid runtime host enforcement")
+        limits = self._assistant_runtime_limits(enforcement["limits"])
+        models = _profile_strings(body.get("approved_models"), "approved_models", _KEY_RE, 100, 128)
+        if not models:
+            raise CollabError(400, "approved_models must not be empty")
+        issued, expires, now = body.get("issued_at"), body.get("expires_at"), self._now()
+        if (not isinstance(issued, (int, float)) or isinstance(issued, bool) or not math.isfinite(issued)
+                or not isinstance(expires, (int, float)) or isinstance(expires, bool) or not math.isfinite(expires)
+                or issued > now + 5 or now - issued > ASSISTANT_RUNTIME_ATTEST_TTL
+                or expires <= now or expires <= issued or expires > now + ASSISTANT_RUNTIME_ATTEST_TTL):
+            raise CollabError(400, "invalid runtime host attestation time")
+        nonce = body.get("nonce")
+        if not isinstance(nonce, str) or not 16 <= len(nonce) <= 128 or not _KEY_RE.fullmatch(nonce):
+            raise CollabError(400, "invalid runtime host attestation nonce")
+        return {
+            "schema_version": 1, "host_id": host_id, "profile": profile,
+            "profile_digest": profile_digest, "runtime": copy.deepcopy(runtime),
+            "enforcement": {**{key: True for key in enforcement_fields - {"limits"}},
+                            "limits": limits},
+            "approved_models": sorted(models), "issued_at": float(issued),
+            "expires_at": float(expires), "nonce": nonce,
+            "role_bindings": self._assistant_role_bindings(body.get("role_bindings")),
+            "capabilities": capabilities, "resources": resources,
+        }
+
+    @staticmethod
+    def _assistant_runtime_host_json(record: dict, now: float, enabled: bool = True) -> dict:
+        status = "stale" if now >= record["expires_at"] else (
+            "unavailable" if record.get("used") or not enabled else "ready")
+        return {
+            "host_id": record["host_id"], "label": record["host_id"], "status": status,
+            "attested_at": record["issued_at"], "expires_at": record["expires_at"],
+            "supported_runtime_kinds": ["pi"], "sandbox_profiles": [record["profile"]],
+            "models": list(record["approved_models"]),
+            "role_bindings": copy.deepcopy(record["role_bindings"]),
+            "capabilities": list(record.get("capabilities", [])),
+            "resources": dict(record.get("resources", {})),
+        }
+
+    def assistant_runtime_host_candidates(self) -> list[dict]:
+        """Placement candidates for every attested host: only fields the runner attested, no owner or room data."""
+        with self._lock:
+            now = self._now()
+            rows = []
+            for host_id in sorted(self._assistant_runtime_hosts):
+                record = self._assistant_runtime_hosts[host_id]
+                host = self._assistant_runtime_host_json(record, now, self._fleet_flags.get(host_id, True))
+                rows.append({
+                    "id": f"host:{host_id}", "kind": "host", "backend": "host", "label": host["label"],
+                    "status": host["status"], "capabilities": host["capabilities"], "free": host["resources"],
+                    "attested_at": host["attested_at"], "profiles": host["sandbox_profiles"],
+                    "role_bindings": [f"{r['id']}@{r['version']}:{r['digest']}" for r in host["role_bindings"]],
+                    "models": host["models"], "queue_wait_s": 0})
+            return rows
+
+    def attest_assistant_runtime_host(self, pr: Principal, body: dict) -> tuple[int, dict]:
+        self._require_operator(pr)
+        attestation = self._normalize_assistant_runtime_attestation(body)
+        with self._lock:
+            prior = self._assistant_runtime_hosts.get(attestation["host_id"])
+            if prior and prior["nonce"] == attestation["nonce"]:
+                comparable = {k: v for k, v in prior.items() if k != "used"}
+                if comparable != attestation:
+                    raise CollabError(409, "attestation nonce already used for different content")
+                return 200, {"host": self._assistant_runtime_host_json(
+                    prior, self._now(), self._fleet_flags.get(prior["host_id"], True)),
+                    "replayed": True}
+            if len(self._assistant_runtime_hosts) >= MAX_ASSISTANT_RUNTIME_HOSTS \
+                    and attestation["host_id"] not in self._assistant_runtime_hosts:
+                raise CollabError(429, "too many runtime hosts")
+            self._commit("assistant_runtime_host_attested", self._actor(
+                pr, attestation=copy.deepcopy(attestation), action="assistant_runtime_host.attest",
+                outcome="allowed", project_ids=[], resource_id=attestation["host_id"]))
+            return 201, {"host": self._assistant_runtime_host_json(
+                self._assistant_runtime_hosts[attestation["host_id"]], self._now(),
+                self._fleet_flags.get(attestation["host_id"], True))}
+
+    def list_assistant_runtime_hosts(self, pr: Principal, room_id: str) -> dict:
+        with self._lock:
+            self._assistant_package_owner(pr, room_id, "assistant_runtime_host.list")
+            now = self._now()
+            rows = [self._assistant_runtime_host_json(
+                record, now, self._fleet_flags.get(host_id, True))
+                for host_id, record in self._assistant_runtime_hosts.items()]
+            rows.sort(key=lambda row: row["host_id"])
+            return {"hosts": rows}
+
+    @staticmethod
+    def _assistant_runtime_json(runtime: dict) -> dict:
+        return {
+            "runtime_id": runtime["runtime_id"], "package_id": runtime["package_id"],
+            "package_digest": runtime["package_digest"], "host_id": runtime["host_id"],
+            "name": runtime["name"], "selected_model": runtime["selected_model"],
+            "status": runtime["status"], "agent_id": runtime["agent_id"],
+            "created_at": runtime["created_at"], "updated_at": runtime["updated_at"],
+            "launch_attestation": copy.deepcopy(runtime["launch_attestation"]),
+            "cancel_requested": runtime["cancel_requested"], "access": ["execute", "read"],
+            "checkpoint": copy.deepcopy(runtime["checkpoint"]),
+            "error_code": runtime["error_code"], "lease_expires_at": runtime["lease_expires_at"],
+        }
+
+    def _assistant_runtime_package(self, runtime: dict) -> dict | None:
+        return self._assistant_packages.get((runtime["room_id"], runtime["owner"], runtime["package_id"]))
+
+    def _assistant_runtime_policy(self, runtime: dict, *, claiming: bool = True) -> tuple[dict, dict]:
+        room = self._rooms.get(runtime["room_id"])
+        member = self._member(room, runtime["owner"]) if room else None
+        package = self._assistant_runtime_package(runtime)
+        host = self._assistant_runtime_hosts.get(runtime["host_id"])
+        if (not self._ok(runtime["owner"]) or not member or member["role"] != "owner"
+                or not package or package["digest"] != runtime["package_digest"]
+                or package["manifest"]["runtime"]["kind"] != "pi"
+                or self._fleet_flags.get(runtime["host_id"], True) is False):
+            raise CollabError(409, "runtime policy changed")
+        if claiming:
+            if (not host or host["nonce"] != runtime["attestation_nonce"] or host.get("used")
+                    or self._now() >= host["expires_at"]):
+                raise CollabError(409, "runtime policy changed")
+        else:
+            host = runtime["attestation"]
+            aid = runtime.get("agent_id")
+            agent = self._agents.get(aid) if aid else None
+            grant = room["grants"].get(aid) if room and aid else None
+            if (not agent or agent["status"] != "active" or not grant
+                    or sorted(grant["actions"]) != ["execute", "read"]):
+                raise CollabError(409, "runtime policy changed")
+        manifest = package["manifest"]
+        artifact_digest = manifest["runtime"]["artifact"]["digest"]
+        profile = manifest["sandbox"]["profile"]
+        limits = manifest["sandbox"]["limits"]
+        required_roles = self._assistant_role_bindings(manifest["references"]["procedures"], 8)
+        room_models = self._profile(runtime["room_id"])["allowed_models"]
+        if (host["runtime"]["artifact_digest"] != artifact_digest or host["profile"] != profile
+                or host["enforcement"]["limits"] != limits
+                or runtime["selected_model"] not in host["approved_models"]
+                or runtime["selected_model"] not in manifest["model_policy"]["allowed"]
+                or any(role not in host["role_bindings"] for role in required_roles)
+                or (room_models is not None and runtime["selected_model"] not in room_models)):
+            raise CollabError(409, "runtime package is not supported by this host")
+        return package, host
+
+    def create_assistant_runtime(self, pr: Principal, room_id: str,
+                                 body: dict) -> tuple[int, dict]:
+        fields = {"package_id", "host_id", "name", "idempotency_key", "selected_model"}
+        required = fields - {"selected_model"}
+        if not isinstance(body, dict) or set(body) - fields or not required <= set(body):
+            raise CollabError(400, "invalid assistant runtime request")
+        with self._lock:
+            room = self._assistant_package_owner(pr, room_id, "assistant_runtime.create")
+            self._expire_assistant_runtimes()
+            package_id, host_id = body.get("package_id"), body.get("host_id")
+            if not isinstance(package_id, str) or not package_id.startswith("package_"):
+                raise CollabError(400, "invalid package_id")
+            host_id = self._require_host(host_id)
+            name, key = _handle(body.get("name")), body.get("idempotency_key")
+            if not isinstance(key, str) or not _KEY_RE.fullmatch(key):
+                raise CollabError(400, "invalid idempotency_key")
+            package = self._assistant_packages.get((room_id, pr.id, package_id))
+            if package is None:
+                raise CollabError(404, "not found")
+            manifest = package["manifest"]
+            if manifest["runtime"]["kind"] != "pi":
+                raise CollabError(409, "this runtime kind is not launchable")
+            model = body.get("selected_model", manifest["model_policy"]["default"])
+            if not isinstance(model, str) or model not in manifest["model_policy"]["allowed"]:
+                raise CollabError(409, "selected model is not allowed by the package")
+            host = self._assistant_runtime_hosts.get(host_id)
+            candidate = {"room_id": room_id, "owner": pr.id, "package_id": package_id,
+                         "package_digest": package["digest"], "host_id": host_id,
+                         "name": name, "selected_model": model}
+            fingerprint = _digest(json.dumps(candidate, sort_keys=True, separators=(",", ":")))
+            prior = self._assistant_runtime_idem.get((pr.id, room_id, key))
+            if prior:
+                if prior[0] != fingerprint:
+                    raise CollabError(409, "idempotency_key already used for a different runtime")
+                return 200, {"runtime": self._assistant_runtime_json(
+                    self._assistant_runtimes[prior[1]]), "replayed": True}
+            if host is None:
+                raise CollabError(409, "runtime host is not attested")
+            probe = {**candidate, "attestation_nonce": host["nonce"]}
+            probe_runtime = {**probe, "project_id": room["project_id"]}
+            self._assistant_runtime_policy(probe_runtime)
+            live = [runtime for runtime in self._assistant_runtimes.values()
+                    if runtime["owner"] == pr.id and runtime["status"] not in _RUNTIME_TERMINAL]
+            if len(live) >= MAX_ASSISTANT_RUNTIMES_PER_OWNER:
+                raise CollabError(429, "too many assistant runtimes")
+            taken = {a["name"] for aid in self._agents_by_owner.get(pr.id, ())
+                     if (a := self._agents[aid])["status"] == "active"}
+            taken |= {runtime["name"] for runtime in live}
+            if name in taken:
+                raise CollabError(409, "agent name is already in use")
+            self._throttle("assistant-runtime:" + pr.id,
+                           ASSISTANT_RUNTIME_RATE, 3600.0, "assistant runtime")
+            runtime_id, now = ids.new_id("collab"), self._now()
+            self._commit("assistant_runtime_requested", self._actor(
+                pr, runtime_id=runtime_id, room_id=room_id, project_id=room["project_id"],
+                package_id=package_id, package_digest=package["digest"], host_id=host_id,
+                name=name, selected_model=model, attestation_nonce=host["nonce"],
+                attestation=copy.deepcopy(host), idempotency_key=key, fingerprint=fingerprint,
+                created_epoch=now, visibility_scope="owner", room_notify=False,
+                action="assistant_runtime.request", outcome="allowed",
+                project_ids=[room["project_id"]], resource_id=room_id))
+            return 202, {"runtime": self._assistant_runtime_json(self._assistant_runtimes[runtime_id])}
+
+    def _expire_assistant_runtimes(self) -> None:
+        now = self._now()
+        actor = {"actor_user_id": None, "actor_agent_id": None}
+        for runtime in list(self._assistant_runtimes.values()):
+            error = None
+            if runtime["status"] == "queued":
+                host = self._assistant_runtime_hosts.get(runtime["host_id"])
+                if not host or host["nonce"] != runtime["attestation_nonce"] or now >= host["expires_at"]:
+                    error = "host_attestation_expired"
+            elif runtime["status"] in _RUNTIME_LIVE and now >= (runtime["lease_expires_at"] or -1):
+                error = "runtime_lease_expired"
+            if error:
+                self._commit("assistant_runtime_expired", {
+                    **actor, "runtime_id": runtime["runtime_id"], "room_id": runtime["room_id"],
+                    "project_id": runtime["project_id"], "error_code": error, "expired_epoch": now,
+                    "visibility_scope": "owner", "room_notify": False,
+                    "action": "assistant_runtime.expire", "outcome": "allowed",
+                    "project_ids": [runtime["project_id"]], "resource_id": runtime["room_id"]})
+                self._fail_assistant_runtime_tasks(actor, runtime, error)
+
+    def _fail_assistant_runtime_tasks(self, actor: dict, runtime: dict, reason: str) -> None:
+        aid = runtime.get("agent_id")
+        if not aid:
+            return
+        for task_id in list(self._tasks_by_target.get(aid, ())):
+            task = self._tasks[task_id]
+            if self._task_status(task) not in {"pending", "accepted"}:
+                continue
+            self._commit("task_updated", {
+                **actor, "project_id": runtime["project_id"], "room_id": runtime["room_id"],
+                "task_id": task_id, "status": "failed", "result": f"runtime ended: {reason}"[:4000],
+                "target_agent_id": aid, "visibility_scope": "room",
+                "action": "assistant_runtime.task.fail", "outcome": "allowed",
+                "project_ids": [runtime["project_id"]], "resource_id": task_id,
+            })
+
+    def list_assistant_runtimes(self, pr: Principal, room_id: str) -> dict:
+        with self._lock:
+            self._assistant_package_owner(pr, room_id, "assistant_runtime.list")
+            self._expire_assistant_runtimes()
+            rows = [runtime for runtime in self._assistant_runtimes.values()
+                    if runtime["room_id"] == room_id and runtime["owner"] == pr.id]
+            rows.sort(key=lambda runtime: (-runtime["created_epoch"], runtime["runtime_id"]))
+            return {"runtimes": [self._assistant_runtime_json(runtime) for runtime in rows]}
+
+    def get_assistant_runtime(self, pr: Principal, room_id: str, runtime_id: str) -> dict:
+        with self._lock:
+            self._assistant_package_owner(pr, room_id, "assistant_runtime.get")
+            self._expire_assistant_runtimes()
+            runtime = self._assistant_runtimes.get(runtime_id)
+            if not runtime or runtime["room_id"] != room_id or runtime["owner"] != pr.id:
+                raise CollabError(404, "not found")
+            return {"runtime": self._assistant_runtime_json(runtime)}
+
+    def cancel_assistant_runtime(self, pr: Principal, room_id: str, runtime_id: str,
+                                 body: dict) -> dict:
+        if body != {}:
+            raise CollabError(400, "cancel request must be empty")
+        with self._lock:
+            room = self._assistant_package_owner(pr, room_id, "assistant_runtime.cancel")
+            self._expire_assistant_runtimes()
+            runtime = self._assistant_runtimes.get(runtime_id)
+            if not runtime or runtime["room_id"] != room_id or runtime["owner"] != pr.id:
+                raise CollabError(404, "not found")
+            if runtime["status"] in _RUNTIME_TERMINAL or runtime["cancel_requested"]:
+                return {"runtime": self._assistant_runtime_json(runtime)}
+            self._commit("assistant_runtime_cancel_requested", self._actor(
+                pr, runtime_id=runtime_id, room_id=room_id, project_id=room["project_id"],
+                requested_epoch=self._now(), visibility_scope="owner", room_notify=False,
+                action="assistant_runtime.cancel", outcome="allowed",
+                project_ids=[room["project_id"]], resource_id=room_id))
+            return {"runtime": self._assistant_runtime_json(runtime)}
+
+    def list_assistant_runtime_queue(self, pr: Principal) -> dict:
+        self._require_operator(pr)
+        with self._lock:
+            self._expire_assistant_runtimes()
+            rows = [runtime for runtime in self._assistant_runtimes.values()
+                    if runtime["status"] == "queued" and not runtime["cancel_requested"]]
+            rows.sort(key=lambda runtime: (runtime["created_epoch"], runtime["runtime_id"]))
+            return {"runtimes": [self._assistant_runtime_json(runtime) for runtime in rows]}
+
+    def _fail_assistant_runtime_policy(self, pr: Principal, runtime: dict) -> None:
+        self._commit("assistant_runtime_expired", self._actor(
+            pr, runtime_id=runtime["runtime_id"], room_id=runtime["room_id"],
+            project_id=runtime["project_id"], error_code="runtime_policy_changed",
+            expired_epoch=self._now(), visibility_scope="owner", room_notify=False,
+            action="assistant_runtime.policy", outcome="denied",
+            project_ids=[runtime["project_id"]], resource_id=runtime["room_id"]))
+
+    def claim_assistant_runtime(self, pr: Principal, runtime_id: str, body: dict) -> dict:
+        self._require_operator(pr)
+        if not isinstance(body, dict) or set(body) != {"host_id", "attestation_nonce"}:
+            raise CollabError(400, "invalid runtime claim")
+        host_id = self._require_host(body.get("host_id"))
+        nonce = body.get("attestation_nonce")
+        if not isinstance(nonce, str) or not _KEY_RE.fullmatch(nonce):
+            raise CollabError(400, "invalid runtime claim")
+        with self._lock:
+            self._expire_assistant_runtimes()
+            runtime = self._assistant_runtimes.get(runtime_id)
+            if not runtime:
+                raise CollabError(404, "not found")
+            if runtime["status"] != "queued" or runtime["cancel_requested"]:
+                raise CollabError(409, "runtime is not claimable")
+            if runtime["host_id"] != host_id or runtime["attestation_nonce"] != nonce:
+                raise CollabError(409, "runtime host attestation does not match")
+            try:
+                package, host = self._assistant_runtime_policy(runtime)
+            except CollabError:
+                self._fail_assistant_runtime_policy(pr, runtime)
+                raise CollabError(409, "runtime policy changed") from None
+            self._agent_slots(runtime["owner"])
+            taken = {self._agents[aid]["name"] for aid in self._agents_by_owner.get(runtime["owner"], ())
+                     if self._agents[aid]["status"] == "active"}
+            if runtime["name"] in taken:
+                self._fail_assistant_runtime_policy(pr, runtime)
+                raise CollabError(409, "agent name is already in use")
+            now = self._now()
+            aid, credential = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32)
+            device, claim_token = "runtime-" + secrets.token_hex(8), "hcr_" + secrets.token_urlsafe(32)
+            lease = now + ASSISTANT_RUNTIME_LEASE
+            self._commit("assistant_runtime_claimed", self._actor(
+                pr, runtime_id=runtime_id, room_id=runtime["room_id"], project_id=runtime["project_id"],
+                agent_id=aid, device_id=device, secret_digest=_digest(credential),
+                credential_expires_at=now + self.remote_credential_ttl,
+                claim_digest=_digest(claim_token), lease_expires_at=lease, claimed_epoch=now,
+                visibility_scope="owner", room_notify=False, action="assistant_runtime.claim",
+                outcome="allowed", project_ids=[runtime["project_id"]], resource_id=runtime["room_id"]))
+            manifest = package["manifest"]
+            return {
+                "runtime": self._assistant_runtime_json(runtime), "credential": credential,
+                "device_id": device, "claim_token": claim_token, "lease_expires_at": lease,
+                "package": {"package_id": package["package_id"], "digest": package["digest"],
+                            "runtime_artifact_digest": manifest["runtime"]["artifact"]["digest"],
+                            "profile": manifest["sandbox"]["profile"],
+                            "limits": copy.deepcopy(manifest["sandbox"]["limits"]),
+                            "required_role_bindings": self._assistant_role_bindings(
+                                manifest["references"]["procedures"], 8)},
+                "selected_model": runtime["selected_model"], "actions": ["execute", "read"],
+            }
+
+    @staticmethod
+    def _assistant_runtime_checkpoint(value: Any) -> dict:
+        if (not isinstance(value, dict) or set(value) - {"sequence", "phase", "output_sha256"}
+                or not {"sequence", "phase"} <= set(value)):
+            raise CollabError(400, "invalid runtime checkpoint")
+        sequence, phase, output = value.get("sequence"), value.get("phase"), value.get("output_sha256")
+        if (not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1
+                or not isinstance(phase, str) or not _KEY_RE.fullmatch(phase)
+                or not (output is None or (isinstance(output, str) and _RUNTIME_DIGEST.fullmatch(output)))):
+            raise CollabError(400, "invalid runtime checkpoint")
+        return {"sequence": sequence, "phase": phase, "output_sha256": output}
+
+    def _assistant_runtime_claim_auth(self, runtime_id: str, body: dict) -> tuple[dict, dict]:
+        runtime = self._assistant_runtimes.get(runtime_id)
+        if runtime is None:
+            raise CollabError(404, "not found")
+        claim_token, nonce = body.get("claim_token"), body.get("attestation_nonce")
+        if (not isinstance(claim_token, str) or not secrets.compare_digest(
+                runtime.get("claim_digest") or "", _digest(claim_token))
+                or nonce != runtime["attestation_nonce"]):
+            raise CollabError(404, "not found")
+        return runtime, self._assistant_runtime_hosts.get(runtime["host_id"], {})
+
+    def heartbeat_assistant_runtime(self, pr: Principal, runtime_id: str, body: dict) -> dict:
+        self._require_operator(pr)
+        if not isinstance(body, dict) or set(body) != {"claim_token", "attestation_nonce", "checkpoint"}:
+            raise CollabError(400, "invalid runtime heartbeat")
+        checkpoint = self._assistant_runtime_checkpoint(body.get("checkpoint"))
+        with self._lock:
+            self._expire_assistant_runtimes()
+            runtime, _ = self._assistant_runtime_claim_auth(runtime_id, body)
+            if runtime["status"] not in _RUNTIME_LIVE or runtime["cancel_requested"]:
+                raise CollabError(409, "runtime cannot heartbeat")
+            try:
+                self._assistant_runtime_policy(runtime, claiming=False)
+            except CollabError:
+                self._fail_assistant_runtime_policy(pr, runtime)
+                self._fail_assistant_runtime_tasks(self._actor(pr), runtime, "runtime_policy_changed")
+                raise CollabError(409, "runtime policy changed") from None
+            if runtime["checkpoint"] and checkpoint["sequence"] <= runtime["checkpoint"]["sequence"]:
+                raise CollabError(409, "checkpoint sequence must increase")
+            now, lease = self._now(), self._now() + ASSISTANT_RUNTIME_LEASE
+            self._commit("assistant_runtime_heartbeat", self._actor(
+                pr, runtime_id=runtime_id, room_id=runtime["room_id"], project_id=runtime["project_id"],
+                checkpoint=checkpoint, lease_expires_at=lease, reported_epoch=now,
+                visibility_scope="owner", room_notify=False, action="assistant_runtime.heartbeat",
+                outcome="allowed", project_ids=[runtime["project_id"]], resource_id=runtime["room_id"]))
+            return {"runtime": self._assistant_runtime_json(runtime)}
+
+    @staticmethod
+    def _assistant_runtime_launch_attestation(value: Any) -> dict:
+        if (not isinstance(value, dict)
+                or set(value) != {"profile_digest", "runtime_artifact_digest", "enforcement",
+                                  "role_bindings"}
+                or not isinstance(value.get("profile_digest"), str)
+                or not _RUNTIME_DIGEST.fullmatch(value["profile_digest"])
+                or not isinstance(value.get("runtime_artifact_digest"), str)
+                or not _RUNTIME_DIGEST.fullmatch(value["runtime_artifact_digest"])):
+            raise CollabError(400, "invalid launch attestation")
+        out = copy.deepcopy(value)
+        out["role_bindings"] = CollabService._assistant_role_bindings(value["role_bindings"], 8)
+        return out
+
+    def report_assistant_runtime(self, pr: Principal, runtime_id: str, body: dict) -> dict:
+        self._require_operator(pr)
+        allowed = {"claim_token", "attestation_nonce", "status", "checkpoint",
+                   "launch_attestation", "instance_id", "error_code"}
+        if not isinstance(body, dict) or set(body) - allowed \
+                or not {"claim_token", "attestation_nonce", "status", "checkpoint"} <= set(body):
+            raise CollabError(400, "invalid runtime report")
+        status = body.get("status")
+        if status not in {"starting", "ready", "failed", "cancelled"}:
+            raise CollabError(400, "invalid runtime status")
+        checkpoint = self._assistant_runtime_checkpoint(body.get("checkpoint"))
+        with self._lock:
+            self._expire_assistant_runtimes()
+            runtime, _ = self._assistant_runtime_claim_auth(runtime_id, body)
+            if runtime["status"] not in _RUNTIME_LIVE:
+                raise CollabError(409, "runtime is terminal")
+            if runtime["cancel_requested"] and status not in {"failed", "cancelled"}:
+                raise CollabError(409, "runtime cancellation is pending")
+            if ((status == "starting" and runtime["status"] != "claimed")
+                    or (status == "ready" and runtime["status"] not in {"claimed", "starting"})):
+                raise CollabError(409, "invalid runtime status transition")
+            if runtime["checkpoint"] and checkpoint["sequence"] <= runtime["checkpoint"]["sequence"]:
+                raise CollabError(409, "checkpoint sequence must increase")
+            launch, instance_id, error = None, None, None
+            if status == "starting":
+                if set(body) != {"claim_token", "attestation_nonce", "status", "checkpoint"}:
+                    raise CollabError(400, "invalid starting report")
+            elif status == "ready":
+                if set(body) != {"claim_token", "attestation_nonce", "status", "checkpoint",
+                                 "launch_attestation", "instance_id"}:
+                    raise CollabError(400, "invalid ready report")
+                launch = self._assistant_runtime_launch_attestation(body.get("launch_attestation"))
+                if launch != {
+                    "profile_digest": runtime["attestation"]["profile_digest"],
+                    "runtime_artifact_digest": runtime["attestation"]["runtime"]["artifact_digest"],
+                    "enforcement": runtime["attestation"]["enforcement"],
+                    "role_bindings": self._assistant_role_bindings(
+                        self._assistant_runtime_package(runtime)["manifest"]["references"]["procedures"], 8),
+                }:
+                    raise CollabError(409, "launch attestation does not match the claim")
+                instance_id = body.get("instance_id")
+                if not isinstance(instance_id, str) or not _KEY_RE.fullmatch(instance_id):
+                    raise CollabError(400, "invalid instance_id")
+            elif status == "failed":
+                if set(body) != {"claim_token", "attestation_nonce", "status", "checkpoint", "error_code"}:
+                    raise CollabError(400, "invalid failed report")
+                error = body.get("error_code")
+                if not isinstance(error, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,79}", error):
+                    raise CollabError(400, "invalid runtime error_code")
+            else:
+                if set(body) != {"claim_token", "attestation_nonce", "status", "checkpoint"}:
+                    raise CollabError(400, "invalid cancelled report")
+                if not runtime["cancel_requested"]:
+                    raise CollabError(409, "cancellation was not requested")
+            if status in {"starting", "ready"}:
+                try:
+                    self._assistant_runtime_policy(runtime, claiming=False)
+                except CollabError:
+                    self._fail_assistant_runtime_policy(pr, runtime)
+                    self._fail_assistant_runtime_tasks(self._actor(pr), runtime,
+                                                       "runtime_policy_changed")
+                    raise CollabError(409, "runtime policy changed") from None
+            now = self._now()
+            self._commit("assistant_runtime_reported", self._actor(
+                pr, runtime_id=runtime_id, room_id=runtime["room_id"], project_id=runtime["project_id"],
+                status=status, checkpoint=checkpoint, launch_attestation=launch,
+                instance_id=instance_id, error_code=error,
+                lease_expires_at=now + ASSISTANT_RUNTIME_LEASE if status in _RUNTIME_LIVE else None,
+                reported_epoch=now, visibility_scope="owner", room_notify=False,
+                action="assistant_runtime.report", outcome="allowed",
+                project_ids=[runtime["project_id"]], resource_id=runtime["room_id"]))
+            if status in {"failed", "cancelled"}:
+                self._fail_assistant_runtime_tasks(self._actor(pr), runtime, status)
+            return {"runtime": self._assistant_runtime_json(runtime)}
+
+    def assistant_runtime_cancel_status(self, pr: Principal, runtime_id: str, body: dict) -> dict:
+        self._require_operator(pr)
+        if not isinstance(body, dict) or set(body) != {"claim_token"}:
+            raise CollabError(400, "invalid cancellation poll")
+        with self._lock:
+            runtime, _ = self._assistant_runtime_claim_auth(runtime_id, {
+                "claim_token": body.get("claim_token"),
+                "attestation_nonce": self._assistant_runtimes.get(runtime_id, {}).get("attestation_nonce"),
+            })
+            return {"runtime_id": runtime_id, "cancel_requested": runtime["cancel_requested"],
+                    "reason": runtime["cancel_reason"]}
 
     def _grant_expiry(self, body: dict) -> float:
         """Every agent grant lapses: the owner may pick a date (up to a year), else the default."""
@@ -4576,6 +5478,15 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             rows.sort(key=lambda r: r[0], reverse=True)
             out = [dict(self._task_json(tid, t, bounds=owner, quoted=owner), untrusted=True) for _, tid, t in rows[:limit]]
         return {"tasks": out}
+
+    def get_task(self, pr: Principal, room_id: str, task_id: str) -> dict:
+        with self._lock:
+            _, first = self._authorize(pr, room_id, "read", "task.get")
+            task = self._tasks.get(task_id) if isinstance(task_id, str) else None
+            if not task or task["room_id"] != room_id or task["seq"] < first:
+                raise CollabError(404, "not found")
+            out = dict(self._task_json(task_id, task), untrusted=True)
+        return {"task": out}
 
     def cancel_task(self, pr: Principal, room_id: str, task_id: str) -> dict:
         self._require_user(pr)
@@ -5615,6 +6526,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     if parts == ["fleet", "spawns"]:
                         st = str(query["status"]) if "status" in query else None
                         return 200, self.list_spawns(pr, st)
+                    if parts == ["fleet", "assistant-runtimes"]:
+                        return 200, self.list_assistant_runtime_queue(pr)
                     raise CollabError(404, "not found")
                 if parts[:1] == ["graph"]:
                     return 200, self.graph_read(pr, parts[1:], query)
@@ -5689,6 +6602,20 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.list_proposals(pr, rid)
                     if n == 4 and parts[2] == "proposals":
                         return 200, self.get_proposal(pr, rid, parts[3])
+                    if n == 4 and parts[2] == "tasks":
+                        return 200, self.get_task(pr, rid, parts[3])
+                    if parts[2:] == ["approval-proposals"]:
+                        return 200, self.list_approval_proposals(pr, rid)
+                    if parts[2:] == ["assistant-packages"]:
+                        return 200, self.list_assistant_packages(pr, rid)
+                    if n == 4 and parts[2] == "assistant-packages":
+                        return 200, self.get_assistant_package(pr, rid, parts[3])
+                    if parts[2:] == ["assistant-hosts"]:
+                        return 200, self.list_assistant_runtime_hosts(pr, rid)
+                    if parts[2:] == ["assistant-runtimes"]:
+                        return 200, self.list_assistant_runtimes(pr, rid)
+                    if n == 4 and parts[2] == "assistant-runtimes":
+                        return 200, self.get_assistant_runtime(pr, rid, parts[3])
                     if parts[2:] == ["flow"]:
                         return 200, self.room_flow(pr, rid)
                     if parts[2:] == ["workspaces"]:
@@ -5762,12 +6689,22 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.finish_helper(pr, parts[2], body)
                     if parts == ["fleet", "spawns"]:
                         return 201, self.request_spawn(pr, body)
+                    if parts == ["fleet", "assistant-runtime-hosts"]:
+                        return self.attest_assistant_runtime_host(pr, body)
                     if parts == ["fleet", "task-activity"]:
                         return 200, self.task_activity(pr, body)
                     if n == 4 and parts[1] == "spawns" and parts[3] == "claim":
                         return 200, self.claim_spawn(pr, parts[2])
                     if n == 4 and parts[1] == "spawns" and parts[3] == "done":
                         return 200, self.finish_spawn(pr, parts[2], body)
+                    if n == 4 and parts[1] == "assistant-runtimes" and parts[3] == "claim":
+                        return 200, self.claim_assistant_runtime(pr, parts[2], body)
+                    if n == 4 and parts[1] == "assistant-runtimes" and parts[3] == "heartbeat":
+                        return 200, self.heartbeat_assistant_runtime(pr, parts[2], body)
+                    if n == 4 and parts[1] == "assistant-runtimes" and parts[3] == "report":
+                        return 200, self.report_assistant_runtime(pr, parts[2], body)
+                    if n == 4 and parts[1] == "assistant-runtimes" and parts[3] == "cancel-status":
+                        return 200, self.assistant_runtime_cancel_status(pr, parts[2], body)
                     raise CollabError(404, "not found")
                 if parts == ["agents", "bulk"]:
                     if operator is None:                  # dashboard owner only: not offered to the public site
@@ -5878,6 +6815,14 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 201, self.create_delegation(pr, rid, body)
                     if n == 5 and parts[2] == "proposals" and parts[4] == "decide":
                         return 200, self.decide_proposal(pr, rid, parts[3], body)
+                    if parts[2:] == ["approval-proposals"]:
+                        return self.create_approval_proposal(pr, rid, body)
+                    if parts[2:] == ["assistant-packages"]:
+                        return self.create_assistant_package(pr, rid, body)
+                    if parts[2:] == ["assistant-runtimes"]:
+                        return self.create_assistant_runtime(pr, rid, body)
+                    if n == 5 and parts[2] == "assistant-runtimes" and parts[4] == "cancel":
+                        return 200, self.cancel_assistant_runtime(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "teams" and parts[4] == "roles":
                         return 200, self.assign_team_role(pr, rid, parts[3], body)
                     if n == 6 and parts[2] == "teams" and parts[4] == "roles" and parts[5] == "clear":

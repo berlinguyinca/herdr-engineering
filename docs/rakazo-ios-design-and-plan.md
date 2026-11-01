@@ -178,3 +178,21 @@ Outside systems join through the existing external-agent path instead of provide
 their heartbeat is fresh (`list_my_agents.online`), and `messaging/status`, `messaging/installations/list` and
 `messaging/installations/remove` list and revoke them. `messaging/installations/start` stays refused: the invite code is a
 one-time secret created in the dashboard, not a URL. Any provider, voice or desktop host would be an adapter on the same client.
+
+### Update 11: one owner for the phone and the dashboard
+
+In single-operator mode a phone `operator` account (YAML, not Cognito) now owns its assistants, threads, runs, grants and approvals
+as the dashboard operator (`open-listener`), in the default space only, so `bots/list` on the phone and the dashboard page show the
+same assistants. `_Ctx.user` is the owner key; `_Ctx.principal` stays the phone account's own principal. Family accounts, Cognito
+accounts, non-default spaces and servers outside single-operator mode are unchanged. Approvals and executions record the phone account's own principal as the actor, so the audit trail still
+names the phone; the owner key says whose approval it is. In single-operator mode self-approval is already allowed by configuration.
+
+Not migrated: assistants the phone created before this change stay owned by `rakazo:<account>` and are shown on neither surface.
+`RakazoBridge.legacy_phone_assistants()` lists them (it moves nothing); moving them means rewriting the owner on every record type
+that carries `user_id`, which needs its own reviewed migration.
+
+### Trying the app locally
+
+`scripts/local-phone-server.py` starts a throwaway control plane (in-memory, bridge on, one operator account with a random
+password printed once, loopback only). Point the iOS simulator's Server field at `http://127.0.0.1:8787` and sign in with the
+printed email and password. Checked: the server starts and `/api/auth/sign-in/email` returns a token. The simulator itself needs Xcode.

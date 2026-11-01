@@ -29,6 +29,7 @@ Design contract (see ADR-0001, ADR-0002 in that directory):
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import ipaddress
@@ -41,8 +42,9 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 
+from . import placement, slurm_placement
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_hub.verbs import Verb
@@ -91,6 +93,102 @@ def redact_secrets(text: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 _FEATURE_FLAG_KEY = "personal_assistant"
+_DELEGATION_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}\Z")
+_DELEGATION_DIGEST = re.compile(r"sha256:[a-f0-9]{64}\Z")
+_DELEGATION_SECRET_KEY = re.compile(
+    r"(?i)(authorization|api.?key|token|password|secret|credential)")
+_DELEGATION_RESERVED_CONTEXT = frozenset({
+    "tenant", "tenant_id", "user", "user_id", "assistant", "assistant_id",
+    "connector", "connectors", "grant", "grants", "oauth", "auth", "role_ref",
+})
+_SECRETARY_ROLE = {
+    "id": "procedure:secretary-system", "version": "1.0.0",
+    "digest": "sha256:942e5b1002d74a9d52ae2fb7c2f8ef07f4f6b08aa1b9e08a36b8e0504ffab120",
+}
+
+
+def _delegation_targets(value: Any) -> dict[str, dict[str, Any]]:
+    if value is None:
+        return {"pi": {"role_ref": None}}
+    if not isinstance(value, dict) or not value or len(value) > 16:
+        raise ValueError("personal_assistant.delegation.targets must be a nonempty object")
+    out = {}
+    for target, raw in value.items():
+        if not isinstance(target, str) or not _DELEGATION_REF.fullmatch(target):
+            raise ValueError("invalid delegation target")
+        if not isinstance(raw, dict) or "role_ref" not in raw or set(raw) - {"role_ref", "requires", "resources", "handles"}:
+            raise ValueError("delegation target takes role_ref, and optionally requires, resources and handles")
+        role = raw["role_ref"]
+        if role is not None:
+            if (not isinstance(role, dict) or set(role) != {"id", "version", "digest"}
+                    or not isinstance(role.get("id"), str) or not role["id"].startswith("procedure:")
+                    or not _DELEGATION_REF.fullmatch(role["id"])
+                    or not isinstance(role.get("version"), str)
+                    or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", role["version"])
+                    or not isinstance(role.get("digest"), str)
+                    or not _DELEGATION_DIGEST.fullmatch(role["digest"])):
+                raise ValueError("invalid delegation role_ref")
+            role = dict(role)
+        if target == "pi" and role is not None:
+            raise ValueError("pi delegation target cannot override a role")
+        if target == "pi-secretary" and role != _SECRETARY_ROLE:
+            raise ValueError("pi-secretary requires the reviewed Secretary role")
+        out[target] = {"role_ref": role}
+        try:
+            if raw.get("requires") is not None:
+                out[target]["requires"] = placement.normalize_capabilities(raw["requires"], what="requires")
+            if raw.get("resources") is not None:
+                out[target]["resources"] = placement.normalize_resources(raw["resources"])
+            if raw.get("handles") is not None:
+                out[target]["handles"] = _delegation_handles(raw["handles"])
+        except placement.PlacementError as exc:
+            raise ValueError(f"delegation target {target}: {exc}") from None
+    return out
+
+
+_HANDLE_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,23}\Z")
+
+
+def _delegation_handles(value: Any) -> list[str]:
+    """Words that mean "this task suits this target". Matching only ever picks WHERE a task goes; it grants nothing."""
+    if (not isinstance(value, list) or not 0 < len(value) <= 24
+            or not all(isinstance(v, str) and _HANDLE_RE.fullmatch(v) for v in value)):
+        raise ValueError("handles must be a list of 1-24 short lowercase words")
+    return sorted(set(value))
+
+
+def _delegation_binding_scope(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {"tenant_id", "user_id"}
+            or not all(isinstance(value.get(key), str) and value[key]
+                       and len(value[key]) <= 200 and value[key].isprintable()
+                       for key in ("tenant_id", "user_id"))):
+        raise ValueError("personal_assistant.delegation.binding_scope needs tenant_id and user_id")
+    return {"tenant_id": value["tenant_id"], "user_id": value["user_id"]}
+
+
+_PI_BINDING_KEYS = {"tenant_id", "user_id", "room_id", "agent_id", "api_url", "credential_file"}
+
+
+def _delegation_pi_bindings(value: Any) -> list[dict[str, str]]:
+    """Operator-owned Pi Secretary bindings, one per (tenant, user). Nothing is inferred or defaulted."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 64:
+        raise ValueError("personal_assistant.delegation.pi_bindings must be a list")
+    out, seen = [], set()
+    for raw in value:
+        if (not isinstance(raw, dict) or set(raw) != _PI_BINDING_KEYS
+                or not all(isinstance(raw[key], str) and raw[key] and len(raw[key]) <= 400
+                           and raw[key].isprintable() for key in _PI_BINDING_KEYS)):
+            raise ValueError("each pi_binding needs exactly " + ", ".join(sorted(_PI_BINDING_KEYS)))
+        scope = (raw["tenant_id"], raw["user_id"])
+        if scope in seen:
+            raise ValueError("duplicate pi_binding for one tenant and user")
+        seen.add(scope)
+        out.append({key: raw[key] for key in sorted(_PI_BINDING_KEYS)})
+    return out
 
 
 _TENANT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}\Z")
@@ -164,6 +262,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     tenancy = section.get("tenancy") if isinstance(section.get("tenancy"), dict) else {}
     tenant_map = tenancy.get("principals") if isinstance(tenancy.get("principals"), dict) else {}
     default_tenant = _tenant_id(tenancy.get("default_tenant", "default"), "tenancy.default_tenant")
+    delegation = section.get("delegation") if isinstance(section, dict) else None
+    delegation = delegation if isinstance(delegation, dict) else {}
     return {
         "enabled": bool(section.get("enabled", False)),
         "approval_ttl_seconds": int(section.get("approval_ttl_seconds", 3600)),
@@ -253,6 +353,13 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "apps": apps_config(section.get("apps")),
         # Tailnet-only MCP hub: off unless enabled; the tenant defaults to the section's default tenant.
         "hub": _hub_config(section.get("hub"), default_tenant),
+        "delegation": {
+            "targets": _delegation_targets(delegation.get("targets")),
+            "binding_scope": _delegation_binding_scope(delegation.get("binding_scope")),
+            "pi_bindings": _delegation_pi_bindings(delegation.get("pi_bindings")),
+        },
+        "placement": {"slurm": slurm_placement.slurm_config(
+            ((section.get("placement") or {}).get("slurm") or {}).get("clusters"))},
         # Earned per-user action grants for hub workers (shadow period, approval thresholds, extra vetoes).
         "grants": _grants_config(section.get("grants")),
     }
@@ -532,6 +639,9 @@ class Assistant:
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
     version: int = 1
+    type: str = "rakazo"              # rakazo, or a configured specialist type (delegation.targets)
+    parent_id: str | None = None      # explicit association; management only, confers no authority
+    idempotency_key: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -539,6 +649,8 @@ class Assistant:
             "tenant_id": self.tenant_id,
             "user_id": self.user_id,
             "name": self.name,
+            "type": self.type,
+            "parent_id": self.parent_id,
             "persona": self.persona,
             "status": self.status,
             "instructions": self.instructions,
@@ -831,8 +943,22 @@ class DelegationRequest:
     assistant_id: str
     task: str
     target_system: str = "pi"
-    status: str = "queued"        # queued|running|succeeded|failed|cancelled
+    status: str = "queued"        # queued|running|succeeded|needs_context|failed|cancelled
     artifact_refs: list[str] = field(default_factory=list)
+    run_id: str = ""               # server-derived; never trusted from an API body
+    context: dict[str, Any] = field(default_factory=dict)
+    source_refs: list[str] = field(default_factory=list)
+    role_ref: dict[str, str] | None = None
+    idempotency_key: str = ""
+    request_fingerprint: str = ""
+    external_id: str = ""
+    checkpoint: dict[str, Any] = field(default_factory=dict)
+    result_text: str = ""
+    error: str = ""
+    cancel_requested: bool = False
+    cancel_dispatched: bool = False
+    completed_at: datetime | None = None
+    revision: int = 1
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
     kind: str = "task"            # task | review | mission | branch
@@ -853,9 +979,41 @@ class DelegationRequest:
             "target_system": self.target_system,
             "status": self.status,
             "artifact_refs": self.artifact_refs,
+            "run_id": self.run_id,
+            "context": self.context,
+            "source_refs": self.source_refs,
+            "role_ref": self.role_ref,
+            "external_id": self.external_id,
+            "checkpoint": self.checkpoint,
+            "result_text": self.result_text,
+            "error": self.error,
+            "cancel_requested": self.cancel_requested,
+            "cancel_dispatched": self.cancel_dispatched,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "revision": self.revision,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
+
+
+@dataclass(frozen=True)
+class DelegationDispatch:
+    """Sanitized adapter input: no tenant/user identity, grants or connectors."""
+
+    delegation_id: str
+    assistant_id: str
+    run_id: str
+    task: str
+    target_system: str
+    context: dict[str, Any]
+    source_refs: list[str]
+    role_ref: dict[str, str] | None
+
+
+class DelegationRuntimeAdapter(Protocol):
+    def submit(self, delegation: DelegationDispatch) -> dict[str, Any]: ...
+    def poll(self, external_id: str) -> dict[str, Any]: ...
+    def cancel(self, external_id: str) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -1001,7 +1159,11 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
                         "value": {"type": "string"}}, "required": ["record", "field", "value"]}},
     "delegate": {"sensitive": True, "description": "Delegate engineering work to a Pi mission.",
                  "parameters": {"type": "object", "properties": {
-                     "task": {"type": "string"}, "target_system": {"type": "string"}},
+                     "task": {"type": "string"},
+                     "target_system": {"type": "string", "description": "Omit or use auto to let the assistant choose; "
+                                       "the approval names the target it chose."},
+                     "context": {"type": "object"},
+                     "source_refs": {"type": "array", "items": {"type": "string"}}},
                      "required": ["task"]}},
     "connector_request": {"sensitive": True,
                           "description": "Call an authorized external connector (MCP/OpenAPI/HTTP).",
@@ -1575,6 +1737,10 @@ class StoreBackend:
     def load(self) -> dict[str, Any] | None:
         raise NotImplementedError
 
+    def persist_required(self, snapshot: dict[str, Any]) -> None:
+        """Acknowledge durable persistence or raise; external dispatch depends on this."""
+        raise RuntimeError("backend does not provide acknowledged persistence")
+
 
 class PostgresStoreBackend(StoreBackend):
     """Sync Postgres backend: upserts the store snapshot into ``pa_store_snapshot``.
@@ -1598,19 +1764,22 @@ class PostgresStoreBackend(StoreBackend):
 
     def persist(self, snapshot: dict[str, Any]) -> None:
         try:
-            conn = self._open()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO pa_store_snapshot (key, data, updated_at) "
-                        "VALUES (%s, %s::jsonb, now()) "
-                        "ON CONFLICT (key) DO UPDATE SET data=EXCLUDED.data, updated_at=now()",
-                        (self.KEY, json.dumps(snapshot, default=str)))
-                conn.commit()
-            finally:
-                conn.close()
+            self.persist_required(snapshot)
         except Exception:  # noqa: BLE001 - never fail a chat run on a DB blip
             pass
+
+    def persist_required(self, snapshot: dict[str, Any]) -> None:
+        conn = self._open()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pa_store_snapshot (key, data, updated_at) "
+                    "VALUES (%s, %s::jsonb, now()) "
+                    "ON CONFLICT (key) DO UPDATE SET data=EXCLUDED.data, updated_at=now()",
+                    (self.KEY, json.dumps(snapshot, default=str)))
+            conn.commit()
+        finally:
+            conn.close()
 
     def load(self) -> dict[str, Any] | None:
         try:
@@ -1783,6 +1952,8 @@ class AssistantStore:
         self.max_event_bytes_per_tenant = 4 * 1024 * 1024
         self._event_index: dict[str, dict[str, int]] = {}   # tenant -> {event_id: size}, oldest first
         self._event_bytes: dict[str, int] = {}
+        self._delegation_idempotency: dict[tuple[str, str, str, str], str] = {}
+        self._durable_delegations: dict[str, DelegationRequest] = {}
         self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
         self._audit: list[dict[str, Any]] = []
         # (entry) -> None. Wired by the control plane to the repo event store so every entry is durable BEFORE it is
@@ -1890,6 +2061,11 @@ class AssistantStore:
             self._event_index, self._event_bytes = {}, {}
             for x in self.worker_events.values():
                 self._index_event(x)
+            self._delegation_idempotency = {
+                (d.tenant_id, d.user_id, d.assistant_id, d.idempotency_key): d.delegation_id
+                for d in self.delegations.values() if d.idempotency_key
+            }
+            self._durable_delegations = copy.deepcopy(self.delegations)
             self.action_grants = {x.grant_id: x for x in
                                   (self._e_from_dict(ActionGrant, d) for d in snap.get("action_grants", []))}
             self.action_requests = {x.request_id: x for x in
@@ -2043,6 +2219,20 @@ class AssistantStore:
             if snap is not None:
                 self.restore(snap)
 
+    @property
+    def supports_required_persistence(self) -> bool:
+        return bool(self._persist_path or (self._persist_backend is not None
+                    and type(self._persist_backend).persist_required is not StoreBackend.persist_required))
+
+    def _persist_required(self) -> None:
+        if self._persist_path:
+            self.persist()
+            return
+        if self._persist_backend is not None:
+            self._persist_backend.persist_required(self.snapshot())
+            return
+        raise RuntimeError("acknowledged assistant persistence is required")
+
     # -- audit --------------------------------------------------------------
     @property
     def audit(self) -> list[dict[str, Any]]:
@@ -2119,6 +2309,35 @@ class AssistantStore:
         with self._lock:
             self.assistants[a.assistant_id] = a
         self._after_mutation()
+
+    def purge_assistant(self, assistant_id: str, *, tenant_id: str, user_id: str, confirm_name: str) -> dict[str, int]:
+        """Drop the assistant and the records keyed to it, in one critical section; returns counts removed. The archived
+        state and the typed name are checked again here, under the lock, so a concurrent re-enable cannot be purged."""
+        with self._lock:
+            a = self.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+            if a.enabled or confirm_name != a.name:
+                raise AssistantError("the assistant is no longer archived, or the name does not match")
+            threads = {t.thread_id for t in self.threads.values() if t.assistant_id == a.assistant_id}
+            counts: dict[str, int] = {}
+
+            def drop(name: str, table: dict, keep) -> None:
+                gone = [k for k, v in table.items() if not keep(v)]
+                for k in gone:
+                    del table[k]
+                counts[name] = len(gone)
+
+            drop("messages", self.messages, lambda m: m.thread_id not in threads)
+            drop("threads", self.threads, lambda t: t.assistant_id != a.assistant_id)
+            drop("runs", self.runs, lambda r: r.assistant_id != a.assistant_id)
+            drop("actions", self.actions, lambda x: x.assistant_id != a.assistant_id)
+            drop("approvals", self.approvals, lambda x: x.assistant_id != a.assistant_id)
+            drop("grants", self.grants, lambda g: g.assistant_id != a.assistant_id)
+            drop("routines", self.routines, lambda r: r.assistant_id != a.assistant_id)
+            drop("memory", self.memory, lambda m: m.assistant_id != a.assistant_id)
+            del self.assistants[a.assistant_id]
+            counts["assistant"] = 1
+        self._after_mutation()
+        return counts
 
     def _assistant(self, assistant_id: str) -> Assistant:
         a = self.assistants.get(assistant_id)
@@ -2324,7 +2543,68 @@ class AssistantStore:
         with self._lock:
             d.updated_at = _now()
             self.delegations[d.delegation_id] = d
+            if d.idempotency_key:
+                self._delegation_idempotency[
+                    (d.tenant_id, d.user_id, d.assistant_id, d.idempotency_key)] = d.delegation_id
         self._after_mutation()
+
+    def reserve_delegation(self, d: DelegationRequest, *,
+                           require_durable: bool = False) -> tuple[DelegationRequest, bool]:
+        """Reserve one idempotency key and acknowledge persistence before dispatch."""
+        key = (d.tenant_id, d.user_id, d.assistant_id, d.idempotency_key)
+        with self._lock:
+            if d.idempotency_key and (prior_id := self._delegation_idempotency.get(key)):
+                prior = self.delegations[prior_id]
+                if prior.request_fingerprint != d.request_fingerprint:
+                    raise ValueError("delegation idempotency_key already used differently")
+                return prior, False
+            d.updated_at = _now()
+            self.delegations[d.delegation_id] = d
+            if d.idempotency_key:
+                self._delegation_idempotency[key] = d.delegation_id
+            if require_durable:
+                try:
+                    self._persist_required()
+                except Exception:
+                    self.delegations.pop(d.delegation_id, None)
+                    if d.idempotency_key:
+                        self._delegation_idempotency.pop(key, None)
+                    raise
+                self._durable_delegations[d.delegation_id] = copy.deepcopy(d)
+        if not require_durable:
+            self._after_mutation()
+        return d, True
+
+    def release_delegation(self, d: DelegationRequest, *, require_durable: bool = False) -> None:
+        """Undo a reservation nothing external has seen yet (its audit entry failed)."""
+        with self._lock:
+            self.delegations.pop(d.delegation_id, None)
+            if d.idempotency_key:
+                self._delegation_idempotency.pop(
+                    (d.tenant_id, d.user_id, d.assistant_id, d.idempotency_key), None)
+            self._durable_delegations.pop(d.delegation_id, None)
+            if require_durable:
+                try:
+                    self._persist_required()
+                except Exception:  # noqa: BLE001 - the caller re-raises the audit failure that got us here
+                    pass
+        if not require_durable:
+            self._after_mutation()
+
+    def put_delegation_required(self, d: DelegationRequest) -> None:
+        with self._lock:
+            previous = self._durable_delegations.get(d.delegation_id)
+            d.updated_at = _now()
+            self.delegations[d.delegation_id] = d
+            try:
+                self._persist_required()
+            except Exception:
+                if previous is None:
+                    self.delegations.pop(d.delegation_id, None)
+                else:
+                    self.delegations[d.delegation_id] = copy.deepcopy(previous)
+                raise
+            self._durable_delegations[d.delegation_id] = copy.deepcopy(d)
 
     def get_delegation(self, delegation_id: str, *, tenant_id: str, user_id: str) -> DelegationRequest:
         d = self.delegations.get(delegation_id)
@@ -2396,6 +2676,10 @@ class AssistantForbidden(AssistantError):
     """The caller is authenticated but not permitted to do this (HTTP 403)."""
 
 
+class DelegationPersistenceError(AssistantUnavailable):
+    """External delegation cannot proceed without acknowledged durable state."""
+
+
 class AssistantNotFound(AssistantError):
     pass
 
@@ -2414,6 +2698,8 @@ class AssistantService:
     def __init__(self, store: AssistantStore | None = None,
                  config: dict[str, Any] | None = None,
                  runner: RuntimeAdapter | None = None,
+                 delegation_adapter: DelegationRuntimeAdapter | None = None,
+                 delegation_adapter_resolver: Callable[[str, str, str], DelegationRuntimeAdapter | None] | None = None,
                  now: Callable[[], datetime] | None = None,
                  repo: Any | None = None):
         self.config = config or assistant_config({})
@@ -2444,6 +2730,8 @@ class AssistantService:
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
         self.google_write = None      # (tenant, user, tool_id, payload) -> dict; runs ONLY an approved Google draft/event
+        self._setup_owner: Callable[[str, str], bool] = lambda tenant, user: False
+        self.self_setup = None      # assistant_self_setup.SelfSetup once api.py has a collaboration operator, else None
         self.canonical_person = lambda tenant, user: (tenant, user)   # single-operator rule hook (see RakazoBridge.canonical_person); identity until api.py wires it
         self.reminders = None         # ReminderStore, set by the server; reminders need no Google account
         self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.apps is set up
@@ -2477,6 +2765,22 @@ class AssistantService:
                 self.runner = LocalRunnerAdapter(self.store)
         self._shell_runner = None  # injected in tests; default uses subprocess
         self._transport = None  # injected in tests; default uses urllib
+        self.delegation_adapter = delegation_adapter
+        self.delegation_adapter_resolver = delegation_adapter_resolver
+        # Placement sources: attested fabric hosts (set by the control plane) and Slurm clusters configured for
+        # assistant use. Both are read-only; neither can start anything from here.
+        self.host_candidates: Callable[[], list[dict[str, Any]]] | None = None
+        self.slurm_probe = (slurm_placement.SlurmProbe(self.config["placement"]["slurm"])
+                            if self.config["placement"]["slurm"] else None)
+        if delegation_adapter is not None and delegation_adapter_resolver is not None:
+            raise ValueError("configure a delegation adapter or resolver, not both")
+        if delegation_adapter is not None and not self.config["delegation"].get("binding_scope"):
+            raise ValueError("a fixed delegation adapter requires delegation.binding_scope")
+        if ((delegation_adapter is not None or delegation_adapter_resolver is not None)
+                and not self.store.supports_required_persistence):
+            raise ValueError("external delegation requires acknowledged assistant persistence")
+        self._delegation_locks: dict[str, threading.RLock] = {}
+        self._delegation_locks_guard = threading.Lock()
         self._approval_ttl = timedelta(seconds=self.config["approval_ttl_seconds"])
         # optional (tenant, user, tool, scope) -> "deny" | "always_allow" | None, set by the Rakazo bridge from the person's own
         # approval rules. A rule can only tighten (deny) or skip the approval prompt for a tool that already has a grant.
@@ -2518,22 +2822,131 @@ class AssistantService:
             raise AssistantUnavailable("personal assistant is disabled")
 
     # -- assistants ------------------------------------------------------------
+    MAX_LINK_DEPTH = 3
+
+    def assistant_types(self) -> list[dict[str, Any]]:
+        """The types a person may create: the built-in ``rakazo`` plus every configured specialist target.
+        Never free text, so a type always names something the control plane knows how to treat."""
+        out = [{"type": "rakazo", "kind": "assistant", "can_be_parent": True, "requires": [], "resources": {},
+                "role": None}]
+        for name, spec in sorted(self.config["delegation"]["targets"].items()):
+            role = spec.get("role_ref")
+            out.append({"type": name, "kind": "specialist", "can_be_parent": False,
+                        "requires": list(spec.get("requires", [])), "resources": dict(spec.get("resources", {})),
+                        "role": f"{role['id']}@{role['version']}" if role else None})
+        return out
+
+    @staticmethod
+    def _assistant_status(a: Assistant) -> str:
+        if not a.enabled:
+            return "disabled"
+        return "ready" if a.type == "rakazo" else "needs_setup"
+
     def create_assistant(self, *, tenant_id: str, user_id: str,
                          name: str, persona: str = "helpful",
                          instructions: str = "",
                          model_policy: str = "auto",
-                         enabled: bool = True) -> Assistant:
+                         enabled: bool = True, type: str = "rakazo",
+                         parent_id: str | None = None, idempotency_key: str = "") -> Assistant:
         self._require_enabled()
+        if type not in {t["type"] for t in self.assistant_types()}:
+            raise AssistantError("unknown assistant type")
+        if idempotency_key and not _DELEGATION_REF.fullmatch(str(idempotency_key)):
+            raise AssistantError("invalid idempotency_key")
+        name = name or "Personal Assistant"
+        if not isinstance(name, str) or not name.strip() or len(name) > 80 or not name.isprintable():
+            raise AssistantError("name must be 1-80 printable characters")
+        name = name.strip()
+        if idempotency_key:
+            for prior in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id):
+                if prior.idempotency_key == idempotency_key and prior.enabled:   # an archived one is gone: create anew
+                    if (prior.name, prior.type, prior.parent_id) != (name, type, parent_id or None):
+                        raise AssistantError("idempotency_key already used differently")
+                    return prior
+        if parent_id:
+            parent = self.store.get_assistant(parent_id, tenant_id=tenant_id, user_id=user_id)
+            self._check_link(parent, None, type)
         a = Assistant(
             assistant_id=_new_id("asst"),
             tenant_id=tenant_id, user_id=user_id,
-            name=name or "Personal Assistant", persona=persona,
+            name=name, persona=persona,
             instructions=instructions, model_policy=model_policy,
-            enabled=enabled, status="ready" if enabled else "disabled")
+            enabled=enabled, type=type, parent_id=parent_id or None,
+            idempotency_key=idempotency_key or "")
+        a.status = self._assistant_status(a)
         self.store.put_assistant(a)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
-                                action="assistant.created", subject_id=a.assistant_id)
+                                action="assistant.created", subject_id=a.assistant_id,
+                                detail=f"type={type}" + (f" parent={parent_id}" if parent_id else ""))
         return a
+
+    def _depth_above(self, a: Assistant, tenant_id: str, user_id: str) -> int:
+        depth, seen, cur = 1, {a.assistant_id}, a
+        while cur.parent_id:
+            if cur.parent_id in seen:
+                raise AssistantError("assistant links form a cycle")
+            seen.add(cur.parent_id)
+            cur = self.store.get_assistant(cur.parent_id, tenant_id=tenant_id, user_id=user_id)
+            depth += 1
+        return depth
+
+    def _height_below(self, a: Assistant, tenant_id: str, user_id: str) -> int:
+        kids = [c for c in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id)
+                if c.parent_id == a.assistant_id]
+        return 1 + max((self._height_below(c, tenant_id, user_id) for c in kids), default=0)
+
+    def _check_link(self, parent: Assistant, child: Assistant | None, child_type: str) -> None:
+        """Management rules only; none of them confers a capability."""
+        if parent.type != "rakazo":
+            raise AssistantError("only a rakazo assistant can be a parent")
+        if not parent.enabled:
+            raise AssistantError("an archived or disabled assistant cannot be linked")
+        tenant, user = parent.tenant_id, parent.user_id
+        if child is not None:
+            if child.assistant_id == parent.assistant_id:
+                raise AssistantError("an assistant cannot be its own parent")
+            if not child.enabled:
+                raise AssistantError("an archived or disabled assistant cannot be linked")
+            walk, seen = parent, {child.assistant_id}
+            while walk is not None:
+                if walk.assistant_id in seen:
+                    raise AssistantError("link would create a cycle")
+                seen.add(walk.assistant_id)
+                walk = (self.store.get_assistant(walk.parent_id, tenant_id=tenant, user_id=user)
+                        if walk.parent_id else None)
+            below = self._height_below(child, tenant, user)
+        else:
+            below = 1
+        if self._depth_above(parent, tenant, user) + below > self.MAX_LINK_DEPTH:
+            raise AssistantError(f"links may be at most {self.MAX_LINK_DEPTH} deep")
+
+    def link_assistant(self, child_id: str, *, tenant_id: str, user_id: str, parent_id: str) -> Assistant:
+        self._require_enabled()
+        child = self.store.get_assistant(child_id, tenant_id=tenant_id, user_id=user_id)
+        parent = self.store.get_assistant(parent_id, tenant_id=tenant_id, user_id=user_id)
+        self._check_link(parent, child, child.type)
+        if child.parent_id == parent.assistant_id:
+            return child                                            # replay: the recorded link
+        child.parent_id = parent.assistant_id
+        child.updated_at = self.now()
+        child.version += 1
+        self.store.put_assistant(child)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.linked", subject_id=child_id, detail=f"parent={parent_id}")
+        return child
+
+    def unlink_assistant(self, child_id: str, *, tenant_id: str, user_id: str) -> Assistant:
+        self._require_enabled()
+        child = self.store.get_assistant(child_id, tenant_id=tenant_id, user_id=user_id)
+        if child.parent_id is None:
+            return child
+        former, child.parent_id = child.parent_id, None
+        child.updated_at = self.now()
+        child.version += 1
+        self.store.put_assistant(child)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.unlinked", subject_id=child_id, detail=f"parent={former}")
+        return child
 
     def get_assistant(self, assistant_id: str, *, tenant_id: str, user_id: str) -> Assistant:
         self._require_enabled()
@@ -2548,10 +2961,15 @@ class AssistantService:
         self._require_enabled()
         a = self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         allowed = {"name", "persona", "instructions", "model_policy", "enabled"}
+        if "name" in patch and (not isinstance(patch["name"], str) or not patch["name"].strip()
+                                or len(patch["name"]) > 80 or not patch["name"].isprintable()):
+            raise AssistantError("name must be 1-80 printable characters")
+        if "name" in patch:
+            patch = {**patch, "name": patch["name"].strip()}
         for key in allowed:
             if key in patch:
                 setattr(a, key, patch[key])
-        a.status = "ready" if a.enabled else "disabled"
+        a.status = self._assistant_status(a)
         a.updated_at = self.now()
         a.version += 1
         self.store.put_assistant(a)
@@ -2571,8 +2989,31 @@ class AssistantService:
         for grant in self.store.list_grants(tenant_id=tenant_id, user_id=user_id,
                                             assistant_id=assistant_id):
             grant.revoked_at = self.now()
+        for child in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id):
+            if child.parent_id == assistant_id:                      # an archived parent leaves no dangling links
+                self.unlink_assistant(child.assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if a.parent_id:
+            self.unlink_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.archived", subject_id=assistant_id)
+
+    def delete_assistant(self, assistant_id: str, *, tenant_id: str, user_id: str, confirm_name: str) -> dict[str, int]:
+        """Permanently remove an ARCHIVED assistant and what only it owned: its threads, messages, runs, actions,
+        approvals, grants, routines and memory. Delegations, notifications and the audit log stay as history. Needs the
+        assistant's exact name as confirmation, so a stray call cannot delete anything; archive comes first."""
+        self._require_enabled()
+        a = self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if a.enabled:
+            raise AssistantError("archive the assistant before deleting it")
+        if confirm_name != a.name:
+            raise AssistantError("confirmation does not match the assistant's name")
+        for child in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id):
+            if child.parent_id == assistant_id:                      # nothing may point at a deleted parent
+                self.unlink_assistant(child.assistant_id, tenant_id=tenant_id, user_id=user_id)
+        # Audit first, as delegation does: if the log refuses, nothing has been deleted.
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="assistant.deleted",
+                                subject_id=assistant_id, detail="permanent delete of an archived assistant")
+        return self.store.purge_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id, confirm_name=confirm_name)
 
     # -- threads & messages -----------------------------------------------------
     def create_thread(self, *, tenant_id: str, user_id: str, assistant_id: str,
@@ -3742,44 +4183,562 @@ class AssistantService:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": redact_secrets(f"shell execution failed: {exc}")}
 
+    @staticmethod
+    def _delegation_context(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise AssistantError("delegation context must be an object")
+        seen, nodes = set(), 0
+
+        def walk(item: Any, depth: int = 0) -> None:
+            nonlocal nodes
+            nodes += 1
+            if depth > 8 or nodes > 512:
+                raise AssistantError("delegation context is too complex")
+            if isinstance(item, dict):
+                ident = id(item)
+                if ident in seen:
+                    raise AssistantError("delegation context must be finite JSON")
+                seen.add(ident)
+                for key, child in item.items():
+                    if (not isinstance(key, str) or not key or len(key) > 100
+                            or not key.isprintable() or key.lower() in _DELEGATION_RESERVED_CONTEXT
+                            or _DELEGATION_SECRET_KEY.search(key)):
+                        raise AssistantError("delegation context contains an invalid or secret-shaped field")
+                    walk(child, depth + 1)
+                seen.remove(ident)
+            elif isinstance(item, list):
+                if len(item) > 100:
+                    raise AssistantError("delegation context list is too large")
+                for child in item:
+                    walk(child, depth + 1)
+            elif isinstance(item, str):
+                if redact_secrets(item) != item:
+                    raise AssistantError("delegation context contains secret-shaped content")
+            elif item is not None and not isinstance(item, (int, float, bool)):
+                raise AssistantError("delegation context must contain JSON values")
+
+        walk(value)
+        try:
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=False, allow_nan=False).encode()
+        except (TypeError, ValueError):
+            raise AssistantError("delegation context must be finite JSON") from None
+        if len(encoded) > 8192:
+            raise AssistantError("delegation context exceeds 8 KiB")
+        return json.loads(encoded)
+
+    @staticmethod
+    def _delegation_source_refs(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if (not isinstance(value, list) or len(value) > 32
+                or not all(isinstance(ref, str) and 0 < len(ref) <= 200
+                           and ref.isprintable() and _DELEGATION_REF.fullmatch(ref)
+                           and redact_secrets(ref) == ref for ref in value)
+                or len(set(value)) != len(value)):
+            raise AssistantError("source_refs must be unique printable references")
+        return list(value)
+
+    @staticmethod
+    def _delegation_artifacts(value: Any) -> list[str]:
+        if (not isinstance(value, list) or len(value) > 32
+                or not all(isinstance(ref, str) and 0 < len(ref) <= 500
+                           and ref.isprintable() for ref in value)
+                or len(set(value)) != len(value)):
+            raise AssistantError("invalid delegation artifact refs")
+        return list(value)
+
+    def _delegation_dispatch(self, d: DelegationRequest) -> DelegationDispatch:
+        return DelegationDispatch(
+            delegation_id=d.delegation_id, assistant_id=d.assistant_id, run_id=d.run_id,
+            task=d.task, target_system=d.target_system, context=json.loads(json.dumps(d.context)),
+            source_refs=list(d.source_refs), role_ref=dict(d.role_ref) if d.role_ref else None)
+
+    def _delegation_adapter_for(self, d: DelegationRequest) -> DelegationRuntimeAdapter | None:
+        return self._delegation_adapter_for_scope(d.tenant_id, d.user_id, d.target_system)
+
+    def attach_self_setup(self, setup: Any, is_owner: Callable[[str, str], bool]) -> bool:
+        """Wire on-demand setup for the dashboard's one owner AFTER construction, under the same guards the constructor
+        applies to a resolver: no fixed adapter beside it, and acknowledged persistence (a delegation needs a durable
+        record). Returns False, wiring nothing, when either does not hold, so delegation is never left failing."""
+        if self.delegation_adapter is not None or not self.store.supports_required_persistence:
+            return False
+        self.self_setup, self._setup_owner = setup, is_owner
+        self.delegation_adapter_resolver = setup.resolver(is_owner, fallback=self.delegation_adapter_resolver)
+        return True
+
+    def _delegation_adapter_for_scope(self, tenant_id: str, user_id: str,
+                                      target: str) -> DelegationRuntimeAdapter | None:
+        if self.delegation_adapter_resolver is not None:
+            return self.delegation_adapter_resolver(tenant_id, user_id, target)
+        scope = (self.config.get("delegation") or {}).get("binding_scope")
+        if (self.delegation_adapter is not None and scope
+                and scope.get("tenant_id") == tenant_id and scope.get("user_id") == user_id):
+            return self.delegation_adapter
+        return None
+
+    @staticmethod
+    def _role_key(role: dict[str, Any] | None) -> str | None:
+        return f"{role['id']}@{role['version']}:{role['digest']}" if role else None
+
+    def placement_candidates(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for source in (self.host_candidates, self.slurm_probe.candidates if self.slurm_probe else None):
+            if source is None:
+                continue
+            try:
+                out.extend(source())
+            except Exception:  # noqa: BLE001 - one unreachable source never hides the others
+                _log.warning("assistant placement source failed", exc_info=True)
+        return out
+
+    def resolve_placement(self, type_name: str, *, require: list[str] | None = None) -> dict[str, Any]:
+        """Where a specialist of this type would run now. Automatic: resources and capabilities decide, a caller can
+        only add requirements, and nothing here grants a tool, a network path or a display."""
+        spec = next((t for t in self.assistant_types() if t["type"] == type_name), None)
+        if spec is None or spec["kind"] != "specialist":
+            raise AssistantError("only specialist types are placed")
+        try:
+            needs = placement.requirements(spec["requires"], require)
+        except placement.PlacementError as exc:
+            raise AssistantError(str(exc)) from None
+        target = self.config["delegation"]["targets"][type_name]
+        decision = placement.place(
+            self.placement_candidates(), needs=needs, resources=spec["resources"],
+            profile="task-restricted-v1", role=self._role_key(target.get("role_ref")))
+        decision["type"] = type_name
+        return decision
+
+    ROUTE_HARNESSES = ("pi", "claude", "codex", "opencode")
+
+    def route_delegation(self, task: str, *, tenant_id: str, user_id: str, hint: str | None = None) -> dict[str, Any]:
+        """Which target a task goes to, with the reasons. Deterministic and read-only: it names a target and never binds,
+        places or grants anything, so a person can see why before approving.
+
+        Order: a target the person named; else a configured specialist whose ``handles`` words appear in the task and that
+        is usable now (bound, or set up on demand); else the engineering harness path (``pi``). A specialist that matches
+        but cannot run is reported under ``skipped`` and the task still goes somewhere that can."""
+        if not isinstance(task, str) or not task.strip():
+            raise AssistantError("a task is required to route")
+        targets = self.config["delegation"]["targets"]
+        words = set(re.findall(r"[a-z0-9][a-z0-9-]+", task.lower()))
+        skipped: list[dict[str, str]] = []
+        if hint and hint != "auto":
+            if hint in targets or hint in self.ROUTE_HARNESSES:
+                return {"target": hint, "kind": "specialist" if hint in targets and hint != "pi" else "harness",
+                        "reasons": ["named by the request"], "skipped": skipped}
+            raise AssistantError("delegation target is not configured")
+        external = self.delegation_adapter is not None or self.delegation_adapter_resolver is not None
+        mentioned = next((h for h in self.ROUTE_HARNESSES if h != "pi" and h in words
+                          and (not external or h in targets)), None)
+        for name in sorted(targets):
+            spec = targets[name]
+            hits = sorted(set(spec.get("handles", [])) & words)
+            if name == "pi" or not hits:
+                continue
+            ready, why = self._specialist_usable(name, tenant_id, user_id)
+            if ready:
+                return {"target": name, "kind": "specialist", "reasons": [f"task mentions {', '.join(hits)}", why],
+                        "skipped": skipped}
+            skipped.append({"target": name, "reason": why})
+        if mentioned:
+            return {"target": mentioned, "kind": "harness", "reasons": [f"task names {mentioned}"], "skipped": skipped}
+        return {"target": "pi", "kind": "harness", "reasons": ["no specialist matched; engineering default"],
+                "skipped": skipped}
+
+    def _specialist_usable(self, name: str, tenant_id: str, user_id: str) -> tuple[bool, str]:
+        try:
+            if self._delegation_adapter_for_scope(tenant_id, user_id, name) is not None:
+                return True, "already set up"
+        except Exception:  # noqa: BLE001 - an unreadable binding is "not bound"
+            pass
+        if self.self_setup is None or not self.self_setup.supports(name):
+            return False, "not set up and no setup is available"
+        if not self._setup_owner(tenant_id, user_id):
+            return False, "setup is only available to the dashboard owner"
+        if not self.resolve_placement(name)["chosen"]:
+            return False, "no host can carry it"
+        return True, "will be set up when you approve"
+
+    def _ensure_specialist(self, name: str, tenant_id: str, user_id: str) -> None:
+        """Lazy setup, run only inside the approved delegation. Idempotent; refuses with the plain reason."""
+        if name not in self.config["delegation"]["targets"] or name == "pi":
+            return
+        if self._delegation_adapter_for_scope(tenant_id, user_id, name) is not None or self.self_setup is None:
+            return
+        if not self._setup_owner(tenant_id, user_id) or not self.self_setup.supports(name):
+            raise AssistantError(f"cannot start {name}: it is not set up and setup is not available to you")
+        from ..assistant_self_setup import SelfSetupError
+        try:
+            result = self.self_setup.provision(name)
+        except SelfSetupError as exc:
+            raise AssistantError(f"cannot start {name}: {exc}") from None
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="assistant.setup",
+                                subject_id=name, detail=f"on demand room={result['room_id']} agent={result['agent_id']}")
+
+    def setup_specialist(self, assistant_id: str, *, tenant_id: str, user_id: str) -> dict[str, Any]:
+        """The owner's explicit request that Rakazo set this specialist up. Idempotent; grants only what the setup module
+        names (read and execute for the owner's own agent in the owner's own room) and audits it."""
+        self._require_enabled()
+        a = self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if a.type == "rakazo" or not a.enabled:
+            raise AssistantError("only an enabled specialist needs setup")
+        if self.self_setup is None:
+            raise AssistantError("self-setup is unavailable: this control plane has no collaboration operator")
+        if not self._setup_owner(tenant_id, user_id):
+            raise AssistantError("self-setup is only available to the dashboard owner")
+        if not self.self_setup.supports(a.type):
+            raise AssistantError(f"no setup is defined for {a.type}")
+        from ..assistant_self_setup import SelfSetupError
+        try:
+            result = self.self_setup.provision(a.type)
+        except SelfSetupError as exc:
+            raise AssistantError(str(exc)) from None
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="assistant.setup",
+                                subject_id=assistant_id, detail=f"room={result['room_id']} agent={result['agent_id']}")
+        return {"assistant_id": assistant_id, "setup": self.specialist_setup(a, tenant_id=tenant_id, user_id=user_id),
+                "room_id": result["room_id"], "agent_id": result["agent_id"]}
+
+    def specialist_setup(self, a: Assistant, *, tenant_id: str, user_id: str) -> list[dict[str, str]]:
+        """What a specialist still needs before delegation can use it, as ordered steps (``done`` | ``todo`` | ``blocked``).
+        Read-only: it reports, it never binds, places or grants anything."""
+        steps: list[dict[str, str]] = []
+        try:
+            bound = self._delegation_adapter_for_scope(tenant_id, user_id, a.type) is not None
+        except Exception:  # noqa: BLE001 - an unreadable binding is simply "not bound"
+            bound = False
+        steps.append({"id": "binding", "state": "done" if bound else "todo",
+                      "detail": "bound to your room and agent" if bound
+                      else "no room and agent are bound for you yet; Rakazo sets this up once approved"})
+        try:
+            decision = self.resolve_placement(a.type)
+            chosen = next((c for c in decision["candidates"] if c["id"] == decision["chosen"]), None)
+            reasons = sorted({r for rej in decision["rejected"] for r in rej["reasons"]})
+            steps.append({"id": "placement", "state": "done" if chosen else "blocked",
+                          "detail": f"would run on {chosen['label']}" if chosen
+                          else "no host can carry it: " + (", ".join(reasons[:4]) or "none attested")})
+        except AssistantError as exc:
+            steps.append({"id": "placement", "state": "blocked", "detail": str(exc)})
+        return steps
+
+    def _graph_placement(self, nodes: list[dict[str, Any]], edges: list[dict[str, str]],
+                         node: dict[str, Any], a: Assistant) -> None:
+        """Current plan for a specialist: ``planned`` is where the resolver would run it now, never a claim that it
+        runs there. ``unplaceable`` carries the reason each candidate was rejected."""
+        try:
+            decision = self.resolve_placement(a.type)
+        except AssistantError as exc:
+            node["placement"] = {"state": "unplaceable", "reasons": [str(exc)]}
+            return
+        chosen = decision["chosen"]
+        known = {n["id"] for n in nodes}
+        if chosen is None:
+            node["placement"] = {"state": "unplaceable", "needs": decision["needs"],
+                                 "reasons": [f"{r['id']}: {'; '.join(r['reasons'])}" for r in decision["rejected"]]
+                                 or ["no host or cluster is configured"]}
+            return
+        cand = next((c for c in self.placement_candidates() if c["id"] == chosen), {"id": chosen})
+        host_node_id = chosen
+        if host_node_id not in known:
+            nodes.append({"id": host_node_id, "kind": "host", "name": cand.get("label", chosen),
+                          "backend": cand.get("backend", cand.get("kind", "host")), "status": cand.get("status"),
+                          "capabilities": list(cand.get("capabilities", [])), "free": dict(cand.get("free", {}))})
+        node["placement"] = {"state": "planned", "host": host_node_id}
+        edges.append({"from": a.assistant_id, "to": host_node_id, "kind": "placed_on", "state": "planned"})
+
+    def assistant_graph(self, *, tenant_id: str, user_id: str, limit: int = 100) -> dict[str, Any]:
+        """Read-only projection of this person's assistants, their delegations and the specialists those run on.
+
+        It grants nothing and changes nothing: a specialist shows as ``bound`` only when delegation would really
+        resolve an adapter (or the engineering handoff consumer) for this person."""
+        self._require_enabled()
+        nodes: list[dict[str, Any]] = [{"id": "you", "kind": "you", "name": "You"}]
+        edges: list[dict[str, str]] = []
+        grants = self.store.list_grants(tenant_id=tenant_id, user_id=user_id)
+        now = self.now()
+        for a in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id):
+            scopes = sorted({g.scope for g in grants if g.assistant_id == a.assistant_id
+                             and g.tool_id == "delegate" and g.active(now)})
+            nodes.append({"id": a.assistant_id, "kind": "assistant", "name": a.name, "status": a.status,
+                          "type": a.type, "parent_id": a.parent_id,
+                          "enabled": a.enabled, "can_delegate": bool(scopes), "delegate_scopes": scopes})
+            edges.append({"from": "you", "to": a.assistant_id, "kind": "owns"})
+            if a.parent_id:
+                edges.append({"from": a.parent_id, "to": a.assistant_id, "kind": "linked"})
+            if a.type != "rakazo" and a.enabled:
+                setup = self.specialist_setup(a, tenant_id=tenant_id, user_id=user_id)
+                nodes[-1]["setup"] = setup
+                nodes[-1]["status"] = "ready" if all(st["state"] == "done" for st in setup) else "needs_setup"
+                self._graph_placement(nodes, edges, nodes[-1], a)
+        consumer_on = bool(self.config.get("delegation_consumer", {}).get("enabled"))
+        for target, spec in self.config["delegation"]["targets"].items():
+            if target == "pi":
+                bound = consumer_on
+            else:
+                try:
+                    bound = self._delegation_adapter_for_scope(tenant_id, user_id, target) is not None
+                except Exception:  # noqa: BLE001 - an unreadable binding is simply "not bound"
+                    bound = False
+            role = spec.get("role_ref")
+            nodes.append({"id": f"specialist:{target}", "kind": "specialist", "name": target, "bound": bound,
+                          "role": f"{role['id']}@{role['version']}" if role else None})
+        known = {n["id"] for n in nodes}
+        for d in self.store.list_delegations(tenant_id=tenant_id, user_id=user_id)[:max(1, min(limit, 500))]:
+            nodes.append({"id": d.delegation_id, "kind": "delegation", "status": d.status,
+                          "name": d.task[:80], "created_at": d.created_at.isoformat()})
+            if d.assistant_id in known:
+                edges.append({"from": d.assistant_id, "to": d.delegation_id, "kind": "delegated"})
+            if f"specialist:{d.target_system}" in known:
+                edges.append({"from": d.delegation_id, "to": f"specialist:{d.target_system}", "kind": "runs_on"})
+        return {"nodes": nodes, "edges": edges}
+
+    def _delegation_lock(self, delegation_id: str) -> threading.RLock:
+        with self._delegation_locks_guard:
+            return self._delegation_locks.setdefault(delegation_id, threading.RLock())
+
+    def _update_delegation(self, d: DelegationRequest, action: str) -> DelegationRequest:
+        d.revision += 1
+        try:
+            if d.external_id or self._delegation_adapter_for(d) is not None:
+                self.store.put_delegation_required(d)
+            else:
+                self.store.put_delegation(d)
+        except Exception as exc:
+            raise DelegationPersistenceError("delegation persistence unavailable") from exc
+        self.store.audit_record(tenant_id=d.tenant_id, user_id=d.user_id, actor=d.user_id,
+                                action=action, subject_id=d.delegation_id)
+        return d
+
+    def _apply_delegation_receipt(self, d: DelegationRequest, value: Any,
+                                  *, submitting: bool = False) -> DelegationRequest:
+        before = (d.external_id, d.status, list(d.artifact_refs), d.result_text,
+                  dict(d.checkpoint), d.error, d.cancel_requested,
+                  d.cancel_dispatched, d.completed_at)
+        allowed = {"external_id", "status", "result_text", "artifact_refs", "checkpoint",
+                   "cancel_requested"}
+        if not isinstance(value, dict) or set(value) - allowed:
+            raise AssistantError("invalid delegation runtime receipt")
+        external_id = value.get("external_id")
+        if (not isinstance(external_id, str) or not _DELEGATION_REF.fullmatch(external_id)
+                or (d.external_id and external_id != d.external_id)):
+            raise AssistantError("invalid delegation external id")
+        status = value.get("status")
+        mapped = {"queued": "queued", "running": "running", "done": "succeeded",
+                  "succeeded": "succeeded", "needs_context": "needs_context",
+                  "failed": "failed", "cancelled": "cancelled",
+                  "cancellation_requested": "running"}.get(status)
+        if mapped is None or (submitting and mapped not in {"queued", "running"}):
+            raise AssistantError("invalid delegation runtime status")
+        if d.status in {"succeeded", "needs_context", "failed", "cancelled"}:
+            return d
+        if d.status == "running" and mapped == "queued":
+            raise AssistantError("delegation runtime status regressed")
+        artifacts = self._delegation_artifacts(list(dict.fromkeys([
+            *d.artifact_refs, *self._delegation_artifacts(value.get("artifact_refs", []))])))
+        result = value.get("result_text")
+        if result is not None and (not isinstance(result, str) or len(result) > 8000):
+            raise AssistantError("invalid delegation result")
+        checkpoint = value.get("checkpoint", {})
+        if not isinstance(checkpoint, dict):
+            raise AssistantError("invalid delegation checkpoint")
+        try:
+            checkpoint_bytes = json.dumps(checkpoint, sort_keys=True, separators=(",", ":"),
+                                          allow_nan=False).encode()
+        except (TypeError, ValueError):
+            raise AssistantError("invalid delegation checkpoint") from None
+        if len(checkpoint_bytes) > 4096:
+            raise AssistantError("delegation checkpoint is too large")
+        d.external_id = external_id
+        d.status = mapped
+        d.artifact_refs = artifacts
+        d.result_text = redact_secrets(result or "") or ""
+        d.checkpoint = json.loads(checkpoint_bytes)
+        d.error = "runtime_failed" if mapped == "failed" else ""
+        if value.get("cancel_requested") is True:
+            d.cancel_requested = True
+        if status == "cancellation_requested":
+            d.cancel_dispatched = True
+        if mapped in {"succeeded", "needs_context", "failed", "cancelled"}:
+            d.completed_at = self.now()
+        after = (d.external_id, d.status, list(d.artifact_refs), d.result_text,
+                 dict(d.checkpoint), d.error, d.cancel_requested,
+                 d.cancel_dispatched, d.completed_at)
+        if before == after:
+            return d
+        return self._update_delegation(d, f"assistant.delegation.{mapped}")
+
+    def _submit_delegation(self, d: DelegationRequest) -> DelegationRequest:
+        with self._delegation_lock(d.delegation_id):
+            d = self.store.delegations[d.delegation_id]
+            adapter = self._delegation_adapter_for(d)
+            if adapter is None or d.external_id or d.status != "queued":
+                return d
+            try:
+                self.store.put_delegation_required(d)
+            except Exception as exc:
+                raise DelegationPersistenceError("delegation persistence unavailable") from exc
+            try:
+                value = adapter.submit(self._delegation_dispatch(d))
+            except Exception:  # noqa: BLE001 - private adapter errors never cross the boundary
+                if d.error != "runtime_unavailable":
+                    d.error = "runtime_unavailable"
+                    self._update_delegation(d, "assistant.delegation.dispatch_deferred")
+                return d
+            try:
+                return self._apply_delegation_receipt(d, value, submitting=True)
+            except DelegationPersistenceError:
+                raise
+            except AssistantError:
+                d.status, d.error, d.completed_at = "failed", "runtime_contract_invalid", self.now()
+                return self._update_delegation(d, "assistant.delegation.failed")
+
+    def _maintain_delegation(self, d: DelegationRequest) -> DelegationRequest:
+        with self._delegation_lock(d.delegation_id):
+            d = self.store.delegations[d.delegation_id]
+            adapter = self._delegation_adapter_for(d)
+            if adapter is None or d.status in {
+                    "succeeded", "needs_context", "failed", "cancelled"}:
+                return d
+            if not d.external_id:
+                return self._submit_delegation(d)
+            try:
+                if d.cancel_requested and not d.cancel_dispatched:
+                    value = adapter.cancel(d.external_id)
+                else:
+                    value = adapter.poll(d.external_id)
+            except Exception:  # noqa: BLE001
+                if d.error != "runtime_unavailable":
+                    d.error = "runtime_unavailable"
+                    self._update_delegation(d, "assistant.delegation.runtime_unavailable")
+                return d
+            try:
+                return self._apply_delegation_receipt(d, value)
+            except DelegationPersistenceError:
+                raise
+            except AssistantError:
+                d.status, d.error, d.completed_at = "failed", "runtime_contract_invalid", self.now()
+                return self._update_delegation(d, "assistant.delegation.failed")
+
+    def maintain_delegations(self, *, tenant_id: str | None = None,
+                             user_id: str | None = None) -> int:
+        """Advance persisted delegations through the injected adapter; never fabricates completion."""
+        if self.delegation_adapter is None and self.delegation_adapter_resolver is None:
+            return 0
+        changed = 0
+        for d in list(self.store.delegations.values()):
+            if ((tenant_id is not None and d.tenant_id != tenant_id)
+                    or (user_id is not None and d.user_id != user_id)
+                    or d.status in {"succeeded", "needs_context", "failed", "cancelled"}):
+                continue
+            before = (d.status, d.external_id, d.revision, d.error)
+            self._maintain_delegation(d)
+            if before != (d.status, d.external_id, d.revision, d.error):
+                changed += 1
+        return changed
+
     def delegate(self, *, tenant_id: str, user_id: str, assistant_id: str,
-                 task: str, target_system: str = "pi",
-                 actor: str = "") -> DelegationRequest:
+                 task: str, target_system: str = "pi", actor: str = "",
+                 run_id: str = "", context: dict[str, Any] | None = None,
+                 source_refs: list[str] | None = None,
+                 idempotency_key: str = "") -> DelegationRequest:
         """Record a delegation request. Status stays ``queued`` until the runtime
         adapter fulfils it; no completion is fabricated."""
         self._require_enabled()
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
-        if not task or not task.strip():
+        if not isinstance(task, str) or not task.strip() or len(task) > 8000:
             raise AssistantError("delegation task is required")
+        targets = (self.config.get("delegation") or {}).get("targets") or {}
+        external_delegation = (self.delegation_adapter is not None
+                               or self.delegation_adapter_resolver is not None)
+        if external_delegation and target_system not in targets:
+            raise AssistantError("delegation target is not configured")
+        if run_id:
+            try:
+                run = self.store.get_run(run_id, tenant_id=tenant_id, user_id=user_id)
+            except KeyError:
+                raise AssistantError("delegation run not found") from None
+            if run.assistant_id != assistant_id:
+                raise AssistantError("delegation run does not belong to the assistant")
+        clean_context = self._delegation_context(context)
+        clean_refs = self._delegation_source_refs(source_refs)
+        role_ref = targets.get(target_system, {}).get("role_ref")
+        if target_system == "pi-secretary":
+            payload = json.dumps({"schema_version": 1, "task": task.strip(),
+                                  "context": clean_context, "source_refs": clean_refs},
+                                 sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            if len(payload) > 4000:
+                raise AssistantError("pi-secretary delegation payload exceeds 4 KiB")
+        if idempotency_key and (not isinstance(idempotency_key, str)
+                                or not _DELEGATION_REF.fullmatch(idempotency_key)):
+            raise AssistantError("invalid delegation idempotency_key")
+        fingerprint = hashlib.sha256(json.dumps({
+            "assistant_id": assistant_id, "run_id": run_id, "task": task.strip(),
+            "target_system": target_system, "context": clean_context,
+            "source_refs": clean_refs, "role_ref": role_ref,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         d = DelegationRequest(delegation_id=_new_id("dlg"), tenant_id=tenant_id,
                               user_id=user_id, assistant_id=assistant_id,
-                              task=task, target_system=target_system)
-        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor or user_id,
-                                action="assistant.delegation.created", subject_id=d.delegation_id)
-        self.store.put_delegation(d)                                # audit first: a refusal leaves no orphan
-        return d
+                              task=task.strip(), target_system=target_system,
+                              run_id=run_id, context=clean_context, source_refs=clean_refs,
+                              role_ref=dict(role_ref) if role_ref else None,
+                              idempotency_key=idempotency_key, request_fingerprint=fingerprint)
+        try:
+            d, created = self.store.reserve_delegation(
+                d, require_durable=(self.delegation_adapter is not None
+                                    or self.delegation_adapter_resolver is not None))
+        except ValueError as exc:
+            raise AssistantError(str(exc)) from None
+        except Exception as exc:
+            raise DelegationPersistenceError("delegation persistence unavailable") from exc
+        if not created:
+            return self._submit_delegation(d)
+        try:
+            self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor or user_id,
+                                    action="assistant.delegation.created", subject_id=d.delegation_id)
+        except Exception:
+            self.store.release_delegation(d, require_durable=(
+                self.delegation_adapter is not None or self.delegation_adapter_resolver is not None))
+            raise                                                   # audit first: a refusal leaves no orphan
+        return self._submit_delegation(d)
 
     def list_delegations(self, *, tenant_id: str, user_id: str) -> list[DelegationRequest]:
         self._require_enabled()
+        self.maintain_delegations(tenant_id=tenant_id, user_id=user_id)
         return self.store.list_delegations(tenant_id=tenant_id, user_id=user_id)
 
     def get_delegation(self, delegation_id: str, *, tenant_id: str, user_id: str) -> DelegationRequest:
         self._require_enabled()
-        return self.store.get_delegation(delegation_id, tenant_id=tenant_id, user_id=user_id)
+        d = self.store.get_delegation(delegation_id, tenant_id=tenant_id, user_id=user_id)
+        return self._maintain_delegation(d)
 
     def cancel_delegation(self, delegation_id: str, *, tenant_id: str, user_id: str) -> DelegationRequest:
         self._require_enabled()
         d = self.store.get_delegation(delegation_id, tenant_id=tenant_id, user_id=user_id)
-        with self.store._lock:                                  # serialised with the dispatcher's claim and hand-off
-            if d.status not in ("queued", "running"):
-                raise AssistantError(f"cannot cancel delegation in state {d.status}")
-            d.status = "cancelled"
-        self.store.put_delegation(d)
-        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
-                                action="assistant.delegation.cancelled", subject_id=delegation_id)
-        consumer = getattr(self, "delegation_consumer", None)
-        if consumer is not None:
-            consumer.on_cancel(d, user_id)                      # the queued handoff must not stay runnable
+        if d.status not in ("queued", "running"):
+            raise AssistantError(f"cannot cancel delegation in state {d.status}")
+        d.cancel_requested = True
+        adapter = self._delegation_adapter_for(d)
+        if adapter is not None:
+            self._update_delegation(d, "assistant.delegation.cancel_requested")
+            if not d.external_id:
+                d = self._submit_delegation(d)
+            if d.external_id:
+                d = self._maintain_delegation(d)
+        elif d.external_id:
+            d.error = "runtime_unavailable"
+            self._update_delegation(d, "assistant.delegation.runtime_unavailable")
+        else:
+            with self.store._lock:                              # serialised with the legacy consumer's hand-off
+                if d.status not in ("queued", "running"):       # the consumer may have finished it since the check above
+                    raise AssistantError(f"cannot cancel delegation in state {d.status}")
+                d.status = "cancelled"
+                d.completed_at = self.now()
+            self._update_delegation(d, "assistant.delegation.cancelled")
+            consumer = getattr(self, "delegation_consumer", None)
+            if consumer is not None:
+                consumer.on_cancel(d, user_id)                  # a queued legacy handoff must not stay runnable
         return d
 
     def register_delegation_artifact(self, delegation_id: str, *, tenant_id: str,
@@ -3787,14 +4746,14 @@ class AssistantService:
         """Attach an artifact (e.g. a Pi mission/artifact URI) back to a delegation."""
         self._require_enabled()
         d = self.store.get_delegation(delegation_id, tenant_id=tenant_id, user_id=user_id)
+        if d.external_id or d.role_ref is not None:
+            raise AssistantError("runtime adapter owns delegation artifacts")
+        artifact_ref = self._delegation_artifacts([artifact_ref])[0]
         if artifact_ref not in d.artifact_refs:
             d.artifact_refs.append(artifact_ref)
-        if d.status == "queued":
+        if d.status == "queued" and not d.external_id:
             d.status = "running"
-        self.store.put_delegation(d)
-        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
-                                action="assistant.delegation.artifact", subject_id=delegation_id,
-                                detail=artifact_ref)
+        self._update_delegation(d, "assistant.delegation.artifact")
         return d
 
     # -- adapters: thin, over existing endpoints --------------------------------------------------------
@@ -4301,6 +5260,16 @@ class AssistantService:
                 return f"[denied: {exc}]"
             args["namespace"] = scope
         else:
+            if tool_id == "delegate" and args.get("target_system") in (None, "", "auto"):
+                try:
+                    routed = self.route_delegation(str(args.get("task", "")), tenant_id=run.tenant_id,
+                                                   user_id=run.user_id)
+                except AssistantError as exc:
+                    return f"[denied: {exc}]"
+                args["target_system"] = routed["target"]      # grants and the approval text then name the real target
+                self.store.audit_record(tenant_id=run.tenant_id, user_id=run.user_id, actor=run.user_id,
+                                        action="assistant.delegation.routed", subject_id=run.run_id,
+                                        detail=f"{routed['target']}: {'; '.join(routed['reasons'])}"[:300])
             target_field = {
                 "browse": "url", "run_shell": "command",
                 "connector_request": "connector_id", "delegate": "target_system",
@@ -4500,11 +5469,17 @@ class AssistantService:
             return self._run_adapter(tool_id, tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                                      payload=payload, actor=actor, action=action)
         if tool_id == "delegate":
+            if isinstance(payload.get("task"), str) and payload["task"].strip() and len(payload["task"]) <= 8000:
+                self._ensure_specialist(payload.get("target_system") or "pi", tenant_id, user_id)
             d = self.delegate(tenant_id=tenant_id, user_id=user_id,
                               assistant_id=assistant_id,
                               task=payload.get("task", ""),
                               target_system=payload.get("target_system", "pi"),
-                              actor=actor or user_id)
+                              actor=actor or user_id,
+                              run_id=action.run_id if action is not None else "",
+                              context=payload.get("context"),
+                              source_refs=payload.get("source_refs"),
+                              idempotency_key=action.idempotency_key if action is not None else "")
             return {"ok": True, "delegation": d.as_dict()}
         raise AssistantError(f"tool {tool_id} has no executor")
 

@@ -300,7 +300,8 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, evolution=None, learning=None, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256, single_operator=False,
-                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
+                 assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
+                 fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None,
@@ -481,8 +482,16 @@ class ControlPlaneServer:
         if assistant_service is None:
             from .assistant import AssistantService
             from .assistant import assistant_config as _build_assistant_config
+            _cfg = _build_assistant_config(assistant_config or {})
+            _resolver = None
+            if _cfg["delegation"]["pi_bindings"]:
+                if assistant_delegation_adapter is not None:
+                    raise ValueError("configure a delegation adapter or pi_bindings, not both")
+                from ..assistant_pi_delegate import build_pi_delegation_resolver
+                _resolver = build_pi_delegation_resolver(_cfg["delegation"]["pi_bindings"])
             self.assistant = AssistantService(
-                config=_build_assistant_config(assistant_config or {}), repo=repo)
+                config=_cfg, repo=repo, delegation_adapter=assistant_delegation_adapter,
+                delegation_adapter_resolver=_resolver)
         else:
             self.assistant = assistant_service
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
@@ -577,6 +586,9 @@ class ControlPlaneServer:
         from .single_flight_cache import SingleFlightCache
         self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
+        if self.assistant.host_candidates is None:       # looked up per call: `collab` may be swapped after startup
+            self.assistant.host_candidates = lambda: (
+                self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
         self.collab_require_https = collab_require_https
         # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
         # `control_plane.federation` on; the gateway is rebuilt if `collab` is swapped (tests do).
@@ -594,6 +606,14 @@ class ControlPlaneServer:
         self.operator_port, self.operator_user = operator_port, operator_user
         self.operator_email = operator_email
         self.operator_hosts = frozenset(h.lower() for h in operator_hosts)
+        # Rakazo sets specialists up for the dashboard's one owner, acting as the collaboration operator the dashboard
+        # already uses for rooms. Without that operator (or collaboration) nothing is wired and setup answers 400.
+        if self.collab is not None and self.operator_user and self.single_operator and self.assistant.self_setup is None:
+            from ..assistant_self_setup import SelfSetup
+            _owner_tenant = self.assistant.tenant_for("open-listener")
+            self.assistant.attach_self_setup(
+                SelfSetup(self.collab, self.operator_user),
+                lambda tenant, user: (tenant, user) == (_owner_tenant, "open-listener"))
         self._operator_httpd = None
         # Dashboard side: forward /api/v1/collab/* to the operator listener of the isolated
         # collab service, so the local owner needs no sign-in.
@@ -1718,6 +1738,11 @@ class ControlPlaneServer:
             self.learning_trails.sweep()
         except Exception as exc:
             log.warning("learning trail sweep failed: %s", type(exc).__name__)
+        try:
+            if self.assistant.config.get("enabled"):
+                self.assistant.maintain_delegations()
+        except Exception as exc:
+            log.warning("assistant delegation maintenance failed: %s", type(exc).__name__)
 
     def _link_flush_loop(self, interval=30):
         """T14: tell the lineage graph what it missed about cross-workspace links (a retraction the graph was down
@@ -3807,7 +3832,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts)
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource)
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
@@ -4641,7 +4666,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):
-            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant
@@ -4743,6 +4768,23 @@ def _make_handler(server, public=False, operator=False):
                                                         svc.list_connectors(tenant_id=tenant_id, user_id=user_id)]})
                 if resource == "assistant-connectors" and len(parts) == 5:
                     return self._json(svc.get_connector(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-types" and len(parts) == 4:
+                    svc._require_enabled()
+                    return self._json({"types": svc.assistant_types()})
+                if resource == "assistant-placement" and len(parts) == 4:
+                    query = parse_qs(urlsplit(self.path).query)
+                    extra = [c for raw in query.get("require", []) for c in raw.split(",") if c]
+                    kind = (query.get("type") or [""])[0]
+                    svc._require_enabled()
+                    return self._json(svc.resolve_placement(kind, require=extra))
+                if resource == "assistant-route" and len(parts) == 4:
+                    query = parse_qs(urlsplit(self.path).query)
+                    svc._require_enabled()
+                    return self._json(svc.route_delegation(
+                        (query.get("task") or [""])[0][:8000], tenant_id=tenant_id, user_id=user_id,
+                        hint=(query.get("target") or [None])[0]))
+                if resource == "assistant-graph" and len(parts) == 4:
+                    return self._json(svc.assistant_graph(tenant_id=tenant_id, user_id=user_id))
                 if resource == "assistant-delegations" and len(parts) == 4:
                     return self._json({"delegations": [d.as_dict() for d in
                                                          svc.list_delegations(tenant_id=tenant_id, user_id=user_id)]})
@@ -4755,7 +4797,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc), "code": "rate_limited"}, 429)
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
-            except ValueError as exc:
+            except (AssistantError, ValueError) as exc:         # a refused request (for example an unknown capability)
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_post(self, parts, resource, body):
@@ -4780,8 +4822,23 @@ def _make_handler(server, public=False, operator=False):
                             persona=body.get("persona", "helpful"),
                             instructions=body.get("instructions", ""),
                             model_policy=body.get("model_policy", "auto"),
-                            enabled=bool(body.get("enabled", True)))
+                            enabled=bool(body.get("enabled", True)),
+                            type=body.get("type", "rakazo"), parent_id=body.get("parent_id"),
+                            idempotency_key=body.get("idempotency_key", ""))
                         return self._json(created.as_dict(), 201)
+                    if len(parts) == 6 and parts[5] == "link" and self.command == "POST":
+                        return self._json(svc.link_assistant(
+                            parts[4], tenant_id=tenant_id, user_id=user_id,
+                            parent_id=str(body.get("parent_id", ""))).as_dict())
+                    if len(parts) == 6 and parts[5] == "delete" and self.command == "POST":
+                        return self._json({"removed": svc.delete_assistant(
+                            parts[4], tenant_id=tenant_id, user_id=user_id,
+                            confirm_name=str(body.get("confirm_name", "")))})
+                    if len(parts) == 6 and parts[5] == "setup" and self.command == "POST":
+                        return self._json(svc.setup_specialist(parts[4], tenant_id=tenant_id, user_id=user_id))
+                    if len(parts) == 6 and parts[5] == "unlink" and self.command == "POST":
+                        return self._json(svc.unlink_assistant(
+                            parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
                     if len(parts) == 5 and self.command in ("PATCH", "POST"):
                         if body.get("archive"):
                             svc.archive_assistant(parts[4], tenant_id=tenant_id, user_id=user_id)
@@ -4992,6 +5049,9 @@ def _make_handler(server, public=False, operator=False):
                                      assistant_id=body.get("assistant_id", ""),
                                      task=body.get("task", ""),
                                      target_system=body.get("target_system", "pi"),
+                                     context=body.get("context"),
+                                     source_refs=body.get("source_refs"),
+                                     idempotency_key=body.get("idempotency_key", ""),
                                      actor=user_id)
                     return self._json(d.as_dict(), 201)
                 if resource == "assistant-delegations" and len(parts) == 6 and parts[5] == "cancel":

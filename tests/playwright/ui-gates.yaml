@@ -24,7 +24,7 @@ screenshots:
   # per-channel difference (0-255) below which a pixel counts as identical (anti-aliasing noise)
   channel_tolerance: 2
   # size policy for the committed PNGs (docs/operations/ui-gates.md, "Baseline policy"): total and per file, in KB
-  max_total_kb: 6144
+  max_total_kb: 6400
   max_file_kb: 300
   fixed_clock: "2026-10-23T10:00:00Z"
 perf:

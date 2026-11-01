@@ -306,3 +306,39 @@ def test_replaying_dispatch_on_a_finished_delegation_is_200_and_a_vanished_hando
     svr.handoffs._rows.pop(f"assistant.{lost.delegation_id}")
     svr.sweep_once()
     assert lost.status == "failed" and "disappeared" in lost.note
+
+
+ROLE_REF = {"id": "procedure:secretary-system", "version": "1.0.0", "digest": "sha256:" + "a" * 64}
+
+
+@pytest.mark.parametrize("owned", [{"role_ref": ROLE_REF}, {"external_id": "grant_task1"}])
+def test_adapter_owned_delegations_never_enter_the_engineering_handoff_queue(world, owned):
+    h, svc, svr = world
+    d = approved_delegation(h, svc)
+    for key, value in owned.items():
+        setattr(d, key, value)
+    con = svr.delegation_consumer
+    out = con.sweep()
+    assert out["dispatched"] == 0 and handoffs(h) == []
+    assert d.status == "queued" and not (d.correlation or {}).get("dispatch")
+    with pytest.raises(AssistantError):
+        con.dispatch(d.delegation_id, tenant_id="acme", user_id=pid("alice"), actor="a")
+    assert handoffs(h) == [] and d.status == "queued"
+
+
+def test_reconcile_and_cancel_leave_adapter_owned_records_alone(world):
+    h, svc, svr = world
+    d = approved_delegation(h, svc)
+    st, _ = h.call("alice", "POST", f"/api/v1/assistant-delegations/{d.delegation_id}/dispatch", {})
+    assert st == 200
+    (row,) = handoffs(h, "queued")
+    d.external_id = "grant_task1"                                          # now owned by the runtime adapter
+    d.role_ref = ROLE_REF
+    h.call("alice", "POST", f"/api/v1/handoffs/{row['handoff_id']}/transition", {"state": "cancelled"})
+    con = svr.delegation_consumer
+    assert con.reconcile() == 0 and d.status == "running"                  # the handoff state is not mirrored over it
+    cancelled = []
+    con._cancel_handoff = lambda hid, actor: cancelled.append(hid)
+    d.status = "cancelled"
+    con.on_cancel(d, "alice")
+    assert cancelled == []
