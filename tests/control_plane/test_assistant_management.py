@@ -222,3 +222,15 @@ def test_deleting_a_parent_leaves_no_dangling_link_on_its_children(hz):
     h.call("alice", "POST", f"/api/v1/assistants/{p['assistant_id']}", {"archive": True})
     h.call("alice", "POST", f"/api/v1/assistants/{p['assistant_id']}/delete", {"confirm_name": "Parent"})
     assert svc.store.assistants[c["assistant_id"]].parent_id is None
+
+
+def test_a_deleted_assistant_stays_gone_in_the_persisted_snapshot(hz):
+    import json
+    h, svc = hz
+    _, a = make(h, "Doomed")
+    h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}", {"archive": True})
+    assert a["assistant_id"] in json.dumps(svc.store.snapshot()["assistants"], default=str)
+    assert h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}/delete", {"confirm_name": "Doomed"})[0] == 200
+    snap = svc.store.snapshot()
+    for table in ("assistants", "threads", "messages", "runs", "grants", "routines"):
+        assert a["assistant_id"] not in json.dumps(snap.get(table, {}), default=str), table
