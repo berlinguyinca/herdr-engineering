@@ -31,6 +31,8 @@ def run(args: argparse.Namespace) -> int:
     if op == "list":
         rows = log.read(agent=args.agent, kind=args.kind, session_id=args.session)
         return _out({"corrections": rows[-args.limit:], "total": len(rows)})
+    if op == "unforget":
+        return _out({"released": log.unforget()})
     if op == "forget":
         if not args.all and not args.session:
             return _out({"code": "invalid_request", "message": "name a --session, or pass --all"}, ok=False)
@@ -62,7 +64,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     c.add_argument("--session")
     c.add_argument("--limit", type=int, default=50)
     c.set_defaults(func=run)
-    c = ops.add_parser("forget", help="delete recorded corrections")
+    ops.add_parser("unforget", help="let forgotten sessions be recorded again").set_defaults(func=run)
+    c = ops.add_parser("forget", help="delete recorded corrections (and keep them from coming back on the next scan)")
     c.add_argument("--session")
     c.add_argument("--all", action="store_true")
     c.set_defaults(func=run)

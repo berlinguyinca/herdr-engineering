@@ -19,7 +19,7 @@ export async function loadAssistantGraph(client, { signal } = {}) {
   }
 }
 
-const chip = (cls, label) => `<span class="pa-graph-chip pa-graph-chip--${cls}">${esc(label)}</span>`;
+const chip = (cls, label) => `<span class="pa-graph-chip pa-graph-chip--${esc(cls)}">${esc(label)}</span>`;
 
 function renderDelegation(node, specialist) {
   return `<li class="pa-graph-node" data-graph-kind="delegation" data-graph-id="${esc(node.id)}">`

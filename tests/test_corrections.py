@@ -212,3 +212,40 @@ def test_scan_recent_takes_the_newest_records_per_harness_and_skips_a_broken_one
     assert (second["scanned"], second["new"], second["skipped"]) == (4, 1, [])   # s0 is new; bad reads as an empty session
     with pytest.raises(PermissionError):
         cx.scan_recent(cx.CorrectionLog(tmp_path / "other"), agents=["claude"], home=home)
+
+
+def test_forget_sticks_across_scans_until_released_and_a_rebuild_does_not_tombstone(log):
+    log.enable()
+    log.record(corr(0, "s1") + corr(1, "s2"))
+    assert log.forget(session_id="s1") == 1
+    assert log.record(corr(0, "s1")) == 0 and [r["session_id"] for r in log.read()] == ["s2"]   # a rescan cannot bring it back
+    assert log.tombstones() == {"s1"} and oct(os.stat(log.forgotten).st_mode & 0o777) == "0o600"
+    assert log.unforget() == 1 and log.record(corr(0, "s1")) == 1                                # released on request
+    assert log.forget(everything=True, tombstone=False) == 2 and log.tombstones() == set()       # extractor rebuild
+    assert log.record(corr(0, "s2")) == 1
+
+
+def test_concurrent_record_and_forget_never_corrupt_the_log(log):
+    import threading
+    log.enable()
+    errors = []
+
+    def writer(i):
+        try:
+            for j in range(15):
+                log.record([cx.Correction(f"id-{i}-{j}", "negation", "claude", f"w{i}", j, None, "x", "y")])
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def forgetter():
+        try:
+            for _ in range(10):
+                log.forget(session_id="never-there")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(3)] + [threading.Thread(target=forgetter)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and len(log.read()) == 45

@@ -109,15 +109,17 @@ def test_the_transport_creates_a_task_for_the_bound_agent_as_the_owner(world):
     assert task and svc.list_tasks(pr, out["room_id"])["tasks"][0]["target_agent_id"] == agent
 
 
-def test_the_control_plane_wires_setup_only_with_collaboration_an_operator_and_single_operator_mode(world):
+def test_the_control_plane_wires_setup_only_with_collaboration_an_operator_single_operator_mode_and_persistence(world, tmp_path):
     from herdr_engineering.control_plane.api import ControlPlaneServer
-    from herdr_engineering.control_plane.assistant import AssistantService, assistant_config
+    from herdr_engineering.control_plane.assistant import AssistantService, AssistantStore, assistant_config
     from herdr_engineering.control_plane.repo import ControlPlaneRepo
     svc, pr, _ = world
 
-    def build(**kw):
+    def build(persist=True, **kw):
+        store = AssistantStore(persist_path=str(tmp_path / f"a{len(kw)}{persist}.json")) if persist else None
         cfg = assistant_config({"personal_assistant": {"enabled": True}})
-        return ControlPlaneServer(ControlPlaneRepo(), assistant_service=AssistantService(config=cfg), allow_open=True, **kw)
+        return ControlPlaneServer(ControlPlaneRepo(), assistant_service=AssistantService(config=cfg, store=store),
+                                  allow_open=True, **kw)
 
     on = build(collab=svc, operator_user=OWNER, single_operator=True)
     assert on.assistant.self_setup is not None
@@ -129,3 +131,39 @@ def test_the_control_plane_wires_setup_only_with_collaboration_an_operator_and_s
     for kw in ({"collab": svc, "operator_user": OWNER}, {"collab": svc, "single_operator": True},
                {"operator_user": OWNER, "single_operator": True}):
         assert build(**kw).assistant.self_setup is None
+    # Without acknowledged persistence a delegation could never be recorded, so nothing is wired and delegation is untouched.
+    bare = build(persist=False, collab=svc, operator_user=OWNER, single_operator=True)
+    assert bare.assistant.self_setup is None and bare.assistant.delegation_adapter_resolver is None
+
+
+def test_a_duplicate_room_resolves_to_the_first_one_instead_of_unbinding(world):
+    svc, pr, setup = world
+    agent = enroll(svc, pr)
+    first = setup.provision(PI_TYPE)["room_id"]
+    pid = svc.list_rooms(pr)["rooms"][0]["project_id"]
+    svc.create_room(pr, pid, {"name": "Assistant: pi-secretary"})            # what a lost race would have left behind
+    assert setup.find(PI_TYPE) == {"room_id": first, "agent_id": agent} or setup.find(PI_TYPE)["agent_id"] == agent
+    again = setup.provision(PI_TYPE)
+    assert again["created_room"] is False and again["room_id"] == min(
+        r["room_id"] for r in svc.list_rooms(pr)["rooms"] if r["name"] == "Assistant: pi-secretary")
+
+
+def test_concurrent_setups_create_one_room(world):
+    import threading
+    svc, pr, setup = world
+    enroll(svc, pr)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(setup.provision(PI_TYPE))) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(results) == 6 and len({r["room_id"] for r in results}) == 1
+    assert len([r for r in svc.list_rooms(pr)["rooms"] if r["name"] == "Assistant: pi-secretary"]) == 1
+
+
+def test_two_agents_of_the_same_name_are_named_in_the_error_not_blamed_on_enrolment(world):
+    svc, pr, setup = world
+    enroll(svc, pr), enroll(svc, pr)
+    with pytest.raises(SelfSetupError, match="2 active agents are named pi-secretary"):
+        setup.provision(PI_TYPE)

@@ -154,6 +154,10 @@ class _FakeSetup:
     def __init__(self, fail=None):
         self.fail, self.calls = fail, []
 
+    @staticmethod
+    def supports(type_name):
+        return type_name == "pi-secretary"
+
     def provision(self, type_name):
         from herdr_engineering.assistant_self_setup import SelfSetupError
         self.calls.append(type_name)
@@ -168,7 +172,9 @@ def test_setup_endpoint_provisions_audits_and_refuses_what_it_cannot_do(hz):
     _, r = make(h, "Fleet PA")
     path = f"/api/v1/assistants/{s['assistant_id']}/setup"
     assert h.call("alice", "POST", path, {})[0] == 400                          # no collaboration operator wired
+    owner = svc.store.assistants[s["assistant_id"]]
     svc.self_setup = _FakeSetup()
+    svc._setup_owner = lambda t, u: (t, u) == (owner.tenant_id, owner.user_id)
     st, out = h.call("alice", "POST", path, {})
     assert st == 200 and (out["room_id"], out["agent_id"]) == ("room_1", "agent_1")
     assert svc.self_setup.calls == ["pi-secretary"]
@@ -234,3 +240,52 @@ def test_a_deleted_assistant_stays_gone_in_the_persisted_snapshot(hz):
     snap = svc.store.snapshot()
     for table in ("assistants", "threads", "messages", "runs", "grants", "routines"):
         assert a["assistant_id"] not in json.dumps(snap.get(table, {}), default=str), table
+
+
+def test_delete_unlinks_children_first_and_rechecks_under_the_lock(hz):
+    from herdr_engineering.control_plane.assistant import AssistantError
+    h, svc = hz
+    _, parent = make(h, "Parent")
+    _, child = make(h, "Child", type="pi-secretary", parent_id=parent["assistant_id"])
+    owner = svc.store.assistants[parent["assistant_id"]]
+    # disabled with PATCH (not archived) is still "not enabled": allowed, and the child must not keep a dead link
+    assert h.call("alice", "PATCH", f"/api/v1/assistants/{parent['assistant_id']}", {"enabled": False})[0] == 200
+    assert svc.store.assistants[child["assistant_id"]].parent_id == parent["assistant_id"]
+    assert h.call("alice", "POST", f"/api/v1/assistants/{parent['assistant_id']}/delete", {"confirm_name": "Parent"})[0] == 200
+    assert svc.store.assistants[child["assistant_id"]].parent_id is None
+    # the purge itself refuses an enabled assistant or a wrong name, whatever the caller checked before
+    _, live = make(h, "Live")
+    with pytest.raises(AssistantError):
+        svc.store.purge_assistant(live["assistant_id"], tenant_id=owner.tenant_id, user_id=owner.user_id, confirm_name="Live")
+    assert live["assistant_id"] in svc.store.assistants
+
+
+def test_delete_audits_before_it_purges(hz):
+    h, svc = hz
+    _, a = make(h, "Doomed")
+    h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}", {"archive": True})
+    real = svc.store.audit_record
+
+    def refuse(**kw):
+        if kw.get("action") == "assistant.deleted":
+            raise RuntimeError("audit sink refused")
+        return real(**kw)
+    svc.store.audit_record = refuse
+    h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}/delete", {"confirm_name": "Doomed"})
+    assert a["assistant_id"] in svc.store.assistants                      # nothing was deleted without its audit entry
+
+
+def test_create_validates_the_name_like_update(hz):
+    h, _ = hz
+    for bad in ("x" * 81, "a\nb"):
+        assert make(h, bad)[0] == 400
+    assert make(h, "  Trimmed ")[1]["name"] == "Trimmed"
+
+
+def test_creating_again_after_archiving_makes_a_new_assistant_not_a_replay_of_the_archived_one(hz):
+    h, _ = hz
+    st1, a = make(h, "Again", idempotency_key="cli-same")
+    assert make(h, "Again", idempotency_key="cli-same")[1]["assistant_id"] == a["assistant_id"]      # a live one replays
+    h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}", {"archive": True})
+    st2, b = make(h, "Again", idempotency_key="cli-same")
+    assert st2 == 201 and b["assistant_id"] != a["assistant_id"] and b["enabled"] is True

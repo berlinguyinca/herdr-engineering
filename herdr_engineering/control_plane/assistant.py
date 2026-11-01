@@ -2310,10 +2310,13 @@ class AssistantStore:
             self.assistants[a.assistant_id] = a
         self._after_mutation()
 
-    def purge_assistant(self, assistant_id: str, *, tenant_id: str, user_id: str) -> dict[str, int]:
-        """Drop the assistant and the records keyed to it, in one critical section; returns counts removed."""
+    def purge_assistant(self, assistant_id: str, *, tenant_id: str, user_id: str, confirm_name: str) -> dict[str, int]:
+        """Drop the assistant and the records keyed to it, in one critical section; returns counts removed. The archived
+        state and the typed name are checked again here, under the lock, so a concurrent re-enable cannot be purged."""
         with self._lock:
             a = self.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+            if a.enabled or confirm_name != a.name:
+                raise AssistantError("the assistant is no longer archived, or the name does not match")
             threads = {t.thread_id for t in self.threads.values() if t.assistant_id == a.assistant_id}
             counts: dict[str, int] = {}
 
@@ -2727,6 +2730,7 @@ class AssistantService:
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
         self.google_write = None      # (tenant, user, tool_id, payload) -> dict; runs ONLY an approved Google draft/event
+        self._setup_owner: Callable[[str, str], bool] = lambda tenant, user: False
         self.self_setup = None      # assistant_self_setup.SelfSetup once api.py has a collaboration operator, else None
         self.canonical_person = lambda tenant, user: (tenant, user)   # single-operator rule hook (see RakazoBridge.canonical_person); identity until api.py wires it
         self.reminders = None         # ReminderStore, set by the server; reminders need no Google account
@@ -2850,9 +2854,12 @@ class AssistantService:
         if idempotency_key and not _DELEGATION_REF.fullmatch(str(idempotency_key)):
             raise AssistantError("invalid idempotency_key")
         name = name or "Personal Assistant"
+        if not isinstance(name, str) or not name.strip() or len(name) > 80 or not name.isprintable():
+            raise AssistantError("name must be 1-80 printable characters")
+        name = name.strip()
         if idempotency_key:
             for prior in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id):
-                if prior.idempotency_key == idempotency_key:
+                if prior.idempotency_key == idempotency_key and prior.enabled:   # an archived one is gone: create anew
                     if (prior.name, prior.type, prior.parent_id) != (name, type, parent_id or None):
                         raise AssistantError("idempotency_key already used differently")
                     return prior
@@ -3000,10 +3007,13 @@ class AssistantService:
             raise AssistantError("archive the assistant before deleting it")
         if confirm_name != a.name:
             raise AssistantError("confirmation does not match the assistant's name")
-        removed = self.store.purge_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        for child in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id):
+            if child.parent_id == assistant_id:                      # nothing may point at a deleted parent
+                self.unlink_assistant(child.assistant_id, tenant_id=tenant_id, user_id=user_id)
+        # Audit first, as delegation does: if the log refuses, nothing has been deleted.
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="assistant.deleted",
-                                subject_id=assistant_id, detail=", ".join(f"{k}={v}" for k, v in sorted(removed.items())))
-        return removed
+                                subject_id=assistant_id, detail="permanent delete of an archived assistant")
+        return self.store.purge_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id, confirm_name=confirm_name)
 
     # -- threads & messages -----------------------------------------------------
     def create_thread(self, *, tenant_id: str, user_id: str, assistant_id: str,
@@ -4249,6 +4259,16 @@ class AssistantService:
     def _delegation_adapter_for(self, d: DelegationRequest) -> DelegationRuntimeAdapter | None:
         return self._delegation_adapter_for_scope(d.tenant_id, d.user_id, d.target_system)
 
+    def attach_self_setup(self, setup: Any, is_owner: Callable[[str, str], bool]) -> bool:
+        """Wire on-demand setup for the dashboard's one owner AFTER construction, under the same guards the constructor
+        applies to a resolver: no fixed adapter beside it, and acknowledged persistence (a delegation needs a durable
+        record). Returns False, wiring nothing, when either does not hold, so delegation is never left failing."""
+        if self.delegation_adapter is not None or not self.store.supports_required_persistence:
+            return False
+        self.self_setup, self._setup_owner = setup, is_owner
+        self.delegation_adapter_resolver = setup.resolver(is_owner, fallback=self.delegation_adapter_resolver)
+        return True
+
     def _delegation_adapter_for_scope(self, tenant_id: str, user_id: str,
                                       target: str) -> DelegationRuntimeAdapter | None:
         if self.delegation_adapter_resolver is not None:
@@ -4310,7 +4330,9 @@ class AssistantService:
                 return {"target": hint, "kind": "specialist" if hint in targets and hint != "pi" else "harness",
                         "reasons": ["named by the request"], "skipped": skipped}
             raise AssistantError("delegation target is not configured")
-        mentioned = next((h for h in self.ROUTE_HARNESSES if h != "pi" and h in words), None)
+        external = self.delegation_adapter is not None or self.delegation_adapter_resolver is not None
+        mentioned = next((h for h in self.ROUTE_HARNESSES if h != "pi" and h in words
+                          and (not external or h in targets)), None)
         for name in sorted(targets):
             spec = targets[name]
             hits = sorted(set(spec.get("handles", [])) & words)
@@ -4332,8 +4354,10 @@ class AssistantService:
                 return True, "already set up"
         except Exception:  # noqa: BLE001 - an unreadable binding is "not bound"
             pass
-        if self.self_setup is None:
+        if self.self_setup is None or not self.self_setup.supports(name):
             return False, "not set up and no setup is available"
+        if not self._setup_owner(tenant_id, user_id):
+            return False, "setup is only available to the dashboard owner"
         if not self.resolve_placement(name)["chosen"]:
             return False, "no host can carry it"
         return True, "will be set up when you approve"
@@ -4344,6 +4368,8 @@ class AssistantService:
             return
         if self._delegation_adapter_for_scope(tenant_id, user_id, name) is not None or self.self_setup is None:
             return
+        if not self._setup_owner(tenant_id, user_id) or not self.self_setup.supports(name):
+            raise AssistantError(f"cannot start {name}: it is not set up and setup is not available to you")
         from ..assistant_self_setup import SelfSetupError
         try:
             result = self.self_setup.provision(name)
@@ -4361,6 +4387,10 @@ class AssistantService:
             raise AssistantError("only an enabled specialist needs setup")
         if self.self_setup is None:
             raise AssistantError("self-setup is unavailable: this control plane has no collaboration operator")
+        if not self._setup_owner(tenant_id, user_id):
+            raise AssistantError("self-setup is only available to the dashboard owner")
+        if not self.self_setup.supports(a.type):
+            raise AssistantError(f"no setup is defined for {a.type}")
         from ..assistant_self_setup import SelfSetupError
         try:
             result = self.self_setup.provision(a.type)
@@ -4701,6 +4731,8 @@ class AssistantService:
             self._update_delegation(d, "assistant.delegation.runtime_unavailable")
         else:
             with self.store._lock:                              # serialised with the legacy consumer's hand-off
+                if d.status not in ("queued", "running"):       # the consumer may have finished it since the check above
+                    raise AssistantError(f"cannot cancel delegation in state {d.status}")
                 d.status = "cancelled"
                 d.completed_at = self.now()
             self._update_delegation(d, "assistant.delegation.cancelled")
@@ -5437,7 +5469,8 @@ class AssistantService:
             return self._run_adapter(tool_id, tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                                      payload=payload, actor=actor, action=action)
         if tool_id == "delegate":
-            self._ensure_specialist(payload.get("target_system") or "pi", tenant_id, user_id)
+            if isinstance(payload.get("task"), str) and payload["task"].strip() and len(payload["task"]) <= 8000:
+                self._ensure_specialist(payload.get("target_system") or "pi", tenant_id, user_id)
             d = self.delegate(tenant_id=tenant_id, user_id=user_id,
                               assistant_id=assistant_id,
                               task=payload.get("task", ""),

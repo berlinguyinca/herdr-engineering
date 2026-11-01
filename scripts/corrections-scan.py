@@ -25,7 +25,7 @@ def main(argv: list[str]) -> int:
     elif op == "disable":
         log.disable()
     elif op == "forget-all":
-        print(json.dumps({"removed": log.forget(everything=True)}))
+        print(json.dumps({"removed": log.forget(everything=True, tombstone=False)}))
         return 0
     elif op == "scan":
         n = int(argv[argv.index("--recent") + 1]) if "--recent" in argv else 40

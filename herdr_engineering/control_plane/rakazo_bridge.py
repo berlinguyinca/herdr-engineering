@@ -1111,7 +1111,11 @@ class RakazoBridge:
         return self.rest.me(ctx)
 
     def _in_space(self, ctx: _Ctx, space_id: str) -> _Ctx:
-        return replace(ctx, space=space_id, tenant=sp.space_tenant(ctx.base_tenant, space_id))
+        tenant = sp.space_tenant(ctx.base_tenant, space_id)
+        # The owner key depends on the space: a mapped operator owns the default space as the dashboard operator and every
+        # other space as the phone's own principal, so crossing spaces must recompute it, never carry it over.
+        owner = self._ctx(ctx.account, tenant, ctx.token, ctx.accepts_stream, space_id, ctx.base_tenant).user
+        return replace(ctx, space=space_id, tenant=tenant, user=owner)
 
     def _space_entry(self, ctx: _Ctx, space_id: str, name: str, owned: bool) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         bots = self._bots(self._in_space(ctx, space_id))
@@ -1372,11 +1376,11 @@ class RakazoBridge:
         # the EXISTING rules decide: owner/approver, expiry, and approver != requester for a sensitive tool unless the
         # operator's YAML (allow_self_approval, or single_operator) says otherwise
         decided = self.svc.decide_approval(approval_id, tenant_id=ctx.tenant, user_id=ctx.user, decision=decision,
-                                           actor=ctx.user)
+                                           actor=ctx.principal or ctx.user)
         if decided.decision == "approved" and self.svc.config["actions"]["auto_execute"]:
             try:
                 self.svc.execute_approved_action(decided.action_id, tenant_id=ctx.tenant, user_id=ctx.user,
-                                                 actor=ctx.user)
+                                                 actor=ctx.principal or ctx.user)
             except AssistantError as exc:        # the approval stands; the card shows the action did not run
                 log.info("rakazo bridge: approved action not executed: %s", redact_secrets(str(exc)))
         return {"ok": True}
@@ -1513,7 +1517,7 @@ class RakazoBridge:
         """The single-operator rule: in single-operator mode a Rakazo phone account configured in YAML with role
         ``operator`` is the same human as the dashboard operator (``open-listener``), so its per-person DATA (Google
         connection, blocked calendars, reminders) is keyed by ``(tenant, open-listener)``. Only the data key changes:
-        approvals, audit and grants keep the real phone principal. Fails closed (returned unchanged) when the server is
+        approvals and executions record the real phone principal as the actor. Fails closed (returned unchanged) when the server is
         not in single-operator mode, the tenant is not the dashboard operator's, the account is not a YAML account
         (Cognito-derived accounts never map, whatever their role), is no longer a member, is not an operator, or on error."""
         if not isinstance(user, str) or not user.startswith("rakazo:") or not self.single_operator_fn():

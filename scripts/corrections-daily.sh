@@ -3,7 +3,13 @@
 # Read-only on transcripts. Each host keeps its own log (0600) next to its own transcripts; only counts come back here.
 # Usage: corrections-daily.sh [RECENT]   (default 60 records per harness per host; the first run can pass a larger number)
 set -u
+LOGDIR="${HERDR_CORRECTIONS_LOG_DIR:-$HOME/.local/share/herdr-engineering/state/corrections}"
+FABRIC_MARKER="$LOGDIR/fabric-enabled"
 if [ "${1:-}" = "--install" ]; then
+  # Scanning other machines is its own opt-in: pass --fabric to allow it (recorded in a marker file beside the log), and
+  # remove that file to stop. Without it the schedule scans this machine only.
+  mkdir -p "$LOGDIR"; chmod 700 "$LOGDIR"
+  if [ "${2:-}" = "--fabric" ]; then : > "$FABRIC_MARKER"; chmod 600 "$FABRIC_MARKER"; fi
   # Copies what the scan needs to a stable place (so a moved or deleted checkout cannot break it) and schedules 03:30 daily.
   SRC="$(cd "$(dirname "$0")/.." && pwd)"; APP="$HOME/.local/share/herdr-engineering/corrections-app"
   mkdir -p "$APP/scripts"
@@ -32,22 +38,24 @@ PL
   exit 0
 fi
 RECENT="${1:-60}"
+case "$RECENT" in ''|*[!0-9]*) echo "RECENT must be a whole number" >&2; exit 2 ;; esac
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-LOGDIR="${HERDR_CORRECTIONS_LOG_DIR:-$HOME/.local/share/herdr-engineering/state/corrections}"
 mkdir -p "$LOGDIR"; chmod 700 "$LOGDIR"
 OUT="$LOGDIR/daily.log"
 FILES="herdr_engineering/__init__.py herdr_engineering/version.py herdr_engineering/corrections.py herdr_engineering/session_history.py herdr_engineering/control_plane/__init__.py herdr_engineering/control_plane/redact.py scripts/corrections-scan.py"
 REMOTE_DIR='.cache/herdr-corrections'
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-RESET="${HERDR_CORRECTIONS_RESET:-}"   # =1 deletes each host's kept corrections before scanning (after the extractor changed)
+RESET=""; [ "${HERDR_CORRECTIONS_RESET:-}" = "1" ] && RESET=1   # =1 deletes each host's kept corrections before scanning (after the extractor changed)
 [ -n "$RESET" ] && (cd "$HERE" && python3 scripts/corrections-scan.py forget-all >/dev/null)
 echo "$(stamp) local: $(cd "$HERE" && python3 scripts/corrections-scan.py scan --recent "$RECENT" 2>&1 | tail -1)" >> "$OUT"
 
 HOSTS="$(herdr-eng machines --json 2>/dev/null | python3 -c 'import json,sys
 try: print(" ".join(m["target"] for m in json.load(sys.stdin) if m.get("enabled")))
 except Exception: pass')"
+[ -f "$FABRIC_MARKER" ] || HOSTS=""     # other machines only after `--install --fabric`
 for host in $HOSTS; do
+  case "$host" in -*|*[!A-Za-z0-9._-]*) echo "$(stamp) skipped a machine name that is not a plain host name" >> "$OUT"; continue ;; esac
   if ! (cd "$HERE" && rsync -aR --quiet -e "ssh -o BatchMode=yes -o ConnectTimeout=8" $FILES "$host:$REMOTE_DIR/") 2>>"$OUT"; then
     echo "$(stamp) $host: sync failed" >> "$OUT"; continue
   fi

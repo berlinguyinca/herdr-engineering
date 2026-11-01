@@ -36,6 +36,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--email", default="tester@example.com")
     args = ap.parse_args()
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"WARNING: --host {args.host} exposes an API with NO authentication beyond the printed account to everything that can "
+              "reach this machine. Use it only on a network you trust, and stop the server when you are done.", flush=True)
     password = secrets.token_urlsafe(12)
     server = build(args.email, password, host=args.host, port=args.port)
     print(f"server   http://{args.host}:{args.port}\nemail    {args.email}\npassword {password}", flush=True)

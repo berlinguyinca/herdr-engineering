@@ -184,8 +184,8 @@ one-time secret created in the dashboard, not a URL. Any provider, voice or desk
 In single-operator mode a phone `operator` account (YAML, not Cognito) now owns its assistants, threads, runs, grants and approvals
 as the dashboard operator (`open-listener`), in the default space only, so `bots/list` on the phone and the dashboard page show the
 same assistants. `_Ctx.user` is the owner key; `_Ctx.principal` stays the phone account's own principal. Family accounts, Cognito
-accounts, non-default spaces and servers outside single-operator mode are unchanged. Approvals still use the owner key as the actor,
-so approver != requester is not weakened.
+accounts, non-default spaces and servers outside single-operator mode are unchanged. Approvals and executions record the phone account's own principal as the actor, so the audit trail still
+names the phone; the owner key says whose approval it is. In single-operator mode self-approval is already allowed by configuration.
 
 Not migrated: assistants the phone created before this change stay owned by `rakazo:<account>` and are shown on neither surface.
 `RakazoBridge.legacy_phone_assistants()` lists them (it moves nothing); moving them means rewriting the owner on every record type

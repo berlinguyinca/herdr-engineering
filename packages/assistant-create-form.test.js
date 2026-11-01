@@ -33,6 +33,11 @@ test('the body matches the CLI fields and omits an empty parent', () => {
   assert.deepEqual(createBody({ name: '', type: '' }), { name: 'Personal Assistant', type: 'rakazo' });
 });
 
+test('an idempotency key rides along only when given', () => {
+  assert.equal(createBody({ name: 'A', type: 'rakazo', idempotency_key: 'k1' }).idempotency_key, 'k1');
+  assert.ok(!('idempotency_key' in createBody({ name: 'A', type: 'rakazo' })));
+});
+
 test('types fall back to rakazo when the server is unreachable', async () => {
   const out = await loadTypes({ assistantTypes: async () => { throw new Error('boom'); } });
   assert.deepEqual(out.types.map(t => t.type), ['rakazo']);

@@ -13,6 +13,7 @@ corrections into proposals you approve. Design points:
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -123,6 +124,7 @@ class CorrectionLog:
         self.dir = Path(directory)
         self.path = self.dir / "corrections.jsonl"
         self.marker = self.dir / "enabled"
+        self.forgotten = self.dir / "forgotten.json"     # session ids only, never content
         self._lock = threading.Lock()
 
     @classmethod
@@ -145,6 +147,33 @@ class CorrectionLog:
     def disable(self) -> None:
         self.marker.unlink(missing_ok=True)
 
+    class _Flock:
+        """Cross-process exclusion (the daily scan and a `forget` may overlap), beside the in-process lock."""
+        def __init__(self, log):
+            self.log = log
+
+        def __enter__(self):
+            self.log._ensure()
+            self.fh = open(self.log.dir / ".lock", "a")
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+
+        def __exit__(self, *exc):
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+            self.fh.close()
+
+    def tombstones(self) -> set[str]:
+        try:
+            return set(json.loads(self.forgotten.read_text()))
+        except (OSError, ValueError):
+            return set()
+
+    def unforget(self) -> int:
+        """Let forgotten sessions be recorded again; returns how many were released."""
+        with self._lock, self._Flock(self):
+            gone = self.tombstones()
+            self.forgotten.unlink(missing_ok=True)
+            return len(gone)
+
     def read(self, *, agent: str | None = None, kind: str | None = None, session_id: str | None = None) -> list[dict]:
         if not self.path.is_file():
             return []
@@ -164,10 +193,10 @@ class CorrectionLog:
         """Appends the ones not already kept; returns how many were new. Refuses while disabled."""
         if not self.enabled():
             raise PermissionError("corrections are off; run `herdr-eng corrections enable` first")
-        with self._lock:
-            self._ensure()
+        with self._lock, self._Flock(self):
             have = {r.get("id") for r in self.read()}
-            fresh = [c for c in corrections if c.id not in have]
+            gone = self.tombstones()
+            fresh = [c for c in corrections if c.id not in have and c.session_id not in gone]
             if fresh:
                 fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
                 with os.fdopen(fd, "a") as handle:
@@ -175,14 +204,20 @@ class CorrectionLog:
                         handle.write(json.dumps(c.as_dict(), sort_keys=True) + "\n")
             return len(fresh)
 
-    def forget(self, *, session_id: str | None = None, everything: bool = False) -> int:
+    def forget(self, *, session_id: str | None = None, everything: bool = False, tombstone: bool = True) -> int:
         """Deletes one session's records, or with ``everything=True`` all of them; returns how many were removed.
-        Naming neither is an error, so a missing argument can never wipe the log. Works while disabled."""
+        Naming neither is an error, so a missing argument can never wipe the log. Works while disabled. With
+        ``tombstone`` (the default) the forgotten session ids are remembered, so the next scan cannot bring them back;
+        ``tombstone=False`` is for rebuilding the log after the extractor changed."""
         if session_id is None and not everything:
             raise ValueError("name a session or pass everything=True")
-        with self._lock:
+        with self._lock, self._Flock(self):
             rows = self.read()
             keep = [r for r in rows if not everything and r.get("session_id") != session_id]
+            if tombstone:
+                marked = {r.get("session_id") for r in rows if r not in keep} | ({session_id} - {None})
+                self.forgotten.write_text(json.dumps(sorted(self.tombstones() | {m for m in marked if m})))
+                os.chmod(self.forgotten, 0o600)
             if len(keep) == len(rows):
                 return 0
             if not keep:

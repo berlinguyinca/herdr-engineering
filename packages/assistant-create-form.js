@@ -52,8 +52,9 @@ export function renderCreateForm({ types, assistants, values = {}, error = '' })
 }
 
 /** The POST body for the form; the same fields as the CLI sends. */
-export function createBody({ name, type, parent_id }) {
+export function createBody({ name, type, parent_id, idempotency_key }) {
   const body = { name: text(name).trim() || 'Personal Assistant', type: type || 'rakazo' };
   if (parent_id) body.parent_id = parent_id;
+  if (idempotency_key) body.idempotency_key = idempotency_key;     // one key per open form: a double click replays
   return body;
 }

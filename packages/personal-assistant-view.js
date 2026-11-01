@@ -235,6 +235,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   const openCreate = async () => {
     const { types } = await loadTypes(client);
     const values = { name: '', type: 'rakazo', parent_id: '' };
+    const idempotencyKey = (globalThis.crypto?.randomUUID?.() || String(Date.now()) + Math.random().toString(16).slice(2)).slice(0, 60);
     let error = '';
     const slot = document.createElement('div');
     container.querySelector('.pa-bar')?.after(slot);
@@ -256,7 +257,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       form.querySelector('[data-create-cancel]').addEventListener('click', () => slot.remove());
       form.addEventListener('submit', async e => {
         e.preventDefault(); read();
-        try { await client.createAssistant(createBody(values)); slot.remove(); await render(); }
+        try { await client.createAssistant(createBody({ ...values, idempotency_key: idempotencyKey })); slot.remove(); await render(); }
         catch (err) { error = String(err?.message || 'could not create'); paint(); }
       });
       form.querySelector('[data-create-name]').focus();

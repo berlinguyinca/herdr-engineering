@@ -55,3 +55,19 @@ def test_not_single_operator_nothing_maps(srv):  # noqa: F811
 def test_a_family_account_never_sees_the_operators_assistants(srv):  # noqa: F811
     srv.assistant.create_assistant(tenant_id=T, user_id=OP, name="Dashboard bot")
     assert "Dashboard bot" not in _names(srv, "fam")
+
+
+def test_crossing_spaces_recomputes_the_owner_so_each_space_lists_its_own_bots(srv):  # noqa: F811
+    ctx = _ctx(srv, "op")
+    account = srv.rakazo._by_principal[srv.p["op"]]
+    other = srv.rakazo._in_space(ctx, "s1")
+    assert other.user == srv.p["op"] and other.space == "s1" and other.tenant.startswith("default") and other.tenant != "default"
+    back = srv.rakazo._in_space(other, rb.sp.DEFAULT_SPACE_ID)
+    assert back.user == OP and back.tenant == "default" and back.principal == account.principal_id
+
+
+def test_approvals_record_the_phone_principal_as_the_actor(srv):  # noqa: F811
+    import inspect
+    src = inspect.getsource(rb.RakazoBridge)
+    assert src.count("actor=ctx.principal or ctx.user") == 2
+    assert "actor=ctx.user)" not in src
