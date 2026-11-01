@@ -64,7 +64,13 @@ peer, so the proof ran without it. Real traffic arrives through peering.
   to peer. Do it when the gateway runs on the fabric host.
 - **Custom models stay on llm-proxy, by design.** They are project-scoped routes to external
   OpenAI-style URLs; the gateway is a fleet router and has no such proxy mode.
-- **A reviewed image.** The prototype binary was built locally from the branch and deleted after
-  the check. Production needs a Linux release of a merged commit, then `llm-gateway/Dockerfile`.
+- **A reviewed image: the binary exists, the image is built where Linux amd64 is native.**
+  The CI-gated Linux release `node-ci-latest` was published for merged commit `5d60af17`
+  (`inferweave.commit`); its `inferweave` asset is x86-64 static-pie, 69706112 bytes, sha256
+  `54254ff46b5a487cecfa5de0ae9999183cf55dd3dc0fd28b5c4c9da2f1af9b9e`, verified against
+  `inferweave.sha256`, and it contains the pre-hashed principals and `/v1/admin/usage` routes.
+  Build the image from that asset with `llm-gateway/Dockerfile` (needs BuildKit for `COPY
+  --chmod`) on an amd64 host. It was not built or run on the arm64 Docker Desktop VM used for
+  the prototype, so the amd64 binary itself has not been executed here.
 - **Full compose bring-up** (control plane, postgres, `llm-proxy`): the gateway container and the
   sync and usage commands ran for real; the compose file as a whole is covered by render tests.
