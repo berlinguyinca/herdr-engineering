@@ -40,7 +40,7 @@ _REJECTED = re.compile(r"doesn'?t want to proceed|user (rejected|denied|declined
                        re.IGNORECASE)
 # Turns that arrive in the user role but were not typed by you: harness gates, task notifications, agent-to-agent messages.
 _AUTOMATED = re.compile(r"^\s*(<|\[harness\]|another \w+ session sent a message|this session is being continued|"
-                        r"[\w-]+ hook (feedback|blocked|error)|\[image:|\[\d+ prior |# /loop|goal check-in)",
+                        r"[\w-]+ hook (feedback|blocked|error)|\[image:|\[\d+ prior |# /loop|goal check-in|# agents\.md instructions)",
                         re.IGNORECASE)
 _WORD = re.compile(r"[a-z0-9']+")
 
@@ -58,6 +58,15 @@ class Correction:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+_DIGITS = re.compile(r"\d+")
+
+
+def _shape(text: str) -> str:
+    """The text with numbers blanked and spacing collapsed, so a scheduled prompt that only changes a job id or a count
+    still reads as the same prompt."""
+    return _DIGITS.sub("#", " ".join(text.split()))[:300]
 
 
 def _words(text: str) -> set[str]:
@@ -82,7 +91,7 @@ def extract(events: Iterable[dict], *, agent: str, session_id: str) -> list[Corr
     always give the same ids, so scanning a session twice records nothing new."""
     evs = list(events)
     # A prompt that arrives three or more times in one session is a schedule or a loop, not you asking again.
-    repeats = Counter(" ".join(str(e.get("text", "")).split()) for e in evs if e.get("kind") == "user")
+    repeats = Counter(_shape(str(e.get("text", ""))) for e in evs if e.get("kind") == "user")
     found: list[Correction] = []
     last_agent_text = ""
     seen_user: list[tuple[int, str]] = []
@@ -94,7 +103,7 @@ def extract(events: Iterable[dict], *, agent: str, session_id: str) -> list[Corr
             found.append(_make("rejected_tool", agent, session_id, i, e, f"{e.get('tool') or 'tool'}: {last_agent_text}"))
         elif kind == "user":
             if (_AUTOMATED.search(text) or (i and evs[i - 1].get("kind") == "user" and str(evs[i - 1].get("text", "")) == text)
-                    or repeats[" ".join(text.split())] >= REPEAT_AUTOMATION):
+                    or repeats[_shape(text)] >= REPEAT_AUTOMATION):
                 continue                      # not typed by a person, or the same turn logged twice
             if _INTERRUPT.search(text):
                 found.append(_make("interrupt", agent, session_id, i, e, last_agent_text))

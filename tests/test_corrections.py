@@ -49,6 +49,16 @@ def test_a_prompt_repeated_three_times_is_a_schedule_and_attachments_and_loops_a
         assert kinds([ev("assistant", "x"), ev("user", text), ev("assistant", "y"), ev("user", text + " again")]) == []
 
 
+def test_a_scheduled_prompt_that_only_changes_a_number_is_still_a_schedule():
+    def cycle(n):
+        return f"Gateway watchdog cycle: check hive job {n} and report anything stuck for more than an hour"
+    events = []
+    for n in (25084057, 25084099, 25091234):
+        events += [ev("user", cycle(n)), ev("assistant", "ok")]
+    assert kinds(events) == []
+    assert kinds([ev("assistant", "x"), ev("user", "# AGENTS.md instructions <INSTRUCTIONS> for this repo")]) == []
+
+
 def test_interrupts_and_rejected_tools_are_found():
     assert kinds([ev("assistant", "running"), ev("user", "[Request interrupted by user]")]) == ["interrupt"]
     got = cx.extract([ev("assistant", "I will delete it"), ev("tool_result", "The user doesn't want to proceed with this tool use.",
