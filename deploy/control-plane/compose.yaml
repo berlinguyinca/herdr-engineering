@@ -351,7 +351,7 @@ services:
       - ${HERDR_LLM_RELAY_CONFIG:-./llm-relay/relay.yaml}:/etc/herdr/llm-relay/relay.yaml:ro
     ports:
       - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_RELAY_PORT:-8088}:8080"
-    command: ["relay", "--config", "/etc/herdr/llm-relay/relay.yaml", "run"]
+    command: ["relay", "run", "--config", "/etc/herdr/llm-relay/relay.yaml"]
     healthcheck:
       test: ["CMD", "/usr/local/bin/inferweave-bin", "relay", "healthcheck", "--url", "http://127.0.0.1:8080/healthz"]
       interval: 15s
