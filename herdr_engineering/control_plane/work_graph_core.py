@@ -244,6 +244,8 @@ def _collab_ops(ev: dict) -> list[dict]:
         tid = _text(p["task_id"])
         sc = _scope("room", rooms=[rid], project=pid)
         text = _text(p.get("text"), 4000) or ""
+        if p.get("target_kind") == "user":      # a task for a person: its words and its assignee stay in the collab service
+            text = ""
         ops.append(ent("task", tid, display_name=(text.splitlines() or [tid])[0][:120] or tid, status="pending", **sc,
                        aliases=[("collab_task", tid)],
                        attrs={"room_task_id": tid, "room_id": rid, "target_agent_id": _text(p.get("target_agent_id")),
@@ -267,6 +269,29 @@ def _collab_ops(ev: dict) -> list[dict]:
         status = _text(p.get("status"), 64) if t == "task_updated" else None
         ops.append(ent("task", tid, status=status, **sc,
                        attrs={"last_update": t, "result_chars": len(str(p.get("result") or "")) or None}))
+    elif t in ("team_attached", "team_detached") and rid and _text(p.get("team_id")):
+        # Team collaboration slice 1.  A team's membership is its own data: the AGENTS the owner attached carry a
+        # ``team_role`` fact on the team, the attach is a live ``references`` edge team -> room, and NOTHING here reads the
+        # room's people (design contradiction 1).  No entity upsert, so an attach cannot widen the visibility of a team that
+        # was made without a room.
+        tid = _text(p["team_id"])
+        sc = _scope("room", rooms=[rid], project=pid)
+        mode = "add" if t == "team_attached" else "remove"
+        ops.append(edge("references", ("team", tid), ("room", rid), mode, **sc))
+        agents = p.get("agents") or {}
+        for aid in sorted(agents if isinstance(agents, dict) else agents):
+            aid = _text(aid)
+            if not aid:
+                continue
+            role = _text(agents.get(aid), 64) if isinstance(agents, dict) else None
+            if t == "team_attached":
+                ops.append(ent("agent", aid, "scope", **_scope(None, rooms=[rid])))
+                ops.append(fact("team_role", f"agent:{aid}", ("team", tid), "open", role=role, **sc))
+                ops.append(fact("agent_grant", f"agent:{aid}", ("room", rid), "open",
+                                actions=sorted((p.get("actions") or {}).get(aid) or []), expires_at=None, team_id=tid, **sc))
+            else:
+                ops.append(fact("team_role", f"agent:{aid}", ("team", tid), "close", **sc))
+                ops.append(fact("agent_grant", f"agent:{aid}", ("room", rid), "close", **sc))
     elif t == "mission_linked" and rid and _text(p.get("mission_id")):
         mid = _text(p["mission_id"])
         sc = _scope("room", rooms=[rid], project=pid)

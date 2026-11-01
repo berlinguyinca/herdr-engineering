@@ -45,7 +45,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from . import placement, slurm_placement
+from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.events import WorkerEvent, event_size
+from .assistant_hub.verbs import Verb
+from .assistant_hub.vetoes import FIXED_VETOES
 from .assistant_hub.workers import Enrollment, Worker
 from .inference_models import RETRY_CODES, ModelResolver
 from .reminders import REMINDER_TOOLS, ReminderError
@@ -357,6 +360,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
         "placement": {"slurm": slurm_placement.slurm_config(
             ((section.get("placement") or {}).get("slurm") or {}).get("clusters"))},
+        # Earned per-user action grants for hub workers (shadow period, approval thresholds, extra vetoes).
+        "grants": _grants_config(section.get("grants")),
     }
 
 
@@ -410,6 +415,84 @@ def _hub_config(raw: Any, default_tenant: str) -> dict[str, Any]:
         "enrollment_ttl_seconds": _hub_pos_int(raw.get("enrollment_ttl_seconds", 900), f"{where}.enrollment_ttl_seconds"),
         "worker_ttl_days": _hub_pos_int(raw.get("worker_ttl_days", 90), f"{where}.worker_ttl_days"),
         "tenant": _tenant_id(raw.get("tenant", default_tenant), "hub.tenant"),
+    }
+
+
+_GRANTS_KEYS = {"shadow_days", "shadow_started_at", "required_approvals", "min_sessions", "min_tasks",
+                "grant_ttl_days", "extra_vetoes", "policy_version"}
+_GRANTS_RISKS = ("local_reversible", "remote_reversible", "outward")
+_GRANTS_APPROVALS = {"local_reversible": 5, "remote_reversible": 10, "outward": 30}
+
+
+def _grants_str(value: Any, where: str, limit: int) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+        raise ValueError(f"{where} must be a non-empty string of at most {limit} characters")
+    return value
+
+
+def _grants_extra_vetoes(value: Any, where: str) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{where} must be a list of mappings")
+    out: list[dict[str, str]] = []
+    for i, item in enumerate(value):
+        at = f"{where}[{i}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{at} must be a mapping")
+        unknown = set(item) - {"code", "reason", "verb", "argv_contains"}
+        if unknown:
+            raise ValueError(f"{at} has unknown keys: {sorted(unknown)}")
+        entry = {"code": _grants_str(item.get("code"), f"{at}.code", 64),
+                 "reason": _grants_str(item.get("reason"), f"{at}.reason", 200)}
+        if entry["code"] in FIXED_VETOES:
+            raise ValueError(f"{at}.code must not reuse the fixed veto code {entry['code']!r}")
+        if "verb" in item:
+            verb = _grants_str(item["verb"], f"{at}.verb", 64)
+            if verb not in {v.value for v in Verb}:
+                raise ValueError(f"{at}.verb is not a known verb: {verb!r}")
+            entry["verb"] = verb
+        if "argv_contains" in item:
+            entry["argv_contains"] = _grants_str(item["argv_contains"], f"{at}.argv_contains", 200)
+        if "verb" not in entry and "argv_contains" not in entry:
+            raise ValueError(f"{at} needs verb or argv_contains")
+        out.append(entry)
+    return out
+
+
+def _grants_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.grants``. ``shadow_started_at`` null means the hub stamps it on first start."""
+    where = "control_plane.personal_assistant.grants"
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - _GRANTS_KEYS
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    started = raw.get("shadow_started_at")
+    if started is not None:
+        try:
+            if not isinstance(started, str):
+                raise ValueError("not a string")
+            parsed = datetime.fromisoformat(started)
+        except ValueError as exc:
+            raise ValueError(f"{where}.shadow_started_at must be an ISO-8601 string or null") from exc
+        if parsed.tzinfo is None:
+            raise ValueError(f"{where}.shadow_started_at must include a UTC offset")
+    approvals = raw.get("required_approvals", {})
+    if not isinstance(approvals, dict):
+        raise ValueError(f"{where}.required_approvals must be a mapping")
+    bad = set(approvals) - set(_GRANTS_RISKS)
+    if bad:
+        raise ValueError(f"{where}.required_approvals has unknown keys: {sorted(bad)}")
+    merged = {**_GRANTS_APPROVALS, **approvals}
+    return {
+        "shadow_days": _hub_pos_int(raw.get("shadow_days", 14), f"{where}.shadow_days"),
+        "shadow_started_at": started,
+        "required_approvals": {k: _hub_pos_int(merged[k], f"{where}.required_approvals.{k}") for k in _GRANTS_RISKS},
+        "min_sessions": _hub_pos_int(raw.get("min_sessions", 3), f"{where}.min_sessions"),
+        "min_tasks": _hub_pos_int(raw.get("min_tasks", 2), f"{where}.min_tasks"),
+        "grant_ttl_days": _hub_pos_int(raw.get("grant_ttl_days", 30), f"{where}.grant_ttl_days"),
+        "extra_vetoes": _grants_extra_vetoes(raw.get("extra_vetoes", []), f"{where}.extra_vetoes"),
+        "policy_version": _hub_pos_int(raw.get("policy_version", 1), f"{where}.policy_version"),
     }
 
 
@@ -1857,6 +1940,14 @@ class AssistantStore:
         self.workers: dict[str, Worker] = {}
         self.enrollments: dict[str, Enrollment] = {}
         self.worker_events: dict[str, WorkerEvent] = {}   # insertion order == oldest first
+        self.action_grants: dict[str, ActionGrant] = {}
+        self.action_requests: dict[str, ActionRequestRow] = {}      # insertion order == oldest first
+        self.action_evidence: dict[str, ActionEvidence] = {}        # insertion order == oldest first
+        self.max_action_rows_per_tenant = 5000
+        self.max_action_grants_per_tenant = 2000
+        self._request_index: dict[str, dict[str, None]] = {}        # tenant -> request ids, oldest first
+        self._evidence_index: dict[str, dict[str, None]] = {}
+        self.policy_state: dict[str, Any] = {}                      # small durable policy facts (shadow start)
         self.max_events_per_tenant = 1000
         self.max_event_bytes_per_tenant = 4 * 1024 * 1024
         self._event_index: dict[str, dict[str, int]] = {}   # tenant -> {event_id: size}, oldest first
@@ -1924,6 +2015,10 @@ class AssistantStore:
                 "workers": [self._e_to_dict(x) for x in self.workers.values()],
                 "enrollments": [self._e_to_dict(x) for x in self.enrollments.values()],
                 "worker_events": [self._e_to_dict(x) for x in self.worker_events.values()],
+                "action_grants": [self._e_to_dict(x) for x in self.action_grants.values()],
+                "action_requests": [self._e_to_dict(x) for x in self.action_requests.values()],
+                "action_evidence": [self._e_to_dict(x) for x in self.action_evidence.values()],
+                "policy_state": dict(self.policy_state),
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
             }
@@ -1971,6 +2066,24 @@ class AssistantStore:
                 for d in self.delegations.values() if d.idempotency_key
             }
             self._durable_delegations = copy.deepcopy(self.delegations)
+            self.action_grants = {x.grant_id: x for x in
+                                  (self._e_from_dict(ActionGrant, d) for d in snap.get("action_grants", []))}
+            self.action_requests = {x.request_id: x for x in
+                                    (self._e_from_dict(ActionRequestRow, d) for d in snap.get("action_requests", []))}
+            self.action_evidence = {x.evidence_id: x for x in
+                                    (self._e_from_dict(ActionEvidence, d) for d in snap.get("action_evidence", []))}
+            self._request_index, self._evidence_index = {}, {}
+            for r in self.action_requests.values():
+                self._request_index.setdefault(r.tenant_id, {})[r.request_id] = None
+            for ev in self.action_evidence.values():
+                self._evidence_index.setdefault(ev.tenant_id, {})[ev.evidence_id] = None
+            self.policy_state = dict(snap.get("policy_state", {}))
+            for rows, index in ((self.action_requests, self._request_index),
+                                (self.action_evidence, self._evidence_index)):
+                for idx in index.values():           # an oversized snapshot must not stay over the cap
+                    while len(idx) > self.max_action_rows_per_tenant:
+                        rows.pop(next(iter(idx)), None)
+                        del idx[next(iter(idx))]
             self._routine_fired = set(snap.get("routine_fired", []))
             kept = {e.get("event_id") for e in snap.get("audit", [])}
             merged = [dict(e) for e in snap.get("audit", [])]
@@ -1995,6 +2108,87 @@ class AssistantStore:
                 self._event_bytes[event.tenant_id] -= idx.pop(old)
                 del self.worker_events[old]
             self._after_mutation()
+
+    # -- action grants, requests and evidence (assistant hub) -------------------
+    def _bounded_put(self, rows: dict[str, Any], index: dict[str, dict[str, None]], tenant_id: str, row_id: str,
+                     row: Any) -> None:
+        existing = rows.get(row_id)
+        if existing is not None and existing.tenant_id != tenant_id:
+            raise ValueError(f"id {row_id!r} already belongs to another tenant")     # ids are immutable per tenant
+        rows[row_id] = row
+        idx = index.setdefault(tenant_id, {})
+        idx[row_id] = None                  # re-putting an id keeps its original position
+        while len(idx) > self.max_action_rows_per_tenant:
+            # decided rows go first, so a flood of vetoed or decided requests never pushes out a pending one
+            old = next((k for k in idx if getattr(rows.get(k), "status", "") in ("vetoed", "denied", "approved")),
+                       None) or next(iter(idx))
+            del idx[old]
+            rows.pop(old, None)
+
+    @staticmethod
+    def _sorted_copies(rows: list[Any]) -> list[Any]:
+        return [replace(r) for r in sorted(rows, key=lambda r: r.created_at)]
+
+    def put_action_grant(self, grant: ActionGrant) -> None:
+        with self._lock:
+            if grant.grant_id not in self.action_grants:
+                held = sum(1 for g in self.action_grants.values() if g.tenant_id == grant.tenant_id)
+                if held >= self.max_action_grants_per_tenant:
+                    raise ValueError(f"tenant {grant.tenant_id!r} already holds {held} action grants")
+            self.action_grants[grant.grant_id] = replace(grant)
+            self._after_mutation()
+
+    def get_action_grant(self, grant_id: str, *, tenant_id: str, user_id: str) -> ActionGrant | None:
+        with self._lock:
+            g = self.action_grants.get(grant_id)
+            return replace(g) if g and g.tenant_id == tenant_id and g.user_id == user_id else None
+
+    def list_action_grants(self, tenant_id: str, user_id: str) -> list[ActionGrant]:
+        with self._lock:
+            return self._sorted_copies([g for g in self.action_grants.values()
+                                        if g.tenant_id == tenant_id and g.user_id == user_id])
+
+    def put_action_request(self, request: ActionRequestRow) -> None:
+        with self._lock:
+            self._bounded_put(self.action_requests, self._request_index, request.tenant_id, request.request_id,
+                              replace(request))
+            self._after_mutation()
+
+    def get_action_request(self, request_id: str, *, tenant_id: str, user_id: str) -> ActionRequestRow | None:
+        with self._lock:
+            r = self.action_requests.get(request_id)
+            return replace(r) if r and r.tenant_id == tenant_id and r.user_id == user_id else None
+
+    def list_action_requests(self, tenant_id: str, user_id: str, status: str | None = None) -> list[ActionRequestRow]:
+        with self._lock:
+            return self._sorted_copies([r for r in self.action_requests.values()
+                                        if r.tenant_id == tenant_id and r.user_id == user_id
+                                        and (status is None or r.status == status)])
+
+    def add_action_evidence(self, evidence: ActionEvidence) -> None:
+        with self._lock:
+            self._bounded_put(self.action_evidence, self._evidence_index, evidence.tenant_id, evidence.evidence_id,
+                              replace(evidence))
+            self._after_mutation()
+
+    def list_action_evidence(self, tenant_id: str, user_id: str, key_id: str | None = None) -> list[ActionEvidence]:
+        with self._lock:
+            return self._sorted_copies([e for e in self.action_evidence.values()
+                                        if e.tenant_id == tenant_id and e.user_id == user_id
+                                        and (key_id is None or e.key_id == key_id)])
+
+    def ensure_shadow_started(self, now: datetime, configured: datetime | None = None) -> datetime:
+        """The shadow period's start: the configured time if set, else the first time seen (persisted)."""
+        if configured is not None:
+            return as_utc(configured)
+        now = as_utc(now)
+        with self._lock:
+            stored = self.policy_state.get("shadow_started_at")
+            if stored:
+                return as_utc(datetime.fromisoformat(stored))
+            self.policy_state["shadow_started_at"] = now.isoformat()
+            self._after_mutation()
+            return now
 
     def persist(self) -> None:
         if not self._persist_path:

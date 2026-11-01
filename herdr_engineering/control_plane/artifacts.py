@@ -44,10 +44,13 @@ class ArtifactMergeConflict(ArtifactError):
     """A collaborator merge did not apply cleanly; nothing was stored except one ``artifact_collab_attempts`` row.
 
     ``conflicts`` are ``artifact_merge.FileConflict`` values (``theirs_sha256`` = head side, ``mine_sha256`` =
-    contributor); the contributor resolves and retries with ``base_version_id = head_version_id``."""
+    contributor); the contributor resolves and retries with ``base_version_id = head_version_id``. ``attempt_id`` is
+    the id of that attempt row when ``merge_commit`` raised it."""
 
-    def __init__(self, head_version_id: str | None, conflicts: list, clean_names: list[str]):
+    def __init__(self, head_version_id: str | None, conflicts: list, clean_names: list[str], *,
+                 attempt_id: str | None = None):
         self.head_version_id = head_version_id
+        self.attempt_id = attempt_id
         self.conflicts = list(conflicts)
         self.clean_names = list(clean_names)
         super().__init__(
@@ -63,6 +66,13 @@ async def _transaction(conn: Any):
         return
     async with transaction():
         yield conn
+
+
+# Display-only caps for ``version_text_diff``: they bound diff cost, they are not storage limits.
+MAX_DIFF_FILE_BYTES = 2 * 1024 * 1024
+MAX_DIFF_RESPONSE_BYTES = 4 * 1024 * 1024   # diff text in one response
+MAX_DIFF_FILES = 200                         # changed files diffed per response; the rest are 'oversize'
+MAX_DIFF_READ_BYTES = 16 * 1024 * 1024       # blob bytes read (both sides, all files) per response
 
 
 class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycleMixin):
@@ -363,6 +373,7 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                            created_by: str,
                            collaborator_agent_id: str,
                            idempotency_key: str | None = None,
+                           ticket_id: str | None = None,
                            max_text_bytes: int = 2 * 1024 * 1024) -> dict:
         """Commit a collaborator's ``changes`` made against ``base_version_id``, merging with the head if it moved.
 
@@ -371,7 +382,12 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         three-way ``merge_manifests`` result is committed on top of the head (``result: "merged"``, parents
         ``[head, base]``). A conflict stores nothing but one ``artifact_collab_attempts`` row and raises
         ``ArtifactMergeConflict``. The artifact row lock (as in ``commit_version``) is held from reading the head to
-        committing, so the head cannot move in between. Idempotent per ``(created_by, idempotency_key)``.
+        committing, so the head cannot move in between. Idempotent per ``(created_by, idempotency_key)``. A retracted
+        artifact, base or head version (``lifecycle`` / ``state``) is refused under that lock.
+
+        ``ticket_id`` (the collab intent that asked for this commit, if any) is stored on the attempt row (the
+        raised ``ArtifactMergeConflict.attempt_id`` names that row) and as ``collab_ticket_id`` in a committed
+        version's provenance, which ``merge_commit_for_key`` returns.
 
         If the merged/contributed content fails the manifest and blob checks of ``commit_version`` (or the scoped blob
         registration), that is a conflict of kind ``validation``: the savepoint is rolled back, one attempt row is
@@ -429,6 +445,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             if head_id is None:
                 raise ArtifactError(f"artifact {artifact_id} has no head version")
             head = base if head_id == base_version_id else await self.get_version(head_id, artifact_id)
+            if head is None or any(version.get("state") == "retracted" for version in (base, head)):
+                raise ArtifactError("version is retracted: commit against a live head instead")
             if artifact["artifact_type"] == "report" or any(
                     version.get("report_descriptor") or version.get("source_manifest_blob")
                     for version in (base, head)):
@@ -460,7 +478,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                             artifact_id, base_version_id=head_id, source_manifest_blob=None,
                             output_manifest=merge.files,
                             provenance={"message": message, "merged_names": merge.merged_names,
-                                        "collab_request_sha256": request_sha},
+                                        "collab_request_sha256": request_sha,
+                                        **({"collab_ticket_id": ticket_id} if ticket_id else {})},
                             created_by=created_by, idempotency_key=idempotency_key,
                             parent_version_ids=[head_id] if fast_forward else [head_id, base_version_id],
                             created_via="collaborator", collaborator_agent_id=collaborator_agent_id)
@@ -472,13 +491,15 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                         name, "validation", (base_files.get(name) or {}).get("sha256"),
                         (head_files.get(name) or {}).get("sha256"), (mine.get(name) or {}).get("sha256"), None)]
             if conflicts:
+                attempt_id = str(uuid.uuid4())
                 await self._conn.execute(
                     "INSERT INTO artifact_collab_attempts (attempt_id, artifact_id, collaborator_agent_id, "
-                    "base_version_id, head_version_id, conflict_names, message) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)",
-                    str(uuid.uuid4()), artifact_id, collaborator_agent_id, base_version_id, head_id,
-                    json.dumps([{"name": c.name, "kind": c.kind} for c in conflicts]), message)
+                    "base_version_id, head_version_id, conflict_names, message, ticket_id) "
+                    "VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)",
+                    attempt_id, artifact_id, collaborator_agent_id, base_version_id, head_id,
+                    json.dumps([{"name": c.name, "kind": c.kind} for c in conflicts]), message, ticket_id)
                 # leave the block normally so the attempt row commits; raise once the transaction is closed
-                conflict = ArtifactMergeConflict(head_id, conflicts, merge.clean_names)
+                conflict = ArtifactMergeConflict(head_id, conflicts, merge.clean_names, attempt_id=attempt_id)
         if conflict is not None:
             raise conflict
         return {"result": "created" if fast_forward else "merged", "version": version,
@@ -495,23 +516,33 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         candidates = list(merge.merged_names) + [c["name"] for c in normalized if c["op"] == "put"]
         return candidates[0] if candidates else (normalized[0]["name"] if normalized else "*")
 
-    async def _merge_replay(self, principal: str, idempotency_key: str | None, request_sha: str) -> dict | None:
+    async def merge_commit_for_key(self, created_by: str, idempotency_key: str | None) -> dict | None:
+        """The ``merge_commit`` already committed for ``(created_by, idempotency_key)``, as ``merge_commit`` returns
+        it plus ``ticket_id`` (the ``ticket_id`` it was committed for, or None), else None. Nothing is compared: the
+        caller decides whether its request is the same one."""
         if not idempotency_key:
             return None
         prior = await self._conn.fetchrow(
             "SELECT version_id FROM artifact_idempotency WHERE principal_id=$1 AND idempotency_key=$2",
-            principal, idempotency_key)
-        if not prior:
-            return None
-        version = await self.get_version(prior["version_id"])
+            created_by or "unknown", idempotency_key)
+        version = await self.get_version(prior["version_id"]) if prior else None
         if version is None:
             return None
         provenance = version.get("provenance") or {}
-        if provenance.get("collab_request_sha256") != request_sha:
-            raise ArtifactError("idempotency key was reused for a different request")
         parents = version.get("parent_version_ids") or []
+        ticket = provenance.get("collab_ticket_id")
         return {"result": "merged" if len(parents) > 1 else "created", "version": version,
-                "merged_names": list(provenance.get("merged_names") or [])}
+                "merged_names": list(provenance.get("merged_names") or []),
+                "ticket_id": ticket if isinstance(ticket, str) else None}
+
+    async def _merge_replay(self, principal: str, idempotency_key: str | None, request_sha: str) -> dict | None:
+        prior = await self.merge_commit_for_key(principal, idempotency_key)
+        if prior is None:
+            return None
+        if (prior["version"].get("provenance") or {}).get("collab_request_sha256") != request_sha:
+            raise ArtifactError("idempotency key was reused for a different request")
+        prior.pop("ticket_id")
+        return prior
 
     @staticmethod
     def _normalize_changes(changes: Any) -> list[dict]:
@@ -648,6 +679,12 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                         size_bytes=output.get("size_bytes"), media_type=output.get("media_type"))
         return len(outputs)
 
+    async def scoped_blob_media_type(self, artifact_id: str, sha256: str) -> str | None:
+        """The media type of the blob registered for ``(artifact_id, sha256)``, or None (scoped rows are immutable,
+        so a new entry for the same bytes must reuse it)."""
+        return await self._conn.fetchval(
+            "SELECT media_type FROM artifact_blobs WHERE scope=$1 AND blob_sha256=$2", artifact_id, sha256)
+
     async def register_report_blob(self, artifact_id: str, *, storage_key: str, sha256: str,
                                    size_bytes: int, media_type: str) -> dict:
         """Record bytes already verified by the scoped HTTP/worker upload boundary."""
@@ -722,9 +759,107 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
     async def list_version_summaries(self, artifact_id: str) -> list[dict]:
         rows = await self._conn.fetch(
             "SELECT version_id, artifact_id, version_number, parent_version_id, parent_version_ids, created_via, "
-            "collaborator_agent_id, created_by, state, created_at, committed_at, (report_descriptor IS NOT NULL) AS is_report FROM artifact_versions "
+            "collaborator_agent_id, created_by, state, created_at, committed_at, (report_descriptor IS NOT NULL) AS is_report, "
+            "provenance->>'message' AS message FROM artifact_versions "
             "WHERE artifact_id=$1 ORDER BY version_number DESC", artifact_id)
         return [self._row(row) for row in rows]
+
+    async def collab_state(self, artifact_id: str) -> dict | None:
+        """Who owns an artifact and whether collaborators may write to it: ``{created_by, writable,
+        writable_reason}``, or None for an unknown artifact. Mirrors the rules ``merge_commit`` and the mirror use."""
+        from .collab_mirror import RENDERED_READ_ONLY, REPORT_READ_ONLY
+        artifact = await self._conn.fetchrow(
+            "SELECT created_by, artifact_type, lifecycle, current_version_id FROM artifacts WHERE artifact_id=$1",
+            artifact_id)
+        if artifact is None:
+            return None
+        reason = None
+        head = None
+        if artifact["current_version_id"]:
+            head = await self._conn.fetchrow(
+                "SELECT state, (report_descriptor IS NOT NULL) AS is_report, (source_manifest_blob IS NOT NULL) AS built "
+                "FROM artifact_versions WHERE version_id=$1 AND artifact_id=$2",
+                artifact["current_version_id"], artifact_id)
+        if artifact["artifact_type"] == "report":
+            reason = REPORT_READ_ONLY
+        elif artifact["lifecycle"] == "retracted":
+            reason = "artifact is retracted"
+        elif head is None:
+            reason = "artifact has no head version"
+        elif head["is_report"] or head["built"]:
+            reason = RENDERED_READ_ONLY
+        return {"created_by": artifact["created_by"], "writable": reason is None, "writable_reason": reason}
+
+    def _read_limited(self, entry: dict, limit: int) -> bytes | None:
+        """The blob's bytes, or None as soon as it is seen to exceed ``limit`` (never buffers more than limit + a chunk)."""
+        reference = entry.get("storage_key") or entry.get("blob_sha256") or entry.get("sha256")
+        if isinstance(reference, str) and len(reference) == 64 and "/" not in reference:
+            reference = f"sha256/{reference[:2]}/{reference[2:4]}/{reference}"
+        digest = entry.get("sha256") or entry.get("blob_sha256")
+        chunks, size = [], 0
+        try:
+            for chunk in self._rf.iter_get(reference, digest, chunk_size=1024 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    return None
+                chunks.append(chunk)
+        except Exception as exc:                          # noqa: BLE001 - missing object, IntegrityError, transport
+            raise ArtifactError(f"cannot read artifact blob for {entry.get('name')}") from exc
+        return b"".join(chunks)
+
+    async def version_text_diff(self, artifact_id: str, version_id: str) -> dict | None:
+        """Display diff of a version against its first parent (None for an unknown version).
+
+        ``{version_id, against, files: [{name, change, diff, reason?}]}`` with files sorted by name. ``diff`` text comes
+        from ``ArtifactBundle.diff``. A changed file bigger than ``MAX_DIFF_FILE_BYTES`` on either side, or met after
+        ``MAX_DIFF_RESPONSE_BYTES`` of diff text is already in the response, has ``reason: oversize``; a non-text
+        file has ``reason: binary``. The caps bound display cost only; nothing is truncated in storage."""
+        from .artifact_bundle import ArtifactBundle
+        version = await self.get_version(version_id, artifact_id)
+        if version is None:
+            return None
+        parents = version.get("parent_version_ids") or ([version["parent_version_id"]]
+                                                          if version.get("parent_version_id") else [])
+        against = parents[0] if parents else None
+        parent = await self.get_version(against, artifact_id) if against else None
+        if against and parent is None:
+            raise ArtifactError("parent version missing")
+        new_files = self._manifest_by_name(version.get("output_manifest"))
+        old_files = self._manifest_by_name(parent.get("output_manifest")) if parent else {}
+        spent, read_total, diffed, out = 0, 0, 0, []
+        for name in sorted(set(new_files) | set(old_files)):
+            old, new = old_files.get(name), new_files.get(name)
+            change = ("added" if old is None else "deleted" if new is None
+                      else "unchanged" if old["sha256"] == new["sha256"] else "modified")
+            item = {"name": name, "change": change, "diff": None}
+            out.append(item)
+            if change == "unchanged":
+                continue
+            media_type = (new or old).get("media_type") or "application/octet-stream"
+            if not (media_type.startswith("text/") or media_type == "application/json"):
+                item["reason"] = "binary"
+                continue
+            sides = [side for side in (old, new) if side is not None]
+            if (spent >= MAX_DIFF_RESPONSE_BYTES or diffed >= MAX_DIFF_FILES
+                    or read_total >= MAX_DIFF_READ_BYTES
+                    or any(isinstance(s.get("size_bytes"), int) and s["size_bytes"] > MAX_DIFF_FILE_BYTES
+                           for s in sides)):
+                item["reason"] = "oversize"
+                continue
+            diffed += 1
+            data = [self._read_limited(side, MAX_DIFF_FILE_BYTES) for side in sides]
+            read_total += sum(len(d) for d in data if d is not None)
+            if any(d is None for d in data):
+                item["reason"] = "oversize"
+                continue
+            if any(b"\x00" in d for d in data):
+                item["reason"] = "binary"
+                continue
+            left = data[0] if old is not None else b""
+            right = data[-1] if new is not None else b""
+            item["diff"] = ArtifactBundle.diff(left, right, media_type=media_type)
+            spent += len(item["diff"].encode("utf-8"))
+        return {"version_id": version_id, "against": against, "files": out}
 
     async def get_report_job(self, artifact_id: str, job_id: str) -> dict | None:
         row = await self._conn.fetchrow(
@@ -1032,7 +1167,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
     async def load_acl(self) -> list[dict]:
         rows = await self._conn.fetch(
             "SELECT artifact_id, principal_id, permissions, expires_at, granted_by "
-            "FROM artifact_acl")
+            "FROM artifact_acl WHERE (principal_id NOT LIKE 'collab:%' OR principal_id LIKE 'collab:user:%') "
+            "AND principal_id NOT LIKE 'collab-invite:%'")
         return [self._row(row) for row in rows]
 
     async def load_reviews(self) -> list[dict]:

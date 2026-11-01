@@ -188,6 +188,13 @@ services:
       - ${HERDR_SHARES_DIR:?run deploy.sh}:/shares
       - ${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events
       - herdr-cp-share-markers:/var/lib/herdr/share-markers
+      # Collaborator bridge (control_plane.collab_artifacts; container paths are its defaults, keep them). The worker runs
+      # as root (no user:), so it writes the mirror (files 0644, dirs 0755), reads staged parts (0600) and unlinks in
+      # the outbox even though deploy.sh creates both as the deploying uid. The spool (assembled uploads, large
+      # storage) is the worker's alone: collab-public never mounts it. deploy.sh creates all three, always.
+      - ${HERDR_COLLAB_MIRROR_DIR:?run deploy.sh}:/collab-mirror
+      - ${HERDR_COLLAB_OUTBOX_DIR:?run deploy.sh}:/collab-outbox
+      - ${HERDR_COLLAB_SPOOL_DIR:?run deploy.sh}:/collab-spool
     environment:
       HERDR_ENGINEERING_CONFIG: /app/control-plane/config.yaml
     command:
@@ -233,9 +240,100 @@ services:
       timeout: 3s
       retries: 3
 
+  # ---- PROTOTYPE: InferWeave gateway at the fabric edge, next to llm-proxy --------
+  # Opt-in: `docker compose --profile llm-gateway up`. The same hk- project key works on both
+  # addresses. llm-proxy keeps chat, token accounting and custom models; this gateway adds
+  # System One and the rest of the InferWeave surface (agents get INFERWEAVE_BASE_URL when
+  # `llm.inferweave_url` is set). llm-gateway-sync renders the control plane's keys as
+  # sha256-only principals; the gateway follows that file live, so keys need no restart.
+  # HERDR_LLM_GATEWAY_DIR must be a 0700 directory holding secrets/kek, secrets/admin and
+  # secrets/client-token. Defaults, not `:?` guards: compose interpolates every service.
+  llm-gateway-sync:
+    profiles: ["llm-gateway"]
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-unset}
+    container_name: herdr-llm-gateway-sync
+    restart: unless-stopped
+    # The gateway image runs as 1000:1000 and reads the 0600 files these write.
+    user: "1000:1000"
+    depends_on:
+      - control-plane-web
+    volumes:
+      - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+    command:
+      - "control-plane"
+      - "llm-gateway-sync"
+      - "--control-plane"
+      - "http://control-plane-web:8080"
+      - "--principals-file"
+      - "/var/lib/herdr-llm-gateway/principals.json"
+    healthcheck:
+      test: ["CMD", "test", "-s", "/var/lib/herdr-llm-gateway/principals.json"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  llm-gateway:
+    profiles: ["llm-gateway"]
+    image: herdr-llm-gateway:${HERDR_LLM_GATEWAY_TAG:-unset}
+    container_name: herdr-llm-gateway
+    restart: unless-stopped
+    depends_on:
+      llm-gateway-sync:
+        condition: service_healthy
+    volumes:
+      - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+      - ./llm-gateway/gateway.yaml:/etc/herdr/llm-gateway/gateway.yaml:ro
+    ports:
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_GATEWAY_PORT:-8089}:8089"
+    command:
+      - "gateway"
+      - "serve"
+      - "--config"
+      - "/etc/herdr/llm-gateway/gateway.yaml"
+      - "--listen"
+      - "0.0.0.0:8089"
+      - "--outbox"
+      - "/var/lib/herdr-llm-gateway/outbox"
+      - "--name"
+      - "herdr-eng-edge"
+      - "--nodes"
+      - "/var/lib/herdr-llm-gateway/nodes.json"
+      - "--adaptive"
+      - "--no-builtin-models"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8089/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  llm-gateway-usage:
+    profiles: ["llm-gateway"]
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-unset}
+    container_name: herdr-llm-gateway-usage
+    restart: unless-stopped
+    # The gateway image runs as 1000:1000 and reads the 0600 files these write.
+    user: "1000:1000"
+    depends_on:
+      llm-gateway:
+        condition: service_healthy
+    volumes:
+      - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+    command:
+      - "control-plane"
+      - "llm-gateway-usage"
+      - "--control-plane"
+      - "http://control-plane-web:8080"
+      - "--gateway"
+      - "http://llm-gateway:8089"
+      - "--admin-secret-file"
+      - "/var/lib/herdr-llm-gateway/secrets/admin"
+      - "--state-file"
+      - "/var/lib/herdr-llm-gateway/usage-state.json"
+
   # ---- dev.lan front door (host network; was deploy/fabric-stack) -------------
   # The worker mounts ./config.yaml (control plane); the fabric services mount
   # the fabric config from ../fabric-stack. Same project, same rendered substitution file.
+
   coredns:
     image: coredns/coredns:1.11.4
     container_name: herdr-coredns

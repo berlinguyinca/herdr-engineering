@@ -67,6 +67,9 @@ class ControlPlaneClient:
     def report(self, record: dict) -> None:
         self._call("/api/v1/token-usage", record)
 
+    def report_batch(self, records: list[dict]) -> None:
+        self._call("/api/v1/token-usage", {"records": records})
+
 
 class ProxyState:
     """Key and custom-model tables, refreshed from the control plane."""

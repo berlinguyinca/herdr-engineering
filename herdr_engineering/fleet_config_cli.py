@@ -190,7 +190,7 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
-                         "contextual", "insights",
+                         "contextual", "insights", "team_rooms", "team_roles",
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled",
@@ -236,6 +236,16 @@ def collab_values(cfg: FleetConfig) -> dict:
         normalize_contextual(collab.get("contextual"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_team_rooms import normalize_team_rooms
+    try:
+        normalize_team_rooms(collab.get("team_rooms"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_team_roles import normalize_team_roles
+    try:
+        normalize_team_roles(collab.get("team_roles"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
     from .control_plane.collab import summary_fix_config
     try:
         summary_fix_config(collab.get("summary_fix"))
@@ -244,11 +254,24 @@ def collab_values(cfg: FleetConfig) -> dict:
     return dict(collab)
 
 
+def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
+    """The one thing collab-public needs of ``control_plane.collab_artifacts``: whether the bridge is on. Exactly
+    ``enabled: true`` renders true; anything else (absent, false, "true", 1) renders false. No limit travels here: the
+    worker publishes its limits in grants.json."""
+    try:
+        section = cfg.section(CONTROL_PLANE_SECTION).get("collab_artifacts")
+    except FleetConfigError:
+        section = None
+    enabled = isinstance(section, dict) and section.get("enabled") is True
+    return {"collab_artifacts": {"enabled": enabled}}
+
+
 def render_collab(cfg: FleetConfig, out: Path) -> None:
-    """Write a minimal fleet file (JSON, valid YAML, 0600) holding only control_plane.collab."""
+    """Write a minimal fleet file (JSON, valid YAML, 0600) holding only control_plane.collab and the
+    ``collab_artifacts: {enabled: <bool>}`` switch."""
     data = {"version": SCHEMA_VERSION,
             "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
-                                                 "values": {"collab": collab_values(cfg)}}},
+                                                 "values": {"collab": collab_values(cfg), **_collab_artifacts_slice(cfg)}}},
             "hosts": {}}
     _parse(data)
     write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")

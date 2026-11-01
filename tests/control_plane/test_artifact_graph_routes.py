@@ -219,6 +219,24 @@ def test_retract_needs_admin_validates_the_body_and_the_version(world):
     assert node(w, "artifact:artifact_1", "reader-key") == 200
 
 
+def test_retract_restrict_all_must_be_a_bool_and_a_failed_persist_without_the_bridge_has_no_callback(world):
+    w = world
+    grant_owner(w)
+    commit(w)
+    for bad in ("yes", 1, None):
+        assert call(w, "/api/v1/artifacts/artifact_1/retract", body={"restrict_all": bad})[0] == 400, bad
+    assert node(w, "artifact:artifact_1") == 200                                 # nothing happened
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("db down")
+    w.store.record_retraction = boom
+    for body in ({}, {"restrict_all": True}):                                      # bridge disabled: nothing to revoke
+        status, out = call(w, "/api/v1/artifacts/artifact_1/retract", body=body)
+        assert status == 500 and out["persisted"] is False
+        assert out["collab_write_grants_revoked"] is None and out["collab_revoke_error"] is None
+        assert out["restrict_all_offered"] is True and "collab_all_grants_revoked" not in out
+
+
 def test_as_of_replay_cannot_resurrect_a_retracted_node():
     """A replayed (historical) projection reads through the CURRENT projection, so the retraction holds in the past."""
     from herdr_engineering.control_plane.artifact_scope import install_gate, visibility_fields

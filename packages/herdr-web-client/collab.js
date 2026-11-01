@@ -75,15 +75,16 @@ function lineageQuery(room, o, extra = {}) {
 }
 
 export class CollabApi {
+  // getTokens = null selects the same-origin dashboard mode: no bearer token, the dashboard proxy authenticates.
   constructor(getTokens, fetchFn = (...a) => fetch(...a), base = '/api/v1/collab') {
     this.getTokens = getTokens; this.fetch = fetchFn; this.base = base;
   }
   async call(method, path, body, signal) {
-    const t = this.getTokens();
-    if (!t) throw new AuthError('signed out');
+    const t = this.getTokens ? this.getTokens() : null;
+    if (this.getTokens && !t) throw new AuthError('signed out');
     const res = await this.fetch(this.base + path, {
       method,
-      headers: { Authorization: `Bearer ${t.access}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      headers: { ...(t ? { Authorization: `Bearer ${t.access}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
       signal,
     });

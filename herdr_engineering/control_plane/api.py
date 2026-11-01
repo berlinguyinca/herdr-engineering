@@ -33,6 +33,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
+from .artifact_acl import is_agent_collaborator
 from .artifacts import ArtifactConflict, ArtifactError
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
@@ -304,6 +305,7 @@ class ControlPlaneServer:
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None,
+                 collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
@@ -441,6 +443,9 @@ class ControlPlaneServer:
         self.share_store = share_store
         self.shares_root = shares_root
         self.share_settings = share_settings
+        # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
+        self.collab_grant_store = collab_grant_store
+        self.collab_artifacts_enabled = collab_artifacts_enabled
         self.attachment_dedupe: dict = {}      # redelivery guard for the email-attachment route; lost on restart
         from .artifact_scope import install_gate
         self.artifact_graph_gate = install_gate(repo.graph, artifact_acl)   # None without an ACL: nodes stay private
@@ -532,6 +537,9 @@ class ControlPlaneServer:
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
         self._ingest_limiter = _RateLimiter(max_requests=6000)
+        # POST /mcp: chunked artifact staging legitimately sends many requests; the edge (25 r/s per IP) is the
+        # binding per-client ceiling, this one is a sanity backstop above it.
+        self._mcp_limiter = _RateLimiter(max_requests=1800)
         self._stream_limiter = _RateLimiter(max_requests=120)
         # Fail-closed (Spec §104): never default a blank/missing role to
         # "operator". Keep roles verbatim after strip; empty/None/unknown
@@ -1677,6 +1685,7 @@ class ControlPlaneServer:
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
             self._summary_scanner.start()
         self._start_background_thread(self._sweep_loop)
+        self._start_background_thread(self._team_roles_loop)
         self._start_background_thread(self._deployments_loop)
         if getattr(self, "ci_watch", None) is not None and self.ci_watch.config["enabled"]:
             self._start_background_thread(self.ci_watch.run)
@@ -1688,6 +1697,20 @@ class ControlPlaneServer:
             self._start_background_thread(self._link_flush_loop)
         self._ready.set()
         return self._httpd
+
+    def _team_roles_loop(self):
+        """Team collaboration slice 2: the server-side clock for tasks held by people. It evaluates leases whether or not the
+        assignee ever polls; the sweep is idempotent, crash-safe (state is replayed from the log) and a no-op while the flag is off."""
+        while not self._maintenance_stop.is_set():
+            interval = 30
+            collab = self.collab
+            if collab is not None:
+                try:
+                    collab.sweep_team_roles()
+                    interval = collab.team_roles_cfg()["sweep_interval_seconds"]
+                except Exception as exc:                        # noqa: BLE001 - a sweep failure must never stop the loop
+                    log.warning("team roles sweep failed: %s", type(exc).__name__)
+            self._maintenance_stop.wait(interval)
 
     def _sweep_loop(self, interval=300):
         """Periodic retention, starting at once so re-hydrated expired rows do not linger."""
@@ -2195,6 +2218,20 @@ def _make_handler(server, public=False, operator=False):
             from . import collab_mcp
             return self._jsonrpc(collab_mcp.handle, "MCP")
 
+        def handle_expect_100(self):
+            """``Expect: 100-continue`` on POST /mcp is answered only after the large-body gate has decided (see
+            ``_continue_100``); inviting the body first would defeat the pre-authentication gate."""
+            if self.command == "POST" and self.path.split("?")[0] == "/mcp":
+                self._expect_100_pending = True
+                return True
+            return super().handle_expect_100()
+
+        def _continue_100(self):
+            if getattr(self, "_expect_100_pending", False):
+                self._expect_100_pending = False
+                self.send_response_only(100)
+                self.end_headers()
+
         def _jsonrpc(self, handle, label):
             from .collab import MAX_BODY
             if server.collab is None:
@@ -2211,17 +2248,45 @@ def _make_handler(server, public=False, operator=False):
             if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                 return self._deny(415, "application/json required")
             length = _content_length(self.headers.get("Content-Length"))
-            if length is None or length <= 0 or length > MAX_BODY:
+            principal, big_tools = None, None
+            if length is None or length <= 0:
                 return self._deny(413, "request body size not allowed")
+            if length > MAX_BODY:
+                if label != "MCP":
+                    return self._deny(413, "request body size not allowed")
+                from . import collab_mcp
+                from .collab_bridge_files import MCP_UPLOAD_MAX_BODY
+                if length > MCP_UPLOAD_MAX_BODY:
+                    return self._deny(413, "request body size not allowed")
+                # Pre-authentication large-body gate: nothing above MAX_BODY is read for a caller who is not an
+                # authenticated agent admitted by a registered predicate (every refusal closes the connection).
+                if (len(self.headers.get_all("Content-Length") or []) != 1
+                        or "Transfer-Encoding" in self.headers):
+                    return self._deny(400, "ambiguous request framing")
+                try:
+                    principal = server.collab.authenticate(
+                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"))
+                    big_tools = collab_mcp.admitted_tools(server.collab, principal) if principal.is_agent else frozenset()
+                except Exception:
+                    big_tools = frozenset()
+                if not big_tools:
+                    return self._deny(413, "request body size not allowed")
+            self._continue_100()
             try:
                 message = json.loads(self.rfile.read(length))
             except (ValueError, RecursionError):
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32700, "message": "parse error"}}, 400)
             try:
+                if big_tools is not None:
+                    from . import collab_mcp
+                    refusal = collab_mcp.oversize_refusal(message, big_tools)
+                    if refusal is not None:
+                        return self._json(refusal[1], refusal[0])
+                extra = {} if principal is None else {"principal": principal}
                 status, payload = handle(
                     server.collab, message, self.headers.get("Authorization", ""),
-                    self.headers.get("X-Herdr-Device"))
+                    self.headers.get("X-Herdr-Device"), **extra)
             except Exception:
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32603, "message": "internal error"}}, 500)
@@ -2373,20 +2438,23 @@ def _make_handler(server, public=False, operator=False):
             path = self.path.split("?")[0]
             # Decide on the DECODED resource: routing unquotes each segment, so a raw
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
-            segs = path.split("/")
-            res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers"}
+            segs = [unquote(seg) for seg in path.split("/")]
+            # What the router matches: every guard below tests THIS, never the raw path. A decoded %2F stays inside its
+            # segment (the router keeps ``a/b`` as ONE part), so it is masked and ``[^/]+`` still matches it.
+            dpath = "/".join(seg.replace("/", "\x00") for seg in segs)
+            res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
+            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
+                                    "assistant-action-requests", "assistant-grants"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
-                    or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
-                    or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
+                    or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
+                    or _TERMINAL_ATTACH.match(dpath) or _STEER_ACK.match(dpath) or _is_rereview(path)):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
-            if path.split("/")[3:4] and path.split("/")[3] in {
-                    "artifacts", "artifact-reports", "artifact-jobs", "artifact-reviews", "publications"}:
+            if res in {"artifacts", "artifact-reports", "artifact-jobs", "artifact-reviews", "publications"}:
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -2481,7 +2549,8 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-routines", "assistant-connectors",
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
-                                        "assistant-reminders", "assistant-workers"}
+                                        "assistant-reminders", "assistant-workers",
+                                        "assistant-action-requests", "assistant-grants"}
 
         def _mutate_verb(self):
             if operator:
@@ -2511,7 +2580,8 @@ def _make_handler(server, public=False, operator=False):
             err = self._require("operator")
             if err:
                 return err
-            if resource in ("assistant-apps", "assistant-reminders", "assistant-workers"):
+            if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
+                            "assistant-action-requests", "assistant-grants"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -2936,6 +3006,8 @@ def _make_handler(server, public=False, operator=False):
                 limiter = server._stream_limiter
             elif self.command == "POST" and path == "/api/v1/ingest":
                 limiter = server._ingest_limiter
+            elif self.command == "POST" and path == "/mcp":
+                limiter = server._mcp_limiter
             else:
                 limiter = server._limiter
             if limiter.allow(who):
@@ -2964,6 +3036,9 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_collab_api import route_collab
+                if route_collab(self, server, parts, resource):
+                    return None
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
                     return None
@@ -3757,6 +3832,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_reminders(parts)
             if resource == "assistant-workers":
                 return self._assistant_workers(parts)
+            if resource in ("assistant-action-requests", "assistant-grants"):
+                return self._assistant_hub_owner(parts, resource)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -3805,6 +3882,8 @@ def _make_handler(server, public=False, operator=False):
                 if not self._artifact_allowed(parts[4], 'admin'):
                     return self._artifact_forbidden()
                 body = self._read_json() or {}
+                if is_agent_collaborator(str(body.get("principal_id") or "")):
+                    return self._json({"error": "collaborator grants use the collaborators route"}, 400)
                 permissions = set(body.get("permissions") or [])
                 grant = server.artifact_acl.grant(
                     parts[4], str(body.get("principal_id") or ""), permissions,
@@ -3815,6 +3894,8 @@ def _make_handler(server, public=False, operator=False):
                 if not self._artifact_allowed(parts[4], 'admin'):
                     return self._artifact_forbidden()
                 body = self._read_json() or {}
+                if is_agent_collaborator(str(body.get("principal_id") or "")):
+                    return self._json({"error": "collaborator grants use the collaborators route"}, 400)
                 server.artifact_acl.revoke(parts[4], str(body.get("principal_id") or ""))
                 return self._json({"ok": True})
             if resource == "artifacts" and server.artifact_graph_gate is not None and len(parts) == 6 \
@@ -3829,6 +3910,10 @@ def _make_handler(server, public=False, operator=False):
             if resource == "artifact-jobs" and server.artifact_graph_gate is not None \
                     and server.artifact_store is not None and len(parts) == 6 and parts[5] == "lineage":
                 return self._artifact_job_lineage(parts[4])
+            if resource == "artifacts" and server.artifact_graph_gate is not None \
+                    and server.artifact_store is not None and len(parts) == 8 and parts[5] == "versions" \
+                    and parts[7] == "collab-lineage":
+                return self._artifact_collab_lineage(parts[4], parts[6])
             if resource == "artifacts" and server.artifact_store is not None and len(parts) == 6 and parts[5] == "versions":
                 if not self._artifact_allowed(parts[4], 'edit'):
                     return self._artifact_forbidden()
@@ -4223,6 +4308,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_reminders(parts)
             if resource == "assistant-workers":
                 return self._assistant_workers(parts, body)     # body was read above; never read it twice
+            if resource in ("assistant-action-requests", "assistant-grants"):
+                return self._assistant_hub_owner(parts, resource, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4475,12 +4562,103 @@ def _make_handler(server, public=False, operator=False):
                     if harness not in HARNESSES:
                         return self._json({"error": f"unknown harness: {harness!r}"}, 400)
                     enrollment, code = registry.create_enrollment(tenant_id=tenant_id, user_id=user_id,
-                                                                  name=name, harness=harness)
+                                                                  name=name, harness=harness,
+                                                                  scopes=body.get("scopes"))
                     return self._json({"enrollment_id": enrollment.enrollment_id, "code": code,
                                        "expires_at": enrollment.expires_at.isoformat(),
+                                       "scopes": list(enrollment.scopes),
                                        "setup": self._worker_setup(harness)}, 201)
+                if len(parts) == 6 and parts[5] == "scopes" and self.command == "POST":
+                    if not isinstance(body, dict) or set(body) != {"scopes"}:
+                        return self._json({"error": 'body must be exactly {"scopes": [...]}'}, 400)
+                    return self._json(registry.set_scopes(tenant_id, user_id, parts[4], body["scopes"]).as_dict())
                 if len(parts) == 5 and self.command == "DELETE":
                     return self._json(registry.revoke(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+
+        @staticmethod
+        def _iso(value):
+            return value.isoformat() if value is not None else None
+
+        def _assistant_hub_owner(self, parts, resource, body=None):
+            """Owner-only views and decisions over the hub's action requests and grants (operator API key only; a
+            Worker credential is not one). ``display`` is returned here and nowhere a worker can read."""
+            from .assistant import AssistantNotFound, AssistantUnavailable
+            from .assistant_hub.policy import (
+                ActivationRefused,
+                activate_grant,
+                record_owner_decision,
+                revoke_action_grant,
+            )
+            if self._require("operator"):
+                return None
+            iso = self._iso
+            try:
+                server.assistant._require_enabled()
+                if server.assistant_workers is None:
+                    raise AssistantUnavailable("the assistant hub is not enabled")
+                tenant_id, user_id = self._assistant_scope()
+                svc, store = server.assistant, server.assistant.store
+                cfg = svc.config["grants"]
+
+                def request_view(r):
+                    return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
+                            "task_id": r.task_id, "verb": r.verb, "risk_class": r.risk_class, "status": r.status,
+                            "reason": r.reason, "display": r.display, "created_at": iso(r.created_at),
+                            "decided_at": iso(r.decided_at), "decided_by": r.decided_by, "key_id": r.key_id}
+
+                def grant_view(g):
+                    return {"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb,
+                            "resource_scope": g.resource_scope, "key_id": g.key_id,
+                            "state": g.effective_state(svc.now(), int(cfg["policy_version"])).value,
+                            "policy_version": g.policy_version, "created_at": iso(g.created_at),
+                            "proposed_at": iso(g.proposed_at), "activated_at": iso(g.activated_at),
+                            "expires_at": iso(g.expires_at), "revoked_at": iso(g.revoked_at),
+                            "confirmed_by": g.confirmed_by}
+
+                def exact(keys):
+                    return isinstance(body, dict) and set(body) == keys
+
+                if resource == "assistant-action-requests":
+                    if len(parts) == 4 and self.command == "GET":
+                        status = _q(self.path, "status")
+                        if status not in (None, "", "pending", "approved", "denied", "vetoed"):
+                            return self._json({"error": "status must be pending, approved, denied or vetoed"}, 400)
+                        rows = store.list_action_requests(tenant_id, user_id, status or None)
+                        return self._json({"requests": [request_view(r) for r in rows]})
+                    if len(parts) == 6 and parts[5] == "decision" and self.command == "POST":
+                        if not exact({"approve"}) or not isinstance(body["approve"], bool):
+                            return self._json({"error": 'body must be exactly {"approve": true|false}'}, 400)
+                        try:
+                            row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
+                                                        body["approve"], decided_by=user_id)
+                        except ValueError as exc:       # already decided, or vetoed (a veto is final)
+                            return self._json({"error": str(exc), "code": "conflict"}, 409)
+                        return self._json(request_view(row))
+                else:
+                    if len(parts) == 4 and self.command == "GET":
+                        return self._json({"grants": [grant_view(g) for g in store.list_action_grants(tenant_id, user_id)]})
+                    if len(parts) == 5 and self.command == "DELETE":
+                        return self._json(grant_view(revoke_action_grant(store, svc.now(), tenant_id, user_id,
+                                                                          parts[4], revoked_by=user_id)))
+                    if len(parts) == 6 and parts[5] == "activate" and self.command == "POST":
+                        if not exact({"confirm"}) or body["confirm"] is not True:
+                            return self._json({"error": 'body must be exactly {"confirm": true}'}, 400)
+                        try:
+                            # The judge gate is hard-coded unsatisfied this phase: Phase 3 wires the real judge gate.
+                            grant = activate_grant(store, cfg, svc.now(), tenant_id, user_id, parts[4],
+                                                   confirmed_by=user_id, judge_gate_satisfied=False)
+                        except ActivationRefused as exc:
+                            if exc.code == "not_found":
+                                return self._json({"error": "not found"}, 404)
+                            return self._json({"error": str(exc), "code": exc.code}, 409)
+                        return self._json(grant_view(grant))
                 return self._json({"error": "not found"}, 404)
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)
@@ -5407,13 +5585,20 @@ def _make_handler(server, public=False, operator=False):
 
         # ----------------------------------------------------- artifact <-> lineage graph routes
         def _artifact_retract(self, artifact_id):
-            """POST /api/v1/artifacts/<id>/retract {"version_id"?, "reason"?}: hide the artifact (or one version) from
-            every graph reader, durably. ``admin`` on the artifact, like the ACL routes."""
+            """POST /api/v1/artifacts/<id>/retract {"version_id"?, "reason"?, "restrict_all"?}: hide the artifact (or one
+            version) from every graph reader, durably. ``admin`` on the artifact, like the ACL routes.
+
+            Fail-safe: when the retraction could not be persisted (hidden in memory only) the artifact's collaborator WRITE
+            grants are revoked. ``restrict_all: true`` additionally revokes its read grants, on that failed path only;
+            without the flag read grants are never touched and the 500 offers it (``restrict_all_offered``)."""
             if not self._artifact_allowed(artifact_id, "admin"):
                 return self._artifact_forbidden()
             body = self._read_json() or {}
-            if not isinstance(body, dict) or set(body) - {"version_id", "reason"}:
-                return self._json({"error": "body may only carry version_id and reason"}, 400)
+            if not isinstance(body, dict) or set(body) - {"version_id", "reason", "restrict_all"}:
+                return self._json({"error": "body may only carry version_id, reason and restrict_all"}, 400)
+            restrict_all = body.get("restrict_all", False)
+            if not isinstance(restrict_all, bool):
+                return self._json({"error": "restrict_all must be a boolean"}, 400)
             version_id = body.get("version_id")
             if version_id is not None and (not isinstance(version_id, str) or not version_id):
                 return self._json({"error": "version_id must be a non-empty string"}, 400)
@@ -5427,9 +5612,30 @@ def _make_handler(server, public=False, operator=False):
             if server.artifact_store is not None:
                 def persist(aid, vid, why):
                     self._artifact_call("record_retraction", aid, vid, why)
+            grants = server.collab_grant_store if server.collab_artifacts_enabled else None
+            on_unpersisted, pending = None, {}
+            if grants is not None:
+                def on_unpersisted(aid):
+                    counts = grants("revoke_grants", aid, write_only=True)
+                    pending["write"] = counts["pending_invites"]
+                    return counts["grants"]
             result = retract(gate=server.artifact_graph_gate, ingest=server.ingest, principal=self._principal(),
                              artifact_id=artifact_id, version_id=version_id, reason=body.get("reason"),
-                             persist=persist)
+                             persist=persist, on_unpersisted=on_unpersisted)
+            result["restrict_all_applied"] = False
+            if result["error"]:
+                result["restrict_all_offered"] = True
+                if "write" in pending:
+                    result["pending_invites_revoked"] = pending["write"]
+                if restrict_all and grants is not None:       # operator-requested, after the write-grant fail-safe
+                    result["collab_all_grants_revoked"], result["collab_restrict_error"] = None, None
+                    try:
+                        counts = grants("revoke_grants", artifact_id, write_only=False)
+                        result["collab_all_grants_revoked"] = counts["grants"]
+                        result["pending_invites_revoked"] = pending.get("write", 0) + counts["pending_invites"]
+                        result["restrict_all_applied"] = True
+                    except Exception as exc:                  # noqa: BLE001 - type name only; the 500 stands
+                        result["collab_restrict_error"] = type(exc).__name__
             return self._json(result, 500 if result["error"] else 200)
 
         def _artifact_backfill(self, artifact_id):
@@ -5462,6 +5668,28 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             if version.get("job_id") != job_id:
                 return self._json({"error": "that version was not committed by this job"}, 409)
+            if server.artifact_graph_gate.version_retracted(artifact_id, version_id):
+                return self._json({"error": "artifact or version is retracted"}, 409)
+            from .artifact_lineage import emit_version_lineage
+            from .artifact_scope import visibility_fields
+            result = emit_version_lineage(server.ingest, {**version, "artifact_id": artifact_id}, self._principal(),
+                                          scope=visibility_fields(gated=True))
+            return self._json(result, 502 if result["error"] else 200)
+
+        def _artifact_collab_lineage(self, artifact_id, version_id):
+            """POST /api/v1/artifacts/<id>/versions/<vid>/collab-lineage {}: the collaborator applier reports a merge
+            version. The body carries nothing; the server reads the version from the registry. A caller without ``edit``
+            and an unknown version are both 404, so existence is not leaked."""
+            body = self._read_json() or {}
+            if not isinstance(body, dict) or body:
+                return self._json({"error": "body must be exactly {}"}, 400)
+            if not self._artifact_allowed(artifact_id, "edit"):
+                return self._deny(404, "not found")
+            version = self._artifact_call("get_version", version_id, artifact_id)
+            if version is None:
+                return self._deny(404, "not found")
+            if version.get("created_via") != "collaborator":
+                return self._json({"error": "that version was not committed by a collaborator"}, 409)
             if server.artifact_graph_gate.version_retracted(artifact_id, version_id):
                 return self._json({"error": "artifact or version is retracted"}, 409)
             from .artifact_lineage import emit_version_lineage

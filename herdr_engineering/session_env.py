@@ -215,6 +215,10 @@ def acquire(cfg: dict[str, Any], *, project: str, session: str | None = None,
     mode = key_mode or s["key_mode"]
     cp = s["control_plane_url"]
     base = {"OPENAI_BASE_URL": _clean(s["gateway_url"])}
+    if s.get("inferweave_url"):
+        # The InferWeave gateway (System One and the rest of its surface). The same hk- key
+        # is valid there, so only the address is injected.
+        base["INFERWEAVE_BASE_URL"] = _clean(str(s["inferweave_url"]))
     if mode == "project":
         cache = project_cache_path(project)
         cached = read_env_file(cache)

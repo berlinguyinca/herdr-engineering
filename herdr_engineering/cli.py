@@ -18,6 +18,7 @@ import signal
 import socket
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -342,10 +343,14 @@ def _build_parser() -> argparse.ArgumentParser:
     add_report_subparser(asub)
     from .artifact_shares_client import add_share_subparser
     add_share_subparser(asub)
+    from .artifact_collab_client import add_collab_subparser
+    add_collab_subparser(asub)
     from .artifact_browse_client import add_browse_subparsers
     add_browse_subparsers(asub)
     from .teams_client import add_teams_subparser
     add_teams_subparser(sub)
+    from .rooms_client import add_rooms_subparser
+    add_rooms_subparser(sub)
     # system-graph artifact (P5): deterministic sanitized snapshot renderer.
     ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
     gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
@@ -698,8 +703,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="PATH to a file holding the API key of a principal in the tenant to anchor (never the key itself)")
     p2.set_defaults(func=_cmd_cp_assistant_audit)
     p2 = csub.add_parser("assistant-worker", help="enroll, list or revoke tailnet-hub workers (owner API)")
-    p2.add_argument("action", choices=["enroll", "list", "revoke", "redeem", "install-hooks"])
-    p2.add_argument("worker_id", nargs="?", default=None, help="the worker to revoke (revoke only)")
+    p2.add_argument("action", choices=["enroll", "list", "revoke", "scopes", "redeem", "install-hooks"])
+    p2.add_argument("worker_id", nargs="?", default=None, help="the worker to revoke or change scopes of (revoke|scopes)")
+    p2.add_argument("--scopes", default=None, help="comma-separated scopes from ask,report,read,act (enroll|scopes)")
     p2.add_argument("--name", default=None, help="a label for the worker (enroll)")
     p2.add_argument("--harness", default=None, help="claude | pi | codex | opencode (enroll)")
     p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
@@ -715,6 +721,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--settings", default=None, help="install-hooks: the Claude Code settings.json to edit")
     p2.add_argument("--yes", action="store_true", help="install-hooks: apply without the confirmation prompt")
     p2.set_defaults(func=_cmd_cp_assistant_worker)
+    p2 = csub.add_parser("assistant-action", help="list, approve or deny hub workers' action requests (owner API)")
+    p2.add_argument("action", choices=["list", "approve", "deny"])
+    p2.add_argument("request_id", nargs="?", default=None, help="the request to decide (approve|deny)")
+    p2.add_argument("--status", default=None, choices=["pending", "approved", "denied", "vetoed"], help="list filter")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
+    p2.set_defaults(func=_cmd_cp_assistant_hub_owner, command_group_kind="action")
+    p2 = csub.add_parser("assistant-grant", help="list, revoke or activate hub action grants (owner API)")
+    p2.add_argument("action", choices=["list", "revoke", "activate"])
+    p2.add_argument("grant_id", nargs="?", default=None, help="the grant (revoke|activate)")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
+    p2.set_defaults(func=_cmd_cp_assistant_hub_owner, command_group_kind="grant")
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -785,6 +804,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="read Cognito JWKS (jwks.json) and group members (members.json) from this "
                          "directory, refreshed by a host job, instead of calling AWS: the "
                          "container then needs no credentials and no outbound network")
+    p2.add_argument("--collab-artifacts-mirror", default=None,
+                    help="with --collab-only: the read-only mirror directory the worker publishes (mounted :ro); the "
+                         "artifact bridge starts only with both this and --collab-artifacts-outbox AND "
+                         "control_plane.collab_artifacts.enabled: true in the slice (otherwise it does nothing)")
+    p2.add_argument("--collab-artifacts-outbox", default=None,
+                    help="with --collab-only: the outbox directory collab-public writes intents and staging into "
+                         "(see --collab-artifacts-mirror)")
     p2.add_argument("--collab-operator-port", type=int, default=None,
                     help="with --collab-only: also serve the collaboration API WITHOUT sign-in on this "
                          "port, as --collab-operator-user, for the local owner's dashboard (publish it "
@@ -875,6 +901,24 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="the llm slice of the central fleet file (`fleet config render-llm`): llm.upstream_key/upstream_url and "
                          "control_plane.llm_proxy tuning (the only source of configuration)")
     p2.set_defaults(func=_cmd_cp_llm_proxy)
+    p2 = csub.add_parser("llm-gateway-sync",
+                         help="keep project keys rendered as sha256-only gateway principals")
+    p2.add_argument("--control-plane", default="http://control-plane-web:8080")
+    p2.add_argument("--principals-file", required=True,
+                    help="file the gateway reads as auth.client_principals_file (written 0600)")
+    p2.add_argument("--interval", type=float, default=5.0)
+    p2.add_argument("--once", action="store_true", help="render once and exit")
+    p2.set_defaults(func=_cmd_cp_llm_gateway_sync)
+    p2 = csub.add_parser("llm-gateway-usage",
+                         help="report the gateway's per-key token usage to the control plane")
+    p2.add_argument("--control-plane", default="http://control-plane-web:8080")
+    p2.add_argument("--gateway", required=True, help="gateway base URL")
+    p2.add_argument("--admin-secret-file", required=True,
+                    help="file holding the gateway admin secret (never printed)")
+    p2.add_argument("--state-file", required=True, help="where the reported baseline is kept")
+    p2.add_argument("--interval", type=float, default=30.0)
+    p2.add_argument("--once", action="store_true", help="report once and exit")
+    p2.set_defaults(func=_cmd_cp_llm_gateway_usage)
 
     return parser
 
@@ -991,6 +1035,43 @@ def _cmd_cp_llm_proxy(args) -> int:
     print(f"llm-proxy listening on {args.host}:{httpd.server_address[1]}", flush=True)
     try:
         httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _cmd_cp_llm_gateway_sync(args) -> int:
+    from pathlib import Path
+
+    from .llm_gateway_bridge import run, sync_once
+    from .llm_proxy import ControlPlaneClient
+    control = ControlPlaneClient(args.control_plane)
+    path = Path(args.principals_file).expanduser()
+    if args.once:
+        return 1 if sync_once(control, path) is None else 0
+    try:
+        run(control, path, interval=args.interval)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _cmd_cp_llm_gateway_usage(args) -> int:
+    from pathlib import Path
+
+    from .llm_gateway_usage import fetch_usage, run, sync_once
+    from .llm_proxy import ControlPlaneClient
+    control = ControlPlaneClient(args.control_plane)
+    secret_path = Path(args.admin_secret_file).expanduser()
+
+    def fetch():  # re-read each pass so a rotated secret is picked up
+        return fetch_usage(args.gateway, secret_path.read_text().strip())
+
+    state = Path(args.state_file).expanduser()
+    if args.once:
+        return 1 if sync_once(control, fetch, state) is None else 0
+    try:
+        run(control, fetch, state, interval=args.interval)
     except KeyboardInterrupt:
         pass
     return 0
@@ -3109,9 +3190,13 @@ def _cmd_cp_assistant_worker(args) -> int:
     if args.action == "enroll" and not (args.name and args.harness):
         print("enroll needs --name and --harness", file=sys.stderr)
         return 2
-    if args.action == "revoke" and not args.worker_id:
-        print("revoke needs a WORKER_ID", file=sys.stderr)
+    if args.action in ("revoke", "scopes") and not args.worker_id:
+        print(f"{args.action} needs a WORKER_ID", file=sys.stderr)
         return 2
+    if args.action == "scopes" and not args.scopes:
+        print("scopes needs --scopes a,b", file=sys.stderr)
+        return 2
+    scopes = [x.strip() for x in args.scopes.split(",")] if args.scopes else None
     try:
         key = Path(args.api_key_file).expanduser().read_text().strip()
         base = resolve_control_plane(args.control_plane)
@@ -3132,8 +3217,12 @@ def _cmd_cp_assistant_worker(args) -> int:
             return json.loads(response.read(1024 * 1024))
     try:
         if args.action == "enroll":
-            out = call("POST", "/api/v1/assistant-workers", {"name": args.name, "harness": args.harness})
+            payload = {"name": args.name, "harness": args.harness}
+            if scopes is not None:
+                payload["scopes"] = scopes
+            out = call("POST", "/api/v1/assistant-workers", payload)
             print(f"enrollment: {out['enrollment_id']}\ncode: {out['code']}\nexpires_at: {out['expires_at']}")
+            print(f"scopes: {','.join(out.get('scopes', []))}")
             print("This code will not be shown again; it is single-use. Redeem it on the worker's device.")
             setup = out.get("setup") or {}
             if not setup.get("supported"):
@@ -3149,6 +3238,9 @@ def _cmd_cp_assistant_worker(args) -> int:
             for w in rows:
                 print(f"{w['worker_id']:<34} {w['name']:<20} {w['harness']:<9} {w['status']:<8} "
                       f"{w['device_id']:<16} {w['expires_at']}")
+        elif args.action == "scopes":
+            out = call("POST", f"/api/v1/assistant-workers/{quote(args.worker_id, safe='')}/scopes", {"scopes": scopes})
+            print(_tty_safe(f"{out['worker_id']}: scopes {','.join(out['scopes'])}"))
         else:
             out = call("DELETE", f"/api/v1/assistant-workers/{quote(args.worker_id, safe='')}")
             print(f"{out['worker_id']}: {out['status']}")
@@ -3157,6 +3249,89 @@ def _cmd_cp_assistant_worker(args) -> int:
         print(f"assistant-worker {args.action} failed: HTTP {exc.code}", file=sys.stderr)
     except (OSError, ValueError, KeyError) as exc:
         print(f"assistant-worker {args.action} failed: {type(exc).__name__}", file=sys.stderr)
+    return 1
+
+
+def _tty_safe(value) -> str:
+    """Server-provided text with every ESC/C0/C1 control character removed (space kept), safe to print to a terminal."""
+    return "".join(c for c in str(value) if c == " " or not (ord(c) < 32 or 0x7F <= ord(c) <= 0x9F))
+
+
+def _cmd_cp_assistant_hub_owner(args) -> int:
+    """``control-plane assistant-action list|approve|deny`` and ``assistant-grant list|revoke|activate``.
+
+    0 on success, 1 on a refusal or failure (one stderr line; an activation refusal prints its code), 2 on usage."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import quote
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    kind = "assistant-action" if args.command_group_kind == "action" else "assistant-grant"
+    target = getattr(args, "request_id", None) or getattr(args, "grant_id", None)
+    if not args.api_key_file:
+        print(f"{kind} {args.action} needs --api-key-file", file=sys.stderr)
+        return 2
+    if args.action != "list" and not target:
+        print(f"{kind} {args.action} needs an ID", file=sys.stderr)
+        return 2
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+    except ValueError:
+        print("cannot read --api-key-file: not a text file", file=sys.stderr)
+        return 2
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(f"{base}{path}", method=method, headers={
+            "X-API-Key": key, "Content-Type": "application/json"},
+            data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read(1024 * 1024))
+    quoted = quote(target, safe="") if target else ""
+    try:
+        if kind == "assistant-action":
+            if args.action == "list":
+                query = f"?status={quote(args.status, safe='')}" if args.status else ""
+                rows = call("GET", f"/api/v1/assistant-action-requests{query}")["requests"]
+                print(f"{'REQUEST_ID':<20} {'STATUS':<9} {'VERB':<14} {'WORKER':<22} DISPLAY")
+                for r in rows:
+                    display = _tty_safe(r["display"])[:120]
+                    print(_tty_safe(f"{r['request_id']:<20} {r['status']:<9} {r['verb']:<14} {r['worker_id']:<22} ")
+                          + display)
+            else:
+                out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision",
+                           {"approve": args.action == "approve"})
+                print(_tty_safe(f"{out['request_id']}: {out['status']}"))
+        elif args.action == "list":
+            rows = call("GET", "/api/v1/assistant-grants")["grants"]
+            print(f"{'GRANT_ID':<24} {'STATE':<9} {'VERB':<14} {'WORKER':<22} EXPIRES")
+            for g in rows:
+                print(_tty_safe(f"{g['grant_id']:<24} {g['state']:<9} {g['verb']:<14} {g['worker_id']:<22} "
+                                f"{g['expires_at'] or '-'}"))
+        elif args.action == "revoke":
+            out = call("DELETE", f"/api/v1/assistant-grants/{quoted}")
+            print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
+        else:
+            out = call("POST", f"/api/v1/assistant-grants/{quoted}/activate", {"confirm": True})
+            print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
+        return 0
+    except urllib.error.HTTPError as exc:
+        code = ""
+        try:
+            code = str(json.loads(exc.read(65536)).get("code") or "")
+        except (OSError, ValueError, AttributeError):
+            pass
+        suffix = f" ({code})" if code and code.replace("_", "").isalnum() else ""
+        print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}", file=sys.stderr)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"{kind} {args.action} failed: {type(exc).__name__}", file=sys.stderr)
     return 1
 
 
@@ -3410,6 +3585,22 @@ def _share_wiring(cp: dict, dsn: str | None):
     return artifact_adapter.SyncArtifactAdapter(create_share_store), Path(share.get("shares_dir") or "/shares"), settings
 
 
+def _collab_grant_wiring(cp: dict, dsn: str | None):
+    """(grant store adapter, enabled) when control_plane.collab_artifacts.enabled is exactly true and a DSN exists, else
+    (None, False). The owner routes for collaborators, activity and diffs use the adapter's call path."""
+    section = cp.get("collab_artifacts")
+    if not isinstance(section, dict) or section.get("enabled") is not True or not dsn:
+        return None, False
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_collab_store import CollabGrantStore
+
+    async def create():
+        import asyncpg
+        return CollabGrantStore(await asyncpg.connect(dsn))
+
+    return artifact_adapter.SyncArtifactAdapter(create), True
+
+
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -3432,7 +3623,7 @@ def _cmd_cp_web(args) -> int:
     if args.collab_only:
         # The public collab container is given only the collab slice of the central
         # file (`fleet config render-collab`): no fleet endpoint, no API keys, no DSN.
-        if args.pg_dsn or set(cp) - {"collab"}:
+        if args.pg_dsn or set(cp) - {"collab", "collab_artifacts"}:
             raise SystemExit("--collab-only must not be given database credentials or other "
                              "control-plane settings (mount the render-collab slice, not the "
                              "central file)")
@@ -3586,7 +3777,9 @@ def _cmd_cp_web(args) -> int:
         artifact_reviews.load(artifact_adapter("load_reviews"))
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
+    collab_grant_store, collab_artifacts_enabled = _collab_grant_wiring(cp, dsn)
     collab = None
+    artifact_bridge = None
     if args.collab_cognito_pool:
         if args.collab_users_file:
             raise SystemExit("use either --collab-cognito-pool or --collab-users-file, not both")
@@ -3633,6 +3826,9 @@ def _cmd_cp_web(args) -> int:
         collab.task_lease_seconds = _task_lease(args, cp)
         if args.collab_only:
             collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
+            artifact_bridge = _wire_collab_artifacts_bridge(
+                collab, cp, getattr(args, "collab_artifacts_mirror", None),
+                getattr(args, "collab_artifacts_outbox", None))
     elif args.collab_users_file:
         from pathlib import Path
 
@@ -3659,6 +3855,10 @@ def _cmd_cp_web(args) -> int:
         collab.steering = normalize_steering(getattr(args, "collab_steering", None))
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
+        from .control_plane.collab_team_rooms import normalize_team_rooms
+        collab.team_rooms = normalize_team_rooms(getattr(args, "collab_team_rooms", None))
+        from .control_plane.collab_team_roles import normalize_team_roles
+        collab.team_roles = normalize_team_roles(getattr(args, "collab_team_roles", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
     from .control_plane.rakazo_bridge import rakazo_bridge_config
     try:
@@ -3702,7 +3902,8 @@ def _cmd_cp_web(args) -> int:
                              operator_hosts=args.collab_operator_host,
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
-                             share_store=share_store, shares_root=shares_root, share_settings=share_settings)
+                             share_store=share_store, shares_root=shares_root, share_settings=share_settings,
+                             collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -3732,10 +3933,14 @@ def _cmd_cp_web(args) -> int:
         if hub_server is not None:
             hub_server.shutdown()
         svr.shutdown()
+        if artifact_bridge is not None:
+            artifact_bridge.stop()
         if artifact_adapter is not None:
             artifact_adapter.close()
         if share_store is not None:
             share_store.close()
+        if collab_grant_store is not None:
+            collab_grant_store.close()
     return 0
 
 
@@ -3880,6 +4085,10 @@ COLLAB_CONFIG_KEYS = {
     "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
     "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
     "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
+    # team collaboration slice 1: attach a team to a room, per-room guest level, the Suggest queue; YAML only, off by default
+    "team_rooms": ("collab_team_rooms", dict),
+    # team collaboration slice 2: roles, routing by role, people as role holders, leases; YAML only, off by default
+    "team_roles": ("collab_team_roles", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
@@ -3915,9 +4124,12 @@ def _apply_collab_config(args, cp) -> None:
         elif kind is dict:
             from .control_plane.collab_attention import normalize_insights
             from .control_plane.collab_context import normalize_contextual
+            from .control_plane.collab_team_roles import normalize_team_roles
+            from .control_plane.collab_team_rooms import normalize_team_rooms
             from .control_plane.collab_workbench import normalize_steering
             try:
-                {"contextual": normalize_contextual, "insights": normalize_insights}.get(key, normalize_steering)(value)
+                {"contextual": normalize_contextual, "insights": normalize_insights,
+                 "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
@@ -3942,6 +4154,8 @@ HOT_COLLAB_SWITCHES = {
     "steering": ("steering_source", "dict"),
     "contextual": ("contextual_source", "dict"),
     "insights": ("insights_source", "dict"),
+    "team_rooms": ("team_rooms_source", "dict"),
+    "team_roles": ("team_roles_source", "dict"),
     "delegation_enabled": ("delegation_source", "bool"),
     "replay_history": ("replay_history_source", "str"),
 }
@@ -3967,8 +4181,11 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
         return source
     from .control_plane.collab_attention import normalize_insights
     from .control_plane.collab_context import normalize_contextual
+    from .control_plane.collab_team_roles import normalize_team_roles
+    from .control_plane.collab_team_rooms import normalize_team_rooms
     from .control_plane.collab_workbench import normalize_steering
-    normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights}
+    normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights,
+                   "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}
 
     def check(key, value):
         return normalizers[key](value) if key in normalizers else value
@@ -4385,6 +4602,109 @@ def _seed_demo(repo):
     repo.register_service("analytics-api", hid2, 9001, status="healthy")
 
 
+_COLLAB_ARTIFACTS_PATHS = {"mirror_dir": "/collab-mirror", "outbox_dir": "/collab-outbox", "spool_dir": "/collab-spool"}
+
+
+@dataclass(frozen=True)
+class CollabArtifactsSettings:
+    """``control_plane.collab_artifacts`` as the worker uses it (YAML only; no environment variable)."""
+    enabled: bool
+    limits: Any
+    mirror_dir: Path
+    outbox_dir: Path
+    spool_dir: Path
+
+
+def _collab_artifacts_settings(cp) -> CollabArtifactsSettings:
+    """Validate the worker's ``control_plane.collab_artifacts`` section. The bridge is off unless ``enabled`` is exactly
+    ``true``; only an enabled section is validated (every limit a positive integer, no unknown key), and an invalid one
+    stops the worker start with a clear message."""
+    from .control_plane.collab_bridge_files import BridgeError, BridgeLimits
+    section = (cp or {}).get("collab_artifacts")
+    if section is not None and not isinstance(section, dict):
+        raise SystemExit("fleet config control_plane.collab_artifacts must be a mapping")
+    section = section or {}
+    paths = {key: Path(default) for key, default in _COLLAB_ARTIFACTS_PATHS.items()}
+    if section.get("enabled") is not True:
+        return CollabArtifactsSettings(False, BridgeLimits(), **paths)
+    limits = {k: v for k, v in section.items() if k != "enabled" and k not in _COLLAB_ARTIFACTS_PATHS}
+    for key in _COLLAB_ARTIFACTS_PATHS:
+        if key in section:
+            if not isinstance(section[key], str) or not section[key]:
+                raise SystemExit(f"fleet config control_plane.collab_artifacts.{key} must be a path string")
+            paths[key] = Path(section[key])
+    try:
+        return CollabArtifactsSettings(True, BridgeLimits.from_mapping(limits), **paths)
+    except BridgeError as exc:
+        raise SystemExit(f"fleet config control_plane.collab_artifacts: {exc.reason}") from None
+
+
+def _collab_lineage_hook(worker_cfg):
+    """The applier's ``lineage`` hook from ``control_plane.artifact_worker.lineage`` (None when the section is absent)."""
+    from .control_plane.artifact_lineage import collab_lineage_poster_from_section
+    try:
+        return collab_lineage_poster_from_section((worker_cfg or {}).get("lineage"))
+    except (ValueError, OSError) as exc:
+        raise SystemExit(f"control_plane.artifact_worker.lineage: {exc}") from None
+
+
+def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, rustfs, connect, lineage):
+    """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
+    applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
+    and staging owner here)."""
+    import time
+
+    from .control_plane import worker as cp_worker
+    from .control_plane.artifact_scope import ArtifactGraphGate
+    from .control_plane.collab_intents import CollabIntentApplier
+    from .control_plane.collab_mirror import CollabMirror
+    clock = time.time
+    gate = ArtifactGraphGate(None)
+    mirror = CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=clock)
+    if lineage is not None:
+        post = lineage
+
+        def lineage(version):                      # noqa: F811 - a version retracted by now is never posted
+            if gate.version_retracted(str(version.get("artifact_id")), str(version.get("version_id"))):
+                return {"skipped": "retracted"}
+            return post(version)
+    applier = CollabIntentApplier(settings.outbox_dir, mirror, rustfs=rustfs, limits=settings.limits,
+                                  spool_dir=settings.spool_dir, lineage=lineage, context_extras={}, clock=clock,
+                                  gate=gate)
+    applier.register_commit()
+    return cp_worker.CollabBridgeLoop(connect, mirror, applier)
+
+
+def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):
+    """collab-public: build the ``CollabArtifactBridge`` and set ``service.artifact_bridge`` only when the rendered slice
+    says ``collab_artifacts.enabled: true`` AND both mount flags are present; otherwise the service keeps None and the
+    MCP tools say "unknown tool"."""
+    section = (cp or {}).get("collab_artifacts")
+    if not (isinstance(section, dict) and section.get("enabled") is True and mirror_dir and outbox_dir):
+        return None
+    from .control_plane.collab_artifacts import CollabArtifactBridge
+    bridge = CollabArtifactBridge(service, Path(mirror_dir), Path(outbox_dir))
+    service.artifact_bridge = bridge
+    try:
+        bridge.start()
+    except BaseException:
+        service.artifact_bridge = None
+        bridge.stop()
+        raise
+    return bridge
+
+
+def _worker_control_plane_section(fleet_config_path) -> dict:
+    """The fleet file's ``control_plane`` section for the worker, or {} when there is no file."""
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return {}
+    try:
+        return dict(load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane"))
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+
+
 def _cmd_cp_worker(args) -> int:
     import asyncio
     import logging
@@ -4396,6 +4716,8 @@ def _cmd_cp_worker(args) -> int:
     from .control_plane.worker import run_one_pass, run_worker
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # validated before anything connects: an invalid collab_artifacts section refuses the start (also with --once)
+    collab_settings = _collab_artifacts_settings(_worker_control_plane_section(getattr(args, "fleet_config", None)))
 
     async def _run():
         cp = _cp_config(getattr(args, "fleet_config", None))
@@ -4425,10 +4747,28 @@ def _cmd_cp_worker(args) -> int:
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                           fabric_compactor=compactor, share_housekeeper=share_hk,
                                           artifact_reconciler=reconciler)
-            await run_worker(conn, interval=args.interval, worker_id=worker_id,
-                             artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                             fabric_compactor=compactor, share_housekeeper=share_hk,
-                             artifact_reconciler=reconciler)
+            stop = asyncio.Event()
+            bridge_task = None
+            if collab_settings.enabled:     # a long-running loop on its own connections; --once never starts it
+                if rustfs is None:
+                    raise SystemExit("control_plane.collab_artifacts needs RustFS (control_plane.rustfs_endpoint)")
+                dsn = cp["postgres_dsn"]
+                bridge_loop = _build_collab_bridge_loop(
+                    collab_settings, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
+                    lineage=_collab_lineage_hook(worker_cfg))
+                bridge_task = asyncio.create_task(bridge_loop.run(stop), name="collab-bridge-loop")
+            try:
+                await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
+                                 artifact_job_runner=runner, inspector_snapshotter=snapshotter,
+                                 fabric_compactor=compactor, share_housekeeper=share_hk,
+                                 artifact_reconciler=reconciler)
+            finally:
+                stop.set()
+                if bridge_task is not None:
+                    try:
+                        await asyncio.wait_for(bridge_task, 60)    # applier.aclose / mirror.close run in its teardown
+                    except Exception as exc:  # noqa: BLE001 - never mask the exception run_worker is raising
+                        logging.getLogger(__name__).warning("collab bridge teardown failed (%s)", type(exc).__name__)
             return None
         finally:
             await conn.close()

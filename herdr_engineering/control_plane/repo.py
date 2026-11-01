@@ -3052,11 +3052,14 @@ class ControlPlaneRepo:
                   "key_id": _usage_str(row.get("key_id"), 128),
                   "duration_ms": _usage_int(row.get("duration_ms"))}
         tokens = [_usage_int(row.get(k)) for k in _TOKEN_FIELDS]
+        source = (row.get("source") if row.get("source") in ("llm-proxy", "transcript", "llm-gateway")
+                  else "llm-proxy")
         if row.get("schema") != 2:
             return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
                                            cache_read_tokens=tokens[3],
                                            cache_write_tokens=tokens[4],
-                                           success=row.get("success", True), **common)
+                                           success=row.get("success", True), source=source,
+                                           **common)
         status = _usage_int(row.get("status"))
         error_class = row.get("error_class") if row.get("error_class") in USAGE_ERROR_CLASSES else None
         success = row.get("success")
@@ -3072,7 +3075,6 @@ class ControlPlaneRepo:
             v2[k] = row[k] if isinstance(row.get(k), bool) else None
         for k in ("queue_ms", "ttft_ms", "gen_ms"):
             v2[k] = _usage_int(row.get(k))
-        source = row.get("source") if row.get("source") in ("llm-proxy", "transcript") else "llm-proxy"
         return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
                                        cache_read_tokens=tokens[3],
                                        cache_write_tokens=tokens[4], success=success,
