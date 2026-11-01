@@ -187,6 +187,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     "for control_plane.rakazo_bridge.accounts[].password_scrypt; the password is never an argument"
                     ).set_defaults(func=_cmd_bridge_hash_password)
 
+    # corrections ----------------------------------------------------------
+    from .corrections_cli import register as _register_corrections
+    _register_corrections(sub)
+
     # google ---------------------------------------------------------------
     from .google_setup_cli import register as _register_google
     _register_google(sub)
