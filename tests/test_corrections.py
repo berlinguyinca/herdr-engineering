@@ -163,3 +163,23 @@ def test_cli_enable_scan_list_forget_round_trip(tmp_path, monkeypatch, capsys):
     assert run("forget")[0] == 1                                      # naming nothing is refused
     assert run("forget", "--all")[1]["result"]["removed"] == 1
     assert run("status")[1]["result"]["total"] == 0
+
+
+def test_scan_recent_takes_the_newest_records_per_harness_and_skips_a_broken_one(log, tmp_path):
+    home = tmp_path / "home"
+    good = [{"type": "assistant", "timestamp": "t", "message": {"content": [{"type": "text", "text": "done"}]}},
+            {"type": "user", "timestamp": "t", "message": {"content": "No, redo it"}}]
+    for i in range(3):
+        f = home / f".claude/projects/-w/s{i}.jsonl"
+        write(f, good)
+        os.utime(f, (1000 + i, 1000 + i))
+    bad = home / ".claude/projects/-w/bad.jsonl"
+    bad.write_text("not json\n")
+    os.utime(bad, (1, 1))                                     # oldest, so only the full pass reaches it
+    log.enable()
+    first = cx.scan_recent(log, agents=["claude"], limit=2, home=home)
+    assert (first["scanned"], first["new"]) == (2, 2)         # s2 and s1, the newest two
+    second = cx.scan_recent(log, agents=["claude"], limit=10, home=home)
+    assert (second["scanned"], second["new"], second["skipped"]) == (4, 1, [])   # s0 is new; bad reads as an empty session
+    with pytest.raises(PermissionError):
+        cx.scan_recent(cx.CorrectionLog(tmp_path / "other"), agents=["claude"], home=home)

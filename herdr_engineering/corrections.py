@@ -193,3 +193,31 @@ def scan_session(log: CorrectionLog, *, agent: str | None = None, session: str |
     found = extract(history["events"], agent=history["agent"] or "", session_id=sid) if history["agent"] and sid else []
     return {"agent": history["agent"], "session_id": sid, "found": len(found), "new": log.record(found),
             "coverage": history["coverage"]}
+
+
+def scan_recent(log: CorrectionLog, *, agents: Iterable[str] = ("claude", "codex", "pi"), limit: int = 20,
+                home: Path | None = None) -> dict[str, Any]:
+    """Scans each harness's newest ``limit`` session records (by modification time). Read-only; one unreadable record is
+    reported and skipped. OpenCode keeps one database rather than a file per session, so it is scanned by id instead."""
+    import glob
+
+    from . import session_history as sh
+    home = home or Path.home()
+    out: dict[str, Any] = {"scanned": 0, "found": 0, "new": 0, "skipped": []}
+    for agent in agents:
+        store = sh._stores(home).get(agent)
+        if store is None or agent == "opencode":
+            continue
+        files = [f for f in glob.glob(str(store / "**" / "*.jsonl"), recursive=True) if "subagents" not in f]
+        for path in sorted(files, key=os.path.getmtime, reverse=True)[:max(0, limit)]:
+            try:
+                res = scan_session(log, agent=agent, session=path, home=home)
+            except PermissionError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one bad record must not stop the rest
+                out["skipped"].append({"agent": agent, "record": Path(path).name, "reason": type(exc).__name__})
+                continue
+            out["scanned"] += 1
+            out["found"] += res["found"]
+            out["new"] += res["new"]
+    return out

@@ -36,6 +36,9 @@ def run(args: argparse.Namespace) -> int:
             return _out({"code": "invalid_request", "message": "name a --session, or pass --all"}, ok=False)
         return _out({"removed": log.forget(session_id=None if args.all else args.session, everything=args.all)})
     try:
+        if args.recent:
+            return _out(cx.scan_recent(log, agents=[args.agent] if args.agent else ("claude", "codex", "pi"),
+                                       limit=args.recent))
         return _out(cx.scan_session(log, agent=args.agent, session=args.session, cwd=args.cwd))
     except PermissionError as error:
         return _out({"code": "disabled", "message": str(error)}, ok=False)
@@ -51,6 +54,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     c.add_argument("--agent", choices=AGENTS)
     c.add_argument("--session", help="session id or transcript path (default: the current directory's newest)")
     c.add_argument("--cwd")
+    c.add_argument("--recent", type=int, metavar="N", help="scan each harness's newest N session records instead")
     c.set_defaults(func=run)
     c = ops.add_parser("list", help="show recorded corrections")
     c.add_argument("--agent", choices=AGENTS)
