@@ -27,9 +27,13 @@ plane's analytics per project and model.
 
 Deploy notes: `HERDR_LLM_GATEWAY_DIR` holds `secrets/admin` (operator secret) and
 `secrets/upstream-token` (the credential the relay presents upstream; for llm.metabolomics.us an
-access key created in the console). On the gateway's own host the public name does not resolve from a
-container (hairpin NAT): add `extra_hosts: ["llm.metabolomics.us:host-gateway"]` to `llm-relay` in an
-override file. Token counts cover chat and embeddings; System One and speech count requests per
+access key created in the console). On the gateway's own host the public name does not resolve from a container (hairpin NAT), and
+`extra_hosts: ["llm.metabolomics.us:host-gateway"]` is not enough on zapp: ufw drops container-to-host
+traffic on 443 (only 22 and 9100 from 10/8 are allowed; published ports like 8290 are reachable but
+are plain HTTP, which the relay refuses to a non-loopback host). Either allow the compose bridge to
+reach 443 on the host (`ufw allow from 172.16.0.0/12 to any port 443 proto tcp`) or run the relay on a
+different host from the gateway. Verified on zapp with a stand-in key: relay health, key auth, bogus and
+revoked keys (401), operator routes gated, usage reporter running; only the upstream hop was blocked. Token counts cover chat and embeddings; System One and speech count requests per
 model but the upstream reports no tokens for them. Custom models stay on `llm-proxy`.
 
 Status: prototype, opt-in (`--profile llm-gateway`). The python `llm-proxy` stays the default.
