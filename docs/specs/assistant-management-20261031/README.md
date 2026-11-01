@@ -337,3 +337,14 @@ The binding is what was found; nothing is stored, no token is minted and no cred
 through it only for the owner's scope (`open-listener` in the owner's tenant) and only for `pi-secretary`; explicit
 `pi_bindings` still win. Setup is an explicit request and is audited (`assistant.setup`). Not built: enrolling the agent itself
 and starting its runtime on a placed host (needs the runner, and Slurm for clusters).
+
+## On-demand delegation (step 1 of the learning plan)
+
+Specialists are optional. `delegate` with `target_system` omitted or `auto` is routed by `AssistantService.route_delegation`
+(also `GET /api/v1/assistant-route?task=` and `herdr-eng assistant route "<task>"`, read-only): a target the request names;
+else a configured specialist whose `handles` words appear in the task and that is usable now; else the engineering default
+`pi`. A specialist that matches but cannot run is listed under `skipped` and the task still goes somewhere that can. The
+routed target is resolved BEFORE grants and approval, so a grant for `pi-secretary` is checked against `pi-secretary` and the
+approval text names it; the choice is audited (`assistant.delegation.routed`). The specialist is set up lazily, only inside the
+approved delegation. Routing and setup grant nothing beyond what that approval covers. `handles` is operator configuration; no
+default words are shipped, so nothing is inferred.

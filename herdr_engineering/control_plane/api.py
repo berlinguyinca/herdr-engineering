@@ -3757,7 +3757,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_reminders(parts)
             if resource == "assistant-workers":
                 return self._assistant_workers(parts)
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement",
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
@@ -4601,6 +4601,12 @@ def _make_handler(server, public=False, operator=False):
                     kind = (query.get("type") or [""])[0]
                     svc._require_enabled()
                     return self._json(svc.resolve_placement(kind, require=extra))
+                if resource == "assistant-route" and len(parts) == 4:
+                    query = parse_qs(urlsplit(self.path).query)
+                    svc._require_enabled()
+                    return self._json(svc.route_delegation(
+                        (query.get("task") or [""])[0][:8000], tenant_id=tenant_id, user_id=user_id,
+                        hint=(query.get("target") or [None])[0]))
                 if resource == "assistant-graph" and len(parts) == 4:
                     return self._json(svc.assistant_graph(tenant_id=tenant_id, user_id=user_id))
                 if resource == "assistant-delegations" and len(parts) == 4:

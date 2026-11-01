@@ -161,6 +161,9 @@ def run_command(args: argparse.Namespace) -> int:
         elif op == "setup":
             target = resolve_ref(_list(client), args.ref)
             result = client.request(f"{BASE}/{quote(target['assistant_id'], safe='')}/setup", {})
+        elif op == "route":
+            query = urlencode({"task": args.task, **({"target": args.target} if args.target else {})})
+            result = client.request(f"/api/v1/assistant-route?{query}")
         elif op == "place":
             query = urlencode({"type": args.type, **({"require": args.require} if args.require else {})})
             result = client.request(f"/api/v1/assistant-placement?{query}")
@@ -220,6 +223,10 @@ def register_management(groups: argparse._SubParsersAction) -> None:
     c = groups.add_parser("setup", help="have Rakazo set up a specialist for you (your enrolled agent, your own private room)")
     c.add_argument("ref", help="assistant id, or its exact name when unique")
     _common(c, "setup")
+    c = groups.add_parser("route", help="show which target a task would go to, and why (read-only)")
+    c.add_argument("task")
+    c.add_argument("--target", help="force a target; it must be configured or a known harness")
+    _common(c, "route")
     c = groups.add_parser("place", help="show where a specialist type would run now, and why other places were rejected")
     c.add_argument("--type", required=True)
     c.add_argument("--require", help="extra capabilities, comma separated; can only add to the type's own")

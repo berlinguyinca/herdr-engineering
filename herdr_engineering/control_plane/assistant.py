@@ -113,8 +113,8 @@ def _delegation_targets(value: Any) -> dict[str, dict[str, Any]]:
     for target, raw in value.items():
         if not isinstance(target, str) or not _DELEGATION_REF.fullmatch(target):
             raise ValueError("invalid delegation target")
-        if not isinstance(raw, dict) or "role_ref" not in raw or set(raw) - {"role_ref", "requires", "resources"}:
-            raise ValueError("delegation target takes role_ref, and optionally requires and resources")
+        if not isinstance(raw, dict) or "role_ref" not in raw or set(raw) - {"role_ref", "requires", "resources", "handles"}:
+            raise ValueError("delegation target takes role_ref, and optionally requires, resources and handles")
         role = raw["role_ref"]
         if role is not None:
             if (not isinstance(role, dict) or set(role) != {"id", "version", "digest"}
@@ -136,9 +136,22 @@ def _delegation_targets(value: Any) -> dict[str, dict[str, Any]]:
                 out[target]["requires"] = placement.normalize_capabilities(raw["requires"], what="requires")
             if raw.get("resources") is not None:
                 out[target]["resources"] = placement.normalize_resources(raw["resources"])
+            if raw.get("handles") is not None:
+                out[target]["handles"] = _delegation_handles(raw["handles"])
         except placement.PlacementError as exc:
             raise ValueError(f"delegation target {target}: {exc}") from None
     return out
+
+
+_HANDLE_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,23}\Z")
+
+
+def _delegation_handles(value: Any) -> list[str]:
+    """Words that mean "this task suits this target". Matching only ever picks WHERE a task goes; it grants nothing."""
+    if (not isinstance(value, list) or not 0 < len(value) <= 24
+            or not all(isinstance(v, str) and _HANDLE_RE.fullmatch(v) for v in value)):
+        raise ValueError("handles must be a list of 1-24 short lowercase words")
+    return sorted(set(value))
 
 
 def _delegation_binding_scope(value: Any) -> dict[str, str] | None:
@@ -1063,7 +1076,9 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
                         "value": {"type": "string"}}, "required": ["record", "field", "value"]}},
     "delegate": {"sensitive": True, "description": "Delegate engineering work to a Pi mission.",
                  "parameters": {"type": "object", "properties": {
-                     "task": {"type": "string"}, "target_system": {"type": "string"},
+                     "task": {"type": "string"},
+                     "target_system": {"type": "string", "description": "Omit or use auto to let the assistant choose; "
+                                       "the approval names the target it chose."},
                      "context": {"type": "object"},
                      "source_refs": {"type": "array", "items": {"type": "string"}}},
                      "required": ["task"]}},
@@ -4036,6 +4051,67 @@ class AssistantService:
         decision["type"] = type_name
         return decision
 
+    ROUTE_HARNESSES = ("pi", "claude", "codex", "opencode")
+
+    def route_delegation(self, task: str, *, tenant_id: str, user_id: str, hint: str | None = None) -> dict[str, Any]:
+        """Which target a task goes to, with the reasons. Deterministic and read-only: it names a target and never binds,
+        places or grants anything, so a person can see why before approving.
+
+        Order: a target the person named; else a configured specialist whose ``handles`` words appear in the task and that
+        is usable now (bound, or set up on demand); else the engineering harness path (``pi``). A specialist that matches
+        but cannot run is reported under ``skipped`` and the task still goes somewhere that can."""
+        if not isinstance(task, str) or not task.strip():
+            raise AssistantError("a task is required to route")
+        targets = self.config["delegation"]["targets"]
+        words = set(re.findall(r"[a-z0-9][a-z0-9-]+", task.lower()))
+        skipped: list[dict[str, str]] = []
+        if hint and hint != "auto":
+            if hint in targets or hint in self.ROUTE_HARNESSES:
+                return {"target": hint, "kind": "specialist" if hint in targets and hint != "pi" else "harness",
+                        "reasons": ["named by the request"], "skipped": skipped}
+            raise AssistantError("delegation target is not configured")
+        mentioned = next((h for h in self.ROUTE_HARNESSES if h != "pi" and h in words), None)
+        for name in sorted(targets):
+            spec = targets[name]
+            hits = sorted(set(spec.get("handles", [])) & words)
+            if name == "pi" or not hits:
+                continue
+            ready, why = self._specialist_usable(name, tenant_id, user_id)
+            if ready:
+                return {"target": name, "kind": "specialist", "reasons": [f"task mentions {', '.join(hits)}", why],
+                        "skipped": skipped}
+            skipped.append({"target": name, "reason": why})
+        if mentioned:
+            return {"target": mentioned, "kind": "harness", "reasons": [f"task names {mentioned}"], "skipped": skipped}
+        return {"target": "pi", "kind": "harness", "reasons": ["no specialist matched; engineering default"],
+                "skipped": skipped}
+
+    def _specialist_usable(self, name: str, tenant_id: str, user_id: str) -> tuple[bool, str]:
+        try:
+            if self._delegation_adapter_for_scope(tenant_id, user_id, name) is not None:
+                return True, "already set up"
+        except Exception:  # noqa: BLE001 - an unreadable binding is "not bound"
+            pass
+        if self.self_setup is None:
+            return False, "not set up and no setup is available"
+        if not self.resolve_placement(name)["chosen"]:
+            return False, "no host can carry it"
+        return True, "will be set up when you approve"
+
+    def _ensure_specialist(self, name: str, tenant_id: str, user_id: str) -> None:
+        """Lazy setup, run only inside the approved delegation. Idempotent; refuses with the plain reason."""
+        if name not in self.config["delegation"]["targets"] or name == "pi":
+            return
+        if self._delegation_adapter_for_scope(tenant_id, user_id, name) is not None or self.self_setup is None:
+            return
+        from ..assistant_self_setup import SelfSetupError
+        try:
+            result = self.self_setup.provision(name)
+        except SelfSetupError as exc:
+            raise AssistantError(f"cannot start {name}: {exc}") from None
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="assistant.setup",
+                                subject_id=name, detail=f"on demand room={result['room_id']} agent={result['agent_id']}")
+
     def setup_specialist(self, assistant_id: str, *, tenant_id: str, user_id: str) -> dict[str, Any]:
         """The owner's explicit request that Rakazo set this specialist up. Idempotent; grants only what the setup module
         names (read and execute for the owner's own agent in the owner's own room) and audits it."""
@@ -4912,6 +4988,16 @@ class AssistantService:
                 return f"[denied: {exc}]"
             args["namespace"] = scope
         else:
+            if tool_id == "delegate" and args.get("target_system") in (None, "", "auto"):
+                try:
+                    routed = self.route_delegation(str(args.get("task", "")), tenant_id=run.tenant_id,
+                                                   user_id=run.user_id)
+                except AssistantError as exc:
+                    return f"[denied: {exc}]"
+                args["target_system"] = routed["target"]      # grants and the approval text then name the real target
+                self.store.audit_record(tenant_id=run.tenant_id, user_id=run.user_id, actor=run.user_id,
+                                        action="assistant.delegation.routed", subject_id=run.run_id,
+                                        detail=f"{routed['target']}: {'; '.join(routed['reasons'])}"[:300])
             target_field = {
                 "browse": "url", "run_shell": "command",
                 "connector_request": "connector_id", "delegate": "target_system",
@@ -5111,6 +5197,7 @@ class AssistantService:
             return self._run_adapter(tool_id, tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                                      payload=payload, actor=actor, action=action)
         if tool_id == "delegate":
+            self._ensure_specialist(payload.get("target_system") or "pi", tenant_id, user_id)
             d = self.delegate(tenant_id=tenant_id, user_id=user_id,
                               assistant_id=assistant_id,
                               task=payload.get("task", ""),
