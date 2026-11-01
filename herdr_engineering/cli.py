@@ -892,6 +892,24 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="the llm slice of the central fleet file (`fleet config render-llm`): llm.upstream_key/upstream_url and "
                          "control_plane.llm_proxy tuning (the only source of configuration)")
     p2.set_defaults(func=_cmd_cp_llm_proxy)
+    p2 = csub.add_parser("llm-gateway-sync",
+                         help="keep project keys rendered as sha256-only gateway principals")
+    p2.add_argument("--control-plane", default="http://control-plane-web:8080")
+    p2.add_argument("--principals-file", required=True,
+                    help="file the gateway reads as auth.client_principals_file (written 0600)")
+    p2.add_argument("--interval", type=float, default=5.0)
+    p2.add_argument("--once", action="store_true", help="render once and exit")
+    p2.set_defaults(func=_cmd_cp_llm_gateway_sync)
+    p2 = csub.add_parser("llm-gateway-usage",
+                         help="report the gateway's per-key token usage to the control plane")
+    p2.add_argument("--control-plane", default="http://control-plane-web:8080")
+    p2.add_argument("--gateway", required=True, help="gateway base URL")
+    p2.add_argument("--admin-secret-file", required=True,
+                    help="file holding the gateway admin secret (never printed)")
+    p2.add_argument("--state-file", required=True, help="where the reported baseline is kept")
+    p2.add_argument("--interval", type=float, default=30.0)
+    p2.add_argument("--once", action="store_true", help="report once and exit")
+    p2.set_defaults(func=_cmd_cp_llm_gateway_usage)
 
     return parser
 
@@ -1008,6 +1026,43 @@ def _cmd_cp_llm_proxy(args) -> int:
     print(f"llm-proxy listening on {args.host}:{httpd.server_address[1]}", flush=True)
     try:
         httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _cmd_cp_llm_gateway_sync(args) -> int:
+    from pathlib import Path
+
+    from .llm_gateway_bridge import run, sync_once
+    from .llm_proxy import ControlPlaneClient
+    control = ControlPlaneClient(args.control_plane)
+    path = Path(args.principals_file).expanduser()
+    if args.once:
+        return 1 if sync_once(control, path) is None else 0
+    try:
+        run(control, path, interval=args.interval)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _cmd_cp_llm_gateway_usage(args) -> int:
+    from pathlib import Path
+
+    from .llm_gateway_usage import fetch_usage, run, sync_once
+    from .llm_proxy import ControlPlaneClient
+    control = ControlPlaneClient(args.control_plane)
+    secret_path = Path(args.admin_secret_file).expanduser()
+
+    def fetch():  # re-read each pass so a rotated secret is picked up
+        return fetch_usage(args.gateway, secret_path.read_text().strip())
+
+    state = Path(args.state_file).expanduser()
+    if args.once:
+        return 1 if sync_once(control, fetch, state) is None else 0
+    try:
+        run(control, fetch, state, interval=args.interval)
     except KeyboardInterrupt:
         pass
     return 0
