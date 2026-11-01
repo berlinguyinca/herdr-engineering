@@ -886,6 +886,12 @@ export class HerdrClient {
   linkAssistant(id, parentId) {
     return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/link`, { method: 'POST', body: { parent_id: parentId } });
   }
+  unlinkAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/unlink`, { method: 'POST', body: {} });
+  }
+  deleteAssistant(id, confirmName) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/delete`, { method: 'POST', body: { confirm_name: confirmName } });
+  }
   setupAssistant(id) {
     return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/setup`, { method: 'POST', body: {} });
   }

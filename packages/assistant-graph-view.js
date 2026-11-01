@@ -3,6 +3,7 @@
 // HTML so the states run under node.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
+import { nodeActions } from './assistant-manage-controls.js';
 
 const text = (v) => (typeof v === 'string' ? v : v == null ? '' : String(v));
 const list = (v) => (Array.isArray(v) ? v : []);
@@ -56,6 +57,7 @@ function renderAssistant(node, inner, byId) {
   const kind = text(node.type) && node.type !== 'rakazo' ? ` ${chip('off', text(node.type))}` : '';
   return `<li class="pa-graph-node" data-graph-kind="assistant" data-graph-id="${esc(node.id)}">`
     + `<strong>${esc(text(node.name))}</strong>${kind} ${chip(text(node.status) || 'unknown', text(node.status) || 'unknown')} ${can}`
+    + nodeActions(node)
     + renderSetup(node)
     + renderPlacement(node, byId)
     + (inner.length ? `<ul class="pa-graph-list">${inner.join('')}</ul>` : '') + '</li>';

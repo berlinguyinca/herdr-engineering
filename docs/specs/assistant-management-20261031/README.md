@@ -348,3 +348,15 @@ routed target is resolved BEFORE grants and approval, so a grant for `pi-secreta
 approval text names it; the choice is audited (`assistant.delegation.routed`). The specialist is set up lazily, only inside the
 approved delegation. Routing and setup grant nothing beyond what that approval covers. `handles` is operator configuration; no
 default words are shipped, so nothing is inferred.
+
+## Rename, remove from the network, archive, delete
+
+Dashboard (graph node buttons and the "Manage" list under the picker) and CLI (`herdr-eng assistant rename|unlink|archive|delete`):
+
+* **Rename** edits the name (1-80 printable characters, trimmed) in Configure -> General; the graph's Rename opens it.
+* **Remove from network** unlinks an assistant from its parent. Management only; nothing is granted or revoked.
+* **Archive** disables it, revokes its grants and unlinks its children (as before).
+* **Delete** is permanent and only for an archived assistant, with its exact name typed (`POST /assistants/{id}/delete`
+  `{confirm_name}`; the server checks both). It removes the assistant, its threads, messages, runs, actions, approvals, grants,
+  routines and memory. Delegations, notifications and the audit log stay as history; `assistant.deleted` records the counts only.
+* **Restore** re-enables an archived assistant from the same list.

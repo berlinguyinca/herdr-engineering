@@ -6,6 +6,7 @@ import { requestErrorDetail } from './dashboard-load-state.js';
 import { mountKeys, roveIndex, TABS } from './personal-assistant-keys.js';
 import { loadAssistantGraph, renderAssistantGraph } from './assistant-graph-view.js';
 import { loadTypes, renderCreateForm, createBody, createCommand } from './assistant-create-form.js';
+import { renderInactive, deleteConfirmed } from './assistant-manage-controls.js';
 
 function statusClass(status) {
   return { ready: 'pa-status--ready', running: 'pa-status--running', disabled: 'pa-status--disabled',
@@ -79,6 +80,8 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   const stamp = a => Date.parse(a.updated_at || a.created_at || '') || 0;
   const isActive = a => a.enabled !== false && !/archiv|disabled|deleted/i.test(String(a.status || ''));
   let showAll = false, configOpen = false, pending = [];
+  let inactiveOpen = false;
+  const inactiveState = { openDelete: '', error: '' };
   // Coming back from Google's sign-in (/#/personal-assistant?connected=google or ?error=<reason>): open the Connectors tab, say what
   // happened in fixed words (never text from the URL), and drop the query so a reload does not repeat the message.
   let appsFlash = null;
@@ -119,6 +122,16 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       const el = container.querySelector('#pa-graph');
       if (el) {
         el.innerHTML = renderAssistantGraph(graphState);
+        const act = async (fn) => { try { await fn(); } catch { /* the graph refreshes below and shows the truth */ } await render(); };
+        el.querySelectorAll('[data-node-rename]').forEach(b => b.addEventListener('click', () => {
+          state.selectedId = b.dataset.nodeRename; state.tab = 'General'; configOpen = true; draw();
+          container.querySelector('[data-f="name"]')?.focus();
+        }));
+        el.querySelectorAll('[data-node-unlink]').forEach(b => b.addEventListener('click', () => act(() => client.unlinkAssistant(b.dataset.nodeUnlink))));
+        el.querySelectorAll('[data-node-archive]').forEach(b => b.addEventListener('click', () => {
+          const a = state.assistants.find(x => x.assistant_id === b.dataset.nodeArchive);
+          if (a && confirm(`Archive ${a.name}? Its children are unlinked and its permissions revoked.`)) act(() => client.archiveAssistant(a.assistant_id));
+        }));
         el.querySelectorAll('[data-setup-assistant]').forEach(btn => btn.addEventListener('click', async () => {
           btn.disabled = true;
           try { await client.setupAssistant(btn.dataset.setupAssistant); }
@@ -144,7 +157,8 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
         <button class="hd-btn hd-btn--ghost" data-config aria-expanded="${configOpen}" title="Show or hide Configure (,)">Configure</button>
         <button class="hd-btn" data-new>+ New</button>
       </div>
-      ${hidden ? `<p class="pa-muted pa-hidden-note">${hidden} inactive assistant${hidden === 1 ? '' : 's'} not listed.</p>` : ''}
+      ${hidden ? `<p class="pa-muted pa-hidden-note">${hidden} inactive assistant${hidden === 1 ? '' : 's'} not listed. <button type="button" class="hd-linkbtn" data-inactive-toggle aria-expanded="${inactiveOpen}">${inactiveOpen ? 'Hide' : 'Manage'}</button></p>` : ''}
+      ${hidden && inactiveOpen ? `<section class="hd-card pa-inactive-card" aria-label="Inactive assistants" id="pa-inactive">${renderInactive(state.assistants, inactiveState)}</section>` : ''}
       ${selected ? `<div id="pa-strip" class="pa-strip" role="status" ${pending.some(ap => ap.assistant_id === selected.assistant_id) ? '' : 'hidden'}></div>` : ''}
       ${selected ? renderChat(selected) : `<div class="hd-card"><div class="pa-empty">${state.assistants.length ? 'No active assistant. Use Show all, or create one.' : 'No assistants yet. Create one to begin.'}</div></div>`}
       ${selected && configOpen ? `<section class="hd-card pa-config" aria-label="Configure ${esc(selected.name)}">
@@ -172,10 +186,39 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     });
     container.querySelector('[data-keys]')?.addEventListener('click', () => keys.openHelp());
     container.querySelectorAll('[data-new]').forEach(el => el.addEventListener('click', () => openCreate()));
+    container.querySelector('[data-inactive-toggle]')?.addEventListener('click', () => { inactiveOpen = !inactiveOpen; inactiveState.openDelete = ''; draw(); });
+    bindInactive();
     const panel = container.querySelector('#pa-panel');
     if (panel) bindPanel(panel, selected);
     bindChat(container, selected);
     restoreFocus(keep);
+  };
+
+  // Restore or permanently delete an inactive assistant. Deleting asks for the exact name; the server checks it again.
+  const bindInactive = () => {
+    const root = container.querySelector('#pa-inactive');
+    if (!root) return;
+    const byId = id => state.assistants.find(x => x.assistant_id === id);
+    root.querySelectorAll('[data-restore]').forEach(b => b.addEventListener('click', async () => {
+      try { await client.updateAssistant(b.dataset.restore, { enabled: true }); } catch { /* the list refreshes below */ }
+      await render();
+    }));
+    root.querySelectorAll('[data-delete-open]').forEach(b => b.addEventListener('click', () => {
+      inactiveState.openDelete = b.dataset.deleteOpen; inactiveState.error = ''; draw();
+    }));
+    root.querySelectorAll('[data-delete-form]').forEach(form => {
+      const a = byId(form.dataset.deleteForm);
+      const input = form.querySelector('[data-delete-confirm]'), go = form.querySelector('[data-delete-go]');
+      input.addEventListener('input', () => { go.disabled = !deleteConfirmed(a, input.value); });
+      form.querySelector('[data-delete-cancel]').addEventListener('click', () => { inactiveState.openDelete = ''; draw(); });
+      form.addEventListener('submit', async e => {
+        e.preventDefault();
+        if (!deleteConfirmed(a, input.value)) return;
+        try { await client.deleteAssistant(a.assistant_id, input.value); inactiveState.openDelete = ''; inactiveState.error = ''; await render(); }
+        catch (err) { inactiveState.error = String(err?.message || 'could not delete'); draw(); }
+      });
+      input.focus();
+    });
   };
 
   // The "+ New" form: the same type, parent and idempotent create the CLI uses, with its equivalent command shown.

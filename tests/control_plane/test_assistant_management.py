@@ -178,3 +178,47 @@ def test_setup_endpoint_provisions_audits_and_refuses_what_it_cannot_do(hz):
     st, out = h.call("alice", "POST", path, {})
     assert st == 400 and "enroll it first" in str(out)
     assert h.call("bea", "POST", path, {})[0] in (403, 404)                     # someone else's assistant
+
+
+def test_rename_validates_and_trims(hz):
+    h, _ = hz
+    _, a = make(h, "Old")
+    path = f"/api/v1/assistants/{a['assistant_id']}"
+    st, out = h.call("alice", "PATCH", path, {"name": "  New name "})
+    assert st == 200 and out["name"] == "New name"
+    for bad in ("", "   ", "x" * 81, "a\nb", 5):
+        assert h.call("alice", "PATCH", path, {"name": bad})[0] == 400
+
+
+def test_delete_needs_archive_first_and_the_exact_name_and_removes_only_its_own_records(hz):
+    h, svc = hz
+    _, keep = make(h, "Keeper")
+    _, gone = make(h, "Doomed")
+    owner = svc.store.assistants[keep["assistant_id"]]
+    for a in (keep, gone):
+        t = svc.create_thread(tenant_id=owner.tenant_id, user_id=owner.user_id, assistant_id=a["assistant_id"])
+        svc.send_message(tenant_id=owner.tenant_id, user_id=owner.user_id, assistant_id=a["assistant_id"],
+                         thread_id=t.thread_id, content="hello")
+    path = f"/api/v1/assistants/{gone['assistant_id']}/delete"
+    st, out = h.call("alice", "POST", path, {"confirm_name": "Doomed"})
+    assert st == 400 and "archive" in str(out)                                   # still enabled
+    assert h.call("alice", "POST", f"/api/v1/assistants/{gone['assistant_id']}", {"archive": True})[0] == 200
+    assert h.call("alice", "POST", path, {"confirm_name": "doomed"})[0] == 400   # exact name only
+    assert h.call("alice", "POST", path, {})[0] == 400
+    assert h.call("bea", "POST", path, {"confirm_name": "Doomed"})[0] in (403, 404)
+    st, out = h.call("alice", "POST", path, {"confirm_name": "Doomed"})
+    assert st == 200 and out["removed"]["assistant"] == 1 and out["removed"]["threads"] == 1
+    assert gone["assistant_id"] not in svc.store.assistants and keep["assistant_id"] in svc.store.assistants
+    assert [t for t in svc.store.threads.values() if t.assistant_id == keep["assistant_id"]]      # the other one is intact
+    assert not [t for t in svc.store.threads.values() if t.assistant_id == gone["assistant_id"]]
+    assert [e["action"] for e in svc.store.audit].count("assistant.deleted") == 1
+    assert h.call("alice", "POST", path, {"confirm_name": "Doomed"})[0] in (404, 400)            # gone for good
+
+
+def test_deleting_a_parent_leaves_no_dangling_link_on_its_children(hz):
+    h, svc = hz
+    _, p = make(h, "Parent")
+    _, c = make(h, "Child", type="pi-secretary", parent_id=p["assistant_id"])
+    h.call("alice", "POST", f"/api/v1/assistants/{p['assistant_id']}", {"archive": True})
+    h.call("alice", "POST", f"/api/v1/assistants/{p['assistant_id']}/delete", {"confirm_name": "Parent"})
+    assert svc.store.assistants[c["assistant_id"]].parent_id is None

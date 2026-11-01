@@ -2116,6 +2116,32 @@ class AssistantStore:
             self.assistants[a.assistant_id] = a
         self._after_mutation()
 
+    def purge_assistant(self, assistant_id: str, *, tenant_id: str, user_id: str) -> dict[str, int]:
+        """Drop the assistant and the records keyed to it, in one critical section; returns counts removed."""
+        with self._lock:
+            a = self.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+            threads = {t.thread_id for t in self.threads.values() if t.assistant_id == a.assistant_id}
+            counts: dict[str, int] = {}
+
+            def drop(name: str, table: dict, keep) -> None:
+                gone = [k for k, v in table.items() if not keep(v)]
+                for k in gone:
+                    del table[k]
+                counts[name] = len(gone)
+
+            drop("messages", self.messages, lambda m: m.thread_id not in threads)
+            drop("threads", self.threads, lambda t: t.assistant_id != a.assistant_id)
+            drop("runs", self.runs, lambda r: r.assistant_id != a.assistant_id)
+            drop("actions", self.actions, lambda x: x.assistant_id != a.assistant_id)
+            drop("approvals", self.approvals, lambda x: x.assistant_id != a.assistant_id)
+            drop("grants", self.grants, lambda g: g.assistant_id != a.assistant_id)
+            drop("routines", self.routines, lambda r: r.assistant_id != a.assistant_id)
+            drop("memory", self.memory, lambda m: m.assistant_id != a.assistant_id)
+            del self.assistants[a.assistant_id]
+            counts["assistant"] = 1
+        self._after_mutation()
+        return counts
+
     def _assistant(self, assistant_id: str) -> Assistant:
         a = self.assistants.get(assistant_id)
         if a is None:
@@ -2734,6 +2760,11 @@ class AssistantService:
         self._require_enabled()
         a = self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         allowed = {"name", "persona", "instructions", "model_policy", "enabled"}
+        if "name" in patch and (not isinstance(patch["name"], str) or not patch["name"].strip()
+                                or len(patch["name"]) > 80 or not patch["name"].isprintable()):
+            raise AssistantError("name must be 1-80 printable characters")
+        if "name" in patch:
+            patch = {**patch, "name": patch["name"].strip()}
         for key in allowed:
             if key in patch:
                 setattr(a, key, patch[key])
@@ -2764,6 +2795,21 @@ class AssistantService:
             self.unlink_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.archived", subject_id=assistant_id)
+
+    def delete_assistant(self, assistant_id: str, *, tenant_id: str, user_id: str, confirm_name: str) -> dict[str, int]:
+        """Permanently remove an ARCHIVED assistant and what only it owned: its threads, messages, runs, actions,
+        approvals, grants, routines and memory. Delegations, notifications and the audit log stay as history. Needs the
+        assistant's exact name as confirmation, so a stray call cannot delete anything; archive comes first."""
+        self._require_enabled()
+        a = self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if a.enabled:
+            raise AssistantError("archive the assistant before deleting it")
+        if confirm_name != a.name:
+            raise AssistantError("confirmation does not match the assistant's name")
+        removed = self.store.purge_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="assistant.deleted",
+                                subject_id=assistant_id, detail=", ".join(f"{k}={v}" for k, v in sorted(removed.items())))
+        return removed
 
     # -- threads & messages -----------------------------------------------------
     def create_thread(self, *, tenant_id: str, user_id: str, assistant_id: str,

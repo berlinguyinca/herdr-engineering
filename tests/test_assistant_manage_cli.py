@@ -119,3 +119,17 @@ def test_setup_verb_is_registered_and_posts_to_the_assistants_setup_route():
     m.register_management(root.add_subparsers(dest="verb"))
     args = root.parse_args(["setup", "Secretary"])
     assert args.assistant_manage == "setup" and args.ref == "Secretary" and args.func is m.run_command
+
+
+def test_rename_and_delete_verbs_are_registered_and_delete_requires_the_name():
+    import argparse
+
+    from herdr_engineering import assistant_manage_cli as m
+    root = argparse.ArgumentParser()
+    m.register_management(root.add_subparsers(dest="verb"))
+    args = root.parse_args(["rename", "Old", "New"])
+    assert (args.assistant_manage, args.ref, args.name) == ("rename", "Old", "New")
+    args = root.parse_args(["delete", "Old", "--confirm-name", "Old"])
+    assert args.assistant_manage == "delete" and args.confirm_name == "Old"
+    with pytest.raises(SystemExit):
+        root.parse_args(["delete", "Old"])

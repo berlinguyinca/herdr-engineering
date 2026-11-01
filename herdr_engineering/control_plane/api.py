@@ -4654,6 +4654,10 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(svc.link_assistant(
                             parts[4], tenant_id=tenant_id, user_id=user_id,
                             parent_id=str(body.get("parent_id", ""))).as_dict())
+                    if len(parts) == 6 and parts[5] == "delete" and self.command == "POST":
+                        return self._json({"removed": svc.delete_assistant(
+                            parts[4], tenant_id=tenant_id, user_id=user_id,
+                            confirm_name=str(body.get("confirm_name", "")))})
                     if len(parts) == 6 and parts[5] == "setup" and self.command == "POST":
                         return self._json(svc.setup_specialist(parts[4], tenant_id=tenant_id, user_id=user_id))
                     if len(parts) == 6 and parts[5] == "unlink" and self.command == "POST":

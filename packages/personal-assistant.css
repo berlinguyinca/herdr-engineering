@@ -122,3 +122,6 @@ a.hd-btn { text-decoration: none; display: inline-flex; align-items: center; }
 .pa-create { display: grid; gap: 8px; margin: var(--space-3, 12px) 0; padding: var(--space-3, 12px); }
 .pa-create label { display: grid; gap: 4px; }
 .pa-create code { word-break: break-all; }
+.pa-node-actions { margin-left: 8px; display: inline-flex; gap: 8px; }
+.pa-inactive { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.pa-delete { display: grid; gap: 6px; margin-top: 6px; }

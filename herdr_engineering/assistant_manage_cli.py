@@ -1,4 +1,4 @@
-"""`herdr-eng assistant create|list|inspect|link|unlink|archive|setup|types|graph`: manage the person's assistants.
+"""`herdr-eng assistant create|list|inspect|link|unlink|rename|archive|delete|setup|route|types|graph`: manage the person's assistants.
 
 A thin client of the Personal Assistant API (/api/v1/assistants...). Identity and tenant come from the API key the
 server maps to a principal, exactly as for `herdr-eng teams` and the dashboard; the CLI offers no user, tenant or
@@ -158,6 +158,14 @@ def run_command(args: argparse.Namespace) -> int:
             target = resolve_ref(_list(client), args.ref)
             client.request(f"{BASE}/{quote(target['assistant_id'], safe='')}", {"archive": True})
             result = {"archived": target["assistant_id"]}
+        elif op == "rename":
+            target = resolve_ref(_list(client), args.ref)
+            result = {"assistant": client.request(f"{BASE}/{quote(target['assistant_id'], safe='')}",
+                                                  {"name": args.name})}
+        elif op == "delete":
+            target = resolve_ref(_list(client), args.ref)
+            result = client.request(f"{BASE}/{quote(target['assistant_id'], safe='')}/delete",
+                                    {"confirm_name": args.confirm_name})
         elif op == "setup":
             target = resolve_ref(_list(client), args.ref)
             result = client.request(f"{BASE}/{quote(target['assistant_id'], safe='')}/setup", {})
@@ -220,6 +228,14 @@ def register_management(groups: argparse._SubParsersAction) -> None:
     c = groups.add_parser("archive", help="archive an assistant (disables it and revokes its grants)")
     c.add_argument("ref")
     _common(c, "archive")
+    c = groups.add_parser("rename", help="rename an assistant")
+    c.add_argument("ref", help="assistant id, or its exact name when unique")
+    c.add_argument("name")
+    _common(c, "rename")
+    c = groups.add_parser("delete", help="permanently delete an ARCHIVED assistant and its conversations")
+    c.add_argument("ref", help="assistant id, or its exact name when unique")
+    c.add_argument("--confirm-name", required=True, help="the assistant's exact name; nothing is deleted without it")
+    _common(c, "delete")
     c = groups.add_parser("setup", help="have Rakazo set up a specialist for you (your enrolled agent, your own private room)")
     c.add_argument("ref", help="assistant id, or its exact name when unique")
     _common(c, "setup")
