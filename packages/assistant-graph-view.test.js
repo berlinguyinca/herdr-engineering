@@ -140,3 +140,10 @@ test('a specialist lists only the setup steps still open, escaped', () => {
   assert.ok(!html.includes('data-setup-step="binding"'));
   assert.ok(!html.includes('<img src=x>'));
 });
+
+test('a specialist with no binding offers Set up; one that only lacks placement does not', () => {
+  const node = (setup) => ({ status: 'ok', edges: [], nodes: [{ id: 'you', kind: 'you', name: 'You' },
+    { id: 's1', kind: 'assistant', name: 'Sec', type: 'pi-secretary', status: 'needs_setup', enabled: true, setup }] });
+  assert.match(renderAssistantGraph(node([{ id: 'binding', state: 'todo', detail: 'x' }])), /data-setup-assistant="s1"/);
+  assert.ok(!renderAssistantGraph(node([{ id: 'binding', state: 'done', detail: 'x' }, { id: 'placement', state: 'blocked', detail: 'y' }])).includes('data-setup-assistant'));
+});

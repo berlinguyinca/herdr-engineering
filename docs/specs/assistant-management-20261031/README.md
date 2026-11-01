@@ -321,3 +321,19 @@ for that person. Two stages, deliberately separate:
 - **Browsing precondition:** no `browser` specialist can be created until a sandbox profile that permits `display` and
   brokered `internet` is designed and reviewed. Until then `place --type browser` reports no host qualifies, which is
   the correct answer.
+
+## Self-setup of specialists (dashboard owner)
+
+The dashboard has one owner, known to the collaboration service as `operator_user` (the identity the dashboard already uses
+for rooms). In single-operator mode with collaboration on, `POST /api/v1/assistants/{id}/setup` (also
+`herdr-eng assistant setup <ref>`, and the dashboard's "Set up" button) has the control plane act as that user, in-process,
+through the same room authorization as any caller (`assistant_self_setup.py`):
+
+1. find the one active agent the owner enrolled with the specialist's type as its name (none or several: refuse, never guess);
+2. find or create a private room `Assistant: <type>` (reusing the project of the owner's other assistant rooms);
+3. grant that agent `read` and `execute` there, nothing else.
+
+The binding is what was found; nothing is stored, no token is minted and no credential file is read. Delegation resolves
+through it only for the owner's scope (`open-listener` in the owner's tenant) and only for `pi-secretary`; explicit
+`pi_bindings` still win. Setup is an explicit request and is audited (`assistant.setup`). Not built: enrolling the agent itself
+and starting its runtime on a placed host (needs the runner, and Slurm for clusters).

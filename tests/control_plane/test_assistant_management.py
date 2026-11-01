@@ -148,3 +148,33 @@ def test_specialist_setup_steps_report_binding_and_placement_and_change_nothing(
     assert steps["binding"]["state"] == "todo"
     assert steps["placement"]["state"] == "blocked" and "no host can carry it" in steps["placement"]["detail"]
     assert (len(svc.store.grants), len(svc.store.delegations), len(svc.store.audit)) == before
+
+
+class _FakeSetup:
+    def __init__(self, fail=None):
+        self.fail, self.calls = fail, []
+
+    def provision(self, type_name):
+        from herdr_engineering.assistant_self_setup import SelfSetupError
+        self.calls.append(type_name)
+        if self.fail:
+            raise SelfSetupError(self.fail)
+        return {"room_id": "room_1", "agent_id": "agent_1"}
+
+
+def test_setup_endpoint_provisions_audits_and_refuses_what_it_cannot_do(hz):
+    h, svc = hz
+    _, s = make(h, "Secretary", type="pi-secretary")
+    _, r = make(h, "Fleet PA")
+    path = f"/api/v1/assistants/{s['assistant_id']}/setup"
+    assert h.call("alice", "POST", path, {})[0] == 400                          # no collaboration operator wired
+    svc.self_setup = _FakeSetup()
+    st, out = h.call("alice", "POST", path, {})
+    assert st == 200 and (out["room_id"], out["agent_id"]) == ("room_1", "agent_1")
+    assert svc.self_setup.calls == ["pi-secretary"]
+    assert [e["action"] for e in svc.store.audit].count("assistant.setup") == 1
+    assert h.call("alice", "POST", f"/api/v1/assistants/{r['assistant_id']}/setup", {})[0] == 400   # rakazo needs none
+    svc.self_setup = _FakeSetup(fail="no active agent named pi-secretary is enrolled for you; enroll it first")
+    st, out = h.call("alice", "POST", path, {})
+    assert st == 400 and "enroll it first" in str(out)
+    assert h.call("bea", "POST", path, {})[0] in (403, 404)                     # someone else's assistant

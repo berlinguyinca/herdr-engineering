@@ -109,3 +109,13 @@ def test_resolve_ref_prefers_active_assistants_for_a_name():
             {"assistant_id": "asst_new", "name": "PA", "enabled": True}]
     assert resolve_ref(rows, "PA")["assistant_id"] == "asst_new"
     assert resolve_ref(rows, "asst_old")["assistant_id"] == "asst_old"
+
+
+def test_setup_verb_is_registered_and_posts_to_the_assistants_setup_route():
+    import argparse
+
+    from herdr_engineering import assistant_manage_cli as m
+    root = argparse.ArgumentParser()
+    m.register_management(root.add_subparsers(dest="verb"))
+    args = root.parse_args(["setup", "Secretary"])
+    assert args.assistant_manage == "setup" and args.ref == "Secretary" and args.func is m.run_command

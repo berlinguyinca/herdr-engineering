@@ -598,6 +598,16 @@ class ControlPlaneServer:
         self.operator_port, self.operator_user = operator_port, operator_user
         self.operator_email = operator_email
         self.operator_hosts = frozenset(h.lower() for h in operator_hosts)
+        # Rakazo sets specialists up for the dashboard's one owner, acting as the collaboration operator the dashboard
+        # already uses for rooms. Without that operator (or collaboration) nothing is wired and setup answers 400.
+        if self.collab is not None and self.operator_user and self.single_operator and self.assistant.self_setup is None:
+            from ..assistant_self_setup import SelfSetup
+            _setup = SelfSetup(self.collab, self.operator_user)
+            _owner_tenant = self.assistant.tenant_for("open-listener")
+            self.assistant.self_setup = _setup
+            self.assistant.delegation_adapter_resolver = _setup.resolver(
+                lambda tenant, user: (tenant, user) == (_owner_tenant, "open-listener"),
+                fallback=self.assistant.delegation_adapter_resolver)
         self._operator_httpd = None
         # Dashboard side: forward /api/v1/collab/* to the operator listener of the isolated
         # collab service, so the local owner needs no sign-in.
@@ -4638,6 +4648,8 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(svc.link_assistant(
                             parts[4], tenant_id=tenant_id, user_id=user_id,
                             parent_id=str(body.get("parent_id", ""))).as_dict())
+                    if len(parts) == 6 and parts[5] == "setup" and self.command == "POST":
+                        return self._json(svc.setup_specialist(parts[4], tenant_id=tenant_id, user_id=user_id))
                     if len(parts) == 6 and parts[5] == "unlink" and self.command == "POST":
                         return self._json(svc.unlink_assistant(
                             parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())

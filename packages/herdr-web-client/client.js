@@ -886,6 +886,9 @@ export class HerdrClient {
   linkAssistant(id, parentId) {
     return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/link`, { method: 'POST', body: { parent_id: parentId } });
   }
+  setupAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/setup`, { method: 'POST', body: {} });
+  }
   listDelegations() {
     return this.request('/api/v1/assistant-delegations');
   }

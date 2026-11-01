@@ -43,7 +43,8 @@ function renderPlacement(node, byId) {
 function renderSetup(node) {
   const open = list(node.setup).filter((st) => st && st.state !== 'done');
   if (!open.length) return '';
-  return `<ul class="pa-graph-setup" data-graph-setup>${open.map((st) =>
+  const binding = open.some((st) => st.id === 'binding');
+  return `${binding ? `<button type="button" class="hd-btn hd-btn--sm" data-setup-assistant="${esc(text(node.id))}">Set up</button>` : ''}<ul class="pa-graph-setup" data-graph-setup>${open.map((st) =>
     `<li data-setup-step="${esc(text(st.id))}">${chip(st.state === 'blocked' ? 'error' : 'off', text(st.state))} ${esc(text(st.detail))}</li>`).join('')}</ul>`;
 }
 

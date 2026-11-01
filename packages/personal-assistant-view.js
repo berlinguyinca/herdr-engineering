@@ -117,7 +117,15 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       const out = await loadAssistantGraph(client);
       graphState = { phase: out.status === 'ok' ? 'ready' : out.status, nodes: out.nodes, edges: out.edges, message: out.message };
       const el = container.querySelector('#pa-graph');
-      if (el) el.innerHTML = renderAssistantGraph(graphState);
+      if (el) {
+        el.innerHTML = renderAssistantGraph(graphState);
+        el.querySelectorAll('[data-setup-assistant]').forEach(btn => btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          try { await client.setupAssistant(btn.dataset.setupAssistant); }
+          catch (err) { btn.insertAdjacentHTML('afterend', `<span class="pa-error" role="alert">${esc(String(err?.message || 'setup failed'))}</span>`); btn.disabled = false; return; }
+          refreshGraph();
+        }));
+      }
     } finally { graphBusy = false; }
   };
 

@@ -2492,6 +2492,7 @@ class AssistantService:
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
         self.google_write = None      # (tenant, user, tool_id, payload) -> dict; runs ONLY an approved Google draft/event
+        self.self_setup = None      # assistant_self_setup.SelfSetup once api.py has a collaboration operator, else None
         self.canonical_person = lambda tenant, user: (tenant, user)   # single-operator rule hook (see RakazoBridge.canonical_person); identity until api.py wires it
         self.reminders = None         # ReminderStore, set by the server; reminders need no Google account
         self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.apps is set up
@@ -4034,6 +4035,25 @@ class AssistantService:
             profile="task-restricted-v1", role=self._role_key(target.get("role_ref")))
         decision["type"] = type_name
         return decision
+
+    def setup_specialist(self, assistant_id: str, *, tenant_id: str, user_id: str) -> dict[str, Any]:
+        """The owner's explicit request that Rakazo set this specialist up. Idempotent; grants only what the setup module
+        names (read and execute for the owner's own agent in the owner's own room) and audits it."""
+        self._require_enabled()
+        a = self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if a.type == "rakazo" or not a.enabled:
+            raise AssistantError("only an enabled specialist needs setup")
+        if self.self_setup is None:
+            raise AssistantError("self-setup is unavailable: this control plane has no collaboration operator")
+        from ..assistant_self_setup import SelfSetupError
+        try:
+            result = self.self_setup.provision(a.type)
+        except SelfSetupError as exc:
+            raise AssistantError(str(exc)) from None
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="assistant.setup",
+                                subject_id=assistant_id, detail=f"room={result['room_id']} agent={result['agent_id']}")
+        return {"assistant_id": assistant_id, "setup": self.specialist_setup(a, tenant_id=tenant_id, user_id=user_id),
+                "room_id": result["room_id"], "agent_id": result["agent_id"]}
 
     def specialist_setup(self, a: Assistant, *, tenant_id: str, user_id: str) -> list[dict[str, str]]:
         """What a specialist still needs before delegation can use it, as ordered steps (``done`` | ``todo`` | ``blocked``).
