@@ -30,6 +30,15 @@ def test_a_near_duplicate_ask_is_a_reask_but_a_short_or_distant_one_is_not():
     assert kinds(far) == []
 
 
+def test_injected_turns_are_not_corrections_and_a_turn_logged_twice_counts_once():
+    gate = "[harness] Automatic engineering gate - round 1 the verifier found these problems to fix first"
+    note = "<task-notification> <task-id>b1</task-id> the background command finished with exit code 0 </task-notification>"
+    assert kinds([ev("assistant", "x"), ev("user", gate), ev("assistant", "y"), ev("user", gate)]) == []
+    assert kinds([ev("assistant", "x"), ev("user", note), ev("assistant", "y"), ev("user", note)]) == []
+    assert kinds([ev("assistant", "x"), ev("user", "Another Claude session sent a message: no do it")]) == []
+    assert kinds([ev("assistant", "x"), ev("user", "no, redo it"), ev("user", "no, redo it")]) == ["negation"]
+
+
 def test_interrupts_and_rejected_tools_are_found():
     assert kinds([ev("assistant", "running"), ev("user", "[Request interrupted by user]")]) == ["interrupt"]
     got = cx.extract([ev("assistant", "I will delete it"), ev("tool_result", "The user doesn't want to proceed with this tool use.",

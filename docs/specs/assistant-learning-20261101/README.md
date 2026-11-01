@@ -19,3 +19,12 @@ correct an agent, with no behavior change.
 Not built: scanning on a schedule or from a hook, proposals from repeated corrections (step 3), and the before/after
 correction-rate measurement (step 4). The patterns are English-only and will miss and over-match; the point of step 2 is to
 read the log and find out how much.
+
+## First real scan (2026-11-01): what it taught us
+
+Scanning the newest 40 records per harness (98 sessions) first found 489 "corrections", 472 of them `reask`. Nearly all were
+machine-written turns in the user role (an automatic engineering gate repeated 329 times in one Pi session, task
+notifications, agent-to-agent messages). The extractor now ignores injected turns and a turn logged twice; the same scan then
+found 17 (9 Claude, 7 Codex, 1 Pi): 8 negations, 6 interrupts, 3 rejected tool calls, and no re-asks. Lessons: most traffic in
+the user role is not from a person, so any later learning must filter on who wrote a turn before it counts anything; `reask`
+may be too strict or genuinely rare and needs more data before it is trusted.

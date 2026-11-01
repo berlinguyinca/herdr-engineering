@@ -6,6 +6,7 @@ corrections into proposals you approve. Design points:
 * Pull, not push. Corrections are read afterwards from the session records ``session_history`` already reads (read-only,
   redacted, clipped), so nothing sits in an agent's request path and there is no added latency.
 * Off until ``enable``. ``scan`` refuses while disabled; ``disable`` stops it; ``forget`` deletes what was kept.
+* Human turns only. Turns the harness or another agent injected (gates, task notifications, agent messages) are ignored.
 * Deterministic. Four kinds, found by fixed patterns, never by a model reading your chats.
 * Small. A record holds the harness, the session, a short excerpt of what you said and of what you were answering. It is
   not a transcript, and it never holds hidden reasoning.
@@ -36,6 +37,9 @@ _NEGATION = re.compile(
 _INTERRUPT = re.compile(r"\[?request interrupted by user|interrupted by user|turn aborted", re.IGNORECASE)
 _REJECTED = re.compile(r"doesn'?t want to proceed|user (rejected|denied|declined)|tool use was rejected|permission denied by user",
                        re.IGNORECASE)
+# Turns that arrive in the user role but were not typed by you: harness gates, task notifications, agent-to-agent messages.
+_AUTOMATED = re.compile(r"^\s*(<|\[harness\]|another \w+ session sent a message|this session is being continued)",
+                        re.IGNORECASE)
 _WORD = re.compile(r"[a-z0-9']+")
 
 
@@ -85,6 +89,8 @@ def extract(events: Iterable[dict], *, agent: str, session_id: str) -> list[Corr
         elif kind == "tool_result" and e.get("ok") is False and _REJECTED.search(text):
             found.append(_make("rejected_tool", agent, session_id, i, e, f"{e.get('tool') or 'tool'}: {last_agent_text}"))
         elif kind == "user":
+            if _AUTOMATED.search(text) or (seen_user and seen_user[-1][1] == text):
+                continue                      # not typed by a person, or the same turn logged twice
             if _INTERRUPT.search(text):
                 found.append(_make("interrupt", agent, session_id, i, e, last_agent_text))
                 continue
