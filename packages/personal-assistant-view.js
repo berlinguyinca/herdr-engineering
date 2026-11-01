@@ -5,6 +5,7 @@ import { skeleton } from './motion.js';
 import { requestErrorDetail } from './dashboard-load-state.js';
 import { mountKeys, roveIndex, TABS } from './personal-assistant-keys.js';
 import { loadAssistantGraph, renderAssistantGraph } from './assistant-graph-view.js';
+import { loadTypes, renderCreateForm, createBody, createCommand } from './assistant-create-form.js';
 
 function statusClass(status) {
   return { ready: 'pa-status--ready', running: 'pa-status--running', disabled: 'pa-status--disabled',
@@ -162,16 +163,44 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       });
     });
     container.querySelector('[data-keys]')?.addEventListener('click', () => keys.openHelp());
-    container.querySelectorAll('[data-new]').forEach(el => el.addEventListener('click', async () => {
-      const name = prompt('Assistant name', 'Personal Assistant');
-      if (!name) return;
-      await client.createAssistant({ name });
-      await render();
-    }));
+    container.querySelectorAll('[data-new]').forEach(el => el.addEventListener('click', () => openCreate()));
     const panel = container.querySelector('#pa-panel');
     if (panel) bindPanel(panel, selected);
     bindChat(container, selected);
     restoreFocus(keep);
+  };
+
+  // The "+ New" form: the same type, parent and idempotent create the CLI uses, with its equivalent command shown.
+  const openCreate = async () => {
+    const { types } = await loadTypes(client);
+    const values = { name: '', type: 'rakazo', parent_id: '' };
+    let error = '';
+    const slot = document.createElement('div');
+    container.querySelector('.pa-bar')?.after(slot);
+    const parentName = () => state.assistants.find(x => x.assistant_id === values.parent_id)?.name;
+    const paint = () => {
+      slot.innerHTML = renderCreateForm({ types, assistants: state.assistants, values, error });
+      const form = slot.querySelector('[data-create-form]');
+      const read = () => {
+        values.name = form.querySelector('[data-create-name]').value;
+        values.type = form.querySelector('[data-create-type]').value;
+        values.parent_id = form.querySelector('[data-create-parent]')?.value || '';
+      };
+      form.querySelector('[data-create-type]').addEventListener('change', () => { read(); values.parent_id = ''; error = ''; paint(); });
+      form.querySelector('[data-create-parent]')?.addEventListener('change', () => { read(); paint(); });
+      form.querySelector('[data-create-name]').addEventListener('input', () => {
+        read();
+        slot.querySelector('[data-create-cli]').textContent = createCommand({ name: values.name, type: values.type, parent: parentName() });
+      });
+      form.querySelector('[data-create-cancel]').addEventListener('click', () => slot.remove());
+      form.addEventListener('submit', async e => {
+        e.preventDefault(); read();
+        try { await client.createAssistant(createBody(values)); slot.remove(); await render(); }
+        catch (err) { error = String(err?.message || 'could not create'); paint(); }
+      });
+      form.querySelector('[data-create-name]').focus();
+    };
+    paint();
   };
 
   // Waiting approvals are the one thing a person must act on here, so they sit above the conversation rather than in a tab.

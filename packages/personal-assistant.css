@@ -119,3 +119,6 @@ a.hd-btn { text-decoration: none; display: inline-flex; align-items: center; }
 .pa-graph-chip { display: inline-block; padding: 0 8px; border-radius: 999px; font-size: var(--text-sm, 13px); border: 1px solid var(--border, rgba(127,127,127,.4)); color: var(--text-muted); }
 .pa-graph-chip--ok, .pa-graph-chip--ready, .pa-graph-chip--done { color: var(--ok, #2e7d32); border-color: currentColor; }
 .pa-graph-chip--failed, .pa-graph-chip--cancelled { color: var(--danger, #c62828); border-color: currentColor; }
+.pa-create { display: grid; gap: 8px; margin: var(--space-3, 12px) 0; padding: var(--space-3, 12px); }
+.pa-create label { display: grid; gap: 4px; }
+.pa-create code { word-break: break-all; }

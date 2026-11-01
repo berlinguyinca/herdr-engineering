@@ -880,6 +880,12 @@ export class HerdrClient {
   assistantGraph({ signal } = {}) {
     return this.request('/api/v1/assistant-graph', { signal });
   }
+  assistantTypes({ signal } = {}) {
+    return this.request('/api/v1/assistant-types', { signal });
+  }
+  linkAssistant(id, parentId) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/link`, { method: 'POST', body: { parent_id: parentId } });
+  }
   listDelegations() {
     return this.request('/api/v1/assistant-delegations');
   }
