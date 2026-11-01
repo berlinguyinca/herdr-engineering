@@ -190,3 +190,9 @@ so approver != requester is not weakened.
 Not migrated: assistants the phone created before this change stay owned by `rakazo:<account>` and are shown on neither surface.
 `RakazoBridge.legacy_phone_assistants()` lists them (it moves nothing); moving them means rewriting the owner on every record type
 that carries `user_id`, which needs its own reviewed migration.
+
+### Trying the app locally
+
+`scripts/local-phone-server.py` starts a throwaway control plane (in-memory, bridge on, one operator account with a random
+password printed once, loopback only). Point the iOS simulator's Server field at `http://127.0.0.1:8787` and sign in with the
+printed email and password. Checked: the server starts and `/api/auth/sign-in/email` returns a token. The simulator itself needs Xcode.
