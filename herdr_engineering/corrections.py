@@ -30,6 +30,7 @@ CONTEXT = 120
 REASK_WINDOW = 12            # user turns are compared against the last few events only
 REASK_SIMILARITY = 0.6
 MIN_REASK_WORDS = 4
+REPEAT_AUTOMATION = 3         # identical user turns in one session at which they count as automation
 
 _NEGATION = re.compile(
     r"^\W*(no\b|nope\b|not (that|what)\b|that'?s (wrong|not)\b|wrong\b|don'?t\b|do not\b|stop\b|instead\b|"
@@ -39,7 +40,7 @@ _REJECTED = re.compile(r"doesn'?t want to proceed|user (rejected|denied|declined
                        re.IGNORECASE)
 # Turns that arrive in the user role but were not typed by you: harness gates, task notifications, agent-to-agent messages.
 _AUTOMATED = re.compile(r"^\s*(<|\[harness\]|another \w+ session sent a message|this session is being continued|"
-                        r"[\w-]+ hook (feedback|blocked|error))",
+                        r"[\w-]+ hook (feedback|blocked|error)|\[image:|\[\d+ prior |# /loop|goal check-in)",
                         re.IGNORECASE)
 _WORD = re.compile(r"[a-z0-9']+")
 
@@ -80,6 +81,8 @@ def extract(events: Iterable[dict], *, agent: str, session_id: str) -> list[Corr
     """Corrections in one session's normalized events (``session_history`` shape). Pure and idempotent: the same events
     always give the same ids, so scanning a session twice records nothing new."""
     evs = list(events)
+    # A prompt that arrives three or more times in one session is a schedule or a loop, not you asking again.
+    repeats = Counter(" ".join(str(e.get("text", "")).split()) for e in evs if e.get("kind") == "user")
     found: list[Correction] = []
     last_agent_text = ""
     seen_user: list[tuple[int, str]] = []
@@ -90,7 +93,8 @@ def extract(events: Iterable[dict], *, agent: str, session_id: str) -> list[Corr
         elif kind == "tool_result" and e.get("ok") is False and _REJECTED.search(text):
             found.append(_make("rejected_tool", agent, session_id, i, e, f"{e.get('tool') or 'tool'}: {last_agent_text}"))
         elif kind == "user":
-            if _AUTOMATED.search(text) or (seen_user and seen_user[-1][1] == text):
+            if (_AUTOMATED.search(text) or (i and evs[i - 1].get("kind") == "user" and str(evs[i - 1].get("text", "")) == text)
+                    or repeats[" ".join(text.split())] >= REPEAT_AUTOMATION):
                 continue                      # not typed by a person, or the same turn logged twice
             if _INTERRUPT.search(text):
                 found.append(_make("interrupt", agent, session_id, i, e, last_agent_text))

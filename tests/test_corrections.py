@@ -41,6 +41,14 @@ def test_injected_turns_are_not_corrections_and_a_turn_logged_twice_counts_once(
     assert kinds([ev("assistant", "x"), ev("user", "no, redo it"), ev("user", "no, redo it")]) == ["negation"]
 
 
+def test_a_prompt_repeated_three_times_is_a_schedule_and_attachments_and_loops_are_ignored():
+    cycle = "Gateway watchdog cycle: check the job queue and report anything stuck for more than an hour"
+    assert kinds([ev("user", cycle), ev("assistant", "a"), ev("user", cycle), ev("assistant", "b"), ev("user", cycle)]) == []
+    assert kinds([ev("user", cycle), ev("assistant", "a"), ev("user", cycle)]) == ["reask"]          # twice can be a person
+    for text in ("[Image: source: /tmp/x.png]", "# /loop - schedule a recurring task", "Goal check-in: implement the spec"):
+        assert kinds([ev("assistant", "x"), ev("user", text), ev("assistant", "y"), ev("user", text + " again")]) == []
+
+
 def test_interrupts_and_rejected_tools_are_found():
     assert kinds([ev("assistant", "running"), ev("user", "[Request interrupted by user]")]) == ["interrupt"]
     got = cx.extract([ev("assistant", "I will delete it"), ev("tool_result", "The user doesn't want to proceed with this tool use.",
