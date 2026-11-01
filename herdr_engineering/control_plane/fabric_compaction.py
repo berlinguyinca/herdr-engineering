@@ -76,8 +76,29 @@ _MOVE_CHUNK = """
         DELETE FROM compaction_pending WHERE ctid IN (SELECT ctid FROM compaction_pending LIMIT $1) RETURNING event_id
     ), moved AS (
         DELETE FROM fabric_events f USING batch WHERE f.event_id = batch.event_id RETURNING f.*
-    ) INSERT INTO fabric_events_archive SELECT moved.*, now() FROM moved
+    ) INSERT INTO fabric_events_archive ({columns}, archived_at) SELECT {moved_columns}, now() FROM moved
 """
+
+# The journal's columns as the catalog has them now, in order, with their types.
+_JOURNAL_COLUMNS = """
+    SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type
+    FROM pg_attribute a WHERE a.attrelid = 'fabric_events'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+    ORDER BY a.attnum
+"""
+_ARCHIVE_COLUMNS = """
+    SELECT a.attname AS name FROM pg_attribute a
+    WHERE a.attrelid = 'fabric_events_archive'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+"""
+
+
+def _quote(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def move_chunk_sql(columns: list[str]) -> str:
+    """The move statement with every column named, so the archive's column order never has to match the journal's."""
+    return _MOVE_CHUNK.format(columns=", ".join(_quote(c) for c in columns),
+                              moved_columns=", ".join("moved." + _quote(c) for c in columns))
 
 
 class FabricCompactor:
@@ -142,11 +163,12 @@ class FabricCompactor:
         moved = 0
         try:
             await conn.execute("DROP TABLE IF EXISTS compaction_pending")
+            move_sql = move_chunk_sql(await self._sync_archive_columns(conn))
             await conn.execute(_LIST, age, s.batch_rows)
             listed = int(await conn.fetchval("SELECT count(*) FROM compaction_pending"))
             while moved < listed:
                 async with conn.transaction():
-                    status = await conn.execute(_MOVE_CHUNK, s.chunk_rows)
+                    status = await conn.execute(move_sql, s.chunk_rows)
                 got = int(status.split()[-1])
                 if not got:
                     break
@@ -163,6 +185,18 @@ class FabricCompactor:
                 await conn.execute("SELECT pg_advisory_unlock($1)", _LOCK)
             except Exception:  # the connection is gone; the session end releases both
                 log.warning("fabric compaction cleanup failed", exc_info=True)
+
+    async def _sync_archive_columns(self, conn) -> list[str]:
+        """Give the archive every column the journal has. A column added to ``fabric_events`` after the archive was created
+        (``trace_id``) made ``INSERT ... SELECT moved.*`` fail with "more expressions than target columns", so no pass
+        moved anything and the journal grew until a boot took ten minutes. Returns the journal's column names."""
+        journal = await conn.fetch(_JOURNAL_COLUMNS)
+        have = {r["name"] for r in await conn.fetch(_ARCHIVE_COLUMNS)}
+        for col in journal:
+            if col["name"] not in have:
+                await conn.execute(f"ALTER TABLE fabric_events_archive ADD COLUMN IF NOT EXISTS {_quote(col['name'])} {col['type']}")
+                log.warning("fabric compaction added missing archive column %s", col["name"])
+        return [r["name"] for r in journal]
 
     async def _rebuild(self, conn) -> str:
         from . import recovery_checkpoint as rc
