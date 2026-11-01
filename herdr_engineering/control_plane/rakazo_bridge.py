@@ -655,6 +655,7 @@ class _Ctx:
     accepts_stream: bool
     space: str = sp.DEFAULT_SPACE_ID
     base_tenant: str = ""
+    principal: str = ""    # the phone account's own principal; ``user`` is the owner key, which differs for a mapped operator
 
 
 # --------------------------------------------------------------------------------------------- the bridge
@@ -782,7 +783,7 @@ class RakazoBridge:
         for account in self.accounts:
             base = self.svc.tenant_for(account.principal_id)
             for space_id in [sp.DEFAULT_SPACE_ID] + [s.space_id for s in self.spaces.list(account.account_id)]:
-                ctx = _Ctx(account, sp.space_tenant(base, space_id), account.principal_id, "", False, space_id, base)
+                ctx = self._ctx(account, sp.space_tenant(base, space_id), "", False, space_id, base)
                 try:
                     started += self.routines.run_due(ctx)
                 except Exception as exc:  # noqa: BLE001 - keep the loop alive
@@ -981,8 +982,7 @@ class RakazoBridge:
             # another account's space, a deleted one and a made-up one all look the same: not found
             raise BridgeError(404, "NOT_FOUND", "Not found")
         tenant = sp.space_tenant(base, space_id)
-        ctx = _Ctx(account, tenant, account.principal_id, token,
-                   "text/event-stream" in headers.get("accept", ""), space_id, base)
+        ctx = self._ctx(account, tenant, token, "text/event-stream" in headers.get("accept", ""), space_id, base)
         try:
             self.svc.check_rate_limit(key=f"{tenant}:{ctx.user}")
             result = handler(ctx, inp)
@@ -1476,7 +1476,7 @@ class RakazoBridge:
         account = self._by_id.get(account_id)
         if account is None:
             return None
-        ctx = _Ctx(account, self.svc.tenant_for(account.principal_id), account.principal_id, "", False)
+        ctx = self._ctx(account, self.svc.tenant_for(account.principal_id), "", False)
         bot_id = self._first_bot(ctx)
         if bot_id is None:
             return None
@@ -1486,6 +1486,28 @@ class RakazoBridge:
         """Every known account: the configured ones plus any added later (those live only in ``_by_id``)."""
         with self._accounts_lock:
             return list(self._by_id.values())
+
+    def _ctx(self, account: Account, tenant: str, token: str, accepts_stream: bool,
+             space: str = sp.DEFAULT_SPACE_ID, base: str = "") -> _Ctx:
+        """The request context. In the default space a mapped operator phone (``canonical_person``) owns its assistants,
+        threads, runs, grants and approvals as the dashboard operator, so the phone and the dashboard show one set; every
+        other account, and every non-default space, keeps the phone's own principal."""
+        owner = account.principal_id
+        if space == sp.DEFAULT_SPACE_ID:
+            owner = self.canonical_person(tenant, owner)[1]
+        return _Ctx(account, tenant, owner, token, accepts_stream, space, base, account.principal_id)
+
+    def legacy_phone_assistants(self) -> list[dict[str, str]]:
+        """Assistants still owned by a mapped operator phone's own principal, created before the phone and the dashboard
+        shared one owner. They are not shown to either surface until moved; this only reports them, it moves nothing."""
+        found: list[dict[str, str]] = []
+        for account in self._operator_accounts():
+            tenant = self.svc.tenant_for(account.principal_id)
+            if self.canonical_person(tenant, account.principal_id)[1] != OPEN_LISTENER_USER:
+                continue
+            found += [{"assistant_id": a.assistant_id, "name": a.name, "owner": account.principal_id, "tenant": tenant}
+                      for a in self.svc.list_assistants(tenant_id=tenant, user_id=account.principal_id)]
+        return found
 
     def canonical_person(self, tenant: str, user: str) -> tuple[str, str]:
         """The single-operator rule: in single-operator mode a Rakazo phone account configured in YAML with role
