@@ -1,6 +1,8 @@
 """Row model, status mapping and ordering for the Shepherd Agents tab (pure functions)."""
 from __future__ import annotations
 
+import json
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -88,10 +90,16 @@ class Agents:
         self.b = bridge
         self.Error = error
         self.repo = None
+        self._lock = threading.Lock()
+        self._counter = 0
+        self._changes: dict[str, tuple[int, dict]] = {}   # session id -> (seq, row) of its latest change
+        self._prints: dict[str, str] = {}                  # session id -> fingerprint of its row as last seen
+        self._shown: set[str] = set()                      # ids the list stream has told the app to show
 
     def procs(self) -> dict:
         return {"agents/list": self.list, "agents/get": self.get,
-                "agents/messages": self.messages, "agents/event": self.event}
+                "agents/messages": self.messages, "agents/event": self.event,
+                "agents/subscribe": self.subscribe, "agents/subscribeList": self.subscribe_list}
 
     # plumbing -----------------------------------------------------------------------------------------------
     def _repo(self):
@@ -162,3 +170,71 @@ class Agents:
             return repo.inspector.get_event(self._sid(inp), seq, "viewer")
         except KeyError:
             raise self._missing() from None
+
+    # live streams -------------------------------------------------------------------------------------------
+    def _stream(self, ctx, inp, fetch):
+        """The shared mechanics of ``threads/subscribe``: one capped, token-bound server-sent-event response."""
+        from . import rakazo_events as ev
+        from .rakazo_bridge import BridgeResponse
+        bridge = self.b
+        if not bridge._streams.acquire(blocking=False):
+            raise self.Error(429, "TOO_MANY_REQUESTS", "Too many live connections.", {"Retry-After": "10"})
+        frames = ev.event_stream(fetch, inp["cursor"], should_stop=lambda: bridge._closed.is_set() or not bridge.tokens.valid(
+            ctx.token), **bridge.stream_options)
+        return BridgeResponse(200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-store",
+                                            "X-Accel-Buffering": "no", "Connection": "close"},
+                              frames=frames, on_close=bridge._streams.release)
+
+    def _check_stream(self, ctx, inp):
+        cursor = inp.get("cursor")
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < -1:
+            raise self.Error(400, "BAD_REQUEST", "cursor must be an integer of at least -1.")
+        if not ctx.accepts_stream:
+            raise self.Error(400, "BAD_REQUEST", "Subscribe with accept: text/event-stream.")
+
+    def subscribe(self, ctx, inp):
+        self._check_stream(ctx, inp)
+        repo = self._repo()
+        sid = self._sid(inp)
+        if repo.get_session(sid) is None:
+            raise self._missing()
+
+        def fetch(after: int) -> list[dict]:
+            try:
+                return repo.inspector.events_after(sid, after, role="viewer")
+            except KeyError:
+                return []
+        return self._stream(ctx, inp, fetch)
+
+    def _refresh(self, repo) -> None:
+        """Fold the current rows into the change log. Rows are built outside the lock; seq numbers are assigned
+        under it, so every subscriber reads one consistent history. Hidden rows stay quiet; a row that was shown and
+        is now hidden (closed or gone stale) is emitted once so the app can drop it."""
+        now = time.time()
+        rows = [self._row(repo, s) for s in repo.list_sessions()]
+        with self._lock:
+            for row in sorted(rows, key=lambda r: _epoch(r.get("updated_at"))):
+                rid = row["id"]
+                print_ = json.dumps(row, sort_keys=True, default=str)
+                if self._prints.get(rid) == print_:
+                    continue
+                self._prints[rid] = print_
+                if visible([row], show_older=False, now=now):
+                    self._shown.add(rid)
+                elif rid in self._shown:
+                    self._shown.discard(rid)
+                else:
+                    continue
+                self._counter += 1
+                self._changes[rid] = (self._counter, row)
+
+    def subscribe_list(self, ctx, inp):
+        self._check_stream(ctx, inp)
+        repo = self._repo()
+
+        def fetch(after: int) -> list[dict]:
+            self._refresh(repo)
+            with self._lock:
+                fresh = sorted((c for c in self._changes.values() if c[0] > after), key=lambda c: c[0])
+            return [{"seq": seq, "row": row} for seq, row in fresh]
+        return self._stream(ctx, inp, fetch)
