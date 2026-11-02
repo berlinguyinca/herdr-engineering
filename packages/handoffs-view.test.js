@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml, modelText, outcomeText } from './handoffs-view.js';
+import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml, modelText, outcomeText,
+  visionRoundTrips, filterByCause, visionStats, visionStatsLine, causeFilterHtml, roundTripHtml, listHtml } from './handoffs-view.js';
 
 test('summarizes handoff lineage without trusting goal text as markup', () => {
   const summary = handoffGraphSummary({
@@ -168,4 +169,82 @@ test('a vision row with missing fields never prints undefined or null and never 
   assert.ok(!detailHtml({ ...VROW, vision: { outcome: 'ok' } }, null).includes('request <code>'));
   assert.ok(!detailHtml({ ...VROW, vision: { outcome: 'ok', request_id: '' } }, null).includes('request <code>'));
   assert.match(detailHtml(VROW, null), /request <code>r1<\/code>/);
+});
+
+const vrow = (id, rid, phase, outcome, created, updated, extra = {}) => ({ handoff_id: id, cause: phase === 'out' ? 'vision_delegate' : 'vision_return',
+  vision: { request_id: rid, phase, outcome }, created_at: created, updated_at: updated || created, state: 'completed', origin: 'lineage', ...extra });
+const T0 = '2026-11-01T10:00:00Z';
+
+test('an out and a back row with one request id pair into one round trip with a duration', () => {
+  const t = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', T0), vrow('b1', 'r1', 'back', 'partial', '2026-11-01T10:00:05Z', '2026-11-01T10:00:07Z')]);
+  assert.equal(t.length, 1);
+  assert.equal(t[0].requestId, 'r1'); assert.equal(t[0].outcome, 'partial'); assert.equal(t[0].durationMs, 7000); assert.equal(t[0].open, false);
+  assert.equal(t[0].out.handoff_id, 'o1'); assert.equal(t[0].back.handoff_id, 'b1');
+});
+test('an out row with no back row is an open round trip', () => {
+  const [t] = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', T0)]);
+  assert.equal(t.outcome, 'open'); assert.equal(t.open, true); assert.equal(t.durationMs, null);
+});
+test('a back row without its out row stands alone with no duration', () => {
+  const [t] = visionRoundTrips([vrow('b1', 'r1', 'back', 'failed', T0)]);
+  assert.equal(t.outcome, 'failed'); assert.equal(t.open, false); assert.equal(t.durationMs, null); assert.equal(t.out, undefined);
+});
+test('two delegations in the same second are two round trips', () => {
+  const t = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', T0), vrow('o2', 'r2', 'out', 'ok', T0), vrow('b2', 'r2', 'back', 'ok', T0), vrow('b1', 'r1', 'back', 'ok', T0)]);
+  assert.equal(t.length, 2); assert.ok(t.every((x) => x.out && x.back));
+});
+test('two rows with empty request ids stay two entries (H3)', () => {
+  const rows = [vrow('o1', '', 'out', 'ok', T0), vrow('o2', '', 'out', 'ok', T0), vrow('o3', undefined, 'back', 'ok', T0), vrow('o4', 7, 'back', 'ok', T0)];
+  const t = visionRoundTrips(rows);
+  assert.equal(t.length, 4);
+  assert.equal(t[0].open, true);
+});
+test('a negative duration is null', () => {
+  const [t] = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', '2026-11-01T11:00:00Z'), vrow('b1', 'r1', 'back', 'ok', T0, T0)]);
+  assert.equal(t.durationMs, null);
+  const [u] = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', ''), vrow('b1', 'r1', 'back', 'ok', T0, 'junk')]);
+  assert.equal(u.durationMs, null);
+});
+test('filterByCause returns only matching rows and null returns all', () => {
+  const rows = [{ cause: 'a' }, { cause: 'b' }, { cause: 'a' }];
+  assert.equal(filterByCause(rows, 'a').length, 2);
+  assert.equal(filterByCause(rows, null).length, 3);
+  assert.equal(filterByCause(rows, '').length, 3);
+});
+test('visionStats counts total, by outcome, the last 24 hours and the last 7 days from a fixed now', () => {
+  const now = Date.parse('2026-11-08T12:00:00Z');
+  const rows = [
+    vrow('o1', 'a', 'out', 'ok', '2026-11-08T12:00:00Z'), vrow('b1', 'a', 'back', 'ok', '2026-11-08T12:00:00Z'),      // exactly now
+    vrow('o2', 'b', 'out', 'ok', '2026-11-07T12:00:00Z'), vrow('b2', 'b', 'back', 'failed', '2026-11-07T12:00:01Z'),  // 24h boundary
+    vrow('o3', 'c', 'out', 'ok', '2026-11-01T12:00:00Z'),                                                          // 7d boundary, open
+    vrow('o4', 'd', 'out', 'ok', '2026-11-01T11:59:59Z'), vrow('b4', 'd', 'back', 'timeout', '2026-11-01T12:00:09Z'), // just outside
+    vrow('o5', 'e', 'out', 'ok', '2026-11-09T00:00:00Z'), vrow('b5', 'e', 'back', 'ok', '2026-11-09T00:00:01Z'),      // future
+    vrow('o6', 'f', 'out', 'ok', ''), vrow('b6', 'f', 'back', 'partial', ''),                                       // no usable time
+  ];
+  const s = visionStats(rows, now);
+  assert.equal(s.total, 6);
+  assert.deepEqual(s.byOutcome, { ok: 2, failed: 1, open: 1, timeout: 1, partial: 1 });
+  assert.equal(s.last24h, 2); assert.equal(s.last7d, 3);
+});
+test('visionStats ignores non-vision rows', () => {
+  const s = visionStats([{ handoff_id: 'x', cause: 'context_pressure', created_at: T0 }, null, vrow('o1', 'r', 'out', 'ok', T0)], Date.parse(T0));
+  assert.equal(s.total, 1);
+  assert.equal(visionStats([], 0).total, 0);
+});
+test('hostile request ids and model names are escaped where round trips and the stats line are rendered', () => {
+  const rows = [vrow('o<1>', HOSTILE, 'out', 'ok', T0, T0, { from_model: HOSTILE, to_model: HOSTILE, cause: HOSTILE }), vrow('b"1', HOSTILE, 'back', 'ok', T0, T0, { from_model: HOSTILE, to_model: HOSTILE })];
+  const [trip] = visionRoundTrips(rows);
+  const html = roundTripHtml(trip) + visionStatsLine(visionStats(rows, Date.parse(T0))) + causeFilterHtml(rows, HOSTILE) + listHtml(rows);
+  assert.ok(!html.includes('<img'), 'no raw markup survives');
+  assert.match(roundTripHtml(trip), /data-handoff="o&lt;1&gt;"/);
+  assert.match(roundTripHtml(trip), /data-handoff="b&quot;1"/);
+});
+test('stats line says it covers the loaded rows of this workspace; list shows one entry per round trip', () => {
+  const rows = [vrow('o1', 'r1', 'out', 'ok', T0), vrow('b1', 'r1', 'back', 'ok', T0), { handoff_id: 'n1', state: 'queued', source: {}, target: {} }];
+  const line = visionStatsLine(visionStats(rows, Date.parse(T0)));
+  assert.match(line, /1 vision delegation/); assert.match(line, /loaded/); assert.match(line, /this workspace/);
+  const html = listHtml(rows);
+  assert.equal((html.match(/data-roundtrip/g) || []).length, 1);
+  assert.match(html, /data-handoff="n1"/);
+  assert.match(causeFilterHtml(rows, null), /data-cause="vision_delegate"/);
 });

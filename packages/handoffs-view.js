@@ -139,6 +139,78 @@ export function routeTable(rows) {
   return [...routes.values()].sort((a, b) => b.attention - a.attention || b.total - a.total || a.key.localeCompare(b.key));
 }
 
+// Vision delegations: Pi emits an out row and a back row per delegation sharing a request id. A row with no usable id
+// is its own entry (keyed by handoff_id) so unusable ids never merge. Times are the control plane's receive times.
+const isVision = (r) => !!r && typeof r === 'object' && !!r.vision && typeof r.vision === 'object';
+const tripKey = (r) => (typeof r.vision.request_id === 'string' && r.vision.request_id ? `r:${r.vision.request_id}` : `h:${r.handoff_id}`);
+const ms = (iso) => { const t = Date.parse(iso || ''); return Number.isNaN(t) ? null : t; };
+export function visionRoundTrips(rows) {
+  const trips = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!isVision(r)) continue;
+    const k = tripKey(r);
+    if (!trips.has(k)) trips.set(k, { requestId: k.startsWith('r:') ? k.slice(2) : '' });
+    const t = trips.get(k);
+    if (r.vision.phase === 'back') t.back = t.back || r; else t.out = t.out || r;
+  }
+  return [...trips.values()].map((t) => {
+    const open = !!t.out && !t.back;
+    const outcome = open ? 'open' : (t.back?.vision?.outcome || 'unknown');
+    const a = t.out ? ms(t.out.created_at) : null, b = t.back ? ms(t.back.updated_at) : null;
+    const durationMs = a !== null && b !== null && b - a >= 0 ? b - a : null;
+    return { ...t, outcome, durationMs, open };
+  });
+}
+export function filterByCause(rows, cause) {
+  const all = Array.isArray(rows) ? rows : [];
+  return cause ? all.filter((r) => r?.cause === cause) : all;
+}
+export function visionStats(rows, now) {
+  const trips = visionRoundTrips(rows);
+  const byOutcome = {};
+  let last24h = 0, last7d = 0;
+  for (const t of trips) {
+    byOutcome[t.outcome] = (byOutcome[t.outcome] || 0) + 1;
+    const start = ms(t.out?.created_at) ?? ms(t.back?.created_at);
+    if (start === null || start > now) continue;
+    if (now - start <= 86400000) last24h++;
+    if (now - start <= 7 * 86400000) last7d++;
+  }
+  return { total: trips.length, byOutcome, last24h, last7d };
+}
+export function visionStatsLine(st) {
+  const o = st.byOutcome || {}, n = st.total;
+  return `<p class="hd-muted" data-vision-stats>${n} vision delegation${n === 1 ? '' : 's'} · ${st.last24h} last 24h · ${st.last7d} last 7d · ${o.ok || 0} ok · ${o.partial || 0} partial · ${o.failed || 0} failed · ${o.timeout || 0} timed out · ${o.open || 0} open <small>(counts the loaded rows of this workspace only)</small></p>`;
+}
+export function causeFilterHtml(rows, active) {
+  const causes = [...new Set((Array.isArray(rows) ? rows : []).map((r) => r?.cause).filter((c) => typeof c === 'string' && c))];
+  if (!causes.length) return '';
+  const btn = (c, label) => `<button type="button" class="hd-route${(c || null) === (active || null) ? ' hd-route--on' : ''}" data-cause="${esc(c || '')}" aria-pressed="${(c || null) === (active || null)}">${esc(label)}</button>`;
+  return `<p class="hd-filter" data-cause-filter>Cause: ${btn('', 'all')} ${causes.map((c) => btn(c, CAUSE[c] || c)).join(' ')}</p>`;
+}
+export function roundTripHtml(trip) {
+  const side = trip.out || trip.back;
+  const models = side ? `${shortModel(side.from_model)} → ${shortModel(side.to_model)}` : '';
+  const dur = trip.durationMs === null ? '' : ` · ${Math.round(trip.durationMs / 100) / 10}s`;
+  const link = (row, label) => row ? `<button type="button" class="hd-route" data-handoff="${esc(row.handoff_id)}">${label}</button>` : '';
+  return `<div class="hd-row hd-row--vision" data-roundtrip>
+    <span class="hd-row__state">${esc(trip.open ? 'open' : outcomeText({ outcome: trip.outcome }))}</span>
+    <strong class="hd-row__who">vision delegation${trip.requestId ? ` <code>${esc(trip.requestId)}</code>` : ''}</strong>
+    <span class="hd-row__goal">${esc(models)}${esc(dur)}</span> ${link(trip.out, 'out')} ${link(trip.back, 'result')}</div>`;
+}
+// The row list: vision rows collapse into one entry per round trip (at the position of its first row).
+export function listHtml(rows) {
+  const trips = new Map(visionRoundTrips(rows).map((t) => [t.out ? tripKey(t.out) : tripKey(t.back), t]));
+  const done = new Set();
+  return (Array.isArray(rows) ? rows : []).map((r) => {
+    if (!isVision(r)) return handoffCard(r);
+    const k = tripKey(r);
+    if (done.has(k)) return '';
+    done.add(k);
+    return roundTripHtml(trips.get(k));
+  }).join('');
+}
+
 export function routesHtml(routes, active, limit = 12) {
   const rows = routes.slice(0, limit).map((r) => `<li><button type="button" class="hd-route${r.key === active ? ' hd-route--on' : ''}" data-route="${esc(r.key)}" aria-pressed="${r.key === active}">
     <span class="hd-route__who">${esc(r.from)} → ${esc(r.to)}</span><span class="hd-route__n">${r.total}</span>
@@ -195,6 +267,8 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
     }
     const allHops = ev.target.closest?.('[data-chain-all]');
     if (allHops) { allHops.closest('ol').querySelectorAll('.hd-hop-far').forEach((li) => { li.hidden = false; }); allHops.parentElement.remove(); return; }
+    const cause = ev.target.closest?.('[data-cause]');
+    if (cause) { const card = cause.closest('[data-workspace]'); card.__cause = cause.dataset.cause || null; paint(card); return; }
     const route = ev.target.closest?.('[data-route]');
     if (route) { const card = route.closest('[data-workspace]'); card.__route = card.__route === route.dataset.route ? null : route.dataset.route; paint(card); return; }
     if (ev.target.closest?.('[data-route-clear]')) { const card = ev.target.closest('[data-workspace]'); card.__route = null; paint(card); return; }
@@ -207,11 +281,14 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
     const body = card.querySelector('.hd-ws__body');
     const all = card.__rows || [], active = card.__route || null;
     const routes = routeTable(all);
-    const shown = active ? all.filter((h) => routeKey(h) === active) : all;
+    const routed = active ? all.filter((h) => routeKey(h) === active) : all;
+    const cause = card.__cause || null;
+    const shown = filterByCause(routed, cause);
+    const hasVision = all.some(isVision);
     const small = routes.length <= SMALL_GRAPH;
     const overview = small ? '<div class="cx-flow-box" data-handoff-graph></div>' : routesHtml(routes, active);
     const bar = active ? `<p class="hd-filter" data-handoff-filter>Showing <strong>${esc(active)}</strong> · ${shown.length} loaded handoff${shown.length === 1 ? '' : 's'} <button type="button" data-route-clear>Show all</button></p>` : '';
-    body.innerHTML = `${overview}${bar}<div class="hd-rows">${shown.map(handoffCard).join('') || '<p class="hd-muted">No handoffs.</p>'}</div>
+    body.innerHTML = `${overview}${bar}${causeFilterHtml(all, cause)}${hasVision ? visionStatsLine(visionStats(all, Date.now())) : ''}<div class="hd-rows">${listHtml(shown) || '<p class="hd-muted">No handoffs.</p>'}</div>
       ${card.__next ? `<button type="button" data-handoff-more data-cursor="${esc(card.__next)}">Load more</button>${active ? '<small class="hd-muted"> Filter applies to handoffs loaded so far.</small>' : ''}` : ''}`;
     if (small) {
       const { flow, latest } = flowFromPage(all);
