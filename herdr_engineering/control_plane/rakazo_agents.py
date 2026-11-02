@@ -12,6 +12,11 @@ from .terminal_attach import _CLOSED
 
 STATUS_ORDER = ("blocked", "done", "working", "idle", "unknown", "closed")
 _LIVE = frozenset(STATUS_ORDER[:5])
+# Real session statuses map onto the vocabulary above: herdr's idle/done/working/blocked pass
+# through; "active" (a live process with no detected agent state) is idle; "running"
+# (create_session-style sessions) is working; _CLOSED values (e.g. stopped) are closed;
+# the _BLOCKED set is blocked; anything else or missing is unknown.
+_ALIASES = {"active": "idle", "running": "working"}
 _STATUS_LINES = {
     "blocked": "Blocked, needs your attention",
     "done": "Finished a turn, waiting for input",
@@ -29,6 +34,7 @@ def agent_status(session: dict) -> str:
         return "closed"
     if status in _BLOCKED:
         return "blocked"
+    status = _ALIASES.get(status, status)
     return status if status in _LIVE else "unknown"
 
 
@@ -46,7 +52,7 @@ def _field(session: dict, key: str):
 def agent_row(session: dict, summary: str | None) -> dict:
     status = agent_status(session)
     sid = session.get("session_id")
-    machine = _field(session, "machine")
+    machine = _field(session, "machine") or session.get("host_id")
     text = summary.strip() if isinstance(summary, str) else ""
     return {
         "id": sid,

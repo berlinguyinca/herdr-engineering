@@ -173,3 +173,12 @@ def test_list_takes_the_inspector_lock_a_constant_number_of_times(bridge, repo):
     repo.inspector._lock = counting
     call(bridge, "list")
     assert counting.n <= 5
+
+
+def test_live_shaped_record_renders_name_machine_and_status(bridge, repo):
+    session(repo, "s-live", "active", host_id="bender", name="Fix the build",
+            summary="looking at CI", agent_role="engineer")
+    row = call(bridge, "list")["agents"][0]
+    assert (row["id"], row["name"], row["machine"], row["status"]) == (
+        "s-live", "Fix the build", "bender", "idle")
+    assert row["summary"] == "looking at CI"
