@@ -59,6 +59,16 @@ def test_malformed_rejected_and_leaves_registry_and_valid_replay_intact(mutate):
     assert row["goal"] == "Continue work" and row["remaining"] == ["test"]
 
 
+def test_integer_revision_from_herdr_memory_cli_accepted_but_bool_and_negative_rejected():
+    ok = json.loads(json.dumps(BLOCK))
+    ok["refs"][0]["revision"] = 3
+    assert validate_memory_context(ok)["refs"][0]["revision"] == 3
+    for bad in (True, -1, 1.5, None):
+        ok["refs"][0]["revision"] = bad
+        with pytest.raises(ValueError):
+            validate_memory_context(ok)
+
+
 def test_null_memory_context_treated_as_absent():
     row, _ = registry().create({**legacy(), "memory_context": None}, {"id": "op"})
     assert "memory_context" not in row

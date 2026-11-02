@@ -16,7 +16,7 @@
         "properties": {
           "memory_id": {"$ref": "#/$defs/id"},
           "bank_id": {"$ref": "#/$defs/id"},
-          "revision": {"$ref": "#/$defs/id"}
+          "revision": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "integer", "minimum": 0}]}
         }
       }
     },

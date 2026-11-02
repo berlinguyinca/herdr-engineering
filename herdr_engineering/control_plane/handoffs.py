@@ -53,8 +53,12 @@ def validate_memory_context(block):
     for ref in refs:
         if not isinstance(ref, dict) or set(ref) != {"memory_id", "bank_id", "revision"}:
             raise ValueError("memory_context ref must have exactly memory_id, bank_id, revision")
-        if not all(isinstance(v, str) and _MEM_ID.fullmatch(v) for v in ref.values()):
-            raise ValueError("memory_context ref values must be safe identifier strings")
+        if not all(isinstance(ref[k], str) and _MEM_ID.fullmatch(ref[k]) for k in ("memory_id", "bank_id")):
+            raise ValueError("memory_context ref ids must be safe identifier strings")
+        # herdr-memory CLI emits revision as an integer; producers may also send a safe string.
+        rev = ref["revision"]
+        if not ((isinstance(rev, str) and _MEM_ID.fullmatch(rev)) or (_is_int(rev) and rev >= 0)):
+            raise ValueError("memory_context ref revision must be a safe string or non-negative integer")
         clean.append({k: ref[k] for k in ("memory_id", "bank_id", "revision")})
     digest = block.get("snapshot_digest")
     if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):

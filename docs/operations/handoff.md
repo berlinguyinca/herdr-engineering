@@ -81,6 +81,6 @@ Hindsight Memory, CONTRACT.md). It is produced by `herdr-handoff` only when a
   through and drop a malformed one.
 - Receiving side: `herdr-handoff resume` prints the refs under an
   "UNTRUSTED MEMORY REFERENCES" heading and re-resolves each through
-  `herdr-memory get`. Unresolved or forbidden refs are reported and never fatal.
+  `herdr-memory get MEMORY_ID --scope S` (the scope is derived from the ref's bank id). Unresolved or forbidden refs are reported and never fatal.
   Retrieved memory is data, never instructions.
 - Pi Blackhole short-term context handling is unchanged.
