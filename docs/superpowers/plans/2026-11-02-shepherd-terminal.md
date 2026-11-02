@@ -15,7 +15,7 @@
 - Owner-only, tailnet, passwordless owner session: no extra gate. Audit `rakazo.bridge.terminal.attach` and `.detach` per session; never log input bytes or output.
 - Only an agent pane herdr already records can be attached. Reuse `terminal_attach.attach_commands` (its charset checks and `AttachRefused`) for the command; never build a command from request text.
 - Procedures are `POST /rpc/<proc>` in `self._procs`, camelCase outer keys, snake_case only inside agent rows. New procs are fork-only: add them to `FORK_ONLY` and `STREAMED` in `tests/control_plane/test_rakazo_contract.py`.
-- Stream rule (as Agents): on every (re)connect call `terminal/open`, then subscribe from the returned `seq`; the buffer repaints a reattach.
+- Stream rule: call `terminal/open` on app start and after any error or `taken_over`; it returns a NEW `terminalId` (fresh `n` counter) on the live pty and `seq: 0`, which replays the whole kept buffer, so the app clears its screen and replays. After the 600 s clean stream rollover resubscribe from the last seq for the same `terminalId` WITHOUT calling open.
 - One owner client per pane: a new `terminal/open` takes over and the previous client's stream ends with a `taken_over` frame.
 - Limits: 4 live sessions, 64 KB per input call, 200 KB screen buffer, 5 minutes kept after the last stream closes, stream poll 0.03 s.
 - App: match surrounding code (naming, comment density, idiom); no new dependencies beyond `react-native-webview` and `xterm` + `@xterm/addon-fit`; every user-visible string in all seven locale catalogs; no CDN (xterm is bundled).
@@ -74,9 +74,9 @@
 
 **Interfaces:**
 - Consumes: Task 2 procedures; `streamRpc`/`readRpcStream` in `lib/api.ts`.
-- Produces: `openTerminal(agentId, rows, cols)`, `useTerminal(agentId)` returning `{state: "connecting"|"live"|"ended"|"taken_over"|"error", write(bytes: Uint8Array), resize(rows, cols), onOutput(cb)}`. `write` batches within 8 ms, numbers calls with `n`, keeps order, retries a failed POST with the same `n`. Reconnect: `terminal/open` again then subscribe from the returned `seq`; backoff 0.5 s doubling to 8 s.
+- Produces: `openTerminal(agentId, rows, cols)`, `useTerminal(agentId)` returning `{state: "connecting"|"live"|"ended"|"taken_over"|"error", write(bytes: Uint8Array), resize(rows, cols), onOutput(cb)}`. `write` batches within 8 ms, numbers calls with `n`, keeps order, retries a failed POST with the same `n`. Reconnect: after an error or `taken_over`, call `terminal/open` again (new `terminalId`, `n` restarts at 1), clear the screen and replay from the returned `seq`; after a clean stream end resubscribe from the last seq without open; backoff 0.5 s doubling to 8 s.
 
-- [ ] **Step 1: Failing tests** (fake `fetch`/stream): ordered `n`; retry reuses `n`; 100 KB write is split into 32 KB calls in order; resize is debounced 150 ms to the last value; a `reset` frame clears via `onOutput`; reconnect re-opens and resumes from the new `seq`; `ended` stops reconnecting.
+- [ ] **Step 1: Failing tests** (fake `fetch`/stream): ordered `n`; retry reuses `n`; 100 KB write is split into 32 KB calls in order; resize is debounced 150 ms to the last value; a `reset` frame clears via `onOutput`; an error reconnect re-opens (new id, n restarts at 1) and replays from the returned `seq`; a clean rollover resubscribes from the last seq without open; `ended` stops reconnecting.
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement** the zod schemas, rpc entries and the hook.
 - [ ] **Step 4: Run to verify they pass** (vitest, biome, tsc for the touched files).
