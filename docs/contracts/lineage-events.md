@@ -427,6 +427,15 @@ authenticated operator key excepted) on a node id or on either endpoint of an ed
   re-emit them with `room_id` (events are idempotent per `event_id`, so emit new event ids; the narrowest scope of an
   object's events wins, so an object whose OLD events lack `room_id` stays operator-only until an operator re-creates it
   under a new id or the old events are retired).
+- **Vision delegation (Pi)** emits TWO `handoff` nodes per delegation of a pasted image to a vision model: `handoff:vision-<requestId>-out`
+  (`attrs.cause: vision_delegate`, state `acknowledged`) when the text-model session sends the image, and
+  `handoff:vision-<requestId>-back` (`attrs.cause: vision_return`, state `committed`, or `failed`) when the findings return. The
+  `requestId` is a UUID, so it contains hyphens: the id is read as `vision-` + everything up to the final `-out` / `-back`.
+  `attrs.from_model` is the text model, `attrs.to_model` the vision model, with `from_session_id` / `to_session_id`. `attrs.handoff_kind`
+  carries the OUTCOME: `vision` (ok; also always the kind of the out node), `vision_partial` (state `committed`), `vision_failed` and
+  `vision_timeout` (state `failed`); any other kind on a `-back` node reads as outcome `unknown`. No image count and no other field is
+  carried. The Handoffs row gains `vision: {request_id, phase: out|back, outcome: ok|partial|failed|timeout|unknown}` (only on these two
+  causes); the switch of models is deliberate, so it is not flagged "model changed", and only a non-`ok` outcome asks for attention.
 - **Large rooms**: the Tabs panel makes three listing reads (agents, tabs, panes) at most every 8 s while open; not load-tested.
 
 ## Lineage views and replay (T09)

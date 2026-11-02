@@ -4,7 +4,7 @@ import json
 import threading
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
-from herdr_engineering.control_plane.handoff_lineage import row_from_node, rows_from_nodes
+from herdr_engineering.control_plane.handoff_lineage import _vision, row_from_node, rows_from_nodes
 from herdr_engineering.control_plane.handoffs import HandoffRegistry
 from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
@@ -90,3 +90,67 @@ def test_the_api_serves_only_the_lineage_handoffs_the_caller_may_read():
     status, page = call(instance.port, "operator", "/api/v1/handoffs?limit=10")
     assert status == 200 and any(r["handoff_id"] == "handoff:open" for r in page["handoffs"])
     assert "handoff:secret" not in json.dumps(call(instance.port, "viewer", "/api/v1/handoffs/overview")[1])
+
+
+RID = "3f2b8c1e-9a4d-4e57-b6c0-1d2e3f4a5b6c"
+
+
+def vision_node(suffix, cause, kind, state, **attrs):
+    return node(f"vision-{RID}-{suffix}", state, cause=cause, handoff_kind=kind, from_model="deepseek/text-model",
+                to_model="google/vision-model", **attrs)
+
+
+def test_a_vision_delegate_node_reads_as_a_switch_from_the_text_model_to_the_vision_model():
+    row = row_from_node(vision_node("out", "vision_delegate", "vision", "acknowledged"))
+    assert row["model_change"] == "switched" and "vision" in row["goal"].lower()
+    assert row["vision"] == {"request_id": RID, "phase": "out", "outcome": "ok"}
+
+
+def test_a_vision_return_node_with_kind_vision_partial_reports_outcome_partial():
+    row = row_from_node(vision_node("back", "vision_return", "vision_partial", "committed"))
+    assert row["vision"] == {"request_id": RID, "phase": "back", "outcome": "partial"}
+
+
+def test_kinds_vision_vision_failed_and_vision_timeout_map_to_ok_failed_and_timeout():
+    got = [row_from_node(vision_node("back", "vision_return", k, s))["vision"]["outcome"]
+           for k, s in (("vision", "committed"), ("vision_failed", "failed"), ("vision_timeout", "failed"))]
+    assert got == ["ok", "failed", "timeout"]
+
+
+def test_an_unknown_kind_on_a_vision_return_node_reports_outcome_unknown_and_still_builds_a_row():
+    row = row_from_node(vision_node("back", "vision_return", "vision_weird", "committed"))
+    assert row is not None and row["vision"]["outcome"] == "unknown"
+    assert row_from_node(vision_node("back", "vision_return", None, "committed"))["vision"]["outcome"] == "unknown"
+
+
+def test_the_request_id_is_parsed_from_vision_id_out_and_vision_id_back_with_or_without_the_handoff_prefix():
+    assert _vision(f"handoff:vision-{RID}-out", "vision_delegate", "vision") == {"request_id": RID, "phase": "out", "outcome": "ok"}
+    assert _vision(f"vision-{RID}-back", "vision_return", "vision_failed") == {"request_id": RID, "phase": "back", "outcome": "failed"}
+    assert _vision(f"vision-{RID}-out", "vision_delegate", "vision_failed")["outcome"] == "ok"
+    assert row_from_node(vision_node("back", "vision_return", "vision", "committed"))["vision"]["request_id"] == RID
+    assert _vision("handoff:something-else", "vision_return", "vision")["request_id"] == ""
+    assert _vision(f"vision-{RID}-out", "context_pressure", "vision") is None and _vision(f"vision-{RID}-out", None, None) is None
+
+
+def test_a_non_vision_handoff_row_has_no_vision_key():
+    assert "vision" not in row_from_node(node("h1", cause="context_pressure", from_model="a", to_model="b"))
+    assert "vision" not in row_from_node(node("h2"))
+
+
+def test_vision_rows_do_not_raise_a_model_switch_alarm_when_ok_but_say_why_when_not():
+    reg = HandoffRegistry(ControlPlaneRepo(), now=lambda: NOW)
+    out = row_from_node(vision_node("out", "vision_delegate", "vision", "acknowledged"))
+    ok = row_from_node(vision_node("back", "vision_return", "vision", "committed"))
+    assert out["model_change"] == "switched" and reg._attention_reason(out, None) is None
+    assert reg._attention_reason(ok, None) is None
+    partial = row_from_node(vision_node("back", "vision_return", "vision_partial", "committed"))
+    failed = row_from_node(vision_node("back", "vision_return", "vision_failed", "failed"))
+    timeout = row_from_node(vision_node("back", "vision_return", "vision_timeout", "failed"))
+    unknown = row_from_node(vision_node("back", "vision_return", "vision_weird", "committed"))
+    assert reg._attention_reason(partial, None) == "vision result partial"
+    assert reg._attention_reason(failed, None) == "failed"          # a failed state already names itself
+    assert reg._attention_reason(timeout, None) == "failed"
+    assert reg._attention_reason(unknown, None) == "vision result unknown"
+    failed_state_ok_row = {**failed, "state": "completed"}
+    assert reg._attention_reason(failed_state_ok_row, None) == "vision delegation failed"
+    assert reg._attention_reason({**timeout, "state": "completed"}, None) == "vision delegation timed out"

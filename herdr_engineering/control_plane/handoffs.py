@@ -206,6 +206,10 @@ class HandoffRegistry:
             return row["state"]
         if self._stalled(row, now):
             return "stalled"
+        vision = row.get("vision")
+        if vision:      # a vision delegation switches models on purpose: only a result that is not whole is worth a look
+            return {"partial": "vision result partial", "failed": "vision delegation failed",
+                    "timeout": "vision delegation timed out", "unknown": "vision result unknown"}.get(vision.get("outcome"))
         if row.get("origin") == "lineage" and row.get("cause") == "context_pressure" and row.get("model_change") == "not_pinned":
             return "successor not pinned to the same model"
         if row.get("origin") == "lineage" and row.get("model_change") == "switched":
