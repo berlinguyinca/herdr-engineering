@@ -110,16 +110,18 @@ class PaneMirror:
         data = self._encode(lines)
         if len(data) <= MAX_FRAME:
             return data
+        total = len(lines)
         lines = [_ANSI.sub("", ln) for ln in lines]  # colour first ...
         data = self._encode(lines)
         while len(data) > MAX_FRAME and len(lines) > 1:  # ... then the top lines: the prompt and the
             # input sit at the bottom of the screen, so those are the rows to keep
             del lines[:len(lines) - max(1, len(lines) * MAX_FRAME // len(data))]
-            data = self._encode(lines)
+            data = self._encode([""] * (total - len(lines)) + lines)
         if len(data) > MAX_FRAME:  # one enormous line
-            lines = [lines[0].encode("utf-8", "replace")[:(MAX_FRAME * 3 // 4) - len(_CLEAR)].decode("utf-8", "ignore")]
-            data = self._encode(lines)
-        return data
+            room = (MAX_FRAME * 3 // 4) - len(_CLEAR) - 2 * (total - 1)
+            lines = [lines[0].encode("utf-8", "replace")[:max(0, room)].decode("utf-8", "ignore")]
+            data = self._encode([""] * (total - 1) + lines)
+        return data   # dropped top lines are blank lines: the frame keeps one line per row, the prompt stays at the bottom
 
     def frame(self) -> dict | None:
         """The screen as one full replacement frame, or None when it is unchanged (or the last

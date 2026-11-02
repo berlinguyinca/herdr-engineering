@@ -572,9 +572,24 @@ def test_frame_still_over_cap_drops_top_lines_and_keeps_the_bottom():
     f = m.frame()
     assert len(f["data"]) <= MAX_FRAME
     lines = decode(f)[len(PREFIX):].split("\r\n")
-    assert 20 < len(lines) < 97
-    assert lines[-1].startswith("096") and not lines[0].startswith("000")  # the bottom rows stay
-    assert all(len(x) == 3003 for x in lines)
+    assert len(lines) == 97                          # still one line per row: the prompt stays at the bottom
+    content = [x for x in lines if x]
+    assert 20 < len(content) < 97 and lines[-len(content):] == content
+    assert lines[-1].startswith("096") and not content[0].startswith("000")  # the bottom rows stay
+    assert all(x == "" for x in lines[:97 - len(content)])    # the dropped top lines are blank
+    assert all(len(x) == 3003 for x in content)
+
+
+def test_a_large_coloured_screen_over_the_cap_keeps_the_prompt_on_the_last_row():
+    row = "\x1b[38;5;196m" + "z" * 2500 + "\x1b[0m"
+    screen = "\n".join([f"\x1b[1m{i:03d}\x1b[0m" + row for i in range(60)] + ["$ prompt"])
+    c = FakeClient([screen], layout=(61, 2600))
+    m, _ = mirror(c)
+    f = m.frame()
+    assert len(f["data"]) <= MAX_FRAME
+    lines = decode(f)[len(PREFIX):].split("\r\n")
+    assert len(lines) == 61 == f["rows"]
+    assert lines[-1] == "$ prompt" and lines[0] == ""
 
 
 def test_small_coloured_frame_keeps_colour():
