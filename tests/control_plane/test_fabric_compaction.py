@@ -16,6 +16,7 @@ from tests.control_plane.test_postgres_recovery import (
     _snapshot,
 )
 
+
 asyncpg = pytest.importorskip("asyncpg")
 
 # The disposable-database fixtures live with the checkpoint tests; re-export them for this module.
@@ -92,6 +93,17 @@ def test_compaction_archives_exactly_the_interior_rows_and_the_replay_agrees(db)
     assert _projections(recovered) == _projections(expected)
     [again] = _run(db, CompactionSettings(enabled=True, dry_run=False, rebuild_checkpoint=False))
     assert again.startswith("archived 0 rows")                                  # idempotent
+
+
+def test_an_archive_that_lacks_a_journal_column_is_repaired_and_the_move_still_works(db):
+    """``trace_id`` was added to fabric_events after the archive existed: the old positional insert failed on every pass."""
+    _seed(db)
+    db.query("ALTER TABLE fabric_events_archive DROP COLUMN IF EXISTS trace_id")
+    [outcome] = _run(db, CompactionSettings(enabled=True, dry_run=False, rebuild_checkpoint=False))
+    assert outcome.startswith("archived 7 rows"), outcome
+    assert db.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'fabric_events_archive' "
+                    "AND column_name = 'trace_id'")
+    assert len(_ids(db, "fabric_events_archive")) == 7
 
 
 def test_batches_drain_over_several_ticks_and_then_rebuild_the_checkpoint(db):
