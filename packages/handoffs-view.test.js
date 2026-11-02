@@ -338,3 +338,28 @@ test('mountHandoffs: cause filter click, round trip links, survival and stale re
     } finally { m.dispose(); }
   });
 });
+
+test('mountHandoffs: a cause or route filter shows the whole round trip, paired from all loaded rows (H7)', async () => {
+  await withGlobals(async () => {
+    const closed = (html) => {
+      assert.equal((html.match(/data-roundtrip/g) || []).length, 1);
+      assert.match(html, /data-handoff="o1"[^>]*>out</); assert.match(html, /data-handoff="b1"[^>]*>result</);
+      assert.match(html, /hd-row__state">analysis complete</); assert.doesNotMatch(html, /hd-row__state">open</);
+    };
+    const h = mountFake({ rows: visionRows() });
+    const m = h.mount(); await h.tick();
+    try {
+      await openCard(h);
+      closed(h.body.innerHTML);
+      for (const cause of ['vision_delegate', 'vision_return']) {
+        h.click({ '[data-cause]': { dataset: { cause }, closest: () => h.card } });
+        closed(h.body.innerHTML);
+        assert.doesNotMatch(h.body.innerHTML, /data-handoff="n2"/);
+      }
+      h.click({ '[data-cause]': { dataset: { cause: '' }, closest: () => h.card } });
+      h.click({ '[data-route]': { dataset: { route: '@a0 → @b0' }, closest: () => h.card } });   // the out row's route only (o1 is a0 -> b0)
+      assert.equal(h.card.__route, '@a0 → @b0');
+      closed(h.body.innerHTML);
+    } finally { m.dispose(); }
+  });
+});

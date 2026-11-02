@@ -70,3 +70,40 @@ test('request ids, handoff ids and model names from the wire are escaped', () =>
   }
   assert.ok(listHtml(rows.map(taint)).includes('&lt;img src=x onerror=alert(1)&gt;'));
 });
+
+// H7: a filter picks which round trips show, never how they read: each shown trip is paired from the card's full loaded rows.
+const sid = (s) => s?.session_id || 'unknown';
+const routeOf = (r) => `${sid(r.source)} → ${sid(r.target)}`;
+const assertWholeTrips = (list, ids, label) => {
+  assert.equal((list.match(/data-roundtrip/g) || []).length, ids.length, `${label}: one entry per delegation`);
+  for (const d of delegations.filter((x) => ids.includes(x.request_id))) {
+    const entry = list.split('data-roundtrip').find((s) => s.includes(d.request_id));
+    assert.ok(entry, `${label}: ${d.name} shown`);
+    assert.match(entry, new RegExp(`data-handoff="handoff:vision-${d.request_id}-out"[^>]*>out<`), `${label}: ${d.name} keeps its out link`);
+    if (d.outcome === 'open') {
+      assert.match(entry, />open</, `${label}: ${d.name} is open`);
+      assert.doesNotMatch(entry, />result</);
+    } else {
+      assert.doesNotMatch(entry, />open</, `${label}: ${d.name} is not open`);
+      assert.match(entry, new RegExp(`data-handoff="handoff:vision-${d.request_id}-back"[^>]*>result<`), `${label}: ${d.name} keeps its result link`);
+      assert.match(entry, / · \d+(\.\d)?s/, `${label}: ${d.name} keeps its duration`);
+    }
+  }
+};
+
+test('a cause filter shows each whole round trip once, paired from all loaded rows (H7)', () => {
+  const all = delegations.map((d) => d.request_id), closed = delegations.filter((d) => d.outcome !== 'open').map((d) => d.request_id);
+  assertWholeTrips(listHtml(filterByCause(rows, 'vision_delegate'), rows), all, 'vision_delegate');
+  assertWholeTrips(listHtml(filterByCause(rows, 'vision_return'), rows), closed, 'vision_return');
+  assertWholeTrips(listHtml(rows, rows), all, 'no filter');
+  assert.equal(listHtml(rows, rows), listHtml(rows), 'unfiltered output is unchanged');
+});
+
+test('a route filter keeps each shown round trip whole (H7)', () => {
+  const routes = [...new Set(rows.map(routeOf))];
+  assert.equal(routes.length, 9);                                         // out text->vision, back vision->text: every pair splits
+  for (const route of routes) {
+    const shown = rows.filter((r) => routeOf(r) === route);
+    assertWholeTrips(listHtml(shown, rows), [...new Set(shown.map((r) => r.vision.request_id))], route);
+  }
+});

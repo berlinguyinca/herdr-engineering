@@ -200,16 +200,18 @@ export function roundTripHtml(trip) {
     <strong class="hd-row__who">vision delegation${trip.requestId ? ` <code>${esc(trip.requestId)}</code>` : ''}</strong>
     <span class="hd-row__goal">${esc(models)}${esc(dur)}</span> ${link(trip.out, 'out')} ${link(trip.back, 'result')}</div>`;
 }
-// The row list: vision rows collapse into one entry per round trip (at the position of its first row).
-export function listHtml(rows) {
-  const trips = new Map(visionRoundTrips(rows).map((t) => [t.out ? tripKey(t.out) : tripKey(t.back), t]));
+// The row list: vision rows collapse into one entry per round trip (at the position of its first shown row). Trips are paired
+// from `all` (the card's full loaded rows, before any cause or route filter) so a filter picks WHICH trips show, never how they
+// read: a shown vision row always renders its whole trip (both links, outcome, duration), and each trip shows once (H7).
+export function listHtml(rows, all = rows) {
+  const trips = new Map(visionRoundTrips(all).map((t) => [t.out ? tripKey(t.out) : tripKey(t.back), t]));
   const done = new Set();
   return (Array.isArray(rows) ? rows : []).map((r) => {
     if (!isVision(r)) return handoffCard(r);
     const k = tripKey(r);
     if (done.has(k)) return '';
     done.add(k);
-    return roundTripHtml(trips.get(k));
+    return roundTripHtml(trips.get(k) || visionRoundTrips([r])[0]);      // a row missing from `all` still renders as itself
   }).join('');
 }
 
@@ -293,7 +295,7 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
     const small = routes.length <= SMALL_GRAPH;
     const overview = small ? '<div class="cx-flow-box" data-handoff-graph></div>' : routesHtml(routes, active);
     const bar = active ? `<p class="hd-filter" data-handoff-filter>Showing <strong>${esc(active)}</strong> · ${shown.length} loaded handoff${shown.length === 1 ? '' : 's'} <button type="button" data-route-clear>Show all</button></p>` : '';
-    body.innerHTML = `${overview}${bar}${causeFilterHtml(all, cause)}${hasVision ? visionStatsLine(visionStats(all, Date.now())) : ''}<div class="hd-rows">${listHtml(shown) || '<p class="hd-muted">No handoffs.</p>'}</div>
+    body.innerHTML = `${overview}${bar}${causeFilterHtml(all, cause)}${hasVision ? visionStatsLine(visionStats(all, Date.now())) : ''}<div class="hd-rows">${listHtml(shown, all) || '<p class="hd-muted">No handoffs.</p>'}</div>
       ${card.__next ? `<button type="button" data-handoff-more data-cursor="${esc(card.__next)}">Load more</button>${active ? '<small class="hd-muted"> Filter applies to handoffs loaded so far.</small>' : ''}` : ''}`;
     if (small) {
       const { flow, latest } = flowFromPage(all);
