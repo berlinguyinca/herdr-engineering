@@ -124,11 +124,16 @@ detailHtml (partial -back): "model changed · qwen3.6-35b-a3b → gemini-3-flash
 any rendered string contains "undefined": false, "null": false, "NaN": false
 ```
 
-Observed, not changed (rendering, outside this task's contract fix): an **out** row's card and detail say "analysis complete",
-because an out row's `vision.outcome` is always `ok` and `outcomeText` maps `ok` to that text. For the open delegation the detail
-reads `model changed · qwen3.6-35b-a3b → gemini-3-flash · analysis complete · request <code>4fbcad96-…</code> · cause
-<code>vision_delegate</code>` although nothing came back. The list collapses vision rows into round trips (which say `open`), so this
-shows only where single rows are drawn: the detail panel, and the "Needs attention" cards (which hold only `-back` rows).
+Found by review of this run, then fixed (commit `b440bd81`, "fix(dashboard): out rows say sent to vision model"): **every**
+out row's card and detail said "analysis complete", whatever became of the delegation (ok, partial, failed, timed out, or still
+open), because an out row's `vision.outcome` is always `ok` and `outcomeText` mapped `ok` to that text. Opening a failed delegation's
+out row from the list's "out" button therefore contradicted its result row. Before the fix the open delegation's detail read
+`model changed · qwen3.6-35b-a3b → gemini-3-flash · analysis complete · request <code>4fbcad96-…</code> · cause <code>vision_delegate</code>`.
+Fix (dashboard wording only; the backend and the `outcome` field are unchanged, and round-trip pairing and `visionStats` are
+untouched): `outcomeText` is phase-aware. Phase `out` reads "sent to vision model". Phase `back`, or no phase (a round trip's outcome),
+keeps ok "analysis complete", partial "partial analysis", failed "analysis failed", timeout "timed out", else "outcome unknown". The
+same detail now reads `model changed · qwen3.6-35b-a3b → gemini-3-flash · sent to vision model · request <code>4fbcad96-…</code> · cause
+<code>vision_delegate</code>`.
 
 ## Pinned in CI
 
@@ -136,8 +141,11 @@ shows only where single rows are drawn: the detail panel, and the "Needs attenti
   `tests/control_plane/fixtures/vision_lineage_envelopes.json`): ingest accepts the envelopes as-is and idempotently; rows, causes,
   vision summary, models, model change, states, sessions, attention, detail, overview, private scope.
 - `tests/control_plane/test_handoff_lineage.py::test_page_and_overview_summaries_carry_the_vision_summary_and_only_on_vision_rows`.
+- `packages/handoffs-view.test.js` › "an out row reads as sent to vision model whatever its delegation became; the back row says the
+  outcome" (out rows of partial, failed, timed-out and open delegations, card and detail; matching back rows keep their outcome text).
 - `packages/vision-lineage-contract.test.js` (fixture `tests/control_plane/fixtures/vision_lineage_api_rows.json`): 5 trips, 4 closed
-  + 1 open, outcomes per delegation, durations, stats, cause filter, list collapse, no `undefined`/`null`/`NaN`, and ids, request ids
+  + 1 open, outcomes per delegation, durations, stats, cause filter, list collapse, no rendered out row (card or detail) saying
+  "analysis complete", no `undefined`/`null`/`NaN`, and ids, request ids
   and model names escaped (each injected with `"><img src=x onerror=alert(1)>`).
 
 Commands and results:
@@ -146,7 +154,7 @@ Commands and results:
 <venv>/bin/python -m pytest tests/control_plane/test_vision_lineage_contract.py tests/control_plane/test_handoff_lineage.py \
     tests/control_plane/test_handoff.py tests/control_plane/test_handoff_overview.py -q      -> 33 passed
 <venv>/bin/python -m pytest tests/control_plane -q -k "handoff or lineage or graph"            -> 579 passed, 54 skipped
-node --test packages/*.test.js                                                                 -> 216 pass, 0 fail (212 before + 4)
+node --test packages/*.test.js                                                                 -> 218 pass, 0 fail (212 before + 4 + 2 for the out-row wording)
 ```
 
 ## Limits
