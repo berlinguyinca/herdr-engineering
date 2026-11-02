@@ -591,3 +591,14 @@ def test_a_push_for_an_ended_terminal_answers_404_so_a_probe_finds_it(env):
     svr.rakazo.terminal._finish(svr.rakazo.terminal._lives["a2"], None, "host_offline", host_knows=True)
     assert http.output(tid2, [frame()])[0] == 404             # host_offline: the returning host learns at once
     assert live is not None
+
+
+# ------------------------------------------------------------------------------------------- pane size
+def test_data_chunks_carry_the_rows_and_cols_of_their_frame(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    http.output(tid, [frame("one", rows=24, cols=80), frame("two", rows=40, cols=120)])
+    http.output(tid, [{"ended": True, "exit": 0}])
+    got = chunks(svr)
+    assert [(c["seq"], c["rows"], c["cols"]) for c in got[:2]] == [(1, 24, 80), (2, 40, 120)]   # a resized pane's next frame
+    assert "rows" not in got[2]                                                # an ended chunk needs no size

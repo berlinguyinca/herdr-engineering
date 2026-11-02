@@ -3,7 +3,8 @@
 The control plane never starts a process. A relay on each fleet host long-polls ``wait`` for commands (open, input,
 resize, zoom, close) and pushes screen frames back with ``accept_frames``; the broker keeps a command queue per host
 and, per agent, a numbered buffer of those frames. The app attaches by cursor: ``chunks_after(seq)`` returns everything
-newer than ``seq``. A frame is a whole screen, so each one is stored as a ``reset`` chunk (the app clears, then paints).
+newer than ``seq``. A frame is a whole screen, so each one is stored as a ``reset`` chunk (the app clears, then paints); it also carries the pane's ``rows`` and ``cols``
+from the frame, so the app can size its screen.
 The buffer is capped, and the newest frame is always kept.
 
 Host protocol. Delivery is at-least-once. Every command has an id ``<epoch>-<counter>-<random>``: the epoch is random per
@@ -95,9 +96,11 @@ class _Live:
     def seq(self):
         return self._seq
 
-    def add(self, data, reset):
+    def add(self, data, reset, rows=None, cols=None):
+        """Keep one chunk with the pane size of its frame. The cap counts the encoded data only: rows and cols are two
+        small integers per chunk, a few bytes against a buffer of 200 KB."""
         self._seq += 1
-        self._chunks.append((self._seq, data, reset))
+        self._chunks.append((self._seq, data, reset, rows, cols))
         self._size += len(data)
         while self._size > _BUFFER_BYTES and len(self._chunks) > 1:   # the newest frame stays, whatever its size
             self._size -= len(self._chunks.popleft()[1])
@@ -111,9 +114,10 @@ class _Live:
 
     def chunks_after(self, seq):
         out = []
-        for n, data, reset in self._chunks:
+        for n, data, reset, rows, cols in self._chunks:
             if n > seq:
-                out.append({"seq": n, "data": data, **({"reset": True} if reset else {})})
+                size = {"rows": rows, "cols": cols} if rows is not None else {}   # the app sizes its screen from these
+                out.append({"seq": n, "data": data, **({"reset": True} if reset else {}), **size})
         if self._ended and self._ended["seq"] > seq:
             out.append(dict(self._ended))
         return out
@@ -262,7 +266,7 @@ class Terminal:
                 if item[0] == "ended":
                     self._finish(live, item[1], item[2], host_knows=True)
                 else:
-                    live.add(item[1], True)
+                    live.add(item[1], True, item[2], item[3])
 
     def _finish(self, live, code, reason, *, host_knows=False) -> None:   # call with self._lock held
         """End a terminal and drop its queued commands, which would be stale: the ones the host is not told about

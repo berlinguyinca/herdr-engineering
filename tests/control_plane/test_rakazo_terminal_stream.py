@@ -106,6 +106,17 @@ def test_a_silent_host_ends_the_stream_with_host_offline(bridge, ctx, repo, cloc
     assert frames(resp) == [{"seq": 1, "ended": True, "exit": None, "reason": "host_offline"}]
 
 
+def test_streamed_chunks_carry_the_pane_size_and_a_replay_the_newest_frames(bridge, ctx, repo, host):
+    tid = opened(bridge, ctx, repo)
+    host.say(tid, "one", rows=24, cols=80)
+    host.say(tid, "two", rows=40, cols=120)
+    out = frames(call(bridge, ctx, "subscribe", terminalId=tid, cursor=0))
+    assert [(e["seq"], e["rows"], e["cols"]) for e in out] == [(1, 24, 80), (2, 40, 120)]
+    again = call(bridge, ctx, "open", id="a1", rows=30, cols=100)               # reopen: the buffer is replayed
+    out = frames(call(bridge, ctx, "subscribe", terminalId=again["terminalId"], cursor=again["seq"]))
+    assert (out[-1]["rows"], out[-1]["cols"]) == (40, 120)
+
+
 def test_subscribe_validation_and_polls_fast(bridge, ctx, repo, monkeypatch):
     tid = opened(bridge, ctx, repo)
     assert status_of(bridge, ctx, "subscribe", terminalId="nope", cursor=0) == 404
