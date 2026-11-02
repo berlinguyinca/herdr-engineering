@@ -20,7 +20,7 @@ ends its terminal with ``reason: "stale"`` for the same reason. A terminal that 
 by a takeover loses its queued open/input/resize/zoom commands (its ``close`` stays, except when the host is gone).
 A host counts as connected while a wait is blocked for it, or for 10 s after its last wait ended; a host silent for
 those 10 s loses its open terminals (``reason: "host_offline"``). What a host may receive or push is decided by the
-caller (``api.py`` requires its key to be explicitly bound to the host id); the broker keeps every queue and every
+caller (``api.py`` takes the host id from the per-host ``X-Host-Token``, never from the request); the broker keeps every queue and every
 terminal id per host.
 """
 from __future__ import annotations
@@ -59,6 +59,7 @@ _POLL_SECONDS = 0.03       # keystroke echo rides this stream
 _BUFFER_BYTES = 200_000    # soft cap on the encoded frames kept per terminal
 _MAX_FRAME = 160 * 1024    # encoded bytes per pushed frame
 _MAX_FRAMES = 20           # frames per output POST
+_MAX_POST = 512 * 1024     # encoded bytes per output POST, over all its frames
 _QUEUE_CAP = 256           # queued commands per host
 _SILENT_SECONDS = 10.0     # one rule: connected for this long after a wait ended, and silent this long = offline
 _COMMAND_TTL = 60.0        # an unacknowledged command is dropped after this long
@@ -113,6 +114,13 @@ class _Live:
                 self._ended["reason"] = reason
 
     def chunks_after(self, seq):
+        """What a client at ``seq`` needs: every frame replaces the whole screen, so only the newest frame (and what
+        came after it) is sent, plus the ended chunk. The buffer keeps older frames only for its cap and ``kept_after``."""
+        out = self.kept_after(seq)
+        newest = max((i for i, c in enumerate(out) if c.get("reset")), default=0)
+        return out[newest:]
+
+    def kept_after(self, seq):
         out = []
         for n, data, reset, rows, cols in self._chunks:
             if n > seq:
@@ -131,6 +139,7 @@ class _Client:
         self.lock = threading.Lock()   # orders input: n is checked and the command queued as one step
         self.last_n = 0
         self.taken = False             # a newer open for the same agent replaced this client
+        self.stream = 0                # the newest subscribe for this id; an older stream ends at once
 
 
 def _parse_frames(frames):
@@ -139,7 +148,7 @@ def _parse_frames(frames):
         raise HostError(400, "frames must be a list.")
     if len(frames) > _MAX_FRAMES:
         raise HostError(413, "Too many frames in one call.")
-    out = []
+    out, total = [], 0
     for frame in frames:
         if not isinstance(frame, dict):
             raise HostError(400, "Each frame must be an object.")
@@ -154,7 +163,8 @@ def _parse_frames(frames):
         data = frame.get("data")
         if not isinstance(data, str):
             raise HostError(400, "data must be base64 text.")
-        if len(data) > _MAX_FRAME:
+        total += len(data)
+        if len(data) > _MAX_FRAME or total > _MAX_POST:
             raise HostError(413, "A frame is too large.")
         try:
             base64.b64decode(data, validate=True)
@@ -546,9 +556,13 @@ class Terminal:
             client = self._client(ctx, inp)
             live = client.pty
             live.streams += 1
+            client.stream = mine = client.stream + 1
         done = threading.Event()
 
         def fetch(after: int) -> list[dict]:
+            if client.stream != mine:   # a newer subscribe for this terminal id: this one ends, releasing its slot
+                done.set()
+                return []
             self._expire_silent_hosts()
             with self._lock:
                 chunks = live.chunks_after(after)

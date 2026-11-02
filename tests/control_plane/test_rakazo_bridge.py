@@ -270,6 +270,26 @@ def test_open_owner_refuses_a_configured_proxy_that_names_no_client(make_server)
     assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.2.2"})[0] == 200
 
 
+def open_from(bridge, peer, forwarded=None):
+    headers = {"origin": "rakazo://", **({"x-forwarded-for": forwarded} if forwarded else {})}
+    return bridge.handle("POST", "/api/auth/open", headers, b"{}", peer).status
+
+
+def test_open_owner_refuses_forwarded_for_from_a_peer_nobody_trusts(make_server):
+    svr, _ = make_server(bridge_section(open_owner=True))
+    assert open_from(svr.rakazo, "198.51.100.7", "100.64.1.1") == 403         # a proxy we do not trust relayed a tailnet address
+    assert open_from(svr.rakazo, "172.17.0.2", "100.64.1.2") == 403
+    assert open_from(svr.rakazo, "100.64.9.9") == 200                         # a direct tailnet peer is the caller
+    assert open_from(svr.rakazo, "100.64.9.10", "100.64.1.3") == 403          # even a tailnet peer may not vouch for another
+
+
+def test_open_owner_believes_forwarded_for_from_a_trusted_proxy_only(make_server):
+    svr, _ = make_server(bridge_section(open_owner=True, trusted_proxies=["10.0.0.0/8"]))
+    assert open_from(svr.rakazo, "10.0.0.2", "100.64.2.1") == 200
+    assert open_from(svr.rakazo, "10.0.0.2", "8.8.8.8") == 403
+    assert open_from(svr.rakazo, "198.51.100.7", "100.64.2.2") == 403
+
+
 def test_open_owner_needs_an_operator_account_to_act_as():
     with pytest.raises(ValueError, match="open_owner"):
         rb.rakazo_bridge_config({"enabled": True, "open_owner": True,

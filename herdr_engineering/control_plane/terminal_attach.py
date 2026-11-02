@@ -15,6 +15,9 @@ attachment and must not be combined with ``--session``, so the remote form is pl
 non-interactive ssh shell does not have ``~/.local/bin`` (where herdr lives) on PATH, hence
 ``bash -lc``. Every value is checked against a strict charset; a value that fails is refused
 and never echoed back.
+
+``attach_commands`` is also the gate of the phone terminal: ``terminal/open`` (rakazo_terminal) runs the same record checks
+(live status, charset-checked host, session, pane and terminal ids) before it queues an open command for the host relay.
 """
 from __future__ import annotations
 

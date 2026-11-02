@@ -51,7 +51,7 @@ log = logging.getLogger(__name__)
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
 _HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
-# Terminal broker, host side: the relay's output POST (an ingest-role route, like the report worker's).
+# Terminal broker, host side: the relay's output POST (per-host token like the fleet routes, never an API key).
 _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
@@ -2379,6 +2379,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._fleet_config_get()
             if self._path_only() in _DEPLOYMENT_HOST_GET_PATHS:      # host token, not X-API-Key
                 return self._deployment_host_get(_DEPLOYMENT_HOST_GET_PATHS[self._path_only()])
+            if self._path_only() == "/api/v1/host/terminal/wait":      # host token, not X-API-Key
+                return self._host_terminal(None)
             if self._path_only() == "/api/v1/health" and "probe" in parse_qs(urlsplit(self.path).query):
                 # Cheap liveness+capability probe (?probe=1): O(1), no repo counters,
                 # no inspector O(total-events) scan, no metrics snapshot. Used by
@@ -2462,8 +2464,10 @@ def _make_handler(server, public=False, operator=False):
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin artifact mutation refused")
+            if _HOST_TERMINAL_OUT.match(dpath):      # host token, not X-API-Key (like the fleet routes above)
+                return self._host_terminal(unquote(dpath.split("/")[5]), post=True)
             min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path) or _is_rereview(path)
-                        or _HOST_REPORT.match(path) or _HOST_TERMINAL_OUT.match(path)
+                        or _HOST_REPORT.match(path)
                        else "operator")
             if _is_rereview(path) and self._role() == "reviewer":
                 # _require would refuse it too ("read-only"); say why. The review gate dispatches its own re-reviews
@@ -3717,8 +3721,6 @@ def _make_handler(server, public=False, operator=False):
                 return self._graph_get(parts)
             if resource == "steering":
                 return self._steering(parts)
-            if resource == "host" and parts[4:] == ["terminal", "wait"]:
-                return self._host_terminal(parts)
             if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
                 # T16 M4: emitter names, actor digests and sequences of other principals are operator
                 # business; every other key sees only the sources it emitted itself.
@@ -3856,8 +3858,6 @@ def _make_handler(server, public=False, operator=False):
             r = server.repo
             if resource == "fabric" and len(parts) == 5 and parts[4] == "resolve-urls":
                 return self._fabric_resolve_urls()
-            if resource == "host" and len(parts) == 7 and parts[4] == "terminal" and parts[6] == "output":
-                return self._host_terminal(parts, self._read_json() or {})
             if resource == "handoffs":
                 body = self._read_json() or {}
                 actor = self._principal()
@@ -5089,43 +5089,52 @@ def _make_handler(server, public=False, operator=False):
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
 
-        def _host_key_allowed(self, host_id, *, explicit=False):
+        def _host_key_allowed(self, host_id):
             """May this key act for ``host_id``? A key bound in control_plane.architecture.agent_hosts acts only for its own
             hosts. An unbound key is trusted to name any host (keys carry a role only; there is no per-host enrollment),
-            except an unbound ``agent`` key under require_host_binding, as for the summary reports. ``explicit`` is the
-            terminal's rule: only a key listed in agent_hosts for THIS host, whatever require_host_binding says (the terminal
-            carries keystrokes and screens, so it never relies on trust)."""
+            except an unbound ``agent`` key under require_host_binding. (The terminal relay does not use this: it
+            authenticates with the per-host token.)"""
             role = self._role()
             bound = (server.architecture_agent_hosts.get(self._principal()["id"])
                      if role in ("agent", "ingest") else None)
-            if explicit:
-                return bound is not None and host_id in bound
             if bound is not None:
                 return host_id in bound
             return not (server.architecture_require_host_binding and role == "agent")
 
-        def _host_terminal(self, parts, body=None):
-            """Terminal broker, host side. ``GET /api/v1/host/terminal/wait?host_id=&timeout=&after=`` long-polls for commands
-            (``after`` acknowledges up to that command id); ``POST /api/v1/host/terminal/<id>/output?host_id=`` pushes screen
-            frames. Ingest API keys only, and only a key explicitly bound to the host in control_plane.architecture.agent_hosts:
-            deploying the relay needs each fleet host's ingest key listed there for its own host id. Agent keys run inside
-            sessions and must not read keystrokes; operator keys cannot be bound, so they never qualify."""
+        def _host_terminal(self, terminal_id, post=False):
+            """Terminal broker, host side. ``GET /api/v1/host/terminal/wait?timeout=&after=`` long-polls for commands (``after``
+            acknowledges up to that command id); ``POST /api/v1/host/terminal/<id>/output`` pushes screen frames. The only
+            credential is the per-host ``X-Host-Token`` of the fleet file (what ``herdr-eng fleet join`` puts in host.json),
+            checked like the other host routes, so it works in open mode and needs no control-plane configuration. The
+            host id comes from the TOKEN; a ``host_id`` in the query or body is never trusted and must equal it. API keys
+            of every role are refused, and so is the open listener without a token."""
+            from ..fleet_config import FleetConfigError
             from .rakazo_terminal import HostError
-            from .terminal_attach import _HOST
             broker = server.rakazo.terminal if server.rakazo is not None else None
             if broker is None:
-                return self._json({"error": "not found"}, 404)
-            if self._principal().get("authenticated_by") != "api_key" or self._role() != "ingest":
-                return self._json({"error": "the terminal relay needs an ingest API key bound to its host"}, 403)
-            host_id = _q(self.path, "host_id")
-            if host_id is None and isinstance(body, dict):
-                host_id = body.get("host_id")
-            if not isinstance(host_id, str) or not _HOST.fullmatch(host_id):
-                return self._json({"error": "a valid host_id is required"}, 400)
-            if not self._host_key_allowed(host_id, explicit=True):
-                return self._json({"error": "this API key is not bound to that host (control_plane.architecture.agent_hosts)"}, 403)
+                return self._deny(404, "not found")
+            tokens = self.headers.get_all("X-Host-Token") or []
+            host = None
+            if len(tokens) == 1 and server.fleet_config is not None:
+                try:
+                    host = self._fleet_host(server.fleet_config.current())
+                except FleetConfigError:
+                    host = None
+            if host is None:
+                return self._deny(403, "the terminal relay needs a host token")
+            given = _q(self.path, "host_id")
+            body = None
+            if post:
+                try:
+                    body = self._read_json() or {}
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+                if given is None and isinstance(body, dict):
+                    given = body.get("host_id")
+            if given is not None and given != host:
+                return self._json({"error": "this host token is not for that host"}, 403)
             try:
-                if body is None:
+                if not post:
                     try:
                         timeout = float(_q(self.path, "timeout") or 25)
                     except ValueError:
@@ -5135,13 +5144,13 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"error": "timeout must be a number of seconds"}, 400)
                     if after is not None and not re.fullmatch(r"[0-9a-f]{8}-\d{1,20}-[A-Za-z0-9_-]{1,64}", after):
                         return self._json({"error": "after must be a command id"}, 400)
-                    commands = broker.wait_commands(host_id, timeout, after)
+                    commands = broker.wait_commands(host, timeout, after)
                     # Serialised here, not by _json's redaction pass: that one rewrites strings that look like credentials,
                     # and a corrupted base64 input would type the wrong keys.
                     return self._json(None, payload=json.dumps({"commands": commands}).encode())
                 if not isinstance(body, dict):
                     return self._json({"error": "body must be an object"}, 400)
-                broker.accept_frames(host_id, parts[5], body.get("frames"))
+                broker.accept_frames(host, terminal_id, body.get("frames"))
                 return self._json({"ok": True})
             except HostError as exc:
                 return self._json({"error": exc.message}, exc.status, headers=exc.headers)

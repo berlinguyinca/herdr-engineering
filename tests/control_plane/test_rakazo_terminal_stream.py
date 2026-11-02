@@ -1,6 +1,7 @@
 """terminal/subscribe: numbered output frames the host pushed, ended, reset and taken_over."""
 import base64
 import json
+import time
 
 import pytest
 
@@ -34,9 +35,9 @@ def test_subscribe_from_the_open_seq_replays_the_buffer(bridge, ctx, repo, host)
     host.say(tid, "two")
     host.end(tid, 0)
     out = frames(call(bridge, ctx, "subscribe", terminalId=tid, cursor=0))
-    assert [e["seq"] for e in out] == [1, 2, 3]
-    assert base64.b64decode(out[0]["data"]) == b"one" and out[0]["reset"] is True and out[1]["reset"] is True
-    assert out[2] == {"seq": 3, "ended": True, "exit": 0}
+    assert [e["seq"] for e in out] == [2, 3]                     # a reattach replays only the newest frame
+    assert base64.b64decode(out[0]["data"]) == b"two" and out[0]["reset"] is True
+    assert out[1] == {"seq": 3, "ended": True, "exit": 0}
 
 
 def test_subscribe_from_a_cursor_skips_what_was_seen(bridge, ctx, repo, host):
@@ -111,10 +112,22 @@ def test_streamed_chunks_carry_the_pane_size_and_a_replay_the_newest_frames(brid
     host.say(tid, "one", rows=24, cols=80)
     host.say(tid, "two", rows=40, cols=120)
     out = frames(call(bridge, ctx, "subscribe", terminalId=tid, cursor=0))
-    assert [(e["seq"], e["rows"], e["cols"]) for e in out] == [(1, 24, 80), (2, 40, 120)]
+    assert [(e["seq"], e["rows"], e["cols"]) for e in out] == [(2, 40, 120)]
     again = call(bridge, ctx, "open", id="a1", rows=30, cols=100)               # reopen: the buffer is replayed
     out = frames(call(bridge, ctx, "subscribe", terminalId=again["terminalId"], cursor=again["seq"]))
     assert (out[-1]["rows"], out[-1]["cols"]) == (40, 120)
+
+
+def test_a_newer_subscribe_for_the_same_terminal_ends_the_older_stream_at_once(bridge, ctx, repo):
+    tid = opened(bridge, ctx, repo)
+    bridge.stream_options["max_seconds"] = 5
+    older = call(bridge, ctx, "subscribe", terminalId=tid, cursor=0)
+    newer = call(bridge, ctx, "subscribe", terminalId=tid, cursor=0)
+    started = time.monotonic()
+    out = frames(older)                                          # ends by itself, not after max_seconds
+    assert time.monotonic() - started < 2 and not any(e.get("ended") for e in out)
+    newer.frames.close()
+    newer.on_close()
 
 
 def test_subscribe_validation_and_polls_fast(bridge, ctx, repo, monkeypatch):

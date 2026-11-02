@@ -7,9 +7,8 @@ Per host:
 
 1. herdr must be running as the same user (the relay talks to `~/.config/herdr/herdr.sock`).
 2. `~/.config/herdr-engineering/host.json` must exist (`herdr-eng fleet join`); the relay uses its control plane URL and
-   the host's ingest key.
-3. On the control plane, that ingest key must be listed for this host's own id in `control_plane.architecture.agent_hosts`.
-   Without it the relay gets 403 and backs off to one try per 30 s, logging once a minute.
+   the host's own host token (`X-Host-Token`, the same credential the fleet routes use).
+3. Nothing to configure on the control plane: the token identifies the host, and a token only works for its own host.
 4. Install one unit and start it as the user that runs herdr:
    - Linux: copy `herdr-terminal-relay.service` to `~/.config/systemd/user/`, then
      `systemctl --user enable --now herdr-terminal-relay`.

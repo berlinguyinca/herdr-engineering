@@ -550,7 +550,8 @@ def test_concurrent_opens_for_one_agent_make_one_terminal(bridge, ctx, repo, hos
         th.join(5)
     assert len(out) == 3 and len({o["terminalId"] for o in out}) == 3
     assert len(bridge.terminal._lives) == 1 and len(bridge.terminal._clients) == 1   # only the newest id is current
-    assert len(host.sent("open")) == 3 and len(host.sent("close")) == 2
+    (current,) = bridge.terminal._clients                      # an open the host had not fetched yet is purged on takeover
+    assert host.sent("open")[-1]["terminal"] == current
 
 
 def test_detach_is_audited_once_however_often_it_runs(bridge, ctx, repo, audit, host):

@@ -1,7 +1,8 @@
 """The host side of the terminal broker: ``GET /api/v1/host/terminal/wait`` and ``POST /api/v1/host/terminal/<id>/output``.
 
-A live ControlPlaneServer is driven over HTTP with host keys; the phone side is the bridge's own ``terminal/open``."""
+A live ControlPlaneServer is driven over HTTP with per-host tokens; the phone side is the bridge's own ``terminal/open``."""
 import base64
+import hashlib
 import json
 import re
 import threading
@@ -11,13 +12,13 @@ import urllib.request
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
+from herdr_engineering.fleet_config import FleetConfigStore
+from herdr_engineering.control_plane.request_metrics import RequestMetrics
 from tests.control_plane.test_rakazo_bridge import bridge_section, make_server  # noqa: F401
 
-KEYS = {"read": "viewer", "write": "operator", "host": "ingest", "host2": "ingest", "free": "ingest",
-        "agent": "agent", "agent-b": "agent"}
-# 'host' acts for beast, 'host2' for other; 'free' is an ingest key nobody bound; agent keys are never terminal hosts.
-BINDINGS = {"host": ["beast"], "host2": ["other"], "agent-b": ["beast"]}
+TOKENS = {"beast": "tok-beast-placeholder", "other": "tok-other-placeholder"}   # what each host's host.json holds
 WAIT, OUT = "/api/v1/host/terminal/wait", "/api/v1/host/terminal/{}/output"
 
 
@@ -30,12 +31,15 @@ def frame(text="x", rows=24, cols=80):
 
 
 class Http:
+    """The relay's side: ``X-Host-Token`` is the only credential; the host id comes from the token."""
+
     def __init__(self, svr):
         self.svr = svr
         self.base = f"http://127.0.0.1:{svr.port}"
 
-    def call(self, path, body=None, key="host", method=None, headers=None, timeout=10):
-        hdrs = {"Content-Type": "application/json", **({"X-API-Key": key} if key else {}), **(headers or {})}
+    def call(self, path, body=None, token=None, apikey=None, method=None, headers=None, timeout=10):
+        hdrs = {"Content-Type": "application/json", **({"X-Host-Token": token} if token else {}),
+                **({"X-API-Key": apikey} if apikey else {}), **(headers or {})}
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.base + path, data=data, headers=hdrs,
                                      method=method or ("POST" if body is not None else "GET"))
@@ -44,28 +48,38 @@ class Http:
                 return resp.status, json.load(resp), dict(resp.headers)
         except urllib.error.HTTPError as err:
             raw = err.read()
-            return err.code, (json.loads(raw) if raw else None), dict(err.headers)
+            try:
+                return err.code, (json.loads(raw) if raw else None), dict(err.headers)
+            except ValueError:
+                return err.code, None, dict(err.headers)
 
-    def wait(self, host="beast", timeout=0, key="host", after=None):
+    def wait(self, host="beast", timeout=0, token="host", after=None, apikey=None):
         extra = f"&after={after}" if after else ""
-        return self.call(f"{WAIT}?host_id={host}&timeout={timeout}{extra}", key=key)
+        token = TOKENS[host] if token == "host" else token
+        return self.call(f"{WAIT}?host_id={host}&timeout={timeout}{extra}", token=token, apikey=apikey)
 
-    def output(self, tid, frames, host="beast", key="host", **kw):
-        return self.call(OUT.format(tid) + f"?host_id={host}", {"frames": frames}, key=key, **kw)
+    def output(self, tid, frames, host="beast", token="host", apikey=None, **kw):
+        token = TOKENS[host] if token == "host" else token
+        return self.call(OUT.format(tid) + f"?host_id={host}", {"frames": frames}, token=token, apikey=apikey, **kw)
 
 
 @pytest.fixture
-def rig(make_server):
-    def build(**kw):
-        svr, _ = make_server(bridge_section(), api_keys=KEYS, **kw)
+def rig(make_server, tmp_path):
+    """Open mode (no api_keys), like production: the fleet file's host tokens are the only host credential."""
+    def build(api_keys=None, **kw):
+        path = tmp_path / "fleet.yaml"
+        path.write_text(yaml.safe_dump({"version": 1, "sections": {}, "hosts": {
+            host: {"roles": [], "token_sha256": hashlib.sha256(tok.encode()).hexdigest()} for host, tok in TOKENS.items()}}))
+        path.chmod(0o600)
+        extra = {"api_keys": api_keys} if api_keys else {}
+        svr, _ = make_server(bridge_section(), fleet_config=FleetConfigStore(path), **extra, **kw)
         return svr, Http(svr)
     return build
 
 
 @pytest.fixture
 def env(rig):
-    svr, http = rig(architecture_options={"agent_hosts": BINDINGS})
-    return svr, http
+    return rig()
 
 
 def owner(svr):
@@ -77,89 +91,65 @@ def owner(svr):
 def open_terminal(svr, http, host="beast", sid="a1"):
     svr.repo.upsert_session(sid, status="working", host_id=host, herdr_session="default", pane_id="w1:p1",
                             terminal_id="term_1")
-    assert http.wait(host, key={"beast": "host", "other": "host2"}[host])[0] == 200      # the relay is polling
+    assert http.wait(host)[0] == 200                                           # the relay is polling
     out = svr.rakazo.terminal.open(owner(svr), {"id": sid, "rows": 30, "cols": 100})
     return out["terminalId"]
 
 
 def chunks(svr, sid="a1", after=0):
-    return svr.rakazo.terminal._lives[sid].chunks_after(after)
+    return svr.rakazo.terminal._lives[sid].kept_after(after)       # the raw buffer; chunks_after collapses frames
 
 
 # ---------------------------------------------------------------------------------------------------- auth
-def test_wait_needs_a_host_key(env):
-    _, http = env
-    assert http.wait(key=None)[0] == 401
-    assert http.wait(key="nonsense")[0] == 401
-    assert http.wait(key="read")[0] == 403                    # viewer
-    assert http.wait(key="agent")[0] == 403                   # agent keys run inside sessions and may not read keystrokes
-    assert http.wait(key="agent-b")[0] == 403                 # not even one bound to the host
-    assert http.wait(key="host")[0] == 200
-
-
-def test_output_needs_a_host_key(env):
+def test_wait_and_output_need_a_host_token_in_open_mode(env):
     svr, http = env
     tid = open_terminal(svr, http)
-    for key, want in ((None, 401), ("read", 403), ("agent", 403), ("agent-b", 403)):
-        assert http.output(tid, [frame()], key=key)[0] == want
+    assert http.wait(token=None)[0] == 403                                     # no token: the open listener is not enough
+    assert http.wait(token="nonsense")[0] in (401, 403)
+    assert http.output(tid, [frame()], token=None)[0] == 403
+    assert http.output(tid, [frame()], token="nonsense")[0] in (401, 403)
     assert chunks(svr) == []
-    assert http.output(tid, [frame()])[0] == 200
+    assert http.wait()[0] == 200 and http.output(tid, [frame()])[0] == 200
 
 
-def test_the_host_id_is_required_and_charset_checked(env):
-    _, http = env
-    assert http.call(f"{WAIT}?timeout=0")[0] == 400
-    for bad in ("", "a%20b", "..%2Fx", "-x", "a" * 64, "be;ast"):
-        assert http.call(f"{WAIT}?host_id={bad}&timeout=0")[0] == 400, bad
-    assert http.call(f"{WAIT}?host_id=beast&timeout=soon")[0] == 400
-
-
-def test_a_key_bound_to_other_hosts_gets_nothing_for_this_one(env):
-    svr, http = env
-    assert http.wait("beast", key="host2")[0] == 403          # bound to other
-    assert http.wait("other", key="host")[0] == 403
-    assert http.wait("other", key="host2")[0] == 200
-    assert not svr.rakazo.terminal.host_connected("beast")    # the refused polls did not mark it connected
-
-
-def test_an_unbound_key_is_refused_on_both_endpoints_under_the_default_config(env):
-    svr, http = env                                           # agent_hosts is set, require_host_binding is NOT
+def test_api_keys_of_every_role_are_refused_with_or_without_a_token(rig):
+    svr, http = rig(api_keys={"read": "viewer", "write": "operator", "host": "ingest", "agent": "agent"})
     tid = open_terminal(svr, http)
-    assert http.wait("beast", key="free")[0] == 403           # an ingest key nobody bound to a host
-    assert http.output(tid, [frame()], key="free")[0] == 403
-    assert http.wait("beast", key="write")[0] == 403          # operator keys cannot be bound, so they never qualify
-    assert http.output(tid, [frame()], key="write")[0] == 403
+    for key in ("read", "write", "host", "agent"):
+        assert http.wait(token=None, apikey=key)[0] == 403, key
+        assert http.output(tid, [frame()], token=None, apikey=key)[0] == 403, key
+    assert http.wait(apikey="write")[0] == 200                                  # the token decides; a key adds nothing
     assert chunks(svr) == []
 
 
-def test_without_any_agent_hosts_no_key_may_be_a_terminal_host(rig):
-    svr, http = rig()
-    assert http.wait("beast", key="host")[0] == 403
-    assert http.wait("beast", key="write")[0] == 403
-    svr2, http2 = rig(architecture_options={"agent_hosts": BINDINGS, "require_host_binding": True})
-    assert http2.wait("beast", key="free")[0] == 403
-    assert http2.wait("beast", key="host")[0] == 200
+def test_the_host_id_is_taken_from_the_token_and_a_given_one_must_match(env):
+    svr, http = env
+    assert http.call(f"{WAIT}?timeout=0", token=TOKENS["beast"])[0] == 200      # none given: the token's host
+    assert http.wait("other", token=TOKENS["beast"])[0] == 403                  # a different one: never trusted
+    for bad in ("a%20b", "..%2Fx", "-x", "a" * 64, "be;ast"):
+        assert http.call(f"{WAIT}?host_id={bad}&timeout=0", token=TOKENS["beast"])[0] in (400, 403), bad
+    assert http.call(f"{WAIT}?host_id=beast&timeout=soon", token=TOKENS["beast"])[0] == 400
 
 
-def test_a_key_bound_to_one_host_cannot_poll_or_post_for_another(env):
+def test_a_host_token_works_for_its_own_host_only(env):
     svr, http = env
     tid = open_terminal(svr, http, "beast")
     open_terminal(svr, http, "other", sid="b1")
-    assert http.wait("other", key="host")[0] == 403
-    assert http.wait("beast", key="host2")[0] == 403
-    assert http.output(tid, [frame()], host="other", key="host")[0] == 403
-    assert http.output(tid, [frame()], host="beast", key="host2")[0] == 403
+    assert http.wait("other", token=TOKENS["beast"])[0] == 403
+    assert http.wait("beast", token=TOKENS["other"])[0] == 403
+    assert http.output(tid, [frame()], host="other", token=TOKENS["beast"])[0] == 403
+    assert http.output(tid, [frame()], host="beast", token=TOKENS["other"])[0] == 403
+    assert http.call(OUT.format(tid), {"frames": [frame()]}, token=TOKENS["other"])[0] == 404   # no host_id: other's own view
     assert chunks(svr) == []
+    assert http.output(tid, [frame()], host="beast")[0] == 200
 
 
-def test_output_for_a_terminal_on_another_host_is_refused(env):
+def test_output_for_a_terminal_opened_on_another_host_is_404(env):
     svr, http = env
     tid = open_terminal(svr, http, "beast")
-    assert http.output(tid, [frame()], host="other", key="host2")[0] == 404    # bound to other, but not this terminal's host
-    assert http.output(tid, [frame()], host="beast", key="host2")[0] == 403    # bound to other: cannot claim beast
-    assert http.output(tid, [frame()], host="other", key="host")[0] == 403
+    open_terminal(svr, http, "other", sid="b1")
+    assert http.output(tid, [frame()], host="other")[0] == 404                  # other's token, beast's terminal
     assert chunks(svr) == []
-    assert http.output(tid, [frame()], host="beast", key="host")[0] == 200
 
 
 def test_output_for_an_unknown_or_retired_terminal_is_404(env):
@@ -211,11 +201,11 @@ def test_wait_wakes_when_a_command_is_queued_and_times_out_empty_otherwise(env):
 def test_wait_delivers_input_in_order_and_only_to_its_own_host(env):
     svr, http = env
     tid = open_terminal(svr, http)
-    http.wait("other", key="host2")
+    http.wait("other", token=TOKENS["other"])
     term = svr.rakazo.terminal
     for n, text in ((1, "ls"), (2, "\r")):
         term.input(owner(svr), {"terminalId": tid, "data": b64(text), "n": n})
-    assert http.wait("other", key="host2")[1] == {"commands": []}
+    assert http.wait("other", token=TOKENS["other"])[1] == {"commands": []}
     cmds = http.wait()[1]["commands"]
     assert [(c["kind"], c.get("n"), c.get("data")) for c in cmds] == [
         ("open", None, None), ("input", 1, b64("ls")), ("input", 2, b64("\r"))]
@@ -269,7 +259,7 @@ def test_malformed_frames_are_400_and_store_nothing(env):
            [{"ended": True, "exit": "x"}], [{"ended": True, "reason": "r" * 300}]]
     for frames in bad:
         assert http.output(tid, [frame()] + frames)[0] == 400, frames
-    assert http.call(OUT.format(tid) + "?host_id=beast", {"frames": "no"})[0] == 400
+    assert http.call(OUT.format(tid) + "?host_id=beast", {"frames": "no"}, token=TOKENS["beast"])[0] == 400
     assert chunks(svr) == []
 
 
@@ -379,7 +369,7 @@ def test_unacked_commands_expire_after_60_seconds(env):
 
 def test_a_malformed_after_cursor_is_400(env):
     _, http = env
-    assert http.call(f"{WAIT}?host_id=beast&timeout=0&after=nope")[0] == 400
+    assert http.call(f"{WAIT}?host_id=beast&timeout=0&after=nope", token=TOKENS["beast"])[0] == 400
 
 
 # --------------------------------------------------------------------------------------- stale commands
@@ -435,7 +425,7 @@ def test_one_host_cannot_lock_out_the_others_and_many_hosts_can_poll(env):
     for th in spam:
         th.start()
     time.sleep(0.3)
-    assert http.wait("other", key="host2")[0] == 200                            # not locked out by beast's 30 polls
+    assert http.wait("other", token=TOKENS["other"])[0] == 200                            # not locked out by beast's 30 polls
     assert svr.rakazo.terminal._waiters <= 30
     for th in spam:
         th.join(5)
@@ -464,8 +454,7 @@ def test_more_than_16_hosts_can_wait_at_once_and_the_65th_waiter_is_429(env):
 @pytest.mark.parametrize("size", [500, 2000, 4000])
 def test_the_wait_response_is_never_redacted(rig, size):
     token = "cifix-test-credential-98c2a1"
-    svr, http = rig(architecture_options={"agent_hosts": BINDINGS},
-                    ci_fix={"enabled": True, "agent_api_key": token, "hosts": ["beast"]})
+    svr, http = rig(ci_fix={"enabled": True, "agent_api_key": token, "hosts": ["beast"]})
     tid = open_terminal(svr, http)
     raw = bytes([0x41]) * (size * 3 // 4 - 1) + bytes([0x1c])                  # base64 text of `size` chars ending in 'c'
     data = b64(raw)
@@ -602,3 +591,33 @@ def test_data_chunks_carry_the_rows_and_cols_of_their_frame(env):
     got = chunks(svr)
     assert [(c["seq"], c["rows"], c["cols"]) for c in got[:2]] == [(1, 24, 80), (2, 40, 120)]   # a resized pane's next frame
     assert "rows" not in got[2]                                                # an ended chunk needs no size
+
+
+# --------------------------------------------------------------------------------------- M8, M3, M5
+def test_one_output_post_is_capped_at_512_kb_encoded(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    big = {"data": "A" * (160 * 1024), "rows": 24, "cols": 80}
+    assert http.output(tid, [big] * 4)[0] == 413                               # 640 KB in four legal frames
+    assert chunks(svr) == []
+    assert http.output(tid, [big] * 3)[0] == 200                               # 480 KB is fine
+
+
+def test_the_long_poll_is_not_a_slow_request():
+    assert RequestMetrics.route("/api/v1/host/terminal/wait?host_id=beast&timeout=25") is None
+    assert RequestMetrics.route("/api/v1/host/terminal/abc/output?host_id=beast") is not None
+    metrics = RequestMetrics()
+    metrics.record("/api/v1/host/terminal/wait?host_id=beast", 25000)
+    snap = metrics.snapshot()
+    assert snap["slow_requests"] == 0 and snap["recent_requests"] == []
+
+
+def test_a_replay_is_only_the_newest_frame_plus_an_ended_chunk(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    http.output(tid, [frame("one"), frame("two"), frame("three")])
+    live = svr.rakazo.terminal._lives["a1"]
+    assert [c["seq"] for c in live.chunks_after(0)] == [3]                     # every frame replaces the screen
+    assert [c["seq"] for c in live.kept_after(0)] == [1, 2, 3]                 # the buffer still holds them for its cap
+    http.output(tid, [{"ended": True, "exit": 0}])
+    assert [c["seq"] for c in live.chunks_after(0)] == [3, 4]

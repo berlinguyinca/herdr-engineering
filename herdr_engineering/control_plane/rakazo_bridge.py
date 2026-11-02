@@ -955,6 +955,12 @@ class RakazoBridge:
         except ValueError:
             raise refuse from None
         addr = getattr(addr, "ipv4_mapped", None) or addr
+        if headers.get("x-forwarded-for") and peer_addr is not None:
+            direct = getattr(peer_addr, "ipv4_mapped", None) or peer_addr
+            if not (direct.is_loopback or any(peer_addr in net for net in self.trusted_proxies)):
+                # a proxy we do not trust relayed this: its forwarded value is never the client
+                log.warning("rakazo bridge: refused an open owner session with X-Forwarded-For from untrusted peer %s", peer[:64])
+                raise refuse
         if peer_addr is not None and any(peer_addr in net for net in self.trusted_proxies) and ip == str(peer_addr):
             log.warning("rakazo bridge: refused an open owner session relayed by %s without a client address", ip[:64])
             raise refuse                                      # a configured proxy that named no client
