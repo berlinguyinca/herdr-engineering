@@ -66,6 +66,7 @@ class TerminalSession:
         self._wake = None  # (read, write) pipe that stops the reader on close()
         self._reader = None
         self._closed = False
+        self._closelock = threading.Lock()
 
     @property
     def alive(self):
@@ -74,26 +75,57 @@ class TerminalSession:
     def start(self):
         if self._pid is not None:
             raise RuntimeError("terminal session already started")
-        exe = shutil.which(self.argv[0]) or self.argv[0]  # resolve in the parent
-        wake_r, wake_w = os.pipe()
-        # Size the pty before the fork so the program never starts at 0x0, and so a resize
-        # that follows start() cannot be overwritten by the child's own setup.
-        fd, slave = os.openpty()
-        _set_winsize(slave, self.rows, self.cols)
-        pid = os.fork()
-        if pid == 0:  # child: login_tty, closerange, execv, _exit only; argv list, no shell
-            try:
-                os.login_tty(slave)  # setsid, controlling tty, stdio
-                os.closerange(3, os.sysconf("SC_OPEN_MAX"))
-                os.execv(exe, self.argv)
-            finally:
-                os._exit(127)
-        os.close(slave)
-        os.set_inheritable(fd, False)
-        os.set_blocking(fd, False)
-        self._pid, self._fd, self._wake = pid, fd, (wake_r, wake_w)
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
+        exe = shutil.which(self.argv[0])  # resolve in the parent, on PATH only
+        if exe is None and "/" in self.argv[0]:
+            exe = self.argv[0]
+        if exe is None:  # never fall back to the bare name: execv would try it in the cwd
+            raise FileNotFoundError(f"executable not found: {self.argv[0]!r}")
+        # SC_OPEN_MAX can be unlimited or huge; a fixed ceiling keeps the child's closerange fast.
+        limit = os.sysconf("SC_OPEN_MAX")
+        limit = limit if 0 < limit <= 65536 else 65536
+        opened, pid = [], None
+        try:
+            wake_r, wake_w = os.pipe()
+            opened += [wake_r, wake_w]
+            # Size the pty before the fork so the program never starts at 0x0, and so a resize
+            # that follows start() cannot be overwritten by the child's own setup.
+            fd, slave = os.openpty()
+            opened += [fd, slave]
+            _set_winsize(slave, self.rows, self.cols)
+            pid = os.fork()
+            if pid == 0:  # child: login_tty, closerange, execv, _exit only; argv list, no shell
+                try:
+                    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # Python ignores it; programs expect default
+                    os.login_tty(slave)  # setsid, controlling tty, stdio
+                    os.closerange(3, limit)
+                    os.execv(exe, self.argv)
+                finally:
+                    os._exit(127)
+            os.close(slave)
+            opened.remove(slave)
+            os.set_inheritable(fd, False)
+            os.set_blocking(fd, False)
+            self._pid, self._fd, self._wake = pid, fd, (wake_r, wake_w)
+            self._reader = threading.Thread(target=self._read_loop, daemon=True)
+            self._reader.start()
+        except BaseException:
+            self._pid = self._fd = self._wake = self._reader = None
+            if pid:
+                for kill, target in ((os.killpg, pid), (os.kill, pid)):  # child may not lead a group yet
+                    try:
+                        kill(target, signal.SIGKILL)
+                    except OSError:
+                        pass
+                try:
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+            for f in opened:
+                try:
+                    os.close(f)
+                except OSError:
+                    pass
+            raise
 
     def _read_loop(self):
         fd, wake_r = self._fd, self._wake[0]
@@ -173,16 +205,17 @@ class TerminalSession:
             return out
 
     def close(self):
-        if self._pid is None or self._closed:
-            return
-        self._closed = True
-        try:
-            os.killpg(self._pid, signal.SIGKILL)  # the child leads its own session and group
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            os.write(self._wake[1], b"x")
-        except OSError:  # reader already finished and closed its end
-            pass
-        self._reader.join(timeout=2)
-        os.close(self._wake[1])
+        with self._closelock:  # check-and-set and the final fd close are one step
+            if self._pid is None or self._closed:
+                return
+            self._closed = True
+            try:
+                os.killpg(self._pid, signal.SIGKILL)  # the child leads its own session and group
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                os.write(self._wake[1], b"x")
+            except OSError:  # reader already finished and closed its end
+                pass
+            self._reader.join(timeout=2)
+            os.close(self._wake[1])

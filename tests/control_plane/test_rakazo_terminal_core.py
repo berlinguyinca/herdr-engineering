@@ -1,5 +1,6 @@
 """Pty relay core: a child on a real pty, output kept as numbered base64 chunks."""
 import base64
+import os
 import sys
 import threading
 import time
@@ -138,7 +139,6 @@ def test_a_second_session_does_not_inherit_the_first_sessions_fds(make):
 @pytest.mark.parametrize('rows,cols', [(0, 80), (24, 0), (-1, 80), (24, -5), (70000, 80), (24, 70000),
                                        (501, 80), (24, 1001), ('24', 80), (24.0, 80), (True, 80), (None, 80)])
 def test_bad_size_is_rejected_before_forking(monkeypatch, rows, cols):
-    import os
     forked = []
     monkeypatch.setattr(os, 'fork', lambda: forked.append(1) or 1)
     with pytest.raises(ValueError):
@@ -194,6 +194,79 @@ def test_buffer_cap_is_soft_the_newest_chunk_is_always_kept(make):
     s = make(['bash', '-c', 'head -c 5000 /dev/zero | tr "\\0" x'], buffer_bytes=10)
     collect(s, until=lambda t, c: any(x.get('ended') for x in c))
     assert any(base64.b64decode(c.get('data', '')) for c in s.chunks_after(0))
+
+
+def _fds():
+    return len(os.listdir('/dev/fd'))
+
+
+def test_a_command_not_on_path_is_never_resolved_against_the_cwd(tmp_path, monkeypatch):
+    marker = tmp_path / 'ran'
+    script = tmp_path / 'zz-not-on-path'
+    script.write_text(f'#!/bin/sh\ntouch {marker}\n')
+    script.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    before = _fds()
+    with pytest.raises(FileNotFoundError):
+        TerminalSession(['zz-not-on-path'], 24, 80).start()
+    time.sleep(0.1)
+    assert not marker.exists() and _fds() == before
+
+
+def test_failed_openpty_leaks_no_fds(monkeypatch):
+    def boom():
+        raise OSError('no ptys')
+    monkeypatch.setattr(os, 'openpty', boom)
+    before = _fds()
+    with pytest.raises(OSError):
+        TerminalSession(['cat'], 24, 80).start()
+    assert _fds() == before
+
+
+def test_failed_fork_leaks_no_fds(monkeypatch):
+    def boom():
+        raise OSError('no procs')
+    monkeypatch.setattr(os, 'fork', boom)
+    before = _fds()
+    with pytest.raises(OSError):
+        TerminalSession(['cat'], 24, 80).start()
+    assert _fds() == before
+
+
+def test_failed_thread_start_reaps_the_child_and_leaks_nothing(monkeypatch):
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(threading.Thread, 'start', boom)
+    before = _fds()
+    s = TerminalSession(['sleep', '30'], 24, 80)
+    with pytest.raises(RuntimeError):
+        s.start()
+    assert _fds() == before and not s.alive
+    s.close()  # must not join an unstarted thread
+
+
+def test_concurrent_close_is_safe(make):
+    s = make(['cat'])
+    errors = []
+
+    def closer():
+        try:
+            s.close()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+    threads = [threading.Thread(target=closer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [] and not s.alive
+
+
+def test_child_gets_default_sigpipe(make):
+    # Under an ignored SIGPIPE `yes` exits 1 on EPIPE; under the default it dies with 141.
+    s = make(['bash', '-c', 'yes | head -1 >/dev/null; echo "C${PIPESTATUS[0]}"'])
+    text, _ = collect(s, until=lambda t, c: b'C1' in t)
+    assert b'C141' in text
 
 
 # ------------------------------------------------------------------ attach_argv
