@@ -132,3 +132,44 @@ def test_requires_owner_token(bridge):
     for proc in ("list", "get", "messages", "event"):
         res = bridge.handle("POST", f"/rpc/agents/{proc}", {"origin": "rakazo://"}, b'{"json": {}}', "127.0.0.1")
         assert res.status == 401
+
+
+def test_list_returns_the_change_cursor_and_messages_returns_rev(bridge, repo):
+    session(repo, "s1")
+    feed(repo, "s1", {"kind": "message", "role": "assistant", "text": "hi"})
+    out = call(bridge, "list")
+    assert isinstance(out["cursor"], int) and out["cursor"] > 0
+    assert call(bridge, "list")["cursor"] == out["cursor"]
+    assert call(bridge, "messages", id="s1")["rev"] == repo.inspector.query("s1")["rev"]
+
+
+def test_secret_values_never_leave_through_list_get_or_messages(bridge, repo):
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    session(repo, "s-sum", summary=f"deployed with {secret}")
+    session(repo, "s-msg")
+    feed(repo, "s-msg", {"kind": "message", "role": "assistant", "text": f"token is {secret}"})
+    blob = json.dumps([call(bridge, "list"), call(bridge, "get", id="s-sum"), call(bridge, "get", id="s-msg"),
+                       call(bridge, "messages", id="s-msg")])
+    assert secret not in blob
+
+
+def test_list_takes_the_inspector_lock_a_constant_number_of_times(bridge, repo):
+    for i in range(60):
+        session(repo, f"s{i}")
+        feed(repo, f"s{i}", {"kind": "message", "role": "assistant", "text": "x"})
+
+    class Counting:
+        def __init__(self, inner):
+            self.inner, self.n = inner, 0
+
+        def __enter__(self):
+            self.n += 1
+            return self.inner.__enter__()
+
+        def __exit__(self, *a):
+            return self.inner.__exit__(*a)
+
+    counting = Counting(repo.inspector._lock)
+    repo.inspector._lock = counting
+    call(bridge, "list")
+    assert counting.n <= 5

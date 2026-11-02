@@ -921,21 +921,43 @@ class InspectorStore:
                 "prefs": self.get_prefs(session_id),
             }
 
-    def events_after(self, session_id: str, after_seq: int, role: str = "viewer",
+    def events_after(self, session_id: str, after_rev: int, role: str = "viewer",
                      limit: int = 200) -> list[dict]:
-        """Events newer than ``after_seq``, ascending, rendered for ``role``."""
+        """Events whose revision is newer than ``after_rev``, ascending by revision, rendered for ``role``.
+
+        Tool and test events are updated in place (same ``seq``, higher ``rev``), so the revision, not the
+        sequence number, is the cursor that delivers a finished tool call after its running frame."""
         limit = max(1, min(int(limit), 200))
         with self._lock:
             sess = self._sessions.get(session_id)
             if sess is None:
                 raise KeyError(session_id)
-            rows = []
-            for e in sess.events:
-                if e["seq"] > after_seq:
-                    rows.append(self._render(e, role, full=False))
-                    if len(rows) >= limit:
-                        break
-            return rows
+            newer = sorted((e for e in sess.events if e["rev"] > after_rev), key=lambda e: e["rev"])
+            return [self._render(e, role, full=False) for e in newer[:limit]]
+
+    def phone_digest(self, session_ids, role: str = "viewer") -> dict[str, tuple[int | None, str | None]]:
+        """``(newest_seq, last_message)`` for each id, taking the lock once for all of them."""
+        out: dict[str, tuple[int | None, str | None]] = {}
+        with self._lock:
+            for sid in session_ids:
+                sess = self._sessions.get(sid)
+                if sess is None:
+                    out[sid] = (None, None)
+                    continue
+                newest = sess.next_seq - 1 if sess.next_seq > 0 else None
+                out[sid] = (newest, self._last_message_locked(sess, role))
+        return out
+
+    def _last_message_locked(self, sess: _Session, role: str) -> str | None:
+        for e in reversed(sess.events):
+            if e["kind"] != "message" or e["data"].get("role") != "assistant":
+                continue
+            if not self._allowed(e, role):
+                continue
+            text = self._render(e, role, full=False)["data"].get("text")
+            if isinstance(text, str):
+                return redact_text(text)[:160]
+        return None
 
     def last_message(self, session_id: str, role: str = "viewer") -> str | None:
         """Newest assistant message text the role may read, redacted and cut to 160 chars."""
@@ -943,15 +965,7 @@ class InspectorStore:
             sess = self._sessions.get(session_id)
             if sess is None:
                 raise KeyError(session_id)
-            for e in reversed(sess.events):
-                if e["kind"] != "message" or e["data"].get("role") != "assistant":
-                    continue
-                if not self._allowed(e, role):
-                    continue
-                text = self._render(e, role, full=False)["data"].get("text")
-                if isinstance(text, str):
-                    return redact_text(text)[:160]
-            return None
+            return self._last_message_locked(sess, role)
 
     def get_event(self, session_id: str, seq: int, role: str = "viewer") -> dict:
         with self._lock:

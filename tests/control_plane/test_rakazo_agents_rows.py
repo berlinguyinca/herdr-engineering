@@ -60,3 +60,8 @@ def test_summary_falls_back_to_status_line_when_none():
     assert agent_row({"session_id": "s2"}, None)["has_conversation"] is False
     nested = agent_row({"session_id": "s3", "detail": {"machine": "m2"}}, None)
     assert nested["machine"] == "m2"
+
+
+def test_needs_input_and_stuck_sort_as_blocked():
+    for raw in ("needs_input", "needs-input", "stuck", "Stuck"):
+        assert agent_status({"status": raw}) == "blocked"

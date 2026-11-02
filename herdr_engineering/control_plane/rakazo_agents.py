@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from .agent_evolution import _BLOCKED   # the repo's own set of needs-attention statuses
 from .redact import redact_text
 from .terminal_attach import _CLOSED
 
@@ -26,6 +27,8 @@ def agent_status(session: dict) -> str:
     status = str(session.get("status") or "").strip().lower()
     if status in _CLOSED:
         return "closed"
+    if status in _BLOCKED:
+        return "blocked"
     return status if status in _LIVE else "unknown"
 
 
@@ -91,7 +94,7 @@ class Agents:
         self.Error = error
         self.repo = None
         self._lock = threading.Lock()
-        self._counter = 0
+        self._counter = int(time.time() * 1000)   # wall-clock seed: seq numbers keep rising across restarts
         self._changes: dict[str, tuple[int, dict]] = {}   # session id -> (seq, row) of its latest change
         self._prints: dict[str, str] = {}                  # session id -> fingerprint of its row as last seen
         self._shown: set[str] = set()                      # ids the list stream has told the app to show
@@ -118,33 +121,37 @@ class Agents:
         sid = inp.get("id")
         return sid if isinstance(sid, str) else ""
 
-    def _summary(self, repo, session: dict) -> str | None:
-        own = session.get("summary")
-        if isinstance(own, str) and own.strip():
-            return redact_text(own)
-        try:
-            return repo.inspector.last_message(session.get("session_id"), role="viewer")
-        except KeyError:
-            return None
+    @staticmethod
+    def _digests(repo, sessions: list[dict]) -> dict:
+        """newest_seq and last_message for every session, under ONE inspector-lock acquisition."""
+        return repo.inspector.phone_digest([s.get("session_id") for s in sessions], role="viewer")
 
-    def _row(self, repo, session: dict) -> dict:
-        row = agent_row(session, self._summary(repo, session))
-        row["has_conversation"] = repo.inspector.newest_seq(session.get("session_id")) is not None
+    def _row(self, session: dict, digest: tuple) -> dict:
+        newest, last = digest
+        own = session.get("summary")
+        summary = redact_text(own) if isinstance(own, str) and own.strip() else last
+        row = agent_row(session, summary)
+        row["has_conversation"] = newest is not None
         return row
 
     # procedures ---------------------------------------------------------------------------------------------
     def list(self, ctx, inp):
         repo = self._repo()
-        rows = sort_rows([self._row(repo, s) for s in repo.list_sessions()])
+        self._refresh_throttled(repo)
+        with self._lock:
+            cursor = self._counter   # read before the rows, so a replay from it can only repeat, never skip
+        sessions = repo.list_sessions()
+        digests = self._digests(repo, sessions)
+        rows = sort_rows([self._row(s, digests[s.get("session_id")]) for s in sessions])
         shown = visible(rows, show_older=bool(inp.get("showOlder")), now=time.time())
-        return {"agents": shown, "hiddenCount": len(rows) - len(shown)}
+        return {"agents": shown, "hiddenCount": len(rows) - len(shown), "cursor": cursor}
 
     def get(self, ctx, inp):
         repo = self._repo()
         session = repo.get_session(self._sid(inp))
         if session is None:
             raise self._missing()
-        row = self._row(repo, session)
+        row = self._row(session, self._digests(repo, [session])[session.get("session_id")])
         return {"agent": row, "hasConversation": row["has_conversation"]}
 
     def messages(self, ctx, inp):
@@ -161,8 +168,9 @@ class Agents:
         try:
             page = repo.inspector.query(sid, "viewer", limit=limit, before_seq=before)
         except KeyError:
-            return {"events": [], "hasMore": False, "newestSeq": None}
-        return {"events": page["events"], "hasMore": page["has_more"], "newestSeq": repo.inspector.newest_seq(sid)}
+            return {"events": [], "hasMore": False, "newestSeq": None, "rev": 0}
+        return {"events": page["events"], "hasMore": page["has_more"], "newestSeq": repo.inspector.newest_seq(sid),
+                "rev": page["rev"]}
 
     def event(self, ctx, inp):
         repo = self._repo()
@@ -204,7 +212,8 @@ class Agents:
 
         def fetch(after: int) -> list[dict]:
             try:
-                return repo.inspector.events_after(sid, after, role="viewer")
+                # the cursor is the per-session revision: a tool finishing re-uses its seq with a higher rev
+                return [{"seq": e["rev"], "event": e} for e in repo.inspector.events_after(sid, after, role="viewer")]
             except KeyError:
                 return []
         return self._stream(ctx, inp, fetch)
@@ -214,11 +223,14 @@ class Agents:
         under it, so every subscriber reads one consistent history. Hidden rows stay quiet; a row that was shown and
         is now hidden (closed or gone stale) is emitted once so the app can drop it."""
         now = time.time()
-        rows = [self._row(repo, s) for s in repo.list_sessions()]
+        sessions = repo.list_sessions()
+        digests = self._digests(repo, sessions)
+        rows = [self._row(s, digests[s.get("session_id")]) for s in sessions]
         with self._lock:
             for row in sorted(rows, key=lambda r: _epoch(r.get("updated_at"))):
                 rid = row["id"]
-                print_ = json.dumps(row, sort_keys=True, default=str)
+                # heartbeats bump updated_at constantly; the fingerprint keeps only its minute (the row keeps the real value)
+                print_ = json.dumps({**row, "updated_at": str(row.get("updated_at"))[:16]}, sort_keys=True, default=str)
                 shown_now = bool(visible([row], show_older=False, now=now))
                 if self._prints.get(rid) == print_ and (shown_now or rid not in self._shown):
                     continue   # unchanged; a shown row that only went stale falls through to its drop frame
@@ -244,7 +256,7 @@ class Agents:
     def _list_fetch(self, repo, after: int) -> list[dict]:
         self._refresh_throttled(repo)
         with self._lock:
-            if after > self._counter:   # a cursor from before a restart: resend what is shown now
+            if after > self._counter:   # direct-caller guard; subscribe_list resolves stale cursors at connect time. A cursor from before a restart: resend what is shown now
                 fresh = [c for rid, c in self._changes.items() if rid in self._shown]
             else:
                 fresh = [c for c in self._changes.values() if c[0] > after]

@@ -56,13 +56,23 @@ def test_subscribe_streams_new_events_after_cursor(bridge, repo, ctx):
     repo.upsert_session("s1", status="working")
     feed(repo, "s1", {"kind": "message", "role": "user", "text": "one"},
          {"kind": "message", "role": "assistant", "text": "two"})
-    first = frames(sub(bridge, "subscribe", ctx, id="s1", cursor=-1))
+    first = frames(sub(bridge, "subscribe", ctx, id="s1", cursor=0))
     assert len(first) >= 2
-    seqs = [e["seq"] for e in first]
-    assert seqs == sorted(seqs)
-    after = frames(sub(bridge, "subscribe", ctx, id="s1", cursor=seqs[0]))
-    assert [e["seq"] for e in after] == seqs[1:]
-    assert frames(sub(bridge, "subscribe", ctx, id="s1", cursor=seqs[-1])) == []
+    revs = [f["seq"] for f in first]
+    assert revs == sorted(revs) and [f["event"]["rev"] for f in first] == revs
+    after = frames(sub(bridge, "subscribe", ctx, id="s1", cursor=revs[0]))
+    assert [f["seq"] for f in after] == revs[1:]
+    assert frames(sub(bridge, "subscribe", ctx, id="s1", cursor=revs[-1])) == []
+
+
+def test_subscribe_delivers_the_finished_tool_after_its_running_frame(bridge, repo, ctx):
+    repo.upsert_session("s1", status="working")
+    feed(repo, "s1", {"kind": "tool", "call_id": "c1", "phase": "start", "tool": "bash"})
+    rev = repo.inspector.query("s1")["rev"]
+    feed(repo, "s1", {"kind": "tool", "call_id": "c1", "phase": "end", "output": "all green", "exit_code": 0})
+    got = frames(sub(bridge, "subscribe", ctx, id="s1", cursor=rev))
+    assert len(got) == 1 and got[0]["seq"] > rev
+    assert got[0]["event"]["data"]["output"] == "all green" and got[0]["event"]["data"]["status"] != "running"
 
 
 def test_subscribe_unknown_agent_is_404_and_no_repo_is_503(bridge, ctx):
@@ -128,14 +138,17 @@ def test_subscribe_429_when_stream_cap_exhausted(bridge, repo, ctx):
 
 
 def test_subscribe_releases_slot_and_stops_when_token_revoked(bridge, repo, ctx):
+    import time
     repo.upsert_session("s1", status="working")
     bridge.stream_options = {"poll_seconds": 0.01, "heartbeat_seconds": 0.05, "max_seconds": 30}
     for proc, extra in (("subscribe", {"id": "s1"}), ("subscribeList", {})):
-        resp = sub(bridge, proc, ctx, cursor=-1, **extra)
+        resp = sub(bridge, proc, ctx, cursor=-1 if proc == "subscribeList" else 0, **extra)
         it = iter(resp.frames)
         next(it)
         bridge.tokens.revoke(ctx.token)
-        assert list(it) is not None   # the generator ends instead of running 30 s
+        started = time.monotonic()
+        list(it)
+        assert time.monotonic() - started < 2
         resp.on_close()
         ctx.token = bridge.tokens.mint("acct", "127.0.0.1")
     held = 0
@@ -190,7 +203,7 @@ def test_subscribe_list_stale_cursor_snapshot_once_then_drop_frames_on_same_conn
     bridge.stream_options = {"poll_seconds": 0.01, "heartbeat_seconds": 0.02, "max_seconds": 30}
     repo.upsert_session("a", status="working")
     repo.upsert_session("b", status="blocked")
-    resp = sub(bridge, "subscribeList", ctx, cursor=4000)
+    resp = sub(bridge, "subscribeList", ctx, cursor=10**15)
     seen, beats, closed = [], 0, False
     try:
         for raw in resp.frames:
@@ -210,4 +223,17 @@ def test_subscribe_list_stale_cursor_snapshot_once_then_drop_frames_on_same_conn
     snapshot = [f for f in seen if f["row"]["status"] != "closed"]
     assert sorted(f["row"]["id"] for f in snapshot) == ["a", "b"]          # delivered exactly once
     assert [(f["row"]["id"], f["row"]["status"]) for f in seen if f["row"]["status"] == "closed"] == [("b", "closed")]
-    assert all(f["seq"] < 4000 for f in seen)
+    assert all(f["seq"] < 10**15 for f in seen)
+
+
+def test_list_stream_ignores_updated_at_changes_within_the_same_minute(bridge, repo):
+    repo.upsert_session("a", status="working")
+    stamp = ["2026-11-01T10:00:05Z"]
+    real = repo.list_sessions
+    repo.list_sessions = lambda *a, **k: [{**x, "updated_at": stamp[0]} for x in real(*a, **k)]
+    first = _fetch_list(bridge, -1)
+    assert len(first) == 1
+    stamp[0] = "2026-11-01T10:00:50Z"
+    assert _fetch_list(bridge, first[-1]["seq"]) == []
+    stamp[0] = "2026-11-01T10:01:10Z"
+    assert len(_fetch_list(bridge, first[-1]["seq"])) == 1
