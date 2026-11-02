@@ -169,12 +169,23 @@ relay_pyok() { # relay_pyok <python>: it REALLY is Python 3.12 or newer (the nam
   v="$("$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || return 1
   case "$v" in 3.[0-9]|3.[0-9][0-9]) [ "${v#3.}" -ge 12 ] ;; *) return 1 ;; esac
 }
-relay_system_python() { # the first system interpreter that is >= 3.12: python3.12, 3.13, ..., homebrew, plain python3
-  local c p
+relay_uv() { # the uv binary: in HERDR_RELAY_UV_DIRS when set (tests), else wherever PATH finds it
+  local d
+  if [ -n "${HERDR_RELAY_UV_DIRS+x}" ]; then
+    for d in $(printf '%s' "$HERDR_RELAY_UV_DIRS" | tr ':' ' '); do
+      if [ -x "$d/uv" ]; then echo "$d/uv"; return 0; fi
+    done
+    return 1
+  fi
   relay_path
+  command -v uv 2>/dev/null
+}
+relay_system_python() { # the first system interpreter that is >= 3.12: python3.12, 3.13, ..., homebrew, plain python3
+  local c d p dirs="${HERDR_RELAY_PYTHON_DIRS-/usr/bin:/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin}"
   for c in python3.12 python3.13 python3.14 python3.15 python3; do
-    p="$(command -v "$c" 2>/dev/null || true)"
-    if [ -n "$p" ] && relay_pyok "$p"; then echo "$p"; return 0; fi
+    for d in $(printf '%s' "$dirs" | tr ':' ' '); do
+      if [ -x "$d/$c" ] && relay_pyok "$d/$c"; then echo "$d/$c"; return 0; fi
+    done
   done
   p="${HERDR_RELAY_BREW_PYTHON-/opt/homebrew/bin/python3.12}"
   if [ -x "$p" ] && relay_pyok "$p"; then echo "$p"; return 0; fi
@@ -185,17 +196,18 @@ relay_nopython() {
 }
 relay_python() { # prints "uv" or the path of a Python >= 3.12; refuses (status 3) when there is none
   relay_path
-  if command -v uv >/dev/null 2>&1; then echo uv; return 0; fi
+  if relay_uv >/dev/null; then echo uv; return 0; fi
   relay_system_python && return 0
   relay_nopython
   return 3
 }
 relay_make_venv() { # relay_make_venv <release-dir>: <dir>/venv with the wheel in <dir> installed
-  local dir="$1" how wheel
+  local dir="$1" how wheel uvbin
   relay_path
   how="$(relay_python)" || return $?
+  uvbin="$(relay_uv || true)"
   rm -rf "$dir/venv"   # not live: a release already behind `current` never gets here
-  if [ "$how" = uv ] && ! uv venv -q --python '>=3.12' "$dir/venv"; then
+  if [ "$how" = uv ] && ! "$uvbin" venv -q --python '>=3.12' "$dir/venv"; then
     echo "uv could not create the venv; trying the system pythons" >&2
     rm -rf "$dir/venv"
     how="$(relay_system_python)" || { relay_nopython; return 3; }
@@ -204,7 +216,7 @@ relay_make_venv() { # relay_make_venv <release-dir>: <dir>/venv with the wheel i
   relay_pyok "$dir/venv/bin/python" || { echo "the release venv is older than Python 3.12 (Python >= 3.12 is required)" >&2; return 3; }
   wheel="$(ls "$dir"/*.whl 2>/dev/null | head -n 1)"
   [ -n "$wheel" ] || { echo "no wheel in $dir" >&2; return 1; }
-  if [ "$how" = uv ]; then uv pip install -q --python "$dir/venv/bin/python" "$wheel" || return 1
+  if [ "$how" = uv ]; then "$uvbin" pip install -q --python "$dir/venv/bin/python" "$wheel" || return 1
   else "$dir/venv/bin/pip" install -q "$wheel" || return 1; fi
   [ -x "$dir/venv/bin/herdr-eng" ] || { echo "herdr-eng is missing from the release venv" >&2; return 1; }
 }
@@ -313,7 +325,7 @@ roll_relay() {
          && put "$target" "$WORK/src/deploy/herdr-terminal-relay/$tmpl" "$rdir"; }; then
     echo "   terminal relay: FAILED on $name (could not stage the release)" >&2; failed=1; return 0
   fi
-  relay_script="$(declare -f relay_path relay_python relay_make_venv relay_render relay_pyok relay_system_python relay_nopython relay_state_dir relay_status_ok relay_start relay_restart relay_host_install); relay_host_install $manager $REL"
+  relay_script="$(declare -f relay_path relay_uv relay_python relay_make_venv relay_render relay_pyok relay_system_python relay_nopython relay_state_dir relay_status_ok relay_start relay_restart relay_host_install); relay_host_install $manager $REL"
   relay_script="${relay_script//\'/\'\\\'\'}"
   if run "$target" "bash -c '$relay_script'"; then echo "   terminal relay: ok"
   else echo "   terminal relay: FAILED on $name" >&2; failed=1; fi

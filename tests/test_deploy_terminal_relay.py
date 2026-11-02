@@ -128,7 +128,13 @@ def host(tmp_path):
     log = tmp_path / "host.log"
     dead = subprocess.Popen(["true"])
     dead.wait()
-    env = dict(os.environ, HOME=str(home), PATH=f"{bindir}:/usr/bin:/bin", HERDR_RELAY_PATH_EXTRA="",
+    # A CI box has a real python3.13 and pip in /usr/bin: a decoy on PATH proves no real interpreter is ever consulted.
+    decoy = tmp_path / "usr-bin"
+    decoy.mkdir()
+    for name in ("python3.13", "python3", "pip", "uv"):
+        _stub(decoy / name, 'case "$*" in *version_info*) echo 3.13 ;; *) echo "decoy $0 $*" >> "$DECOY_LOG"; exit 9 ;; esac\n')
+    env = dict(os.environ, HOME=str(home), PATH=f"{bindir}:{decoy}:/usr/bin:/bin", DECOY_LOG=str(tmp_path / "decoy.log"),
+               HERDR_RELAY_PATH_EXTRA="", HERDR_RELAY_PYTHON_DIRS=str(bindir), HERDR_RELAY_UV_DIRS=str(bindir),
                HERDR_RELAY_BREW_PYTHON=str(tmp_path / "no-brew-python"), HERDR_RELAY_HEALTH_SECONDS="2",
                HERDR_ENGINEERING_STATE=str(state), STUB_ALIVE_PID=str(os.getpid()), STUB_DEAD_PID=str(dead.pid))
     env.pop("HERDR_SOCKET_PATH", None)        # a developer's own herdr must not leak into the checks
@@ -188,8 +194,9 @@ esac
 
     def calls():
         return log.read_text() if log.exists() else ""
-    return SimpleNamespaceLike(home=home, bindir=bindir, env=env, stubs=stubs, release=release, call=call, calls=calls,
-                               tmp=tmp_path, state=state, pystub=pystub)
+    yield SimpleNamespaceLike(home=home, bindir=bindir, env=env, stubs=stubs, release=release, call=call, calls=calls,
+                              tmp=tmp_path, state=state, pystub=pystub)
+    assert not (tmp_path / "decoy.log").exists(), "a real-looking interpreter, pip or uv outside the stubs was used"
 
 
 class SimpleNamespaceLike:
