@@ -37,6 +37,15 @@ recording fake emitter, so no control plane ever received anything. Instead:
    `-back` node so durations are non-zero) saved the API's page rows, detail rows and overview attention as
    `tests/control_plane/fixtures/vision_lineage_api_rows.json`; `<scratchpad>/e2e-vision/render.mjs` ran the real
    `packages/handoffs-view.js` functions over them, and `packages/vision-lineage-contract.test.js` pins the result.
+   That script lives outside the repo, so the fixture is now pinned and refreshed IN the repo:
+   `tests/control_plane/test_vision_lineage_contract.py::test_the_api_rows_fixture_the_dashboard_tests_render_is_the_live_api_output`
+   replays the envelopes and compares the live page rows, details and overview attention with the file (only the receipt times
+   `created_at` / `updated_at` / `first_seen_at` / `last_seen_at` masked; nothing else varies between runs). The default run only
+   compares. To refresh the fixture after an intended API change run
+   `HERDR_REGEN_VISION_FIXTURES=1 <venv>/bin/python -m pytest tests/control_plane/test_vision_lineage_contract.py`: the test rewrites
+   the file from the live output and reports itself skipped. A regenerated file has no replay pauses, so its durations are the
+   millisecond gaps between ingest calls (on a trial regeneration only the 21 timestamp pairs changed and all JS tests still passed;
+   the committed file keeps the paused replay's times).
 
 ## What Pi sent
 
@@ -141,6 +150,12 @@ same detail now reads `model changed · qwen3.6-35b-a3b → gemini-3-flash · se
   `tests/control_plane/fixtures/vision_lineage_envelopes.json`): ingest accepts the envelopes as-is and idempotently; rows, causes,
   vision summary, models, model change, states, sessions, attention, detail, overview, private scope.
 - `tests/control_plane/test_handoff_lineage.py::test_page_and_overview_summaries_carry_the_vision_summary_and_only_on_vision_rows`.
+- `tests/control_plane/test_vision_lineage_contract.py::test_the_api_rows_fixture_the_dashboard_tests_render_is_the_live_api_output`:
+  the rows fixture equals the live API output, receipt times masked (H9).
+- `tests/control_plane/test_handoff_lineage.py`: `test_vision_hops_never_hijack_the_chain_of_real_work_handoffs` and
+  `test_the_chain_of_a_vision_row_is_exactly_its_out_and_back_pair` (H8); `test_both_rows_of_a_delegation_share_the_text_sessions_workspace` (H10).
+- `packages/vision-lineage-contract.test.js` › "a cause filter shows each whole round trip once…" and "a route filter keeps each shown
+  round trip whole" and `packages/handoffs-view.test.js` › "mountHandoffs: a cause or route filter shows the whole round trip…" (H7).
 - `packages/handoffs-view.test.js` › "an out row reads as sent to vision model whatever its delegation became; the back row says the
   outcome" (out rows of partial, failed, timed-out and open delegations, card and detail; matching back rows keep their outcome text).
 - `packages/vision-lineage-contract.test.js` (fixture `tests/control_plane/fixtures/vision_lineage_api_rows.json`): 5 trips, 4 closed
@@ -152,9 +167,9 @@ Commands and results:
 
 ```
 <venv>/bin/python -m pytest tests/control_plane/test_vision_lineage_contract.py tests/control_plane/test_handoff_lineage.py \
-    tests/control_plane/test_handoff.py tests/control_plane/test_handoff_overview.py -q      -> 33 passed
-<venv>/bin/python -m pytest tests/control_plane -q -k "handoff or lineage or graph"            -> 579 passed, 54 skipped
-node --test packages/*.test.js                                                                 -> 218 pass, 0 fail (212 before + 4 + 2 for the out-row wording)
+    tests/control_plane/test_handoff.py tests/control_plane/test_handoff_overview.py -q      -> 37 passed (33 + 4 for H8/H9/H10)
+<venv>/bin/python -m pytest tests/control_plane -q -k "handoff or lineage or graph"            -> 583 passed, 54 skipped
+node --test packages/*.test.js                                                                 -> 221 pass, 0 fail (218 + 3 for H7)
 ```
 
 ## Limits
@@ -174,6 +189,10 @@ node --test packages/*.test.js                                                  
    and confirm two vision rows per delegation in `GET /api/v1/handoffs`. Note Pi's default `visibility: private`: only the key Pi
    writes with can read the rows, so set `visibility: org` (or `room` + `room_id`) in the `herdr:` block, or read with Pi's own key,
    or the Handoffs page shows nothing.
+   Also check the workspace grouping there: a vision back row is grouped by its TARGET (the text session) so both rows of a
+   delegation share one workspace card (H10). That assumption was only exercised with synthetic known sessions
+   (`tests/control_plane/test_handoff_lineage.py::test_both_rows_of_a_delegation_share_the_text_sessions_workspace`), not with a
+   live control plane whose session records come from real Pi sessions.
 2. **The browser page**: open Handoffs, expand the workspace (`Unassigned` when no mission/repository is known), and check the round
    trip rows, outcomes, durations, the stats line and the cause filter; take a screenshot.
 3. **The Pi side from a real delegation**: confirm a real `VisionDelegator` run emits the same envelope shape as

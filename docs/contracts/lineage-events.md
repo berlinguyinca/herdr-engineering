@@ -437,7 +437,9 @@ authenticated operator key excepted) on a node id or on either endpoint of an ed
   carried. The Handoffs row gains `vision: {request_id, phase: out|back, outcome: ok|partial|failed|timeout|unknown}` (only on these two
   causes), in the detail row AND in the page / overview-attention summaries the Handoffs page pairs round trips from; the switch of
   models is deliberate, so it is not flagged "model changed", and only a non-`ok` outcome asks for attention. Pi's real envelopes for
-  this are pinned in `tests/control_plane/fixtures/vision_lineage_envelopes.json`.
+  this are pinned in `tests/control_plane/fixtures/vision_lineage_envelopes.json`. Pi writes lineage as `visibility: private` by
+  default, so a dashboard opened with any other key (an operator key included) shows none of these rows until Pi's `herdr:` block
+  sets `visibility: org` (or `room` with a `room_id`).
 - **Large rooms**: the Tabs panel makes three listing reads (agents, tabs, panes) at most every 8 s while open; not load-tested.
 
 ## Lineage views and replay (T09)
