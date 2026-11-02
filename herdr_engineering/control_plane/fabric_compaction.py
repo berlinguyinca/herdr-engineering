@@ -163,11 +163,17 @@ class FabricCompactor:
         moved = 0
         try:
             await conn.execute("DROP TABLE IF EXISTS compaction_pending")
-            move_sql = move_chunk_sql(await self._sync_archive_columns(conn))
+            columns = await self._sync_archive_columns(conn)
+            move_sql = move_chunk_sql(columns)
             await conn.execute(_LIST, age, s.batch_rows)
             listed = int(await conn.fetchval("SELECT count(*) FROM compaction_pending"))
             while moved < listed:
                 async with conn.transaction():
+                    # A column added to the journal since this pass began would be deleted with its row but not copied:
+                    # stop here, the next pass starts from the new column list.
+                    if [r["name"] for r in await conn.fetch(_JOURNAL_COLUMNS)] != columns:
+                        log.warning("fabric compaction stopped: the journal's columns changed during the pass")
+                        break
                     status = await conn.execute(move_sql, s.chunk_rows)
                 got = int(status.split()[-1])
                 if not got:
@@ -194,7 +200,10 @@ class FabricCompactor:
         have = {r["name"] for r in await conn.fetch(_ARCHIVE_COLUMNS)}
         for col in journal:
             if col["name"] not in have:
-                await conn.execute(f"ALTER TABLE fabric_events_archive ADD COLUMN IF NOT EXISTS {_quote(col['name'])} {col['type']}")
+                async with conn.transaction():        # never wait long on a lock while the compaction lock is held
+                    await conn.execute("SET LOCAL lock_timeout = '5s'")
+                    await conn.execute(
+                        f"ALTER TABLE fabric_events_archive ADD COLUMN IF NOT EXISTS {_quote(col['name'])} {col['type']}")
                 log.warning("fabric compaction added missing archive column %s", col["name"])
         return [r["name"] for r in journal]
 
