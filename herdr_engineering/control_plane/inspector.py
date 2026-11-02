@@ -921,6 +921,38 @@ class InspectorStore:
                 "prefs": self.get_prefs(session_id),
             }
 
+    def events_after(self, session_id: str, after_seq: int, role: str = "viewer",
+                     limit: int = 200) -> list[dict]:
+        """Events newer than ``after_seq``, ascending, rendered for ``role``."""
+        limit = max(1, min(int(limit), 200))
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                raise KeyError(session_id)
+            rows = []
+            for e in sess.events:
+                if e["seq"] > after_seq:
+                    rows.append(self._render(e, role, full=False))
+                    if len(rows) >= limit:
+                        break
+            return rows
+
+    def last_message(self, session_id: str, role: str = "viewer") -> str | None:
+        """Newest assistant message text the role may read, redacted and cut to 160 chars."""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                raise KeyError(session_id)
+            for e in reversed(sess.events):
+                if e["kind"] != "message" or e["data"].get("role") != "assistant":
+                    continue
+                if not self._allowed(e, role):
+                    continue
+                text = self._render(e, role, full=False)["data"].get("text")
+                if isinstance(text, str):
+                    return redact_text(text)[:160]
+            return None
+
     def get_event(self, session_id: str, seq: int, role: str = "viewer") -> dict:
         with self._lock:
             sess = self._sessions.get(session_id)

@@ -1117,3 +1117,41 @@ def test_replay_restores_reused_tool_call_ids_as_distinct_entries():
     fresh = InspectorStore()
     fresh.hydrate(rows)
     assert [e["data"]["output"] for e in fresh.query(SID, view="tools")["events"]] == ["1", "0"]
+
+
+# ------------------------------------------------------- phone read helpers
+def test_events_after_returns_only_newer_events_ascending_and_respects_limit(store):
+    feed(store, *[{"kind": "message", "role": "assistant", "text": f"m{i}"} for i in range(5)])
+    rows = store.events_after(SID, 1)
+    assert [r["seq"] for r in rows] == [2, 3, 4]
+    assert [r["seq"] for r in store.events_after(SID, -1, limit=2)] == [0, 1]
+    assert len(store.events_after(SID, -1, limit=0)) == 1
+    assert store.events_after(SID, 4) == []
+
+
+def test_events_after_withholds_sensitive_text_for_viewer(store):
+    feed(store, {"kind": "message", "role": "assistant", "text": "private", "sensitive": True})
+    viewer = store.events_after(SID, -1, role="viewer")[0]
+    assert viewer["data"]["text"] is None and viewer["data"]["withheld"] is True
+    operator = store.events_after(SID, -1, role="operator")[0]
+    assert operator["data"]["text"] == "private"
+
+
+def test_events_after_unknown_session_raises_keyerror(store):
+    with pytest.raises(KeyError):
+        store.events_after("nope", 0)
+    with pytest.raises(KeyError):
+        store.last_message("nope")
+
+
+def test_last_message_skips_withheld_and_non_assistant_messages(store):
+    assert feed(store, {"kind": "lifecycle", "phase": "started"})
+    assert store.last_message(SID) is None
+    feed(store,
+         {"kind": "message", "role": "assistant", "text": "older answer"},
+         {"kind": "message", "role": "assistant", "text": "secret", "sensitive": True},
+         {"kind": "message", "role": "user", "text": "a question"})
+    assert store.last_message(SID) == "older answer"
+    assert store.last_message(SID, role="operator") == "secret"
+    feed(store, {"kind": "message", "role": "assistant", "text": "x" * 500})
+    assert store.last_message(SID) == "x" * 160
