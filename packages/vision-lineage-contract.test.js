@@ -45,6 +45,17 @@ test('stats, cause filter and list agree with the API rows', () => {
   assert.ok(list.includes('qwen3.6-35b-a3b → gemini-3-flash · '));
 });
 
+test('no rendered out row says analysis complete; each says it was sent to the vision model', () => {
+  const outs = rows.filter((r) => r.vision.phase === 'out');
+  assert.equal(outs.length, 5);
+  for (const r of [...outs, ...details.filter((d) => d.vision.phase === 'out')]) {
+    for (const html of [handoffCard(r), detailHtml(r, null)]) {
+      assert.ok(!html.includes('analysis complete'), r.handoff_id);
+      assert.match(html, /sent to vision model/);
+    }
+  }
+});
+
 test('nothing rendered from the API rows says undefined, null or NaN', () => {
   for (const html of rendered(rows, details)) assert.doesNotMatch(html, /undefined|\bnull\b|NaN/);
 });

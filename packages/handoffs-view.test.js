@@ -112,13 +112,13 @@ const VROW = { handoff_id: 'handoff:vision-r1-out', origin: 'lineage', state: 'c
 
 test('a vision card names the cause, both models and the outcome', () => {
   const html = handoffCard(VROW);
-  assert.match(html, /vision delegation · model changed · text-model → vision-model · analysis complete/);
-  assert.match(handoffCard({ ...VROW, cause: 'vision_return' }), /vision result · model changed/);
+  assert.match(html, /vision delegation · model changed · text-model → vision-model · sent to vision model/);
+  assert.match(handoffCard({ ...VROW, cause: 'vision_return', vision: { ...VROW.vision, phase: 'back' } }), /vision result · model changed · text-model → vision-model · analysis complete/);
   assert.ok(!html.includes('hd-row--attention'));
 });
 
 test('a partial outcome reads as partial analysis and is marked for attention', () => {
-  const html = handoffCard({ ...VROW, vision: { ...VROW.vision, outcome: 'partial' }, attention: true, attention_reason: 'partial analysis' });
+  const html = handoffCard({ ...VROW, vision: { ...VROW.vision, phase: 'back', outcome: 'partial' }, attention: true, attention_reason: 'partial analysis' });
   assert.match(html, /· partial analysis/);
   assert.match(html, /hd-row--attention/);
   assert.equal(outcomeText({ outcome: 'failed' }), 'analysis failed');
@@ -126,7 +126,7 @@ test('a partial outcome reads as partial analysis and is marked for attention', 
 });
 
 test('an unknown outcome reads as outcome unknown', () => {
-  assert.match(handoffCard({ ...VROW, vision: { ...VROW.vision, outcome: 'unknown' } }), /outcome unknown/);
+  assert.match(handoffCard({ ...VROW, vision: { ...VROW.vision, phase: 'back', outcome: 'unknown' } }), /outcome unknown/);
   assert.equal(outcomeText(undefined), 'outcome unknown');
   assert.equal(outcomeText({ outcome: 'weird' }), 'outcome unknown');
 });
@@ -136,8 +136,31 @@ test('hostile markup in a model name and in the request id is escaped in the car
   assert.ok(!handoffCard(row).includes('<img'));
   const html = detailHtml(row, null);
   assert.ok(!html.includes('<img'));
-  assert.match(html, /analysis complete/);
+  assert.match(html, /sent to vision model/);
   assert.match(html, /&lt;img src=x/);
+});
+
+test('an out row reads as sent to vision model whatever its delegation became; the back row says the outcome', () => {
+  const back = { ok: 'analysis complete', partial: 'partial analysis', failed: 'analysis failed', timeout: 'timed out' };
+  for (const fate of ['partial', 'failed', 'timeout', 'open', 'ok']) {
+    // Pi always reports an out row's outcome as ok; a stray outcome on it must not leak into the wording either
+    for (const outcome of ['ok', fate === 'open' ? 'ok' : fate]) {
+      const out = { ...VROW, vision: { request_id: `r-${fate}`, phase: 'out', outcome } };
+      for (const html of [handoffCard(out), detailHtml(out, null)]) {
+        assert.match(html, /sent to vision model/, fate);
+        assert.ok(!html.includes('analysis complete'), `${fate} out row`);
+      }
+    }
+    if (fate === 'open') continue;
+    const row = { ...VROW, handoff_id: `handoff:vision-r-${fate}-back`, cause: 'vision_return', vision: { request_id: `r-${fate}`, phase: 'back', outcome: fate } };
+    for (const html of [handoffCard(row), detailHtml(row, null)]) {
+      assert.ok(html.includes(back[fate]), `${fate} back row`);
+      assert.ok(!html.includes('sent to vision model'));
+    }
+  }
+  assert.equal(outcomeText({ phase: 'out', outcome: 'failed' }), 'sent to vision model');
+  assert.equal(outcomeText({ phase: 'back', outcome: 'ok' }), 'analysis complete');
+  assert.equal(outcomeText({ outcome: 'ok' }), 'analysis complete');          // no phase (a round trip's outcome): the result wording
 });
 
 // Golden strings below were rendered by the PRE-CHANGE module (git show 14ded885:packages/handoffs-view.js), not by this one.

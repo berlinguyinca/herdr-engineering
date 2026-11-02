@@ -51,8 +51,10 @@ export function modelText(h) {
 }
 
 const CAUSE = { context_pressure: 'context pressure', quota_exhausted: 'quota exhausted', phase_transition: 'phase transition', vision_delegate: 'vision delegation', vision_return: 'vision result' };
-// How a vision delegation ended (Pi reports no image count, so none is shown).
-export const outcomeText = (v) => ({ ok: 'analysis complete', partial: 'partial analysis', failed: 'analysis failed', timeout: 'timed out' })[v?.outcome] || 'outcome unknown';
+// How a vision delegation ended (Pi reports no image count, so none is shown). An out row only records that the image was sent
+// (Pi always reports its outcome as ok), so it never claims a result; the back row, or a round trip's outcome, says how it ended.
+export const outcomeText = (v) => (v?.phase === 'out' ? 'sent to vision model'
+  : ({ ok: 'analysis complete', partial: 'partial analysis', failed: 'analysis failed', timeout: 'timed out' })[v?.outcome] || 'outcome unknown');
 
 export function handoffCard(h) {
   return `<button type="button" class="hd-row${h.attention ? ' hd-row--attention' : ''}" data-handoff="${esc(h.handoff_id)}" title="${esc(h.attention_reason ? `${h.handoff_id} — ${h.attention_reason}` : h.handoff_id)}">
