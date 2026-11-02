@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml, modelText } from './handoffs-view.js';
+import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml, modelText, outcomeText } from './handoffs-view.js';
 
 test('summarizes handoff lineage without trusting goal text as markup', () => {
   const summary = handoffGraphSummary({
@@ -104,4 +104,45 @@ test('a Pi handoff says what happened to the model, and the detail is honest abo
   assert.match(html, /data-handoff-model/); assert.match(html, /not pinned/); assert.match(html, /abcdef123456/); assert.ok(!html.includes('<img'));
   assert.ok(!html.includes('<h3>Accomplished</h3>'), 'no empty accomplished/missing columns for a handoff that has no written summary');
   assert.match(handoffCard({ ...lineage, attention: true, attention_reason: 'successor not pinned', completed: 0, remaining: 0 }), /not pinned · was q/);
+});
+
+const VROW = { handoff_id: 'handoff:vision-r1-out', origin: 'lineage', state: 'completed', goal: 'g', source: {}, target: {}, completed: 0, remaining: 0, cause: 'vision_delegate',
+  model_change: 'switched', from_model: 'p/text-model', to_model: 'p/vision-model', vision: { request_id: 'r1', phase: 'out', outcome: 'ok' } };
+
+test('a vision card names the cause, both models and the outcome', () => {
+  const html = handoffCard(VROW);
+  assert.match(html, /vision delegation · model changed · text-model → vision-model · analysis complete/);
+  assert.match(handoffCard({ ...VROW, cause: 'vision_return' }), /vision result · model changed/);
+  assert.ok(!html.includes('hd-row--attention'));
+});
+
+test('a partial outcome reads as partial analysis and is marked for attention', () => {
+  const html = handoffCard({ ...VROW, vision: { ...VROW.vision, outcome: 'partial' }, attention: true, attention_reason: 'partial analysis' });
+  assert.match(html, /· partial analysis/);
+  assert.match(html, /hd-row--attention/);
+  assert.equal(outcomeText({ outcome: 'failed' }), 'analysis failed');
+  assert.equal(outcomeText({ outcome: 'timeout' }), 'timed out');
+});
+
+test('an unknown outcome reads as outcome unknown', () => {
+  assert.match(handoffCard({ ...VROW, vision: { ...VROW.vision, outcome: 'unknown' } }), /outcome unknown/);
+  assert.equal(outcomeText(undefined), 'outcome unknown');
+  assert.equal(outcomeText({ outcome: 'weird' }), 'outcome unknown');
+});
+
+test('hostile markup in a model name and in the request id is escaped in the card and the detail', () => {
+  const row = { ...VROW, to_model: HOSTILE, vision: { request_id: HOSTILE, phase: 'out', outcome: 'ok' } };
+  assert.ok(!handoffCard(row).includes('<img'));
+  const html = detailHtml(row, null);
+  assert.ok(!html.includes('<img'));
+  assert.match(html, /analysis complete/);
+  assert.match(html, /&lt;img src=x/);
+});
+
+test('non-vision cards render exactly as before', () => {
+  const row = { handoff_id: 'handoff:h1', origin: 'lineage', state: 'accepted', goal: 'g', source: {}, target: {}, cause: 'context_pressure', model_change: 'same', to_model: 'a/b', completed: 0, remaining: 0, updated_at: '' };
+  const html = handoffCard(row);
+  assert.match(html, /<span class="hd-row__goal">context pressure · same model · b<\/span>/);
+  assert.ok(!html.includes('analysis') && !html.includes('outcome'));
+  assert.ok(!detailHtml(row, null).includes('request'));
 });

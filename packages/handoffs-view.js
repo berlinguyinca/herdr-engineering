@@ -50,13 +50,15 @@ export function modelText(h) {
   return h.origin === 'lineage' ? 'model not reported' : '';
 }
 
-const CAUSE = { context_pressure: 'context pressure', quota_exhausted: 'quota exhausted', phase_transition: 'phase transition' };
+const CAUSE = { context_pressure: 'context pressure', quota_exhausted: 'quota exhausted', phase_transition: 'phase transition', vision_delegate: 'vision delegation', vision_return: 'vision result' };
+// How a vision delegation ended (Pi reports no image count, so none is shown).
+export const outcomeText = (v) => ({ ok: 'analysis complete', partial: 'partial analysis', failed: 'analysis failed', timeout: 'timed out' })[v?.outcome] || 'outcome unknown';
 
 export function handoffCard(h) {
   return `<button type="button" class="hd-row${h.attention ? ' hd-row--attention' : ''}" data-handoff="${esc(h.handoff_id)}" title="${esc(h.attention_reason ? `${h.handoff_id} — ${h.attention_reason}` : h.handoff_id)}">
     <span class="hd-row__state hd-row__state--${esc(h.state)}">${esc(String(h.state).replace('_', ' '))}${h.stalled ? ' · stalled' : ''}</span>
     <strong class="hd-row__who">${esc(agentName(h.source))} → ${esc(agentName(h.target))}</strong>
-    <span class="hd-row__goal">${esc(h.origin === 'lineage' ? `${CAUSE[h.cause] || h.cause || 'handoff'} · ${modelText(h)}` : clip(h.goal, 140))}</span>
+    <span class="hd-row__goal">${esc(h.origin === 'lineage' ? `${CAUSE[h.cause] || h.cause || 'handoff'} · ${modelText(h)}${h.vision ? ` · ${outcomeText(h.vision)}` : ''}` : clip(h.goal, 140))}</span>
     <small class="hd-row__meta">${h.origin === 'lineage' ? esc([h.attention_reason, h.updated_at && ago(h.updated_at)].filter(Boolean).join(' · ')) : `${h.completed} done · ${h.remaining} left · ${esc(ago(h.updated_at))}`}</small></button>`;
 }
 
@@ -92,7 +94,7 @@ export function detailHtml(row, chain) {
     <p><span class="hd-badge">${esc(String(row.state).replace('_', ' '))}</span> ${esc(SENTENCE[row.state] || '')}${ago(row.updated_at) ? ` · updated ${esc(ago(row.updated_at))}` : ''}${hint ? ` · model hint <code>${esc(hint)}</code>` : ''}</p>
     ${row.mission_id ? `<p class="hd-muted">Mission <a href="#/missions/${encodeURIComponent(row.mission_id)}">${esc(row.mission_id)}</a></p>` : ''}</header>
     <h3>Handoff text — what the next agent was told</h3><p class="hd-goal" data-handoff-goal>${esc(row.goal || '')}</p>
-    ${row.origin === 'lineage' ? `<h3>Model</h3><p data-handoff-model><strong>${esc(modelText(row))}</strong>${row.cause ? ` · cause <code>${esc(row.cause)}</code>` : ''}${row.checkpoint ? ` · checkpoint <code>${esc(String(row.checkpoint).slice(0, 12))}</code>` : ''}</p>
+    ${row.origin === 'lineage' ? `<h3>Model</h3><p data-handoff-model><strong>${esc(modelText(row))}</strong>${row.vision ? ` · ${esc(outcomeText(row.vision))} · request <code>${esc(row.vision.request_id)}</code>` : ''}${row.cause ? ` · cause <code>${esc(row.cause)}</code>` : ''}${row.checkpoint ? ` · checkpoint <code>${esc(String(row.checkpoint).slice(0, 12))}</code>` : ''}</p>
       <p class="hd-muted">Pi records this handoff and its verified checkpoint, not a written summary: the work done so far is in the checkpoint, and the successor continues from it.</p>`
       : `<div class="hd-cols"><div><h3>Accomplished</h3>${list(row.completed)}</div><div><h3>Missing / what happens next</h3>${list(row.remaining)}</div></div>`}
     ${hops ? `<h3>Where this sits in the work</h3><ol class="hd-chain" aria-label="Handoff chain, oldest first">${hops}</ol>` : ''}
