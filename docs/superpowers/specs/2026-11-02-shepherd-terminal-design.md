@@ -56,3 +56,23 @@ Assistant tab (3), rooms (4), iPad sidebar redesign beyond the Terminal pane (5)
 - Rotating the phone or resizing the iPad window resizes the pty and the view agrees.
 - An agent that disappears while attached shows "session ended" and returns to the list, not a spinner.
 - Ctrl-C and Esc reach the agent (the two keys people most need on a phone).
+
+## Amendment 2026-11-02 (owner direction): the terminal replaces Moshi, and runs on the host
+
+The owner uses this app **instead of Moshi** (an SSH/mosh client) and used Moshi only to manage agents, so the in-app terminal stays. The review of the first build showed that a pty started *by the control plane* cannot work as deployed (the web service runs in a container with no `herdr`, no ssh client and no keys) and would need a key that opens a shell on every fleet host. The owner asked why the assistants and agents that already run on each host cannot do this. They can, and it is the better design. This section replaces "How it works" above; everything else (goals, non-goals, the phone and iPad experience, the app) is unchanged.
+
+### How it works now
+- **Host relay.** A small service on each fleet host (shipped by `deploy/deploy-fleet-agents.sh` next to the existing `herdr-cp-sessions` plugin and started by systemd, using the host's own `host.json` credentials) runs `herdr --session <s> agent attach <pane>` **locally** in a pty (the `TerminalSession` core already built, run on the host). No ssh, no keys, nothing inbound.
+- **Outbound only.** The relay keeps a long-poll open to the control plane (`GET /api/v1/host/terminal/wait`) to receive `open | input | resize | close` commands for sessions on its host, and pushes output chunks with `POST /api/v1/host/terminal/<id>/output`. It uses its existing key, like steering delivery does.
+- **Control plane = broker.** It stores a numbered 200 KB buffer per terminal and a command queue per host, and never starts a process. The phone-facing procedures (`terminal/open|input|resize|close|subscribe`) and the app do not change. Replay, takeover, input numbering, the 4-session cap and the 5-minute keep stay as built, now enforced in the broker.
+- **Host offline.** The broker knows when a host last polled; `terminal/open` for a host that is not connected answers at once with a plain "host not connected" message and the chat view keeps working.
+- **Validation twice.** The control plane and the relay both check the pane id against the same strict charset; the relay attaches only panes that herdr on that host already lists.
+
+### What it fixes
+No credentials in the web service or on the phone; no container changes (no ssh client, no herdr, no host-name or DNS workarounds); the Mac and every other host work the same way once the relay is installed; the web service can no longer become a shell on the fleet.
+
+### What it costs
+A new host-side component to ship and keep running on bender, beast and the Mac. The server's terminal manager becomes a broker (the pty and fd-hardening work moves to the host side; the owner-only gate, the rate-limit exemption for input/resize and the narrower `open_owner` stay as already built). A host that is offline or not yet updated cannot open terminals.
+
+### Mosh-style roaming
+Moshi's selling point is a session that survives network changes. Here the pty lives on the host and the app reattaches from the saved buffer, so a drop, a sleep or a network switch shows the live screen again without losing the agent.
