@@ -1,0 +1,144 @@
+"""Pty relay core: a child on a real pty, output kept as numbered base64 chunks."""
+import base64
+import time
+
+import pytest
+
+from herdr_engineering.control_plane.rakazo_terminal import TerminalSession, attach_argv
+from herdr_engineering.control_plane.terminal_attach import AttachRefused
+
+LIVE = {'session_id': 'herdr:beast:default:wK%3ApH', 'host_id': 'beast', 'herdr_session': 'default',
+        'pane_id': 'wK:pH', 'terminal_id': 'term_65df79f50e51582', 'status': 'idle'}
+
+
+@pytest.fixture
+def make():
+    made = []
+
+    def _make(argv, rows=24, cols=80, **kwargs):
+        s = TerminalSession(argv, rows, cols, **kwargs)
+        made.append(s)
+        s.start()
+        return s
+
+    yield _make
+    for s in made:
+        s.close()
+
+
+def collect(session, *, until, cursor=0, timeout=3.0):
+    """Poll chunks_after until ``until(text, chunks)`` holds; returns (text, chunks)."""
+    deadline = time.monotonic() + timeout
+    text, chunks = b'', []
+    while time.monotonic() < deadline:
+        for chunk in session.chunks_after(cursor):
+            chunks.append(chunk)
+            cursor = chunk['seq']
+            text += base64.b64decode(chunk.get('data', ''))
+        if until(text, chunks):
+            break
+        time.sleep(0.01)
+    return text, chunks
+
+
+def test_output_arrives_as_base64_chunks_with_increasing_seq(make):
+    s = make(['bash', '-c', 'echo one; sleep 0.1; echo two'])
+    text, chunks = collect(s, until=lambda t, c: b'two' in t)
+    assert b'one' in text and b'two' in text
+    seqs = [c['seq'] for c in chunks]
+    assert seqs == sorted(set(seqs)) and seqs[0] >= 1
+    assert s.snapshot_seq() >= seqs[-1]
+
+
+def test_write_reaches_the_child_and_echoes(make):
+    s = make(['cat'])
+    s.write(b'hi\n')
+    text, _ = collect(s, until=lambda t, c: t.count(b'hi') >= 2)  # tty echo + cat's output
+    assert text.count(b'hi') >= 2
+
+
+def test_resize_is_seen_by_the_child(make):
+    s = make(['bash', '-c', 'read x; stty size'])
+    s.resize(40, 120)
+    s.write(b'go\n')
+    text, _ = collect(s, until=lambda t, c: b'40 120' in t)
+    assert b'40 120' in text
+
+
+def test_initial_size_is_applied(make):
+    s = make(['bash', '-c', 'stty size'], rows=30, cols=100)
+    text, _ = collect(s, until=lambda t, c: b'30 100' in t)
+    assert b'30 100' in text
+
+
+def test_ctrl_c_interrupts_a_foreground_sleep(make):
+    s = make(['bash', '-c', 'sleep 30; echo after'])
+    time.sleep(0.2)
+    s.write(b'\x03')
+    _, chunks = collect(s, until=lambda t, c: any(x.get('ended') for x in c))
+    assert chunks[-1].get('ended') is True and not s.alive
+
+
+def test_buffer_over_the_cap_drops_oldest_and_stale_cursor_gets_reset(make):
+    s = make(['bash', '-c', 'for i in $(seq 1 400); do echo line-$i-xxxxxxxxxxxxxxxxxxxx; done'],
+             buffer_bytes=2000)
+    collect(s, until=lambda t, c: any(x.get('ended') for x in c))
+    first = s.chunks_after(0)
+    assert first[0].get('reset') is True
+    assert sum(len(base64.b64decode(c.get('data', ''))) for c in first) < 4000
+    assert not any(c.get('reset') for c in s.chunks_after(first[-1]['seq']))
+
+
+def test_current_cursor_never_gets_a_reset(make):
+    s = make(['bash', '-c', 'echo a; echo b'])
+    collect(s, until=lambda t, c: any(x.get('ended') for x in c))
+    chunks = s.chunks_after(0)
+    assert not any(c.get('reset') for c in chunks)
+    assert s.chunks_after(chunks[-1]['seq']) == []
+
+
+def test_child_exit_yields_ended_chunk_with_exit_code(make):
+    s = make(['bash', '-c', 'echo bye; exit 3'])
+    _, chunks = collect(s, until=lambda t, c: any(x.get('ended') for x in c))
+    ended = chunks[-1]
+    assert ended['ended'] is True and ended['exit'] == 3
+    assert ended['seq'] == s.snapshot_seq() and s.alive is False
+
+
+def test_close_kills_a_running_child(make):
+    s = make(['sleep', '30'])
+    assert s.alive
+    s.close()
+    assert not s.alive
+
+
+def test_write_after_exit_is_ignored(make):
+    s = make(['bash', '-c', 'exit 0'])
+    collect(s, until=lambda t, c: any(x.get('ended') for x in c))
+    s.write(b'x')  # must not raise
+
+
+# ------------------------------------------------------------------ attach_argv
+def test_local_host_runs_herdr_attach_directly():
+    assert attach_argv(LIVE, local_host='beast') == ['herdr', '--session', 'default', 'agent', 'attach', 'wK:pH']
+
+
+def test_remote_host_goes_through_ssh_with_a_login_shell():
+    assert attach_argv(LIVE, local_host='bender') == [
+        'ssh', '-tt', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', 'beast',
+        "bash -lc 'herdr --session default agent attach wK:pH'"]
+
+
+@pytest.mark.parametrize('changes', [{'status': 'stopped'}, {'pane_id': None}, {'terminal_id': ''}])
+def test_dead_session_is_refused(changes):
+    with pytest.raises(AttachRefused) as exc:
+        attach_argv({**LIVE, **changes}, local_host='beast')
+    assert exc.value.body['reason'] == 'not_live'
+
+
+@pytest.mark.parametrize('field,value', [('host_id', '-oProxyCommand=sh'), ('pane_id', 'w1:p1`id`'),
+                                         ('herdr_session', "x'$(id)'")])
+def test_unsafe_identity_is_refused(field, value):
+    with pytest.raises(AttachRefused) as exc:
+        attach_argv({**LIVE, field: value}, local_host='bender')
+    assert exc.value.status == 409 and exc.value.body['reason'] == 'unsafe_identity'
