@@ -279,8 +279,11 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
   const SMALL_GRAPH = 6;       // routes a drawn graph can still show legibly
   const paint = (card) => {
     const body = card.querySelector('.hd-ws__body');
-    const all = card.__rows || [], active = card.__route || null;
+    const all = card.__rows || [];
     const routes = routeTable(all);
+    if (card.__route && !routes.some((r) => r.key === card.__route)) card.__route = null;   // a reload can drop the chosen route or cause; never leave an unclearable filter
+    if (card.__cause && !all.some((r) => r?.cause === card.__cause)) card.__cause = null;
+    const active = card.__route || null;
     const routed = active ? all.filter((h) => routeKey(h) === active) : all;
     const cause = card.__cause || null;
     const shown = filterByCause(routed, cause);

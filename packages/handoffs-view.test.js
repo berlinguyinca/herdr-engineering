@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml, modelText, outcomeText,
-  visionRoundTrips, filterByCause, visionStats, visionStatsLine, causeFilterHtml, roundTripHtml, listHtml } from './handoffs-view.js';
+  mountHandoffs, visionRoundTrips, filterByCause, visionStats, visionStatsLine, causeFilterHtml, roundTripHtml, listHtml } from './handoffs-view.js';
 
 test('summarizes handoff lineage without trusting goal text as markup', () => {
   const summary = handoffGraphSummary({
@@ -247,4 +247,71 @@ test('stats line says it covers the loaded rows of this workspace; list shows on
   assert.equal((html.match(/data-roundtrip/g) || []).length, 1);
   assert.match(html, /data-handoff="n1"/);
   assert.match(causeFilterHtml(rows, null), /data-cause="vision_delegate"/);
+});
+
+// ------------------------------------------------------------------ mountHandoffs wiring (fake DOM)
+function mountFake(pagesRef) {
+  const listeners = [];
+  const body = { innerHTML: '', hidden: true, querySelector: () => null };
+  const head = { setAttribute() {} };
+  const card = { dataset: { workspace: 'ws' }, querySelector: (s) => (s === '.hd-ws__body' ? body : s === '.hd-ws__head' ? head : null) };
+  head.closest = () => card;
+  let listHtmlOut = '';
+  const wsList = { set innerHTML(v) { listHtmlOut = v; }, get innerHTML() { return listHtmlOut; }, querySelectorAll: () => [], querySelector: () => card };
+  const els = { '[data-handoff-summary]': { textContent: '' }, '[data-handoff-attention]': { innerHTML: '' }, '[data-handoff-list]': wsList,
+    '[data-handoff-detail]': { innerHTML: '', scrollIntoView() {} }, '[data-handoff-retry]': { hidden: true, addEventListener() {} } };
+  const container = { innerHTML: '', querySelector: (s) => els[s] || null, querySelectorAll: () => [], contains: () => true,
+    addEventListener: (t, fn) => { if (t === 'click') listeners.push(fn); } };
+  let total = 1;
+  const calls = [];
+  const client = {
+    getHandoffOverview: async () => ({ workspaces: [{ workspace: 'ws', total: total++, states: {} }], total: 1 }),
+    pageHandoffs: async () => ({ handoffs: pagesRef.rows, next_cursor: null }),
+    getHandoff: async (id) => { calls.push(id); return { handoff_id: id, state: 'completed' }; },
+    getHandoffChain: async () => null,
+  };
+  const click = (map) => { for (const fn of listeners) fn({ target: { closest: (s) => map[s] || null } }); };
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  return { mount: () => mountHandoffs(container, client), card, body, click, tick, calls, head };
+}
+const withGlobals = async (fn) => {
+  const had = { CSS: globalThis.CSS, window: globalThis.window };
+  globalThis.CSS = { escape: (x) => x }; globalThis.window = {};
+  try { await fn(); } finally { globalThis.CSS = had.CSS; globalThis.window = had.window; }
+};
+const sourced = (r, n) => ({ ...r, source: { agent_id: `a${n}` }, target: { agent_id: `b${n}` } });
+const visionRows = (cause = 'context_pressure') => [vrow('o1', 'r1', 'out', 'ok', T0), vrow('b1', 'r1', 'back', 'ok', T0)].map(sourced)
+  .concat([2, 3, 4, 5, 6, 7, 8].map((n) => sourced({ handoff_id: `n${n}`, cause, state: 'queued', origin: 'lineage' }, n)));
+const openCard = async (h) => { h.click({ '.hd-ws__head': h.head }); await h.tick(); };
+
+test('mountHandoffs: cause filter click, round trip links, survival and stale reset', async () => {
+  await withGlobals(async () => {
+    const pages = { rows: visionRows() };
+    const h = mountFake(pages);
+    const m = h.mount(); await h.tick();
+    try {
+      await openCard(h);
+      assert.match(h.body.innerHTML, /data-roundtrip/); assert.match(h.body.innerHTML, /data-handoff="n2"/);
+      // (a) cause click filters
+      h.click({ '[data-cause]': { dataset: { cause: 'context_pressure' }, closest: () => h.card } });
+      assert.ok(!/data-roundtrip/.test(h.body.innerHTML)); assert.match(h.body.innerHTML, /data-handoff="n2"/);
+      // (c) filter survives a reload whose rows still have the cause
+      await m.refresh(); await h.tick();
+      assert.equal(h.card.__cause, 'context_pressure'); assert.ok(!/data-roundtrip/.test(h.body.innerHTML));
+      // (d) reload without that cause clears the filter, list shows rows, control still usable
+      pages.rows = visionRows('quota_exhausted');
+      await m.refresh(); await h.tick();
+      assert.equal(h.card.__cause, null); assert.match(h.body.innerHTML, /data-roundtrip/);
+      assert.match(h.body.innerHTML, /data-cause="vision_delegate"/);
+      h.click({ '[data-cause]': { dataset: { cause: 'vision_return' }, closest: () => h.card } });
+      assert.equal(h.card.__cause, 'vision_return'); assert.match(h.body.innerHTML, /data-roundtrip/);
+      h.click({ '[data-cause]': { dataset: { cause: '' }, closest: () => h.card } });
+      assert.equal(h.card.__cause, null);
+      // (b) out and result buttons open the out then the back handoff
+      h.click({ '[data-handoff]': { dataset: { handoff: 'o1' } } }); await h.tick();
+      h.click({ '[data-handoff]': { dataset: { handoff: 'b1' } } }); await h.tick();
+      assert.deepEqual(h.calls, ['o1', 'b1']);
+      assert.match(h.body.innerHTML, /data-handoff="o1"[^>]*>out</); assert.match(h.body.innerHTML, /data-handoff="b1"[^>]*>result</);
+    } finally { m.dispose(); }
+  });
 });
