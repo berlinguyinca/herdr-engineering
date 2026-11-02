@@ -1,0 +1,70 @@
+<h2>Agent screen with a real terminal, and the iPad layout (my guess)</h2>
+<p class="subtitle">Phone: one agent, switch between a readable Chat view and the live Terminal. iPad: the same pieces side by side.</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Phone: agent, Terminal view</div>
+    <div class="mockup-body" style="max-width:300px;margin:0 auto;font-size:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0"><span>&lsaquo; codex &middot; bender</span><span style="color:#d97706">blocked</span></div>
+      <div style="display:flex;border:1px solid #bbb;border-radius:8px;overflow:hidden;margin:6px 0;text-align:center">
+        <div style="flex:1;padding:4px;opacity:.6">Chat</div><div style="flex:1;padding:4px;background:#3d3dbd;color:#fff">Terminal</div>
+      </div>
+      <div style="background:#111;color:#cfe;font-family:monospace;font-size:10.5px;line-height:1.35;padding:8px;border-radius:6px;height:250px;overflow:hidden">
+        $ codex<br>&gt; push v1.4 to origin?<br>&nbsp;&nbsp;1. Yes<br>&nbsp;&nbsp;2. No, show diff<br>&nbsp;&nbsp;3. Cancel<br><br>Waiting for choice_<br><br><br><span style="opacity:.5">pinch to zoom &middot; swipe to scroll</span>
+      </div>
+      <div style="display:flex;gap:4px;margin:6px 0;font-family:monospace;font-size:11px;text-align:center">
+        <span style="flex:1;border:1px solid #bbb;border-radius:6px;padding:5px 0">esc</span>
+        <span style="flex:1;border:1px solid #bbb;border-radius:6px;padding:5px 0">tab</span>
+        <span style="flex:1;border:1px solid #bbb;border-radius:6px;padding:5px 0">ctrl</span>
+        <span style="flex:1;border:1px solid #bbb;border-radius:6px;padding:5px 0">&uarr;</span>
+        <span style="flex:1;border:1px solid #bbb;border-radius:6px;padding:5px 0">&darr;</span>
+        <span style="flex:1;border:1px solid #bbb;border-radius:6px;padding:5px 0">&crarr;</span>
+      </div>
+      <div class="mock-input" style="margin:0">Type to the terminal...</div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">iPad: three columns</div>
+    <div class="mockup-body" style="font-size:11px">
+      <div style="display:flex;gap:6px;height:330px">
+        <div style="width:26%;border:1px solid #bbb;border-radius:6px;padding:6px">
+          <div style="font-weight:600;margin-bottom:4px">Agents</div>
+          <div style="padding:3px 0;color:#d97706"><b>codex</b> bender &middot; blocked</div>
+          <div style="padding:3px 0"><b>claude</b> beast &middot; working</div>
+          <div style="padding:3px 0"><b>pi</b> bender &middot; idle</div>
+          <div style="padding:3px 0;opacity:.6">denoise-lcb &middot; done</div>
+          <div style="margin-top:8px;font-weight:600">Rooms</div>
+          <div style="padding:3px 0">release-prep</div>
+        </div>
+        <div style="flex:1;border:1px solid #bbb;border-radius:6px;padding:6px;display:flex;flex-direction:column">
+          <div style="display:flex;justify-content:space-between"><b>codex &middot; Terminal</b><span style="opacity:.6">Chat | <b>Terminal</b></span></div>
+          <div style="background:#111;color:#cfe;font-family:monospace;font-size:10px;padding:6px;border-radius:4px;flex:1;margin:4px 0">&gt; push v1.4 to origin?<br>&nbsp;1. Yes &nbsp;2. No &nbsp;3. Cancel<br>Waiting for choice_</div>
+          <div class="mock-input" style="margin:0">Type to the terminal... (hardware keyboard works too)</div>
+        </div>
+        <div style="width:24%;border:1px solid #bbb;border-radius:6px;padding:6px">
+          <div style="font-weight:600;margin-bottom:4px">Summary</div>
+          <div style="opacity:.8">codex asks to push v1.4. Tests green on main. pi has release notes queued.</div>
+          <div style="margin-top:8px;font-weight:600">Skills</div>
+          <div style="padding:2px 0">/release</div><div style="padding:2px 0">/review</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3 style="margin-top:24px">What should open when you tap an agent?</h3>
+<div class="options">
+  <div class="option" data-choice="chat-first" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content"><h3>Chat first, Terminal one tap away</h3><p>Opens on the readable conversation with a Chat | Terminal switch. You drop into the terminal when you need the full feel.</p></div>
+  </div>
+  <div class="option" data-choice="terminal-first" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content"><h3>Terminal first</h3><p>Opens straight into the live terminal, as if you had attached. The Chat view is the alternate.</p></div>
+  </div>
+  <div class="option" data-choice="smart" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content"><h3>Smart default</h3><p>Terminal when the agent is blocked on a prompt, Chat otherwise. You can always switch and it remembers your last choice per agent.</p></div>
+  </div>
+</div>
