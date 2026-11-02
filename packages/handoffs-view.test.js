@@ -139,10 +139,33 @@ test('hostile markup in a model name and in the request id is escaped in the car
   assert.match(html, /&lt;img src=x/);
 });
 
+// Golden strings below were rendered by the PRE-CHANGE module (git show 14ded885:packages/handoffs-view.js), not by this one.
+const GOLD_LINEAGE = { handoff_id: 'handoff:h1', origin: 'lineage', state: 'accepted', goal: 'Context pressure', cause: 'context_pressure', checkpoint: 'abcdef1234567890', model_change: 'not_pinned', from_model: 'q', attention: true, attention_reason: 'successor not pinned',
+  source: { harness: 'pi', session_id: 's1' }, target: { harness: 'pi', session_id: 's2' }, completed: 0, remaining: 0, history: [] };
+const GOLD_REGISTRY = { handoff_id: 'h1', state: 'in_progress', goal: 'Continue the drain work.', completed: ['parser'], remaining: ['tests'], decisions: ['d'], risks: ['r'], validation: [], history: [],
+  source: { harness: 'pi', agent_id: 'a', session_id: 's1' }, target: { harness: 'claude', model_hint: 'qwen' }, mission_id: 'm1' };
+const GOLD = { lc: "<button type=\"button\" class=\"hd-row hd-row--attention\" data-handoff=\"handoff:h1\" title=\"handoff:h1 — successor not pinned\">\n    <span class=\"hd-row__state hd-row__state--accepted\">accepted</span>\n    <strong class=\"hd-row__who\">s1 → s2</strong>\n    <span class=\"hd-row__goal\">context pressure · not pinned · was q · routed normally</span>\n    <small class=\"hd-row__meta\">successor not pinned</small></button>",
+  ld: "<section class=\"hd-detail\" data-handoff-detail-body aria-label=\"Handoff handoff:h1\">\n    <header><h2>pi s1 → pi s2</h2>\n    <p><span class=\"hd-badge\">accepted</span> accepted</p>\n    </header>\n    <h3>Handoff text — what the next agent was told</h3><p class=\"hd-goal\" data-handoff-goal>Context pressure</p>\n    <h3>Model</h3><p data-handoff-model><strong>not pinned · was q · routed normally</strong> · cause <code>context_pressure</code> · checkpoint <code>abcdef123456</code></p>\n      <p class=\"hd-muted\">Pi records this handoff and its verified checkpoint, not a written summary: the work done so far is in the checkpoint, and the successor continues from it.</p>\n    \n    \n    \n    \n    \n    <details class=\"hd-full\" data-handoff-full><summary>Full handoff as text</summary><p><button type=\"button\" data-handoff-copy>Copy to clipboard</button> <small class=\"hd-muted\" data-handoff-copied hidden>Copied</small></p><pre class=\"hd-pre\">HANDOFF handoff:h1 · accepted\nFrom: pi · session s1\nTo:   pi · session s2\n\nCreated: ? · updated ?\n\nGOAL\nContext pressure\n\nACCOMPLISHED\n(none recorded)\n\nMISSING / NEXT\n(none recorded)\n\nDECISIONS\n(none recorded)\n\nRISKS\n(none recorded)\n\nVALIDATION\n(none recorded)\n\nARTIFACTS\n(none)\n\nPROVENANCE\n(none)\n\nHISTORY\n(none)</pre></details></section>",
+  rc: "<button type=\"button\" class=\"hd-row\" data-handoff=\"h1\" title=\"h1\">\n    <span class=\"hd-row__state hd-row__state--in_progress\">in progress</span>\n    <strong class=\"hd-row__who\">@a → claude</strong>\n    <span class=\"hd-row__goal\">Continue the drain work.</span>\n    <small class=\"hd-row__meta\">1 done · 1 left · </small></button>",
+  rd: "<section class=\"hd-detail\" data-handoff-detail-body aria-label=\"Handoff h1\">\n    <header><h2>pi @a → claude</h2>\n    <p><span class=\"hd-badge\">in progress</span> in progress · model hint <code>qwen</code></p>\n    <p class=\"hd-muted\">Mission <a href=\"#/missions/m1\">m1</a></p></header>\n    <h3>Handoff text — what the next agent was told</h3><p class=\"hd-goal\" data-handoff-goal>Continue the drain work.</p>\n    <div class=\"hd-cols\"><div><h3>Accomplished</h3><ul><li>parser</li></ul></div><div><h3>Missing / what happens next</h3><ul><li>tests</li></ul></div></div>\n    \n    <h3>Decisions</h3><ul><li>d</li></ul>\n    <h3>Risks</h3><ul><li>r</li></ul>\n    \n    \n    <details class=\"hd-full\" data-handoff-full><summary>Full handoff as text</summary><p><button type=\"button\" data-handoff-copy>Copy to clipboard</button> <small class=\"hd-muted\" data-handoff-copied hidden>Copied</small></p><pre class=\"hd-pre\">HANDOFF h1 · in progress\nFrom: pi · @a · session s1\nTo:   claude · model qwen\nMission: m1\n\nCreated: ? · updated ?\n\nGOAL\nContinue the drain work.\n\nACCOMPLISHED\n- parser\n\nMISSING / NEXT\n- tests\n\nDECISIONS\n- d\n\nRISKS\n- r\n\nVALIDATION\n(none recorded)\n\nARTIFACTS\n(none)\n\nPROVENANCE\n(none)\n\nHISTORY\n(none)</pre></details></section>" };
+
 test('non-vision cards render exactly as before', () => {
-  const row = { handoff_id: 'handoff:h1', origin: 'lineage', state: 'accepted', goal: 'g', source: {}, target: {}, cause: 'context_pressure', model_change: 'same', to_model: 'a/b', completed: 0, remaining: 0, updated_at: '' };
-  const html = handoffCard(row);
-  assert.match(html, /<span class="hd-row__goal">context pressure · same model · b<\/span>/);
-  assert.ok(!html.includes('analysis') && !html.includes('outcome'));
-  assert.ok(!detailHtml(row, null).includes('request'));
+  assert.equal(handoffCard(GOLD_LINEAGE), GOLD.lc);
+  assert.equal(detailHtml(GOLD_LINEAGE, null), GOLD.ld);
+  assert.equal(handoffCard({ ...GOLD_REGISTRY, completed: 1, remaining: 1 }), GOLD.rc);
+  assert.equal(detailHtml(GOLD_REGISTRY, null), GOLD.rd);
+  for (const row of [GOLD_LINEAGE, GOLD_REGISTRY]) {
+    assert.equal(detailHtml({ ...row, vision: undefined }, null), detailHtml(row, null));
+    assert.equal(handoffCard({ ...row, vision: undefined, completed: 1, remaining: 1 }), handoffCard({ ...row, completed: 1, remaining: 1 }));
+  }
+});
+
+test('a vision row with missing fields never prints undefined or null and never throws', () => {
+  const variants = [{ outcome: 'ok' }, { outcome: 'ok', request_id: '' }, { outcome: 'ok', request_id: 42 }, { request_id: 'r1' }, {}];
+  for (const vision of variants) for (const row of [{ ...VROW, vision }, { ...VROW, vision, to_model: undefined }, { ...VROW, vision, from_model: null, to_model: null }]) {
+    for (const html of [handoffCard(row), detailHtml(row, null)]) assert.ok(!/undefined|null/.test(html.replace(/data-handoff-[a-z-]+|hd-[a-z_-]+/g, '')), JSON.stringify(vision));
+  }
+  assert.ok(!detailHtml({ ...VROW, vision: { outcome: 'ok' } }, null).includes('request <code>'));
+  assert.ok(!detailHtml({ ...VROW, vision: { outcome: 'ok', request_id: '' } }, null).includes('request <code>'));
+  assert.match(detailHtml(VROW, null), /request <code>r1<\/code>/);
 });
