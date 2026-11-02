@@ -1,8 +1,10 @@
 """Row model, status mapping and ordering for the Shepherd Agents tab (pure functions)."""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
+from .redact import redact_text
 from .terminal_attach import _CLOSED
 
 STATUS_ORDER = ("blocked", "done", "working", "idle", "unknown", "closed")
@@ -73,3 +75,90 @@ def visible(rows: list[dict], *, show_older: bool, now: float) -> list[dict]:
     return [r for r in rows if r["status"] != "closed" and not (
         r["status"] == "idle"
         and now - _epoch(r.get("updated_at")) > _IDLE_CUTOFF_SECONDS)]
+
+
+_NOT_READY = "The Agents view is not ready."
+_DEFAULT_PAGE, _MAX_PAGE = 50, 200
+
+
+class Agents:
+    """The read-only ``agents/*`` procedures. ``repo`` is set by the API glue; every read uses the viewer role."""
+
+    def __init__(self, bridge, error):
+        self.b = bridge
+        self.Error = error
+        self.repo = None
+
+    def procs(self) -> dict:
+        return {"agents/list": self.list, "agents/get": self.get,
+                "agents/messages": self.messages, "agents/event": self.event}
+
+    # plumbing -----------------------------------------------------------------------------------------------
+    def _repo(self):
+        if self.repo is None:
+            raise self.Error(503, "UNAVAILABLE", _NOT_READY)
+        return self.repo
+
+    def _missing(self):
+        return self.Error(404, "NOT_FOUND", "No such agent.")
+
+    @staticmethod
+    def _sid(inp) -> str:
+        sid = inp.get("id")
+        return sid if isinstance(sid, str) else ""
+
+    def _summary(self, repo, session: dict) -> str | None:
+        own = session.get("summary")
+        if isinstance(own, str) and own.strip():
+            return redact_text(own)
+        try:
+            return repo.inspector.last_message(session.get("session_id"), role="viewer")
+        except KeyError:
+            return None
+
+    def _row(self, repo, session: dict) -> dict:
+        row = agent_row(session, self._summary(repo, session))
+        row["has_conversation"] = repo.inspector.newest_seq(session.get("session_id")) is not None
+        return row
+
+    # procedures ---------------------------------------------------------------------------------------------
+    def list(self, ctx, inp):
+        repo = self._repo()
+        rows = sort_rows([self._row(repo, s) for s in repo.list_sessions()])
+        shown = visible(rows, show_older=bool(inp.get("showOlder")), now=time.time())
+        return {"agents": shown, "hiddenCount": len(rows) - len(shown)}
+
+    def get(self, ctx, inp):
+        repo = self._repo()
+        session = repo.get_session(self._sid(inp))
+        if session is None:
+            raise self._missing()
+        row = self._row(repo, session)
+        return {"agent": row, "hasConversation": row["has_conversation"]}
+
+    def messages(self, ctx, inp):
+        repo = self._repo()
+        sid = self._sid(inp)
+        before = inp.get("beforeSeq")
+        limit = inp.get("limit", _DEFAULT_PAGE)
+        if isinstance(limit, bool) or not isinstance(limit, int) or (
+                before is not None and (isinstance(before, bool) or not isinstance(before, int))):
+            raise self.Error(400, "BAD_REQUEST", "limit and beforeSeq must be integers.")
+        limit = max(1, min(limit, _MAX_PAGE))
+        if repo.get_session(sid) is None:
+            raise self._missing()
+        try:
+            page = repo.inspector.query(sid, "viewer", limit=limit, before_seq=before)
+        except KeyError:
+            return {"events": [], "hasMore": False, "newestSeq": None}
+        return {"events": page["events"], "hasMore": page["has_more"], "newestSeq": repo.inspector.newest_seq(sid)}
+
+    def event(self, ctx, inp):
+        repo = self._repo()
+        seq = inp.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise self.Error(400, "BAD_REQUEST", "seq must be an integer.")
+        try:
+            return repo.inspector.get_event(self._sid(inp), seq, "viewer")
+        except KeyError:
+            raise self._missing() from None

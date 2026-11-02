@@ -691,6 +691,7 @@ class ControlPlaneServer:
         self._pr_lister = SharedCredentialPrLister()
         self.intelligence.single_operator_fn = lambda: self.single_operator
         if self.rakazo is not None:
+            self.rakazo.agents.repo = self.repo
             self.rakazo.desk.routes = self.intelligence      # board proposals as phone cards (scope: assistant_viewers)
             self.intelligence.board.on_new = self.rakazo.notify_proposal      # and as push notifications
             self.intelligence.push_status_fn = lambda: dict(self.rakazo.push.counters, enabled=self.rakazo.push.enabled)
