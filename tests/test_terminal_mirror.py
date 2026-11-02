@@ -412,13 +412,84 @@ def test_partial_utf8_flushed_in_paste_mode_goes_raw():
     assert t.feed(b"x\x1b[201~") == [("text", "x"), ("raw", b"\x1b[201~")]
 
 
-def test_missing_end_marker_cannot_capture_input_beyond_2mb():
+def test_3mb_paste_with_late_end_marker_stays_text_throughout():
     t = InputTranslator()
     t.feed(b"\x1b[200~")
-    t.feed(b"a" * (2 * 1024 * 1024 + 10))
-    assert t.feed(b"\x03\x1b[A") == [("keys", ["ctrl+c"]), ("keys", ["up"])]
+    chunk = b"line of text\nsecond\r\n" * 3000  # ~66 KB
+    sent = 0
+    while sent < 3 * 1024 * 1024:
+        out = t.feed(chunk)
+        sent += len(chunk)
+        assert out and all(a[0] == "text" for a in out)
+    assert t.feed(b"\x1b[201~\r") == [("raw", b"\x1b[201~"), ("keys", ["enter"])]
 
 
+def test_lost_marker_after_a_long_paste_still_releases_after_30s():
+    clock = Clock()
+    t = InputTranslator(now=clock.now)
+    t.feed(b"\x1b[200~")
+    t.feed(b"a" * (3 * 1024 * 1024))
+    clock.t += 31
+    assert t.feed(b"\x03") == [("keys", ["ctrl+c"])]
+
+
+def test_flush_clears_the_cr_flag():
+    t = InputTranslator()
+    assert t.feed(b"\r") == [("keys", ["enter"])]
+    assert t.flush() == []
+    assert t.feed(b"\n") == [("keys", ["enter"])]
+
+
+def test_cr_flag_expires_after_50ms():
+    clock = Clock()
+    t = InputTranslator(now=clock.now)
+    t.feed(b"\r")
+    clock.t += 0.06
+    assert t.feed(b"\n") == [("keys", ["enter"])]
+    t.feed(b"\r")
+    clock.t += 0.01
+    assert t.feed(b"\n") == []
+
+
+def test_resize_shows_new_rows_cols_on_next_frame():
+    c = FakeClient(["1\n2\n3", "1\n2\n3\n4\n5\n6"], layout=(3, 10))
+    m, clock = mirror(c)
+    assert (m.frame()["rows"], m.frame is not None) == (3, True)
+    c._layout = (6, 20)
+    clock.t += 1
+    f = m.frame()
+    assert (f["rows"], f["cols"]) == (6, 20)
+
+
+def test_content_wider_than_cached_layout_refreshes_it():
+    c = FakeClient(["ab", "a" * 30], layout=(1, 10))
+    m, clock = mirror(c)
+    m.frame()
+    c._layout = (1, 40)
+    clock.t += 1
+    assert m.frame()["cols"] == 40
+
+
+def test_failing_layout_stays_bounded_while_the_screen_changes_shape():
+    c = FakeClient(["a", "a\nb", "a\nb\nc", "a\nb\nc\nd"])
+    m, clock = mirror(c)
+    for _ in range(4):
+        m.frame()
+        clock.t += 1
+    assert (c.layout_calls, c.list_calls) == (1, 1)
+
+
+def test_truncated_trailing_escape_is_stripped_when_over_cap():
+    row = "\x1b[31mxxxxx\x1b[0m" * 200 + "\x1b[31"
+    m, _ = mirror(FakeClient(["\n".join([row] * 97)], layout=(97, 1000)))
+    body = decode(m.frame())[len(PREFIX):]
+    assert "\x1b" not in body and body.split("\r\n") == ["x" * 1000] * 97
+
+
+def test_fallback_rows_ignore_a_trailing_newline():
+    m, _ = mirror(FakeClient(["a\nb\nc\n"]), )
+    m.client.list_panes = lambda: []
+    assert m.frame()["rows"] == 3
 def test_missing_end_marker_cannot_capture_input_after_30s():
     clock = Clock()
     t = InputTranslator(now=clock.now)
@@ -495,14 +566,15 @@ def test_frame_over_cap_is_re_encoded_without_colour():
     assert (f["rows"], f["cols"]) == (97, 1000)
 
 
-def test_frame_still_over_cap_drops_trailing_lines():
+def test_frame_still_over_cap_drops_top_lines_and_keeps_the_bottom():
     c = FakeClient(["\n".join(f"{i:03d}" + "y" * 3000 for i in range(97))], layout=(97, 3003))
     m, _ = mirror(c)
     f = m.frame()
     assert len(f["data"]) <= MAX_FRAME
     lines = decode(f)[len(PREFIX):].split("\r\n")
     assert 20 < len(lines) < 97
-    assert lines[0].startswith("000") and all(len(x) == 3003 for x in lines)
+    assert lines[-1].startswith("096") and not lines[0].startswith("000")  # the bottom rows stay
+    assert all(len(x) == 3003 for x in lines)
 
 
 def test_small_coloured_frame_keeps_colour():

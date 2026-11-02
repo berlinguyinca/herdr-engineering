@@ -24,15 +24,16 @@ from herdr_engineering.herdr_pane_client import MAX_BYTES, MAX_KEYS, HerdrError
 Action = tuple
 
 # The mirror owns the cap on the ENCODED (base64) frame, so a busy coloured screen cannot flood the
-# broker: over the cap the colour is stripped, and if that is not enough trailing lines are dropped.
+# broker: over the cap the colour is stripped, and if that is not enough the top lines are dropped (the bottom rows hold the prompt).
 MAX_FRAME = 150 * 1024
 _LAYOUT_TTL = 5.0  # seconds a layout (or its failure) is trusted before asking herdr again
-_PASTE_MAX = 2 * 1024 * 1024  # paste text without an end marker after which key translation resumes
-_PASTE_IDLE = 30.0            # ...or seconds without a paste byte
+_PASTE_IDLE = 30.0  # seconds without a paste byte after which a lost end marker is given up on
+_CR_WINDOW = 0.05   # an LF this soon after a CR is the same Enter (the relay flushes after 50 ms)
 _CLEAR = "\x1b[0m\x1b[H\x1b[2J"
 _POLL = 0.1
 _EPS = 1e-6  # clock slack: a sleep of exactly min_interval must count as elapsed
-_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]"
+                   r"|\x1b(?:\[[0-?]*[ -/]*)?\Z")  # ...and a truncated sequence at the end of a line
 
 
 class PaneMirror:
@@ -48,6 +49,7 @@ class PaneMirror:
         self._size_at: float | None = None
         self._layout: tuple[int, int] | None = None  # (rows, cols) from pane.layout, None when it failed
         self._viewport: int | None = None
+        self._shape: tuple[int, int] = (0, 0)  # (lines, widest line) of the screen the layout was cached for
 
     @staticmethod
     def _digest(text: str) -> bytes:
@@ -68,12 +70,21 @@ class PaneMirror:
             w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
         return w
 
+    @staticmethod
+    def _lines(text: str) -> list[str]:
+        return text.removesuffix("\n").replace("\r\n", "\n").split("\n")
+
     def _size(self, text: str) -> tuple[int, int]:
-        # The layout (or the fact that it failed) is cached, so a failing layout() does not cost a
-        # list_panes() call per frame.
+        # The layout (or the fact that it failed) is cached for a few seconds, so a failing
+        # layout() does not cost a list_panes() call per frame. A cached layout is dropped early
+        # when the screen's shape changed (a resize), but a cached failure is only retried on the
+        # TTL, which keeps a broken layout() bounded.
         now = self._now()
-        if self._size_at is None or now - self._size_at >= _LAYOUT_TTL:
-            self._size_at, self._layout, self._viewport = now, None, None
+        lines = self._lines(text)
+        shape = (len(lines), max(self._width(ln) for ln in lines))
+        stale = self._layout is not None and (shape[0] != self._shape[0] or shape[1] > self._layout[1])
+        if self._size_at is None or stale or now - self._size_at >= _LAYOUT_TTL:
+            self._size_at, self._layout, self._viewport, self._shape = now, None, None, shape
             try:
                 lay = self.client.layout(self.pane_id)
                 self._layout = (int(lay["height"]), int(lay["width"]))
@@ -87,8 +98,7 @@ class PaneMirror:
                     pass
         if self._layout:
             return self._layout
-        lines = text.split("\n")
-        return self._viewport or len(lines), max(1, max(self._width(ln) for ln in lines))
+        return self._viewport or shape[0], max(1, shape[1])
 
     @staticmethod
     def _encode(lines: list[str]) -> str:
@@ -96,14 +106,15 @@ class PaneMirror:
         return base64.b64encode((_CLEAR + body).encode("utf-8", "replace")).decode("ascii")
 
     def _fit(self, text: str) -> str:
-        lines = text.removesuffix("\n").replace("\r\n", "\n").split("\n")
+        lines = self._lines(text)
         data = self._encode(lines)
         if len(data) <= MAX_FRAME:
             return data
         lines = [_ANSI.sub("", ln) for ln in lines]  # colour first ...
         data = self._encode(lines)
-        while len(data) > MAX_FRAME and len(lines) > 1:  # ... then trailing lines
-            del lines[max(1, len(lines) * MAX_FRAME // len(data)):]
+        while len(data) > MAX_FRAME and len(lines) > 1:  # ... then the top lines: the prompt and the
+            # input sit at the bottom of the screen, so those are the rows to keep
+            del lines[:len(lines) - max(1, len(lines) * MAX_FRAME // len(data))]
             data = self._encode(lines)
         if len(data) > MAX_FRAME:  # one enormous line
             lines = [lines[0].encode("utf-8", "replace")[:(MAX_FRAME * 3 // 4) - len(_CLEAR)].decode("utf-8", "ignore")]
@@ -213,9 +224,9 @@ class InputTranslator:
         self._now = now
         self._buf = b""    # an incomplete escape sequence or UTF-8 character, kept for the next call
         self._paste = False
-        self._paste_bytes = 0
         self._paste_at = 0.0
         self._cr = False   # the last byte was CR: a directly following LF is the same Enter
+        self._cr_at = 0.0
 
     def _paste_expired(self) -> bool:
         # A lost end marker must not capture later keystrokes (Ctrl-C, arrows) for good.
@@ -235,7 +246,7 @@ class InputTranslator:
                 i = self._feed_paste(buf, i, out)
                 continue
             c = buf[i]
-            cr, self._cr = self._cr, False
+            cr, self._cr = self._cr and self._now() - self._cr_at <= _CR_WINDOW, False
             if c == 0x0a and cr:
                 i += 1
             elif c == 0x1b:
@@ -246,7 +257,7 @@ class InputTranslator:
                 i += used
             elif c in (0x0d, 0x0a):
                 out.append(("keys", ["enter"])); i += 1
-                self._cr = c == 0x0d
+                self._cr, self._cr_at = c == 0x0d, self._now()
             elif c == 0x7f:
                 out.append(("keys", ["backspace"])); i += 1
             elif c == 0x09:
@@ -264,7 +275,6 @@ class InputTranslator:
 
     def _feed_paste(self, buf: bytes, i: int, out: list[Action]) -> int:
         n = len(buf)
-        self._paste_bytes += n - i
         end = buf.find(_PASTE_OFF, i)
         if end >= 0:
             out += _text_actions(buf[i:end], False)[0]
@@ -279,8 +289,6 @@ class InputTranslator:
         acts, pend = _text_actions(buf[i:n - hold], hold == 0)
         out += acts
         self._buf = pend + buf[n - hold:]
-        if self._paste_bytes > _PASTE_MAX:
-            self._paste = False  # no end marker in sight: resume key translation
         return n
 
     def _escape(self, buf: bytes, i: int, out: list[Action]) -> int:
@@ -307,7 +315,7 @@ class InputTranslator:
                     return self._incomplete(buf, i, out)
             seq = buf[i:end]
             if seq == _PASTE_ON:
-                self._paste, self._paste_bytes, self._paste_at = True, 0, self._now()
+                self._paste, self._paste_at = True, self._now()
                 out.append(("raw", seq))
             elif seq in _CSI_KEYS:
                 out.append(("keys", [_CSI_KEYS[seq]]))
@@ -343,6 +351,7 @@ class InputTranslator:
         """Emit whatever is held: a lone escape is the Esc key (the relay calls this after 50 ms of
         silence); any other partial sequence goes raw."""
         self._paste_expired()
+        self._cr = False
         buf, self._buf = self._buf, b""
         if not buf:
             return []
@@ -364,7 +373,8 @@ def translate_input(data: bytes) -> list[Action]:
 def apply(client, pane_id: str, actions: list[Action]) -> int:
     """Perform actions in order; consecutive key actions go out in one send_keys call. Raw bytes
     that are not valid UTF-8 cannot ride in the JSON API and are dropped; returns how many bytes
-    were dropped so the relay can log it."""
+    were dropped so the relay MUST log it (a partial UTF-8 tail flushed from a paste ends up
+    here too), since otherwise input is lost silently."""
     dropped = 0
     keys: list[str] = []
 
