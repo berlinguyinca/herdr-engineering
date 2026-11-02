@@ -230,24 +230,36 @@ _MAX_INPUT = 64 * 1024     # bytes per terminal/input call, after base64 decodin
 _KEEP_SECONDS = 300.0      # a session outlives its last stream by this long
 _POLL_SECONDS = 0.03       # keystroke echo rides this stream
 _NOT_READY = "The terminal is not ready."
+_REASONS = {"not_live": "NOT_RUNNING", "unsafe_identity": "UNSAFE_IDENTITY"}
 
 
-class _Open:
-    """One live terminal as the manager sees it."""
+class _Pty:
+    """One live pty, kept per agent. Clients (terminal ids) come and go; the pty and its buffer stay."""
 
-    def __init__(self, tid, agent, host, account, session, now):
-        self.tid, self.agent, self.host, self.account, self.session = tid, agent, host, account, session
-        self.lock = threading.Lock()   # orders input: n is checked and the bytes written as one step
-        self.last_n = 0
+    def __init__(self, agent, host, account, session, now):
+        self.agent, self.host, self.account, self.session = agent, host, account, session
+        self.client = None             # the one client that may type and stream
         self.streams = 0
-        self.idle_since = now          # set when the last stream closes (and at open)
-        self.taken = False             # a newer open for the same agent replaced this one
+        self.idle_since = now          # set when the last stream closes (and at every open)
+        self.ended_seen = False        # a stream has delivered the child's ended frame
         self.closed = False
         self.detached = False
 
 
+class _Client:
+    """One terminal id: a numbered input sequence bound to the account that opened it."""
+
+    def __init__(self, tid, pty, account_id):
+        self.tid, self.pty, self.account_id = tid, pty, account_id
+        self.lock = threading.Lock()   # orders input: n is checked and the bytes written as one step
+        self.last_n = 0
+        self.taken = False             # a newer open for the same agent replaced this client
+
+
 class Terminal:
-    """The ``terminal/*`` procedures: owner-only pty relays onto herdr agent panes. ``repo`` is set by the API glue."""
+    """The ``terminal/*`` procedures: owner-only pty relays onto herdr agent panes. ``repo`` is set by the API glue.
+    One daemon reaper thread (started on the first open, stopped by ``close_all``) enforces the idle expiry, because
+    a timer per session would need cancelling on every stream open and close."""
 
     def __init__(self, bridge, error, *, spawn=TerminalSession, local_host=None, ttl=_KEEP_SECONDS, clock=time.monotonic):
         self.b = bridge
@@ -258,8 +270,10 @@ class Terminal:
         self.ttl = ttl
         self._clock = clock
         self._lock = threading.Lock()
-        self._by_id: dict[str, _Open] = {}
-        self._by_agent: dict[str, str] = {}   # agent id -> terminal id of its one live session
+        self._clients: dict[str, _Client] = {}   # terminal id -> its client (current clients only)
+        self._ptys: dict[str, _Pty] = {}         # agent id -> its pty
+        self._stop = None
+        self._reaper = None
 
     def procs(self) -> dict:
         return {"terminal/open": self.open, "terminal/input": self.input, "terminal/resize": self.resize,
@@ -270,20 +284,20 @@ class Terminal:
         if ctx.account.role != "operator":
             raise self.Error(403, "FORBIDDEN", "Only the owner can use the terminal.")
 
-    def _reap(self) -> None:
-        with self._lock:
-            gone = self._expired()
-        for entry in gone:
-            self._detach(entry)
+    def _missing(self):
+        return self.Error(404, "NOT_FOUND", "No such terminal.")
 
-    def _find(self, inp) -> _Open:
-        self._reap()
+    def _client(self, ctx, inp) -> _Client:   # call with self._lock held
         tid = inp.get("terminalId")
+        client = self._clients.get(tid) if isinstance(tid, str) else None
+        if client is None or client.account_id != ctx.account.account_id:
+            raise self._missing()
+        return client
+
+    def _find(self, ctx, inp) -> _Client:
+        self._reap()
         with self._lock:
-            entry = self._by_id.get(tid) if isinstance(tid, str) else None
-        if entry is None:
-            raise self.Error(404, "NOT_FOUND", "No such terminal.")
-        return entry
+            return self._client(ctx, inp)
 
     def _size(self, inp):
         rows, cols = inp.get("rows"), inp.get("cols")
@@ -293,33 +307,49 @@ class Terminal:
             raise self.Error(400, "BAD_REQUEST", "rows and cols are out of range.") from None
         return rows, cols
 
-    def _detach(self, entry: _Open) -> None:
-        """End the session and audit it once (ids and host only, never input or output)."""
-        entry.closed = True
-        entry.session.close()
-        if not entry.detached:
-            entry.detached = True
-            self.b._audit(entry.account, "rakazo.bridge.terminal.detach", entry.agent, f"host={entry.host}")
+    def _detach(self, pty: _Pty) -> None:
+        """End the pty and audit it once (ids and host only, never input or output)."""
+        pty.closed = True
+        pty.session.close()
+        if not pty.detached:
+            pty.detached = True
+            self.b._audit(pty.account, "rakazo.bridge.terminal.detach", pty.agent, f"host={pty.host}")
 
-    def _drop(self, entry: _Open) -> None:   # call with self._lock held
-        self._by_id.pop(entry.tid, None)
-        if self._by_agent.get(entry.agent) == entry.tid:
-            del self._by_agent[entry.agent]
+    def _remove(self, pty: _Pty) -> None:   # call with self._lock held
+        if self._ptys.get(pty.agent) is pty:
+            del self._ptys[pty.agent]
+        if pty.client is not None:
+            self._clients.pop(pty.client.tid, None)
 
-    def _expired(self) -> list[_Open]:   # call with self._lock held
+    def _reapable(self, pty: _Pty, now: float) -> bool:
+        if pty.streams:
+            return False
+        # an ended child is dropped as soon as a stream has shown its exit; otherwise it waits out the ttl
+        return now - pty.idle_since >= self.ttl or (not pty.session.alive and pty.ended_seen)
+
+    def _reap(self) -> None:
         now = self._clock()
-        gone = [e for e in self._by_id.values() if e.streams == 0 and now - e.idle_since >= self.ttl]
-        for entry in gone:
-            self._drop(entry)
-        return gone
+        with self._lock:
+            gone = [p for p in self._ptys.values() if self._reapable(p, now)]
+            for pty in gone:
+                self._remove(pty)
+        for pty in gone:
+            self._detach(pty)
+
+    def _reap_loop(self, stop) -> None:
+        while not stop.wait(max(0.05, min(5.0, self.ttl / 4))):
+            self._reap()
 
     def close_all(self) -> None:
         with self._lock:
-            gone = list(self._by_id.values())
-            self._by_id.clear()
-            self._by_agent.clear()
-        for entry in gone:
-            self._detach(entry)
+            stop, self._stop, self._reaper = self._stop, None, None
+            gone = list(self._ptys.values())
+            self._ptys.clear()
+            self._clients.clear()
+        if stop is not None:
+            stop.set()
+        for pty in gone:
+            self._detach(pty)
 
     # procedures ---------------------------------------------------------------------------------------------
     def open(self, ctx, inp):
@@ -334,38 +364,50 @@ class Terminal:
         try:
             argv = attach_argv(session, local_host=self.local_host)
         except AttachRefused as exc:
-            raise self.Error(exc.status, "CONFLICT", exc.body["error"]) from None
+            reason = exc.body["reason"]
+            raise self.Error(exc.status, _REASONS.get(reason, reason.upper()), exc.body["error"]) from None
         host = session["host_id"]
-        tid = secrets.token_urlsafe(16)
         self._reap()
+        tid = secrets.token_urlsafe(16)
+        retired = None
         with self._lock:
-            old = self._by_id.get(self._by_agent.get(sid))
-            if old is not None:
-                self._drop(old)
-            try:
-                if len(self._by_id) >= _MAX_SESSIONS:
+            pty = self._ptys.get(sid)
+            if pty is not None and not pty.closed and pty.session.alive:
+                pty.session.resize(rows, cols)       # reattach: same pty and buffer, the new client's size
+            else:
+                if len(self._ptys) - (pty is not None) >= _MAX_SESSIONS:
                     raise self.Error(429, "TOO_MANY_REQUESTS", "Too many live terminals.", {"Retry-After": "10"})
                 live = self.spawn(argv, rows, cols)
                 try:
                     live.start()
                 except OSError:
                     raise self.Error(503, "UNAVAILABLE", "Could not start the terminal.") from None
-                entry = _Open(tid, sid, host, ctx.account, live, self._clock())
-                self._by_id[tid], self._by_agent[sid] = entry, tid
-            except BaseException:
-                if old is not None:   # the takeover failed: the first client keeps its session
-                    self._by_id[old.tid], self._by_agent[sid] = old, old.tid
-                    old = None
-                raise
-        if old is not None:
-            old.taken = True
-            self._detach(old)
+                retired, pty = pty, _Pty(sid, host, ctx.account, live, self._clock())   # an ended one is replaced
+                if retired is not None:
+                    self._remove(retired)
+                self._ptys[sid] = pty
+            previous = pty.client
+            if previous is not None:
+                previous.taken = True                # its stream ends with taken_over; the pty lives on
+                self._clients.pop(previous.tid, None)
+            pty.client = self._clients[tid] = _Client(tid, pty, ctx.account.account_id)
+            pty.idle_since = self._clock()
+        if retired is not None:
+            self._detach(retired)
+        self._start_reaper()
         self.b._audit(ctx.account, "rakazo.bridge.terminal.attach", sid, f"host={host}")
-        return {"terminalId": tid, "seq": 0, "rows": rows, "cols": cols}
+        return {"terminalId": tid, "seq": 0, "rows": rows, "cols": cols}   # 0 replays the whole kept buffer
+
+    def _start_reaper(self) -> None:
+        with self._lock:
+            if self._reaper is None and not self.b._closed.is_set():
+                self._stop = threading.Event()
+                self._reaper = threading.Thread(target=self._reap_loop, args=(self._stop,), daemon=True)
+                self._reaper.start()
 
     def input(self, ctx, inp):
         self._owner(ctx)
-        entry = self._find(inp)
+        client = self._find(ctx, inp)
         data, n = inp.get("data"), inp.get("n")
         if not isinstance(data, str) or isinstance(n, bool) or not isinstance(n, int):
             raise self.Error(400, "BAD_REQUEST", "data must be base64 text and n an integer.")
@@ -377,59 +419,63 @@ class Terminal:
             raise self.Error(400, "BAD_REQUEST", "data is not valid base64.") from None
         if len(raw) > _MAX_INPUT:
             raise self.Error(400, "BAD_REQUEST", "Too much input in one call.")
-        with entry.lock:
-            if n == entry.last_n + 1:   # anything else is a retry or a gap: answered ok, typed never
-                entry.last_n = n
-                entry.session.write(raw)
+        with client.lock:
+            if n == client.last_n + 1:   # anything else is a retry or a gap: answered ok, typed never
+                client.last_n = n
+                client.pty.session.write(raw)
         return {"ok": True}
 
     def resize(self, ctx, inp):
         self._owner(ctx)
-        entry = self._find(inp)
+        client = self._find(ctx, inp)
         rows, cols = self._size(inp)
-        entry.session.resize(rows, cols)
+        client.pty.session.resize(rows, cols)
         return {"ok": True}
 
     def close(self, ctx, inp):
         self._owner(ctx)
         self._reap()
-        tid = inp.get("terminalId")
         with self._lock:
-            entry = self._by_id.get(tid) if isinstance(tid, str) else None
-            if entry is not None:
-                self._drop(entry)
-        if entry is not None:
-            self._detach(entry)
+            try:
+                pty = self._client(ctx, inp).pty
+            except self.Error:
+                return {"ok": True}
+            self._remove(pty)
+        self._detach(pty)
         return {"ok": True}
 
     def subscribe(self, ctx, inp):
         self._owner(ctx)
         self.b.agents._check_stream(ctx, inp)
-        entry = self._find(inp)
+        self._reap()
+        with self._lock:
+            client = self._client(ctx, inp)
+            pty = client.pty
+            pty.streams += 1
         done = threading.Event()
 
         def fetch(after: int) -> list[dict]:
-            taken = entry.taken
-            chunks = entry.session.chunks_after(after)
-            if taken and entry.closed:   # the session was closed under this client: its exit is not news
+            chunks = pty.session.chunks_after(after)
+            if client.taken:   # a newer open owns the pty: this client just stops, the session goes on
                 chunks = [c for c in chunks if not c.get("ended")]
-                chunks.append({"seq": entry.session.snapshot_seq() + 1, "taken_over": True})
+                chunks.append({"seq": max(after, pty.session.snapshot_seq()) + 1, "taken_over": True})
                 done.set()
-            elif any(c.get("ended") for c in chunks):
+            elif any(c.get("ended") for c in chunks) or pty.closed:
+                if not any(c.get("ended") for c in chunks):   # closed under the client: say so
+                    chunks.append({"seq": max(after, pty.session.snapshot_seq()) + 1, "ended": True, "exit": None})
+                pty.ended_seen = True
                 done.set()
             return chunks
 
         def release():
             with self._lock:
-                entry.streams -= 1
-                if entry.streams == 0:
-                    entry.idle_since = self._clock()
+                pty.streams -= 1
+                if pty.streams == 0:
+                    pty.idle_since = self._clock()
 
-        with self._lock:
-            entry.streams += 1
         try:
-            return self.b.agents._stream(ctx, inp, fetch, stop=lambda: done.is_set() or (entry.closed and not entry.taken),
-                                         on_close=release, poll_seconds=_POLL_SECONDS)
+            return self.b.agents._stream(ctx, inp, fetch, stop=done.is_set, on_close=release,
+                                         poll_seconds=_POLL_SECONDS)
         except BaseException:
             release()
             raise

@@ -74,7 +74,7 @@ def test_a_second_open_ends_the_first_stream_with_taken_over(bridge, ctx, repo):
     call(bridge, ctx, "open", id="a1", rows=24, cols=80)
     out = frames(resp)                                           # ends by itself, not by max_seconds
     assert out[-1] == {"seq": out[-1]["seq"], "taken_over": True} and out[-1]["seq"] > 1
-    assert not any(e.get("ended") for e in out)
+    assert not any(e.get("ended") for e in out) and not s.closed
 
 
 def test_a_closed_terminal_ends_its_stream(bridge, ctx, repo):
@@ -82,7 +82,7 @@ def test_a_closed_terminal_ends_its_stream(bridge, ctx, repo):
     bridge.stream_options["max_seconds"] = 5
     resp = call(bridge, ctx, "subscribe", terminalId=tid, cursor=0)
     call(bridge, ctx, "close", terminalId=tid)
-    assert frames(resp) == []
+    assert [e.get("ended") for e in frames(resp)] == [True]
 
 
 def test_the_stream_stops_after_the_ended_frame(bridge, ctx, repo):

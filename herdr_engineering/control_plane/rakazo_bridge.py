@@ -793,7 +793,10 @@ class RakazoBridge:
 
     def close(self) -> None:
         self._closed.set()
-        self.terminal.close_all()
+        try:
+            self.terminal.close_all()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("rakazo bridge: closing the terminals failed (%s)", type(exc).__name__)
         self.desk.close()
         self.push.close()
 

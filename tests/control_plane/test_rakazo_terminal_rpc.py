@@ -3,6 +3,7 @@ import base64
 import json
 import socket
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +47,10 @@ class FakeSession:
 
     def say(self, text):
         self.chunks.append({"seq": len(self.chunks) + 1, "data": base64.b64encode(text.encode()).decode()})
+
+    def end(self, code=0):
+        self.chunks.append({"seq": len(self.chunks) + 1, "ended": True, "exit": code})
+        self.alive = False
 
     def close(self):
         self.closed = True
@@ -222,12 +227,68 @@ def test_the_fifth_session_is_429_and_a_close_frees_a_slot(bridge, ctx, repo):
     call(bridge, ctx, "open", id="a4", rows=24, cols=80)
 
 
-def test_a_second_open_takes_over_and_closes_the_first(bridge, ctx, repo):
+def test_a_second_open_reuses_the_pty_and_retires_the_old_id(bridge, ctx, repo):
     live(repo)
     first = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
-    second = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
-    assert first != second and FakeSession.made[0].closed and not FakeSession.made[1].closed
-    assert status_of(bridge, ctx, "input", terminalId=first, data=b64("x"), n=1) == 404
+    call(bridge, ctx, "input", terminalId=first, data=b64("a"), n=1)
+    second = call(bridge, ctx, "open", id="a1", rows=30, cols=100)
+    assert first != second["terminalId"] and len(FakeSession.made) == 1 and not FakeSession.made[0].closed
+    assert FakeSession.made[0].resizes == [(30, 100)]
+    assert status_of(bridge, ctx, "input", terminalId=first, data=b64("x"), n=2) == 404
+    assert status_of(bridge, ctx, "resize", terminalId=first, rows=24, cols=80) == 404
+    assert call(bridge, ctx, "close", terminalId=first) == {"ok": True}      # a retired id cannot end the session
+    assert not FakeSession.made[0].closed
+    call(bridge, ctx, "input", terminalId=second["terminalId"], data=b64("b"), n=1)   # n restarts at 1
+    assert FakeSession.made[0].written == [b"a", b"b"]
+
+
+def test_reopen_replays_the_buffer_after_the_stream_dropped(bridge, ctx, repo):
+    live(repo)
+    tid = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
+    s = FakeSession.made[0]
+    s.say("screen")
+    again = call(bridge, ctx, "open", id="a1", rows=24, cols=80)
+    assert [c["seq"] for c in s.chunks_after(again["seq"])] == [1] and len(FakeSession.made) == 1
+    assert status_of(bridge, ctx, "subscribe", terminalId=tid, cursor=0) == 404
+
+
+def test_reuse_does_not_count_against_the_cap(bridge, ctx, repo):
+    for i in range(4):
+        call(bridge, ctx, "open", id=live(repo, f"a{i}"), rows=24, cols=80)
+    call(bridge, ctx, "open", id="a2", rows=24, cols=80)
+    assert len(FakeSession.made) == 4
+
+
+def test_an_ended_pty_is_respawned_on_the_next_open(bridge, ctx, repo, audit):
+    live(repo)
+    call(bridge, ctx, "open", id="a1", rows=24, cols=80)
+    FakeSession.made[0].end(255)
+    call(bridge, ctx, "open", id="a1", rows=24, cols=80)
+    assert len(FakeSession.made) == 2 and FakeSession.made[0].closed and not FakeSession.made[1].closed
+    assert [e["action"].rsplit(".", 1)[1] for e in audit] == ["attach", "detach", "attach"]
+
+
+def test_another_operator_cannot_use_the_terminal_id(bridge, ctx, repo):
+    live(repo)
+    tid = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
+    other = ctx_for(bridge)
+    other.account = SimpleNamespace(**{**vars(ctx.account), "account_id": "someone-else"})
+    assert status_of(bridge, other, "input", terminalId=tid, data=b64("x"), n=1) == 404
+    assert status_of(bridge, other, "subscribe", terminalId=tid, cursor=0) == 404
+    assert call(bridge, other, "close", terminalId=tid) == {"ok": True} and not FakeSession.made[0].closed
+
+
+def test_open_errors_carry_the_reason_as_the_code(bridge, ctx, repo):
+    repo.upsert_session("dead", status="closed", host_id="beast", herdr_session="default", pane_id="w1:p1",
+                        terminal_id="term_1")
+    with pytest.raises(BridgeError) as e:
+        call(bridge, ctx, "open", id="dead", rows=24, cols=80)
+    assert (e.value.status, e.value.code) == (409, "NOT_RUNNING")
+    repo.upsert_session("bad", status="working", host_id="beast", herdr_session="default", pane_id="w1 p1",
+                        terminal_id="term_1")
+    with pytest.raises(BridgeError) as e:
+        call(bridge, ctx, "open", id="bad", rows=24, cols=80)
+    assert (e.value.status, e.value.code) == (409, "UNSAFE_IDENTITY")
 
 
 def test_audit_records_attach_and_detach_without_any_data(bridge, ctx, repo, audit):
@@ -243,11 +304,11 @@ def test_audit_records_attach_and_detach_without_any_data(bridge, ctx, repo, aud
     assert "secret" not in text and b64("secret-input") not in text and tid not in text
 
 
-def test_a_takeover_audits_the_old_detach(bridge, ctx, repo, audit):
+def test_a_client_takeover_is_not_a_detach(bridge, ctx, repo, audit):
     live(repo)
     call(bridge, ctx, "open", id="a1", rows=24, cols=80)
     call(bridge, ctx, "open", id="a1", rows=24, cols=80)
-    assert [e["action"].rsplit(".", 1)[1] for e in audit] == ["attach", "detach", "attach"]
+    assert [e["action"].rsplit(".", 1)[1] for e in audit] == ["attach", "attach"]
 
 
 def test_an_idle_session_is_dropped_five_minutes_after_the_last_stream(bridge, ctx, repo, clock, audit):
@@ -272,6 +333,38 @@ def test_a_live_stream_keeps_the_session_and_its_close_starts_the_clock(bridge, 
     call(bridge, ctx, "resize", terminalId=tid, rows=24, cols=80)
     clock.now += 2
     assert status_of(bridge, ctx, "resize", terminalId=tid, rows=24, cols=80) == 404
+
+
+def test_the_reaper_closes_an_idle_session_with_no_further_calls(bridge, repo, audit):
+    live(repo)
+    t = rt.Terminal(bridge, BridgeError, spawn=FakeSession, local_host="beast", ttl=0.2)
+    t.repo = repo
+    ctx = ctx_for(bridge)
+    t.open(ctx, {"id": "a1", "rows": 24, "cols": 80})
+    deadline = time.monotonic() + 3
+    while not FakeSession.made[0].closed and time.monotonic() < deadline:
+        time.sleep(0.02)
+    t.close_all()
+    assert FakeSession.made[0].closed and [e["action"].rsplit(".", 1)[1] for e in audit] == ["attach", "detach"]
+
+
+def test_an_ended_session_without_a_stream_does_not_hold_a_slot(bridge, ctx, repo, clock):
+    for i in range(4):
+        call(bridge, ctx, "open", id=live(repo, f"a{i}"), rows=24, cols=80)
+    FakeSession.made[0].end(255)
+    resp = call(bridge, ctx, "subscribe", terminalId=next(iter(bridge.terminal._clients)), cursor=0)
+    list(resp.frames)                                            # the ended frame is delivered, the stream closes
+    resp.frames.close()
+    resp.on_close()
+    call(bridge, ctx, "open", id=live(repo, "a4"), rows=24, cols=80)
+    assert FakeSession.made[0].closed and len(FakeSession.made) == 5
+
+
+def test_an_ended_session_keeps_its_slot_until_the_ended_frame_was_seen(bridge, ctx, repo):
+    for i in range(4):
+        call(bridge, ctx, "open", id=live(repo, f"a{i}"), rows=24, cols=80)
+    FakeSession.made[0].end(255)
+    assert status_of(bridge, ctx, "open", id=live(repo, "a4"), rows=24, cols=80) == 429
 
 
 def test_agents_list_is_unaffected(bridge, repo, ctx):
