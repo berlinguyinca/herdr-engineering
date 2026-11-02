@@ -21,6 +21,7 @@ import base64
 import binascii
 import collections
 import fcntl
+import http.client
 import json
 import logging
 import os
@@ -30,12 +31,10 @@ import secrets
 import signal
 import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from pathlib import Path
 from urllib.parse import urlencode
 
-from . import host_config as _hc
 from .control_plane.terminal_attach import _PANE
 from .herdr_pane_client import HerdrError
 from .terminal_mirror import InputTranslator, PaneMirror, apply
@@ -74,41 +73,94 @@ class _Stopped(Exception):
 
 
 class ControlPlaneHttp:
-    """The relay's only network path: host.json's URL, the host token in ``X-Host-Token`` (never an API key or a bearer),
-    and the shared no-redirect opener of ``host_config`` (the token goes to that URL and nowhere else). Only the host
-    terminal routes are allowed. ``request`` returns ``(status, parsed JSON or None)``; network failures raise OSError."""
+    """The relay's only network path: host.json's URL and the host token in ``X-Host-Token`` (never an API key or a
+    bearer). Only the host terminal routes are allowed. ``http.client`` never follows a redirect, so the token goes to
+    that URL and nowhere else (the same rule as ``host_config``'s no-redirect opener). Connections are kept alive and
+    pooled (every keystroke's echo is a frame push, and a new TLS handshake per push is visible); one the gateway has
+    closed is replaced transparently. ``request`` returns ``(status, parsed JSON or None)``; network failures raise OSError."""
+
+    _IDLE = 4   # pooled idle connections: the poll loop, a few mirrors
 
     def __init__(self, config, token):
         self._url = config.control_plane_url.rstrip("/")
         self.token = token
         self.auth_rejected = False
+        self._pool_lock = threading.Lock()
+        self._idle: list[http.client.HTTPConnection] = []
 
     @property
     def url(self):
         return self._url
 
     def retarget(self, url, api_key=None):    # ConfigRefresher.sync() points the client at the live configuration
-        self._url = url.rstrip("/") if url else self._url   # the ingest key it offers is not this relay's credential
+        url = url.rstrip("/") if url else self._url   # the ingest key it offers is not this relay's credential
+        if url != self._url:
+            self._url = url
+            self.close()
+
+    def close(self) -> None:
+        with self._pool_lock:
+            idle, self._idle = self._idle, []
+        for conn in idle:
+            conn.close()
+
+    def _connection(self, timeout):
+        """(connection, reused) for the current URL; a pooled one has its socket timeout reset."""
+        base = urllib.parse.urlsplit(self._url)
+        with self._pool_lock:
+            conn = self._idle.pop() if self._idle else None
+        if conn is not None and conn.host == base.hostname and conn.port == (base.port or conn.default_port):
+            conn.timeout = timeout
+            if conn.sock is not None:
+                conn.sock.settimeout(timeout)
+            return conn, True
+        if conn is not None:
+            conn.close()
+        cls = http.client.HTTPSConnection if base.scheme == "https" else http.client.HTTPConnection
+        return cls(base.hostname, base.port, timeout=timeout), False
+
+    def _release(self, conn) -> None:
+        with self._pool_lock:
+            if len(self._idle) < self._IDLE:
+                self._idle.append(conn)
+                return
+        conn.close()
 
     def request(self, method, path, body=None, timeout=10.0):
         if not path.startswith("/api/v1/host/terminal/"):
             raise ValueError("unsupported relay route")
         data = json.dumps(body, allow_nan=False).encode() if body is not None else None
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "X-Host-Token": self.token}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        headers["X-Host-Token"] = self.token
-        req = urllib.request.Request(self._url + path, data=data, method=method, headers=headers)
-        try:
-            with _hc._OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
+        prefix = urllib.parse.urlsplit(self._url).path.rstrip("/")
+        for attempt in (0, 1):
+            try:
+                conn, reused = self._connection(timeout)
+            except (ValueError, OSError):
+                raise OSError("InvalidURL") from None
+            try:
+                conn.request(method, prefix + path, body=data, headers=headers)
+                resp = conn.getresponse()
                 raw = resp.read(MAX_REPLY + 1)
-                status = resp.status
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403):
-                self.auth_rejected = True
-            return exc.code, None
-        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
-            raise OSError(type(exc).__name__) from None
+                status, closing = resp.status, resp.will_close
+            except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+                conn.close()
+                if reused and attempt == 0:   # a pooled socket the gateway closed while idle: retry on a new one
+                    continue
+                raise OSError("ConnectionClosed") from None
+            except (http.client.HTTPException, OSError, ValueError) as exc:
+                conn.close()
+                raise OSError(type(exc).__name__) from None
+            break
+        if closing or len(raw) > MAX_REPLY:
+            conn.close()
+        else:
+            self._release(conn)
+        if status in (401, 403):
+            self.auth_rejected = True
+        if status >= 400:
+            return status, None
         if len(raw) > MAX_REPLY:
             raise OSError("reply too large")
         try:
@@ -322,7 +374,8 @@ class TerminalRelay:
             self._ids[cid] = None
             while len(self._ids) > _KEEP_IDS:
                 self._ids.popitem(last=False)
-            self._save()   # remembered before it is acted on: a crash loses a keystroke rather than typing it twice
+            if command.get("kind") != "input":   # an input is saved once, by _input, together with its (terminal, n)
+                self._save()   # remembered before it is acted on: a crash loses a keystroke rather than typing it twice
             try:
                 self._dispatch(command)
             except Exception as exc:   # one bad command must not stop the loop
@@ -480,7 +533,8 @@ class TerminalRelay:
         if gap:
             self._end(tid, term, "input_gap")
             return
-        self._save()
+        self._save()   # the single save point of an input command: its id (added by _handle) and this n reach the
+        #                disk before the keystroke, so a crash loses a keystroke rather than typing it twice
         with term.lock:
             if not term.dead:
                 self._type(tid, term, term.translator.feed(raw))

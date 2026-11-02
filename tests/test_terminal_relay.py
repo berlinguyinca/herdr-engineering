@@ -615,6 +615,7 @@ class Front:
     def __init__(self, cp, keepalive=True):
         front = self
         self.cp, self.seen, self.connections = cp, [], 0
+        self.drop_after_reply = 0     # close the socket after this many replies WITHOUT announcing it (an idle-timeout gateway)
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1" if keepalive else "HTTP/1.0"
@@ -643,6 +644,9 @@ class Front:
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
+                if front.drop_after_reply:
+                    front.drop_after_reply -= 1
+                    self.close_connection = True
 
             do_GET = do_POST = _serve
 
@@ -682,6 +686,45 @@ def test_the_relay_talks_to_the_broker_with_the_host_token_and_nothing_else(env,
     assert f.seen and all(h.get("x-host-token") == TOKEN for _, _, h in f.seen)
     assert not any("x-api-key" in h or "authorization" in h for _, _, h in f.seen)
     assert not any("host_id" in path for _, path, _ in f.seen)     # the host id comes from the token
+
+
+def _http_to(front_, **kw):
+    return ControlPlaneHttp(SimpleNamespace(host_id=HOST, control_plane_url=front_.url), token=TOKEN, **kw)
+
+
+def test_frame_pushes_reuse_one_keep_alive_connection(env, front):
+    f = front()
+    http_ = _http_to(f)
+    for _ in range(3):
+        assert http_.request("POST", f"/api/v1/host/terminal/{TID}/output", {"frames": []})[0] == 200
+    assert http_.request("GET", "/api/v1/host/terminal/wait?timeout=0")[0] == 200
+    assert f.connections == 1
+
+
+def test_a_connection_the_gateway_closed_is_replaced_transparently(env, front):
+    f = front()
+    f.drop_after_reply = 1                          # the first reply is followed by a silent close
+    http_ = _http_to(f)
+    path = f"/api/v1/host/terminal/{TID}/output"
+    assert http_.request("POST", path, {"frames": []})[0] == 200
+    assert http_.request("POST", path, {"frames": []})[0] == 200    # the stale socket fails, a new one carries it
+    assert f.connections == 2
+    assert http_.request("POST", path, {"frames": []})[0] == 200
+    assert f.connections == 2
+
+
+def test_a_server_that_never_keeps_alive_still_works(env, front):
+    f = front(keepalive=False)
+    http_ = _http_to(f)
+    for _ in range(3):
+        assert http_.request("GET", "/api/v1/host/terminal/wait?timeout=0")[0] == 200
+    assert f.connections == 3
+
+
+def test_an_unreachable_server_raises_oserror(env):
+    http_ = ControlPlaneHttp(SimpleNamespace(host_id=HOST, control_plane_url="http://127.0.0.1:1"), token=TOKEN)
+    with pytest.raises(OSError):
+        http_.request("GET", "/api/v1/host/terminal/wait?timeout=0", timeout=2)
 
 
 @pytest.mark.parametrize("token", ["not-this-hosts-token", ""])
@@ -896,6 +939,22 @@ def test_the_state_file_is_fsynced_before_the_replace(env, monkeypatch):
     open_cmd(env.cp)
     assert wait_until(lambda: "replace" in order)
     assert order[:2] == ["fsync", "replace"]
+
+
+def test_one_state_save_per_input_command_and_it_precedes_the_keystroke(env, monkeypatch):
+    import os
+    events = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("save"), real_fsync(fd))[1])
+    r = env.make()
+    env.client.hook = lambda method, pane, value: events.append("type")
+    env.start(r)
+    open_cmd(env.cp)
+    assert wait_until(lambda: r.active_terminals() == 1 and env.cp.typed_frames(TID))
+    events.clear()
+    inp(env.cp, 1, "a"), inp(env.cp, 2, "b")
+    assert wait_until(lambda: env.client.texts() == ["a", "b"])
+    assert events == ["save", "type", "save", "type"]        # at-most-once typing: persisted first, one fsync each
 
 
 def test_retarget_follows_the_url_but_the_host_token_never_changes():
