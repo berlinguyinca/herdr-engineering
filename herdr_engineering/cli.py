@@ -666,6 +666,14 @@ def _build_parser() -> argparse.ArgumentParser:
     from .architecture import command as _architecture_command
     _architecture_command.register(sub)
 
+    # host agents ----------------------------------------------------------
+    p = sub.add_parser("host", help="agents that run as services on a fleet host")
+    hsub = p.add_subparsers(dest="host_command", required=True)
+    p2 = hsub.add_parser("terminal-relay", help="relay herdr panes to the Shepherd terminal (outbound only)")
+    p2.add_argument("--once-for-test", action="store_true",
+                    help="run a single long-poll and exit (for tests and smoke checks)")
+    p2.set_defaults(func=_cmd_host_terminal_relay)
+
     # control-plane --------------------------------------------------------
     p = sub.add_parser("control-plane",
                        help="HerdR Dev Fabric Control Plane (spec 0190)")
@@ -999,6 +1007,28 @@ def _cmd_cp_mission_feed(args) -> int:
                     control_dir=Path(args.control_dir) if args.control_dir else None,
                     interval=args.interval, once=args.once, refresher=refresher,
                     follow_url=not args.control_plane)
+
+
+def _cmd_host_terminal_relay(args) -> int:
+    from .herdr_pane_client import HerdrPaneClient
+    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
+    from .terminal_relay import ControlPlaneHttp, RelayLocked, TerminalRelay
+    try:
+        cfg = host_config()
+        refresher = None if args.once_for_test else ConfigRefresher(cfg)
+        relay = TerminalRelay(cfg, HerdrPaneClient(), ControlPlaneHttp(cfg), refresher=refresher)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: relay.stop())
+    try:
+        relay.run_forever(once=args.once_for_test)
+    except RelayLocked as exc:
+        print(f"herdr-eng: {exc}", file=sys.stderr)
+        return 1
+    except HostConfigUnavailable as exc:   # the control plane revoked this host's token
+        return exit_unavailable(exc)
+    return 0
 
 
 def _cmd_cp_llm_proxy(args) -> int:

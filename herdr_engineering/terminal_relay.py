@@ -1,0 +1,545 @@
+"""Host relay for the Shepherd terminal: carries a herdr pane's screen to the control plane and the phone's typing back.
+
+One relay runs per fleet host, as the user that runs herdr. It only makes outbound calls: it long-polls the control
+plane's broker (``GET /api/v1/host/terminal/wait``) for commands and pushes screen frames back
+(``POST /api/v1/host/terminal/<id>/output``), authenticated with the host's own ingest key from ``host.json``. What it
+does with a command is limited to herdr socket calls: it starts no process and touches no file chosen by a command.
+
+Delivery from the broker is at-least-once and the relay makes it exactly-once for typing: every command id and every
+``(terminal, n)`` is remembered (also across a restart, in the state file) BEFORE it is acted on, so a redelivered batch
+types nothing twice; a gap in ``n`` ends that terminal, because typing around a hole would corrupt the line. The ``after``
+cursor goes out with the next wait, only once the commands up to it were handled. A terminal the broker retired (stale,
+input_overflow, host_offline, taken over) answers the next frame push with 404, which stops its mirror. Frames are whole
+screens, so a failed push is repaired by sending the current screen again, never by queueing frames.
+
+Nothing here logs frame data, input bytes, key material or a full terminal id: only counts and short reasons.
+"""
+from __future__ import annotations
+
+import base64
+import binascii
+import collections
+import fcntl
+import json
+import logging
+import os
+import random
+import re
+import secrets
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from urllib.parse import quote, urlencode
+
+from . import host_config as _hc
+from .control_plane.terminal_attach import _PANE, _TERMINAL
+from .herdr_pane_client import HerdrError
+from .terminal_mirror import InputTranslator, PaneMirror, apply
+
+log = logging.getLogger(__name__)
+
+MAX_MIRRORS = 4            # live mirror threads, whatever the broker asks for
+MAX_INPUT = 64 * 1024      # bytes per input command (the broker's own cap)
+MAX_REPLY = 24 * 1024 * 1024   # 256 queued commands of 64 KB each, base64 encoded
+_WAIT = 25                 # seconds the broker may hold a wait
+_WAIT_SLACK = 10.0         # http timeout beyond the wait
+_POST_TIMEOUT = 10.0
+_POST_FRAMES = 20          # frames per output POST (the broker's cap)
+_BACKOFF_MIN, _BACKOFF_MAX = 0.5, 8.0
+_AUTH_BACKOFF = 30.0       # a refused key must not hammer the control plane
+_AUTH_LOG_EVERY = 60.0
+_FLUSH_AFTER = 0.05        # silence after which a lone ESC becomes the Esc key
+_CHANGE_WAIT = 0.3         # how long a mirror waits for a change before checking whether it should stop
+_FAIL_LIMIT = 3            # consecutive herdr failures before a terminal ends with herdr_unavailable
+_FAIL_PAUSE = 0.25
+_PUSH_RETRY = 2.0          # pause after a refused or failed frame push
+_KEEP_IDS = 300            # remembered command ids (the broker queues at most 256)
+_JOIN = 1.0
+_CMD_ID = re.compile(r"^[0-9a-f]{8}-\d{1,20}-[A-Za-z0-9_-]{1,64}$")
+STATE_REL = Path(".local/share/herdr-engineering/state")
+
+
+class RelayLocked(RuntimeError):
+    """Another relay already runs for this host."""
+
+
+class _Stopped(Exception):
+    pass
+
+
+class ControlPlaneHttp:
+    """The relay's only network path: host.json's URL, the ingest key in ``X-API-Key``, and the shared no-redirect
+    opener of ``host_config`` (the key goes to that URL and nowhere else). Only the host terminal routes are allowed.
+    ``request`` returns ``(status, parsed JSON or None)``; network failures raise OSError."""
+
+    def __init__(self, config):
+        self.url = config.control_plane_url.rstrip("/")
+        self.key = config.api_key
+        self.auth_rejected = False
+
+    def retarget(self, url, api_key):    # ConfigRefresher.sync() points the client at the live configuration
+        if url:
+            self.url = url.rstrip("/")
+        if api_key is not None:
+            self.key = api_key
+
+    def request(self, method, path, body=None, timeout=10.0):
+        if not path.startswith("/api/v1/host/terminal/"):
+            raise ValueError("unsupported relay route")
+        data = json.dumps(body, allow_nan=False).encode() if body is not None else None
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if self.key:
+            headers["X-API-Key"] = self.key
+        req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
+        try:
+            with _hc._OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
+                raw = resp.read(MAX_REPLY + 1)
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                self.auth_rejected = True
+            return exc.code, None
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            raise OSError(type(exc).__name__) from None
+        if len(raw) > MAX_REPLY:
+            raise OSError("reply too large")
+        try:
+            return status, json.loads(raw) if raw else None
+        except ValueError:
+            return status, None
+
+
+class _Term:
+    def __init__(self, pane, last_n=0):
+        self.pane = pane
+        self.last_n = last_n
+        self.translator = InputTranslator()
+        self.lock = threading.Lock()   # orders typing and the 50 ms flush for this terminal
+        self.stop = threading.Event()
+        self.thread = None
+        self.dead = False
+
+
+class TerminalRelay:
+    def __init__(self, config, client, http, *, state_dir=None, sleep=None, rng=random.random,
+                 clock=time.monotonic, refresher=None):
+        self.config = config
+        self.client = client
+        self.http = http
+        self.host_id = config.host_id
+        self.state_dir = Path(state_dir) if state_dir else Path(
+            os.environ.get("HERDR_ENGINEERING_STATE") or Path.home() / STATE_REL)
+        self._stop = threading.Event()
+        self._sleep = sleep or self._stop.wait
+        self._rng = rng
+        self._clock = clock              # throttles the auth warning only
+        self._refresher = refresher
+        self._lock = threading.Lock()    # _terms, _threads
+        self._save_lock = threading.Lock()
+        self._terms: dict[str, _Term] = {}
+        self._threads: list[threading.Thread] = []
+        self._ids: collections.OrderedDict[str, None] = collections.OrderedDict()
+        self._after: str | None = None
+        self._lock_fd = None
+        self._running = False
+        self._flush_cv = threading.Condition()
+        self._flush_at: dict[str, float] = {}
+        self._flusher = None
+        self._fails = 0
+        self._auth_logged: float | None = None
+        self._quick_empty = 0
+        self._saved: dict = self._load()
+
+    # -- single instance and state ---------------------------------------------------------------
+    def acquire_lock(self) -> None:
+        if self._lock_fd is not None:
+            return
+        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self.state_dir / "terminal-relay.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise RelayLocked("another terminal relay is already running for this host") from None
+        self._lock_fd = fd
+
+    def _release_lock(self) -> None:
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)    # closing drops the flock
+            self._lock_fd = None
+
+    def _state_path(self) -> Path:
+        return self.state_dir / "terminal-relay-state.json"
+
+    def _load(self) -> dict:
+        try:
+            data = json.loads(self._state_path().read_text())
+            ids = [i for i in data.get("ids", []) if isinstance(i, str) and _CMD_ID.fullmatch(i)][-_KEEP_IDS:]
+            terms = {t: v for t, v in data.get("terminals", {}).items()
+                     if _TERMINAL.fullmatch(t) and isinstance(v, dict) and isinstance(v.get("pane"), str)
+                     and _PANE.fullmatch(v["pane"]) and type(v.get("n")) is int and v["n"] >= 0}
+        except (OSError, ValueError, AttributeError, TypeError):
+            return {"terminals": {}}
+        self._ids.update((i, None) for i in ids)
+        return {"terminals": dict(list(terms.items())[:MAX_MIRRORS])}
+
+    def _save(self) -> None:
+        with self._lock:
+            snap = {"ids": list(self._ids),
+                    "terminals": {t: {"pane": x.pane, "n": x.last_n} for t, x in self._terms.items()}}
+        with self._save_lock:
+            tmp = self.state_dir / f".terminal-relay-state.{secrets.token_hex(4)}.tmp"
+            try:
+                self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(snap, fh)
+                os.replace(tmp, self._state_path())
+            except OSError:
+                log.warning("terminal relay: could not save its state")
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    # -- loop --------------------------------------------------------------------------------------
+    def run_forever(self, *, once: bool = False) -> None:
+        self.acquire_lock()
+        self._running = True
+        try:
+            self._start_flusher()
+            self._restore()
+            while not self._stop.is_set():
+                self._poll()
+                if once:
+                    break
+        finally:
+            self._running = False
+            self._shutdown()
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._flush_cv:
+            self._flush_cv.notify_all()
+        if not self._running:
+            self._shutdown()
+
+    def active_terminals(self) -> int:
+        with self._lock:
+            return len(self._terms)
+
+    def _shutdown(self) -> None:
+        with self._lock:
+            for term in self._terms.values():
+                term.stop.set()
+            threads = list(self._threads)
+        for thread in threads + [self._flusher]:
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(5)
+        self._release_lock()
+
+    def _backoff(self) -> float:
+        base = min(_BACKOFF_MAX, _BACKOFF_MIN * 2 ** self._fails)
+        self._fails += 1
+        return min(_BACKOFF_MAX, base * (1 - 0.2 * self._rng()))   # jitter downwards: never above the cap
+
+    def _poll(self) -> None:
+        try:
+            if self._refresher is not None:
+                self._refresher.sync(self.http)
+            query = {"host_id": self.host_id, "timeout": _WAIT}
+            if self._after:
+                query["after"] = self._after
+            began = time.monotonic()
+            status, body = self.http.request("GET", "/api/v1/host/terminal/wait?" + urlencode(query),
+                                             timeout=_WAIT + _WAIT_SLACK)
+        except OSError:
+            log.warning("terminal relay: the control plane is unreachable")
+            self._sleep(self._backoff())
+            return
+        if status in (401, 403):
+            now = self._clock()
+            if self._auth_logged is None or now - self._auth_logged >= _AUTH_LOG_EVERY:
+                self._auth_logged = now
+                log.warning("terminal relay: the control plane refused this host's key (HTTP %d); is its ingest key "
+                            "listed for this host in agent_hosts?", status)
+            self._sleep(_AUTH_BACKOFF * (1 + 0.2 * self._rng()))
+            return
+        commands = body.get("commands") if isinstance(body, dict) else None
+        if status != 200 or not isinstance(commands, list):
+            log.warning("terminal relay: unexpected answer from the control plane (HTTP %s)", status)
+            self._sleep(self._backoff())
+            return
+        self._fails = 0
+        self._auth_logged = None
+        if not commands:   # a timeout, or a newer waiter took over: poll again at once, unless that spins
+            self._quick_empty = self._quick_empty + 1 if time.monotonic() - began < 0.01 else 0
+            if self._quick_empty >= 5:
+                self._quick_empty = 0
+                self._sleep(0.5)
+            return
+        self._quick_empty = 0
+        for command in commands:
+            if self._stop.is_set():
+                return
+            self._handle(command)
+
+    # -- commands ----------------------------------------------------------------------------------
+    def _handle(self, command) -> None:
+        cid = command.get("id") if isinstance(command, dict) else None
+        if not isinstance(cid, str) or not _CMD_ID.fullmatch(cid):
+            log.warning("terminal relay: ignored a command without a valid id")
+            return
+        if cid not in self._ids:
+            self._ids[cid] = None
+            while len(self._ids) > _KEEP_IDS:
+                self._ids.popitem(last=False)
+            self._save()   # remembered before it is acted on: a crash loses a keystroke rather than typing it twice
+            try:
+                self._dispatch(command)
+            except Exception as exc:   # one bad command must not stop the loop
+                log.warning("terminal relay: a %r command failed (%s)", str(command.get("kind"))[:16], type(exc).__name__)
+        self._after = cid
+
+    def _dispatch(self, command) -> None:
+        kind, tid = command.get("kind"), command.get("terminal")
+        if not isinstance(tid, str) or not _TERMINAL.fullmatch(tid):
+            log.warning("terminal relay: ignored a command for a malformed terminal id")
+            return
+        if kind == "open":
+            self._open(tid, command.get("pane_id"))
+        elif kind == "input":
+            self._input(tid, command.get("n"), command.get("data"))
+        elif kind == "zoom":
+            self._zoom(tid, command.get("zoom"))
+        elif kind == "resize":
+            pass   # the pane owns its size: the phone fits its view to the pane, the pty is never resized
+        elif kind == "close":
+            with self._lock:
+                term = self._terms.get(tid)
+            if term is not None:
+                self._forget(tid, term)
+        else:
+            log.warning("terminal relay: ignored an unknown command kind")
+
+    def _term(self, tid):
+        with self._lock:
+            return self._terms.get(tid)
+
+    def _alive_threads(self) -> int:
+        with self._lock:
+            self._threads = [t for t in self._threads if t.is_alive()]
+            return len(self._threads)
+
+    def _open(self, tid, pane) -> None:
+        if self._term(tid) is not None:
+            return
+        if not isinstance(pane, str) or not _PANE.fullmatch(pane):
+            self._refuse(tid, "invalid_pane")
+            return
+        if self._alive_threads() >= MAX_MIRRORS:
+            self._refuse(tid, "too_many_terminals")
+            return
+        try:
+            listed = any(p.get("pane_id") == pane for p in self.client.list_panes())
+        except (HerdrError, OSError):
+            self._refuse(tid, "herdr_unavailable")
+            return
+        if not listed:   # only panes herdr lists on THIS host are served
+            self._refuse(tid, "pane_closed")
+            return
+        self._start(tid, _Term(pane))
+
+    def _refuse(self, tid, reason) -> None:
+        log.warning("terminal relay: refused to open a terminal (%s)", reason)
+        self._push(tid, [{"ended": True, "exit": None, "reason": reason}])
+
+    def _start(self, tid, term) -> None:
+        thread = threading.Thread(target=self._mirror_loop, args=(tid, term), name="terminal-mirror-" + tid[5:13],
+                                  daemon=True)
+        term.thread = thread
+        with self._lock:
+            self._terms[tid] = term
+            self._threads.append(thread)
+        self._save()
+        thread.start()
+
+    def _restore(self) -> None:
+        # Terminals that were open when the relay last stopped keep their n and get a mirror again; their
+        # opens are remembered, so the broker's redelivery does not start them a second time.
+        for tid, saved in self._saved["terminals"].items():
+            try:
+                listed = any(p.get("pane_id") == saved["pane"] for p in self.client.list_panes())
+                reason = None if listed else "pane_closed"
+            except (HerdrError, OSError):
+                reason = "herdr_unavailable"
+            if reason:
+                self._push(tid, [{"ended": True, "exit": None, "reason": reason}])
+            else:
+                self._start(tid, _Term(saved["pane"], saved["n"]))
+        self._saved = {"terminals": {}}
+        self._save()
+
+    def _forget(self, tid, term) -> None:
+        term.dead = True
+        term.stop.set()
+        with self._lock:
+            if self._terms.get(tid) is term:
+                del self._terms[tid]
+        with self._flush_cv:
+            self._flush_at.pop(tid, None)
+        self._save()
+        if term.thread is not None and term.thread is not threading.current_thread():
+            term.thread.join(_JOIN)
+
+    def _end(self, tid, term, reason) -> None:
+        if not term.dead:
+            log.info("terminal relay: a terminal ended (%s)", reason)
+            self._push(tid, [{"ended": True, "exit": None, "reason": reason}])
+        self._forget(tid, term)
+
+    # -- input -------------------------------------------------------------------------------------
+    def _input(self, tid, n, data) -> None:
+        term = self._term(tid)
+        if term is None:   # closed, ended or never opened: a stale input is never typed
+            return
+        if type(n) is not int or n < 1 or not isinstance(data, str) or len(data) > MAX_INPUT * 4 // 3 + 4:
+            log.warning("terminal relay: ignored a malformed input command")
+            return
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            log.warning("terminal relay: ignored an input command that is not base64")
+            return
+        if len(raw) > MAX_INPUT:
+            return
+        with term.lock:
+            if term.dead or n <= term.last_n:   # a retry of what was typed already
+                return
+            if n != term.last_n + 1:
+                log.warning("terminal relay: input gap (expected %d, got %d); ending the terminal", term.last_n + 1, n)
+                gap = True
+            else:
+                gap = False
+                term.last_n = n
+        if gap:
+            self._end(tid, term, "input_gap")
+            return
+        self._save()
+        with term.lock:
+            if not term.dead:
+                self._type(tid, term, term.translator.feed(raw))
+        with self._flush_cv:
+            self._flush_at[tid] = time.monotonic() + _FLUSH_AFTER
+            self._flush_cv.notify_all()
+
+    def _type(self, tid, term, actions) -> None:   # call with term.lock held
+        if not actions:
+            return
+        try:
+            dropped = apply(self.client, term.pane, actions)
+        except HerdrError as exc:
+            if "not_found" in exc.code:
+                self._end(tid, term, "pane_closed")
+            else:
+                log.warning("terminal relay: typing failed (%s)", exc.code)
+            return
+        except (OSError, ValueError) as exc:
+            log.warning("terminal relay: typing failed (%s)", type(exc).__name__)
+            return
+        if dropped:
+            log.warning("terminal relay: input dropped %d bytes that herdr cannot carry", dropped)
+
+    def _start_flusher(self) -> None:
+        self._flusher = threading.Thread(target=self._flush_loop, name="terminal-flush", daemon=True)
+        self._flusher.start()
+
+    def _flush_loop(self) -> None:
+        while not self._stop.is_set():
+            with self._flush_cv:
+                now = time.monotonic()
+                due = [t for t, at in self._flush_at.items() if at <= now]
+                for tid in due:
+                    del self._flush_at[tid]
+                if not due:
+                    nxt = min(self._flush_at.values(), default=None)
+                    self._flush_cv.wait(1.0 if nxt is None else max(0.0, min(1.0, nxt - now)))
+                    continue
+            for tid in due:
+                term = self._term(tid)
+                if term is not None:
+                    with term.lock:
+                        if not term.dead:
+                            self._type(tid, term, term.translator.flush())
+
+    def _zoom(self, tid, on) -> None:
+        term = self._term(tid)
+        if term is None or not isinstance(on, bool):
+            return
+        try:
+            self.client.zoom(term.pane, on)
+        except HerdrError as exc:
+            log.warning("terminal relay: zoom failed (%s)", exc.code)
+        except (OSError, ValueError) as exc:
+            log.warning("terminal relay: zoom failed (%s)", type(exc).__name__)
+
+    # -- output ------------------------------------------------------------------------------------
+    def _push(self, tid, frames) -> int | None:
+        """POST frames (at most 20 per call); the first non-200 status, or None when unreachable."""
+        path = f"/api/v1/host/terminal/{tid}/output?host_id={quote(self.host_id, safe='')}"
+        status = None
+        for i in range(0, len(frames), _POST_FRAMES):
+            try:
+                status, _ = self.http.request("POST", path, {"frames": frames[i:i + _POST_FRAMES]},
+                                              timeout=_POST_TIMEOUT)
+            except (OSError, ValueError):
+                return None
+            if status != 200:
+                return status
+        return status
+
+    def _mirror_loop(self, tid, term) -> None:
+        def pause(seconds):
+            if term.stop.wait(seconds) or self._stop.is_set():
+                raise _Stopped
+
+        def fresh():   # a new mirror forgets what it sent, so the current screen goes out again
+            return PaneMirror(self.client, term.pane, sleep=pause)
+
+        mirror, fails, pushing = fresh(), 0, True
+        try:
+            while not term.stop.is_set() and not self._stop.is_set():
+                try:
+                    frame = mirror.frame() if mirror.wait_for_change(_CHANGE_WAIT) else None
+                    fails = 0
+                except HerdrError as exc:
+                    if "not_found" in exc.code:
+                        self._end(tid, term, "pane_closed")
+                        return
+                    fails += 1
+                except (OSError, ValueError, KeyError, TypeError):
+                    fails += 1
+                else:
+                    if frame is not None:
+                        status = self._push(tid, [frame])
+                        if status == 404:   # the broker retired this terminal
+                            self._forget(tid, term)
+                            return
+                        if status != 200:
+                            if pushing:
+                                log.warning("terminal relay: pushing frames failed (%s)", status or "unreachable")
+                            pushing, mirror = False, fresh()
+                            pause(_PUSH_RETRY)
+                        else:
+                            pushing = True
+                    continue
+                if fails >= _FAIL_LIMIT:
+                    self._end(tid, term, "herdr_unavailable")
+                    return
+                pause(_FAIL_PAUSE)
+        except _Stopped:
+            return
