@@ -21,6 +21,7 @@ def bridge(repo):
         {"email": "a@example.com", "password_scrypt": rb.hash_password("pw pw pw pw pw", n=2 ** 14), "role": "operator"}]})
     b = rb.RakazoBridge(cfg, assistant=None, version="x")
     b.agents.repo = repo
+    b.agents.refresh_interval = 0
     b.stream_options = {"poll_seconds": 0.01, "heartbeat_seconds": 0.05, "max_seconds": 0.5}
     return b
 
@@ -143,3 +144,43 @@ def test_subscribe_releases_slot_and_stops_when_token_revoked(bridge, repo, ctx)
     assert held == rb.MAX_STREAMS
     for _ in range(held):
         bridge._streams.release()
+
+
+def _fetch_list(bridge, after):
+    return bridge.agents._list_fetch(bridge.agents.repo, after)
+
+
+def test_list_stream_drops_a_shown_row_that_only_goes_stale(bridge, repo, monkeypatch):
+    from herdr_engineering.control_plane import rakazo_agents as ra
+    bridge.agents.refresh_interval = 0
+    repo.upsert_session("quiet", status="idle")
+    first = _fetch_list(bridge, -1)
+    assert [f["row"]["id"] for f in first] == ["quiet"]
+    real = ra.time.time()
+    monkeypatch.setattr(ra.time, "time", lambda: real + 8 * 86400)
+    dropped = _fetch_list(bridge, first[-1]["seq"])
+    assert [(f["row"]["id"], f["row"]["status"]) for f in dropped] == [("quiet", "idle")]
+    assert _fetch_list(bridge, dropped[-1]["seq"]) == []
+
+
+def test_list_stream_cursor_ahead_of_counter_gets_a_snapshot(bridge, repo):
+    bridge.agents.refresh_interval = 0
+    repo.upsert_session("a", status="working")
+    repo.upsert_session("old", status="closed")
+    got = _fetch_list(bridge, 4000)
+    assert [f["row"]["id"] for f in got] == ["a"]
+
+
+def test_list_stream_rebuilds_rows_once_per_interval_across_subscribers(bridge, repo):
+    import threading
+    bridge.agents.refresh_interval = 60
+    repo.upsert_session("a", status="working")
+    calls = []
+    real = repo.list_sessions
+    repo.list_sessions = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(_fetch_list(bridge, -1))) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len(calls) == 1
+    assert all([f["row"]["id"] for f in r] == ["a"] for r in results)

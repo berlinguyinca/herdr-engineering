@@ -95,6 +95,9 @@ class Agents:
         self._changes: dict[str, tuple[int, dict]] = {}   # session id -> (seq, row) of its latest change
         self._prints: dict[str, str] = {}                  # session id -> fingerprint of its row as last seen
         self._shown: set[str] = set()                      # ids the list stream has told the app to show
+        self.refresh_interval = 1.0                        # seconds between row rebuilds, shared by all subscribers
+        self._refresh_lock = threading.Lock()
+        self._refreshed_at: float | None = None
 
     def procs(self) -> dict:
         return {"agents/list": self.list, "agents/get": self.get,
@@ -216,10 +219,11 @@ class Agents:
             for row in sorted(rows, key=lambda r: _epoch(r.get("updated_at"))):
                 rid = row["id"]
                 print_ = json.dumps(row, sort_keys=True, default=str)
-                if self._prints.get(rid) == print_:
-                    continue
+                shown_now = bool(visible([row], show_older=False, now=now))
+                if self._prints.get(rid) == print_ and (shown_now or rid not in self._shown):
+                    continue   # unchanged; a shown row that only went stale falls through to its drop frame
                 self._prints[rid] = print_
-                if visible([row], show_older=False, now=now):
+                if shown_now:
                     self._shown.add(rid)
                 elif rid in self._shown:
                     self._shown.discard(rid)
@@ -228,13 +232,25 @@ class Agents:
                 self._counter += 1
                 self._changes[rid] = (self._counter, row)
 
+    def _refresh_throttled(self, repo) -> None:
+        """At most one rebuild per ``refresh_interval`` however many subscribers poll; the others wait and then read."""
+        with self._refresh_lock:
+            now = time.monotonic()
+            if self._refreshed_at is not None and now - self._refreshed_at < self.refresh_interval:
+                return
+            self._refresh(repo)
+            self._refreshed_at = time.monotonic()
+
+    def _list_fetch(self, repo, after: int) -> list[dict]:
+        self._refresh_throttled(repo)
+        with self._lock:
+            if after > self._counter:   # a cursor from before a restart: resend what is shown now
+                fresh = [c for rid, c in self._changes.items() if rid in self._shown]
+            else:
+                fresh = [c for c in self._changes.values() if c[0] > after]
+        return [{"seq": seq, "row": row} for seq, row in sorted(fresh, key=lambda c: c[0])]
+
     def subscribe_list(self, ctx, inp):
         self._check_stream(ctx, inp)
         repo = self._repo()
-
-        def fetch(after: int) -> list[dict]:
-            self._refresh(repo)
-            with self._lock:
-                fresh = sorted((c for c in self._changes.values() if c[0] > after), key=lambda c: c[0])
-            return [{"seq": seq, "row": row} for seq, row in fresh]
-        return self._stream(ctx, inp, fetch)
+        return self._stream(ctx, inp, lambda after: self._list_fetch(repo, after))
