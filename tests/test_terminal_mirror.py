@@ -7,7 +7,7 @@ import base64
 import pytest
 
 from herdr_engineering.herdr_pane_client import HerdrError, HerdrPaneClient
-from herdr_engineering.terminal_mirror import InputTranslator, PaneMirror, apply, translate_input
+from herdr_engineering.terminal_mirror import MAX_FRAME, InputTranslator, PaneMirror, apply, translate_input
 
 PANE = "w1:p1"
 PREFIX = "\x1b[0m\x1b[H\x1b[2J"
@@ -20,17 +20,21 @@ class FakeClient:
         self.viewport_rows = viewport_rows
         self.calls = []
         self.reads = 0
+        self.layout_calls = 0
+        self.list_calls = 0
 
     def read_visible(self, pane_id):
         self.reads += 1
         return self.screens[0] if len(self.screens) == 1 else self.screens.pop(0)
 
     def layout(self, pane_id):
+        self.layout_calls += 1
         if self._layout is None:
             raise HerdrError("pane_not_in_layout", "x")
         return {"width": self._layout[1], "height": self._layout[0]}
 
     def list_panes(self):
+        self.list_calls += 1
         return [{"pane_id": PANE, "scroll": {"viewport_rows": self.viewport_rows}}]
 
     def send_text(self, pane_id, text):
@@ -310,11 +314,12 @@ def test_paste_end_marker_false_alarm_stays_text():
     assert t.feed(b"Xq") == [("text", "\x1b[2Xq")]
 
 
-def test_paste_flush_emits_held_text():
+def test_paste_flush_keeps_holding_a_possible_end_marker():
     t = InputTranslator()
     t.feed(b"\x1b[200~")
     assert t.feed(b"\x1b") == []
-    assert t.flush() == [("text", "\x1b")]
+    assert t.flush() == []
+    assert t.feed(b"[201~\r") == [("raw", b"\x1b[201~"), ("keys", ["enter"])]
 
 
 def test_100kb_paste_splits_into_4kb_text_actions():
@@ -390,3 +395,170 @@ def test_apply_with_real_client_validators_accepts_every_translation():
     apply(c, PANE, translate_input(b"ls\r\x03\x1b[1;5D\x1bb\x1b[5~\x7f\t\x1b[Z" + "é".encode()))
     assert [m for m, _ in c.sent] == ["pane.send_text", "pane.send_keys", "pane.send_input",
                                       "pane.send_keys", "pane.send_text"]
+
+
+# -- fix round 1 -------------------------------------------------------------------------------
+def test_paste_marker_split_across_a_flush():
+    t = InputTranslator()
+    assert t.feed(b"\x1b[200~ab\x1b[20") == [("raw", b"\x1b[200~"), ("text", "ab")]
+    assert t.flush() == []
+    assert t.feed(b"1~\r") == [("raw", b"\x1b[201~"), ("keys", ["enter"])]
+
+
+def test_partial_utf8_flushed_in_paste_mode_goes_raw():
+    t = InputTranslator()
+    assert t.feed(b"\x1b[200~a\xe4\xb8") == [("raw", b"\x1b[200~"), ("text", "a")]
+    assert t.flush() == [("raw", b"\xe4\xb8")]
+    assert t.feed(b"x\x1b[201~") == [("text", "x"), ("raw", b"\x1b[201~")]
+
+
+def test_missing_end_marker_cannot_capture_input_beyond_2mb():
+    t = InputTranslator()
+    t.feed(b"\x1b[200~")
+    t.feed(b"a" * (2 * 1024 * 1024 + 10))
+    assert t.feed(b"\x03\x1b[A") == [("keys", ["ctrl+c"]), ("keys", ["up"])]
+
+
+def test_missing_end_marker_cannot_capture_input_after_30s():
+    clock = Clock()
+    t = InputTranslator(now=clock.now)
+    t.feed(b"\x1b[200~ab")
+    clock.t += 29
+    assert t.feed(b"\x03") == [("text", "\x03")]  # still pasting; refreshes the timer
+    clock.t += 31
+    assert t.feed(b"\x03\x1b[A") == [("keys", ["ctrl+c"]), ("keys", ["up"])]
+
+
+def test_paste_timeout_also_applies_to_flush_and_held_marker():
+    clock = Clock()
+    t = InputTranslator(now=clock.now)
+    t.feed(b"\x1b[200~\x1b[2")
+    clock.t += 31
+    assert t.flush() == [("raw", b"\x1b[2")]
+    assert t.feed(b"\x03") == [("keys", ["ctrl+c"])]
+
+
+def test_crlf_is_one_enter():
+    assert translate_input(b"a\r\nb") == [("text", "a"), ("keys", ["enter"]), ("text", "b")]
+    assert translate_input(b"\r\r\n\n") == [("keys", ["enter"])] * 3
+
+
+def test_crlf_split_across_feeds_is_one_enter():
+    t = InputTranslator()
+    assert t.feed(b"\r") == [("keys", ["enter"])]
+    assert t.feed(b"\nx") == [("text", "x")]
+    assert t.feed(b"\n") == [("keys", ["enter"])]  # a bare LF later is a real enter
+
+
+def test_crlf_inside_paste_stays_text():
+    assert translate_input(b"\x1b[200~a\r\nb\x1b[201~") == [
+        ("raw", b"\x1b[200~"), ("text", "a\r\nb"), ("raw", b"\x1b[201~")]
+
+
+def test_colour_only_change_produces_a_frame():
+    m, clock = mirror(FakeClient(["\x1b[31mhi", "\x1b[32mhi"], layout=(2, 2)))
+    assert m.frame() is not None
+    clock.t += 1
+    assert decode(m.frame()) == PREFIX + "\x1b[32mhi"
+
+
+def test_herdr_error_in_wait_for_change_propagates():
+    c = FakeClient(["a"], layout=(2, 2))
+    m, _ = mirror(c)
+
+    def boom(_):
+        raise HerdrError("unavailable", "gone")
+
+    c.read_visible = boom
+    with pytest.raises(HerdrError):
+        m.wait_for_change(1)
+
+
+def test_one_read_per_emitted_frame_after_wait_for_change():
+    c = FakeClient(["a", "b"], layout=(2, 2))
+    m, _ = mirror(c)
+    m.frame()
+    assert m.wait_for_change(5) is True
+    assert decode(m.frame()) == PREFIX + "b"
+    assert c.reads == 2
+
+
+def test_frame_over_cap_is_re_encoded_without_colour():
+    row = "\x1b[31mxxxxx\x1b[0m" * 200
+    c = FakeClient(["\n".join([row] * 97)], layout=(97, 1000))
+    m, _ = mirror(c)
+    f = m.frame()
+    assert len(f["data"]) <= MAX_FRAME
+    body = decode(f)
+    assert "\x1b[31m" not in body and body.startswith(PREFIX)
+    assert body[len(PREFIX):].split("\r\n") == ["x" * 1000] * 97
+    assert (f["rows"], f["cols"]) == (97, 1000)
+
+
+def test_frame_still_over_cap_drops_trailing_lines():
+    c = FakeClient(["\n".join(f"{i:03d}" + "y" * 3000 for i in range(97))], layout=(97, 3003))
+    m, _ = mirror(c)
+    f = m.frame()
+    assert len(f["data"]) <= MAX_FRAME
+    lines = decode(f)[len(PREFIX):].split("\r\n")
+    assert 20 < len(lines) < 97
+    assert lines[0].startswith("000") and all(len(x) == 3003 for x in lines)
+
+
+def test_small_coloured_frame_keeps_colour():
+    m, _ = mirror(FakeClient(["\x1b[31mred"], layout=(2, 2)))
+    assert "\x1b[31m" in decode(m.frame())
+
+
+def test_failing_layout_does_not_list_panes_on_every_frame():
+    c = FakeClient(["a", "b", "c"])
+    m, clock = mirror(c)
+    for _ in range(3):
+        assert m.frame() is not None
+        clock.t += 1
+    assert (c.layout_calls, c.list_calls) == (1, 1)
+    clock.t += 5
+    c.screens = ["d"]
+    m.frame()
+    assert (c.layout_calls, c.list_calls) == (2, 2)
+
+
+def test_layout_is_cached_for_5_seconds():
+    c = FakeClient(["a", "b", "c"], layout=(9, 9))
+    m, clock = mirror(c)
+    for _ in range(3):
+        m.frame()
+        clock.t += 1
+    assert c.layout_calls == 1
+
+
+def test_width_fallback_counts_tabs_and_wide_characters():
+    m, _ = mirror(FakeClient(["\tab"]))
+    assert m.frame()["cols"] == 10
+    m, _ = mirror(FakeClient(["世界世界世界\nabc"]))
+    assert m.frame()["cols"] == 12
+
+
+def test_apply_returns_count_of_dropped_bytes():
+    c = FakeClient()
+    assert apply(c, PANE, [("raw", b"\xff\xfe"), ("text", "a"), ("raw", b"\x1b[H")]) == 2
+    assert apply(c, PANE, [("text", "a")]) == 0
+
+
+def test_1mb_of_invalid_utf8_is_linear():
+    import time
+    data = b"\xff" * (1024 * 1024)
+    t0 = time.perf_counter()
+    out = translate_input(data)
+    assert time.perf_counter() - t0 < 1.0
+    assert all(a[0] == "raw" and len(a[1]) <= 4096 for a in out)
+    assert b"".join(a[1] for a in out) == data
+
+
+def test_invalid_bytes_interleaved_with_text_at_scale_is_linear():
+    import time
+    data = b"ab\xff" * 300000
+    t0 = time.perf_counter()
+    out = translate_input(data)
+    assert time.perf_counter() - t0 < 2.0
+    assert sum(len(a[1]) for a in out if a[0] == "raw") == 300000
