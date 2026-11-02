@@ -11,6 +11,13 @@ dependencies:
     license: "MIT"
     maintenance: "active; standalone artifact skill"
     note: "Required cross-harness artifact skill, installed into the same four harnesses as herdr-handoff."
+  herdr-memory:
+    source: "berlinguyinca/herdr-memory"
+    revision: "c4e0c64"
+    decision: ADOPT
+    license: "private"
+    maintenance: "active; private Hindsight-backed memory client (v0.1.1)"
+    note: "Optional (opt-in `scripts/install.sh --with-memory`); managed harness config via `herdr-eng memory install`. Pin must match herdr_engineering.memory_install.PINNED_REVISION."
   herdr-handoff:
     source: "berlinguyinca/herdr-handoff"
     revision: "3051d8c"

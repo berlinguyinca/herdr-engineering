@@ -394,6 +394,34 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--no-dashboard", action="store_true")
     p2.set_defaults(func=_cmd_summary_publish)
 
+    # memory ---------------------------------------------------------------
+    p = sub.add_parser("memory", help="herdr-memory harness adapters: plan/install/status/doctor/repair/upgrade/uninstall")
+    mmsub = p.add_subparsers(dest="memory_command", required=True)
+    for name, helptext in (("plan", "show what install would change (read-only)"),
+                           ("install", "install managed herdr-memory config into detected harnesses"),
+                           ("status", "per-harness managed-config state (read-only)"),
+                           ("doctor", "drift, config validity, credential permissions, server health"),
+                           ("repair", "re-apply missing or drifted managed blocks"),
+                           ("upgrade", "re-apply managed blocks at the current pinned revision"),
+                           ("uninstall", "remove only managed blocks (backup first)"),
+                           ("capabilities", "verified native capabilities and explicit fallbacks")):
+        p2 = mmsub.add_parser(name, help=helptext)
+        p2.add_argument("--harness", action="append", choices=("pi", "claude", "codex", "opencode"),
+                        help="limit to a harness (repeatable)")
+        p2.add_argument("--all", action="store_true", help="all four harnesses (default when --harness is absent)")
+        p2.add_argument("--home", default=None, help="override $HOME (isolated testing)")
+        if name in ("install", "repair", "upgrade", "uninstall"):
+            p2.add_argument("--dry-run", action="store_true", help="show the plan; write nothing")
+        p2.add_argument("--json", action="store_true")
+        p2.set_defaults(func=_cmd_memory)
+    p2 = mmsub.add_parser("mcp-serve", help="stdio MCP server exposing engineering-scoped memory_recall/memory_retain")
+    p2.add_argument("--harness", required=True, choices=("pi", "claude", "codex", "opencode"))
+    p2.set_defaults(func=_cmd_memory_mcp_serve)
+    p2 = mmsub.add_parser("hook", help="native lifecycle hook runner (prints bounded recall; never fails a session)")
+    p2.add_argument("hook_harness", choices=("pi", "claude", "codex", "opencode"))
+    p2.add_argument("hook_event")
+    p2.set_defaults(func=_cmd_memory_hook)
+
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
     jsub = p.add_subparsers(dest="journal_command", required=True)
@@ -1136,6 +1164,56 @@ def _cmd_summary_manage(args) -> int:
             if r.action == "preserved":
                 print(f"warning: kept existing {r.target}", file=sys.stderr)
     return 0 if ok else 1
+
+
+def _cmd_memory(args) -> int:
+    from .memory_install import MemoryInstaller
+    inst = MemoryInstaller(Path(args.home) if args.home else None)
+    names = None if (args.all or not args.harness) else args.harness
+    cmd, dry = args.memory_command, getattr(args, "dry_run", False)
+    if cmd == "capabilities":
+        out = {"ok": True, "capabilities": inst.capabilities(names)}
+        _print_json(out)
+        return 0
+    if cmd == "doctor":
+        out = inst.doctor(names)
+        if args.json:
+            _print_json(out)
+        else:
+            for c in out["checks"]:
+                print(f"{c['status'].upper():8} {c['name']}  {c['detail']}")
+            print(f"overall: {out['overall']}")
+        return 0 if out["ok"] else 1
+    if cmd == "plan":
+        res = inst.plan_install(names)
+    elif cmd == "install":
+        res = inst.install(names, dry_run=dry)
+    elif cmd in ("status",):
+        res = inst.status(names)
+    elif cmd in ("repair", "upgrade"):
+        res = getattr(inst, cmd)(names, dry_run=dry)
+    else:
+        res = inst.uninstall_managed_only(names, dry_run=dry)
+    if args.json:
+        _print_json(res.to_dict())
+    else:
+        for r in res.reports:
+            print(f"{r.action:9} {r.harness:9} {r.unit:6} {r.path}" + (f"  [{r.state}]" if r.state != "absent" else ""))
+            if r.action == "conflict":
+                print(f"warning: foreign entry kept untouched: {r.path}", file=sys.stderr)
+            if r.diff and (dry or cmd == "plan"):
+                print(r.diff, end="")
+    return 0 if res.ok else 1
+
+
+def _cmd_memory_mcp_serve(args) -> int:
+    from .memory_mcp import main_serve
+    return main_serve(args.harness)
+
+
+def _cmd_memory_hook(args) -> int:
+    from .memory_mcp import run_hook
+    return run_hook(args.hook_harness, args.hook_event, sys.stdin, sys.stdout)
 
 
 def _cmd_summary_history(args) -> int:
