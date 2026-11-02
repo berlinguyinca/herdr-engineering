@@ -246,3 +246,132 @@ def test_subscribe_server_close_raises(fake):
     with pytest.raises(HerdrError) as e:
         next(it)
     assert e.value.code == "closed"
+
+
+# -- fix round 1 -------------------------------------------------------------------------------
+def test_subscribe_validates_pane_id_eagerly(fake):
+    f = fake(lambda r, c: ok(r, {"type": "ok"}))
+    with pytest.raises(ValueError):  # at call time, before iteration
+        HerdrPaneClient(f.path).subscribe_output("../x")
+    assert f.requests == []
+
+
+def test_send_text_rejects_empty(fake):
+    f = fake(lambda r, c: ok(r, {"type": "ok"}))
+    with pytest.raises(ValueError):
+        HerdrPaneClient(f.path).send_text("w1:p1", "")
+    assert f.requests == []
+
+
+@pytest.mark.parametrize("result", [
+    {"type": "pane_list", "panes": ["x"]},
+    {"type": "pane_list", "panes": [1]},
+])
+def test_list_panes_malformed_is_bad_reply(fake, result):
+    f = fake(lambda r, c: ok(r, result))
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(f.path).list_panes()
+    assert e.value.code == "bad_reply"
+
+
+@pytest.mark.parametrize("layout", [
+    "str", ["a"], {"panes": "x"}, {"panes": ["x"]},
+    {"panes": [{"pane_id": "w1:p1", "rect": {"x": 0}}]},
+    {"panes": [{"pane_id": "w1:p1", "rect": {"width": "a", "height": 2}}]},
+])
+def test_layout_malformed_is_bad_reply(fake, layout):
+    f = fake(lambda r, c: ok(r, {"type": "pane_layout", "layout": layout}))
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(f.path).layout("w1:p1")
+    assert e.value.code == "bad_reply"
+
+
+def test_reply_id_must_match(fake):
+    f = fake(lambda r, c: [{"id": "other", "result": {"type": "pane_list", "panes": []}}])
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(f.path).list_panes()
+    assert e.value.code == "bad_reply"
+
+
+def test_event_before_subscription_started_is_not_the_reply(fake):
+    event = {"event": "pane.output_matched", "data": {"pane_id": "w1:p1"}}
+
+    def handler(req, c):
+        yield event
+        yield {"id": req["id"], "result": {"type": "subscription_started"}}
+        yield event
+    f = fake(handler)
+    it = HerdrPaneClient(f.path, timeout=1).subscribe_output("w1:p1")
+    assert next(it) == event["data"]
+    it.close()
+
+
+def test_error_message_is_truncated(fake):
+    f = fake(lambda r, c: [{"id": r["id"], "error": {"code": "x" * 500, "message": "m" * 5000}}])
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(f.path).list_panes()
+    assert len(e.value.message) <= 200 and len(e.value.code) <= 64
+
+
+def test_socket_override_must_be_a_socket(tmp_path):
+    p = tmp_path / "fake.sock"
+    p.write_text("x")
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(str(p)).list_panes()
+    assert e.value.code == "unavailable"
+
+
+def test_socket_override_symlink_refused(fake):
+    f = fake(lambda r, c: ok(r, {"type": "pane_list", "panes": []}))
+    link = os.path.join(f.dir, "link.sock")
+    os.symlink(f.path, link)
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(link).list_panes()
+    assert e.value.code == "unavailable"
+
+
+def test_socket_owned_by_someone_else_refused(fake, monkeypatch):
+    f = fake(lambda r, c: ok(r, {"type": "pane_list", "panes": []}))
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(f.path).st_uid + 1)
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(f.path).list_panes()
+    assert e.value.code == "unavailable"
+
+
+def test_reply_over_cap_is_refused(fake):
+    def handler(req, c):
+        try:
+            c.sendall(b"x" * (8 * 1024 * 1024 + 70000))
+        except OSError:
+            pass
+        return []
+    f = fake(handler)
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(f.path, timeout=5).list_panes()
+    assert e.value.code == "bad_reply"
+
+
+def test_slow_drip_hits_the_overall_deadline(fake):
+    def handler(req, c):
+        for _ in range(40):
+            try:
+                c.sendall(b" ")
+            except OSError:
+                break
+            time.sleep(0.1)
+        return []
+    f = fake(handler)
+    t = time.monotonic()
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(f.path, timeout=0.5).list_panes()
+    assert time.monotonic() - t < 1.5 and e.value.code == "timeout"
+
+
+def test_non_json_reply_is_bad_reply(fake):
+    def handler(req, c):
+        c.sendall(b"not json\n")
+        return []
+    f = fake(handler)
+    with pytest.raises(HerdrError) as e:
+        HerdrPaneClient(f.path).list_panes()
+    assert e.value.code == "bad_reply"
