@@ -138,3 +138,35 @@ def test_future_listener_advertisement_cannot_create_a_record():
     with pytest.raises(ValueError, match='timestamp'):
         advertise(repo, observed_at=future)
     assert repo.export_state() == before
+
+
+def _listener_rows(repo, sid):
+    return [e for e in repo._events.get(("service", sid), []) if e["event_type"] == "ServiceListenerObserved"]
+
+
+def test_an_unchanged_listener_heartbeat_is_journaled_once_per_window():
+    clock = [1_000_000.0]
+    repo = ControlPlaneRepo(now=lambda: clock[0])
+    native(repo)
+    sid = advertise(repo)
+    for _ in range(5):
+        clock[0] += 1
+        assert advertise(repo) == sid
+    assert len(_listener_rows(repo, sid)) == 1
+    # the projection still follows every heartbeat
+    assert repo.get_service(sid)['metadata_observation']['observed_at'] == repo._stamp()
+
+
+def test_a_heartbeat_after_the_window_or_with_new_facts_is_journaled(monkeypatch):
+    mono = [0.0]
+    monkeypatch.setattr("herdr_engineering.control_plane.repo.time.monotonic", lambda: mono[0])
+    repo = ControlPlaneRepo()
+    native(repo)
+    sid = advertise(repo)
+    advertise(repo)
+    assert len(_listener_rows(repo, sid)) == 1
+    mono[0] += ControlPlaneRepo._LISTENER_HEARTBEAT_JOURNAL_SECONDS + 1
+    advertise(repo)
+    assert len(_listener_rows(repo, sid)) == 2
+    advertise(repo, commit_sha='c' * 40)
+    assert len(_listener_rows(repo, sid)) == 3
