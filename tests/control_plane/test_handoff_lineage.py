@@ -167,3 +167,69 @@ def test_page_and_overview_summaries_carry_the_vision_summary_and_only_on_vision
     assert page[f"handoff:vision-{RID}-back"]["vision"]["outcome"] == "partial"
     assert "vision" not in page["handoff:h1"]
     assert reg.overview(extra=extra)["attention"][0]["vision"]["phase"] == "back"
+
+
+def timed_node(hid, at, frm, to, state="acknowledged", **attrs):
+    view = node(hid, state, from_session_id=f"session:{frm}", **({"to_session_id": f"session:{to}"} if to else {}), **attrs)
+    if not to:
+        view["attrs"].pop("to_session_id")
+    return {**view, "first_seen_at": at, "last_seen_at": at}
+
+
+def delegations_from(text, n, start_minute=1):
+    """n vision delegations from ``text``: an out row text -> vision and a back row vision -> text, one new vision session each."""
+    views = []
+    for i in range(n):
+        rid = f"0000000{i}-aaaa-4bbb-8ccc-dddddddddddd"
+        at = f"2026-10-30T10:{start_minute + 2 * i:02d}:00+00:00"
+        views.append(timed_node(f"vision-{rid}-out", at, text, f"vis{i}", cause="vision_delegate", handoff_kind="vision"))
+        back = f"2026-10-30T10:{start_minute + 2 * i:02d}:30+00:00"
+        views.append(timed_node(f"vision-{rid}-back", back, f"vis{i}", text, "committed", cause="vision_return", handoff_kind="vision"))
+    return views
+
+
+def test_vision_hops_never_hijack_the_chain_of_real_work_handoffs():
+    # H8: h0 s0 -> s1, six delegations from s1, then the real successor h1 s1 -> s2
+    reg = HandoffRegistry(ControlPlaneRepo(), now=lambda: NOW)
+    extra = rows_from_nodes([timed_node("h0", "2026-10-30T10:00:00+00:00", "s0", "s1", cause="context_pressure", from_model="a", to_model="a"),
+                             *delegations_from("s1", 6),
+                             timed_node("h1", "2026-10-30T10:30:00+00:00", "s1", "s2", cause="context_pressure", from_model="a", to_model="a")])
+    for start, position in (("handoff:h0", 0), ("handoff:h1", 1)):
+        out = reg.chain(start, extra=extra)
+        assert [r["handoff_id"] for r in out["chain"]] == ["handoff:h0", "handoff:h1"], start
+        assert out["position"] == position and not out["more_before"] and not out["more_after"]
+        assert not [r for r in out["chain"] if "vision" in r]
+
+
+def test_the_chain_of_a_vision_row_is_exactly_its_out_and_back_pair():
+    reg = HandoffRegistry(ControlPlaneRepo(), now=lambda: NOW)
+    extra = rows_from_nodes([timed_node("h0", "2026-10-30T10:00:00+00:00", "s0", "s1", cause="context_pressure", from_model="a", to_model="a"),
+                             *delegations_from("s1", 3),
+                             timed_node("h1", "2026-10-30T10:30:00+00:00", "s1", "s2", cause="context_pressure", from_model="a", to_model="a")])
+    rid = "00000001-aaaa-4bbb-8ccc-dddddddddddd"
+    pair = [f"handoff:vision-{rid}-out", f"handoff:vision-{rid}-back"]
+    for position, start in enumerate(pair):
+        out = reg.chain(start, extra=extra)
+        assert [r["handoff_id"] for r in out["chain"]] == pair
+        assert out["position"] == position and not out["more_before"] and not out["more_after"]
+    alone = rows_from_nodes(delegations_from("s1", 1))[:1]                # an open delegation: its out row alone
+    assert [r["handoff_id"] for r in reg.chain(alone[0]["handoff_id"], extra=alone)["chain"]] == [alone[0]["handoff_id"]]
+
+
+def test_both_rows_of_a_delegation_share_the_text_sessions_workspace():
+    # H10: the back row's source is the new vision session; it groups by its target (the text session) instead
+    repo = ControlPlaneRepo()
+    repo.upsert_session("text", repository_id="org/R")
+    repo.upsert_session("vis1", repository_id="org/other")               # known, but elsewhere
+    reg = HandoffRegistry(repo, now=lambda: NOW)
+    views = delegations_from("text", 2)                                   # vis0 unknown, vis1 in org/other
+    views.append(timed_node("vision-0000000x-aaaa-4bbb-8ccc-dddddddddddd-back", "2026-10-30T10:50:00+00:00", "text", None,
+                            "failed", cause="vision_return", handoff_kind="vision_failed"))   # the pane never started: no target
+    extra = rows_from_nodes(views)
+    page = reg.page(workspace="org/R", extra=extra)["handoffs"]
+    assert len(page) == 5 and {r["workspace"] for r in page} == {"org/R"}
+    ov = reg.overview(extra=extra)
+    assert [(w["workspace"], w["total"]) for w in ov["workspaces"]] == [("org/R", 5)]
+    # a non-vision row still groups by its source session
+    plain = rows_from_nodes([timed_node("h9", "2026-10-30T11:00:00+00:00", "vis1", "text", cause="context_pressure", from_model="a", to_model="a")])
+    assert reg.page(extra=plain)["handoffs"][0]["workspace"] == "org/other"

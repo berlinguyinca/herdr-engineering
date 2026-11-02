@@ -36,6 +36,11 @@ def _when(text):
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
+def _is_vision(row):
+    """A Pi vision-delegation row (out or back): it carries the vision summary."""
+    return isinstance(row.get("vision"), dict)
+
+
 class HandoffRegistry:
     def __init__(self, repo, *, now=None):
         self.repo = repo
@@ -184,8 +189,13 @@ class HandoffRegistry:
         return merged
 
     def _workspace(self, row):
-        """The group a handoff belongs to: its source session's repository, else working directory, else its mission."""
+        """The group a handoff belongs to: its source session's repository, else working directory, else its mission.
+        A vision BACK row runs from the new vision session to the text session, so it groups by its target (the text session)
+        to share a workspace with its out row; with no target (the pane never started) its source is the text session (H10)."""
         sid = (row.get("source") or {}).get("session_id")
+        vision = row.get("vision")
+        if isinstance(vision, dict) and vision.get("phase") == "back":
+            sid = (row.get("target") or {}).get("session_id") or sid
         session = self.repo.get_session(sid) if sid else None
         if session:
             if session.get("repository_id"):
@@ -297,7 +307,9 @@ class HandoffRegistry:
     def chain(self, handoff_id, extra=None):
         """The single path of handoffs through this one: backwards to the handoff that delivered the work to its source session,
         forwards to the one that took it on from its target session (the same session ids the Usage tab joins on). A session that
-        received or gave many handoffs contributes only the nearest one in time, so the chain stays a path, not a blob."""
+        received or gave many handoffs contributes only the nearest one in time, so the chain stays a path, not a blob.
+        Vision delegations are side trips, not hops of the work: a walk from a real handoff skips them, and the chain of a vision
+        row is just its out and back pair (the rows sharing its request id, out first) (H8)."""
         with self.repo._event_lock:
             rows = self._with(extra)
             row = rows.get(handoff_id)
@@ -305,8 +317,19 @@ class HandoffRegistry:
                 raise KeyError(handoff_id)
             now = _when(self.now()) or datetime.now(timezone.utc)
             key = lambda r: (r.get("created_at") or "", r["handoff_id"])
+            if _is_vision(row):
+                rid = row["vision"].get("request_id")
+                pair = [row]
+                if isinstance(rid, str) and rid:          # an unparseable id (request_id "") pairs with nothing (H3)
+                    pair = sorted((r for r in rows.values() if _is_vision(r) and r["vision"].get("request_id") == rid),
+                                  key=lambda r: (r["vision"].get("phase") != "out", key(r)))
+                return {"handoff_id": handoff_id, "position": [r["handoff_id"] for r in pair].index(handoff_id),
+                        "more_before": False, "more_after": False,
+                        "chain": [self._summary(r, self._workspace(r), now) for r in pair], "untrusted_text": True}
             by_target, by_source = {}, {}
             for r in rows.values():
+                if _is_vision(r):
+                    continue
                 t, sr = (r.get("target") or {}).get("session_id"), (r.get("source") or {}).get("session_id")
                 if t:
                     by_target.setdefault(t, []).append(r)
