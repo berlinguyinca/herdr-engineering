@@ -213,6 +213,36 @@ def test_capabilities_advertise_email_and_password_only(srv):
         assert api.raw("POST", f"/api/auth/{path}", {"email": "alice@example.com"})[0] == 404
 
 
+# --------------------------------------------------------------------------------------------- open owner
+def test_the_open_owner_session_is_off_unless_configured(srv):
+    _, api = srv
+    assert api.raw("POST", "/api/auth/open", {})[0] == 404
+
+
+def test_open_owner_gives_the_first_operator_a_session_from_a_private_or_tailnet_address(make_server):
+    _, api = make_server(bridge_section(open_owner=True))
+    for ip in ("127.0.0.1", "192.168.1.20", "100.104.39.6", "fd7a:115c:a1e0::1"):
+        status, body, hdrs = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})
+        assert status == 200, (ip, body)
+        token = json.loads(body)["token"]
+        assert api.ok("me", token=token)["email"] == "alice@example.com"
+
+
+def test_open_owner_refuses_a_public_address(make_server):
+    _, api = make_server(bridge_section(open_owner=True))
+    for ip in ("8.8.8.8", "100.128.0.1", "2001:4860:4860::8888"):
+        status, body, hdrs = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})
+        assert status == 403 and "set-auth-token" not in {k.lower() for k in hdrs}, ip
+
+
+def test_open_owner_needs_an_operator_account_to_act_as():
+    with pytest.raises(ValueError, match="open_owner"):
+        rb.rakazo_bridge_config({"enabled": True, "open_owner": True,
+                          "accounts": [{"email": "kid@example.com", "password_scrypt": HASH_A, "role": "family"}]})
+    with pytest.raises(ValueError, match="open_owner"):
+        rb.rakazo_bridge_config({"enabled": True, "open_owner": "yes", "accounts": ACCOUNTS})
+
+
 # --------------------------------------------------------------------------------------------- sign-in
 def test_sign_in_returns_the_token_in_the_header_and_body(srv):
     _, api = srv

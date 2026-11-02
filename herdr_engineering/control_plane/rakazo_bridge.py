@@ -68,6 +68,7 @@ SLOW_CALL_MS = 300           # a call slower than this is logged (name + duratio
 VERY_SLOW_CALL_MS = 2000      # ... as a warning
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
+_TAILNET = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))   # Tailscale's ranges
 _MAX_N = 2 ** 17                     # 128 MiB: a hash in the YAML cannot make one sign-in allocate more than this
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
 _COLLAB_USER = re.compile(r"[A-Za-z0-9._@+:-]{1,200}\Z")
@@ -182,7 +183,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
-                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push", "default_tools"})
+                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push", "default_tools", "open_owner"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -249,7 +250,12 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         if link is not None and (not isinstance(link, str) or not _COLLAB_USER.match(link)):
             raise ValueError(f"{where}.collab_user must be a collaboration user id (letters, digits and . _ @ + : -)")
         accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff, link))
-    return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
+    open_owner = raw.get("open_owner", False)
+    if not isinstance(open_owner, bool):
+        raise ValueError("control_plane.rakazo_bridge.open_owner must be true or false")
+    if open_owner and not any(a.role == "operator" for a in accounts):
+        raise ValueError("control_plane.rakazo_bridge.open_owner needs an account with role operator to act as")
+    return {"enabled": True, "open_owner": open_owner, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
             "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join), "default_tools": tuple(dict.fromkeys(tools)),
             "cognito": cognito_cfg, "push": _push_config(raw.get("push"))}
@@ -671,6 +677,7 @@ class RakazoBridge:
         self.svc = assistant
         self.version = version
         self.accounts: list[Account] = list(config["accounts"])
+        self.open_owner = bool(config.get("open_owner"))
         self._by_principal = {a.principal_id: a for a in self.accounts}
         self._by_id = {a.account_id: a for a in self.accounts}
         self._cognito_users: dict[str, str] = {}      # account id -> Cognito username, for pool members who signed in
@@ -848,6 +855,8 @@ class RakazoBridge:
                                         "nativePasskeys": {"ios": False, "android": False}, "crispWebsiteId": None})
         if method == "POST" and name == "sign-in/email":
             return self._sign_in(body, ip)
+        if method == "POST" and name == "open" and self.open_owner:
+            return self._open_owner(ip)
         if method == "POST" and name == "sign-out":
             token = self._bearer(headers)
             account = self._by_id.get(self.tokens.lookup(token, ip) or "") if token else None
@@ -910,6 +919,19 @@ class RakazoBridge:
             raise BridgeError(401, "INVALID_EMAIL_OR_PASSWORD", "Invalid credentials")
         self.limiter.success(ip)
         return self._finish_sign_in(matched, ip)
+
+    def _open_owner(self, ip: str) -> BridgeResponse:
+        """A session for the first operator account with no password, for one-person setups where the network is the
+        credential: only from loopback or a private / tailnet address (the same peers the dashboard itself serves)."""
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            raise BridgeError(403, "FORBIDDEN", "This server only opens a session from your own network.") from None
+        if not (addr.is_loopback or addr.is_private or any(addr in net for net in _TAILNET)):
+            log.warning("rakazo bridge: refused an open owner session from %s", ip[:64])
+            raise BridgeError(403, "FORBIDDEN", "This server only opens a session from your own network.")
+        owner = next(a for a in self.accounts if a.role == "operator")
+        return self._finish_sign_in(owner, ip)
 
     def _finish_sign_in(self, matched: Account, ip: str) -> BridgeResponse:
         try:
