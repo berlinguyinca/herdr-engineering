@@ -3090,6 +3090,12 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "reviews":
                     return self._send_json(503, {"error": "Review persistence is unavailable; no launch or decision was acknowledged."})
                 return self._send_json(503, {"error": "Integration service is unavailable."})
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                # The client gave up before the reply was written; the work is
+                # done, and a 500 or traceback would misreport it as a failure.
+                self._request_cause = type(exc).__name__
+                self.close_connection = True
+                return None
             except Exception as exc:  # never drop a connection: surface 500
                 self._request_cause = type(exc).__name__
                 if resource == "ingest":
