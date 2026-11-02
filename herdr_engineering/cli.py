@@ -1014,7 +1014,7 @@ def _cmd_host_terminal_relay(args) -> int:
     the control plane could not be reached for the first configuration), 2 only when restarting cannot help (host.json
     missing or incomplete, token revoked). argparse usage errors also exit 2, but never under a unit file."""
     from .herdr_pane_client import HerdrPaneClient
-    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
+    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config, host_token
     from .terminal_relay import (
         ControlPlaneHttp,
         RelayLocked,
@@ -1030,7 +1030,7 @@ def _cmd_host_terminal_relay(args) -> int:
     try:
         cfg = host_config()
         refresher = None if args.once_for_test else ConfigRefresher(cfg)
-        relay = TerminalRelay(cfg, HerdrPaneClient(), ControlPlaneHttp(cfg), refresher=refresher)
+        relay = TerminalRelay(cfg, HerdrPaneClient(), ControlPlaneHttp(cfg, host_token()), refresher=refresher)
     except HostConfigUnavailable as exc:
         return unavailable(exc)
     restore = install_signal_handlers(relay)

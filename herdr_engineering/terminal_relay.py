@@ -2,7 +2,8 @@
 
 One relay runs per fleet host, as the user that runs herdr. It only makes outbound calls: it long-polls the control
 plane's broker (``GET /api/v1/host/terminal/wait``) for commands and pushes screen frames back
-(``POST /api/v1/host/terminal/<id>/output``), authenticated with the host's own ingest key from ``host.json``. What it
+(``POST /api/v1/host/terminal/<id>/output``), authenticated with the host's own token from ``host.json`` (``X-Host-Token``,
+the credential of every host agent; the control plane takes the host id from it). What it
 does with a command is limited to herdr socket calls: it starts no process and touches no file chosen by a command.
 
 Delivery from the broker is at-least-once and the relay makes it exactly-once for typing: every command id and every
@@ -32,7 +33,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 from . import host_config as _hc
 from .control_plane.terminal_attach import _PANE
@@ -73,25 +74,21 @@ class _Stopped(Exception):
 
 
 class ControlPlaneHttp:
-    """The relay's only network path: host.json's URL, the ingest key in ``X-API-Key``, and the shared no-redirect
-    opener of ``host_config`` (the key goes to that URL and nowhere else). Only the host terminal routes are allowed.
-    ``request`` returns ``(status, parsed JSON or None)``; network failures raise OSError."""
+    """The relay's only network path: host.json's URL, the host token in ``X-Host-Token`` (never an API key or a bearer),
+    and the shared no-redirect opener of ``host_config`` (the token goes to that URL and nowhere else). Only the host
+    terminal routes are allowed. ``request`` returns ``(status, parsed JSON or None)``; network failures raise OSError."""
 
-    def __init__(self, config):
-        self._target = (config.control_plane_url.rstrip("/"), config.api_key)   # swapped as one tuple
+    def __init__(self, config, token):
+        self._url = config.control_plane_url.rstrip("/")
+        self.token = token
         self.auth_rejected = False
 
     @property
     def url(self):
-        return self._target[0]
+        return self._url
 
-    @property
-    def key(self):
-        return self._target[1]
-
-    def retarget(self, url, api_key):    # ConfigRefresher.sync() points the client at the live configuration
-        old_url, old_key = self._target
-        self._target = (url.rstrip("/") if url else old_url, api_key if api_key is not None else old_key)
+    def retarget(self, url, api_key=None):    # ConfigRefresher.sync() points the client at the live configuration
+        self._url = url.rstrip("/") if url else self._url   # the ingest key it offers is not this relay's credential
 
     def request(self, method, path, body=None, timeout=10.0):
         if not path.startswith("/api/v1/host/terminal/"):
@@ -100,10 +97,8 @@ class ControlPlaneHttp:
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        url, key = self._target
-        if key:
-            headers["X-API-Key"] = key
-        req = urllib.request.Request(url + path, data=data, method=method, headers=headers)
+        headers["X-Host-Token"] = self.token
+        req = urllib.request.Request(self._url + path, data=data, method=method, headers=headers)
         try:
             with _hc._OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
                 raw = resp.read(MAX_REPLY + 1)
@@ -161,6 +156,7 @@ class TerminalRelay:
         self._flush_at: dict[str, float] = {}
         self._flusher = None
         self._fails = 0
+        self._connected = False
         self._auth_logged: float | None = None
         self._quick_empty = 0
         self._saved: dict = self._load()
@@ -272,7 +268,7 @@ class TerminalRelay:
         try:
             if self._refresher is not None:
                 self._refresher.sync(self.http)
-            query = {"host_id": self.host_id, "timeout": _WAIT}
+            query = {"timeout": _WAIT}
             if self._after:
                 query["after"] = self._after
             began = time.monotonic()
@@ -286,8 +282,8 @@ class TerminalRelay:
             now = self._clock()
             if self._auth_logged is None or now - self._auth_logged >= _AUTH_LOG_EVERY:
                 self._auth_logged = now
-                log.warning("terminal relay: the control plane refused this host's key (HTTP %d); is its ingest key "
-                            "listed for this host in agent_hosts?", status)
+                log.warning("terminal relay: the control plane refused this host's token (HTTP %d); is host.json's "
+                            "token the one in the fleet file?", status)
             self._sleep(_AUTH_BACKOFF * (1 + 0.2 * self._rng()))
             return
         commands = body.get("commands") if isinstance(body, dict) else None
@@ -297,6 +293,9 @@ class TerminalRelay:
             return
         self._fails = 0
         self._auth_logged = None
+        if not self._connected:   # the rollout's health check looks for this line: proof that a wait got through
+            self._connected = True
+            log.info("terminal relay connected")
         if not commands:   # a timeout, or a newer waiter took over: poll again at once, unless that spins
             self._quick_empty = self._quick_empty + 1 if time.monotonic() - began < 0.01 else 0
             if self._quick_empty >= 5:
@@ -545,7 +544,7 @@ class TerminalRelay:
     # -- output ------------------------------------------------------------------------------------
     def _push(self, tid, frames) -> int | None:
         """POST frames (at most 20 per call); the first non-200 status, or None when unreachable."""
-        path = f"/api/v1/host/terminal/{tid}/output?host_id={quote(self.host_id, safe='')}"
+        path = f"/api/v1/host/terminal/{tid}/output"
         status = None
         for i in range(0, len(frames), _POST_FRAMES):
             try:

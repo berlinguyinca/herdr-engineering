@@ -2,6 +2,7 @@
 import base64
 import copy
 import http.server
+import json
 import logging
 import threading
 import time
@@ -13,9 +14,10 @@ import pytest
 from herdr_engineering import terminal_relay as relay_mod
 from herdr_engineering.herdr_pane_client import HerdrError
 from herdr_engineering.terminal_relay import ControlPlaneHttp, RelayLocked, TerminalRelay
+from tests.control_plane.test_rakazo_bridge import make_server  # noqa: F401  (fixture for the real-broker tests)
 
 HOST = "bender"
-KEY = "ingest-key-SECRET-9d41"
+TOKEN = "host-token-SECRET-9d41"   # host.json's token: the relay's only credential
 EPOCH = "0a1b2c3d"
 TID = "term_aaaaaaaaaaaaaaaaaaaaaaaa"
 TID2 = "term_bbbbbbbbbbbbbbbbbbbbbbbb"
@@ -193,7 +195,7 @@ def fast(monkeypatch):
 
 @pytest.fixture
 def env(tmp_path):
-    cfg = SimpleNamespace(host_id=HOST, api_key=KEY, control_plane_url="http://cp.invalid")
+    cfg = SimpleNamespace(host_id=HOST, control_plane_url="http://cp.invalid")
     cp, client = FakeCP(), FakeClient()
     started = []
 
@@ -236,9 +238,9 @@ def test_open_pushes_first_frame_at_once_then_only_changes(env):
     assert len(env.cp.typed_frames(TID)) == 1       # an unchanged screen is never sent twice
     env.client.screens["p1"] = "$ ls"
     assert wait_until(lambda: len(env.cp.typed_frames(TID)) == 2)
-    assert all(host == HOST for _, host, _ in env.cp.posts)
+    assert all(host is None for _, host, _ in env.cp.posts)    # the host id comes from the token, never the query
     first_wait = env.cp.waits[0]
-    assert first_wait == (HOST, "25", None)          # no `after` until something was handled
+    assert first_wait == (None, "25", None)          # no `after` until something was handled
     assert wait_until(lambda: any(w[2] == cmd["id"] for w in env.cp.waits))
 
 
@@ -543,7 +545,7 @@ def test_no_screen_input_key_or_terminal_id_reaches_the_logs(env, caplog):
     assert wait_until(lambda: env.cp.ended(TID2))
     r.stop()
     text = "\n".join(x.getMessage() for x in caplog.records)
-    for secret in ("SCREEN-SECRET", b64("SCREEN-SECRET-xyz"), typed, b64(typed), b64(b"\xff\xfe"), KEY, TID, TID2):
+    for secret in ("SCREEN-SECRET", b64("SCREEN-SECRET-xyz"), typed, b64(typed), b64(b"\xff\xfe"), TOKEN, TID, TID2):
         assert secret not in text
     assert "dropped 2 bytes" in text
 
@@ -570,7 +572,7 @@ class _Redirect(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def test_control_plane_http_sends_the_key_and_never_follows_a_redirect():
+def test_control_plane_http_sends_the_host_token_and_never_follows_a_redirect():
     other, cp = (http.server.HTTPServer(("127.0.0.1", 0), _Redirect) for _ in range(2))
     other.target = None
     cp.target = f"http://127.0.0.1:{other.server_port}"
@@ -578,17 +580,120 @@ def test_control_plane_http_sends_the_key_and_never_follows_a_redirect():
         threading.Thread(target=s.serve_forever, daemon=True).start()
     _Redirect.seen = []
     try:
-        cfg = SimpleNamespace(host_id=HOST, api_key=KEY, control_plane_url=f"http://127.0.0.1:{cp.server_port}")
-        status, body = ControlPlaneHttp(cfg).request("GET", "/api/v1/host/terminal/wait?host_id=bender", timeout=3)
+        cfg = SimpleNamespace(host_id=HOST, control_plane_url=f"http://127.0.0.1:{cp.server_port}")
+        status, body = ControlPlaneHttp(cfg, token=TOKEN).request("GET", "/api/v1/host/terminal/wait", timeout=3)
         assert status == 302 and body is None
-        assert [p for p, _ in _Redirect.seen] == ["/api/v1/host/terminal/wait?host_id=bender"]   # the key went nowhere else
-        assert _Redirect.seen[0][1]["X-Api-Key"] == KEY
+        assert [p for p, _ in _Redirect.seen] == ["/api/v1/host/terminal/wait"]   # the token went nowhere else
+        headers = {k.lower(): v for k, v in _Redirect.seen[0][1].items()}
+        assert headers["x-host-token"] == TOKEN
+        assert "x-api-key" not in headers and "authorization" not in headers    # never an API key or a bearer
         cp.target = None
-        assert ControlPlaneHttp(cfg).request("GET", "/api/v1/host/terminal/wait", timeout=3) == (200, {"commands": []})
+        assert ControlPlaneHttp(cfg, token=TOKEN).request(
+            "GET", "/api/v1/host/terminal/wait", timeout=3) == (200, {"commands": []})
     finally:
         for s in (other, cp):
             s.shutdown()
             s.server_close()
+
+
+def test_the_first_successful_poll_logs_one_connected_line(env, caplog):
+    env.cp.fail_waits = 2
+    r = env.make(sleep=lambda s: time.sleep(0.01))
+    with caplog.at_level(logging.INFO, logger="herdr_engineering.terminal_relay"):
+        env.start(r)
+        assert wait_until(lambda: len(env.cp.waits) >= 6)
+    lines = [x for x in caplog.records if x.getMessage() == "terminal relay connected"]
+    assert len(lines) == 1 and lines[0].levelno == logging.INFO    # the rollout's health check greps for it
+    first_ok = next(i for i, x in enumerate(caplog.records) if x.getMessage() == "terminal relay connected")
+    assert all("unreachable" in x.getMessage() for x in caplog.records[:first_ok])   # only after a poll got an answer
+
+
+class Front:
+    """A FakeCP behind a real HTTP listener that speaks the broker's host auth: ``X-Host-Token`` must be this host's token
+    (anything else, an API key included, is 403) and a ``host_id`` in the query must be the token's host."""
+
+    def __init__(self, cp, keepalive=True):
+        front = self
+        self.cp, self.seen, self.connections = cp, [], 0
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1" if keepalive else "HTTP/1.0"
+
+            def setup(self):
+                super().setup()
+                front.connections += 1
+
+            def _serve(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n)) if n else None
+                front.seen.append((self.command, self.path, {k.lower(): v for k, v in self.headers.items()}))
+                given = parse_qs(urlsplit(self.path).query).get("host_id")
+                if self.headers.get_all("X-Host-Token") != [TOKEN] or (given and given != [HOST]):
+                    return self._reply(403, {"error": "the terminal relay needs a host token"})
+                try:
+                    status, payload = cp.request(self.command, self.path, body)
+                except OSError:
+                    self.close_connection = True      # the answer is lost: the relay sees a dropped connection
+                    return
+                self._reply(status, payload)
+
+            def _reply(self, status, payload):
+                raw = json.dumps(payload).encode() if payload is not None else b""
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            do_GET = do_POST = _serve
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def front(env):
+    fronts = []
+
+    def make(**kw):
+        f = Front(env.cp, **kw)
+        fronts.append(f)
+        return f
+    yield make
+    for f in fronts:
+        f.close()
+
+
+def test_the_relay_talks_to_the_broker_with_the_host_token_and_nothing_else(env, front):
+    f = front()
+    cfg = SimpleNamespace(host_id=HOST, control_plane_url=f.url)
+    r = env.make(http=ControlPlaneHttp(cfg, token=TOKEN))
+    env.start(r)
+    open_cmd(env.cp)
+    assert wait_until(lambda: env.cp.typed_frames(TID))
+    assert f.seen and all(h.get("x-host-token") == TOKEN for _, _, h in f.seen)
+    assert not any("x-api-key" in h or "authorization" in h for _, _, h in f.seen)
+    assert not any("host_id" in path for _, path, _ in f.seen)     # the host id comes from the token
+
+
+@pytest.mark.parametrize("token", ["not-this-hosts-token", ""])
+def test_a_refused_host_token_backs_off_30s(env, front, token):
+    f = front()
+    sleeps = []
+    cfg = SimpleNamespace(host_id=HOST, control_plane_url=f.url)
+    r = env.make(http=ControlPlaneHttp(cfg, token=token), sleep=lambda s: sleeps.append(s))
+    env.start(r)
+    assert wait_until(lambda: len(sleeps) >= 3)
+    assert all(30 <= s <= 36 for s in sleeps[:3])
+    assert env.cp.waits == []                       # the broker never saw a wait
 
 
 # ---------------------------------------------------------------------------------------------- fix round 1
@@ -766,7 +871,7 @@ def test_sigterm_stops_a_blocked_long_poll_promptly(tmp_path):
         def request(self, method, path, body=None, timeout=10.0):
             time.sleep(8)
             return 200, {"commands": []}
-    cfg = SimpleNamespace(host_id=HOST, api_key=KEY, control_plane_url="http://cp.invalid")
+    cfg = SimpleNamespace(host_id=HOST, control_plane_url="http://cp.invalid")
     r = TerminalRelay(cfg, FakeClient(), Blocking(), state_dir=tmp_path)
     restore = relay_mod.install_signal_handlers(r)
     timer = threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGTERM))
@@ -793,36 +898,28 @@ def test_the_state_file_is_fsynced_before_the_replace(env, monkeypatch):
     assert order[:2] == ["fsync", "replace"]
 
 
-def test_retarget_swaps_url_and_key_together():
-    cfg = SimpleNamespace(host_id=HOST, api_key=KEY, control_plane_url="http://a.invalid")
-    h = ControlPlaneHttp(cfg)
-    h.retarget("http://b.invalid/", "k2")
-    assert (h.url, h.key) == ("http://b.invalid", "k2")
-    assert hasattr(h, "_target") and isinstance(h._target, tuple)
+def test_retarget_follows_the_url_but_the_host_token_never_changes():
+    cfg = SimpleNamespace(host_id=HOST, control_plane_url="http://a.invalid")
+    h = ControlPlaneHttp(cfg, token=TOKEN)
+    h.retarget("http://b.invalid/", "an-ingest-key-the-relay-must-not-adopt")
+    assert h.url == "http://b.invalid" and h.token == TOKEN
 
 
-# ------------------------------------------------------------------------- against the real broker, in process
-class BrokerHttp:
-    """The relay's http, wired straight to a rakazo_terminal.Terminal: what api.py's host routes do, without sockets."""
+# ------------------------------------------------------------------------- against the real broker, over HTTP
+class Flaky:
+    """The relay's real ControlPlaneHttp, with a switch that makes the network unreachable."""
 
-    def __init__(self, broker):
-        self.broker = broker
+    def __init__(self, inner):
+        self.inner = inner
         self.offline = False
 
-    def request(self, method, path, body=None, timeout=10.0):
-        from herdr_engineering.control_plane.rakazo_terminal import HostError
+    def request(self, *a, **kw):
         if self.offline:
             raise OSError("offline")
-        url = urlsplit(path)
-        q = {k: v[0] for k, v in parse_qs(url.query).items()}
-        try:
-            if url.path.endswith("/wait"):
-                commands = self.broker.wait_commands(q["host_id"], min(float(q["timeout"]), 0.1), q.get("after"))
-                return 200, {"commands": commands}
-            self.broker.accept_frames(q["host_id"], url.path.split("/")[5], body["frames"])
-            return 200, {"ok": True}
-        except HostError as exc:
-            return exc.status, None
+        return self.inner.request(*a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
 
 class Clock:
@@ -833,37 +930,49 @@ class Clock:
 
 
 @pytest.fixture
-def real(env):
-    from herdr_engineering.control_plane import rakazo_bridge as rb
-    from herdr_engineering.control_plane import rakazo_terminal as rt
-    from herdr_engineering.control_plane.repo import ControlPlaneRepo
-    hashed = rb.hash_password("pw pw pw pw pw", n=2 ** 14)
-    cfg = rb.rakazo_bridge_config({"enabled": True, "accounts": [
-        {"email": "a@example.com", "password_scrypt": hashed, "role": "operator"}]})
-    bridge = rb.RakazoBridge(cfg, assistant=None, version="x")
-    bridge.svc = SimpleNamespace(tenant_for=lambda principal: "t", store=SimpleNamespace(audit_record=lambda **kw: None))
-    repo, clock = ControlPlaneRepo(), Clock()
+def real(env, tmp_path, make_server, monkeypatch):
+    """A live ControlPlaneServer in open mode (like production) whose fleet file holds this host's token; the relay
+    talks to it through ControlPlaneHttp, so the real host-token check, routes and JSON are all in the path."""
+    import hashlib
 
-    def new_broker():
-        broker = rt.Terminal(bridge, rb.BridgeError, clock=clock)
-        broker.repo = repo
-        return broker
-    broker = new_broker()
-    ctx = SimpleNamespace(account=bridge.accounts[0], token=bridge.tokens.mint(bridge.accounts[0].account_id, "127.0.0.1"),
-                          accepts_stream=True)
+    import yaml
+
+    from herdr_engineering.fleet_config import FleetConfigStore
+    from tests.control_plane.test_rakazo_bridge import bridge_section
+    servers, make = [], make_server
+    monkeypatch.setattr(relay_mod, "_WAIT", 0.1)    # a wait the relay left behind must not hold the broker for 25 s
+    fleet = tmp_path / "fleet.yaml"
+    fleet.write_text(yaml.safe_dump({"version": 1, "sections": {}, "hosts": {
+        HOST: {"roles": [], "token_sha256": hashlib.sha256(TOKEN.encode()).hexdigest()}}}))
+    fleet.chmod(0o600)
+    clock = Clock()
+
+    def new_server():
+        svr, _ = make(bridge_section(), fleet_config=FleetConfigStore(fleet))
+        svr.rakazo.terminal._clock = clock
+        servers.append(svr)
+        return svr
+    svr = new_server()
     for i in range(6):
         env.client.screens[f"w1:p{i}"] = f"pane {i}"
-        repo.upsert_session(f"s{i}", status="working", host_id=HOST, herdr_session="default", pane_id=f"w1:p{i}",
-                            terminal_id=f"term_{i}")
-    http = BrokerHttp(broker)
+        svr.repo.upsert_session(f"s{i}", status="working", host_id=HOST, herdr_session="default", pane_id=f"w1:p{i}",
+                                terminal_id=f"term_{i}")
+
+    def owner(server):
+        bridge = server.rakazo
+        account = bridge.accounts[0]
+        return SimpleNamespace(account=account, token=bridge.tokens.mint(account.account_id, "127.0.0.1"),
+                               accepts_stream=True)
+    http = Flaky(ControlPlaneHttp(SimpleNamespace(host_id=HOST, control_plane_url=f"http://127.0.0.1:{svr.port}"), TOKEN))
     r = env.make(http=http, sleep=lambda s: time.sleep(0.01))
     env.start(r)
+    broker = svr.rakazo.terminal
     assert wait_until(lambda: broker.host_connected(HOST))
-    ns = SimpleNamespace(env=env, broker=broker, http=http, ctx=ctx, clock=clock, relay=r, new_broker=new_broker,
-                         procs=lambda: broker.procs())
+    ns = SimpleNamespace(env=env, svr=svr, broker=broker, http=http, ctx=owner(svr), clock=clock, relay=r,
+                         new_server=new_server, owner=owner, procs=lambda: broker.procs())
     yield ns
-    for b in {broker, http.broker}:
-        b.close_all()
+    for server in servers:
+        server.rakazo.terminal.close_all()
 
 
 def frames_of(broker, sid):
@@ -888,24 +997,29 @@ def test_real_broker_takeover_and_cap(real):
     assert wait_until(lambda: real.relay.active_terminals() == 4)
     again = proc(real.ctx, {"id": "s0", "rows": 24, "cols": 80})["terminalId"]    # takeover: close, then open
     assert again != tids[0]
-    assert wait_until(lambda: len(frames_of(real.broker, "s0")) >= 1)
+    assert wait_until(lambda: again in real.relay._terms)        # the old live's frames do not prove the takeover
     assert real.relay.active_terminals() == 4
-    assert all(real.env.cp.ended(t) == [] for t in tids) if False else True
+    # the takeover's close really reached the relay: the old terminal is gone from it, the new one took its slot
+    assert set(real.relay._terms) == {*tids[1:], again}
+    assert tids[0] not in real.relay._terms
 
 
 def test_real_broker_restart_with_idle_panes_lets_a_fifth_open_succeed(real):
-    from herdr_engineering.control_plane import rakazo_terminal as rt
     proc = real.broker.procs()["terminal/open"]
     for i in range(4):
         proc(real.ctx, {"id": f"s{i}", "rows": 24, "cols": 80})
     assert wait_until(lambda: real.relay.active_terminals() == 4)
-    fresh = real.new_broker()
-    real.http.broker = fresh                       # the control plane restarted: no terminal known any more
+    second = real.new_server()                     # the control plane restarted: no terminal known any more
+    fresh = second.rakazo.terminal
+    second.repo.upsert_session("s4", status="working", host_id=HOST, herdr_session="default", pane_id="w1:p4",
+                               terminal_id="term_4")
+    real.http.retarget(f"http://127.0.0.1:{second.port}")
     assert wait_until(lambda: fresh.host_connected(HOST))
-    out = fresh.procs()["terminal/open"](real.ctx, {"id": "s4", "rows": 24, "cols": 80})
+    out = fresh.procs()["terminal/open"](real.owner(second), {"id": "s4", "rows": 24, "cols": 80})
     assert wait_until(lambda: frames_of(fresh, "s4"))
     assert wait_until(lambda: real.relay.active_terminals() == 1)
-    assert isinstance(fresh, rt.Terminal) and out["terminalId"]
+    assert set(real.relay._terms) == {out["terminalId"]}      # only the new control plane's terminal is served
+    assert fresh._lives["s4"].alive
 
 
 def test_real_broker_host_offline_then_the_host_returns(real, monkeypatch):
@@ -913,6 +1027,7 @@ def test_real_broker_host_offline_then_the_host_returns(real, monkeypatch):
     monkeypatch.setattr(relay_mod, "_PUSH_RETRY", 0.05)
     tid = real.broker.procs()["terminal/open"](real.ctx, {"id": "s0", "rows": 24, "cols": 80})["terminalId"]
     assert wait_until(lambda: frames_of(real.broker, "s0"))
+    assert tid in real.relay._terms
     real.http.offline = True
     time.sleep(0.3)                                # no wait is blocked any more
     real.clock.now += 11
@@ -921,4 +1036,4 @@ def test_real_broker_host_offline_then_the_host_returns(real, monkeypatch):
     assert real.broker._lives["s0"].chunks_after(0)[-1]["reason"] == "host_offline"
     real.http.offline = False
     assert wait_until(lambda: real.relay.active_terminals() == 0, 5)   # the probe got a 404
-    assert tid
+    assert tid not in real.relay._terms

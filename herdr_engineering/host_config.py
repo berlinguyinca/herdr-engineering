@@ -118,6 +118,11 @@ def _read_host_json(home: Path) -> dict:
     return {"control_plane_url": url.rstrip("/"), "host_id": hid, "token": tok}
 
 
+def host_token(home: Path | None = None) -> str:
+    """The per-host token of host.json (what every host agent sends as ``X-Host-Token``)."""
+    return _read_host_json(Path(home) if home is not None else Path.home())["token"]
+
+
 def _write_cache(path: Path, payload: dict) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
