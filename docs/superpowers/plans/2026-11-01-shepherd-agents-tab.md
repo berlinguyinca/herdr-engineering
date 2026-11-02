@@ -75,9 +75,9 @@
 **Interfaces:**
 - Consumes: Task 1 functions; Task 2 methods.
 - Produces: `class Agents` with `__init__(self, bridge, error)`, attribute `repo` (set by the API glue; `None` until then) and `def procs(self) -> dict[str, Callable[[_Ctx, dict], Any]]` returning `agents/list`, `agents/get`, `agents/messages`, `agents/event`.
-  - `agents/list` input `{"showOlder": bool = false}` -> `{"agents": [row...], "hiddenCount": int}`.
+  - `agents/list` input `{"showOlder": bool = false}` -> `{"agents": [row...], "hiddenCount": int, "cursor": int}` (`cursor` is the list stream's current change counter: subscribe from it).
   - `agents/get` input `{"id": str}` -> `{"agent": row, "hasConversation": bool}`; 404 `NOT_FOUND` when the session is unknown.
-  - `agents/messages` input `{"id": str, "beforeSeq": int | None, "limit": int = 50 (max 200)}` -> `{"events": [rendered...], "hasMore": bool, "newestSeq": int | None}` newest-first like `query`, 404 for an unknown session.
+  - `agents/messages` input `{"id": str, "beforeSeq": int | None, "limit": int = 50 (max 200)}` -> `{"events": [rendered...], "hasMore": bool, "newestSeq": int | None, "rev": int}` newest-first like `query` (`rev` is the session's current revision: the cursor for `agents/subscribe`), 404 for an unknown session.
   - `agents/event` input `{"id": str, "seq": int}` -> the full rendered event (`full=True`), 404 when absent.
   - Without a repo (`repo is None`) every procedure answers 503 `UNAVAILABLE` "The Agents view is not ready."
 
@@ -95,7 +95,7 @@
 
 **Interfaces:**
 - Consumes: Task 3 `Agents`; `ev.event_stream(fetch, cursor, should_stop=..., **bridge.stream_options)`; `bridge._streams`; `BridgeResponse`.
-- Produces: procedures `agents/subscribe` (input `{"id": str, "cursor": int >= -1}`; frames are rendered inspector events whose `seq` > cursor) and `agents/subscribeList` (input `{"cursor": int >= -1}`; frames are `{"seq": <change counter>, "row": row}` for each row that changed since the cursor; `Agents` keeps a per-row fingerprint map and a monotonically increasing counter under a lock). Errors: cursor not an integer >= -1 -> 400; request without `accept: text/event-stream` -> 400; stream cap exhausted -> 429 with `Retry-After: 10`; unknown agent on `agents/subscribe` -> 404.
+- Produces: procedures `agents/subscribe` (input `{"id": str, "cursor": int >= -1}`; the cursor is the session's `rev`, because the inspector updates tool events in place and bumps `rev` while `seq` stays; frames are `{"seq": <event rev>, "event": <rendered event>}` for every event whose `rev` > cursor, ascending, so a finished tool call arrives again with its output) and `agents/subscribeList` (input `{"cursor": int >= -1}`; frames are `{"seq": <change counter>, "row": row}` for each row that changed since the cursor; `Agents` keeps a per-row fingerprint map and a monotonically increasing counter under a lock). Errors: cursor not an integer >= -1 -> 400; request without `accept: text/event-stream` -> 400; stream cap exhausted -> 429 with `Retry-After: 10`; unknown agent on `agents/subscribe` -> 404.
 
 - [ ] **Step 1: Failing tests** `test_subscribe_streams_new_events_after_cursor`, `test_subscribe_list_emits_only_changed_rows_with_increasing_seq`, `test_subscribe_rejects_bad_cursor_and_missing_accept_header`, `test_subscribe_429_when_stream_cap_exhausted`, `test_subscribe_stops_when_token_revoked`. Shorten `bridge.stream_options` in tests (as `test_rakazo_bridge.py` does).
 - [ ] **Step 2: Run; expect FAIL.**
@@ -121,7 +121,7 @@
 - Test: `packages/contracts/src/agents.test.ts`, `apps/mobile/lib/agents.test.ts`
 
 **Interfaces:**
-- Produces: zod `AgentRowSchema` (`id, name, machine (nullable), status (enum of the six), summary, updatedAt, hasConversation`), `AgentEventSchema`, and procedures `agents.list/get/messages/event` matching Task 3; in `apps/mobile/lib/agents.ts`: `type AgentRow`; `function agentListQuery(showOlder: boolean)`; `function subscribeAgentList(onRow: (row: AgentRow) => void, onFallback: () => void): () => void` (SSE with cursor, calls `onFallback` on 429 / drop so the caller polls); `function subscribeAgent(id: string, cursor: number, onEvent: (e: AgentEvent) => void, onFallback: () => void): () => void`; `function isAgentsUnsupported(error: unknown): boolean` (true for the bridge's unknown-procedure 404).
+- Produces: zod `AgentRowSchema` (`id, name, machine (nullable), status (enum of the six), summary, updatedAt, hasConversation`), `AgentEventSchema`, and procedures `agents.list/get/messages/event` matching Task 3; in `apps/mobile/lib/agents.ts`: `type AgentRow`; `function agentListQuery(showOlder: boolean)`; `function subscribeAgentList(onRow: (row: AgentRow) => void, onFallback: () => void): () => void` (SSE with cursor, calls `onFallback` on 429 / drop so the caller polls); `function subscribeAgent(id: string, rev: number, onEvent: (e: AgentEvent) => void, onFallback: () => void): () => void`; `function isAgentsUnsupported(error: unknown): boolean` (true for the bridge's unknown-procedure 404).
 
 - [ ] **Step 1: Failing tests** `schema accepts the six statuses and rejects others`, `isAgentsUnsupported is true for an unknown-procedure error and false for network errors`, `subscribeAgentList calls onFallback on a 429`.
 - [ ] **Step 2: Run `pnpm exec vitest run packages/contracts/src/agents.test.ts apps/mobile/lib/agents.test.ts`; expect FAIL.**
@@ -159,7 +159,7 @@
 
 - [ ] **Step 1: Failing tests** `shows messages oldest at top and loads older on scroll up using beforeSeq`, `collapses tool calls to one line and expands on tap fetching the full event when output_more`, `appends live events from the stream without a refetch`, `shows the empty state for a session with no conversation`, `shows This agent is no longer available on 404 and returns to the list`, `withheld events render a withheld chip, never blank text`.
 - [ ] **Step 2: Run; expect FAIL.**
-- [ ] **Step 3: Implement** with the cursor equal to the newest seq loaded; on stream fallback poll `agents.messages` for events newer than the cursor every 5 seconds.
+- [ ] **Step 3: Implement** so that on EVERY (re)connect the screen first calls `agents.messages` and subscribes from the returned `rev`, never from a remembered cursor (after a server restart per-session revs can be lower than a remembered one); a frame replaces the loaded event with the same `seq` (tool calls update in place); on stream fallback poll `agents.messages` and merge by `seq` every 5 seconds.
 - [ ] **Step 4: Run `pnpm test` in `apps/mobile`; expect all green.**
 - [ ] **Step 5: Commit** `Agent screen: live conversation`.
 
