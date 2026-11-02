@@ -878,3 +878,35 @@ def test_learning_trails_default_to_the_operator_role_and_reject_missing_or_wron
         assert _fc_req(port, "GET", path, {"X-API-Key": "viewkey"})[0] == 403
         assert _fc_req(port, "GET", path, {"X-API-Key": "opkey"})[0] == 200
         assert _fc_req(port, "GET", path + "?limit=0", {"X-API-Key": "opkey"})[0] == 400
+
+
+def test_a_client_that_hangs_up_during_ingest_is_not_logged_as_an_ingest_failure(
+        acknowledged_sink, caplog, monkeypatch):
+    import logging
+    import socket
+    import time
+
+    svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), scheduler_admission=True)
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    real = svr.ingest.ingest
+
+    def slow(*args, **kwargs):
+        time.sleep(0.4)  # the client resets the connection while we work
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(svr.ingest, "ingest", slow)
+    body = json.dumps({"entity_type": "host", "entity_id": "bender", "event_type": "host.registered",
+                       "payload": {"host_name": "bender"}}).encode()
+    try:
+        with caplog.at_level(logging.ERROR):
+            s = socket.create_connection(("127.0.0.1", svr.port))
+            s.sendall(b"POST /api/v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                      b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+            time.sleep(0.1)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+            s.close()  # RST
+            time.sleep(0.8)
+        assert "ingest failed" not in caplog.text
+    finally:
+        svr.shutdown()
