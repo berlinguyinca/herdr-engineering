@@ -235,6 +235,33 @@ def test_open_owner_refuses_a_public_address(make_server):
         assert status == 403 and "set-auth-token" not in {k.lower() for k in hdrs}, ip
 
 
+def test_open_owner_refuses_ranges_that_are_not_your_own_network(make_server):
+    _, api = make_server(bridge_section(open_owner=True))
+    for ip in ("2001::1", "2002::1", "192.0.2.1", "169.254.1.1", "0.0.0.1", "::ffff:8.8.8.8"):   # is_private says yes to most
+        assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})[0] == 403, ip
+    assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "::ffff:192.168.1.1"})[0] == 200
+
+
+def test_open_owner_only_answers_the_app_not_a_web_page(make_server):
+    _, api = make_server(bridge_section(open_owner=True))
+    for origin in ("https://evil.example", "http://localhost:3000", ""):
+        assert api.raw("POST", "/api/auth/open", {}, {"origin": origin})[0] == 403, origin
+
+
+def test_open_owner_is_rate_limited_per_address_so_it_cannot_evict_the_owners_sessions(make_server):
+    _, api = make_server(bridge_section(open_owner=True))
+    first = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.1.1"})
+    again = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.1.1"})
+    other = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.1.2"})
+    assert (first[0], again[0], other[0]) == (200, 429, 200) and again[2].get("Retry-After") == "30"
+
+
+def test_open_owner_refuses_a_configured_proxy_that_names_no_client(make_server):
+    _, api = make_server(bridge_section(open_owner=True, trusted_proxies=["127.0.0.1"]))
+    assert api.raw("POST", "/api/auth/open", {})[0] == 403                          # the proxy's own address is not a caller
+    assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.2.2"})[0] == 200
+
+
 def test_open_owner_needs_an_operator_account_to_act_as():
     with pytest.raises(ValueError, match="open_owner"):
         rb.rakazo_bridge_config({"enabled": True, "open_owner": True,

@@ -68,7 +68,11 @@ SLOW_CALL_MS = 300           # a call slower than this is logged (name + duratio
 VERY_SLOW_CALL_MS = 2000      # ... as a warning
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
-_TAILNET = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))   # Tailscale's ranges
+# The networks an open owner session may come from: this machine, RFC 1918, unique-local IPv6 and Tailscale. Explicit on purpose:
+# ``is_private`` also covers Teredo, 6to4, documentation and link-local ranges.
+_OWN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"))
+_OPEN_OWNER_INTERVAL = 30.0          # seconds between open sessions from one address: they evict the owner's older tokens
 _MAX_N = 2 ** 17                     # 128 MiB: a hash in the YAML cannot make one sign-in allocate more than this
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
 _COLLAB_USER = re.compile(r"[A-Za-z0-9._@+:-]{1,200}\Z")
@@ -678,6 +682,8 @@ class RakazoBridge:
         self.version = version
         self.accounts: list[Account] = list(config["accounts"])
         self.open_owner = bool(config.get("open_owner"))
+        self._open_lock = threading.Lock()
+        self._open_last: dict[str, float] = {}
         self._by_principal = {a.principal_id: a for a in self.accounts}
         self._by_id = {a.account_id: a for a in self.accounts}
         self._cognito_users: dict[str, str] = {}      # account id -> Cognito username, for pool members who signed in
@@ -836,7 +842,7 @@ class RakazoBridge:
         ip = self.client_address(peer, headers.get("x-forwarded-for", ""))
         try:
             if path.startswith("/api/auth/"):
-                return self._auth(method, path[len("/api/auth/"):], headers, body, ip)
+                return self._auth(method, path[len("/api/auth/"):], headers, body, ip, peer)
             return self._rpc(method, path[len("/rpc/"):], headers, body, ip)
         except BridgeError as err:
             return _rpc_error(err) if path.startswith("/rpc/") else _auth_error(err.status, err.code, err.message,
@@ -847,7 +853,7 @@ class RakazoBridge:
             return _rpc_error(fail) if path.startswith("/rpc/") else _auth_error(500, fail.code, fail.message)
 
     # auth ------------------------------------------------------------------------------------------------------
-    def _auth(self, method: str, name: str, headers, body: bytes, ip: str) -> BridgeResponse:
+    def _auth(self, method: str, name: str, headers, body: bytes, ip: str, peer: str = "") -> BridgeResponse:
         if method == "GET" and name == "capabilities":
             # email + password only: no sign-up, one-time codes, passkeys, SSO or reset mail
             return _json_response(200, {"sso": None, "passwordAuth": True, "passwordReset": False, "resetUrl": None,
@@ -856,7 +862,7 @@ class RakazoBridge:
         if method == "POST" and name == "sign-in/email":
             return self._sign_in(body, ip)
         if method == "POST" and name == "open" and self.open_owner:
-            return self._open_owner(ip)
+            return self._open_owner(headers, ip, peer)
         if method == "POST" and name == "sign-out":
             token = self._bearer(headers)
             account = self._by_id.get(self.tokens.lookup(token, ip) or "") if token else None
@@ -920,25 +926,44 @@ class RakazoBridge:
         self.limiter.success(ip)
         return self._finish_sign_in(matched, ip)
 
-    def _open_owner(self, ip: str) -> BridgeResponse:
+    def _open_owner(self, headers, ip: str, peer: str) -> BridgeResponse:
         """A session for the first operator account with no password, for one-person setups where the network is the
-        credential: only from loopback or a private / tailnet address (the same peers the dashboard itself serves)."""
+        credential. Allowed only from this machine, a private network or the tailnet, and only from the app itself
+        (its ``rakazo://`` origin, which a web page cannot send). Never enable it behind a reverse proxy or NAT that does
+        not set X-Forwarded-For: the proxy's own address would then count as the caller."""
+        refuse = BridgeError(403, "FORBIDDEN", "This server only opens a session from your own network.")
+        if headers.get("origin", "") != "rakazo://":
+            raise refuse
         try:
             addr = ipaddress.ip_address(ip)
+            peer_addr = ipaddress.ip_address(peer) if peer else None
         except ValueError:
-            raise BridgeError(403, "FORBIDDEN", "This server only opens a session from your own network.") from None
-        if not (addr.is_loopback or addr.is_private or any(addr in net for net in _TAILNET)):
+            raise refuse from None
+        addr = getattr(addr, "ipv4_mapped", None) or addr
+        if peer_addr is not None and any(peer_addr in net for net in self.trusted_proxies) and ip == str(peer_addr):
+            log.warning("rakazo bridge: refused an open owner session relayed by %s without a client address", ip[:64])
+            raise refuse                                      # a configured proxy that named no client
+        if not any(addr in net for net in _OWN_NETWORKS):
             log.warning("rakazo bridge: refused an open owner session from %s", ip[:64])
-            raise BridgeError(403, "FORBIDDEN", "This server only opens a session from your own network.")
+            raise refuse
+        now = self._monotonic()
+        with self._open_lock:
+            last = self._open_last.get(ip)
+            if last is not None and now - last < _OPEN_OWNER_INTERVAL:
+                raise BridgeError(429, "TOO_MANY_REQUESTS", "Try again in a moment.", {"Retry-After": "30"})
+            if len(self._open_last) > 256:
+                self._open_last = {k: v for k, v in self._open_last.items() if now - v < _OPEN_OWNER_INTERVAL}
+            self._open_last[ip] = now
         owner = next(a for a in self.accounts if a.role == "operator")
-        return self._finish_sign_in(owner, ip)
+        log.info("rakazo bridge: open owner session for %s from %s", owner.account_id, ip[:64])
+        return self._finish_sign_in(owner, ip, "rakazo.bridge.open_owner")
 
-    def _finish_sign_in(self, matched: Account, ip: str) -> BridgeResponse:
+    def _finish_sign_in(self, matched: Account, ip: str, action: str = "rakazo.bridge.sign_in") -> BridgeResponse:
         try:
             token = self.tokens.mint(matched.account_id, ip)
         except TokenStoreError:
             raise BridgeError(500, "INTERNAL_SERVER_ERROR", "Could not start a session. Try again later.") from None
-        self._audit(matched, "rakazo.bridge.sign_in")
+        self._audit(matched, action)
         return _json_response(200, {"token": token, "redirect": False,
                                     "user": {"id": matched.principal_id, "email": matched.email,
                                              "name": matched.email.split("@", 1)[0]}},
