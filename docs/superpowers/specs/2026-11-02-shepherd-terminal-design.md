@@ -76,3 +76,19 @@ A new host-side component to ship and keep running on bender, beast and the Mac.
 
 ### Mosh-style roaming
 Moshi's selling point is a session that survives network changes. Here the pty lives on the host and the app reattaches from the saved buffer, so a drop, a sleep or a network switch shows the live screen again without losing the agent.
+
+## Amendment 2, same day: mirror and drive the herdr pane, do not attach a pty
+
+The owner pointed out that nearly all agents already run in herdr tabs and panes, so herdr already owns their terminals. Checked on bender (herdr 0.9.1, read-only commands): herdr has a socket API with `pane.read`, `pane.send_input`, `pane.send_keys`, `pane.send_text`, `agent.prompt`, `pane.scroll`, `pane.get` and events (`pane_output_changed`, `pane.updated`, `pane.agent_status_changed`), plus `herdr machine` / `--machine` for reaching other hosts through herdr's own saved ssh machines. `herdr agent attach` is an exclusive client (it has `--takeover`), so a phone attaching could kick the desktop session off the pane or resize it.
+
+This amendment replaces the pty in Amendment 1. The host relay does **not** start `herdr agent attach`:
+- **Screen out:** the relay subscribes to `pane_output_changed` for the open pane (falling back to a 200 ms poll), reads `pane read --source visible --format ansi` (measured on bender: 4 ms, about 8 KB for a 97-row pane) and sends a frame only when it changed. The app clears and redraws the xterm screen with each frame. Scrollback uses `--source recent --lines N`.
+- **Keys in:** printable text goes through `pane send_text`, special keys and Ctrl combinations through `pane send_keys`, and raw bytes through `pane send_input` if it accepts bytes (to be confirmed).
+- **No second client:** nothing attaches, so the desktop session is never kicked, resized or disturbed, and there is no pty, fd handling or process lifecycle to harden.
+- **Everything else in Amendment 1 holds:** outbound-only host relay with the host's own credentials, control plane as a broker, the phone-facing procedures and the app unchanged, the owner-only gate, the input/resize rate-limit exemption and the narrowed `open_owner`.
+
+### Limits to be honest about
+- It is a screen mirror, not a raw byte stream: mouse reporting and graphics are out; a full-screen program shows as its current frame.
+- The pane keeps its own size (the sample panes are 46 to 97 rows). The phone cannot resize it without affecting the desktop, so the app shows the pane at its real size, fits it to the screen width and scrolls, with a pinch/zoom control.
+- Unconfirmed, to test before building: whether herdr reports the cursor position (else the app draws no cursor), the exact key-name vocabulary of `send_keys`, whether `send_input` takes raw bytes, and how `pane_output_changed` behaves on a busy pane.
+- A host with an older herdr, or that is offline, cannot open terminals.
