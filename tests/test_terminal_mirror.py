@@ -7,10 +7,16 @@ import base64
 import pytest
 
 from herdr_engineering.herdr_pane_client import HerdrError, HerdrPaneClient
-from herdr_engineering.terminal_mirror import MAX_FRAME, InputTranslator, PaneMirror, apply, translate_input
+from herdr_engineering.terminal_mirror import MAX_FRAME, InputTranslator, PaneMirror, apply
 
 PANE = "w1:p1"
 PREFIX = "\x1b[0m\x1b[H\x1b[2J"
+
+
+def translate_input(data: bytes):
+    """Everything one burst of bytes means, once the 50 ms flush has passed (the relay calls feed and flush itself)."""
+    t = InputTranslator()
+    return t.feed(data) + t.flush()
 
 
 class FakeClient:
@@ -217,10 +223,6 @@ def test_lone_escape_alone_is_held_until_flush():
     assert t.feed(b"\x1b") == []
     assert t.flush() == [("keys", ["esc"])]
     assert t.flush() == []
-
-
-def test_translate_input_wrapper_flushes_lone_escape():
-    assert translate_input(b"\x1b") == [("keys", ["esc"])]
 
 
 def test_double_escape_is_esc_then_held_esc():

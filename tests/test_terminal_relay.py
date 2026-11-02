@@ -188,9 +188,6 @@ class FakeClient:
     def zoom(self, pane, on):
         self._rec("zoom", pane, on)
 
-    def resize_split(self, pane, direction, amount):
-        self._rec("resize_split", pane, (direction, amount))
-
     def texts(self):
         with self.lock:
             return [v for m, _, v in self.sent if m == "text"]

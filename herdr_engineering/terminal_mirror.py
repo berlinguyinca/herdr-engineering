@@ -367,11 +367,6 @@ class InputTranslator:
         return _raw(buf)
 
 
-def translate_input(data: bytes) -> list[Action]:
-    t = InputTranslator()
-    return t.feed(data) + t.flush()
-
-
 def apply(client, pane_id: str, actions: list[Action]) -> int:
     """Perform actions in order; consecutive key actions go out in one send_keys call. Raw bytes
     that are not valid UTF-8 cannot ride in the JSON API and are dropped; returns how many bytes

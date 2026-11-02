@@ -46,8 +46,7 @@ class FakeHerdr:
         self.requests.append(req)
         for line in self.handler(req, c):
             c.sendall(json.dumps(line).encode() + b"\n")
-        if req["method"] != "events.subscribe":
-            c.close()
+        c.close()
 
     def close(self):
         self._stop = True
@@ -115,13 +114,7 @@ def test_read_visible_asks_for_raw_ansi(fake):
                                        "format": "ansi", "strip_ansi": False}
 
 
-def test_read_recent_passes_line_count(fake):
-    f = fake(_read("a\nb\n"))
-    assert HerdrPaneClient(f.path).read_recent("w1:p1", 50) == "a\nb\n"
-    assert f.requests[0]["params"] == {"pane_id": "w1:p1", "source": "recent", "lines": 50}
-
-
-def test_send_text_keys_input_zoom_resize_bodies(fake):
+def test_send_text_keys_input_zoom_bodies(fake):
     f = fake(lambda r, c: ok(r, {"type": "ok"}))
     c = HerdrPaneClient(f.path)
     c.send_text("w1:p1", "hello é")
@@ -129,7 +122,6 @@ def test_send_text_keys_input_zoom_resize_bodies(fake):
     c.send_input("w1:p1", b"\x1b[H\x1b[3~")
     c.zoom("w1:p1", True)
     c.zoom("w1:p1", False)
-    c.resize_split("w1:p1", "left", 0.1)
     got = [(r["method"], r["params"]) for r in f.requests]
     assert got == [
         ("pane.send_text", {"pane_id": "w1:p1", "text": "hello é"}),
@@ -137,7 +129,6 @@ def test_send_text_keys_input_zoom_resize_bodies(fake):
         ("pane.send_input", {"pane_id": "w1:p1", "text": "\x1b[H\x1b[3~"}),  # raw bytes ride in text
         ("pane.zoom", {"pane_id": "w1:p1", "mode": "on"}),
         ("pane.zoom", {"pane_id": "w1:p1", "mode": "off"}),
-        ("pane.resize", {"pane_id": "w1:p1", "direction": "left", "amount": 0.1}),
     ]
 
 
@@ -176,10 +167,7 @@ def test_size_limits_and_types(fake):
     for call in (lambda: cl.send_input("w1:p1", b"a" * 4097), lambda: cl.send_input("w1:p1", b""),
                  lambda: cl.send_input("w1:p1", "str"), lambda: cl.send_input("w1:p1", b"\xff\xfe"),
                  lambda: cl.send_text("w1:p1", "a" * 4097), lambda: cl.send_text("w1:p1", b"x"),
-                 lambda: cl.zoom("w1:p1", "yes"), lambda: cl.resize_split("w1:p1", "diagonal", 0.1),
-                 lambda: cl.resize_split("w1:p1", "left", 0), lambda: cl.resize_split("w1:p1", "left", 2),
-                 lambda: cl.resize_split("w1:p1", "left", float("nan")),
-                 lambda: cl.read_recent("w1:p1", 0), lambda: cl.read_recent("w1:p1", 100001)):
+                 lambda: cl.zoom("w1:p1", "yes")):
         with pytest.raises(ValueError):
             call()
     assert len(f.requests) == 2
@@ -211,51 +199,7 @@ def test_missing_socket_is_a_herdr_error(tmp_path):
     assert e.value.code == "unavailable"
 
 
-def test_subscribe_output_yields_events_then_idle_none(fake):
-    event = {"event": "pane.output_matched", "data": {"pane_id": "w1:p1", "matched_line": "hi",
-             "read": {"text": "hi\n", "revision": 3}}}
-
-    def handler(req, c):
-        yield {"id": req["id"], "result": {"type": "subscription_started"}}
-        yield event
-    f = fake(handler)
-    it = HerdrPaneClient(f.path, timeout=0.3).subscribe_output("w1:p1")
-    assert next(it) == event["data"]
-    assert next(it) is None  # socket idle: caller falls back to polling the screen
-    sub = f.requests[0]
-    assert sub["method"] == "events.subscribe"
-    s = sub["params"]["subscriptions"][0]
-    assert s["type"] == "pane.output_matched" and s["pane_id"] == "w1:p1"
-    assert s["source"] == "visible" and s["match"]["type"] == "regex"
-    it.close()
-
-
-def test_subscribe_refused_raises(fake):
-    f = fake(lambda r, c: [{"id": r["id"], "error": {"code": "pane_not_found", "message": "gone"}}])
-    with pytest.raises(HerdrError) as e:
-        next(HerdrPaneClient(f.path).subscribe_output("w1:p1"))
-    assert e.value.code == "pane_not_found"
-
-
-def test_subscribe_server_close_raises(fake):
-    def handler(req, c):
-        yield {"id": req["id"], "result": {"type": "subscription_started"}}
-        c.close()
-    f = fake(handler)
-    it = HerdrPaneClient(f.path, timeout=1).subscribe_output("w1:p1")
-    with pytest.raises(HerdrError) as e:
-        next(it)
-    assert e.value.code == "closed"
-
-
 # -- fix round 1 -------------------------------------------------------------------------------
-def test_subscribe_validates_pane_id_eagerly(fake):
-    f = fake(lambda r, c: ok(r, {"type": "ok"}))
-    with pytest.raises(ValueError):  # at call time, before iteration
-        HerdrPaneClient(f.path).subscribe_output("../x")
-    assert f.requests == []
-
-
 def test_send_text_rejects_empty(fake):
     f = fake(lambda r, c: ok(r, {"type": "ok"}))
     with pytest.raises(ValueError):
@@ -291,19 +235,6 @@ def test_reply_id_must_match(fake):
     with pytest.raises(HerdrError) as e:
         HerdrPaneClient(f.path).list_panes()
     assert e.value.code == "bad_reply"
-
-
-def test_event_before_subscription_started_is_not_the_reply(fake):
-    event = {"event": "pane.output_matched", "data": {"pane_id": "w1:p1"}}
-
-    def handler(req, c):
-        yield event
-        yield {"id": req["id"], "result": {"type": "subscription_started"}}
-        yield event
-    f = fake(handler)
-    it = HerdrPaneClient(f.path, timeout=1).subscribe_output("w1:p1")
-    assert next(it) == event["data"]
-    it.close()
 
 
 def test_error_message_is_truncated(fake):

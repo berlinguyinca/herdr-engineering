@@ -10,45 +10,38 @@ Wire format, confirmed against ``herdr api schema --json`` and a live server on 
   One connection per request is fine: the server answers one line and we close.
 * Methods used (params -> result payload key):
   ``pane.list {}`` -> ``panes``; ``pane.layout {pane_id}`` -> ``layout`` (area, panes[].rect);
-  ``pane.read {pane_id, source: visible|recent, format: text|ansi, strip_ansi, lines}`` -> ``read.text``;
+  ``pane.read {pane_id, source: visible, format: ansi, strip_ansi}`` -> ``read.text``;
   ``pane.send_text {pane_id, text}``; ``pane.send_keys {pane_id, keys[]}`` (herdr's own key names,
   ``ctrl+c`` yes, ``ctrl-c``/Home/End/PageUp/PageDown/Delete/Insert no);
   ``pane.send_input {pane_id, text}`` writes ``text`` to the pty verbatim, so raw escape
   sequences (``\\x1b[H``) ride in it (verified: ``cat -v`` shows ``^[[H``);
-  ``pane.zoom {pane_id, mode: on|off|toggle}``; ``pane.resize {pane_id, direction, amount}``.
-* Subscription: ``events.subscribe {subscriptions: [{type, ...}]}`` answers
-  ``{"result": {"type": "subscription_started"}}`` and then keeps the connection open, pushing
-  ``{"event": "<kind>", "data": {...}}`` lines. herdr has no "output changed" event; the closest
-  is ``pane.output_matched`` with a regex that matches any non-empty line, whose ``data.read``
-  carries the visible screen and a ``revision``. Callers still re-read the screen on each event.
+  ``pane.zoom {pane_id, mode: on|off|toggle}``.
+* herdr has no "output changed" event (``events.subscribe`` only offers ``pane.output_matched`` on a
+  regex line), so the mirror polls ``pane.read``; no subscription method is kept here.
 
 Every method is reachable over the socket, so there is no CLI fallback.
 """
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import socket
 import stat
 import time
 import uuid
-from typing import Iterator
 
 from herdr_engineering.control_plane.terminal_attach import _PANE
 
 MAX_BYTES = 4096        # per send_text / send_input call
 MAX_KEYS = 32
 MAX_REPLY = 8 * 1024 * 1024  # a pane list with many agents is large, but never this large
-MAX_LINES = 100000
 
 # Names herdr's send-keys accepts (confirmed on bender); anything else is refused here rather
 # than relying on herdr to reject it. Unsupported keys go through send_input as raw bytes.
 # ctrl+] and ctrl+space are kept on purpose: herdr returned ok for both on bender.
 _KEY = re.compile(r"^(esc|tab|enter|backspace|space|up|down|left|right|f1|shift\+tab|alt\+left|ctrl\+left"
                   r"|ctrl\+[a-z\]]|ctrl\+space|alt\+[a-z])$")
-_DIRECTIONS = ("left", "right", "up", "down")
 
 
 class HerdrError(Exception):
@@ -117,7 +110,7 @@ class HerdrPaneClient:
         return msg["result"]
 
     def _readline(self, s: socket.socket, buf: bytearray, deadline: float | None) -> dict:
-        # Reads one JSON line. deadline None = rely on the per-recv socket timeout (subscription).
+        # Reads one JSON line. deadline None = rely on the per-recv socket timeout only.
         idx = buf.find(b"\n")
         while idx < 0:
             if deadline is not None:
@@ -204,11 +197,6 @@ class HerdrPaneClient:
         return self._read({"pane_id": _pane(pane_id), "source": "visible", "format": "ansi",
                            "strip_ansi": False})
 
-    def read_recent(self, pane_id: str, lines: int) -> str:
-        if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= MAX_LINES:
-            raise ValueError("invalid line count")
-        return self._read({"pane_id": _pane(pane_id), "source": "recent", "lines": lines})
-
     # -- writes ------------------------------------------------------------------------------
     def send_text(self, pane_id: str, text: str) -> None:
         pane_id = _pane(pane_id)
@@ -242,41 +230,3 @@ class HerdrPaneClient:
         if not isinstance(on, bool):
             raise ValueError("invalid zoom")
         self._call("pane.zoom", {"pane_id": pane_id, "mode": "on" if on else "off"})
-
-    def resize_split(self, pane_id: str, direction: str, amount: float) -> None:
-        pane_id = _pane(pane_id)
-        if direction not in _DIRECTIONS:
-            raise ValueError("invalid direction")
-        if (isinstance(amount, bool) or not isinstance(amount, (int, float))
-                or not math.isfinite(amount) or not 0 < amount <= 1):
-            raise ValueError("invalid amount")
-        self._call("pane.resize", {"pane_id": pane_id, "direction": direction, "amount": float(amount)})
-
-    # -- subscription ------------------------------------------------------------------------
-    def subscribe_output(self, pane_id: str) -> Iterator[dict | None]:
-        # Validate now, not on first next(): a plain function returning the generator.
-        return self._subscribe(_pane(pane_id))
-
-    def _subscribe(self, pane_id: str) -> Iterator[dict | None]:
-        """Yield ``data`` of each push event for the pane; yield None whenever the socket was idle
-        for ``timeout`` seconds, so the caller can poll the screen anyway. Raises HerdrError when
-        herdr refuses the subscription or the connection drops."""
-        s = self._connect()
-        try:
-            buf = bytearray()
-            rid = self._send(s, "events.subscribe", {"subscriptions": [{
-                "type": "pane.output_matched", "pane_id": pane_id, "source": "visible",
-                "match": {"type": "regex", "value": ".+"}}]})
-            self._reply(s, buf, rid, time.monotonic() + self.timeout)
-            while True:
-                try:
-                    msg = self._readline(s, buf, None)
-                except HerdrError as e:
-                    if e.code != "timeout":
-                        raise
-                    yield None
-                    continue
-                if isinstance(msg.get("data"), dict):
-                    yield msg["data"]
-        finally:
-            s.close()
