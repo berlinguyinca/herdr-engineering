@@ -229,7 +229,9 @@ class HandoffRegistry:
                 "completed": len(row.get("completed") or []), "remaining": len(row.get("remaining") or []),
                 "attention": self._needs_attention(row, now), "stalled": self._stalled(row, now),
                 "attention_reason": self._attention_reason(row, now),
-                **({k: row.get(k) for k in ("origin", "cause", "from_model", "to_model", "model_change", "checkpoint")} if row.get("origin") == "lineage" else {"origin": "registry"})}
+                **({k: row.get(k) for k in ("origin", "cause", "from_model", "to_model", "model_change", "checkpoint")} if row.get("origin") == "lineage" else {"origin": "registry"}),
+                # the page pairs vision round trips from these rows, so the summary carries the vision summary too (vision rows only)
+                **({"vision": row["vision"]} if row.get("origin") == "lineage" and isinstance(row.get("vision"), dict) else {})}
 
     def overview(self, extra=None):
         """Counts by workspace and the few handoffs that need a human; no rows beyond OVERVIEW_ATTENTION."""

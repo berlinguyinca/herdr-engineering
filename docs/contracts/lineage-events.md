@@ -435,7 +435,9 @@ authenticated operator key excepted) on a node id or on either endpoint of an ed
   carries the OUTCOME: `vision` (ok; also always the kind of the out node), `vision_partial` (state `committed`), `vision_failed` and
   `vision_timeout` (state `failed`); any other kind on a `-back` node reads as outcome `unknown`. No image count and no other field is
   carried. The Handoffs row gains `vision: {request_id, phase: out|back, outcome: ok|partial|failed|timeout|unknown}` (only on these two
-  causes); the switch of models is deliberate, so it is not flagged "model changed", and only a non-`ok` outcome asks for attention.
+  causes), in the detail row AND in the page / overview-attention summaries the Handoffs page pairs round trips from; the switch of
+  models is deliberate, so it is not flagged "model changed", and only a non-`ok` outcome asks for attention. Pi's real envelopes for
+  this are pinned in `tests/control_plane/fixtures/vision_lineage_envelopes.json`.
 - **Large rooms**: the Tabs panel makes three listing reads (agents, tabs, panes) at most every 8 s while open; not load-tested.
 
 ## Lineage views and replay (T09)

@@ -154,3 +154,16 @@ def test_vision_rows_do_not_raise_a_model_switch_alarm_when_ok_but_say_why_when_
     failed_state_ok_row = {**failed, "state": "completed"}
     assert reg._attention_reason(failed_state_ok_row, None) == "vision delegation failed"
     assert reg._attention_reason({**timeout, "state": "completed"}, None) == "vision delegation timed out"
+
+
+def test_page_and_overview_summaries_carry_the_vision_summary_and_only_on_vision_rows():
+    # The Handoffs page builds its round trips from the page rows (registry._summary), not from the detail row.
+    reg = HandoffRegistry(ControlPlaneRepo(), now=lambda: NOW)
+    extra = rows_from_nodes([vision_node("out", "vision_delegate", "vision", "acknowledged"),
+                             vision_node("back", "vision_return", "vision_partial", "committed"),
+                             node("h1", cause="context_pressure", from_model="a", to_model="a")])
+    page = {r["handoff_id"]: r for r in reg.page(extra=extra)["handoffs"]}
+    assert page[f"handoff:vision-{RID}-out"]["vision"] == {"request_id": RID, "phase": "out", "outcome": "ok"}
+    assert page[f"handoff:vision-{RID}-back"]["vision"]["outcome"] == "partial"
+    assert "vision" not in page["handoff:h1"]
+    assert reg.overview(extra=extra)["attention"][0]["vision"]["phase"] == "back"
