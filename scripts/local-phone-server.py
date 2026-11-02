@@ -24,7 +24,7 @@ def build(email: str, password: str, *, host: str = "127.0.0.1", port: int = 0):
     key.write_bytes(os.urandom(32))
     cfg = assistant_config({"personal_assistant": {
         "enabled": True, "apps": {"key_file": str(key), "redirect_base": f"http://{host}"}}})
-    bridge = {"enabled": True, "accounts": [{
+    bridge = {"enabled": True, "open_owner": True, "accounts": [{
         "email": email, "password_scrypt": rb.hash_password(password), "role": "operator"}]}
     return ControlPlaneServer(ControlPlaneRepo(), assistant_service=AssistantService(config=cfg), rakazo_bridge=bridge,
                               single_operator=True, host=host, port=port, allow_open=True)
