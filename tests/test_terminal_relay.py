@@ -57,6 +57,7 @@ class FakeCP:
         self.gate = None         # an Event: pushes (for gate_tids, or all) block until it is set or their timeout passes
         self.gate_tids = None
         self.blocked = 0         # pushes that reached a closed gate
+        self.post_timeouts = []  # the timeout each output POST was given
 
     def push(self, kind, **fields):
         with self.cond:
@@ -92,6 +93,7 @@ class FakeCP:
         parts = url.path.split("/")
         if method == "POST" and len(parts) == 7 and parts[5:] and parts[6] == "output":
             tid = parts[5]
+            self.post_timeouts.append(timeout)
             gate = self.gate
             if gate is not None and (self.gate_tids is None or tid in self.gate_tids) and not gate.is_set():
                 self.blocked += 1
@@ -245,7 +247,8 @@ def test_open_pushes_first_frame_at_once_then_only_changes(env):
     assert wait_until(lambda: len(env.cp.typed_frames(TID)) == 2)
     assert all(host is None for _, host, _ in env.cp.posts)    # the host id comes from the token, never the query
     first_wait = env.cp.waits[0]
-    assert first_wait == (None, "25", None)          # no `after` until something was handled
+    assert first_wait == (None, "0", None)           # no `after` until something was handled; the first wait never blocks
+    assert wait_until(lambda: len(env.cp.waits) >= 2) and env.cp.waits[1][1] == "25"
     assert wait_until(lambda: any(w[2] == cmd["id"] for w in env.cp.waits))
 
 
@@ -599,6 +602,56 @@ def test_control_plane_http_sends_the_host_token_and_never_follows_a_redirect():
         for s in (other, cp):
             s.shutdown()
             s.server_close()
+
+
+def status_file(env):
+    import json as _j
+    path = env.tmp / "terminal-relay-status.json"
+    return _j.loads(path.read_text()) if path.exists() else None
+
+
+def test_the_first_wait_does_not_block_and_writes_the_status_file(env):
+    import os
+    import stat
+    r = env.make()
+    env.start(r)
+    assert wait_until(lambda: status_file(env) is not None)
+    st = status_file(env)
+    assert st["pid"] == os.getpid() and st["state"] == "connected"
+    assert abs(st["connected_at"] - time.time()) < 5 and st["started_at"] <= st["connected_at"]
+    assert stat.S_IMODE((env.tmp / "terminal-relay-status.json").stat().st_mode) == 0o600
+    assert not list(env.tmp.glob(".terminal-relay-status*"))      # atomic: no temp file left behind
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_refused_relay_never_writes_the_status_file(env, status):
+    env.cp.status_waits = [status] * 50
+    r = env.make(sleep=lambda s: time.sleep(0.01))
+    env.start(r)
+    assert wait_until(lambda: len(env.cp.waits) >= 5)
+    assert status_file(env) is None
+
+
+def test_the_status_file_is_written_once_per_process(env):
+    r = env.make()
+    env.start(r)
+    assert wait_until(lambda: status_file(env) is not None)
+    first = (env.tmp / "terminal-relay-status.json").stat().st_mtime_ns
+    env.cp.fail_waits = 1
+    assert wait_until(lambda: len(env.cp.waits) >= 4)
+    assert (env.tmp / "terminal-relay-status.json").stat().st_mtime_ns == first
+
+
+@pytest.fixture
+def real_wait():
+    """Marks a real-broker test that must run with the production 25 s wait (no _WAIT patch)."""
+
+
+def test_the_first_connected_evidence_appears_within_seconds_against_the_real_broker(real, real_wait):
+    began = time.monotonic()
+    assert wait_until(lambda: status_file(real.env) is not None, 4)
+    assert time.monotonic() - began < 4
+    assert relay_mod._WAIT == 25
 
 
 def test_the_first_successful_poll_logs_one_connected_line(env, caplog):
@@ -1012,7 +1065,8 @@ def test_one_state_save_per_input_command_and_it_precedes_the_keystroke(env, mon
     import os
     events = []
     real_fsync = os.fsync
-    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("save"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("save") if not os.path.isdir(f"/dev/fd/{fd}") else None,
+                                                 real_fsync(fd))[1])   # the state directory's own fsync is not a save
     r = env.make()
     env.client.hook = lambda method, pane, value: events.append("type")
     env.start(r)
@@ -1024,11 +1078,128 @@ def test_one_state_save_per_input_command_and_it_precedes_the_keystroke(env, mon
     assert events == ["save", "type", "save", "type"]        # at-most-once typing: persisted first, one fsync each
 
 
-def test_retarget_follows_the_url_but_the_host_token_never_changes():
+def test_retarget_rereads_the_token_with_the_url_and_never_adopts_the_ingest_key():
     cfg = SimpleNamespace(host_id=HOST, control_plane_url="http://a.invalid")
-    h = ControlPlaneHttp(cfg, token=TOKEN)
+    reads = []
+    h = ControlPlaneHttp(cfg, token=TOKEN, token_source=lambda: reads.append(1) or "token-from-host-json-now")
+    h.retarget("http://a.invalid/", "an-ingest-key-the-relay-must-not-adopt")
+    assert h.token == TOKEN and reads == []                    # same URL: nothing to re-read
     h.retarget("http://b.invalid/", "an-ingest-key-the-relay-must-not-adopt")
-    assert h.url == "http://b.invalid" and h.token == TOKEN
+    assert h.url == "http://b.invalid" and h.token == "token-from-host-json-now"   # an old token never goes to a new URL
+
+
+def test_retarget_keeps_url_and_token_together_when_host_json_cannot_be_read():
+    from herdr_engineering.host_config import HostConfigUnavailable
+
+    def broken():
+        raise HostConfigUnavailable("gone")
+    cfg = SimpleNamespace(host_id=HOST, control_plane_url="http://a.invalid")
+    h = ControlPlaneHttp(cfg, token=TOKEN, token_source=broken)
+    h.retarget("http://b.invalid", None)
+    assert h.url == "http://a.invalid" and h.token == TOKEN
+
+
+def test_two_interleaved_saves_never_leave_the_older_snapshot_on_disk(env):
+    import json as _j
+    r = env.make()
+
+    class GateLock:
+        def __init__(self):
+            self.inner, self.gate, self.first = threading.Lock(), threading.Event(), True
+
+        def __enter__(self):
+            if self.first:
+                self.first = False
+                self.gate.wait(5)           # the first saver stalls before it may write
+            self.inner.acquire()
+
+        def __exit__(self, *a):
+            self.inner.release()
+    gate_lock = GateLock()
+    r._save_lock = gate_lock
+    r._ids["0a1b2c3d-1-aaaa"] = None
+    a = threading.Thread(target=r._save)
+    a.start()
+    time.sleep(0.1)
+    r._ids["0a1b2c3d-2-bbbb"] = None
+    r._save()                                # the newer state is saved while the first saver still waits
+    gate_lock.gate.set()
+    a.join(5)
+    assert _j.loads((env.tmp / "terminal-relay-state.json").read_text())["ids"] == ["0a1b2c3d-1-aaaa", "0a1b2c3d-2-bbbb"]
+
+
+def test_the_state_directory_is_fsynced_after_the_replace(env, monkeypatch):
+    import os
+    import stat as _st
+    order = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (order.append("dir" if _st.S_ISDIR(os.fstat(fd).st_mode) else "file"),
+                                                 real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace", lambda a, b: (order.append("replace"), real_replace(a, b))[1])
+    r = env.make()
+    r._save()
+    assert order == ["file", "replace", "dir"]
+
+
+def test_stop_completes_within_15s_even_when_the_broker_never_answers(env):
+    env.cp.gate = threading.Event()                 # no push is ever answered (they time out after 10 s)
+    r = env.make()
+    t = env.start(r)
+    try:
+        env.client.screens["p1"] = "$ "
+        open_cmd(env.cp)
+        env.cp.push("open", terminal=TID2, pane_id="nope", rows=1, cols=1)
+        assert wait_until(lambda: env.cp.blocked >= 2)
+        for i in range(70):                          # more end notices than the queue holds
+            r._push_later(f"term_{i:024d}", [{"ended": True, "exit": None, "reason": "x"}])
+        began = time.monotonic()
+        r.stop()
+        t.join(15)
+        assert not t.is_alive() and time.monotonic() - began < 15
+    finally:
+        env.cp.gate.set()
+
+
+def test_a_terminal_that_ends_itself_leaves_no_dead_thread_behind(env):
+    r = env.make()
+    env.start(r)
+    open_cmd(env.cp)
+    assert wait_until(lambda: env.cp.typed_frames(TID))
+    del env.client.screens["p1"]
+    assert wait_until(lambda: env.cp.ended(TID))
+    assert wait_until(lambda: r._threads == [])
+
+
+def test_an_input_id_is_deduped_on_its_own_not_only_by_terminal_and_n(env):
+    r = env.make()
+    env.start(r)
+    open_cmd(env.cp)
+    c1 = inp(env.cp, 1, "a")
+    assert wait_until(lambda: env.client.texts() == ["a"])
+    env.cp.redeliver({**c1, "n": 2, "data": b64("z")})       # the SAME command id, a fresh n: still the same command
+    inp(env.cp, 2, "b")
+    assert wait_until(lambda: env.client.texts() == ["a", "b"])
+    time.sleep(0.2)
+    assert env.client.texts() == ["a", "b"]
+
+
+def test_probing_at_the_cap_happens_once_per_cooldown_and_each_push_is_bounded(env):
+    r = env.make()
+    env.client.screens.update({f"q{i}": "x" for i in range(6)})
+    env.start(r)
+    tids = [f"term_{i:024d}" for i in range(4)]
+    for i, t in enumerate(tids):
+        open_cmd(env.cp, t, f"q{i}")
+    assert wait_until(lambda: r.active_terminals() == 4 and all(env.cp.typed_frames(t) for t in tids))
+    before = len(env.cp.posts)
+    env.cp.post_timeouts.clear()
+    open_cmd(env.cp, TID2, "q4")
+    assert wait_until(lambda: env.cp.ended(TID2))
+    first = len(env.cp.posts) - before
+    assert first >= 5 and all(t <= 2.0 for t in env.cp.post_timeouts[:4])     # 4 probes (each <= 2 s) and the refusal
+    open_cmd(env.cp, "term_cccccccccccccccccccccccc", "q5")
+    assert wait_until(lambda: env.cp.ended("term_cccccccccccccccccccccccc"))
+    assert len(env.cp.posts) - before == first + 1                            # the refusal only: no second probe pass
 
 
 # ------------------------------------------------------------------------- against the real broker, over HTTP
@@ -1056,7 +1227,7 @@ class Clock:
 
 
 @pytest.fixture
-def real(env, tmp_path, make_server, monkeypatch):
+def real(env, tmp_path, make_server, monkeypatch, request):
     """A live ControlPlaneServer in open mode (like production) whose fleet file holds this host's token; the relay
     talks to it through ControlPlaneHttp, so the real host-token check, routes and JSON are all in the path."""
     import hashlib
@@ -1066,7 +1237,8 @@ def real(env, tmp_path, make_server, monkeypatch):
     from herdr_engineering.fleet_config import FleetConfigStore
     from tests.control_plane.test_rakazo_bridge import bridge_section
     servers, make = [], make_server
-    monkeypatch.setattr(relay_mod, "_WAIT", 0.1)    # a wait the relay left behind must not hold the broker for 25 s
+    if "real_wait" not in request.fixturenames:
+        monkeypatch.setattr(relay_mod, "_WAIT", 0.1)    # a wait the relay left behind must not hold the broker for 25 s
     fleet = tmp_path / "fleet.yaml"
     fleet.write_text(yaml.safe_dump({"version": 1, "sections": {}, "hosts": {
         HOST: {"roles": [], "token_sha256": hashlib.sha256(TOKEN.encode()).hexdigest()}}}))
@@ -1089,7 +1261,8 @@ def real(env, tmp_path, make_server, monkeypatch):
         account = bridge.accounts[0]
         return SimpleNamespace(account=account, token=bridge.tokens.mint(account.account_id, "127.0.0.1"),
                                accepts_stream=True)
-    http = Flaky(ControlPlaneHttp(SimpleNamespace(host_id=HOST, control_plane_url=f"http://127.0.0.1:{svr.port}"), TOKEN))
+    http = Flaky(ControlPlaneHttp(SimpleNamespace(host_id=HOST, control_plane_url=f"http://127.0.0.1:{svr.port}"), TOKEN,
+                                 token_source=lambda: TOKEN))
     r = env.make(http=http, sleep=lambda s: time.sleep(0.01))
     env.start(r)
     broker = svr.rakazo.terminal

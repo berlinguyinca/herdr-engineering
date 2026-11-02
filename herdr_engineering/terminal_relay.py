@@ -36,6 +36,7 @@ import urllib.parse
 from pathlib import Path
 from urllib.parse import urlencode
 
+from . import host_config as _hc
 from .control_plane.terminal_attach import _PANE
 from .herdr_pane_client import HerdrError
 from .terminal_mirror import InputTranslator, PaneMirror, apply
@@ -60,11 +61,13 @@ _PUSH_RETRY = 2.0          # pause after a refused or failed frame push
 _KEEP_IDS = 300            # remembered command ids (the broker queues at most 256)
 _JOIN = _POST_TIMEOUT + 1.0   # a mirror blocked in a push may take this long to notice it was stopped (a reaper waits)
 _INLINE_PUSH = 2.0         # the poll loop itself never waits longer than this for the broker (the host is offline at 10 s)
+_SHUTDOWN_BUDGET = 12.0    # seconds a stop waits for all its threads together
 _PROBE_COOLDOWN = 5.0      # an open at the cap probes at most this often, so a batch of opens costs one probe
 _PROBE_EVERY = 30.0        # a silent pane re-sends its screen this often: the push is a liveness probe (404 = retired)
 _TID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")   # the broker mints url-safe random ids
 _CMD_ID = re.compile(r"^[0-9a-f]{8}-\d{1,20}-[A-Za-z0-9_-]{1,64}$")
 STATE_REL = Path(".local/share/herdr-engineering/state")
+STATUS_FILE = "terminal-relay-status.json"
 
 
 class RelayLocked(RuntimeError):
@@ -84,9 +87,10 @@ class ControlPlaneHttp:
 
     _IDLE = 4   # pooled idle connections: the poll loop, a few mirrors
 
-    def __init__(self, config, token):
+    def __init__(self, config, token, token_source=None):
         self._url = config.control_plane_url.rstrip("/")
         self.token = token
+        self._token_source = token_source or _hc.host_token   # host.json's token, re-read when the URL changes
         self.auth_rejected = False
         self._pool_lock = threading.Lock()
         self._idle: list[http.client.HTTPConnection] = []
@@ -98,7 +102,11 @@ class ControlPlaneHttp:
     def retarget(self, url, api_key=None):    # ConfigRefresher.sync() points the client at the live configuration
         url = url.rstrip("/") if url else self._url   # the ingest key it offers is not this relay's credential
         if url != self._url:
-            self._url = url
+            try:
+                token = self._token_source()   # URL and token come from host.json together: an old token never goes to a new URL
+            except _hc.HostConfigUnavailable:
+                return
+            self._url, self.token = url, token
             self.close()
 
     def close(self) -> None:
@@ -216,6 +224,7 @@ class TerminalRelay:
         self._flusher = None
         self._fails = 0
         self._connected = False
+        self._started_at = time.time()
         self._auth_logged: float | None = None
         self._quick_empty = 0
         self._saved: dict = self._load()
@@ -256,11 +265,12 @@ class TerminalRelay:
         return {"terminals": dict(list(terms.items())[:MAX_MIRRORS])}
 
     def _save(self) -> None:
-        with self._lock:
-            snap = {"ids": list(self._ids),
-                    "epoch": self._epoch,
-                    "terminals": {t: {"pane": x.pane, "n": x.last_n, "epoch": x.epoch} for t, x in self._terms.items()}}
-        with self._save_lock:
+        with self._save_lock:   # the snapshot is taken under the save lock: an older one can never overwrite a newer one
+            with self._lock:
+                snap = {"ids": list(self._ids),
+                        "epoch": self._epoch,
+                        "terminals": {t: {"pane": x.pane, "n": x.last_n, "epoch": x.epoch}
+                                      for t, x in self._terms.items()}}
             tmp = self.state_dir / f".terminal-relay-state.{secrets.token_hex(4)}.tmp"
             try:
                 self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -270,12 +280,35 @@ class TerminalRelay:
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp, self._state_path())
+                dfd = os.open(self.state_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)   # the rename itself must survive a crash too
+                finally:
+                    os.close(dfd)
             except OSError:
                 log.warning("terminal relay: could not save its state")
                 try:
                     os.unlink(tmp)
                 except OSError:
                     pass
+
+    def _write_status(self) -> None:
+        """The rollout's health evidence: written atomically (0600) on this process's first successful wait. The script
+        accepts it only when it is newer than its own restart marker and its pid is alive."""
+        tmp = self.state_dir / f".terminal-relay-status.{secrets.token_hex(4)}.tmp"
+        try:
+            self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"pid": os.getpid(), "started_at": self._started_at, "connected_at": time.time(),
+                           "state": "connected"}, fh)
+            os.replace(tmp, self.state_dir / STATUS_FILE)
+        except OSError:
+            log.warning("terminal relay: could not write its status file")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     # -- loop --------------------------------------------------------------------------------------
     def run_forever(self, *, once: bool = False) -> None:
@@ -317,10 +350,14 @@ class TerminalRelay:
             out, self._out = self._out, None
             reapers = list(self._reapers)
         if out is not None:
-            out.put(None)
+            try:
+                out.put_nowait(None)   # full: the worker checks the stop flag between pushes and drops what is left
+            except queue.Full:
+                pass
+        deadline = time.monotonic() + _SHUTDOWN_BUDGET   # all joins share one budget: a stop never takes minutes
         for thread in threads + reapers + [self._flusher, self._out_thread]:
             if thread is not None and thread is not threading.current_thread():
-                thread.join(5)
+                thread.join(max(0.0, deadline - time.monotonic()))
         self._release_lock()
 
     def _backoff(self) -> float:
@@ -332,7 +369,7 @@ class TerminalRelay:
         try:
             if self._refresher is not None:
                 self._refresher.sync(self.http)
-            query = {"timeout": _WAIT}
+            query = {"timeout": _WAIT if self._connected else 0}   # the first wait answers at once: connected shows in seconds
             if self._after:
                 query["after"] = self._after
             began = time.monotonic()
@@ -360,6 +397,7 @@ class TerminalRelay:
         if not self._connected:   # the rollout's health check looks for this line: proof that a wait got through
             self._connected = True
             log.info("terminal relay connected")
+            self._write_status()
         if not commands:   # a timeout, or a newer waiter took over: poll again at once, unless that spins
             self._quick_empty = self._quick_empty + 1 if time.monotonic() - began < 0.01 else 0
             if self._quick_empty >= 5:
@@ -502,8 +540,13 @@ class TerminalRelay:
 
     def _out_loop(self, q) -> None:
         while True:
-            item = q.get()
-            if item is None:
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
+            if item is None or self._stop.is_set():   # stopping: end notices still queued are dropped
                 return
             try:
                 self._push(*item)
@@ -675,6 +718,9 @@ class TerminalRelay:
                 self._end(tid, term, "relay_error")
             except Exception:   # noqa: BLE001
                 term.dead = True
+        finally:   # a mirror that ended itself leaves no dead thread in the list
+            with self._lock:
+                self._threads = [t for t in self._threads if t is not threading.current_thread()]
 
     def _mirror(self, tid, term) -> None:
         def pause(seconds):
