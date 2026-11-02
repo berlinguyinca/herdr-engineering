@@ -16,26 +16,32 @@ pytestmark = pytest.mark.filterwarnings('ignore:This process .* is multi-threade
 
 
 class FakeHost:
-    """Plays the relay for the broker: fetches what was queued for its hosts and pushes frames back."""
+    """Plays the relay for the broker: fetches what was queued for its hosts (acking as it goes, deduping by command id)
+    and pushes frames back. It learns which host a terminal lives on from the open commands it receives."""
 
     def __init__(self, terminal, hosts=("beast", "elsewhere")):
         self.terminal, self.hosts, self.log = terminal, hosts, []
+        self.acked, self.where = {}, {}
 
     def poll(self):
         for host in self.hosts:
-            self.log += [dict(c, host=host) for c in self.terminal.wait_commands(host, 0)]
+            for c in self.terminal.wait_commands(host, 0, after=self.acked.get(host)):
+                self.acked[host] = c["id"]
+                if c["kind"] == "open":
+                    self.where[c["terminal"]] = host
+                self.log.append(dict(c, host=host))
 
     def sent(self, kind=None):
         self.poll()
         return [c for c in self.log if kind is None or c["kind"] == kind]
 
     def say(self, tid, text, rows=24, cols=80):
-        host = self.terminal._clients[tid].pty.host
-        self.terminal.accept_frames(host, tid, [{"data": b64(text), "rows": rows, "cols": cols}])
+        self.poll()
+        self.terminal.accept_frames(self.where[tid], tid, [{"data": b64(text), "rows": rows, "cols": cols}])
 
     def end(self, tid, code=0, reason=None):
-        host = self.terminal._clients[tid].pty.host
-        self.terminal.accept_frames(host, tid, [{"ended": True, "exit": code, **({"reason": reason} if reason else {})}])
+        self.poll()
+        self.terminal.accept_frames(self.where[tid], tid, [{"ended": True, "exit": code, **({"reason": reason} if reason else {})}])
 
 
 class Clock:
@@ -147,12 +153,33 @@ def test_open_for_a_host_that_is_not_connected_is_a_plain_503_at_once(bridge, ct
     assert not bridge.terminal._lives and not bridge.terminal._queues.get("gamma")
 
 
-def test_a_host_stays_connected_for_30_seconds_after_its_last_wait(bridge, clock):
-    assert bridge.terminal.host_connected("beast") and not bridge.terminal.host_connected("gamma")
-    clock.now += 30
-    assert bridge.terminal.host_connected("beast")
-    clock.now += 1
-    assert not bridge.terminal.host_connected("beast")
+def test_a_host_is_connected_while_a_wait_blocks_and_for_10_seconds_after_it_ends(bridge, clock):
+    terminal = bridge.terminal
+    assert terminal.host_connected("beast") and not terminal.host_connected("gamma")
+    clock.now += 9
+    assert terminal.host_connected("beast")
+    clock.now += 1.1
+    assert not terminal.host_connected("beast")                                # last wait ended more than 10 s ago
+    blocked = threading.Thread(target=lambda: terminal.wait_commands("gamma", 1.5), daemon=True)
+    blocked.start()
+    time.sleep(0.2)
+    clock.now += 500
+    assert terminal.host_connected("gamma")                                    # a blocked waiter is a connected host
+    blocked.join(5)
+    assert terminal.host_connected("gamma")                                    # its end time is recorded when it returns
+    clock.now += 10.1
+    assert not terminal.host_connected("gamma")
+
+
+def test_state_for_hosts_not_seen_for_ten_minutes_is_pruned(bridge, clock):
+    terminal = bridge.terminal
+    terminal.wait_commands("gone", 0)
+    clock.now += 599
+    terminal._reap()
+    assert "gone" in terminal._polled
+    clock.now += 2
+    terminal._reap()
+    assert "gone" not in terminal._polled and "gone" not in terminal._queues
 
 
 def test_open_errors(bridge, ctx, repo, host):
@@ -377,7 +404,7 @@ def test_the_reaper_closes_an_idle_terminal_with_no_further_calls(bridge, repo, 
             time.sleep(0.02)
         assert not t._lives, "the reaper never closed the idle terminal"
         assert [e["action"].rsplit(".", 1)[1] for e in audit] == ["attach", "detach"]
-        assert [c["kind"] for c in t.wait_commands("beast", 0)] == ["open", "close"]
+        assert [c["kind"] for c in t.wait_commands("beast", 0)] == ["close"]
     finally:
         t.close_all()
 
@@ -390,7 +417,7 @@ def test_close_all_stops_the_reaper_and_a_later_open_is_refused(bridge, repo, ct
     t.close_all()
     reaper.join(2)
     assert not reaper.is_alive() and not t._lives
-    assert [c["kind"] for c in t.wait_commands("beast", 0)] == ["open", "close"]
+    assert [c["kind"] for c in t.wait_commands("beast", 0)] == ["close"]
     bridge._closed.set()
     with pytest.raises(BridgeError) as e:
         t.open(ctx, {"id": "a1", "rows": 24, "cols": 80})
@@ -557,11 +584,11 @@ def test_a_host_that_stops_polling_ends_its_terminals_with_host_offline(bridge, 
 
 def test_a_new_terminal_gets_ten_seconds_from_its_open_even_if_the_host_polled_long_ago(bridge, ctx, repo, clock):
     live(repo)
-    clock.now += 25                                              # beast last polled 25 s ago: still connected
+    clock.now += 9                                               # beast last polled 9 s ago: still connected
     tid = bridge.terminal.open(ctx, {"id": "a1", "rows": 24, "cols": 80})["terminalId"]
     bridge.terminal._reap()
     assert bridge.terminal._lives["a1"].alive
-    clock.now += 11
+    clock.now += 10
     bridge.terminal._reap()
     assert not bridge.terminal._lives["a1"].alive and tid
 
@@ -571,7 +598,8 @@ def test_a_stuck_host_cannot_block_the_phone_calls(bridge, ctx, repo, host):
     tid = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
     for n in range(1, 301):                                      # the host never fetches: no call waits for it
         bridge.terminal.input(ctx, {"terminalId": tid, "data": b64("x"), "n": n})
-    assert len(bridge.terminal._queues["beast"]) == 256
+    assert len(bridge.terminal._queues["beast"]) <= 256
+    assert bridge.terminal._lives["a1"].chunks_after(0)[-1]["reason"] == "input_overflow"
 
 
 def test_agents_list_is_unaffected(bridge, repo, ctx):

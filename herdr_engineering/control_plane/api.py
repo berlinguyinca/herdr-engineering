@@ -5089,45 +5089,56 @@ def _make_handler(server, public=False, operator=False):
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
 
-        def _host_key_allowed(self, host_id, *, strict=False):
+        def _host_key_allowed(self, host_id, *, explicit=False):
             """May this key act for ``host_id``? A key bound in control_plane.architecture.agent_hosts acts only for its own
             hosts. An unbound key is trusted to name any host (keys carry a role only; there is no per-host enrollment),
-            except an unbound ``agent`` key under require_host_binding, as for the summary reports. ``strict`` also refuses
-            an unbound ingest key then: the terminal carries keystrokes and screens, so it never relies on trust alone."""
+            except an unbound ``agent`` key under require_host_binding, as for the summary reports. ``explicit`` is the
+            terminal's rule: only a key listed in agent_hosts for THIS host, whatever require_host_binding says (the terminal
+            carries keystrokes and screens, so it never relies on trust)."""
             role = self._role()
             bound = (server.architecture_agent_hosts.get(self._principal()["id"])
                      if role in ("agent", "ingest") else None)
+            if explicit:
+                return bound is not None and host_id in bound
             if bound is not None:
                 return host_id in bound
-            return not (server.architecture_require_host_binding and (role == "agent" or strict and role == "ingest"))
+            return not (server.architecture_require_host_binding and role == "agent")
 
         def _host_terminal(self, parts, body=None):
-            """Terminal broker, host side. ``GET /api/v1/host/terminal/wait?host_id=&timeout=`` long-polls for commands;
-            ``POST /api/v1/host/terminal/<id>/output?host_id=`` pushes screen frames. Ingest or operator API keys only
-            (an agent key runs inside sessions and must not read keystrokes), bound to the host like steering delivery."""
+            """Terminal broker, host side. ``GET /api/v1/host/terminal/wait?host_id=&timeout=&after=`` long-polls for commands
+            (``after`` acknowledges up to that command id); ``POST /api/v1/host/terminal/<id>/output?host_id=`` pushes screen
+            frames. Ingest API keys only, and only a key explicitly bound to the host in control_plane.architecture.agent_hosts:
+            deploying the relay needs each fleet host's ingest key listed there for its own host id. Agent keys run inside
+            sessions and must not read keystrokes; operator keys cannot be bound, so they never qualify."""
             from .rakazo_terminal import HostError
             from .terminal_attach import _HOST
             broker = server.rakazo.terminal if server.rakazo is not None else None
             if broker is None:
                 return self._json({"error": "not found"}, 404)
-            if self._principal().get("authenticated_by") != "api_key" or self._role() not in ("ingest", "operator"):
-                return self._json({"error": "the terminal relay needs an ingest or operator API key"}, 403)
+            if self._principal().get("authenticated_by") != "api_key" or self._role() != "ingest":
+                return self._json({"error": "the terminal relay needs an ingest API key bound to its host"}, 403)
             host_id = _q(self.path, "host_id")
             if host_id is None and isinstance(body, dict):
                 host_id = body.get("host_id")
             if not isinstance(host_id, str) or not _HOST.fullmatch(host_id):
                 return self._json({"error": "a valid host_id is required"}, 400)
-            if not self._host_key_allowed(host_id, strict=True):
-                return self._json({"error": "this API key may not act for that host"}, 403)
+            if not self._host_key_allowed(host_id, explicit=True):
+                return self._json({"error": "this API key is not bound to that host (control_plane.architecture.agent_hosts)"}, 403)
             try:
                 if body is None:
                     try:
                         timeout = float(_q(self.path, "timeout") or 25)
                     except ValueError:
                         timeout = -1
+                    after = _q(self.path, "after")
                     if not 0 <= timeout < float("inf"):
                         return self._json({"error": "timeout must be a number of seconds"}, 400)
-                    return self._json({"commands": broker.wait_commands(host_id, timeout)})
+                    if after is not None and not re.fullmatch(r"\d{1,20}-[A-Za-z0-9_-]{1,64}", after):
+                        return self._json({"error": "after must be a command id"}, 400)
+                    commands = broker.wait_commands(host_id, timeout, after)
+                    # Serialised here, not by _json's redaction pass: that one rewrites strings that look like credentials,
+                    # and a corrupted base64 input would type the wrong keys.
+                    return self._json(None, payload=json.dumps({"commands": commands}).encode())
                 if not isinstance(body, dict):
                     return self._json({"error": "body must be an object"}, 400)
                 broker.accept_frames(host_id, parts[5], body.get("frames"))

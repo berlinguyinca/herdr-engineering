@@ -100,3 +100,12 @@ This amendment replaces the pty in Amendment 1. The host relay does **not** star
 - No cursor position appears in any read format: the app draws no cursor unless the socket API reports one.
 - `pane layout` reports each pane's rect and the workspace area (the area comes from the open herdr window; with none it is 120x40). `pane resize` changes a split ratio (worked); it cannot set an exact column count. The owner allows the phone to resize panes: the app offers zoom and split-ratio changes, and otherwise shows the pane at its real size, fitted to the screen width.
 - Frames are sent as full-screen replacements marked `reset: true`, which the built app client already treats as "clear, then draw", so the app's data path does not change.
+
+## Deployment requirements (host relay)
+
+The control plane hands a host key keystrokes and takes screens from it, so it never trusts a key to name any host. Both
+host terminal endpoints (`GET /api/v1/host/terminal/wait`, `POST /api/v1/host/terminal/<id>/output`) accept only an
+`ingest` key that is EXPLICITLY listed in `control_plane.architecture.agent_hosts` for the host id it acts for, whatever
+`require_host_binding` says. Deploying the relay therefore requires each fleet host's ingest key to be listed there for
+its own host id (for example `agent_hosts: {<host key>: [bender]}`); an unlisted ingest key, an operator key and every
+agent key are refused with 403.

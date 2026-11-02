@@ -3,6 +3,7 @@
 A live ControlPlaneServer is driven over HTTP with host keys; the phone side is the bridge's own ``terminal/open``."""
 import base64
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -45,8 +46,9 @@ class Http:
             raw = err.read()
             return err.code, (json.loads(raw) if raw else None), dict(err.headers)
 
-    def wait(self, host="beast", timeout=0, key="host"):
-        return self.call(f"{WAIT}?host_id={host}&timeout={timeout}", key=key)
+    def wait(self, host="beast", timeout=0, key="host", after=None):
+        extra = f"&after={after}" if after else ""
+        return self.call(f"{WAIT}?host_id={host}&timeout={timeout}{extra}", key=key)
 
     def output(self, tid, frames, host="beast", key="host", **kw):
         return self.call(OUT.format(tid) + f"?host_id={host}", {"frames": frames}, key=key, **kw)
@@ -120,12 +122,34 @@ def test_a_key_bound_to_other_hosts_gets_nothing_for_this_one(env):
     assert not svr.rakazo.terminal.host_connected("beast")    # the refused polls did not mark it connected
 
 
-def test_an_unbound_ingest_key_is_refused_when_binding_is_required_else_trusted(rig):
-    svr, http = rig(architecture_options={"agent_hosts": BINDINGS, "require_host_binding": True})
-    assert http.wait("beast", key="free")[0] == 403
-    assert http.wait("beast", key="write")[0] == 200          # operators stay trusted, as for the summary reports
-    svr2, http2 = rig(architecture_options={"agent_hosts": BINDINGS})
-    assert http2.wait("beast", key="free")[0] == 200
+def test_an_unbound_key_is_refused_on_both_endpoints_under_the_default_config(env):
+    svr, http = env                                           # agent_hosts is set, require_host_binding is NOT
+    tid = open_terminal(svr, http)
+    assert http.wait("beast", key="free")[0] == 403           # an ingest key nobody bound to a host
+    assert http.output(tid, [frame()], key="free")[0] == 403
+    assert http.wait("beast", key="write")[0] == 403          # operator keys cannot be bound, so they never qualify
+    assert http.output(tid, [frame()], key="write")[0] == 403
+    assert chunks(svr) == []
+
+
+def test_without_any_agent_hosts_no_key_may_be_a_terminal_host(rig):
+    svr, http = rig()
+    assert http.wait("beast", key="host")[0] == 403
+    assert http.wait("beast", key="write")[0] == 403
+    svr2, http2 = rig(architecture_options={"agent_hosts": BINDINGS, "require_host_binding": True})
+    assert http2.wait("beast", key="free")[0] == 403
+    assert http2.wait("beast", key="host")[0] == 200
+
+
+def test_a_key_bound_to_one_host_cannot_poll_or_post_for_another(env):
+    svr, http = env
+    tid = open_terminal(svr, http, "beast")
+    open_terminal(svr, http, "other", sid="b1")
+    assert http.wait("other", key="host")[0] == 403
+    assert http.wait("beast", key="host2")[0] == 403
+    assert http.output(tid, [frame()], host="other", key="host")[0] == 403
+    assert http.output(tid, [frame()], host="beast", key="host2")[0] == 403
+    assert chunks(svr) == []
 
 
 def test_output_for_a_terminal_on_another_host_is_refused(env):
@@ -181,7 +205,7 @@ def test_wait_wakes_when_a_command_is_queued_and_times_out_empty_otherwise(env):
     assert cmd["kind"] == "open" and cmd["terminal"] == tid and cmd["id"]
     assert (cmd["pane_id"], cmd["rows"], cmd["cols"]) == ("w1:p1", 30, 100)
     started = time.monotonic()
-    assert http.wait(timeout=0.4)[1] == {"commands": []} and 0.3 < time.monotonic() - started < 3
+    assert http.wait(timeout=0.4, after=cmd["id"])[1] == {"commands": []} and 0.3 < time.monotonic() - started < 3
 
 
 def test_wait_delivers_input_in_order_and_only_to_its_own_host(env):
@@ -196,7 +220,9 @@ def test_wait_delivers_input_in_order_and_only_to_its_own_host(env):
     assert [(c["kind"], c.get("n"), c.get("data")) for c in cmds] == [
         ("open", None, None), ("input", 1, b64("ls")), ("input", 2, b64("\r"))]
     assert len({c["id"] for c in cmds}) == 3 and len(cmds[0]["id"]) >= 16        # unguessable
-    assert http.wait()[1] == {"commands": []}                                   # fetched once
+    ids = [c["id"] for c in cmds]
+    assert all(re.fullmatch(r"\d+-[A-Za-z0-9_-]{16,}", i) for i in ids)         # <counter>-<random>, counter ascending
+    assert [int(i.split("-")[0]) for i in ids] == sorted(int(i.split("-")[0]) for i in ids)
 
 
 def test_a_waiter_ends_when_the_bridge_closes(env):
@@ -208,23 +234,6 @@ def test_a_waiter_ends_when_the_bridge_closes(env):
     svr.rakazo._closed.set()
     poller.join(3)
     assert got and got[0][1] == {"commands": []}
-
-
-def test_at_most_16_waiters_and_the_17th_is_429(env):
-    svr, http = env
-    results = []
-    threads = [threading.Thread(target=lambda: results.append(http.wait(timeout=2)[0]), daemon=True) for _ in range(16)]
-    for th in threads:
-        th.start()
-    deadline = time.monotonic() + 3
-    while svr.rakazo.terminal._waiters < 16 and time.monotonic() < deadline:
-        time.sleep(0.02)
-    status, _, headers = http.wait(timeout=2)
-    assert status == 429 and headers.get("Retry-After")
-    for th in threads:
-        th.join(5)
-    assert results == [200] * 16
-    assert http.wait(timeout=0)[0] == 200                                       # the slots came back
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -290,15 +299,176 @@ def test_a_silent_host_ends_its_terminal_with_host_offline(env):
     assert http.output(tid, [frame()])[0] == 200 and len(chunks(svr)) == 1     # accepted, but nothing follows an end
 
 
-def test_the_command_queue_per_host_is_capped_at_256_oldest_input_first(env):
+def test_a_full_queue_ends_the_terminal_whose_input_overflowed_and_never_leaves_a_gap(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    term, ctx = svr.rakazo.terminal, owner(svr)
+    for n in range(1, 301):                                                    # the host never fetches
+        term.input(ctx, {"terminalId": tid, "data": b64(f"{n}"), "n": n})
+    last = chunks(svr)[-1]
+    assert last["ended"] is True and last["reason"] == "input_overflow"
+    assert http.wait()[1] == {"commands": []}                                  # none of its inputs is delivered with a hole in n
+
+
+def test_input_overflow_drops_only_the_overflowing_terminals_inputs(env):
+    svr, http = env
+    t1 = open_terminal(svr, http, sid="a1")
+    t2 = open_terminal(svr, http, sid="a2")
+    term, ctx = svr.rakazo.terminal, owner(svr)
+    http.wait(after=http.wait()[1]["commands"][-1]["id"])                       # both opens delivered and acked
+    for n in range(1, 128):                                                    # 254 queued inputs, alternating, t1's first
+        term.input(ctx, {"terminalId": t1, "data": b64("a"), "n": n})
+        term.input(ctx, {"terminalId": t2, "data": b64("b"), "n": n})
+    for n in range(128, 131):                                                  # t2 keeps typing into a full queue
+        term.input(ctx, {"terminalId": t2, "data": b64("b"), "n": n})
+    cmds = http.wait()[1]["commands"]
+    assert chunks(svr, "a1")[-1]["reason"] == "input_overflow" and chunks(svr, "a2") == []
+    assert [c["n"] for c in cmds if c["terminal"] == t2] == list(range(1, 131))   # the other terminal has no gap
+    assert not [c for c in cmds if c["terminal"] == t1 and c["kind"] == "input"]
+
+
+def test_a_full_queue_with_no_input_to_drop_refuses_and_keeps_the_open(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    term, ctx = svr.rakazo.terminal, owner(svr)
+    for _ in range(255):
+        term.resize(ctx, {"terminalId": tid, "rows": 24, "cols": 80})
+    with pytest.raises(term.Error) as e:
+        term.resize(ctx, {"terminalId": tid, "rows": 24, "cols": 80})
+    assert e.value.status == 503
+    cmds = http.wait()[1]["commands"]
+    assert len(cmds) == 256 and cmds[0]["kind"] == "open"                      # an open (or close) is never dropped for room
+
+
+# ------------------------------------------------------------------------------- at-least-once delivery
+def test_commands_stay_queued_until_acked_with_after(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    for n in (1, 2):
+        svr.rakazo.terminal.input(owner(svr), {"terminalId": tid, "data": b64("x"), "n": n})
+    first = http.wait()[1]["commands"]
+    assert [c["kind"] for c in first] == ["open", "input", "input"]
+    assert http.wait()[1]["commands"] == first                                  # not acked: delivered again, same ids
+    assert http.wait(after=first[0]["id"])[1]["commands"] == first[1:]          # the ack covers everything up to that id
+    assert http.wait(after=first[-1]["id"])[1] == {"commands": []}
+    assert http.wait()[1] == {"commands": []}                                   # and an ack is permanent
+
+
+def test_an_orphan_waiter_does_not_swallow_commands(env):
     svr, http = env
     tid = open_terminal(svr, http)
     term = svr.rakazo.terminal
-    ctx = owner(svr)
-    for n in range(1, 301):
-        term.input(ctx, {"terminalId": tid, "data": b64(f"{n}"), "n": n})
+    got = term.wait_commands("beast", 0)                                        # a relay whose connection then died
+    term.input(owner(svr), {"terminalId": tid, "data": b64("x"), "n": 1})
+    again = http.wait()[1]["commands"]
+    assert [c["id"] for c in again][:len(got)] == [c["id"] for c in got] and again[-1]["kind"] == "input"
+
+
+def test_unacked_commands_expire_after_60_seconds(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    now = [time.monotonic()]
+    svr.rakazo.terminal._clock = lambda: now[0]
+    http.wait()
+    now[0] += 59
+    assert [c["kind"] for c in http.wait()[1]["commands"]] == ["open"]
+    now[0] += 2
+    assert http.wait()[1] == {"commands": []} and tid
+
+
+def test_a_malformed_after_cursor_is_400(env):
+    _, http = env
+    assert http.call(f"{WAIT}?host_id=beast&timeout=0&after=nope")[0] == 400
+
+
+# --------------------------------------------------------------------------------------- stale commands
+def test_a_terminal_that_ended_leaves_no_stale_commands_for_a_host_that_returns(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    term, ctx = svr.rakazo.terminal, owner(svr)
+    now = [time.monotonic()]
+    term._clock = lambda: now[0]
+    http.wait()                                                                # connected; the open is queued, never fetched
+    term.input(ctx, {"terminalId": tid, "data": b64("typed just before it went down"), "n": 1})
+    term.resize(ctx, {"terminalId": tid, "rows": 30, "cols": 90, "zoom": True})
+    now[0] += 11                                                               # the host went down
+    term._reap()
+    assert chunks(svr)[-1]["reason"] == "host_offline"
+    now[0] += 1                                                                # back, well inside the 60 s expiry
+    assert http.wait()[1] == {"commands": []}                                  # no open, input, resize or zoom is replayed
+    now[0] += 3600
+    assert http.wait()[1] == {"commands": []}
+
+
+def test_a_closed_or_retired_terminal_keeps_only_its_close(env):
+    svr, http = env
+    first = open_terminal(svr, http)
+    term, ctx = svr.rakazo.terminal, owner(svr)
+    term.input(ctx, {"terminalId": first, "data": b64("x"), "n": 1})
+    second = term.open(ctx, {"id": "a1", "rows": 24, "cols": 80})["terminalId"]   # takeover before anything was fetched
+    sent = http.wait()[1]["commands"]
+    assert [(c["kind"], c["terminal"]) for c in sent] == [("close", first), ("open", second)]
+    http.wait(after=sent[-1]["id"])
+    term.input(ctx, {"terminalId": second, "data": b64("y"), "n": 1})
+    term.close(ctx, {"terminalId": second})
+    assert [(c["kind"], c["terminal"]) for c in http.wait()[1]["commands"]] == [("close", second)]
+
+
+# ------------------------------------------------------------------------------------------ waiter caps
+def test_a_newer_wait_for_the_same_host_ends_the_older_one(env):
+    svr, http = env
+    got = []
+    older = threading.Thread(target=lambda: got.append(http.wait(timeout=20)), daemon=True)
+    older.start()
+    time.sleep(0.3)
+    newer = threading.Thread(target=lambda: got.append(http.wait(timeout=1.5)), daemon=True)
+    newer.start()
+    older.join(1.0)
+    assert not older.is_alive() and got == [(200, {"commands": []}, got[0][2])]   # the older poll was ended, empty
+    newer.join(5)
+
+
+def test_one_host_cannot_lock_out_the_others_and_many_hosts_can_poll(env):
+    svr, http = env
+    spam = [threading.Thread(target=lambda: http.wait("beast", timeout=1.5), daemon=True) for _ in range(30)]
+    for th in spam:
+        th.start()
+    time.sleep(0.3)
+    assert http.wait("other", key="host2")[0] == 200                            # not locked out by beast's 30 polls
+    assert svr.rakazo.terminal._waiters <= 30
+    for th in spam:
+        th.join(5)
+
+
+def test_more_than_16_hosts_can_wait_at_once_and_the_65th_waiter_is_429(env):
+    svr, http = env
+    term = svr.rakazo.terminal
+    results = []
+    threads = [threading.Thread(target=lambda h=f"h{i}": results.append(term.wait_commands(h, 1.5)), daemon=True)
+               for i in range(64)]
+    for th in threads:
+        th.start()
+    deadline = time.monotonic() + 3
+    while term._waiters < 64 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert term._waiters == 64
+    status, _, headers = http.wait(timeout=2)
+    assert status == 429 and headers.get("Retry-After")
+    for th in threads:
+        th.join(5)
+    assert len(results) == 64
+
+
+# ---------------------------------------------------------------------------------------------- redaction
+@pytest.mark.parametrize("size", [500, 2000, 4000])
+def test_the_wait_response_is_never_redacted(rig, size):
+    token = "cifix-test-credential-98c2a1"
+    svr, http = rig(architecture_options={"agent_hosts": BINDINGS},
+                    ci_fix={"enabled": True, "agent_api_key": token, "hosts": ["beast"]})
+    tid = open_terminal(svr, http)
+    raw = bytes([0x41]) * (size * 3 // 4 - 1) + bytes([0x1c])                  # base64 text of `size` chars ending in 'c'
+    data = b64(raw)
+    assert len(data) == size and data.endswith(token[0])
+    svr.rakazo.terminal.input(owner(svr), {"terminalId": tid, "data": data, "n": 1})
     cmds = http.wait()[1]["commands"]
-    assert len(cmds) == 256 and cmds[0]["kind"] == "open"                      # the open is never the victim while inputs exist
-    assert [c["n"] for c in cmds[1:]] == list(range(46, 301))                  # 300 inputs + open = 301: the 45 oldest inputs were dropped
-    note = base64.b64decode(chunks(svr)[-1]["data"])
-    assert b"input dropped" in note and "reset" not in chunks(svr)[-1]         # the terminal says so, without clearing the screen
+    assert cmds[-1]["data"] == data
