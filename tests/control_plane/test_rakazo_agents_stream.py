@@ -184,3 +184,30 @@ def test_list_stream_rebuilds_rows_once_per_interval_across_subscribers(bridge, 
     [t.join() for t in threads]
     assert len(calls) == 1
     assert all([f["row"]["id"] for f in r] == ["a"] for r in results)
+
+
+def test_subscribe_list_stale_cursor_snapshot_once_then_drop_frames_on_same_connection(bridge, repo, ctx):
+    bridge.stream_options = {"poll_seconds": 0.01, "heartbeat_seconds": 0.02, "max_seconds": 30}
+    repo.upsert_session("a", status="working")
+    repo.upsert_session("b", status="blocked")
+    resp = sub(bridge, "subscribeList", ctx, cursor=4000)
+    seen, beats, closed = [], 0, False
+    try:
+        for raw in resp.frames:
+            event = json.loads(raw[6:])["json"]
+            if event.get("type") == "heartbeat":
+                beats += 1
+                if beats == 6 and not closed:
+                    repo.upsert_session("b", status="closed")
+                    closed = True
+                if beats >= 12:
+                    break
+                continue
+            seen.append(event)
+    finally:
+        resp.frames.close()
+        resp.on_close()
+    snapshot = [f for f in seen if f["row"]["status"] != "closed"]
+    assert sorted(f["row"]["id"] for f in snapshot) == ["a", "b"]          # delivered exactly once
+    assert [(f["row"]["id"], f["row"]["status"]) for f in seen if f["row"]["status"] == "closed"] == [("b", "closed")]
+    assert all(f["seq"] < 4000 for f in seen)

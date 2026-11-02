@@ -253,4 +253,9 @@ class Agents:
     def subscribe_list(self, ctx, inp):
         self._check_stream(ctx, inp)
         repo = self._repo()
+        self._refresh_throttled(repo)
+        with self._lock:
+            stale = inp["cursor"] > self._counter
+        if stale:   # a cursor from before a restart: resolve it once here, so event_stream's own cursor then advances normally
+            inp = {**inp, "cursor": -1}
         return self._stream(ctx, inp, lambda after: self._list_fetch(repo, after))
