@@ -3,6 +3,7 @@ import base64
 import json
 import socket
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -335,17 +336,213 @@ def test_a_live_stream_keeps_the_session_and_its_close_starts_the_clock(bridge, 
     assert status_of(bridge, ctx, "resize", terminalId=tid, rows=24, cols=80) == 404
 
 
-def test_the_reaper_closes_an_idle_session_with_no_further_calls(bridge, repo, audit):
+def short_lived(bridge, repo, **kw):
     live(repo)
-    t = rt.Terminal(bridge, BridgeError, spawn=FakeSession, local_host="beast", ttl=0.2)
+    t = rt.Terminal(bridge, BridgeError, spawn=FakeSession, local_host="beast", ttl=0.2, **kw)
     t.repo = repo
-    ctx = ctx_for(bridge)
+    return t
+
+
+def test_the_reaper_closes_an_idle_session_with_no_further_calls(bridge, repo, audit):
+    t = short_lived(bridge, repo)
+    try:
+        t.open(ctx_for(bridge), {"id": "a1", "rows": 24, "cols": 80})
+        deadline = time.monotonic() + 3
+        while not FakeSession.made[0].closed and time.monotonic() < deadline:   # no call, no close_all
+            time.sleep(0.02)
+        assert FakeSession.made[0].closed, "the reaper never closed the idle session"
+        assert [e["action"].rsplit(".", 1)[1] for e in audit] == ["attach", "detach"]
+    finally:
+        t.close_all()
+
+
+def test_close_all_stops_the_reaper_and_a_later_open_is_refused(bridge, repo, ctx):
+    t = short_lived(bridge, repo)
     t.open(ctx, {"id": "a1", "rows": 24, "cols": 80})
-    deadline = time.monotonic() + 3
-    while not FakeSession.made[0].closed and time.monotonic() < deadline:
-        time.sleep(0.02)
+    reaper = t._reaper
+    assert reaper.is_alive()
     t.close_all()
-    assert FakeSession.made[0].closed and [e["action"].rsplit(".", 1)[1] for e in audit] == ["attach", "detach"]
+    reaper.join(2)
+    assert not reaper.is_alive() and FakeSession.made[0].closed
+    bridge._closed.set()
+    with pytest.raises(BridgeError) as e:
+        t.open(ctx, {"id": "a1", "rows": 24, "cols": 80})
+    assert e.value.status == 503 and len(FakeSession.made) == 1
+
+
+def test_the_reaper_survives_a_failing_pass_and_restarts_after_close_all(bridge, repo, ctx):
+    t = short_lived(bridge, repo)
+    calls = []
+    real = t._reap
+
+    def flaky():
+        if threading.current_thread() is threading.main_thread():
+            return real()                      # the open's own sweep
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        real()
+    t._reap = flaky
+    try:
+        t.open(ctx, {"id": "a1", "rows": 24, "cols": 80})
+        deadline = time.monotonic() + 3
+        while len(calls) < 3 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert len(calls) >= 3 and t._reaper.is_alive()
+        first = t._reaper
+        t.close_all()
+        first.join(2)
+        t.open(ctx, {"id": "a1", "rows": 24, "cols": 80})      # the manager is reusable until the bridge closes
+        assert t._reaper is not first and t._reaper.is_alive()
+    finally:
+        t.close_all()
+
+
+def test_a_reopen_refreshes_the_idle_clock(bridge, repo, ctx, clock):
+    live(repo)
+    t = rt.Terminal(bridge, BridgeError, spawn=FakeSession, local_host="beast", ttl=100, clock=clock)
+    t.repo = repo
+    try:
+        t.open(ctx, {"id": "a1", "rows": 24, "cols": 80})
+        clock.now += 90
+        t.open(ctx, {"id": "a1", "rows": 24, "cols": 80})
+        clock.now += 50                      # 140 s after the first open, 50 after the reopen
+        t._reap()
+        assert not FakeSession.made[0].closed
+        clock.now += 51
+        t._reap()
+        assert FakeSession.made[0].closed
+    finally:
+        t.close_all()
+
+
+def test_replacing_an_ended_pty_works_with_every_slot_full(bridge, ctx, repo):
+    for i in range(4):
+        call(bridge, ctx, "open", id=live(repo, f"a{i}"), rows=24, cols=80)
+    FakeSession.made[0].end(255)
+    call(bridge, ctx, "open", id="a0", rows=24, cols=80)
+    assert len(FakeSession.made) == 5 and not FakeSession.made[4].closed
+    assert status_of(bridge, ctx, "open", id=live(repo, "a4"), rows=24, cols=80) == 429
+
+
+def test_bridge_close_still_closes_desk_and_push_when_the_terminals_fail(bridge, monkeypatch):
+    shut = []
+
+    def boom():
+        raise RuntimeError("nope")
+    monkeypatch.setattr(bridge.terminal, "close_all", boom)
+    bridge.desk = SimpleNamespace(close=lambda: shut.append("desk"))
+    bridge.push = SimpleNamespace(close=lambda: shut.append("push"))
+    bridge.close()
+    monkeypatch.undo()                      # the fixture's own teardown closes the terminals for real
+    assert shut == ["desk", "push"]
+
+
+def test_an_input_that_lost_the_race_with_a_takeover_does_not_type(bridge, ctx, repo, monkeypatch):
+    live(repo)
+    tid = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
+    stale = bridge.terminal._clients[tid]
+    call(bridge, ctx, "open", id="a1", rows=24, cols=80)
+    monkeypatch.setattr(bridge.terminal, "_find", lambda c, i: stale)      # it passed the lookup before the takeover
+    assert call(bridge, ctx, "input", terminalId=tid, data=b64("late"), n=1) == {"ok": True}
+    assert FakeSession.made[0].written == []
+
+
+def test_a_takeover_waits_for_an_input_in_flight(bridge, ctx, repo):
+    live(repo)
+    tid = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
+    client = bridge.terminal._clients[tid]
+    done = threading.Event()
+
+    def reopen():
+        call(bridge, ctx, "open", id="a1", rows=24, cols=80)
+        done.set()
+    with client.lock:                                  # an input is mid-write
+        threading.Thread(target=reopen, daemon=True).start()
+        assert not done.wait(0.2) and not client.taken
+    assert done.wait(2) and client.taken
+
+
+class SlowResize(FakeSession):
+    gate = None
+
+    def resize(self, rows, cols):
+        if SlowResize.gate is not None:
+            SlowResize.gate.wait(5)
+        super().resize(rows, cols)
+
+
+def test_a_stuck_reattach_does_not_freeze_other_terminal_calls(bridge, ctx, repo):
+    bridge.terminal.spawn = SlowResize
+    a = call(bridge, ctx, "open", id=live(repo, "a1"), rows=24, cols=80)["terminalId"]
+    b = call(bridge, ctx, "open", id=live(repo, "a2"), rows=24, cols=80)["terminalId"]
+    SlowResize.gate = threading.Event()
+    try:
+        reopen = threading.Thread(target=lambda: call(bridge, ctx, "open", id="a1", rows=30, cols=90), daemon=True)
+        reopen.start()
+        time.sleep(0.1)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(
+            call(bridge, ctx, "input", terminalId=b, data=b64("x"), n=1)), daemon=True)
+        worker.start()
+        worker.join(1)
+        assert results == [{"ok": True}], "terminal calls froze behind a stuck resize"
+        closer = threading.Thread(target=bridge.terminal._reap, daemon=True)
+        closer.start()
+        closer.join(1)
+        assert not closer.is_alive(), "the reaper froze behind a stuck resize"
+    finally:
+        SlowResize.gate.set()
+        reopen.join(2)
+        SlowResize.gate = None
+
+
+class SlowStart(FakeSession):
+    def start(self):
+        time.sleep(0.1)
+        super().start()
+
+
+def test_concurrent_opens_for_one_agent_make_one_pty(bridge, ctx, repo):
+    bridge.terminal.spawn = SlowStart
+    live(repo)
+    out = []
+    threads = [threading.Thread(target=lambda: out.append(call(bridge, ctx, "open", id="a1", rows=24, cols=80)))
+               for _ in range(3)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(5)
+    assert len(out) == 3 and len({o["terminalId"] for o in out}) == 3
+    assert len(FakeSession.made) == 1 and len(bridge.terminal._ptys) == 1
+    assert sum(c.last_n == 0 for c in bridge.terminal._clients.values()) == 1    # only the newest id is current
+
+
+class FailingClose(FakeSession):
+    def close(self):
+        super().close()
+        raise OSError("close failed")
+
+
+def test_one_failing_close_does_not_stop_the_rest_of_a_reap(bridge, ctx, repo, clock, audit):
+    bridge.terminal.spawn = FailingClose
+    call(bridge, ctx, "open", id=live(repo, "a1"), rows=24, cols=80)
+    bridge.terminal.spawn = FakeSession
+    call(bridge, ctx, "open", id=live(repo, "a2"), rows=24, cols=80)
+    clock.now += 301
+    bridge.terminal._reap()
+    assert all(s.closed for s in FakeSession.made)
+    assert [e["action"].rsplit(".", 1)[1] for e in audit].count("detach") == 2
+    assert not bridge.terminal._ptys
+
+
+def test_detach_is_audited_once_however_often_it_runs(bridge, ctx, repo, audit):
+    live(repo)
+    call(bridge, ctx, "open", id="a1", rows=24, cols=80)
+    pty = bridge.terminal._ptys["a1"]
+    bridge.terminal._detach(pty)
+    bridge.terminal._detach(pty)
+    assert [e["action"].rsplit(".", 1)[1] for e in audit] == ["attach", "detach"]
 
 
 def test_an_ended_session_without_a_stream_does_not_hold_a_slot(bridge, ctx, repo, clock):

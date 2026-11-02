@@ -12,6 +12,7 @@ import base64
 import binascii
 import collections
 import fcntl
+import logging
 import os
 import secrets
 import select
@@ -26,6 +27,7 @@ import time
 from .terminal_attach import AttachRefused, attach_commands
 
 _READ = 65536
+log = logging.getLogger(__name__)
 
 
 def attach_argv(session, *, local_host, hosts=()):
@@ -270,6 +272,7 @@ class Terminal:
         self.ttl = ttl
         self._clock = clock
         self._lock = threading.Lock()
+        self._open_lock = threading.Lock()
         self._clients: dict[str, _Client] = {}   # terminal id -> its client (current clients only)
         self._ptys: dict[str, _Pty] = {}         # agent id -> its pty
         self._stop = None
@@ -310,7 +313,10 @@ class Terminal:
     def _detach(self, pty: _Pty) -> None:
         """End the pty and audit it once (ids and host only, never input or output)."""
         pty.closed = True
-        pty.session.close()
+        try:
+            pty.session.close()
+        except Exception as exc:  # noqa: BLE001  one stuck close must not skip the audit or the rest of a batch
+            log.warning("rakazo terminal: closing a session failed (%s)", type(exc).__name__)
         if not pty.detached:
             pty.detached = True
             self.b._audit(pty.account, "rakazo.bridge.terminal.detach", pty.agent, f"host={pty.host}")
@@ -338,7 +344,10 @@ class Terminal:
 
     def _reap_loop(self, stop) -> None:
         while not stop.wait(max(0.05, min(5.0, self.ttl / 4))):
-            self._reap()
+            try:
+                self._reap()
+            except Exception as exc:  # noqa: BLE001  the reaper must outlive any one failure
+                log.warning("rakazo terminal: reaping failed (%s)", type(exc).__name__)
 
     def close_all(self) -> None:
         with self._lock:
@@ -367,31 +376,48 @@ class Terminal:
             reason = exc.body["reason"]
             raise self.Error(exc.status, _REASONS.get(reason, reason.upper()), exc.body["error"]) from None
         host = session["host_id"]
-        self._reap()
-        tid = secrets.token_urlsafe(16)
-        retired = None
-        with self._lock:
-            pty = self._ptys.get(sid)
-            if pty is not None and not pty.closed and pty.session.alive:
+        with self._open_lock:   # one open at a time; the manager lock is never held across pty work
+            return self._open(ctx, sid, host, argv, rows, cols)
+
+    def _open(self, ctx, sid, host, argv, rows, cols):
+        while True:
+            if self.b._closed.is_set():   # the bridge shut down while this open was retrying
+                raise self.Error(503, "UNAVAILABLE", _NOT_READY)
+            self._reap()
+            tid = secrets.token_urlsafe(16)
+            with self._lock:
+                pty = self._ptys.get(sid)
+                reuse = pty is not None and not pty.closed and pty.session.alive
+                if reuse:
+                    pty.idle_since = self._clock()
+                elif len(self._ptys) - (pty is not None) >= _MAX_SESSIONS:
+                    raise self.Error(429, "TOO_MANY_REQUESTS", "Too many live terminals.", {"Retry-After": "10"})
+            if reuse:
                 pty.session.resize(rows, cols)       # reattach: same pty and buffer, the new client's size
             else:
-                if len(self._ptys) - (pty is not None) >= _MAX_SESSIONS:
-                    raise self.Error(429, "TOO_MANY_REQUESTS", "Too many live terminals.", {"Retry-After": "10"})
                 live = self.spawn(argv, rows, cols)
                 try:
                     live.start()
                 except OSError:
                     raise self.Error(503, "UNAVAILABLE", "Could not start the terminal.") from None
-                retired, pty = pty, _Pty(sid, host, ctx.account, live, self._clock())   # an ended one is replaced
-                if retired is not None:
-                    self._remove(retired)
-                self._ptys[sid] = pty
-            previous = pty.client
-            if previous is not None:
+            retired = None
+            with self._lock:
+                if reuse and (pty.closed or self._ptys.get(sid) is not pty):
+                    continue                          # closed or reaped while resizing: decide again
+                if not reuse:
+                    retired, pty = self._ptys.get(sid), _Pty(sid, host, ctx.account, live, self._clock())
+                    if retired is not None:           # an ended one is replaced
+                        self._remove(retired)
+                    self._ptys[sid] = pty
+                previous = pty.client
+                if previous is not None:
+                    self._clients.pop(previous.tid, None)
+                pty.client = self._clients[tid] = _Client(tid, pty, ctx.account.account_id)
+                pty.idle_since = self._clock()
+            break
+        if previous is not None:
+            with previous.lock:   # waits for an input mid-write; later ones see taken and type nothing
                 previous.taken = True                # its stream ends with taken_over; the pty lives on
-                self._clients.pop(previous.tid, None)
-            pty.client = self._clients[tid] = _Client(tid, pty, ctx.account.account_id)
-            pty.idle_since = self._clock()
         if retired is not None:
             self._detach(retired)
         self._start_reaper()
@@ -420,7 +446,8 @@ class Terminal:
         if len(raw) > _MAX_INPUT:
             raise self.Error(400, "BAD_REQUEST", "Too much input in one call.")
         with client.lock:
-            if n == client.last_n + 1:   # anything else is a retry or a gap: answered ok, typed never
+            # a retry, a gap or a retired client is answered ok and typed never
+            if n == client.last_n + 1 and not client.taken:
                 client.last_n = n
                 client.pty.session.write(raw)
         return {"ok": True}
