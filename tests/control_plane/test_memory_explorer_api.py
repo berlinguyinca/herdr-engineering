@@ -8,7 +8,11 @@ import urllib.request
 import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
-from herdr_engineering.control_plane.memory_explorer import MemoryAdapter, MemoryNotFound, MemoryUnavailable
+from herdr_engineering.control_plane.memory_explorer import (
+    MemoryAdapter,
+    MemoryNotFound,
+    MemoryUnavailable,
+)
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 SECRET_TEXT = "deploy token sk-abcdefghijklmnopqrstuvwxyz123456 for the fleet"
