@@ -1,0 +1,14 @@
+# User unit: back up the Hindsight memory database (container herdr-hindsight-db, compose profile `memory`).
+# Mirrors the herdr-memory candidate's herdr-memory-backup.service (oneshot, UMask=0077, NoNewPrivileges) and calls
+# memory-backup.sh, which writes owner-only, archive-verified dumps to ~/.local/share/herdr-memory/backups.
+# Installed and enabled by `deploy.sh --with-memory` (or `memory-backup.sh install`); not installed by anything else.
+# No Environment=: defaults live in the script; `herdr-eng doctor` reports the newest backup's age.
+[Unit]
+Description=Back up the private Herdr Hindsight memory database
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=true
+TimeoutStartSec=30min
+ExecStart=%h/.local/share/herdr-engineering/memory-backup.sh backup
