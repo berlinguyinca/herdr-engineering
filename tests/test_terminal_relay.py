@@ -661,6 +661,20 @@ def test_probing_at_the_cap_is_bounded_when_the_broker_is_slow(env):
         env.cp.gate.set()
 
 
+def test_the_relay_command_logs_at_info_so_the_health_check_can_see_the_connected_line(monkeypatch):
+    import argparse
+
+    from herdr_engineering import cli, host_config
+    calls = []
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: calls.append(kw))
+
+    def unavailable():
+        raise host_config.HostConfigUnavailable("no host.json", permanent=True)
+    monkeypatch.setattr(host_config, "host_config", unavailable)
+    assert cli._cmd_host_terminal_relay(argparse.Namespace(once_for_test=True)) == 2
+    assert calls and calls[0]["level"] == logging.INFO
+
+
 class Front:
     """A FakeCP behind a real HTTP listener that speaks the broker's host auth: ``X-Host-Token`` must be this host's token
     (anything else, an API key included, is 403) and a ``host_id`` in the query must be the token's host."""

@@ -6,9 +6,11 @@
   <string>com.herdr.terminal-relay</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/sh</string>
-    <string>-c</string>
-    <string>exec "$HOME/.local/bin/herdr-eng" host terminal-relay</string>
+    <!-- @CURRENT@ and @USER@ are filled in by deploy/deploy-fleet-agents.sh --with-terminal-relay: the per-release venv
+         behind the `current` symlink, and the account name (launchd does not expand ~ or $HOME). -->
+    <string>@CURRENT@/venv/bin/herdr-eng</string>
+    <string>host</string>
+    <string>terminal-relay</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -23,8 +25,7 @@
        restart every 30 s: a relay that cannot work stays quiet instead of spinning. -->
   <key>ThrottleInterval</key>
   <integer>30</integer>
-  <!-- launchd does not expand ~ or $HOME here: replace USER with the account name when installing. -->
   <key>StandardErrorPath</key>
-  <string>/Users/USER/Library/Logs/herdr-terminal-relay.log</string>
+  <string>/Users/@USER@/Library/Logs/herdr-terminal-relay.log</string>
 </dict>
 </plist>

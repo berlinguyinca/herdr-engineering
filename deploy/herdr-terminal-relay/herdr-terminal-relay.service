@@ -5,7 +5,9 @@ Description=HerdR terminal relay (Shepherd terminal, outbound only)
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/herdr-eng host terminal-relay
+# @CURRENT@ is filled in by deploy/deploy-fleet-agents.sh --with-terminal-relay: the per-release venv behind the
+# `current` symlink, so the unit depends on no other herdr-eng install on the host.
+ExecStart=@CURRENT@/venv/bin/herdr-eng host terminal-relay
 Restart=always
 RestartSec=3
 # Exit 2: host.json is missing or the token was revoked; restarting cannot fix that.

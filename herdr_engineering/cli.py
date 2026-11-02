@@ -1027,6 +1027,7 @@ def _cmd_host_terminal_relay(args) -> int:
             return exit_unavailable(exc)
         print(f"herdr-eng: {exc}", file=sys.stderr)
         return 1
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")   # journald / launchd log
     try:
         cfg = host_config()
         refresher = None if args.once_for_test else ConfigRefresher(cfg)
