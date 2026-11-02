@@ -6,8 +6,8 @@
   <string>com.herdr.terminal-relay</string>
   <key>ProgramArguments</key>
   <array>
-    <!-- @CURRENT@ and @USER@ are filled in by deploy/deploy-fleet-agents.sh --with-terminal-relay: the per-release venv
-         behind the `current` symlink, and the account name (launchd does not expand ~ or $HOME). -->
+    <!-- @CURRENT@ and @HOME@ are filled in by deploy/deploy-fleet-agents.sh --with-terminal-relay: the per-release venv
+         behind the `current` symlink, and the account's home directory (launchd does not expand ~ or $HOME). -->
     <string>@CURRENT@/venv/bin/herdr-eng</string>
     <string>host</string>
     <string>terminal-relay</string>
@@ -26,6 +26,6 @@
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>StandardErrorPath</key>
-  <string>/Users/@USER@/Library/Logs/herdr-terminal-relay.log</string>
+  <string>@HOME@/Library/Logs/herdr-terminal-relay.log</string>
 </dict>
 </plist>

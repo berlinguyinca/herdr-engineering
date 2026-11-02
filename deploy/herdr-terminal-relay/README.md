@@ -10,14 +10,15 @@ Per host:
    the host's own host token (`X-Host-Token`, the same credential the fleet routes use).
 3. Nothing to configure on the control plane: the token identifies the host, and a token only works for its own host.
 4. Roll it out from the checkout, per host, with `deploy/deploy-fleet-agents.sh --with-terminal-relay --hosts <host>`
-   (opt-in: a normal fleet roll never installs it; `--dry-run` shows the plan). The script builds
+   (opt-in: a normal fleet roll never installs it; `--only-terminal-relay` rolls just the relay; `--dry-run` shows the plan). The script builds
    `~/.local/share/herdr-terminal-relay/releases/<release>/venv` on Python >= 3.12 (`uv` if present, else `python3.12`,
    else `/opt/homebrew/bin/python3.12`; it refuses with a message when there is none, because plain `python3` over
    non-login ssh may be 3.9), installs the package from the checkout, switches `.../herdr-terminal-relay/current`, and
-   renders the unit or plist from this directory (`@CURRENT@` becomes that `current` path, `@USER@` the account name)
+   renders the unit or plist from this directory (`@CURRENT@` becomes that `current` path, `@HOME@` the remote home directory)
    so it runs `<current>/venv/bin/herdr-eng host terminal-relay` with no dependency on any other herdr-eng install.
-   It then enables and starts it (systemd user unit, or `launchctl load` of the LaunchAgent) and waits up to 20 s for the
-   relay's `terminal relay connected` log line (the first successful wait); without it the `current` symlink goes back
+   It then enables and starts it (systemd user unit, or `launchctl bootout`/`bootstrap` of the LaunchAgent, `kickstart -k` to restart) and waits up to 20 s for the
+   relay's status file (`terminal-relay-status.json` in `~/.local/share/herdr-engineering/state`, written on its first
+   successful wait; it must be newer than the restart and name a live pid); without it the `current` symlink goes back
    to the previous release, which is restarted, and the script exits non-zero.
 
    - Linux needs the user's systemd instance to run without a login: `loginctl enable-linger <user>` (the script checks

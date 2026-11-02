@@ -4,7 +4,7 @@
 #   * the service-ownership feed     (python package)               -> herdr-service-metadata
 #
 #   deploy/deploy-fleet-agents.sh [--ref origin/main] [--hosts bender,beast] [--dry-run] [--no-fetch]
-#                                 [--with-terminal-relay]
+#                                 [--with-terminal-relay | --only-terminal-relay]
 #
 # Each host gets a new release directory named for the commit; the `-current`
 # symlink is switched and the service restarted. If the service is not active a few
@@ -15,8 +15,9 @@
 # (deploy/herdr-terminal-relay) per host: a release venv on Python >= 3.12 (uv, python3.12 or
 # /opt/homebrew/bin/python3.12; plain python3 over ssh may be 3.9), the package from this checkout, a `current` symlink,
 # and the systemd user unit or launchd plist pointing at <current>/venv/bin/herdr-eng. The roll only counts when the
-# relay logs "terminal relay connected" (a successful wait) within 20 s; otherwise `current` goes back to the previous
-# release, which is restarted, and the run exits non-zero. Linger off, herdr not running as that user or a missing
+# relay writes its status file (first successful wait, pid alive, newer than the restart) within 20 s; otherwise `current` goes back to the previous
+# release, which is restarted, and the run exits non-zero. --only-terminal-relay rolls just the relay (no hooks,
+# plugin or feed) and implies the flag. Linger off, herdr not running as that user or a missing
 # herdr socket only warn.
 #
 # Copies no env and no secrets. A host's configuration is its own
@@ -24,7 +25,7 @@
 # a host without it is skipped with a hint, and the run exits non-zero.
 set -euo pipefail
 
-REF="origin/main"; ONLY=""; DRY=0; FETCH=1; RELAY=0
+REF="origin/main"; ONLY=""; DRY=0; FETCH=1; RELAY=0; ONLY_RELAY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?}"; shift 2 ;;
@@ -32,7 +33,8 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1; shift ;;
     --no-fetch) FETCH=0; shift ;;
     --with-terminal-relay) RELAY=1; shift ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --only-terminal-relay) RELAY=1; ONLY_RELAY=1; shift ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -162,58 +164,98 @@ relay_path() { # the tools a non-login ssh shell does not have on PATH
   local extra="${HERDR_RELAY_PATH_EXTRA-$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin}"
   if [ -n "$extra" ]; then PATH="$extra:$PATH"; export PATH; fi
 }
-relay_python() { # prints "uv" or the path of a Python 3.12 interpreter; refuses (status 3) when there is none
+relay_pyok() { # relay_pyok <python>: it REALLY is Python 3.12 or newer (the name proves nothing; macOS python3 is 3.9)
+  local v
+  v="$("$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || return 1
+  case "$v" in 3.[0-9]|3.[0-9][0-9]) [ "${v#3.}" -ge 12 ] ;; *) return 1 ;; esac
+}
+relay_system_python() { # the first system interpreter that is >= 3.12: python3.12, 3.13, ..., homebrew, plain python3
+  local c p
+  relay_path
+  for c in python3.12 python3.13 python3.14 python3.15 python3; do
+    p="$(command -v "$c" 2>/dev/null || true)"
+    if [ -n "$p" ] && relay_pyok "$p"; then echo "$p"; return 0; fi
+  done
+  p="${HERDR_RELAY_BREW_PYTHON-/opt/homebrew/bin/python3.12}"
+  if [ -x "$p" ] && relay_pyok "$p"; then echo "$p"; return 0; fi
+  return 1
+}
+relay_nopython() {
+  echo "no Python >= 3.12 on this host: install uv, python3.12 or /opt/homebrew/bin/python3.12 (plain python3 over ssh may be 3.9), then roll again" >&2
+}
+relay_python() { # prints "uv" or the path of a Python >= 3.12; refuses (status 3) when there is none
   relay_path
   if command -v uv >/dev/null 2>&1; then echo uv; return 0; fi
-  local py brew="${HERDR_RELAY_BREW_PYTHON-/opt/homebrew/bin/python3.12}"
-  py="$(command -v python3.12 2>/dev/null || true)"
-  if [ -z "$py" ] && [ -x "$brew" ]; then py="$brew"; fi
-  if [ -n "$py" ]; then echo "$py"; return 0; fi
-  echo "no Python >= 3.12 on this host: install uv, python3.12 or /opt/homebrew/bin/python3.12 (plain python3 over ssh may be 3.9), then roll again" >&2
+  relay_system_python && return 0
+  relay_nopython
   return 3
 }
 relay_make_venv() { # relay_make_venv <release-dir>: <dir>/venv with the wheel in <dir> installed
   local dir="$1" how wheel
   relay_path
   how="$(relay_python)" || return $?
-  rm -rf "$dir/venv"
-  if [ "$how" = uv ]; then uv venv -q --python '>=3.12' "$dir/venv" || return 1
-  else "$how" -m venv "$dir/venv" || return 1; fi
-  "$dir/venv/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' \
-    || { echo "the release venv is older than Python 3.12 (Python >= 3.12 is required)" >&2; return 3; }
+  rm -rf "$dir/venv"   # not live: a release already behind `current` never gets here
+  if [ "$how" = uv ] && ! uv venv -q --python '>=3.12' "$dir/venv"; then
+    echo "uv could not create the venv; trying the system pythons" >&2
+    rm -rf "$dir/venv"
+    how="$(relay_system_python)" || { relay_nopython; return 3; }
+  fi
+  if [ "$how" != uv ]; then "$how" -m venv "$dir/venv" || return 1; fi
+  relay_pyok "$dir/venv/bin/python" || { echo "the release venv is older than Python 3.12 (Python >= 3.12 is required)" >&2; return 3; }
   wheel="$(ls "$dir"/*.whl 2>/dev/null | head -n 1)"
   [ -n "$wheel" ] || { echo "no wheel in $dir" >&2; return 1; }
   if [ "$how" = uv ]; then uv pip install -q --python "$dir/venv/bin/python" "$wheel" || return 1
   else "$dir/venv/bin/pip" install -q "$wheel" || return 1; fi
   [ -x "$dir/venv/bin/herdr-eng" ] || { echo "herdr-eng is missing from the release venv" >&2; return 1; }
 }
-relay_render() { # relay_render <template> <out> <current>: fill @CURRENT@ (the `current` symlink) and @USER@ (the account)
-  sed -e "s|@CURRENT@|$3|g" -e "s|@USER@|$(id -un)|g" "$1" > "$2"
-}
-relay_log_lines() { # lines in the launchd log, 0 when there is none
-  wc -l < "$HOME/Library/Logs/herdr-terminal-relay.log" 2>/dev/null | tr -d ' ' || true
-}
-relay_connected() { # relay_connected <manager> <marker>: the relay logged a successful wait since <marker>
+relay_render() { # relay_render <template> <out> <current>: fill @CURRENT@ (the `current` symlink) and @HOME@ (plist log path)
+  local current="$3" home="$HOME"
   case "$1" in
-    systemd) journalctl --user -u herdr-terminal-relay.service --since "$2" --no-pager -o cat 2>/dev/null \
-               | grep -q "terminal relay connected" ;;
-    launchd) tail -n +"$(( ${2:-0} + 1 ))" "$HOME/Library/Logs/herdr-terminal-relay.log" 2>/dev/null \
-               | grep -q "terminal relay connected" ;;
+    *.plist) current="$(printf '%s' "$current" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+             home="$(printf '%s' "$home" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')" ;;
+    *) current="$(printf '%s' "$current" | sed -e 's/%/%%/g' -e 's/"/\\"/g')" ;;   # systemd specifiers and quoting
+  esac
+  sedq() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+  sed -e "s|@CURRENT@|$(sedq "$current")|g" -e "s|@HOME@|$(sedq "$home")|g" "$1" > "$2"
+}
+relay_state_dir() { echo "${HERDR_ENGINEERING_STATE:-$HOME/.local/share/herdr-engineering/state}"; }
+relay_status_ok() { # relay_status_ok <marker-seconds>: the relay wrote its status file AFTER the marker and its pid is alive
+  local f pid at
+  f="$(relay_state_dir)/terminal-relay-status.json"
+  [ -r "$f" ] || return 1
+  grep -q '"state": *"connected"' "$f" || return 1
+  pid="$(sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' "$f" | head -n 1)"
+  at="$(sed -n 's/.*"connected_at": *\([0-9][0-9.]*\).*/\1/p' "$f" | head -n 1)"
+  [ -n "$pid" ] && [ -n "$at" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  awk -v a="$at" -v b="$1" 'BEGIN { exit !(a >= b) }'
+}
+relay_start() { # relay_start <manager>: load (launchd) or restart (systemd) the unit
+  case "$1" in
+    systemd) systemctl --user restart herdr-terminal-relay.service ;;
+    launchd) launchctl bootout "gui/$(id -u)/com.herdr.terminal-relay" 2>/dev/null || true
+             launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.herdr.terminal-relay.plist" ;;
+    *) echo "unknown service manager '$1' (systemd or launchd)" >&2; return 2 ;;
   esac
 }
 relay_restart() { # relay_restart <manager>
   case "$1" in
     systemd) systemctl --user restart herdr-terminal-relay.service ;;
-    launchd) launchctl unload "$HOME/Library/LaunchAgents/com.herdr.terminal-relay.plist" 2>/dev/null || true
-             launchctl load -w "$HOME/Library/LaunchAgents/com.herdr.terminal-relay.plist" ;;
+    launchd) launchctl kickstart -k "gui/$(id -u)/com.herdr.terminal-relay" ;;
+    *) echo "unknown service manager '$1' (systemd or launchd)" >&2; return 2 ;;
   esac
 }
 relay_host_install() { # relay_host_install <systemd|launchd> <release>
   local manager="$1" rel="$2" base="$HOME/.local/share/herdr-terminal-relay" dir prev marker waited=0 sock
+  case "$manager" in systemd|launchd) ;; *) echo "   terminal relay: unknown service manager '$manager' (systemd or launchd)" >&2; return 2 ;; esac
   dir="$base/releases/$rel"
   relay_path
   prev="$(readlink "$base/current" 2>/dev/null || true)"
-  relay_make_venv "$dir" || { echo "   terminal relay: could not build the release venv" >&2; return 1; }
+  if [ "$prev" = "$dir" ] && [ -x "$dir/venv/bin/herdr-eng" ]; then
+    echo "   terminal relay: release $rel is already current; keeping its venv, re-rendering and verifying"
+  else
+    relay_make_venv "$dir" || { echo "   terminal relay: could not build the release venv" >&2; return 1; }
+  fi
   # Warnings only: the other services on this host are not this relay's business.
   sock="${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}"
   pgrep -u "$(id -u)" -x herdr >/dev/null 2>&1 \
@@ -228,27 +270,31 @@ relay_host_install() { # relay_host_install <systemd|launchd> <release>
       mkdir -p "$HOME/.config/systemd/user"
       relay_render "$dir/herdr-terminal-relay.service" "$HOME/.config/systemd/user/herdr-terminal-relay.service" "$base/current"
       systemctl --user daemon-reload
-      systemctl --user enable herdr-terminal-relay.service
-      marker="$(date '+%Y-%m-%d %H:%M:%S')" ;;
+      systemctl --user enable herdr-terminal-relay.service ;;
     launchd)
       mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-      relay_render "$dir/com.herdr.terminal-relay.plist" "$HOME/Library/LaunchAgents/com.herdr.terminal-relay.plist" "$base/current"
-      marker="$(relay_log_lines)" ;;
+      relay_render "$dir/com.herdr.terminal-relay.plist" "$HOME/Library/LaunchAgents/com.herdr.terminal-relay.plist" "$base/current" ;;
   esac
-  relay_restart "$manager" || true
+  # Health evidence is the relay's status file (written on its first successful wait): only one newer than this
+  # marker, with a live pid, counts. The old file goes first so it can never satisfy the check.
+  rm -f "$(relay_state_dir)/terminal-relay-status.json"
+  marker="$(date +%s)"
+  relay_start "$manager" || true
   while [ "$waited" -lt "${HERDR_RELAY_HEALTH_SECONDS:-20}" ]; do
-    if relay_connected "$manager" "$marker"; then echo "   terminal relay: connected (release $rel)"; return 0; fi
+    if relay_status_ok "$marker"; then echo "   terminal relay: connected (release $rel)"; return 0; fi
     sleep 1; waited=$((waited + 1))
   done
-  echo "   terminal relay: no 'terminal relay connected' within ${HERDR_RELAY_HEALTH_SECONDS:-20}s, rolling back" >&2
-  if [ -n "$prev" ]; then
+  echo "   terminal relay: no fresh status file from a live relay within ${HERDR_RELAY_HEALTH_SECONDS:-20}s, rolling back" >&2
+  if [ -n "$prev" ] && [ "$prev" != "$dir" ]; then
     ln -sfn "$prev" "$base/current"; relay_restart "$manager" || true
     echo "   terminal relay: restored $prev" >&2
+  elif [ -n "$prev" ]; then
+    echo "   terminal relay: release $rel was already current: nothing to roll back to" >&2
   else
     ln -sfn "$dir" "$base/failed"; rm -f "$base/current"
     case "$manager" in
       systemd) systemctl --user disable --now herdr-terminal-relay.service || true ;;
-      launchd) launchctl unload "$HOME/Library/LaunchAgents/com.herdr.terminal-relay.plist" 2>/dev/null || true ;;
+      launchd) launchctl bootout "gui/$(id -u)/com.herdr.terminal-relay" 2>/dev/null || true ;;
     esac
     echo "   terminal relay: first install failed, the relay is stopped" >&2
   fi
@@ -256,17 +302,42 @@ relay_host_install() { # relay_host_install <systemd|launchd> <release>
 }
 # --- end terminal relay host functions ---
 
+# Terminal relay roll for the current host (opt-in). Every failure marks the host failed and returns 0, so the multi-host
+# run goes on under `set -e`.
+roll_relay() {
+  local rb='$HOME/.local/share/herdr-terminal-relay' rdir tmpl relay_script
+  if [ "$manager" = launchd ]; then tmpl=com.herdr.terminal-relay.plist; else tmpl=herdr-terminal-relay.service; fi
+  if ! { run "$target" "mkdir -p -m 700 $rb/releases/$REL" \
+         && rdir="$(run "$target" "echo $rb/releases/$REL")" \
+         && put "$target" "$WHEEL" "$rdir" \
+         && put "$target" "$WORK/src/deploy/herdr-terminal-relay/$tmpl" "$rdir"; }; then
+    echo "   terminal relay: FAILED on $name (could not stage the release)" >&2; failed=1; return 0
+  fi
+  relay_script="$(declare -f relay_path relay_python relay_make_venv relay_render relay_pyok relay_system_python relay_nopython relay_state_dir relay_status_ok relay_start relay_restart relay_host_install); relay_host_install $manager $REL"
+  relay_script="${relay_script//\'/\'\\\'\'}"
+  if run "$target" "bash -c '$relay_script'"; then echo "   terminal relay: ok"
+  else echo "   terminal relay: FAILED on $name" >&2; failed=1; fi
+  return 0
+}
+
 failed=0
 while IFS='|' read -r name target manager; do
   name="$(echo "$name" | xargs)"; target="$(echo "$target" | xargs)"; manager="$(echo "$manager" | xargs)"
   case "$name" in ''|\#*) continue ;; esac
   if [ -n "$ONLY" ] && ! printf ',%s,' "$ONLY" | grep -q ",$name,"; then continue; fi
+  case "$manager" in
+    systemd|launchd) ;;
+    *) echo "== $name: unknown service manager '$manager' in the hosts file (systemd or launchd); skipping" >&2
+       failed=1; continue ;;
+  esac
   echo "== $name ($manager)"
   if [ "$DRY" = 1 ]; then
-    echo "   [dry-run] would check host.json, then install plugin + feed release $REL and native hooks for installed runtimes"
+    if [ "$ONLY_RELAY" = 0 ]; then
+      echo "   [dry-run] would check host.json, then install plugin + feed release $REL and native hooks for installed runtimes"
+    fi
     if [ "$RELAY" = 1 ]; then
       echo "   [dry-run] terminal relay release $REL: venv on Python >= 3.12, package from $SHA, current symlink, $manager unit/plist" \
-           "-> <current>/venv/bin/herdr-eng; needs \"terminal relay connected\" within 20 s, else roll back and exit non-zero"
+           "-> <current>/venv/bin/herdr-eng; needs a fresh status file from a live relay within 20 s, else roll back and exit non-zero"
     else
       echo "   [dry-run] terminal relay: not requested (--with-terminal-relay)"
     fi
@@ -278,6 +349,8 @@ while IFS='|' read -r name target manager; do
     echo "   host.json missing on $name: run  herdr-eng fleet join $name  first; skipping" >&2
     failed=1; continue
   fi
+
+  if [ "$ONLY_RELAY" = 1 ]; then roll_relay; continue; fi
 
   # Run through bash even if the remote login shell differs. Quote the function
   # as data so paths and the embedded Python cannot be interpreted by that shell.
@@ -320,18 +393,6 @@ while IFS='|' read -r name target manager; do
     echo "   ownership feed: not installed here, skipped"
   fi
 
-  # ---- terminal relay (opt-in): a release venv on Python >= 3.12, the unit/plist, and a health check ----
-  if [ "$RELAY" = 1 ]; then
-    rb='$HOME/.local/share/herdr-terminal-relay'
-    run "$target" "mkdir -p -m 700 $rb/releases/$REL"
-    rdir="$(run "$target" "echo $rb/releases/$REL")"
-    if [ "$manager" = launchd ]; then tmpl=com.herdr.terminal-relay.plist; else tmpl=herdr-terminal-relay.service; fi
-    put "$target" "$WHEEL" "$rdir"
-    put "$target" "$WORK/src/deploy/herdr-terminal-relay/$tmpl" "$rdir"
-    relay_script="$(declare -f relay_path relay_python relay_make_venv relay_render relay_log_lines relay_connected relay_restart relay_host_install); relay_host_install $manager $REL"
-    relay_script="${relay_script//\'/\'\\\'\'}"
-    if run "$target" "bash -c '$relay_script'"; then echo "   terminal relay: ok"
-    else echo "   terminal relay: FAILED on $name" >&2; failed=1; fi
-  fi
+  if [ "$RELAY" = 1 ]; then roll_relay; fi
 done < "$HOSTS_FILE"
 exit "$failed"
