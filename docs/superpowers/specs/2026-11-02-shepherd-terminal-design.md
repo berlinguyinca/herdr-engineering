@@ -92,3 +92,11 @@ This amendment replaces the pty in Amendment 1. The host relay does **not** star
 - The pane keeps its own size (the sample panes are 46 to 97 rows). The phone cannot resize it without affecting the desktop, so the app shows the pane at its real size, fits it to the screen width and scrolls, with a pinch/zoom control.
 - Unconfirmed, to test before building: whether herdr reports the cursor position (else the app draws no cursor), the exact key-name vocabulary of `send_keys`, whether `send_input` takes raw bytes, and how `pane_output_changed` behaves on a busy pane.
 - A host with an older herdr, or that is offline, cannot open terminals.
+
+### Confirmed on bender (throwaway workspace, since closed)
+- `pane read --source visible --format ansi` returns the screen with colours; `pane run` sends a line plus Enter; `pane send-text` sends literal text.
+- `pane send-keys` accepts `esc tab enter backspace space up down left right f1`, `shift+tab`, `ctrl+<letter>` (also `C-c`; `ctrl+c`, `ctrl+z`, `ctrl+a`, `ctrl+l`, `ctrl+e`, `ctrl+u`, `ctrl+r`, `ctrl+]`, `ctrl+space`), `alt+<letter>`, `alt+left`, `ctrl+left`. It rejects `ctrl-c` (hyphen), `C-d`, `C-z`, `M-b`, `S-Tab`, and Home, End, PageUp, PageDown, Delete, Insert under every name tried.
+- So: letters and Ctrl combinations go through `send-keys` with the `ctrl+x` form; printable text through `send-text`; Home, End, PageUp, PageDown, Delete and anything else unsupported go as raw bytes through the socket API `pane.send_input` (to be confirmed by the first task).
+- No cursor position appears in any read format: the app draws no cursor unless the socket API reports one.
+- `pane layout` reports each pane's rect and the workspace area (the area comes from the open herdr window; with none it is 120x40). `pane resize` changes a split ratio (worked); it cannot set an exact column count. The owner allows the phone to resize panes: the app offers zoom and split-ratio changes, and otherwise shows the pane at its real size, fitted to the screen width.
+- Frames are sent as full-screen replacements marked `reset: true`, which the built app client already treats as "clear, then draw", so the app's data path does not change.
