@@ -51,6 +51,8 @@ log = logging.getLogger(__name__)
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
 _HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
+# Terminal broker, host side: the relay's output POST (an ingest-role route, like the report worker's).
+_HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
@@ -2447,7 +2449,8 @@ def _make_handler(server, public=False, operator=False):
                                     "assistant-action-requests", "assistant-grants"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
-                    or _TERMINAL_ATTACH.match(dpath) or _STEER_ACK.match(dpath) or _is_rereview(path)):
+                    or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
+                    or _is_rereview(path)):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -2460,7 +2463,7 @@ def _make_handler(server, public=False, operator=False):
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin artifact mutation refused")
             min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path) or _is_rereview(path)
-                        or _HOST_REPORT.match(path)
+                        or _HOST_REPORT.match(path) or _HOST_TERMINAL_OUT.match(path)
                        else "operator")
             if _is_rereview(path) and self._role() == "reviewer":
                 # _require would refuse it too ("read-only"); say why. The review gate dispatches its own re-reviews
@@ -3714,6 +3717,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._graph_get(parts)
             if resource == "steering":
                 return self._steering(parts)
+            if resource == "host" and parts[4:] == ["terminal", "wait"]:
+                return self._host_terminal(parts)
             if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
                 # T16 M4: emitter names, actor digests and sequences of other principals are operator
                 # business; every other key sees only the sources it emitted itself.
@@ -3851,6 +3856,8 @@ def _make_handler(server, public=False, operator=False):
             r = server.repo
             if resource == "fabric" and len(parts) == 5 and parts[4] == "resolve-urls":
                 return self._fabric_resolve_urls()
+            if resource == "host" and len(parts) == 7 and parts[4] == "terminal" and parts[6] == "output":
+                return self._host_terminal(parts, self._read_json() or {})
             if resource == "handoffs":
                 body = self._read_json() or {}
                 actor = self._principal()
@@ -4186,11 +4193,7 @@ def _make_handler(server, public=False, operator=False):
                 host_id = body.get("host_id") if isinstance(body, dict) else None
                 if not isinstance(host_id, str) or not host_id or len(host_id) > 253:
                     return self._json({"ok": False, "error": "host_id is required"}, 400)
-                # A key bound in control_plane.architecture.agent_hosts acts only for its own hosts.
-                bound = (server.architecture_agent_hosts.get(self._principal()["id"])
-                         if self._role() in ("agent", "ingest") else None)
-                if (bound is None and self._role() == "agent" and server.architecture_require_host_binding
-                        or bound is not None and host_id not in bound):
+                if not self._host_key_allowed(host_id):
                     return self._json({"ok": False, "error": "this API key may not act for that host"}, 403)
                 if reports is None or not reports.enabled:
                     if parts[5] == "publish":
@@ -5086,6 +5089,52 @@ def _make_handler(server, public=False, operator=False):
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
 
+        def _host_key_allowed(self, host_id, *, strict=False):
+            """May this key act for ``host_id``? A key bound in control_plane.architecture.agent_hosts acts only for its own
+            hosts. An unbound key is trusted to name any host (keys carry a role only; there is no per-host enrollment),
+            except an unbound ``agent`` key under require_host_binding, as for the summary reports. ``strict`` also refuses
+            an unbound ingest key then: the terminal carries keystrokes and screens, so it never relies on trust alone."""
+            role = self._role()
+            bound = (server.architecture_agent_hosts.get(self._principal()["id"])
+                     if role in ("agent", "ingest") else None)
+            if bound is not None:
+                return host_id in bound
+            return not (server.architecture_require_host_binding and (role == "agent" or strict and role == "ingest"))
+
+        def _host_terminal(self, parts, body=None):
+            """Terminal broker, host side. ``GET /api/v1/host/terminal/wait?host_id=&timeout=`` long-polls for commands;
+            ``POST /api/v1/host/terminal/<id>/output?host_id=`` pushes screen frames. Ingest or operator API keys only
+            (an agent key runs inside sessions and must not read keystrokes), bound to the host like steering delivery."""
+            from .rakazo_terminal import HostError
+            from .terminal_attach import _HOST
+            broker = server.rakazo.terminal if server.rakazo is not None else None
+            if broker is None:
+                return self._json({"error": "not found"}, 404)
+            if self._principal().get("authenticated_by") != "api_key" or self._role() not in ("ingest", "operator"):
+                return self._json({"error": "the terminal relay needs an ingest or operator API key"}, 403)
+            host_id = _q(self.path, "host_id")
+            if host_id is None and isinstance(body, dict):
+                host_id = body.get("host_id")
+            if not isinstance(host_id, str) or not _HOST.fullmatch(host_id):
+                return self._json({"error": "a valid host_id is required"}, 400)
+            if not self._host_key_allowed(host_id, strict=True):
+                return self._json({"error": "this API key may not act for that host"}, 403)
+            try:
+                if body is None:
+                    try:
+                        timeout = float(_q(self.path, "timeout") or 25)
+                    except ValueError:
+                        timeout = -1
+                    if not 0 <= timeout < float("inf"):
+                        return self._json({"error": "timeout must be a number of seconds"}, 400)
+                    return self._json({"commands": broker.wait_commands(host_id, timeout)})
+                if not isinstance(body, dict):
+                    return self._json({"error": "body must be an object"}, 400)
+                broker.accept_frames(host_id, parts[5], body.get("frames"))
+                return self._json({"ok": True})
+            except HostError as exc:
+                return self._json({"error": exc.message}, exc.status, headers=exc.headers)
+
         def _steering(self, parts, body=None):
             """T12 delivery to the emitter that owns a steering target (keyed API; no browser, no HCN credential).
             ``GET /api/v1/steering/pending`` returns confirmed requests pinned to THIS key's graph principal;
@@ -5573,7 +5622,7 @@ def _make_handler(server, public=False, operator=False):
                 self.close_connection = True
                 raise
 
-        def _json(self, data, status=200, *, etag=None, payload=None):
+        def _json(self, data, status=200, *, etag=None, payload=None, headers=None):
             if server.ci_fix is not None and payload is None:
                 data = server.ci_fix.redact(data)
             payload = json.dumps(data).encode() if payload is None else payload
@@ -5583,6 +5632,8 @@ def _make_handler(server, public=False, operator=False):
             self.send_header("Content-Length", str(len(payload)))
             if etag and status == 200:
                 self.send_header("ETag", etag)
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers()
