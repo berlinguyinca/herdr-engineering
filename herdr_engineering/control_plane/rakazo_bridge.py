@@ -33,6 +33,7 @@ from typing import Any
 
 from . import project_intelligence as pi
 from . import rakazo_agents
+from . import rakazo_terminal
 from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_cognito as cognito
@@ -739,6 +740,8 @@ class RakazoBridge:
         self._procs.update(self.rooms.procs())
         self.agents = rakazo_agents.Agents(self, BridgeError)       # the API glue sets .repo
         self._procs.update(self.agents.procs())
+        self.terminal = rakazo_terminal.Terminal(self, BridgeError)   # the API glue sets .repo
+        self._procs.update(self.terminal.procs())
         self.max_bots = MAX_BOTS
         self.bots = bots.Bots(self, BridgeError)
         self.memory = memory.Memory(self, BridgeError)
@@ -790,6 +793,7 @@ class RakazoBridge:
 
     def close(self) -> None:
         self._closed.set()
+        self.terminal.close_all()
         self.desk.close()
         self.push.close()
 
@@ -992,11 +996,12 @@ class RakazoBridge:
             self._cognito_users[account_id] = who["user"]
         return account
 
-    def _audit(self, account: Account, action: str) -> None:
+    def _audit(self, account: Account, action: str, subject: str | None = None, detail: str = "") -> None:
         """Best effort: signing in must not depend on the audit store, but a refusal is logged (never any secret)."""
         try:
             self.svc.store.audit_record(tenant_id=self.svc.tenant_for(account.principal_id), user_id=account.principal_id,
-                                        actor=account.principal_id, action=action, subject_id=account.account_id)
+                                        actor=account.principal_id, action=action,
+                                        subject_id=subject or account.account_id, detail=detail)
         except Exception as exc:  # noqa: BLE001
             log.warning("rakazo bridge: could not write the audit entry %s (%s)", action, type(exc).__name__)
 

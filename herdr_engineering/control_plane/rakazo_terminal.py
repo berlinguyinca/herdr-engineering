@@ -9,17 +9,21 @@ the session record through ``attach_commands`` and never builds a command from r
 from __future__ import annotations
 
 import base64
+import binascii
 import collections
 import fcntl
 import os
+import secrets
 import select
 import shutil
 import signal
+import socket
 import struct
 import termios
 import threading
+import time
 
-from .terminal_attach import attach_commands
+from .terminal_attach import AttachRefused, attach_commands
 
 _READ = 65536
 
@@ -219,3 +223,213 @@ class TerminalSession:
                 pass
             self._reader.join(timeout=2)
             os.close(self._wake[1])
+
+
+_MAX_SESSIONS = 4
+_MAX_INPUT = 64 * 1024     # bytes per terminal/input call, after base64 decoding
+_KEEP_SECONDS = 300.0      # a session outlives its last stream by this long
+_POLL_SECONDS = 0.03       # keystroke echo rides this stream
+_NOT_READY = "The terminal is not ready."
+
+
+class _Open:
+    """One live terminal as the manager sees it."""
+
+    def __init__(self, tid, agent, host, account, session, now):
+        self.tid, self.agent, self.host, self.account, self.session = tid, agent, host, account, session
+        self.lock = threading.Lock()   # orders input: n is checked and the bytes written as one step
+        self.last_n = 0
+        self.streams = 0
+        self.idle_since = now          # set when the last stream closes (and at open)
+        self.taken = False             # a newer open for the same agent replaced this one
+        self.closed = False
+        self.detached = False
+
+
+class Terminal:
+    """The ``terminal/*`` procedures: owner-only pty relays onto herdr agent panes. ``repo`` is set by the API glue."""
+
+    def __init__(self, bridge, error, *, spawn=TerminalSession, local_host=None, ttl=_KEEP_SECONDS, clock=time.monotonic):
+        self.b = bridge
+        self.Error = error
+        self.repo = None
+        self.spawn = spawn
+        self.local_host = (local_host or socket.gethostname()).lower()
+        self.ttl = ttl
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._by_id: dict[str, _Open] = {}
+        self._by_agent: dict[str, str] = {}   # agent id -> terminal id of its one live session
+
+    def procs(self) -> dict:
+        return {"terminal/open": self.open, "terminal/input": self.input, "terminal/resize": self.resize,
+                "terminal/close": self.close, "terminal/subscribe": self.subscribe}
+
+    # plumbing -----------------------------------------------------------------------------------------------
+    def _owner(self, ctx) -> None:
+        if ctx.account.role != "operator":
+            raise self.Error(403, "FORBIDDEN", "Only the owner can use the terminal.")
+
+    def _reap(self) -> None:
+        with self._lock:
+            gone = self._expired()
+        for entry in gone:
+            self._detach(entry)
+
+    def _find(self, inp) -> _Open:
+        self._reap()
+        tid = inp.get("terminalId")
+        with self._lock:
+            entry = self._by_id.get(tid) if isinstance(tid, str) else None
+        if entry is None:
+            raise self.Error(404, "NOT_FOUND", "No such terminal.")
+        return entry
+
+    def _size(self, inp):
+        rows, cols = inp.get("rows"), inp.get("cols")
+        try:
+            _check_size(rows, cols)
+        except ValueError:
+            raise self.Error(400, "BAD_REQUEST", "rows and cols are out of range.") from None
+        return rows, cols
+
+    def _detach(self, entry: _Open) -> None:
+        """End the session and audit it once (ids and host only, never input or output)."""
+        entry.closed = True
+        entry.session.close()
+        if not entry.detached:
+            entry.detached = True
+            self.b._audit(entry.account, "rakazo.bridge.terminal.detach", entry.agent, f"host={entry.host}")
+
+    def _drop(self, entry: _Open) -> None:   # call with self._lock held
+        self._by_id.pop(entry.tid, None)
+        if self._by_agent.get(entry.agent) == entry.tid:
+            del self._by_agent[entry.agent]
+
+    def _expired(self) -> list[_Open]:   # call with self._lock held
+        now = self._clock()
+        gone = [e for e in self._by_id.values() if e.streams == 0 and now - e.idle_since >= self.ttl]
+        for entry in gone:
+            self._drop(entry)
+        return gone
+
+    def close_all(self) -> None:
+        with self._lock:
+            gone = list(self._by_id.values())
+            self._by_id.clear()
+            self._by_agent.clear()
+        for entry in gone:
+            self._detach(entry)
+
+    # procedures ---------------------------------------------------------------------------------------------
+    def open(self, ctx, inp):
+        self._owner(ctx)
+        if self.repo is None:
+            raise self.Error(503, "UNAVAILABLE", _NOT_READY)
+        rows, cols = self._size(inp)
+        sid = inp.get("id")
+        session = self.repo.get_session(sid) if isinstance(sid, str) else None
+        if session is None:
+            raise self.Error(404, "NOT_FOUND", "No such agent.")
+        try:
+            argv = attach_argv(session, local_host=self.local_host)
+        except AttachRefused as exc:
+            raise self.Error(exc.status, "CONFLICT", exc.body["error"]) from None
+        host = session["host_id"]
+        tid = secrets.token_urlsafe(16)
+        self._reap()
+        with self._lock:
+            old = self._by_id.get(self._by_agent.get(sid))
+            if old is not None:
+                self._drop(old)
+            try:
+                if len(self._by_id) >= _MAX_SESSIONS:
+                    raise self.Error(429, "TOO_MANY_REQUESTS", "Too many live terminals.", {"Retry-After": "10"})
+                live = self.spawn(argv, rows, cols)
+                try:
+                    live.start()
+                except OSError:
+                    raise self.Error(503, "UNAVAILABLE", "Could not start the terminal.") from None
+                entry = _Open(tid, sid, host, ctx.account, live, self._clock())
+                self._by_id[tid], self._by_agent[sid] = entry, tid
+            except BaseException:
+                if old is not None:   # the takeover failed: the first client keeps its session
+                    self._by_id[old.tid], self._by_agent[sid] = old, old.tid
+                    old = None
+                raise
+        if old is not None:
+            old.taken = True
+            self._detach(old)
+        self.b._audit(ctx.account, "rakazo.bridge.terminal.attach", sid, f"host={host}")
+        return {"terminalId": tid, "seq": 0, "rows": rows, "cols": cols}
+
+    def input(self, ctx, inp):
+        self._owner(ctx)
+        entry = self._find(inp)
+        data, n = inp.get("data"), inp.get("n")
+        if not isinstance(data, str) or isinstance(n, bool) or not isinstance(n, int):
+            raise self.Error(400, "BAD_REQUEST", "data must be base64 text and n an integer.")
+        if len(data) > _MAX_INPUT * 4 // 3 + 4:
+            raise self.Error(400, "BAD_REQUEST", "Too much input in one call.")
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            raise self.Error(400, "BAD_REQUEST", "data is not valid base64.") from None
+        if len(raw) > _MAX_INPUT:
+            raise self.Error(400, "BAD_REQUEST", "Too much input in one call.")
+        with entry.lock:
+            if n == entry.last_n + 1:   # anything else is a retry or a gap: answered ok, typed never
+                entry.last_n = n
+                entry.session.write(raw)
+        return {"ok": True}
+
+    def resize(self, ctx, inp):
+        self._owner(ctx)
+        entry = self._find(inp)
+        rows, cols = self._size(inp)
+        entry.session.resize(rows, cols)
+        return {"ok": True}
+
+    def close(self, ctx, inp):
+        self._owner(ctx)
+        self._reap()
+        tid = inp.get("terminalId")
+        with self._lock:
+            entry = self._by_id.get(tid) if isinstance(tid, str) else None
+            if entry is not None:
+                self._drop(entry)
+        if entry is not None:
+            self._detach(entry)
+        return {"ok": True}
+
+    def subscribe(self, ctx, inp):
+        self._owner(ctx)
+        self.b.agents._check_stream(ctx, inp)
+        entry = self._find(inp)
+        done = threading.Event()
+
+        def fetch(after: int) -> list[dict]:
+            taken = entry.taken
+            chunks = entry.session.chunks_after(after)
+            if taken and entry.closed:   # the session was closed under this client: its exit is not news
+                chunks = [c for c in chunks if not c.get("ended")]
+                chunks.append({"seq": entry.session.snapshot_seq() + 1, "taken_over": True})
+                done.set()
+            elif any(c.get("ended") for c in chunks):
+                done.set()
+            return chunks
+
+        def release():
+            with self._lock:
+                entry.streams -= 1
+                if entry.streams == 0:
+                    entry.idle_since = self._clock()
+
+        with self._lock:
+            entry.streams += 1
+        try:
+            return self.b.agents._stream(ctx, inp, fetch, stop=lambda: done.is_set() or (entry.closed and not entry.taken),
+                                         on_close=release, poll_seconds=_POLL_SECONDS)
+        except BaseException:
+            release()
+            raise

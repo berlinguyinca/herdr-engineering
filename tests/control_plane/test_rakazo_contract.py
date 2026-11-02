@@ -26,8 +26,10 @@ from tests.control_plane.test_rakazo_bridge import (  # noqa: F401
 CONTRACT = json.loads((Path(__file__).parent / "fixtures" / "rakazo_contract.json").read_text())
 PROCS = CONTRACT["procedures"]
 FORK_ONLY = {"agents/list", "agents/get", "agents/messages", "agents/event",
-             "agents/subscribe", "agents/subscribeList"}   # Shepherd extensions: not in the pinned upstream contract; checked by test_rakazo_agents_*.py
-STREAMED = {"threads/subscribe", "agents/subscribe", "agents/subscribeList"}          # an event stream, not a JSON body: covered by test_rakazo_bridge
+             "agents/subscribe", "agents/subscribeList",
+             "terminal/open", "terminal/input", "terminal/resize", "terminal/close",
+             "terminal/subscribe"}   # Shepherd extensions: not in the pinned upstream contract; checked by test_rakazo_agents_*.py and test_rakazo_terminal_*.py
+STREAMED = {"threads/subscribe", "agents/subscribe", "agents/subscribeList", "terminal/subscribe"}          # an event stream, not a JSON body: covered by test_rakazo_bridge
 
 
 UNTYPED_OUTPUT = {"vault/reveal"}      # upstream exports a union the JSON-schema converter cannot express
