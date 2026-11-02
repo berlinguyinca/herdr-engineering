@@ -219,9 +219,9 @@ def test_the_open_owner_session_is_off_unless_configured(srv):
     assert api.raw("POST", "/api/auth/open", {})[0] == 404
 
 
-def test_open_owner_gives_the_first_operator_a_session_from_a_private_or_tailnet_address(make_server):
+def test_open_owner_gives_the_first_operator_a_session_from_loopback_or_the_tailnet(make_server):
     _, api = make_server(bridge_section(open_owner=True))
-    for ip in ("127.0.0.1", "192.168.1.20", "100.104.39.6", "fd7a:115c:a1e0::1"):
+    for ip in ("127.0.0.1", "::1", "100.104.39.6", "100.64.0.1", "fd7a:115c:a1e0::1", "::ffff:100.64.1.1"):
         status, body, hdrs = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})
         assert status == 200, (ip, body)
         token = json.loads(body)["token"]
@@ -235,11 +235,19 @@ def test_open_owner_refuses_a_public_address(make_server):
         assert status == 403 and "set-auth-token" not in {k.lower() for k in hdrs}, ip
 
 
+def test_open_owner_refuses_lan_and_container_networks(make_server):
+    """A docker bridge or a LAN neighbour is not the owner: only loopback and the tailnet qualify."""
+    _, api = make_server(bridge_section(open_owner=True))
+    for ip in ("172.17.0.1", "172.31.255.254", "10.0.0.5", "192.168.1.20", "fc00::1", "fd00::1", "::ffff:192.168.1.1"):
+        status, body, hdrs = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})
+        assert status == 403 and "set-auth-token" not in {k.lower() for k in hdrs}, ip
+
+
 def test_open_owner_refuses_ranges_that_are_not_your_own_network(make_server):
     _, api = make_server(bridge_section(open_owner=True))
     for ip in ("2001::1", "2002::1", "192.0.2.1", "169.254.1.1", "0.0.0.1", "::ffff:8.8.8.8"):   # is_private says yes to most
         assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})[0] == 403, ip
-    assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "::ffff:192.168.1.1"})[0] == 200
+    assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "::ffff:100.64.1.9"})[0] == 200
 
 
 def test_open_owner_only_answers_the_app_not_a_web_page(make_server):

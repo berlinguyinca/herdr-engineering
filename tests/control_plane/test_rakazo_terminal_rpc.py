@@ -269,11 +269,12 @@ def test_an_ended_pty_is_respawned_on_the_next_open(bridge, ctx, repo, audit):
     assert [e["action"].rsplit(".", 1)[1] for e in audit] == ["attach", "detach", "attach"]
 
 
-def test_another_operator_cannot_use_the_terminal_id(bridge, ctx, repo):
+def test_another_account_cannot_use_the_terminal_id(bridge, ctx, repo, monkeypatch):
     live(repo)
     tid = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
     other = ctx_for(bridge)
     other.account = SimpleNamespace(**{**vars(ctx.account), "account_id": "someone-else"})
+    monkeypatch.setattr(bridge, "is_owner", lambda account: True)     # past the gate: the id binding still holds
     assert status_of(bridge, other, "input", terminalId=tid, data=b64("x"), n=1) == 404
     assert status_of(bridge, other, "subscribe", terminalId=tid, cursor=0) == 404
     assert call(bridge, other, "close", terminalId=tid) == {"ok": True} and not FakeSession.made[0].closed

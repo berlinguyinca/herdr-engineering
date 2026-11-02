@@ -284,7 +284,7 @@ class Terminal:
 
     # plumbing -----------------------------------------------------------------------------------------------
     def _owner(self, ctx) -> None:
-        if ctx.account.role != "operator":
+        if not self.b.is_owner(ctx.account):
             raise self.Error(403, "FORBIDDEN", "Only the owner can use the terminal.")
 
     def _missing(self):
