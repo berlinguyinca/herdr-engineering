@@ -26,6 +26,7 @@ import os
 import random
 import re
 import secrets
+import signal
 import threading
 import time
 import urllib.error
@@ -34,7 +35,7 @@ from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from . import host_config as _hc
-from .control_plane.terminal_attach import _PANE, _TERMINAL
+from .control_plane.terminal_attach import _PANE
 from .herdr_pane_client import HerdrError
 from .terminal_mirror import InputTranslator, PaneMirror, apply
 
@@ -56,7 +57,9 @@ _FAIL_LIMIT = 3            # consecutive herdr failures before a terminal ends w
 _FAIL_PAUSE = 0.25
 _PUSH_RETRY = 2.0          # pause after a refused or failed frame push
 _KEEP_IDS = 300            # remembered command ids (the broker queues at most 256)
-_JOIN = 1.0
+_JOIN = _POST_TIMEOUT + 1.0   # a mirror blocked in a push may take this long to notice it was stopped
+_PROBE_EVERY = 30.0        # a silent pane re-sends its screen this often: the push is a liveness probe (404 = retired)
+_TID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")   # the broker mints url-safe random ids
 _CMD_ID = re.compile(r"^[0-9a-f]{8}-\d{1,20}-[A-Za-z0-9_-]{1,64}$")
 STATE_REL = Path(".local/share/herdr-engineering/state")
 
@@ -75,15 +78,20 @@ class ControlPlaneHttp:
     ``request`` returns ``(status, parsed JSON or None)``; network failures raise OSError."""
 
     def __init__(self, config):
-        self.url = config.control_plane_url.rstrip("/")
-        self.key = config.api_key
+        self._target = (config.control_plane_url.rstrip("/"), config.api_key)   # swapped as one tuple
         self.auth_rejected = False
 
+    @property
+    def url(self):
+        return self._target[0]
+
+    @property
+    def key(self):
+        return self._target[1]
+
     def retarget(self, url, api_key):    # ConfigRefresher.sync() points the client at the live configuration
-        if url:
-            self.url = url.rstrip("/")
-        if api_key is not None:
-            self.key = api_key
+        old_url, old_key = self._target
+        self._target = (url.rstrip("/") if url else old_url, api_key if api_key is not None else old_key)
 
     def request(self, method, path, body=None, timeout=10.0):
         if not path.startswith("/api/v1/host/terminal/"):
@@ -92,9 +100,10 @@ class ControlPlaneHttp:
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        if self.key:
-            headers["X-API-Key"] = self.key
-        req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
+        url, key = self._target
+        if key:
+            headers["X-API-Key"] = key
+        req = urllib.request.Request(url + path, data=data, method=method, headers=headers)
         try:
             with _hc._OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
                 raw = resp.read(MAX_REPLY + 1)
@@ -114,9 +123,10 @@ class ControlPlaneHttp:
 
 
 class _Term:
-    def __init__(self, pane, last_n=0):
+    def __init__(self, pane, last_n=0, epoch=None):
         self.pane = pane
         self.last_n = last_n
+        self.epoch = epoch   # the control-plane process (first part of the command id) that opened it
         self.translator = InputTranslator()
         self.lock = threading.Lock()   # orders typing and the 50 ms flush for this terminal
         self.stop = threading.Event()
@@ -144,6 +154,7 @@ class TerminalRelay:
         self._threads: list[threading.Thread] = []
         self._ids: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._after: str | None = None
+        self._epoch: str | None = None
         self._lock_fd = None
         self._running = False
         self._flush_cv = threading.Condition()
@@ -179,8 +190,10 @@ class TerminalRelay:
         try:
             data = json.loads(self._state_path().read_text())
             ids = [i for i in data.get("ids", []) if isinstance(i, str) and _CMD_ID.fullmatch(i)][-_KEEP_IDS:]
+            epoch = data.get("epoch")
+            self._epoch = epoch if isinstance(epoch, str) else None
             terms = {t: v for t, v in data.get("terminals", {}).items()
-                     if _TERMINAL.fullmatch(t) and isinstance(v, dict) and isinstance(v.get("pane"), str)
+                     if _TID.fullmatch(t) and isinstance(v, dict) and isinstance(v.get("pane"), str)
                      and _PANE.fullmatch(v["pane"]) and type(v.get("n")) is int and v["n"] >= 0}
         except (OSError, ValueError, AttributeError, TypeError):
             return {"terminals": {}}
@@ -190,7 +203,8 @@ class TerminalRelay:
     def _save(self) -> None:
         with self._lock:
             snap = {"ids": list(self._ids),
-                    "terminals": {t: {"pane": x.pane, "n": x.last_n} for t, x in self._terms.items()}}
+                    "epoch": self._epoch,
+                    "terminals": {t: {"pane": x.pane, "n": x.last_n, "epoch": x.epoch} for t, x in self._terms.items()}}
         with self._save_lock:
             tmp = self.state_dir / f".terminal-relay-state.{secrets.token_hex(4)}.tmp"
             try:
@@ -198,6 +212,8 @@ class TerminalRelay:
                 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "w") as fh:
                     json.dump(snap, fh)
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 os.replace(tmp, self._state_path())
             except OSError:
                 log.warning("terminal relay: could not save its state")
@@ -217,8 +233,13 @@ class TerminalRelay:
                 self._poll()
                 if once:
                     break
+        except KeyboardInterrupt:   # SIGTERM/SIGINT raised into the blocked long-poll (install_signal_handlers)
+            self._stop.set()
         finally:
             self._running = False
+            self._stop.set()   # whatever ended the loop, nothing may keep running without it
+            with self._flush_cv:
+                self._flush_cv.notify_all()
             self._shutdown()
 
     def stop(self) -> None:
@@ -294,7 +315,11 @@ class TerminalRelay:
         if not isinstance(cid, str) or not _CMD_ID.fullmatch(cid):
             log.warning("terminal relay: ignored a command without a valid id")
             return
-        if cid not in self._ids:
+        self._new_epoch(cid.split("-", 1)[0])
+        if cid in self._ids:
+            if command.get("kind") == "close":   # idempotent, and a crash may have saved the id before the terminal went
+                self._dispatch(command)
+        else:
             self._ids[cid] = None
             while len(self._ids) > _KEEP_IDS:
                 self._ids.popitem(last=False)
@@ -305,13 +330,27 @@ class TerminalRelay:
                 log.warning("terminal relay: a %r command failed (%s)", str(command.get("kind"))[:16], type(exc).__name__)
         self._after = cid
 
+    def _new_epoch(self, epoch) -> None:
+        """A command from another control-plane process: the old one is gone with every terminal it knew (the app
+        opens again), so those terminals would only pin mirror slots. Epochs are random, so 'newer' means 'different'."""
+        if epoch == self._epoch and not any(t.epoch != epoch for t in list(self._terms.values())):
+            return
+        self._epoch = epoch
+        with self._lock:
+            old = [(t, x) for t, x in self._terms.items() if x.epoch != epoch]
+        if old:
+            log.info("terminal relay: the control plane restarted; dropping %d terminals", len(old))
+        for tid, term in old:
+            self._forget(tid, term)
+        self._save()
+
     def _dispatch(self, command) -> None:
         kind, tid = command.get("kind"), command.get("terminal")
-        if not isinstance(tid, str) or not _TERMINAL.fullmatch(tid):
+        if not isinstance(tid, str) or not _TID.fullmatch(tid):
             log.warning("terminal relay: ignored a command for a malformed terminal id")
             return
         if kind == "open":
-            self._open(tid, command.get("pane_id"))
+            self._open(tid, command.get("pane_id"), command["id"].split("-", 1)[0])
         elif kind == "input":
             self._input(tid, command.get("n"), command.get("data"))
         elif kind == "zoom":
@@ -330,29 +369,45 @@ class TerminalRelay:
         with self._lock:
             return self._terms.get(tid)
 
-    def _alive_threads(self) -> int:
-        with self._lock:
-            self._threads = [t for t in self._threads if t.is_alive()]
-            return len(self._threads)
+    def _pane_state(self, pane) -> str | None:
+        """'agent' for an agent pane herdr lists on this host, 'plain' for any other pane, 'gone' when it is not
+        listed, None when herdr cannot be asked. The broker only ever opens agent panes, so a plain shell is not served."""
+        try:
+            for p in self.client.list_panes():
+                if p.get("pane_id") == pane:
+                    return "agent" if isinstance(p.get("agent"), str) and p["agent"] else "plain"
+        except (HerdrError, OSError):
+            return None
+        return "gone"
 
-    def _open(self, tid, pane) -> None:
+    def _open(self, tid, pane, epoch) -> None:
         if self._term(tid) is not None:
             return
         if not isinstance(pane, str) or not _PANE.fullmatch(pane):
             self._refuse(tid, "invalid_pane")
             return
-        if self._alive_threads() >= MAX_MIRRORS:
+        if self.active_terminals() >= MAX_MIRRORS:   # registered terminals, not threads
+            self._probe_all()                        # reap the ones the broker already ended or lost
+        if self.active_terminals() >= MAX_MIRRORS:
             self._refuse(tid, "too_many_terminals")
             return
-        try:
-            listed = any(p.get("pane_id") == pane for p in self.client.list_panes())
-        except (HerdrError, OSError):
-            self._refuse(tid, "herdr_unavailable")
-            return
-        if not listed:   # only panes herdr lists on THIS host are served
-            self._refuse(tid, "pane_closed")
-            return
-        self._start(tid, _Term(pane))
+        state = self._pane_state(pane)   # only panes herdr lists on THIS host are served
+        if state == "agent":
+            self._start(tid, _Term(pane, epoch=epoch))
+        else:
+            self._refuse(tid, {None: "herdr_unavailable", "gone": "pane_closed"}.get(state, "invalid_pane"))
+
+    def _probe_all(self) -> None:
+        """Push every terminal's current screen: a 404 means the broker retired it, and it goes."""
+        with self._lock:
+            terms = list(self._terms.items())
+        for tid, term in terms:
+            try:
+                frame = PaneMirror(self.client, term.pane).frame()
+            except (HerdrError, OSError, ValueError, KeyError, TypeError):
+                continue
+            if frame is not None and self._push(tid, [frame]) == 404:
+                self._forget(tid, term)
 
     def _refuse(self, tid, reason) -> None:
         log.warning("terminal relay: refused to open a terminal (%s)", reason)
@@ -372,15 +427,12 @@ class TerminalRelay:
         # Terminals that were open when the relay last stopped keep their n and get a mirror again; their
         # opens are remembered, so the broker's redelivery does not start them a second time.
         for tid, saved in self._saved["terminals"].items():
-            try:
-                listed = any(p.get("pane_id") == saved["pane"] for p in self.client.list_panes())
-                reason = None if listed else "pane_closed"
-            except (HerdrError, OSError):
-                reason = "herdr_unavailable"
+            state = self._pane_state(saved["pane"])
+            reason = None if state == "agent" else {None: "herdr_unavailable", "gone": "pane_closed"}.get(state, "invalid_pane")
             if reason:
                 self._push(tid, [{"ended": True, "exit": None, "reason": reason}])
             else:
-                self._start(tid, _Term(saved["pane"], saved["n"]))
+                self._start(tid, _Term(saved["pane"], saved["n"], saved.get("epoch")))
         self._saved = {"terminals": {}}
         self._save()
 
@@ -470,11 +522,14 @@ class TerminalRelay:
                     self._flush_cv.wait(1.0 if nxt is None else max(0.0, min(1.0, nxt - now)))
                     continue
             for tid in due:
-                term = self._term(tid)
-                if term is not None:
-                    with term.lock:
-                        if not term.dead:
-                            self._type(tid, term, term.translator.flush())
+                try:
+                    term = self._term(tid)
+                    if term is not None:
+                        with term.lock:
+                            if not term.dead:
+                                self._type(tid, term, term.translator.flush())
+                except Exception as exc:   # noqa: BLE001  one bad flush must not end the flusher
+                    log.warning("terminal relay: a flush failed (%s)", type(exc).__name__)
 
     def _zoom(self, tid, on) -> None:
         term = self._term(tid)
@@ -503,6 +558,18 @@ class TerminalRelay:
         return status
 
     def _mirror_loop(self, tid, term) -> None:
+        try:
+            self._mirror(tid, term)
+        except _Stopped:
+            pass
+        except Exception as exc:   # noqa: BLE001  a dying mirror ends its own terminal, never silently
+            log.warning("terminal relay: a mirror failed (%s)", type(exc).__name__)
+            try:
+                self._end(tid, term, "relay_error")
+            except Exception:   # noqa: BLE001
+                term.dead = True
+
+    def _mirror(self, tid, term) -> None:
         def pause(seconds):
             if term.stop.wait(seconds) or self._stop.is_set():
                 raise _Stopped
@@ -510,36 +577,52 @@ class TerminalRelay:
         def fresh():   # a new mirror forgets what it sent, so the current screen goes out again
             return PaneMirror(self.client, term.pane, sleep=pause)
 
-        mirror, fails, pushing = fresh(), 0, True
-        try:
-            while not term.stop.is_set() and not self._stop.is_set():
-                try:
-                    frame = mirror.frame() if mirror.wait_for_change(_CHANGE_WAIT) else None
-                    fails = 0
-                except HerdrError as exc:
-                    if "not_found" in exc.code:
-                        self._end(tid, term, "pane_closed")
-                        return
-                    fails += 1
-                except (OSError, ValueError, KeyError, TypeError):
-                    fails += 1
-                else:
-                    if frame is not None:
-                        status = self._push(tid, [frame])
-                        if status == 404:   # the broker retired this terminal
-                            self._forget(tid, term)
-                            return
-                        if status != 200:
-                            if pushing:
-                                log.warning("terminal relay: pushing frames failed (%s)", status or "unreachable")
-                            pushing, mirror = False, fresh()
-                            pause(_PUSH_RETRY)
-                        else:
-                            pushing = True
-                    continue
-                if fails >= _FAIL_LIMIT:
-                    self._end(tid, term, "herdr_unavailable")
+        mirror, fails, pushing, last_push = fresh(), 0, True, time.monotonic()
+        while not term.stop.is_set() and not self._stop.is_set():
+            try:
+                changed = mirror.wait_for_change(_CHANGE_WAIT)
+                frame = mirror.frame() if changed else None
+                fails = 0
+            except HerdrError as exc:
+                if "not_found" in exc.code:
+                    self._end(tid, term, "pane_closed")
                     return
-                pause(_FAIL_PAUSE)
-        except _Stopped:
-            return
+                fails += 1
+            except (OSError, ValueError, KeyError, TypeError):
+                fails += 1
+            else:
+                if frame is None and time.monotonic() - last_push >= _PROBE_EVERY:
+                    mirror = fresh()   # silence: send the screen again, a 404 then retires this terminal
+                    last_push = time.monotonic()
+                if frame is not None:
+                    last_push = time.monotonic()
+                    status = self._push(tid, [frame])
+                    if status == 404:   # the broker retired this terminal
+                        self._forget(tid, term)
+                        return
+                    if status != 200:
+                        if pushing:
+                            log.warning("terminal relay: pushing frames failed (%s)", status or "unreachable")
+                        pushing, mirror = False, fresh()
+                        pause(_PUSH_RETRY)
+                    else:
+                        pushing = True
+                continue
+            if fails >= _FAIL_LIMIT:
+                self._end(tid, term, "herdr_unavailable")
+                return
+            pause(_FAIL_PAUSE)
+
+
+def install_signal_handlers(relay):
+    """SIGTERM/SIGINT stop the relay at once: the handler runs in the main thread, which is blocked in the long-poll,
+    and raises there (run_forever turns that into a clean shutdown). Returns a function that restores the old handlers."""
+    def handler(signum, frame):
+        relay.stop()
+        raise KeyboardInterrupt
+    previous = {sig: signal.signal(sig, handler) for sig in (signal.SIGINT, signal.SIGTERM)}
+
+    def restore():
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+    return restore

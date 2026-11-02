@@ -19,9 +19,12 @@
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <!-- launchd cannot be told not to restart on exit status 2 (host.json missing, token revoked), so it may only
+       restart every 30 s: a relay that cannot work stays quiet instead of spinning. -->
   <key>ThrottleInterval</key>
-  <integer>3</integer>
+  <integer>30</integer>
+  <!-- launchd does not expand ~ or $HOME here: replace USER with the account name when installing. -->
   <key>StandardErrorPath</key>
-  <string>/tmp/herdr-terminal-relay.log</string>
+  <string>/Users/USER/Library/Logs/herdr-terminal-relay.log</string>
 </dict>
 </plist>

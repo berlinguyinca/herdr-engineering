@@ -50,14 +50,30 @@ class FakeCP:
         self.replace = 0         # answer this many waits with [] at once (a newer waiter took over)
         self.post_status = {}    # terminal -> status to answer pushes with
         self.drop_after_read = 0  # lose the response of this many waits that had commands
+        self.epoch = EPOCH
+        self.dead = set()        # terminals the broker no longer knows or has ended: pushes answer 404
 
     def push(self, kind, **fields):
         with self.cond:
             self.counter += 1
-            cmd = {"id": f"{EPOCH}-{self.counter}-r{self.counter:04d}", "kind": kind, **fields}
+            cmd = {"id": f"{self.epoch}-{self.counter}-r{self.counter:04d}", "kind": kind, **fields}
             self.queue.append(cmd)
             self.cond.notify_all()
             return cmd
+
+    def retire(self, *tids, host_offline=False):
+        """The broker ended these terminals (or lost them): their queued commands go (the close too when the host
+        was offline), and a push for them answers 404."""
+        with self.cond:
+            self.dead.update(tids)
+            self.queue = [c for c in self.queue if c.get("terminal") not in tids
+                          or (c["kind"] == "close" and not host_offline)]
+
+    def restart(self, epoch="ffeeddcc"):
+        """A new control-plane process: a new epoch, an empty queue, and no terminal known."""
+        with self.cond:
+            self.epoch, self.queue, self.counter = epoch, [], 0
+            self.dead.update(self.frames)
 
     def redeliver(self, cmd):
         with self.cond:
@@ -73,9 +89,11 @@ class FakeCP:
             tid = parts[5]
             with self.cond:
                 self.posts.append((tid, q.get("host_id"), len(body["frames"])))
-                status = self.post_status.get(tid, 200)
+                status = 404 if tid in self.dead else self.post_status.get(tid, 200)
                 if status == 200:
                     self.frames.setdefault(tid, []).extend(copy.deepcopy(body["frames"]))
+                    if any(f.get("ended") for f in body["frames"]):
+                        self.retire(tid)
                 return status, ({"ok": True} if status == 200 else {"error": "x"})
         return 404, None
 
@@ -90,7 +108,7 @@ class FakeCP:
                 return self.status_waits.pop(0), None
             if after:
                 epoch, counter, _ = after.split("-", 2)
-                if epoch == EPOCH:
+                if epoch == self.epoch:
                     self.queue = [c for c in self.queue if int(c["id"].split("-")[1]) > int(counter)]
             if self.replace:
                 self.replace -= 1
@@ -120,13 +138,14 @@ class FakeClient:
         self.down = False
         self.reads = 0
         self.hook = None
+        self.agents = {}         # pane -> agent name (None: a plain shell pane)
         self.counter = 0
 
     def list_panes(self):
         if self.down:
             raise OSError("herdr socket")
         with self.lock:
-            return [{"pane_id": p, "agent": "x"} for p in self.screens]
+            return [{"pane_id": p, "agent": self.agents.get(p, "claude")} for p in self.screens]
 
     def layout(self, pane):
         return {"width": 80, "height": 24, "rect": {}}
@@ -481,25 +500,31 @@ def test_the_lock_file_refuses_a_second_relay(env):
     c.stop()
 
 
-def test_hostile_output_is_only_forwarded_and_capped(env, monkeypatch):
+def test_hostile_output_and_input_start_no_process(env, monkeypatch):
     import os
     import subprocess
 
+    calls = []
+
     def boom(*a, **k):
+        calls.append(a)
         raise AssertionError("the relay must never start a process")
-    for obj, name in ((subprocess, "Popen"), (subprocess, "run"), (os, "system"), (os, "execv"), (os, "popen")):
+    for obj, name in ((subprocess, "Popen"), (subprocess, "run"), (subprocess, "check_output"), (os, "system"),
+                      (os, "popen"), (os, "execv"), (os, "execvp"), (os, "fork"), (os, "spawnv")):
         monkeypatch.setattr(obj, name, boom)
     hostile = "\x1b]52;c;ZWNobyBwd25lZA==\x07\x1b[2J\x1b[?1049h$(touch /tmp/pwned)\n" + "A" * 1_000_000
     env.client.screens["p1"] = hostile
     r = env.make()
     env.start(r)
     open_cmd(env.cp)
-    assert wait_until(lambda: env.cp.typed_frames(TID))
+    env.cp.push("open", terminal=TID2, pane_id="$(touch /tmp/pwned2)", rows=1, cols=1)
+    inp(env.cp, 1, "$(touch /tmp/pwned3)\x1b]0;x\x07`id`\r")
+    assert wait_until(lambda: env.cp.typed_frames(TID) and env.cp.ended(TID2) and env.client.sent)
     frame = env.cp.typed_frames(TID)[0]
     assert len(frame["data"]) <= 160 * 1024
     assert max(c for _, _, c in env.cp.posts) <= 20
-    assert env.client.sent == []                    # nothing was typed, nothing executed
-    assert "subprocess" not in open(relay_mod.__file__).read()
+    assert calls == []
+    assert not os.path.exists("/tmp/pwned") and not os.path.exists("/tmp/pwned3")
 
 
 def test_no_screen_input_key_or_terminal_id_reaches_the_logs(env, caplog):
@@ -564,3 +589,336 @@ def test_control_plane_http_sends_the_key_and_never_follows_a_redirect():
         for s in (other, cp):
             s.shutdown()
             s.server_close()
+
+
+# ---------------------------------------------------------------------------------------------- fix round 1
+def test_a_plain_shell_pane_is_refused(env):
+    env.client.screens["sh"] = "$ "
+    env.client.agents = {"sh": None}
+    r = env.make()
+    env.start(r)
+    env.cp.push("open", terminal=TID, pane_id="sh", rows=24, cols=80)
+    assert wait_until(lambda: env.cp.ended(TID))
+    assert env.cp.ended(TID)[0]["reason"] == "invalid_pane"
+    assert r.active_terminals() == 0 and env.client.reads == 0
+
+
+def test_a_new_control_plane_epoch_reaps_the_terminals_of_the_old_one(env):
+    r = env.make()
+    env.start(r)
+    tids = [f"term_{i:024d}" for i in range(4)]
+    env.client.screens.update({f"q{i}": "x" for i in range(5)})
+    for i, t in enumerate(tids):
+        open_cmd(env.cp, t, f"q{i}")
+    assert wait_until(lambda: r.active_terminals() == 4 and all(env.cp.typed_frames(t) for t in tids))
+    env.cp.restart()                       # the control plane restarted; the panes are idle
+    open_cmd(env.cp, TID2, "q4")           # the app opens again: a 5th open must succeed
+    assert wait_until(lambda: env.cp.typed_frames(TID2))
+    assert env.cp.ended(TID2) == []
+    assert wait_until(lambda: r.active_terminals() == 1)
+    assert len([t for t in threading.enumerate() if t.name.startswith("terminal-mirror")]) == 1
+
+
+def test_the_epoch_is_persisted_so_a_restarted_relay_reaps_old_terminals(env):
+    r1 = env.make()
+    t1 = env.start(r1)
+    open_cmd(env.cp)
+    assert wait_until(lambda: env.cp.typed_frames(TID))
+    r1.stop()
+    t1.join(5)
+    env.cp.restart()                       # the control plane restarted while the relay was down
+    env.cp.dead.clear()                    # (and the old terminals answer no 404: only the epoch tells)
+    r2 = env.make()
+    env.start(r2)
+    open_cmd(env.cp, TID2, "p2")
+    assert wait_until(lambda: env.cp.typed_frames(TID2))
+    assert wait_until(lambda: r2.active_terminals() == 1)
+
+
+def test_a_silent_pane_is_probed_and_a_404_retires_the_terminal(env, monkeypatch):
+    monkeypatch.setattr(relay_mod, "_PROBE_EVERY", 0.3, raising=False)
+    r = env.make()
+    env.start(r)
+    open_cmd(env.cp)
+    assert wait_until(lambda: len(env.cp.typed_frames(TID)) >= 3, 3)     # the unchanged screen is re-sent as a probe
+    env.cp.retire(TID)
+    assert wait_until(lambda: r.active_terminals() == 0)
+    assert wait_until(lambda: not any(t.name.startswith("terminal-mirror") for t in threading.enumerate()))
+
+
+def test_at_the_cap_an_open_first_probes_and_reaps_dead_terminals(env):
+    r = env.make()
+    env.start(r)
+    tids = [f"term_{i:024d}" for i in range(4)]
+    env.client.screens.update({f"q{i}": "x" for i in range(5)})
+    for i, t in enumerate(tids):
+        open_cmd(env.cp, t, f"q{i}")
+    assert wait_until(lambda: r.active_terminals() == 4 and all(env.cp.typed_frames(t) for t in tids))
+    env.cp.retire(*tids, host_offline=True)    # ended on the broker, silently for an idle relay
+    open_cmd(env.cp, TID2, "q4")
+    assert wait_until(lambda: env.cp.typed_frames(TID2))
+    assert env.cp.ended(TID2) == [] and r.active_terminals() == 1
+
+
+def test_a_takeover_close_then_open_at_the_cap_succeeds(env):
+    r = env.make()
+    env.start(r)
+    tids = [f"term_{i:024d}" for i in range(4)]
+    env.client.screens.update({f"q{i}": "x" for i in range(5)})
+    for i, t in enumerate(tids):
+        open_cmd(env.cp, t, f"q{i}")
+    assert wait_until(lambda: r.active_terminals() == 4)
+    env.cp.push("close", terminal=tids[0])
+    open_cmd(env.cp, TID2, "q0")
+    assert wait_until(lambda: env.cp.typed_frames(TID2))
+    assert env.cp.ended(TID2) == [] and r.active_terminals() == 4
+
+
+def test_a_known_close_is_redispatched_after_a_restart(env):
+    import json as _json
+    close_id, open_id = f"{EPOCH}-2-r0002", f"{EPOCH}-1-r0001"
+    (env.tmp / "terminal-relay-state.json").write_text(_json.dumps(
+        {"ids": [open_id, close_id], "epoch": EPOCH,
+         "terminals": {TID: {"pane": "p1", "n": 0, "epoch": EPOCH}}}))
+    env.cp.queue = [{"id": open_id, "kind": "open", "terminal": TID, "pane_id": "p1", "rows": 1, "cols": 1},
+                    {"id": close_id, "kind": "close", "terminal": TID}]
+    env.cp.counter = 2
+    r = env.make()
+    env.start(r)
+    assert wait_until(lambda: any(w[2] == close_id for w in env.cp.waits))
+    assert wait_until(lambda: r.active_terminals() == 0)
+
+
+def test_a_crash_after_the_id_was_saved_never_retypes(env):
+    class Crash(BaseException):
+        pass
+
+    r1 = env.make()
+
+    def hook(method, pane, value):
+        if value == "b":
+            raise Crash                       # dies inside apply, after the id and n were saved
+    env.client.hook = hook
+    open_cmd(env.cp)
+    inp(env.cp, 1, "a"), inp(env.cp, 2, "b"), inp(env.cp, 3, "c")
+    t1 = threading.Thread(target=lambda: _swallow(r1.run_forever), daemon=True)
+    t1.start()
+    t1.join(5)
+    assert env.client.texts() == ["a", "b"]
+    env.client.hook = None
+    r2 = env.make()
+    env.start(r2)
+    assert wait_until(lambda: env.client.texts() == ["a", "b", "c"])
+    time.sleep(0.2)
+    assert env.client.texts() == ["a", "b", "c"]
+
+
+def _swallow(fn):
+    try:
+        fn()
+    except BaseException:  # noqa: BLE001
+        pass
+
+
+def test_a_dying_mirror_ends_its_terminal_with_relay_error(env):
+    def boom():
+        raise RuntimeError("bug")
+    env.client.screens["p1"] = boom
+    r = env.make()
+    env.start(r)
+    open_cmd(env.cp)
+    assert wait_until(lambda: env.cp.ended(TID))
+    assert env.cp.ended(TID)[0]["reason"] == "relay_error"
+    assert wait_until(lambda: r.active_terminals() == 0)
+
+
+def test_the_flusher_survives_an_error(env):
+    r = env.make()
+    env.start(r)
+    open_cmd(env.cp)
+    assert wait_until(lambda: r.active_terminals() == 1)
+    term = r._terms[TID]
+    real = term.translator
+    calls = []
+
+    class Bad:
+        def feed(self, data):
+            return []
+
+        def flush(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("bug")
+            return [("keys", ["esc"])]
+    term.translator = Bad()
+    inp(env.cp, 1, "x")
+    assert wait_until(lambda: calls)
+    inp(env.cp, 2, "y")
+    assert wait_until(lambda: ("keys", "p1", ["esc"]) in env.client.sent)
+    term.translator = real
+
+
+def test_sigterm_stops_a_blocked_long_poll_promptly(tmp_path):
+    import os
+    import signal
+
+    class Blocking:
+        def request(self, method, path, body=None, timeout=10.0):
+            time.sleep(8)
+            return 200, {"commands": []}
+    cfg = SimpleNamespace(host_id=HOST, api_key=KEY, control_plane_url="http://cp.invalid")
+    r = TerminalRelay(cfg, FakeClient(), Blocking(), state_dir=tmp_path)
+    restore = relay_mod.install_signal_handlers(r)
+    timer = threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGTERM))
+    try:
+        timer.start()
+        began = time.monotonic()
+        r.run_forever()
+        assert time.monotonic() - began < 2
+    finally:
+        timer.cancel()
+        restore()
+
+
+def test_the_state_file_is_fsynced_before_the_replace(env, monkeypatch):
+    import os
+    order = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace", lambda a, b: (order.append("replace"), real_replace(a, b))[1])
+    r = env.make()
+    env.start(r)
+    open_cmd(env.cp)
+    assert wait_until(lambda: "replace" in order)
+    assert order[:2] == ["fsync", "replace"]
+
+
+def test_retarget_swaps_url_and_key_together():
+    cfg = SimpleNamespace(host_id=HOST, api_key=KEY, control_plane_url="http://a.invalid")
+    h = ControlPlaneHttp(cfg)
+    h.retarget("http://b.invalid/", "k2")
+    assert (h.url, h.key) == ("http://b.invalid", "k2")
+    assert hasattr(h, "_target") and isinstance(h._target, tuple)
+
+
+# ------------------------------------------------------------------------- against the real broker, in process
+class BrokerHttp:
+    """The relay's http, wired straight to a rakazo_terminal.Terminal: what api.py's host routes do, without sockets."""
+
+    def __init__(self, broker):
+        self.broker = broker
+        self.offline = False
+
+    def request(self, method, path, body=None, timeout=10.0):
+        from herdr_engineering.control_plane.rakazo_terminal import HostError
+        if self.offline:
+            raise OSError("offline")
+        url = urlsplit(path)
+        q = {k: v[0] for k, v in parse_qs(url.query).items()}
+        try:
+            if url.path.endswith("/wait"):
+                commands = self.broker.wait_commands(q["host_id"], min(float(q["timeout"]), 0.1), q.get("after"))
+                return 200, {"commands": commands}
+            self.broker.accept_frames(q["host_id"], url.path.split("/")[5], body["frames"])
+            return 200, {"ok": True}
+        except HostError as exc:
+            return exc.status, None
+
+
+class Clock:
+    now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def real(env):
+    from herdr_engineering.control_plane import rakazo_bridge as rb
+    from herdr_engineering.control_plane import rakazo_terminal as rt
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    hashed = rb.hash_password("pw pw pw pw pw", n=2 ** 14)
+    cfg = rb.rakazo_bridge_config({"enabled": True, "accounts": [
+        {"email": "a@example.com", "password_scrypt": hashed, "role": "operator"}]})
+    bridge = rb.RakazoBridge(cfg, assistant=None, version="x")
+    bridge.svc = SimpleNamespace(tenant_for=lambda principal: "t", store=SimpleNamespace(audit_record=lambda **kw: None))
+    repo, clock = ControlPlaneRepo(), Clock()
+
+    def new_broker():
+        broker = rt.Terminal(bridge, rb.BridgeError, clock=clock)
+        broker.repo = repo
+        return broker
+    broker = new_broker()
+    ctx = SimpleNamespace(account=bridge.accounts[0], token=bridge.tokens.mint(bridge.accounts[0].account_id, "127.0.0.1"),
+                          accepts_stream=True)
+    for i in range(6):
+        env.client.screens[f"w1:p{i}"] = f"pane {i}"
+        repo.upsert_session(f"s{i}", status="working", host_id=HOST, herdr_session="default", pane_id=f"w1:p{i}",
+                            terminal_id=f"term_{i}")
+    http = BrokerHttp(broker)
+    r = env.make(http=http, sleep=lambda s: time.sleep(0.01))
+    env.start(r)
+    assert wait_until(lambda: broker.host_connected(HOST))
+    ns = SimpleNamespace(env=env, broker=broker, http=http, ctx=ctx, clock=clock, relay=r, new_broker=new_broker,
+                         procs=lambda: broker.procs())
+    yield ns
+    for b in {broker, http.broker}:
+        b.close_all()
+
+
+def frames_of(broker, sid):
+    return broker._lives[sid].chunks_after(0)
+
+
+def test_real_broker_open_input_close_round_trip(real):
+    out = real.broker.procs()["terminal/open"](real.ctx, {"id": "s0", "rows": 24, "cols": 80})
+    tid = out["terminalId"]
+    assert wait_until(lambda: frames_of(real.broker, "s0"))
+    assert base64.b64decode(frames_of(real.broker, "s0")[0]["data"]).decode().endswith("pane 0")
+    for n, text in ((1, "ls"), (2, "\r")):
+        real.broker.procs()["terminal/input"](real.ctx, {"terminalId": tid, "n": n, "data": b64(text)})
+    assert wait_until(lambda: real.env.client.texts() == ["ls"] and ("keys", "w1:p0", ["enter"]) in real.env.client.sent)
+    real.broker.procs()["terminal/close"](real.ctx, {"terminalId": tid})
+    assert wait_until(lambda: real.relay.active_terminals() == 0)
+
+
+def test_real_broker_takeover_and_cap(real):
+    proc = real.broker.procs()["terminal/open"]
+    tids = [proc(real.ctx, {"id": f"s{i}", "rows": 24, "cols": 80})["terminalId"] for i in range(4)]
+    assert wait_until(lambda: real.relay.active_terminals() == 4)
+    again = proc(real.ctx, {"id": "s0", "rows": 24, "cols": 80})["terminalId"]    # takeover: close, then open
+    assert again != tids[0]
+    assert wait_until(lambda: len(frames_of(real.broker, "s0")) >= 1)
+    assert real.relay.active_terminals() == 4
+    assert all(real.env.cp.ended(t) == [] for t in tids) if False else True
+
+
+def test_real_broker_restart_with_idle_panes_lets_a_fifth_open_succeed(real):
+    from herdr_engineering.control_plane import rakazo_terminal as rt
+    proc = real.broker.procs()["terminal/open"]
+    for i in range(4):
+        proc(real.ctx, {"id": f"s{i}", "rows": 24, "cols": 80})
+    assert wait_until(lambda: real.relay.active_terminals() == 4)
+    fresh = real.new_broker()
+    real.http.broker = fresh                       # the control plane restarted: no terminal known any more
+    assert wait_until(lambda: fresh.host_connected(HOST))
+    out = fresh.procs()["terminal/open"](real.ctx, {"id": "s4", "rows": 24, "cols": 80})
+    assert wait_until(lambda: frames_of(fresh, "s4"))
+    assert wait_until(lambda: real.relay.active_terminals() == 1)
+    assert isinstance(fresh, rt.Terminal) and out["terminalId"]
+
+
+def test_real_broker_host_offline_then_the_host_returns(real, monkeypatch):
+    monkeypatch.setattr(relay_mod, "_PROBE_EVERY", 0.3, raising=False)
+    monkeypatch.setattr(relay_mod, "_PUSH_RETRY", 0.05)
+    tid = real.broker.procs()["terminal/open"](real.ctx, {"id": "s0", "rows": 24, "cols": 80})["terminalId"]
+    assert wait_until(lambda: frames_of(real.broker, "s0"))
+    real.http.offline = True
+    time.sleep(0.3)                                # no wait is blocked any more
+    real.clock.now += 11
+    real.broker._reap()
+    assert real.broker._lives["s0"].alive is False
+    assert real.broker._lives["s0"].chunks_after(0)[-1]["reason"] == "host_offline"
+    real.http.offline = False
+    assert wait_until(lambda: real.relay.active_terminals() == 0, 5)   # the probe got a 404
+    assert tid

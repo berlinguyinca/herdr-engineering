@@ -41,9 +41,10 @@ class HostConfigUnavailable(RuntimeError):
 
     ``revoked`` is True only for HTTP 401 from the fleet endpoint."""
 
-    def __init__(self, message: str = "", *, revoked: bool = False):
+    def __init__(self, message: str = "", *, revoked: bool = False, permanent: bool = False):
         super().__init__(message)
         self.revoked = revoked
+        self.permanent = permanent or revoked   # restarting cannot fix it (no host.json, or a revoked token)
 
 
 class HostConfig:
@@ -111,9 +112,9 @@ def _read_host_json(home: Path) -> dict:
         url, hid, tok = data["control_plane_url"], data["host_id"], data["token"]
     except (OSError, ValueError, KeyError, TypeError):
         raise HostConfigUnavailable(
-            f"host configuration missing or unreadable at {path}; {JOIN_HINT}") from None
+            f"host configuration missing or unreadable at {path}; {JOIN_HINT}", permanent=True) from None
     if not all(isinstance(x, str) and x for x in (url, hid, tok)):
-        raise HostConfigUnavailable(f"host configuration at {path} is incomplete; {JOIN_HINT}")
+        raise HostConfigUnavailable(f"host configuration at {path} is incomplete; {JOIN_HINT}", permanent=True)
     return {"control_plane_url": url.rstrip("/"), "host_id": hid, "token": tok}
 
 

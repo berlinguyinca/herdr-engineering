@@ -1,7 +1,7 @@
 [Unit]
 Description=HerdR terminal relay (Shepherd terminal, outbound only)
-After=network-online.target
-Wants=network-online.target
+# No After=network-online.target: a user unit cannot be ordered against system units. The relay retries with
+# backoff until the network is up, so ordering is not needed. It needs the user's session (see README: linger).
 
 [Service]
 Type=simple
@@ -11,8 +11,9 @@ Restart=always
 RestartSec=3
 # Exit 2: host.json is missing or the token was revoked; restarting cannot fix that.
 RestartPreventExitStatus=2
+# Only directives that work in a user unit without user namespaces. PrivateTmp, ProtectSystem and the like need
+# namespaces (unprivileged user namespaces are off on some hosts) and would stop the unit from starting.
 NoNewPrivileges=yes
-PrivateTmp=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 

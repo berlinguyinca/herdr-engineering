@@ -16,5 +16,16 @@ Per host:
    - macOS: copy `com.herdr.terminal-relay.plist` to `~/Library/LaunchAgents/`, then
      `launchctl load ~/Library/LaunchAgents/com.herdr.terminal-relay.plist`.
 
+   - Linux needs the user's systemd instance to run without a login: `loginctl enable-linger <user>`. The unit uses
+     only directives that work without user namespaces (no `PrivateTmp`/`ProtectSystem`); do not add them on hosts where
+     unprivileged user namespaces are disabled, the unit would fail to start.
+   - macOS: replace `USER` in the plist's log path (launchd does not expand `~`); the log is
+     `~/Library/Logs/herdr-terminal-relay.log`. launchd cannot be told not to restart on exit status 2, so the plist
+     throttles restarts to one per 30 s.
+
+Exit status: 0 stopped by SIGTERM/SIGINT, 1 restartable failure (another relay holds the lock, control plane not
+reachable for the first configuration), 2 only when restarting cannot help (host.json missing or incomplete, token
+revoked). argparse usage errors also exit 2.
+
 Exactly one relay runs per host (a lock file under `~/.local/share/herdr-engineering/state`); a second one exits with
 status 1. Nothing is logged about screen contents, typed input or key material.
