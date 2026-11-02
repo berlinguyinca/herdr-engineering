@@ -297,7 +297,7 @@ def test_a_silent_host_ends_its_terminal_with_host_offline(env):
     now[0] += 11
     svr.rakazo.terminal._reap()
     assert chunks(svr) == [{"seq": 1, "ended": True, "exit": None, "reason": "host_offline"}]
-    assert http.output(tid, [frame()])[0] == 200 and len(chunks(svr)) == 1     # accepted, but nothing follows an end
+    assert http.output(tid, [frame()])[0] == 404 and len(chunks(svr)) == 1     # a relay's probe learns of the end; nothing follows it
 
 
 def test_a_full_queue_ends_the_terminal_whose_input_overflowed_and_never_leaves_a_gap(env):
@@ -578,3 +578,16 @@ def test_the_terminal_cap_is_checked_before_any_terminal_is_ended_for_room(env):
     with pytest.raises(term.Error) as e:
         term.open(ctx, {"id": "a4", "rows": 24, "cols": 80})
     assert e.value.status == 429 and term._lives["a0"].alive                    # a refused open ended nothing
+
+
+def test_a_push_for_an_ended_terminal_answers_404_so_a_probe_finds_it(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    assert http.output(tid, [frame()])[0] == 200
+    assert http.output(tid, [{"ended": True, "exit": 0}])[0] == 200
+    assert http.output(tid, [frame()])[0] == 404              # ended on the broker, not yet reaped
+    live = svr.rakazo.terminal._lives["a1"]
+    tid2 = open_terminal(svr, http, sid="a2")
+    svr.rakazo.terminal._finish(svr.rakazo.terminal._lives["a2"], None, "host_offline", host_knows=True)
+    assert http.output(tid2, [frame()])[0] == 404             # host_offline: the returning host learns at once
+    assert live is not None

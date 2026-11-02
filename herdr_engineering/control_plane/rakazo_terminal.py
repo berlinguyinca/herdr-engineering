@@ -253,7 +253,8 @@ class Terminal:
         with self._lock:
             client = self._clients.get(terminal_id) if isinstance(terminal_id, str) else None
             live = client.pty if client is not None else None
-            if live is None or live.host != host_id or live.closed:
+            if live is None or live.host != host_id or not live.alive:
+                # an ended terminal is as unknown as a retired one: that 404 is how a relay's liveness probe finds out
                 raise HostError(404, "No such terminal.")
             for item in parsed:
                 if not live.alive:
