@@ -25,7 +25,9 @@ from tests.control_plane.test_rakazo_bridge import (  # noqa: F401
 
 CONTRACT = json.loads((Path(__file__).parent / "fixtures" / "rakazo_contract.json").read_text())
 PROCS = CONTRACT["procedures"]
-STREAMED = {"threads/subscribe"}          # an event stream, not a JSON body: covered by test_rakazo_bridge
+FORK_ONLY = {"agents/list", "agents/get", "agents/messages", "agents/event",
+             "agents/subscribe", "agents/subscribeList"}   # Shepherd extensions: not in the pinned upstream contract; checked by test_rakazo_agents_*.py
+STREAMED = {"threads/subscribe", "agents/subscribe", "agents/subscribeList"}          # an event stream, not a JSON body: covered by test_rakazo_bridge
 
 
 UNTYPED_OUTPUT = {"vault/reveal"}      # upstream exports a union the JSON-schema converter cannot express
@@ -80,11 +82,17 @@ def validated_elsewhere() -> set[str]:
 
 
 def test_every_bridge_procedure_exists_upstream_and_has_a_contract_check(srv):
-    implemented = set(srv[0].rakazo._procs) - STREAMED
+    implemented = set(srv[0].rakazo._procs) - STREAMED - FORK_ONLY
     assert implemented <= set(PROCS), f"the bridge answers procedures the app does not have: {implemented - set(PROCS)}"
     rest = srv[0].rakazo.rest      # defaults are validated in test_rakazo_rest; refusals return no value
     unchecked = implemented - set(CASES) - validated_elsewhere() - set(rr.READS) - rest.refused
     assert not unchecked, f"no test validates the response of: {sorted(unchecked)}"
+
+
+def test_the_fork_only_list_is_exactly_the_agents_extensions(srv):
+    answered = set(srv[0].rakazo._procs)
+    assert FORK_ONLY <= answered and not (FORK_ONLY & set(PROCS))     # an upstream name never hides in the exemption
+    assert {p for p in answered - set(PROCS) - FORK_ONLY - {"threads/subscribe"}} == set()
 
 
 @pytest.mark.parametrize("proc", sorted(CASES))

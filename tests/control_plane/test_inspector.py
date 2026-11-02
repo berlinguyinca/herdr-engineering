@@ -1117,3 +1117,65 @@ def test_replay_restores_reused_tool_call_ids_as_distinct_entries():
     fresh = InspectorStore()
     fresh.hydrate(rows)
     assert [e["data"]["output"] for e in fresh.query(SID, view="tools")["events"]] == ["1", "0"]
+
+
+# ------------------------------------------------------- phone read helpers
+def test_events_after_returns_only_newer_revs_ascending_and_respects_limit(store):
+    feed(store, *[{"kind": "message", "role": "assistant", "text": f"m{i}"} for i in range(5)])
+    revs = [e["rev"] for e in store.events_after(SID, 0)]
+    assert revs == sorted(revs) and len(revs) == 5
+    assert [r["seq"] for r in store.events_after(SID, revs[1])] == [2, 3, 4]
+    assert [r["seq"] for r in store.events_after(SID, 0, limit=2)] == [0, 1]
+    assert len(store.events_after(SID, 0, limit=0)) == 1
+    assert store.events_after(SID, revs[-1]) == []
+
+
+def test_events_after_returns_an_updated_tool_again_by_rev(store):
+    feed(store, tool("c1", "start", tool="bash"))
+    rev = store.query(SID)["rev"]
+    feed(store, tool("c1", "end", output="done", exit_code=0))
+    rows = store.events_after(SID, rev)
+    assert [r["seq"] for r in rows] == [0] and rows[0]["rev"] > rev
+    assert rows[0]["data"]["output"] == "done" and rows[0]["data"]["status"] != "running"
+
+
+def test_phone_digest_matches_newest_seq_and_last_message_in_one_lock_pass(store):
+    feed(store, {"kind": "message", "role": "assistant", "text": "hello"}, sid="a")
+    feed(store, {"kind": "lifecycle", "phase": "started"}, sid="b")
+    feed(store, {"kind": "message", "role": "assistant", "text": "private", "sensitive": True}, sid="c")
+    feed(store, {"kind": "message", "role": "user", "text": "hi"}, sid="d")
+    out = store.phone_digest(["a", "b", "c", "d", "nope"])
+    assert out["a"] == (store.newest_seq("a"), store.last_message("a")) == (0, "hello")
+    assert out["b"] == (0, None)
+    assert out["c"] == (0, None)        # withheld from the viewer
+    assert out["d"] == (0, None)        # not an assistant message
+    assert out["nope"] == (None, None)
+    assert store.phone_digest(["c"], role="operator")["c"] == (0, "private")
+
+
+def test_events_after_withholds_sensitive_text_for_viewer(store):
+    feed(store, {"kind": "message", "role": "assistant", "text": "private", "sensitive": True})
+    viewer = store.events_after(SID, 0, role="viewer")[0]
+    assert viewer["data"]["text"] is None and viewer["data"]["withheld"] is True
+    operator = store.events_after(SID, 0, role="operator")[0]
+    assert operator["data"]["text"] == "private"
+
+
+def test_events_after_unknown_session_raises_keyerror(store):
+    with pytest.raises(KeyError):
+        store.events_after("nope", 0)
+    with pytest.raises(KeyError):
+        store.last_message("nope")
+
+
+def test_last_message_skips_withheld_and_non_assistant_messages(store):
+    assert feed(store, {"kind": "lifecycle", "phase": "started"})
+    assert store.last_message(SID) is None
+    feed(store,
+         {"kind": "message", "role": "assistant", "text": "older answer"},
+         {"kind": "message", "role": "assistant", "text": "secret", "sensitive": True},
+         {"kind": "message", "role": "user", "text": "a question"})
+    assert store.last_message(SID) == "older answer"
+    assert store.last_message(SID, role="operator") == "secret"
+    feed(store, {"kind": "message", "role": "assistant", "text": "x" * 500})
+    assert store.last_message(SID) == "x" * 160

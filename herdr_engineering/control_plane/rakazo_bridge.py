@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import project_intelligence as pi
+from . import rakazo_agents
 from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_cognito as cognito
@@ -736,6 +737,8 @@ class RakazoBridge:
         self.auto_join_rooms = tuple(config.get("auto_join_rooms", ()))
         self.rooms = rooms.Rooms(self, BridgeError)
         self._procs.update(self.rooms.procs())
+        self.agents = rakazo_agents.Agents(self, BridgeError)       # the API glue sets .repo
+        self._procs.update(self.agents.procs())
         self.max_bots = MAX_BOTS
         self.bots = bots.Bots(self, BridgeError)
         self.memory = memory.Memory(self, BridgeError)

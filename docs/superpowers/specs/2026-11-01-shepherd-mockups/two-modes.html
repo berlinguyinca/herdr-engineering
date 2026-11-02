@@ -1,0 +1,58 @@
+<h2>Two modes: how I picture them (my guess, please correct)</h2>
+<p class="subtitle">Left: assistant mode, just ask. Right: agent mode, a room of agents you give tasks to.</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Assistant mode</div>
+    <div class="mockup-body" style="max-width:300px;margin:0 auto;font-size:13px">
+      <div style="text-align:center;font-weight:600;padding:6px 0">Shepherd</div>
+      <div style="background:#e8e8ec;border-radius:12px;padding:8px 10px;margin:8px 0;width:78%">Which hosts are low on disk?</div>
+      <div style="background:#3d3dbd;color:#fff;border-radius:12px;padding:8px 10px;margin:8px 0 8px auto;width:82%">bender is at 91%. I started a cleanup agent to find what is safe to remove.</div>
+      <div style="border:1px solid #bbb;border-radius:10px;padding:8px 10px;margin:8px 0">
+        <div style="font-size:11px;opacity:.7">AGENT STARTED BY ASSISTANT</div>
+        <div><b>disk-cleanup</b> on bender</div>
+        <div style="font-size:12px;opacity:.8">Scanning /var/lib/docker... 40%</div>
+      </div>
+      <div style="background:#3d3dbd;color:#fff;border-radius:12px;padding:8px 10px;margin:8px 0 8px auto;width:82%">Found 38 GB of old images. Remove them?</div>
+      <div style="display:flex;gap:8px;margin:8px 0"><div class="mock-button" style="flex:1;text-align:center">Remove</div><div class="mock-button" style="flex:1;text-align:center;opacity:.6">Not now</div></div>
+      <div class="mock-input" style="margin-top:12px">Ask anything...</div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">Agent mode: a room</div>
+    <div class="mockup-body" style="max-width:300px;margin:0 auto;font-size:13px">
+      <div style="text-align:center;font-weight:600;padding:6px 0">Room: release-prep</div>
+      <div style="display:flex;gap:6px;margin:6px 0;font-size:11px">
+        <span style="border:1px solid #bbb;border-radius:12px;padding:3px 8px">claude · working</span>
+        <span style="border:1px solid #bbb;border-radius:12px;padding:3px 8px">pi · idle</span>
+        <span style="border:1px solid #bbb;border-radius:12px;padding:3px 8px">codex · blocked</span>
+      </div>
+      <div style="border-left:3px solid #3d3dbd;padding:4px 8px;margin:8px 0;background:#f2f2f5;font-size:12px"><b>Summary</b> 3 tasks open. codex waits on your approval to push.</div>
+      <div style="background:#e8e8ec;border-radius:12px;padding:8px 10px;margin:8px 0;width:80%"><b>claude</b>: tests are green on main.</div>
+      <div style="background:#e8e8ec;border-radius:12px;padding:8px 10px;margin:8px 0;width:80%"><b>codex</b>: ready to push v1.4. Approve?</div>
+      <div style="border:1px solid #bbb;border-radius:10px;padding:8px 10px;margin:8px 0">
+        <div style="font-size:11px;opacity:.7">TASK</div>
+        <div>Write release notes</div>
+        <div style="font-size:12px;opacity:.8">assigned to pi · queued</div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:10px;font-size:12px"><span style="border:1px solid #bbb;border-radius:12px;padding:3px 8px">/skill</span><span style="border:1px solid #bbb;border-radius:12px;padding:3px 8px">@assign</span><div class="mock-input" style="flex:1;margin:0">Message the room...</div></div>
+    </div>
+  </div>
+</div>
+
+<h3 style="margin-top:24px">How should you move between the two?</h3>
+<div class="options">
+  <div class="option" data-choice="tabs" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content"><h3>Two tabs at the bottom</h3><p>Assistant | Agents. Always one tap away, equal weight.</p></div>
+  </div>
+  <div class="option" data-choice="home-assistant" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content"><h3>Assistant is home, agents behind it</h3><p>The app opens in the assistant chat. A single "Agents" button leads to your rooms. The assistant can also open a room for you when work needs one.</p></div>
+  </div>
+  <div class="option" data-choice="one-list" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content"><h3>One list, both kinds</h3><p>A single inbox where the assistant and every room are just conversations, sorted by what needs you. No explicit modes.</p></div>
+  </div>
+</div>
