@@ -1,11 +1,16 @@
 """Pty relay core: a child on a real pty, output kept as numbered base64 chunks."""
 import base64
+import sys
+import threading
 import time
 
 import pytest
 
 from herdr_engineering.control_plane.rakazo_terminal import TerminalSession, attach_argv
 from herdr_engineering.control_plane.terminal_attach import AttachRefused
+
+# os.fork in a threaded test process warns; the child only execs.
+pytestmark = pytest.mark.filterwarnings('ignore:This process .* is multi-threaded:DeprecationWarning')
 
 LIVE = {'session_id': 'herdr:beast:default:wK%3ApH', 'host_id': 'beast', 'herdr_session': 'default',
         'pane_id': 'wK:pH', 'terminal_id': 'term_65df79f50e51582', 'status': 'idle'}
@@ -116,6 +121,79 @@ def test_write_after_exit_is_ignored(make):
     s = make(['bash', '-c', 'exit 0'])
     collect(s, until=lambda t, c: any(x.get('ended') for x in c))
     s.write(b'x')  # must not raise
+
+
+PROBE = ("import os\nfor f in range(3, 256):\n"
+         "    try: os.fstat(f); print('OPEN', f)\n    except OSError: pass\nprint('DONE')")
+
+
+def test_a_second_session_does_not_inherit_the_first_sessions_fds(make):
+    a = make(['cat'])
+    b = make([sys.executable, '-c', PROBE])
+    text, _ = collect(b, until=lambda t, c: b'DONE' in t)
+    assert b'DONE' in text and b'OPEN' not in text, text
+    assert a.alive
+
+
+@pytest.mark.parametrize('rows,cols', [(0, 80), (24, 0), (-1, 80), (24, -5), (70000, 80), (24, 70000),
+                                       (501, 80), (24, 1001), ('24', 80), (24.0, 80), (True, 80), (None, 80)])
+def test_bad_size_is_rejected_before_forking(monkeypatch, rows, cols):
+    import os
+    forked = []
+    monkeypatch.setattr(os, 'fork', lambda: forked.append(1) or 1)
+    with pytest.raises(ValueError):
+        TerminalSession(['cat'], rows, cols)
+    assert forked == []
+
+
+def test_bad_resize_is_rejected_and_not_stored(make):
+    s = make(['cat'], rows=24, cols=80)
+    for rows, cols in [(0, 80), (24, 1001), ('x', 80)]:
+        with pytest.raises(ValueError):
+            s.resize(rows, cols)
+    assert (s.rows, s.cols) == (24, 80)
+
+
+def test_close_is_prompt_with_a_hup_ignoring_grandchild(make):
+    s = make(['bash', '-c', "(trap '' HUP; sleep 30) & sleep 30"])
+    time.sleep(0.2)
+    started = time.monotonic()
+    s.close()
+    assert time.monotonic() - started < 2
+    assert not s.alive and not s._reader.is_alive()
+    s.write(b'x')
+    s.resize(10, 10)  # no-ops after close, never touching a recycled fd
+    assert threading.active_count() >= 1
+
+
+def test_closed_session_does_not_touch_a_reused_fd(make):
+    s = make(['cat'])
+    s.close()
+    r, w = __import__('os').pipe()
+    try:
+        s.write(b'leak')
+        s.resize(10, 10)
+        __import__('os').set_blocking(r, False)
+        try:
+            leaked = __import__('os').read(r, 10)
+        except BlockingIOError:
+            leaked = b''
+        assert leaked == b''
+    finally:
+        __import__('os').close(r)
+        __import__('os').close(w)
+
+
+def test_start_twice_raises(make):
+    s = make(['cat'])
+    with pytest.raises(RuntimeError):
+        s.start()
+
+
+def test_buffer_cap_is_soft_the_newest_chunk_is_always_kept(make):
+    s = make(['bash', '-c', 'head -c 5000 /dev/zero | tr "\\0" x'], buffer_bytes=10)
+    collect(s, until=lambda t, c: any(x.get('ended') for x in c))
+    assert any(base64.b64decode(c.get('data', '')) for c in s.chunks_after(0))
 
 
 # ------------------------------------------------------------------ attach_argv
