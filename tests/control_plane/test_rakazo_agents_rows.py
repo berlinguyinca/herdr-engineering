@@ -27,7 +27,19 @@ def test_agent_status_maps_herdr_values_and_closed_set():
 def test_unknown_or_missing_status_is_unknown():
     assert agent_status({}) == "unknown"
     assert agent_status({"status": None}) == "unknown"
-    assert agent_status({"status": "active"}) == "unknown"
+    assert agent_status({"status": "bogus"}) == "unknown"
+
+
+def test_active_is_idle_and_running_is_working():
+    assert agent_status({"status": "active"}) == "idle"
+    assert agent_status({"status": "Running"}) == "working"
+    assert agent_status({"status": "stopped"}) == "closed"
+
+
+def test_machine_prefers_explicit_then_host_id_then_none():
+    assert agent_row({"session_id": "a", "machine": "m1", "host_id": "h"}, None)["machine"] == "m1"
+    assert agent_row({"session_id": "a", "host_id": "Mac.lan"}, None)["machine"] == "Mac.lan"
+    assert agent_row({"session_id": "a"}, None)["machine"] is None
 
 
 def test_sort_blocked_first_then_done_working_idle_unknown_closed_newest_first_within_group():
