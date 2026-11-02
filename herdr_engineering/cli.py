@@ -271,6 +271,26 @@ def _build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--template", required=True, help="collab-edge/nginx.conf (snippets beside it)")
             sp.add_argument("--out", required=True, help="nginx.conf to write")
         sp.set_defaults(func=_cmd_fleet_config)
+    pm = csub.add_parser("memory", help="optional Hindsight shared-memory backend (control_plane.memory); "
+                                        "secrets are generated on this host and never printed")
+    pm.add_argument("--path", default=FLEET_CONFIG_DEFAULT)
+    msub = pm.add_subparsers(dest="memory_command", required=True)
+    mi = msub.add_parser("init", help="create/complete control_plane.memory: generate the missing database "
+                                      "password and tenant keys (0600 file, backup first); prints names only")
+    mi.add_argument("--enable", action="store_true", help="set enabled: true (deploy.sh --with-memory still opts in)")
+    mi.add_argument("--endpoint", default=None, help="https URL other hosts use, e.g. https://memory.dev.lan")
+    mi.add_argument("--model-dir", default=None, help="absolute path of the pinned ONNX model directory")
+    mi.add_argument("--image-tag", default=None, help="tag of herdr-memory-hindsight (default: the candidate's pin)")
+    mi.add_argument("--port", type=int, default=None, help="loopback port (default 8888)")
+    mi.add_argument("--rotate", action="append", default=[], metavar="TENANT",
+                    help="regenerate this tenant's key (project|global|infra|personal); repeatable")
+    msub.add_parser("status", help="presence of each secret (never a value), endpoint, port, enabled")
+    msub.add_parser("endpoint", help="print the non-secret https endpoint other hosts use")
+    mk = msub.add_parser("export-key", help="write one tenant's key to a 0600 file in a 0700 directory "
+                                            "(for a host's herdr-memory credentials); never printed")
+    mk.add_argument("tenant", help="project | global | infra | personal")
+    mk.add_argument("--out", required=True, help="file to write (0600)")
+    pm.set_defaults(func=_cmd_fleet_config)
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
     pu.add_argument("--host", default=None, help="update only this host (default: all)")
@@ -1338,6 +1358,24 @@ def _cmd_fleet_config(args) -> int:
         elif cmd == "render-edge":
             fcc.render_edge(load_fleet_config(path), Path(args.template).expanduser(), Path(args.out).expanduser())
             print(f"wrote {args.out}")
+        elif cmd == "memory":
+            from . import fleet_memory as fm
+            if args.memory_command == "init":
+                made = fm.init_memory(path, enable=args.enable, endpoint=args.endpoint, model_dir=args.model_dir,
+                                      image_tag=args.image_tag, port=args.port, rotate=tuple(args.rotate))
+                print("generated: " + (", ".join(made) if made else "nothing (all secrets already present)"))
+                print(f"updated {path} (0600); values are not printed")
+            elif args.memory_command == "status":
+                print(json.dumps(fm.status_summary(load_fleet_config(path)), indent=2, sort_keys=True))
+            elif args.memory_command == "endpoint":
+                url = fm.endpoint_url(load_fleet_config(path))
+                if not url:
+                    print("error: control_plane.memory.endpoint is not set", file=sys.stderr)
+                    return 1
+                print(url)
+            elif args.memory_command == "export-key":
+                fm.export_key(load_fleet_config(path), args.tenant, Path(args.out))
+                print(f"wrote the {args.tenant} key to {args.out} (0600)")
     except FleetConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
