@@ -212,6 +212,7 @@ class ControlPlaneRepo:
         self._missions = {}
         self._sessions = {}
         self._services = {}
+        self._listener_journaled = {}  # service_id -> (material facts, monotonic time) of the last journaled observation
         self._service_archive_days = validate_archive_days(service_archive_days)
         self._hosts = {}
         self._artifacts = {}
@@ -935,10 +936,34 @@ class ControlPlaneRepo:
             candidate["status"] = "healthy"
         candidate.update(updated_at=stamp, metadata_updated_at=stamp, metadata_observation=observation,
                          endpoint_scope="local_only", route=None, url=None)
-        self.record_event("service", service_id, "ServiceListenerObserved", _deep_copy(candidate),
-                          session_id=candidate.get("session_id"), publish=False)
+        if not self._listener_repeat(service_id, candidate, observation):
+            self.record_event("service", service_id, "ServiceListenerObserved", _deep_copy(candidate),
+                              session_id=candidate.get("session_id"), publish=False)
         self._services[service_id] = candidate
         return self.get_service(service_id)
+
+    # A listener that re-reports unchanged facts is a heartbeat: the projection still advances, but it is journaled
+    # at most this often. It stays well inside the observation's 90 s staleness window, so a replay never reads a
+    # live listener as stale.
+    _LISTENER_HEARTBEAT_JOURNAL_SECONDS = 30.0
+
+    def _listener_repeat(self, service_id, candidate, observation):
+        """True when this observation repeats the last journaled one and need not be journaled again yet."""
+        if observation["state"] != "observed":
+            self._listener_journaled.pop(service_id, None)
+            return False
+        material = {key: value for key, value in candidate.items()
+                    if key not in {"updated_at", "metadata_updated_at", "metadata_observation"}}
+        if isinstance(material.get("verified_origin"), dict):
+            material["verified_origin"] = {key: value for key, value in material["verified_origin"].items()
+                                           if key != "verified_at"}
+        facts = json.dumps(material, sort_keys=True, default=str)
+        now = time.monotonic()
+        last = self._listener_journaled.get(service_id)
+        if last is not None and last[0] == facts and now - last[1] < self._LISTENER_HEARTBEAT_JOURNAL_SECONDS:
+            return True
+        self._listener_journaled[service_id] = (facts, now)
+        return False
 
     def _ensure_service_desc(self, rec):
         """Guarantee ``rec`` carries a non-empty human description.
