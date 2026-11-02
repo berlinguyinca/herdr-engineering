@@ -6,12 +6,16 @@ and, per agent, a numbered buffer of those frames. The app attaches by cursor: `
 newer than ``seq``. A frame is a whole screen, so each one is stored as a ``reset`` chunk (the app clears, then paints).
 The buffer is capped, and the newest frame is always kept.
 
-Host protocol. Delivery is at-least-once. Every command has an ordered id ``<counter>-<random>`` (the counter never
-goes backwards, not even across a restart). A command stays queued until the relay acknowledges it by passing the last
-id it handled as ``wait(after=...)``; an unacknowledged command is delivered again (a relay whose response was lost, or
-whose connection died, loses nothing) and expires after 60 s. The relay must therefore dedupe by command id, and must
+Host protocol. Delivery is at-least-once. Every command has an id ``<epoch>-<counter>-<random>``: the epoch is random per
+process start and the counter ascends within it. A command stays queued until the relay acknowledges it by passing the
+last id it handled as ``wait(after=...)``; an unacknowledged command is delivered again (a relay whose response was lost,
+or whose connection died, loses nothing) and expires after 60 s. A cursor from another epoch (a restarted control plane),
+or with a counter beyond anything this process issued, is ignored: nothing is acknowledged and the whole queue comes back,
+so a stale or forged ack can never cover commands the relay has not seen. The relay must dedupe by command id AND by
+``(terminal, n)`` (a second relay polling the same host would dedupe separately, so only one relay runs per host), and must
 refuse a gap in ``n``: when the queue is full the broker drops every queued input of the overflowing terminal and ends it
-with ``reason: "input_overflow"`` rather than deliver inputs with a hole. A terminal that ends, is closed or is retired
+with ``reason: "input_overflow"`` rather than deliver inputs with a hole; an input, open or resize that expired unacknowledged
+ends its terminal with ``reason: "stale"`` for the same reason. A terminal that ends, is closed or is retired
 by a takeover loses its queued open/input/resize/zoom commands (its ``close`` stays, except when the host is gone).
 A host counts as connected while a wait is blocked for it, or for 10 s after its last wait ended; a host silent for
 those 10 s loses its open terminals (``reason: "host_offline"``). What a host may receive or push is decided by the
@@ -175,10 +179,10 @@ class Terminal:
         self._lives: dict[str, _Live] = {}       # agent id -> its terminal
         self._queues: dict[str, collections.deque] = {}   # host id -> commands not yet acknowledged
         self._polled: dict[str, float] = {}      # host id -> when its last wait ended
-        self._blocked: dict[str, int] = {}       # host id -> waits blocked right now
+        self._blocked: dict[str, int] = {}       # host id -> its current wait (a replaced wait no longer counts)
         self._gen: dict[str, int] = {}           # host id -> newest wait, which ends any older one
-        self._counter = int(time.time() * 1000)  # command ids ascend across restarts, so an old ack cannot cover new commands
-        self._waiters = 0
+        self._epoch = secrets.token_hex(4)       # per process: an ack from another epoch is ignored
+        self._counter = 0
         self._stop = None
         self._reaper = None
 
@@ -197,25 +201,30 @@ class Terminal:
         with self._lock:
             return self._connected(host_id, self._clock())
 
-    @staticmethod
-    def _counter_of(command_id):
+    @property
+    def _waiters(self) -> int:
+        return len(self._blocked)
+
+    def _acked(self, command_id) -> int:   # call with self._lock held
+        """The counter an ack covers; 0 (nothing) for a cursor of another epoch or beyond what was ever issued."""
         try:
-            return int(str(command_id).split("-", 1)[0])
+            epoch, counter, _ = str(command_id).split("-", 2)
+            counter = int(counter)
         except ValueError:
             return 0
+        return counter if epoch == self._epoch and 0 < counter <= self._counter else 0
 
     def wait_commands(self, host_id, timeout, after=None) -> list[dict]:
         """Long-poll: acknowledge up to ``after``, then return the commands queued for ``host_id`` as soon as there are
         any; ``[]`` after ``timeout`` seconds. A newer wait for the same host ends this one with ``[]``."""
         end = time.monotonic() + max(0.0, min(float(timeout), _MAX_WAIT))
-        acked = self._counter_of(after) if after else 0
         with self._cond:
-            if self._waiters >= _MAX_WAITERS:
+            if host_id not in self._blocked and self._waiters >= _MAX_WAITERS:   # a takeover needs no free slot
                 raise HostError(429, "Too many waiting hosts.", {"Retry-After": "5"})
-            self._waiters += 1
-            self._blocked[host_id] = self._blocked.get(host_id, 0) + 1
             self._gen[host_id] = mine = self._gen.get(host_id, 0) + 1
-            self._cond.notify_all()                    # an older wait of this host sees it was replaced
+            self._blocked[host_id] = mine              # the older wait stops counting at once
+            self._cond.notify_all()                    # ...and sees it was replaced
+            acked = self._acked(after) if after else 0
             try:
                 queue = self._queues.get(host_id)
                 if queue and acked:
@@ -233,9 +242,7 @@ class Terminal:
                         return []
                     self._cond.wait(min(left, _WAIT_SLICE))
             finally:
-                self._waiters -= 1
-                self._blocked[host_id] -= 1
-                if not self._blocked[host_id]:
+                if self._blocked.get(host_id) == mine:   # a replaced wait leaves the slot to its replacement
                     del self._blocked[host_id]
                 self._polled[host_id] = self._clock()  # the connected window starts when the wait ends
 
@@ -272,8 +279,13 @@ class Terminal:
 
     def _expire_commands(self, host) -> None:   # call with self._lock held
         queue, now = self._queues.get(host), self._clock()
+        expired = []
         while queue and now - queue[0]["_t"] > _COMMAND_TTL:
-            queue.popleft()
+            expired.append(queue.popleft())
+        for command in expired:   # an input that was never delivered would leave a gap in n: end that terminal
+            client = self._clients.get(command.get("terminal"))
+            if command["kind"] != "close" and client is not None and client.pty.alive:
+                self._finish(client.pty, None, "stale")
 
     def _room(self, host, need) -> None:   # call with self._lock held
         """Make room for ``need`` more commands. Never drops an open or a close: it ends the terminal whose input is
@@ -291,13 +303,15 @@ class Terminal:
                 self._finish(client.pty, None, "input_overflow")
 
     def _enqueue(self, host, command) -> None:   # call with self._lock held
-        self._room(host, 1)
+        if command["kind"] != "close":                 # a close always fits: it frees the host's pane, and callers hold room
+            self._room(host, 1)
         client = self._clients.get(command.get("terminal"))
         if command["kind"] != "close" and client is not None and not client.pty.alive:
             return                                     # the room it needed just ended its own terminal
+        self._queues.setdefault(host, collections.deque())
         self._counter += 1
         command["_n"], command["_t"] = self._counter, self._clock()
-        command["id"] = f"{self._counter}-{secrets.token_urlsafe(12)}"
+        command["id"] = f"{self._epoch}-{self._counter}-{secrets.token_urlsafe(12)}"
         self._queues[host].append(command)
         self._cond.notify_all()
 
@@ -356,10 +370,7 @@ class Terminal:
             if live.client is not None:
                 self._purge(live.host, live.client.tid)   # its close, if any, is the only command that stays
             if tell_host:
-                try:
-                    self._enqueue(live.host, {"kind": "close", "terminal": live.client.tid})
-                except self.Error:
-                    log.warning("rakazo terminal: could not queue a close (host queue full)")
+                self._enqueue(live.host, {"kind": "close", "terminal": live.client.tid})
         if not live.detached:
             live.detached = True
             self.b._audit(live.account, "rakazo.bridge.terminal.detach", live.agent, f"host={live.host}")
@@ -433,11 +444,13 @@ class Terminal:
         self._reap()
         tid = secrets.token_urlsafe(16)
         with self._lock:
-            self._room(host, 2)                       # a close and an open: refuse before anything changes
             live = self._lives.get(sid)
             reuse = live is not None and not live.closed and live.alive and live.host == host
-            if not reuse and len(self._lives) - (live is not None) >= _MAX_SESSIONS:
+            if not reuse and len(self._lives) - (live is not None) >= _MAX_SESSIONS:   # before room: a refusal ends nothing
                 raise self.Error(429, "TOO_MANY_REQUESTS", "Too many live terminals.", {"Retry-After": "10"})
+            self._room(host, 2)                       # a close and an open: refuse before anything changes
+            live = self._lives.get(sid)               # making room may have ended this very terminal
+            reuse = live is not None and not live.closed and live.alive and live.host == host
             retired = None
             if not reuse:
                 retired, live = live, _Live(sid, host, pane, ctx.account, self._clock())
@@ -487,7 +500,7 @@ class Terminal:
             # a retry, a gap or a retired client is answered ok and typed never
             if n == client.last_n + 1 and not client.taken:
                 with self._lock:
-                    if client.pty.alive:   # a refused enqueue (503) burns no n
+                    if client.pty.alive and self._clients.get(client.tid) is client:   # a refused enqueue (503) burns no n
                         self._enqueue(client.pty.host, {"kind": "input", "terminal": client.tid, "n": n, "data": data})
                 client.last_n = n
         return {"ok": True}
@@ -500,8 +513,9 @@ class Terminal:
         if zoom is not None and not isinstance(zoom, bool):
             raise self.Error(400, "BAD_REQUEST", "zoom must be true or false.")
         with self._lock:
-            if client.pty.alive and not client.taken:
+            if client.pty.alive and not client.taken and self._clients.get(client.tid) is client:
                 host = client.pty.host
+                self._room(host, 2 if zoom is not None else 1)   # both commands or neither
                 self._enqueue(host, {"kind": "resize", "terminal": client.tid, "rows": rows, "cols": cols})
                 if zoom is not None:
                     self._enqueue(host, {"kind": "zoom", "terminal": client.tid, "zoom": zoom})

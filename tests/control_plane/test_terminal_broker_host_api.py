@@ -221,8 +221,9 @@ def test_wait_delivers_input_in_order_and_only_to_its_own_host(env):
         ("open", None, None), ("input", 1, b64("ls")), ("input", 2, b64("\r"))]
     assert len({c["id"] for c in cmds}) == 3 and len(cmds[0]["id"]) >= 16        # unguessable
     ids = [c["id"] for c in cmds]
-    assert all(re.fullmatch(r"\d+-[A-Za-z0-9_-]{16,}", i) for i in ids)         # <counter>-<random>, counter ascending
-    assert [int(i.split("-")[0]) for i in ids] == sorted(int(i.split("-")[0]) for i in ids)
+    assert all(re.fullmatch(r"[0-9a-f]{8}-\d+-[A-Za-z0-9_-]{16,}", i) for i in ids)   # <epoch>-<counter>-<random>
+    assert len({i.split("-")[0] for i in ids}) == 1                             # one epoch per process
+    assert [int(i.split("-")[1]) for i in ids] == sorted(int(i.split("-")[1]) for i in ids)
 
 
 def test_a_waiter_ends_when_the_bridge_closes(env):
@@ -472,3 +473,108 @@ def test_the_wait_response_is_never_redacted(rig, size):
     svr.rakazo.terminal.input(owner(svr), {"terminalId": tid, "data": data, "n": 1})
     cmds = http.wait()[1]["commands"]
     assert cmds[-1]["data"] == data
+
+
+# ----------------------------------------------------------------------------------------- the ack cursor
+def test_an_after_cursor_from_another_epoch_or_beyond_anything_issued_acks_nothing(env):
+    svr, http = env
+    open_terminal(svr, http)
+    (cmd,) = http.wait()[1]["commands"]
+    epoch, counter, rand = cmd["id"].split("-", 2)
+    other = "0" * 8 if epoch != "0" * 8 else "1" * 8
+    for forged in (f"{other}-{counter}-{rand}", f"{other}-1-{rand}", f"{epoch}-{int(counter) + 1000}-{rand}"):
+        assert http.wait(after=forged)[1]["commands"] == [cmd], forged           # ignored: the whole queue comes back
+    assert http.wait(after=cmd["id"])[1] == {"commands": []}
+
+
+def test_a_retried_after_cursor_is_harmless(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    svr.rakazo.terminal.input(owner(svr), {"terminalId": tid, "data": b64("x"), "n": 1})
+    first = http.wait()[1]["commands"]
+    assert http.wait(after=first[0]["id"])[1]["commands"] == first[1:]
+    assert http.wait(after=first[0]["id"])[1]["commands"] == first[1:]           # the same ack again acks nothing more
+
+
+def test_a_command_that_expired_ends_its_terminal_so_n_has_no_gap(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    term = svr.rakazo.terminal
+    now = [time.monotonic()]
+    term._clock = lambda: now[0]
+    http.wait(after=http.wait()[1]["commands"][0]["id"])
+    term.input(owner(svr), {"terminalId": tid, "data": b64("lost"), "n": 1})
+    now[0] += 61
+    assert http.wait()[1] == {"commands": []}
+    assert chunks(svr)[-1]["reason"] == "stale"
+
+
+def test_a_replaced_waiter_stops_counting_and_a_takeover_needs_no_free_slot(env):
+    svr, http = env
+    term = svr.rakazo.terminal
+    threads = [threading.Thread(target=lambda h=f"h{i}": term.wait_commands(h, 1.5), daemon=True) for i in range(64)]
+    for th in threads:
+        th.start()
+    deadline = time.monotonic() + 3
+    while term._waiters < 64 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    outcome = []
+
+    def retake():
+        try:
+            outcome.append(term.wait_commands("h0", 1))
+        except Exception as exc:  # noqa: BLE001
+            outcome.append(type(exc).__name__)
+    again = threading.Thread(target=retake, daemon=True)
+    again.start()                                                              # h0 already waits: it takes over its slot
+    time.sleep(0.3)
+    assert term._waiters == 64
+    assert http.wait("beast", timeout=0)[0] == 429
+    for th in threads + [again]:
+        th.join(5)
+    assert outcome == [[]] and term._waiters == 0 and not term._blocked
+
+
+# ---------------------------------------------------------------------------------------------- room for closes
+def test_a_close_is_queued_even_when_the_queue_is_full_of_other_terminals_commands(env):
+    svr, http = env
+    t1 = open_terminal(svr, http, sid="a1")
+    http.wait(after=http.wait()[1]["commands"][-1]["id"])
+    t2 = open_terminal(svr, http, sid="a2")
+    term, ctx = svr.rakazo.terminal, owner(svr)
+    for _ in range(255):
+        term.resize(ctx, {"terminalId": t2, "rows": 24, "cols": 80})
+    assert len(term._queues["beast"]) == 256
+    term.close(ctx, {"terminalId": t1})
+    assert [(c["kind"], c["terminal"]) for c in http.wait()[1]["commands"]][-1] == ("close", t1)
+
+
+def test_a_resize_with_zoom_queues_both_commands_or_neither(env):
+    svr, http = env
+    tid = open_terminal(svr, http)
+    term, ctx = svr.rakazo.terminal, owner(svr)
+    for _ in range(254):
+        term.resize(ctx, {"terminalId": tid, "rows": 24, "cols": 80})
+    assert len(term._queues["beast"]) == 255
+    with pytest.raises(term.Error):
+        term.resize(ctx, {"terminalId": tid, "rows": 30, "cols": 90, "zoom": True})
+    assert len(term._queues["beast"]) == 255
+
+
+def test_the_terminal_cap_is_checked_before_any_terminal_is_ended_for_room(env):
+    svr, http = env
+    term, ctx = svr.rakazo.terminal, owner(svr)
+    first = open_terminal(svr, http, sid="a0")
+    for i in range(1, 4):
+        svr.repo.upsert_session(f"a{i}", status="working", host_id="beast", herdr_session="default",
+                                pane_id="w1:p1", terminal_id="term_1")
+        term.open(ctx, {"id": f"a{i}", "rows": 24, "cols": 80})
+    n = 0
+    while len(term._queues["beast"]) < 255:
+        n += 1
+        term.input(ctx, {"terminalId": first, "data": b64("x"), "n": n})
+    svr.repo.upsert_session("a4", status="working", host_id="beast", herdr_session="default",
+                            pane_id="w1:p1", terminal_id="term_1")
+    with pytest.raises(term.Error) as e:
+        term.open(ctx, {"id": "a4", "rows": 24, "cols": 80})
+    assert e.value.status == 429 and term._lives["a0"].alive                    # a refused open ended nothing

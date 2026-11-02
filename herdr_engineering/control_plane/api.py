@@ -5133,7 +5133,7 @@ def _make_handler(server, public=False, operator=False):
                     after = _q(self.path, "after")
                     if not 0 <= timeout < float("inf"):
                         return self._json({"error": "timeout must be a number of seconds"}, 400)
-                    if after is not None and not re.fullmatch(r"\d{1,20}-[A-Za-z0-9_-]{1,64}", after):
+                    if after is not None and not re.fullmatch(r"[0-9a-f]{8}-\d{1,20}-[A-Za-z0-9_-]{1,64}", after):
                         return self._json({"error": "after must be a command id"}, 400)
                     commands = broker.wait_commands(host_id, timeout, after)
                     # Serialised here, not by _json's redaction pass: that one rewrites strings that look like credentials,

@@ -512,6 +512,18 @@ def test_an_input_that_lost_the_race_with_a_takeover_queues_nothing(bridge, ctx,
     assert host.sent("input") == []
 
 
+def test_an_input_or_resize_in_flight_during_a_takeover_is_not_queued_after_the_close(bridge, ctx, repo, host, monkeypatch):
+    live(repo)
+    tid = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
+    stale = bridge.terminal._clients[tid]
+    call(bridge, ctx, "open", id="a1", rows=24, cols=80)
+    stale.taken = False                                                     # it passed the taken check before the takeover
+    monkeypatch.setattr(bridge.terminal, "_find", lambda c, i: stale)
+    bridge.terminal.input(ctx, {"terminalId": tid, "data": b64("late"), "n": 1})
+    bridge.terminal.resize(ctx, {"terminalId": tid, "rows": 30, "cols": 90})
+    assert host.sent("input") == [] and host.sent("resize") == []
+
+
 def test_a_takeover_waits_for_an_input_in_flight(bridge, ctx, repo):
     live(repo)
     tid = call(bridge, ctx, "open", id="a1", rows=24, cols=80)["terminalId"]
