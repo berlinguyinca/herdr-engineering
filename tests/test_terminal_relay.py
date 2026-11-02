@@ -54,6 +54,9 @@ class FakeCP:
         self.drop_after_read = 0  # lose the response of this many waits that had commands
         self.epoch = EPOCH
         self.dead = set()        # terminals the broker no longer knows or has ended: pushes answer 404
+        self.gate = None         # an Event: pushes (for gate_tids, or all) block until it is set or their timeout passes
+        self.gate_tids = None
+        self.blocked = 0         # pushes that reached a closed gate
 
     def push(self, kind, **fields):
         with self.cond:
@@ -89,6 +92,11 @@ class FakeCP:
         parts = url.path.split("/")
         if method == "POST" and len(parts) == 7 and parts[5:] and parts[6] == "output":
             tid = parts[5]
+            gate = self.gate
+            if gate is not None and (self.gate_tids is None or tid in self.gate_tids) and not gate.is_set():
+                self.blocked += 1
+                if not gate.wait(timeout):
+                    raise OSError("timed out")     # a blocked POST: the relay's own timeout ends it
             with self.cond:
                 self.posts.append((tid, q.get("host_id"), len(body["frames"])))
                 status = 404 if tid in self.dead else self.post_status.get(tid, 200)
@@ -606,6 +614,54 @@ def test_the_first_successful_poll_logs_one_connected_line(env, caplog):
     assert len(lines) == 1 and lines[0].levelno == logging.INFO    # the rollout's health check greps for it
     first_ok = next(i for i, x in enumerate(caplog.records) if x.getMessage() == "terminal relay connected")
     assert all("unreachable" in x.getMessage() for x in caplog.records[:first_ok])   # only after a poll got an answer
+
+
+def test_a_mirror_blocked_in_a_10s_push_does_not_delay_the_poll_loop(env):
+    env.cp.gate, env.cp.gate_tids = threading.Event(), {TID}
+    r = env.make()
+    env.start(r)
+    try:
+        open_cmd(env.cp)
+        assert wait_until(lambda: r.active_terminals() == 1)
+        time.sleep(0.3)                              # the mirror is now inside its blocked first push
+        close = env.cp.push("close", terminal=TID)
+        assert wait_until(lambda: any(w[2] == close["id"] for w in env.cp.waits), 2)   # the next wait went out at once
+        assert r.active_terminals() == 0             # the slot is freed by registration, not by the join
+        env.cp.push("open", terminal=TID2, pane_id="p2", rows=24, cols=80)
+        assert wait_until(lambda: env.cp.typed_frames(TID2), 2)
+    finally:
+        env.cp.gate.set()
+
+
+def test_a_refusal_whose_push_blocks_does_not_stop_the_next_command(env):
+    env.cp.gate, env.cp.gate_tids = threading.Event(), {TID2}
+    r = env.make()
+    env.start(r)
+    try:
+        env.cp.push("open", terminal=TID2, pane_id="nope", rows=1, cols=1)      # refused: its push blocks
+        assert wait_until(lambda: env.cp.blocked == 1)
+        open_cmd(env.cp)
+        assert wait_until(lambda: env.cp.typed_frames(TID), 2)
+    finally:
+        env.cp.gate.set()
+
+
+def test_probing_at_the_cap_is_bounded_when_the_broker_is_slow(env):
+    r = env.make()
+    env.client.screens.update({f"q{i}": "x" for i in range(5)})
+    env.start(r)
+    tids = [f"term_{i:024d}" for i in range(4)]
+    for i, t in enumerate(tids):
+        open_cmd(env.cp, t, f"q{i}")
+    assert wait_until(lambda: r.active_terminals() == 4 and all(env.cp.typed_frames(t) for t in tids))
+    env.cp.gate = threading.Event()                  # the broker stops answering pushes
+    try:
+        began = time.monotonic()
+        fifth = open_cmd(env.cp, TID2, "q4")
+        assert wait_until(lambda: any(w[2] == fifth["id"] for w in env.cp.waits), 5)
+        assert time.monotonic() - began < 4          # not 4 pushes x 10 s
+    finally:
+        env.cp.gate.set()
 
 
 class Front:

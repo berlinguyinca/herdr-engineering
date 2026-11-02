@@ -25,6 +25,7 @@ import http.client
 import json
 import logging
 import os
+import queue
 import random
 import re
 import secrets
@@ -57,7 +58,9 @@ _FAIL_LIMIT = 3            # consecutive herdr failures before a terminal ends w
 _FAIL_PAUSE = 0.25
 _PUSH_RETRY = 2.0          # pause after a refused or failed frame push
 _KEEP_IDS = 300            # remembered command ids (the broker queues at most 256)
-_JOIN = _POST_TIMEOUT + 1.0   # a mirror blocked in a push may take this long to notice it was stopped
+_JOIN = _POST_TIMEOUT + 1.0   # a mirror blocked in a push may take this long to notice it was stopped (a reaper waits)
+_INLINE_PUSH = 2.0         # the poll loop itself never waits longer than this for the broker (the host is offline at 10 s)
+_PROBE_COOLDOWN = 5.0      # an open at the cap probes at most this often, so a batch of opens costs one probe
 _PROBE_EVERY = 30.0        # a silent pane re-sends its screen this often: the push is a liveness probe (404 = retired)
 _TID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")   # the broker mints url-safe random ids
 _CMD_ID = re.compile(r"^[0-9a-f]{8}-\d{1,20}-[A-Za-z0-9_-]{1,64}$")
@@ -199,6 +202,10 @@ class TerminalRelay:
         self._save_lock = threading.Lock()
         self._terms: dict[str, _Term] = {}
         self._threads: list[threading.Thread] = []
+        self._reapers: list[threading.Thread] = []
+        self._out: queue.Queue | None = None     # ended frames and refusals: pushed by a worker, never by the poll loop
+        self._out_thread = None
+        self._probed_at = float("-inf")
         self._ids: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._after: str | None = None
         self._epoch: str | None = None
@@ -306,7 +313,12 @@ class TerminalRelay:
             for term in self._terms.values():
                 term.stop.set()
             threads = list(self._threads)
-        for thread in threads + [self._flusher]:
+        with self._lock:
+            out, self._out = self._out, None
+            reapers = list(self._reapers)
+        if out is not None:
+            out.put(None)
+        for thread in threads + reapers + [self._flusher, self._out_thread]:
             if thread is not None and thread is not threading.current_thread():
                 thread.join(5)
         self._release_lock()
@@ -450,20 +462,53 @@ class TerminalRelay:
             self._refuse(tid, {None: "herdr_unavailable", "gone": "pane_closed"}.get(state, "invalid_pane"))
 
     def _probe_all(self) -> None:
-        """Push every terminal's current screen: a 404 means the broker retired it, and it goes."""
+        """Push every terminal's current screen: a 404 means the broker retired it, and it goes. This runs in the poll
+        loop, so the whole pass is bounded to ``_INLINE_PUSH`` seconds and repeats at most every ``_PROBE_COOLDOWN``."""
+        began = time.monotonic()
+        if began - self._probed_at < _PROBE_COOLDOWN:
+            return
+        self._probed_at = began
         with self._lock:
             terms = list(self._terms.items())
         for tid, term in terms:
+            left = began + _INLINE_PUSH - time.monotonic()
+            if left <= 0:
+                break
             try:
                 frame = PaneMirror(self.client, term.pane).frame()
             except (HerdrError, OSError, ValueError, KeyError, TypeError):
                 continue
-            if frame is not None and self._push(tid, [frame]) == 404:
+            if frame is not None and self._push(tid, [frame], timeout=left) == 404:
                 self._forget(tid, term)
 
     def _refuse(self, tid, reason) -> None:
         log.warning("terminal relay: refused to open a terminal (%s)", reason)
-        self._push(tid, [{"ended": True, "exit": None, "reason": reason}])
+        self._push_later(tid, [{"ended": True, "exit": None, "reason": reason}])
+
+    def _push_later(self, tid, frames) -> None:
+        """Hand a push to the output worker: the poll loop must never wait on the broker (10 s offline window)."""
+        with self._lock:
+            if self._stop.is_set():
+                return
+            if self._out is None:
+                self._out = queue.Queue(maxsize=64)
+                self._out_thread = threading.Thread(target=self._out_loop, args=(self._out,), name="terminal-push",
+                                                    daemon=True)
+                self._out_thread.start()
+            try:
+                self._out.put_nowait((tid, frames))
+            except queue.Full:
+                log.warning("terminal relay: dropped an end notice (the broker is not answering)")
+
+    def _out_loop(self, q) -> None:
+        while True:
+            item = q.get()
+            if item is None:
+                return
+            try:
+                self._push(*item)
+            except Exception as exc:   # noqa: BLE001  one bad push must not end the worker
+                log.warning("terminal relay: a push failed (%s)", type(exc).__name__)
 
     def _start(self, tid, term) -> None:
         thread = threading.Thread(target=self._mirror_loop, args=(tid, term), name="terminal-mirror-" + tid[5:13],
@@ -482,7 +527,7 @@ class TerminalRelay:
             state = self._pane_state(saved["pane"])
             reason = None if state == "agent" else {None: "herdr_unavailable", "gone": "pane_closed"}.get(state, "invalid_pane")
             if reason:
-                self._push(tid, [{"ended": True, "exit": None, "reason": reason}])
+                self._push_later(tid, [{"ended": True, "exit": None, "reason": reason}])
             else:
                 self._start(tid, _Term(saved["pane"], saved["n"], saved.get("epoch")))
         self._saved = {"terminals": {}}
@@ -498,12 +543,21 @@ class TerminalRelay:
             self._flush_at.pop(tid, None)
         self._save()
         if term.thread is not None and term.thread is not threading.current_thread():
-            term.thread.join(_JOIN)
+            self._reap(term.thread)
+
+    def _reap(self, thread) -> None:
+        """The mirror may sit in a push for up to 10 s: its slot is already free (registration), so the join happens
+        on a reaper thread and the poll loop moves on."""
+        reaper = threading.Thread(target=thread.join, args=(_JOIN,), name="terminal-reaper", daemon=True)
+        with self._lock:
+            self._reapers = [t for t in self._reapers if t.is_alive()] + [reaper]
+            self._threads = [t for t in self._threads if t.is_alive() or t is thread]
+        reaper.start()
 
     def _end(self, tid, term, reason) -> None:
         if not term.dead:
             log.info("terminal relay: a terminal ended (%s)", reason)
-            self._push(tid, [{"ended": True, "exit": None, "reason": reason}])
+            self._push_later(tid, [{"ended": True, "exit": None, "reason": reason}])
         self._forget(tid, term)
 
     # -- input -------------------------------------------------------------------------------------
@@ -596,14 +650,14 @@ class TerminalRelay:
             log.warning("terminal relay: zoom failed (%s)", type(exc).__name__)
 
     # -- output ------------------------------------------------------------------------------------
-    def _push(self, tid, frames) -> int | None:
+    def _push(self, tid, frames, timeout=_POST_TIMEOUT) -> int | None:
         """POST frames (at most 20 per call); the first non-200 status, or None when unreachable."""
         path = f"/api/v1/host/terminal/{tid}/output"
         status = None
         for i in range(0, len(frames), _POST_FRAMES):
             try:
                 status, _ = self.http.request("POST", path, {"frames": frames[i:i + _POST_FRAMES]},
-                                              timeout=_POST_TIMEOUT)
+                                              timeout=timeout)
             except (OSError, ValueError):
                 return None
             if status != 200:
