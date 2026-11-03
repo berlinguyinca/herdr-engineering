@@ -49,6 +49,7 @@ import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-
 import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
 import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
+import { mountMemory } from './memory-view.js';
 import { mountScheduling } from './scheduler-view.js';
 import { mountDeployments } from './deployments-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
@@ -95,6 +96,7 @@ const NAV = [
   { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects', '/pr'] },
   { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
   { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
+  { group: 'Code', path: '/memory', label: 'Memory', capability: 'memory_v1' },
   { group: 'Code', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
 ];
 // Handoffs are the thread through the Agents section: who started whom, and why. Topology is no longer listed (the lineage
@@ -251,6 +253,7 @@ const ROUTES = {
   '/publications': viewPublications,
   '/scheduling': viewScheduling,
   '/handoffs': viewHandoffs,
+  '/memory': viewMemory,
 };
 
 // Router rule: render() runs only on a route change (any hash change, query
@@ -444,6 +447,15 @@ async function viewTeamMap() {
 async function viewHandoffs() {
   root.innerHTML = `${liveHead('<h1>Handoffs</h1>')}<div id="handoffs"></div>`;
   return mountHandoffs(root.querySelector('#handoffs'), client, { freshness: chipIn(root), open: route().query.get('open') || '' });
+}
+
+async function viewMemory() {
+  root.innerHTML = `${liveHead('<h1>Memory</h1>')}<div id="memory"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  const view = mountMemory(root.querySelector('#memory'), client, { query: route().query,
+    freshness: (ok, message) => chip.touch(ok, message),
+    setQuery: (o) => history.replaceState(null, '', `#/memory${Object.keys(o).length ? `?${new URLSearchParams(o)}` : ''}`) });
+  return ownPolling(view);   // a live event must not wipe the person's query or the open drawer
 }
 
 // ------------------------------------------------------------- topology

@@ -305,7 +305,7 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
-                 unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None):
@@ -577,6 +577,8 @@ class ControlPlaneServer:
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
         self.fleet_config = fleet_config
+        from .memory_explorer import MemoryExplorer
+        self.memory = MemoryExplorer(repo, lambda: memory_config if memory_config is not None else self._control_plane_value(fleet_config, "memory"), memory_adapter)
         # callable(urls, source_machine) -> {'resolutions': [...]}; None when no fabric gateway is configured
         self.fabric_resolver = fabric_resolver
         self.fabric_services = fabric_services      # callable() -> {'leases': [...]} | None
@@ -1574,6 +1576,8 @@ class ControlPlaneServer:
             caps.append("assistant_v1")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             caps.append("project_intelligence_v1")
+        if getattr(self, "memory", None) is not None and self.memory.enabled():
+            caps.append("memory_v1")
         if getattr(self, "unified_workspace_enabled", False):
             caps.append("unified_workspace_v1")
         if getattr(self, "skills", None) is not None:
@@ -3408,6 +3412,11 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server._health())
             if resource == "architecture":
                 return self._architecture_get(parts)
+            if resource == "memory":
+                status, body = server.memory.get(
+                    parts[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},
+                    self._principal(), self._role())
+                return self._json(body, status)
             if resource == "intelligence":
                 status, body = server.intelligence.get(
                     parts[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},
