@@ -34,7 +34,7 @@ class FakeAdapter:
             raise MemoryUnavailable("down")
         return {"results": list(self.records), "degraded": False, "offline": False, "timing_ms": 3}
 
-    def get(self, memory_id):
+    def get(self, memory_id, *, scope="project", project=None):
         self.calls.append(("get", memory_id))
         if self.fail:
             raise MemoryUnavailable("down")
@@ -200,3 +200,15 @@ def test_adapter_parses_contract_json_and_rejects_garbage():
         MemoryAdapter(runner=lambda argv, t: (3, '{"error": "not_found"}')).get("m1")
     with pytest.raises(MemoryUnavailable):
         MemoryAdapter(runner=lambda argv, t: (0, '{"contract": 2}')).status()
+
+
+def test_cli_argv_matches_real_herdr_memory_parser():
+    """`--project` is top-level in herdr-memory (before the action); get is per scope."""
+    seen = []
+    def run(argv, t):
+        seen.append(argv)
+        return 0, '{"results": []}'
+    MemoryAdapter(runner=run).recall("q", scope="global", project="p1")
+    MemoryAdapter(runner=run).get("m1", scope="infra")
+    assert seen[0][:3] == ["herdr-memory", "--project", "p1"] and seen[0][3] == "recall"
+    assert seen[1] == ["herdr-memory", "get", "m1", "--scope", "infra"]

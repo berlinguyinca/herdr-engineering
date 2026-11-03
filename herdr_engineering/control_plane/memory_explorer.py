@@ -82,18 +82,19 @@ class MemoryAdapter:
         return data
 
     def recall(self, query, *, scope=None, project=None, max_results=RECALL_CAP):
-        args = ["recall", query, "--max-results", str(int(max_results))]
+        # `--project` is a top-level option of herdr-memory: argparse rejects it after the action.
+        args = ["--project", project] if project else []
+        args += ["recall", query, "--max-results", str(int(max_results))]
         if scope:
             args += ["--scope", scope]
-        if project:
-            args += ["--project", project]
         data = self._call(*args)
         if not isinstance(data.get("results"), list):
             raise MemoryUnavailable("herdr-memory recall is not contract v1")
         return data
 
-    def get(self, memory_id):
-        return self._call("get", memory_id)
+    def get(self, memory_id, *, scope="project", project=None):
+        args = ["--project", project] if project else []
+        return self._call(*args, "get", memory_id, "--scope", scope)
 
     def status(self):
         data = self._call("status")
@@ -256,10 +257,14 @@ class MemoryExplorer:
         return 200, out
 
     def _detail(self, memory_id, principal, viewer):
-        try:
-            raw = self.adapter().get(memory_id)
-        except MemoryNotFound:
-            raw = None
+        raw = None
+        # herdr-memory `get` is per scope (one bank each) and the route carries none: try the shared scopes first.
+        for scope in ("global", "infra", "project"):
+            try:
+                raw = self.adapter().get(memory_id, scope=scope)
+                break
+            except MemoryNotFound:
+                continue
         if isinstance(raw, dict) and isinstance(raw.get("memory"), dict):
             raw = {**raw["memory"], "revisions": raw.get("revisions", raw["memory"].get("revisions"))}
         memory = clean_memory(raw, viewer, detail=True)
