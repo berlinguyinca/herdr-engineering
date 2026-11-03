@@ -219,3 +219,23 @@ other tenant name is not visible until the tenant mapping is decided (spec quest
   install` to `discover_endpoint()`.
 * Moving memory secrets out of the fleet file's mounted directory (see the trade-off above).
 * amd64 only. Running on arm64 needs separately verified platform digests (the deploy refuses until then).
+
+## Operational notes from the first production deployment (bender)
+
+* **Port.** The first deployment used `control_plane.memory.port: 8897` because 8888 was already taken by an earlier,
+  unmanaged candidate. If you use a non-default port, set it in **three** places: the fleet config, the two
+  `herdr-memory-route` lines in `deploy/fabric-stack/config.yaml`, and `fabric.agent_exclude_ports` (next item).
+* **Keep the fabric agent off the API port.** The agent (`herdr-eng devfabric agent`) mirrors every loopback listener
+  onto the tailnet IP as plain HTTP. Add the port to `fabric.agent_exclude_ports` in
+  `~/.config/herdr-engineering/config.yaml` and restart `herdr-eng-fabric-agent.service`. A forwarder that already
+  exists is **restored from the agent state on restart**, so also remove that port's entry from
+  `~/.local/share/herdr-engineering/state/fabric-agent.json` while the agent is stopped. Verify with
+  `curl http://<tailnet-ip>:<port>/health` (must fail) and `ss -ltn | grep <port>` (loopback only).
+* **Routes on a running gateway.** The gateway bind-mounts `config.yaml` as a single file, so edit it **in place** (same
+  inode; `sed -i` replaces the file and the container keeps the old one), then `docker restart herdr-fabric-gateway`.
+  Check which checkout the running gateway uses: `docker inspect herdr-fabric-gateway` label
+  `com.docker.compose.project.working_dir` (on bender it is `~/.local/share/herdr-engineering/gateway-deploy`, not
+  `deploy-src`). The restart drops fabric leases until agents re-register (about a minute).
+* **Clients.** `memory.local.metabolomics.us` carries a public certificate and works from any host; `memory.dev.lan`
+  needs the private CA trusted. Keys are exported per tenant (`fleet config memory export-key`); never `personal` to an
+  engineering harness.
