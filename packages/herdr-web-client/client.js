@@ -127,6 +127,19 @@ export class HerdrClient {
     }
   }
 
+  // Memory Explorer (read-only): the control plane authorizes and proxies herdr-memory; the browser holds no memory credentials.
+  exploreMemory(params, { signal } = {}) {
+    return this.request(`/api/v1/memory/search?${params}`, { signal });
+  }
+
+  getMemoryRecord(id, { signal } = {}) {
+    return this.request(`/api/v1/memory/${encodeURIComponent(id)}`, { signal });
+  }
+
+  getMemoryServiceStatus({ signal } = {}) {
+    return this.request('/api/v1/memory/status', { signal });
+  }
+
   getHandoffTree({ signal, sessionId } = {}) {
     return this.request(`/api/v1/handoffs/tree${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, { signal });
   }
