@@ -13,12 +13,13 @@ fleet-wide use until acceptance runs with REAL harness sessions on two hosts. Ne
   https://memory.dev.lan (private CA). Fabric agent excludes 8897 from the tailnet mirror.
 - Merged: herdr-memory #1 #2 (client contract v1; main = b3c5074), herdr-handoff #1, pi-engineering #556,
   herdr-engineering #560 #562 #563 #564 #565 #566.
-- Control plane on bender was redeployed to origin/main 492445c9 (ok). The `--with-memory` step was still building the
-  memory image when this was written: VERIFY with
-  `ssh bender 'tail -15 ~/.local/state/herdr-engineering/deploy-memory-20261103.log; cat ~/.local/state/herdr-engineering/memory/deployed.json; docker ps | grep hindsight'`.
-  Expected: exit 0, herdr-hindsight + herdr-hindsight-db healthy, port 8897. If the deploy ssh session died, rerun
-  `cd ~/.local/share/herdr-engineering/deploy-src && deploy/control-plane/deploy.sh --with-memory` (idempotent; auto-rollback).
-  Then re-run canary basics (below) because the API may have been recreated.
+- bender REDEPLOY DONE and VERIFIED (2026-11-03 18:06Z): control plane + memory at herdr-engineering 492445c9
+  (`deploy.sh --with-memory`, exit 0, log ~/.local/state/herdr-engineering/deploy-memory-20261103b.log). First attempt failed in the
+  memory image step (`uv: command not found` on the non-interactive ssh PATH) and auto-rolled back cleanly; the retry with
+  `export PATH=$HOME/.local/bin:$PATH` succeeded. ALWAYS export that PATH before `deploy.sh --with-memory` over ssh.
+  Needs the herdr-memory clone at ~/.local/share/herdr-engineering/herdr-memory (now present, gh-authed).
+  Post-deploy: client status healthy, retain+recall OK via https route, tailnet :8897 refused, dashboard 200, gateway route 200,
+  hindsight + db healthy. #560/#563 code is now live.
 - Live canary PASSED earlier (isolation, restart persistence, backup + restore-test, doctor all ok). Cross-host Mac<->bender
   retain/recall/correct PASSED at the CLI level.
 
@@ -44,7 +45,7 @@ Pi integration = pi-engineering PR #556 (merged): src/blackhole/hindsight.ts `Hi
 Known: Pi promotion flow does not specially handle `queued_durable`; recallAll() uses recall "*".
 
 ## Remaining open items (priority order)
-1. Finish/verify bender redeploy (above). Update STATUS.md.
+1. (done) bender redeploy. Still copy these results into STATUS.md.
 2. Pi live test (above). Then real Claude Code / Codex / OpenCode installs: `herdr-eng memory install` (herdr-engineering #560)
    writes managed blocks (marker `herdr-memory:managed`); only Claude has native hooks, others MCP/skill. Test with real sessions.
 3. Acceptance items 2-6 across two hosts with real harnesses (docs/specs/.../tests/ACCEPTANCE.md).
