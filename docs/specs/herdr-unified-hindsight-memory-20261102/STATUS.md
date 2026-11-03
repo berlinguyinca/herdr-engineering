@@ -1,6 +1,6 @@
 # STATUS — 2026-11-02
 
-**Release readiness: BLOCKED.** No reachable Hindsight endpoint or credentials on the execution host (`Gerts-MacBook-Pro`); no live cross-host verification has occurred. **All results below are MOCKED / local unit tests unless stated.** Nothing is merged or deployed.
+**Release readiness: BLOCKED (canary not run).** A Hindsight stack is now deployed on `bender` (2026-11-02, see Deployment) but no client credentials are exported, no cross-host verification has occurred, and the canary checklist has not been run. **All results below are MOCKED / local unit tests unless stated.** Nothing is merged or deployed.
 
 | Phase | PR | Commits | Tests (mocked) | State |
 |---|---|---|---|---|
@@ -10,6 +10,7 @@
 | P02 installer | herdr-engineering#560 | 8863390f | 19 pass (re-run); 5+1 failures also on main per agent | open |
 | P03 handoff | herdr-handoff#1, herdr-engineering#562 | 65bd45c, 3ff6c7ea | 27 pass (re-run); 43 targeted pass | open; conformed to real P01 CLI (handoff c94c85c, control-plane 0c2b2b4b); 30 pass incl. 2 real-CLI tests vs a fake Hindsight server |
 | P04 Explorer | herdr-engineering#563 | 2f44a878 cb5d52ba 33ce4ba2 1b491a94 | 13 API pass (re-run in venv), 1046 JS, 1 Playwright; mocked data | open |
+| P06a fabric integration | herdr-engineering#564 **MERGED** 562eb9cd | cf586348..3d3145fc | 121 new tests pass (mocked); Linux CI unit-gates green | merged + deployed to bender |
 | P05 intelligence | — | — | — | NOT STARTED (needs reliable P01 on a live server) |
 | P06 canary | — | — | — | NOT STARTED (needs authorization + endpoint) |
 
@@ -28,3 +29,9 @@
 1. A reachable Hindsight deployment + scoped credentials (hosts `beast`/`bender` unprobed), authorization to run a single-host canary.
 2. Live run of acceptance #2–#6 across two hosts.
 3. Review and merge order: herdr-memory#1 → pin bump → #560/#562/#563/handoff#1/pi#556.
+
+## Deployment — bender (2026-11-02, authorized by operator; option 3: merge #564, fresh stack, old candidate untouched)
+- Control plane redeployed from origin/main `562eb9cd` via `deploy.sh --with-memory` (exit 0, receipt written, all services healthy; dashboard health 200 at 100.104.39.6:80).
+- New stack `herdr-hindsight` + `herdr-hindsight-db` healthy; `/health` 200 on 127.0.0.1:8897; bad token -> 401. Backup timer `herdr-hindsight-backup.timer` active. Fleet config backup: `fleet-backups/fleet-config.yaml.bak-20261102T235913689490Z`.
+- Old candidate `herdr-memory-api-1/-db-1` (port 8888, 6 daily dumps) untouched; not migrated.
+- **Open:** the fabric agent (`herdr-eng devfabric agent`) mirrors 127.0.0.1:8897 onto the tailnet IP (plain HTTP, bearer-auth enforced). Consider `fabric.agent_exclude_ports: [8897]`. The `memory.dev.lan` gateway route is OFF (port in config is 8888; set to 8897 then `fabric-stack.sh memory-route enable` + gateway recreate). No tenant keys exported to clients; canary checklist, doctor, restore test and cross-host acceptance not run.
