@@ -56,7 +56,7 @@ def row_from_node(node):
     provenance = {k: v for k, v in {"cause": cause, "checkpoint": _text(attrs.get("checkpoint_sha")), "kind": _text(attrs.get("handoff_kind")),
                                     "from_model": from_model, "to_model": to_model, "lineage_state": raw_state,
                                     "from_generation": _text(attrs.get("from_generation")), "to_generation": _text(attrs.get("to_generation"))}.items() if v}
-    return {"handoff_id": node["id"], "origin": ORIGIN, "state": state, "schema_version": 1,
+    row = {"handoff_id": node["id"], "origin": ORIGIN, "state": state, "schema_version": 1,
             "created_at": _text(node.get("first_seen_at")) or "", "updated_at": _text(node.get("last_seen_at")) or "",
             "created_by": "pi", "goal": CAUSE_TEXT.get(cause or "", goal) if not node.get("label") else goal,
             "source": {"harness": "pi", "agent_id": None, "session_id": _bare(attrs.get("from_session_id"))},
@@ -66,6 +66,14 @@ def row_from_node(node):
             "cause": cause, "from_model": from_model, "to_model": to_model, "model_change": change,
             "checkpoint": _text(attrs.get("checkpoint_sha")), "handoff_kind": _text(attrs.get("handoff_kind")),
             "lineage_visibility": _text(node.get("visibility_scope"), 80)}
+    # Optional additive memory references (ids only); a malformed block is dropped, never fatal to the row.
+    if attrs.get("memory_context") is not None:
+        from .handoffs import validate_memory_context
+        try:
+            row["memory_context"] = validate_memory_context(attrs["memory_context"])
+        except ValueError:
+            pass
+    return row
 
 
 def rows_from_nodes(views):
