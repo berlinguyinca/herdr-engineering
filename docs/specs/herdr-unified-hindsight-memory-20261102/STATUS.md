@@ -183,3 +183,7 @@ against the live stack (Hindsight `0.5.0`); nothing here is mocked.
   `~/IdeaProjects/herdr-engineering` is dirty), so unattended fleet updates are not applying. It
   must either be cleaned/disabled or made to refuse silently-and-loudly; while broken it also
   cannot be trusted to preserve a manual client upgrade.
+
+Filed for tracking: herdr-engineering#570 (D8 client path pinning), #571 (D10 cwd-dependent
+resolution, with the mapped/unmapped `doctor` comparison above), #572 (D9 + the failing fleet
+timer), herdr-memory#4 (D17 attempt accounting after SIGKILL).
