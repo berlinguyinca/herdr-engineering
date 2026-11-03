@@ -33,6 +33,7 @@ from typing import Any
 
 from . import project_intelligence as pi
 from . import rakazo_agents
+from . import rakazo_terminal
 from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_cognito as cognito
@@ -69,10 +70,15 @@ SLOW_CALL_MS = 300           # a call slower than this is logged (name + duratio
 VERY_SLOW_CALL_MS = 2000      # ... as a warning
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
-# The networks an open owner session may come from: this machine, RFC 1918, unique-local IPv6 and Tailscale. Explicit on purpose:
-# ``is_private`` also covers Teredo, 6to4, documentation and link-local ranges.
-_OWN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
-    "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"))
+# The networks an open owner session may come from: this machine and the tailnet (Tailscale's IPv4 CGNAT range and its IPv6
+# ULA prefix). LAN and container ranges (RFC 1918, other unique-local) are deliberately absent: a docker bridge peer or a
+# neighbour on the Wi-Fi is not the owner, and this session reaches the terminal. Explicit on purpose: ``is_private`` also
+# covers Teredo, 6to4, documentation and link-local ranges.
+OPEN_OWNER_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"))
+# Procedures that ride the keystroke stream: already bounded by their sequence number, the 64 KB cap and the session cap,
+# so the shared per-account request limiter (which would drop typing after 120 calls a minute) does not meter them.
+_UNMETERED = frozenset({"terminal/input", "terminal/resize"})
 _OPEN_OWNER_INTERVAL = 30.0          # seconds between open sessions from one address: they evict the owner's older tokens
 _MAX_N = 2 ** 17                     # 128 MiB: a hash in the YAML cannot make one sign-in allocate more than this
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
@@ -739,6 +745,8 @@ class RakazoBridge:
         self._procs.update(self.rooms.procs())
         self.agents = rakazo_agents.Agents(self, BridgeError)       # the API glue sets .repo
         self._procs.update(self.agents.procs())
+        self.terminal = rakazo_terminal.Terminal(self, BridgeError)   # the API glue sets .repo
+        self._procs.update(self.terminal.procs())
         self.max_bots = MAX_BOTS
         self.bots = bots.Bots(self, BridgeError)
         self.memory = memory.Memory(self, BridgeError)
@@ -790,6 +798,10 @@ class RakazoBridge:
 
     def close(self) -> None:
         self._closed.set()
+        try:
+            self.terminal.close_all()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("rakazo bridge: closing the terminals failed (%s)", type(exc).__name__)
         self.desk.close()
         self.push.close()
 
@@ -931,7 +943,7 @@ class RakazoBridge:
 
     def _open_owner(self, headers, ip: str, peer: str) -> BridgeResponse:
         """A session for the first operator account with no password, for one-person setups where the network is the
-        credential. Allowed only from this machine, a private network or the tailnet, and only from the app itself
+        credential. Allowed only from this machine or the tailnet (not LAN or container networks), and only from the app itself
         (its ``rakazo://`` origin, which a web page cannot send). Never enable it behind a reverse proxy or NAT that does
         not set X-Forwarded-For: the proxy's own address would then count as the caller."""
         refuse = BridgeError(403, "FORBIDDEN", "This server only opens a session from your own network.")
@@ -943,10 +955,16 @@ class RakazoBridge:
         except ValueError:
             raise refuse from None
         addr = getattr(addr, "ipv4_mapped", None) or addr
+        if headers.get("x-forwarded-for") and peer_addr is not None:
+            direct = getattr(peer_addr, "ipv4_mapped", None) or peer_addr
+            if not (direct.is_loopback or any(peer_addr in net for net in self.trusted_proxies)):
+                # a proxy we do not trust relayed this: its forwarded value is never the client
+                log.warning("rakazo bridge: refused an open owner session with X-Forwarded-For from untrusted peer %s", peer[:64])
+                raise refuse
         if peer_addr is not None and any(peer_addr in net for net in self.trusted_proxies) and ip == str(peer_addr):
             log.warning("rakazo bridge: refused an open owner session relayed by %s without a client address", ip[:64])
             raise refuse                                      # a configured proxy that named no client
-        if not any(addr in net for net in _OWN_NETWORKS):
+        if not any(addr in net for net in OPEN_OWNER_NETWORKS):
             log.warning("rakazo bridge: refused an open owner session from %s", ip[:64])
             raise refuse
         now = self._monotonic()
@@ -992,11 +1010,12 @@ class RakazoBridge:
             self._cognito_users[account_id] = who["user"]
         return account
 
-    def _audit(self, account: Account, action: str) -> None:
+    def _audit(self, account: Account, action: str, subject: str | None = None, detail: str = "") -> None:
         """Best effort: signing in must not depend on the audit store, but a refusal is logged (never any secret)."""
         try:
             self.svc.store.audit_record(tenant_id=self.svc.tenant_for(account.principal_id), user_id=account.principal_id,
-                                        actor=account.principal_id, action=action, subject_id=account.account_id)
+                                        actor=account.principal_id, action=action,
+                                        subject_id=subject or account.account_id, detail=detail)
         except Exception as exc:  # noqa: BLE001
             log.warning("rakazo bridge: could not write the audit entry %s (%s)", action, type(exc).__name__)
 
@@ -1034,7 +1053,8 @@ class RakazoBridge:
         tenant = sp.space_tenant(base, space_id)
         ctx = self._ctx(account, tenant, token, "text/event-stream" in headers.get("accept", ""), space_id, base)
         try:
-            self.svc.check_rate_limit(key=f"{tenant}:{ctx.user}")
+            if proc not in _UNMETERED:
+                self.svc.check_rate_limit(key=f"{tenant}:{ctx.user}")
             result = handler(ctx, inp)
         except AssistantNotFound:
             raise BridgeError(404, "NOT_FOUND", "Not found.") from None
@@ -1584,6 +1604,15 @@ class RakazoBridge:
         except Exception:  # noqa: BLE001 - never widen access on an error
             log.warning("rakazo: canonical_person lookup failed; person left unchanged")
         return tenant, user
+
+    def is_owner(self, account) -> bool:
+        """The terminal gate. A shell on every fleet host is more than any operator role grants, so only the owner passes:
+        the account ``open_owner`` acts as (the first YAML operator), never a Cognito-derived account and never an account
+        that is no longer the configured object (a removed or replaced one)."""
+        with self._accounts_lock:
+            owner = next((a for a in self.accounts if a.role == "operator"), None)
+            return (owner is not None and account is owner and self._by_id.get(account.account_id) is account
+                    and account.account_id not in self._cognito_users)
 
     def _operator_accounts(self) -> list[Any]:
         """The accounts a board proposal (and, for the open-listener operator, a reminder) is pushed to."""

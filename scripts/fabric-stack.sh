@@ -9,7 +9,11 @@
 #   ./scripts/fabric-stack.sh            # detect IP, write .env, build+up
 #   ./scripts/fabric-stack.sh --replace  # also stop the OLD host-run services
 #   ./scripts/fabric-stack.sh down       # stop the stack
-#   ./scripts/fabric-stack.sh status     # show container + healthz state
+#   ./scripts/fabric-stack.sh status     # show container + healthz state (+ Hindsight memory, when deployed)
+#   ./scripts/fabric-stack.sh memory-route enable|disable|status
+#                                        # route https://memory.<domain> and https://memory.dev.lan to the loopback
+#                                        # Hindsight API through the gateway (deploy/fabric-stack/config.yaml `routes`);
+#                                        # edits the file only, then prints the gateway recreate command to run
 set -euo pipefail
 
 STACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../deploy/fabric-stack" && pwd)"
@@ -83,12 +87,51 @@ up() {
     write_env
     gen_coredns
     "${COMPOSE[@]}" build fabric-gateway
-    "${COMPOSE[@]}" up -d --remove-orphans
+    # The optional Hindsight memory containers belong to compose profile `memory`, managed by deploy.sh --with-memory.
+    # While they exist, never ask compose to remove "orphans": this script's env file carries no memory variables.
+    local orphans=(--remove-orphans)
+    if docker inspect herdr-hindsight >/dev/null 2>&1 || docker inspect herdr-hindsight-db >/dev/null 2>&1; then
+        orphans=()
+        warn "Hindsight memory containers present: not using --remove-orphans (managed by deploy.sh --with-memory)"
+    fi
+    "${COMPOSE[@]}" up -d ${orphans[@]+"${orphans[@]}"}
     "${COMPOSE[@]}" ps
+}
+
+memory_status() {
+    # Read-only. UNKNOWN when docker cannot answer; never a guess.
+    local name state
+    for name in herdr-hindsight-db herdr-hindsight; do
+        state="$(docker inspect -f '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$name" 2>&1)" || {
+            case "$state" in *"No such"*) continue ;; *) echo "$name: UNKNOWN (docker did not answer)"; continue ;; esac; }
+        echo "$name: $state"
+    done
+}
+
+memory_route() {
+    local cfg="$STACK_DIR/config.yaml" mark='# herdr-memory-route'
+    case "${1:-status}" in
+        enable)
+            sed -i.bak -E "/$mark\$/ s/^( *)# - /\1- /" "$cfg" && rm -f "$cfg.bak"
+            say "memory routes enabled in $cfg (https://memory.<domain> and https://memory.dev.lan -> 127.0.0.1:<memory port>)"
+            say "apply: recreate the fabric-gateway container the way you normally do (deploy/fabric-stack/README.md, 'HTTPS on 443');"
+            say "       it needs the compose variables deploy.sh renders (GATEWAY_BIND ...), so use the same invocation as for any gateway change"
+            ;;
+        disable)
+            sed -i.bak -E "/$mark\$/ s/^( *)- /\1# - /" "$cfg" && rm -f "$cfg.bak"
+            say "memory routes disabled in $cfg; apply by recreating fabric-gateway (deploy/fabric-stack/README.md)"
+            ;;
+        status)
+            grep "$mark" "$cfg" || echo "(no memory route lines in $cfg)"
+            ;;
+        *) echo "usage: $0 memory-route enable|disable|status" >&2; exit 2 ;;
+    esac
 }
 
 status() {
     "${COMPOSE[@]}" ps 2>/dev/null || { echo "stack not running"; exit 0; }
+    say "hindsight memory (optional profile):"
+    memory_status
     say "gateway healthz:"
     curl -fsS "http://127.0.0.1:29999/healthz" || echo "(unreachable)"
     echo
@@ -120,8 +163,12 @@ case "$cmd" in
     stop-old)
         stop_old_host_services
         ;;
+    memory-route)
+        memory_route "${2:-status}"
+        exit 0
+        ;;
     *)
-        echo "usage: $0 [up|up-replace|down|status|stop-old]" >&2
+        echo "usage: $0 [up|up-replace|down|status|stop-old|memory-route enable|disable|status]" >&2
         exit 2
         ;;
 esac

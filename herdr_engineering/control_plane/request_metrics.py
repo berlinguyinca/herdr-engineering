@@ -18,7 +18,7 @@ class RequestMetrics:
         parts = path.split('?', 1)[0].strip('/').split('/')
         if parts[:2] != ['api', 'v1'] or len(parts) < 3:
             return '/static'
-        if parts[-1] == 'stream':
+        if parts[-1] == 'stream' or parts[2:5] == ['host', 'terminal', 'wait']:   # long-lived by design
             return None
         # Keep resource identity and depth, never arbitrary path segments.
         resource = parts[2]

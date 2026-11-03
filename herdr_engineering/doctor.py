@@ -187,6 +187,14 @@ def run_doctor(config: dict[str, Any] | None = None,
     except Exception as exc:  # doctor must never crash on an optional section
         report.add("memory", "warn", f"memory doctor failed: {type(exc).__name__}")
 
+    # Hindsight shared memory (only where this host runs or uses it; unreachable is "unknown", never ok)
+    try:
+        from .memory_hindsight_status import check_memory_backend
+        for chk in check_memory_backend():
+            report.add(chk["name"], chk["status"], chk["detail"], chk["data"])
+    except Exception as exc:  # doctor must never crash on an optional section
+        report.add("memory_hindsight", "warn", f"memory backend checks failed: {type(exc).__name__}")
+
     # external providers
     ci_offline = not (config or {}).get("ci", {}).get("provider")
     report.add("ci_provider", "warn" if ci_offline else "ok",

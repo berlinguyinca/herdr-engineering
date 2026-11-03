@@ -13,11 +13,19 @@ dependencies:
     note: "Required cross-harness artifact skill, installed into the same four harnesses as herdr-handoff."
   herdr-memory:
     source: "berlinguyinca/herdr-memory"
-    revision: "c4e0c64"
+    revision: "83c5b64"
     decision: ADOPT
     license: "private"
-    maintenance: "active; private Hindsight-backed memory client (v0.1.1)"
+    maintenance: "active; private Hindsight-backed memory client (contract v1)"
     note: "Optional (opt-in `scripts/install.sh --with-memory`); managed harness config via `herdr-eng memory install`. Pin must match herdr_engineering.memory_install.PINNED_REVISION."
+  herdr-memory-deploy:
+    source: "berlinguyinca/herdr-memory"
+    revision: "c4e0c64"
+    checkout: "~/.local/share/herdr-engineering/herdr-memory"
+    decision: OPTIONAL
+    license: "private"
+    maintenance: "active; private Hindsight deployment candidate (deploy/{compose.yaml,Dockerfile,build.sh})"
+    note: "Build pin for `deploy/control-plane/deploy.sh --with-memory` (amd64 only): deploy.sh exports exactly this revision from the clone at `checkout` (override: --memory-checkout / HERDR_MEMORY_CHECKOUT) and runs its deploy/build.sh. Distinct from the client pin of `herdr-memory` (herdr_engineering.memory_install.PINNED_REVISION); bump both deliberately."
   herdr-handoff:
     source: "berlinguyinca/herdr-handoff"
     revision: "3051d8c"
