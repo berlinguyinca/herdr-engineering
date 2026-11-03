@@ -59,7 +59,7 @@ needs `herdr-memory` on PATH and a project config, and depends on the P01 contra
 
 ## Pin
 
-`lock/upstreams.yaml` pins `herdr-memory` at `83c5b64` (contract v1, private repo); the same
+`lock/upstreams.yaml` pins `herdr-memory` at `b3c5074` (contract v1, private repo); the same
 value is `memory_install.PINNED_REVISION` and a test keeps them equal. The installed
 manifest records the pin used. `scripts/install.sh --with-memory` installs the harness
 adapters only; the herdr-memory package itself must be installed at the pinned revision.

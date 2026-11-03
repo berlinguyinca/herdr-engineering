@@ -35,7 +35,7 @@ from typing import Any
 MARKER = "herdr-memory:managed"
 ADAPTER_VERSION = 1
 # Pinned herdr-memory revision; must match lock/upstreams.yaml (tested).
-PINNED_REVISION = "83c5b64"
+PINNED_REVISION = "b3c5074"
 SERVER_NAME = "herdr-memory"
 HARNESSES = ("pi", "claude", "codex", "opencode")
 ALLOWED_SCOPE_PATTERN = r"^(project|global|infra|mission:[a-z0-9][a-z0-9_-]{0,63})$"
