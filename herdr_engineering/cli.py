@@ -686,6 +686,14 @@ def _build_parser() -> argparse.ArgumentParser:
     from .architecture import command as _architecture_command
     _architecture_command.register(sub)
 
+    # host agents ----------------------------------------------------------
+    p = sub.add_parser("host", help="agents that run as services on a fleet host")
+    hsub = p.add_subparsers(dest="host_command", required=True)
+    p2 = hsub.add_parser("terminal-relay", help="relay herdr panes to the Shepherd terminal (outbound only)")
+    p2.add_argument("--once-for-test", action="store_true",
+                    help="run a single long-poll and exit (for tests and smoke checks)")
+    p2.set_defaults(func=_cmd_host_terminal_relay)
+
     # control-plane --------------------------------------------------------
     p = sub.add_parser("control-plane",
                        help="HerdR Dev Fabric Control Plane (spec 0190)")
@@ -1019,6 +1027,44 @@ def _cmd_cp_mission_feed(args) -> int:
                     control_dir=Path(args.control_dir) if args.control_dir else None,
                     interval=args.interval, once=args.once, refresher=refresher,
                     follow_url=not args.control_plane)
+
+
+def _cmd_host_terminal_relay(args) -> int:
+    """Exit status: 0 stopped by a signal (or --once-for-test), 1 restartable failure (another relay holds the lock,
+    the control plane could not be reached for the first configuration), 2 only when restarting cannot help (host.json
+    missing or incomplete, token revoked). argparse usage errors also exit 2, but never under a unit file."""
+    from .herdr_pane_client import HerdrPaneClient
+    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config, host_token
+    from .terminal_relay import (
+        ControlPlaneHttp,
+        RelayLocked,
+        TerminalRelay,
+        install_signal_handlers,
+    )
+
+    def unavailable(exc):
+        if exc.permanent:
+            return exit_unavailable(exc)
+        print(f"herdr-eng: {exc}", file=sys.stderr)
+        return 1
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")   # journald / launchd log
+    try:
+        cfg = host_config()
+        refresher = None if args.once_for_test else ConfigRefresher(cfg)
+        relay = TerminalRelay(cfg, HerdrPaneClient(), ControlPlaneHttp(cfg, host_token()), refresher=refresher)
+    except HostConfigUnavailable as exc:
+        return unavailable(exc)
+    restore = install_signal_handlers(relay)
+    try:
+        relay.run_forever(once=args.once_for_test)
+    except RelayLocked as exc:
+        print(f"herdr-eng: {exc}", file=sys.stderr)
+        return 1
+    except HostConfigUnavailable as exc:   # the control plane revoked this host's token
+        return unavailable(exc)
+    finally:
+        restore()
+    return 0
 
 
 def _cmd_cp_llm_proxy(args) -> int:
