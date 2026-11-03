@@ -28,6 +28,54 @@ CHAIN_MAX = 10
 UNASSIGNED = "Unassigned"
 
 
+_MEM_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
+_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
+MEMORY_REFS_MAX = 100
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_memory_context(block):
+    """Strictly validate the optional additive ``memory_context`` block; ids and counts only, never memory text.
+
+    Returns a normalized copy or raises ValueError. Callers skip this entirely when the block is absent.
+    """
+    if not isinstance(block, dict) or set(block) - {"version", "refs", "snapshot_digest", "checkpoint"}:
+        raise ValueError("memory_context must be an object with only version, refs, snapshot_digest, checkpoint")
+    if not _is_int(block.get("version")) or block["version"] != 1:
+        raise ValueError("memory_context.version must be 1")
+    refs = block.get("refs")
+    if not isinstance(refs, list) or len(refs) > MEMORY_REFS_MAX:
+        raise ValueError("memory_context.refs must be a bounded list")
+    clean = []
+    for ref in refs:
+        if not isinstance(ref, dict) or set(ref) != {"memory_id", "bank_id", "revision"}:
+            raise ValueError("memory_context ref must have exactly memory_id, bank_id, revision")
+        if not all(isinstance(ref[k], str) and _MEM_ID.fullmatch(ref[k]) for k in ("memory_id", "bank_id")):
+            raise ValueError("memory_context ref ids must be safe identifier strings")
+        # herdr-memory CLI emits revision as an integer; producers may also send a safe string.
+        rev = ref["revision"]
+        if not ((isinstance(rev, str) and _MEM_ID.fullmatch(rev)) or (_is_int(rev) and rev >= 0)):
+            raise ValueError("memory_context ref revision must be a safe string or non-negative integer")
+        clean.append({k: ref[k] for k in ("memory_id", "bank_id", "revision")})
+    digest = block.get("snapshot_digest")
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise ValueError("memory_context.snapshot_digest must be sha256:<64 hex>")
+    cp = block.get("checkpoint")
+    if not isinstance(cp, dict) or set(cp) != {"state", "outbox_pending", "at"}:
+        raise ValueError("memory_context.checkpoint must have exactly state, outbox_pending, at")
+    if cp["state"] not in {"synced", "pending"}:
+        raise ValueError("memory_context.checkpoint.state must be synced or pending")
+    if not _is_int(cp["outbox_pending"]) or cp["outbox_pending"] < 0:
+        raise ValueError("memory_context.checkpoint.outbox_pending must be a non-negative integer")
+    if _when(cp["at"]) is None if isinstance(cp["at"], str) else True:
+        raise ValueError("memory_context.checkpoint.at must be an ISO timestamp")
+    return {"version": 1, "refs": clean, "snapshot_digest": digest,
+            "checkpoint": {"state": cp["state"], "outbox_pending": cp["outbox_pending"], "at": cp["at"]}}
+
+
 def _when(text):
     try:
         value = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
@@ -94,6 +142,9 @@ class HandoffRegistry:
             goal = body.get("goal")
             if not isinstance(goal, str) or not goal.strip() or len(goal) > 12000:
                 raise ValueError("goal must be a non-empty bounded string")
+            memory_context = None
+            if body.get("memory_context") is not None:
+                memory_context = validate_memory_context(body["memory_context"])
             now = self.now()
             row = {
                 "handoff_id": hid, "schema_version": 1, "state": "queued",
@@ -115,6 +166,8 @@ class HandoffRegistry:
                 "fingerprint": fingerprint,
                 "history": [{"state": "queued", "actor": actor, "at": now}],
             }
+            if memory_context is not None:
+                row["memory_context"] = memory_context
             row = copy.deepcopy(row)
             self.repo.record_event("handoff", hid, "HandoffQueued", copy.deepcopy(row),
                                    mission_id=row.get("mission_id"), session_id=row["source"].get("session_id"),
@@ -239,6 +292,7 @@ class HandoffRegistry:
                 "completed": len(row.get("completed") or []), "remaining": len(row.get("remaining") or []),
                 "attention": self._needs_attention(row, now), "stalled": self._stalled(row, now),
                 "attention_reason": self._attention_reason(row, now),
+                **({"memory_context": row["memory_context"]} if row.get("memory_context") else {}),
                 **({k: row.get(k) for k in ("origin", "cause", "from_model", "to_model", "model_change", "checkpoint")} if row.get("origin") == "lineage" else {"origin": "registry"}),
                 # the page pairs vision round trips from these rows, so the summary carries the vision summary too (vision rows only)
                 **({"vision": row["vision"]} if row.get("origin") == "lineage" and isinstance(row.get("vision"), dict) else {})}

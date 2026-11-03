@@ -155,6 +155,9 @@ def compose_env(cfg: FleetConfig) -> dict[str, str]:
     out["GATEWAY_BIND"] = LOOPBACK if ip == LOOPBACK else f"{LOOPBACK},{ip}"
     # host part of the gateway healthcheck URL (an IPv6 literal needs brackets)
     out["GATEWAY_HEALTH_HOST"] = f"[{ip}]" if addr.version == 6 else ip
+    # Optional Hindsight memory profile: variables exist only while control_plane.memory.enabled is true.
+    from .fleet_memory import memory_compose_env
+    out.update(memory_compose_env(values, out))
     return out
 
 

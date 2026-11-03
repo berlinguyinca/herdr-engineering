@@ -1,0 +1,4 @@
+{"handoff_id": "handoff_legacy_1", "goal": "Continue work", "source_harness": "pi",
+ "target_harness": "claude", "model_hint": "sonnet", "remaining": ["test"],
+ "artifact_refs": [{"artifact_id": "art_1", "version_id": "ver_1"}],
+ "source_agent_id": "agent-a", "target_agent_id": "agent-b", "some_unknown_field": {"x": 1}}

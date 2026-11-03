@@ -85,6 +85,13 @@ def row_from_node(node):
             "cause": cause, "from_model": from_model, "to_model": to_model, "model_change": change,
             "checkpoint": _text(attrs.get("checkpoint_sha")), "handoff_kind": _text(attrs.get("handoff_kind")),
             "lineage_visibility": _text(node.get("visibility_scope"), 80)}
+    # Optional additive memory references (ids only); a malformed block is dropped, never fatal to the row.
+    if attrs.get("memory_context") is not None:
+        from .handoffs import validate_memory_context
+        try:
+            row["memory_context"] = validate_memory_context(attrs["memory_context"])
+        except ValueError:
+            pass
     vision = _vision(node["id"], cause, _text(attrs.get("handoff_kind")))
     if vision:
         row["vision"] = vision

@@ -24,6 +24,7 @@ export const ENTITY_ROUTES = {
   pr: (id, p) => { const m = /^([\w.-]{1,100})\/([\w.-]{1,100})#([1-9]\d{0,9})$/.exec(id); return m ? `#/pr/${m[1]}/${m[2]}/${m[3]}${q(p)}` : `#/reviews${q({ search: id, ...p })}`; },
   project: (id, p) => `#/github${q({ repository: id, ...p })}`,
   'llm-session': (id, p) => `#/llm/session/${enc(id)}${q(p)}`,
+  handoff: (id, p) => `#/handoffs${q({ open: id, ...p })}`,
   artifact: (id, p) => `#/artifacts/${enc(id)}${q(p)}`,
   'intel-project': (id, p) => `#/intelligence${q({ project: id, ...p })}`,
 };

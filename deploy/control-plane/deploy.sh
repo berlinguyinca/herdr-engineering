@@ -4,6 +4,7 @@
 #   deploy/control-plane/deploy.sh [--ref origin/main] [--dry-run] [--no-fetch]
 #                                  [--fleet-config PATH] [--collab-lock-wait SECONDS]
 #                                  [--deploy-lock-wait SECONDS]
+#                                  [--with-memory [--memory-checkout PATH]]
 #
 # What it does, in order:
 #   1. checks the central fleet config (default
@@ -79,6 +80,20 @@
 # deploy. Its content is kept equal to InferWeave's deploy/pipelines on origin/main by the
 # herdr-pipelines-sync timer (pipelines-sync.sh), installed by every real deploy.
 #
+# OPTIONAL Hindsight shared memory (--with-memory, off unless given; docs/operations/memory-hindsight.md):
+# after the control plane above is deployed, verified and receipted, a SEPARATE health-gated step builds the pinned
+# herdr-memory image (lock/upstreams.yaml `herdr-memory-deploy`: revision, default checkout; --memory-checkout or
+# HERDR_MEMORY_CHECKOUT override the path) and recreates ONLY hindsight-db and hindsight-api (compose profile
+# `memory`). Refused before anything changes unless: this is an amd64 host (the pinned image digests are linux/amd64),
+# control_plane.memory.enabled is true and complete in the central file, the checkout holds the pinned revision, and
+# (real deploy) the model directory has onnx/model.onnx. The memory step can never take the control plane down: it
+# touches no control-plane container; a failure there exits 4 with the control plane running as deployed.
+#   Rollback of the memory step: the previous api image is re-tagged and the api recreated from the PREVIOUS config
+#   snapshot, then verified; if it cannot be restored it says so (exit 4, "FAILED TO ROLL BACK memory"). The database
+#   service and its volume are never rolled back or deleted. FIRST memory deploy: there is nothing to roll back to,
+#   so a failed first deploy STOPS the new memory containers (data volume kept) and says so. --dry-run validates all
+#   of it (config, pin, checkout, arch, `docker compose --profile memory config`) and changes nothing.
+#
 #   HERDR_CP_HEALTH_URL / _TRIES (900) / _INTERVAL (2s) tune the health check.
 #
 # The central file is the only configuration source: no env file is authored or
@@ -86,6 +101,7 @@
 set -euo pipefail
 
 REF="origin/main"; DRY=0; FETCH=1; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
+MEMORY=0; MEMORY_CHECKOUT="${HERDR_MEMORY_CHECKOUT:-}"
 CENTRAL="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -95,6 +111,8 @@ while [ $# -gt 0 ]; do
     --fleet-config) CENTRAL="${2:?--fleet-config needs a value}"; shift 2 ;;
     --collab-lock-wait) COLLAB_LOCK_WAIT="${2:?--collab-lock-wait needs a value}"; shift 2 ;;
     --deploy-lock-wait) DEPLOY_LOCK_WAIT="${2:?--deploy-lock-wait needs a value}"; shift 2 ;;
+    --with-memory) MEMORY=1; shift ;;
+    --memory-checkout) MEMORY_CHECKOUT="${2:?--memory-checkout needs a value}"; shift 2 ;;
     -h|--help) sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -291,6 +309,17 @@ ENV_FILE="$ENV_DIR/compose.env"
 herdr_eng fleet config render-compose --path "$CENTRAL" --out "$ENV_FILE" >/dev/null
 chmod 600 "$ENV_FILE"
 
+# ---- optional Hindsight memory: validated BEFORE anything changes (also in --dry-run) ----
+MEM_PIN=""; MEM_CK=""; MEM_TAG=""; MEM_PORT=""; MEM_MODEL_DIR=""; MEM_STATE_DIR="$HOME/.local/state/herdr-engineering/memory"
+if [ "$MEMORY" = 1 ]; then
+  # the memory functions come from the commit being deployed (same rule as herdr_eng): sourced, not forked
+  MEM_LIB="$WORK/deploy/control-plane/memory-deploy.sh"
+  [ -r "$MEM_LIB" ] || { echo "--with-memory: $MEM_LIB is missing in $SHA; nothing was changed" >&2; exit 1; }
+  # shellcheck source=memory-deploy.sh
+  . "$MEM_LIB"
+fi
+if [ "$MEMORY" = 1 ]; then memory_preflight || exit 1; fi
+
 # only_file <dir> <name>: the directory (mounted whole into a container) holds nothing else
 only_file() {
   [ -d "$1" ] || return 0
@@ -430,6 +459,21 @@ if [ "$DRY" = 1 ]; then
     fi
   else
     echo "[dry-run] docker compose not available: skipped offline compose validation"
+  fi
+  if [ "$MEMORY" = 1 ]; then
+    if docker compose version >/dev/null 2>&1; then
+      if HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" \
+          HERDR_CP_APPS_DIR="$APPS_DIR" HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
+          docker compose --env-file "$ENV_FILE" -p "$PROJECT" --profile memory "${COMPOSE_FILES[@]}" config -q >/dev/null 2>&1; then
+        echo "[dry-run] docker compose --profile memory config: valid"
+      else
+        echo "[dry-run] docker compose --profile memory config FAILED (details withheld; they could contain values)" >&2
+        exit 1
+      fi
+    fi
+    echo "[dry-run] memory: amd64 host, control_plane.memory complete, pin $MEM_PIN found in $MEM_CK"
+    echo "[dry-run] memory: after the control plane is verified, would build herdr-memory-hindsight:$MEM_TAG from the pinned checkout and recreate ONLY hindsight-db and hindsight-api (loopback port $MEM_PORT); a failure exits 4 and never touches the control plane"
+    echo "[dry-run] memory: would install the backup timer (herdr-hindsight-backup.timer) and record ~/.local/state/herdr-engineering/memory/deployed.json"
   fi
   echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <file>"
   echo "[dry-run] control-plane-web and worker mount $FLEET_DIR read-only; the file is $MOUNT_TARGET"
@@ -807,6 +851,7 @@ if forward; then
     "herdr-engineering:$TAG" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)"
   python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
   echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
+  if [ "$MEMORY" = 1 ]; then memory_phase || exit 4; fi
   exit 0
 fi
 

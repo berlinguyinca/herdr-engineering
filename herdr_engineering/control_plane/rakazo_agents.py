@@ -189,18 +189,19 @@ class Agents:
             raise self._missing() from None
 
     # live streams -------------------------------------------------------------------------------------------
-    def _stream(self, ctx, inp, fetch):
-        """The shared mechanics of ``threads/subscribe``: one capped, token-bound server-sent-event response."""
+    def _stream(self, ctx, inp, fetch, *, stop=lambda: False, on_close=lambda: None, **options):
+        """The shared mechanics of ``threads/subscribe``: one capped, token-bound server-sent-event response.
+        ``stop`` ends it early, ``on_close`` runs after the stream slot is released, ``options`` override the bridge's."""
         from . import rakazo_events as ev
         from .rakazo_bridge import BridgeResponse
         bridge = self.b
         if not bridge._streams.acquire(blocking=False):
             raise self.Error(429, "TOO_MANY_REQUESTS", "Too many live connections.", {"Retry-After": "10"})
-        frames = ev.event_stream(fetch, inp["cursor"], should_stop=lambda: bridge._closed.is_set() or not bridge.tokens.valid(
-            ctx.token), **bridge.stream_options)
+        frames = ev.event_stream(fetch, inp["cursor"], should_stop=lambda: stop() or bridge._closed.is_set() or not bridge.tokens.valid(
+            ctx.token), **{**bridge.stream_options, **options})
         return BridgeResponse(200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-store",
                                             "X-Accel-Buffering": "no", "Connection": "close"},
-                              frames=frames, on_close=bridge._streams.release)
+                              frames=frames, on_close=lambda: (bridge._streams.release(), on_close()))
 
     def _check_stream(self, ctx, inp):
         cursor = inp.get("cursor")
