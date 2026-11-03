@@ -36,6 +36,7 @@ import { flash, skeleton } from './motion.js';
 import { noteStreamContact, freshnessSources } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountFabricServices } from './fabric-services-view.js';
+import { mountAiSync } from './ai-sync-view.js';
 import { mountPrTrail } from './pr-trail-view.js';
 import { mountTeamMap } from './team-map-view.js';
 import { mountTeams } from './teams-view.js';
@@ -88,7 +89,7 @@ const NAV = [
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
-  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling'] },
+  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
   { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
@@ -104,7 +105,7 @@ const NAV = [
 const SECTION_TABS = [
   [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
   [['/attention', 'Attention'], ['/activity', 'Activity']],
-  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling']],
+  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
   [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
@@ -230,6 +231,7 @@ const ROUTES = {
   '/system-services': viewServices,
   '/local-services': viewServices,
   '/fabric-services': viewFabricServices,
+  '/ai-sync': viewAiSync,
   '/pr/:owner/:repo/:number': viewPrTrail,
   '/teams': viewTeams,
   '/team-map': viewTeamMap,
@@ -1017,6 +1019,14 @@ async function viewFabricServices(_parts, revision) {
   const view = mountFabricServices(root, client, data, { search: route().query.get('search') || '' });
   root.querySelector('herdr-freshness')?.touch?.(true);
   return view;
+}
+
+async function viewAiSync(_parts, revision) {
+  const data = await client.listAiSync();
+  if (revision !== renderRevision) return;
+  const stop = mountAiSync(root, client, data);
+  root.querySelector('herdr-freshness')?.touch?.(true);
+  return { refresh() {}, dispose: stop };
 }
 
 async function viewService(parts, revision) {
