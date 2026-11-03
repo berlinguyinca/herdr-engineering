@@ -86,3 +86,22 @@ Synthetic canary memories were forgotten; config.json on the Mac now has a `path
   src/artifacts/ArtifactStore.ts, src/orchestration/observability/types.ts. The ArtifactStore conflicts are in integrity/locking
   code (assertCategoryPinned vs assertUnchangedContent): needs its author or a careful review, not a blind resolution.
 - herdr-engineering #522 (ai-sync fabric status) is also open and unrelated.
+
+### #554 reconciliation - IN PROGRESS (not merged, tree does not typecheck)
+WIP branch `rebase/retire-openviking` in berlinguyinca/pi-engineering (worktree ~/IdeaProjects/.worktrees/pi-retire = #554's branch +
+merge of origin/main, with `npm ci` done). Done: the 3 conflicts (types.ts, BlackholeManager.ts, interactiveMemory.ts) resolved
+toward ONE backend = `HindsightDurableMemory` (CLI), durable kinds memory|shared-file|hindsight(cli,scopes,timeoutMs), OpenViking gone,
+unconfigured = off (opt-in PI_HINDSIGHT_ENABLED kept; do not enable by default without the user).
+Remaining (`npx tsc --noEmit -p .` shows 9 errors, plus test fallout):
+- src/blackhole/hindsight.ts and test/unit/hindsight-memory.test.ts import './OpenViking.ts' -> now './durableProvider.ts'.
+- src/blackhole/config.ts: remove REST validation (`baseUrl`, `project`) for kind "hindsight"; validate cli/scopes/timeoutMs instead.
+- DELETE the REST layer: `HindsightProvider`, `HindsightRequestError`, `mapRecallItem` in durable.ts; src/blackhole/envConfig.ts
+  (+ test/unit/blackhole-envconfig.test.ts); test/support/hindsightServer.ts (fake REST server).
+- `hindsightBlackholeOption` (extensions/index.ts:387) -> build `{enabled:true, durable:{kind:"hindsight", cli, scopes, timeoutMs}}` from
+  hindsight.ts `resolveHindsightFromEnv`.
+- src/blackhole/connectionSetup.ts is an interactive host-URL + token wizard for the REST design; credentials now live in
+  herdr-memory's config. Replace with a check that `herdr-memory status` works (and a pointer to `herdr-eng memory install`);
+  rewrite test/unit/memory-setup.test.ts, interactive-memory.test.ts, everyday-memory integration test, telemetry-sink/blackhole tests,
+  scripts/fresh-review-blackhole-sharing.ts, test/fixtures/public-exports.txt, docs. interactiveMemory.ts:206 has a TS error:
+  type the failure code union explicitly (auth/forbidden no longer occur).
+- Then: `npm run test:unit`, real-CLI e2e (see Pi test section), update #554 (push to its branch) and merge.
