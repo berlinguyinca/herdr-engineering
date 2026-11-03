@@ -72,3 +72,17 @@ Synthetic canary memories were forgotten; config.json on the Mac now has a `path
 - Rotate the Context7 API key (leaked into an agent tool output earlier).
 - A Postgres DSN and an API key from the bender fleet config appeared in a session transcript: rotate if the transcript is exposed.
 - Delete canary keys/config (~/.config/herdr-memory) on Mac and bender once real harness config replaces them.
+
+## Open pi-engineering PRs reviewed 2026-11-03 (NOT merged: both conflict with main)
+- **#554 "Retire OpenViking; Hindsight (herdr-memory) is the durable memory backend"** (67 files, +694/-2461). Conflicts in
+  src/blackhole/{BlackholeManager,interactiveMemory,types}.ts. DESIGN CONFLICT: it adds a `HindsightProvider` that talks to the
+  Hindsight REST API directly (seam renamed to durableProvider.ts), while main already has `HindsightDurableMemory`
+  (pi#556/#559) that shells out to the herdr-memory CLI. Direct REST bypasses the client contract (durable outbox, tenant keys,
+  tombstones, evidence gate, untrusted-data wrapping, corrections ledger) - contradicts the spec's reuse rule. Recommended
+  resolution: rebase #554 onto main, KEEP its OpenViking removal (services/openviking, deploy scripts, docs, env vars), DROP its
+  REST provider and make `HindsightDurableMemory` the default provider (still honoring fail-closed when herdr-memory is missing),
+  then run the real-CLI e2e from this handoff and `npm ci && npm run test:unit`. Do this only after the real Pi session test passes.
+- **#558 "make priorart a required external MCP tool"** (unrelated to memory). Conflicts in .pi/engineering.yaml,
+  src/artifacts/ArtifactStore.ts, src/orchestration/observability/types.ts. The ArtifactStore conflicts are in integrity/locking
+  code (assertCategoryPinned vs assertUnchangedContent): needs its author or a careful review, not a blind resolution.
+- herdr-engineering #522 (ai-sync fabric status) is also open and unrelated.
