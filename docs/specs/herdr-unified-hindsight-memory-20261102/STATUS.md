@@ -47,3 +47,71 @@
 - Mac client (herdr-memory 83c5b64, own venv, scoped keys scp'd 0600) retained a project fact through `https://memory.local.metabolomics.us`; bender recalled it (paraphrase query, rev 1); bender `correct` produced rev 2 (`supersedes_revision: 1`); the Mac then recalled rev 2 / `verified` with the corrected text. Test memories forgotten afterwards.
 - **Bug found:** `herdr-memory get <id>` on a host that never saw the memory reports `revision: 1`, `status: candidate`, `kind: unknown` even when the server holds rev 2 (revision/status come from the local ledger, not the server). Recall is correct. Affects the Memory Explorer detail view on such hosts. Needs a fix in herdr-memory (read revision/status/kind from server metadata).
 - Unit-gates CI on #560 failed on one test (`test_credential_permissions`): it depended on the host umask (CI umask 077 masked `mkdir(mode=0o755)`). Test fixed (explicit chmod); CI rerunning.
+
+## Redeploy — bender (2026-11-03 18:06Z, authorized by operator; mode: production smoke, verified)
+
+- Control plane + memory redeployed from `origin/main` = herdr-engineering **`492445c9`** with `deploy.sh --with-memory`; exit 0, receipt `~/.local/state/herdr-engineering/deploy/492445c98a90.json`, log `~/.local/state/herdr-engineering/deploy-memory-20261103b.log`.
+  - **Failure mode found:** the first attempt died in the memory image step with `uv: command not found` — `uv` lives in `~/.local/bin`, which a non-interactive ssh shell does not put on `PATH`. The deploy auto-rolled back cleanly (rollback target was the already-running `492445c98a90`, no downtime beyond the recreate). **Always `export PATH=$HOME/.local/bin:$PATH` before `deploy.sh --with-memory` over ssh.** Also requires the herdr-memory clone at `~/.local/share/herdr-engineering/herdr-memory` (now present, gh-authed).
+  - Log tail: `ok: control-plane-web control-plane-worker llm-proxy collab-public collab-edge share-public running 492445c98a90`; `memory: building herdr-memory-hindsight:5a672f0c… from herdr-memory c4e0c64 (deploy/build.sh)`; `ok: memory running (hindsight-db, hindsight-api on 127.0.0.1:8897)`.
+- #560 (installer) and #563 (explorer) code is live on bender as of this deploy.
+
+## Post-deploy re-verification (2026-11-03T18:23Z, live on bender; mode: production smoke)
+
+- `herdr-hindsight` Up (healthy) `herdr-memory-hindsight:5a672f0cdb89…`, `herdr-hindsight-db` Up (healthy) `pgvector/pgvector`, `herdr-cp-web` on `herdr-engineering:492445c98a90`, `herdr-fabric-gateway` Up (healthy).
+- `http://127.0.0.1:8897/health` = **200**; tailnet `http://100.104.39.6:8897/health` = **refused** (the `fabric.agent_exclude_ports: [8897]` exclusion survived the redeploy); `https://memory.local.metabolomics.us/health` = **200** from the Mac.
+- Real P01 client on bender, `herdr-memory --project canary --harness pi status` → `{"healthy": true, "pending": 0, "outbox_pending": 0, "dead_letter": 0, "contract": 1}`.
+
+## Pi provider (pi-engineering) — merged + locally re-verified (2026-11-03)
+
+- **pi-engineering #559 MERGED 2026-11-03T18:09:16Z** (`1a86b883`, main = `06d0dbc3`). The three defects the mocked suite hid, all found by running the real provider against the live bender server (mode: real cross-host at provider level):
+  1. harness defaulted to `codex` for both credential selection and provenance → now `HERDR_HARNESS=pi` unless the caller overrides;
+  2. `retain` requires `--evidence` flags — refs nested only in `--provenance` do not count, so *every* Pi retain was being rejected → each `evidenceIds` entry is now passed as its own `--evidence`;
+  3. `--timeout-ms` is accepted only by `recall`/`get`; on `retain`/`correct`/`forget` argparse rejected the whole call → the flag is now action-gated (`TIMEOUT_FLAG_ACTIONS`).
+- After the fix, against the live server: retain persisted, search recalled, candidate and secret-bearing records blocked client-side, `forget` ok. Synthetic canary memories were forgotten afterwards.
+- Targeted memory suite re-run on the Mac in `.worktrees/pi-harness-id` (`fix/hindsight-harness-id` = merged content), deps installed: **82 pass / 1 fail / 0 skipped** across `hindsight-memory`, `hindsight-harness-env`, `interactive-memory`, `memory-setup`, `blackhole-memory-workers`, `interactive-memory-cache`, `everyday-memory` (mode: local integration, macOS). The single failure is `interactive-memory-cache.test.ts:9` and is the known Linux-only artifact-integrity guard (`ARTIFACT INTEGRITY: secure descriptor-relative artifact access requires Linux`, `src/artifacts/ArtifactStore.ts:86`) reached through `getRuntimeByCwd` — environment, not memory behaviour.
+- **Was open, now closed at session level** (see "Pi session-level acceptance" below): recall injection in a real session, promotion through `/remember`, the 250 ms automatic budget, and untrusted-data handling are all now measured in real Pi sessions against the live server.
+- Note: the Pi provider passes no `--project`, so cwd must map to a project via `paths` in `~/.config/herdr-memory/config.json`. The Mac config currently carries a temporary `paths` entry for `.worktrees/pi-harness-id` (remove once real harness config replaces the canary).
+
+## Pi session-level acceptance (2026-11-03, Mac ↔ bender, real sessions)
+
+Mode: **real cross-host, real Pi sessions** (`pi 1.3.0 --no-extensions --mode json`,
+`PI_HINDSIGHT_ENABLED=1`, real `herdr-memory` CLI, live bender server). Report:
+`audit/PI_SESSION_LIVE_20261103.md`; raw artifacts in `audit/evidence/pi-session-20261103/`.
+A temporary `paths` entry mapped a throwaway fixture cwd to the `canary` project; five synthetic
+memories were seeded through the real CLI (one a deliberate prompt-injection lure) and all five were
+forgotten afterwards (recall returns 0, `outbox_pending 0`, `dead_letter 0`); the fixture dir and the
+temporary config entry were removed and the config verified identical to its backup apart from that entry.
+
+| Check | Result |
+|---|---|
+| Recall injected into a real session context | **pass** — five notes reached the model with id / scope / revision / status / sourceRefs under the Hindsight untrusted-data header |
+| Retrieved memory handled as untrusted data | **pass** — the model quoted the lure, named it a prompt-injection attempt, made **zero tool calls** in every run |
+| `/remember` → `retain` → server | **pass on merged pi#559 code** (`mem-80bd8b17…`, rev 1, `verified`); **fail on the runtime Pi actually runs today** (D1) |
+| 250 ms automatic budget | **pass** — a provider sleeping 5 s was cut at 250 ms and the turn continued without memory; a missing CLI returns in 1 ms |
+| Fail-open on outage | **pass** — missing CLI and server pointed at `https://127.0.0.1:1` both completed normally, no notes, no crash |
+| Harness identification | **pass** — server row metadata records `"harness": "pi"` |
+
+Defects found only by running the real thing:
+
+- **D1 (high, operations)** the runtime Pi actually loads — `~/.pi/pi-engineering/current →
+  versions/0.2.0-2dbef666d458`, commit `2dbef666`, the parent of `1a86b883` — **predates pi#559**, so live Pi
+  sessions still lose every memory write. Captured argv: `retain … --timeout-ms 5000` with no `--evidence`,
+  CLI exit 2, session reports "Memory save was rejected or not confirmed". Remedy: install/pin a runtime
+  built from main (`≥ 06d0dbc3`); this is a deploy action, not a code change.
+- **D2 (medium, methodology)** `pi -e <checkout>` does **not** run that checkout: `RuntimeHost.startupSources()`
+  (`src/runtime/host/extension.ts:978`) prefers `PI_ENGINEERING_RUNTIME_SOURCE`, then installed `current`, then
+  `previous`, then the package checkout. Session-level verification must set `PI_ENGINEERING_RUNTIME_SOURCE` (or
+  install+pin) and confirm via CLI argv shape, otherwise it silently tests an older runtime.
+- **D3 (medium)** `recallAll()` issues `recall "*"`; the live server rejects that with **HTTP 422**, so the
+  session-start "N saved notes" path can never return anything (it fails open to zero). Previously listed only
+  as a design assumption; it is confirmed broken.
+- **D4 (low)** harness attribution is written (`metadata.harness`, `harness:<name>` tags) but dropped by the CLI's
+  normalized `results`, so acceptance #2's "which harness touched which memory" cannot be answered from the read side.
+- **D5 (low)** headless failure notices are host-blind: `firstNoticeToday()` hashes `new URL(baseUrl).host`, and the
+  synthetic Hindsight baseUrl (`hindsight:<cli>:<scopes>`) parses with an empty host, so every host shares one
+  marker named `e3b0c44298fc1c14-<date>` (observed on this Mac).
+- **D6 (medium, headroom)** live cross-host recall measures **214–231 ms against the 250 ms automatic budget** —
+  injection is already marginal, and any slower path silently drops memory with no degraded signal in headless runs.
+
+Still unproven at session level: real Claude Code / Codex / OpenCode sessions (acceptance #2 remainder),
+acceptance #4 `correct`/`--as-of` cache invalidation, #5 crash/queue/outbox replay, #10 dashboard, #12 benchmark.

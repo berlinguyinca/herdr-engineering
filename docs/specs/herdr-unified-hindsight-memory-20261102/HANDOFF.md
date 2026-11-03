@@ -31,21 +31,37 @@ fleet-wide use until acceptance runs with REAL harness sessions on two hosts. Ne
   (`--project` is TOP-LEVEL, before the action; `--scope project|global|infra|mission:ID`; correct needs `--evidence`).
 - Worktrees under ~/IdeaProjects/.worktrees/ (spec: herdr-unified-memory; pi: pi-hindsight).
 
-## Pi test — DONE at provider level (live), NOT yet in a full Pi session
+## Pi test — DONE at provider level AND in a real Pi session (live, 2026-11-03)
 Ran the real `HindsightDurableMemory` (pi-engineering src/blackhole/hindsight.ts) with the real herdr-memory CLI against the live
 bender server (project "canary", cwd mapped via `paths` in ~/.config/herdr-memory/config.json on the Mac). It exposed 3 defects the
 mocked tests hid, fixed and merged in pi-engineering#559: (1) harness defaulted to codex (credential + provenance) -> now
 HERDR_HARNESS=pi; (2) retain needs `--evidence` flags (refs in --provenance don't count) -> every Pi retain was rejected;
 (3) `--timeout-ms` is valid only on recall/get. After fix: retain persisted, search recalled, candidate and secret blocked, forget ok.
-STILL TO DO for Pi: run a REAL Pi session (pi-engineering deps are not installed on the Mac: ~/pi-engineering has no node_modules, so the
-existing unit suite cannot run here; `npm ci` first, on a worktree) with PI_HINDSIGHT_ENABLED=1 and HERDR_MEMORY_CONFIG set; verify
-recall injection at session start, promotion retain, offline fail-open (<250 ms), and that retrieved memory is treated as untrusted data.
+
+**Session level now verified** (`audit/PI_SESSION_LIVE_20261103.md`, raw artifacts in `audit/evidence/pi-session-20261103/`):
+real headless `pi --mode json` sessions with `PI_HINDSIGHT_ENABLED=1` + `HERDR_MEMORY_CONFIG` showed recall injection into context
+(id/scope/revision/status/sourceRefs + untrusted-data header), the model refusing to obey an injected "run echo pwned" lure with zero
+tool calls, `/remember` persisting (`mem-80bd8b17…` rev 1 verified), the 250 ms automatic budget cutting a 5 s provider at ~250 ms,
+and fail-open on a missing CLI and an unreachable server. Five synthetic memories seeded, all forgotten afterwards; the temporary
+fixture `paths` entry and fixture dir are removed.
+
+**Blocker found (D1):** `pi -e <checkout>` does not run that checkout (`RuntimeHost.startupSources()`,
+src/runtime/host/extension.ts:978 prefers PI_ENGINEERING_RUNTIME_SOURCE -> installed current -> previous -> checkout), and the
+installed runtime `~/.pi/pi-engineering/current → versions/0.2.0-2dbef666d458` predates pi#559 — in a plain session every `/remember`
+was rejected (argv had `--timeout-ms 5000`, no `--evidence`, CLI exit 2). Install/pin a runtime built from main (>= 06d0dbc3) before
+claiming Pi memory works for real, and always set `PI_ENGINEERING_RUNTIME_SOURCE` when testing pi changes in a live session.
+Other defects from the same run (D3-D6 in STATUS.md): `recall "*"` is HTTP 422 so recallAll() never returns notes; harness attribution
+is written but dropped from the CLI's normalized results; headless failure notices hash an empty host; live cross-host recall takes
+214-231 ms against a 250 ms budget.
+
 Also: the Pi provider passes no --project, so the cwd must map to a project via `paths` in herdr-memory config.json.
 Synthetic canary memories were forgotten; config.json on the Mac now has a `paths` entry for the pi-harness-id worktree (remove later).
 
 ## Remaining open items (priority order)
-1. (done) bender redeploy. Still copy these results into STATUS.md.
-2. Pi live test (above). Then real Claude Code / Codex / OpenCode installs: `herdr-eng memory install` (herdr-engineering #560)
+1. (done) bender redeploy; results are now in STATUS.md ("Redeploy — bender" + "Post-deploy re-verification").
+2. (done for Pi) Pi live session test — see the Pi test section above and `audit/PI_SESSION_LIVE_20261103.md`.
+   Next: install/pin a pi-engineering runtime from main (>= 06d0dbc3) so sessions run pi#559 without the dev override (D1),
+   then real Claude Code / Codex / OpenCode installs: `herdr-eng memory install` (herdr-engineering #560)
    writes managed blocks (marker `herdr-memory:managed`); only Claude has native hooks, others MCP/skill. Test with real sessions.
 3. Acceptance items 2-6 across two hosts with real harnesses (docs/specs/.../tests/ACCEPTANCE.md).
 4. Drift on bender: gateway route + agent exclusion are hand edits (documented in docs/operations/memory-hindsight.md, PR #566);
