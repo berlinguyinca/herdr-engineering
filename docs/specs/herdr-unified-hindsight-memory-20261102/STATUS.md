@@ -146,3 +146,40 @@ Full evidence: [`audit/HARNESS_INSTALL_20261103.md`](audit/HARNESS_INSTALL_20261
   carry no provenance.
 - **Still open:** #5 failure drill (needs authorization), #10 dashboard, #12 benchmark,
   #4 `correct`/`--as-of` invalidation, and the D3 `recall "*"` HTTP 422 fix in Pi.
+
+## 2026-11-04 — durability/failure drills (acceptance #5) and auth states (#6)
+
+Full evidence: [`audit/DRILLS_20261104.md`](audit/DRILLS_20261104.md). All commands ran on `bender`
+against the live stack (Hindsight `0.5.0`); nothing here is mocked.
+
+- **#5 run at container level:** outage (stop/start), SIGKILL of the memory container, bad model
+  directory, queue pressure (10 then 30 concurrent writes against a 2-slot worker pool), invalid
+  credential. Fail-open held inside Pi's budget (`recall-context.ts` 112 ms / 0 bytes during the
+  outage); 20 writes acked `queued_durable` survived SIGKILL and replayed **exactly once** (20/20,
+  no duplicates); queue pressure drained to `pending: 0, dead: 0`; with the model asset absent the
+  server came up `unhealthy`, reads failed open, writes queued, and everything delivered after the
+  asset was restored.
+- **#6 was broken on the installed build:** a refused credential returned exit 1 with no degraded
+  shape, kept serving cached rows, parked writes into `dead_letter`, while `status` and
+  `herdr-eng memory doctor` still reported `healthy` / `OK server reachable` (D13, D14, D16, D18).
+- **Fix: [herdr-memory#3](https://github.com/berlinguyinca/herdr-memory/pull/3)** (client `0.1.2`) —
+  health now requires an accepted credential; 401/403 became `Rejected` and is never queued; reads
+  return the degraded fail-open shape and clear the refused scope's cache; `recall`/`status` drain
+  the outbox so recovery needs no hand-run `sync` (D13, D14, D15); `--version` reports client **and**
+  contract (D18). `69 passed, 4 skipped, 20 subtests passed`; the 10 new tests fail on `origin/main`
+  (`8 failed, 2 passed`) and pass on the branch; GitGuardian green. **Open, not merged** — awaiting
+  operator go-ahead, then promote the client install on both hosts and re-run #6 there.
+- Production was never mutated for the fix proof: the candidate build ran from
+  `~/.venvs/herdr-memory-fix` only. Config restored byte-for-byte from the drill backup (verified),
+  `/tmp/hm-drill` deleted, `herdr-eng memory install` re-run (`noop ... [current]` for
+  pi/claude/codex; `opencode` skipped, binary absent), client back to
+  `{"pending": 0, "dead_letter": 0, "healthy": true}`.
+- **Open from these drills:** **D17** — writes in flight at SIGKILL were removed from the durable
+  outbox during replay with no `dead_letter`/`delivered` record (20 writes silently), so "never
+  delivered" is indistinguishable from "delivered"; needs attempt accounting. Also still unrun: the
+  Pi-tool-surface latency and concurrent multi-harness halves of #5.
+- **Operational risk on bender:** `herdr-eng-fleet-update.timer` is `active` but
+  `herdr-eng-fleet-update.service` is `failed` (its checkout
+  `~/IdeaProjects/herdr-engineering` is dirty), so unattended fleet updates are not applying. It
+  must either be cleaned/disabled or made to refuse silently-and-loudly; while broken it also
+  cannot be trusted to preserve a manual client upgrade.
