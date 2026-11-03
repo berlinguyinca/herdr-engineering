@@ -384,6 +384,94 @@ services:
       - "--state-file"
       - "/var/lib/herdr-llm-gateway/relay-usage-state.json"
 
+  # ---- OPTIONAL shared memory: Hindsight (compose profile `memory`) --------------------------
+  # Off unless deploy.sh --with-memory (which also needs control_plane.memory.enabled: true in the central file).
+  # Source of the images/pins: berlinguyinca/herdr-memory deploy/ (docs/operations/memory-hindsight.md).
+  # Two services, same hardening and limits as that candidate:
+  #   hindsight-db   pgvector pinned by DIGEST; only on the internal network (no route out, no host port); named volume.
+  #   hindsight-api  built by deploy.sh from the pinned herdr-memory checkout (tag HERDR_MEMORY_IMAGE_TAG); the ONNX
+  #                  model directory is mounted read-only; its ONLY host binding is loopback. Other fabric hosts reach it
+  #                  over HTTPS through fabric-gateway (memory.<domain> / memory.dev.lan route), never over plain HTTP.
+  # Compose interpolates every service, profile or not, so these variables use `:-` defaults (a `:?` guard would break
+  # every deploy that does not use memory). They are enforced where it matters instead: `fleet config render-compose`
+  # refuses an enabled block with anything missing, deploy.sh --with-memory re-checks the rendered file before touching
+  # anything, and an EMPTY value fails closed (postgres refuses an empty password; the tenant extension refuses to start
+  # with no keys).
+  hindsight-db:
+    profiles: ["memory"]
+    image: pgvector/pgvector@sha256:a97d77306ff47cc1d8add4d000cec2207da2e110746318df3137ce53c337ca30
+    container_name: herdr-hindsight-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hindsight
+      POSTGRES_DB: hindsight
+      POSTGRES_PASSWORD: "${HERDR_MEMORY_DB_PASSWORD:-}"
+    volumes:
+      - herdr-hindsight-db:/var/lib/postgresql/data
+    networks:
+      - hindsight-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hindsight -d hindsight"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 4g
+    cpus: 2
+
+  hindsight-api:
+    profiles: ["memory"]
+    image: herdr-memory-hindsight:${HERDR_MEMORY_IMAGE_TAG:-5a672f0cdb89f4a3b841770cce2036a5b28b799d}
+    container_name: herdr-hindsight
+    restart: unless-stopped
+    environment:
+      HINDSIGHT_API_DATABASE_URL: "postgresql://hindsight:${HERDR_MEMORY_DB_PASSWORD:-}@hindsight-db:5432/hindsight"
+      # tenant:key pairs rendered from control_plane.memory.tenants (project, global, infra, personal: four keys)
+      HINDSIGHT_API_TENANT_USERS: "${HERDR_MEMORY_TENANT_USERS:-}"
+      HINDSIGHT_ENABLE_CP: "false"
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: onnx
+      HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID: intfloat/multilingual-e5-small
+      HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_PATH: /models/onnx/model.onnx
+      HINDSIGHT_API_EMBEDDINGS_ONNX_TOKENIZER_NAME_OR_PATH: /models
+      HINDSIGHT_API_EMBEDDINGS_ONNX_DIMENSIONS: "384"
+      HINDSIGHT_API_RERANKER_PROVIDER: rrf
+      HINDSIGHT_API_RETAIN_EXTRACTION_MODE: chunks
+      HINDSIGHT_API_ENABLE_OBSERVATIONS: "false"
+      HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION: "false"
+      HINDSIGHT_API_ENABLE_GRAPH_RETRIEVAL: "false"
+      HINDSIGHT_API_ENABLE_TEMPORAL_RETRIEVAL: "false"
+      HINDSIGHT_API_WORKER_ENABLED: "true"
+      HINDSIGHT_API_WORKER_MAX_SLOTS: "2"
+      HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS: "0"
+      HINDSIGHT_API_RETAIN_MAX_CONCURRENT: "2"
+      HINDSIGHT_API_LLM_PROVIDER: none
+      HINDSIGHT_API_TENANT_EXTENSION: hindsight_ext_static_keys_tenant:StaticKeysTenantExtension
+      HF_HUB_OFFLINE: "1"
+      OMP_NUM_THREADS: "4"
+      TOKENIZERS_PARALLELISM: "false"
+    ports:
+      - "127.0.0.1:${HERDR_MEMORY_PORT:-8888}:8888"   # loopback only; never a tailnet or public address
+    volumes:
+      - ${HERDR_MEMORY_MODEL_DIR:-/nonexistent-herdr-memory-model-dir}:/models:ro
+    depends_on:
+      hindsight-db:
+        condition: service_healthy
+    networks:
+      - hindsight-internal
+      - hindsight-access
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 6g
+    cpus: 4
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD", "/app/api/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      start_period: 120s
+      retries: 18
+
   # ---- dev.lan front door (host network; was deploy/fabric-stack) -------------
   # The worker mounts ./config.yaml (control plane); the fabric services mount
   # the fabric config from ../fabric-stack. Same project, same rendered substitution file.
@@ -470,7 +558,16 @@ services:
       retries: 3
       start_period: 5s
 
+networks:
+  # Memory profile only. The database lives on an internal-only network. Docker suppresses published ports on an
+  # internal-only network, so the API also joins a plain bridge purely for its loopback host binding.
+  hindsight-internal:
+    internal: true
+  hindsight-access:
+    driver: bridge
+
 volumes:
+  herdr-hindsight-db:         # memory profile: Hindsight's database (back it up: memory-backup.sh)
   herdr-cp-pg:
   herdr-cp-rustfs:
   herdr-cp-share-markers:     # the worker's share-events ingest marker (worker-private)

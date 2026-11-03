@@ -134,6 +134,14 @@ def _parse(data: Any) -> FleetConfig:
                 parse_review_gate_section(sec["values"]["review_gate"], check_key_file=False)
             except ValueError as exc:
                 raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and sec["values"].get("memory") not in (None, {}):
+            from herdr_engineering.fleet_memory import parse_memory_section
+
+            parse_memory_section(sec["values"]["memory"])   # names keys only, never values
+        if name == "memory":
+            from herdr_engineering.fleet_memory import parse_public_section
+
+            parse_public_section(sec["values"])             # served to every host: only a non-secret URL
         if name == "github" and sec["values"].get("app") not in (None, {}):
             from herdr_engineering.github_auth import GitHubAuthError, parse_app_config
 
