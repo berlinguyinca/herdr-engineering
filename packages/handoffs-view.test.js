@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml, modelText } from './handoffs-view.js';
+import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml, modelText, outcomeText,
+  mountHandoffs, visionRoundTrips, filterByCause, visionStats, visionStatsLine, causeFilterHtml, roundTripHtml, listHtml } from './handoffs-view.js';
 
 test('summarizes handoff lineage without trusting goal text as markup', () => {
   const summary = handoffGraphSummary({
@@ -104,4 +105,261 @@ test('a Pi handoff says what happened to the model, and the detail is honest abo
   assert.match(html, /data-handoff-model/); assert.match(html, /not pinned/); assert.match(html, /abcdef123456/); assert.ok(!html.includes('<img'));
   assert.ok(!html.includes('<h3>Accomplished</h3>'), 'no empty accomplished/missing columns for a handoff that has no written summary');
   assert.match(handoffCard({ ...lineage, attention: true, attention_reason: 'successor not pinned', completed: 0, remaining: 0 }), /not pinned · was q/);
+});
+
+const VROW = { handoff_id: 'handoff:vision-r1-out', origin: 'lineage', state: 'completed', goal: 'g', source: {}, target: {}, completed: 0, remaining: 0, cause: 'vision_delegate',
+  model_change: 'switched', from_model: 'p/text-model', to_model: 'p/vision-model', vision: { request_id: 'r1', phase: 'out', outcome: 'ok' } };
+
+test('a vision card names the cause, both models and the outcome', () => {
+  const html = handoffCard(VROW);
+  assert.match(html, /vision delegation · model changed · text-model → vision-model · sent to vision model/);
+  assert.match(handoffCard({ ...VROW, cause: 'vision_return', vision: { ...VROW.vision, phase: 'back' } }), /vision result · model changed · text-model → vision-model · analysis complete/);
+  assert.ok(!html.includes('hd-row--attention'));
+});
+
+test('a partial outcome reads as partial analysis and is marked for attention', () => {
+  const html = handoffCard({ ...VROW, vision: { ...VROW.vision, phase: 'back', outcome: 'partial' }, attention: true, attention_reason: 'partial analysis' });
+  assert.match(html, /· partial analysis/);
+  assert.match(html, /hd-row--attention/);
+  assert.equal(outcomeText({ outcome: 'failed' }), 'analysis failed');
+  assert.equal(outcomeText({ outcome: 'timeout' }), 'timed out');
+});
+
+test('an unknown outcome reads as outcome unknown', () => {
+  assert.match(handoffCard({ ...VROW, vision: { ...VROW.vision, phase: 'back', outcome: 'unknown' } }), /outcome unknown/);
+  assert.equal(outcomeText(undefined), 'outcome unknown');
+  assert.equal(outcomeText({ outcome: 'weird' }), 'outcome unknown');
+});
+
+test('hostile markup in a model name and in the request id is escaped in the card and the detail', () => {
+  const row = { ...VROW, to_model: HOSTILE, vision: { request_id: HOSTILE, phase: 'out', outcome: 'ok' } };
+  assert.ok(!handoffCard(row).includes('<img'));
+  const html = detailHtml(row, null);
+  assert.ok(!html.includes('<img'));
+  assert.match(html, /sent to vision model/);
+  assert.match(html, /&lt;img src=x/);
+});
+
+test('an out row reads as sent to vision model whatever its delegation became; the back row says the outcome', () => {
+  const back = { ok: 'analysis complete', partial: 'partial analysis', failed: 'analysis failed', timeout: 'timed out' };
+  for (const fate of ['partial', 'failed', 'timeout', 'open', 'ok']) {
+    // Pi always reports an out row's outcome as ok; a stray outcome on it must not leak into the wording either
+    for (const outcome of ['ok', fate === 'open' ? 'ok' : fate]) {
+      const out = { ...VROW, vision: { request_id: `r-${fate}`, phase: 'out', outcome } };
+      for (const html of [handoffCard(out), detailHtml(out, null)]) {
+        assert.match(html, /sent to vision model/, fate);
+        assert.ok(!html.includes('analysis complete'), `${fate} out row`);
+      }
+    }
+    if (fate === 'open') continue;
+    const row = { ...VROW, handoff_id: `handoff:vision-r-${fate}-back`, cause: 'vision_return', vision: { request_id: `r-${fate}`, phase: 'back', outcome: fate } };
+    for (const html of [handoffCard(row), detailHtml(row, null)]) {
+      assert.ok(html.includes(back[fate]), `${fate} back row`);
+      assert.ok(!html.includes('sent to vision model'));
+    }
+  }
+  assert.equal(outcomeText({ phase: 'out', outcome: 'failed' }), 'sent to vision model');
+  assert.equal(outcomeText({ phase: 'back', outcome: 'ok' }), 'analysis complete');
+  assert.equal(outcomeText({ outcome: 'ok' }), 'analysis complete');          // no phase (a round trip's outcome): the result wording
+});
+
+// Golden strings below were rendered by the PRE-CHANGE module (git show 14ded885:packages/handoffs-view.js), not by this one.
+const GOLD_LINEAGE = { handoff_id: 'handoff:h1', origin: 'lineage', state: 'accepted', goal: 'Context pressure', cause: 'context_pressure', checkpoint: 'abcdef1234567890', model_change: 'not_pinned', from_model: 'q', attention: true, attention_reason: 'successor not pinned',
+  source: { harness: 'pi', session_id: 's1' }, target: { harness: 'pi', session_id: 's2' }, completed: 0, remaining: 0, history: [] };
+const GOLD_REGISTRY = { handoff_id: 'h1', state: 'in_progress', goal: 'Continue the drain work.', completed: ['parser'], remaining: ['tests'], decisions: ['d'], risks: ['r'], validation: [], history: [],
+  source: { harness: 'pi', agent_id: 'a', session_id: 's1' }, target: { harness: 'claude', model_hint: 'qwen' }, mission_id: 'm1' };
+const GOLD = { lc: "<button type=\"button\" class=\"hd-row hd-row--attention\" data-handoff=\"handoff:h1\" title=\"handoff:h1 — successor not pinned\">\n    <span class=\"hd-row__state hd-row__state--accepted\">accepted</span>\n    <strong class=\"hd-row__who\">s1 → s2</strong>\n    <span class=\"hd-row__goal\">context pressure · not pinned · was q · routed normally</span>\n    <small class=\"hd-row__meta\">successor not pinned</small></button>",
+  ld: "<section class=\"hd-detail\" data-handoff-detail-body aria-label=\"Handoff handoff:h1\">\n    <header><h2>pi s1 → pi s2</h2>\n    <p><span class=\"hd-badge\">accepted</span> accepted</p>\n    </header>\n    <h3>Handoff text — what the next agent was told</h3><p class=\"hd-goal\" data-handoff-goal>Context pressure</p>\n    <h3>Model</h3><p data-handoff-model><strong>not pinned · was q · routed normally</strong> · cause <code>context_pressure</code> · checkpoint <code>abcdef123456</code></p>\n      <p class=\"hd-muted\">Pi records this handoff and its verified checkpoint, not a written summary: the work done so far is in the checkpoint, and the successor continues from it.</p>\n    \n    \n    \n    \n    \n    <details class=\"hd-full\" data-handoff-full><summary>Full handoff as text</summary><p><button type=\"button\" data-handoff-copy>Copy to clipboard</button> <small class=\"hd-muted\" data-handoff-copied hidden>Copied</small></p><pre class=\"hd-pre\">HANDOFF handoff:h1 · accepted\nFrom: pi · session s1\nTo:   pi · session s2\n\nCreated: ? · updated ?\n\nGOAL\nContext pressure\n\nACCOMPLISHED\n(none recorded)\n\nMISSING / NEXT\n(none recorded)\n\nDECISIONS\n(none recorded)\n\nRISKS\n(none recorded)\n\nVALIDATION\n(none recorded)\n\nARTIFACTS\n(none)\n\nPROVENANCE\n(none)\n\nHISTORY\n(none)</pre></details></section>",
+  rc: "<button type=\"button\" class=\"hd-row\" data-handoff=\"h1\" title=\"h1\">\n    <span class=\"hd-row__state hd-row__state--in_progress\">in progress</span>\n    <strong class=\"hd-row__who\">@a → claude</strong>\n    <span class=\"hd-row__goal\">Continue the drain work.</span>\n    <small class=\"hd-row__meta\">1 done · 1 left · </small></button>",
+  rd: "<section class=\"hd-detail\" data-handoff-detail-body aria-label=\"Handoff h1\">\n    <header><h2>pi @a → claude</h2>\n    <p><span class=\"hd-badge\">in progress</span> in progress · model hint <code>qwen</code></p>\n    <p class=\"hd-muted\">Mission <a href=\"#/missions/m1\">m1</a></p></header>\n    <h3>Handoff text — what the next agent was told</h3><p class=\"hd-goal\" data-handoff-goal>Continue the drain work.</p>\n    <div class=\"hd-cols\"><div><h3>Accomplished</h3><ul><li>parser</li></ul></div><div><h3>Missing / what happens next</h3><ul><li>tests</li></ul></div></div>\n    \n    <h3>Decisions</h3><ul><li>d</li></ul>\n    <h3>Risks</h3><ul><li>r</li></ul>\n    \n    \n    <details class=\"hd-full\" data-handoff-full><summary>Full handoff as text</summary><p><button type=\"button\" data-handoff-copy>Copy to clipboard</button> <small class=\"hd-muted\" data-handoff-copied hidden>Copied</small></p><pre class=\"hd-pre\">HANDOFF h1 · in progress\nFrom: pi · @a · session s1\nTo:   claude · model qwen\nMission: m1\n\nCreated: ? · updated ?\n\nGOAL\nContinue the drain work.\n\nACCOMPLISHED\n- parser\n\nMISSING / NEXT\n- tests\n\nDECISIONS\n- d\n\nRISKS\n- r\n\nVALIDATION\n(none recorded)\n\nARTIFACTS\n(none)\n\nPROVENANCE\n(none)\n\nHISTORY\n(none)</pre></details></section>" };
+
+test('non-vision cards render exactly as before', () => {
+  assert.equal(handoffCard(GOLD_LINEAGE), GOLD.lc);
+  assert.equal(detailHtml(GOLD_LINEAGE, null), GOLD.ld);
+  assert.equal(handoffCard({ ...GOLD_REGISTRY, completed: 1, remaining: 1 }), GOLD.rc);
+  assert.equal(detailHtml(GOLD_REGISTRY, null), GOLD.rd);
+  for (const row of [GOLD_LINEAGE, GOLD_REGISTRY]) {
+    assert.equal(detailHtml({ ...row, vision: undefined }, null), detailHtml(row, null));
+    assert.equal(handoffCard({ ...row, vision: undefined, completed: 1, remaining: 1 }), handoffCard({ ...row, completed: 1, remaining: 1 }));
+  }
+});
+
+test('a vision row with missing fields never prints undefined or null and never throws', () => {
+  const variants = [{ outcome: 'ok' }, { outcome: 'ok', request_id: '' }, { outcome: 'ok', request_id: 42 }, { request_id: 'r1' }, {}];
+  for (const vision of variants) for (const row of [{ ...VROW, vision }, { ...VROW, vision, to_model: undefined }, { ...VROW, vision, from_model: null, to_model: null }]) {
+    for (const html of [handoffCard(row), detailHtml(row, null)]) assert.ok(!/undefined|null/.test(html.replace(/data-handoff-[a-z-]+|hd-[a-z_-]+/g, '')), JSON.stringify(vision));
+  }
+  assert.ok(!detailHtml({ ...VROW, vision: { outcome: 'ok' } }, null).includes('request <code>'));
+  assert.ok(!detailHtml({ ...VROW, vision: { outcome: 'ok', request_id: '' } }, null).includes('request <code>'));
+  assert.match(detailHtml(VROW, null), /request <code>r1<\/code>/);
+});
+
+const vrow = (id, rid, phase, outcome, created, updated, extra = {}) => ({ handoff_id: id, cause: phase === 'out' ? 'vision_delegate' : 'vision_return',
+  vision: { request_id: rid, phase, outcome }, created_at: created, updated_at: updated || created, state: 'completed', origin: 'lineage', ...extra });
+const T0 = '2026-11-01T10:00:00Z';
+
+test('an out and a back row with one request id pair into one round trip with a duration', () => {
+  const t = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', T0), vrow('b1', 'r1', 'back', 'partial', '2026-11-01T10:00:05Z', '2026-11-01T10:00:07Z')]);
+  assert.equal(t.length, 1);
+  assert.equal(t[0].requestId, 'r1'); assert.equal(t[0].outcome, 'partial'); assert.equal(t[0].durationMs, 7000); assert.equal(t[0].open, false);
+  assert.equal(t[0].out.handoff_id, 'o1'); assert.equal(t[0].back.handoff_id, 'b1');
+});
+test('an out row with no back row is an open round trip', () => {
+  const [t] = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', T0)]);
+  assert.equal(t.outcome, 'open'); assert.equal(t.open, true); assert.equal(t.durationMs, null);
+});
+test('a back row without its out row stands alone with no duration', () => {
+  const [t] = visionRoundTrips([vrow('b1', 'r1', 'back', 'failed', T0)]);
+  assert.equal(t.outcome, 'failed'); assert.equal(t.open, false); assert.equal(t.durationMs, null); assert.equal(t.out, undefined);
+});
+test('two delegations in the same second are two round trips', () => {
+  const t = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', T0), vrow('o2', 'r2', 'out', 'ok', T0), vrow('b2', 'r2', 'back', 'ok', T0), vrow('b1', 'r1', 'back', 'ok', T0)]);
+  assert.equal(t.length, 2); assert.ok(t.every((x) => x.out && x.back));
+});
+test('two rows with empty request ids stay two entries (H3)', () => {
+  const rows = [vrow('o1', '', 'out', 'ok', T0), vrow('o2', '', 'out', 'ok', T0), vrow('o3', undefined, 'back', 'ok', T0), vrow('o4', 7, 'back', 'ok', T0)];
+  const t = visionRoundTrips(rows);
+  assert.equal(t.length, 4);
+  assert.equal(t[0].open, true);
+});
+test('a negative duration is null', () => {
+  const [t] = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', '2026-11-01T11:00:00Z'), vrow('b1', 'r1', 'back', 'ok', T0, T0)]);
+  assert.equal(t.durationMs, null);
+  const [u] = visionRoundTrips([vrow('o1', 'r1', 'out', 'ok', ''), vrow('b1', 'r1', 'back', 'ok', T0, 'junk')]);
+  assert.equal(u.durationMs, null);
+});
+test('filterByCause returns only matching rows and null returns all', () => {
+  const rows = [{ cause: 'a' }, { cause: 'b' }, { cause: 'a' }];
+  assert.equal(filterByCause(rows, 'a').length, 2);
+  assert.equal(filterByCause(rows, null).length, 3);
+  assert.equal(filterByCause(rows, '').length, 3);
+});
+test('visionStats counts total, by outcome, the last 24 hours and the last 7 days from a fixed now', () => {
+  const now = Date.parse('2026-11-08T12:00:00Z');
+  const rows = [
+    vrow('o1', 'a', 'out', 'ok', '2026-11-08T12:00:00Z'), vrow('b1', 'a', 'back', 'ok', '2026-11-08T12:00:00Z'),      // exactly now
+    vrow('o2', 'b', 'out', 'ok', '2026-11-07T12:00:00Z'), vrow('b2', 'b', 'back', 'failed', '2026-11-07T12:00:01Z'),  // 24h boundary
+    vrow('o3', 'c', 'out', 'ok', '2026-11-01T12:00:00Z'),                                                          // 7d boundary, open
+    vrow('o4', 'd', 'out', 'ok', '2026-11-01T11:59:59Z'), vrow('b4', 'd', 'back', 'timeout', '2026-11-01T12:00:09Z'), // just outside
+    vrow('o5', 'e', 'out', 'ok', '2026-11-09T00:00:00Z'), vrow('b5', 'e', 'back', 'ok', '2026-11-09T00:00:01Z'),      // future
+    vrow('o6', 'f', 'out', 'ok', ''), vrow('b6', 'f', 'back', 'partial', ''),                                       // no usable time
+  ];
+  const s = visionStats(rows, now);
+  assert.equal(s.total, 6);
+  assert.deepEqual(s.byOutcome, { ok: 2, failed: 1, open: 1, timeout: 1, partial: 1 });
+  assert.equal(s.last24h, 2); assert.equal(s.last7d, 3);
+});
+test('visionStats ignores non-vision rows', () => {
+  const s = visionStats([{ handoff_id: 'x', cause: 'context_pressure', created_at: T0 }, null, vrow('o1', 'r', 'out', 'ok', T0)], Date.parse(T0));
+  assert.equal(s.total, 1);
+  assert.equal(visionStats([], 0).total, 0);
+});
+test('hostile request ids and model names are escaped where round trips and the stats line are rendered', () => {
+  const rows = [vrow('o<1>', HOSTILE, 'out', 'ok', T0, T0, { from_model: HOSTILE, to_model: HOSTILE, cause: HOSTILE }), vrow('b"1', HOSTILE, 'back', 'ok', T0, T0, { from_model: HOSTILE, to_model: HOSTILE })];
+  const [trip] = visionRoundTrips(rows);
+  const html = roundTripHtml(trip) + visionStatsLine(visionStats(rows, Date.parse(T0))) + causeFilterHtml(rows, HOSTILE) + listHtml(rows);
+  assert.ok(!html.includes('<img'), 'no raw markup survives');
+  assert.match(roundTripHtml(trip), /data-handoff="o&lt;1&gt;"/);
+  assert.match(roundTripHtml(trip), /data-handoff="b&quot;1"/);
+});
+test('stats line says it covers the loaded rows of this workspace; list shows one entry per round trip', () => {
+  const rows = [vrow('o1', 'r1', 'out', 'ok', T0), vrow('b1', 'r1', 'back', 'ok', T0), { handoff_id: 'n1', state: 'queued', source: {}, target: {} }];
+  const line = visionStatsLine(visionStats(rows, Date.parse(T0)));
+  assert.match(line, /1 vision delegation/); assert.match(line, /loaded/); assert.match(line, /this workspace/);
+  const html = listHtml(rows);
+  assert.equal((html.match(/data-roundtrip/g) || []).length, 1);
+  assert.match(html, /data-handoff="n1"/);
+  assert.match(causeFilterHtml(rows, null), /data-cause="vision_delegate"/);
+});
+
+// ------------------------------------------------------------------ mountHandoffs wiring (fake DOM)
+function mountFake(pagesRef) {
+  const listeners = [];
+  const body = { innerHTML: '', hidden: true, querySelector: () => null };
+  const head = { setAttribute() {} };
+  const card = { dataset: { workspace: 'ws' }, querySelector: (s) => (s === '.hd-ws__body' ? body : s === '.hd-ws__head' ? head : null) };
+  head.closest = () => card;
+  let listHtmlOut = '';
+  const wsList = { set innerHTML(v) { listHtmlOut = v; }, get innerHTML() { return listHtmlOut; }, querySelectorAll: () => [], querySelector: () => card };
+  const els = { '[data-handoff-summary]': { textContent: '' }, '[data-handoff-attention]': { innerHTML: '' }, '[data-handoff-list]': wsList,
+    '[data-handoff-detail]': { innerHTML: '', scrollIntoView() {} }, '[data-handoff-retry]': { hidden: true, addEventListener() {} } };
+  const container = { innerHTML: '', querySelector: (s) => els[s] || null, querySelectorAll: () => [], contains: () => true,
+    addEventListener: (t, fn) => { if (t === 'click') listeners.push(fn); } };
+  let total = 1;
+  const calls = [];
+  const client = {
+    getHandoffOverview: async () => ({ workspaces: [{ workspace: 'ws', total: total++, states: {} }], total: 1 }),
+    pageHandoffs: async () => ({ handoffs: pagesRef.rows, next_cursor: null }),
+    getHandoff: async (id) => { calls.push(id); return { handoff_id: id, state: 'completed' }; },
+    getHandoffChain: async () => null,
+  };
+  const click = (map) => { for (const fn of listeners) fn({ target: { closest: (s) => map[s] || null } }); };
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  return { mount: () => mountHandoffs(container, client), card, body, click, tick, calls, head };
+}
+const withGlobals = async (fn) => {
+  const had = { CSS: globalThis.CSS, window: globalThis.window };
+  globalThis.CSS = { escape: (x) => x }; globalThis.window = {};
+  try { await fn(); } finally { globalThis.CSS = had.CSS; globalThis.window = had.window; }
+};
+const sourced = (r, n) => ({ ...r, source: { agent_id: `a${n}` }, target: { agent_id: `b${n}` } });
+const visionRows = (cause = 'context_pressure') => [vrow('o1', 'r1', 'out', 'ok', T0), vrow('b1', 'r1', 'back', 'ok', T0)].map(sourced)
+  .concat([2, 3, 4, 5, 6, 7, 8].map((n) => sourced({ handoff_id: `n${n}`, cause, state: 'queued', origin: 'lineage' }, n)));
+const openCard = async (h) => { h.click({ '.hd-ws__head': h.head }); await h.tick(); };
+
+test('mountHandoffs: cause filter click, round trip links, survival and stale reset', async () => {
+  await withGlobals(async () => {
+    const pages = { rows: visionRows() };
+    const h = mountFake(pages);
+    const m = h.mount(); await h.tick();
+    try {
+      await openCard(h);
+      assert.match(h.body.innerHTML, /data-roundtrip/); assert.match(h.body.innerHTML, /data-handoff="n2"/);
+      // (a) cause click filters
+      h.click({ '[data-cause]': { dataset: { cause: 'context_pressure' }, closest: () => h.card } });
+      assert.ok(!/data-roundtrip/.test(h.body.innerHTML)); assert.match(h.body.innerHTML, /data-handoff="n2"/);
+      // (c) filter survives a reload whose rows still have the cause
+      await m.refresh(); await h.tick();
+      assert.equal(h.card.__cause, 'context_pressure'); assert.ok(!/data-roundtrip/.test(h.body.innerHTML));
+      // (d) reload without that cause clears the filter, list shows rows, control still usable
+      pages.rows = visionRows('quota_exhausted');
+      await m.refresh(); await h.tick();
+      assert.equal(h.card.__cause, null); assert.match(h.body.innerHTML, /data-roundtrip/);
+      assert.match(h.body.innerHTML, /data-cause="vision_delegate"/);
+      h.click({ '[data-cause]': { dataset: { cause: 'vision_return' }, closest: () => h.card } });
+      assert.equal(h.card.__cause, 'vision_return'); assert.match(h.body.innerHTML, /data-roundtrip/);
+      h.click({ '[data-cause]': { dataset: { cause: '' }, closest: () => h.card } });
+      assert.equal(h.card.__cause, null);
+      // (b) out and result buttons open the out then the back handoff
+      h.click({ '[data-handoff]': { dataset: { handoff: 'o1' } } }); await h.tick();
+      h.click({ '[data-handoff]': { dataset: { handoff: 'b1' } } }); await h.tick();
+      assert.deepEqual(h.calls, ['o1', 'b1']);
+      assert.match(h.body.innerHTML, /data-handoff="o1"[^>]*>out</); assert.match(h.body.innerHTML, /data-handoff="b1"[^>]*>result</);
+    } finally { m.dispose(); }
+  });
+});
+
+test('mountHandoffs: a cause or route filter shows the whole round trip, paired from all loaded rows (H7)', async () => {
+  await withGlobals(async () => {
+    const closed = (html) => {
+      assert.equal((html.match(/data-roundtrip/g) || []).length, 1);
+      assert.match(html, /data-handoff="o1"[^>]*>out</); assert.match(html, /data-handoff="b1"[^>]*>result</);
+      assert.match(html, /hd-row__state">analysis complete</); assert.doesNotMatch(html, /hd-row__state">open</);
+    };
+    const h = mountFake({ rows: visionRows() });
+    const m = h.mount(); await h.tick();
+    try {
+      await openCard(h);
+      closed(h.body.innerHTML);
+      for (const cause of ['vision_delegate', 'vision_return']) {
+        h.click({ '[data-cause]': { dataset: { cause }, closest: () => h.card } });
+        closed(h.body.innerHTML);
+        assert.doesNotMatch(h.body.innerHTML, /data-handoff="n2"/);
+      }
+      h.click({ '[data-cause]': { dataset: { cause: '' }, closest: () => h.card } });
+      h.click({ '[data-route]': { dataset: { route: '@a0 → @b0' }, closest: () => h.card } });   // the out row's route only (o1 is a0 -> b0)
+      assert.equal(h.card.__route, '@a0 → @b0');
+      closed(h.body.innerHTML);
+    } finally { m.dispose(); }
+  });
 });

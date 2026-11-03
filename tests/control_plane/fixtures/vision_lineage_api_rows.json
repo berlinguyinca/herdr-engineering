@@ -1,0 +1,882 @@
+{
+  "_about": "GET /api/v1/handoffs?limit=50 rows (Pi's key) after replaying vision_lineage_envelopes.json through herdr's real HTTP ingest; see docs/evidence/vision-delegation-dashboard.md. Times are the control plane's receipt times of that replay.",
+  "handoffs": [
+    {
+      "handoff_id": "handoff:vision-4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05-out",
+      "state": "accepted",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-open"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-open",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:08.893503+00:00",
+      "created_at": "2026-11-02T21:49:08.893503+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": false,
+      "stalled": false,
+      "attention_reason": null,
+      "origin": "lineage",
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-back",
+      "state": "failed",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-timeout"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-timeout",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision result: the vision model handed its findings back",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:08.892687+00:00",
+      "created_at": "2026-11-02T21:49:08.892687+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": true,
+      "stalled": false,
+      "attention_reason": "failed",
+      "origin": "lineage",
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04",
+        "phase": "back",
+        "outcome": "timeout"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-out",
+      "state": "accepted",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-timeout"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-timeout",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:07.386237+00:00",
+      "created_at": "2026-11-02T21:49:07.386237+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": false,
+      "stalled": false,
+      "attention_reason": null,
+      "origin": "lineage",
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-back",
+      "state": "failed",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-failed"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-failed",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision result: the vision model handed its findings back",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:07.385483+00:00",
+      "created_at": "2026-11-02T21:49:07.385483+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": true,
+      "stalled": false,
+      "attention_reason": "failed",
+      "origin": "lineage",
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03",
+        "phase": "back",
+        "outcome": "failed"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-out",
+      "state": "accepted",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-failed"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-failed",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:05.878552+00:00",
+      "created_at": "2026-11-02T21:49:05.878552+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": false,
+      "stalled": false,
+      "attention_reason": null,
+      "origin": "lineage",
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-back",
+      "state": "completed",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-partial"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-partial",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision result: the vision model handed its findings back",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:05.875908+00:00",
+      "created_at": "2026-11-02T21:49:05.875908+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": true,
+      "stalled": false,
+      "attention_reason": "vision result partial",
+      "origin": "lineage",
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02",
+        "phase": "back",
+        "outcome": "partial"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-out",
+      "state": "accepted",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-partial"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-partial",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:04.369579+00:00",
+      "created_at": "2026-11-02T21:49:04.369579+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": false,
+      "stalled": false,
+      "attention_reason": null,
+      "origin": "lineage",
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-back",
+      "state": "completed",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-ok"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-ok",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision result: the vision model handed its findings back",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:04.366917+00:00",
+      "created_at": "2026-11-02T21:49:04.366917+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": false,
+      "stalled": false,
+      "attention_reason": null,
+      "origin": "lineage",
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01",
+        "phase": "back",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-out",
+      "state": "accepted",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-ok"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-ok",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:02.859950+00:00",
+      "created_at": "2026-11-02T21:49:02.859950+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": false,
+      "stalled": false,
+      "attention_reason": null,
+      "origin": "lineage",
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    }
+  ],
+  "details": [
+    {
+      "handoff_id": "handoff:vision-4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05-out",
+      "origin": "lineage",
+      "state": "accepted",
+      "schema_version": 1,
+      "created_at": "2026-11-02T21:49:08.893503+00:00",
+      "updated_at": "2026-11-02T21:49:08.893503+00:00",
+      "created_by": "pi",
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-open"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-open",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "completed": [],
+      "remaining": [],
+      "decisions": [],
+      "risks": [],
+      "validation": [],
+      "artifact_refs": [],
+      "provenance": {
+        "cause": "vision_delegate",
+        "kind": "vision",
+        "from_model": "local/qwen3.6-35b-a3b",
+        "to_model": "google/gemini-3-flash",
+        "lineage_state": "acknowledged"
+      },
+      "mission_id": null,
+      "room_id": null,
+      "history": [],
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "handoff_kind": "vision",
+      "lineage_visibility": "private",
+      "vision": {
+        "request_id": "4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-back",
+      "origin": "lineage",
+      "state": "failed",
+      "schema_version": 1,
+      "created_at": "2026-11-02T21:49:08.892687+00:00",
+      "updated_at": "2026-11-02T21:49:08.892687+00:00",
+      "created_by": "pi",
+      "goal": "Vision result: the vision model handed its findings back",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-timeout"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-timeout",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "completed": [],
+      "remaining": [],
+      "decisions": [],
+      "risks": [],
+      "validation": [],
+      "artifact_refs": [],
+      "provenance": {
+        "cause": "vision_return",
+        "kind": "vision_timeout",
+        "from_model": "local/qwen3.6-35b-a3b",
+        "to_model": "google/gemini-3-flash",
+        "lineage_state": "failed"
+      },
+      "mission_id": null,
+      "room_id": null,
+      "history": [],
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "handoff_kind": "vision_timeout",
+      "lineage_visibility": "private",
+      "vision": {
+        "request_id": "3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04",
+        "phase": "back",
+        "outcome": "timeout"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-out",
+      "origin": "lineage",
+      "state": "accepted",
+      "schema_version": 1,
+      "created_at": "2026-11-02T21:49:07.386237+00:00",
+      "updated_at": "2026-11-02T21:49:07.386237+00:00",
+      "created_by": "pi",
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-timeout"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-timeout",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "completed": [],
+      "remaining": [],
+      "decisions": [],
+      "risks": [],
+      "validation": [],
+      "artifact_refs": [],
+      "provenance": {
+        "cause": "vision_delegate",
+        "kind": "vision",
+        "from_model": "local/qwen3.6-35b-a3b",
+        "to_model": "google/gemini-3-flash",
+        "lineage_state": "acknowledged"
+      },
+      "mission_id": null,
+      "room_id": null,
+      "history": [],
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "handoff_kind": "vision",
+      "lineage_visibility": "private",
+      "vision": {
+        "request_id": "3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-back",
+      "origin": "lineage",
+      "state": "failed",
+      "schema_version": 1,
+      "created_at": "2026-11-02T21:49:07.385483+00:00",
+      "updated_at": "2026-11-02T21:49:07.385483+00:00",
+      "created_by": "pi",
+      "goal": "Vision result: the vision model handed its findings back",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-failed"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-failed",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "completed": [],
+      "remaining": [],
+      "decisions": [],
+      "risks": [],
+      "validation": [],
+      "artifact_refs": [],
+      "provenance": {
+        "cause": "vision_return",
+        "kind": "vision_failed",
+        "from_model": "local/qwen3.6-35b-a3b",
+        "to_model": "google/gemini-3-flash",
+        "lineage_state": "failed"
+      },
+      "mission_id": null,
+      "room_id": null,
+      "history": [],
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "handoff_kind": "vision_failed",
+      "lineage_visibility": "private",
+      "vision": {
+        "request_id": "2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03",
+        "phase": "back",
+        "outcome": "failed"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-out",
+      "origin": "lineage",
+      "state": "accepted",
+      "schema_version": 1,
+      "created_at": "2026-11-02T21:49:05.878552+00:00",
+      "updated_at": "2026-11-02T21:49:05.878552+00:00",
+      "created_by": "pi",
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-failed"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-failed",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "completed": [],
+      "remaining": [],
+      "decisions": [],
+      "risks": [],
+      "validation": [],
+      "artifact_refs": [],
+      "provenance": {
+        "cause": "vision_delegate",
+        "kind": "vision",
+        "from_model": "local/qwen3.6-35b-a3b",
+        "to_model": "google/gemini-3-flash",
+        "lineage_state": "acknowledged"
+      },
+      "mission_id": null,
+      "room_id": null,
+      "history": [],
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "handoff_kind": "vision",
+      "lineage_visibility": "private",
+      "vision": {
+        "request_id": "2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-back",
+      "origin": "lineage",
+      "state": "completed",
+      "schema_version": 1,
+      "created_at": "2026-11-02T21:49:05.875908+00:00",
+      "updated_at": "2026-11-02T21:49:05.875908+00:00",
+      "created_by": "pi",
+      "goal": "Vision result: the vision model handed its findings back",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-partial"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-partial",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "completed": [],
+      "remaining": [],
+      "decisions": [],
+      "risks": [],
+      "validation": [],
+      "artifact_refs": [],
+      "provenance": {
+        "cause": "vision_return",
+        "kind": "vision_partial",
+        "from_model": "local/qwen3.6-35b-a3b",
+        "to_model": "google/gemini-3-flash",
+        "lineage_state": "committed"
+      },
+      "mission_id": null,
+      "room_id": null,
+      "history": [],
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "handoff_kind": "vision_partial",
+      "lineage_visibility": "private",
+      "vision": {
+        "request_id": "1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02",
+        "phase": "back",
+        "outcome": "partial"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-out",
+      "origin": "lineage",
+      "state": "accepted",
+      "schema_version": 1,
+      "created_at": "2026-11-02T21:49:04.369579+00:00",
+      "updated_at": "2026-11-02T21:49:04.369579+00:00",
+      "created_by": "pi",
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-partial"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-partial",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "completed": [],
+      "remaining": [],
+      "decisions": [],
+      "risks": [],
+      "validation": [],
+      "artifact_refs": [],
+      "provenance": {
+        "cause": "vision_delegate",
+        "kind": "vision",
+        "from_model": "local/qwen3.6-35b-a3b",
+        "to_model": "google/gemini-3-flash",
+        "lineage_state": "acknowledged"
+      },
+      "mission_id": null,
+      "room_id": null,
+      "history": [],
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "handoff_kind": "vision",
+      "lineage_visibility": "private",
+      "vision": {
+        "request_id": "1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-back",
+      "origin": "lineage",
+      "state": "completed",
+      "schema_version": 1,
+      "created_at": "2026-11-02T21:49:04.366917+00:00",
+      "updated_at": "2026-11-02T21:49:04.366917+00:00",
+      "created_by": "pi",
+      "goal": "Vision result: the vision model handed its findings back",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-ok"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-ok",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "completed": [],
+      "remaining": [],
+      "decisions": [],
+      "risks": [],
+      "validation": [],
+      "artifact_refs": [],
+      "provenance": {
+        "cause": "vision_return",
+        "kind": "vision",
+        "from_model": "local/qwen3.6-35b-a3b",
+        "to_model": "google/gemini-3-flash",
+        "lineage_state": "committed"
+      },
+      "mission_id": null,
+      "room_id": null,
+      "history": [],
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "handoff_kind": "vision",
+      "lineage_visibility": "private",
+      "vision": {
+        "request_id": "0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01",
+        "phase": "back",
+        "outcome": "ok"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-out",
+      "origin": "lineage",
+      "state": "accepted",
+      "schema_version": 1,
+      "created_at": "2026-11-02T21:49:02.859950+00:00",
+      "updated_at": "2026-11-02T21:49:02.859950+00:00",
+      "created_by": "pi",
+      "goal": "Vision delegation: the session sent an image to a vision model",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-ok"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-ok",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "completed": [],
+      "remaining": [],
+      "decisions": [],
+      "risks": [],
+      "validation": [],
+      "artifact_refs": [],
+      "provenance": {
+        "cause": "vision_delegate",
+        "kind": "vision",
+        "from_model": "local/qwen3.6-35b-a3b",
+        "to_model": "google/gemini-3-flash",
+        "lineage_state": "acknowledged"
+      },
+      "mission_id": null,
+      "room_id": null,
+      "history": [],
+      "cause": "vision_delegate",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "handoff_kind": "vision",
+      "lineage_visibility": "private",
+      "vision": {
+        "request_id": "0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01",
+        "phase": "out",
+        "outcome": "ok"
+      }
+    }
+  ],
+  "overview_attention": [
+    {
+      "handoff_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-back",
+      "state": "failed",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-timeout"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-timeout",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision result: the vision model handed its findings back",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:08.892687+00:00",
+      "created_at": "2026-11-02T21:49:08.892687+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": true,
+      "stalled": false,
+      "attention_reason": "failed",
+      "origin": "lineage",
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04",
+        "phase": "back",
+        "outcome": "timeout"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-back",
+      "state": "failed",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-failed"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-failed",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision result: the vision model handed its findings back",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:07.385483+00:00",
+      "created_at": "2026-11-02T21:49:07.385483+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": true,
+      "stalled": false,
+      "attention_reason": "failed",
+      "origin": "lineage",
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03",
+        "phase": "back",
+        "outcome": "failed"
+      }
+    },
+    {
+      "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-back",
+      "state": "completed",
+      "workspace": "Unassigned",
+      "source": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-vision-session-partial"
+      },
+      "target": {
+        "harness": "pi",
+        "agent_id": null,
+        "session_id": "pi-text-session-partial",
+        "model_hint": "google/gemini-3-flash"
+      },
+      "goal": "Vision result: the vision model handed its findings back",
+      "mission_id": null,
+      "updated_at": "2026-11-02T21:49:05.875908+00:00",
+      "created_at": "2026-11-02T21:49:05.875908+00:00",
+      "completed": 0,
+      "remaining": 0,
+      "attention": true,
+      "stalled": false,
+      "attention_reason": "vision result partial",
+      "origin": "lineage",
+      "cause": "vision_return",
+      "from_model": "local/qwen3.6-35b-a3b",
+      "to_model": "google/gemini-3-flash",
+      "model_change": "switched",
+      "checkpoint": null,
+      "vision": {
+        "request_id": "1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02",
+        "phase": "back",
+        "outcome": "partial"
+      }
+    }
+  ]
+}

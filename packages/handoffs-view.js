@@ -50,13 +50,17 @@ export function modelText(h) {
   return h.origin === 'lineage' ? 'model not reported' : '';
 }
 
-const CAUSE = { context_pressure: 'context pressure', quota_exhausted: 'quota exhausted', phase_transition: 'phase transition' };
+const CAUSE = { context_pressure: 'context pressure', quota_exhausted: 'quota exhausted', phase_transition: 'phase transition', vision_delegate: 'vision delegation', vision_return: 'vision result' };
+// How a vision delegation ended (Pi reports no image count, so none is shown). An out row only records that the image was sent
+// (Pi always reports its outcome as ok), so it never claims a result; the back row, or a round trip's outcome, says how it ended.
+export const outcomeText = (v) => (v?.phase === 'out' ? 'sent to vision model'
+  : ({ ok: 'analysis complete', partial: 'partial analysis', failed: 'analysis failed', timeout: 'timed out' })[v?.outcome] || 'outcome unknown');
 
 export function handoffCard(h) {
   return `<button type="button" class="hd-row${h.attention ? ' hd-row--attention' : ''}" data-handoff="${esc(h.handoff_id)}" title="${esc(h.attention_reason ? `${h.handoff_id} — ${h.attention_reason}` : h.handoff_id)}">
     <span class="hd-row__state hd-row__state--${esc(h.state)}">${esc(String(h.state).replace('_', ' '))}${h.stalled ? ' · stalled' : ''}</span>
     <strong class="hd-row__who">${esc(agentName(h.source))} → ${esc(agentName(h.target))}</strong>
-    <span class="hd-row__goal">${esc(h.origin === 'lineage' ? `${CAUSE[h.cause] || h.cause || 'handoff'} · ${modelText(h)}` : clip(h.goal, 140))}</span>
+    <span class="hd-row__goal">${esc(h.origin === 'lineage' ? `${CAUSE[h.cause] || h.cause || 'handoff'} · ${modelText(h)}${h.vision ? ` · ${outcomeText(h.vision)}` : ''}` : clip(h.goal, 140))}</span>
     <small class="hd-row__meta">${h.origin === 'lineage' ? esc([h.attention_reason, h.updated_at && ago(h.updated_at)].filter(Boolean).join(' · ')) : `${h.completed} done · ${h.remaining} left · ${esc(ago(h.updated_at))}`}</small></button>`;
 }
 
@@ -92,7 +96,7 @@ export function detailHtml(row, chain) {
     <p><span class="hd-badge">${esc(String(row.state).replace('_', ' '))}</span> ${esc(SENTENCE[row.state] || '')}${ago(row.updated_at) ? ` · updated ${esc(ago(row.updated_at))}` : ''}${hint ? ` · model hint <code>${esc(hint)}</code>` : ''}</p>
     ${row.mission_id ? `<p class="hd-muted">Mission <a href="#/missions/${encodeURIComponent(row.mission_id)}">${esc(row.mission_id)}</a></p>` : ''}</header>
     <h3>Handoff text — what the next agent was told</h3><p class="hd-goal" data-handoff-goal>${esc(row.goal || '')}</p>
-    ${row.origin === 'lineage' ? `<h3>Model</h3><p data-handoff-model><strong>${esc(modelText(row))}</strong>${row.cause ? ` · cause <code>${esc(row.cause)}</code>` : ''}${row.checkpoint ? ` · checkpoint <code>${esc(String(row.checkpoint).slice(0, 12))}</code>` : ''}</p>
+    ${row.origin === 'lineage' ? `<h3>Model</h3><p data-handoff-model><strong>${esc(modelText(row))}</strong>${row.vision ? ` · ${esc(outcomeText(row.vision))}${typeof row.vision.request_id === 'string' && row.vision.request_id ? ` · request <code>${esc(row.vision.request_id)}</code>` : ''}` : ''}${row.cause ? ` · cause <code>${esc(row.cause)}</code>` : ''}${row.checkpoint ? ` · checkpoint <code>${esc(String(row.checkpoint).slice(0, 12))}</code>` : ''}</p>
       <p class="hd-muted">Pi records this handoff and its verified checkpoint, not a written summary: the work done so far is in the checkpoint, and the successor continues from it.</p>`
       : `<div class="hd-cols"><div><h3>Accomplished</h3>${list(row.completed)}</div><div><h3>Missing / what happens next</h3>${list(row.remaining)}</div></div>`}
     ${hops ? `<h3>Where this sits in the work</h3><ol class="hd-chain" aria-label="Handoff chain, oldest first">${hops}</ol>` : ''}
@@ -135,6 +139,80 @@ export function routeTable(rows) {
     routes.set(key, r);
   }
   return [...routes.values()].sort((a, b) => b.attention - a.attention || b.total - a.total || a.key.localeCompare(b.key));
+}
+
+// Vision delegations: Pi emits an out row and a back row per delegation sharing a request id. A row with no usable id
+// is its own entry (keyed by handoff_id) so unusable ids never merge. Times are the control plane's receive times.
+const isVision = (r) => !!r && typeof r === 'object' && !!r.vision && typeof r.vision === 'object';
+const tripKey = (r) => (typeof r.vision.request_id === 'string' && r.vision.request_id ? `r:${r.vision.request_id}` : `h:${r.handoff_id}`);
+const ms = (iso) => { const t = Date.parse(iso || ''); return Number.isNaN(t) ? null : t; };
+export function visionRoundTrips(rows) {
+  const trips = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!isVision(r)) continue;
+    const k = tripKey(r);
+    if (!trips.has(k)) trips.set(k, { requestId: k.startsWith('r:') ? k.slice(2) : '' });
+    const t = trips.get(k);
+    if (r.vision.phase === 'back') t.back = t.back || r; else t.out = t.out || r;
+  }
+  return [...trips.values()].map((t) => {
+    const open = !!t.out && !t.back;
+    const outcome = open ? 'open' : (t.back?.vision?.outcome || 'unknown');
+    const a = t.out ? ms(t.out.created_at) : null, b = t.back ? ms(t.back.updated_at) : null;
+    const durationMs = a !== null && b !== null && b - a >= 0 ? b - a : null;
+    return { ...t, outcome, durationMs, open };
+  });
+}
+export function filterByCause(rows, cause) {
+  const all = Array.isArray(rows) ? rows : [];
+  return cause ? all.filter((r) => r?.cause === cause) : all;
+}
+export function visionStats(rows, now) {
+  const trips = visionRoundTrips(rows);
+  const byOutcome = {};
+  let last24h = 0, last7d = 0;
+  for (const t of trips) {
+    byOutcome[t.outcome] = (byOutcome[t.outcome] || 0) + 1;
+    const start = ms(t.out?.created_at) ?? ms(t.back?.created_at);
+    if (start === null || start > now) continue;
+    if (now - start <= 86400000) last24h++;
+    if (now - start <= 7 * 86400000) last7d++;
+  }
+  return { total: trips.length, byOutcome, last24h, last7d };
+}
+export function visionStatsLine(st) {
+  const o = st.byOutcome || {}, n = st.total;
+  return `<p class="hd-muted" data-vision-stats>${n} vision delegation${n === 1 ? '' : 's'} · ${st.last24h} last 24h · ${st.last7d} last 7d · ${o.ok || 0} ok · ${o.partial || 0} partial · ${o.failed || 0} failed · ${o.timeout || 0} timed out · ${o.open || 0} open <small>(counts the loaded rows of this workspace only)</small></p>`;
+}
+export function causeFilterHtml(rows, active) {
+  const causes = [...new Set((Array.isArray(rows) ? rows : []).map((r) => r?.cause).filter((c) => typeof c === 'string' && c))];
+  if (!causes.length) return '';
+  const btn = (c, label) => `<button type="button" class="hd-route${(c || null) === (active || null) ? ' hd-route--on' : ''}" data-cause="${esc(c || '')}" aria-pressed="${(c || null) === (active || null)}">${esc(label)}</button>`;
+  return `<p class="hd-filter" data-cause-filter>Cause: ${btn('', 'all')} ${causes.map((c) => btn(c, CAUSE[c] || c)).join(' ')}</p>`;
+}
+export function roundTripHtml(trip) {
+  const side = trip.out || trip.back;
+  const models = side ? `${shortModel(side.from_model)} → ${shortModel(side.to_model)}` : '';
+  const dur = trip.durationMs === null ? '' : ` · ${Math.round(trip.durationMs / 100) / 10}s`;
+  const link = (row, label) => row ? `<button type="button" class="hd-route" data-handoff="${esc(row.handoff_id)}">${label}</button>` : '';
+  return `<div class="hd-row hd-row--vision" data-roundtrip>
+    <span class="hd-row__state">${esc(trip.open ? 'open' : outcomeText({ outcome: trip.outcome }))}</span>
+    <strong class="hd-row__who">vision delegation${trip.requestId ? ` <code>${esc(trip.requestId)}</code>` : ''}</strong>
+    <span class="hd-row__goal">${esc(models)}${esc(dur)}</span> ${link(trip.out, 'out')} ${link(trip.back, 'result')}</div>`;
+}
+// The row list: vision rows collapse into one entry per round trip (at the position of its first shown row). Trips are paired
+// from `all` (the card's full loaded rows, before any cause or route filter) so a filter picks WHICH trips show, never how they
+// read: a shown vision row always renders its whole trip (both links, outcome, duration), and each trip shows once (H7).
+export function listHtml(rows, all = rows) {
+  const trips = new Map(visionRoundTrips(all).map((t) => [t.out ? tripKey(t.out) : tripKey(t.back), t]));
+  const done = new Set();
+  return (Array.isArray(rows) ? rows : []).map((r) => {
+    if (!isVision(r)) return handoffCard(r);
+    const k = tripKey(r);
+    if (done.has(k)) return '';
+    done.add(k);
+    return roundTripHtml(trips.get(k) || visionRoundTrips([r])[0]);      // a row missing from `all` still renders as itself
+  }).join('');
 }
 
 export function routesHtml(routes, active, limit = 12) {
@@ -193,6 +271,8 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
     }
     const allHops = ev.target.closest?.('[data-chain-all]');
     if (allHops) { allHops.closest('ol').querySelectorAll('.hd-hop-far').forEach((li) => { li.hidden = false; }); allHops.parentElement.remove(); return; }
+    const cause = ev.target.closest?.('[data-cause]');
+    if (cause) { const card = cause.closest('[data-workspace]'); card.__cause = cause.dataset.cause || null; paint(card); return; }
     const route = ev.target.closest?.('[data-route]');
     if (route) { const card = route.closest('[data-workspace]'); card.__route = card.__route === route.dataset.route ? null : route.dataset.route; paint(card); return; }
     if (ev.target.closest?.('[data-route-clear]')) { const card = ev.target.closest('[data-workspace]'); card.__route = null; paint(card); return; }
@@ -203,13 +283,19 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
   const SMALL_GRAPH = 6;       // routes a drawn graph can still show legibly
   const paint = (card) => {
     const body = card.querySelector('.hd-ws__body');
-    const all = card.__rows || [], active = card.__route || null;
+    const all = card.__rows || [];
     const routes = routeTable(all);
-    const shown = active ? all.filter((h) => routeKey(h) === active) : all;
+    if (card.__route && !routes.some((r) => r.key === card.__route)) card.__route = null;   // a reload can drop the chosen route or cause; never leave an unclearable filter
+    if (card.__cause && !all.some((r) => r?.cause === card.__cause)) card.__cause = null;
+    const active = card.__route || null;
+    const routed = active ? all.filter((h) => routeKey(h) === active) : all;
+    const cause = card.__cause || null;
+    const shown = filterByCause(routed, cause);
+    const hasVision = all.some(isVision);
     const small = routes.length <= SMALL_GRAPH;
     const overview = small ? '<div class="cx-flow-box" data-handoff-graph></div>' : routesHtml(routes, active);
     const bar = active ? `<p class="hd-filter" data-handoff-filter>Showing <strong>${esc(active)}</strong> · ${shown.length} loaded handoff${shown.length === 1 ? '' : 's'} <button type="button" data-route-clear>Show all</button></p>` : '';
-    body.innerHTML = `${overview}${bar}<div class="hd-rows">${shown.map(handoffCard).join('') || '<p class="hd-muted">No handoffs.</p>'}</div>
+    body.innerHTML = `${overview}${bar}${causeFilterHtml(all, cause)}${hasVision ? visionStatsLine(visionStats(all, Date.now())) : ''}<div class="hd-rows">${listHtml(shown, all) || '<p class="hd-muted">No handoffs.</p>'}</div>
       ${card.__next ? `<button type="button" data-handoff-more data-cursor="${esc(card.__next)}">Load more</button>${active ? '<small class="hd-muted"> Filter applies to handoffs loaded so far.</small>' : ''}` : ''}`;
     if (small) {
       const { flow, latest } = flowFromPage(all);
