@@ -31,18 +31,17 @@ fleet-wide use until acceptance runs with REAL harness sessions on two hosts. Ne
   (`--project` is TOP-LEVEL, before the action; `--scope project|global|infra|mission:ID`; correct needs `--evidence`).
 - Worktrees under ~/IdeaProjects/.worktrees/ (spec: herdr-unified-memory; pi: pi-hindsight).
 
-## NEXT TASK (user asked): test on Pi
-Pi integration = pi-engineering PR #556 (merged): src/blackhole/hindsight.ts `HindsightDurableMemory`, OPT-IN via
-`PI_HINDSIGHT_ENABLED=1`; shells out to `herdr-memory` (recall budget 250 ms / 60 s cache, fail-open). Steps:
-1. Make sure pi's checkout is current (see memory note: pi loads the local checkout ~/IdeaProjects/pi-engineering; local main
-   differs from origin/main - do NOT discard local-only commits; use a worktree or cherry-pick).
-2. Run `PI_HINDSIGHT_ENABLED=1` with HERDR_MEMORY_CONFIG=~/.config/herdr-memory/config.json (project "canary") in a real Pi
-   session. Check: Pi recalls a seeded memory (retain one via CLI first, e.g. document-id pi-test-001, scope project),
-   Pi session end/promotion retains with outcome persisted|queued_durable, and recall works while the server is unreachable
-   (cache fail-open, no hang >250 ms).
-3. Verify untrusted-data handling: retrieved memory is wrapped/treated as data, not instructions.
-4. Clean up synthetic memories with `forget`. Record results in STATUS.md (real vs mocked, be explicit).
-Known: Pi promotion flow does not specially handle `queued_durable`; recallAll() uses recall "*".
+## Pi test — DONE at provider level (live), NOT yet in a full Pi session
+Ran the real `HindsightDurableMemory` (pi-engineering src/blackhole/hindsight.ts) with the real herdr-memory CLI against the live
+bender server (project "canary", cwd mapped via `paths` in ~/.config/herdr-memory/config.json on the Mac). It exposed 3 defects the
+mocked tests hid, fixed and merged in pi-engineering#559: (1) harness defaulted to codex (credential + provenance) -> now
+HERDR_HARNESS=pi; (2) retain needs `--evidence` flags (refs in --provenance don't count) -> every Pi retain was rejected;
+(3) `--timeout-ms` is valid only on recall/get. After fix: retain persisted, search recalled, candidate and secret blocked, forget ok.
+STILL TO DO for Pi: run a REAL Pi session (pi-engineering deps are not installed on the Mac: ~/pi-engineering has no node_modules, so the
+existing unit suite cannot run here; `npm ci` first, on a worktree) with PI_HINDSIGHT_ENABLED=1 and HERDR_MEMORY_CONFIG set; verify
+recall injection at session start, promotion retain, offline fail-open (<250 ms), and that retrieved memory is treated as untrusted data.
+Also: the Pi provider passes no --project, so the cwd must map to a project via `paths` in herdr-memory config.json.
+Synthetic canary memories were forgotten; config.json on the Mac now has a `paths` entry for the pi-harness-id worktree (remove later).
 
 ## Remaining open items (priority order)
 1. (done) bender redeploy. Still copy these results into STATUS.md.
