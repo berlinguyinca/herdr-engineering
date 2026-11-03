@@ -121,3 +121,29 @@ Remaining (`npx tsc --noEmit -p .` shows 9 errors, plus test fallout):
   scripts/fresh-review-blackhole-sharing.ts, test/fixtures/public-exports.txt, docs. interactiveMemory.ts:206 has a TS error:
   type the failure code union explicitly (auth/forbidden no longer occur).
 - Then: `npm run test:unit`, real-CLI e2e (see Pi test section), update #554 (push to its branch) and merge.
+
+### 2026-11-03 (evening) — adapters live on both hosts, Pi runtime pinned
+Done: `herdr-eng memory install` on Mac (pi/claude/codex/opencode) and bender (pi/claude/codex,
+opencode absent), idempotent and non-clobbering; Pi runtime pinned to
+`~/.pi/pi-engineering/versions/0.2.0-06d0dbc3784f` via `~/.pi/agent/settings.json` (backup
+`settings.json.bak-d1-20261103T191741Z`, previous value in `_d1_previous_packages`) → D1 closed, live
+`/remember` persists; real Codex + OpenCode sessions on the Mac read and wrote shared memory; bender
+CLI write recalled on the Mac; bender's wrong-`0.1.1` client replaced with the contract-v1 wheel
+(built from herdr-memory `b3c5074`). Evidence: `audit/HARNESS_INSTALL_20261103.md`; defects D7-D12 there.
+
+Next:
+1. Live Claude Code session on either host after 11-06 10:00 PT, and a bender Codex session after
+   11-04 06:40 PT, to finish acceptance #4 with a non-Pi harness on host 2.
+2. Decide the bender `herdr-eng` question (D9): upgrade `~/.venvs/herdr-engineering` to a
+   memory-capable build (then repoint the managed blocks and retire `~/.venvs/herdr-eng-main`) or keep
+   the side venv. Also make deploy install the memory wheel by path/hash and probe the contract (D7).
+3. Pin an absolute client path into the managed block env (D8) and give `doctor` a contract probe +
+   real package revision (D11); make `memory install` accept `--config` so a non-default config path
+   can be pinned (needed whenever `~/.config/herdr-memory/config.json` is not the intended file).
+4. Fix D3 (`recall "*"` → 422) in pi-engineering so session-start notes load; then re-run the Pi
+   session audit.
+5. #5 failure drill (bad `model_dir`) still needs a go-ahead; #10 dashboard and #12 benchmark remain.
+6. Cleanup when the canary project retires: `herdr-eng memory uninstall` on both hosts, or repoint
+   credentials to real projects; remove `~/canary-harness-test` mappings and the `/tmp/he-main`
+   worktree install (`uv tool install --force --editable ~/IdeaProjects/herdr-engineering` restores the
+   previous Mac setup).

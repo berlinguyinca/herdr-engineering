@@ -115,3 +115,34 @@ Defects found only by running the real thing:
 
 Still unproven at session level: real Claude Code / Codex / OpenCode sessions (acceptance #2 remainder),
 acceptance #4 `correct`/`--as-of` cache invalidation, #5 crash/queue/outbox replay, #10 dashboard, #12 benchmark.
+
+## 2026-11-03 (evening) — adapters installed on both hosts, D1 closed
+
+Full evidence: [`audit/HARNESS_INSTALL_20261103.md`](audit/HARNESS_INSTALL_20261103.md).
+
+- **D1 closed.** The failure was bigger than a stale runtime: real Pi sessions load the runtime named
+  in `~/.pi/agent/settings.json` → `packages`, which pointed at
+  `~/.local/share/herdr-engineering/pi/releases/4b89237…` — a build with **no `hindsight.ts` at all**,
+  so `PI_HINDSIGHT_ENABLED` was inert. Pinned to `~/.pi/pi-engineering/versions/0.2.0-06d0dbc3784f`
+  (backup `settings.json.bak-d1-20261103T191741Z`). A plain session with no dev overrides now emits
+  `session_start` `recall *` + `before_agent_start` recall, and `/remember` → `retain … --evidence`
+  with no `--timeout-ms`, persisted server-side (`mem-87ebf153…`, cleaned up after). Fleet equivalent:
+  `herdr-eng fleet rollout --pi-revision <40-char sha>`.
+- **Acceptance #2 met** on both hosts: Mac `pi`/`claude`/`codex`/`opencode` and bender
+  `pi`/`claude`/`codex` (`opencode` binary absent there → skipped), all `current` on re-run, existing
+  MCP servers and Claude hooks preserved. Mac `herdr-eng` had to move off an editable install of a
+  feature branch to `origin/main` (#560); bender's `herdr-eng` predates `memory`, so adapters point at
+  a side venv `~/.venvs/herdr-eng-main` (production venv untouched).
+- **Real sessions:** Codex and OpenCode on the Mac each recalled the seeded fact and wrote through
+  `memory_retain` (`mem-79a31670…`, `mem-c929a20a…`); Pi proven above. bender wrote `mem-c95cff3b…`
+  which a Mac recall returns — shared cross-host memory. Live Claude Code (both hosts) and bender
+  Codex sessions are **provider-quota blocked** (Codex 11-04 06:40 PT, Claude 11-06 10:00 PT), so #4 is
+  met via Pi/Codex/OpenCode + cross-host reads but not yet for a live Claude session.
+- **New defects D7-D12** (detail in the audit): a *different* `herdr-memory` build labelled `0.1.1`
+  was installed on bender with no `retain`/`--scope`/`--evidence`, silently breaking every adapter
+  there (fixed by installing the wheel built from herdr-memory `b3c5074`; undetectable through
+  `--version`/`doctor`); `mcp-serve`/`hook` resolve the client by PATH and fail open off a login
+  shell; `default_project` is not a cwd fallback so unmapped directories get no memory; MCP retains
+  carry no provenance.
+- **Still open:** #5 failure drill (needs authorization), #10 dashboard, #12 benchmark,
+  #4 `correct`/`--as-of` invalidation, and the D3 `recall "*"` HTTP 422 fix in Pi.
