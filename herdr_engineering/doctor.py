@@ -174,6 +174,19 @@ def run_doctor(config: dict[str, Any] | None = None,
                handoff.detail, {"missing_harnesses": handoff.missing_harnesses,
                                 "executable": handoff.executable})
 
+    # herdr-memory managed adapters (only when opted in; never fake healthy)
+    try:
+        from .memory_install import MemoryInstaller
+        mem = MemoryInstaller()
+        if mem.manifest_path.is_file():
+            md = mem.doctor()
+            report.add("memory", "ok" if md["overall"] == "ok" else
+                       ("fail" if md["overall"] == "fail" else "warn"),
+                       f"herdr-memory adapters: {md['overall']}",
+                       {"checks": [c for c in md["checks"] if c["status"] not in ("ok", "skip")][:10]})
+    except Exception as exc:  # doctor must never crash on an optional section
+        report.add("memory", "warn", f"memory doctor failed: {type(exc).__name__}")
+
     # Hindsight shared memory (only where this host runs or uses it; unreachable is "unknown", never ok)
     try:
         from .memory_hindsight_status import check_memory_backend
