@@ -214,7 +214,8 @@ def write_cfg(home, cred, extra=None):
 
 def test_credential_permissions(home):
     d = home / "creds"
-    d.mkdir(mode=0o755)
+    d.mkdir()
+    os.chmod(d, 0o755)   # mkdir(mode=) is masked by the umask (077 on CI hosts)
     tok = d / "t"
     tok.write_text("secret-value")
     os.chmod(tok, 0o644)
