@@ -2,6 +2,11 @@
 
 Status: **implemented, deployed, live-verified** (2026-10-16/17).
 
+Scope note: only the Pi agent is wrapped automatically (`deploy/pi-build-gate`);
+other agents and shells are gated only if they invoke `herdr-eng build-coordinate`
+themselves. With `--record` builds are also registered in a lease registry, see
+`docs/build-registry.md`.
+
 ## Problem
 
 Autonomous pi sessions (and the workers/subagents they spawn) each fire
