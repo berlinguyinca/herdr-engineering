@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### CI: the graph ingest-linearity check no longer fails on one stalled batch
+- `test_review_fan_in_hub_reads_stay_fast_and_ingest_stays_linear` compared one second batch of 2,500 edges against `max(first * 3, 0.5 s)` and failed on loaded CI hosts (0.507 s and 0.533 s in two runs of one PR, 0.9 s for the whole test on an idle host, identical on main and on that PR's branch). It now times three later batches and asserts the best of them, the same way its read checks already take the best of three tries: a stall slows one batch, quadratic growth slows all of them. The bound is unchanged. Not mutation-tested against a deliberately quadratic ingest.
+
 ### Fix: the macOS fleet updater reads an existing agent's Label without `plutil`
 - `scripts/fleet-auto-update-macos.sh install` decides whether an existing launchd plist is its own by reading `Label` with `plutil`, which exists only on macOS. On the Linux CI hosts the read failed, so `test_install_without_load_writes_the_agent_and_keeps_the_previous_copy` failed on a clean main and turned unit-gates red for every PR. The script now falls back to Python's `plistlib` when `plutil` is unavailable. A foreign label is still refused. All 12 tests in the file pass.
 
