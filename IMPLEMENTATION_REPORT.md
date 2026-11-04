@@ -97,7 +97,7 @@ telemetry is `builds.jsonl`, the host-local API/SSE and the dashboard panel.
 - Dashboard table is cramped on mobile (tables scroll in focusable regions).
 - ui-gates not run; typecheck of the Pi extension not run.
 - M6: SIGKILL of the record-mode wrapper orphans the build (no PDEATHSIG); documented, mitigated by lease expiry and cleanup refusing.
-- Also: fenced finish leaves rows non-terminal; eviction has no timer; S3 quota not enforced; Herdr-side corrupt-entry quarantine not implemented; `rollback` doc cites `/api/build-cache/*` but routes are `/api/v1/build-cache/*`.
+- Also: fenced finish leaves rows non-terminal; eviction has no timer; S3 quota not enforced; Herdr-side corrupt-entry quarantine not implemented; (rollback doc route drift fixed).
 - Upstream sccache claims (TOML `region`, `key_prefix`, path-style, read-only enforcement) are UNVERIFIED against a live binary.
 
 ## Security review summary
@@ -112,9 +112,48 @@ eviction dry-run default and requires `destructive_enabled` plus `--apply`, no d
 of symlinks or paths outside the cache, Slurm outputs validated, no secrets in the
 generated sccache TOML.
 
-### Opus review of specs 06-13: PENDING
+### Adversarial review of specs 06-13 (done; fixes on this branch)
 
-(To be filled by the operator.)
+Findings: 0 critical, 2 high, 6 medium, 8 low. The server never deletes anything; no
+path let `--apply` delete outside the cache dir or bypass `destructive_enabled`.
+
+Fixed (each with a test, real deps, no mocks):
+- H1 Pi extension/CLI version skew: the extension probes `herdr-eng build-coordinate --help`
+  once at load; without `--require-cache-enabled` and `--trace-*` (or on probe failure) the
+  light path is skipped and the legacy heavy rewrite is byte-identical. Tested with real stub
+  executables on PATH for old and new help output.
+- H2 sccache server pinning the slot flock / maintenance LOCK_SH: the wrapper now starts the
+  per-policy server itself (`sccache --start-server`, `close_fds=True`, stdio detached) before
+  the build, so the long-lived daemon never inherits lock fds. Tested with a real daemonizing
+  stub that outlives the build (slot free, LOCK_EX obtainable, second build acquires). Design
+  note: the build's direct child still inherits the lock fds on purpose (an orphaned build after
+  wrapper SIGKILL keeps cleanup refused; covered by a chaos test). A grandchild daemon spawned by
+  the build itself (not the sccache server) can still pin them.
+- M1 unwritable-state-dir fallback now `exec`s (SIGINT reaches the command's own trap).
+- M2 sccache port range 20000-31999 (below ephemeral 32768-60999), `SCCACHE_IGNORE_SERVER_IO_ERROR=1`.
+  Collisions among policies/other listeners are still possible (12000 slots) and degrade to uncached.
+- M3 cache is not applied when argv has `--config ...rustc-wrapper` or a cargo config
+  (`.cargo/config*` up the tree, `$CARGO_HOME`) sets `build.rustc-wrapper`/workspace wrapper.
+- M4 light commands wait at most 5 s (`HERDR_BUILD_GATE_LIGHT_WAIT`) for a slot, then run ungated.
+- M5 Slurm adapter: build/attempt ids, epoch and digests validated and quoted before rendering
+  (injection test); symlinked directories flagged anywhere in the output tree; staging hashes
+  regular files with O_NOFOLLOW|O_NONBLOCK in a stream (FIFO no longer hangs); preview does not
+  read the source tree unless slurm is requested; cancel with a malformed binding is refused.
+- M6 `build_cache` event stream bounded (500 per host, trimmed at 2x).
+- L4 trace ids use `sanitize_trace_id`; L6 `HERDR_ENG` shell-quoted, slots must be digits.
+- Doc drift: `docs/build-cache-rollback.md` now cites `/api/v1/build-cache/*`.
+
+Documented, not fixed (see HANDOFF.md "Review fixes (specs 06-13)"): L1 unlink TOCTOU, L2 atime
+recheck, L3 two dry-run knobs, L5 hosts() stampede, L7 check order, L8 adaptive slots; the
+`output reads follow a swapped symlink` window is narrowed (O_NOFOLLOW) but not closed for
+parent directories.
+
+Spec-05 HIGHs re-checked by the reviewer and CLOSED: H1 (repo-local config cannot select
+policy), H2 (no credentials in cargo env; shared mode degrades to `shared_requires_server`),
+H3 (per-policy port; server lock-fd inheritance and port range now also fixed).
+
+Status caveat: spec 08 stays "partial" (python + node tests pass; TypeScript typecheck not
+run, no real Pi run). Nothing here was run against a real sccache or Slurm.
 
 ## Safety-rule compliance checklist
 

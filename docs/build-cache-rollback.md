@@ -48,7 +48,7 @@ slot). Paths are under the host state dir (`$HERDR_ENGINEERING_STATE`, default
 | `gate.N`, `build-maintenance.lock` | slot and maintenance flock files | YES: keep |
 
 Control plane: if `control_plane.build_cache.enabled` was on, turn it off too; the
-`/api/build-cache/*` routes then answer 404 and the capability `build_cache_v1`
+`/api/v1/build-cache/*` routes then answer 404 and the capability `build_cache_v1`
 disappears.
 
 ## 3. Pi extension ordering

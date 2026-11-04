@@ -148,3 +148,24 @@ Not done: nothing; read-only.
 Risks: see AUDIT.md "Findings that change the spec" (no sccache on bender, no Slurm runner, no S3 endpoint, logical-vs-physical writes, no SSE resume ids).
 Baseline: `python3 -m pytest tests/test_build_coord.py tests/test_build_cleanup.py tests/test_build_maintenance.py tests/test_cleanup_deploy.py -q` → 63 passed.
 Next: 01-measure.
+
+
+## Review fixes (specs 06-13)
+Fixed on feat/fabric-build-cache after the adversarial review (details in IMPLEMENTATION_REPORT.md):
+H1 Pi version-skew probe; H2 sccache server prestart without lock fds; M1 exec in ungated
+fallback; M2 port range 20000-31999 + ignore server IO errors; M3 cargo-config/`--config`
+wrapper respected; M4 light-command wait 5 s; M5 slurm adapter id/digest validation, symlinked
+dirs, safe staging; M6 bounded build_cache event stream; L4, L6.
+
+Not fixed (known, documented):
+- L1 `build_cache_policy` realpath-then-unlink TOCTOU for a same-uid attacker; fix is dir_fd/O_NOFOLLOW walking.
+- L2 eviction recheck compares size+mtime, not atime.
+- L3 `cleanup.dry_run` does not stop `build-cache-evict --apply`; only `eviction.destructive_enabled` does.
+- L5 `hosts()` cache stampede (no single-flight) and synchronous scans on operator preview.
+- L7 wrong content type on `cleanup/execute` yields 415 before 501 (harmless).
+- L8 adaptive slot count may differ between concurrent processes (bounded by max_slots).
+- H2 residual: a daemon spawned by the BUILD itself (not the sccache server) still inherits lock fds
+  by design, so an orphaned build keeps cleanup refused.
+- Port collisions with unrelated listeners remain possible; they degrade to uncached compiles.
+- Slurm output reads: O_NOFOLLOW on the final component only; parent-dir swaps are not defended.
+- Heavy commands still use the full wait (HERDR_BUILD_GATE_WAIT, default 900 s).
