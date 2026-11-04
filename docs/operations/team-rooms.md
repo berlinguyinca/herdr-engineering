@@ -26,8 +26,8 @@ answer 404 (except `detach`, below).
    separate events in the collab log.
 2. **Guest level, per room.** `read_only` | `suggest` | `direct`. The default is `suggest` (configurable to `read_only`; `direct`
    is refused as a default). Only the owner user sets it. **Direct is stored and validated (agents or roles it may address, never
-   "any"; per hour, open and text caps) but is not implemented: it behaves as `suggest`.** Slices 2 and 3 define what it may
-   do; until then it fails closed. Nothing lets a guest assign work to an agent.
+   "any"; per hour, open and text caps) but behaves as `suggest` unless `team_rooms.direct_enabled` is also on** (see the Direct
+   guest level section at the end). Without that flag it fails closed and nothing lets a guest assign work to an agent.
 3. **The Suggest queue.** A guest (a room member whose role is `guest`) files a request. It is a `pending` row in the owner's
    queue; it creates no task and reaches no agent. At `read_only` the guest gets 403 and nothing is written. The owner approves
    or rejects; approving creates one **new** task made by the owner (`origin: suggestion`) whose text is the owner's command
@@ -375,5 +375,122 @@ herdr-eng rooms coordination ROOM                              # a coordinator's
 
 Web UI of any kind (no coordinator or coordination screen), assistant briefs and the brief-reference check (slice 4: the refusal
 "an external coordinator cannot read a brief reference" holds because no such route exists yet, and the only assistant API an
-external credential reaches is rejected with 401, tested), approval-gated external actions (slice 5), and `direct` guest behaviour.
-Coordinators cannot yet be handed work by Suggest requests.
+external credential reaches is rejected with 401, tested) and approval-gated external actions (slice 5). The `direct` guest level
+is a separate flag (last section). Coordinators cannot yet be handed work by Suggest requests.
+
+---
+
+# Direct guest level
+
+The Direct level of the same design (`TEAM_COLLABORATION.md` sections 2, 9.3, 13 rows T-TC5 / T-TC12 / T-TC15, 15). It sits behind
+its own flag `control_plane.collab.team_rooms.direct_enabled` (a key of the existing `team_rooms` block, off by default) and ALSO needs
+`team_rooms.enabled`. With either off, `direct` is still stored and validated, but it **acts as Suggest**: the guest-level view says
+`behaves_as: suggest`, a guest has no task right (403 on `POST /rooms/{room}/tasks`, exactly as before; a test pins it), and the new
+routes answer 404. Only withdrawing a guest's right (below) stays reachable with the flags off.
+
+## What it does
+
+- **A guest assigns work inside the owner's limits.** In a room whose level is `direct`, a guest sends the ordinary
+  `POST /rooms/{room}/tasks` with `target_agent_id` (an allowed agent) or `target_role` (an allowed team role; the server picks the
+  least-loaded holder; needs `team_roles`), `text`, and optionally `idempotency_key`. The limits are the room's `direct_limits`:
+  `agents` / `roles` (the allow-list, never "any"), `per_hour`, `max_open`, `max_text`, and two flags that are off unless the owner sets
+  them: `may_request_review`, `may_cancel_own`. Where the owner names no number the service defaults apply: **3 per hour and 2 open**
+  (`team_rooms.direct_default_per_hour`, `direct_default_max_open`). `ROLE_ACTIONS["guest"]` stays `{"read"}`; the extra right is
+  computed from the level and the flag on every request.
+- **The task is the guest's, tainted.** `created_by` is the guest and every event carries their user id; `origin` is `guest-direct`;
+  the taint is `external-source:guest`; the command is a fixed sentence and the guest's words ride as `quoted_source` (untrusted data,
+  with the same note as an approved Suggest request). The agent's inbox shows all of that. The same `TASK_RATE` per-creator throttle and
+  the per-agent open cap apply as for anyone else.
+- **What a guest cannot do.** Name a person, a parent task, a lease, a policy or a team (403 `direct_field_forbidden`); target an agent
+  or role outside the allow-list (403 `direct_target_not_allowed`, the same answer for an agent that does not exist); target a personal
+  assistant, a coordinator agent or an external agent (403 `direct_target_is_assistant` / `direct_target_external`); choose a reviewer
+  (403 `direct_reviewer_choice`); ask for a review unless `may_request_review` (403 `direct_review_not_allowed`); hand work on
+  (an agent that accepted a guest's task cannot create a task under it: 400 `direct_no_children`); grant, invite, approve, decide
+  Suggest requests, change the level, limits or settings (the same 404 plus audit as any non-owner). Every refusal above writes an
+  `audit_denied` event under the guest's id. Over a cap: 429 `direct_rate` (per hour) or `direct_open`. **Nothing is silently
+  turned into a Suggest request**: a refusal is a refusal; the guest can still file a Suggest request, which the owner decides.
+- **Review.** A review request is by role only (`target_role: reviewer`, `reviews_task_id` = a Direct task the same guest assigned). The
+  server picks the holder; the guest, the agent that did the work and anyone in a reviewer group of them are excluded. Reviewer-role
+  agents hold read/post only (slice 2) and cannot take a task, so the request goes to a person who holds the reviewer role, or fails
+  with 409 `no_role_holder`.
+- **Seeing it.** A guest reads their own tasks with `GET /rooms/{room}/direct-tasks` (status, their own text, role; never an agent's
+  result, never another guest's task). The owner sees all of them with the submitter. The room task list and task events stay hidden
+  from guests, as before. `may_cancel_own` lets a guest cancel their own open task (`POST .../direct-tasks/{id}/cancel`); the owner
+  can always cancel (`POST .../tasks/{id}/cancel`).
+- **Revocation (cancel, never requeue).** A guest's task is served only while the flag is on, the room is at `direct`, the guest is an
+  unexpired guest of the room whose own right is not withdrawn, and the target is still allowed. Lowering the level, narrowing the
+  allow-list, removing the guest, withdrawing their right (`direct-guests --deny`), the guest expiring, the identity provider dropping
+  them and turning the flag off each make the task unservable on the very next request (the agent's inbox omits it; `update` is a 404),
+  and the sweep (or the owner's action itself, for the first four) then writes a `task_updated` to `cancelled` with reason
+  `direct_revoked`. Finished tasks are not rewritten. It is cancel and not requeue because nothing in a guest task's chain was ever
+  approved by the operator: re-homing it under the operator (what an external coordinator's revocation does) would launder an
+  unapproved guest's words into operator work. A repeat changes nothing.
+
+## Turn it on
+
+```yaml
+control_plane:
+  collab:
+    team_rooms:
+      enabled: true
+      direct_enabled: true          # absent = off; direct then acts as suggest
+      direct_default_per_hour: 3    # 1 .. 100, used where a room's direct_limits name no per_hour
+      direct_default_max_open: 2    # 1 .. 50
+    team_roles: {enabled: true}     # only for role targets; naming an agent does not need it
+```
+
+Read per request (a missing, unreadable or invalid file turns it OFF). No migration, no table, no environment variable. Then, per room:
+
+```bash
+herdr-eng rooms guest-level ROOM direct --agents AGENT_ID,AGENT_ID --roles implementer --per-hour 3 --max-open 2 \
+    [--max-text 2000] [--may-request-review] [--may-cancel-own]
+herdr-eng rooms guest-level ROOM                       # shows behaves_as and the effective limits
+herdr-eng rooms direct-tasks ROOM                      # owner: every guest task; guest: your own
+herdr-eng rooms direct-guests ROOM [--deny USER | --allow USER]
+# a guest, with their own token:
+herdr-eng rooms direct ROOM "please fix the flaky build" --agent AGENT_ID [--key K]
+herdr-eng rooms direct ROOM "review that" --role reviewer --reviews TASK_ID
+herdr-eng rooms direct-cancel ROOM TASK_ID
+```
+
+| Route (`/api/v1/collab`) | Who |
+|---|---|
+| `POST /rooms/{room}/tasks` `{"target_agent_id" \| "target_role", "text", "idempotency_key", "reviews_task_id"}` | a guest at `direct` |
+| `GET /rooms/{room}/direct-tasks` | guest: own; owner: all |
+| `POST /rooms/{room}/direct-tasks/{id}/cancel` | the guest, with `may_cancel_own` |
+| `GET` / `POST /rooms/{room}/direct-guests` `{"user_id", "allowed"}` | owner (withdrawing is reachable with the flags off) |
+
+## Roll back
+
+- **The flag is the whole rollback and it is safe.** `direct_enabled: false` (or `team_rooms.enabled: false` / `kill_switch: true`): the
+  level goes back to acting as Suggest, new guest tasks are 403, open guest tasks are no longer served at once and the next sweep cancels
+  them (they stay cancelled when the flag comes back; nothing is revived). Nothing is deleted from the log. To end one guest or all of them
+  without touching the flag: `direct-guests --deny USER`, or `guest-level ROOM suggest`. Both are safety writes and still work when the log is full.
+- **Image rollback: remove the key first.** An older image rejects the unknown `direct_enabled` key, so the hot path turns ALL team rooms
+  off and the startup path refuses to start. With the key removed, the older image replays a log that holds `guest_direct_set`, guest tasks
+  and cancellations without trouble and serves none of the guest tasks (a guest has no `task` right there, so the "requester still has
+  authority" test fails), but it also lacks the cancel sweep and the per-guest withdrawal. So: set `direct_enabled: false`, wait one sweep
+  interval (or `guest-level ROOM suggest` for each room), remove the key, then roll back the image if you must. See the threat model
+  (R-DG5) and the replay check recorded in `evidence/STATUS.md`.
+- No migration, no table, no environment variable.
+
+## Choices made where the design left room
+
+- **Entry point.** The design's sketch reuses `POST /rooms/{room}/tasks`; so does this. The extra routes are the guest's own view,
+  the cancel and the per-guest switch.
+- **Fallback.** The design does not say a refused Direct request becomes a Suggest request, and §9.2 already lets a guest file one. A
+  refusal is therefore a refusal (403 plus audit, or 429); the guest decides whether to file a request.
+- **"Max task depth".** Fixed at zero for a guest chain (T-TC5: guest-created tasks cannot create children); there is no depth number to set.
+- **Per-guest revoke.** The design has none. `guest_direct_set` is a small owner-only event (`allowed` true or false) beside the level;
+  the level and limits are untouched.
+- **Cancel, not requeue**, on revocation (above).
+- **Denial codes.** A guest or other non-owner using an owner route gets the existing 404 plus an audit event (the indistinguishable-404
+  rule), not 403; an agent principal gets 403 plus audit. A guest's own refusals are 403/429 with a `code`.
+- **Defaults.** 3 per hour and 2 open where the owner names none; `may_request_review` and `may_cancel_own` off.
+- **Person-held review.** The reviewer role is the one case where a guest's task may go to a person (see Review).
+
+## Not built here
+
+Web UI (the label in `packages/collab-team-rooms.js`, from PR #598 which is not merged, says Direct "acts as Suggest for now" and must change
+when both land), the attention inbox, external actions (slice 5), grants of anything wider than a task, taint inheritance into child
+tasks (children are refused instead), and any approval step between a guest and an allowed agent (that is what Suggest is for).

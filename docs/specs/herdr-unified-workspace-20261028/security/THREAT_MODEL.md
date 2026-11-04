@@ -208,8 +208,9 @@ quoted data tainted `external-source:guest`. Hot YAML flag, off by default, fail
 real Postgres, real collab service and real HTTP (`tests/control_plane/test_team_rooms.py`); not deployed, not run live.
 
 Residual risks:
-- **R-TR1 (Medium).** `direct` is stored and validated but behaves as `suggest`. It fails closed; the risk is a reader assuming it
-  is enforced as a limit. Slices 2 and 3 must define it before it does anything.
+- **R-TR1 (Medium).** `direct` is stored and validated but behaves as `suggest` unless `team_rooms.direct_enabled` is also on (it is
+  off by default; see "Direct guest level" below). It fails closed; the risk is a reader assuming the stored level is what runs:
+  read `behaves_as` in the guest-level view.
 - **R-TR2 (Medium).** The quoted request still reaches a language model in the target agent's `tasks_inbox`. Taint labels and the
   fixed "untrusted data" note reduce, but do not remove, prompt injection by an approved guest request; approval authorises work,
   it does not sanitise text. The owner can trim it (`edited_text`) before approving.
@@ -290,10 +291,56 @@ Residual risks:
 - **R-TC5 (Medium).** Image rollback: an older image ignores the coordinator events and `task_requeued` (no `attempt` fence, requeued
   work shows its old requester) and the slice 2 caveat for person tasks still holds (R-TR14). Fail-closed on serving (the old code serves
   none of a coordinator's tasks), but roll back the flags, not the image.
-- **R-TC6 (Low).** `direct` guests and Suggest requests cannot target a coordinator yet, and the brief-reference refusal in the design
-  is untestable until slice 4 builds the route (the assistant API already rejects collaboration credentials).
+- **R-TC6 (Low).** Suggest requests cannot target a coordinator yet (approval names an agent that may execute; a coordinator's grant
+  is checked at the Direct level, which refuses coordinator and assistant agents as targets: R-DG3), and the brief-reference refusal in
+  the design is untestable until slice 4 builds the route (the assistant API already rejects collaboration credentials).
 - **R-TC7 (Info).** No web UI; the API and `herdr-eng rooms coordinator|coordination` only. The Work Graph shows the coordinator as a
   `team_role` fact for display; it never grants.
+
+#### Direct guest level (`control_plane.collab.team_rooms.direct_enabled`, also needs `team_rooms`; T-TC5, T-TC12, T-TC15)
+Mechanism (`collab_direct.py`, wired in `collab.py`, `collab_coordinators.py` and `collab_team_roles.py`): at level `direct` a guest
+hands work to an agent through the ordinary `POST /rooms/{room}/tasks`, judged against the owner's `direct_limits` (an agent or role
+allow-list, `per_hour`, `max_open`, `max_text`, and the off-by-default `may_request_review` / `may_cancel_own`). The right is computed
+from the room level and flag on each request; `ROLE_ACTIONS["guest"]` stays `{"read"}`. The task is created by the guest (events carry
+their user id), has `origin: guest-direct` and the sticky taint `external-source:guest`, a fixed-sentence command, and the guest's
+words as quoted, untrusted data (exactly as an approved Suggest request). Refusals are 403 plus an `audit_denied` event with a distinct
+reason (an allow-list or field violation, a withdrawn right, an assistant or external target, a reviewer choice, a review request without
+the flag) or 429 for the caps; nothing falls back to the Suggest queue automatically (the guest can still file a Suggest request, which
+is a different, owner-decided act). `_creator_valid` makes the task valid only while the flag is on, the level is `direct`, the guest is
+an unexpired guest whose own right is not withdrawn, and the target is still inside the limits, so the agent's inbox and `update_task`
+refuse it at once; `sweep_direct`, a level change, a member removal and a per-guest withdrawal then CANCEL what is still open (never
+requeue: a guest task has no operator decision in its chain). Lowering the level and withdrawing one guest's right are safety writes
+(they use a full log; setting `direct` is pre-paid). Tested with real HTTP, a real collab service and a real Postgres
+(`test_team_rooms_direct.py`, `test_team_rooms_direct_cli.py`), mutation-checked; not deployed, not run live.
+
+How the design's rows are met:
+- **T-TC5** (guest abuse of Direct): explicit allow-list, never "any"; per-hour and open caps counted from the replayed log (a restart
+  cannot reset them) on top of `TASK_RATE` and `MAX_OPEN_TASKS_PER_AGENT`; no `instruct`, no person target, no parent, no lease or policy,
+  no named reviewer; and **no children**: an agent cannot create a task under a guest's task (`direct_no_children`), so a guest's words do
+  not fan out through a chain. The design's "max task depth" is therefore fixed at zero for a guest chain, not a number.
+- **T-TC12** (revocation lag): lowering the level, narrowing the allow-list, removing the guest, withdrawing the guest's right, the guest
+  expiring and the flag turning off all make the tasks unservable on the next request; the sweep (up to `sweep_interval_seconds`) writes
+  the cancellations.
+- **T-TC15** (collusion): a guest cannot decide Suggest requests, change the level or the limits, or reach a coordinator or an assistant;
+  a guest is excluded from reviewing what they assigned by the same disqualification rule as every other principal.
+
+Residual risks:
+- **R-DG1 (Medium).** An allowed agent still reads the guest's words (quoted, tainted, with the fixed note) and can be steered by them
+  within its own authority; the allow-list and caps bound who and how often, not what the words say (R-TR2 applies, with no operator
+  approval in between). Allow only agents whose own grants you are content to have a guest steer. This is why the flag is off by default.
+- **R-DG2 (Low-Medium).** Caps and the cancel sweep are one-process and replay-derived (like R-TR6 / R-TC2). Between an expiry or an
+  identity-provider group drop and the next sweep, the task is already unservable but is not yet marked cancelled.
+- **R-DG3 (Low).** Assistants and coordinators are excluded by derivation from the log (designated coordinators, claimed assistant
+  runtimes), not by any label the client sends. An assistant that is not yet claimed or designated is not recognised; operators must not
+  list one in `direct_limits`.
+- **R-DG4 (Low).** A review request goes by role only and the server picks the holder. Read/post-only reviewer agents cannot take tasks
+  (R-TR12), so it routes to a person holder of the reviewer role or fails closed with 409; a person reviewer sees the fixed command text,
+  not the guest's words, and must open the work task to review it.
+- **R-DG5 (Medium).** Image rollback: see the flag row in section 5. An older image rejects the new `direct_enabled` key (the hot
+  path turns all team rooms off; the startup path may refuse to start) and does not know `guest_direct_set`, so remove the key first.
+- **R-DG6 (Info).** No web UI: `packages/collab-team-rooms.js` (PR #598, not merged) shows `direct` as "acts as Suggest for now"; that
+  label must change when both land. The guest's own view is `GET /rooms/{room}/direct-tasks` and `herdr-eng rooms direct-tasks`, and it
+  never includes an agent's result.
 
 ## 4. Severity summary (judged from reading; unverified)
 | Id | Severity | One line |
@@ -317,6 +364,8 @@ Residual risks:
 | R-TC1, R-TC5 | Medium | Coordinators: an opted-in external person instructs the team's agents; image rollback loses the requeue fence |
 | R-TC2, R-TC3 | Low-Medium | Coordinators: one-process caps; identity-provider revocation lag |
 | R-TC4, R-TC6, R-TC7 | Low / Info | See section 3.8 (slice 3) |
+| R-DG1, R-DG5 | Medium | Direct: an allowed agent is steered by a guest's quoted words with no approval between; image rollback needs the key removed first |
+| R-DG2, R-DG3, R-DG4, R-DG6 | Low-Medium / Low / Info | See section 3.8 (Direct guest level) |
 | R-SH4, R-CL1, R-DP2 | Low-Medium | See sections |
 | R-WG2-4, R-SH5-7, R-ART3, R-RA3, R-TL3, R-CL2 | Low | See sections |
 
@@ -332,6 +381,7 @@ with the flag off (migrations are additive, so the image can be ahead of the fla
 | `control_plane.collab.team_rooms.enabled` | off | Set `true` (hot, read each request); existing rooms' guests become Suggest unless a room is set `read_only` first | `suggestion_submitted`/`decided` events, 403/404 rates on `/rooms/*/suggestions`, `team_attached` grants | `false` or `kill_switch: true`: routes 404, guests see tasks again. `herdr-eng rooms detach` first if attached teams must go (works with the flag off). See `docs/operations/team-rooms.md` |
 | `control_plane.collab.team_roles.enabled` (also needs `team_rooms`) | off | Set `true` (hot); assign people to roles per room and team; set the policy per team (default escalate) | `task_reminded` / `task_escalated` events, `blocked` tasks in the owner's attention, 409 `no_role_holder` rate | `false` or `kill_switch: true`: new fields unknown, routes 404, sweep stops. Do NOT roll the image back while a person task newer than ~8 days exists (R-TR14); roll back the flag. See `docs/operations/team-rooms.md` |
 | `control_plane.collab.coordinators.enabled` (also needs `team_rooms`, `team_roles`) | off | Set `true` (hot); designate an agent per team; `external.enabled` is a second flag and the per-team opt-in a third | `team_coordinator_set`, `task_requeued` events, 429 `coordinator_rate` / `coordinator_open`, 400 `coordination_loop`, 403 audit events from coordinators | `external-coordination off` per team, then `external.enabled: false`, then `enabled: false`; cancel what you do not want. Do not roll the image back (R-TC5) |
+| `control_plane.collab.team_rooms.direct_enabled` (also needs `team_rooms`) | off | Set `true` (hot) only after choosing, per room, the agents and roles a guest may address and the caps (`herdr-eng rooms guest-level ROOM direct ...`); defaults are 3 per hour, 2 open | `task_created` events with `origin: guest-direct`, `audit_denied` reasons `direct_*`, 429 `direct_rate` / `direct_open`, `task_updated` cancellations with reason `direct_revoked` | `direct_enabled: false` (the level acts as Suggest at once; open guest tasks stop being served and the next sweep cancels them). Image rollback is safe for serving (an older image replays the log and serves no guest task, checked) but it rejects the unknown key: remove `direct_enabled` first (R-DG5). See `docs/operations/team-rooms.md` |
 | Share links `control_plane.share.enabled` (+ `signing_secret`, collab `public_url`) | off | Complete the share block; `deploy.sh` refuses incomplete config, renders the edge with `/s/`, starts `share-public` | share `events` (`opened`, `denied`), 404 rate on `/s/`, live bytes | Revoke individual shares first (`POST .../shares/{sid}/revoke` removes state, then bundle); then `enabled: false` and deploy: the edge stops routing `/s/` and `share-public` is stopped |
 | Per-user rollout | not built | The spec asks for it; every flag today is global | | |
 
