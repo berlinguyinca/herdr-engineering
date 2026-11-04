@@ -302,3 +302,15 @@ def test_log_rotation_does_not_break_event_sync(served):
     call(base, "GET", "/api/v1/build-cache/status", "k-view")
     evs = [e for e in repo.recent_events(limit=100) if e["entity_type"] == "build_cache"]
     assert [e["payload"]["build_id"] for e in evs] == ["b5"]
+
+
+def test_build_cache_event_stream_is_bounded():
+    from herdr_engineering.control_plane.repo import BUILD_CACHE_STREAM_MAX
+    repo = ControlPlaneRepo()
+    n = BUILD_CACHE_STREAM_MAX * 3 + 7
+    for i in range(n):
+        repo.record_event("build_cache", "h1", "build_cache.build_finished", {"build_id": f"b{i}"})
+    stream = repo.stream("build_cache", "h1")
+    assert BUILD_CACHE_STREAM_MAX <= len(stream) <= BUILD_CACHE_STREAM_MAX * 2
+    assert stream[-1]["payload"]["build_id"] == f"b{n - 1}" and stream[-1]["sequence"] == n - 1
+    assert len([e for e in repo.recent_events(limit=100000) if e["entity_type"] == "build_cache"]) == len(stream)

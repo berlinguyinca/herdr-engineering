@@ -86,7 +86,8 @@ def build_build_cache(cfg, *, record_event):
 def _trace(value):
     if not isinstance(value, dict):
         return None
-    out = {k: v for k, v in value.items() if k in ("session", "mission") and isinstance(v, str) and len(v) <= 64}
+    from ..build_metrics import sanitize_trace_id
+    out = {k: v for k, v in value.items() if k in ("session", "mission") and sanitize_trace_id(v)}
     return out or None
 
 
