@@ -96,7 +96,20 @@ def test_sigterm_forwarded_to_child_only(tmp_path):
         f"state_dir={str(tmp_path)!r}))"
     )
     proc = subprocess.Popen([sys.executable, "-c", script])
-    time.sleep(1.0)
+    # Signal only once the build has started (handlers installed, child forked);
+    # a fixed sleep races interpreter start-up under load.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            if any(e["event"] == "build_started" for e in _events(tmp_path)):
+                break
+        except (FileNotFoundError, ValueError):  # not written yet / partial line
+            pass
+        time.sleep(0.05)
+    else:
+        proc.kill()
+        pytest.fail("build_started never recorded")
+    time.sleep(0.2)
     proc.send_signal(signal.SIGTERM)
     assert proc.wait(timeout=10) == 128 + signal.SIGTERM
     fin = [e for e in _events(tmp_path) if e["event"] == "build_finished"][0]
