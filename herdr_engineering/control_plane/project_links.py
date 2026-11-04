@@ -129,12 +129,20 @@ def _project_mapping():
         return {}, "error", "Project repository mapping could not be read or is invalid."
 
 
-def project_for_repository(repository):
+def load_project_index():
+    """Read the bounded repository/project mapping once for a bulk projection.
+
+    An empty mapping is a valid frozen index, including invalid/missing config.
+    """
+    return _project_mapping()[0]
+
+
+def project_for_repository(repository, *, project_index=None):
     """Apply the bounded shared-project mapping, defaulting to forge identity."""
     identity = canonical_repository(repository)
     if identity is None:
         return None
-    mapping, _, _ = _project_mapping()
+    mapping = load_project_index() if project_index is None else project_index
     return mapping.get(identity, identity)
 
 

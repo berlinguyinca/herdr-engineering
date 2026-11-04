@@ -12,6 +12,7 @@ CI. ``PostgresSource`` is the real asyncpg-backed implementation.
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as _dt
 import json
 import threading
@@ -75,14 +76,49 @@ class PostgresSource(DurableSource):
     """
 
     def __init__(self, conn: Any = None, *, run: Callable | None = None,
-                 events_table: str = "fabric_events", dsn: str | None = None):
+                 events_table: str = "fabric_events", dsn: str | None = None,
+                 use_checkpoints: bool = True, checkpoint_publish: bool = False):
+        self._owned_runner = None
         if run is None:
-            run = _LoopRunner().run
+            self._owned_runner = _LoopRunner()
+            run = self._owned_runner.run
         self._conn = conn
         self._dsn = dsn
         self._run = run
         self._events_table = events_table
         self._cache: dict | None = None
+        self.checkpoint_enabled = bool(use_checkpoints and dsn and events_table == 'fabric_events')
+        self.checkpoint_publish = checkpoint_publish
+        self.recovery_info = None
+        self._history_provider = None
+
+    def recover_projection(self, repo):
+        if not self.checkpoint_enabled:
+            return None
+        from .projection_recovery import recover_repository
+        try:
+            return recover_repository(repo, self)
+        except Exception as exc:
+            if self.checkpoint_publish:
+                raise
+            import logging
+            logging.getLogger(__name__).warning('checkpoint recovery unavailable (%s); replaying complete retained history',type(exc).__name__)
+            from .projection_recovery import _reset_private
+            _reset_private(repo)
+            self.recovery_info={'mode':'full_replay','reason':type(exc).__name__}
+            if self._conn is not None and self._conn.is_closed():
+                self._conn=None
+            self._cache=None
+            return None
+
+    def close(self):
+        if self._history_provider is not None:
+            self._history_provider.close()
+        if self._conn is not None and not self._conn.is_closed():
+            self._run(self._conn.close())
+        if self._owned_runner is not None:
+            self._owned_runner._loop.call_soon_threadsafe(self._owned_runner._loop.stop)
+            self._owned_runner._thread.join(timeout=3)
 
     def _load(self) -> dict:
         if self._cache is None:
@@ -410,6 +446,16 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
 
 
 def load_into(repo, source: DurableSource) -> dict:
+    recover = getattr(source, 'recover_projection', None)
+    if callable(recover):
+        result = recover(repo)
+        if result is not None:
+            return result
+    return _load_full_into(repo, source)
+
+
+def _load_full_into(repo, source: DurableSource, *, core_override=None,
+                    projection_state=None, capture_event_core=False) -> dict:
     """Hydrate ``repo`` from ``source``. Idempotent; returns counts.
 
     Designed for a fresh repo at server startup: replaces all structured state
@@ -483,7 +529,7 @@ def load_into(repo, source: DurableSource) -> dict:
             "updated_at": _iso(row.get("updated_at") or row.get("created_at")),
         }
 
-    if isinstance(source, PostgresSource):
+    if callable(getattr(source, 'take_events', None)):
         events, event_order = _rebuild_events(source.take_events(), reuse=True)
     else:
         events, event_order = _rebuild_events(source.events())
@@ -504,8 +550,16 @@ def load_into(repo, source: DurableSource) -> dict:
             elif base.get(k) in (None, "", []):
                 base[k] = v
 
-    rmissions, rsessions, rhosts, rservices, rartifacts = \
-        _reconstruct_from_events(events)
+    if core_override is None:
+        rmissions, rsessions, rhosts, rservices, rartifacts = _reconstruct_from_events(events)
+    else:
+        rmissions, rsessions, rhosts, rservices, rartifacts = (
+            copy.deepcopy(core_override[name])
+            for name in ('missions', 'sessions', 'hosts', 'services', 'artifacts'))
+    if capture_event_core:
+        repo._checkpoint_event_core = copy.deepcopy(dict(zip(
+            ('missions','sessions','hosts','services','artifacts'),
+            (rmissions,rsessions,rhosts,rservices,rartifacts))))
     for mid, m in rmissions.items():
         _overlay(missions.setdefault(mid, m), m)
     for sid, s in rsessions.items():
@@ -565,12 +619,20 @@ def load_into(repo, source: DurableSource) -> dict:
         if mid in missions and sid not in missions[mid]["sessions"]:
             missions[mid]["sessions"].append(sid)
 
-    repo.import_state({
+    restored_state = {
+        **(projection_state or {}),
         "version": 1,
         "missions": missions, "sessions": sessions, "services": services,
         "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
-        "telemetry": {}, "events": events, "event_order": event_order,
-    })
+        "telemetry": (projection_state or {}).get('telemetry', {}),
+        "events": events, "event_order": event_order,
+    }
+    for key in ('leases', 'scheduler_reservations', 'scheduler_leases'):
+        if key in (projection_state or {}):
+            restored_state[key] = projection_state[key]
+    if getattr(source, 'source_ledger', None) is not None:
+        restored_state['source_ledger'] = source.source_ledger
+    repo.import_state(restored_state)
     return {"missions": len(missions), "sessions": len(sessions),
             "services": len(services), "hosts": len(hosts),
             "events": len(event_order), "artifacts": len(artifacts)}

@@ -516,6 +516,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
+    p2 = csub.add_parser("checkpoint", help="prewarm durable projection checkpoints")
+    p2.add_argument("--fleet-config", required=True)
+    p2.add_argument("--migrations", default=None)
+    p2.set_defaults(func=_cmd_cp_checkpoint)
     p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
                          "never deletes: rows move to a quarantine file/table)")
     p2.add_argument("--log-file", default=None, help="a collab-only JSON-lines log; without it the Postgres "
@@ -2557,6 +2561,36 @@ def _cmd_cp_migrate(args) -> int:
     return 0
 
 
+def _cmd_cp_checkpoint(args) -> int:
+    import asyncio
+
+    from .control_plane.db import Migrator
+    from .control_plane.projection_refresh import refresh_checkpoint
+
+    try:
+        _, cp = _load_cp_fleet_config(args.fleet_config)
+        dsn = cp.get("pg_dsn")
+        if not dsn:
+            _print_json({"ok": False, "error": "checkpoint requires control_plane.pg_dsn"})
+            return 1
+
+        async def migrate():
+            conn = await _cp_connect(dsn)
+            try:
+                await Migrator(conn).apply(args.migrations or _cp_migrations_dir())
+            finally:
+                await conn.close()
+
+        asyncio.run(migrate())
+        result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
+                                    inspector_limits=cp.get("inspector_limits") or {})
+    except (Exception, SystemExit) as exc:
+        _print_json({"ok": False, "error": type(exc).__name__})
+        return 1
+    _print_json({"ok": True, **result})
+    return 0
+
+
 def _cmd_cp_collab_repair(args) -> int:
     import asyncio
 
@@ -3265,8 +3299,23 @@ def _cmd_cp_worker(args) -> int:
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
                                           artifact_job_runner=runner)
-            await run_worker(conn, interval=args.interval, worker_id=worker_id,
-                             artifact_job_runner=runner)
+            from .control_plane.projection_refresh import ProjectionRefresh
+
+            # --once stays a bounded maintenance pass; only fleet-configured
+            # continuous workers publish checkpoints on a separate connection.
+            _, fleet_cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
+            refresh = None
+            if fleet_cp.get("pg_dsn"):
+                refresh = ProjectionRefresh(
+                    fleet_cp["pg_dsn"], host_aliases=_host_aliases_from(fleet_cp),
+                    inspector_limits=fleet_cp.get("inspector_limits") or {})
+                refresh.start()
+            try:
+                await run_worker(conn, interval=args.interval, worker_id=worker_id,
+                                 artifact_job_runner=runner)
+            finally:
+                if refresh is not None:
+                    await asyncio.to_thread(refresh.stop)
             return None
         finally:
             await conn.close()

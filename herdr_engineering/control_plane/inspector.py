@@ -24,6 +24,15 @@ from collections import OrderedDict, deque
 from datetime import UTC, datetime
 from typing import Any
 
+from .envelope import (
+    _checkpoint_header,
+    _checkpoint_int,
+    _checkpoint_json,
+    _checkpoint_object,
+    _checkpoint_require,
+    _checkpoint_stamp,
+    _checkpoint_time,
+)
 from .redact import redact_payload, redact_text
 
 KINDS = frozenset({
@@ -281,6 +290,138 @@ class InspectorStore:
         self._lock = threading.RLock()
         self.stats = {"accepted": 0, "duplicates": 0, "rejected": 0,
                       "evicted_events": 0, "evicted_sessions": 0}
+
+    def export_checkpoint(self) -> dict:
+        """Explicit JSON state; indexes encode references, never duplicate entries.
+
+        This is a private projection capsule, not a public inspector response.
+        Runtime authorization, subscribers and the process epoch are excluded.
+        """
+        with self._lock:
+            sessions = []
+            for sess in self._sessions.values():
+                sessions.append({
+                    "session_id": sess.session_id, "events": list(sess.events),
+                    "next_seq": sess.next_seq, "rev": sess.rev,
+                    "dropped_ring": sess.dropped_ring, "client_dropped": sess.client_dropped,
+                    "seen": list(sess.seen), "capabilities": sess.capabilities,
+                    "assoc": sess.assoc, "models": list(sess.models),
+                    "usage_totals": sess.usage_totals, "usage_latest": sess.usage_latest,
+                    "last_event": sess.last_event, "last_ingest": sess.last_ingest,
+                    "ended": sess.ended, "prefs": sess.prefs, "evicted_to": sess.evicted_to,
+                    "tools": {key: entry["seq"] for key, entry in sess.tools.items()},
+                    "tests": {key: entry["seq"] for key, entry in sess.tests.items()},
+                })
+            return _checkpoint_json({"version": 1, "domain": "inspector", "sessions": sessions,
+                                     "global_prefs": self._global_prefs, "stats": self.stats})
+
+    def restore_checkpoint(self, state) -> None:
+        state = _checkpoint_header(state, "inspector", ("sessions", "global_prefs", "stats"))
+        _checkpoint_require(type(state["sessions"]) is list)
+        _checkpoint_object(state["stats"], ("accepted", "duplicates", "rejected", "evicted_events", "evicted_sessions"))
+        for value in state["stats"].values():
+            _checkpoint_int(value)
+
+        def prefs(value):
+            _checkpoint_require(type(value) is dict and validate_prefs(value) == value)
+
+        prefs(state["global_prefs"])
+        restored = InspectorStore(limits=self.limits, clock=self._clock,
+                                  store_reasoning=self.store_reasoning)
+        restored._global_prefs, restored.stats = state["global_prefs"], state["stats"]
+        session_fields = ("session_id", "events", "next_seq", "rev", "dropped_ring", "client_dropped",
+                          "seen", "capabilities", "assoc", "models", "usage_totals", "usage_latest",
+                          "last_event", "last_ingest", "ended", "prefs", "evicted_to", "tools", "tests")
+        entry_fields = ("seq", "rev", "kind", "agent_id", "parent_agent_id", "event_id", "ts",
+                        "recv", "sensitive", "redacted", "truncated", "data", "size")
+        usage_keys = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens")
+        for row in state["sessions"]:
+            _checkpoint_object(row, session_fields)
+            sid = row["session_id"]
+            _checkpoint_require(type(sid) is str and len(sid) <= 128
+                                and (_SESSION_ID.fullmatch(sid) or _CANONICAL_SESSION_ID.fullmatch(sid))
+                                and sid not in restored._sessions)
+            sess = _Session(sid)
+            for key in ("next_seq", "rev", "dropped_ring", "client_dropped"):
+                _checkpoint_int(row[key])
+                setattr(sess, key, row[key])
+            _checkpoint_int(row["evicted_to"], -1)
+            _checkpoint_require(row["evicted_to"] < row["next_seq"] and type(row["ended"]) is bool)
+            sess.evicted_to, sess.ended = row["evicted_to"], row["ended"]
+            _checkpoint_time(row["last_event"])
+            sess.last_event = row["last_event"]
+            if row["last_ingest"] is not None:
+                _checkpoint_stamp(row["last_ingest"])
+            sess.last_ingest = row["last_ingest"]
+            prefs(row["prefs"])
+            sess.prefs = row["prefs"]
+            _checkpoint_require(type(row["seen"]) is list
+                                and all(type(eid) is str and bool(eid) and len(eid) <= 128 for eid in row["seen"])
+                                and len(set(row["seen"])) == len(row["seen"]))
+            sess.seen = OrderedDict((eid, True) for eid in row["seen"])
+            while len(sess.seen) > max(_MAX_SEEN_IDS, restored._limits_for(sess)[0]):
+                sess.seen.popitem(last=False)
+            _checkpoint_require(row["capabilities"] is None or type(row["capabilities"]) is dict)
+            _checkpoint_require(type(row["assoc"]) is dict and type(row["models"]) is list
+                                and len(row["models"]) <= 20 and all(type(v) is dict for v in row["models"])
+                                and (row["usage_latest"] is None or type(row["usage_latest"]) is dict))
+            sess.capabilities, sess.assoc = row["capabilities"], row["assoc"]
+            sess.models = deque(row["models"], maxlen=20)
+            _checkpoint_object(row["usage_totals"], usage_keys)
+            for value in row["usage_totals"].values():
+                _checkpoint_int(value)
+                _checkpoint_require(value <= _MAX_NUM)
+            sess.usage_totals, sess.usage_latest = row["usage_totals"], row["usage_latest"]
+            _checkpoint_require(type(row["events"]) is list)
+            previous = -1
+            for entry in row["events"]:
+                _checkpoint_object(entry, entry_fields, ("t0",))
+                _checkpoint_int(entry["seq"])
+                _checkpoint_int(entry["rev"])
+                _checkpoint_int(entry["size"])
+                _checkpoint_require(previous < entry["seq"] < sess.next_seq
+                                    and entry["rev"] <= sess.rev and type(entry["kind"]) is str
+                                    and entry["kind"] in KINDS
+                                    and type(entry["data"]) is dict)
+                previous = entry["seq"]
+                _checkpoint_time(entry["recv"])
+                _checkpoint_stamp(entry["ts"])
+                for key in ("agent_id", "parent_agent_id", "event_id"):
+                    _checkpoint_require(entry[key] is None or type(entry[key]) is str)
+                for key in ("sensitive", "redacted", "truncated"):
+                    _checkpoint_require(type(entry[key]) is bool)
+                if "t0" in entry:
+                    _checkpoint_time(entry["t0"])
+                if entry["kind"] in ("tool", "test"):
+                    identity = "call_id" if entry["kind"] == "tool" else "run_id"
+                    _checkpoint_require(type(entry["data"].get(identity)) is str
+                                        and type(entry["data"].get("status")) is str)
+                # Current policy may disable reasoning capture entirely.
+                if entry["kind"] == "reasoning" and not self.store_reasoning:
+                    continue
+                entry["size"] = self._size(entry["data"])
+                sess.events.append(entry)
+                sess.by_seq[entry["seq"]] = entry
+                sess.bytes += entry["size"]
+            for name, kind, identity in (("tools", "tool", "call_id"), ("tests", "test", "run_id")):
+                _checkpoint_require(type(row[name]) is dict)
+                for key, seq in row[name].items():
+                    _checkpoint_int(seq)
+                    entry = sess.by_seq.get(seq)
+                    _checkpoint_require(entry is not None and entry["kind"] == kind
+                                        and entry["data"].get(identity) == key)
+                    getattr(sess, name)[key] = entry
+            restored._sessions[sid] = sess
+            restored._enforce(sess)
+        restored._enforce_global()
+        with self._lock:
+            for sess in self._sessions.values():
+                for sub in sess.subs:
+                    sub.close()
+            self._sessions, self._global_prefs = restored._sessions, restored._global_prefs
+            self.stats = restored.stats
+            self.epoch = restored.epoch
+            self._lock = threading.RLock()
 
     def usage_events(self) -> list[tuple[str, str, dict]]:
         """``(session_id, ts, data)`` for every usage event still in a session's ring. The

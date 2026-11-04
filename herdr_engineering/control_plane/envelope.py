@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -192,6 +193,67 @@ def _actor_id(actor: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _checkpoint_require(condition: bool) -> None:
+    if not condition:
+        raise ValueError("invalid projection checkpoint schema")
+
+
+def _checkpoint_object(value, fields, optional=()):
+    _checkpoint_require(type(value) is dict and set(fields) <= value.keys()
+                        and value.keys() <= set(fields) | set(optional))
+
+
+def _checkpoint_json(value):
+    """Copy strict JSON without coercing tuple keys, objects or nonfinite floats."""
+    def check(item):
+        if item is None or type(item) in (str, bool, int):
+            return
+        if type(item) is float and math.isfinite(item):
+            return
+        if type(item) is list:
+            for child in item:
+                check(child)
+            return
+        if type(item) is dict and all(type(k) is str for k in item):
+            for child in item.values():
+                check(child)
+            return
+        raise ValueError("projection checkpoint must contain strict JSON values")
+    try:
+        check(value)
+        return copy.deepcopy(value)
+    except (RecursionError, OverflowError) as exc:
+        raise ValueError("invalid projection checkpoint") from exc
+
+
+def _checkpoint_header(state, domain, fields):
+    state = _checkpoint_json(state)
+    _checkpoint_object(state, ("version", "domain", *fields))
+    _checkpoint_require(type(state["version"]) is int and state["version"] == 1
+                        and state["domain"] == domain)
+    return state
+
+
+def _checkpoint_int(value, minimum=0):
+    _checkpoint_require(type(value) is int and value >= minimum)
+
+
+def _checkpoint_time(value):
+    try:
+        _checkpoint_require(type(value) in (int, float) and math.isfinite(value))
+    except OverflowError as exc:
+        raise ValueError("invalid checkpoint number") from exc
+
+
+def _checkpoint_stamp(value):
+    _checkpoint_require(type(value) is str)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        _checkpoint_require(parsed.tzinfo is not None and math.isfinite(parsed.timestamp()))
+    except (ValueError, OverflowError, OSError) as exc:
+        raise ValueError("invalid checkpoint timestamp") from exc
+
+
 class SourceLedger:
     """Idempotency, sequence-collision and gap/freshness state per sequence domain.
 
@@ -215,6 +277,110 @@ class SourceLedger:
         self._events: OrderedDict[tuple, tuple] = OrderedDict()   # (actor, id) -> (hash, source, seq, actor)
         self._sequences: dict[tuple[str, str, int], str] = {}   # (actor, source, seq) -> id
         self._sources: dict[tuple[str, str], dict] = {}
+
+    def export_checkpoint(self) -> dict:
+        """Versioned bounded admission state; ordered arrays preserve eviction ties."""
+        with self.lock:
+            return _checkpoint_json({
+                "version": 1, "domain": "source_ledger",
+                "events": [[a, eid, digest, source, seq, owner]
+                           for (a, eid), (digest, source, seq, owner) in self._events.items()],
+                "sources": list(self._sources.values()),
+            })
+
+    def restore_checkpoint(self, state) -> None:
+        """Replace admission state without persisting or changing runtime bindings."""
+        state = _checkpoint_header(state, "source_ledger", ("events", "sources"))
+        _checkpoint_require(type(state["events"]) is list and type(state["sources"]) is list)
+        events, sequences, sources = OrderedDict(), {}, {}
+        for row in state["events"]:
+            _checkpoint_require(type(row) is list and len(row) == 6)
+            actor, eid, digest, source, seq, owner = row
+            _checkpoint_require(all(type(v) is str for v in (actor, eid, source, owner))
+                                and bool(eid) and bool(source) and owner == actor
+                                and (digest is None or type(digest) is str))
+            _checkpoint_int(seq)
+            _checkpoint_require((actor, eid) not in events and (actor, source, seq) not in sequences)
+            events[(actor, eid)] = (digest, source, seq, owner)
+            sequences[(actor, source, seq)] = eid
+        counts = {}
+        for row in state["sources"]:
+            _checkpoint_object(row, ("actor", "source", "last_sequence", "last_seen_at", "gaps"),
+                               ("gaps_truncated",))
+            actor, source = row["actor"], row["source"]
+            _checkpoint_require(type(actor) is str and type(source) is str and bool(source)
+                                and (actor, source) not in sources and type(row["gaps"]) is list)
+            if row["last_sequence"] is not None:
+                _checkpoint_int(row["last_sequence"])
+            if row["last_seen_at"] is not None:
+                _checkpoint_stamp(row["last_seen_at"])
+            if "gaps_truncated" in row:
+                _checkpoint_require(type(row["gaps_truncated"]) is bool)
+            for gap in row["gaps"]:
+                _checkpoint_object(gap, ("from", "to", "seen_at"))
+                _checkpoint_int(gap["from"])
+                _checkpoint_int(gap["to"], gap["from"])
+                _checkpoint_stamp(gap["seen_at"])
+                _checkpoint_require(row["last_sequence"] is not None and gap["to"] < row["last_sequence"])
+            ordered_gaps = sorted(row["gaps"], key=lambda gap: gap["from"])
+            _checkpoint_require(all(left["to"] < right["from"]
+                                    for left, right in zip(ordered_gaps, ordered_gaps[1:])))
+            _checkpoint_require(len(row["gaps"]) <= MAX_GAPS_PER_SOURCE)
+            counts[actor] = counts.get(actor, 0) + 1
+            sources[(actor, source)] = row
+        _checkpoint_require(len(sources) <= MAX_SOURCES
+                            and all(n <= MAX_SOURCES_PER_ACTOR for n in counts.values()))
+        # Apply the current cache budget, retaining the newest admission entries.
+        while len(events) > self._max_events:
+            (actor, _), (_, source, seq, _) = events.popitem(last=False)
+            sequences.pop((actor, source, seq), None)
+        with self.lock:
+            self._events, self._sequences, self._sources = events, sequences, sources
+            self.lock = threading.RLock()
+
+    def replay_tail(self, events) -> None:
+        """Apply rows in caller-supplied durable replay order, retaining the prefix.
+
+        The caller orders by replay_position (legacy bootstrap ordering is its
+        responsibility). Timestamps remain freshness evidence, never a sort key.
+        """
+        pending = []
+        for row in events:
+            if row.get("source") is None or row.get("source_sequence") is None:
+                continue
+            payload = row.get("payload") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except ValueError as exc:
+                    raise ValueError("invalid replay payload") from exc
+            _checkpoint_require(type(payload) is dict)
+            meta = payload.get("_envelope") or {}
+            _checkpoint_require(type(meta) is dict)
+            seq = row["source_sequence"]
+            _checkpoint_int(seq)
+            actor = row.get("actor")
+            if isinstance(actor, str):
+                try:
+                    actor = json.loads(actor)
+                except ValueError as exc:
+                    raise ValueError("invalid replay actor") from exc
+            _checkpoint_require(actor is None or type(actor) is dict)
+            _checkpoint_require(type(row.get("event_id")) is str and bool(row["event_id"])
+                                and type(row["source"]) is str and bool(row["source"]))
+            received = row.get("ingest_timestamp")
+            if isinstance(received, datetime):
+                received = received.isoformat()
+            _checkpoint_stamp(received)
+            digest = meta.get("content_sha256")
+            _checkpoint_require(digest is None or type(digest) is str)
+            pending.append({"event_id": row["event_id"], "source": row["source"],
+                            "actor": actor, "source_sequence": seq,
+                            "content_hash": digest, "received_at": received})
+        with self.lock:
+            for env in pending:
+                if self.check(env) == "new":
+                    self.commit(env, persist=False)
 
     # ------------------------------------------------------------ admission
     def check(self, env: dict) -> str:
@@ -303,15 +469,21 @@ class SourceLedger:
                 state["gaps"].sort(key=lambda g: g["from"])
                 return
 
-    def hydrate(self, events: list[dict]) -> None:
-        """Rebuild from replayed event dicts (restart); arrival order preserved."""
+    def hydrate(self, events: list[dict], *, preserve_order: bool = False) -> None:
+        """Replace the ledger from durable rows without persistence callbacks.
+
+        The default retains legacy ingest-timestamp ordering. With preserve_order,
+        consume the caller's authoritative admission order, including backdates;
+        database ordering columns are never copied into the ledger checkpoint.
+        """
         with self.lock:
             self._events.clear()
             self._sequences.clear()
             self._sources.clear()
             rows = [e for e in events if e.get("source") is not None
                     and e.get("source_sequence") is not None]
-            rows.sort(key=lambda e: str(e.get("ingest_timestamp") or ""))
+            if not preserve_order:
+                rows.sort(key=lambda e: str(e.get("ingest_timestamp") or ""))
             for e in rows:
                 meta = e.get("payload") or {}
                 if isinstance(meta, str):

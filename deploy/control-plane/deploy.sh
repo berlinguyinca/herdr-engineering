@@ -2,7 +2,10 @@
 # Build the control-plane web image from a git ref and roll it, with rollback.
 #
 #   deploy/control-plane/deploy.sh [--ref origin/main] [--dry-run] [--no-fetch]
-#                                  [--fleet-config PATH]
+#                                  [--fleet-config PATH] [--allow-divergent]
+#   HEAD expressions use the caller worktree only after common-repository proof.
+#   Normal rollouts must descend from the verified deployed commit; intentional
+#   manual rollback requires --allow-divergent (automatic rollback is unchanged).
 #
 # What it does, in order:
 #   1. checks the central fleet config (default
@@ -45,24 +48,42 @@
 # kept. Nothing from it is printed by this script or written to a receipt.
 set -euo pipefail
 
-REF="origin/main"; DRY=0; FETCH=1
+REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0
 CENTRAL="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?--ref needs a value}"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --no-fetch) FETCH=0; shift ;;
+    --allow-divergent) ALLOW_DIVERGENT=1; shift ;;
     --fleet-config) CENTRAL="${2:?--fleet-config needs a value}"; shift 2 ;;
     -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO="$(git -C "$HERE" rev-parse --show-toplevel)"
+REF_REPO="$REPO"
+case "$REF" in
+  HEAD|HEAD[~^:@]*|@|@[~^:]*|'@{'*)
+    # A canonical tool worktree has its own HEAD. Never substitute that for the
+    # caller's revision, and never trust an unrelated clone merely sharing SHAs.
+    CALLER_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    TOOL_COMMON="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)"
+    if [ -z "$CALLER_COMMON" ] || ! [ "$CALLER_COMMON" -ef "$TOOL_COMMON" ]; then
+      echo "cannot resolve caller-local HEAD without a shared Git repository; use --ref <published ref> or --ref <full commit SHA>" >&2
+      exit 2
+    fi
+    REF_REPO="$(pwd -P)"
+    ;;
+esac
 PROJECT="${HERDR_CP_PROJECT:-herdr-control-plane}"
 HEALTH_URL="${HERDR_CP_HEALTH_URL:-}"
 STATE_DIR="$HOME/.local/state/herdr-engineering/deploys"
+STATE_HELPER="$HERE/deploy-state.py"
+# shellcheck source=deploy-lock.sh
+source "$HERE/deploy-lock.sh"
 MOUNT_TARGET="/etc/herdr/fleet/fleet-config.yaml"
 # Collaboration network (HCN) is opt-in per host: it is layered on only when this
 # marker file exists, so an ordinary deploy never switches it on elsewhere.
@@ -89,22 +110,51 @@ if [ -n "$OTHERS" ]; then
 fi
 
 WORK=""; ENV_DIR=""; PREV_WORK=""
+HOST_MUTATED=0
+DEPLOY_FINISHED=0
+# Called by the EXIT trap via finish().
+# shellcheck disable=SC2317
 cleanup() {
   if [ -n "$PREV_WORK" ]; then git -C "$REPO" worktree remove --force "$PREV_WORK" >/dev/null 2>&1 || true; fi
   [ -z "$ENV_DIR" ] || rm -rf "$ENV_DIR"
-  if [ -n "$WORK" ]; then git -C "$REPO" worktree remove --force "$WORK" >/dev/null 2>&1 || rm -rf "$WORK"; fi
+  if [ -n "$WORK" ]; then
+    if [ "$DRY" = 1 ]; then rm -rf "$WORK"
+    else git -C "$REPO" worktree remove --force "$WORK" >/dev/null 2>&1 || rm -rf "$WORK"; fi
+  fi
+  deploy_lock_cleanup
 }
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM HUP
+# shellcheck disable=SC2317
+finish() {
+  local status=$? rollback_status=0
+  # Repeated interrupts must not cut short recovery or release ownership early.
+  trap '' INT TERM HUP
+  trap - EXIT
+  if [ "$HOST_MUTATED" = 1 ] && [ "$DEPLOY_FINISHED" = 0 ]; then
+    rollback || rollback_status=$?
+    [ "$rollback_status" != 3 ] || status=3
+  fi
+  deploy_lock_phase cleanup || true
+  cleanup
+  exit "$status"
+}
+trap finish EXIT
+trap 'trap "" INT TERM HUP; exit 130' INT
+trap 'trap "" INT TERM HUP; exit 143' TERM HUP
 
-[ "$FETCH" = 1 ] && git -C "$REPO" fetch -q origin
-FULL="$(git -C "$REPO" rev-parse --verify "$REF^{commit}")"
+if [ "$DRY" = 0 ]; then
+  deploy_lock_acquire || exit $?
+  [ "$FETCH" = 0 ] || git -C "$REPO" fetch -q origin
+fi
+FULL="$(git -C "$REF_REPO" rev-parse --verify "$REF^{commit}")"
 SHA="${FULL:0:12}"
 TAG="$SHA"
 
 WORK="$(mktemp -d)"
-git -C "$REPO" worktree add -q --detach "$WORK" "$FULL"
+if [ "$DRY" = 1 ]; then
+  git -C "$REPO" archive "$FULL" | tar -x -C "$WORK"
+else
+  git -C "$REPO" worktree add -q --detach "$WORK" "$FULL"
+fi
 # herdr-eng from exactly the commit being deployed, so the rendered variables match
 # the compose files that ship with it.
 # Run from inside $WORK: `python3 -m` puts the cwd first on sys.path, so a caller
@@ -239,18 +289,17 @@ fi
 
 PREVIOUS_IMAGE="$(docker inspect -f '{{.Config.Image}}' herdr-cp-web 2>/dev/null || true)"
 echo "currently running: ${PREVIOUS_IMAGE:-nothing}"
-STATE_HELPER="$HERE/deploy-state.py"
-
 # What to roll back to: the commit recorded in the running image's receipt, deployed
 # again with THAT commit's compose files. Only a commit whose compose.yaml carries
 # `x-herdr-deploy-layout: 2` can run on this script's variables; anything older (or no
 # receipt at all) gets no automatic rollback and a manual recipe instead.
 PREV_COMMIT=""; PREV_SHA=""; PREV_TAG=""; PREV_COLLAB_HASH=""; ROLLBACK_NOTE=""
-PREV_RECEIPT_TAG=""
+PREV_RECEIPT_TAG=""; VERIFIED_PREV_COMMIT=""
 if [ -n "$PREVIOUS_IMAGE" ]; then
   # Protected rollback uses image IDs as Config.Image. Recover its logical tag
   # from the actual image buildstamp, cross-checked against the existing receipt.
-  PREV_RECEIPT_TAG="$(python3 "$STATE_HELPER" resolve-previous "$STATE_DIR" "$PREVIOUS_IMAGE")" || exit 1
+  PREVIOUS_IDENTITY="$(python3 "$STATE_HELPER" verified-previous "$STATE_DIR" "$PREVIOUS_IMAGE")" || exit 1
+  read -r PREV_RECEIPT_TAG VERIFIED_PREV_COMMIT <<< "$PREVIOUS_IDENTITY"
 fi
 if [ -z "$PREVIOUS_IMAGE" ]; then
   ROLLBACK_NOTE="nothing was running (first deploy)"
@@ -262,6 +311,10 @@ else
       "$STATE_DIR/$PREV_RECEIPT_TAG.json" "$1" 2>/dev/null || true
   }
   CANDIDATE="$(receipt_field commit)"
+  if [ "$CANDIDATE" != "$VERIFIED_PREV_COMMIT" ]; then
+    echo "previous deployment receipt changed after image verification; refusing deployment" >&2
+    exit 1
+  fi
   PREV_COLLAB_HASH="$(receipt_field collab_slice_sha256)"
   # (no `git show | grep -q` under pipefail: grep's early exit would SIGPIPE git)
   PREV_COMPOSE=""
@@ -288,6 +341,15 @@ else
   fi
 fi
 
+# Apply the ancestry guard to every verified previous commit, even old layouts
+# lacking automatic rollback. Missing history cannot prove a safe forward roll.
+# This guards only forward entry; rollback() always uses its protected snapshot.
+if [ -n "$VERIFIED_PREV_COMMIT" ] && [ "$ALLOW_DIVERGENT" = 0 ] \
+    && ! git -C "$REPO" merge-base --is-ancestor "$VERIFIED_PREV_COMMIT" "$FULL"; then
+  echo "candidate $SHA does not descend from verified deployed commit $VERIFIED_PREV_COMMIT; refusing stale/divergent rollout before build or host changes. Use --allow-divergent only for an intentional manual rollback." >&2
+  exit 1
+fi
+
 if [ -z "$HEALTH_URL" ]; then
   # The UI is published on HERDR_CP_WEB_BIND:HERDR_CP_WEB_PUBLIC_PORT.
   BIND="$(grep -E '^HERDR_CP_WEB_BIND=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"")"
@@ -311,6 +373,8 @@ if [ "$COLLAB" = 1 ]; then
          "Fix: run deploy.sh as that user, or set HERDR_COLLAB_CERT_UID to $HAVE_UID." >&2
   fi
 fi
+
+deploy_lock_phase build
 
 # A failed build exits here: nothing on the host has been touched yet.
 docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
@@ -440,6 +504,8 @@ verify() {   # <commit>: the web reports it AND every recreated service is up
 }
 
 forward() {
+  deploy_lock_phase forward || return 1
+  HOST_MUTATED=1
   install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
   if [ "$COLLAB" = 1 ]; then
     install_private "$NEW_COLLAB" "$COLLAB_CONFIG" || return 1
@@ -459,8 +525,65 @@ forward() {
     # same image but a changed slice: collab-public reads it only at startup
     compose_run "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
   fi
+  deploy_lock_phase verify || return 1
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
   verify "$SHA"
+}
+
+rollback() {
+  trap '' INT TERM HUP
+  DEPLOY_FINISHED=1
+  deploy_lock_phase rollback || true
+
+  echo "deploy of $SHA failed (an install step or compose up failed, the health check did not report $SHA, or a recreated service is not running)" >&2
+  # Host files go back first (slices rendered by the previous deploy, its nginx.conf and
+  # collab-sync units), so a rollback - or the old containers left running - read them.
+  RESTORED=1
+  if ! restore_host_state; then
+    RESTORED=0
+    echo "WARNING: could not restore every host file this deploy changed" >&2
+  fi
+  if [ -z "$PREV_COMMIT" ]; then
+    python3 "$STATE_HELPER" outcome "$ATTEMPT" failed_no_rollback || return 3
+    echo "NOT rolled back: $ROLLBACK_NOTE." >&2
+    if [ -n "${PREV_COMMIT_OLD:-}" ]; then
+      echo "manual rollback (that commit's own deploy.sh reads ~/.config/herdr-engineering/control-plane.env):" >&2
+      echo "  git -C $REPO worktree add /tmp/herdr-rollback $PREV_COMMIT_OLD && /tmp/herdr-rollback/deploy/control-plane/deploy.sh --ref $PREV_COMMIT_OLD --no-fetch" >&2
+    elif [ -n "$PREVIOUS_IMAGE" ]; then
+      echo "manual rollback: redeploy the commit $PREVIOUS_IMAGE was built from with that commit's deploy/control-plane/deploy.sh" >&2
+    fi
+    [ "$RESTORED" = 1 ] || return 3
+    return 1
+  fi
+
+  echo "rolling back to $PREVIOUS_IMAGE with the compose files and code of commit $PREV_SHA" >&2
+  PREV_CONFIG="$ATTEMPT/previous/fleet-config.yaml"
+  FLEET_DIR="$(dirname "$PREV_CONFIG")"
+  ROLLBACK_IMAGES="$ATTEMPT/rollback-images.json"
+  printf -v MANUAL '%q --ref %q --no-fetch --allow-divergent --fleet-config %q' \
+    "$REPO/deploy/control-plane/deploy.sh" "$PREV_COMMIT" "$PREV_CONFIG"
+  PREV_WORK="$ENV_DIR/rollback-worktree"
+  PREV_ENV="$ENV_DIR/rollback-compose.env"
+  # the compose env as the PREVIOUS commit's own code renders it
+  prev_render() {
+    (cd "$PREV_WORK" && PYTHONPATH="$PREV_WORK" python3 -m herdr_engineering.cli \
+      fleet config render-compose --path "$PREV_CONFIG" --out "$PREV_ENV") >/dev/null 2>&1
+  }
+  if [ "$RESTORED" = 1 ] \
+      && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
+      && prev_render \
+      && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+      && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
+      && verify "$PREV_SHA"; then
+    python3 "$STATE_HELPER" outcome "$ATTEMPT" rolled_back || return 3
+    echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy (all of: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}); the deploy of $SHA FAILED" >&2
+    return 1
+  fi
+  python3 "$STATE_HELPER" outcome "$ATTEMPT" rollback_failed || return 3
+  echo "FAILED TO ROLL BACK to $PREVIOUS_IMAGE (commit $PREV_SHA): the control plane may be down or mixed." >&2
+  echo "manual rollback: $MANUAL" >&2
+  echo "pinned rollback images and recovery metadata: $ATTEMPT" >&2
+  return 3
 }
 
 if forward; then
@@ -469,56 +592,11 @@ if forward; then
   python3 "$STATE_HELPER" receipt "$ATTEMPT" "$STATE_DIR/$SHA.json" "$REF" \
     "herdr-engineering:$TAG" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)"
   python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
+  DEPLOY_FINISHED=1
   echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
   exit 0
 fi
 
-echo "deploy of $SHA failed (an install step or compose up failed, the health check did not report $SHA, or a recreated service is not running)" >&2
-# Host files go back first (slices rendered by the previous deploy, its nginx.conf and
-# collab-sync units), so a rollback - or the old containers left running - read them.
-RESTORED=1
-if ! restore_host_state; then
-  RESTORED=0
-  echo "WARNING: could not restore every host file this deploy changed" >&2
-fi
-if [ -z "$PREV_COMMIT" ]; then
-  python3 "$STATE_HELPER" outcome "$ATTEMPT" failed_no_rollback
-  echo "NOT rolled back: $ROLLBACK_NOTE." >&2
-  if [ -n "${PREV_COMMIT_OLD:-}" ]; then
-    echo "manual rollback (that commit's own deploy.sh reads ~/.config/herdr-engineering/control-plane.env):" >&2
-    echo "  git -C $REPO worktree add /tmp/herdr-rollback $PREV_COMMIT_OLD && /tmp/herdr-rollback/deploy/control-plane/deploy.sh --ref $PREV_COMMIT_OLD --no-fetch" >&2
-  elif [ -n "$PREVIOUS_IMAGE" ]; then
-    echo "manual rollback: redeploy the commit $PREVIOUS_IMAGE was built from with that commit's deploy/control-plane/deploy.sh" >&2
-  fi
-  [ "$RESTORED" = 1 ] || exit 3
-  exit 1
-fi
-
-echo "rolling back to $PREVIOUS_IMAGE with the compose files and code of commit $PREV_SHA" >&2
-PREV_CONFIG="$ATTEMPT/previous/fleet-config.yaml"
-FLEET_DIR="$(dirname "$PREV_CONFIG")"
-ROLLBACK_IMAGES="$ATTEMPT/rollback-images.json"
-printf -v MANUAL '%q --ref %q --no-fetch --fleet-config %q' \
-  "$REPO/deploy/control-plane/deploy.sh" "$PREV_COMMIT" "$PREV_CONFIG"
-PREV_WORK="$ENV_DIR/rollback-worktree"
-PREV_ENV="$ENV_DIR/rollback-compose.env"
-# the compose env as the PREVIOUS commit's own code renders it
-prev_render() {
-  (cd "$PREV_WORK" && PYTHONPATH="$PREV_WORK" python3 -m herdr_engineering.cli \
-    fleet config render-compose --path "$PREV_CONFIG" --out "$PREV_ENV") >/dev/null 2>&1
-}
-if [ "$RESTORED" = 1 ] \
-    && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
-    && prev_render \
-    && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
-    && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
-    && verify "$PREV_SHA"; then
-  python3 "$STATE_HELPER" outcome "$ATTEMPT" rolled_back
-  echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy (all of: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}); the deploy of $SHA FAILED" >&2
-  exit 1
-fi
-python3 "$STATE_HELPER" outcome "$ATTEMPT" rollback_failed
-echo "FAILED TO ROLL BACK to $PREVIOUS_IMAGE (commit $PREV_SHA): the control plane may be down or mixed." >&2
-echo "manual rollback: $MANUAL" >&2
-echo "pinned rollback images and recovery metadata: $ATTEMPT" >&2
-exit 3
+rollback_status=0
+rollback || rollback_status=$?
+exit "$rollback_status"

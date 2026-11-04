@@ -14,6 +14,15 @@ import math
 import threading
 import time
 
+from .envelope import (
+    _checkpoint_header,
+    _checkpoint_int,
+    _checkpoint_json,
+    _checkpoint_object,
+    _checkpoint_require,
+    _checkpoint_time,
+)
+
 MAX_SAMPLE_BYTES = 16 * 1024
 MAX_STATE_BYTES = 16 * 1024
 MAX_POINTS = 300
@@ -192,6 +201,62 @@ class HostMetricsStore:
         self._open: dict[str, dict] = {}  # host -> {"start", "points"}
         self._state: dict[str, dict] = {}  # host -> last persisted state
         self._seq = 0
+
+    def export_checkpoint(self) -> dict:
+        """Capture raw samples, closed rollups and unfinished buckets as JSON."""
+        with self._lock:
+            return _checkpoint_json({
+                "version": 1, "domain": "host_metrics", "raw": self._raw,
+                "rollups": self._rollups, "open": self._open,
+                "state": self._state, "sequence": self._seq,
+            })
+
+    def restore_checkpoint(self, state) -> None:
+        state = _checkpoint_header(state, "host_metrics", ("raw", "rollups", "open", "state", "sequence"))
+        _checkpoint_int(state["sequence"])
+        for name in ("raw", "rollups", "open", "state"):
+            _checkpoint_require(type(state[name]) is dict and all(state[name]))
+
+        def points(rows):
+            _checkpoint_require(type(rows) is list)
+            previous = None
+            for point in rows:
+                _checkpoint_require(type(point) is dict and "ts" in point
+                                    and point.keys() <= set(_SCALARS) | {"ts", "n", "gpu_util_pct", "gpu_temp_c"})
+                for value in point.values():
+                    _checkpoint_time(value)
+                _checkpoint_require(previous is None or point["ts"] >= previous)
+                previous = point["ts"]
+                if "n" in point:
+                    _checkpoint_int(point["n"], 1)
+
+        for name in ("raw", "rollups"):
+            for rows in state[name].values():
+                points(rows)
+        for bucket in state["open"].values():
+            _checkpoint_object(bucket, ("start", "points"))
+            _checkpoint_time(bucket["start"])
+            _checkpoint_require(bucket["start"] % BUCKET_S == 0)
+            points(bucket["points"])
+            _checkpoint_require(all(bucket["start"] <= point["ts"] < bucket["start"] + BUCKET_S
+                                    for point in bucket["points"]))
+        for record in state["state"].values():
+            _checkpoint_object(record, ("fields",))
+            _checkpoint_object(record["fields"], STATE_KEYS)
+            for key, value in record["fields"].items():
+                clean_state(key, value)
+        # Prune on a detached store: malformed input never partially replaces state.
+        restored = HostMetricsStore(now=self._now)
+        restored._raw, restored._rollups = state["raw"], state["rollups"]
+        restored._open, restored._state = state["open"], state["state"]
+        now = self._now()
+        for hid in set(restored._raw) | set(restored._rollups) | set(restored._open):
+            restored._prune(hid, now)
+        with self._lock:
+            self._raw, self._rollups = restored._raw, restored._rollups
+            self._open, self._state = restored._open, restored._state
+            self._seq = state["sequence"]
+            self._lock = threading.RLock()
 
     # ---------------------------------------------------------------- write
     def record(self, host_id: str, sample: dict) -> None:

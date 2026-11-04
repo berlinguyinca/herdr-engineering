@@ -73,7 +73,7 @@ export function selectServices(services, {search = '', host = '', status = 'curr
   }).sort((a,b) => String(a.service_name || '').localeCompare(String(b.service_name || '')) || String(a.service_id).localeCompare(String(b.service_id)));
 }
 
-export function groupServices(services, by = 'project') {
+export function groupServices(services, by = 'project', preserveOrder = false) {
   const groups = new Map();
   for (const service of services) {
     const project=identity(service,'project_id'), repository=identity(service,'repository_id');
@@ -84,7 +84,7 @@ export function groupServices(services, by = 'project') {
     if (!groups.has(key)) groups.set(key, {key, label, services:[]});
     groups.get(key).services.push(service);
   }
-  return [...groups.values()].sort((a,b) => a.label.localeCompare(b.label));
+  return preserveOrder ? [...groups.values()] : [...groups.values()].sort((a,b) => a.label.localeCompare(b.label));
 }
 
 function lastSeen(s) { return seenAgo(s.lifecycle?.last_seen_at || s.updated_at); }
@@ -189,9 +189,15 @@ export function mountServiceDetails(page, client, initial) {
     const request=new AbortController();controller=request;
     const timeout=setTimeout(()=>request.abort(),12000);
     try {
-      const data=await client.listServices({signal:request.signal});
+      let found;
+      if(typeof client.getService==='function')found=await client.getService(service.service_id,{signal:request.signal});
+      else if(typeof client.request==='function')found=await client.request(`/api/v1/services/${encodeURIComponent(service.service_id)}`,{signal:request.signal});
+      else {
+        // Older embedded clients may expose only the original collection method.
+        const data=await client.listServices({signal:request.signal});
+        found=data?.services?.find(item=>item?.service_id===service.service_id);
+      }
       if(disposed||request.signal.aborted)return;
-      const found=Array.isArray(data?.services) && data.services.find(item=>item?.service_id===service.service_id);
       if(!found)throw new Error('Service report unavailable');
       service=found;error='';chip.touch(true);
     } catch (failure) {
@@ -207,11 +213,17 @@ export function mountServiceDetails(page, client, initial) {
 }
 
 export function mountServices(root, client, initial, {showAll = false, status, scope = 'herdr'} = {}) {
-  let services = initial;
+  const paged = !!initial?.page;
+  let metadata = paged ? initial : null;
+  let services = paged ? initial.services : initial;
   let disposed = false;
   let pending = false;
+  let controller = null, generation = 0, searchTimer = null;
+  let loadedPages = 1;
+  const groupMetadata = new Map((metadata?.groups || []).map(group=>[group.key,group]));
   const state = {scope:SCOPE_PAGE[scope] ? scope : 'herdr',search:'',host:'',status:['current','unavailable','unknown','all','archived'].includes(status)?status:showAll?'all':'current',archived:status==='archived',group:SCOPE_PAGE[scope] && scope!=='herdr'?'type':'project'};
   const openGroups = new Map();
+  let defaultGroupOpen = null;
   root.innerHTML = `${styles}<div class="hd-live-head"><h1>${SCOPE_PAGE[state.scope].title}</h1><herdr-freshness interval="30000"></herdr-freshness></div>
     <p class="sc-intro">${SCOPE_INTRO[state.scope]}</p>
     <p class="sc-meta">${Object.entries(SCOPE_PAGE).filter(([key])=>key!==state.scope).map(([,page])=>`<a href="${page.path}">${page.label} →</a>`).join(' · ')}</p>
@@ -225,7 +237,7 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       <label class="sc-check"><input type="checkbox" id="sc-archived">Include archived</label>
     </div>
     <div class="sc-toolbar"><span id="sc-result" role="status"></span><div><button class="hd-btn" id="sc-expand">Expand groups</button> <button class="hd-btn" id="sc-collapse">Collapse groups</button></div></div>
-    <p id="sc-error" role="status" class="sc-meta"></p><div id="sc-results"></div>`;
+    <p id="sc-error" role="status" class="sc-meta"></p><div id="sc-results"></div>${paged ? '<button class="hd-btn" id="sc-load-more" type="button">Load more</button>' : ''}`;
   const el = id => root.querySelector(`#sc-${id}`);
   el('status').value = state.status; el('archived').checked = state.archived; el('group').value = state.group;
   const filterKey=node=>node.closest('[data-filter]')?.dataset.filter;
@@ -240,12 +252,28 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       group:focused.closest('details[data-group]')?.dataset.group,
       summary:focused.tagName==='SUMMARY',
       filter:focused.closest('[data-filter]')?.dataset.filter,
+      loadMore:paged && focused===el('load-more'),
     } : null;
     const scroll={x:window.scrollX,y:window.scrollY};
     root.querySelectorAll('.sc-group').forEach(d=>openGroups.set(d.dataset.group,d.open));
     const scoped = services.filter(service=>inScope(service,state.scope));
-    const counts = {current:0,unavailable:0,archived:0,unknown:0};
-    scoped.forEach(s=>counts[serviceState(s)]++);
+    const counts = paged ? {...metadata.counts} : {current:0,unavailable:0,archived:0,unknown:0};
+    const displayGroups = paged ? new Map([...groupMetadata].map(([key,group])=>[key,{...group,states:{...group.states}}])) : null;
+    if(paged) {
+      // Make already-loaded observations expire immediately, even during an outage.
+      for(const service of services) {
+        const before=serviceState(service,Date.parse(metadata.as_of)),after=serviceState(service);
+        if(before!==after) {
+          counts[before]--;counts[after]++;
+          const group=displayGroups.get(groupServices([service],state.group,true)[0]?.key);
+          if(group) {
+            group.states[before]--;
+            if((state.archived || after!=='archived') && (state.status==='all' || after===state.status))group.states[after]++;
+            else {group.total--;counts.matching_total--;if(!group.total)counts.matching_groups--;}
+          }
+        }
+      }
+    } else scoped.forEach(s=>counts[serviceState(s)]++);
     const countButton = (key,label) => `<button type="button" data-filter="${key}" aria-pressed="${state.status===key}"><strong>${counts[key]}</strong>${label}</button>`;
     // The panels are rebuilt with innerHTML (Task 19 moves them onto the patcher), so motion pairs
     // old and new nodes by key: counts by filter, rows by service id (state label change = flash).
@@ -253,25 +281,35 @@ export function mountServices(root, client, initial, {showAll = false, status, s
     const statesBefore=snapshotText(el('results'),'[data-service-id] .sc-health strong',serviceKey);
     el('counts').innerHTML = countButton('current','Reported healthy');
     el('history-counts').innerHTML = [['unavailable','Unavailable'],['unknown','Unconfirmed'],['archived','Archived']].map(([key,label])=>countButton(key,label)).join('');
-    el('history-summary').textContent = `${scoped.length-counts.current} history and unconfirmed reports`;
+    el('history-summary').textContent = `${(paged ? counts.scope_total : scoped.length)-counts.current} history and unconfirmed reports`;
     if(state.status!=='current')el('history').open=true;
     el('policy').textContent = 'Current requires a recent healthy report and, when available, a fresh listener observation. Stopped or unconfirmed services leave this view automatically; history remains available below.';
-    const hosts = [...new Set(scoped.map(hostLabel))].sort();
+    const hosts = paged ? metadata.facets.hosts.map(host=>host.value) : [...new Set(scoped.map(hostLabel))].sort();
     el('host').innerHTML = '<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');
     el('host').value=state.host;
-    const selected=selectServices(services,state);
-    const groups=groupServices(selected,state.group);
-    el('result').textContent=`${selected.length} matching services · ${groups.length} groups`;
+    // Server pages already have their search/host/order applied. Only freshness
+    // is reevaluated locally; never locale-sort or count a partial page as a catalog.
+    const selected=paged ? services.filter(service=>{
+      const current=serviceState(service);
+      return (state.archived || current!=='archived') && (state.status==='all' || current===state.status);
+    }) : selectServices(services,state);
+    const groups=groupServices(selected,state.group,paged);
+    el('result').textContent=paged ? `${counts.matching_total} matching services · ${counts.matching_groups} groups · ${selected.length} loaded`
+      : `${selected.length} matching services · ${groups.length} groups`;
+    if(paged) {el('load-more').hidden=!metadata.page.has_more;el('load-more').setAttribute('aria-disabled',String(pending));}
     el('results').innerHTML=groups.length ? groups.map(g=>{
       const key=g.key;
-      const open=openGroups.has(key)?openGroups.get(key):groups.length<=3&&selected.length<=12;
-      const summary=[...new Set(g.services.map(stateLabel))].map(label=>`${g.services.filter(s=>stateLabel(s)===label).length} ${label.toLowerCase()}`).join(' · ');
-      return `<details class="sc-group" data-group="${esc(key)}" ${open?'open':''}><summary>${esc(g.label)}<span>${g.services.length} services · ${esc(summary)}</span></summary>${g.services.map(serviceRow).join('')}</details>`;
-    }).join(''):`<herdr-empty message="${!scoped.length ? state.scope==='herdr' ? 'No services have a confirmed HerdR launch association yet. Discovered listeners are under Local services.' : state.scope==='system' ? 'No services have been confirmed as system units.' : 'No local services have been reported.' : 'No services match these filters. Choose a status count above, select All statuses, or clear your search to explore the catalog.'}"></herdr-empty>`;
+      const open=openGroups.has(key)?openGroups.get(key):defaultGroupOpen ?? (paged ? counts.matching_groups<=3&&counts.matching_total<=12 : groups.length<=3&&selected.length<=12);
+      const complete=paged && displayGroups.get(g.key);
+      const labels={current:'reported healthy',unavailable:'unavailable',unknown:'unconfirmed',archived:'archived'};
+      const summary=complete ? Object.entries(complete.states).filter(([,count])=>count).map(([key,count])=>`${count} ${labels[key]}`).join(' · ')
+        : [...new Set(g.services.map(stateLabel))].map(label=>`${g.services.filter(s=>stateLabel(s)===label).length} ${label.toLowerCase()}`).join(' · ');
+      return `<details class="sc-group" data-group="${esc(key)}" ${open?'open':''}><summary>${esc(g.label)}<span>${complete ? complete.total : g.services.length} services · ${esc(summary)}</span></summary>${g.services.map(serviceRow).join('')}</details>`;
+    }).join(''):`<herdr-empty message="${!(paged ? counts.scope_total : scoped.length) ? state.scope==='herdr' ? 'No services have a confirmed HerdR launch association yet. Discovered listeners are under Local services.' : state.scope==='system' ? 'No services have been confirmed as system units.' : 'No local services have been reported.' : 'No services match these filters. Choose a status count above, select All statuses, or clear your search to explore the catalog.'}"></herdr-empty>`;
     animateChanges(root,'[data-filter] strong',countsBefore,filterKey);
     animateChanges(el('results'),'[data-service-id] .sc-health strong',statesBefore,serviceKey,{count:false,target:node=>node.closest('[data-service-id]')});
     root.querySelectorAll('.sc-group').forEach(d=>d.addEventListener('toggle',()=>{if(d.isConnected)openGroups.set(d.dataset.group,d.open);}));
-    if(focusKey && !focused.isConnected) {
+    if(focusKey && (!focused.isConnected || (focusKey.loadMore && el('load-more').hidden))) {
       let target;
       if(focusKey.service) {
         const rows=[...root.querySelectorAll('[data-service-id]')];
@@ -280,6 +318,7 @@ export function mountServices(root, client, initial, {showAll = false, status, s
         target=[...(row?.querySelectorAll('a') || [])].find(anchor=>anchor.getAttribute('href')===focusKey.href) || row?.querySelector('.sc-name');
       } else if(focusKey.filter) target=[...root.querySelectorAll('[data-filter]')].find(button=>button.dataset.filter===focusKey.filter);
       else if(focusKey.summary) target=[...root.querySelectorAll('.sc-group')].find(group=>group.dataset.group===focusKey.group)?.querySelector('summary');
+      if(focusKey.loadMore)target=[...root.querySelectorAll('.sc-name')].at(-1);
       target ||= el('search');
       const group=target.closest('details');
       if(group && !group.open && !focusKey.summary)target=group.querySelector('summary');
@@ -292,7 +331,7 @@ export function mountServices(root, client, initial, {showAll = false, status, s
     state.status=key;
     state.archived=key==='archived';
     el('status').value=state.status;el('archived').checked=state.archived;
-    draw();
+    if(paged)refresh({reset:true});else draw();
   }
   root.addEventListener('click',chooseStatus);
   for(const name of ['search','host','status','group','archived']) {
@@ -301,27 +340,78 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       if(name==='archived'&&state.archived){state.status='all';el('status').value='all';}
       if(name==='status'&&state.status==='archived'){state.archived=true;el('archived').checked=true;}
       if(name==='archived'&&!state.archived&&state.status==='archived'){state.status='current';el('status').value='current';}
-      draw();
+      if(paged) {
+        clearTimeout(searchTimer);
+        controller?.abort();generation++;
+        if(name==='search')searchTimer=setTimeout(()=>refresh({reset:true}),150);
+        else refresh({reset:true});
+      } else draw();
     });
   }
   for(const [name,open] of [['expand',true],['collapse',false]]) el(name).addEventListener('click',()=>{
+    defaultGroupOpen=open;openGroups.clear();
     root.querySelectorAll('.sc-group').forEach(d=>{openGroups.set(d.dataset.group,open);d.open=open;});
   });
-  async function refresh() {
-    if(disposed||pending||document.hidden)return;
-    pending=true;
+  async function refresh({reset=false,append=false} = {}) {
+    if(disposed||document.hidden||(!paged&&pending)||(paged&&append&&pending))return;
+    if(!paged) {
+      pending=true;
+      try {
+        const data=await client.listServices();
+        if(disposed)return;
+        services=data.services;el('error').textContent='';chip()?.touch(true);draw();
+      } catch(error) {
+        if(!disposed){el('error').textContent='Could not refresh services. Showing the last received catalog.';chip()?.touch(false,error?.message||'request failed');}
+      } finally {pending=false;}
+      return;
+    }
+    controller?.abort();
+    const request=new AbortController(), version=++generation;
+    controller=request;pending=true;el('load-more').setAttribute('aria-disabled','true');
+    const timeout=setTimeout(()=>request.abort(),12000);
+    const options={scope:SCOPE_OF[state.scope],status:state.status,includeArchived:state.archived,
+      search:state.search,hostId:state.host,groupBy:state.group,limit:metadata.page.limit,signal:request.signal};
+    const target=reset ? 1 : loadedPages;
+    let fetched=[],groups=new Map(),body=null,pages=0;
+    async function readWindow(appendPage) {
+      let cursor=appendPage ? metadata.page.next_cursor : null;
+      do {
+        body=await client.listServiceCatalog({...options,cursor});
+        if(disposed||version!==generation||request.signal.aborted)return false;
+        if(!body?.page||!Array.isArray(body.services))throw new Error('Invalid catalog page');
+        fetched.push(...body.services);
+        for(const group of body.groups)groups.set(group.key,group);
+        pages++;cursor=body.page.next_cursor;
+      } while(!appendPage && cursor && pages<target);
+      return true;
+    }
     try {
-      const data=await client.listServices();
-      if(disposed)return;
-      services=data.services;
-      el('error').textContent='';
-      chip()?.touch(true);
-      // Capture before replacement, including toggles whose queued event has not fired.
-      root.querySelectorAll('.sc-group').forEach(d=>openGroups.set(d.dataset.group,d.open));
-      draw();
-    } catch (error) { if(!disposed){el('error').textContent='Could not refresh services. Showing the last received catalog.';chip()?.touch(false,error?.message||'request failed');} }
-    finally {pending=false;}
+      try {if(!await readWindow(append))return;}
+      catch(error) {
+        if(error?.status!==409||request.signal.aborted||version!==generation)throw error;
+        // An evicted/expired snapshot is restartable, never a legacy-list fallback.
+        fetched=[];groups=new Map();pages=0;
+        if(!await readWindow(false))return;
+        append=false;
+      }
+      if(disposed||version!==generation||request.signal.aborted)return;
+      const unique=new Map((append ? [...services,...fetched] : fetched).map(service=>[service.service_id,service]));
+      services=[...unique.values()];metadata=body;
+      if(!append)groupMetadata.clear();
+      for(const [key,group] of groups)groupMetadata.set(key,group);
+      loadedPages=append ? loadedPages+pages : pages;
+      el('error').textContent='';chip()?.touch(true);draw();
+    } catch(error) {
+      if(!disposed&&version===generation) {
+        el('error').textContent='Could not refresh services. Showing the last received catalog.';
+        chip()?.touch(false,request.signal.aborted?'timed out':error?.message||'request failed');
+      }
+    } finally {
+      clearTimeout(timeout);
+      if(version===generation){pending=false;controller=null;if(!disposed)el('load-more').setAttribute('aria-disabled','false');}
+    }
   }
+  if(paged)el('load-more').addEventListener('click',()=>refresh({append:true}));
   draw();
   // The catalog arrived with the route; the chip starts fresh and follows each 30 s poll.
   const chip=()=>root.querySelector('herdr-freshness');
@@ -331,9 +421,11 @@ export function mountServices(root, client, initial, {showAll = false, status, s
   const clock=setInterval(()=>{
     if(disposed||document.hidden)return;
     const next=services.map(s=>serviceState(s)).join(',');
-    if(next!==classification){classification=next;draw();}
+    if(next!==classification){classification=next;draw();if(paged&&!pending)refresh();}
     // "Last report N ago" keeps counting between refreshes (written only when the text changes).
     for(const age of root.querySelectorAll('[data-service-seen]'))patchText(age,seenAgo(age.dataset.serviceSeen));
   },1000);
-  return {refresh,dispose(){disposed=true;clearInterval(timer);clearInterval(clock);root.removeEventListener('click',chooseStatus);}};
+  function visibility(){if(document.hidden){controller?.abort();}else if(paged){draw();refresh();}}
+  if(paged)document.addEventListener('visibilitychange',visibility);
+  return {refresh,dispose(){disposed=true;generation++;controller?.abort();clearTimeout(searchTimer);clearInterval(timer);clearInterval(clock);document.removeEventListener('visibilitychange',visibility);root.removeEventListener('click',chooseStatus);}};
 }
