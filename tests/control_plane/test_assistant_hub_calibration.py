@@ -203,8 +203,13 @@ def test_stale_report() -> None:
 
 
 def test_effective_state_resets_on_judge_version_change() -> None:
-    g = ActionGrant(state=GrantState.PROPOSED, judge_version="a", policy_version=1)
-    assert g.effective_state(NOW, 1) is GrantState.PROPOSED
-    assert g.effective_state(NOW, 1, "a") is GrantState.PROPOSED
-    assert g.effective_state(NOW, 1, "b") is GrantState.SHADOW
+    # only an ACTIVE grant is judged by version; PROPOSED rows are created with an empty version and stay PROPOSED
+    p = ActionGrant(state=GrantState.PROPOSED, judge_version="a", policy_version=1)
+    assert p.effective_state(NOW, 1, "b") is GrantState.PROPOSED
     assert ActionGrant(state=GrantState.PROPOSED, judge_version="").effective_state(NOW, 1, "b") is GrantState.PROPOSED
+    kw = dict(state=GrantState.ACTIVE, policy_version=1, activated_at=NOW, confirmed_by="o", expires_at=NOW + timedelta(days=1))
+    a = ActionGrant(judge_version="a", **kw)
+    assert a.effective_state(NOW, 1) is GrantState.ACTIVE
+    assert a.effective_state(NOW, 1, "a") is GrantState.ACTIVE
+    assert a.effective_state(NOW, 1, "b") is GrantState.SHADOW
+    assert ActionGrant(judge_version="", **kw).effective_state(NOW, 1, "b") is GrantState.SHADOW

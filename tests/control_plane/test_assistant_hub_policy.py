@@ -7,6 +7,7 @@ import pytest
 from herdr_engineering.control_plane.assistant import AssistantStore, _grants_config
 from herdr_engineering.control_plane.assistant_hub.actiongrants import ActionGrant, GrantState
 from herdr_engineering.control_plane.assistant_hub.canonical import RawAction, derive
+from herdr_engineering.control_plane.assistant_hub.judge_version import judge_version
 from herdr_engineering.control_plane.assistant_hub.policy import (
     ActivationRefused,
     Decision,
@@ -558,7 +559,7 @@ def test_active_grant_missing_activation_facts_is_not_live(missing):
     fields = dict(grant_id="ag_c", tenant_id=T, user_id=U, worker_id=W, resource_scope=key.resource_scope,
                   key_id=key.key_id(), verb=key.verb.value, key_canonical=key.canonical(), state=GrantState.ACTIVE,
                   created_at=NOW, activated_at=NOW, expires_at=NOW + timedelta(days=5), confirmed_by="owner",
-                  policy_version=1)
+                  policy_version=1, judge_version=judge_version(_RT.cfg_getter()))
     assert _decide(store, cfg, _push()).outcome == "pending"                 # baseline, no grant yet
     store.put_action_grant(ActionGrant(**fields))
     assert _decide(store, cfg, _push(), session="s2").outcome == "authorized"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -56,8 +57,9 @@ def closed_port() -> int:
 class WireListener:
     """Raw listener serving one fixed documented-shape body to every request; counts requests and keeps the bytes."""
 
-    def __init__(self, body: bytes) -> None:
+    def __init__(self, body: bytes, delay: float = 0.0) -> None:
         self.body = body
+        self.delay = delay
         self.hits = 0
         self.seen: list[bytes] = []
         self._lock = threading.Lock()
@@ -107,6 +109,8 @@ class WireListener:
                 with self._lock:
                     self.hits += 1
                     self.seen.append(data)
+                if self.delay:
+                    time.sleep(self.delay)
                 head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(self.body)
                 conn.sendall(head + self.body)
             except OSError:

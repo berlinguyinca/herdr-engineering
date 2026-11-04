@@ -262,6 +262,12 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
             return _pending(store, worker, raw, derived, session_id, task_id, now, "judge_unavailable",
                             _JUDGE_UNAVAILABLE_REASON, judge, extra=f" code={result}")
         outcome, source = _apply_verdict(result)
+        if outcome == "authorized":
+            # The consult can be slow: re-check that the grant is still live (revoked/expired/judge changed meanwhile).
+            grant = _live_grant(store, cfg, worker, derived.key, now, current_judge_version(judge))
+            if grant is None:
+                return _pending(store, worker, raw, derived, session_id, task_id, now, "owner",
+                                "No active grant covers this exact action, so the owner decides.", judge)
         if outcome == "pending":
             return _pending(store, worker, raw, derived, session_id, task_id, now, source, _JUDGE_REASON, judge,
                             extra=_verdict_detail(result))
@@ -333,16 +339,20 @@ def _check_judge_gate(store: AssistantStore, now: datetime, tenant_id: str, user
     """Builds the calibration report from the store and returns the judge version, or refuses with the gate's code."""
     if judge is None:
         raise _refuse("judge_disabled", _GATE_MESSAGES["judge_disabled"])
-    jcfg = judge.cfg_getter()
     try:
         risk = ActionKey.from_canonical(grant.key_canonical).risk_class.value
     except Exception:
         raise _refuse("insufficient_labels", "the grant has no readable action key") from None
-    report = build_report(store.list_judge_records(tenant_id, user_id), jcfg, now, tenant_id, user_id)
-    ok, code = gate_satisfied(report, jcfg, risk)
+    try:
+        jcfg = judge.cfg_getter()
+        report = build_report(store.list_judge_records(tenant_id, user_id), jcfg, now, tenant_id, user_id)
+        ok, code = gate_satisfied(report, jcfg, risk)
+        version = _judge_version(jcfg)
+    except Exception:
+        raise _refuse("judge_error", "the judge gate could not be evaluated") from None
     if not ok:
         raise _refuse(code, _GATE_MESSAGES.get(code, "judge gate not satisfied"))
-    return _judge_version(jcfg)
+    return version
 
 
 def _activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str, grant_id: str,

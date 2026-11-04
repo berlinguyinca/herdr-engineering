@@ -14,6 +14,7 @@ from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.assistant import AssistantService, assistant_config
 from herdr_engineering.control_plane.assistant_hub.actiongrants import ActionGrant, GrantState
 from herdr_engineering.control_plane.assistant_hub.canonical import RawAction, derive
+from herdr_engineering.control_plane.assistant_hub.judge_version import judge_version
 from herdr_engineering.control_plane.assistant_hub.mcp import UNTRUSTED, Hub
 from herdr_engineering.control_plane.assistant_hub.server import HubServer
 from herdr_engineering.control_plane.assistant_hub.workers import WorkerRegistry
@@ -261,7 +262,8 @@ def test_active_grant_is_not_honoured_during_the_global_shadow_period(acknowledg
             grant_id="ag_shadow", tenant_id=TENANT, user_id=OWNER, worker_id=wk.wid, resource_scope=key.resource_scope,
             key_id=key.key_id(), verb=key.verb.value, key_canonical=key.canonical(), state=GrantState.ACTIVE,
             created_at=now, proposed_at=now, activated_at=now, expires_at=now + timedelta(days=30),
-            policy_version=w.svc.config["grants"]["policy_version"], confirmed_by="owner"))
+            policy_version=w.svc.config["grants"]["policy_version"], confirmed_by="owner",
+            judge_version=judge_version(w.svc._test_judge.cfg_getter())))
         res, _ = ask_action(w, wk, PUSH)
         assert res["outcome"] == "pending" and res["source"] == "shadow" and res["grant_id"] is None
         assert w.svc.store.verify_audit(TENANT) is True

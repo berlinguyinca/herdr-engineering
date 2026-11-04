@@ -557,3 +557,86 @@ def test_cli_wiring_shares_one_judge_runtime_between_hub_and_owner_api(tmp_path:
     off = SimpleNamespace(assistant=AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}})),
                           assistant_workers="x", assistant_judge="unset")
     assert _wire_assistant_hub(off) is None and off.assistant_judge is None
+
+
+def test_active_grant_without_judge_version_never_authorizes_even_with_safe_judge(
+        key_file: Path, listener_safe: WireListener) -> None:
+    store, cfg = AssistantStore(), _cfg()
+    rt = _runtime(store, listener_safe, key_file)
+    g = _proposed(store, cfg, _push())
+    force_active_grant_for_tests(store, cfg, g.grant_id, NOW, None)           # stored judge_version == ""
+    assert store.get_action_grant(g.grant_id, tenant_id=T, user_id=U).judge_version == ""   # type: ignore[union-attr]
+    d = decide(store, cfg, _worker(), _push(), "s1", "t1", NOW, judge=rt)
+    assert d.outcome == "pending" and d.grant_id is None
+    assert not any(e["action"] == "assistant.action.authorized" for e in store._audit)
+    _stop(rt)
+
+
+def test_revoke_during_the_judge_call_is_not_authorized(key_file: Path) -> None:
+    li = WireListener(success_body(SAFE), delay=1.0)
+    try:
+        store, cfg = AssistantStore(), _cfg()
+        rt = _runtime(store, li, key_file)
+        g = _active(store, cfg, rt)
+        out: list[Any] = []
+        t = threading.Thread(target=lambda: out.append(decide(store, cfg, _worker(), _push(), "s1", "t1", NOW, judge=rt)))
+        t.start()
+        assert _wait(lambda: li.hits >= 1)                  # the consult is in flight
+        revoke_action_grant(store, NOW, T, U, g.grant_id, "owner")
+        t.join(10)
+        assert out and out[0].outcome == "pending" and out[0].grant_id is None
+        assert not any(e["action"] == "assistant.action.authorized" for e in store._audit)
+        _stop(rt)
+    finally:
+        li.close()
+
+
+def test_owner_decision_before_the_record_exists_is_copied_by_the_recorder(key_file: Path, listener_safe: WireListener) -> None:
+    store, cfg = AssistantStore(), _cfg()
+    rt = _runtime(store, listener_safe, key_file)
+    d = decide(store, cfg, _worker(), _push(), "s1", "t1", NOW)                # no runtime: nothing submitted
+    assert d.request_id is not None
+    record_owner_decision(store, cfg, NOW, T, U, d.request_id, False, "owner")  # owner is faster than the recorder
+    assert store.list_judge_records(T, U) == []
+    key = derive(_push()).key
+    assert key is not None
+    from herdr_engineering.control_plane.assistant_hub.shadow import ShadowJob, label_decision
+    rt.recorder._process(ShadowJob(T, U, W, "s1", "t1", d.request_id, key))
+    rec = store.list_judge_records(T, U)[0]
+    assert rec.owner_decision == "denied" and rec.status == "ok"
+    assert label_decision(store, lambda: {}, T, U, d.request_id, True, NOW) is False     # first label still wins
+    assert store.list_judge_records(T, U)[0].owner_decision == "denied"
+    _stop(rt)
+
+
+@pytest.mark.parametrize("break_it", ["cfg_getter_raises", "report_raises"])
+def test_gate_errors_become_judge_error(key_file: Path, break_it: str) -> None:
+    store, cfg = AssistantStore(), _cfg()
+    good = _runtime(store, None, key_file)
+    g = _proposed(store, cfg, _push())
+
+    def boom() -> dict[str, Any]:
+        raise RuntimeError("config exploded")
+    getter = boom if break_it == "cfg_getter_raises" else (lambda: {})
+    bad = JudgeRuntime(cfg_getter=getter, client_factory=good.client_factory, recorder=good.recorder, now=good.now)
+    with pytest.raises(ActivationRefused) as err:
+        _activate(store, cfg, g, bad)
+    assert err.value.code == "judge_error" and "exploded" not in str(err.value)
+    assert store.get_action_grant(g.grant_id, tenant_id=T, user_id=U).state is GrantState.PROPOSED   # type: ignore[union-attr]
+    _stop(good)
+
+
+def test_route_judge_error_is_409(acknowledged_sink: Any, key_file: Path) -> None:
+    w = _Route(acknowledged_sink, key_file, True)
+    try:
+        g = w.propose()
+        assert w.rt is not None
+
+        def boom() -> dict[str, Any]:
+            raise RuntimeError("x")
+        w.svr.assistant_judge = JudgeRuntime(cfg_getter=boom, client_factory=w.rt.client_factory,
+                                             recorder=w.rt.recorder, now=w.rt.now)
+        status, body = _call(w.base, "POST", f"/api/v1/assistant-grants/{g.grant_id}/activate", {"confirm": True})
+        assert (status, body["code"]) == (409, "judge_error")
+    finally:
+        w.close()

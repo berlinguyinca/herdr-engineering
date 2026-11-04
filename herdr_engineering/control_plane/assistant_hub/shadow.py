@@ -160,7 +160,17 @@ class ShadowRecorder:
         record = self._judge(job, cfg, base)
         if self._stopped:
             return                      # stop() was called while the judge call was in flight
-        self._store.add_judge_record(record)
+        if self._store.add_judge_record(record):
+            self._copy_early_decision(job, record)
+
+    def _copy_early_decision(self, job: ShadowJob, record: JudgeRecord) -> None:
+        """The owner may decide before this record exists; then the label would be lost, so copy it now.
+
+        ``label_decision`` keeps the first label, so a decision that raced in between is never overwritten."""
+        row = self._store.get_action_request(job.request_id, tenant_id=job.tenant_id, user_id=job.user_id)
+        if row is not None and row.status in ("approved", "denied"):
+            label_decision(self._store, self._cfg_getter, job.tenant_id, job.user_id, job.request_id,
+                           row.status == "approved", row.decided_at or self._now())
 
     def _judge(self, job: ShadowJob, cfg: Mapping[str, object], base: JudgeRecord) -> JudgeRecord:
         try:
