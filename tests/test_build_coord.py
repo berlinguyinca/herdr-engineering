@@ -161,44 +161,47 @@ def test_bypass_on_timeout_runs_ungated(tmp_path):
             pass
 
 
-def test_record_mode_daemon_child_does_not_inherit_lock_fds(tmp_path):
-    """A daemonizing grandchild (sccache-server style) outliving the build must
-    not keep the slot flock or the maintenance LOCK_SH alive."""
+def test_sccache_server_daemon_does_not_pin_slot_or_maintenance_lock(tmp_path):
+    """The per-policy sccache server outlives the build; started by the wrapper
+    without the lock fds it must not keep the slot flock or LOCK_SH alive."""
     import fcntl
 
     state = tmp_path / "state"
     pidfile = tmp_path / "daemon.pid"
-    daemon = (
+    stub = tmp_path / "sccache"          # a real daemonizing executable, not a mock
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
         "import os,sys,time\n"
-        "if os.fork()==0:\n"
+        "if sys.argv[1:] == ['--start-server'] and os.fork() == 0:\n"
         "    os.setsid()\n"
         f"    open({str(pidfile)!r},'w').write(str(os.getpid()))\n"
-        "    time.sleep(8); os._exit(0)\n"
-    )
+        "    time.sleep(8); os._exit(0)\n")
+    stub.chmod(0o755)
     script = (
-        "import sys; sys.path.insert(0, " + repr(_REPO_ROOT) + "); "
-        "from herdr_engineering.build_coord import run_gated; "
-        f"sys.exit(run_gated([sys.executable, '-c', {daemon!r}], slots=1, max_load=0, "
-        f"record=True, state_dir={str(state)!r}))"
+        "import fcntl, os, sys; sys.path.insert(0, " + repr(_REPO_ROOT) + "); "
+        "from herdr_engineering.build_coord import _run_gated; "
+        f"os.makedirs({str(state)!r}, exist_ok=True); "
+        f"m = os.open({str(state / 'build-maintenance.lock')!r}, os.O_RDWR|os.O_CREAT); "
+        "fcntl.flock(m, fcntl.LOCK_SH); os.set_inheritable(m, True); "
+        "sys.exit(_run_gated(['true'], slots=1, max_load=0, record=True, "
+        f"state_dir={str(state)!r}, child_env=dict(os.environ, RUSTC_WRAPPER={str(stub)!r})))"
     )
     try:
-        out = subprocess.run([sys.executable, "-c", script], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, timeout=30)
-        assert out.returncode == 0
+        r = subprocess.run([sys.executable, "-c", script], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=30)
+        assert r.returncode == 0
         deadline = time.monotonic() + 5
         while not pidfile.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
-        pid = int(pidfile.read_text())
-        os.kill(pid, 0)  # the daemon really outlives the build
+        os.kill(int(pidfile.read_text()), 0)  # the server really outlives the build
         gate = BuildGate(state_dir=state, slots=1)
         assert gate.status()[0]["held"] is False
         fd = os.open(state / "build-maintenance.lock", os.O_RDWR)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # cleanup can take it
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # cleanup/evict can take it
         finally:
             os.close(fd)
-        got = gate.acquire(["second"], wait_seconds=1)  # a second build gets the slot
-        os.close(got[0])
+        os.close(gate.acquire(["second"], wait_seconds=1)[0])  # second build gets the slot
     finally:
         try:
             os.kill(int(pidfile.read_text()), 9)

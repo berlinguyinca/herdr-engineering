@@ -223,6 +223,26 @@ class BuildGate:
         return out
 
 
+def _prestart_sccache_server(env: dict[str, str] | None) -> None:
+    """Start the per-policy sccache server WITHOUT the gate's lock fds.
+
+    The first cargo/rustc compile would otherwise spawn the long-lived server as
+    a grandchild that inherits the slot flock and the maintenance LOCK_SH, pinning
+    both for as long as it lives (review H2). Started here with ``close_fds=True``
+    (stdio detached) it holds neither. Best effort: a failure just means the
+    compile starts the server itself.
+    """
+    if not env or os.path.basename(env.get("RUSTC_WRAPPER", "")) != "sccache":
+        return
+    try:
+        subprocess.run([env["RUSTC_WRAPPER"], "--start-server"], env=env,
+                       close_fds=True, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
             slot_fd: int | None = None, env: dict[str, str] | None = None,
             cache: dict | None = None,
@@ -232,14 +252,7 @@ def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
         os.execvp(cmd[0], cmd)
         raise AssertionError("unreachable")  # pragma: no cover
     from .build_metrics import run_measured
-    # The wrapper alone holds the locks; make that explicit so no child tree
-    # (even via a future spawn path) can inherit them.
-    for lock_fd in (slot_fd,):
-        if lock_fd is not None:
-            try:
-                os.set_inheritable(lock_fd, False)
-            except OSError:
-                pass
+    _prestart_sccache_server(env)
     try:
         return run_measured(cmd, state_dir=state_dir, slot=slot, env=env,
                             cache=cache, registry=True, trace=trace).exit_code
@@ -377,12 +390,13 @@ def _run_ungated(cmd: list[str], reason: str, exc: OSError) -> int:
     """
     print(f"build-coordinate: gate unavailable ({reason}: {exc}); running ungated",
           file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
     try:
-        code = subprocess.call(cmd)
+        os.execvp(cmd[0], cmd)  # same signal/exit semantics as the ungated command
     except OSError as e:
         print(f"build-coordinate: could not exec {cmd[0]}: {e}", file=sys.stderr)
         return 127
-    return 128 - code if code < 0 else code
 
 
 def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
@@ -415,8 +429,6 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
         except BaseException:
             os.close(maintenance_fd)
             raise
-    if maintenance_fd is not None and record:
-        os.set_inheritable(maintenance_fd, False)  # wrapper-held only (no exec)
     try:
         return _run_gated(cmd, slots=slots, max_load=max_load,
                           wait_seconds=wait_seconds, json_out=json_out,

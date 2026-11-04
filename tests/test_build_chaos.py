@@ -882,3 +882,28 @@ NEEDS = {
 @pytest.mark.parametrize("scenario", sorted(NEEDS))
 def test_requires_infrastructure_not_available_here(scenario):
     pytest.skip(f"{scenario}: {NEEDS[scenario]}")
+
+
+@pytest.mark.skipif(IS_ROOT, reason="permission bits are not enforced for root")
+def test_ungated_fallback_execs_so_sigint_reaches_the_command_itself(tmp_path):
+    """The fallback replaces the wrapper (exec): a SIGINT is handled by the
+    command's own trap, exactly as without the gate (no SIGKILL by the wrapper)."""
+    import signal
+    state = tmp_path / "state"
+    gates = state / "build-gates"
+    gates.mkdir(parents=True)
+    gates.chmod(0o500)
+    marker, ready = tmp_path / "trapped", tmp_path / "ready"
+    sh = f"trap 'echo t > {marker}; exit 9' INT; touch {ready}; while :; do sleep 0.1; done"
+    try:
+        p = subprocess.Popen(_cli_argv("--max-load", "0", "--", "sh", "-c", sh),
+                             env=_env(state, tmp_path), cwd=tmp_path,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        end = time.monotonic() + 15
+        while not ready.exists() and time.monotonic() < end:
+            time.sleep(0.05)
+        p.send_signal(signal.SIGINT)
+        assert p.wait(timeout=15) == 9
+        assert marker.exists()
+    finally:
+        gates.chmod(0o700)

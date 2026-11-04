@@ -376,9 +376,8 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
                  trace: dict[str, str] | None = None) -> Measured:
     """Fork+exec ``cmd``, wait with wait4, return its exit code and metrics.
 
-    The caller keeps any lock fds open for the duration of this call; the child
-    does NOT inherit them (close_fds), so a daemon it leaves behind (e.g. an
-    sccache server) cannot pin the slot or maintenance lock. SIGINT/SIGTERM received by
+    The caller keeps any lock fds open for the duration of this call (inheritable
+    fds are inherited by the child like with exec). SIGINT/SIGTERM received by
     this process are forwarded to the child only. Raises ``OSError`` if the
     command cannot be started (callers map that to exit 127).
 
@@ -414,7 +413,7 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
 
     t0 = time.monotonic()
     try:
-        proc = subprocess.Popen(cmd, cwd=cwd, close_fds=True, env=env)  # may raise OSError
+        proc = subprocess.Popen(cmd, cwd=cwd, close_fds=False, env=env)  # may raise OSError
     except BaseException:
         if run is not None:
             run.on_exit(None, spawn_failed=True)
