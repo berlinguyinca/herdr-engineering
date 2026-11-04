@@ -155,6 +155,7 @@ class CollabMirror:
         self._binary: set[str] = set()                 # content-addressed, so "not UTF-8" never expires
         self._bad: dict[str, float] = {}               # sha -> retry-after (epoch) for failed fetches
         self._cache_lock = threading.Lock()            # _bad/_binary are touched from worker threads
+        self._new_heads: set[str] = set()              # artifacts whose head.json appeared (annotations follow them)
         self._grants_lock = asyncio.Lock()             # one publish at a time: a stale snapshot never lands last
         self._grants_body: dict | None = None
         self._grants_written_at: float | None = None
@@ -365,7 +366,11 @@ class CollabMirror:
     def _publish_head(self, artifact_id: str, doc: dict) -> None:
         """Swap ``head.json``, then collect every blob it does not mark mirrored (stale ``.tmp-*`` included)."""
         parts = [ARTIFACTS_DIR, artifact_id, BLOBS_DIR]
+        first = not file_exists_beneath(self.root, [ARTIFACTS_DIR, artifact_id], HEAD_NAME)
         atomic_write_json(self.root / ARTIFACTS_DIR / artifact_id, HEAD_NAME, doc)
+        if first:
+            with self._cache_lock:
+                self._new_heads.add(artifact_id)
         keep = {f["sha256"] for v in doc["versions"] for f in v["files"] if f["mirrored"]}
         try:
             entries = list_beneath(self.root, parts, max_entries=len(keep) + MIRROR_MAX_ENTRIES)
@@ -475,6 +480,13 @@ class CollabMirror:
         artifact_id = artifact["artifact_id"]
         return (artifact["current_version_id"], artifact["lifecycle"], artifact["artifact_type"],
                 tuple(sorted(v["version_id"] for v in self._live(artifact_id, versions, gate))))
+
+    def take_new_heads(self) -> set[str]:
+        """Artifact ids whose ``head.json`` was written for the first time (or again after ``remove``) since the last
+        call. An agent granted after people annotated needs ``annotations.json`` next to that new head."""
+        with self._cache_lock:
+            taken, self._new_heads = self._new_heads, set()
+        return taken
 
     async def publish_annotations(self, artifact_id: str, rows: list[dict]) -> bool:
         """Write ``artifacts/<id>/annotations.json`` (open annotations, newest first, at most 1 MiB; ``truncated`` when cut).

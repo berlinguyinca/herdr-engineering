@@ -282,3 +282,38 @@ def test_a_real_filesystem_error_is_raised_so_the_window_holds(registry_pg, tmp_
         await hk.tick(conn)
         assert hk._since is not None
     run(registry_pg, body)
+
+
+def test_late_granted_agent_gets_annotations_made_before_the_artifact_was_mirrored(registry_pg, tmp_path):
+    """Members annotate, the owner grants an agent afterwards: head.json appears later and annotations.json must follow."""
+    async def body(store, conn):
+        aid, _, sid = await seed(conn)
+        mirror = real_mirror(tmp_path)                         # no head.json yet: nothing is mirrored
+        now = [1000.0]
+        hk = housekeeper(tmp_path, mirror=mirror, interval=15.0, clock=lambda: now[0])
+        append(tmp_path / "events" / "annotations.jsonl", create(sid, 3))
+        out = await hk.tick(conn)
+        assert out["published"] == 0 and hk._dirty_artifacts == {aid}          # pending, not "published"
+        assert mirrored(mirror, aid) is None
+        now[0] += 15.0                                                         # next tick, inside the backoff
+        mirror._publish_head(aid, {"versions": []})                            # the sync writes head.json (grant)
+        await hk.tick(conn)                                                    # no new annotation row, still published
+        assert [r["body"] for r in mirrored(mirror, aid)["annotations"]] == ["note"]
+        assert hk._dirty_artifacts == set()
+    run(registry_pg, body)
+
+
+def test_a_regranted_artifact_with_no_new_annotation_is_republished(registry_pg, tmp_path):
+    async def body(store, conn):
+        aid, _, sid = await seed(conn)
+        mirror = real_mirror(tmp_path, aid)
+        hk = housekeeper(tmp_path, mirror=mirror)
+        append(tmp_path / "events" / "annotations.jsonl", create(sid, 4))
+        await hk.tick(conn)
+        assert mirrored(mirror, aid) is not None
+        await mirror.remove(aid)                                                # revoked: directory gone
+        assert mirrored(mirror, aid) is None
+        mirror._publish_head(aid, {"versions": []})                             # granted again
+        await hk.tick(conn)
+        assert [r["body"] for r in mirrored(mirror, aid)["annotations"]] == ["note"]
+    run(registry_pg, body)

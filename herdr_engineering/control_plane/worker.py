@@ -223,13 +223,21 @@ class AnnotationHousekeeper:
         projection window."""
         if self.mirror is None:
             return 0
-        self._dirty_artifacts |= touched
+        fresh = self.mirror.take_new_heads()            # a new head.json is the moment to publish: no waiting
+        for artifact_id in fresh:
+            self._backoff.pop(artifact_id, None)
+        self._dirty_artifacts |= touched | fresh
         published = 0
         for artifact_id in sorted(self._dirty_artifacts):
             if now < self._backoff.get(artifact_id, (0.0, 0))[0]:   # (the overlap margin re-touches: no reset)
                 continue
             try:
-                await self.mirror.publish_annotations(artifact_id, await store.open_for_agents(artifact_id))
+                written = await self.mirror.publish_annotations(artifact_id, await store.open_for_agents(artifact_id))
+                if not written:                       # not mirrored (yet): pending, retried with the same backoff
+                    failures = self._backoff.get(artifact_id, (0.0, 0))[1] + 1
+                    self._backoff[artifact_id] = (now + min(self.interval * 2 ** failures, ANNOTATION_MAX_BACKOFF),
+                                                  failures)
+                    continue
             except Exception as exc:  # noqa: BLE001
                 failures = self._backoff.get(artifact_id, (0.0, 0))[1] + 1
                 delay = min(self.interval * 2 ** failures, ANNOTATION_MAX_BACKOFF)
