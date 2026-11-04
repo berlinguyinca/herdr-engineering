@@ -166,7 +166,7 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
     } catch (err) {
       if (mine !== token || disposed) return;
       Object.assign(st, { results: [], has_more: false }, classify(err));
-      freshness?.(false, err?.message);
+      reportFailure(err);
     }
     paint();
   }
@@ -179,13 +179,15 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
     paintDrawer(); $('#mem-drawer-title')?.focus();
   }
   function close() { drawer = null; paintDrawer(); lastFocus?.focus?.(); }
+  // Only a real failure turns the chip red: forbidden, disabled and unavailable are answers the control plane gave, shown calmly on the page.
+  function reportFailure(err) { classify(err).phase === 'error' ? freshness?.(false, err?.message) : freshness?.(true); }
   async function loadStatus() {
     // The service status is the one request the page makes before anyone searches, so it is what the chip reports until then.
     let failure = null;
     try { status = { phase: 'ok', data: await client.getMemoryServiceStatus() }; } catch (err) { status = classify(err); failure = err; }
     if (disposed) return;
     paintStatus();
-    if (st.phase === 'idle') freshness?.(!failure, failure?.message);
+    if (st.phase === 'idle') failure ? reportFailure(failure) : freshness?.(true);
   }
 
   root.addEventListener('submit', (e) => {
