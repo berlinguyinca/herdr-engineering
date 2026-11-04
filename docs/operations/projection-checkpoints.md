@@ -41,6 +41,16 @@ frontier and domain validation still apply. Any Python or compatibility-policy
 change disables those aliases until explicitly reviewed. Do not regenerate this
 binding for reducer changes: let preparation replay retained history instead.
 
+When complete projection checkpoints are active, set
+`control_plane.fabric_compaction.rebuild_checkpoint: false` in the central fleet
+configuration. This stops rebuilding the redundant legacy row-selection cache;
+ordinary journal archival and the complete projection refresh continue. Keep
+the last valid legacy cache for fallback. Rebuilding/pruning the large legacy
+coverage tables can saturate database storage and queue synchronous ingestion
+writes; the rollout investigation observed approximately 19 GB across those
+legacy tables. Apply the setting under deployment ownership and restart only
+the worker on its existing image after making a validated private config backup.
+
 Ordinary append-only inspector updates advance the private owner capsule only
 when their replay order follows its captured boundary. Service and session
 updates fold into the saved event projection only when every new server-ingest
