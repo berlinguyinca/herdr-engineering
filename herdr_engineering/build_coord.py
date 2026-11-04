@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -311,6 +312,8 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
         else:
             print(f"build-coordinate: {exc}", file=sys.stderr)
         return 1
+    except OSError as exc:  # slot file unusable (TimeoutError handled above)
+        return _run_ungated(cmd, "state_dir_unwritable", exc)
 
     try:
         # Default: replaces this process; flock held by fd. With ``record`` the
@@ -358,6 +361,22 @@ def _cache_env(cfg: BuildCacheConfig, cmd: list[str], state_dir: Path | None):
     return ({**env, **p.env_overrides} if p.applied else None), summary
 
 
+def _run_ungated(cmd: list[str], reason: str, exc: OSError) -> int:
+    """Gate state is unusable (read-only/full state dir): run the plain command.
+
+    A coordination aid must never be the reason a build fails. The command runs
+    exactly as it would without the gate (no cache env, no recording).
+    """
+    print(f"build-coordinate: gate unavailable ({reason}: {exc}); running ungated",
+          file=sys.stderr)
+    try:
+        code = subprocess.call(cmd)
+    except OSError as e:
+        print(f"build-coordinate: could not exec {cmd[0]}: {e}", file=sys.stderr)
+        return 127
+    return 128 - code if code < 0 else code
+
+
 def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
               wait_seconds: float = 0.0, json_out: bool = False,
               state_dir: Path | None = None,
@@ -376,9 +395,12 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
     maintenance_fd = None
     if cmd and _HAS_FCNTL:
         directory = Path(state_dir) if state_dir is not None else _default_state_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        maintenance_fd = os.open(directory / "build-maintenance.lock",
-                                 os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            maintenance_fd = os.open(directory / "build-maintenance.lock",
+                                     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except OSError as exc:
+            return _run_ungated(cmd, "state_dir_unwritable", exc)
         try:
             fcntl.flock(maintenance_fd, fcntl.LOCK_SH)
             os.set_inheritable(maintenance_fd, True)
