@@ -5471,7 +5471,9 @@ def _make_handler(server, public=False, operator=False):
             filename = _q(self.path, "filename") or "upload"
             mime = _q(self.path, "mime") or \
                 self.headers.get("Content-Type", "application/octet-stream")
-            if any(ord(c) < 32 or ord(c) == 127 for c in mime):
+            from ..media_type import canonical_upload_media_type
+            mime = canonical_upload_media_type(mime)
+            if mime is None:
                 return self._json({"error": "invalid mime"}, 400)
             session_id = _q(self.path, "session_id")
             mission_id = _q(self.path, "mission_id")

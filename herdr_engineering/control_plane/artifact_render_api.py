@@ -20,6 +20,7 @@ import posixpath
 import re
 from urllib.parse import quote, unquote, urlsplit
 
+from ..media_type import safe_media_type
 from .artifact_report_api import PinnedOutputError, _access, pinned_output
 from .share_bundle import ShareBundleError, normalise_name
 from .share_render import (
@@ -158,19 +159,19 @@ def _send_render(handler, kind: str, data: bytes, resolve: Resolver, cache_key) 
 
 
 def safe_mime(mime: object) -> str:
-    """The stored media type when it is safe to put in a header line, else ``application/octet-stream``.
+    """The bare ``type/subtype`` of a stored media type, else ``application/octet-stream``.
 
-    ``send_header`` does not strip CR/LF, so a media type that arrived through a query string could split the
-    response and drop the sandbox CSP. Any control character (or a non-string) is refused."""
-    if isinstance(mime, str) and mime and len(mime) <= 255 and not any(ord(c) < 32 or ord(c) == 127 for c in mime):
-        return mime
-    return "application/octet-stream"
+    Stored parameters are never forwarded: a comma, quote or second type in them makes a browser read another
+    type than the one the CSP was chosen for (see ``herdr_engineering.media_type``)."""
+    return safe_media_type(mime)
 
 
 def _live_headers(mime: str) -> list[tuple[str, str]]:
-    base = mime.split(";")[0].strip().lower()
-    csp = PDF_LIVE_CSP if base == "application/pdf" else LIVE_CSP
-    content_type = mime if ";" in mime or not base.startswith("text/") else mime + "; charset=utf-8"
+    base = safe_media_type(mime)
+    if base == "application/pdf":
+        content_type, csp = "application/pdf", PDF_LIVE_CSP
+    else:
+        content_type, csp = (base + "; charset=utf-8" if base.startswith("text/") else base), LIVE_CSP
     return [("Content-Type", content_type), ("Content-Security-Policy", csp), ("X-Frame-Options", "DENY"),
             ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"), ("Cache-Control", "no-store")]
 

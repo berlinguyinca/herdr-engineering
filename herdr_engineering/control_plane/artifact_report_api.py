@@ -7,6 +7,8 @@ import tempfile
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, quote, urlsplit
 
+from ..media_type import safe_media_type
+
 MAX_ASSET_BYTES = 1024 * 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
 
@@ -113,7 +115,7 @@ def _download(handler, server, asset):
         spool.seek(0)
         handler._response_status = 200
         handler.send_response(200)
-        handler.send_header("Content-Type", asset["media_type"])
+        handler.send_header("Content-Type", safe_media_type(asset["media_type"]))
         handler.send_header("Content-Length", str(size))
         handler.send_header("Content-Disposition", "attachment; filename*=UTF-8''" +
                             quote(PurePosixPath(asset["name"]).name, safe=""))

@@ -339,3 +339,87 @@ def test_mime_upload_query_with_control_characters_is_refused(world):
     with pytest.raises(urllib.error.HTTPError) as caught:
         urllib.request.urlopen(req)
     assert caught.value.code == 400
+
+
+# --- X1: a stored media type's parameters are never sent -------------------------------------------------------
+HOSTILE_MIMES = [
+    "application/pdf;a=1,text/html", "application/pdf, text/html", "application/pdf;,text/html",
+    'application/pdf;a="x,text/html', "application/pdf;a=\\,text/html", "application/pdf,text/html",
+    "application/pdf;a=1", "APPLICATION/PDF;a=1,TEXT/HTML", "text/html\r\nX-Evil: 1", "text/html\nx", "", "   ",
+    "text/html;charset=utf-8,application/pdf", "application/pdf /html", "pdf", "application/", "/pdf",
+]
+
+
+@pytest.mark.parametrize("mime", HOSTILE_MIMES)
+def test_live_never_sends_stored_parameters(world, mime):
+    """Every variant at send time: the type is a bare token pair; only a literal application/pdf escapes the sandbox."""
+    from herdr_engineering.control_plane.artifact_render_api import _live_headers
+    headers = dict(_live_headers(mime))
+    content_type = headers["Content-Type"]
+    assert not any(c in content_type for c in ',"\\\r\n') and content_type.count("/") == 1
+    if content_type == "application/pdf":
+        assert headers["Content-Security-Policy"] == "frame-ancestors 'none'"
+        assert mime.split(";")[0].strip().lower() == "application/pdf" and "," not in mime.split(";")[0]
+    else:
+        assert headers["Content-Security-Policy"].startswith("sandbox allow-scripts allow-downloads")
+
+
+@pytest.mark.parametrize("mime", HOSTILE_MIMES)
+def test_live_and_download_over_http_never_send_stored_parameters(world, mime):
+    base, store = world
+    store.add("x1", "evil.pdf", mime, b"<script>1</script>")
+    store.acl.grant("x1", f"api-key:{OWNER}:operator", {"read"})
+    for path in ("/api/v1/artifacts/x1/live", "/api/v1/artifacts/x1/download"):
+        status, _, headers = get(base, path)
+        assert status == 200, path
+        content_type = headers["Content-Type"]
+        assert content_type.split(";")[0] == content_type.split(";")[0].strip().lower()
+        assert not any(c in content_type for c in ',"\\') and content_type.count("/") == 1, (path, content_type)
+        assert headers.get("X-Evil") is None
+    live = get(base, "/api/v1/artifacts/x1/live")[2]
+    if live["Content-Type"] != "application/pdf":
+        assert live["Content-Security-Policy"].startswith("sandbox")
+
+
+def test_a_bare_uppercase_or_spaced_pdf_type_is_still_a_pdf(world):
+    from herdr_engineering.control_plane.artifact_render_api import _live_headers
+    for mime in ("application/pdf", "Application/PDF", " application/pdf ; a=1"):
+        assert dict(_live_headers(mime))["Content-Type"] == "application/pdf"
+    assert dict(_live_headers("text/plain"))["Content-Type"] == "text/plain; charset=utf-8"
+    assert dict(_live_headers("text/plain; charset=latin-1"))["Content-Type"] == "text/plain; charset=utf-8"
+
+
+@pytest.mark.parametrize("mime", ["application/pdf;a=1,text/html", "application/pdf, text/html", 'text/html;a="b',
+                                  "text/html;a=\\b", "text/html\r\nX: 1", "nonsense", "", "a/b/c", "text /html"])
+def test_upload_query_refuses_hostile_media_types(world, mime):
+    from urllib.parse import quote
+    base, _ = world
+    req = urllib.request.Request(base + "/api/v1/artifacts?filename=a.pdf&mime=" + quote(mime, safe=""), data=b"x",
+                                 method="POST", headers={"X-API-Key": "owner-key", "Content-Type": "application/pdf"})
+    if mime == "":      # an empty ?mime= falls back to the request Content-Type, which is valid here
+        return
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(req)
+    assert caught.value.code == 400
+
+
+def test_upload_content_type_header_with_a_comma_is_refused_and_plain_parameters_are_dropped(world):
+    base, _ = world
+    bad = urllib.request.Request(base + "/api/v1/artifacts?filename=a.pdf", data=b"x", method="POST", headers={
+        "X-API-Key": "owner-key", "Content-Type": "application/pdf;a=1,text/html"})
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(bad)
+    assert caught.value.code == 400
+
+
+def test_plain_parameters_are_dropped_by_the_shared_upload_validator():
+    from herdr_engineering.media_type import canonical_upload_media_type
+    assert canonical_upload_media_type("Text/Plain; charset=utf-8") == "text/plain"
+    assert canonical_upload_media_type("application/pdf") == "application/pdf"
+
+
+@pytest.mark.parametrize("mime", ["application/pdf;a=1,text/html", 'x/y;a="b', "x/y;a=\\", "x/y,z/w", "x y/z", "", "x/y\r\n"])
+def test_the_one_shared_upload_validator(mime):
+    from herdr_engineering.media_type import canonical_upload_media_type
+    assert canonical_upload_media_type(mime) is None
+    assert canonical_upload_media_type(None) is None and canonical_upload_media_type("a/" + "b" * 300) is None

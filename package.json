@@ -7,7 +7,7 @@
   "scripts": {
     "test": "node --test --test-concurrency=1 packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js packages/*.test.js 'tests/playwright/!(ui-gates-)*.test.mjs'",
     "test:ui": "node --test --test-concurrency=1 'tests/playwright/!(ui-gates-)*.test.mjs'",
-    "test:annotations": "node --test --test-concurrency=1 tests/playwright/annotate-view.test.mjs tests/playwright/artifact-feedback.test.mjs tests/playwright/artifact-reports.test.mjs tests/playwright/share-annotations.test.mjs",
+    "test:annotations": "node --test --test-concurrency=1 tests/playwright/annotate-view.test.mjs tests/playwright/artifact-feedback.test.mjs tests/playwright/artifact-reports.test.mjs tests/playwright/share-annotations.test.mjs tests/playwright/live-mime.test.mjs",
     "test:client": "node --test packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js packages/*.test.js",
     "test:ui-gates": "node --test --test-concurrency=1 tests/playwright/ui-gates-*.test.mjs tests/visual/*.test.mjs",
     "ui-gates:baselines:update": "node tests/playwright/visual-baselines.mjs update",
