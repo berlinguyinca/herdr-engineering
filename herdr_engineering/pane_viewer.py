@@ -12,7 +12,7 @@ import signal
 import sys
 import termios
 import tty
-from typing import Callable
+from collections.abc import Callable
 
 from .md_render import RESET, visible_width
 

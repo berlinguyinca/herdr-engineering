@@ -22,6 +22,7 @@ from pathlib import Path
 
 from . import session_history as sh
 from .control_plane.redact import redact_text
+from .md_render import visible_width  # noqa: F401  (re-exported for callers measuring rendered lines)
 from .session_history import AGENTS
 
 HARNESSES = ("claude", "codex")
@@ -259,35 +260,74 @@ def _open_side_pane(file, pane_id, env, run, herdr="herdr"):
         return {"ok": False, "error": "herdr_unavailable"}
 
 
-def view_report(file, *, close_pane=None, run=subprocess.run, out=None, width=None, herdr="herdr",
-                which=shutil.which, ask=input):
-    """Render the Markdown report ``file`` and page it; then close ``close_pane`` (the pane showing it).
+def _close_panes(run, herdr, *panes):
+    """Close each pane in turn; one that is already gone, or a herdr that cannot be run, is not an error."""
+    for pane in panes:
+        if pane:
+            try:
+                run([herdr, "pane", "close", pane], capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
 
-    Closing happens in ``finally`` so Ctrl-C or a pager failure still leaves no empty pane behind. When stdout is
-    not a terminal the rendered text is just written out.
-    """
-    from .md_render import render_markdown
-    out = out or sys.stdout
+
+def _view(draw, out, viewer, title, scroll, run, herdr, close_pane, peer_pane):
+    """Run ``draw(width, height) -> lines`` in the viewer loop, or print it without a terminal; then close the panes."""
     try:
-        text = Path(file).read_text()
-        cols = width or min(max(shutil.get_terminal_size((100, 24)).columns - 2, 40), 110)
-        rendered = render_markdown(text, width=cols, color=os.environ.get("NO_COLOR") is None)
         if not out.isatty():
-            out.write(rendered + "\n")
+            out.write("\n".join(draw(100, 24)) + "\n")
             return 0
-        pager = which("less")
-        if pager:
-            prompt = " session summary \u00b7 q closes this pane \u00b7 space/arrows scroll \u00b7 / searches"
-            run([pager, "-R", "-Pm" + prompt, "-PM" + prompt], input=rendered + "\n", text=True)
-        else:
-            out.write(rendered + "\n")
-            ask("\nPress Enter to close ")
-        return 0
-    except (OSError, EOFError, KeyboardInterrupt):
+        return viewer(draw, scroll=scroll, title=title, out=out)
+    except (Exception, KeyboardInterrupt):
         return 1
     finally:
-        if close_pane:
-            run([herdr, "pane", "close", close_pane], capture_output=True, text=True, timeout=10)
+        _close_panes(run, herdr, close_pane, peer_pane)
+
+
+def view_report(file, *, close_pane=None, peer_pane=None, run=subprocess.run, out=None, herdr="herdr",
+                viewer=None):
+    """Show the Markdown report ``file`` full screen, re-wrapped whenever the pane is resized.
+
+    When the reader quits, ``close_pane`` (the pane showing it) closes and then ``peer_pane`` (the graph under
+    it), in ``finally`` so Ctrl-C or a failure still leaves no orphan. Without a terminal the text is printed.
+    """
+    from .md_render import render_markdown
+    from .pane_viewer import run_viewer
+    out = out or sys.stdout
+    color = os.environ.get("NO_COLOR") is None
+    try:
+        text = Path(file).read_text()
+    except OSError:
+        _close_panes(run, herdr, close_pane, peer_pane)
+        return 1
+
+    def draw(width, _height):
+        return render_markdown(text, width=min(max(width - 2, 40), 110), color=color).split("\n")
+    return _view(draw, out, viewer or run_viewer, "session summary", True, run, herdr, close_pane, peer_pane)
+
+
+def view_graph(file, *, close_pane=None, peer_pane=None, run=subprocess.run, out=None, herdr="herdr",
+               viewer=None):
+    """Draw the drift graph saved beside the report ``file``, fitted to the pane, until the reader quits.
+
+    It reads only the ``<file>.graph.json`` sidecar that ``publish`` wrote, never the session history. Closing
+    behaves as in ``view_report``; a missing or unusable sidecar closes the panes and returns 1.
+    """
+    from .graph_render import render_graph
+    from .pane_viewer import run_viewer
+    out = out or sys.stdout
+    try:
+        graph = json.loads(Path(str(file) + ".graph.json").read_text())
+        if not isinstance(graph, dict) or not graph.get("segments"):
+            raise ValueError("unusable graph")
+    except (OSError, ValueError):
+        _close_panes(run, herdr, close_pane, peer_pane)
+        return 1
+    color = os.environ.get("NO_COLOR") is None
+    unicode = "utf" in (getattr(out, "encoding", None) or "utf-8").lower()
+
+    def draw(width, _height):
+        return render_graph(graph, width, unicode=unicode, color=color)
+    return _view(draw, out, viewer or run_viewer, "drift graph", True, run, herdr, close_pane, peer_pane)
 
 
 def publish_report(agent, session_id, text, *, home=None, environ=None, run=subprocess.run,

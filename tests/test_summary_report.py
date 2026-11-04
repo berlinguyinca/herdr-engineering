@@ -1,5 +1,6 @@
 """Headless /summary runner: fake harness binaries, no network, no real sessions."""
 import json
+import os
 import stat
 from pathlib import Path
 import subprocess
@@ -292,67 +293,148 @@ class _Tty:
         self.text += s
 
 
-def test_view_pages_the_rendered_report_then_closes_its_pane(tmp_path):
-    f = tmp_path / "r.md"
-    f.write_text("# Title\n\nSome **bold** text.\n")
-    calls = []
-
-    def run(argv, **kw):
-        calls.append((argv, kw))
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-    assert sr.view_report(f, close_pane="w1:p9", run=run, out=_Tty(True), width=60, which=lambda _: "/usr/bin/less") == 0
-    pager, closer = calls
-    assert pager[0][0] == "/usr/bin/less" and "-R" in pager[0]
-    assert "**" not in pager[1]["input"] and "# " not in pager[1]["input"] and "\x1b[" in pager[1]["input"]
-    assert closer[0] == ["herdr", "pane", "close", "w1:p9"]
+def _closes(calls):
+    return [c for c in calls if c[1:3] == ["pane", "close"]]
 
 
-def test_view_still_closes_its_pane_when_the_pager_is_interrupted(tmp_path):
-    f = tmp_path / "r.md"
-    f.write_text("# Title\n")
-    calls = []
-
+def _recorder(calls, fail_on=None):
     def run(argv, **kw):
         calls.append(argv)
-        if argv[0] == "/usr/bin/less":
-            raise KeyboardInterrupt
+        if fail_on and argv[-1] == fail_on:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such pane")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-    assert sr.view_report(f, close_pane="w1:p9", run=run, out=_Tty(True), which=lambda _: "/usr/bin/less") == 1
-    assert calls[-1] == ["herdr", "pane", "close", "w1:p9"]
+    return run
 
 
-def test_view_without_less_prints_waits_for_enter_then_closes_its_pane(tmp_path):
+def test_view_renders_through_the_viewer_loop_then_closes_its_pane_and_its_peer(tmp_path):
+    f = tmp_path / "r.md"
+    f.write_text("# Title\n\n" + "Some **bold** text that is long enough to need wrapping at a narrow width. " * 3)
+    calls, drawn = [], {}
+
+    def viewer(render, **kw):
+        drawn["lines"], drawn["kw"] = render(50, 20), kw
+        return 0
+    assert sr.view_report(f, close_pane="w1:p9", peer_pane="w1:pA", run=_recorder(calls), out=_Tty(True), viewer=viewer) == 0
+    assert drawn["kw"]["scroll"] is True
+    text = "\n".join(drawn["lines"])
+    assert "**" not in text and "# " not in text and "\x1b[" in text
+    assert all(sr.visible_width(line) <= 50 for line in drawn["lines"])
+    assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pA"]          # itself first, then its peer
+
+
+def test_view_honours_no_color(tmp_path, monkeypatch):
+    f = tmp_path / "r.md"
+    f.write_text("# Title\n\n**bold**\n")
+    monkeypatch.setenv("NO_COLOR", "1")
+    drawn = {}
+    sr.view_report(f, run=_recorder([]), out=_Tty(True), viewer=lambda render, **kw: drawn.update(l=render(60, 10)) or 0)
+    assert not any("\x1b" in line for line in drawn["l"])
+
+
+def test_view_still_closes_both_panes_when_the_viewer_fails_or_is_interrupted(tmp_path):
     f = tmp_path / "r.md"
     f.write_text("# Title\n")
-    out, calls, asked = _Tty(True), [], []
-    run = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0)       # noqa: E731
-    assert sr.view_report(f, close_pane="w1:p9", run=run, out=out, which=lambda _: None,
-                          ask=lambda prompt: asked.append(prompt) or "") == 0
-    assert "Title" in out.text and len(asked) == 1 and calls == [["herdr", "pane", "close", "w1:p9"]]
-    # a closed stdin must not leave the pane open either
-    calls.clear()
+    for exc in (KeyboardInterrupt, RuntimeError):
+        calls = []
 
-    def eof(prompt):
-        raise EOFError
-    assert sr.view_report(f, close_pane="w1:p9", run=run, out=out, which=lambda _: None, ask=eof) == 1
-    assert calls == [["herdr", "pane", "close", "w1:p9"]]
+        def viewer(render, **kw):
+            raise exc
+        assert sr.view_report(f, close_pane="w1:p9", peer_pane="w1:pA", run=_recorder(calls), out=_Tty(True), viewer=viewer) == 1
+        assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pA"]
 
 
-def test_view_without_a_terminal_prints_and_leaves_no_pane_to_close(tmp_path):
+def test_a_peer_pane_that_is_already_gone_is_not_an_error(tmp_path):
+    f = tmp_path / "r.md"
+    f.write_text("# Title\n")
+    calls = []
+    assert sr.view_report(f, close_pane="w1:p9", peer_pane="w1:pA", run=_recorder(calls, fail_on="w1:pA"),
+                          out=_Tty(True), viewer=lambda render, **kw: 0) == 0
+    assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pA"]
+
+    def exploding(argv, **kw):
+        raise FileNotFoundError("herdr")
+    assert sr.view_report(f, close_pane="w1:p9", peer_pane="w1:pA", run=exploding, out=_Tty(True),
+                          viewer=lambda render, **kw: 0) == 0
+
+
+def test_view_without_a_terminal_prints_and_does_not_start_the_viewer(tmp_path):
     f = tmp_path / "r.md"
     f.write_text("# Title\n")
     out, calls = _Tty(False), []
-    assert sr.view_report(f, run=lambda argv, **kw: calls.append(argv), out=out) == 0
+
+    def viewer(render, **kw):
+        raise AssertionError("no terminal: the viewer must not start")
+    assert sr.view_report(f, run=_recorder(calls), out=out, viewer=viewer) == 0
     assert "Title" in out.text and calls == []
 
 
-def test_view_closes_its_pane_even_if_the_report_is_missing(tmp_path):
+def test_view_closes_its_panes_even_if_the_report_is_missing(tmp_path):
     calls = []
-    sr.view_report(tmp_path / "gone.md", close_pane="w1:p9",
-                   run=lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0), out=_Tty(True))
-    assert calls == [["herdr", "pane", "close", "w1:p9"]]
+    assert sr.view_report(tmp_path / "gone.md", close_pane="w1:p9", peer_pane="w1:pA", run=_recorder(calls),
+                          out=_Tty(True), viewer=lambda render, **kw: 0) == 1
+    assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pA"]
 
 
+GRAPH = {"total_prompts": 12, "drift": {"at": 6, "note": "web page task"}, "segments": [
+    {"label": "USB stick", "from_prompt": 1, "to_prompt": 5, "count": 5, "start": "2026-01-01T09:00:00Z", "agents": None},
+    {"label": "web page", "from_prompt": 6, "to_prompt": 12, "count": 7, "start": "2026-01-01T10:00:00Z", "agents": 2}]}
+
+
+def _with_sidecar(tmp_path, graph=GRAPH):
+    f = tmp_path / "claude-s1.md"
+    f.write_text("# Session summary\n")
+    (tmp_path / "claude-s1.md.graph.json").write_text(json.dumps(graph))
+    return f
+
+
+def test_graph_viewer_draws_the_sidecar_and_closes_itself_then_its_peer(tmp_path):
+    f, calls, drawn = _with_sidecar(tmp_path), [], {}
+
+    def viewer(render, **kw):
+        drawn["lines"], drawn["kw"] = render(90, 12), kw
+        return 0
+    assert sr.view_graph(f, close_pane="w1:pB", peer_pane="w1:p9", run=_recorder(calls), out=_Tty(True), viewer=viewer) == 0
+    text = "\n".join(drawn["lines"])
+    assert "USB stick" in text and "web page" in text and "Looks like a new task" in text
+    assert drawn["kw"]["scroll"] is True                                   # a column graph can be taller than its pane
+    assert [c[3] for c in _closes(calls)] == ["w1:pB", "w1:p9"]
+
+
+def test_graph_viewer_follows_the_pane_width_and_output_encoding(tmp_path):
+    f = _with_sidecar(tmp_path)
+    ascii_out, drawn = _Tty(True), {}
+    ascii_out.encoding = "ascii"
+    sr.view_graph(f, run=_recorder([]), out=ascii_out, viewer=lambda render, **kw: drawn.update(wide=render(120, 20), narrow=render(32, 40)) or 0)
+    assert all(line.isascii() for line in drawn["wide"] + drawn["narrow"])
+    assert all(sr.visible_width(line) <= 32 for line in drawn["narrow"])
+
+
+@pytest.mark.parametrize("content", [None, "not json", "[]"])
+def test_graph_viewer_without_a_usable_sidecar_closes_and_returns_1(tmp_path, content):
+    f = tmp_path / "claude-s1.md"
+    f.write_text("# Session summary\n")
+    if content is not None:
+        (tmp_path / "claude-s1.md.graph.json").write_text(content)
+    calls = []
+    assert sr.view_graph(f, close_pane="w1:pB", peer_pane="w1:p9", run=_recorder(calls), out=_Tty(True),
+                         viewer=lambda render, **kw: 0) == 1
+    assert [c[3] for c in _closes(calls)] == ["w1:pB", "w1:p9"]
+
+
+def test_graph_viewer_without_a_terminal_prints_the_graph(tmp_path):
+    out = _Tty(False)
+    assert sr.view_graph(_with_sidecar(tmp_path), run=_recorder([]), out=out) == 0
+    assert "USB stick" in out.text
+
+
+def test_cli_graph_and_view_accept_a_peer(tmp_path):
+    f = _with_sidecar(tmp_path)
+    for argv in (["summary", "graph", str(f), "--peer", "none"], ["summary", "view", str(f), "--peer", "none"]):
+        done = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", *argv], capture_output=True, text=True,
+                              timeout=60, env={**os.environ, "PATH": "/nonexistent"})
+        assert done.returncode == 0, done.stderr
+    assert "USB stick" in subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "summary", "graph", str(f)],
+                                         capture_output=True, text=True, timeout=60).stdout
 def test_publish_one_destination_failing_still_reports_the_other(tmp_path):
     out = sr.publish_report("claude", "abc-123", REPORT, home=tmp_path, environ={}, run=_fake_herdr([]),
                             load_config=lambda: _Cfg, post=lambda cfg, body: (200, {}))
