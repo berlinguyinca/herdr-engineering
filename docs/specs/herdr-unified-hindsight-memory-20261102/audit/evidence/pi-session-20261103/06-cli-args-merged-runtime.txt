@@ -1,0 +1,7 @@
+Same session with PI_ENGINEERING_RUNTIME_SOURCE=<pi-harness-id worktree> (merged pi#559 code):
+
+  recall * --max-results 50 --scope project --timeout-ms 5000
+  retain Synthetic canary session note: the fixture spillway width is 2.5 m. --scope project --provenance {"source_system":"pi-engineering","evidence_refs":["user-request:pi-note-8683cd14-3685-49b2-b446-17b34b4782bc"]} --evidence user-request:pi-note-8683cd14-3685-49b2-b446-17b34b4782bc
+
+  -> persisted as mem-80bd8b1741982d56540e91ad13afa6c7422f1fdd rev 1 (verified), session reports
+     "Saved private memory pi-note-8683cd14-...".  (see 03-remember-persisted-merged-runtime.jsonl)

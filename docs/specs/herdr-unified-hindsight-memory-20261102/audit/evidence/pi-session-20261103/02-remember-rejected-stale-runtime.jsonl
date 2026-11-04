@@ -1,0 +1,8 @@
+[pi-engineering] loading runtime…
+[pi-engineering] runtime ready in 5338ms
+Warning: No models match pattern "development/qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m"
+Warning: No models match pattern "development/qwen3.8-flash_next-modality-vision-quant-mxfp4_fp8_gptq"
+{"type":"session","version":3,"id":"01a1a2ac-d401-774b-8855-66bf8e4fbb78","timestamp":"2026-11-03T18:29:57.889Z","cwd":"/Users/wohlgemuth/.cache/hindsight-pi-fixture"}
+[warning] Memory: request timed out. Use /memory setup to check your host and key.
+{"type":"message_start","message":{"role":"custom","customType":"pi-engineering-memory-status","content":"Memory save was rejected or not confirmed. Check /memory before retrying.","display":true,"timestamp":1793730603597}}
+{"type":"message_end","message":{"role":"custom","customType":"pi-engineering-memory-status","content":"Memory save was rejected or not confirmed. Check /memory before retrying.","display":true,"timestamp":1793730603597}}
