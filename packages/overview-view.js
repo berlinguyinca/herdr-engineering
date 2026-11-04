@@ -58,12 +58,14 @@ export function unresolvedCiFailures(entries) {
   return entries.filter(e=>e.tab==='failed' && !((passedAt.get(key(e.record)) || 0) > when(e.record)) && !e.record.pr_merged && !merged.has(`${e.record.repository || ''}#${pr(e.record)}`));
 }
 const OVERVIEW_CARDS = ['week','sessions','missions','fleet','ci','reviews','services','hosts','activity'];
+// WC-006: without the work_center_v1 capability the overview has exactly the cards it had before the Work Command Center.
+export const overviewCards = (workCenter = true) => workCenter ? OVERVIEW_CARDS : OVERVIEW_CARDS.filter(key => key !== 'week');
 const CARD_LABELS = {week:'This week',missions:'Current missions',fleet:'Fleet health',sessions:'Agents',ci:'CI builds',reviews:'Reviews',services:'HerdR services',hosts:'Hosts',activity:'Recent changes'};
 const PREFERENCES_KEY = 'herdr.overview.layout.v1';
-export function sanitizeOverviewPreferences(value) {
+export function sanitizeOverviewPreferences(value, cards = OVERVIEW_CARDS) {
   const valid = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  const order = [...new Set((Array.isArray(valid.order) ? valid.order : []).filter(key=>OVERVIEW_CARDS.includes(key)))];
-  return {order:[...order,...OVERVIEW_CARDS.filter(key=>!order.includes(key))],hidden:[...new Set((Array.isArray(valid.hidden) ? valid.hidden : []).filter(key=>OVERVIEW_CARDS.includes(key)))]};
+  const order = [...new Set((Array.isArray(valid.order) ? valid.order : []).filter(key=>cards.includes(key)))];
+  return {order:[...order,...cards.filter(key=>!order.includes(key))],hidden:[...new Set((Array.isArray(valid.hidden) ? valid.hidden : []).filter(key=>cards.includes(key)))]};
 }
 
 // Attention is a projection of the same retained observations as the cards.
@@ -228,7 +230,7 @@ export function renderWeekCard(data = {}, states = {}, received = Date.now(), no
     <p class="ov-note">Week of ${esc(w.window.start.slice(0, 10))} (${esc(m.timeZone)}), counted from recorded timestamps. Progress is shown only where a mission reports measured evidence.</p>`;
 }
 
-export function renderOverviewSection(section, data = {}, states = {}, received = Date.now(), now = Date.now()) {
+export function renderOverviewSection(section, data = {}, states = {}, received = Date.now(), now = Date.now(), { workCenter = true } = {}) {
   const model = overviewModel(data,received,now);
   if (section === 'attention') {
     const mode=states.attention===undefined ? 'browser' : states.attention.error ? 'fallback' : states.attention.loaded && data.attention ? 'server' : states.attention.disabled ? 'browser' : states.attention.loaded ? 'browser' : 'loading';
@@ -242,7 +244,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
       ${attention.items.length>limit ? `<div class="ov-attention-controls"><span class="ov-note">Showing ${visible.length} of ${attention.items.length} observed items</span><button type="button" class="hd-btn hd-btn--secondary" data-attention-toggle aria-expanded="${expanded}" aria-controls="ov-attention-items">${expanded?'Show fewer':`Show all ${attention.items.length}`}</button></div>` : ''}
       ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"${attention.server?' data-attention-origin="server"':''}><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
   }
-  if (section === 'week') return renderWeekCard(data, states, received, now);
+  if (section === 'week') return workCenter ? renderWeekCard(data, states, received, now) : '';
   if (section === 'missions') {
     const m = model.missions;
     const ready = states.projections?.loaded || states.missions?.loaded;
@@ -336,13 +338,14 @@ function saveSnoozed(map) {
   try { localStorage.setItem(SNOOZE_KEY, JSON.stringify(Object.fromEntries(map))); } catch { /* ignore */ }
 }
 
-export function mountOverview(container, client, { freshness = () => null } = {}) {
+export function mountOverview(container, client, { freshness = () => null, workCenter = false } = {}) {
+  const CARDS=overviewCards(workCenter);
   let disposed=false, clock=null, received=Date.now();
   const data={snoozed:loadSnoozed()}, states={}, signatures=new Map();
   const chip=freshnessSources(freshness);
-  const panels=['attention',...OVERVIEW_CARDS,'health'];
+  const panels=['attention',...CARDS,'health'];
   let preferences;
-  try { preferences=sanitizeOverviewPreferences(JSON.parse(localStorage.getItem(PREFERENCES_KEY) || 'null')); } catch { preferences=sanitizeOverviewPreferences(); }
+  try { preferences=sanitizeOverviewPreferences(JSON.parse(localStorage.getItem(PREFERENCES_KEY) || 'null'),CARDS); } catch { preferences=sanitizeOverviewPreferences(undefined,CARDS); }
   const sources={
     projections:signal=>client.listMissionActivity({signal}),
     missions:signal=>client.listMissions(undefined,{signal}),
@@ -358,7 +361,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     attention:signal=>client.attention({state:'open'},{signal}).catch(error=>{if(error?.status===404)return {disabled:true};throw error;}),
   };
   states.attention={loaded:false,error:false};
-  container.innerHTML=`${styles}<details class="ov-customize"><summary>Customize Overview</summary><p class="ov-note">Attention is always visible. Health stays in the footer.</p><div data-overview-controls></div><button type="button" class="hd-btn hd-btn--secondary hd-btn--sm" data-overview-reset>Reset layout</button></details><section class="ov-panel ov-attention" data-overview="attention" aria-label="Attention"></section><div class="ov-layout">${OVERVIEW_CARDS.map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key==='week'?'This week':key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
+  container.innerHTML=`${styles}<details class="ov-customize"><summary>Customize Overview</summary><p class="ov-note">Attention is always visible. Health stays in the footer.</p><div data-overview-controls></div><button type="button" class="hd-btn hd-btn--secondary hd-btn--sm" data-overview-reset>Reset layout</button></details><section class="ov-panel ov-attention" data-overview="attention" aria-label="Attention"></section><div class="ov-layout">${CARDS.map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key==='week'?'This week':key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
   function applyPreferences() {
     const focused=document.activeElement;
     const action=focused?.dataset.overviewAction, card=focused?.dataset.card;
@@ -427,7 +430,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     motionSettled=settled;userChange=false;
     for(const panel of panels) {
       const element=container.querySelector(`[data-overview="${panel}"]`);
-      const html=renderOverviewSection(panel,data,states,received);
+      const html=renderOverviewSection(panel,data,states,received,Date.now(),{workCenter});
       // Ignore clock text in the signature so an unchanged report keeps DOM/focus.
       const signature=html.replace(/(<span data-overview-stamp="[^"]+">)[^<]*(<\/span>)/g,'$1$2');
       if(signature===signatures.get(panel))continue;
@@ -493,7 +496,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     if(event.target.closest?.('[data-attention-toggle]')){data.attentionExpanded=!data.attentionExpanded;draw();return;}
     const control=event.target.closest?.('[data-overview-action], [data-overview-reset]');
     if(control) {
-      if(control.hasAttribute('data-overview-reset'))preferences=sanitizeOverviewPreferences();
+      if(control.hasAttribute('data-overview-reset'))preferences=sanitizeOverviewPreferences(undefined,CARDS);
       else {
         const key=control.dataset.card, action=control.dataset.overviewAction,index=preferences.order.indexOf(key);
         if(action==='toggle')preferences.hidden=preferences.hidden.includes(key)?preferences.hidden.filter(value=>value!==key):[...preferences.hidden,key];

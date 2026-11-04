@@ -4,6 +4,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import {withPage} from './helpers/fixture.mjs';
+import {withFlag} from './helpers/work-center.mjs';
 import {boot,until,sleep} from './helpers/live.mjs';
 
 const shots=path.resolve(import.meta.dirname,'../../docs/specs/herdr-work-command-center-wc001/screenshots');
@@ -34,7 +35,7 @@ const REFS=[
  {kind:'mission',id:'pi:MSN-2',type:'issue',repository:'acme/app',number:3},
  {kind:'mission',id:'pi:MSN-3',type:'issue',repository:'acme/app',number:3},
 ];
-const handler=(p,url)=>{
+const rawHandler=(p,url)=>{
  if(p==='/api/v1/mission-outcomes')return OUTCOMES;
  if(p==='/api/v1/github/projects')return url.searchParams.get('project')?{...sync,project:board,items:ITEMS}:{...sync,projects:[board]};
  return {services:[],hosts:[],activities:[],events:[],items:[],reviews:[],available:true,components:[],summary:{},status:'ok',repositories:[],pipelines:[],missions:[]};
@@ -51,6 +52,7 @@ const mountWithRefs=(page,refs)=>page.evaluate(async refs=>{
  window.__board=mountGithubProjects(host,{getGithubProjects:get},{project:'PVT_1',herdrRefs:refs});
 },refs);
 
+const handler=withFlag(rawHandler);
 test('real app: a PR card recorded by exactly one mission offers Open in Herdr; none, ambiguous, other-repo and issue cards do not; all requests are reads',async()=>withPage(async(page,base)=>{
  const net=await withProjects(page);
  const reads=await boot(page,base,'/github/projects?project=PVT_1',handler);
