@@ -13,7 +13,6 @@ import * as playwright from 'playwright';
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const PYTHON = process.env.PYTHON || (fs.existsSync(path.join(ROOT, '.venv/bin/python')) ? path.join(ROOT, '.venv/bin/python') : 'python3');
 const WANTED = ['chromium', 'firefox', 'webkit'];
-const CHROMIUM_FALLBACK = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
 const PANEL = 'aside[data-annotate-panel]';
 
 let server;
@@ -40,12 +39,7 @@ async function launch(name) {
     options.args = ['--no-sandbox'];
     if (process.env.PLAYWRIGHT_CHROMIUM) options.executablePath = process.env.PLAYWRIGHT_CHROMIUM;
   }
-  try {
-    return await playwright[name].launch(options);
-  } catch (error) {
-    if (name !== 'chromium' || !fs.existsSync(CHROMIUM_FALLBACK)) throw error;
-    return playwright.chromium.launch({ ...options, executablePath: CHROMIUM_FALLBACK });
-  }
+  return playwright[name].launch(options);
 }
 
 async function control(method, route) {

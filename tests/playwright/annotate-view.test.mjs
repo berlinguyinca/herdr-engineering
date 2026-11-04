@@ -14,12 +14,7 @@ const POINTS = [[0.5, 0.5], [0.15, 0.2], [0.85, 0.8]];
 async function launch(args) {
   const options = { headless: true, args: ['--no-sandbox', ...args] };
   if (process.env.PLAYWRIGHT_CHROMIUM) options.executablePath = process.env.PLAYWRIGHT_CHROMIUM;
-  try { return await chromium.launch(options); }
-  catch (error) {
-    const fallback = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
-    if (!fs.existsSync(fallback)) throw error;
-    return chromium.launch({ ...options, executablePath: fallback });
-  }
+  return chromium.launch(options);
 }
 
 async function withView(callback) {

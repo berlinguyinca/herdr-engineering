@@ -26,12 +26,7 @@ async function withFeedback(callback, env = {}) {
     });
     const options = { headless: true, args: ['--no-sandbox'] };
     if (process.env.PLAYWRIGHT_CHROMIUM) options.executablePath = process.env.PLAYWRIGHT_CHROMIUM;
-    try { browser = await chromium.launch(options); }
-    catch (error) {
-      const fallback = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
-      if (!fs.existsSync(fallback)) throw error;
-      browser = await chromium.launch({ ...options, executablePath: fallback });
-    }
+    browser = await chromium.launch(options);
     const base = `http://127.0.0.1:${port}`;
     const context = await browser.newContext();
     const page = await context.newPage();

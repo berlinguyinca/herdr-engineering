@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   LIMITS, annotationUrls, cleanRow, cleanText, clipHead, clipTail, describeAnchor, errorMessage, findQuote, isRawHref,
   statusLabel, textQuote, textQuoteFromString, unitBox,
-} from '../../herdr_engineering/control_plane/share_static/anchor.js';
+} from '../herdr_engineering/control_plane/share_static/anchor.js';
 
 const ID = 'ann_' + 'A'.repeat(22);
 
