@@ -60,6 +60,7 @@ const FAKE_BACKEND = async () => {
     if (method === 'GET' && (m = /\/threads\/([^/]+)$/.exec(path))) return reply(200, { thread: { thread_id: m[1] }, messages: [{ role: 'assistant', content: `hello from ${m[1]}`, provenance: 'direct' }] });
     if (method === 'POST' && /\/messages$/.test(path)) return reply(202, { run: { run_id: 'run_1', state: 'completed' } });
     if (method === 'POST' && /\/decision$/.test(path)) return reply(200, { decision: 'approved' });
+    if (method === 'PATCH' && /\/assistants\/[^/]+$/.test(path)) return reply(200, { assistant: db.assistants[0] });
     return reply(404, { error: 'not found' });
   };
   window.__calls = calls;
@@ -174,4 +175,20 @@ test('Enter during a slow redraw still sends (the handler no longer waits for th
 test('AltGr-produced brackets still switch assistant (AltGr reports ctrl+alt)', () => withPage(async (page) => {
   await page.evaluate(() => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: ']', ctrlKey: true, altKey: true, modifierAltGraph: true, bubbles: true })));
   assert.equal(await selectedAssistant(page), 'asst_2');
+}));
+
+test('saving re-reads the list without flashing the loading skeleton over the page', () => withPage(async (page) => {
+  await page.keyboard.press('1');
+  await page.locator('[data-save]').waitFor();
+  await page.evaluate(() => {
+    window.__skeletonSeen = 0;
+    new MutationObserver((records) => { for (const r of records) for (const n of r.addedNodes) if (n.nodeType === 1 && (n.matches('[aria-label="Loading Personal Assistant"]') || n.querySelector('[aria-label="Loading Personal Assistant"]'))) window.__skeletonSeen += 1; })
+      .observe(document.getElementById('stage'), { childList: true, subtree: true });
+  });
+  const reads = () => page.evaluate(() => window.__calls.filter((c) => c.method === 'GET' && c.path === '/api/v1/assistants').length);
+  const before = await reads();
+  await page.locator('[data-save]').click();
+  await page.waitForFunction((n) => window.__calls.filter((c) => c.method === 'GET' && c.path === '/api/v1/assistants').length > n, before);
+  await page.locator('[data-save]').waitFor();
+  assert.equal(await page.evaluate(() => window.__skeletonSeen), 0);
 }));
