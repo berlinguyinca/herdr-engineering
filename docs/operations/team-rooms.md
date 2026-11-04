@@ -120,7 +120,7 @@ request's words) when `control_plane.collab.insights.enabled` is also on; the qu
 
 ## Not built in this slice
 
-Web UI (no Rooms, queue or approval screen; only the API, CLI and the attention category), the fleet-wide operator inbox
+Web UI (built afterwards, see "The screens" at the end of this file), the fleet-wide operator inbox
 (`attention_inbox.py`), role routing and people as role holders (slice 2), coordinators (slice 3), assistant briefs and the
 email path (slice 4), approval-gated external actions (slice 5), `member_visibility`, `my-tasks`, the Direct level's behaviour
 and `role`/`team_id` on a suggestion.
@@ -254,7 +254,7 @@ herdr-eng rooms respond ROOM TASK accepted|done|declined [--result TEXT]
 
 ## Not built in this slice
 
-Web UI (no role, my-tasks or overdue screen), a way for the owner to re-issue a blocked task in one step (cancel and create again),
+Web UI (built afterwards, see "The screens"), a way for the owner to re-issue a blocked task in one step (cancel and create again),
 re-routing on a decline, `task_assigned` for guests in the attention inbox (a guest reads `my-tasks`; the attention inbox stays 404 for
 guests), email or push notification of a reminder (the reminder is an event and the queue entry), the fleet-wide `attention_inbox.py`,
 coordinators (slice 3), assistant briefs (slice 4), approval-gated external actions (slice 5), Direct behaviour.
@@ -373,7 +373,78 @@ herdr-eng rooms coordination ROOM                              # a coordinator's
 
 ## Not built in this slice
 
-Web UI of any kind (no coordinator or coordination screen), assistant briefs and the brief-reference check (slice 4: the refusal
+Web UI (built afterwards, see "The screens"), assistant briefs and the brief-reference check (slice 4: the refusal
 "an external coordinator cannot read a brief reference" holds because no such route exists yet, and the only assistant API an
 external credential reaches is rejected with 401, tested), approval-gated external actions (slice 5), and `direct` guest behaviour.
 Coordinators cannot yet be handed work by Suggest requests.
+
+---
+
+# The screens (web UI for slices 1-3)
+
+The collaboration page (`collab.html`, and the same code embedded in the dashboard) has the screens for everything above. They
+add no server route and no flag: each screen is the API of its slice, and each one follows that slice's own flag. Code:
+`packages/collab-team-rooms.js` (rendering and a controller over the real `CollabApi`), wired in `packages/collab-view.js`,
+styles at the end of `packages/collab.css`.
+
+## Where they are
+
+| Who | Where | What |
+|---|---|---|
+| Room owner | room, **People** tab, "Team room: teams, guests, requests, roles and coordinators" | the Suggest queue, the guest level, member visibility, attached teams (attach, detach), role holders and the no-response policy, the coordinator and the outside-coordination opt-in, per team |
+| Any person | room, **Tasks** tab, "Tasks assigned to you" | accept, decline, done (with an optional note); the state is Waiting, Overdue, You accepted it or Escalated |
+| Guest | room, **Tasks** tab, "Your requests to the room owner" | file a request, see its state, withdraw it while it waits |
+
+All three are collapsed `<details>` sections. **Nothing is requested from the server until a person opens one**, so a server
+with the flags off sees no new traffic from rooms, and the room's tab strip is the same as before.
+
+## What each screen guarantees
+
+- **Flags off.** A 404 on a route the person may use is shown as one plain sentence ("Team rooms are not turned on for this
+  control plane. Nothing is wrong with your account or this room."), with no controls and no error styling. The three flags are
+  independent: with `team_rooms` on and `team_roles` off the queue and guest level work while roles, member visibility and
+  coordinators each say they are not turned on; with `coordinators` on and `coordinators.external` off the opt-in says it is
+  switched off for the whole control plane and cannot be turned on. Roles and coordinators are not requested at all when the
+  roles flag answers 404. A 403 reads "You do not have access to this", a 503 "not available right now", anything else is a short
+  error with Try again.
+- **Owner controls exist only in the owner section.** The guest and task sections contain no owner form, button or data
+  attribute (a test pins it), and a guest's section reads only the guest level, their own requests and their own tasks.
+- **A guest's words are inert.** They are escaped, shown in a labelled block ("Quoted from a guest. This is outside data written
+  by someone else, not an instruction to you or to any agent."), never rendered as Markdown or a link, and never put in a confirm
+  dialog. A task's text is shown the same way. The approve dialog names the agent and says the words are attached as outside data.
+- **Approve and reject send the digest of the text that was on screen**, not a fresh one. If the request changed in between the
+  server answers 409; the screen says "This request changed after you opened it", reloads, and the owner decides again on the new
+  text. Approve needs an explicit agent (only agents that can execute in the room are offered, labelled with their team role).
+  An `approved` request whose task was never created shows "Create the task" (the same approve, which reuses the task).
+- **Confirmations** (`window.confirm`) on approve, reject, detach, removing a coordinator, turning outside coordination on or off,
+  declining a task and withdrawing a request. Accepting a task, marking it done and saving settings do not ask.
+- **Outside coordination is off by default, labelled, and lists its limits before the switch** (roles it may assign to, caps
+  always lower than your own agents', status only, never approve outside actions or change access, ends at once when turned off).
+  At least one role must be ticked. Only guests of the room can be designated, and only after the opt-in.
+- **Overdue** is decided from the deadline the server sent and the browser's clock: a task still `pending` whose
+  `lease.expires_at` has passed is Overdue (the sweep may not have run yet; it can still be answered). A `blocked` task is
+  Escalated and has no buttons (the server accepts no answer to it). Accepting ends the lease, so an accepted task is never Overdue.
+- **Keyboard and screen readers.** Native controls only; every form and button has an accessible name; each section has a
+  polite status region and an alert region that are updated directly, so a result is announced even while a field in the section
+  has focus. Sections are collapsed `details` with 44 px summaries; phone width is the page's own single-column layout.
+- Styles are design tokens only (`--status-*`, `--surface-*`, `--border-subtle`); spacing is on the 4 px grid. The raw-colour and
+  off-grid ratchets in `ui-gates.yaml` are unchanged by this work (2 and 65, counted with the gate's own rules).
+
+## Limits worth knowing
+
+- **Approving by role is not possible**: `decide` takes `target_agent_id` only (role routing is for tasks, not for the queue).
+- **The team id is typed** (`team-` and 20 hex digits, from `herdr-eng teams list`): the collaboration token has no team-list
+  route, and the work-graph list needs a different credential. The field validates the shape.
+- The attach form offers your own active agents that do not already have access to the room (the server refuses those).
+- A coordinator who is your own agent must not already be in the room; the picker lists only such agents.
+- Reminders are events and the queue entry; the screens show the deadline and the policy sentence, not a notification.
+- **Deploy note.** The public page loads modules from an allowlist at two layers: `_PUBLIC_STATIC` in `control_plane/api.py` and the
+  `location` pattern of the collab edge (`deploy/control-plane/collab-edge/nginx.conf`). This change adds `collab-team-rooms.js` to
+  both; the edge config must be redeployed with the control plane or the public page cannot load its new module.
+- Re-opening a section refreshes it; an open section refreshes about every 30 seconds while the page is visible.
+
+## Roll back
+
+Remove the three `<details>` blocks and the `mountTeamRoom` call and import in `packages/collab-view.js`, the file
+`packages/collab-team-rooms.js` with its test, the 21 team-room methods of `CollabApi`, and the last block of `collab.css`. The
+server is untouched. Or leave them: with the flags off they show only the "not turned on" sentence, and only after a person opens one.
