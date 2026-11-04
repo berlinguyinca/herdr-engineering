@@ -428,6 +428,7 @@ def test_the_one_shared_upload_validator(mime):
 @pytest.mark.parametrize("unit", ["<style>", "<style ", "<style></style", "<style x='>", "</style "])
 def test_drop_style_elements_is_linear_on_raw_text(unit):
     import time
+
     from herdr_engineering.control_plane.artifact_render_api import drop_style_elements
     text = unit * (400_000 // len(unit))
     started = time.monotonic()
