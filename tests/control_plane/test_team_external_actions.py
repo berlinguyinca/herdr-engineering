@@ -24,7 +24,14 @@ from herdr_engineering.control_plane.google_oauth import SCOPES
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane import brief_fixtures as fx
 from tests.control_plane.external_fakes import FakeGitHubServer, FakeGmailServer
-from tests.control_plane.test_assistant_team_briefs import BRIEFS, KEY, OTHER_KEY, URL, _collab, principal_id
+from tests.control_plane.test_assistant_team_briefs import (
+    BRIEFS,
+    KEY,
+    OTHER_KEY,
+    URL,
+    _collab,
+    principal_id,
+)
 from tests.control_plane.test_collab import BASE, Clock
 from tests.control_plane.test_team_coordinators import TEAM, TEAM2, CPlane, _http, ext_team
 from tests.control_plane.test_team_rooms import USERS

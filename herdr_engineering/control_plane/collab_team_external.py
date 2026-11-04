@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from .assistant_briefs import REFERENCE
-from .external_actions import DRAFT, ISSUE, KINDS, REPO
+from .external_actions import ISSUE, KINDS, REPO
 
 EA_EVENTS = frozenset({"team_issue_target_set", "external_action_filed", "external_action_decided"})
 _FILE_FIELDS = frozenset({"kind", "reference", "title", "labels", "body"})

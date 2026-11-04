@@ -1,3 +1,4 @@
+# ruff: noqa: F811  (pytest fixtures are imported by name from the sibling test modules)
 """Slice 5 of docs/specs/herdr-unified-workspace-20261028/design/TEAM_COLLABORATION.md: the approval ledger and the executor.
 
 A real ``AssistantService`` whose store is the real ``pa_store_snapshot`` table of a private Postgres, the product's own GitHub client

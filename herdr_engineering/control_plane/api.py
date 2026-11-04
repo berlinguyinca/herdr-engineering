@@ -4805,7 +4805,12 @@ def _make_handler(server, public=False, operator=False):
             The scope is the authenticated API-key principal's own ``(tenant, user)``; collaboration credentials do not
             authenticate here. Filing, deciding and retrying go through the collaboration service (the same authorisation and
             audit as the collab door); that mapping needs ``actions.collab_users``. Off answers like a route that does not exist."""
-            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant import (
+                AssistantError,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
             from .assistant_adapters import ExternalActionsBridge
             from .collab import CollabError, Principal
             try:
