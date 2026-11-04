@@ -335,7 +335,12 @@ class TeamBriefService:
 
     # ------------------------------------------------------------------ step 2
     def submit(self, rec: TeamBriefRecord) -> dict[str, Any]:
-        from .assistant import AssistantForbidden, AssistantNotFound, AssistantUnavailable, RateLimited
+        from .assistant import (
+            AssistantForbidden,
+            AssistantNotFound,
+            AssistantUnavailable,
+            RateLimited,
+        )
         svc = self.assistant
         collab_user = svc.config["actions"]["collab_users"].get(rec.user_id)
         if not collab_user or svc.brief_submitter is None:

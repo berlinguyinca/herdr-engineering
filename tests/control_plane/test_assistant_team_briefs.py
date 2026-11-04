@@ -17,7 +17,11 @@ import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.assistant import AssistantService, assistant_config
-from herdr_engineering.control_plane.collab import CollabService, FileEventLog, StaticTokenAuthenticator
+from herdr_engineering.control_plane.collab import (
+    CollabService,
+    FileEventLog,
+    StaticTokenAuthenticator,
+)
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane import brief_fixtures as fx
 from tests.control_plane.test_collab import BASE, Clock, _digest
@@ -267,7 +271,7 @@ def test_no_raw_mail_data_reaches_the_team_the_room_log_the_graph_events_or_audi
     held, rev, coord = team_up(w)
     s, out = w.brief()
     assert s == 201, out
-    sid, ref = out["brief"]["suggestion_id"], out["brief"]["reference"]
+    sid, _ref = out["brief"]["suggestion_id"], out["brief"]["reference"]
     # approve to the implementer and let the task exist: the strongest point at which the data could have crept in
     row = w.queue("pending")[1]["suggestions"][0]
     s, ok = w.decide(sid, decision="approve", expected_digest=row["digest"], target_agent_id=held[0]["agent_id"])

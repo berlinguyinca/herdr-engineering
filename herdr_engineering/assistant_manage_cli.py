@@ -11,7 +11,6 @@ import argparse
 import hashlib
 import json
 import os
-import sys
 from typing import Any
 from urllib.parse import quote, urlencode
 
