@@ -12,10 +12,14 @@ Cache keys are sccache's job: it hashes the compiler, flags, profile and
 features itself, so cargo profile/features are deliberately NOT parsed here and
 no hand-written cache namespace is added. The toolchain fingerprint exists only
 to record/compare which compiler produced a build (events, spec 04 namespaces).
-Shared (S3) settings are ignored: that is spec 04.
+Shared (S3) level (spec 04): ``plan`` only DECIDES and renders text; the sccache
+TOML is written by :func:`materialize` (called from ``run_gated``), and
+credentials travel only in ``EnvPlan.secret_env`` (hidden from repr), never in
+``env_overrides``, reasons, warnings or events.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import shutil
@@ -27,6 +31,14 @@ from enum import StrEnum
 from pathlib import Path
 
 from .build_cache_config import BuildCacheConfig, Mode
+from .build_cache_storage import (
+    SHARED_ENV_KEYS,
+    Code,
+    StorageError,
+    prepare_shared,
+    shared_env,
+    write_config_atomic,
+)
 from .build_metrics import classify_cmd
 
 TOOL_TIMEOUT_S = 3.0
@@ -72,12 +84,30 @@ class Fingerprint:
 
 
 @dataclass(frozen=True)
+class SharedStatus:
+    """Event-safe outcome of the shared level: no endpoint, paths or secrets."""
+    active: bool
+    reason: str  # "active" | "not_requested" | "shared_unavailable:<code>"
+    namespace_digest: str | None = None
+
+    def as_event(self) -> dict[str, object]:
+        return {"active": self.active, "reason": self.reason,
+                "namespace_digest": self.namespace_digest}
+
+
+NOT_REQUESTED = SharedStatus(False, "not_requested")
+
+
+@dataclass(frozen=True)
 class EnvPlan:
     applied: bool
     env_overrides: dict[str, str]
     reasons: list[str]
     warnings: list[str] = field(default_factory=list)
     fingerprint: Fingerprint | None = None
+    shared: SharedStatus = NOT_REQUESTED
+    secret_env: dict[str, str] = field(default_factory=dict, repr=False)
+    shared_toml: str | None = field(default=None, repr=False)
 
 
 def _run_text(argv: list[str]) -> str | None:
@@ -155,9 +185,19 @@ def _no(reason: Reason, warnings: list[str] | None = None) -> EnvPlan:
     return EnvPlan(False, {}, [reason.value], warnings or [], None)
 
 
+def _unavailable(code: Code) -> SharedStatus:
+    return SharedStatus(False, f"shared_unavailable:{code.value}")
+
+
 def plan(config: BuildCacheConfig, cmd: list[str], base_env: Mapping[str, str],
-         tools: Tools, workspace: Path, state_dir: Path) -> EnvPlan:
-    """Decide the cache environment for one command. Pure: no side effects."""
+         tools: Tools, workspace: Path, state_dir: Path,
+         shared_reachable: bool | None = None) -> EnvPlan:
+    """Decide the cache environment for one command. No writes, no network.
+
+    It may READ the registry and credentials files when the shared level is
+    requested. ``shared_reachable`` is the caller's pre-build probe result
+    (``build_cache_storage.check_shared``); ``None`` means not probed.
+    """
     if not config.enabled:
         return _no(Reason.DISABLED)
     if config.effective_mode not in (Mode.LOCAL_ONLY, Mode.SHARED_CACHE):
@@ -196,8 +236,43 @@ def plan(config: BuildCacheConfig, cmd: list[str], base_env: Mapping[str, str],
         warnings.append("shared CARGO_TARGET_DIR is user-set; not managed")
     if lo.ram_scratch_gib > 0:
         warnings.append("ram_scratch not implemented")
-    if config.shared_cache.enabled:
-        warnings.append("shared cache handled by spec 04 (not active)")
     if any(t.startswith("+") for t in cmd[1:2]):
         warnings.append("cargo +toolchain override: fingerprint reflects default rustc")
-    return EnvPlan(True, env, [Reason.APPLIED.value], warnings, fp)
+    shared, secret, toml = _shared(config, tools, fp, state_dir, shared_reachable, env)
+    return EnvPlan(True, env, [Reason.APPLIED.value], warnings, fp, shared, secret, toml)
+
+
+def _shared(config: BuildCacheConfig, tools: Tools, fp: Fingerprint, state_dir: Path,
+            reachable: bool | None, env: dict[str, str]
+            ) -> tuple[SharedStatus, dict[str, str], str | None]:
+    """Add the shared level to ``env`` (in place) or explain why not. Never raises."""
+    if not config.shared_cache.enabled:
+        return NOT_REQUESTED, {}, None
+    if config.effective_mode is not Mode.SHARED_CACHE:
+        return _unavailable(Code.NOT_SHARED_MODE), {}, None
+    try:
+        setup = prepare_shared(config, sccache_version=tools.sccache_version,
+                               toolchain_digest=fp.digest, host_triple=fp.host,
+                               state_dir=state_dir, reachable=reachable)
+    except StorageError as exc:
+        return _unavailable(exc.code), {}, None
+    env.update(shared_env(setup.inputs, setup.conf_path))
+    return (SharedStatus(True, "active", setup.namespace_digest),
+            setup.credentials.as_child_env(), setup.toml)
+
+
+def materialize(p: EnvPlan, state_dir: Path) -> EnvPlan:
+    """Write the sccache TOML for an active shared plan (0600, atomic).
+
+    On any failure the shared parts are removed and the build proceeds with the
+    local cache only (reason ``shared_unavailable:config_write_failed``).
+    """
+    if p.shared_toml is None or not p.shared.active:
+        return p
+    try:
+        write_config_atomic(state_dir / "sccache" / "sccache.toml", p.shared_toml)
+    except OSError:
+        env = {k: v for k, v in p.env_overrides.items() if k not in SHARED_ENV_KEYS}
+        return dataclasses.replace(p, env_overrides=env, secret_env={}, shared_toml=None,
+                                   shared=_unavailable(Code.CONFIG_WRITE_FAILED))
+    return p

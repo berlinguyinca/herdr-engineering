@@ -43,6 +43,7 @@ class SharedCache:
     max_total_gib: float
     tls_required: bool
     credentials_file: str | None
+    registry_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,7 @@ class BuildCacheConfig:
                 "namespace": sc.namespace, "writes_enabled": self.shared_writes_effective,
                 "max_total_gib": sc.max_total_gib, "tls_required": sc.tls_required,
                 "credentials_configured": sc.credentials_file is not None,
+                "registry_configured": sc.registry_file is not None,
             },
             "local": {
                 "capacity_gib": lo.capacity_gib, "ram_scratch_gib": lo.ram_scratch_gib,
@@ -238,6 +240,10 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     if cred is not None and (not isinstance(cred, str) or not os.path.isabs(cred)):
         raise _bad(f"{sp}.credentials_file", "must be an absolute path string (path only; "
                    "never the secret itself)")
+    reg = s["registry_file"]
+    if reg is not None and (not isinstance(reg, str) or not os.path.isabs(reg)):
+        raise _bad(f"{sp}.registry_file", "must be an absolute path string to the protected "
+                   "service registry file")
     if writes and not s_enabled:
         raise _bad(f"{sp}.writes_enabled", "requires shared_cache.enabled")
 
@@ -288,7 +294,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
 
     return BuildCacheConfig(
         enabled=enabled, mode=mode, allowed_hosts=allowed_hosts,
-        shared_cache=SharedCache(s_enabled, ep, s["namespace"], writes, max_total, tls, cred),
+        shared_cache=SharedCache(s_enabled, ep, s["namespace"], writes, max_total, tls, cred, reg),
         local=Local(capacity, ram, free, incr),
         execution=Execution(slurm, clusters, parts, gpu, fb, slots),
         cleanup=Cleanup(dry, idle, evict),
@@ -297,20 +303,23 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     )
 
 
-def check_credentials_file(path: str) -> Path:
-    """Lazy check: regular file, not a symlink, owned by us, no group/other bits."""
+def check_credentials_file(path: str, label: str = "credentials_file") -> Path:
+    """Lazy check: regular file, not a symlink, owned by us, no group/other bits.
+
+    ``label`` names the config key in error messages (also used for registry_file).
+    """
     p = Path(path)
     try:
         st = p.lstat()
     except OSError as exc:
-        raise InvalidError(f"credentials_file {path} is not readable: {exc.strerror}") from None
+        raise InvalidError(f"{label} {path} is not readable: {exc.strerror}") from None
     if stat.S_ISLNK(st.st_mode):
-        raise InvalidError(f"credentials_file {path} must not be a symlink")
+        raise InvalidError(f"{label} {path} must not be a symlink")
     if not stat.S_ISREG(st.st_mode):
-        raise InvalidError(f"credentials_file {path} must be a regular file")
+        raise InvalidError(f"{label} {path} must be a regular file")
     if st.st_uid != os.geteuid():
-        raise InvalidError(f"credentials_file {path} must be owned by the current user")
+        raise InvalidError(f"{label} {path} must be owned by the current user")
     if st.st_mode & 0o077:
-        raise InvalidError(f"credentials_file {path} must not be accessible by group/other "
+        raise InvalidError(f"{label} {path} must not be accessible by group/other "
                            "(chmod 600)")
     return p

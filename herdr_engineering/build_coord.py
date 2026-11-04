@@ -333,20 +333,25 @@ def _cache_env(cfg: BuildCacheConfig, cmd: list[str], state_dir: Path | None):
     The child env is a COPY of os.environ plus overrides (None => inherit as
     today). Planning failure never blocks a build: it just runs uncached.
     """
-    from .build_cache_env import detect_tools, plan
+    from .build_cache_env import NOT_REQUESTED, detect_tools, materialize, plan
+    from .build_cache_storage import check_shared
     directory = Path(state_dir) if state_dir is not None else _default_state_dir()
     try:
         env = dict(os.environ)
-        p = plan(cfg, cmd, env, detect_tools(env.get("PATH")), Path.cwd(), directory)
+        reachable = check_shared(cfg, directory)  # bounded probe, negative-cached
+        p = materialize(plan(cfg, cmd, env, detect_tools(env.get("PATH")), Path.cwd(),
+                             directory, reachable), directory)
     except Exception as exc:  # noqa: BLE001 - never break a build
         print(f"build-coordinate: cache planning failed ({type(exc).__name__}); uncached",
               file=sys.stderr)
-        return None, {"applied": False, "reasons": ["plan_error"], "fingerprint": None}
+        return None, {"applied": False, "reasons": ["plan_error"], "fingerprint": None,
+                      "shared": NOT_REQUESTED.as_event()}
     for w in p.warnings:
         print(f"build-coordinate: cache: {w}", file=sys.stderr)
     summary = {"applied": p.applied, "reasons": p.reasons,
-               "fingerprint": p.fingerprint.digest if p.fingerprint else None}
-    return ({**env, **p.env_overrides} if p.applied else None), summary
+               "fingerprint": p.fingerprint.digest if p.fingerprint else None,
+               "shared": p.shared.as_event()}
+    return ({**env, **p.env_overrides, **p.secret_env} if p.applied else None), summary
 
 
 def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,

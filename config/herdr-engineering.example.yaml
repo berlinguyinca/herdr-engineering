@@ -92,6 +92,7 @@ fabric_build_cache:
     max_total_gib: 250
     tls_required: true        # default true; false only for endpoint_ref "*.local-test"
     credentials_file: null    # absolute path, mode 0600, owned by the service user
+    registry_file: null       # absolute path, mode 0600: YAML service registry mapping endpoint_ref -> host/region/bucket
   local:
     capacity_gib: 20
     ram_scratch_gib: 0

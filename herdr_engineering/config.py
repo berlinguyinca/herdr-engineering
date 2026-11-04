@@ -42,7 +42,7 @@ DEFAULTS: dict[str, Any] = {
         "shared_cache": {
             "enabled": False, "endpoint_ref": None, "namespace": "trusted-dev",
             "writes_enabled": False, "max_total_gib": 250, "tls_required": True,
-            "credentials_file": None,
+            "credentials_file": None, "registry_file": None,
         },
         "local": {
             "capacity_gib": 20, "ram_scratch_gib": 0, "min_free_disk_percent": 20,

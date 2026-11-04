@@ -231,3 +231,22 @@ def test_shipped_example_loads_with_feature_off():
     cfg = load_config([REPO / "config" / "herdr-engineering.example.yaml"])
     c = validate(cfg["fabric_build_cache"])
     assert not c.enabled and c.effective_mode is Mode.LOCAL_ONLY and c.cleanup.dry_run
+
+
+def test_registry_file_is_absolute_path_only_and_not_in_public_view():
+    bad("registry_file", shared_cache={"registry_file": "relative/reg.yaml"})
+    bad("registry_file", shared_cache={"registry_file": 3})
+    assert validate(sec()).shared_cache.registry_file is None
+    c = validate(sec(shared_cache={"registry_file": "/very/private/reg.yaml"}))
+    assert c.shared_cache.registry_file == "/very/private/reg.yaml"
+    view = c.public_view()
+    assert view["shared_cache"]["registry_configured"] is True
+    assert "/very/private" not in repr(view)
+
+
+def test_check_credentials_file_label_names_the_key(tmp_path):
+    loose = tmp_path / "reg.yaml"
+    loose.write_text("x")
+    loose.chmod(0o644)
+    with pytest.raises(InvalidError, match="registry_file"):
+        check_credentials_file(str(loose), "registry_file")

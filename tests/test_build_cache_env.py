@@ -206,10 +206,10 @@ def test_ram_scratch_warns_explicitly(tmp_path):
     assert p.applied and "ram_scratch not implemented" in p.warnings
 
 
-def test_shared_cache_ignored_with_warning(tmp_path):
+def test_shared_cache_in_local_mode_is_inactive_with_reason(tmp_path):
     cfg = _cfg(shared_cache={"enabled": True, "endpoint_ref": "e"})
     p = _plan(tmp_path, cfg)
-    assert p.applied and "shared cache handled by spec 04 (not active)" in p.warnings
+    assert p.applied and p.shared.reason == "shared_unavailable:mode_not_shared"
     assert not any(k.startswith(("SCCACHE_BUCKET", "SCCACHE_ENDPOINT")) for k in p.env_overrides)
 
 
