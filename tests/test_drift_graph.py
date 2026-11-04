@@ -1,0 +1,121 @@
+"""The drift-graph block: extracted from the report, validated against the real prompts."""
+import json
+
+import pytest
+
+from herdr_engineering import drift_graph as dg
+
+
+def prompts(n, ts=True):
+    return [{"n": i, "ts": f"2026-01-01T{9 + i // 60:02d}:{i % 60:02d}:00Z" if ts else None, "text": f"p{i}"}
+            for i in range(1, n + 1)]
+
+
+def block(segments, **extra):
+    return json.dumps({"segments": segments, **extra})
+
+
+GOOD = [{"label": "USB stick", "from_prompt": 1, "to_prompt": 5},
+        {"label": "web page", "from_prompt": 6, "to_prompt": 12}]
+REPORT = "# Session summary\n\nbody\n\n```drift-graph\n{\"segments\": []}\n```\n\nEvidence coverage: complete\n"
+
+
+def test_extract_block_strips_all_blocks_and_returns_first():
+    text = "# S\n\n```drift-graph\n{\"a\": 1}\n```\n\nmiddle\n\n```drift-graph\n{\"b\": 2}\n```\n\nend\n"
+    clean, raw = dg.extract_block(text)
+    assert "drift-graph" not in clean and "{" not in clean and "middle" in clean and clean.rstrip().endswith("end")
+    assert json.loads(raw) == {"a": 1}
+    assert "\n\n\n" not in clean
+
+
+def test_report_without_block_is_unchanged():
+    text = "# S\n\n```python\nprint(1)\n```\n\nEvidence coverage: complete\n"
+    assert dg.extract_block(text) == (text, None)
+
+
+def test_extract_block_leaves_other_fences_alone():
+    clean, raw = dg.extract_block(REPORT.replace("```drift-graph", "```json"))
+    assert raw is None and "```json" in clean
+
+
+@pytest.mark.parametrize("raw", [None, "", "not json", "[]", '{"segments": "x"}', '{"segments": [1, 2]}'])
+def test_unusable_input_gives_none(raw):
+    assert dg.build_graph(raw, prompts(12), 12) is None
+
+
+@pytest.mark.parametrize("segments", [
+    [GOOD[0]],                                                                         # one segment
+    [{"label": f"s{i}", "from_prompt": i, "to_prompt": i} for i in range(1, 10)],      # nine segments
+    [GOOD[0], {"label": "b", "from_prompt": 7, "to_prompt": 12}],                      # gap
+    [{"label": "a", "from_prompt": 2, "to_prompt": 5}, {"label": "b", "from_prompt": 6, "to_prompt": 12}],  # not from 1
+    [GOOD[0], {"label": "b", "from_prompt": 6, "to_prompt": 13}],                      # past the total
+    [GOOD[0], {"label": "b", "from_prompt": 6, "to_prompt": 5}],                       # backwards
+    [{"label": "", "from_prompt": 1, "to_prompt": 5}, GOOD[1]],                        # empty label
+])
+def test_invalid_segments_give_none(segments):
+    assert dg.build_graph(block(segments), prompts(12), 12) is None
+
+
+def test_fewer_than_five_prompts_gives_none():
+    assert dg.build_graph(block([{"label": "a", "from_prompt": 1, "to_prompt": 2},
+                                 {"label": "b", "from_prompt": 3, "to_prompt": 4}]), prompts(4), 4) is None
+
+
+def test_valid_graph_computes_counts_and_start_times_from_prompts():
+    ps = prompts(12)
+    g = dg.build_graph(block(GOOD), ps, 12)
+    assert g["total_prompts"] == 12
+    assert [(s["from_prompt"], s["to_prompt"], s["count"]) for s in g["segments"]] == [(1, 5, 5), (6, 12, 7)]
+    assert [s["start"] for s in g["segments"]] == [ps[0]["ts"], ps[5]["ts"]]
+    assert g["drift"] is None
+
+
+def test_model_supplied_times_and_counts_are_ignored():
+    segs = [dict(GOOD[0], count=99, start="1999-01-01T00:00:00Z"), GOOD[1]]
+    g = dg.build_graph(block(segs), prompts(12), 12)
+    assert g["segments"][0]["count"] == 5 and g["segments"][0]["start"].startswith("2026")
+
+
+def test_start_is_none_when_the_prompt_has_no_time():
+    g = dg.build_graph(block(GOOD), prompts(12, ts=False), 12)
+    assert [s["start"] for s in g["segments"]] == [None, None]
+
+
+def test_drift_is_kept_on_a_later_segment_start():
+    g = dg.build_graph(block(GOOD, drift_at=6, drift_note="this is a web page task"), prompts(12), 12)
+    assert g["drift"] == {"at": 6, "note": "this is a web page task"}
+
+
+@pytest.mark.parametrize("at", [1, 3, 99, "x", None])
+def test_bad_drift_is_dropped_but_segments_are_kept(at):
+    g = dg.build_graph(block(GOOD, drift_at=at, drift_note="n"), prompts(12), 12)
+    assert g is not None and g["drift"] is None and len(g["segments"]) == 2
+
+
+def test_labels_and_note_are_redacted_and_clipped():
+    secret = "sk-ant-api03-SECRETSECRETSECRETSECRET1234"
+    segs = [{"label": f"{secret} " + "x" * 80, "from_prompt": 1, "to_prompt": 5}, GOOD[1]]
+    g = dg.build_graph(block(segs, drift_at=6, drift_note="n" * 300), prompts(12), 12)
+    assert "SECRETSECRET" not in g["segments"][0]["label"]
+    assert len(g["segments"][0]["label"]) <= dg.MAX_LABEL and g["segments"][0]["label"].endswith("…")
+    assert len(g["drift"]["note"]) <= dg.MAX_NOTE
+
+
+def test_sampled_sessions_use_the_true_total():
+    ps = prompts(12)
+    g = dg.build_graph(block([{"label": "a", "from_prompt": 1, "to_prompt": 300},
+                              {"label": "b", "from_prompt": 301, "to_prompt": 500}]), ps + [{"n": 13, "ts": None}], 500)
+    assert g is None                      # n above the prompts we hold has no time source: refuse rather than guess
+    full = [{"n": i, "ts": f"2026-01-01T00:00:{i % 60:02d}Z"} for i in range(1, 501)]
+    g = dg.build_graph(block([{"label": "a", "from_prompt": 1, "to_prompt": 300},
+                              {"label": "b", "from_prompt": 301, "to_prompt": 500}]), full, 500)
+    assert [s["count"] for s in g["segments"]] == [300, 200]
+
+
+def test_agents_counts_dispatches_inside_each_segment_and_is_none_without_dispatches():
+    ps = prompts(12)
+    during_second = [ps[6]["ts"], ps[7]["ts"], None]
+    g = dg.build_graph(block(GOOD), ps, 12, dispatch_ts=during_second)
+    assert [s["agents"] for s in g["segments"]] == [0, 2]
+    assert [s["agents"] for s in dg.build_graph(block(GOOD), ps, 12, dispatch_ts=[])["segments"]] == [None, None]
+    assert [s["agents"] for s in dg.build_graph(block(GOOD), ps, 12)["segments"]] == [None, None]

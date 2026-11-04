@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from herdr_engineering import session_history as sh
 
 
@@ -263,9 +265,6 @@ def test_history_reports_every_recorded_cwd_latest_last(tmp_path):
 
 
 # --- real user prompts, untrimmed and harness-neutral (session drift graph) ---
-
-import pytest
-
 
 @pytest.mark.parametrize("text", ["", "<task-notification>x", "<system-reminder>x", "<environment_context>x",
                                   "<command-name>/x", "<local-command-stdout>", "<pasted_content id='a'>x"])
