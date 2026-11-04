@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parseaddr
@@ -217,8 +218,10 @@ class TeamBriefRecord:
     sender_class: str = "unknown"
     flagged: bool = False
     summary: str = ""
+    attachments: int = 0
     room_id: str = ""
     team_id: str = ""
+    target_agent_id: str = ""
     suggestion_id: str = ""            # empty until the collab log has the request: a crash between the two steps heals on retry
     private: dict[str, str] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -229,3 +232,159 @@ class TeamBriefRecord:
                 "summary": self.summary, "room_id": self.room_id, "team_id": self.team_id,
                 "suggestion_id": self.suggestion_id or None, "created_at": self.created_at.isoformat(),
                 "message": dict(self.private)}
+
+
+class TeamBriefError(Exception):
+    """A refused hand-off with the HTTP status it deserves (400 invalid, 409 conflict)."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class TeamBriefService:
+    """The assistant side of the hand-off. One entry point, ``process_message``, serves both the operator's HTTP route and any
+    scanner tick, so the same email gets the same answer however it arrives.
+
+    Two durable steps, in this order, each idempotent on ``brief_key``:
+
+    1. ``prepare``: derive the brief and make its record (reference, private pointers) durable with an ACKNOWLEDGED write.
+    2. ``submit``: hand the derived text and the opaque reference to the collab service, which indexes ``brief_key`` from its own
+       log, then record the suggestion id.
+
+    A crash after 1 leaves a record with no suggestion: the next try reuses the SAME reference and finishes. A crash after the
+    collab commit leaves a record that does not know its suggestion yet: the next try gets the collab service's replay answer
+    (same suggestion, nothing new) and fills it in. Nothing here can create a second request."""
+
+    PROVIDER = "gmail"
+
+    def __init__(self, assistant: Any) -> None:
+        self.assistant = assistant
+        self._lock = threading.RLock()
+
+    # ------------------------------------------------------------------ gates
+    @property
+    def cfg(self) -> dict:
+        return self.assistant.config["team_briefs"]
+
+    def enabled(self) -> bool:
+        return bool(self.assistant.config.get("enabled") and self.cfg["enabled"])
+
+    def _require_enabled(self) -> None:
+        from .assistant import AssistantNotFound
+        if not self.enabled():
+            raise AssistantNotFound("not found")                      # off means the route does not exist
+
+    # ------------------------------------------------------------------ step 1
+    def prepare(self, *, tenant_id: str, user_id: str, assistant_id: str, message_ref: str, room_id: str, team_id: str,
+                target_agent_id: str | None = None) -> TeamBriefRecord | None:
+        """Derive the brief for one message and make its record durable. None when no listed topic matches."""
+        from .assistant import AssistantNotFound, AssistantUnavailable
+        self._require_enabled()
+        svc = self.assistant
+        try:
+            svc.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        except (LookupError, KeyError):
+            raise AssistantNotFound("not found") from None
+        if not isinstance(message_ref, str) or not message_ref or len(message_ref) > 200:
+            raise AssistantNotFound("not found")
+        if svc.mail_source is None:
+            raise AssistantUnavailable("the mailbox is not connected")
+        key = brief_key(user_id, self.PROVIDER, message_ref)
+        with self._lock:
+            have = self._by_key(tenant_id, user_id, key)
+            if have is not None:
+                if (have.room_id, have.team_id) != (room_id, team_id) and have.suggestion_id:
+                    raise TeamBriefError(409, "this email was already offered to another room or team")
+                if not have.suggestion_id and (have.room_id, have.team_id, have.target_agent_id) != (
+                        room_id, team_id, target_agent_id or ""):
+                    have.room_id, have.team_id, have.target_agent_id = room_id, team_id, target_agent_id or ""
+                    self._put(have)                                        # nothing was filed yet: the new target wins
+                return have
+        try:
+            msg = svc.mail_source(tenant_id, user_id, message_ref)
+        except LookupError:
+            raise AssistantNotFound("not found") from None
+        brief = derive_brief(msg, cfg=self.cfg, user_id=user_id, provider=self.PROVIDER)
+        if brief is None:
+            return None
+        with self._lock:
+            have = self._by_key(tenant_id, user_id, brief.brief_key)       # another thread may have made it meanwhile
+            if have is not None:
+                return have
+            rec = TeamBriefRecord(
+                reference=new_reference(), brief_key=brief.brief_key, tenant_id=tenant_id, user_id=user_id,
+                assistant_id=assistant_id, topic=brief.topic, sender_class=brief.sender_class, flagged=brief.flagged,
+                summary=brief.summary, attachments=brief.attachments, room_id=room_id, team_id=team_id,
+                target_agent_id=target_agent_id or "", private=dict(brief.private), created_at=svc.now())
+            self._put(rec)
+            svc.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id, action="assistant.team_brief.derived",
+                                   subject_id=rec.reference, detail=f"topic {rec.topic}")
+            return rec
+
+    def _put(self, rec: TeamBriefRecord) -> None:
+        try:
+            self.assistant.store.put_team_brief_required(rec)
+        except Exception:                                                  # noqa: BLE001 - the reference must be durable first
+            from .assistant import AssistantUnavailable
+            raise AssistantUnavailable("the brief could not be stored durably; nothing was offered") from None
+
+    def _by_key(self, tenant_id: str, user_id: str, key: str) -> TeamBriefRecord | None:
+        return next((r for r in self.assistant.store.team_briefs.values()
+                     if r.brief_key == key and r.tenant_id == tenant_id and r.user_id == user_id), None)
+
+    # ------------------------------------------------------------------ step 2
+    def submit(self, rec: TeamBriefRecord) -> dict[str, Any]:
+        from .assistant import AssistantForbidden, AssistantNotFound, AssistantUnavailable, RateLimited
+        svc = self.assistant
+        collab_user = svc.config["actions"]["collab_users"].get(rec.user_id)
+        if not collab_user or svc.brief_submitter is None:
+            raise AssistantNotFound("not found")                           # no collaboration identity mapped: same answer as a miss
+        payload = {"brief_key": rec.brief_key, "reference": rec.reference, "text": render_brief(rec, rec.reference),
+                   "topic": rec.topic, "sender_class": rec.sender_class, "flagged": rec.flagged,
+                   "attachments": rec.attachments, "team_id": rec.team_id}
+        if rec.target_agent_id:
+            payload["target_agent_id"] = rec.target_agent_id
+        try:
+            out = svc.brief_submitter(collab_user, rec.room_id, payload)
+        except Exception as exc:                                           # noqa: BLE001 - the collab service's own refusal
+            status = getattr(exc, "status", 503)
+            if status == 404:
+                raise AssistantNotFound("not found") from None
+            if status == 403:
+                raise AssistantForbidden("forbidden") from None
+            if status == 429:
+                raise RateLimited("too many briefs this hour") from None
+            if status in (400, 409):
+                raise TeamBriefError(status, str(getattr(exc, "message", "refused"))[:200]) from None
+            raise AssistantUnavailable("the room could not take the brief right now; try again") from None
+        with self._lock:
+            if rec.suggestion_id != out["suggestion_id"]:
+                rec.suggestion_id = out["suggestion_id"]
+                self._put(rec)
+                svc.store.audit_record(tenant_id=rec.tenant_id, user_id=rec.user_id, actor=rec.user_id,
+                                       action="assistant.team_brief.offered", subject_id=rec.reference,
+                                       detail=f"suggestion {out['suggestion_id']}")
+        return {"reference": rec.reference, "suggestion_id": out["suggestion_id"], "state": out["state"], "topic": rec.topic,
+                "flagged": rec.flagged, "sender_class": rec.sender_class, "replayed": bool(out["replayed"])}
+
+    def process_message(self, **kw: Any) -> dict[str, Any] | None:
+        """Derive, store, offer. The brief dict, or None when the message matches no topic."""
+        rec = self.prepare(**kw)
+        return None if rec is None else self.submit(rec)
+
+    # ------------------------------------------------------------------ the operator's reads
+    def reference(self, reference: str, *, tenant_id: str, user_id: str) -> dict[str, Any]:
+        """Resolve a reference for the person it belongs to. Anything else is the one 404 of a missing object."""
+        from .assistant import AssistantNotFound
+        self._require_enabled()
+        rec = self.assistant.store.team_briefs.get(reference) if isinstance(reference, str) else None
+        if rec is None or rec.tenant_id != tenant_id or rec.user_id != user_id:
+            raise AssistantNotFound("not found")
+        return rec.as_dict()
+
+    def list(self, *, tenant_id: str, user_id: str) -> list[dict[str, Any]]:
+        self._require_enabled()
+        rows = [r for r in self.assistant.store.team_briefs.values() if r.tenant_id == tenant_id and r.user_id == user_id]
+        return [{k: v for k, v in r.as_dict().items() if k != "message"}
+                for r in sorted(rows, key=lambda r: r.created_at, reverse=True)]
