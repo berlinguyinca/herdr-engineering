@@ -564,6 +564,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         # plan 3: the collab-public artifact bridge (collab_artifacts.CollabArtifactBridge), wired by the server
         # when control_plane.collab_artifacts is enabled; None = no artifact tools
         self.artifact_bridge = None
+        self.member_service: Any = None     # MemberService, set by the cli wiring when a member group is configured
         self.stats = defaultdict(int)
         self._init_workbench()
         self._init_context()

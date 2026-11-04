@@ -4989,10 +4989,14 @@ def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):
     from .control_plane.collab_artifacts import CollabArtifactBridge
     bridge = CollabArtifactBridge(service, Path(mirror_dir), Path(outbox_dir))
     service.artifact_bridge = bridge
+    if getattr(service, "member_group", None):
+        from .control_plane.artifact_member_service import MemberService
+        service.member_service = MemberService(service, bridge)
     try:
         bridge.start()
     except BaseException:
         service.artifact_bridge = None
+        service.member_service = None
         bridge.stop()
         raise
     return bridge

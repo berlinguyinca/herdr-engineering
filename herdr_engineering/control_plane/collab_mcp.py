@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from . import collab_member_tools as _member_tools
 from . import collab_waiters
 from .collab import MAX_TASK_TEXT, CollabError, CollabService
 
@@ -238,7 +239,12 @@ def tools_for(service: CollabService, pr=None) -> list[dict]:
     else:
         drop |= DELEGATION_TOOL_NAMES | CONSULT_TOOL_NAMES
     out = [t for t in out if t["name"] not in drop]
-    return out + _ARTIFACT_TOOLS if with_artifacts else out
+    out = out + _ARTIFACT_TOOLS if with_artifacts else out
+    if bridge is not None and bridge.available() and _member_tools.member_pr(service, pr):
+        have = {t["name"] for t in out}
+        out = out + [t for t in _ARTIFACT_TOOLS if t["name"] in _member_tools.VIEW_TOOL_NAMES - have] \
+            + _member_tools.MEMBER_TOOLS
+    return out
 
 
 def _result(rid: Any, result: dict) -> dict:
@@ -423,6 +429,18 @@ def _artifact_call(service: CollabService, pr, name: str, args: dict) -> dict:
 
 def _call(service: CollabService, pr, name: str, args: dict) -> dict:
     import secrets
+    if name in _member_tools.MEMBER_TOOL_NAMES:
+        if service.artifact_bridge is None:
+            raise CollabError(404, "unknown tool")
+        if not service.artifact_bridge.available():
+            raise CollabError(503, "collaboration bridge unavailable")
+        return _text(_member_tools.call(service, pr, name, args), untrusted=True)
+    if name in _member_tools.VIEW_TOOL_NAMES and service.artifact_bridge is not None \
+            and service.artifact_bridge.available() and _member_tools.member_pr(service, pr):
+        if _member_tools.view_access(service, pr, args.get("artifact_id")):
+            return _text(_member_tools.call(service, pr, name, args), untrusted=True)
+        if not service.artifact_bridge.has_grants(pr):          # same answer as an id that does not exist
+            _member_tools.call(service, pr, name, args)         # validates, audits, then refuses
     if name in ARTIFACT_TOOL_NAMES:           # before the room_id check: these tools take no room
         return _artifact_call(service, pr, name, args)
     if name in ("helper_spawn", "helper_wait", "helper_result", "helper_cancel"):
