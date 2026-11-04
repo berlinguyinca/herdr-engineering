@@ -28,9 +28,9 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from ..version import __version__
 from .artifact_acl import is_agent_collaborator
@@ -3004,6 +3004,10 @@ def _make_handler(server, public=False, operator=False):
                 from .artifact_collab_api import route_collab
                 if route_collab(self, server, parts, resource):
                     return None
+                # route_render FIRST: route_report claims every versioned preview/outputs path of any depth.
+                from .artifact_render_api import route_render
+                if route_render(self, server, parts, resource):
+                    return None
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
                     return None
@@ -3562,20 +3566,14 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({**page, "events": [_redact_event(event) for event in page["events"]]})
                     return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
-                data = r.get_artifact_data(parts[4])
-                a = r.get_artifact(parts[4])
-                if a is None and server.artifact_store is not None:
-                    a = self._artifact_call('get_record', parts[4], principal_id=self._resource_principal())
-                # payload lives in the object store, not the in-memory blob
-                if data is None and a is not None and server.rustfs is not None \
-                        and a.get("storage_key") and a.get("sha256"):
-                    try:
-                        data = server.rustfs.get(a["storage_key"], a["sha256"])
-                    except Exception:
-                        data = None
+                a, data = self._artifact_current_file(parts[4])
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
-                return self._bytes(data, a.get("mime_type", "application/octet-stream"))
+                # No artifact byte may execute on the dashboard origin: download as an attachment under a sandbox.
+                name = PurePosixPath(a.get("original_filename") or "artifact").name or "artifact"
+                return self._bytes(data, a.get("mime_type", "application/octet-stream"), headers=[
+                    ("Content-Disposition", "attachment; filename*=UTF-8''" + quote(name, safe="")),
+                    ("Content-Security-Policy", "default-src 'none'; sandbox")])
             if resource == "artifacts" and len(parts) == 4:
                 if server.artifact_store is not None:
                     artifacts = self._artifact_call(
@@ -5778,12 +5776,30 @@ def _make_handler(server, public=False, operator=False):
                 return self._etag_json(body)
             return self._json(body, etag=etag)
 
-        def _bytes(self, data, mime):
+        def _artifact_current_file(self, artifact_id):
+            """``(record, bytes)`` of the artifact's current file (either may be None), as ``/download`` serves it."""
+            r = server.repo
+            data = r.get_artifact_data(artifact_id)
+            a = r.get_artifact(artifact_id)
+            if a is None and server.artifact_store is not None:
+                a = self._artifact_call('get_record', artifact_id, principal_id=self._resource_principal())
+            # payload lives in the object store, not the in-memory blob
+            if data is None and a is not None and server.rustfs is not None \
+                    and a.get("storage_key") and a.get("sha256"):
+                try:
+                    data = server.rustfs.get(a["storage_key"], a["sha256"])
+                except Exception:
+                    data = None
+            return a, data
+
+        def _bytes(self, data, mime, headers=()):
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
+            for name, value in headers:
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
             return None

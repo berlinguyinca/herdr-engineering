@@ -49,15 +49,19 @@ test('report reader uses versioned metadata and fetches preview/evidence only on
     assert.equal(requests.filter(r => /\/assets\//.test(r.url)).length, 0);
     assert.equal(requests.filter(r => r.url.endsWith('/preview')).length, 0);
     await page.getByRole('button', { name: 'Load lightweight preview', exact: true }).click();
-    await page.locator('iframe[title="Report preview"]').waitFor();
-    assert.equal(await page.locator('iframe[title="Report preview"]').getAttribute('sandbox'), '');
-    const embedded = page.frameLocator('iframe[title="Report preview"]');
-    await embedded.getByRole('heading', { name: 'Findings', exact: true }).waitFor();
-    assert.equal(await embedded.locator('a').count(), 0);
+    const preview = page.locator('[data-static-preview]');
+    await preview.waitFor();
+    // Locators pierce the open shadow root of the static copy.
+    await preview.getByRole('heading', { name: 'Findings', exact: true }).waitFor();
+    assert.equal(await page.locator('iframe').count(), 0);
+    assert.equal(page.frames().length, 1);
+    assert.equal(await preview.locator('a').count(), 0);
+    assert.match(await preview.getAttribute('style'), /contain:\s*paint/);
+    await preview.getByRole('heading', { name: 'Findings', exact: true }).click();
     assert.equal(page.url(), `${base}/#/artifacts/report_1`);
-    assert.equal(page.frames().find(frame => frame !== page.mainFrame())?.url(), 'about:srcdoc');
-    await page.getByText('Use the surrounding reader controls to navigate findings and download files.', { exact: true }).waitFor();
-    assert.equal(requests.filter(r => r.url.endsWith('/versions/version_2/preview')).length, 1);
+    await page.getByText('Scripts, frames and embedded media are not shown in this static copy', { exact: true }).waitFor();
+    assert.equal(requests.filter(r => r.url.endsWith('/versions/version_2/preview/render')).length, 1);
+    assert.equal(requests.filter(r => r.url.endsWith('/versions/version_2/preview')).length, 0);
     assert.equal(requests.filter(r => /\/assets\//.test(r.url)).length, 0);
     const download = page.waitForEvent('download');
     await page.getByRole('button', { name: 'Download evidence/timing.csv', exact: true }).click();
@@ -214,12 +218,14 @@ test('mixed report histories preserve legacy output previews and downloads on th
     assert.equal(await page.locator('[data-report-feedback-form]').count(), 0);
     assert.equal(requests.filter(request => /\/outputs\//.test(request.url)).length, 0);
     await page.getByRole('button', { name: 'Preview index.html', exact: true }).click();
-    await page.frameLocator('iframe[title="Report preview"]').getByRole('heading', { name: 'Legacy version_1' }).waitFor();
+    await page.locator('[data-static-preview]').getByRole('heading', { name: 'Legacy version_1' }).waitFor();
+    assert.equal(page.frames().length, 1);
     const downloading = page.waitForEvent('download');
     await page.getByRole('button', { name: 'Download index.html', exact: true }).click();
     const downloaded = await downloading;
     assert.match(fs.readFileSync(await downloaded.path(), 'utf8'), /Legacy version_1/);
-    assert.equal(requests.filter(request => request.url.endsWith('/versions/version_1/outputs/0')).length, 2);
+    assert.equal(requests.filter(request => request.url.endsWith('/versions/version_1/outputs/0/render')).length, 1);
+    assert.equal(requests.filter(request => request.url.endsWith('/versions/version_1/outputs/0')).length, 1);
     assert.equal(requests.filter(request => request.url.endsWith('/artifacts/report_1/download')).length, 0);
     assert.equal(requests.filter(request => request.url.endsWith('/versions/version_1/report')).length, 0);
     await page.locator('[data-report-version]').selectOption('version_2');
@@ -234,8 +240,68 @@ test('legacy Markdown report history opens its pinned version directly', async (
     await page.getByRole('heading', { name: 'Legacy report version', exact: true }).waitFor();
     assert.equal(await page.locator('[data-report-version]').inputValue(), 'version_1');
     await page.getByRole('button', { name: 'Preview index.html', exact: true }).click();
-    await page.frameLocator('iframe[title="Report preview"]').getByRole('heading', { name: 'Legacy version_1' }).waitFor();
+    await page.locator('[data-static-preview]').getByRole('heading', { name: 'Legacy version_1' }).waitFor();
+    assert.equal(page.frames().length, 1);
     assert.equal(requests.filter(request => request.url.endsWith('/versions/version_2/outputs/0')).length, 0);
     assert.equal(requests.filter(request => request.url.endsWith('/artifacts/report_1/download')).length, 0);
   }, { REPORT_ALL_LEGACY: '1' });
+});
+
+test('an HTML artifact shows a static copy: its script never runs on the dashboard and no frame exists', async () => {
+  await withReports(async ({ page, base, requests }) => {
+    await page.goto(`${base}/#/artifacts/html_1`);
+    const preview = page.locator('[data-static-preview]');
+    await preview.getByRole('heading', { name: 'Plain page heading' }).waitFor();
+    assert.equal(await page.evaluate(() => window.__x), undefined);
+    assert.equal(await page.locator('iframe').count(), 0);
+    assert.equal(page.frames().length, 1);
+    assert.equal(await preview.locator('a').count(), 0);
+    await preview.getByText('Body text').click();
+    assert.equal(page.url(), `${base}/#/artifacts/html_1`);
+    assert.equal(requests.filter(r => r.url.endsWith('/artifacts/html_1/render')).length, 1);
+    assert.equal(requests.filter(r => r.url.endsWith('/artifacts/html_1/download')).length, 0);
+  });
+});
+
+test('a PDF artifact is drawn on a canvas with visible ink and no frame', async () => {
+  await withReports(async ({ page, base }) => {
+    await page.goto(`${base}/#/artifacts/pdf_1`);
+    await page.locator('.hd-pdf-page[data-drawn="true"] canvas').waitFor({ timeout: 20000 });
+    const inked = await page.evaluate(() => {
+      const canvas = document.querySelector('.hd-pdf-page canvas');
+      const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+      for (let i = 0; i < data.length; i += 4) if (data[i + 3] > 0 && (data[i] < 200 || data[i + 1] < 200 || data[i + 2] < 200)) return true;
+      return false;
+    });
+    assert.equal(inked, true);
+    assert.equal(await page.locator('iframe, embed, object').count(), 0);
+    assert.equal(page.frames().length, 1);
+  });
+});
+
+test('the live link opens the raw file in an opaque-origin sandbox, and the dashboard origin is untouched', async () => {
+  await withReports(async ({ page, base }) => {
+    await page.goto(`${base}/#/artifacts/html_1`);
+    const link = page.locator('[data-open-live]');
+    await link.waitFor();
+    assert.equal(await link.getAttribute('rel'), 'noopener noreferrer');
+    assert.equal(await link.getAttribute('target'), '_blank');
+    const popupPromise = page.context().waitForEvent('page');
+    await link.click();
+    const popup = await popupPromise;
+    await popup.waitForLoadState('domcontentloaded');
+    assert.match(popup.url(), /\/api\/v1\/artifacts\/html_1\/live$/);
+    await popup.getByRole('heading', { name: 'Plain page heading' }).waitFor();
+    const facts = await popup.evaluate(() => {
+      let domainThrows = false;
+      try { void document.domain; void window.parent.document.cookie; } catch { domainThrows = true; }
+      let storageThrows = false;
+      try { void localStorage.length; } catch { storageThrows = true; }
+      return { origin: window.origin, ran: window.__x, storageThrows, domainThrows };
+    });
+    assert.equal(facts.origin, 'null');
+    assert.equal(facts.ran, 1);
+    assert.equal(facts.storageThrows, true);
+    assert.equal(await page.evaluate(() => window.__x), undefined);
+  });
 });

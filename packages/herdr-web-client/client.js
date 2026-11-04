@@ -213,6 +213,31 @@ export class HerdrClient {
     return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/download`;
   }
 
+  // Static (sanitised) copy of the current file: { kind, html, too_large }.
+  artifactRender(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/render`, { signal });
+  }
+
+  // Static copy of one legacy report output of a version.
+  artifactOutputRender(id, versionId, index, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/outputs/${encodeURIComponent(index)}/render`, { signal });
+  }
+
+  // Static copy of a report version's lightweight preview.
+  artifactReportPreviewRender(id, versionId, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/preview/render`, { signal });
+  }
+
+  // The sandboxed raw view, opened in a new tab (never framed).
+  artifactLiveUrl(id) {
+    return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/live`;
+  }
+
+  // The current file's bytes (the /download route, with this client's headers).
+  artifactBytes(id, { signal } = {}) {
+    return this.artifactReportContent(`/api/v1/artifacts/${encodeURIComponent(id)}/download`, 'buffer', signal);
+  }
+
   artifactVersions(id, { signal, summary = false } = {}) {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions${summary ? '?summary=true' : ''}`, { signal });
   }
@@ -383,7 +408,7 @@ export class HerdrClient {
       error.requestId = response.headers?.get?.('X-Request-ID') || '';
       throw error;
     }
-    return kind === 'text' ? response.text() : response.blob();
+    return kind === 'text' ? response.text() : kind === 'buffer' ? response.arrayBuffer() : response.blob();
   }
 
   listPublications({ signal } = {}) {

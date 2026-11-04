@@ -83,7 +83,7 @@ def _text(handler, data, *, mime="text/html; charset=utf-8", status=200):
     handler.send_header("Referrer-Policy", "no-referrer")
     handler.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
                         "script-src 'none'; img-src 'none'; base-uri 'none'; form-action 'none'; "
-                        "frame-ancestors 'self'; sandbox")
+                        "frame-ancestors 'none'; sandbox")
     handler.end_headers()
     handler.wfile.write(payload)
 
