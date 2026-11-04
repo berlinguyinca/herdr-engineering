@@ -89,6 +89,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(func=_cmd_build_cache_inventory)
 
+    p = sub.add_parser("build-cache-evict",
+                       help="local sccache quota preview; --apply deletes only with "
+                            "eviction.destructive_enabled (spec 07; nothing when disabled)")
+    p.add_argument("--apply", action="store_true",
+                   help="really delete planned entries (dry-run otherwise)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=_cmd_build_cache_evict)
+
     # doctor ---------------------------------------------------------------
     p = sub.add_parser("doctor", help="capability/health checks (spec 0050/0170)")
     p.add_argument("--json", action="store_true", help="stable machine-readable output")
@@ -2749,15 +2757,21 @@ def _cmd_build_coordinate(args) -> int:
     autonomous agents on a host, so N agents can't each launch a full-workspace
     build at once and CPU-starve the machine (the "build storm").
     """
-    from .build_coord import BuildGate, _default_slots, run_gated
+    from .build_cache_policy import effective_slots, observed_slot_suggestion
+    from .build_coord import BuildGate, _default_slots, _default_state_dir, run_gated
     from .build_metrics import summarize
 
-    slots = args.slots if args.slots is not None else _default_slots()
+    cache_cfg = _build_cache_config()
+    slots = args.slots if args.slots is not None else effective_slots(
+        cache_cfg, _default_slots(), _default_state_dir())
     if getattr(args, "status", False):
         gate = BuildGate(slots=slots)
         if args.json:
-            _print_json({"slots": slots, "occupancy": gate.status(),
-                         "builds": summarize(gate.dir / "builds.jsonl")})
+            view = {"slots": slots, "occupancy": gate.status(),
+                    "builds": summarize(gate.dir / "builds.jsonl")}
+            if cache_cfg is not None:
+                view["slot_suggestion"] = observed_slot_suggestion(cache_cfg, gate.dir)
+            _print_json(view)
         else:
             for entry in gate.status():
                 if entry["held"]:
@@ -2779,7 +2793,7 @@ def _cmd_build_coordinate(args) -> int:
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
                      record=getattr(args, "record", False),
-                     cache_config=_build_cache_config())
+                     cache_config=cache_cfg)
 
 
 def _build_cache_config():
@@ -2808,8 +2822,28 @@ def _cmd_build_cache_inventory(args) -> int:
         print(f"build-cache-inventory: invalid config: {exc}", file=sys.stderr)
         return 1
     cap = collect(cfg)
-    _print_json(inventory_view(cfg, [cap] if cap else []))
+    view = inventory_view(cfg, [cap] if cap else [])
+    if cap:
+        from .build_cache_policy import observed_slot_suggestion
+        from .build_coord import _default_state_dir
+        view["slot_suggestion"] = observed_slot_suggestion(cfg, _default_state_dir())
+    _print_json(view)
     return 0
+
+
+def _cmd_build_cache_evict(args) -> int:
+    from .build_cache_config import validate
+    from .build_cache_policy import run_eviction
+    from .build_coord import _default_state_dir
+    from .config import load_config
+    try:
+        cfg = validate(load_config(strict_build_cache=True).get("fabric_build_cache"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"build-cache-evict: invalid config: {exc}", file=sys.stderr)
+        return 1
+    result = run_eviction(cfg, _default_state_dir(), apply=args.apply)
+    _print_json(result)
+    return 0 if result.get("status") in (None, "preview", "applied") else 1
 
 
 def _cmd_build_cleanup(args) -> int:

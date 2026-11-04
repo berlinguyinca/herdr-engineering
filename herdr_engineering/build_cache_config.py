@@ -72,6 +72,20 @@ class Cleanup:
 
 
 @dataclass(frozen=True)
+class Eviction:
+    destructive_enabled: bool
+    hard_cap_gib: float
+    max_entries_per_run: int
+
+
+@dataclass(frozen=True)
+class AdaptiveSlots:
+    enabled: bool
+    min_slots: int
+    max_slots: int
+
+
+@dataclass(frozen=True)
 class Observability:
     enabled: bool
     export_existing_metrics_pipeline: bool
@@ -88,6 +102,8 @@ class BuildCacheConfig:
     cleanup: Cleanup
     observability: Observability
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    eviction: Eviction = Eviction(False, 40, 5000)
+    adaptive_slots: AdaptiveSlots = AdaptiveSlots(False, 1, 4)
 
     @property
     def effective_mode(self) -> Mode:
@@ -133,6 +149,16 @@ class BuildCacheConfig:
             "cleanup": {
                 "dry_run": cl.dry_run, "min_idle_hours": cl.min_idle_hours,
                 "max_evict_per_pass_gib": cl.max_evict_per_pass_gib,
+            },
+            "eviction": {
+                "destructive_enabled": self.eviction.destructive_enabled,
+                "hard_cap_gib": self.eviction.hard_cap_gib,
+                "max_entries_per_run": self.eviction.max_entries_per_run,
+            },
+            "adaptive_slots": {
+                "enabled": self.adaptive_slots.enabled,
+                "min_slots": self.adaptive_slots.min_slots,
+                "max_slots": self.adaptive_slots.max_slots,
             },
             "observability": {
                 "enabled": self.observability.enabled,
@@ -277,6 +303,26 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     if not dry:
         warnings.append(f"{cp}.dry_run is false: cleanup will really delete cache entries")
 
+    vp = f"{p}.eviction"
+    ev = _filled(top["eviction"], base["eviction"], vp)
+    destructive = _bool(ev, "destructive_enabled", vp)
+    hard_cap = _num(ev, "hard_cap_gib", vp, lo=0, lo_incl=False)
+    if hard_cap < capacity:
+        raise _bad(f"{vp}.hard_cap_gib", f"must be >= {p}.local.capacity_gib ({capacity})")
+    max_entries = int(_num(ev, "max_entries_per_run", vp, lo=1, lo_incl=True,
+                           hi=1_000_000, hi_incl=True, integer=True))
+    if destructive:
+        warnings.append(f"{vp}.destructive_enabled is true: build-cache-evict --apply may "
+                        "delete local sccache entries")
+
+    ap = f"{p}.adaptive_slots"
+    ad = _filled(top["adaptive_slots"], base["adaptive_slots"], ap)
+    ad_on = _bool(ad, "enabled", ap)
+    min_s = int(_num(ad, "min_slots", ap, lo=1, lo_incl=True, hi=16, hi_incl=True, integer=True))
+    max_s = int(_num(ad, "max_slots", ap, lo=1, lo_incl=True, hi=16, hi_incl=True, integer=True))
+    if min_s > max_s:
+        raise _bad(f"{ap}.min_slots", f"must be <= {ap}.max_slots")
+
     op = f"{p}.observability"
     ob = _filled(top["observability"], base["observability"], op)
     obs = _bool(ob, "enabled", op)
@@ -300,6 +346,8 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
         cleanup=Cleanup(dry, idle, evict),
         observability=Observability(obs, exp),
         warnings=tuple(warnings),
+        eviction=Eviction(destructive, hard_cap, max_entries),
+        adaptive_slots=AdaptiveSlots(ad_on, min_s, max_s),
     )
 
 
