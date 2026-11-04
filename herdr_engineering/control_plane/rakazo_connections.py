@@ -89,9 +89,7 @@ class Connections:
 
     def complete(self, ctx, inp):
         slug = self._slug(inp.get("connectionId"))
-        card = self._cards(ctx).get(slug)
-        if card is None:
-            raise self.Error(400, "BAD_REQUEST", _REASONS["unavailable"])
+        card = self._cards(ctx).get(slug) or {"id": slug, "connected": False}    # a failed read keeps the app polling
         return self._row(card)
 
     def revoke(self, ctx, inp):
