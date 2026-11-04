@@ -7,13 +7,14 @@ Escalation is decided by the pure ``evaluate``; ``consult`` only adds the networ
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from .jev import JevClient, JudgeResult, JudgeUnavailable, NoulAnswer, ScoreAnswer
 from .judge_version import QUESTION_SET_VERSION, judge_version
-from .verbs import ActionKey
+from .verbs import ActionKey, Verb
 
 __all__ = ["QUESTION_SET_VERSION", "SEVERITY_LEVELS", "QUESTIONS", "Verdict", "build_state", "evaluate", "consult"]
 
@@ -56,6 +57,23 @@ _REASONS = {
 }
 
 
+_SAFE_FREE_TEXT = re.compile(r"[\w.\-/@,+:]{0,120}")
+REDACTED = "[redacted]"
+RECIPIENTS = "[recipients]"
+_EMAIL_VERBS = (Verb.EMAIL_DRAFT, Verb.EMAIL_SEND)
+
+
+def _guard(value: str) -> str:
+    """Worker-authored free text is only forwarded when it is short and made of identifier-like characters."""
+    return value if _SAFE_FREE_TEXT.fullmatch(value) else REDACTED
+
+
+def _scope(key: ActionKey) -> str:
+    if key.verb in _EMAIL_VERBS and "@" in key.resource_scope:
+        return RECIPIENTS
+    return _guard(key.resource_scope)
+
+
 def build_state(key: ActionKey, owner_context: Mapping[str, str]) -> dict[str, Any]:
     for name, value in owner_context.items():
         if name not in OWNER_CONTEXT_KEYS:
@@ -64,9 +82,9 @@ def build_state(key: ActionKey, owner_context: Mapping[str, str]) -> dict[str, A
             raise ValueError("owner_context value must be a string of at most 500 characters")
     return {
         "action": {
-            "tool": key.tool,
+            "tool": _guard(key.tool),
             "verb": key.verb.value,
-            "resource_scope": key.resource_scope,
+            "resource_scope": _scope(key),
             "flag_class": key.flag_class.value,
             "risk_class": key.risk_class.value,
         },
@@ -118,6 +136,4 @@ def evaluate(result: JudgeResult, thresholds: Mapping[str, float], version: str)
 def consult(client: JevClient, key: ActionKey, cfg: Mapping[str, Any], *, timeout: float | None = None) -> Verdict:
     # Phase 3 sends no owner context: it is an extension point, never a path for worker-supplied data.
     result = client.ask(build_state(key, {}), QUESTIONS, timeout=timeout)
-    if not result.model:
-        raise JudgeUnavailable("malformed")
     return evaluate(result, cfg["thresholds"], judge_version(cfg))
