@@ -253,6 +253,8 @@ def _close_if_alive(sidecar, run, env, herdr):
 
 
 def _split(run, env, herdr, parent, direction, cwd, *extra):
+    if env.get("PYTHONPATH"):                  # a pane's shell starts from Herdr's environment, not ours
+        extra = (*extra, "--env", f"PYTHONPATH={env['PYTHONPATH']}")
     done = run([herdr, "pane", "split", "--pane", parent, "--direction", direction, *extra, "--no-focus",
                 "--cwd", str(cwd)], capture_output=True, text=True, timeout=10, env=env)
     return json.loads(done.stdout)["result"]["pane"]["pane_id"] if done.returncode == 0 else None

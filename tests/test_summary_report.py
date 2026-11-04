@@ -578,3 +578,17 @@ def test_sidecar_removed_when_a_later_publish_has_no_graph(tmp_path):
     assert Path(first["file"] + ".graph.json").exists()
     second = _publish(tmp_path, calls, text=REPORT)
     assert second["graph"]["ok"] is False and not Path(second["file"] + ".graph.json").exists()
+
+
+def test_panes_inherit_the_publishers_pythonpath_so_the_viewer_matches_the_publishing_code(tmp_path):
+    calls = []
+    sr.publish_report("claude", "abc-123", WITH_BLOCK, home=tmp_path,
+                      environ={"HERDR_PANE_ID": "w1:p1", "PYTHONPATH": "/work/tree"}, run=_graph_fake(calls),
+                      load_config=lambda: _Cfg, post=lambda cfg, body: (200, {}), history=_history())
+    splits = [c for c in calls if c[1:3] == ["pane", "split"]]
+    assert len(splits) == 2
+    for split in splits:
+        assert split[split.index("--env") + 1] == "PYTHONPATH=/work/tree"
+    calls.clear()
+    _publish(tmp_path, calls)                                  # environ without PYTHONPATH: no --env at all
+    assert not any("--env" in c for c in calls)
