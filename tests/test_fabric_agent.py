@@ -738,11 +738,16 @@ def test_watchdog_exits_on_wedged_scan(tmp_path, monkeypatch):
         target=agent.run, args=(stop,),
         kwargs={"cycle_timeout": 0.5, "poll": 0.05},
         daemon=True).start()
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and not exited:
-        time.sleep(0.05)
-    assert exited == [1]  # watchdog detected the stall and exited
-    stop.set()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not exited:
+            time.sleep(0.05)
+        # The stub returns, so the stall is still there on the next poll and the watchdog calls it again: assert the
+        # code, not the count. And always stop the thread: if it outlived the test it would call the REAL os._exit
+        # once monkeypatch restores it, and kill the whole pytest run.
+        assert exited and set(exited) == {1}  # watchdog detected the stall and exited
+    finally:
+        stop.set()
 
 
 def test_watchdog_does_not_fire_when_cycles_complete(tmp_path, monkeypatch):
@@ -759,9 +764,11 @@ def test_watchdog_does_not_fire_when_cycles_complete(tmp_path, monkeypatch):
         target=agent.run, args=(stop,),
         kwargs={"cycle_timeout": 0.5, "poll": 0.05},
         daemon=True).start()
-    time.sleep(1.0)  # several healthy cycles
-    assert exited == []
-    stop.set()
+    try:
+        time.sleep(1.0)  # several healthy cycles
+        assert exited == []
+    finally:
+        stop.set()  # a failed assert must not leave the watchdog running past monkeypatch's restore of os._exit
     try:
         server.shutdown()
         agent.stop()

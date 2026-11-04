@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### CI: the fabric agent watchdog tests always stop their watchdog thread
+- Run 550 of an unrelated PR lost its whole unit-gates step at 87%: a `fabric_agent._watchdog` thread dumped every thread's stack and called the real `os._exit(1)`, which ended the pytest process (the log shows `FF`, no summary). Both watchdog tests stub `os._exit` with `monkeypatch`, which restores the real one when the test ends; `test_watchdog_exits_on_wedged_scan` also asserted `exited == [1]` although the stub returns, so the watchdog calls it again on every poll, and a failed assertion skipped `stop.set()`, leaving the thread to outlive the stub. Both tests now stop the thread in a `finally`, and the first asserts the exit code, not the count. This was not reproduced (6 of 6 runs of the old test passed with every core busy), so it is hardening that removes the way a watchdog can outlive its stub, not a proven fix of that one run.
+
 ### CI: the graph ingest-linearity check no longer fails on one stalled batch
 - `test_review_fan_in_hub_reads_stay_fast_and_ingest_stays_linear` compared one second batch of 2,500 edges against `max(first * 3, 0.5 s)` and failed on loaded CI hosts (0.507 s and 0.533 s in two runs of one PR, 0.9 s for the whole test on an idle host, identical on main and on that PR's branch). It now times three later batches and asserts the best of them, the same way its read checks already take the best of three tries: a stall slows one batch, quadratic growth slows all of them. The bound is unchanged. Not mutation-tested against a deliberately quadratic ingest.
 
