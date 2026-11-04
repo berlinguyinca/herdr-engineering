@@ -192,13 +192,15 @@ NOT measured: a real second host (the (b) run is a same-host simulation with two
 dirs), a different toolchain fingerprint (isolation by namespace was measured; by
 toolchain digest only unit-tested), the tailnet endpoint, concurrent builders.
 
-## Tailnet endpoint gap
+## Tailnet endpoint (fixed in code; active after the agent restarts)
 
-`100.104.39.6:9000` is held by the fabric agent (`herdr-eng devfabric agent`, a Host-aware
-forwarder), not by Docker; the compose file publishes rustfs on `127.0.0.1` only. A SigV4
-list request signed for `100.104.39.6:9000` with valid credentials is rejected through that
-forwarder (`credentials_rejected` here) while the same request on loopback succeeds. The
-cause was not isolated (suspect: the forwarder alters the signed request). Until the
-operator publishes rustfs on the tailnet address (compose binding) or fixes the forwarder,
-other hosts cannot use the shared tier, and the build reports
-`shared_unavailable:credentials_rejected` and builds locally.
+`100.104.39.6:9000` is held by the fabric agent (`herdr-eng devfabric agent`), whose
+HTTP-aware forwarder rewrote `Host:` to `127.0.0.1:<port>` for requests addressed to a
+fabric-owned name. AWS SigV4 signs the `Host` header, so every signed S3 request through the
+tailnet address got `SignatureDoesNotMatch` (`credentials_rejected` in the build event) while
+loopback worked. `AgentForwarder._rewrite_head` now forwards any SigV4-signed request
+(`Authorization: AWS4-HMAC-SHA256 ...`, or `X-Amz-Algorithm`/`X-Amz-Signature` in the query)
+byte-for-byte; unsigned requests keep the Host rewrite. The running agent keeps the old code
+until the operator restarts it: `systemctl --user restart herdr-eng-fabric-agent.service`.
+Verified with a throwaway forwarder on the tailnet IP: `aws s3 ls`, put/get/delete and a full
+sccache cold build + warm hit all succeed through it.

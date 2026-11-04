@@ -1,4 +1,8 @@
 # HANDOFF (rolling; newest section first)
+## Update 2026-11-04: tailnet gap fixed in code
+
+Cause: `AgentForwarder._rewrite_head` rewrote `Host`, which SigV4 signs. Fix: signed requests pass through untouched (tests in `tests/test_fabric_agent.py`, `*sigv4*`). Proven via a throwaway forwarder on 100.104.39.6 (aws-cli + sccache cold/warm). ACTIVATES ONLY AFTER THE OPERATOR RESTARTS THE AGENT: `systemctl --user restart herdr-eng-fabric-agent.service` (not done here). Still untested: a real second host.
+
 ## Update 2026-11-04: shared tier on rustfs
 
 Done: provisioning command (`build_cache_rustfs.py`, applied once on bender: bucket `herdr-build-cache`, users `herdr-build-cache-rw`/`-ro`), explicit per-policy sccache server start (`build_cache_server.py`, credentials in the server env only), trusted-plaintext (loopback/tailnet) validation, TOML fix (`no_credentials = false`), policy-port stats in build events, honest `cache.shared.active`. Tests: `tests/test_build_cache_rustfs.py`, `test_build_cache_server.py`, `test_build_cache_rustfs_live.py` (real sccache + real rustfs; skips when absent).

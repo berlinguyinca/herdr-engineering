@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: the fabric agent forwarder no longer breaks SigV4-signed requests
+- `AgentForwarder` rewrote `Host:` to `127.0.0.1:<port>`, which invalidates AWS SigV4 (the signature covers Host), so rustfs/MinIO answered `SignatureDoesNotMatch` on the tailnet address. SigV4-signed requests (Authorization header or presigned query) are now forwarded byte-for-byte; unsigned requests behave as before. Takes effect when the operator restarts the agent (`systemctl --user restart herdr-eng-fabric-agent.service`). Proven with a throwaway forwarder on the tailnet IP: aws-cli list/put/get/delete and sccache cold+warm via `http://100.104.39.6:<port>`.
+
 ### Fabric build cache: the shared tier works against the herdr rustfs server
 - `herdr-eng build-cache-rustfs-provision` (dry-run default, `--apply`): additive, idempotent creation of bucket `herdr-build-cache` (hard quota), read/write and read-only users with bucket-limited policies, and 0600 credential/registry files. Admin credential from the central fleet config, never echoed; MinIO client runs in the container with a private removed config dir; never touches `herdr-artifacts`; no delete path.
 - `build-coordinate` now starts or reuses a per-policy sccache server before cargo with the credentials in the SERVER environment only (cargo/rustc/build scripts get just the port), `close_fds=True`, idle-timeout reaping. `cache.shared.active` is true only after the server is verified (signed list request + `--show-stats` bucket/prefix). New reasons: `server_start_failed`, `server_not_shared`, `credentials_rejected`. `shared_requires_server` is now only the transient validated state.
