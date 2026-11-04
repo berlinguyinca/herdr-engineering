@@ -43,7 +43,7 @@ export function workSummaries({projections = [], recorded = [], sessions = [], r
       evidence: [e.projection && {kind: 'mission_projection', ref: e.key, timestamp: stamp(e.projection.activity_snapshot_at ?? e.projection.snapshot_at)},
         e.recorded && {kind: 'mission_record', ref: e.key, timestamp: stamp(e.recorded.updated_at)}].filter(Boolean),
       ...(progress ? {progress: {percent: progress.percent, label: progress.label, basis: 'measuredProgress', measured_at: stamp(e.projection?.activity_snapshot_at ?? e.projection?.snapshot_at)}} : {}),
-      ...compact({started_at: stamp(e.recorded?.created_at), completed_at: e.outcome === 'finished' ? stamp(e.recorded?.completed_at ?? e.recorded?.updated_at) : undefined, updated_at: stamp(e.recorded?.updated_at)}),
+      ...compact({started_at: stamp(e.recorded?.created_at), completed_at: e.outcome === 'finished' ? stamp(e.recorded?.completed_at) : undefined, updated_at: stamp(e.recorded?.updated_at)}),
       coverage: e.projection && e.tab === 'current' ? 'complete' : 'unconfirmed',
     }];
   }));
