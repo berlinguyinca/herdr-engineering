@@ -112,3 +112,70 @@ def test_ascii_fallback_is_ascii_for_a_long_cjk_note_in_every_layout(width):
         {"label": "second topic with a long label", "from_prompt": 5, "to_prompt": 9, "count": 5, "start": None, "agents": None}]}
     lines = render_graph(g, width, unicode=False, color=False)
     assert all(line.isascii() for line in lines), [x for x in lines if not x.isascii()]
+
+
+# --- segment metrics --------------------------------------------------------------------------------------
+
+from herdr_engineering.graph_render import format_duration, format_tokens  # noqa: E402
+
+
+@pytest.mark.parametrize("seconds,text", [(0, "<1m"), (59, "<1m"), (60, "1m"), (2520, "42m"), (3600, "1h"),
+                                          (3900, "1h05m"), (10800, "3h"), (93600, "26h")])
+def test_format_duration(seconds, text):
+    assert format_duration(seconds) == text
+
+
+@pytest.mark.parametrize("n,text", [(0, "0"), (999, "999"), (1000, "1k"), (1500, "1.5k"), (180_000, "180k"),
+                                    (999_999, "1M"), (3_100_000, "3.1M"), (250_000_000, "250M")])
+def test_format_tokens(n, text):
+    assert format_tokens(n) == text
+
+
+def metric_graph(**totals):
+    g = graph(2)
+    first, second = g["segments"]
+    first.update(worked_s=2520, span_s=3 * 3600, fresh=180_000, cached=3_100_000)
+    second.update(worked_s=600, span_s=600, fresh=None, cached=None)
+    g["drift"].update(worked_s=3300, fresh=1_400_000, cached=9_000_000)
+    g["totals"] = {"worked_s": 3120, "span_s": 4 * 3600, "fresh": 1_580_000, "cached": 12_100_000, "main_only": False, **totals}
+    return g
+
+
+def test_box_shows_time_worked_span_and_fresh_over_cached_tokens():
+    text = "\n".join(render(metric_graph(), 200))
+    assert "42m worked · 3h span" in text and "180k fresh · 3.1M cached" in text
+    assert "10m worked" in text and "10m worked ·" not in text        # span equal to worked is not repeated
+
+
+def test_a_segment_without_usage_shows_no_token_text_and_never_a_zero():
+    g = metric_graph()
+    g["segments"][0].update(fresh=None, cached=None)
+    text = "\n".join(render(g, 200))
+    assert "fresh" not in text.split("Looks like")[0]                 # no segment box mentions tokens
+    assert " 0 fresh" not in text and "0 cached" not in text
+
+
+def test_total_line_and_the_cost_of_the_drift():
+    text = "\n".join(render(metric_graph(), 200))
+    assert "52m worked" in text and "1.6M fresh" in text and "12M cached" in text
+    drift = [line for line in text.split("\n") if "55m worked" in line]
+    assert drift and "1.4M fresh" in drift[0]
+
+
+def test_main_session_only_is_said_when_children_exist():
+    assert "main session only" in "\n".join(render(metric_graph(main_only=True), 200))
+    assert "main session only" not in "\n".join(render(metric_graph(), 200))
+
+
+def test_graph_without_metrics_renders_as_before():
+    text = "\n".join(render(graph(2), 200))
+    assert "worked" not in text and "fresh" not in text and "Total" not in text
+
+
+@pytest.mark.parametrize("width", list(range(4, 70)) + [80, 110, 200])
+@pytest.mark.parametrize("unicode", [True, False])
+def test_metrics_never_overflow_any_width_or_charset(width, unicode):
+    for line in render(metric_graph(main_only=True), width, unicode=unicode):
+        assert visible_width(line) <= width, (width, line)
+    if not unicode:
+        assert "\n".join(render(metric_graph(), width, unicode=False)).isascii()
