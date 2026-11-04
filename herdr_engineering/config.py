@@ -34,6 +34,27 @@ DEFAULTS: dict[str, Any] = {
         "low_water_percent": 80,
         "min_age_hours": 24,
     },
+    # Spec 02: default-off; validated by build_cache_config.validate (fails closed).
+    "fabric_build_cache": {
+        "enabled": False,
+        "mode": "local_only",
+        "allowed_hosts": [],
+        "shared_cache": {
+            "enabled": False, "endpoint_ref": None, "namespace": "trusted-dev",
+            "writes_enabled": False, "max_total_gib": 250, "tls_required": True,
+            "credentials_file": None,
+        },
+        "local": {
+            "capacity_gib": 20, "ram_scratch_gib": 0, "min_free_disk_percent": 20,
+            "incremental_disabled_for_cacheable_builds": True,
+        },
+        "execution": {
+            "slurm_enabled": False, "allowed_clusters": [], "allowed_partitions": [],
+            "gpu_for_cpu_builds": False, "remote_fallback": "local", "max_build_slots": 2,
+        },
+        "cleanup": {"dry_run": True, "min_idle_hours": 24, "max_evict_per_pass_gib": 10},
+        "observability": {"enabled": False, "export_existing_metrics_pipeline": False},
+    },
     "herdr": {"capability_cache_ttl_seconds": 30},
     "web": {"private_only": True, "host": "127.0.0.1", "port": 8787},
     "artifacts": {
@@ -243,7 +264,10 @@ def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
                 "fleet file), so this section has no effect", path)
         cfg = _deep_merge(cfg, data)
     validate_github(cfg.get("github"))
-    return _expand_env(cfg)
+    cfg = _expand_env(cfg)
+    from .build_cache_config import validate as validate_build_cache
+    validate_build_cache(cfg.get("fabric_build_cache"))
+    return cfg
 
 
 def _read_simple_yaml(path: Path) -> dict[str, Any]:

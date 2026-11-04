@@ -77,6 +77,41 @@ build_cleanup:
   low_water_percent: 80
   min_age_hours: 24
 
+# Fabric build cache (spec 02). Everything is OFF by default; invalid values fail
+# closed at load (unknown keys, "false" strings, URLs, embedded secrets are errors).
+# Secrets are referenced by absolute file PATH only (mode 0600), never embedded.
+fabric_build_cache:
+  enabled: false              # default false: master switch; off => effective mode local_only
+  mode: local_only            # local_only | shared_cache | slurm_full_build | distributed
+  allowed_hosts: []           # default none: hosts allowed to use this feature
+  shared_cache:
+    enabled: false            # default false
+    endpoint_ref: null        # identifier from the protected service registry, NOT a URL
+    namespace: trusted-dev
+    writes_enabled: false     # default false: read-only unless explicitly enabled
+    max_total_gib: 250
+    tls_required: true        # default true; false only for endpoint_ref "*.local-test"
+    credentials_file: null    # absolute path, mode 0600, owned by the service user
+  local:
+    capacity_gib: 20
+    ram_scratch_gib: 0
+    min_free_disk_percent: 20
+    incremental_disabled_for_cacheable_builds: true
+  execution:
+    slurm_enabled: false      # default false: no remote builds
+    allowed_clusters: []      # required non-empty for slurm_full_build/distributed
+    allowed_partitions: []    # required non-empty for slurm_full_build/distributed
+    gpu_for_cpu_builds: false # default false: true only warns, never recommended
+    remote_fallback: local    # local | fail
+    max_build_slots: 2        # 1..16
+  cleanup:
+    dry_run: true             # default true: report only, delete nothing
+    min_idle_hours: 24
+    max_evict_per_pass_gib: 10
+  observability:
+    enabled: false
+    export_existing_metrics_pipeline: false
+
 # GitHub catalog (control-plane-web). The catalog runs only in the control
 # plane, which reads these keys from the central fleet file's `github` section
 # (next to github.token), live on the next sync pass; they are listed here for
