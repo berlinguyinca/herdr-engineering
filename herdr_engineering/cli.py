@@ -4424,7 +4424,8 @@ def _task_lease_value(value) -> float:
     return float(value)
 
 
-_MEMBER_KEYS = frozenset({"enabled", "group", "groups_ttl", "max_artifact_bytes", "max_member_bytes", "max_artifacts"})
+_MEMBER_KEYS = frozenset({"enabled", "group", "groups_ttl", "removed_grace", "max_artifact_bytes", "max_member_bytes",
+                          "max_artifacts"})
 
 
 def _members_settings(cp) -> dict | None:
@@ -4450,13 +4451,16 @@ def _members_settings(cp) -> dict | None:
     ttl = raw.get("groups_ttl", 24 * 3600.0)
     if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not ttl > 0:
         raise SystemExit(f"{where}.groups_ttl must be a positive number")
+    grace = raw.get("removed_grace", 3600.0)
+    if isinstance(grace, bool) or not isinstance(grace, (int, float)) or not 0 <= grace <= 30 * 86400:
+        raise SystemExit(f"{where}.removed_grace must be a number of seconds, 0 to 2592000")
     defaults = {}
     for key in ("max_artifact_bytes", "max_member_bytes", "max_artifacts"):
         value = raw.get(key)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise SystemExit(f"{where}.{key} must be a positive integer or null")
         defaults[key] = value
-    return {"group": group, "groups_ttl": float(ttl), "defaults": defaults}
+    return {"group": group, "groups_ttl": float(ttl), "removed_grace": float(grace), "defaults": defaults}
 
 
 def _collab_member_kwargs(cp, *, state_dir=None) -> dict:
@@ -4482,7 +4486,8 @@ def _members_runtime(cp, settings: CollabArtifactsSettings):
         return None
     share = _share_worker_settings(cp)
     return MemberRuntime(outbox=settings.outbox_dir, mirror_root=settings.mirror_dir, group=got["group"], enabled=True,
-                         defaults=got["defaults"], shares_root=Path(share["shares_dir"]) if share["enabled"] else None,
+                         defaults=got["defaults"], removed_grace=got["removed_grace"],
+                         shares_root=Path(share["shares_dir"]) if share["enabled"] else None,
                          clock=time.time)
 
 

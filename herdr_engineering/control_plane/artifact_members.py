@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
@@ -85,15 +86,22 @@ def member_for_actor(actor: Mapping[str, Any], *, agents: Mapping[str, Mapping[s
         return _refuse("unknown_user")
 
 
-def positively_out(entry: Mapping[str, Any] | None, group: str) -> bool:
-    """True only for POSITIVE evidence that a member is out: the directory says ``disabled`` or ``removed``, or an
-    ``approved`` record whose groups exclude ``group``. A missing entry, ``unknown`` or any other status is not
-    evidence, so callers that destroy anything (revoking shares, dropping uploads) act on this and nothing else."""
+def positively_out(entry: Mapping[str, Any] | None, group: str, *, now: float, grace: float) -> bool:
+    """True only for POSITIVE evidence that a member is out: the directory says ``disabled``; or ``removed`` and has
+    said so continuously for ``grace`` seconds (``removed_since`` at least ``grace`` before ``now``; a ``removed``
+    without a usable ``removed_since`` never counts); or an ``approved`` record whose groups exclude ``group``. A
+    missing entry, ``unknown`` or any other status is no evidence, so callers that destroy anything (revoking
+    shares, dropping uploads) act on this and nothing else."""
     if entry is None:
         return False
     status = entry.get("status")
-    if status in ("disabled", "removed"):
+    if status == "disabled":
         return True
+    if status == "removed":
+        since = entry.get("removed_since")
+        if isinstance(since, bool) or not isinstance(since, (int, float)) or not math.isfinite(since):
+            return False
+        return 0 <= grace <= now - since
     groups = entry.get("groups")
     return status == "approved" and isinstance(groups, (list, tuple, set, frozenset)) and group not in groups
 

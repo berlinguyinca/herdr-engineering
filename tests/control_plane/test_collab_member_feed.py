@@ -26,7 +26,7 @@ from herdr_engineering.control_plane.collab_bridge_files import (
 )
 from herdr_engineering.control_plane.collab_intents import AGENTS_FEED_MAX_BYTES
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
-from tests.control_plane.test_collab_approval import TOKENS, call, who
+from tests.control_plane.test_collab_approval import IAT, TOKENS, call, who
 from tests.control_plane.test_collab_approval import s as approval_svc  # noqa: F401
 from tests.control_plane.test_collab_external import enroll
 from tests.control_plane.test_collab_mcp_artifacts import KIB, padded, post_msg, raw_post
@@ -87,7 +87,8 @@ def test_the_directory_lists_group_users_with_email_and_marks_others_removed(net
     doc = directory(net.outbox)
     assert doc["group"] == GROUP and doc["updated"] == net.s._now()
     assert set(doc["users"]) == {"op", "lab", "mal", "adm"}       # bob has no groups claim: no evidence, not listed
-    assert doc["users"]["mal"] == {"email": None, "display_name": "mal", "status": "removed", "groups": ["Users"]}
+    assert doc["users"]["mal"] == {"email": None, "display_name": "mal", "status": "removed", "groups": ["Users"],
+                                  "removed_since": net.s._now()}
     assert doc["users"]["op"] == {"email": "op@example.org", "display_name": "op", "status": "approved",
                                   "groups": [GROUP]}
 
@@ -403,9 +404,12 @@ def test_enabled_members_read_group_ttl_and_optional_limits():
     from herdr_engineering import cli
     got = cli._members_settings(collab(enabled=True, group="staff", groups_ttl=60, max_member_bytes=10,
                                        max_artifact_bytes=None))
-    assert got == {"group": "staff", "groups_ttl": 60.0,
+    assert got == {"group": "staff", "groups_ttl": 60.0, "removed_grace": 3600.0,
                    "defaults": {"max_artifact_bytes": None, "max_member_bytes": 10, "max_artifacts": None}}
     plain = cli._members_settings(collab(enabled=True, group="staff"))
+    assert cli._members_settings(collab(enabled=True, group="staff", removed_grace=0))["removed_grace"] == 0.0
+    with pytest.raises(SystemExit):
+        cli._members_settings(collab(enabled=True, group="staff", removed_grace=-1))
     assert plain["groups_ttl"] == 24 * 3600.0 and plain["defaults"] == {
         "max_artifact_bytes": None, "max_member_bytes": None, "max_artifacts": None}
 
@@ -515,3 +519,124 @@ def test_the_members_task_runs_again_at_once_when_notified(tmp_path):
         await asyncio.wait_for(task, 5)
         loop.mirror.close()
     asyncio.run(go())
+
+
+# ------------------------------------------------------------------------------ ordering, grace, hostile state
+@pytest.fixture
+def newer_group_claims():
+    """Restore the shared fake token table after a test that edits it."""
+    saved = dict(TOKENS), dict(IAT)
+    yield
+    TOKENS.clear()
+    TOKENS.update(saved[0])
+    IAT.clear()
+    IAT.update(saved[1])
+
+
+def status_of(net, uid="op"):
+    return directory(net.outbox)["users"][uid]
+
+
+def test_an_older_token_cannot_turn_an_approved_member_into_removed(net, newer_group_claims):
+    IAT["t-op"] = 200.0
+    net.person("op")                                               # approved, claim issued at 200
+    TOKENS["t-old"] = ("op", ["Users"])                            # a still-valid token issued BEFORE the group add
+    IAT["t-old"] = 100.0
+    net.s.authenticate("Bearer t-old", None)
+    net.bridge.write_agents_feed()
+    assert status_of(net)["status"] == "approved" and "removed_since" not in status_of(net)
+    IAT["t-new"], TOKENS["t-new"] = 300.0, ("op", ["Users"])        # a NEWER token without the group is real
+    net.s.authenticate("Bearer t-new", None)
+    net.bridge.write_agents_feed()
+    assert status_of(net)["status"] == "removed"
+
+
+def test_a_token_without_iat_can_never_record_a_removal(net, newer_group_claims):
+    net.person("op")
+    seen = []
+
+    class NoIat:
+        def verify_claims(self, token):
+            return {"user": "op", "exp": 4e9, "groups": ["Users"]}
+
+        def exists(self, uid):
+            return True
+    real, net.s.auth = net.s.auth, NoIat()
+    try:
+        net.s.authenticate("Bearer anything", None)
+    finally:
+        net.s.auth = real
+    net.bridge.write_agents_feed()
+    assert status_of(net)["status"] == "approved", seen
+
+
+def test_removed_since_is_sticky_and_a_later_approved_claim_clears_it(net, newer_group_claims):
+    net.person("op")
+    TOKENS["t-op"], IAT["t-op"] = ("op", ["Users"]), 10.0
+    net.s.authenticate("Bearer t-op", None)
+    first = net.s._now()
+    net.s._now.t += 100
+    IAT["t-op"] = 11.0
+    net.s.authenticate("Bearer t-op", None)                         # still removed: the clock is NOT restarted
+    net.bridge.write_agents_feed()
+    assert status_of(net)["removed_since"] == first
+    TOKENS["t-op"], IAT["t-op"] = ("op", [GROUP]), 12.0
+    net.s.authenticate("Bearer t-op", None)
+    net.bridge.write_agents_feed()
+    assert status_of(net)["status"] == "approved" and "removed_since" not in status_of(net)
+    TOKENS["t-op"], IAT["t-op"] = ("op", ["Users"]), 13.0
+    net.s._now.t += 5
+    net.s.authenticate("Bearer t-op", None)
+    net.bridge.write_agents_feed()
+    assert status_of(net)["removed_since"] == net.s._now()          # a fresh removal starts a fresh grace period
+
+
+def test_ordering_and_removed_since_survive_a_restart(net, tmp_path, newer_group_claims):
+    path = tmp_path / "state" / "member-groups.json"
+    first = make_service(tmp_path, path)
+    IAT["t-op"] = 50.0
+    first.authenticate("Bearer t-op", None)
+    TOKENS["t-old"], IAT["t-old"] = ("op", ["Users"]), 5.0
+    again = make_service(tmp_path, path)
+    again.authenticate("Bearer t-old", None)                        # older than the persisted iat: still ignored
+    assert again._user_groups["op"].groups == (GROUP,) and again._user_groups["op"].iat == 50.0
+    TOKENS["t-new"], IAT["t-new"] = ("op", ["Users"]), 60.0
+    again.authenticate("Bearer t-new", None)
+    third = make_service(tmp_path, path)
+    assert third._user_groups["op"].removed_since == again._user_groups["op"].removed_since is not None
+
+
+def test_a_capped_claim_without_the_group_is_no_evidence(net):
+    net.person("op")
+    net.s._note_groups("op", ["a", "b"], 5.0, True)                 # the verifier cut the list at 64
+    assert net.s._user_groups["op"].groups == (GROUP,)
+    net.s._note_groups("op", ["a", GROUP], 6.0, True)               # a capped claim that HAS the group is fine
+    assert GROUP in net.s._user_groups["op"].groups
+
+
+def test_cognito_flags_a_group_list_past_the_cap():
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from herdr_engineering.control_plane.collab_cognito import CognitoAuthenticator
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    auth = CognitoAuthenticator(pool_id="us-west-2_abc", client_ids=["cid"], required_group="Users", open_signup=True)
+    auth._key_for = lambda kid: key.public_key()
+    base = {"iss": auth.issuer, "sub": "u", "username": "u", "client_id": "cid", "token_use": "access",
+            "exp": 4e9, "iat": 1700000000}
+
+    def verify(groups):
+        return auth.verify_claims(jwt.encode({**base, "cognito:groups": groups}, key, algorithm="RS256",
+                                             headers={"kid": "k"}))
+    few, many = verify(["a"]), verify([f"g{i}" for i in range(70)])
+    assert few["groups_capped"] is False and few["iat"] == 1700000000.0
+    assert many["groups_capped"] is True and len(many["groups"]) == 64
+
+
+@pytest.mark.parametrize("payload", [b"[" * 200_000 + b"]" * 200_000, b'{"users": ' * 50_000 + b"1" + b"}" * 50_000,
+                                     b'{"users": {"op": {"at": "x"}}}', b'{"users": {"op": 3}}', b"\xff\xfe",
+                                     b'{"users": {"op": {"at": 1e999, "groups": ["a"]}}}'])
+def test_hostile_claims_files_mean_no_knowledge_and_never_crash_startup(tmp_path, payload):
+    bad = tmp_path / "member-groups.json"
+    bad.write_bytes(payload)
+    assert make_service(tmp_path, bad).member_directory() == {"group": GROUP, "users": {}}

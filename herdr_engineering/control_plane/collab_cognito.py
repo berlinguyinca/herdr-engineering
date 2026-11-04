@@ -104,12 +104,15 @@ class CognitoAuthenticator:
         user = claims.get("username") or claims.get("sub")
         if not isinstance(user, str) or not user or not isinstance(groups, list) or not _USER_RE.fullmatch(user):
             return None
+        capped = len(groups) > 64             # a list past the cap may hide the group a caller looks for
         groups = [g for g in groups if isinstance(g, str)][:64]
         if not self.open_signup:
             if self.required_group not in groups or not self._still_in_group(user):
                 return None
         self._seen.add(user)
-        return {"user": user, "exp": float(claims["exp"]), "groups": groups}
+        iat = claims.get("iat")
+        return {"user": user, "exp": float(claims["exp"]), "groups": groups, "groups_capped": capped,
+                "iat": float(iat) if isinstance(iat, (int, float)) and not isinstance(iat, bool) else None}
 
     def verify_id_token(self, token: str, *, user: str) -> str | None:
         """Verified, lower-cased, ASCII-only email from an ID token that belongs to ``user``.

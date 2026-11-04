@@ -28,7 +28,7 @@ import threading
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 from urllib.parse import urlparse
 
 from ..assistant_packages import ManifestError, agent_package_record
@@ -394,6 +394,15 @@ class FileEventLog:
     record = record_required
 
 
+class _GroupClaim(NamedTuple):
+    """The last accepted group claim of a user: when seen, the groups, the token's ``iat`` (None when it had none) and
+    since when the claims have continuously lacked the member group (None while they include it)."""
+    at: float
+    groups: tuple[str, ...]
+    iat: float | None
+    removed_since: float | None
+
+
 class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin,
                     CoordinatorsMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
@@ -419,7 +428,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             raise ValueError("member_groups_ttl must be a positive number")
         self.member_group = member_group
         self.member_groups_ttl = float(member_groups_ttl)
-        self._user_groups: dict[str, tuple[float, tuple[str, ...]]] = {}
+        self._user_groups: dict[str, _GroupClaim] = {}
         # Last-seen claims survive a restart in a private file (0600); a claim older than the TTL is "unknown", never
         # "removed", so a restart or a quiet day cannot look like leaving the group to the worker.
         self._groups_path = None if member_groups_path is None else str(member_groups_path)
@@ -1321,6 +1330,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             raise CollabError(401, "unauthorized")
         if scheme == "Bearer":
             claims = getattr(self.auth, "verify_claims", None)
+            c = None
             if claims is not None:
                 c = claims(token)
                 got, groups = ((c["user"], c["exp"]), c["groups"]) if c else (None, [])
@@ -1333,7 +1343,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 raise CollabError(503, "collaboration is disabled; ask the operator")
             pr = Principal("user", got[0], got[0], exp=got[1])
             if claims is not None:
-                self._note_groups(got[0], groups)
+                self._note_groups(got[0], groups, c.get("iat") if c else None, bool(c and c.get("groups_capped")))
             if self.approval is not None:
                 self._admit(pr, set(groups))
             return pr
@@ -1374,20 +1384,36 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     MEMBER_FORGET_AFTER = 30 * 24 * 3600.0     # an unrefreshed claim is "unknown" for this long, then forgotten
     GROUPS_SAVE_EVERY = 300.0
 
-    def _note_groups(self, uid: str, groups: Any) -> None:
+    def _note_groups(self, uid: str, groups: Any, iat: Any = None, capped: bool = False) -> None:
         """Remember the group claims of a verified sign-in; wake the feed when the set changed.
 
-        An empty claim (Cognito omits ``cognito:groups`` for a token without groups) is no evidence either way: it
-        refreshes nothing, so the stored claim ages into "unknown" instead of reading as "left the group"."""
+        Evidence rules (a claim that cannot be trusted to be the newest is ignored, never read as "left the group"):
+        an empty claim proves nothing; a claim capped by the verifier that lacks the member group proves nothing (the
+        group may be past the cap); a token older (``iat``) than the one already recorded is ignored; a token with no
+        ``iat`` can confirm membership but never record a removal."""
         clean = tuple(sorted({g for g in (groups if isinstance(groups, (list, tuple, set, frozenset)) else ())
                               if isinstance(g, str) and 0 < len(g) <= 128}))[:self.MAX_NOTED_GROUPS]
         if not clean:
             return
+        member = self.member_group is not None and self.member_group in clean
+        if capped and not member:
+            return
+        stamp = None if isinstance(iat, bool) or not isinstance(iat, (int, float)) or not math.isfinite(iat) \
+            else float(iat)
+        if stamp is None and not member:
+            return
         with self._lock:
             old = self._user_groups.get(uid)
+            if old is not None and stamp is not None and old.iat is not None and stamp < old.iat:
+                return
             now = self._now()
-            self._user_groups[uid] = (now, clean)
-            changed = old is None or old[1] != clean
+            if stamp is None and old is not None:
+                stamp = old.iat
+            removed_since = None
+            if not member and self.member_group is not None:
+                removed_since = old.removed_since if old is not None and old.removed_since is not None else now
+            self._user_groups[uid] = _GroupClaim(now, clean, stamp, removed_since)
+            changed = old is None or old.groups != clean
             persist = changed or now - self._groups_saved >= self.GROUPS_SAVE_EVERY
         if persist:
             self._save_groups()
@@ -1401,7 +1427,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         if path is None:
             return
         with self._lock:
-            snap = {u: {"at": at, "groups": list(g)} for u, (at, g) in self._user_groups.items()}
+            snap = {u: {"at": c.at, "groups": list(c.groups), "iat": c.iat, "removed_since": c.removed_since}
+                    for u, c in self._user_groups.items()}
             self._groups_saved = self._now()
         data = json.dumps({"version": 1, "users": snap}, ensure_ascii=False, allow_nan=False).encode("utf-8")
         try:
@@ -1423,24 +1450,32 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             print(f"collab: member group claims not saved error={type(exc).__name__}", file=sys.stderr)
 
     def _load_groups(self) -> None:
-        """Read the persisted claims; a missing or damaged file means no knowledge (everyone starts unseen)."""
+        """Read the persisted claims; a missing, damaged or hostile file (any parse failure, including deeply nested
+        JSON) means no knowledge: everyone starts unseen. Never raises."""
         try:
             with open(self._groups_path, "rb") as fh:
                 doc = json.loads(fh.read(8 * 1024 * 1024))
             users = doc["users"]
-        except (OSError, ValueError, KeyError, TypeError):
+            if not isinstance(users, dict):
+                return
+            loaded: dict[str, _GroupClaim] = {}
+            for uid, row in users.items():
+                try:
+                    at, groups = float(row["at"]), row["groups"]
+                    iat, since = row.get("iat"), row.get("removed_since")
+                    iat = float(iat) if isinstance(iat, (int, float)) and not isinstance(iat, bool) else None
+                    since = float(since) if isinstance(since, (int, float)) and not isinstance(since, bool) else None
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
+                if isinstance(uid, str) and math.isfinite(at) and isinstance(groups, list) \
+                        and all(x is None or math.isfinite(x) for x in (iat, since)):
+                    clean = tuple(sorted({g for g in groups if isinstance(g, str) and 0 < len(g) <= 128}))[
+                        :self.MAX_NOTED_GROUPS]
+                    if clean:
+                        loaded[uid] = _GroupClaim(at, clean, iat, since)
+            self._user_groups.update(loaded)
+        except Exception:                                              # noqa: BLE001 - incl. RecursionError, MemoryError
             return
-        if not isinstance(users, dict):
-            return
-        for uid, row in users.items():
-            try:
-                at, groups = float(row["at"]), row["groups"]
-            except (KeyError, TypeError, ValueError):
-                continue
-            if isinstance(uid, str) and math.isfinite(at) and isinstance(groups, list):
-                clean = tuple(sorted({g for g in groups if isinstance(g, str) and 0 < len(g) <= 128}))[:self.MAX_NOTED_GROUPS]
-                if clean:
-                    self._user_groups[uid] = (at, clean)
 
     def _member_status(self, uid: str) -> tuple[str, list[str]] | None:
         """``(status, groups)`` for a user whose claims were ever seen, else None. Caller holds the lock.
@@ -1450,10 +1485,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         seen = self._user_groups.get(uid)
         if seen is None or self.member_group is None:
             return None
-        age = self._now() - seen[0]
+        age = self._now() - seen.at
         if not 0 <= age <= self.member_groups_ttl:
-            return ("unknown", list(seen[1])) if 0 <= age <= self.MEMBER_FORGET_AFTER else None
-        groups = list(seen[1])
+            return ("unknown", list(seen.groups)) if 0 <= age <= self.MEMBER_FORGET_AFTER else None
+        groups = list(seen.groups)
         if self.member_group not in groups:
             return "removed", groups
         if self.approval is not None and uid not in self._users:   # no account record (e.g. log not replayed): no proof
@@ -1463,9 +1498,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     def _groups_of(self, uid: str) -> list[str]:
         """The fresh last-seen groups of ``uid`` (``[]`` when never seen or older than the TTL). Caller holds the lock."""
         seen = self._user_groups.get(uid)
-        if seen is None or not 0 <= self._now() - seen[0] <= self.member_groups_ttl:
+        if seen is None or not 0 <= self._now() - seen.at <= self.member_groups_ttl:
             return []
-        return list(seen[1])
+        return list(seen.groups)
 
     def member_directory(self) -> dict | None:
         """``member-directory.json``'s body, or None when no member group is configured.
@@ -1485,6 +1520,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 email = self._user_email.get(uid) if status != "removed" else None
                 users[uid] = {"email": email, "display_name": email.split("@")[0] if email else uid,
                               "status": status, "groups": groups}
+                if status == "removed":
+                    users[uid]["removed_since"] = self._user_groups[uid].removed_since
         return {"group": group, "users": users}
 
     def member_check(self, pr: Principal):

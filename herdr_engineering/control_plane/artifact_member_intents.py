@@ -104,6 +104,7 @@ class MemberRuntime:
     defaults: Mapping[str, Any]
     shares_root: Path | None
     clock: Callable[[], float]
+    removed_grace: float = 3600.0      # seconds a member must be continuously listed ``removed`` before anything is revoked
 
 
 # ----------------------------------------------------------------------------- payloads
@@ -218,6 +219,8 @@ def load_directory(rt: MemberRuntime) -> dict[str, dict[str, Any]] | None:
         groups = entry.get("groups")
         out[user_id] = {"status": entry.get("status"),
                         "groups": groups if isinstance(groups, list) else [rt.group]}
+        if "removed_since" in entry:
+            out[user_id]["removed_since"] = entry["removed_since"]
     return out
 
 
@@ -577,7 +580,7 @@ async def sweep_disabled_members(conn: Any, rt: MemberRuntime) -> int:
     revoked = 0
     for r in rows:
         entry = directory.get(r["created_by"][len("member:"):])
-        if not r["off"] and not positively_out(entry, rt.group):    # absent or "unknown" proves nothing
+        if not r["off"] and not positively_out(entry, rt.group, now=rt.clock(), grace=rt.removed_grace):    # absent or "unknown" proves nothing
             continue
         try:
             await revoke_share(conn, rt, r["share_id"], actor="member-disabled")
@@ -639,7 +642,7 @@ def staging_keep(rt: MemberRuntime) -> Callable[[str, Any], Any]:
         by_key = cache["by_key"]
         if by_key is None:
             return True
-        return not positively_out(by_key.get(owner_key), rt.group)
+        return not positively_out(by_key.get(owner_key), rt.group, now=now, grace=rt.removed_grace)
     return keep
 
 

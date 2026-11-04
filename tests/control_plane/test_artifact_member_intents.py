@@ -67,6 +67,14 @@ def write_feeds(env, *, directory_age=0.0, users=None, group="lab", agents=None)
                                                            "users": users}))
 
 
+def removed(env, ago, groups=()):
+    """A directory record: removed from the group ``ago`` seconds before the worker's now."""
+    return {"status": "removed", "groups": list(groups), "removed_since": env.clock() - ago}
+
+
+GRACE = 3600.0
+
+
 def mrun(pg, tmp_path, body, *, defaults=None, enabled=True, **kw):
     clock = kw.pop("clock", None) or Clock()
     runtime = MemberRuntime(outbox=tmp_path / "outbox", mirror_root=tmp_path / "mirror", group="lab", enabled=enabled,
@@ -607,7 +615,7 @@ def test_a_members_staging_is_kept_while_valid_and_swept_after_the_ttl_or_when_d
         assert await sweep(env) == 1 and fresh.is_dir() and not old.exists()
         write_feeds(env, users={"alice": {"status": "disabled"}})
         assert await sweep(env) == 1 and not fresh.exists()
-        write_feeds(env, users={"alice": {"status": "removed", "groups": []}, "bob": {"status": "removed"}})
+        write_feeds(env, users={"alice": removed(env, GRACE + 1), "bob": removed(env, GRACE + 1)})
         _, bobs = stage(env, BK, aid, "c.html", HTML)            # bob is positively listed as removed
         assert await sweep(env) == 1 and not bobs.exists()
     mrun(registry_pg, tmp_path, body)
@@ -622,7 +630,7 @@ def test_unlisted_and_unknown_members_keep_their_staging_a_removed_one_loses_it(
         assert await sweep(env) == 0 and a.is_dir() and b.is_dir()
         write_feeds(env, users={"alice": {"status": "unknown", "groups": ["lab"]}})
         assert await sweep(env) == 0 and a.is_dir() and b.is_dir()
-        write_feeds(env, users={"alice": {"status": "removed", "groups": ["other"]}})
+        write_feeds(env, users={"alice": removed(env, GRACE + 1, ["other"])})
         assert await sweep(env) == 1 and not a.exists() and b.is_dir()
     mrun(registry_pg, tmp_path, body)
 
@@ -641,10 +649,50 @@ def test_a_restart_unknown_or_absent_directory_revokes_nothing_but_removed_and_d
             async with env.pool.acquire() as conn:
                 assert await sweep_disabled_members(conn, rt) == 0
             assert await states() == {sid: "live", pend: "pending"}
-        write_feeds(env, users={"alice": {"status": "removed", "groups": []}})
+        write_feeds(env, users={"alice": removed(env, GRACE + 1)})
         async with env.pool.acquire() as conn:
             assert await sweep_disabled_members(conn, rt) == 2
         assert set((await states()).values()) == {"revoked"}
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_removed_acts_only_after_the_grace_period_and_only_with_a_removed_since(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, user("alice"))
+        pub = await publish(env, aid)
+        sid = await live_share(env, aid, pub["version_id"], ALICE)
+        _, staged = stage(env, AK, aid, "a.html", HTML)
+
+        async def state():
+            return (await sql(env, "SELECT state FROM artifact_shares WHERE share_id=$1", sid))[0]["state"]
+        for entry in (removed(env, GRACE - 5), removed(env, 0), {"status": "removed", "groups": []},
+                      {"status": "removed", "groups": [], "removed_since": None},
+                      {"status": "removed", "groups": [], "removed_since": env.clock() + 99}):
+            write_feeds(env, users={"alice": entry})
+            async with env.pool.acquire() as conn:
+                assert await sweep_disabled_members(conn, rt) == 0
+            assert await state() == "live" and await sweep(env) == 0 and staged.is_dir()
+            out = await send(env, user("alice"), "member.artifact_create",
+                             {"title": "T", "filename": "a.html", "profile": "web"})
+            assert out["result"] == "rejected" and out["reason"] == "not_in_group"      # writes are refused at once
+        write_feeds(env, users={"alice": removed(env, GRACE + 1)})
+        async with env.pool.acquire() as conn:
+            assert await sweep_disabled_members(conn, rt) == 1
+        assert await state() == "revoked" and await sweep(env) >= 1 and not staged.exists()
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_a_member_re_added_before_the_grace_ends_is_never_revoked(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, user("alice"))
+        pub = await publish(env, aid)
+        sid = await live_share(env, aid, pub["version_id"], ALICE)
+        write_feeds(env, users={"alice": removed(env, GRACE - 60)})
+        env.clock.t += 120                                       # the grace would now be over ...
+        write_feeds(env, users={"alice": {"status": "approved", "groups": ["lab"]}})      # ... but she was re-added
+        async with env.pool.acquire() as conn:
+            assert await sweep_disabled_members(conn, rt) == 0
+        assert (await sql(env, "SELECT state FROM artifact_shares WHERE share_id=$1", sid))[0]["state"] == "live"
     mrun(registry_pg, tmp_path, body)
 
 
