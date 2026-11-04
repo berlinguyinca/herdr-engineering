@@ -83,7 +83,7 @@ def test_start_is_none_when_the_prompt_has_no_time():
 
 def test_drift_is_kept_on_a_later_segment_start():
     g = dg.build_graph(block(GOOD, drift_at=6, drift_note="this is a web page task"), prompts(12), 12)
-    assert g["drift"] == {"at": 6, "note": "this is a web page task"}
+    assert g["drift"] == {"at": 6, "note": "this is a web page task", "worked_s": None, "fresh": None, "cached": None}
 
 
 @pytest.mark.parametrize("at", [1, 3, 99, "x", None])
@@ -167,3 +167,81 @@ def test_crlf_blocks_are_found_and_stripped():
 def test_an_unterminated_block_is_stripped_and_gives_no_graph():
     clean, raw = dg.extract_block("# R\n\nbody\n\n```drift-graph\n" + _raw()[:40])
     assert "drift-graph" not in clean and "body" in clean and raw is None
+
+
+# --- segment metrics: time worked and tokens -------------------------------------------------------------
+
+def timed(starts):
+    """12 prompts where prompt 1 and prompt 6 start at the given times; the rest are placeholders in between."""
+    ps = prompts(12)
+    ps[0]["ts"], ps[5]["ts"] = starts
+    return ps
+
+
+def test_worked_seconds_drops_idle_gaps_but_keeps_short_ones():
+    ts = ["2026-01-01T09:00:00Z", "2026-01-01T09:10:00Z", "2026-01-01T09:40:00Z",     # 10 + 30 min, both within the limit
+          "2026-01-01T20:00:00Z", "2026-01-01T20:10:00Z"]                              # 11 h gap dropped, then 10 min
+    assert dg.worked_seconds(ts, "2026-01-01T09:00:00Z", None) == 50 * 60
+    assert dg.worked_seconds(ts, "2026-01-01T09:00:00Z", None, idle=20 * 60) == 20 * 60   # the 30 min gap is idle now
+
+
+def test_worked_seconds_ignores_untimed_and_garbage_entries_and_order():
+    ts = ["2026-01-01T09:10:00Z", None, "garbage", "2026-01-01T09:00:00Z"]
+    assert dg.worked_seconds(ts, "2026-01-01T09:00:00Z", None) == 10 * 60
+
+
+def test_segments_report_worked_time_and_wall_clock_span():
+    ps = timed(("2026-01-01T09:00:00Z", "2026-01-01T19:40:00Z"))
+    activity = ["2026-01-01T09:00:00Z", "2026-01-01T09:10:00Z", "2026-01-01T09:20:00Z", "2026-01-01T09:40:00Z",
+                "2026-01-01T19:40:00Z", "2026-01-01T19:50:00Z", "2026-01-01T20:00:00Z"]
+    g = dg.build_graph(block(GOOD), ps, 12, activity_ts=activity)
+    first, second = g["segments"]
+    assert (first["worked_s"], first["span_s"]) == (40 * 60, 10 * 3600 + 40 * 60)     # the overnight-style gap is not work
+    assert (second["worked_s"], second["span_s"]) == (20 * 60, 20 * 60)
+    assert g["totals"]["worked_s"] == 60 * 60 and g["totals"]["span_s"] == 11 * 3600
+
+
+def test_time_is_none_without_activity_or_without_a_known_boundary():
+    ps = timed(("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z"))
+    plain = dg.build_graph(block(GOOD), ps, 12)
+    assert [(s["worked_s"], s["span_s"]) for s in plain["segments"]] == [(None, None), (None, None)]
+    assert plain["totals"]["worked_s"] is None
+    ps[5]["ts"] = None
+    g = dg.build_graph(block(GOOD), ps, 12, activity_ts=["2026-01-01T09:00:00Z", "2026-01-01T09:05:00Z"])
+    assert [s["worked_s"] for s in g["segments"]] == [None, None]     # segment 1 has no end, segment 2 no start
+
+
+def test_tokens_are_split_at_the_segment_boundary_and_never_guessed():
+    ps = timed(("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z"))
+    usage = [{"ts": "2026-01-01T09:05:00Z", "fresh": 100, "cached": 1000},
+             {"ts": "2026-01-01T09:29:59Z", "fresh": 50, "cached": 500},
+             {"ts": "2026-01-01T09:30:00Z", "fresh": 7, "cached": 70},
+             {"ts": None, "fresh": 3, "cached": 30}]                     # cannot be placed, but is in the total
+    g = dg.build_graph(block(GOOD), ps, 12, usage=usage)
+    assert [(s["fresh"], s["cached"]) for s in g["segments"]] == [(150, 1500), (7, 70)]
+    assert (g["totals"]["fresh"], g["totals"]["cached"]) == (160, 1600)
+
+
+def test_no_usage_means_none_never_zero():
+    ps = timed(("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z"))
+    for usage in (None, []):
+        g = dg.build_graph(block(GOOD), ps, 12, usage=usage)
+        assert [s["fresh"] for s in g["segments"]] == [None, None] and g["totals"]["fresh"] is None
+    only_first = [{"ts": "2026-01-01T09:05:00Z", "fresh": 5, "cached": 0}]
+    assert dg.build_graph(block(GOOD), ps, 12, usage=only_first)["segments"][1]["fresh"] is None
+
+
+def test_the_drift_carries_the_cost_of_everything_after_it():
+    ps = timed(("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z"))
+    activity = ["2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z", "2026-01-01T09:55:00Z"]
+    usage = [{"ts": "2026-01-01T09:05:00Z", "fresh": 100, "cached": 1}, {"ts": "2026-01-01T09:40:00Z", "fresh": 40, "cached": 4}]
+    g = dg.build_graph(block(GOOD, drift_at=6, drift_note="n"), ps, 12, activity_ts=activity, usage=usage)
+    assert g["drift"]["worked_s"] == 25 * 60 and g["drift"]["fresh"] == 40 and g["drift"]["cached"] == 4
+    assert dg.build_graph(block(GOOD), ps, 12, activity_ts=activity, usage=usage)["drift"] is None
+
+
+def test_main_session_only_is_carried_when_children_exist():
+    ps = timed(("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z"))
+    usage = [{"ts": "2026-01-01T09:05:00Z", "fresh": 1, "cached": 0}]
+    assert dg.build_graph(block(GOOD), ps, 12, usage=usage, main_only=True)["totals"]["main_only"] is True
+    assert dg.build_graph(block(GOOD), ps, 12, usage=usage)["totals"]["main_only"] is False
