@@ -23,6 +23,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .artifact_members import is_member_principal
 from .artifact_report_api import CHUNK_BYTES, PinnedOutputError, _access, pinned_output
 from .artifact_shares import ShareError, new_token
 from .share_bundle import (
@@ -75,6 +76,23 @@ def share_settings_config(raw: dict | None, *, public_url: str | None) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ helpers
+
+
+UNBOUNDED = 2**63 - 1
+
+
+def _caps(server, created_by) -> tuple[int, int | None]:
+    """``(max_share_bytes, max_total_bytes)`` for a share by this creator; ``max_total_bytes`` None = no total check.
+
+    Member-created shares use ``share_settings["member_share_limits"]`` (control_plane.collab.members.share_limits,
+    D8; a null value means no check); everyone else keeps the global caps.
+    """
+    settings = server.share_settings
+    if is_member_principal(created_by):
+        limits = settings.get("member_share_limits") or {}
+        per_share = limits.get("max_share_bytes")
+        return (UNBOUNDED if per_share is None else per_share), limits.get("max_total_bytes")
+    return settings["max_share_bytes"], settings["max_total_bytes"]
 
 
 def _call(store, method, *args, **kwargs):
@@ -156,7 +174,8 @@ def shared_file_names(version: dict) -> frozenset[str]:
     return frozenset(names)
 
 
-def _plan(server, artifact_id: str, version_id: str, entry: str | None) -> tuple[list[dict], str, list[str]]:
+def _plan(server, artifact_id: str, version_id: str, entry: str | None,
+          created_by: str | None = None) -> tuple[list[dict], str, list[str]]:
     """Dry run: the files a bundle of this version holds, its entry and warnings. No object bytes are read."""
     registry = server.artifact_store
     settings = server.share_settings
@@ -200,8 +219,9 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None) -> tuple
     if len(files) > settings["max_files"]:
         raise ShareHTTPError(400, f"share has {len(files)} files, more than the {settings['max_files']} files allowed")
     declared = sum(f["size_bytes"] or 0 for f in files)
-    if declared > settings["max_share_bytes"]:
-        raise ShareHTTPError(400, f"share is {declared} bytes, over the {settings['max_share_bytes']} byte cap")
+    max_share_bytes = _caps(server, created_by)[0]
+    if declared > max_share_bytes:
+        raise ShareHTTPError(400, f"share is {declared} bytes, over the {max_share_bytes} byte cap")
     try:
         chosen = choose_entry(entry, names)
     except ShareBundleError as exc:
@@ -246,13 +266,15 @@ def approve_share(server, share: dict, *, approved_by: str | None = None) -> tup
     if expires_at is not None and expires_at <= datetime.now(UTC):
         raise ShareHTTPError(410, "share expired before approval; create a new share")
     with _APPROVE_LOCK:
-        files, entry, warnings = _plan(server, share["artifact_id"], share["version_id"], share.get("entry"))
+        creator = share.get("created_by")
+        files, entry, warnings = _plan(server, share["artifact_id"], share["version_id"], share.get("entry"), creator)
         _call(server.artifact_store, "verify_share_outputs", share["artifact_id"], share["version_id"])
-        live = int(_call(server.share_store, "live_total_bytes"))
-        cap, total_cap = settings["max_share_bytes"], settings["max_total_bytes"]
+        member = is_member_principal(creator)
+        live = int(_call(server.share_store, "live_total_bytes", member=member))    # member / operator totals are separate
+        cap, total_cap = _caps(server, creator)
 
         def over_total(size):
-            if live + size > total_cap:
+            if total_cap is not None and live + size > total_cap:
                 raise ShareHTTPError(400, f"approving would put {live + size} bytes live, over the {total_cap} byte total cap "
                                      f"({live} already live)")
 
@@ -283,7 +305,7 @@ def approve_share(server, share: dict, *, approved_by: str | None = None) -> tup
                 _call(server.share_store, "mark_live", share_id, token_hash=token_hash, index=index,
                       approved_by=approved_by or "unknown")
             except ShareError as exc:
-                raise ShareHTTPError(410 if exc.code == "expired" else 409, str(exc)) from None
+                raise ShareHTTPError({"expired": 410, "not_found": 404}.get(exc.code, 409), str(exc)) from None
         except BaseException:
             if token_hash is not None:
                 remove_state(root, token_hash)
@@ -335,13 +357,15 @@ def _create(handler, server, artifact_id):
     if body.get("room_id") is not None:
         allow_emails = _room_emails(server, audience, body["room_id"], allow_emails)
     owners = server.share_settings.get("owner_emails") or []
-    if audience == "lab" and owners and (allow_emails is None or (
+    principal = handler._resource_principal()
+    # A member's lab share never inherits the operator owner merge: its audience is the caller's own, checked by the store.
+    if audience == "lab" and owners and not is_member_principal(principal) and (allow_emails is None or (
             isinstance(allow_emails, list) and all(isinstance(e, str) for e in allow_emails))):
         allow_emails = sorted({e.lower() for e in (*(allow_emails or []), *owners)})   # the owners may always sign in
-    files, chosen, warnings = _plan(server, artifact_id, version_id, entry)
+    files, chosen, warnings = _plan(server, artifact_id, version_id, entry, principal)
     row = _call(server.share_store, "create", artifact_id=artifact_id, version_id=version_id, audience=audience,
                 allow_emails=allow_emails, allow_groups=body.get("allow_groups"),
-                expires_at=expires_at, entry=entry, title=title, created_by=handler._resource_principal())
+                expires_at=expires_at, entry=entry, title=title, created_by=principal)
     handler._json({"share": _jsonable(row),
                    "summary": _summary(files, chosen, warnings, audience, row.get("expires_at"))}, 201)
 
@@ -351,7 +375,8 @@ def _show(handler, server, share):
     out = {"share": _jsonable(share)}
     if share.get("state") == "pending":
         try:
-            files, entry, warnings = _plan(server, share["artifact_id"], share["version_id"], share.get("entry"))
+            files, entry, warnings = _plan(server, share["artifact_id"], share["version_id"], share.get("entry"),
+                                           share.get("created_by"))
             out["summary"] = _summary(files, entry, warnings, share["audience"], share.get("expires_at"))
         except ShareHTTPError as exc:      # the version changed since create: say what approve would refuse
             out["summary_error"] = exc.message
@@ -426,4 +451,8 @@ def route_share(handler, server, parts, resource) -> bool:
                 handler._json({"share": _jsonable(row), "url": url, "summary": summary})
     except ShareHTTPError as exc:
         handler._json({"error": exc.message}, exc.status)
+    except ShareError as exc:
+        if exc.code not in {"not_found", "member_audience_refused"}:
+            raise
+        handler._json({"error": str(exc)}, 404 if exc.code == "not_found" else 403)
     return True

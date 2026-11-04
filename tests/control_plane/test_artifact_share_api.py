@@ -204,7 +204,7 @@ class Shares:
                                     "actor": actor, "detail": {"was": was}})
         return self._public(row)
 
-    def live_total_bytes(self):
+    def live_total_bytes(self, *, member=False):
         return self.live_bytes_extra + sum(r["total_bytes"] or 0 for r in self.rows.values() if r["state"] == "live")
 
     def events(self, share_id, limit=200):

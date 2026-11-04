@@ -141,7 +141,7 @@ def test_state_machine(share_postgres):
         assert live["approved_at"] and "token_hash" not in live
         with pytest.raises(ShareError):  # not pending any more
             await store.mark_live(sid, token_hash=token_hash, index=index(), approved_by="op")
-        assert await store.live_total_bytes() >= 42
+        assert await store.live_total_bytes(member=False) >= 42
         revoked = await store.mark_revoked(sid, actor="op")
         assert revoked["state"] == "revoked" and revoked["revoked_at"]
         again = await store.mark_revoked(sid, actor="op2")  # no-op
@@ -167,13 +167,13 @@ def test_state_machine(share_postgres):
 def test_live_expired_and_totals(share_postgres):
     async def body(store, conn):
         aid, vid = await seed(conn)
-        before = await store.live_total_bytes()
+        before = await store.live_total_bytes(member=False)
         ids = []
         for size in (5, 7):
             s = await store.create(**kw(aid, vid, expires_at=datetime.now(UTC) + timedelta(days=2)))
             await store.mark_live(s["share_id"], token_hash=new_token()[1], index=index(size=size), approved_by="op")
             ids.append(s["share_id"])
-        assert await store.live_total_bytes() == before + 12
+        assert await store.live_total_bytes(member=False) == before + 12
         await conn.execute("UPDATE artifact_shares SET expires_at=now()-interval '1 second' WHERE share_id=$1", ids[0])
         due = await store.live_expired(datetime.now(UTC))
         assert ids[0] in [d["share_id"] for d in due] and ids[1] not in [d["share_id"] for d in due]
@@ -182,7 +182,7 @@ def test_live_expired_and_totals(share_postgres):
         await store.mark_revoked(ids[0], actor="sweep")
         await store.add_event(ids[0], "expired", "sweep", {"reason": "expiry"})
         assert ids[0] not in [d["share_id"] for d in await store.live_expired(datetime.now(UTC))]
-        assert await store.live_total_bytes() == before + 7
+        assert await store.live_total_bytes(member=False) == before + 7
         got = await store.get(ids[1])
         assert re.fullmatch(r"[0-9a-f]{64}", got["token_hash"]) and await store.get("share_nope") is None
         with pytest.raises(ShareError):
