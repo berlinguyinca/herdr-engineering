@@ -512,7 +512,18 @@ exec '{original}' "$@"
     docker.chmod(0o755)
     if fail:
         env["env"]["STUB_PREWARM_FAIL"] = "1"
-    result = deploy(env)
+    entered, release = barrier(env, "docker", '[ "$1" = run ]', "prewarm-")
+    with first(env) as proc:
+        try:
+            wait_for(entered, proc)
+            owner = json.loads((state(env) / "rollout-owner.json").read_text())
+            assert owner["phase"] == "checkpoint-prewarm"
+            assert proc.poll() is None
+            assert " up " not in env["log"].read_text()
+        finally:
+            release.touch()
+        out, err = proc.communicate(timeout=DEPLOY_TIMEOUT)
+        result = subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
     log = env["log"].read_text()
     assert "prewarm-before-host-changes" in log
     assert "PREWARM-SECRET" not in result.stdout + result.stderr

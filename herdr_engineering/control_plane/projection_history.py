@@ -92,6 +92,18 @@ def _boundary(kind, identity, cursor):
         raise ValueError('invalid history cursor') from exc
 
 
+class DurableHistoryUnavailable(RuntimeError):
+    """A durable read failed; expose only a static message and exception class."""
+
+    def __init__(self, cause_name):
+        super().__init__('Durable history is unavailable.')
+        self.cause_name = cause_name
+
+
+class HistoryCursorStale(ValueError):
+    """A validated cursor no longer identifies its original durable anchor."""
+
+
 class PostgresHistory:
     def __init__(self, dsn, run, *, schema='public'):
         self.dsn, self.run, self.schema = dsn, run, schema
@@ -119,8 +131,10 @@ class PostgresHistory:
     def _call(self, operation):
         try:
             return self.run(operation)
-        except TimeoutError as exc:
-            raise TimeoutError('durable history database read timed out') from exc
+        except HistoryCursorStale:
+            raise
+        except Exception as exc:
+            raise DurableHistoryUnavailable(type(exc).__name__) from None
 
     def stream(self, kind, identity):
         return self._call(self._stream(kind, identity))
@@ -160,7 +174,7 @@ class PostgresHistory:
                         f'AND sequence=$3 AND ingest_timestamp=$4 AND {key}=$5', kind, identity, value[4], stamp, _unb64(value[2]))
                     matches=anchor is not None and _event_digest(anchor)==value[3]
                 if not matches:
-                    raise ValueError('staleHistoryCursor')
+                    raise HistoryCursorStale('staleHistoryCursor')
                 actor = anchor['actor'] or {}
                 if isinstance(actor, str):
                     actor = json.loads(actor)

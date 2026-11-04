@@ -1,0 +1,10 @@
+{
+  "format_version": 1,
+  "checkpoint_schema": 1,
+  "compatible_code_fingerprints": [
+    "9d2aa47a5b170b1ad0740e6769d8998c4040f30a1fbc324ff57c4bc11ef422d6"
+  ],
+  "reason": "Reviewed operational-only history read failure handling and exact-build compatibility lookup; stored projection codecs, reducers, writer coverage and policy checks unchanged.",
+  "producer_commit": "000e1774bec825af5461e773a5bdcdc5474ef1fc",
+  "current_code_fingerprint": "8042c315dcfa3190281505268e5a304815ff991706f3d2966d6512608fac61eb"
+}

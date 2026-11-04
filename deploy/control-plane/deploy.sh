@@ -669,6 +669,7 @@ if [ -n "$PREVIOUS_IMAGE" ] && grep -q '^def _cmd_cp_checkpoint(' "$WORK/herdr_e
   PREWARM_LOG="$ATTEMPT/checkpoint-prewarm.log"
   (umask 077; : > "$PREWARM_LOG")
   chmod 600 "$PREWARM_LOG"
+  deploy_lock_phase checkpoint-prewarm
   echo "prewarming target projection checkpoint before host or service changes"
   if ! docker run --rm --network container:herdr-cp-web \
       --mount "type=bind,src=$ATTEMPT/candidate,dst=/etc/herdr/fleet,readonly" \

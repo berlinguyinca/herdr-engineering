@@ -15,6 +15,7 @@ from .projection_checkpoint import (
     policy_fingerprint,
     restore_projection,
 )
+from .projection_compatibility import compatible_fingerprints
 from .projection_history import ENVELOPE_ONLY, PostgresHistory, hidden_history, public_event
 from .projection_store import CheckpointInvalid, ProjectionStore, SnapshotChanged, decode_checkpoint
 
@@ -67,7 +68,7 @@ async def _read_prepared_once(source, code, policy):
         schema = await conn.fetchval('SELECT current_schema()')
         structured = {name:[dict(row) for row in await conn.fetch(f'SELECT * FROM {name}')]
                       for name in ('missions','sessions','services','hosts')}
-        candidates = await store.candidates(code, policy)
+        candidates = await store.candidates(code, policy, compatible_codes=compatible_fingerprints(code))
         # Retain the shipped row-selection/inspector optimization until an
         # explicit materializer has prepared a compatible complete capsule.
         if not candidates and not source.checkpoint_publish:

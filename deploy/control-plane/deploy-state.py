@@ -195,7 +195,7 @@ def prepare(state, central, commit, previous_commit, previous_image, collab):
 
 # These fields are deliberately bounded/allowlisted: never print arbitrary owner
 # files, process command lines, refs, config paths, or environment values.
-LOCK_PHASES = {"prepare", "build", "forward", "verify", "rollback", "cleanup"}
+LOCK_PHASES = {"prepare", "build", "checkpoint-prewarm", "forward", "verify", "rollback", "cleanup"}
 
 
 def lock_metadata(action, args):

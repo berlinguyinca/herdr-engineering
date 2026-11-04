@@ -49,6 +49,7 @@ def operator_policies(rows, initial=None):
 
 
 def code_fingerprint():
+    from .projection_compatibility import fingerprint_policy
     root = Path(__file__).parent
     digest = hashlib.sha256()
     for path in sorted(root.glob('*.py')):
@@ -58,6 +59,8 @@ def code_fingerprint():
         path = root.parent / name
         digest.update(name.encode())
         digest.update(path.read_bytes())
+    digest.update(b'checkpoint-compatibility-policy-v1\0')
+    digest.update(fingerprint_policy())
     return digest.hexdigest()
 
 

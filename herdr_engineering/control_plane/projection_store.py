@@ -143,10 +143,11 @@ class ProjectionStore:
             'SELECT * FROM projection_event_changes WHERE position>$1 AND ($2::bigint IS NULL OR position<=$2) ORDER BY position',
             frontier, through)]
 
-    async def candidates(self, code, policy):
+    async def candidates(self, code, policy, *, compatible_codes=()):
         return [dict(row) for row in await self.conn.fetch(
-            'SELECT * FROM projection_checkpoints WHERE code_fingerprint=$1 AND policy_fingerprint=$2 '
-            'AND format_version=$3 ORDER BY frontier DESC, checkpoint_id DESC LIMIT 4', code, policy, FORMAT_VERSION)]
+            'SELECT * FROM projection_checkpoints WHERE code_fingerprint=ANY($1::text[]) AND policy_fingerprint=$2 '
+            'AND format_version=$3 ORDER BY frontier DESC, checkpoint_id DESC LIMIT 4',
+            [code, *compatible_codes], policy, FORMAT_VERSION)]
 
     async def publish(self, code, policy, frontier, value):
         packed, checksum = encode_checkpoint(value)

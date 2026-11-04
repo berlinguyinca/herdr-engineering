@@ -34,6 +34,13 @@ shipped recovery optimizations remain available until a compatible capsule is
 prepared. Code and policy fingerprints bind capsules to their reducer code,
 inspector limits/redaction settings and host-alias policy.
 
+A bundled compatibility manifest can name a previously verified producer for a
+reviewed operational-only patch. Its policy is itself fingerprinted, and aliases
+activate only for the exact declared current build. Policy, format, checksum,
+frontier and domain validation still apply. Any Python or compatibility-policy
+change disables those aliases until explicitly reviewed. Do not regenerate this
+binding for reducer changes: let preparation replay retained history instead.
+
 Ordinary append-only inspector updates advance the private owner capsule only
 when their replay order follows its captured boundary. Service and session
 updates fold into the saved event projection only when every new server-ingest

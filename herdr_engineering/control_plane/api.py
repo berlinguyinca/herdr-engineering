@@ -2360,7 +2360,10 @@ def _make_handler(server, public=False, operator=False):
             try:
                 return dispatch()
             except Exception as exc:
-                self._request_cause = type(exc).__name__
+                # A client closing while we write a dependency error must not
+                # replace the already-recorded reason that the request failed.
+                if self._request_cause is None:
+                    self._request_cause = type(exc).__name__
                 raise
             finally:
                 elapsed_ms = (time.monotonic() - self._request_started) * 1000
@@ -3110,6 +3113,10 @@ def _make_handler(server, public=False, operator=False):
                                        {"error": str(exc)})
             except RuntimeError as exc:
                 self._request_cause = type(exc).__name__
+                if resource == 'events':
+                    from .projection_history import DurableHistoryUnavailable
+                    if isinstance(exc, DurableHistoryUnavailable):
+                        self._request_cause = exc.cause_name
                 if resource == "github":
                     from ..github import GitHubError
                     if isinstance(exc, GitHubError):
