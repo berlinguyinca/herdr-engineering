@@ -1,7 +1,22 @@
-"""Daily controller fleet maintenance, invoked by the user systemd timer."""
+"""Daily controller fleet maintenance, invoked by the user systemd timer.
+
+An unattended run distinguishes two kinds of bad outcome:
+
+* **skip** - a precondition the operator must resolve first (the checkout holds local
+  work, is not on `main`, ...). The updater must never touch that work, so the run
+  reports the reason and exits 0: a refused update is not a broken timer, and a red
+  systemd unit every night hides the real failures.
+* **failure** - the update itself went wrong (fetch, install, playbook, ...), which
+  keeps exiting 1.
+
+Both outcomes are recorded in a small state file so `herdr-eng memory doctor` can
+surface them; before that, a permanently skipped updater looked exactly like a
+permanently failed one.
+"""
 
 from __future__ import annotations
 
+import datetime as dt
 import fcntl
 import json
 import os
@@ -9,6 +24,18 @@ import subprocess
 from pathlib import Path
 
 from .fleet import fleet_update
+
+#: How many dirty paths to name in a skip report (the count is always exact).
+SKIP_PREVIEW_FILES = 8
+STATE_NAME = "fleet-auto-update.json"
+
+
+class SkipUpdate(RuntimeError):
+    """A precondition the operator must resolve; reported as a skip, not a failure."""
+
+    def __init__(self, message: str, detail: dict | None = None):
+        super().__init__(message)
+        self.detail = detail or {}
 
 
 def _git(root: Path, *args: str) -> str:
@@ -18,6 +45,69 @@ def _git(root: Path, *args: str) -> str:
     if result.returncode:
         raise RuntimeError(f"checkout validation failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def _git_optional(root: Path, *args: str) -> str | None:
+    """Best-effort git probe used only to enrich a report; never raises."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def state_path() -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+    return state / "herdr-engineering" / STATE_NAME
+
+
+def read_state() -> dict | None:
+    """The last recorded unattended run, or None when there is none."""
+    try:
+        record = json.loads(state_path().read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def record_run(outcome: str, *, reason: str | None = None, revision: str | None = None,
+               detail: dict | None = None) -> dict:
+    """Persist this run so drift is visible without reading the journal."""
+    record: dict = {
+        "last_run": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
+        "outcome": outcome,                       # updated | skipped | failed
+        "reason": (reason or "")[:500] or None,
+        "revision": revision,
+        "ok": outcome == "updated",
+        "skipped": outcome == "skipped",
+    }
+    if detail:
+        record["detail"] = detail
+    path = state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(record, sort_keys=True) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        # Losing the state file must not turn a skip into a failure.
+        pass
+    return record
+
+
+def _divergence(root: Path) -> dict:
+    """How the checkout sits relative to `origin/main`; probes never fail the run."""
+    detail: dict = {}
+    ahead = _git_optional(root, "rev-list", "--count", "origin/main..HEAD")
+    behind = _git_optional(root, "rev-list", "--count", "HEAD..origin/main")
+    if ahead is not None:
+        detail["unpublished_commits"] = int(ahead)
+    if behind is not None:
+        detail["behind_origin_main"] = int(behind)
+    return detail
 
 
 def run_update() -> dict:
@@ -34,10 +124,29 @@ def run_update() -> dict:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError("another automatic fleet update is already running") from exc
-        if _git(root, "branch", "--show-current") != "main":
-            raise RuntimeError("automatic updates require the main branch")
-        if _git(root, "status", "--porcelain", "--untracked-files=all"):
-            raise RuntimeError("controller checkout is dirty; preserve local work before updating")
+        branch = _git(root, "branch", "--show-current")
+        if branch != "main":
+            raise SkipUpdate(
+                f"automatic updates require the main branch "
+                f"(checkout is on {branch or 'a detached HEAD'})",
+                {"branch": branch, "checkout": str(root)},
+            )
+        dirty = [line for line in _git(root, "status", "--porcelain",
+                                       "--untracked-files=all").splitlines() if line]
+        if dirty:
+            detail = {
+                "checkout": str(root),
+                "dirty_paths": len(dirty),
+                "tracked_changes": sum(1 for line in dirty if not line.startswith("?? ")),
+                "examples": [line[:120] for line in dirty[:SKIP_PREVIEW_FILES]],
+                "hint": "preserve this work elsewhere, or point HERDR_ENGINEERING_REPO at a "
+                        "dedicated clean checkout for unattended updates",
+            }
+            detail.update(_divergence(root))
+            raise SkipUpdate(
+                "controller checkout is dirty; local work is preserved and this update is skipped",
+                detail,
+            )
         # fleet_update performs the origin/main fast-forward, installation,
         # service convergence and status verification, failing on any error.
         return fleet_update()
@@ -46,8 +155,17 @@ def run_update() -> dict:
 def main() -> int:
     try:
         report = run_update()
+    except SkipUpdate as exc:
+        report = {"ok": True, "skipped": True, "reason": str(exc)}
+        if exc.detail:
+            report["detail"] = exc.detail
+        record_run("skipped", reason=str(exc), detail=exc.detail or None)
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         report = {"ok": False, "error": str(exc)}
+        record_run("failed", reason=str(exc))
+    else:
+        record_run("updated" if report.get("ok") else "failed",
+                   reason=report.get("error"), revision=report.get("revision"))
     print(json.dumps(report, sort_keys=True))
     return 0 if report.get("ok") else 1
 

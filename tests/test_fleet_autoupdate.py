@@ -1,4 +1,4 @@
-"""Unattended updates refuse local work and serialize timer invocations."""
+"""Unattended updates report refused preconditions as skips and serialize invocations."""
 
 import fcntl
 import json
@@ -10,6 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path, monkeypatch):
+    """An unattended-update test must never record into the developer's real state dir."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
 
 @pytest.fixture
@@ -28,27 +34,40 @@ def checkout(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("dirty", ["tracked", "untracked"])
-def test_dirty_checkout_refuses_updates(checkout, dirty, capsys):
+def test_dirty_checkout_is_a_reported_skip_not_a_failure(checkout, dirty, capsys):
+    """Local work is never touched, and a refused update must not look like a broken timer."""
     from herdr_engineering import fleet_autoupdate
 
     (checkout / (".gitignore" if dirty == "tracked" else "notes.txt")).write_text("local work")
     with patch.object(fleet_autoupdate, "fleet_update") as update:
-        assert fleet_autoupdate.main() == 1
-    assert "dirty" in json.loads(capsys.readouterr().out)["error"]
+        assert fleet_autoupdate.main() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is True and report["skipped"] is True
+    assert "dirty" in report["reason"]
+    assert report["detail"]["dirty_paths"] == 1
+    assert report["detail"]["tracked_changes"] == (1 if dirty == "tracked" else 0)
+    assert report["detail"]["examples"]
+    assert "clean checkout" in report["detail"]["hint"]
     update.assert_not_called()
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "skipped" and recorded["skipped"] is True
+    assert "dirty" in recorded["reason"]
 
 
-def test_non_main_checkout_refuses_updates(checkout, capsys):
+def test_non_main_checkout_is_a_reported_skip(checkout, capsys):
     from herdr_engineering import fleet_autoupdate
 
     subprocess.run(["git", "-C", str(checkout), "checkout", "-b", "feature"], check=True, capture_output=True)
     with patch.object(fleet_autoupdate, "fleet_update") as update:
-        assert fleet_autoupdate.main() == 1
-    assert "main" in json.loads(capsys.readouterr().out)["error"]
+        assert fleet_autoupdate.main() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is True and report["skipped"] is True
+    assert "main branch" in report["reason"] and report["detail"]["branch"] == "feature"
     update.assert_not_called()
+    assert fleet_autoupdate.read_state()["outcome"] == "skipped"
 
 
-def test_success_allows_ignored_inventory_and_reports_result(checkout, capsys):
+def test_success_allows_ignored_inventory_and_records_the_revision(checkout, capsys):
     from herdr_engineering import fleet_autoupdate
 
     inventory = checkout / "ansible" / "inventory"
@@ -59,15 +78,21 @@ def test_success_allows_ignored_inventory_and_reports_result(checkout, capsys):
         assert fleet_autoupdate.main() == 0
     update.assert_called_once_with()
     assert json.loads(capsys.readouterr().out) == result
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "updated" and recorded["ok"] is True
+    assert recorded["last_run"] and recorded["revision"] is None
 
 
-def test_update_failure_has_nonzero_exit(checkout, capsys):
+def test_update_failure_has_nonzero_exit_and_is_recorded(checkout, capsys):
     from herdr_engineering import fleet_autoupdate
 
-    result = {"ok": False, "steps": {"fleet_sync": {"rc": 2}}}
+    result = {"ok": False, "steps": {"fleet_sync": {"rc": 2}}, "error": "fleet sync failed"}
     with patch.object(fleet_autoupdate, "fleet_update", return_value=result):
         assert fleet_autoupdate.main() == 1
     assert json.loads(capsys.readouterr().out) == result
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "failed" and recorded["ok"] is False
+    assert recorded["reason"] == "fleet sync failed"
 
 
 def test_overlapping_timer_is_rejected(checkout, tmp_path, capsys):

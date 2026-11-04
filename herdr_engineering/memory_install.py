@@ -35,7 +35,11 @@ from typing import Any
 MARKER = "herdr-memory:managed"
 ADAPTER_VERSION = 1
 # Pinned herdr-memory revision; must match lock/upstreams.yaml (tested).
-PINNED_REVISION = "b3c5074"
+PINNED_REVISION = "89a8529"
+#: Client release the fleet is expected to run (`herdr-memory --version`).
+PINNED_CLIENT_VERSION = "0.1.3"
+#: An unattended controller update older than this looks like a timer that stopped landing.
+FRESH_UPDATE_HOURS = 26
 SERVER_NAME = "herdr-memory"
 HARNESSES = ("pi", "claude", "codex", "opencode")
 ALLOWED_SCOPE_PATTERN = r"^(project|global|infra|mission:[a-z0-9][a-z0-9_-]{0,63})$"
@@ -728,16 +732,105 @@ class MemoryInstaller:
         return res
 
     # drift / doctor ------------------------------------------------------
-    def installed_revision(self) -> str | None:
-        """Revision of the installed ``herdr-memory`` package, or None if unknowable."""
+    def _client_site_packages(self) -> Path | None:
+        """``site-packages`` of the install that owns the ``herdr-memory`` CLI.
+
+        The wrapper's own interpreter usually cannot import the client at all (the CLI
+        is a `uv tool` install or its own venv), so provenance has to be read from the
+        install the CLI actually runs from: `<prefix>/bin/herdr-memory` ->
+        `<prefix>/lib/python*/site-packages`.
+        """
+        exe = self.which("herdr-memory")
+        if not exe:
+            return None
+        libs = Path(exe).resolve().parent.parent / "lib"
+        if not libs.is_dir():
+            return None
+        for candidate in sorted(libs.glob("python*/site-packages")):
+            if any(candidate.glob("herdr_memory-*.dist-info")):
+                return candidate
+        return None
+
+    def _client_dist_infos(self) -> list[Path]:
+        """Candidate `herdr_memory-*.dist-info` directories, this interpreter first."""
+        infos: list[Path] = []
         try:
             from importlib import metadata
-            raw = metadata.distribution("herdr-memory").read_text("direct_url.json")
-            if raw:
-                return json.loads(raw).get("vcs_info", {}).get("commit_id")
+            own = getattr(metadata.distribution("herdr-memory"), "_path", None)
+            if own:
+                infos.append(Path(own))
         except Exception:
-            return None
+            pass
+        site = self._client_site_packages()
+        if site:
+            infos.extend(sorted(site.glob("herdr_memory-*.dist-info")))
+        return infos
+
+    def installed_revision(self) -> str | None:
+        """Revision of the installed ``herdr-memory`` package, or None if unknowable."""
+        for info in self._client_dist_infos():
+            try:
+                raw = (info / "direct_url.json").read_text()
+            except OSError:
+                continue
+            try:
+                return json.loads(raw).get("vcs_info", {}).get("commit_id")
+            except ValueError:
+                continue
         return None
+
+    def installed_version(self) -> str | None:
+        """Version of the client the CLI runs from, from its own metadata."""
+        for info in self._client_dist_infos():
+            name = info.name
+            if name.startswith("herdr_memory-") and name.endswith(".dist-info"):
+                return name[len("herdr_memory-"):-len(".dist-info")]
+        return None
+
+    def reported_version(self) -> dict | None:
+        """What `herdr-memory --version` says, or None if the CLI cannot answer."""
+        exe = self.which("herdr-memory")
+        if not exe:
+            return None
+        try:
+            data = json.loads(self.run([exe, "--version"]).stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def fleet_update_status(self) -> dict:
+        """Last unattended controller update (`herdr-eng-fleet-update.timer`).
+
+        A refused update (local work in the checkout) is a *skip* and shows as a warning
+        with the reason; only a failed update is a failure. Without this check a fleet
+        that had not updated for weeks still reported `overall: ok`.
+        """
+        from .fleet_autoupdate import read_state
+
+        record = read_state()
+        if record is None:
+            return {"name": "fleet_update", "status": "unknown",
+                    "detail": "no unattended fleet update has recorded a run", "data": {}}
+        outcome = record.get("outcome")
+        reason = record.get("reason")
+        data = {"outcome": outcome, "reason": reason, "last_run": record.get("last_run"),
+                "revision": record.get("revision")}
+        age = _hours_since(record.get("last_run"))
+        if outcome == "updated":
+            if age is None:
+                return {"name": "fleet_update", "status": "unknown",
+                        "detail": "unattended update record has no readable timestamp", "data": data}
+            if age > FRESH_UPDATE_HOURS:
+                return {"name": "fleet_update", "status": "warn",
+                        "detail": f"last unattended update was {age:.0f}h ago (timer not landing?)",
+                        "data": data}
+            return {"name": "fleet_update", "status": "ok",
+                    "detail": f"unattended update ok {age:.0f}h ago", "data": data}
+        if outcome == "skipped":
+            return {"name": "fleet_update", "status": "warn",
+                    "detail": f"unattended update skipped: {reason}", "data": data}
+        return {"name": "fleet_update", "status": "fail",
+                "detail": f"unattended update failed: {reason}", "data": data}
 
     def doctor(self, harnesses=None, *, config_path: Path | None = None) -> dict:
         checks: list[dict] = []
@@ -772,12 +865,32 @@ class MemoryInstaller:
             add("pin", "ok", f"adapter pin {pinned}")
         rev = self.installed_revision()
         if rev is None:
-            add("package_revision", "unknown", "installed herdr-memory revision not determinable")
+            version = self.installed_version()
+            add("package_revision", "unknown",
+                "installed herdr-memory revision not determinable"
+                + (f" (wheel install {version}: no VCS provenance recorded)" if version
+                   else " (no herdr-memory distribution found for this CLI)"),
+                **({"version": version} if version else {}))
         elif not (rev.startswith(PINNED_REVISION) or PINNED_REVISION.startswith(rev)):
             add("package_revision", "warn", f"herdr-memory {rev[:12]} != pin {PINNED_REVISION}",
                 installed=rev, pinned=PINNED_REVISION)
         else:
             add("package_revision", "ok", f"herdr-memory {rev[:12]} matches pin")
+        reported = self.reported_version()
+        reported_client = reported.get("client") if reported else None
+        if reported_client is None:
+            add("client_version", "unknown",
+                "herdr-memory --version did not report a client version (older client?)"
+                if self.which("herdr-memory") else
+                "herdr-memory CLI not on PATH")
+        elif reported_client != PINNED_CLIENT_VERSION:
+            add("client_version", "warn",
+                f"client {reported_client} != pinned {PINNED_CLIENT_VERSION}; promote the pinned build",
+                installed=reported_client, pinned=PINNED_CLIENT_VERSION)
+        else:
+            add("client_version", "ok", f"client {reported_client}",
+                contract=reported.get("contract"))
+        checks.append(self.fleet_update_status())
 
         cfg = config_path or Path(os.environ.get("HERDR_MEMORY_CONFIG") or
                                   self.home / ".config" / "herdr-memory" / "config.json")
@@ -804,6 +917,21 @@ class MemoryInstaller:
             return {"name": "server", "status": "ok", "detail": "healthy",
                     "data": {k: data.get(k) for k in ("outbox_pending", "dead_letter", "server_version")}}
         return {"name": "server", "status": "fail", "detail": "server reports unhealthy", "data": {}}
+
+
+def _hours_since(iso: object) -> float | None:
+    """Hours between now and an ISO-8601 timestamp, or None if it cannot be parsed."""
+    import datetime as dt
+
+    if not isinstance(iso, str) or not iso:
+        return None
+    try:
+        stamp = dt.datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.UTC)
+    return (dt.datetime.now(dt.UTC) - stamp).total_seconds() / 3600.0
 
 
 def _is_empty_doc(text: str) -> bool:
