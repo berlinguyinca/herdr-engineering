@@ -135,7 +135,17 @@ _TRIPWIRE_OUTPUTS = [
     _LT + 'meta http-equiv=refresh content="0;url=//e">',
     _LT + "base href=//e/>",
     _LT + "form action=//e>",
+    _LT + 'a title="<" onclick=x>',
 ]
+
+
+def test_tripwire_is_linear_on_unterminated_tags() -> None:
+    import time
+
+    for unit in (_LT + "a ", _LT + 'a b="', _LT + "a on"):
+        started = time.monotonic()
+        sr._tripwire_ok(unit * 400_000)
+        assert time.monotonic() - started < 3.0, unit
 
 
 @pytest.mark.parametrize("out", _TRIPWIRE_OUTPUTS)

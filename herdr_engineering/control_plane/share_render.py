@@ -327,7 +327,7 @@ _FRAME_FAMILY = "|".join(
     ]
 )
 _TRIPWIRE = re.compile(
-    r"<\s*(?:script|" + _FRAME_FAMILY + r"|meta|base|form)(?![a-z0-9])|<[^>]*(?:\son[a-z]+\s*=|javascript:|srcdoc)",
+    r"<\s*(?:script|" + _FRAME_FAMILY + r"|meta|base|form)(?![a-z0-9])|<[^<>]*(?:\son[a-z]+\s*=|javascript:|srcdoc)",
     re.I,
 )
 
