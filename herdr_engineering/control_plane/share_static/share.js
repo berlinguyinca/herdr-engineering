@@ -113,10 +113,11 @@
   }
 
   async function openShare(sharePath, tokens) {
+    // same-origin: the response sets the HttpOnly write cookie that the annotation routes require
     var r = await fetch(sharePath + "session", {
       method: "POST",
       cache: "no-store",
-      credentials: "omit",
+      credentials: "same-origin",
       headers: { "Authorization": "Bearer " + tokens.access, "X-Id-Token": tokens.id }
     });
     forget(); // the session path replaces the tokens; nothing is kept either way

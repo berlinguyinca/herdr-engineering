@@ -18,7 +18,12 @@ from herdr_engineering.control_plane.share_bundle import (
     write_own_projection,
     write_state,
 )
-from herdr_engineering.control_plane.share_session import csrf_token, mint_session
+from herdr_engineering.control_plane.share_session import (
+    csrf_token,
+    mint_session,
+    write_cookie_name,
+    write_cookie_value,
+)
 from tests.control_plane.test_share_lab import LAB_ALLOW, NOW0, SECRET, lab_config
 from tests.control_plane.test_share_public import OTHER_TOKEN, TOKEN, Env
 
@@ -68,12 +73,23 @@ def api(sess=None):
     return f"/s/{TOKEN}/k/{sess or session()}/annotations"
 
 
+def write_cookie(sess=None, share_id="shr-1"):
+    """The ``Cookie`` header value the session exchange would have set for ``sess`` (see test_share_write_cookie)."""
+    sess = sess or session()
+    return f"{write_cookie_name(share_id, sess)}={write_cookie_value(SECRET, share_id, sess)}"
+
+
 def good_headers(sess=None, body=b"{}", **over):
     sess = sess or session()
-    headers = {"Origin": ORIGIN, "X-Herdr-Annotate": csrf_token(SECRET, "shr-1", sess),
+    headers = {"Origin": ORIGIN, "X-Herdr-Annotate": csrf_token(SECRET, "shr-1", sess), "Cookie": write_cookie(sess),
                "Content-Type": "application/json", "Content-Length": str(len(body))}
     headers.update(over)
     return {k: v for k, v in headers.items() if v is not None}
+
+
+def aget(env, sess=None, **over):
+    """GET of the annotations route as the viewer's browser sends it: with the write cookie."""
+    return env.request("GET", api(sess), {"Cookie": write_cookie(sess), **over})
 
 
 def create_body(file="index.html", comment="Looks wrong", **extra):
@@ -223,10 +239,10 @@ def test_conditional_and_range_on_the_modified_response(lab):
     assert status == 412
 
 
-def raw_expectation(name, data):
+def raw_expectation(name, data, lab=True):
     etag = f'"{hashlib.sha256(data).hexdigest()}"'
     expected = dict((k.lower(), v) for k, v in share_public._content_headers(
-        name, etag, share_public.sandbox_csp(ORIGIN, TOKEN)))
+        name, etag, share_public.sandbox_csp(ORIGIN, TOKEN), sandbox_pdf=lab))
     expected.update({k.lower(): v for k, v in share_public.CORS_HEADERS})
     expected["content-length"] = str(len(data))
     return expected
@@ -235,7 +251,7 @@ def raw_expectation(name, data):
 def assert_raw(env, path, headers, name, data):
     status, h, body = env.request("GET", path, headers)
     assert status == 200 and body == data
-    for key, value in raw_expectation(name, data).items():
+    for key, value in raw_expectation(name, data, env.state.get("audience") == "lab").items():
         assert h[key] == value, key
     assert "vary" not in h
 
@@ -479,7 +495,7 @@ def raw_post(env, headers: list[str], body: bytes) -> bytes:
 def test_framing_refusals_write_nothing(lab):
     body = create_body()
     base_headers = [f"Origin: {ORIGIN}", "Content-Type: application/json",
-                    f"X-Herdr-Annotate: {csrf_token(SECRET, 'shr-1', session())}"]
+                    f"X-Herdr-Annotate: {csrf_token(SECRET, 'shr-1', session())}", f"Cookie: {write_cookie()}"]
     out = raw_post(lab, base_headers + [f"Content-Length: {len(body)}", f"Content-Length: {len(body)}"], body)
     assert out.startswith(b"HTTP/1.1 404") and lines(lab) == []
     out = raw_post(lab, base_headers + ["Transfer-Encoding: chunked"], b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body))
@@ -495,7 +511,7 @@ def test_framing_refusals_write_nothing(lab):
 def test_short_body_is_refused(lab):
     body = create_body()
     headers = [f"Origin: {ORIGIN}", "Content-Type: application/json",
-               f"X-Herdr-Annotate: {csrf_token(SECRET, 'shr-1', session())}", f"Content-Length: {len(body) + 50}"]
+               f"X-Herdr-Annotate: {csrf_token(SECRET, 'shr-1', session())}", f"Cookie: {write_cookie()}", f"Content-Length: {len(body) + 50}"]
     head = f"POST {api()} HTTP/1.1\r\nHost: x\r\n" + "".join(h + "\r\n" for h in headers) + "\r\n"
     with socket.create_connection(("127.0.0.1", lab.port), timeout=10) as conn:
         conn.sendall(head.encode() + body)
@@ -655,25 +671,25 @@ CID = "ann_" + "C" * 22
 
 
 def test_get_returns_only_the_callers_own_rows(lab):
-    status, h, out = lab.request("GET", api())
+    status, h, out = aget(lab)
     assert status == 200 and json.loads(out) == {"annotations": []}
     seed(lab, "alice", [row(AID)])
     seed(lab, "bob", [row(BID, body="bobs secret")])
-    status, h, out = lab.request("GET", api())
+    status, h, out = aget(lab)
     assert status == 200 and b"bobs secret" not in out
     assert [r["annotation_id"] for r in json.loads(out)["annotations"]] == [AID]
     for key, value in (("cache-control", "no-store"), ("x-content-type-options", "nosniff")):
         assert h[key] == value
     assert "access-control-allow-origin" not in h and h["content-type"] == "application/json"
     bob = session("bob", "bob@lab.example")
-    assert [r["annotation_id"] for r in json.loads(lab.request("GET", api(bob))[2])["annotations"]] == [BID]
+    assert [r["annotation_id"] for r in json.loads(aget(lab, bob)[2])["annotations"]] == [BID]
 
 
 def test_get_with_a_corrupt_projection_is_unavailable(lab):
     seed(lab, "alice", [row(AID)])
     name = hashlib.sha256(b"alice").hexdigest() + ".json"
     (lab.root / "shr-1" / "annotations" / name).write_bytes(b"not json")
-    assert lab.request("GET", api())[0] == 503
+    assert aget(lab)[0] == 503
 
 
 def item(aid, verb, sess=None):

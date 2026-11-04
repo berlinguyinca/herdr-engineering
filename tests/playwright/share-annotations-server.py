@@ -10,7 +10,8 @@ default signed-in session per lab share (``v/``, ``a/`` and ``f/`` base URLs) pl
 The control server (plain HTTP, 127.0.0.1, NOT part of the share server):
   GET  /__lines                  the parsed annotations.jsonl lines
   POST /__signin/<share>/<user>  a real session exchange (signed Cognito-shaped tokens) -> {landing, base}
-  POST /__session/<share>/<user> a session minted with the real signing code (no exchange rate limit) -> {base}
+  POST /__session/<share>/<user> a session minted with the real signing code (no exchange rate limit) -> {base, cookie}
+  POST /__tokens/<user>          Cognito-shaped access and id tokens, for a browser's own session exchange
   POST /__project                the worker's tick: fold the lines into each viewer's projection file
   POST /__status/<id>/<status>   mark a projected annotation dismissed or addressed (the owner's side)
   POST /__seed/<share>/<user>/<n>  n projected annotations of the user on big.html
@@ -46,7 +47,11 @@ from herdr_engineering.control_plane.share_bundle import (  # noqa: E402
     write_state,
 )
 from herdr_engineering.control_plane.share_public import ShareConfig, make_share_server  # noqa: E402
-from herdr_engineering.control_plane.share_session import mint_session  # noqa: E402
+from herdr_engineering.control_plane.share_session import (  # noqa: E402
+    mint_session,
+    write_cookie_name,
+    write_cookie_value,
+)
 from tests.control_plane.test_share_lab import access, ident, lab_config  # noqa: E402
 
 LISTENER = int(sys.argv[1]) if len(sys.argv) > 1 else 9
@@ -109,6 +114,15 @@ COVER = ("<!doctype html><html><head><style>:host{position:fixed!important;inset
          "filter:blur(1px);mix-blend-mode:difference;background:red}div,p{position:fixed;inset:0;z-index:2147483647;"
          "transform:translateZ(0);background:rgba(0,0,255,.5)}</style></head><body><div>cover</div><p>Cover text sentence.</p>"
          "</body></html>")
+STEAL = ("<!doctype html><html><body><p id=steal>cookie probe</p><script>"
+         "var out={cookie:'none',get:'none',post:'none',self:location.href};"
+         "try{out.cookie=document.cookie}catch(e){out.cookie='threw:'+e.name}"
+         "var gets=fetch('../annotations',{credentials:'include'}).then(function(r){out.get=r.status}).catch(function(e){out.get='threw:'+e.name});"
+         "var posts=fetch('../annotations',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json',"
+         "'X-Herdr-Annotate':'x'.repeat(43)},body:'{}'}).then(function(r){out.post=r.status}).catch(function(e){out.post='threw:'+e.name});"
+         "Promise.all([gets,posts]).then(function(){var p=document.createElement('pre');p.id='probe-result';"
+         "p.textContent=JSON.stringify(out);document.body.append(p)});"
+         "</script></body></html>")
 PAGE2 = "<!doctype html><html><body><p id=two>This is the second page with its own sentence.</p></body></html>"
 EVIL = ("<!doctype html><html><head><style>* { display: none !important }</style></head><body>"
         "<script>window.__x=1;alert('evil script')</script>"
@@ -130,7 +144,7 @@ BIG_PARAGRAPHS = 17500
 SHARES: dict[str, dict] = {
     "html": {"id": "shr-html", "token": "H" * 43, "audience": "lab", "entry": "index.html",
              "files": {"index.html": INDEX.encode(), "page2.html": PAGE2.encode(), "evil.html": EVIL.encode(), "big.html": make_big(),
-                       "cover.html": COVER.encode()}},
+                       "cover.html": COVER.encode(), "steal.html": STEAL.encode()}},
     "pdf": {"id": "shr-pdf", "token": "P" * 43, "audience": "lab", "entry": "report.pdf",
             "files": {"report.pdf": make_pdf()}},
     "png": {"id": "shr-png", "token": "G" * 43, "audience": "lab", "entry": "pic.png",
@@ -238,15 +252,22 @@ class Harness:
                 "X-Id-Token": ident(user, email=f"{user}@lab.example"), "Content-Length": "0"})
             resp = conn.getresponse()
             body = resp.read()
+            set_cookie = resp.getheader("Set-Cookie")
         finally:
             conn.close()
-        if resp.status != 200:
+        if resp.status != 200 or not set_cookie:
             raise RuntimeError(f"sign-in refused: {resp.status}")
         landing = json.loads(body)["landing"]
         match = re.match(r"(/s/[^/]+/k/[^/]+/)", landing)
         if match is None:
             raise RuntimeError("unexpected landing")
-        return {"landing": landing, "base": self.origin + match.group(1)}
+        name, _, rest = set_cookie.partition("=")
+        return {"landing": landing, "base": self.origin + match.group(1),
+                "cookie": {"name": name, "value": rest.split(";")[0], "path": f"/s/{token}/"}}
+
+    def tokens(self, user: str) -> dict:
+        """Cognito-shaped tokens, so a browser can make the real session exchange itself."""
+        return {"access": access(user, groups=("Readers",)), "id": ident(user, email=f"{user}@lab.example")}
 
     def session(self, share: str, user: str) -> dict:
         """A session minted with the real signing code, for tests that need many identities without exceeding the
@@ -254,7 +275,10 @@ class Harness:
         info = SHARES[share]
         session = mint_session(self.config.signing_secret, info["id"], user, time.time() + 3600,
                                email=f"{user}@lab.example", basis="g")
-        return {"base": f"{self.origin}/s/{info['token']}/k/{session}/"}
+        cookie = {"name": write_cookie_name(info["id"], session),
+                  "value": write_cookie_value(self.config.signing_secret, info["id"], session),
+                  "path": f"/s/{info['token']}/"}
+        return {"base": f"{self.origin}/s/{info['token']}/k/{session}/", "cookie": cookie}
 
     def project(self) -> None:
         """The worker's tick (the real one needs PostgreSQL): fold the lines into one projection file per viewer."""
@@ -318,6 +342,8 @@ def control_handler(h: Harness) -> type[BaseHTTPRequestHandler]:
                     return self._send(h.signin(parts[1], parts[2]))
                 if parts[0] == "__session" and len(parts) == 3:
                     return self._send(h.session(parts[1], parts[2]))
+                if parts[0] == "__tokens" and len(parts) == 2:
+                    return self._send(h.tokens(parts[1]))
                 if parts[0] == "__project":
                     h.project()
                     return self._send({"ok": True})

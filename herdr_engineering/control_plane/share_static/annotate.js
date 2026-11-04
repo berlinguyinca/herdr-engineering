@@ -628,10 +628,11 @@ function csrfToken() {
 }
 
 async function send(url, token, payload) {
-  // The session is in the URL path, so no credentials are needed. No explicit mode: with the default (cors) mode the POST
+  // The session is in the URL path AND the HttpOnly write cookie must accompany every annotation request (same-origin
+  // fetches from this page carry it; an f/ page's requests never do). No explicit mode: with the default (cors) mode the POST
   // keeps its Origin header; an explicit mode 'same-origin' together with the no-referrer policy made Firefox and WebKit
   // send "Origin: null" (verified), which the server refuses.
-  const init = { credentials: 'omit', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer' };
+  const init = { credentials: 'same-origin', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer' };
   if (payload === undefined) {
     init.headers = { Accept: 'application/json' };
   } else {

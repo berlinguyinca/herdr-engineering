@@ -222,10 +222,30 @@ them is run by the build. Do them in this order, and do not deploy a partial set
 - The MCP tool `artifact_annotation_resolve` holds its request thread for up to 10 s per call.
 - The edge's per-IP rate limits (`share_req` 100 r/s, burst 300) are generous for the expensive `a/` renders; the
   single sanitiser lane is the real bound.
-- **A scripted `f/` page sees its own session URL.** Author JavaScript in a raw HTML file (sandboxed, opaque origin)
-  can read `location.href`, which carries the viewer's session; it could navigate away with it. With annotations the
-  session also has write power for that viewer's own annotations. Operator decision pending: a read-only derived
-  credential for `f/`, or an opaque id in the path.
+- **A scripted `f/` page sees its own session URL (mitigated by a write cookie).** Author JavaScript in a raw HTML
+  file (sandboxed, opaque origin) can read `location.href`, which carries the viewer's session, and an author
+  `<meta name="referrer" content="unsafe-url">` overrides our `Referrer-Policy: no-referrer` header, so a click or a
+  meta refresh can send the session URL to another site in the `Referer` (Firefox and WebKit, even without script).
+  That URL alone no longer reads or writes annotations: the session exchange also sets
+  `hw_<hash>=<MAC>; Path=/s/<token>/; HttpOnly; Secure; SameSite=Strict`, a MAC under its own domain label
+  (`herdr-annotate-write-v1`), and both annotation routes (GET and POST) require it in addition to the CSRF token,
+  `Origin` and the allow-list checks. The opaque-origin `f/` page cannot read it (HttpOnly) and its requests are
+  cross-site, so Strict never sends it; the `a/` page and the `f/` and `v/` views do not need it (a click-through
+  from `f/` to `a/` still works, and the `a/` page's own requests carry the cookie). Verified in Chromium, Firefox
+  and WebKit (`tests/playwright/share-annotations.test.mjs`). What remains: the stolen URL still opens the share's
+  files (`f/`, `v/`, `a/` page including its CSRF meta) until the session expires, because the author already holds
+  those files; the viewer's email is part of the session segment and therefore of the URL (removing it would mean
+  changing the session format; deferred); and a cookie is bound to the session, not to a device, so it protects
+  against URL leaks, not against malware in the viewer's browser. Lab PDFs on `f/` are now served under the sandbox
+  policy as well; where a browser refuses to show a sandboxed PDF inline, use the `v/` view.
+- **Stored media types.** Responses never carry a stored media type's parameters: `/live`, `/download`, report asset
+  downloads and the public gateways send the bare `type/subtype` (or `application/octet-stream`); uploads refuse `,`,
+  `"` and `\` and store the bare lowercase type. Artifacts uploaded before this check are safe because the send-time
+  reader does not depend on it.
+- **A single failing ingest line can stall the worker.** A deterministic non-poison error (not a data or integrity
+  error) on one `annotations.jsonl` line aborts every ingest pass at that offset; the batch rolls back and the marker
+  does not move. The worker logs a warning with a consecutive-failure counter so an operator sees it; clearing it
+  means fixing or removing that line. Only a compromised edge can write such lines.
 - The worker does not re-check an annotation author against the share's allow-list when it ingests a line (the edge
   does); a compromised edge could mint unlisted or owner-role authors.
 - Comments and anchor text may contain bidirectional and zero-width format characters (they render as text, but can

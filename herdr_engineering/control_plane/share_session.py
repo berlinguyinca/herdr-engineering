@@ -125,3 +125,51 @@ def check_csrf(secret: bytes, share_id: str, session: str, value: object) -> boo
         return hmac.compare_digest(value.encode("ascii"), expected.encode("ascii"))
     except Exception:
         return False
+
+
+# The write cookie. A session lives in the URL path, so anything that can read the URL (a script on an f/ page, a
+# Referer sent by an author <meta name=referrer>) holds the whole credential. The annotation routes therefore ALSO
+# require this cookie: HttpOnly (no script reads it), Secure, SameSite=Strict (never sent from the opaque-origin f/
+# page or any cross-site context), Path=/s/<token>/. Its value is a MAC under its own domain label, so it is derived
+# from nothing a URL contains and equals neither the session MAC nor the CSRF token.
+_WRITE_DOMAIN = b"herdr-annotate-write-v1"
+_COOKIE_VALUE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+
+
+def write_cookie_name(share_id: str, session: str) -> str:
+    """``hw_`` + 16 hex of SHA-256(share_id, session): one cookie per session, so two sessions never overwrite each other."""
+    digest = hashlib.sha256(_WRITE_DOMAIN + b"\x00name\x00" + _field(share_id) + _field(session)).hexdigest()
+    return "hw_" + digest[:16]
+
+
+def write_cookie_value(secret: bytes, share_id: str, session: str) -> str:
+    """b64url(HMAC-SHA256(secret, write domain || share_id || session)); raises ValueError like ``csrf_token``."""
+    if not isinstance(secret, bytes) or len(secret) < MIN_SECRET_BYTES:
+        raise ValueError("signing secret is missing or too short")
+    if not isinstance(share_id, str) or not share_id or not isinstance(session, str) or not session:
+        raise ValueError("bad cookie input")
+    msg = _WRITE_DOMAIN + b"\x00" + _field(share_id) + _field(session)
+    return _b64(hmac.new(secret, msg, hashlib.sha256).digest())
+
+
+def write_cookie_header(secret: bytes, share_id: str, token: str, session: str, max_age: int) -> str:
+    """The ``Set-Cookie`` value for a freshly minted session; ``max_age`` is the session's remaining seconds."""
+    return (f"{write_cookie_name(share_id, session)}={write_cookie_value(secret, share_id, session)}; "
+            f"Max-Age={max(int(max_age), 0)}; Path=/s/{token}/; HttpOnly; Secure; SameSite=Strict")
+
+
+def check_write_cookie(secret: bytes, share_id: str, session: str, cookie_headers) -> bool:
+    """True when one of the ``Cookie`` header lines carries this session's cookie with the right MAC; never raises."""
+    try:
+        name = write_cookie_name(share_id, session)
+        expected = write_cookie_value(secret, share_id, session).encode("ascii")
+        found = False
+        for line in cookie_headers or ():
+            for pair in line.split(";"):
+                key, sep, value = pair.strip().partition("=")
+                if sep and key == name and _COOKIE_VALUE_RE.fullmatch(value) \
+                        and hmac.compare_digest(value.encode("ascii"), expected):
+                    found = True
+        return found
+    except Exception:
+        return False

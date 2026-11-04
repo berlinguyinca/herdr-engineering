@@ -48,8 +48,12 @@ async function control(method, route) {
 }
 const lines = () => control('GET', '/__lines');
 const project = () => control('POST', '/__project');
-const signinReal = (share, user) => control('POST', `/__signin/${share}/${user}`);   // the real session exchange
-const signin = (share, user) => control('POST', `/__session/${share}/${user}`);       // a minted session
+// Sessions made by the control server carry the HttpOnly write cookie its session exchange would have set; `open()`
+// installs every one of them in the context it opens a page in (a cookie only matches its own session path).
+const issued = [];
+const remember = (session) => { issued.push(session.cookie); return session; };
+const signinReal = async (share, user) => remember(await control('POST', `/__signin/${share}/${user}`));   // the real session exchange
+const signin = async (share, user) => remember(await control('POST', `/__session/${share}/${user}`));       // a minted session
 const freshUser = () => `user${Date.now().toString(36)}${userCount++}`;
 
 before(async () => {
@@ -87,6 +91,12 @@ async function newContext(name = 'chromium', viewport = { width: 1100, height: 8
   return browsers.get(name).newContext({ ignoreHTTPSErrors: true, viewport, acceptDownloads: true });
 }
 
+async function installCookies(context) {
+  const host = new URL(info.origin).hostname;
+  await context.addCookies(issued.map((c) => ({ name: c.name, value: c.value, domain: host, path: c.path,
+    secure: true, httpOnly: true, sameSite: 'Strict' })));
+}
+
 // A page that records every console error, page error, dialog, popup and request of its context.
 async function open(context, url, { dialogs = 'dismiss' } = {}) {
   const page = await context.newPage();
@@ -96,6 +106,7 @@ async function open(context, url, { dialogs = 'dismiss' } = {}) {
   page.on('dialog', (d) => { seen.dialogs.push(d.message()); if (dialogs === 'accept') d.accept(); else d.dismiss(); });
   page.on('request', (r) => seen.requests.push({ url: r.url(), method: r.method(), headers: r.headers() }));
   context.on('page', () => { seen.popups += 1; });
+  await installCookies(context);
   if (url) await page.goto(url);
   return { page, seen };
 }
@@ -849,6 +860,7 @@ test('chromium: a 2 MB document with 1000 annotations never blocks the main thre
   await control('POST', `/__seed/html/${user}/1000`);
   const context = await newContext('chromium');
   const session = await signin('html', user);
+  await installCookies(context);
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
@@ -879,5 +891,80 @@ test('chromium: a 2 MB document with 1000 annotations never blocks the main thre
   assert.ok(marks >= 10 && marks <= 60, `highlights are capped: ${marks}`);
   assert.deepEqual(errors, []);
   assert.ok(long.every((x) => x.ms < 300), `long tasks: ${JSON.stringify(long)}`);
+  await context.close();
+});
+
+// ------------------------------------------------------------------------------------------------ the write cookie (I3)
+
+// The browser itself makes the real session exchange from the viewer page, so every attribute of the Set-Cookie is
+// enforced by the engine (Secure over the TLS front, SameSite=Strict, HttpOnly, Path).
+async function browserSignIn(context, share, user) {
+  const tokens = await control('POST', `/__tokens/${user}`);
+  const page = await context.newPage();
+  await page.goto(`${info.origin}/s/static/config.json`);     // same origin, and a page that never navigates away
+  const landing = await page.evaluate(async ([path, t]) => {
+    const r = await fetch(path + 'session', { method: 'POST', cache: 'no-store', credentials: 'same-origin',
+      headers: { Authorization: 'Bearer ' + t.access, 'X-Id-Token': t.id } });
+    return r.ok ? (await r.json()).landing : `status ${r.status}`;
+  }, [`/s/${info.tokens[share]}/`, tokens]);
+  assert.match(landing, /^\/s\/[^/]+\/k\/[^/]+\/[fv]\//, landing);
+  const visibleToScript = await page.evaluate(() => document.cookie);
+  await page.close();
+  return { base: info.origin + landing.match(/^(\/s\/[^/]+\/k\/[^/]+\/)/)[1], visibleToScript };
+}
+
+matrix('the session exchange sets an HttpOnly Secure SameSite=Strict cookie the page script cannot read', async (name) => {
+  const context = await newContext(name);
+  const session = await browserSignIn(context, 'html', freshUser());
+  const cookies = (await context.cookies()).filter((c) => c.name.startsWith('hw_'));
+  assert.equal(cookies.length, 1, JSON.stringify(cookies));
+  assert.equal(cookies[0].httpOnly, true);
+  assert.equal(cookies[0].secure, true);
+  assert.equal(cookies[0].sameSite, 'Strict');
+  assert.equal(cookies[0].path, `/s/${info.tokens.html}/`);
+  assert.equal(session.visibleToScript, '', 'HttpOnly: document.cookie shows nothing');
+  await context.close();
+});
+
+matrix('the opaque-origin f/ page cannot read the cookie or use it, and a stolen URL alone is refused', async (name) => {
+  const context = await newContext(name);
+  const user = freshUser();
+  const session = await browserSignIn(context, 'html', user);
+  const { page } = await open(context, `${session.base}f/steal.html`);
+  const before = (await lines()).length;
+  const text = await page.locator('#probe-result').textContent({ timeout: 15000 });
+  const out = JSON.parse(text);
+  assert.ok(/^threw:/.test(out.cookie) || out.cookie === '', `document.cookie from the sandboxed page: ${out.cookie}`);
+  assert.ok(out.get === 404 || String(out.get).startsWith('threw:'), `GET from the sandboxed page: ${out.get}`);
+  assert.ok(out.post === 404 || String(out.post).startsWith('threw:'), `POST from the sandboxed page: ${out.post}`);
+  assert.equal((await lines()).length, before);
+  // curl with the stolen URL and forged headers (no cookie jar): refused for read and write
+  const stranger = await playwright.request.newContext({ ignoreHTTPSErrors: true });
+  const forged = { Origin: info.origin, 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty' };
+  assert.equal((await stranger.get(`${session.base}annotations`, { headers: forged })).status(), 404);
+  assert.equal((await stranger.post(`${session.base}annotations`, { headers: { ...forged, 'Content-Type': 'application/json', 'X-Herdr-Annotate': 'x'.repeat(43) }, data: '{}' })).status(), 404);
+  await stranger.dispose();
+  // the same URL from the signed-in browser context (cookie jar) still reads
+  assert.equal((await context.request.get(`${session.base}annotations`, { headers: forged })).status(), 200);
+  await context.close();
+});
+
+matrix('a click from the f/ page to the a/ view works and the annotation is written', async (name) => {
+  const context = await newContext(name);
+  const session = await browserSignIn(context, 'html', freshUser());
+  const { page, seen } = await open(context, `${session.base}f/index.html`);
+  await page.locator('#marker').waitFor();
+  const before = (await lines()).length;
+  await page.locator('a[data-herdr-mode-switch]').click();             // a navigation out of the opaque-origin page
+  await page.waitForURL(/\/a\/index\.html$/);
+  await waitPanel(page);
+  await selectIn(page, '#first', 4, 19);
+  await anchorQuote(page).filter({ hasText: 'quick brown fox' }).waitFor();
+  await submitComment(page, 'from the click-through');
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'from the click-through' }).waitFor();
+  const made = await annotationLines(before);
+  assert.equal(made.length, 1, JSON.stringify(made));
+  assert.equal(made[0].op, 'create');
+  noErrors(seen);
   await context.close();
 });

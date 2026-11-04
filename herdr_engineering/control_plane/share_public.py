@@ -56,12 +56,15 @@ path after ``/s/<token>/``                            methods        match
   mounted in a declarative shadow root inside ``#herdr-viewport`` (``contain: paint``, ``overflow: clip``), so neither
   its markup, ids nor styles reach our mode bar, panel, data node or the CSRF meta, which is delivered ONLY in this
   page. It needs annotations enabled; otherwise the uniform 404.
+* The annotations GET needs the same write cookie (a stolen session URL alone reads nothing). The ``a/`` page, ``f/`` and
+  ``v/`` do not: a navigation out of the opaque-origin ``f/`` page is cross-site and arrives without it.
 * The annotation POSTs are the only routes that read a body. A POST is refused (uniform 404, reason ``annotate_refused``)
   unless the session is valid and the share's allow-list still admits its email (``share_lab.still_admitted``: an email
   removed from ``allow_emails`` stops writing at once when the session's MAC'd admission basis is ``e``; a session
   admitted by a group claim (basis ``g``) needs the share to still have ``allow_groups``, but a removed group MEMBER
   keeps writing until the session expires), ``Origin`` equals the share origin exactly, the CSRF
-  header passes a constant-time check, ``Content-Type`` is exactly ``application/json`` and there is exactly one ``Content-Length`` of 1 to
+  header passes a constant-time check, the write cookie (set by the ``session`` POST: HttpOnly, Secure, SameSite=Strict,
+  ``Path=/s/<token>/``, a MAC over the session under its own domain label) is present and valid, ``Content-Type`` is exactly ``application/json`` and there is exactly one ``Content-Length`` of 1 to
   32768 bytes and no ``Transfer-Encoding``. Accepted requests append one line to ``annotations.jsonl`` for the worker;
   author identity and email come from the session only. Edits and deletes are decided against the viewer's own
   read-back projection, so an annotation is editable only after the worker has ingested it.
@@ -117,7 +120,15 @@ from .share_render import (
     share_resolver,
     wrap_content,
 )
-from .share_session import MIN_SECRET_BYTES, check_csrf, check_session, csrf_token, mint_session
+from .share_session import (
+    MIN_SECRET_BYTES,
+    check_csrf,
+    check_session,
+    check_write_cookie,
+    csrf_token,
+    mint_session,
+    write_cookie_header,
+)
 
 log = logging.getLogger("herdr.share_public")
 
@@ -702,11 +713,13 @@ def deny(handler, state: dict | None, reason: str, actor: str = "public") -> Non
     send_not_found(handler)
 
 
-def _content_headers(name: str, etag: str, csp: str = CSP) -> list[tuple[str, str]]:
+def _content_headers(name: str, etag: str, csp: str = CSP, *, sandbox_pdf: bool = False) -> list[tuple[str, str]]:
     content_type = content_type_for(name)
     if content_type == "application/pdf":
+        # A lab PDF (its URL holds a session) gets the sandbox policy too: a viewer with PDF scripting must not be
+        # able to reach the session URL. Public shares keep the plain frame-ancestors policy.
         headers = [("Content-Type", "application/pdf"), ("Content-Disposition", "inline"),
-                   ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", PDF_CSP)]
+                   ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", csp if sandbox_pdf else PDF_CSP)]
     else:
         headers = [("Content-Type", content_type), ("Content-Security-Policy", csp),
                    ("X-Content-Type-Options", "nosniff")]
@@ -795,7 +808,7 @@ def _read_all(fd: int, size: int) -> bytes | None:
 
 
 def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True, actor: str = "public",
-                      token: str | None = None, mode_switch: str | None = None) -> bool:
+                      token: str | None = None, mode_switch: str | None = None, sandbox_pdf: bool = False) -> bool:
     """Serve ``rel_path`` (raw, still percent-encoded) from ``state``'s bundle; True when served, False after a 404.
 
     ``state`` is what ``load_state`` returned. Handles HEAD, If-Match (412), If-None-Match (304), If-Range and a single
@@ -848,7 +861,7 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
                 injected = inject_mode_switch(data, mode_switch.encode("ascii"))
             if injected is not None:
                 return _serve_with_link(handler, state, name, item, injected, csp, cors=cors, actor=actor)
-        headers = _content_headers(name, etag, csp)
+        headers = _content_headers(name, etag, csp, sandbox_pdf=sandbox_pdf)
         if _announces_body(handler):
             handler.close_connection = True
         if_match = handler.headers.get("If-Match")
@@ -1108,7 +1121,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         if route == "lab_file":
             link = self._mode_switch(parts) if enabled else None
             serve_bundle_file(self, state, "/".join(parts[6:]), actor=got["identity"], token=parts[2],
-                              mode_switch=link)
+                              mode_switch=link, sandbox_pdf=True)
             return None
         if route == "lab_view":
             if parts[5] == "v":
@@ -1119,6 +1132,8 @@ class ShareHandler(BaseHTTPRequestHandler):
         if not enabled:
             return deny(self, state, "annotations_disabled", got["identity"])
         if route == "annotations" and self.command == "GET":
+            if not self._has_write_cookie(state, session, lab):
+                return deny(self, state, "no_write_cookie", got["identity"])   # the URL alone is not a credential
             return self._annotations_get(state, got)
         return self._annotation_post(state, parts, got, lab)
 
@@ -1306,6 +1321,9 @@ class ShareHandler(BaseHTTPRequestHandler):
         self._send_json(status, {"error": code})
         return None
 
+    def _has_write_cookie(self, state: ShareState, session: str, lab: LabSettings) -> bool:
+        return check_write_cookie(lab.secret, state["share_id"], session, self.headers.get_all("Cookie"))
+
     def _gate_ok(self, state: ShareState, session: str, got: dict, lab: LabSettings) -> bool:
         """Every POST precondition except the body: share allow-list, Origin, CSRF, content type and framing."""
         headers = self.headers
@@ -1320,7 +1338,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             return False
         if ctype != "application/json":              # exactly, case-sensitive, no parameters
             return False
-        return check_csrf(lab.secret, state["share_id"], session, csrf)
+        return check_csrf(lab.secret, state["share_id"], session, csrf) and self._has_write_cookie(state, session, lab)
 
     def _annotation_post(self, state: ShareState, parts, got: dict, lab: LabSettings):
         server, share_id = self.server, state["share_id"]
@@ -1482,7 +1500,9 @@ class ShareHandler(BaseHTTPRequestHandler):
         landing = f"/s/{token}/k/{session}/{kind}/{quote(entry, safe='/')}"
         body = json.dumps({"landing": landing, "expires_at": exp_int},
                           sort_keys=True, ensure_ascii=True).encode("ascii")
+        cookie = write_cookie_header(lab.secret, share_id, token, session, exp_int - now)
         _send_headers(self, 200, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
+                                  ("Set-Cookie", cookie),
                                   ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
                                   ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),
                                   ("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")],
