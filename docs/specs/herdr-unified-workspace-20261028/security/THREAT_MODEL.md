@@ -353,6 +353,69 @@ Residual risks:
 - **R-TB9 (Low).** A brief is filed even into a `read_only` room (it is the operator's own assistant, not a guest) and counts against
   the room's pending cap, so a flood of briefs can crowd out guest requests until the operator decides some.
 
+### 3.9 Approval-gated external actions (`control_plane.personal_assistant.external_actions.enabled`, slice 5)
+Code: `external_actions.py` (the approval ledger, the executor, the two provider clients), `collab_team_external.py` (who may file,
+decide and retry, and the audit trail), `assistant_adapters.ExternalActionsBridge`, `deployment_escalation.GitHubIssueSink`
+(credential lookup only), `google_workspace.create_draft` / `find_draft_by_key`. Design: `TEAM_COLLABORATION.md` section 14 slice 5 and
+contradiction 10 (the ledger is `AssistantProposal` with `dedupe_key`, not the unwired `workspace_contracts` ledger).
+
+Two actions exist: `github_issue_create` (one issue in the repository the room owner set for a team) and `email_reply_draft` (one Gmail
+DRAFT; the code has no method that sends). Both are built only from an email brief the operator already approved, never from text the
+filer supplies alone.
+
+Threats and mitigations (all exercised in `test_external_actions_*` and `test_team_external_actions*.py` unless marked):
+- **T-EA1, confused deputy.** The operator's credentials act for a request a team agent or a guest wrote. Only the account owner
+  (the room owner as a person, or the API key mapped to that user) can approve, reject or retry; a coordinator, an opted-in external
+  coordinator, a guest, a contributor, a viewer, the issue writer, an implementer, a reviewer and every agent get 403 plus an audit
+  record under their own identity (deduped for 60 s per principal, action and room); a stranger gets 404. `actions.approvers` is
+  deliberately NOT honoured for these kinds. The filer chooses neither the repository, the recipient, the thread nor the brief text.
+- **T-EA2, injection into the issue body.** The body is the approved brief (already redacted, capped, email-tainted) inside a fixed
+  frame, in a fenced block, with a trailing machine marker; the title is single-line, control characters stripped, 200 characters; labels
+  come only from `external_actions.github.labels`. The card shows the exact title, labels and body, and approval needs the SHA-256 of
+  that content, so what is approved is what is sent. Residual R-EA2: a person or model reading the issue later still reads email text.
+- **T-EA3, SSRF and redirect abuse.** The GitHub host comes from YAML only (`github.api_base`; https, or plain http only to a loopback
+  host), never from a request or from the repository field; the repository must match `owner/name`; redirects are refused; responses are
+  read up to 256 KiB; the path is built from validated parts. Gmail goes through the existing `GoogleWorkspace`, which has its own host
+  allowlist.
+- **T-EA4, double execution.** The key is `sha256(kind | brief_key)`: the same email is one action for ever (unless it was rejected, or
+  expired without starting). The intent (`executing`, attempt count, time) is made durable with an acknowledged write BEFORE the provider
+  is called, and a failed write means no call. Every run after the first looks for the key at the provider before creating (GitHub: the
+  last line of the issue body, in a listing of issues updated since the first intent; Gmail: an `X-Herdr-Action-Key` header in the newest
+  50 drafts). A crash, restart, lost answer or timeout leaves the action `unknown`; nothing but the owner's retry (which re-confirms the
+  hash) runs it again, and `recover()` after a restart only READS the provider. Tested through restarts, a lost answer after a successful
+  create, a revoked token and a down provider.
+- **T-EA5, token exposure.** No credential is in a request, a response, the log, an audit record, the proposal or an error: the token is
+  fetched per call from the existing storage (the GitHub App's own `team_issues` write capability, else the server-held `github.token`),
+  held in one request header, and a credential sweep over every response, the collab log and the stored snapshot finds none. There is no
+  environment variable and no key that names a secret. The static `github.token` fallback is allowed and is the same PAT the escalation
+  issues use; remove it as well as the App capability to stop writes (R-EA5).
+- **T-EA6, cost and flooding.** `actions_per_hour` (filing) and `executions_per_hour` (provider calls), counted from the ledger; a filer
+  is also throttled by the collab service. 429 on the cap.
+- **T-EA7, silent failure.** A failure is a visible state (`failed`: a definite refusal; `unknown`: no usable answer) with a fixed
+  reason, an owner notification and an audit record; only the owner can retry.
+- **T-EA8, send by mistake.** `GmailDrafts` has `create` and `find` only; the connection's existing `gmail.compose` scope can send at the Google API level, so the guarantee is the code (only
+  `drafts.create` and a drafts listing are called; a test asserts the send endpoint is never requested); the card says "nothing is sent". The operator sends from Gmail, later, by hand.
+
+Residual risks:
+- **R-EA1 (Low-Medium). Exactly once has limits.** A request that reached GitHub only AFTER the next run read the listing (a provider
+  still processing a cut connection) can yield a second issue. A Gmail draft older than the newest 50 is not found, so a retry can add a
+  second DRAFT (never a second send). Both are rare and visible in the operator's list. A provider that ignores the marker (an edited
+  issue body) defeats reconcile.
+- **R-EA2 (Medium).** The text of an approved brief ends up in a GitHub issue that other people and models read; "this is data" is
+  advice, not a mechanism. The operator sees and approves the exact text first.
+- **R-EA3 (Low).** GitHub is not Gmail: the Gmail DRAFT carries the recipient from the original message's sender, taken from the
+  assistant's private record, never from the filer; a spoofed From header is the operator's to notice on the card.
+- **R-EA4 (Medium). Image rollback.** All state lives in fields the older `AssistantProposal` already had, so an older image replays and
+  rewrites the snapshot without losing an action. The older image has no executor and does not know the kind: it lists the action in its
+  proposal queue and an approver (not only the owner) can mark it `approved` there, which records permission and runs nothing. After
+  rolling forward that action shows as approved-but-not-run and only the owner's retry with the SHA-256 runs it. Roll back the flag first.
+  This path is reasoned from the older code, not run against an older image.
+- **R-EA5 (Medium).** The `github.token` fallback is a broad personal credential; the App capability `team_issues` is narrower. Prefer
+  the App and remove the PAT.
+- **R-EA6 (Info).** Everything above runs against CONTRACT-LEVEL FAKE servers (`tests/control_plane/external_fakes.py`) speaking the
+  GitHub and Gmail REST shapes; GitHub and Gmail were never called. The real services' behaviour (rate limits, search lag, a draft
+  header surviving) is as documented, not observed. No web UI, no attention inbox, no conversation view. The caps live in one process.
+
 ## 4. Severity summary (judged from reading; unverified)
 | Id | Severity | One line |
 |---|---|---|
@@ -378,6 +441,9 @@ Residual risks:
 | R-TB1, R-TB2, R-TB5 | Medium | Assistant briefs: injection via the brief text, free text through the excerpt, image rollback drops references |
 | R-TB3, R-TB4, R-TB6, R-TB8, R-TB9 | Low-Medium / Low | See section 3.8 (slice 4) |
 | R-TB7 | Info | No automatic scan, no web UI, live Gmail fetch not exercised |
+| R-EA2, R-EA4, R-EA5 | Medium | External actions: approved brief text lands in an issue; image rollback exposes the kind to the old queue; broad PAT fallback |
+| R-EA1, R-EA3 | Low-Medium / Low | External actions: exactly-once limits at the provider; reply recipient comes from the original sender |
+| R-EA6 | Info | External actions were tested against contract-level fakes only; no web UI |
 | R-SH4, R-CL1, R-DP2 | Low-Medium | See sections |
 | R-WG2-4, R-SH5-7, R-ART3, R-RA3, R-TL3, R-CL2 | Low | See sections |
 
@@ -394,6 +460,7 @@ with the flag off (migrations are additive, so the image can be ahead of the fla
 | `control_plane.collab.team_roles.enabled` (also needs `team_rooms`) | off | Set `true` (hot); assign people to roles per room and team; set the policy per team (default escalate) | `task_reminded` / `task_escalated` events, `blocked` tasks in the owner's attention, 409 `no_role_holder` rate | `false` or `kill_switch: true`: new fields unknown, routes 404, sweep stops. Do NOT roll the image back while a person task newer than ~8 days exists (R-TR14); roll back the flag. See `docs/operations/team-rooms.md` |
 | `control_plane.collab.coordinators.enabled` (also needs `team_rooms`, `team_roles`) | off | Set `true` (hot); designate an agent per team; `external.enabled` is a second flag and the per-team opt-in a third | `team_coordinator_set`, `task_requeued` events, 429 `coordinator_rate` / `coordinator_open`, 400 `coordination_loop`, 403 audit events from coordinators | `external-coordination off` per team, then `external.enabled: false`, then `enabled: false`; cancel what you do not want. Do not roll the image back (R-TC5) |
 | `control_plane.personal_assistant.team_briefs.enabled` (also needs `personal_assistant.enabled`, a persistence DSN, `team_rooms`) | off | Set `true` with a topic list; restart the control plane (read at start); attach a team to a room first | `suggestion_submitted` events with `source: assistant_brief`, 429 `brief_rate`, pending queue age, assistant audit `assistant.team_brief.*` | `false` and restart: both routes 404, the in-process door closes, briefs already filed stay in the queue (decide or reject them). Do NOT roll the image back (R-TB5). See `docs/operations/team-rooms.md` |
+| `control_plane.personal_assistant.external_actions.enabled` (also needs `personal_assistant.enabled` with a persistence DSN, `team_rooms`, an approved brief, a team issue repository set by the owner) | off | Set `true` with `github.labels`; give the App the `team_issues` write capability (or keep `github.token`); restart the control plane | `external_action_filed` / `_decided` events, assistant audit `assistant.external.*`, 429 caps, actions in `unknown` or `failed`, 403 audit records | `false` or `kill_switch: true` and restart: every route 404; actions in the ledger stay. Do NOT roll the image back first (R-EA4). Remove the PAT and the App capability to stop writes. See `docs/operations/team-rooms.md` |
 | Share links `control_plane.share.enabled` (+ `signing_secret`, collab `public_url`) | off | Complete the share block; `deploy.sh` refuses incomplete config, renders the edge with `/s/`, starts `share-public` | share `events` (`opened`, `denied`), 404 rate on `/s/`, live bytes | Revoke individual shares first (`POST .../shares/{sid}/revoke` removes state, then bundle); then `enabled: false` and deploy: the edge stops routing `/s/` and `share-public` is stopped |
 | Per-user rollout | not built | The spec asks for it; every flag today is global | | |
 
