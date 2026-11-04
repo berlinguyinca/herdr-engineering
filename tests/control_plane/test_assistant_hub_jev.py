@@ -262,7 +262,9 @@ def test_key_never_in_repr_or_error(key_file: Path) -> None:
 class Listener:
     """Raw TCP listener that produces hostile transport behavior for one connection at a time."""
 
-    def __init__(self, behavior: Callable[[socket.socket], None]) -> None:
+    def __init__(self, behavior: Callable[[socket.socket], None], read_full: bool = False) -> None:
+        self._read_full = read_full
+        self._lock = threading.Lock()
         self._srv = socket.socket()
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind(("127.0.0.1", 0))
@@ -287,10 +289,34 @@ class Listener:
         with conn:
             conn.settimeout(5)
             try:
-                self.seen += conn.recv(65536)
+                data = self._read_request(conn) if self._read_full else conn.recv(65536)
+                with self._lock:
+                    self.seen += data
                 self._behavior(conn)
             except OSError:
                 pass
+
+    @staticmethod
+    def _read_request(conn: socket.socket, cap: int = 1 << 20) -> bytes:
+        """Read headers up to the blank line, then Content-Length body bytes (conn timeout applies)."""
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(65536)
+            if not chunk or len(buf) > cap:
+                return buf
+            buf += chunk
+        head, _, body = buf.partition(b"\r\n\r\n")
+        length = 0
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                length = min(int(value.strip() or b"0"), cap)
+        while len(body) < length:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        return head + b"\r\n\r\n" + body
 
     def close(self) -> None:
         self._stop.set()
@@ -298,11 +324,11 @@ class Listener:
 
 
 @pytest.fixture
-def listener() -> Iterator[Callable[[Callable[[socket.socket], None]], Listener]]:
+def listener() -> Iterator[Callable[..., Listener]]:
     made: list[Listener] = []
 
-    def make(behavior: Callable[[socket.socket], None]) -> Listener:
-        li = Listener(behavior)
+    def make(behavior: Callable[[socket.socket], None], read_full: bool = False) -> Listener:
+        li = Listener(behavior, read_full)
         made.append(li)
         return li
 
@@ -471,7 +497,7 @@ def test_ask_success_over_wire_resolved_model_and_request_id(listener: Any, key_
     """Success-path body test: the DOCUMENTED sample (not captured) served over a raw socket."""
     doc = json.loads(json.dumps(DOCUMENTED))
     doc["model"] = "concrete-checkpoint-id"
-    li = listener(lambda c: c.sendall(_ok_http(_body(doc), "req-42")))
+    li = listener(lambda c: c.sendall(_ok_http(_body(doc), "req-42")), read_full=True)
     res = _client(li, key_file, 3.0).ask({"tool": "Bash"}, QUESTIONS)
     assert res.model == "concrete-checkpoint-id" and res.request_id == "req-42"
     assert b"POST /v1/systemone" in li.seen and b'"model":"laya-auto"' in li.seen
@@ -479,7 +505,7 @@ def test_ask_success_over_wire_resolved_model_and_request_id(listener: Any, key_
 
 def test_health_success_over_wire(listener: Any, key_file: Path) -> None:
     """Success-path: an OpenAI-shaped model list served over a raw socket."""
-    li = listener(lambda c: c.sendall(_ok_http(b'{"object":"list","data":[{"id":"laya-auto"},{"id":"b"}]}')))
+    li = listener(lambda c: c.sendall(_ok_http(b'{"object":"list","data":[{"id":"laya-auto"},{"id":"b"}]}')), read_full=True)
     assert _client(li, key_file, 3.0).health() == ["laya-auto", "b"]
     assert b"GET /v1/models" in li.seen
 
@@ -496,7 +522,7 @@ def test_health_hostile_bodies(listener: Any, key_file: Path, body: bytes) -> No
 
 
 def test_key_rotation_between_calls(listener: Any, key_file: Path) -> None:
-    li = listener(lambda c: c.sendall(_ok_http(b'{"data":[{"id":"m"}]}')))
+    li = listener(lambda c: c.sendall(_ok_http(b'{"data":[{"id":"m"}]}')), read_full=True)
     client = _client(li, key_file, 3.0)
     client.health()
     assert b"Bearer sk-test-not-a-real-key" in li.seen
