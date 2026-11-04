@@ -31,6 +31,8 @@ import sys
 import time
 from pathlib import Path
 
+from .build_cache_config import BuildCacheConfig
+
 try:
     import fcntl  # POSIX only (Linux/macOS); the gate is a no-op elsewhere
     _HAS_FCNTL = True
@@ -219,14 +221,16 @@ class BuildGate:
 
 
 def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
-            slot_fd: int | None = None) -> int:
+            slot_fd: int | None = None, env: dict[str, str] | None = None,
+            cache: dict | None = None) -> int:
     """exec ``cmd`` (default) or, with ``record``, run it measured and return its code."""
     if not record:
         os.execvp(cmd[0], cmd)
         raise AssertionError("unreachable")  # pragma: no cover
     from .build_metrics import run_measured
     try:
-        return run_measured(cmd, state_dir=state_dir, slot=slot).exit_code
+        return run_measured(cmd, state_dir=state_dir, slot=slot, env=env,
+                            cache=cache).exit_code
     finally:
         # Held until the child is reaped above; only now may the slot be freed.
         if slot_fd is not None:
@@ -239,7 +243,9 @@ def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
 def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
               wait_seconds: float = 0.0, json_out: bool = False,
               state_dir: Path | None = None,
-              bypass_on_timeout: bool = False, record: bool = False) -> int:
+              bypass_on_timeout: bool = False, record: bool = False,
+              child_env: dict[str, str] | None = None,
+              cache: dict | None = None) -> int:
     """Run ``cmd`` under the per-host build gate.
 
     This is the entry point for ``herdr-eng build-coordinate``. It acquires a
@@ -286,7 +292,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
             print(f"build-coordinate: {exc}; running ungated (bypass-on-timeout)",
                   file=sys.stderr)
             try:
-                return _launch(cmd, record, None, gate.dir)
+                return _launch(cmd, record, None, gate.dir, None, child_env, cache)
             except OSError as e:
                 if json_out:
                     print(json.dumps({"error": f"could not exec {cmd[0]}: {e}"},
@@ -305,7 +311,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
     try:
         # Default: replaces this process; flock held by fd. With ``record`` the
         # parent stays alive holding every lock fd until the child exits.
-        return _launch(cmd, record, _slot, gate.dir, fd)
+        return _launch(cmd, record, _slot, gate.dir, fd, child_env, cache)
     except OSError as exc:
         if fd is not None and not record:  # record mode already closed it
             try:
@@ -321,15 +327,42 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
         return 127
 
 
+def _cache_env(cfg: BuildCacheConfig, cmd: list[str], state_dir: Path | None):
+    """Plan the spec-03 cache env. Returns (child_env | None, event summary).
+
+    The child env is a COPY of os.environ plus overrides (None => inherit as
+    today). Planning failure never blocks a build: it just runs uncached.
+    """
+    from .build_cache_env import detect_tools, plan
+    directory = Path(state_dir) if state_dir is not None else _default_state_dir()
+    try:
+        env = dict(os.environ)
+        p = plan(cfg, cmd, env, detect_tools(env.get("PATH")), Path.cwd(), directory)
+    except Exception as exc:  # noqa: BLE001 - never break a build
+        print(f"build-coordinate: cache planning failed ({type(exc).__name__}); uncached",
+              file=sys.stderr)
+        return None, {"applied": False, "reasons": ["plan_error"], "fingerprint": None}
+    for w in p.warnings:
+        print(f"build-coordinate: cache: {w}", file=sys.stderr)
+    summary = {"applied": p.applied, "reasons": p.reasons,
+               "fingerprint": p.fingerprint.digest if p.fingerprint else None}
+    return ({**env, **p.env_overrides} if p.applied else None), summary
+
+
 def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
               wait_seconds: float = 0.0, json_out: bool = False,
               state_dir: Path | None = None,
-              bypass_on_timeout: bool = False, record: bool = False) -> int:
+              bypass_on_timeout: bool = False, record: bool = False,
+              cache_config: BuildCacheConfig | None = None) -> int:
     """Hold a maintenance read lock for the entire build, even on slot bypass.
 
     Cleanup takes the exclusive side of this lock. The inheritable descriptor
     survives exec just like the build slot; kernel teardown releases both.
     """
+    child_env, cache = None, None
+    if cache_config is not None and cmd:
+        child_env, cache = _cache_env(cache_config, cmd, state_dir)
+        record = record or child_env is not None
     maintenance_fd = None
     if cmd and _HAS_FCNTL:
         directory = Path(state_dir) if state_dir is not None else _default_state_dir()
@@ -346,7 +379,7 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
         return _run_gated(cmd, slots=slots, max_load=max_load,
                           wait_seconds=wait_seconds, json_out=json_out,
                           state_dir=state_dir, bypass_on_timeout=bypass_on_timeout,
-                          record=record)
+                          record=record, child_env=child_env, cache=cache)
     finally:
         if maintenance_fd is not None:
             os.close(maintenance_fd)

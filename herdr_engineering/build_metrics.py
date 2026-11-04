@@ -46,7 +46,7 @@ FINISHED_FIELDS = (
     "event", "ts", "build_id", "host", "slot", "cmd_kind", "exit_code",
     "elapsed_s", "user_cpu_s", "sys_cpu_s", "max_rss_kb", "rusage_oublock",
     "proc_io_write_bytes", "host_disk_write_bytes_delta", "host_disk_scope",
-    "sccache_stats", "unavailable",
+    "sccache_stats", "unavailable", "cache",
 )
 
 
@@ -57,6 +57,7 @@ class BuildStarted(TypedDict):
     host: str
     slot: int | None
     cmd_kind: str
+    cache: dict[str, Any] | None
 
 
 class BuildFinished(TypedDict):
@@ -77,6 +78,7 @@ class BuildFinished(TypedDict):
     host_disk_scope: str | None  # "device:<name>" | "host_wide_physical_ish"
     sccache_stats: dict[str, float] | None
     unavailable: list[str]
+    cache: dict[str, Any] | None  # spec 03 plan outcome; never paths/env values
 
 
 _warned = False
@@ -323,7 +325,8 @@ def _exit_code(status: int) -> int:
 
 def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
                  slot: int | None = None, cwd: str | None = None,
-                 emit: bool = True) -> Measured:
+                 emit: bool = True, env: dict[str, str] | None = None,
+                 cache: dict[str, Any] | None = None) -> Measured:
     """Fork+exec ``cmd``, wait with wait4, return its exit code and metrics.
 
     The caller keeps any lock fds open for the duration of this call (inheritable
@@ -340,10 +343,10 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
     if emit and state_dir is not None:
         append_event(state_dir, BuildStarted(
             event="build_started", ts=_now_iso(), build_id=build_id, host=host,
-            slot=slot, cmd_kind=kind))
+            slot=slot, cmd_kind=kind, cache=cache))
 
     t0 = time.monotonic()
-    proc = subprocess.Popen(cmd, cwd=cwd, close_fds=False)  # may raise OSError
+    proc = subprocess.Popen(cmd, cwd=cwd, close_fds=False, env=env)  # may raise OSError
     pid = proc.pid
 
     def forward(signum: int, _frame: Any) -> None:
@@ -409,7 +412,7 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
         max_rss_kb=ru.ru_maxrss, rusage_oublock=ru.ru_oublock,
         proc_io_write_bytes=io_bytes, host_disk_write_bytes_delta=host_delta,
         host_disk_scope=scope, sccache_stats=sccache_delta,
-        unavailable=sorted(unavailable))
+        unavailable=sorted(unavailable), cache=cache)
     out = dict(fin)
     if emit and state_dir is not None:
         append_event(state_dir, out)

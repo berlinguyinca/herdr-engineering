@@ -2772,7 +2772,24 @@ def _cmd_build_coordinate(args) -> int:
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
-                     record=getattr(args, "record", False))
+                     record=getattr(args, "record", False),
+                     cache_config=_build_cache_config())
+
+
+def _build_cache_config():
+    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid.
+
+    A config problem must never block a build: it just runs uncached.
+    """
+    from .build_cache_config import validate
+    from .config import load_config
+    try:
+        section = load_config().get("fabric_build_cache")
+        cfg = validate(section) if section else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"build-coordinate: build cache config ignored: {exc}", file=sys.stderr)
+        return None
+    return cfg if cfg is not None and cfg.enabled else None
 
 
 def _cmd_build_cleanup(args) -> int:
