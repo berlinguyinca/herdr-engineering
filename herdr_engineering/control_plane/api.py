@@ -1635,6 +1635,8 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        if getattr(self.source, 'recovery_info', None):
+            h['recovery'] = dict(self.source.recovery_info)
         if self.repo.agent_identities.conflict_count:
             h["agent_identity_degraded"] = True
             h["agent_identity_conflicts"] = self.repo.agent_identities.conflict_count
@@ -2365,7 +2367,10 @@ def _make_handler(server, public=False, operator=False):
             try:
                 return dispatch()
             except Exception as exc:
-                self._request_cause = type(exc).__name__
+                # A client closing while we write a dependency error must not
+                # replace the already-recorded reason that the request failed.
+                if self._request_cause is None:
+                    self._request_cause = type(exc).__name__
                 raise
             finally:
                 elapsed_ms = (time.monotonic() - self._request_started) * 1000
@@ -3122,6 +3127,10 @@ def _make_handler(server, public=False, operator=False):
                                        {"error": str(exc)})
             except RuntimeError as exc:
                 self._request_cause = type(exc).__name__
+                if resource == 'events':
+                    from .projection_history import DurableHistoryUnavailable
+                    if isinstance(exc, DurableHistoryUnavailable):
+                        self._request_cause = exc.cause_name
                 if resource == "github":
                     from ..github import GitHubError
                     if isinstance(exc, GitHubError):
@@ -3556,6 +3565,32 @@ def _make_handler(server, public=False, operator=False):
                     s = r.get_service(parts[4])
                     return self._etag_json(s) if s else self._json(
                         {"error": "not found"}, 404)
+                view = _q(self.path, 'view')
+                if view is not None:
+                    from .service_catalog_query import CatalogSnapshotExpired
+                    try:
+                        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                        allowed = {'view','scope','status','include_archived','search','host_id','group_by','limit','cursor'}
+                        if set(query)-allowed or any(len(values)!=1 for values in query.values()):
+                            raise ValueError('Unknown or repeated catalog parameter')
+                        if view != 'catalog':
+                            raise ValueError('Unknown services view')
+                        archived = query.get('include_archived', ['false'])[0]
+                        if archived not in ('true','false'):
+                            raise ValueError('include_archived must be true or false')
+                        raw_limit = query.get('limit', ['100'])[0]
+                        if not re.fullmatch(r'[0-9]{1,3}', raw_limit):
+                            raise ValueError('limit must be an integer between 1 and 500')
+                        page = r.service_catalog_page(scope=query.get('scope',['herdr'])[0],
+                            status=query.get('status',['current'])[0], include_archived=archived=='true',
+                            search=query.get('search',[''])[0], host_id=query.get('host_id',[''])[0],
+                            group_by=query.get('group_by',['project'])[0], limit=int(raw_limit),
+                            cursor=query.get('cursor',[None])[0])
+                        return self._etag_json(page)
+                    except CatalogSnapshotExpired as exc:
+                        return self._json({'error':'staleCatalogCursor','message':str(exc)},409)
+                    except ValueError as exc:
+                        return self._json({'error':str(exc)},400)
                 services = r.list_services()
                 host_filter = _q(self.path, "host_id")
                 if host_filter:
@@ -3628,6 +3663,9 @@ def _make_handler(server, public=False, operator=False):
                     # per-entity stream: /api/v1/events?entity_type=mission&entity_id=m1
                     etype = _q(self.path, "entity_type")
                     eid = _q(self.path, "entity_id")
+                    from .projection_history import hidden_history
+                    if etype and hidden_history(etype):
+                        return self._json({'error':'not found'},404)
                     if etype == "lineage":
                         return self._json({"error": "not found"}, 404)  # read via the scope-checked /api/v1/graph
                     if etype == "review_request":

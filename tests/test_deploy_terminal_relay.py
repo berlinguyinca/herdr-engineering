@@ -43,7 +43,8 @@ def rig(tmp_path):
     env = dict(os.environ, HOME=str(home), PATH=f"{bindir}:{os.environ['PATH']}", HERDR_FLEET_HOSTS=str(hosts))
 
     def run(*args):
-        return subprocess.run(["bash", str(SCRIPT), "--no-fetch", "--ref", "HEAD", *args], env=env,
+        return subprocess.run(["bash", str(SCRIPT), "--no-fetch", "--ref",
+                               os.environ.get("HERDR_DEPLOY_TEST_REF", "HEAD"), *args], env=env,
                               capture_output=True, text=True, timeout=120, cwd=ROOT)
 
     def calls():
@@ -452,7 +453,8 @@ def test_a_typo_in_the_hosts_file_manager_fails_that_host_only(tmp_path, rig):
     run, calls = rig
     hosts_file = tmp_path / "hosts.txt"
     hosts_file.write_text("alpha|alpha.example.test|systemdd\nbeta|beta.example.test|launchd\n")
-    r = subprocess.run(["bash", str(SCRIPT), "--no-fetch", "--ref", "HEAD", "--with-terminal-relay"],
+    r = subprocess.run(["bash", str(SCRIPT), "--no-fetch", "--ref",
+                        os.environ.get("HERDR_DEPLOY_TEST_REF", "HEAD"), "--with-terminal-relay"],
                        env={**os.environ, "HOME": str(tmp_path / "home"), "HERDR_FLEET_HOSTS": str(hosts_file),
                             "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}, capture_output=True, text=True, timeout=120, cwd=ROOT)
     assert r.returncode != 0 and "systemd or launchd" in r.stderr

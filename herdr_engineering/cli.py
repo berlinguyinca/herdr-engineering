@@ -737,6 +737,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
+    p2 = csub.add_parser("checkpoint", help="prewarm durable projection checkpoints")
+    p2.add_argument("--fleet-config", required=True)
+    p2.add_argument("--migrations", default=None)
+    p2.set_defaults(func=_cmd_cp_checkpoint)
     p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
                          "never deletes: rows move to a quarantine file/table)")
     p2.add_argument("--log-file", default=None, help="a collab-only JSON-lines log; without it the Postgres "
@@ -1067,7 +1071,13 @@ def _cmd_host_terminal_relay(args) -> int:
     the control plane could not be reached for the first configuration), 2 only when restarting cannot help (host.json
     missing or incomplete, token revoked). argparse usage errors also exit 2, but never under a unit file."""
     from .herdr_pane_client import HerdrPaneClient
-    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config, host_token
+    from .host_config import (
+        ConfigRefresher,
+        HostConfigUnavailable,
+        exit_unavailable,
+        host_config,
+        host_token,
+    )
     from .terminal_relay import (
         ControlPlaneHttp,
         RelayLocked,
@@ -3635,6 +3645,49 @@ def _assistant_worker_install_hooks(args) -> int:
     return 0
 
 
+def _cmd_cp_checkpoint(args) -> int:
+    import asyncio
+
+    from .control_plane.db import Migrator
+    from .control_plane.projection_refresh import refresh_checkpoint
+    from .control_plane.projection_store import CheckpointInvalid, ProjectionStore
+
+    stage = 'configuration'
+    try:
+        _, cp = _load_cp_fleet_config(args.fleet_config)
+        dsn = cp.get("pg_dsn")
+        if not dsn:
+            _print_json({"ok": False, "error": "checkpoint requires control_plane.pg_dsn"})
+            return 1
+
+        async def migrate():
+            nonlocal stage
+            stage = 'database_connection'
+            conn = await _cp_connect(dsn)
+            try:
+                stage = 'migration'
+                await Migrator(conn).apply(args.migrations or _cp_migrations_dir())
+                # Migrator has committed: concurrent indexes must run outside its transaction.
+                stage = 'index_preparation'
+                await ProjectionStore(conn).ensure_indexes()
+            finally:
+                await conn.close()
+
+        asyncio.run(migrate())
+        stage = 'materialization'
+        result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
+                                    inspector_limits=cp.get("inspector_limits") or {})
+    except (Exception, SystemExit) as exc:
+        error = {"ok": False, "error": type(exc).__name__, "stage": stage}
+        if isinstance(exc, CheckpointInvalid):
+            # Only our own static validation messages are safe to surface.
+            error['reason'] = str(exc)
+        _print_json(error)
+        return 1
+    _print_json({"ok": True, **result})
+    return 0
+
+
 def _cmd_cp_collab_repair(args) -> int:
     import asyncio
 
@@ -5006,7 +5059,18 @@ def _cmd_cp_worker(args) -> int:
                 raise
             if bridge_loop is not None:
                 bridge_task = asyncio.create_task(bridge_loop.run(stop), name="collab-bridge-loop")
+            from .control_plane.projection_refresh import ProjectionRefresh
+
+            # --once stays bounded. A dedicated thread/source leaves lease and
+            # artifact work on its existing connection and event loop.
+            fleet_cp = _worker_control_plane_section(getattr(args, "fleet_config", None))
+            refresh = None
             try:
+                if fleet_cp.get("pg_dsn"):
+                    refresh = ProjectionRefresh(
+                        fleet_cp["pg_dsn"], host_aliases=_host_aliases_from(fleet_cp),
+                        inspector_limits=fleet_cp.get("inspector_limits") or {})
+                    refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                  fabric_compactor=compactor, share_housekeeper=share_hk,
@@ -5014,6 +5078,8 @@ def _cmd_cp_worker(args) -> int:
                                  artifact_reconciler=reconciler)
             finally:
                 stop.set()
+                if refresh is not None:
+                    await asyncio.to_thread(refresh.stop)
                 if bridge_task is not None:
                     try:
                         await asyncio.wait_for(bridge_task, 60)    # applier.aclose / mirror.close run in its teardown

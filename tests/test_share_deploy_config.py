@@ -843,7 +843,9 @@ def test_rollback_recreates_share_public_from_the_previous_commit_when_its_edge_
     full, prev_tag = _ds._seed_previous(env, _rollback_target_with_share_public())
     _seed_share_edge(env, with_s=True)
     env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
-    r = _ds.deploy(env)
+    # The synthetic deployed commit is a child of HEAD; intentionally allow this
+    # older/sibling candidate so the failure exercises protected automatic rollback.
+    r = _ds.deploy(env, "--allow-divergent")
     assert r.returncode == 1 and "and healthy" in r.stderr, r.stdout + r.stderr
     recreated = [nxt for cur, nxt in _log_pairs(env)
                  if cur.startswith("docker compose") and cur.endswith("--force-recreate share-public")]
@@ -857,7 +859,9 @@ def test_rollback_stops_share_public_when_the_restored_edge_does_not_route_s(env
     _, prev_tag = _ds._seed_previous(env, _rollback_target_with_share_public())
     _seed_share_edge(env, with_s=False)
     env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
-    r = _ds.deploy(env)
+    # The synthetic deployed commit is a child of HEAD; intentionally allow this
+    # older/sibling candidate so the failure exercises protected automatic rollback.
+    r = _ds.deploy(env, "--allow-divergent")
     assert r.returncode == 1 and "and healthy" in r.stderr, r.stdout + r.stderr
     assert "docker stop herdr-share-public" in env["log"].read_text()
     recreated = [nxt for cur, nxt in _log_pairs(env)

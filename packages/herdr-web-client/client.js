@@ -540,6 +540,19 @@ export class HerdrClient {
     return this.request('/api/v1/services', { signal });
   }
 
+  listServiceCatalog({scope='herdr', status='current', includeArchived=false,
+    search='', hostId='', groupBy='project', limit=100, cursor, signal} = {}) {
+    const query = new URLSearchParams({view:'catalog', scope:scope==='local'?'unassigned':scope,
+      status, include_archived:String(includeArchived), search, host_id:hostId,
+      group_by:groupBy, limit:String(limit)});
+    if(cursor != null)query.set('cursor',cursor);
+    return this.request(`/api/v1/services?${query}`, {signal});
+  }
+
+  getService(serviceId, {signal} = {}) {
+    return this.request(`/api/v1/services/${encodeURIComponent(serviceId)}`, {signal});
+  }
+
   /** Canonical fabric URLs for URLs in agent output (read-only; originals are never changed). */
   resolveFabricUrls(urls, sourceMachine = null, { signal } = {}) {
     return this.request('/api/v1/fabric/resolve-urls', { method: 'POST', body: { urls, source_machine: sourceMachine }, signal });
