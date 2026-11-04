@@ -1071,7 +1071,13 @@ def _cmd_host_terminal_relay(args) -> int:
     the control plane could not be reached for the first configuration), 2 only when restarting cannot help (host.json
     missing or incomplete, token revoked). argparse usage errors also exit 2, but never under a unit file."""
     from .herdr_pane_client import HerdrPaneClient
-    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config, host_token
+    from .host_config import (
+        ConfigRefresher,
+        HostConfigUnavailable,
+        exit_unavailable,
+        host_config,
+        host_token,
+    )
     from .terminal_relay import (
         ControlPlaneHttp,
         RelayLocked,
@@ -3644,8 +3650,9 @@ def _cmd_cp_checkpoint(args) -> int:
 
     from .control_plane.db import Migrator
     from .control_plane.projection_refresh import refresh_checkpoint
-    from .control_plane.projection_store import ProjectionStore
+    from .control_plane.projection_store import CheckpointInvalid, ProjectionStore
 
+    stage = 'configuration'
     try:
         _, cp = _load_cp_fleet_config(args.fleet_config)
         dsn = cp.get("pg_dsn")
@@ -3654,19 +3661,28 @@ def _cmd_cp_checkpoint(args) -> int:
             return 1
 
         async def migrate():
+            nonlocal stage
+            stage = 'database_connection'
             conn = await _cp_connect(dsn)
             try:
+                stage = 'migration'
                 await Migrator(conn).apply(args.migrations or _cp_migrations_dir())
                 # Migrator has committed: concurrent indexes must run outside its transaction.
+                stage = 'index_preparation'
                 await ProjectionStore(conn).ensure_indexes()
             finally:
                 await conn.close()
 
         asyncio.run(migrate())
+        stage = 'materialization'
         result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
                                     inspector_limits=cp.get("inspector_limits") or {})
     except (Exception, SystemExit) as exc:
-        _print_json({"ok": False, "error": type(exc).__name__})
+        error = {"ok": False, "error": type(exc).__name__, "stage": stage}
+        if isinstance(exc, CheckpointInvalid):
+            # Only our own static validation messages are safe to surface.
+            error['reason'] = str(exc)
+        _print_json(error)
         return 1
     _print_json({"ok": True, **result})
     return 0

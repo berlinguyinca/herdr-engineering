@@ -28,6 +28,12 @@
 - Preserve highest operator host-policy revisions and complete global inspector
   preference history explicitly. Independent review reproduced data/state loss
   without those dependencies; regression tests cover both.
+- Retain complete host streams (13,903 rows; 1.9 MB payload) instead of compacting
+  them. This preserves the existing operator-policy reducer and avoids creating
+  a second policy-ordering system to save a small amount of memory. Verified
+  append folding applies to service/session streams; inspector owns its delta.
+- The production-sized capsule exceeded the initial 256 MiB decoded-size limit.
+  Keep a bounded 1 GiB limit and verify the actual capsule before rollout.
 
 ## Global Constraints
 

@@ -35,7 +35,7 @@ prepared. Code and policy fingerprints bind capsules to their reducer code,
 inspector limits/redaction settings and host-alias policy.
 
 Ordinary append-only inspector updates advance the private owner capsule only
-when their replay order follows its captured boundary. Service, session and host
+when their replay order follows its captured boundary. Service and session
 updates fold into the saved event projection only when every new server-ingest
 clock follows that stream's captured maximum. Otherwise recovery reconstructs
 the authoritative affected stream or falls back to full replay. These local
@@ -51,7 +51,9 @@ phase before retrying. Writer-fence waits are bounded; failure releases the
 connection and its session locks. Corrupt checkpoint rows can be ignored safely;
 never delete raw journal rows to make recovery pass.
 
-Only service, session and host histories are compacted in process memory.
+Only service and session histories are compacted in process memory. Complete
+host history remains in memory because its operator-policy ordering matters and
+its measured payload is small (about 1.9 MB in the release dataset).
 Complete retained history remains in PostgreSQL and backs the history APIs and
 explicit full exports. Checkpoint publication prunes checkpoint/change metadata,
 not raw events. Existing archive/retention jobs retain their separate policies.

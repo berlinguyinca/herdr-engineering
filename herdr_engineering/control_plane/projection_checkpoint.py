@@ -211,7 +211,13 @@ def restore_projection(repo, checkpoint, *, full_streams, tail_rows, structured,
         if kind in {'inspector', HOST_METRICS_ENTITY}:
             continue
         if rows:
-            streams[key] = copy.deepcopy(rows[-1:] if kind in COMPACT_TYPES else rows)
+            if kind in COMPACT_TYPES:
+                latest = max(rows, key=lambda row: (row.get('sequence') or 0,
+                             row.get('ingest_timestamp') or '', row.get('event_id') or '',
+                             str((row.get('actor') or {}).get('id') or '')))
+                streams[key] = [copy.deepcopy(latest)]
+            else:
+                streams[key] = copy.deepcopy(rows)
         else:
             streams.pop(key, None)
         if kind in COMPACT_TYPES:

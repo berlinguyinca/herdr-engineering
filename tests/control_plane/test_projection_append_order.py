@@ -1,5 +1,7 @@
 import copy
 
+import pytest
+
 from herdr_engineering.control_plane.bridge import _load_full_into
 from herdr_engineering.control_plane.projection_checkpoint import (
     PreparedSource,
@@ -55,3 +57,15 @@ def test_equal_policy_revision_capsule_uses_replay_order_across_appends():
     expected = replay(prefix + [disabled, automatic, report])
     assert second._hosts['h']['scheduler_policy'] == expected._hosts['h']['scheduler_policy']
     assert second._checkpoint_operator_policies == expected._checkpoint_operator_policies
+
+
+@pytest.mark.parametrize('kind', ['service', 'session'])
+def test_backdated_fallback_keeps_maximum_sequence_for_subsequent_writes(kind):
+    prefix = [event('high', 100, 1, {'status': 'healthy'}, entity_type=kind),
+              event('recent', 1, 3, {'status': 'healthy'}, entity_type=kind)]
+    tail = event('late', 0, 2, {'status': 'unavailable'}, entity_type=kind)
+    full = [prefix[0], tail, prefix[1]]
+    restored = append(capsule(replay(prefix)), [tail], {(kind, 'h'): full})
+    expected = replay(full)
+    assert restored.record_event(kind, 'h', 'Observation', {})['sequence'] == (
+        expected.record_event(kind, 'h', 'Observation', {})['sequence']) == 101

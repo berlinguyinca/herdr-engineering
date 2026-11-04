@@ -58,6 +58,9 @@ def test_explicit_checkpoint_order_cleanup_and_sanitization(monkeypatch, capsys,
         expected.append('load')
     assert calls == expected
     assert json.loads(output)['ok'] is (not failure)
+    if failure:
+        assert json.loads(output)['stage'] == {
+            'migrate': 'migration', 'indexes': 'index_preparation', 'load': 'materialization'}[failure]
 
 
 def test_checkpoint_requires_dsn(monkeypatch, capsys):
@@ -193,6 +196,7 @@ def test_cli_rejects_successful_load_without_publication(monkeypatch, capsys, re
     monkeypatch.setattr(projection_refresh.bridge, 'load_into', lambda *args: {'events': 123})
     assert cli.main(['control-plane', 'checkpoint', '--fleet-config', '/fleet']) == 1
     output = capsys.readouterr().out
-    assert json.loads(output) == {'ok': False, 'error': 'CheckpointNotPublished'}
+    assert json.loads(output) == {
+        'ok': False, 'error': 'CheckpointNotPublished', 'stage': 'materialization'}
     assert 'secret' not in output
     assert closed == ['migration', 'source']
