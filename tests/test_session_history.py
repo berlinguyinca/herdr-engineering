@@ -365,3 +365,80 @@ def test_dispatch_timestamps_are_reported(tmp_path):
     claude_fixture(tmp_path)
     out = sh.read_history(sh.resolve(agent="claude", session="c1", home=tmp_path), home=tmp_path)
     assert out["dispatch_ts"] == [None]          # one child dispatch whose fixture timestamp is not a real time
+
+
+def _usage_home(agent, home):
+    t = lambda m: f"2026-01-01T00:{m:02d}:00Z"  # noqa: E731
+    if agent == "claude":
+        use = {"input_tokens": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 5000, "output_tokens": 40}
+        a = lambda ts, blk: {"type": "assistant", "timestamp": ts, "message": {"id": "m1", "usage": use, "content": [blk]}}  # noqa: E731
+        _jl(home / ".claude/projects/-w/u1.jsonl", [
+            {"type": "user", "timestamp": t(0), "message": {"content": "go"}},
+            a(t(1), {"type": "text", "text": "hi"}),
+            a(t(1), {"type": "tool_use", "id": "x", "name": "Bash", "input": {"command": "ls"}}),   # same message, repeated usage
+            {"type": "assistant", "timestamp": t(2), "message": {"id": "m2", "content": "no usage here"}}])
+    elif agent == "pi":
+        use = {"input": 10, "output": 40, "cacheRead": 5000, "cacheWrite": 100, "reasoning": 0, "totalTokens": 5150}
+        _jl(home / ".pi/agent/sessions/--w--/2026_u1.jsonl", [
+            {"type": "session", "id": "u1", "cwd": "/w"},
+            {"type": "message", "timestamp": t(1), "message": {"role": "assistant", "usage": use,
+                                                              "content": [{"type": "text", "text": "hi"}]}}])
+    elif agent == "codex":
+        def tc(ts, total, last):
+            return {"type": "event_msg", "timestamp": ts, "payload": {"type": "token_count", "info": {
+                "total_token_usage": total, "last_token_usage": last}}}
+        one = {"input_tokens": 1000, "cached_input_tokens": 900, "output_tokens": 40, "reasoning_output_tokens": 30}
+        two = {"input_tokens": 2000, "cached_input_tokens": 1500, "output_tokens": 60, "reasoning_output_tokens": 10}
+        tot1 = dict(one)
+        tot2 = {"input_tokens": 3000, "cached_input_tokens": 2400, "output_tokens": 100, "reasoning_output_tokens": 40}
+        _jl(home / ".codex/sessions/2026/01/01/rollout-x-u1.jsonl", [
+            tc(t(1), tot1, one), tc(t(1), tot1, one),      # exact repeat of the same event
+            tc(t(2), tot2, two),
+            {"type": "event_msg", "timestamp": t(3), "payload": {"type": "token_count", "info": None}}])
+    else:
+        db = home / ".local/share/opencode/opencode.db"
+        db.parent.mkdir(parents=True)
+        con = sqlite3.connect(db)
+        con.executescript("""create table session(id text primary key, parent_id text, time_updated integer);
+            create table message(id text primary key, session_id text, time_created integer, data text);
+            create table part(id text primary key, message_id text, session_id text, time_created integer, data text);""")
+        con.execute("insert into session values('u1',null,9)")
+        ms = 1767225660000
+        data = {"role": "assistant", "time": {"created": ms, "completed": ms + 5000},
+                "tokens": {"input": 10, "output": 40, "reasoning": 7, "cache": {"read": 5000, "write": 100}}}
+        con.execute("insert into message values('m1','u1',?,?)", (ms, json.dumps(data)))
+        con.execute("insert into message values('m2','u1',?,?)", (ms + 1, json.dumps({"role": "assistant", "tokens": {
+            "input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}})))
+        con.execute("insert into part values('p1','m1','u1',?,?)", (ms, json.dumps({"type": "text", "text": "hi"})))
+        con.commit(); con.close()
+
+
+_EXPECT_USAGE = {
+    "claude": [{"ts": "2026-01-01T00:01:00Z", "fresh": 150, "cached": 5000}],
+    "pi": [{"ts": "2026-01-01T00:01:00Z", "fresh": 150, "cached": 5000}],
+    "codex": [{"ts": "2026-01-01T00:01:00Z", "fresh": 140, "cached": 900},
+              {"ts": "2026-01-01T00:02:00Z", "fresh": 560, "cached": 1500}],
+    "opencode": [{"ts": "2026-01-01T00:01:05Z", "fresh": 157, "cached": 5000}],
+}
+
+
+@pytest.mark.parametrize("agent", ["claude", "pi", "codex", "opencode"])
+def test_usage_rows_per_harness(tmp_path, agent):
+    _usage_home(agent, tmp_path)
+    out = sh.read_history(sh.resolve(agent=agent, session="u1", home=tmp_path), home=tmp_path)
+    assert out["usage"] == _EXPECT_USAGE[agent]
+
+
+def test_history_without_usage_has_an_empty_list_and_activity_times(tmp_path):
+    _prompt_session("claude", tmp_path)
+    out = sh.read_history(sh.resolve(agent="claude", session="p1", home=tmp_path), home=tmp_path)
+    assert out["usage"] == []
+    assert out["activity_ts"] == ["2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z", "2026-01-01T00:02:00Z"]
+
+
+def test_activity_times_survive_the_event_trim(tmp_path):
+    rows = [{"type": "user", "timestamp": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z", "message": {"content": f"p{i}"}}
+            for i in range(500)]
+    _jl(tmp_path / ".claude/projects/-w/big.jsonl", rows)
+    out = sh.read_history(sh.resolve(agent="claude", session="big", home=tmp_path), home=tmp_path)
+    assert len(out["events"]) < 500 and len(out["activity_ts"]) == 500
