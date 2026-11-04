@@ -163,7 +163,9 @@ case "$command" in
     path="$(plist_path)"
     mkdir -p "$AGENT_DIR" "$STATE_DIR"
     if [ -f "$path" ]; then
-      existing="$(plutil -extract Label raw "$path" 2>/dev/null || true)"
+      # plutil exists only on macOS; plistlib reads the same file anywhere python3 is (the tests run on Linux)
+      existing="$(plutil -extract Label raw "$path" 2>/dev/null \
+        || python3 -c 'import plistlib, sys; print(plistlib.load(open(sys.argv[1], "rb"))["Label"])' "$path" 2>/dev/null || true)"
       if [ "$existing" = "$LABEL" ]; then
         backup="$path.bak-$(date +%Y%m%d-%H%M%S)"
         cp "$path" "$backup"
