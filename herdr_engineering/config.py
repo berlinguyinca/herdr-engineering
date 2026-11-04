@@ -234,7 +234,14 @@ def _discover_config_paths() -> list[Path]:
     return [c for c in candidates if c.exists()]
 
 
-def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
+def _repo_local_paths() -> set[Path]:
+    """Config files taken from the current directory (untrusted: the repo being built)."""
+    cwd = Path.cwd()
+    return {cwd / "config" / "herdr-engineering.yaml", cwd / "herdr-engineering.yaml"}
+
+
+def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = False
+                ) -> dict[str, Any]:
     """Load config by precedence. Each path may be missing (skipped).
 
     When ``paths`` is omitted, a sensible default set is discovered (machine-
@@ -242,6 +249,8 @@ def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
     file written by the installer is actually used.
     """
     cfg = copy.deepcopy(DEFAULTS)
+    discovered = paths is None
+    repo_local = _repo_local_paths() if discovered else set()
     for path in (paths if paths is not None else _discover_config_paths()):
         if not path.exists():
             continue
@@ -262,11 +271,24 @@ def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
                 "%s: github.* is validated but not read from this file; control-plane-web reads "
                 "github.organizations and github.sync from the central fleet config (control_plane "
                 "fleet file), so this section has no effect", path)
+        if path in repo_local:
+            # A checkout being built must never choose build-cache policy
+            # (writes, namespace, credentials): machine-local config only.
+            data.pop("fabric_build_cache", None)
         cfg = _deep_merge(cfg, data)
     validate_github(cfg.get("github"))
     cfg = _expand_env(cfg)
     from .build_cache_config import validate as validate_build_cache
-    validate_build_cache(cfg.get("fabric_build_cache"))
+    try:
+        validate_build_cache(cfg.get("fabric_build_cache"))
+    except InvalidError as exc:
+        if strict_build_cache:
+            raise
+        # Fail closed: an invalid build-cache section disables the feature
+        # instead of breaking every unrelated command.
+        logging.getLogger(__name__).warning(
+            "fabric_build_cache config invalid, feature disabled: %s", exc)
+        cfg["fabric_build_cache"] = copy.deepcopy(DEFAULTS["fabric_build_cache"])
     return cfg
 
 

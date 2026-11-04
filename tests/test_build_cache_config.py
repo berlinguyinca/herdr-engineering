@@ -199,7 +199,9 @@ def test_load_config_defaults_and_invalid_fail_closed(tmp_path):
             dry_run: "false"
     """)
     with pytest.raises(InvalidError, match="cleanup.dry_run"):
-        load_config([p])
+        load_config([p], strict_build_cache=True)
+    # non-strict (every other command): fail closed to disabled, no crash
+    assert load_config([p])["fabric_build_cache"]["enabled"] is False
     p = _write(tmp_path / "d.yaml", """
         fabric_build_cache:
           enabled: true
@@ -250,3 +252,30 @@ def test_check_credentials_file_label_names_the_key(tmp_path):
     loose.chmod(0o644)
     with pytest.raises(InvalidError, match="registry_file"):
         check_credentials_file(str(loose), "registry_file")
+
+
+def test_repo_local_config_cannot_set_build_cache_policy(tmp_path, monkeypatch):
+    home, repo = tmp_path / "home", tmp_path / "repo"
+    (home / ".config" / "herdr-engineering").mkdir(parents=True)
+    repo.mkdir()
+    (home / ".config" / "herdr-engineering" / "config.yaml").write_text(
+        "fabric_build_cache:\n  enabled: true\n  shared_cache: {writes_enabled: false}\n")
+    (repo / "herdr-engineering.yaml").write_text(
+        "fabric_build_cache:\n  enabled: true\n  shared_cache: {writes_enabled: true,"
+        " namespace: evil-ns}\nbuild_cleanup: {enabled: true}\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    monkeypatch.chdir(repo)
+    cfg = load_config()
+    assert cfg["fabric_build_cache"]["shared_cache"]["writes_enabled"] is False
+    assert cfg["fabric_build_cache"]["shared_cache"]["namespace"] != "evil-ns"
+    assert cfg["build_cleanup"]["enabled"] is True  # other sections still merge
+
+
+def test_invalid_repo_local_section_does_not_break_commands(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "h"))
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    (tmp_path / "herdr-engineering.yaml").write_text(
+        "fabric_build_cache: {enabled: yes-please}\n")
+    monkeypatch.chdir(tmp_path)
+    assert load_config(strict_build_cache=True)["fabric_build_cache"]["enabled"] is False

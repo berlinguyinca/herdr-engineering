@@ -2790,7 +2790,7 @@ def _build_cache_config():
     from .build_cache_config import validate
     from .config import load_config
     try:
-        section = load_config().get("fabric_build_cache")
+        section = load_config(strict_build_cache=True).get("fabric_build_cache")
         cfg = validate(section) if section else None
     except Exception as exc:  # noqa: BLE001
         print(f"build-coordinate: build cache config ignored: {exc}", file=sys.stderr)
@@ -2803,7 +2803,7 @@ def _cmd_build_cache_inventory(args) -> int:
     from .build_cache_inventory import collect, inventory_view
     from .config import load_config
     try:
-        cfg = validate(load_config().get("fabric_build_cache"))
+        cfg = validate(load_config(strict_build_cache=True).get("fabric_build_cache"))
     except Exception as exc:  # noqa: BLE001
         print(f"build-cache-inventory: invalid config: {exc}", file=sys.stderr)
         return 1
