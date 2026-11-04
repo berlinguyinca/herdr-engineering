@@ -77,7 +77,7 @@ def dashboard_resolver(siblings: dict[str, str] | None = None, name: str = "") -
 
     Absolute http(s)/mailto links and ``data:image/(png|jpeg|gif|webp)`` images survive; every relative reference is
     dropped (a fragment link would drive the SPA's hash router). ``siblings`` maps the normalised name of each other
-    output of the same version to its outputs-route URL; an ``img``/``link``/``css`` reference naming one of them is
+    output of the same version to its outputs-route URL; an ``img`` reference naming one of them is
     rewritten to it, resolved relative to ``name``.
     """
     index = siblings or {}
@@ -96,7 +96,9 @@ def dashboard_resolver(siblings: dict[str, str] | None = None, name: str = "") -
             return None
         if parts.scheme or parts.netloc or cleaned.startswith(("//", "\\")) or "\\" in cleaned:
             return _absolute_link(cleaned) if context == "a" else None
-        if context == "a" or not index or not parts.path or parts.query or parts.fragment:
+        # Only images are mapped. A sibling stylesheet would be raw, unsanitised CSS (url() and @import beacons) in a
+        # dashboard that has no CSP, so link and css references to siblings are dropped like every other relative one.
+        if context != "img" or not index or not parts.path or parts.query or parts.fragment:
             return None
         try:
             target = normalise_name(posixpath.normpath(posixpath.join(posixpath.dirname(name), unquote(parts.path))))
@@ -109,6 +111,7 @@ def dashboard_resolver(siblings: dict[str, str] | None = None, name: str = "") -
 
 def _send_json(handler, body: dict, status: int = 200) -> None:
     payload = json.dumps(body).encode()
+    handler._render_started = True
     handler._response_status = status
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
@@ -151,6 +154,7 @@ def _live_headers(mime: str) -> list[tuple[str, str]]:
 
 
 def _send_live(handler, data: bytes, mime: str) -> None:
+    handler._render_started = True
     handler._response_status = 200
     handler.send_response(200)
     for name, value in _live_headers(mime):
@@ -170,6 +174,8 @@ def _legacy_output(handler, server, artifact_id: str, version_id: str, index: in
         pinned = pinned_output(outputs[index])
     except PinnedOutputError:
         return None
+    if render_kind(pinned["name"], pinned["media_type"]) not in ("html", "text"):
+        return outputs, pinned, b""          # nothing is rendered for it: do not read the blob
     if server.rustfs is None:
         raise _Unavailable
     return outputs, pinned, server.rustfs.get(pinned["storage_key"], pinned["sha256"])
@@ -201,6 +207,7 @@ def route_render(handler, server, parts, resource) -> bool:
         route = "preview"
     else:
         return False
+    handler._render_started = False
     artifact_id = parts[4]
     versioned = route in ("output", "preview")
     try:
@@ -209,8 +216,12 @@ def route_render(handler, server, parts, resource) -> bool:
             handler._deny(404, "not found")
             return True
         if route in ("render", "live"):
-            record, data = handler._artifact_current_file(artifact_id)
-            if record is None or data is None:
+            def wanted(rec):
+                return route == "live" or render_kind(rec.get("original_filename") or "",
+                                                       rec.get("mime_type")) in ("html", "text")
+            record, data = handler._artifact_current_file(artifact_id, want=wanted)
+            if record is None or (data is None and route == "live") or (
+                    data is None and wanted(record)):
                 handler._deny(404, "not found")
                 return True
             mime = record.get("mime_type") or "application/octet-stream"
@@ -220,7 +231,7 @@ def route_render(handler, server, parts, resource) -> bool:
             name = record.get("original_filename") or ""
             kind = render_kind(name, mime)
             key = (_DASHBOARD_KEY, artifact_id, record.get("sha256"))
-            _send_render(handler, kind, data, dashboard_resolver(), key)
+            _send_render(handler, kind, data or b"", dashboard_resolver(), key)
             return True
         version_id = parts[6]
         if route == "preview":
@@ -253,5 +264,8 @@ def route_render(handler, server, parts, resource) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001 - fixed 503; the class name is the only thing logged
         _LOG.error("artifact render route failed: %s", type(exc).__name__)
-        _send_json(handler, _UNAVAILABLE, 503)
+        if not getattr(handler, "_render_started", False):   # never a second response after headers went out
+            _send_json(handler, _UNAVAILABLE, 503)
+        else:
+            handler.close_connection = True
         return True

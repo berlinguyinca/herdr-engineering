@@ -20,12 +20,12 @@ from herdr_engineering.control_plane.artifact_renderers import RendererRegistry 
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
 
 
-def tiny_pdf(text):
+def tiny_pdf(text, height=200):
     """A valid one-page PDF that draws ``text`` in black Helvetica (real xref offsets)."""
     stream = f"BT /F1 36 Tf 40 100 Td ({text}) Tj ET".encode()
     objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-               b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R "
-               b"/Resources << /Font << /F1 5 0 R >> >> >>",
+               (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 %d] /Contents 4 0 R "
+                b"/Resources << /Font << /F1 5 0 R >> >> >>") % height,
                b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
     out, offsets = bytearray(b"%PDF-1.4\n"), []
@@ -48,6 +48,12 @@ class ReportFixture:
             ("html_1", "page.html", "text/html", b"<h1>Plain page heading</h1><script>window.__x=1</script>"
              b"<a href=\"#/settings\">settings</a><p>Body text</p>"),
             ("pdf_1", "doc.pdf", "application/pdf", tiny_pdf("Hello PDF")),
+            ("pdf_tall", "tall.pdf", "application/pdf", tiny_pdf("Tall", height=14400)),
+            ("host_1", "host.html", "text/html",
+             b"<style>:host{position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;"
+             b"z-index:2147483647!important;display:block!important;background:red!important}"
+             b"#cover{position:fixed;inset:0;z-index:2147483647;background:blue}</style>"
+             b"<div id=cover>cover</div><p>Hostile host page</p>"),
         ):
             digest = hashlib.sha256(data).hexdigest()
             key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"

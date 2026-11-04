@@ -93,10 +93,11 @@ export async function mountPdf(container, bytes, { signal, document: doc = globa
       const viewport = page.getViewport({ scale });
       holder.style.width = `${Math.floor(viewport.width)}px`;
       holder.style.height = `${Math.floor(viewport.height)}px`;
-      const ratio = Math.max(1, Math.min(globalThis.devicePixelRatio || 1, 2, Math.sqrt(16e6 / (viewport.width * viewport.height))));
+      // no floor at 1: a tall page must shrink below device pixels so the 16M-pixel cap always holds
+      const ratio = Math.min(globalThis.devicePixelRatio || 1, 2, Math.sqrt(16e6 / (viewport.width * viewport.height)));
       const canvas = doc.createElement('canvas');
-      canvas.width = Math.floor(viewport.width * ratio);
-      canvas.height = Math.floor(viewport.height * ratio);
+      canvas.width = Math.max(1, Math.floor(viewport.width * ratio));
+      canvas.height = Math.max(1, Math.floor(viewport.height * ratio));
       canvas.style.width = `${Math.floor(viewport.width)}px`;
       canvas.style.height = `${Math.floor(viewport.height)}px`;
       const textLayer = doc.createElement('div');

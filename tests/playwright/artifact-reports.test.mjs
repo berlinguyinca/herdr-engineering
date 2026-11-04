@@ -305,3 +305,35 @@ test('the live link opens the raw file in an opaque-origin sandbox, and the dash
     assert.equal(await page.evaluate(() => window.__x), undefined);
   });
 });
+
+test('a hostile :host fixed-position payload cannot cover or capture clicks on the dashboard', async () => {
+  await withReports(async ({ page, base }) => {
+    await page.setViewportSize({ width: 1000, height: 800 });
+    await page.goto(`${base}/#/artifacts/host_1`);
+    const preview = page.locator('[data-static-preview]');
+    await preview.getByText('Hostile host page').waitFor();
+    const link = page.locator('[data-open-live]');
+    await link.scrollIntoViewIfNeeded();
+    const hit = await link.evaluate(node => {
+      const box = node.getBoundingClientRect();
+      const top = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+      return top === node || node.contains(top);
+    });
+    assert.equal(hit, true, 'the dashboard control must stay hit-testable');
+    const heading = page.locator('h2').first();
+    const boxOf = await heading.boundingBox();
+    const topAtHeading = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.tagName, { x: boxOf.x + 4, y: boxOf.y + 4 });
+    assert.equal(topAtHeading, 'H2');
+    const wrapper = await preview.boundingBox();
+    assert.ok(wrapper.width <= 1000 && wrapper.height <= 640 + 2, JSON.stringify(wrapper));
+  });
+});
+
+test('a very tall PDF page stays under the canvas pixel cap', async () => {
+  await withReports(async ({ page, base }) => {
+    await page.goto(`${base}/#/artifacts/pdf_tall`);
+    await page.locator('.hd-pdf-page[data-drawn="true"] canvas').waitFor({ timeout: 20000 });
+    const pixels = await page.evaluate(() => { const c = document.querySelector('.hd-pdf-page canvas'); return c.width * c.height; });
+    assert.ok(pixels <= 16e6 + 1e5, String(pixels));
+  });
+});

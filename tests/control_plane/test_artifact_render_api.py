@@ -104,10 +104,14 @@ def world():
     for aid in list(store.records):
         acl.grant(aid, f"api-key:{OWNER}:operator", {"read"})
     index = b'<h1>Legacy</h1><img src="fig.png"><img src="../escape.png"><a href="other.html">o</a><a href="#/x">x</a>'
+    index += b'<link rel="stylesheet" href="style.css"><link rel="stylesheet" href="./style.css">'
+    sheet = b"body{background:url(https://tracker.example/pixel.gif)}@import url(https://tracker.example/i.css);"
     store.outputs[("h1", "v1")] = [
         {"name": "index.html", "media_type": "text/html", **blobs.add(index)},
         {"name": "fig.png", "media_type": "image/png", **blobs.add(b"\x89PNG")},
+        {"name": "style.css", "media_type": "text/css", **blobs.add(sheet)},
     ]
+    store.blobs = blobs
     store.outputs[("h1", "v2")] = []
     try:
         yield f"http://127.0.0.1:{server.port}", store
@@ -174,6 +178,23 @@ def test_legacy_output_resolver_maps_siblings_and_drops_the_rest(world):
     assert 'src="/api/v1/artifacts/h1/versions/v1/outputs/1"' in html
     assert "escape.png" not in html and "other.html" not in html and "#/x" not in html
     assert "Legacy" in html
+    # a sibling stylesheet is raw CSS (url() / @import beacons) and the dashboard has no CSP: never mapped or served here
+    assert "style.css" not in html and "/outputs/2" not in html and "tracker.example" not in html
+    status, body, _ = envelope(base, "/api/v1/artifacts/h1/versions/v1/outputs/2/render")
+    assert status == 200 and body["kind"] == "text" and "tracker.example" in body["html"]   # escaped text, never a stylesheet
+    assert "<style" not in body["html"].lower() and "<link" not in body["html"].lower()
+
+
+def test_pdf_and_image_renders_do_not_read_the_blob(world):
+    base, store = world
+    reads = []
+    original = store.blobs.get
+    store.blobs.get = lambda key, digest: (reads.append(key), original(key, digest))[1]
+    for path in ("/api/v1/artifacts/p1/render", "/api/v1/artifacts/i1/render",
+                 "/api/v1/artifacts/h1/versions/v1/outputs/1/render"):
+        assert envelope(base, path)[0] == 200
+    assert reads == []
+    assert envelope(base, "/api/v1/artifacts/h1/render")[1]["kind"] == "html" and len(reads) == 1
 
 
 def test_preview_and_outputs_render_win_over_the_report_routes(world):

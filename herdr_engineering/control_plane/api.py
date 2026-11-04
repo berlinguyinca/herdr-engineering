@@ -5776,15 +5776,17 @@ def _make_handler(server, public=False, operator=False):
                 return self._etag_json(body)
             return self._json(body, etag=etag)
 
-        def _artifact_current_file(self, artifact_id):
-            """``(record, bytes)`` of the artifact's current file (either may be None), as ``/download`` serves it."""
+        def _artifact_current_file(self, artifact_id, want=None):
+            """``(record, bytes)`` of the artifact's current file (either may be None), as ``/download`` serves it.
+
+            ``want(record) -> bool`` may veto reading the bytes (they are then None) for callers that need only the record."""
             r = server.repo
             data = r.get_artifact_data(artifact_id)
             a = r.get_artifact(artifact_id)
             if a is None and server.artifact_store is not None:
                 a = self._artifact_call('get_record', artifact_id, principal_id=self._resource_principal())
             # payload lives in the object store, not the in-memory blob
-            if data is None and a is not None and server.rustfs is not None \
+            if data is None and a is not None and (want is None or want(a)) and server.rustfs is not None \
                     and a.get("storage_key") and a.get("sha256"):
                 try:
                     data = server.rustfs.get(a["storage_key"], a["sha256"])

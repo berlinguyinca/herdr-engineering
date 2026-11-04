@@ -381,6 +381,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
   }
   versionsRead.catch(() => {});
   const mime = artifact.mime_type || 'application/octet-stream';
+  const mediaType = mime.split(';')[0].trim().toLowerCase();
   const url = client.artifactDownloadUrl(id);
   container.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><div class="hd-card"><h2>Preview</h2><div data-artifact-preview>${skeleton('preview', { rows: 1 })}</div></div><div class="hd-card"><dl><dt>Artifact ID</dt><dd><code>${esc(id)}</code></dd><dt>Type</dt><dd>${esc(artifact.artifact_type || 'other')}</dd><dt>MIME</dt><dd>${esc(mime)}</dd><dt>Status</dt><dd>${esc(artifact.status || 'unknown')}</dd><dt>SHA-256</dt><dd><code>${esc(artifact.sha256 || 'versioned blob')}</code></dd></dl></div><div class="hd-card"><h2>Versions</h2><div data-artifact-versions>${skeleton('versions', { rows: 1 })}</div></div><div class="hd-card" data-artifact-share-card><h2>Share</h2><div data-artifact-share></div></div><div class="hd-card"><h2>Review</h2><div data-artifact-reviews>${skeleton('reviews', { rows: 1 })}</div></div><div class="hd-card"><h2>Linked to</h2><div data-artifact-links>${skeleton('links', { rows: 1 })}</div></div>`;
   client.artifactLinks(id, { signal: bounded() }).then(({ links }) => {
@@ -409,15 +410,15 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
   // Only a non-report artifact may fetch the download for its preview.
   const previewSlot = container.querySelector('[data-artifact-preview]');
   const imageHtml = `<img src="${esc(url)}" alt="${esc(artifact.original_filename || id)}" style="max-width:100%;max-height:640px;object-fit:contain">`;
-  const textHtml = `<a class="hd-btn" href="${esc(url)}" target="_blank" rel="noopener">Open text artifact</a>`;
+  const textHtml = liveLink(client.artifactLiveUrl(id));
   const otherHtml = `<a class="hd-btn" href="${esc(url)}" download>Download artifact</a>`;
-  if (mime === 'application/pdf' || mime === 'text/html') {
+  if (mediaType === 'application/pdf' || mediaType === 'text/html') {
     // No frames: a PDF is drawn on canvases, HTML is the server's sanitised copy; the raw file opens sandboxed in a new tab.
     previewSlot.innerHTML = `<div data-preview-body>${skeleton('preview', { rows: 1 })}</div><p>${liveLink(client.artifactLiveUrl(id))}</p>`;
     const body = previewSlot.querySelector('[data-preview-body]');
     const alive = () => !signal?.aborted && container.isConnected && body.isConnected;
     const unavailable = message => { if (alive()) body.innerHTML = `<p role="alert">${esc(message)}</p>`; };
-    if (mime === 'application/pdf') {
+    if (mediaType === 'application/pdf') {
       client.artifactBytes(id, { signal }).then(bytes => { if (alive()) return mountPdf(body, bytes, { signal }); })
         .catch(error => unavailable(`Preview unavailable: ${error?.message || 'request failed'}`));
     } else {
@@ -428,7 +429,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
       }).catch(error => unavailable(`Preview unavailable: ${error?.message || 'request failed'}`));
     }
   } else {
-    previewSlot.innerHTML = mime.startsWith('image/') ? imageHtml : mime.startsWith('text/') || mime === 'application/json' ? textHtml : otherHtml;
+    previewSlot.innerHTML = mediaType.startsWith('image/') ? imageHtml : mediaType.startsWith('text/') || mediaType === 'application/json' ? textHtml : otherHtml;
   }
   results.push((await Promise.allSettled([reviewsRead]))[0]);
   if (signal?.aborted || !container.isConnected) return;
