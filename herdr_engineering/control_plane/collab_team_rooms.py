@@ -313,8 +313,12 @@ class TeamRoomsMixin:
             if have is not None and have["level"] == level and have["direct_limits"] == limits:
                 return {**self._tr_level_view(room_id), "replayed": True}
             self._throttle("guest-level:" + pr.key, 30, 600.0, "guest level")
+            # only leaving Direct is a revocation the log pre-paid (setting Direct costs one slot); a toggle among the other
+            # levels is an ordinary write, so it cannot be used to fill the log past the room that revocations need
+            revokes_direct = have is not None and have["level"] == "direct" and level != "direct"
             self._commit("room_guest_level_set", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, level=level, direct_limits=limits,
+                revokes_direct=revokes_direct,
                 visibility_scope="room", action="room.guest_level.set", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
             self._dg_reconcile_room(room_id)             # Direct: a lowered or narrowed level ends what it no longer allows

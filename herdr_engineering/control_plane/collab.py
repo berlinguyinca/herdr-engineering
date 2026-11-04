@@ -641,7 +641,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         if event_type == "team_external_coordination_set" and payload is not None:
             return payload.get("enabled") is False        # turning the opt-in OFF is a revocation; ON is an ordinary write
         if event_type == "room_guest_level_set" and payload is not None:
-            return payload.get("level") != "direct"       # lowering the level is a revocation; setting Direct is pre-paid
+            return payload.get("revokes_direct") is True  # leaving Direct is a revocation (pre-paid by setting it); other toggles are ordinary
         if event_type == "guest_direct_set" and payload is not None:
             return payload.get("allowed") is False        # withdrawing one guest's Direct right is a revocation
         return event_type in SAFETY_EVENTS

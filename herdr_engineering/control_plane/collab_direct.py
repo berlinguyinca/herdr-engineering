@@ -209,7 +209,7 @@ class DirectMixin:
                 raise _err(400, "reviews_task_id goes with the reviewer role")
         text = self._task_text(body.get("text"), "text")
         if len(text) > lim["max_text"]:
-            raise _err(400, f"text must be 1-{lim['max_text']} characters in this room")
+            raise self._dg_deny(pr, room, 400, "direct_text_too_long", f"text must be 1-{lim['max_text']} characters in this room")
         ikey = body.get("idempotency_key")
         if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
             raise _err(400, "invalid idempotency_key")
@@ -253,11 +253,11 @@ class DirectMixin:
                 self._tr2_check_review(pr, room_id, key, reviews)
         use = self._dg_usage(room_id, uid)
         if use["created_last_hour"] >= lim["per_hour"]:
-            raise _err(429, "too many direct tasks in the last hour", code="direct_rate")
+            raise self._dg_deny(pr, room, 429, "direct_rate", "too many direct tasks in the last hour")
         if use["open"] >= lim["max_open"]:
-            raise _err(429, "you have too many open direct tasks", code="direct_open")
+            raise self._dg_deny(pr, room, 429, "direct_open", "you have too many open direct tasks")
         if self._tr2_open_load(key) >= MAX_OPEN_TASKS_PER_AGENT:
-            raise _err(429, "that agent has too many open tasks")
+            raise self._dg_deny(pr, room, 429, "direct_agent_busy", "that agent has too many open tasks")
         self._throttle("task:" + pr.key, TASK_RATE, 600.0, "task")
         self._throttle("task-owner:" + pr.owner, TASK_RATE * 2, 600.0, "task")
         task_id = ids.new_id("grant")
