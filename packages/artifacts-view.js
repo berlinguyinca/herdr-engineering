@@ -15,10 +15,47 @@ const humanSize = value => {
 
 export function mountArtifacts(container, client, { freshness = () => null } = {}) {
   let disposed = false, timer, controller, generation = 0, loaded = false;
-  container.innerHTML = '<div class="hd-card" data-artifact-registry><div class="hd-card__title">Artifact registry</div><div class="hd-inline"><input class="hd-input" data-artifact-query placeholder="Search artifacts" aria-label="Search artifacts"><select class="hd-input" data-artifact-type aria-label="Filter artifact type"><option value="">All types</option><option value="other">Other</option><option value="web">Web</option><option value="report">Report</option><option value="document">Document</option></select><select class="hd-input" data-artifact-status aria-label="Filter artifact status"><option value="">All statuses</option><option value="available">Available</option><option value="draft">Draft</option></select><select class="hd-input" data-artifact-context-kind aria-label="Linked to"><option value="">Any work</option><option value="project">Project</option><option value="issue">Issue</option><option value="task">Task</option><option value="room">Room</option></select><input class="hd-input" data-artifact-context-ref placeholder="Project, issue, task or room id" aria-label="Linked work id"></div><p data-artifact-state role="status"></p><div data-artifact-results></div><button type="button" data-artifact-retry hidden>Retry</button></div>';
+  container.innerHTML = '<div class="hd-card" data-artifact-registry><div class="hd-card__title">Artifact registry</div><div class="hd-inline"><input class="hd-input" data-artifact-query placeholder="Search artifacts" aria-label="Search artifacts"><select class="hd-input" data-artifact-type aria-label="Filter artifact type"><option value="">All types</option><option value="other">Other</option><option value="web">Web</option><option value="report">Report</option><option value="document">Document</option></select><select class="hd-input" data-artifact-status aria-label="Filter artifact status"><option value="">All statuses</option><option value="available">Available</option><option value="draft">Draft</option></select><select class="hd-input" data-artifact-context-kind aria-label="Linked to"><option value="">Any work</option><option value="project">Project</option><option value="issue">Issue</option><option value="task">Task</option><option value="room">Room</option></select><input class="hd-input" data-artifact-context-ref placeholder="Project, issue, task or room id" aria-label="Linked work id"></div><div class="hd-inline" data-artifact-owner hidden><select class="hd-input" data-artifact-view aria-label="Show artifacts"><option value="active">Active artifacts</option><option value="deleted">Deleted artifacts</option></select><button type="button" class="hd-btn" data-artifact-delete disabled>Delete</button><button type="button" class="hd-btn" data-artifact-purge disabled>Delete permanently</button><button type="button" class="hd-btn" data-artifact-restore hidden disabled>Restore</button></div><form class="hd-inline" data-artifact-purge-form hidden><label>Type <strong data-artifact-purge-count></strong> to delete permanently <input class="hd-input" data-artifact-purge-confirm autocomplete="off" inputmode="numeric" style="max-width:8ch"></label><button type="submit" class="hd-btn" data-artifact-purge-go disabled>Delete permanently</button><button type="button" class="hd-btn" data-artifact-purge-cancel>Cancel</button></form><p data-artifact-action-state role="status"></p><p data-artifact-state role="status"></p><div data-artifact-results></div><button type="button" data-artifact-retry hidden>Retry</button></div>';
   const results = container.querySelector('[data-artifact-results]');
   const state = container.querySelector('[data-artifact-state]');
   const retry = container.querySelector('[data-artifact-retry]');
+  const q = selector => container.querySelector(selector);
+  const ownerBar = q('[data-artifact-owner]'), actionState = q('[data-artifact-action-state]'), purgeForm = q('[data-artifact-purge-form]');
+  const selected = new Set();
+  let owner = false, view = 'active';
+  const SUMMARY = { not_found: 'not found', refused: 'refused', already_purged: 'already purged' };
+  const syncOwner = () => {
+    const count = selected.size, deleted = view === 'deleted';
+    ownerBar.hidden = !owner;
+    q('[data-artifact-delete]').hidden = q('[data-artifact-purge]').hidden = deleted;
+    q('[data-artifact-restore]').hidden = !deleted;
+    q('[data-artifact-delete]').disabled = q('[data-artifact-purge]').disabled = q('[data-artifact-restore]').disabled = !count;
+    q('[data-artifact-purge-count]').textContent = String(count);
+    q('[data-artifact-purge-go]').disabled = q('[data-artifact-purge-confirm]').value !== String(count) || !count;
+    if (!count) purgeForm.hidden = true;
+  };
+  const announce = (results, verb) => {
+    const counts = {};
+    for (const row of Array.isArray(results) ? results : []) counts[row.result] = (counts[row.result] || 0) + 1;
+    const parts = Object.entries(counts).map(([key, n]) => `${n} ${['tombstoned', 'deleted', 'restored'].includes(key) ? verb : SUMMARY[key] || 'not changed'}`);
+    actionState.textContent = parts.length ? `${parts.join(', ')}.` : 'Nothing changed.';
+  };
+  // One fixed message for every failure: the server's text is never shown.
+  const act = async (run, verb) => {
+    actionState.textContent = 'Working…';
+    for (const button of ownerBar.querySelectorAll('button')) button.disabled = true;
+    try {
+      const out = await run();
+      selected.clear();
+      q('[data-artifact-purge-confirm]').value = '';
+      purgeForm.hidden = true;
+      syncOwner();
+      await render({ replace: true });
+      announce(out?.results, verb);
+      return;
+    } catch { actionState.textContent = 'That did not work. Nothing was confirmed; reload and try again.'; }
+    syncOwner();
+  };
   const render = async ({ replace = false } = {}) => {
     if (disposed || (controller && !replace)) return;
     controller?.abort();
@@ -33,6 +70,16 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
       const contextRef = container.querySelector('[data-artifact-context-ref]').value.trim();
       const q = container.querySelector('[data-artifact-query]').value;
       // A named piece of work asks the registry for what is linked to it; type and status do not apply there.
+      if (view === 'deleted' && owner) {
+        const { artifacts: gone } = await client.listTombstonedArtifacts({ signal });
+        if (disposed || current !== generation) return;
+        if (!Array.isArray(gone)) throw new Error('Invalid response');
+        const live = new Set(gone.filter(a => !a.purged).map(a => a.artifact_id));
+        for (const id of [...selected]) if (!live.has(id)) selected.delete(id);
+        morph(results, gone.length ? `<div class="hd-table-wrap"><table class="hd-table"><thead><tr><th><span class="visually-hidden">Select</span></th><th>Name</th><th>Deleted</th><th>Purge after</th></tr></thead><tbody>${gone.map(a => `<tr><td><input type="checkbox" data-artifact-select value="${esc(a.artifact_id)}" aria-label="Select ${esc(a.original_filename || a.artifact_id)}"${selected.has(a.artifact_id) ? ' checked' : ''}${a.purged ? ' disabled' : ''}></td><td>${esc(a.original_filename || a.artifact_id)}${a.purged ? ' (purged)' : ''}</td><td>${esc(a.tombstoned_at || 'unknown')}</td><td>${esc(a.purge_after || 'held')}</td></tr>`).join('')}</tbody></table></div>` : '<herdr-empty message="No deleted artifacts"></herdr-empty>');
+        loaded = true; state.textContent = ''; syncOwner(); freshness()?.touch(true);
+        return;
+      }
       const { artifacts } = contextKind && contextRef
         ? await client.artifactsForContext(contextKind, contextRef, { q, limit: 100, signal })
         : await client.listArtifacts({
@@ -42,8 +89,8 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
         });
       if (disposed || current !== generation) return;
       if (!Array.isArray(artifacts)) throw new Error('Invalid artifact registry response');
-      morph(results, artifacts.length ? `<div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Status</th><th>Created</th></tr></thead><tbody>${artifacts.map(artifact => `<tr><td><a href="#/artifacts/${encodeURIComponent(artifact.artifact_id)}">${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}</a></td><td>${esc(artifact.artifact_type || 'other')}</td><td>${artifact.size_bytes == null ? '—' : humanSize(artifact.size_bytes)}</td><td>${esc(artifact.status || '—')}</td><td>${esc(artifact.created_at || 'unknown')}</td></tr>`).join('')}</tbody></table></div>` : '<herdr-empty message="No artifacts match the current filters"></herdr-empty>');
-      loaded = true;
+      morph(results, artifacts.length ? `<div class="hd-table-wrap"><table class="hd-table"><thead><tr>${owner ? '<th><span class="visually-hidden">Select</span></th>' : ''}<th>Name</th><th>Type</th><th>Size</th><th>Status</th><th>Created</th></tr></thead><tbody>${artifacts.map(artifact => `<tr>${owner ? `<td><input type="checkbox" data-artifact-select value="${esc(artifact.artifact_id)}" aria-label="Select ${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}"${selected.has(artifact.artifact_id) ? ' checked' : ''}></td>` : ''}<td><a href="#/artifacts/${encodeURIComponent(artifact.artifact_id)}">${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}</a></td><td>${esc(artifact.artifact_type || 'other')}</td><td>${artifact.size_bytes == null ? '—' : humanSize(artifact.size_bytes)}</td><td>${esc(artifact.status || '—')}</td><td>${esc(artifact.created_at || 'unknown')}</td></tr>`).join('')}</tbody></table></div>` : '<herdr-empty message="No artifacts match the current filters"></herdr-empty>');
+      loaded = true; syncOwner();
       state.textContent = artifacts.length === 100 ? 'Showing the first 100 artifacts. Refine the search to narrow results.' : '';
       freshness()?.touch(true);
     } catch (error) {
@@ -57,6 +104,28 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
   const schedule = () => { clearTimeout(timer); timer = setTimeout(() => render({ replace: true }), 200); };
   container.querySelectorAll('[data-artifact-query],[data-artifact-type],[data-artifact-status],[data-artifact-context-kind],[data-artifact-context-ref]').forEach(control => control.addEventListener('input', schedule));
   retry.addEventListener('click', render);
+  const key = () => (globalThis.crypto?.randomUUID?.() || String(Date.now())).replace(/[^A-Za-z0-9-]/g, '');
+  results.addEventListener('change', event => {
+    const box = event.target.closest?.('[data-artifact-select]');
+    if (!box) return;
+    if (box.checked && selected.size >= 200) { box.checked = false; actionState.textContent = 'Select at most 200 artifacts at a time.'; return; }
+    if (box.checked) selected.add(box.value); else selected.delete(box.value);
+    syncOwner();
+  });
+  q('[data-artifact-view]').addEventListener('change', event => { view = event.target.value; selected.clear(); purgeForm.hidden = true; syncOwner(); render({ replace: true }); });
+  q('[data-artifact-delete]').addEventListener('click', () => act(() => client.deleteArtifacts([...selected], { reason: 'Deleted from the dashboard', requestKey: key() }), 'deleted'));
+  q('[data-artifact-restore]').addEventListener('click', () => act(() => client.restoreArtifacts([...selected], { requestKey: key() }), 'restored'));
+  q('[data-artifact-purge]').addEventListener('click', () => { purgeForm.hidden = false; q('[data-artifact-purge-confirm]').value = ''; syncOwner(); q('[data-artifact-purge-confirm]').focus(); });
+  q('[data-artifact-purge-cancel]').addEventListener('click', () => { purgeForm.hidden = true; q('[data-artifact-purge-confirm]').value = ''; });
+  q('[data-artifact-purge-confirm]').addEventListener('input', syncOwner);
+  purgeForm.addEventListener('submit', event => {
+    event.preventDefault();
+    const typed = q('[data-artifact-purge-confirm]').value;
+    if (typed !== String(selected.size) || !selected.size) return;
+    act(() => client.deleteArtifacts([...selected], { mode: 'purge_now', confirm: typed, reason: 'Permanently deleted from the dashboard', requestKey: key() }), 'permanently deleted');
+  });
+  // Only an owner sees the controls; a failed probe leaves them hidden. The server enforces this on every call.
+  client.artifactDeleteAccess?.().then(access => { if (!disposed && access?.owner === true) { owner = true; syncOwner(); render({ replace: true }); } }, () => {});
   const stop = pollWhileVisible(render, 30000);
   void render();
   return { refresh: render, dispose() { disposed = true; clearTimeout(timer); stop(); controller?.abort(); } };
