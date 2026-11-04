@@ -260,3 +260,59 @@ def test_cli_plan_states_not_submitted(tmp_path, monkeypatch, capsys):
     assert out["message"] == "not submitted; no runner verified"
     assert out["decision"]["use_slurm"] is False
     assert out["decision"]["reason"] == "disabled"
+
+
+# --- review fixes (specs 06-13) ----------------------------------------------
+@pytest.mark.parametrize("field", ["build_id", "attempt_id"])
+@pytest.mark.parametrize("bad", ["abc\nrm -rf / #", "x" * 100, "a b", "$(id)", "", "A;B"])
+def test_ids_rendered_into_script_are_validated(tmp_path, field, bad):
+    b = sa.LeaseBinding(**{**binding().__dict__, field: bad})
+    with pytest.raises(sa.PlanError):
+        sa.build_sbatch(request(tmp_path, binding=b))
+    with pytest.raises(sa.PlanError):
+        sa.render_comment(b)
+
+
+def test_epoch_and_digests_are_validated(tmp_path):
+    with pytest.raises(sa.PlanError):
+        sa.build_sbatch(request(tmp_path, binding=sa.LeaseBinding("b" * 32, "a" * 32, "/r", "1\nx")))
+    m = request(tmp_path).manifest
+    bad = sa.StagingManifest("x\nrm -rf /", m.toolchain_digest, m.manifest_digest, 1, 1)
+    with pytest.raises(sa.PlanError):
+        sa.build_sbatch(request(tmp_path, manifest=bad))
+
+
+def test_registry_style_dashed_uuid_ids_are_accepted(tmp_path):
+    import uuid
+    b = sa.LeaseBinding(str(uuid.uuid4()), str(uuid.uuid4()), "/r", 1)
+    assert sa.build_sbatch(request(tmp_path, binding=b)).script
+
+
+def test_cancel_with_malformed_binding_is_refused_not_raised():
+    b = sa.LeaseBinding("x\ny", "a" * 32, "/r", 1)
+    assert sa.cancel_target(b, "anything", job_id="123").allowed is False
+
+
+def test_output_symlinked_directory_anywhere_is_flagged(tmp_path):
+    out, exp = make_out(tmp_path)
+    (out / "extra_dir_link").symlink_to("/etc")
+    (out / "sub").mkdir()
+    (out / "sub" / "deep").symlink_to("/etc")
+    codes = {(p.relpath, p.code) for p in sa.validate_outputs(out, [exp])}
+    assert ("extra_dir_link", "symlink") in codes and ("sub/deep", "symlink") in codes
+
+
+def test_manifest_refuses_fifo_without_hanging(tmp_path):
+    src = tree(tmp_path)
+    os.mkfifo(src / "pipe")
+    with pytest.raises(sa.StagingError):
+        sa.stage_manifest(src, "tc")
+
+
+def test_preview_does_not_stage_when_slurm_not_requested(tmp_path):
+    src = tree(tmp_path)
+    os.mkfifo(src / "pipe")  # would raise/hang if the tree were read
+    from herdr_engineering.build_cache_config import validate
+    out = sa.preview(validate(None), str(src), None, "tc")
+    assert out["submitted"] is False and out["decision"]["reason"] == "disabled"
+    assert out.get("manifest") is None

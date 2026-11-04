@@ -40,6 +40,8 @@ from .build_cache_config import BuildCacheConfig
 NOT_SUBMITTED_MESSAGE = "not submitted; no runner verified"
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _JOB_ID_RE = re.compile(r"^[0-9]{1,12}$")
+_ID_RE = re.compile(r"^[0-9A-Za-z-]{8,64}$")  # uuid4 hex or dashed uuid
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _ARG_RE = re.compile(r"^[A-Za-z0-9._:=/+,@%-]+$")
 _SKIP_DIRS = frozenset({".git", "target", "node_modules", "__pycache__"})
 _CARGO_SUBCOMMANDS = frozenset({"check", "build", "test", "clippy", "nextest"})
@@ -174,6 +176,24 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _hash_regular_file(p: Path, base: Path) -> tuple[str, int]:
+    """Stream-hash a regular file opened with O_NOFOLLOW|O_NONBLOCK (never blocks on a FIFO)."""
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise StagingError(f"cannot stage {p.relative_to(base)}: {exc.strerror}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise StagingError(f"not a regular file in source tree: {p.relative_to(base)}")
+        h, size = hashlib.sha256(), 0
+        while chunk := os.read(fd, 1 << 20):
+            h.update(chunk)
+            size += len(chunk)
+        return h.hexdigest(), size
+    finally:
+        os.close(fd)
+
+
 def stage_manifest(root: str | os.PathLike[str], toolchain_fingerprint: str) -> StagingManifest:
     """Deterministic digest of the source tree (relative path + content) and toolchain."""
     base = Path(root)
@@ -187,9 +207,9 @@ def stage_manifest(root: str | os.PathLike[str], toolchain_fingerprint: str) -> 
                 raise StagingError(f"symlink in source tree: {p.relative_to(base)}")
         for name in sorted(filenames):
             p = Path(dirpath, name)
-            data = p.read_bytes()
-            total += len(data)
-            entries.append((p.relative_to(base).as_posix(), _sha(data)))
+            digest, size = _hash_regular_file(p, base)
+            total += size
+            entries.append((p.relative_to(base).as_posix(), digest))
             if len(entries) > _MAX_STAGE_FILES:
                 raise StagingError("source tree has too many files to stage")
     entries.sort()
@@ -199,11 +219,21 @@ def stage_manifest(root: str | os.PathLike[str], toolchain_fingerprint: str) -> 
 
 
 # --- ownership / fencing -------------------------------------------------------
+def _check_binding(b: LeaseBinding) -> None:
+    for label, v in (("build_id", b.build_id), ("attempt_id", b.attempt_id)):
+        if not isinstance(v, str) or not _ID_RE.fullmatch(v):
+            raise PlanError(f"{label} is not a plain id")
+    if not isinstance(b.epoch, int) or isinstance(b.epoch, bool) or b.epoch < 0:
+        raise PlanError("epoch must be a non-negative integer")
+
+
 def render_name(b: LeaseBinding) -> str:
+    _check_binding(b)
     return f"hbc-{b.build_id[:12]}-e{b.epoch}"
 
 
 def render_comment(b: LeaseBinding) -> str:
+    _check_binding(b)
     scope = _sha(b.scope.encode())[:12]
     return f"herdr-build-cache build={b.build_id} attempt={b.attempt_id} epoch={b.epoch} scope={scope}"
 
@@ -216,7 +246,11 @@ def fence_ok(b: LeaseBinding, lease_row: dict[str, Any] | None) -> bool:
 
 
 def cancel_target(b: LeaseBinding, job_comment: str, *, job_id: str) -> CancelTarget:
-    if not _JOB_ID_RE.match(job_id) or job_comment != render_comment(b):
+    try:
+        expected = render_comment(b)
+    except PlanError:
+        return CancelTarget(False)
+    if not _JOB_ID_RE.match(job_id) or job_comment != expected:
         return CancelTarget(False)
     return CancelTarget(True, job_id)
 
@@ -242,6 +276,11 @@ def decide_placement(cfg: BuildCacheConfig, runner: SlurmRunner, req: SubmitRequ
 
 # --- rendering (data only, never executed) --------------------------------------
 def _check_req(req: SubmitRequest) -> None:
+    _check_binding(req.binding)
+    for label, v in (("source_digest", req.manifest.source_digest),
+                     ("toolchain_digest", req.manifest.toolchain_digest)):
+        if not isinstance(v, str) or not _DIGEST_RE.fullmatch(v):
+            raise PlanError(f"{label} is not a sha256 hex digest")
     for label, v in (("partition", req.partition), ("account", req.account)):
         if not _NAME_RE.match(v or ""):
             raise PlanError(f"{label} {v!r} is not a plain name")
@@ -274,13 +313,21 @@ def build_sbatch(req: SubmitRequest) -> SbatchPlan:
     script = "\n".join([
         "#!/bin/bash",
         "set -euo pipefail",
-        f"# herdr build cache: build={b.build_id} attempt={b.attempt_id} epoch={b.epoch}",
-        f"# staged source sha256 {m.source_digest}",
-        f"# toolchain sha256 {m.toolchain_digest}",
+        "# herdr build cache: " + shlex.quote(
+            f"build={b.build_id} attempt={b.attempt_id} epoch={int(b.epoch)}"),
+        "# staged source sha256 " + shlex.quote(m.source_digest),
+        "# toolchain sha256 " + shlex.quote(m.toolchain_digest),
         "export CARGO_INCREMENTAL=0",
         "exec " + " ".join(shlex.quote(x) for x in req.argv),
         ""])
     return SbatchPlan(argv, script)
+
+
+def _digest_nofollow(p: Path) -> str | None:
+    try:
+        return _hash_regular_file(p, p.parent)[0]
+    except (StagingError, OSError):
+        return None
 
 
 # --- output validation -----------------------------------------------------------
@@ -318,9 +365,13 @@ def validate_outputs(out_dir: str | os.PathLike[str],
             problems.append(OutputProblem(rel, "missing"))
         elif st.st_size != art.size:
             problems.append(OutputProblem(rel, "size_mismatch"))
-        elif _sha(cur.read_bytes()) != art.sha256:
+        elif _digest_nofollow(cur) != art.sha256:
             problems.append(OutputProblem(rel, "digest_mismatch"))
-    for dirpath, _dirs, files in os.walk(root, followlinks=False):
+    for dirpath, dirs, files in os.walk(root, followlinks=False):
+        for d in dirs:  # a symlink to a directory is listed in dirs, not files
+            dp = Path(dirpath, d)
+            if stat.S_ISLNK(dp.lstat().st_mode):
+                problems.append(OutputProblem(dp.relative_to(root).as_posix(), "symlink"))
         for f in files:
             rel = Path(dirpath, f).relative_to(root).as_posix()
             if rel not in seen:
@@ -339,7 +390,10 @@ def preview(cfg: BuildCacheConfig, source_dir: str, partition: str | None,
         "binding": "placeholder (no registry lease acquired)",
         "decision": None, "sbatch_argv": None, "script": None, "error": None}
     try:
-        manifest = stage_manifest(source_dir, toolchain)
+        if cfg.slurm_runner_requested:
+            manifest = stage_manifest(source_dir, toolchain)
+        else:  # nothing will be staged: do not read the source tree at all
+            manifest = StagingManifest("0" * 64, _sha(toolchain.encode()), "0" * 64, 0, 0)
         req = SubmitRequest(
             binding=LeaseBinding("0" * 32, "0" * 32, source_dir, 0), manifest=manifest,
             partition=part, account=cfg.slurm.account or "unset", cpus=cfg.slurm.cpus,
@@ -353,7 +407,8 @@ def preview(cfg: BuildCacheConfig, source_dir: str, partition: str | None,
     d = decide_placement(cfg, NullRunner(), req, current_epoch=0)
     out["decision"] = {"use_slurm": d.use_slurm, "reason": d.reason.value if d.reason else None,
                        "fallback": d.fallback}
-    out["manifest"] = asdict(manifest)
+    if cfg.slurm_runner_requested:
+        out["manifest"] = asdict(manifest)
     try:
         plan = build_sbatch(req)
         out["sbatch_argv"], out["script"] = list(plan.argv), plan.script
