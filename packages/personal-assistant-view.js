@@ -59,7 +59,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   let graphState = { phase: 'loading' };
 
   const render = async () => {
-    container.innerHTML = skeleton('Personal Assistant');
+    container.innerHTML = skeleton('Personal Assistant', { rows: 5, height: 64 });   // sized to the page that replaces it
     try {
       const { assistants = [] } = await client.listAssistants();
       if (disposed) return;
