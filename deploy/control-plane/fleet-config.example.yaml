@@ -172,7 +172,7 @@ sections:
       #     worker_ttl_days: 90          # redeemed worker credential lifetime
       #     # tenant: default            # defaults to the assistant's default tenant
       #   # OPTIONAL: earned action grants for hub workers with the `act` scope (docs/operations/assistant-hub.md).
-      #   # Nothing is autonomous yet: activation answers 409 until the Phase 3 judge gate exists.
+      #   # Activation answers 409 until the judge below is enabled, confirmed and calibrated (Phase 3).
       #   grants:
       #     shadow_days: 14              # global shadow period before any grant can be activated or honoured
       #     shadow_started_at: null      # ISO-8601 with offset; null = stamped on first start
@@ -185,6 +185,26 @@ sections:
       #     grant_ttl_days: 30           # lifetime of a proposed grant, and of an active one from activation
       #     extra_vetoes: []             # extra hard denies: [{code: no_prod, reason: "...", argv_contains: "prod"}]
       #     policy_version: 1            # bump to invalidate every existing grant
+      #   # OPTIONAL: the action judge (Phase 3). It can only ADD friction: an active grant is honoured only when the
+      #   # judge answers AND does not escalate; unreachable/disabled => the owner decides. Register the key with
+      #   # `herdr-eng control-plane assistant-judge register --endpoint URL --key-file PATH --key-stdin` (stdin only).
+      #   # See docs/operations/assistant-hub.md ("Phase 3"). Inline secrets (api_key, key, token) are rejected.
+      #   judge:
+      #     enabled: false
+      #     provider: jev                # only "jev" (System One) exists
+      #     endpoint: ""                 # https URL of System One; http only for loopback. Required when enabled
+      #     model: laya-auto             # must appear in GET <endpoint>/v1/models; changing it resets every grant to shadow
+      #     api_key_file: ""             # absolute PATH only, never the key itself; 0600, owned by the service user
+      #     timeout_seconds: 5           # integer 1..60; budget on the authorize path (real Laya may need more; see docs)
+      #     fail_mode: closed            # only "closed": judge unavailable => pending
+      #     backend_confirmed: false     # set true ONLY after you verified a real model (not the mock) serves this
+      #     thresholds:                  # escalate when any answer reaches its threshold (changing them resets grants)
+      #       destructive: 0.30
+      #       irreversible: 0.30
+      #       severity_score: 2.0        # expected severity, 0 informational .. 3 critical
+      #     calibration:                 # the activation gate, evaluated per risk class
+      #       min_labeled_decisions: 200 # minimum 20
+      #       max_false_negative_bound: 0.05   # exclusive upper bound, 0 < x < 1
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)

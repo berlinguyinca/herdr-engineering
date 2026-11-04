@@ -117,3 +117,27 @@ def test_judge_version_ignores_endpoint_and_calibration_and_int_float() -> None:
     assert jv.judge_version(_judge(_on(endpoint="https://other.example.org"))) == v
     assert jv.judge_version({"model": "laya-auto", "thresholds": {"destructive": 0.3, "irreversible": 0.3,
                                                                   "severity_score": 2}}) == v
+
+
+def test_example_yaml_judge_block_parses_and_matches_the_defaults() -> None:
+    """Uncomment the judge block of deploy/control-plane/fleet-config.example.yaml and run it through the real parser."""
+    import re
+    from pathlib import Path
+
+    import yaml
+
+    text = (Path(__file__).resolve().parents[2] / "deploy/control-plane/fleet-config.example.yaml").read_text()
+    lines = text.splitlines()
+    start = next(i for i, ln in enumerate(lines) if re.fullmatch(r"\s*#   judge:", ln))
+    block: list[str] = []
+    for ln in lines[start:]:
+        m = re.fullmatch(r"      #(.*)", ln)
+        if m is None or (block and re.match(r"   \S", m.group(1))):
+            break
+        block.append(m.group(1)[3:] if m.group(1).startswith("   ") else m.group(1))
+    parsed = yaml.safe_load("\n".join(block))["judge"]
+    assert _judge(parsed) == _judge()                      # shipped example == code defaults
+    on = dict(parsed, enabled=True, endpoint="https://jev.example.org", api_key_file="/etc/herdr/jev.key")
+    assert _judge(on)["enabled"] is True                   # and it is valid once the operator fills the two paths
+    assert {"thresholds", "calibration", "backend_confirmed", "api_key_file"} <= set(parsed)
+    assert "api_key" not in parsed and "key" not in parsed
