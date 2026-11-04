@@ -124,13 +124,25 @@ def _send_json(handler, body: dict, status: int = 200) -> None:
     handler.wfile.write(payload)
 
 
+# The dashboard has no CSP, so a style element (url(), @import, CSS escapes) would make the owner's browser fetch
+# whatever URL the author names, LAN and loopback included. The sanitiser's output is canonical markup, so the
+# elements are cut out after the fact; a leftover opener (unclosed element) is defanged rather than trusted.
+_STYLE_ELEMENT = re.compile(r"<style\b[^>]*>.*?</style\s*>", re.I | re.S)
+_STYLE_TOKEN = re.compile(r"<(/?)style", re.I)
+
+
+def drop_style_elements(html: str) -> str:
+    """``html`` without any style element (the share ``a/`` view keeps them: it has its own CSP)."""
+    return _STYLE_TOKEN.sub(lambda m: "&lt;" + m.group(1) + "style", _STYLE_ELEMENT.sub("", html))
+
+
 def _envelope(kind: str, data: bytes, resolve: Resolver, cache_key) -> dict:
     """The render response body for ``data`` of ``kind``; raises the ``Render*`` errors."""
     if kind not in ("html", "text"):
         return {"kind": kind, "html": None, "too_large": False}
     if len(data) > MAX_RENDER_INPUT:
         return {"kind": kind, "html": None, "too_large": True}
-    html = sanitize_html(data, resolve=resolve, cache_key=cache_key) if kind == "html" else render_text(data)
+    html = drop_style_elements(sanitize_html(data, resolve=resolve, cache_key=cache_key)) if kind == "html" else render_text(data)
     return {"kind": kind, "html": html, "too_large": False}
 
 

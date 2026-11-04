@@ -112,6 +112,7 @@ def world():
         {"name": "style.css", "media_type": "text/css", **blobs.add(sheet)},
     ]
     store.blobs = blobs
+    store.acl = acl
     store.outputs[("h1", "v2")] = []
     try:
         yield f"http://127.0.0.1:{server.port}", store
@@ -290,3 +291,29 @@ def test_dead_store_connection_is_a_fixed_503_without_driver_text(world):
         status, body, headers = get(base, path)
         assert status == 503, path
         assert json.loads(body) == UNAVAILABLE and b"secret_db_user" not in body and b"password" not in body
+
+
+STYLE_PAYLOADS = [
+    b"<p>keep</p><style>@import 'http://192.168.1.1/reboot'; p{color:red}</style>",
+    b"<p>keep</p><style>p{background:url(http://127.0.0.1:9/x)}</style>",
+    b"<p>keep</p><style>p{background:u\\72l(http://127.0.0.1:9/x)}</style>",
+    b"<p>keep</p><STYLE type=text/css>@\\69mport url(//evil.example/a.css)</STYLE >",
+    b"<p>keep</p><svg><style>p{background:url(http://127.0.0.1:9/x)}</style></svg>",
+    b"<p>keep</p><style>a{}</style><style>b{background:url(http://127.0.0.1:9/x)}",
+]
+
+
+@pytest.mark.parametrize("payload", STYLE_PAYLOADS)
+def test_dashboard_render_drops_every_style_element(world, payload):
+    """No dashboard CSP exists, so a style body (url(), @import, escapes) would let the author make the owner's browser
+    fetch LAN or loopback URLs. The dashboard path keeps no style at all."""
+    base, store = world
+    store.add("s1", "s.html", "text/html", payload)
+    store.acl.grant("s1", f"api-key:{OWNER}:operator", {"read"})
+    for path in ("/api/v1/artifacts/s1/render",):
+        status, body, _ = envelope(base, path)
+        assert status == 200
+        html = body["html"].lower()
+        assert "keep" in html
+        for bad in ("<style", "</style", "@import", "url(", "\\72", "\\69", "127.0.0.1", "192.168", "evil.example"):
+            assert bad not in html, (bad, html)
