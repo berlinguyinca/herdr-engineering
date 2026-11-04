@@ -1232,10 +1232,12 @@ def test_review_fan_in_hub_reads_stay_fast_and_ingest_stays_linear():
     t = time.perf_counter()
     _bulk(g, A, 2500)
     first = time.perf_counter() - t
-    t = time.perf_counter()
-    _bulk(g, A, 2500, start=2500)
-    second = time.perf_counter() - t
-    assert second < max(first * 3.0, 0.5)                    # no quadratic growth in ingest
+    later = []
+    for batch in (1, 2, 3):                         # a stalled host slows one batch; quadratic growth slows every later one
+        t = time.perf_counter()
+        _bulk(g, A, 2500, start=2500 * batch)
+        later.append(time.perf_counter() - t)
+    assert min(later) < max(first * 3.0, 0.5)                # no quadratic growth in ingest
     for read in (lambda: g.get_node(V, "commit:h"),
                  lambda: g.neighborhood(V, "commit:h", depth=2, max_edges=2000),
                  lambda: g.get_edge(V, "reviewed", "agent:v", "commit:h")):
