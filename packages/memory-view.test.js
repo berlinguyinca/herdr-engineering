@@ -118,3 +118,16 @@ test('mount: 503 shows the unavailable state, never stale results', async () => 
   assert.match(nodes['[data-mem-status]'].innerHTML, /UNKNOWN/);
   assert.ok(handlers.keydown);
 });
+
+// failing-first: the chip is red only for a real failure; the service's own answers (403/404/503) are shown calmly on the page.
+for (const [status, red] of [[403, false], [404, false], [503, false], [500, true], [undefined, true]]) {
+  test(`mount: status ${status} ${red ? 'turns' : 'does not turn'} the freshness chip red`, async () => {
+    const fail = () => { throw Object.assign(new Error('x'), { status }); };
+    const client = { async exploreMemory() { fail(); }, async getMemoryServiceStatus() { fail(); }, async getMemoryRecord() { return {}; } };
+    const { root } = fakeRoot();
+    const reports = [];
+    mountMemory(root, client, { query: new URLSearchParams(''), freshness: (ok) => reports.push(ok) });
+    await tick();
+    assert.deepEqual(reports, [!red]);
+  });
+}

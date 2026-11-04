@@ -13,8 +13,6 @@ import plistlib
 import subprocess
 from pathlib import Path
 
-import pytest
-
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "fleet-auto-update-macos.sh"
 LABEL = "com.herdr-engineering.test-fleet-auto-update"
@@ -89,6 +87,28 @@ def test_install_without_load_writes_the_agent_and_keeps_the_previous_copy(tmp_p
     backups = list(path.parent.glob(f"{LABEL}.plist.bak-*"))
     assert len(backups) == 1
     assert plistlib.loads(backups[0].read_bytes())["Label"] == LABEL
+
+
+def test_the_ownership_check_works_where_plutil_does_not_exist(tmp_path):
+    """The guard used `plutil` to read the Label, and `plutil` exists only on macOS.
+
+    On Linux it read nothing, treated the agent this script owns as somebody else's, and refused the
+    second install - the single failure that turned the unit gate red for #583, because the suite runs
+    on Linux (#588 landed the `plistlib` fallback). A `plutil` that always exits 127 stands in for its
+    absence, so the fallback - the only code that runs on Linux - is exercised on macOS too, where a
+    working `plutil` would otherwise hide it.
+    """
+    environment = env(tmp_path)
+    no_plutil = tmp_path / "no-plutil"
+    no_plutil.mkdir()
+    stub = no_plutil / "plutil"
+    stub.write_text("#!/bin/sh\nexit 127\n")
+    stub.chmod(0o755)
+    environment["PATH"] = f"{no_plutil}:{environment['PATH']}"
+
+    assert run(environment, "install", "--no-load").returncode == 0
+    second = run(environment, "install", "--no-load")
+    assert second.returncode == 0, second.stderr
 
 
 def test_install_refuses_to_overwrite_someone_elses_agent(tmp_path):

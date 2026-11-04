@@ -1,6 +1,7 @@
 """Approval-gated Google writes: a Gmail DRAFT and a Calendar event, never anything that delivers mail."""
 import base64
 import email
+import io
 import json
 import os
 import urllib.error
@@ -43,7 +44,9 @@ class WritableGoogle(Google):
             for needle, code in self.fail.items():
                 if needle in url:
                     self.requests.append((method, url, req.get_header("Authorization"), req.data))
-                    raise urllib.error.HTTPError(url, code, "x", {}, None)
+                    code, reason = code if isinstance(code, tuple) else (code, "")
+                    body = io.BytesIO(json.dumps({"error": {"errors": [{"reason": reason}]}}).encode()) if reason else None
+                    raise urllib.error.HTTPError(url, code, "x", {}, body)
         if url != gw.TOKEN_URL and path.endswith("/messages/send") and method == "POST":
             self.requests.append((method, url, req.get_header("Authorization"), req.data))
             return Resp({"id": "sent1", "threadId": "t9"})
@@ -384,11 +387,11 @@ def test_no_card_for_invalid_content_on_the_direct_tool_route_or_dry_run(store):
 
 def test_a_connection_without_write_scopes_maps_403_to_reconnect_needed(store):
     w, g = make(store)
-    g.fail["/drafts"] = 403
+    g.fail["/drafts"] = (403, "insufficientPermissions")
     with pytest.raises(gw.GoogleError) as exc:
         w.create_draft("t", "key:u1", **DRAFT)
     assert exc.value.reason == "reconnect_needed"
-    g.fail = {"/events": 403}
+    g.fail = {"/events": (403, "insufficientPermissions")}
     with pytest.raises(gw.GoogleError) as exc:
         w.create_event("t", "key:u1", **EVENT)
     assert exc.value.reason == "reconnect_needed"
@@ -401,7 +404,7 @@ def test_a_connection_without_write_scopes_maps_403_to_reconnect_needed(store):
 
 
 def test_drafts_api_reports_reconnect_needed_as_409(connected):
-    connected.google_fake.fail["/drafts/"] = 403
+    connected.google_fake.fail["/drafts/"] = (403, "insufficientPermissions")
     assert call(connected, BASE + "/google/drafts/r-1", None, "DELETE") == (409, {"error": "reconnect_needed"})
 
 
@@ -447,3 +450,31 @@ def test_a_wrong_key_file_gives_409_not_set_up_on_the_drafts_and_calendars_route
     assert call(connected, BASE + "/google/drafts") == (409, {"error": "not_set_up"})
     assert call(connected, BASE + "/google/drafts/r-1", None, "DELETE") == (409, {"error": "not_set_up"})
     assert call(connected, BASE + "/google/calendars") == (409, {"error": "not_set_up"})
+
+
+def test_a_403_that_is_not_about_scope_stays_forbidden(store):
+    w, g = make(store)
+    for body_reason in ("", "rateLimitExceeded", "forbiddenForServiceAccounts"):
+        g.fail = {"/drafts": (403, body_reason) if body_reason else 403}
+        with pytest.raises(gw.GoogleError) as exc:
+            w.create_draft("t", "key:u1", **DRAFT)
+        assert exc.value.reason == "forbidden"
+
+
+def test_lone_surrogate_body_is_refused_before_any_request(store):
+    w, g = make(store)
+    with pytest.raises(gw.GoogleError):
+        w.create_draft("t", "key:u1", **{**DRAFT, "body": "hello \ud800 there"})
+    with pytest.raises(gw.GoogleError):
+        gw.validate_write("create_email_draft", {**DRAFT, "body": "x\udc00"})
+    assert g.requests == []
+
+
+def test_zwj_and_zwnj_are_allowed_in_subjects_but_other_format_chars_are_not(store):
+    w, _ = make(store)
+    assert w.create_draft("t", "key:u1", **{**DRAFT, "subject": "family \U0001F468\u200d\U0001F469 \u200c ok"}) == {"id": "r-new"}
+    for bad in ("\u202e", "\u2066", "\ufeff", "\u200b"):
+        with pytest.raises(gw.GoogleError):
+            w.create_draft("t", "key:u1", **{**DRAFT, "subject": f"a{bad}b"})
+    with pytest.raises(gw.GoogleError):
+        w.create_event("t", "key:u1", **{**EVENT, "summary": "a\u200db"})       # only subjects relax the rule

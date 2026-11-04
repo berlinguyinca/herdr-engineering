@@ -834,6 +834,11 @@ export class HerdrClient {
     return this.request('/api/v1/reviews', { signal });
   }
 
+  // Every open review, not limited to the newest page: a long-waiting review is the one that page drops.
+  listWaitingReviews({ signal } = {}) {
+    return this.request('/api/v1/reviews?needs_decision=1', { signal });
+  }
+
   getTests() {
     return this.request('/api/v1/tests');
   }
