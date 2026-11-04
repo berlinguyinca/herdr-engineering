@@ -317,3 +317,42 @@ def test_run_update_refuses_to_update_the_checkout_it_imported(checkout, monkeyp
     update.assert_not_called()
     # Refused before any work: no lock file, no state recorded as a fleet change.
     assert not (tmp_path / "state" / "herdr-engineering" / "fleet-auto-update.lock").exists()
+
+
+def test_a_parity_failure_records_which_host_failed(checkout, capsys, monkeypatch):
+    """`unattended update failed: None` told the operator nothing.
+
+    The 2026-11-04 run on bender deployed to all three hosts (`fleet_sync` rc 0, status rc 0) and
+    failed only the parity check on one host's agent state. That report has no `error` key, so the
+    recorded reason was null and `herdr-eng memory doctor` printed `unattended update failed: None`.
+    """
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    report = {
+        "ok": False,
+        "revision": "3c1946abd8b6c6a89390257fe88d88d23520992b",
+        "steps": {
+            "fleet_sync": {"ok": True, "rc": 0},
+            "revision_parity": {"ok": False, "invalid_hosts": ["mac"], "mismatched_hosts": []},
+        },
+    }
+    with patch.object(fleet_autoupdate, "fleet_update", return_value=report):
+        assert fleet_autoupdate.main() == 1
+    capsys.readouterr()
+
+    state = fleet_autoupdate.read_state()
+    assert state["outcome"] == "failed"
+    assert state["reason"] is not None, "a failure must never record a null reason"
+    assert "mac" in state["reason"]
+    assert state["revision"] == report["revision"]
+
+
+def test_a_failure_with_no_detail_at_all_still_says_so(checkout, capsys, monkeypatch):
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": False}):
+        assert fleet_autoupdate.main() == 1
+    capsys.readouterr()
+    assert fleet_autoupdate.read_state()["reason"] == "fleet update failed without reporting a reason"
