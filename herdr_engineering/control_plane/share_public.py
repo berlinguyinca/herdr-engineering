@@ -147,6 +147,7 @@ SESSION_GLOBAL_PER_MINUTE = 600     # verified session attempts across all lab s
 STATIC_MAX_BYTES = 1024 * 1024
 VENDOR_MAX_BYTES = 4 * 1024 * 1024   # the vendored pdf.js worker is ~1.4 MB
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parent / "share_static"
+SHARED_BY_MAX = 120      # ``state.json`` ``shared_by``: the creator's display name on a member-created link (artifact_share_api)
 VIEWER_FILE = "viewer.html"
 STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8",
                 "annotate.js": "text/javascript; charset=utf-8", "anchor.js": "text/javascript; charset=utf-8",
@@ -172,7 +173,7 @@ _RANGE_SPEC = re.compile(r"(\d{0,19})-(\d{0,19})")
 _SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,768}")
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,6}")
-_VIEW_PLACEHOLDER = re.compile(r"\{\{(NONCE|MODE|CSRF_META|SWITCH|DATA_JSON|PANEL|CONTENT)\}\}")
+_VIEW_PLACEHOLDER = re.compile(r"\{\{(NONCE|MODE|CSRF_META|SWITCH|DATA_JSON|PANEL|CONTENT|BANNER)\}\}")
 
 _CSP_TEMPLATE = ("sandbox allow-scripts allow-downloads; default-src {self}; script-src {self} 'unsafe-inline' "
                  "'wasm-unsafe-eval'; style-src {self} 'unsafe-inline'; img-src {self} data: blob:; font-src {self} data:; "
@@ -567,6 +568,9 @@ def _prepare(raw: dict) -> _Prepared:
         return bad("invalid_state")
     if entry not in index:
         return bad("invalid_state")
+    shared_by = raw.get("shared_by")
+    if "shared_by" in raw and (not isinstance(shared_by, str) or not shared_by or len(shared_by) > SHARED_BY_MAX):
+        return bad("invalid_state")       # the banner name is ours to bound: a bad one fails closed like any bad state
     state = ShareState(raw)
     state["entry"] = entry
     state.index = index
@@ -1277,8 +1281,11 @@ class ShareHandler(BaseHTTPRequestHandler):
             token = csrf_token(lab.secret, state["share_id"], parts[4])
             csrf = f'<meta name="herdr-annotate-csrf" content="{html.escape(token)}">'
             panel = '<aside data-annotate-panel aria-label="Annotations"></aside>'
+        shared_by = state.get("shared_by")
+        banner = (f'<aside class="herdr-shared-by" role="note">Shared by {html.escape(shared_by)} \u2014 content was not '
+                  'reviewed by the operator</aside>') if isinstance(shared_by, str) else ""
         values = {
-            "NONCE": nonce, "MODE": mode, "CSRF_META": csrf, "PANEL": panel,
+            "BANNER": banner, "NONCE": nonce, "MODE": mode, "CSRF_META": csrf, "PANEL": panel,
             "SWITCH": '<nav data-mode-switch aria-label="View mode">' + "".join(links) + "</nav>",
             "DATA_JSON": f'<script type="application/json" id="herdr-view-data" nonce="{nonce}">{data_json}</script>',
             "CONTENT": content}
@@ -1542,7 +1549,7 @@ class ShareServer(ThreadingHTTPServer):
         text = (static / VIEW_FILE).read_text(encoding="utf-8") if (static / VIEW_FILE).is_file() else ""
         found = [m.group(1) for m in _VIEW_PLACEHOLDER.finditer(text)]
         if self.lab is not None and sorted(found) != sorted(["NONCE", "MODE", "CSRF_META", "SWITCH", "DATA_JSON",
-                                                              "PANEL", "CONTENT"]):
+                                                              "PANEL", "CONTENT", "BANNER"]):
             raise RuntimeError("share_static/view.html must hold each placeholder exactly once")
         return text
 

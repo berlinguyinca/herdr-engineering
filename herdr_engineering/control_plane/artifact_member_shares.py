@@ -209,8 +209,11 @@ async def handle_share_approve(ctx: IntentContext, intent: Intent) -> dict:
         return await _refuse(ctx, who, "share_approve", "not_pending", intent, share_id=share_id,
                              audience=share["audience"])
     await asyncio.to_thread(sweep_secrets, rt)
+    directory = await asyncio.to_thread(load_directory, rt) or {}       # a stale directory only costs the display name
+    name = (directory.get(who.principal[len("member:"):]) or {}).get("display_name")
     try:
-        url, summary = await asyncio.to_thread(approve_share, _Server(ctx, rt), share, approved_by=who.principal)
+        url, summary = await asyncio.to_thread(approve_share, _Server(ctx, rt), share, approved_by=who.principal,
+                                               shared_by_name=name)
     except ShareHTTPError as exc:
         # mark_live's own refusals (404, 410) are audited by the store; the rest are ours to record
         return await _refuse(ctx, who, "share_approve", _http_reason(exc) if exc.status != 410 else "expired", intent,

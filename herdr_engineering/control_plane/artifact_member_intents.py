@@ -300,6 +300,8 @@ def load_directory(rt: MemberRuntime) -> dict[str, dict[str, Any]] | None:
         groups = entry.get("groups")
         out[user_id] = {"status": entry.get("status"),
                         "groups": groups if isinstance(groups, list) else [rt.group]}
+        if isinstance(entry.get("display_name"), str):
+            out[user_id]["display_name"] = entry["display_name"]
         if isinstance(entry.get("email"), str):
             out[user_id]["email"] = entry["email"]
         if "removed_since" in entry:

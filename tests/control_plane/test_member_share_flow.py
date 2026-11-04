@@ -43,7 +43,7 @@ from tests.control_plane.test_collab_intents import Clock, run, settle, sql
 
 PUBLIC_URL = "https://share.example.org"
 DIRECTORY = {
-    "alice": {"status": "approved", "email": "Alice@Lab.example.org"},
+    "alice": {"status": "approved", "email": "Alice@Lab.example.org", "display_name": "Alice <i>A</i>"},
     "bob": {"status": "approved", "email": "bob@lab.example.org"},
     "carol": {"status": "approved", "email": "carol@lab.example.org", "groups": ["other-group"]},
     "dave": {"status": "disabled", "email": "dave@lab.example.org"},
@@ -587,3 +587,19 @@ def test_a_repeated_approve_with_the_same_idempotency_key_is_already_approved(re
 def r1_ticket_name(env):
     (only,) = [p.name for p in (env.outbox / SECRETS_DIR).iterdir()]
     return only
+
+
+def _states(tmp_path):
+    return [json.loads(p.read_text()) for p in (tmp_path / "shares").glob("by-token/*/state.json")]
+
+
+def test_approved_member_link_records_the_directory_display_name_or_the_user_id(registry_pg, tmp_path):
+    async def body(env, rt):
+        for who, owner, expected in ((user("alice"), ALICE, "Alice <i>A</i>"), (user("bob"), BOB, "bob")):
+            aid, vid = await published(env, who, owner=owner)
+            out = await share(env, who, aid, vid, expires_in_days=7)
+            _, done = await approve(env, who, aid, out["share_id"])
+            assert done["result"] == "live", done
+            (state,) = [s for s in _states(tmp_path) if s["share_id"] == out["share_id"]]
+            assert state["shared_by"] == expected
+    srun(registry_pg, tmp_path, body)

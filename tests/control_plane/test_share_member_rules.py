@@ -481,3 +481,45 @@ def test_create_route_member_public_share_works_and_maps_errors(aenv):
     with pytest.raises(ShareError) as exc:       # bob has no grant on alice's artifact
         _create(Handler("member:bob", {"version_id": "v_html", "audience": "public"}), env.server, AID)
     assert exc.value.code == "not_found"
+
+
+# ------------------------------------------------------------------------------------- "Shared by" label (Task 8)
+
+
+def stored_state(env, row):
+    paths = list(env.root.glob("by-token/*/state.json"))
+    docs = [json.loads(p.read_text()) for p in paths]
+    return next(d for d in docs if d["share_id"] == row["share_id"])
+
+
+@pytest.mark.parametrize("audience", ["public", "lab"])
+def test_member_approve_writes_shared_by(aenv, audience):
+    env = aenv()
+    extra = ({"allow_emails": ["a@x.org"], "member_groups": frozenset({"lab"}), "member_emails": frozenset({"a@x.org"})}
+             if audience == "lab" else {})
+    row = env.create("member:alice", audience=audience, **extra)
+    approve_share(env.server, env.adapter("get", row["share_id"]), approved_by="member:alice",
+                  shared_by_name="Alice <b>Example</b>")
+    assert stored_state(env, row)["shared_by"] == "Alice <b>Example</b>"       # stored raw; escaped when rendered
+
+
+def test_member_without_a_display_name_falls_back_to_the_user_id(aenv):
+    env = aenv()
+    row = env.create("member:alice")
+    env.approve(row, "member:alice")
+    assert stored_state(env, row)["shared_by"] == "alice"
+
+
+def test_shared_by_is_cut_to_120_chars_and_control_chars_dropped(aenv):
+    env = aenv()
+    row = env.create("member:alice")
+    approve_share(env.server, env.adapter("get", row["share_id"]), approved_by="member:alice",
+                  shared_by_name="\n" + "z" * 300)
+    assert stored_state(env, row)["shared_by"] == "z" * 120
+
+
+def test_operator_links_get_no_shared_by_even_on_a_member_owned_artifact(aenv):
+    env = aenv()                                  # the artifact is owned by member:alice
+    row = env.create(OPERATOR)
+    approve_share(env.server, env.adapter("get", row["share_id"]), approved_by=OPERATOR, shared_by_name="Alice")
+    assert "shared_by" not in stored_state(env, row)

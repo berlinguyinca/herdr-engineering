@@ -38,6 +38,7 @@ from .share_bundle import (
     remove_state,
     write_state,
 )
+from .share_public import SHARED_BY_MAX
 
 DEFAULTS = {"max_share_bytes": 512 * 1024 * 1024, "max_files": 20000, "max_total_bytes": 2 * 1024 * 1024 * 1024,
             "default_public_days": 30}
@@ -261,8 +262,19 @@ def _get_share(server, artifact_id: str, share_id: str) -> dict:
 # ------------------------------------------------------------------------------------------------ approve
 
 
-def approve_share(server, share: dict, *, approved_by: str | None = None) -> tuple[str, dict]:
+def _shared_by(creator: str, name: str | None) -> str:
+    """The banner name of a member-created link: ``name`` when it is a non-blank string, else the user id."""
+    text = name if isinstance(name, str) else ""
+    text = "".join(ch for ch in text if ch.isprintable()).strip()
+    return (text or creator[len("member:"):])[:SHARED_BY_MAX] or "a member"
+
+
+def approve_share(server, share: dict, *, approved_by: str | None = None,
+                  shared_by_name: str | None = None) -> tuple[str, dict]:
     """Build the frozen bundle for a pending ``share``, publish its state and mark it live; returns ``(url, summary)``.
+
+    A share created by a member (``member:<id>``) gets ``shared_by`` in its state: ``shared_by_name`` (the directory's
+    display name) else the user id, control characters dropped and cut to ``SHARED_BY_MAX``. Operator links get no field.
 
     Order: validate -> scope check -> measure -> build bundle -> total cap -> write state.json -> mark live. On any
     failure the state file and bundle this call wrote are removed and the share stays pending. Between write_state and
@@ -307,8 +319,9 @@ def approve_share(server, share: dict, *, approved_by: str | None = None) -> tup
             built = True
             over_total(index.total_bytes)
             token, token_hash = new_token()
+            extra = {"shared_by": _shared_by(creator, shared_by_name)} if member else {}
             write_state(root, token_hash, {
-                "share_id": share_id, "audience": share["audience"], "state": "live",
+                **extra, "share_id": share_id, "audience": share["audience"], "state": "live",
                 "expires_at": _jsonable(expires_at), "allow_emails": list(share.get("allow_emails") or []),
                 "allow_groups": list(share.get("allow_groups") or []), "entry": index.entry, "title": share.get("title"),
                 "files": [{"name": f.name, "sha256": f.sha256, "size": f.size, "content_type": f.content_type}
