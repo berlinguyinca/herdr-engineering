@@ -46,6 +46,7 @@ from urllib.parse import urlsplit
 
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.events import WorkerEvent, event_size
+from .assistant_hub.shadow import JudgeRecord
 from .assistant_hub.verbs import Verb
 from .assistant_hub.vetoes import FIXED_VETOES
 from .assistant_hub.workers import Enrollment, Worker
@@ -1892,6 +1893,8 @@ class AssistantStore:
         self.action_grants: dict[str, ActionGrant] = {}
         self.action_requests: dict[str, ActionRequestRow] = {}      # insertion order == oldest first
         self.action_evidence: dict[str, ActionEvidence] = {}        # insertion order == oldest first
+        self.judge_records: dict[str, JudgeRecord] = {}             # insertion order == oldest first
+        self._judge_index: dict[str, dict[str, None]] = {}
         self.max_action_rows_per_tenant = 5000
         self.max_action_grants_per_tenant = 2000
         self._request_index: dict[str, dict[str, None]] = {}        # tenant -> request ids, oldest first
@@ -1965,6 +1968,7 @@ class AssistantStore:
                 "action_grants": [self._e_to_dict(x) for x in self.action_grants.values()],
                 "action_requests": [self._e_to_dict(x) for x in self.action_requests.values()],
                 "action_evidence": [self._e_to_dict(x) for x in self.action_evidence.values()],
+                "judge_records": [self._e_to_dict(x) for x in self.judge_records.values()],
                 "policy_state": dict(self.policy_state),
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
@@ -2014,14 +2018,19 @@ class AssistantStore:
                                     (self._e_from_dict(ActionRequestRow, d) for d in snap.get("action_requests", []))}
             self.action_evidence = {x.evidence_id: x for x in
                                     (self._e_from_dict(ActionEvidence, d) for d in snap.get("action_evidence", []))}
-            self._request_index, self._evidence_index = {}, {}
+            self.judge_records = {x.record_id: x for x in
+                                  (self._e_from_dict(JudgeRecord, d) for d in snap.get("judge_records", []))}
+            self._request_index, self._evidence_index, self._judge_index = {}, {}, {}
+            for j in self.judge_records.values():
+                self._judge_index.setdefault(j.tenant_id, {})[j.record_id] = None
             for r in self.action_requests.values():
                 self._request_index.setdefault(r.tenant_id, {})[r.request_id] = None
             for ev in self.action_evidence.values():
                 self._evidence_index.setdefault(ev.tenant_id, {})[ev.evidence_id] = None
             self.policy_state = dict(snap.get("policy_state", {}))
             for rows, index in ((self.action_requests, self._request_index),
-                                (self.action_evidence, self._evidence_index)):
+                                (self.action_evidence, self._evidence_index),
+                                (self.judge_records, self._judge_index)):
                 for idx in index.values():           # an oversized snapshot must not stay over the cap
                     while len(idx) > self.max_action_rows_per_tenant:
                         rows.pop(next(iter(idx)), None)
@@ -2118,6 +2127,63 @@ class AssistantStore:
             return self._sorted_copies([e for e in self.action_evidence.values()
                                         if e.tenant_id == tenant_id and e.user_id == user_id
                                         and (key_id is None or e.key_id == key_id)])
+
+    # -- shadow judge records ----------------------------------------------------
+    def add_judge_record(self, record: JudgeRecord) -> bool:
+        """Store a record; exactly one per (tenant, request). False when the request already has one."""
+        with self._lock:
+            if self._judge_by_request(record.tenant_id, record.user_id, record.request_id) is not None:
+                return False
+            self._bounded_put(self.judge_records, self._judge_index, record.tenant_id, record.record_id,
+                              replace(record))
+            self._after_mutation()
+            return True
+
+    def _judge_by_request(self, tenant_id: str, user_id: str, request_id: str) -> JudgeRecord | None:
+        for rid in self._judge_index.get(tenant_id, {}):
+            r = self.judge_records.get(rid)
+            if r is not None and r.request_id == request_id and r.user_id == user_id:
+                return r
+        return None
+
+    def get_judge_record_by_request(self, tenant_id: str, user_id: str, request_id: str) -> JudgeRecord | None:
+        with self._lock:
+            r = self._judge_by_request(tenant_id, user_id, request_id)
+            return replace(r) if r else None
+
+    _JUDGE_LABEL_FIELDS = frozenset({"owner_decision", "decided_at", "regret", "label_note"})
+
+    def update_judge_label(self, tenant_id: str, user_id: str, request_id: str, /, **changes: Any) -> bool:
+        """Set owner-label fields on the request's record; False (and no change) when there is none."""
+        bad = set(changes) - self._JUDGE_LABEL_FIELDS
+        if bad:
+            raise ValueError(f"not a judge label field: {sorted(bad)}")
+        with self._lock:
+            r = self._judge_by_request(tenant_id, user_id, request_id)
+            if r is None:
+                return False
+            for name, value in changes.items():
+                setattr(r, name, value)
+            self._after_mutation()
+            return True
+
+    def mark_judge_regret(self, tenant_id: str, key_id: str, worker_id: str, *, user_id: str | None = None) -> int:
+        with self._lock:
+            hit = [self.judge_records[rid] for rid in self._judge_index.get(tenant_id, {})
+                   if rid in self.judge_records and self.judge_records[rid].key_id == key_id
+                   and self.judge_records[rid].worker_id == worker_id
+                   and (user_id is None or self.judge_records[rid].user_id == user_id)]
+            for r in hit:
+                r.regret = True
+            if hit:
+                self._after_mutation()
+            return len(hit)
+
+    def list_judge_records(self, tenant_id: str, user_id: str, judge_version: str | None = None) -> list[JudgeRecord]:
+        with self._lock:
+            return self._sorted_copies([r for r in self.judge_records.values()
+                                        if r.tenant_id == tenant_id and r.user_id == user_id
+                                        and (judge_version is None or r.judge_version == judge_version)])
 
     def ensure_shadow_started(self, now: datetime, configured: datetime | None = None) -> datetime:
         """The shadow period's start: the configured time if set, else the first time seen (persisted)."""
