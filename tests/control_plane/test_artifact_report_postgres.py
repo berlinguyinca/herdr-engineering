@@ -53,7 +53,7 @@ def report_postgres():
 
         def start():
             subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-l", str(area / "server.log"),
-                            "-o", f"-c listen_addresses='' -k {area}", "-w", "start"],
+                            "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap", "-w", "start"],
                            check=True, capture_output=True)
 
         def stop():
