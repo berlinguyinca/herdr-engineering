@@ -1,0 +1,12 @@
+  Mode: manual (run 'ai-sync env reset' to re-enable auto-detect)
+
+  claude       Claude Code      enabled
+              Config: /HOME/.claude
+  codex        Codex            disabled
+              Config: /HOME/.codex
+  opencode     OpenCode         disabled
+              Config: /HOME/.config/opencode
+  antigravity  Antigravity      disabled
+              Config: /HOME/.antigravity
+  pi           Pi               enabled
+              Config: /HOME/.pi/agent
