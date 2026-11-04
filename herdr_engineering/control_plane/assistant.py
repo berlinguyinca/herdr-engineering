@@ -48,6 +48,7 @@ from . import placement, slurm_placement
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
+from .external_actions import EXTERNAL_KINDS, ExternalActionService, external_actions_config
 from .assistant_hub.verbs import Verb
 from .assistant_hub.vetoes import FIXED_VETOES
 from .assistant_hub.workers import Enrollment, Worker
@@ -363,6 +364,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "inbox_watch": inbox_watch_config(section.get("inbox_watch")),
         # Team collaboration slice 4 (assistant_briefs.py): derived briefs to a team; off unless enabled; no key skips approval.
         "team_briefs": team_briefs_config(section.get("team_briefs")),
+        # Team collaboration slice 5 (external_actions.py): approval-gated GitHub issue / Gmail draft; off unless enabled.
+        "external_actions": external_actions_config(section.get("external_actions")),
         # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
         "apps": apps_config(section.get("apps")),
         # Tailnet-only MCP hub: off unless enabled; the tenant defaults to the section's default tenant.
@@ -2556,6 +2559,20 @@ class AssistantStore:
              if c.tenant_id == tenant_id and c.user_id == user_id],
             key=lambda c: c.created_at)
 
+    def put_proposal_required(self, x: AssistantProposal) -> None:
+        """Store one proposal and acknowledge durable persistence, or raise (and leave the store as it was). External actions record
+        their intent through this BEFORE the provider is called, so a crash can lose a result but never the intent."""
+        with self._lock:
+            previous = self.proposals.get(x.proposal_id)
+            self.proposals[x.proposal_id] = x
+            try:
+                self._persist_required()
+            except Exception:
+                if previous is None:
+                    self.proposals.pop(x.proposal_id, None)
+                # an existing proposal was mutated in place by the caller, which restores its own fields
+                raise
+
     # -- delegations ---------------------------------------------------------------
     def put_team_brief_required(self, rec: TeamBriefRecord) -> None:
         """Store one brief record and acknowledge durable persistence, or raise (and leave the store as it was). The collab log
@@ -2787,6 +2804,11 @@ class AssistantService:
         if self.config["team_briefs"]["enabled"] and not self.store.supports_required_persistence:
             raise ValueError("control_plane.personal_assistant.team_briefs requires acknowledged assistant persistence "
                              "(personal_assistant.persistence.dsn): the brief reference must survive a restart")
+        # Team collaboration slice 5. The provider clients and the collaboration hooks are wired by the control plane.
+        self.external_actions = ExternalActionService(self)
+        if self.config["external_actions"]["enabled"] and not self.store.supports_required_persistence:
+            raise ValueError("control_plane.personal_assistant.external_actions requires acknowledged assistant persistence "
+                             "(personal_assistant.persistence.dsn): the intent must be durable before anything leaves")
         if runner is not None:
             self.runner = runner
         else:
@@ -3739,7 +3761,8 @@ class AssistantService:
         to what was approved. Exactly one caller claims it; a replay returns the recorded result."""
         self._require_enabled()
         x = self.store.proposals.get(proposal_id)
-        if x is None or x.tenant_id != tenant_id or not (x.user_id == user_id or self._is_approver(user_id)):
+        if x is None or x.tenant_id != tenant_id or not (
+                x.user_id == user_id or (self._is_approver(user_id) and x.kind not in EXTERNAL_KINDS)):
             raise AssistantNotFound("proposal not found")
 
         def refuse(message: str, exc: type[AssistantError] = AssistantForbidden):
@@ -3822,7 +3845,8 @@ class AssistantService:
         """What executing this proposal WOULD do. No side effect, no state change."""
         self._require_enabled()
         x = self.store.proposals.get(proposal_id)
-        if x is None or x.tenant_id != tenant_id or not (x.user_id == user_id or self._is_approver(user_id)):
+        if x is None or x.tenant_id != tenant_id or not (
+                x.user_id == user_id or (self._is_approver(user_id) and x.kind not in EXTERNAL_KINDS)):
             raise AssistantNotFound("proposal not found")
         p = x.payload
         what = (f"Queue a branch-creation request for {p.get('repo', '')} titled '{p.get('title', '')}' with the "
@@ -4886,7 +4910,7 @@ class AssistantService:
         now = self.now()
         out = []
         for x in self.store.proposals.values():
-            if x.tenant_id != tenant_id or not (x.user_id == user_id or self._is_approver(user_id)):
+            if x.tenant_id != tenant_id or not (x.user_id == user_id or (self._is_approver(user_id) and x.kind not in EXTERNAL_KINDS)):
                 continue
             if x.status == "awaiting_approval" and (x.expires_at is None or x.expires_at <= now):
                 x.status = "expired"
@@ -4903,10 +4927,13 @@ class AssistantService:
         if decision not in ("approved", "rejected"):
             raise AssistantError("decision must be 'approved' or 'rejected'")
         x = self.store.proposals.get(proposal_id)
-        if x is None or x.tenant_id != tenant_id or not (x.user_id == user_id or self._is_approver(user_id)):
+        if x is None or x.tenant_id != tenant_id or not (
+                x.user_id == user_id or (self._is_approver(user_id) and x.kind not in EXTERNAL_KINDS)):
             raise AssistantNotFound("proposal not found")
         if x.kind == "ci_repair":
             raise AssistantError("CI repair proposals are decided in the attention queue, not here")
+        if x.kind in EXTERNAL_KINDS:
+            raise AssistantError("external actions are decided through assistant-external-actions, not here")
         if x.status != "awaiting_approval":
             raise AssistantError(f"proposal already {x.status}")
         if x.expires_at is None or x.expires_at <= self.now():

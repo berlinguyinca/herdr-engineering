@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import threading
 import urllib.error
@@ -291,4 +292,419 @@ def utc_iso(dt: datetime) -> str:
 
 
 SINCE_MARGIN = timedelta(minutes=10)      # a provider clock may differ from ours: look this far before the first intent
-_lock = threading.Lock()
+
+
+def sink_credential(sink):
+    """``credential(repo) -> token`` for ``GitHubIssues`` from a ``GitHubIssueSink`` (the App capability, else ``github.token``).
+    A missing credential is a definite failure with a fixed reason; the secret is never in the exception."""
+    def credential(repo: str) -> str:
+        from .deployment_escalation import IssueRefused
+        try:
+            return sink.credential(repo)[0]
+        except IssueRefused:
+            raise ProviderError("failed", "no_credential") from None
+    return credential
+
+
+# ------------------------------------------------------------------------------------------------------------- service
+_SAFE = re.compile(r"[a-z_]{1,40}\Z")
+
+
+class Mismatch(Exception):
+    """The caller did not confirm the content hash they were shown: HTTP 409."""
+
+    status = 409
+
+
+class ExternalActionService:
+    """The approval ledger and executor for external actions. One per ``AssistantService`` (``assistant.external_actions``); the
+    provider clients (``github``, ``gmail``) are wired by the control plane and absent means "not available".
+
+    States of one action (an ``AssistantProposal``): ``status`` ``awaiting_approval`` -> ``approved`` | ``rejected`` | ``expired``;
+    ``execution`` ``not_started`` -> ``executing`` -> ``executed`` | ``failed`` | ``unknown``. All of it lives in fields the
+    proposal already had, so an older image that rewrites the snapshot loses nothing (and the marker on the provider side is the
+    backstop after a rollback).
+
+    Exactly once, and where that stops:
+
+    * the key is ``sha256(kind | brief_key)``; filing the same email again returns the existing action unless it was rejected, or
+      expired without ever starting (then a new decision is a new action);
+    * the intent (``executing``, an attempt count, the time) is made durable with an acknowledged write BEFORE the provider is
+      called; a failed write means no call;
+    * every run after the first looks for the key at the provider BEFORE creating (GitHub: a listing of the issues updated since the
+      first intent, the key being the last line of the body; Gmail: the newest drafts, the key being a header). Found means adopted,
+      not created again;
+    * a definite refusal (4xx, a revoked token) is ``failed``; anything without a usable answer (timeout, 5xx, a cut connection, a
+      crash) is ``unknown``. Neither is retried by anything but the operator's own retry, which re-confirms the content hash;
+    * what this CANNOT promise: a request that reached GitHub only AFTER the next run read the listing (a provider still processing a
+      cut connection) can yield a second issue; a Gmail draft older than the newest 50 is not found, so a retry can add a second
+      DRAFT (never a second send: nothing here sends). Both are rare and visible to the operator.
+    """
+
+    def __init__(self, assistant: Any) -> None:
+        self.assistant = assistant
+        self._lock = threading.RLock()
+        self.github: GitHubIssues | None = None
+        self.gmail: GmailDrafts | None = None
+
+    # ------------------------------------------------------------------ gates
+    @property
+    def cfg(self) -> dict:
+        return self.assistant.config["external_actions"]
+
+    def enabled(self) -> bool:
+        return bool(self.assistant.config.get("enabled") and self.cfg["enabled"] and not self.cfg["kill_switch"])
+
+    def _require_enabled(self) -> None:
+        from .assistant import AssistantNotFound
+        if not self.enabled():
+            raise AssistantNotFound("not found")                      # off means the route does not exist
+
+    def _now(self) -> datetime:
+        return self.assistant.now()
+
+    # ------------------------------------------------------------------ lookups and views
+    def _mine(self, proposal_id: Any, tenant_id: str, user_id: str):
+        """Only the owner. ``actions.approvers`` is deliberately NOT honoured for these kinds: an approver could otherwise read a
+        draft's recipient, or approve something that leaves the system for a person who never named them."""
+        from .assistant import AssistantNotFound
+        x = self.assistant.store.proposals.get(proposal_id) if isinstance(proposal_id, str) else None
+        if x is None or x.kind not in EXTERNAL_KINDS or x.tenant_id != tenant_id or x.user_id != user_id:
+            raise AssistantNotFound("not found")
+        return x
+
+    def _stale(self, x) -> bool:
+        at = (x.correlation or {}).get("last_intent_at")
+        try:
+            return datetime.fromisoformat(at) + timedelta(seconds=self.cfg["intent_stale_seconds"]) <= self._now()
+        except (TypeError, ValueError):
+            return True
+
+    def state_of(self, x) -> str:
+        if x.status == "awaiting_approval":
+            return "awaiting_approval" if x.expires_at and x.expires_at > self._now() else "expired"
+        if x.status in ("rejected", "expired"):
+            return x.status
+        if x.execution == "executing":
+            return "unknown" if self._stale(x) else "executing"
+        return "approved" if x.execution == "not_started" else x.execution
+
+    def view(self, x, *, detail: bool = True) -> dict:
+        c = x.correlation or {}
+        state = self.state_of(x)
+        out = {"action_id": x.proposal_id, "kind": x.kind, "state": state, "status": x.status, "execution": x.execution,
+               "title": x.title, "room_id": c.get("room_id"), "team_id": c.get("team_id"), "requested_by": x.requested_by,
+               "decided_by": x.decided_by or None, "created_at": x.created_at.isoformat(),
+               "expires_at": x.expires_at.isoformat() if x.expires_at else None, "attempts": int(c.get("attempts") or 0),
+               "result": {"ref": x.result_ref} if x.result_ref else None, "sha256": x.payload_sha256,
+               "failure": None}
+        if state in ("failed", "unknown"):
+            out["failure"] = {"outcome": state, "reason": x.execution_error or "interrupted"}
+        if detail:
+            out["card"] = self.card(x)
+        return out
+
+    @staticmethod
+    def card(x) -> dict:
+        p = x.payload
+        if x.kind == ISSUE:
+            return {"will": "create one GitHub issue", "repository": p["repo"], "title": p["title"], "labels": list(p["labels"]),
+                    "body": p["body"]}
+        return {"will": "save one Gmail DRAFT (nothing is sent; you send it yourself, later, from Gmail)", "to": list(p["to"]),
+                "subject": p["subject"], "body": p["body"], "in_reply_to_thread": bool(p.get("thread_id"))}
+
+    def _rows(self, tenant_id: str, user_id: str):
+        rows = [x for x in self.assistant.store.proposals.values()
+                if x.kind in EXTERNAL_KINDS and x.tenant_id == tenant_id and x.user_id == user_id]
+        return sorted(rows, key=lambda r: r.created_at, reverse=True)
+
+    def list(self, *, tenant_id: str, user_id: str, state: str | None = None) -> list[dict]:
+        self._require_enabled()
+        out = [self.view(x) for x in self._rows(tenant_id, user_id)]
+        return [v for v in out if state is None or v["state"] == state]
+
+    def get(self, proposal_id: str, *, tenant_id: str, user_id: str) -> dict:
+        self._require_enabled()
+        return self.view(self._mine(proposal_id, tenant_id, user_id))
+
+    def for_room(self, room_id: str, *, tenant_id: str, user_id: str, filed_by: str | None = None) -> list[dict]:
+        """The room's actions. The owner gets the full card; a filer (``filed_by``) only their own, with no content."""
+        self._require_enabled()
+        rows = [x for x in self._rows(tenant_id, user_id)
+                if (x.correlation or {}).get("room_id") == room_id and (filed_by is None or x.requested_by == filed_by)]
+        if filed_by is None:
+            return [self.view(x) for x in rows]
+        keep = ("action_id", "kind", "state", "created_at", "team_id")
+        return [{k: v for k, v in self.view(x, detail=False).items() if k in keep} for x in rows]
+
+    # ------------------------------------------------------------------ filing
+    def build_payload(self, kind: str, ctx: dict, *, tenant_id: str, user_id: str) -> tuple[dict, str]:
+        """(payload, key) from the context the collaboration service vouched for. Everything the filer cannot choose (the
+        repository, the recipient, the thread, the brief text) comes from there or from the operator's private record."""
+        from .assistant import AssistantError, AssistantNotFound
+        from .redact import redact_text
+        key = action_key(kind, ctx["brief_key"])
+        try:
+            if kind == ISSUE:
+                repo = ctx["repo"]
+                if not isinstance(repo, str) or not REPO.match(repo):
+                    raise ValueError("the team has no valid issue repository")
+                title = clean_title(ctx.get("title") or ctx["default_title"])
+                labels = ctx.get("labels") or []
+                allowed = set(self.cfg["github"]["labels"])
+                if (not isinstance(labels, list) or len(labels) > MAX_LABELS or len(set(map(str, labels))) != len(labels)
+                        or not all(isinstance(x, str) and x in allowed for x in labels)):
+                    raise ValueError(f"labels must come from external_actions.github.labels (up to {MAX_LABELS})")
+                return {"repo": repo, "title": title, "labels": sorted(labels), "body": issue_body(ctx["brief_text"], key)}, key
+            rec = self.assistant.store.team_briefs.get(ctx["reference"])
+            if (rec is None or rec.tenant_id != tenant_id or rec.user_id != user_id or rec.brief_key != ctx["brief_key"]
+                    or rec.suggestion_id != ctx["suggestion_id"]):
+                raise AssistantNotFound("not found")
+            from .google_workspace import _ADDRESS, MESSAGE_ID_HEADER, THREAD_ID
+            sender = rec.private.get("sender", "")
+            if not _ADDRESS.match(sender):
+                raise ValueError("the original email has no usable reply address")
+            subject = " ".join(_CONTROL.sub(" ", rec.private.get("subject", "")).split())
+            subject = subject if subject.lower().startswith("re:") else "Re: " + subject
+            text = ctx.get("body")
+            if (not isinstance(text, str) or not text.strip() or len(text) > 800 or "\x00" in text
+                    or _CONTROL.search(text.replace("\n", " "))):
+                raise ValueError("the reply body must be 1-800 characters of plain text")
+            if redact_text(text) != text:
+                raise ValueError("the reply body contains something that looks like a secret")
+            thread, header = rec.private.get("thread_id", ""), rec.private.get("message_id_header", "")
+            return {"to": [sender], "subject": subject[:200], "body": text, "action_key": key,
+                    "thread_id": thread if THREAD_ID.fullmatch(thread) else "",
+                    "in_reply_to": header if MESSAGE_ID_HEADER.match(header) else ""}, key
+        except ValueError as exc:
+            raise AssistantError(str(exc)) from None
+
+    def file(self, *, tenant_id: str, user_id: str, kind: str, ctx: dict, requested_by: str, assistant_id: str = "") -> dict:
+        """File one action for the owner's approval. Idempotent on the key. Starts nothing and calls no provider."""
+        from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
+        self._require_enabled()
+        if kind not in EXTERNAL_KINDS:
+            raise AssistantError("unknown external action kind")
+        svc = self.assistant
+        if not assistant_id:
+            assistant_id = next((a.assistant_id for a in svc.store.list_assistants(tenant_id=tenant_id, user_id=user_id)
+                                 if a.enabled), "")
+        if not assistant_id:
+            raise AssistantNotFound("not found")
+        payload, key = self.build_payload(kind, ctx, tenant_id=tenant_id, user_id=user_id)
+        with self._lock:
+            have = self._existing(tenant_id, user_id, kind, key)
+            if have is not None:
+                return {**self.view(have, detail=False), "replayed": True}
+            now = self._now()
+            if sum(1 for x in self._rows(tenant_id, user_id) if now - x.created_at < timedelta(hours=1)) >= self.cfg["actions_per_hour"]:
+                raise RateLimited("too many external actions this hour")
+            title = (f"Create a GitHub issue in {payload['repo']}: {payload['title']}" if kind == ISSUE
+                     else f"Save a Gmail draft reply: {payload['subject']}")
+            corr = {"room_id": ctx.get("room_id"), "team_id": ctx.get("team_id"), "suggestion_id": ctx.get("suggestion_id"),
+                    "brief_key": ctx["brief_key"], "attempts": 0}
+            try:
+                x, created = svc.create_proposal(
+                    tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id, kind=kind, title=title, payload=payload,
+                    requested_by=requested_by, dedupe_key=key, external_ref=key, correlation=corr, link="#/assistant")
+            except (AssistantError, KeyError):
+                raise AssistantNotFound("not found") from None
+            try:
+                svc.store.put_proposal_required(x)
+            except Exception:                                      # noqa: BLE001 - the card must be durable before it is shown
+                svc.store.proposals.pop(x.proposal_id, None)
+                raise AssistantUnavailable("the action could not be stored durably; nothing was filed") from None
+            self._audit(x, requested_by, "filed", f"{kind} key {key[:12]}")
+            self._notify(x, f"{'Issue' if kind == ISSUE else 'Reply draft'} waiting for your approval: {x.title}")
+            return {**self.view(x, detail=False), "replayed": not created}
+
+    def _existing(self, tenant_id: str, user_id: str, kind: str, key: str):
+        now = self._now()
+        for x in self._rows(tenant_id, user_id):
+            if x.kind != kind or x.dedupe_key != key or x.status == "rejected":
+                continue
+            if x.status == "awaiting_approval" and not (x.expires_at and x.expires_at > now):
+                continue
+            if x.status == "expired" and x.execution == "not_started":
+                continue
+            return x
+        return None
+
+    def _notify(self, x, text: str) -> None:
+        try:
+            self.assistant.notify(tenant_id=x.tenant_id, user_id=x.user_id, key=f"external-action:{x.proposal_id}:{x.execution}",
+                                  priority="normal", text=text[:300], link="#/assistant")
+        except Exception:                                          # noqa: BLE001 - a notification is never a reason to fail
+            pass
+
+    def _audit(self, x, actor: str, what: str, detail: str = "") -> None:
+        self.assistant.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
+                                          action=f"assistant.external.{what}", subject_id=x.proposal_id, detail=detail[:200])
+
+    # ------------------------------------------------------------------ deciding
+    def _owner_only(self, x, actor: str, what: str) -> None:
+        from .assistant import AssistantForbidden
+        if actor != x.user_id:
+            self._audit(x, str(actor)[:80], "denied", f"{what}: not the owner")
+            raise AssistantForbidden("only the account owner decides external actions")
+
+    def decide(self, proposal_id: str, *, tenant_id: str, user_id: str, actor: str, decision: str, expected_sha256: Any) -> dict:
+        """The owner approves (and the action runs once) or rejects. Nobody else, whatever their standing elsewhere, can approve a
+        thing that leaves the system for this person. Approving needs the sha256 of the content the owner was shown."""
+        from .assistant import AssistantError, AssistantUnavailable
+        self._require_enabled()
+        x = self._mine(proposal_id, tenant_id, user_id)
+        self._owner_only(x, actor, "decision")
+        if decision not in ("approved", "rejected"):
+            raise AssistantError("decision must be 'approved' or 'rejected'")
+        with self._lock:
+            if x.status != "awaiting_approval":
+                if x.status == decision:
+                    return {**self.view(x), "replayed": True}      # the same decision again changes nothing
+                raise AssistantError(f"the action is {self.state_of(x)}")
+            if not (x.expires_at and x.expires_at > self._now()):
+                x.status = "expired"
+                self.assistant.store.put_proposal(x)
+                raise AssistantError("the action expired; it must be filed again")
+            if decision == "approved" and expected_sha256 != x.payload_sha256:
+                raise Mismatch("approve with the sha256 of the content you were shown")
+            x.status, x.decided_by, x.decided_at = decision, actor, self._now()
+            try:
+                self.assistant.store.put_proposal_required(x)
+            except Exception:                                      # noqa: BLE001
+                x.status, x.decided_by, x.decided_at = "awaiting_approval", "", None
+                raise AssistantUnavailable("the decision could not be stored durably; nothing was done") from None
+            self._audit(x, actor, decision, f"{x.kind} key {x.dedupe_key[:12]}")
+        if decision == "approved":
+            self._run(x, actor)
+        return {**self.view(x), "replayed": False}
+
+    def retry(self, proposal_id: str, *, tenant_id: str, user_id: str, actor: str, expected_sha256: Any) -> dict:
+        """The owner runs a ``failed`` or ``unknown`` (or approved but never started) action again. It looks for the key first."""
+        from .assistant import AssistantError
+        self._require_enabled()
+        x = self._mine(proposal_id, tenant_id, user_id)
+        self._owner_only(x, actor, "retry")
+        if expected_sha256 != x.payload_sha256:
+            raise Mismatch("retry with the sha256 of the content you were shown")
+        with self._lock:
+            state = self.state_of(x)
+            if x.status != "approved" or state not in ("failed", "unknown", "approved"):
+                raise AssistantError(f"the action is {state}; only a failed, unknown or approved-but-not-run action is retried")
+            self._audit(x, actor, "retry", state)
+        self._run(x, actor)
+        return {**self.view(x), "replayed": False}
+
+    # ------------------------------------------------------------------ running
+    def _provider(self, x):
+        p = self.github if x.kind == ISSUE else self.gmail
+        if p is None:
+            raise ProviderError("failed", "not_wired")
+        return p
+
+    def _find(self, x, since: str) -> dict | None:
+        p = self._provider(x)
+        if x.kind == ISSUE:
+            return p.find(x.payload["repo"], x.dedupe_key, since)
+        return p.find(x.tenant_id, x.user_id, x.dedupe_key)
+
+    def _create(self, x) -> dict:
+        p, pl = self._provider(x), x.payload
+        if x.kind == ISSUE:
+            return p.create(pl["repo"], pl["title"], pl["body"], pl["labels"])
+        return p.create(x.tenant_id, x.user_id, pl)
+
+    @staticmethod
+    def _intent_within(x, now: datetime, span: timedelta) -> bool:
+        try:
+            return now - datetime.fromisoformat((x.correlation or {}).get("last_intent_at") or "") < span
+        except (TypeError, ValueError):
+            return False
+
+    def _run(self, x, actor: str) -> None:
+        """Claim, record the intent durably, reconcile, create, record. The claim is the only door: a concurrent or repeated call
+        finds ``executing``/``executed`` and does nothing."""
+        from .assistant import AssistantError, AssistantUnavailable, RateLimited, canonical_json
+        svc = self.assistant
+        with self._lock:
+            if x.execution == "executed":
+                return
+            if x.execution == "executing" and not self._stale(x):
+                raise AssistantError("the action is already running")
+            if hashlib.sha256(canonical_json([x.kind, x.payload]).encode()).hexdigest() != x.payload_sha256:
+                x.execution, x.execution_error = "failed", "payload_changed"
+                svc.store.put_proposal(x)
+                raise AssistantError("the content changed after approval; nothing was run")
+            now = self._now()
+            if sum(1 for o in self._rows(x.tenant_id, x.user_id)
+                   if self._intent_within(o, now, timedelta(hours=1))) >= self.cfg["executions_per_hour"]:
+                raise RateLimited("too many external actions were run this hour")
+            c = dict(x.correlation or {})
+            prior = int(c.get("attempts") or 0)
+            before = (x.execution, x.execution_error, x.correlation)
+            c.update(attempts=prior + 1, last_intent_at=now.isoformat())
+            c.setdefault("intent_at", now.isoformat())
+            x.correlation, x.execution, x.execution_error = c, "executing", ""
+            try:
+                svc.store.put_proposal_required(x)                 # the intent is durable BEFORE any provider call
+                self._audit(x, actor, "executing", f"attempt {prior + 1}")
+            except Exception:                                      # noqa: BLE001 - no intent on record, no call
+                x.execution, x.execution_error, x.correlation = before
+                try:
+                    svc.store.put_proposal(x)
+                except Exception:                                  # noqa: BLE001
+                    pass
+                raise AssistantUnavailable("the intent could not be recorded durably; nothing was sent") from None
+        since = utc_iso(datetime.fromisoformat(c["intent_at"]) - SINCE_MARGIN)
+        outcome, ref, how = "executed", "", "created"
+        try:
+            found = self._find(x, since) if prior >= 1 else None
+            if found is not None:
+                ref, how = found["ref"], "adopted"
+            else:
+                ref = self._create(x)["ref"]
+        except ProviderError as exc:
+            outcome, how = exc.outcome, exc.reason
+        except Exception:                                          # noqa: BLE001 - our own bug is not a provider answer
+            logging.getLogger(__name__).exception("external action %s crashed", x.proposal_id)
+            outcome, how = "unknown", "internal_error"
+        with self._lock:
+            x.execution = outcome
+            x.executed_by, x.executed_at = actor, self._now()
+            x.result_ref, x.execution_error = (ref, "") if outcome == "executed" else ("", how if _SAFE.match(how) else "provider_error")
+            try:
+                svc.store.put_proposal_required(x)
+            except Exception:                                      # noqa: BLE001 - the truth stays in memory; recover() heals
+                logging.getLogger(__name__).error("external action %s: the result could not be stored durably", x.proposal_id)
+            try:
+                self._audit(x, actor, outcome if outcome != "executed" else "executed",
+                            f"{how} {x.kind}" + (f" {ref}" if ref and x.kind == ISSUE else ""))
+            except Exception:                                      # noqa: BLE001
+                logging.getLogger(__name__).error("external action %s: the result audit could not be written", x.proposal_id)
+        if outcome != "executed":
+            self._notify(x, f"An approved external action did not complete ({outcome}: {x.execution_error}): {x.title}")
+
+    # ------------------------------------------------------------------ after a crash
+    def recover(self) -> dict:
+        """After a restart: every action left ``executing`` is looked up at the provider. Found -> executed (adopted); not found
+        or no answer -> ``unknown`` for the operator. This only READS the provider; it never creates anything."""
+        out = {"adopted": 0, "unknown": 0}
+        if not self.enabled():
+            return out
+        for x in [r for r in list(self.assistant.store.proposals.values()) if r.kind in EXTERNAL_KINDS and r.execution == "executing"]:
+            try:
+                since = utc_iso(datetime.fromisoformat((x.correlation or {})["intent_at"]) - SINCE_MARGIN)
+                found = self._find(x, since)
+            except Exception:                                      # noqa: BLE001 - ProviderError or a bad record: still not known
+                found = None
+            with self._lock:
+                if found is not None:
+                    x.execution, x.result_ref, x.execution_error = "executed", found["ref"], ""
+                    out["adopted"] += 1
+                else:
+                    x.execution, x.execution_error = "unknown", "interrupted"
+                    out["unknown"] += 1
+                x.executed_by, x.executed_at = "recovery", self._now()
+                self.assistant.store.put_proposal(x)
+                self._audit(x, "recovery", "executed" if found else "unknown", "adopted after restart" if found else "interrupted")
+        return out
