@@ -20,10 +20,24 @@
 #      otherwise it prints the command and continues)
 #   7. puts `herdr-eng` and `herdr-handoff` on PATH (~/.local/bin) when writable
 #   8. runs `herdr-eng doctor` and prints a summary
+#   (opt-in) --with-memory / HERDR_INSTALL_MEMORY=1: after step 7, plans and
+#      installs the managed herdr-memory harness adapters (pi, claude, codex,
+#      opencode) via `herdr-eng memory install`; harnesses that are not
+#      installed are skipped and foreign config is reported, never overwritten.
 #
 # Re-running produces no unexpected changes. No secrets are written anywhere.
 #
 set -euo pipefail
+
+# Opt-in herdr-memory step: `--with-memory` or HERDR_INSTALL_MEMORY=1.
+WITH_MEMORY="${HERDR_INSTALL_MEMORY:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --with-memory) WITH_MEMORY=1 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    *) printf 'unknown option: %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -247,6 +261,15 @@ if [ -d "$LINK_DIR" ] || mkdir -p "$LINK_DIR" 2>/dev/null; then
   fi
 else
   warn "could not create $LINK_DIR; use: source $VENV/bin/activate"
+fi
+
+# --- 7b. opt-in herdr-memory harness adapters -------------------------------
+if [ "$WITH_MEMORY" = "1" ]; then
+  step "7b/8 herdr-memory harness adapters (opt-in; pinned adapter revision)"
+  "$PY" -m herdr_engineering.cli memory plan || warn "memory plan reported conflicts (see above)"
+  "$PY" -m herdr_engineering.cli memory install --all || warn "memory install reported conflicts (see above); foreign config was left untouched"
+else
+  printf '\n  (herdr-memory adapters not installed; opt in with --with-memory)\n'
 fi
 
 # --- 8. doctor ------------------------------------------------------------

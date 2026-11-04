@@ -204,9 +204,30 @@ The CoreDNS + gateway containers are removed; the `herdr-state` named volume
 After committing and publishing local changes, enable the controller's timer:
 
 ```bash
-scripts/fleet-auto-update.sh
+scripts/fleet-auto-update.sh                            # writes the user units
+systemctl --user daemon-reload
+systemctl --user enable --now herdr-eng-fleet-update.timer
 systemctl --user list-timers herdr-eng-fleet-update.timer
 ```
+
+macOS has no systemd, so the same job installs as a LaunchAgent
+(`com.herdr-engineering.fleet-auto-update`) that runs the **same module**,
+`python -m herdr_engineering.fleet_autoupdate`, with the same `HERDR_ENGINEERING_REPO` and
+`XDG_STATE_HOME`. Behaviour — including what a skipped run means — is therefore identical on
+both platforms; the schedule is read out of `scripts/herdr-eng-fleet-update.timer` rather than
+restated, so the two installers cannot drift (a test asserts they agree).
+
+```bash
+scripts/fleet-auto-update-macos.sh install      # write + bootstrap the LaunchAgent
+scripts/fleet-auto-update-macos.sh install --dry-run   # print the plist, write nothing
+scripts/fleet-auto-update-macos.sh run-now             # one immediate run
+scripts/fleet-auto-update-macos.sh status       # loaded? last exit? recorded skip?
+scripts/fleet-auto-update-macos.sh uninstall    # bootout + remove the plist
+```
+
+`install` refuses an existing agent whose `Label` it does not own, keeps a timestamped copy of
+one it does, and prints a NOTE when the checkout is not clean on `main` — because a skipped run
+exits 0 and `launchctl` reports nothing.
 
 ### Optional hosts (laptops)
 
@@ -225,10 +246,55 @@ private inventory; install it on the controller only, not every fleet host.
 
 Automatic updates require a clean `main` checkout, fetch `origin/main`, reject
 unpublished/divergent commits, and fast-forward before reinstalling. Ignored
-private inventory is retained. Pull/install/deployment failures return nonzero;
-a lock prevents overlapping scheduled runs. SSH authentication must remain valid
+private inventory is retained. A lock prevents overlapping scheduled runs.
+
+Failures divide in two, and the difference is what makes the job safe to leave switched on:
+
+* **reported skip, exit 0** — the checkout is dirty, or not on `main`, or holds unpublished
+  commits. Operator work is preserved and nothing is updated; the reason lands in
+  `fleet-auto-update.json` and surfaces as `WARN fleet_update` in `herdr-eng memory doctor`.
+  `launchctl` / `systemctl` show a healthy service, so **doctor is the only place this is
+  visible** — a skip is not free: the host stops taking unattended updates until it is cleaned.
+* **failure, exit nonzero** — fetch refused, divergent from `origin/main`, install or deployment
+  error. Visible in `systemctl --user status` / the LaunchAgent's stderr log, and it stops the
+  run before anything is changed.
+
+### Unpinning a host (stop unattended updates)
+
+A controller checkout that is long-dirty should be unpinned rather than left failing, or left
+"skipping" invisibly. Both routes keep the operator's work; the pinned install path
+(`herdr-eng memory install` / `install-from-git`, or `uv tool install`) then owns the tooling:
+
+```bash
+systemctl --user disable --now herdr-eng-fleet-update.timer herdr-eng-fleet-update.service   # Linux
+scripts/fleet-auto-update-macos.sh uninstall                                                  # macOS
+```
+
+Re-enable with the installer above. Check with `systemctl --user is-enabled
+herdr-eng-fleet-update.timer`, `scripts/fleet-auto-update-macos.sh status`, and
+`herdr-eng memory doctor` (`fleet_update`). SSH authentication must remain valid
 for unattended access. Hosts requiring an interactive Tailscale SSH check will
 fail that deployment and be retried by a later scheduled run.
+
+**A refused update is a skip, not a failure.** If the configured checkout holds local
+work or is not on `main`, the run preserves that work, prints
+`{"ok": true, "skipped": true, "reason": ..., "detail": {dirty_paths, tracked_changes,
+examples, hint}}` and exits 0. Refusing to touch an operator's work is correct, but a
+unit that exited 1 every night for it meant the daily status was permanently red, so a
+real deployment failure looked exactly like a busy checkout
+([herdr-engineering#572](https://github.com/berlinguyinca/herdr-engineering/issues/572)).
+The reason names the checkout and previews up to eight dirty paths, so the operator sees
+what to move; the hint points at the supported fix — point `HERDR_ENGINEERING_REPO` at a
+dedicated clean checkout for unattended updates, which is the only way a controller whose
+`main` checkout is a busy multi-agent workspace (and whose private inventory is gitignored
+and therefore not in any clone) gets unattended updates at all.
+
+Every run records its outcome (`updated` | `skipped` | `failed`, reason, revision,
+timestamp) in `$XDG_STATE_HOME/herdr-engineering/fleet-auto-update.json`, and
+`herdr-eng memory doctor` reports it as the `fleet_update` check: `ok` when a successful
+run landed within the last 26h, `warn` for a skip or a stale record, `fail` for a failed
+update. Before that, `doctor` reported `overall: ok` for a fleet that had not updated in
+weeks.
 
 Fleet sync refreshes the fabric agent and Pi build gate. On Linux, it also
 installs/restarts the Rust cleanup companion according to each machine's existing
@@ -242,12 +308,22 @@ Inspect update results and installed revisions:
 ```bash
 journalctl --user -u herdr-eng-fleet-update.service
 herdr-eng fleet status
+herdr-eng memory doctor
 herdr-eng build-cleanup status
 ```
 
 The update service emits a JSON report with step failures and revision mismatches.
 `fleet status` now includes source revision and cleanup service state. The legacy
 `scripts/fleet-self-update.sh` delegates to the same guarded updater.
+
+`memory doctor` also reports client provenance without needing to import the client: the
+`package_revision` check reads `direct_url.json` from the install that owns the
+`herdr-memory` CLI (`<prefix>/lib/python*/site-packages/herdr_memory-*.dist-info`), and
+`client_version` compares `herdr-memory --version` against
+`memory_install.PINNED_CLIENT_VERSION`. A wheel install with no VCS provenance reports
+`UNKNOWN package_revision ... (wheel install 0.1.3: no VCS provenance recorded)` instead
+of the old bare `not determinable`, which is what made an unpinned build invisible to
+health reporting (D11, D17).
 
 Disable unattended updates with:
 

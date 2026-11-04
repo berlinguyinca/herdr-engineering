@@ -156,6 +156,9 @@ def compose_env(cfg: FleetConfig) -> dict[str, str]:
     out["GATEWAY_BIND"] = LOOPBACK if ip == LOOPBACK else f"{LOOPBACK},{ip}"
     # host part of the gateway healthcheck URL (an IPv6 literal needs brackets)
     out["GATEWAY_HEALTH_HOST"] = f"[{ip}]" if addr.version == 6 else ip
+    # Optional Hindsight memory profile: variables exist only while control_plane.memory.enabled is true.
+    from .fleet_memory import memory_compose_env
+    out.update(memory_compose_env(values, out))
     return out
 
 
@@ -191,7 +194,7 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
-                         "contextual", "insights", "team_rooms",
+                         "contextual", "insights", "team_rooms", "team_roles", "coordinators",
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled",
@@ -240,6 +243,16 @@ def collab_values(cfg: FleetConfig) -> dict:
     from .control_plane.collab_team_rooms import normalize_team_rooms
     try:
         normalize_team_rooms(collab.get("team_rooms"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_team_roles import normalize_team_roles
+    try:
+        normalize_team_roles(collab.get("team_roles"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_coordinators import normalize_coordinators
+    try:
+        normalize_coordinators(collab.get("coordinators"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
     from .control_plane.collab import summary_fix_config

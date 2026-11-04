@@ -244,6 +244,8 @@ def _collab_ops(ev: dict) -> list[dict]:
         tid = _text(p["task_id"])
         sc = _scope("room", rooms=[rid], project=pid)
         text = _text(p.get("text"), 4000) or ""
+        if p.get("target_kind") == "user":      # a task for a person: its words and its assignee stay in the collab service
+            text = ""
         ops.append(ent("task", tid, display_name=(text.splitlines() or [tid])[0][:120] or tid, status="pending", **sc,
                        aliases=[("collab_task", tid)],
                        attrs={"room_task_id": tid, "room_id": rid, "target_agent_id": _text(p.get("target_agent_id")),
@@ -290,6 +292,23 @@ def _collab_ops(ev: dict) -> list[dict]:
             else:
                 ops.append(fact("team_role", f"agent:{aid}", ("team", tid), "close", **sc))
                 ops.append(fact("agent_grant", f"agent:{aid}", ("room", rid), "close", **sc))
+    elif t in ("team_coordinator_set", "team_coordinator_cleared") and rid and _text(p.get("team_id")) and _text(p.get("holder"), 200):
+        # Team collaboration slice 3.  The coordinator is one more ``team_role`` fact on the team (role "coordinator"), shown for
+        # display only: authority is decided in the collab log.  An operator-owned agent also carries its room grant.
+        tid, holder = _text(p["team_id"]), _text(p["holder"], 200)
+        sc = _scope("room", rooms=[rid], project=pid)
+        opening = t == "team_coordinator_set"
+        if opening:
+            ops.append(fact("team_role", holder, ("team", tid), "open", role="coordinator", **sc))
+        else:
+            ops.append(fact("team_role", holder, ("team", tid), "close", **sc))
+        if holder.startswith("agent:"):
+            if opening:
+                ops.append(ent("agent", holder[6:], "scope", **_scope(None, rooms=[rid])))
+                ops.append(fact("agent_grant", holder, ("room", rid), "open", actions=sorted(p.get("actions") or []),
+                                expires_at=None, team_id=tid, **sc))
+            else:
+                ops.append(fact("agent_grant", holder, ("room", rid), "close", **sc))
     elif t == "mission_linked" and rid and _text(p.get("mission_id")):
         mid = _text(p["mission_id"])
         sc = _scope("room", rooms=[rid], project=pid)

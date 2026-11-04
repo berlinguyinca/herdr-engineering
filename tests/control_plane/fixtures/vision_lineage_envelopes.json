@@ -1,0 +1,761 @@
+{
+  "_about": "Envelopes Pi's real LineageEmitter (createLineageFromConnection -> ControlPlaneIngest -> EnvelopeStore outbox) POSTed for five vision delegations via emitVisionLineage, captured by a recording fake fetch (no live control plane). Not hand-edited. See docs/evidence/vision-delegation-dashboard.md.",
+  "captured_with": {
+    "pi_commit": "0bfe0c34",
+    "pi_branch": "feat/vision-delegation",
+    "requests": 30,
+    "urls": [
+      "POST https://control-plane.invalid/api/v1/ingest"
+    ],
+    "headers": {
+      "content-type": "application/json",
+      "x-api-key": "<redacted>"
+    },
+    "emitter_stats": {
+      "emitted": 44,
+      "dropped": 0,
+      "errors": 0
+    }
+  },
+  "delegations": [
+    {
+      "name": "ok",
+      "request_id": "0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01",
+      "outcome": "ok"
+    },
+    {
+      "name": "partial",
+      "request_id": "1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02",
+      "outcome": "partial"
+    },
+    {
+      "name": "failed",
+      "request_id": "2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03",
+      "outcome": "failed"
+    },
+    {
+      "name": "timeout",
+      "request_id": "3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04",
+      "outcome": "timeout"
+    },
+    {
+      "name": "open",
+      "request_id": "4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05",
+      "outcome": "open"
+    }
+  ],
+  "envelopes": [
+    {
+      "schema_version": 2,
+      "event_id": "lin_50207902b127df8c3c32a5e2358bac64",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 1,
+      "occurred_at": "2026-11-02T21:46:27.821Z",
+      "entity_type": "lineage",
+      "entity_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-out",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "handoff",
+        "node_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-out",
+        "state": "acknowledged",
+        "attrs": {
+          "handoff_kind": "vision",
+          "from_session_id": "session:pi-text-session-ok",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "to_session_id": "session:pi-vision-session-ok",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_47523db5291531ddaca2200ff0708aeb",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 2,
+      "occurred_at": "2026-11-02T21:46:27.821Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-ok",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-text-session-ok",
+        "attrs": {
+          "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_385fb8f0524c904fa2caffd03ae42b2c",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 3,
+      "occurred_at": "2026-11-02T21:46:27.821Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-vision-session-ok",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-vision-session-ok",
+        "attrs": {
+          "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_6bfd8a47db48de48cc5509a5bc1c7cba",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 4,
+      "occurred_at": "2026-11-02T21:46:27.821Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-ok",
+      "event_type": "edge.add",
+      "payload": {
+        "edge_type": "handoff",
+        "from_id": "session:pi-text-session-ok",
+        "to_id": "session:pi-vision-session-ok",
+        "attrs": {
+          "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-out",
+          "handoff_kind": "vision",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_bc5e0325f100aa6238b54ee51ff166ec",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 5,
+      "occurred_at": "2026-11-02T21:46:27.915Z",
+      "entity_type": "lineage",
+      "entity_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-back",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "handoff",
+        "node_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-back",
+        "state": "committed",
+        "attrs": {
+          "handoff_kind": "vision",
+          "from_session_id": "session:pi-vision-session-ok",
+          "cause": "vision_return",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "to_session_id": "session:pi-text-session-ok",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_3acc5d93a99e21462fde55c9482b0c5c",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 6,
+      "occurred_at": "2026-11-02T21:46:27.915Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-vision-session-ok",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-vision-session-ok",
+        "attrs": {
+          "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-back",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_ee253de2d25d4242bab07811fbef0c70",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 7,
+      "occurred_at": "2026-11-02T21:46:27.915Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-ok",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-text-session-ok",
+        "attrs": {
+          "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-back",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_28bc7362740621163028e81637483240",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 8,
+      "occurred_at": "2026-11-02T21:46:27.915Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-vision-session-ok",
+      "event_type": "edge.add",
+      "payload": {
+        "edge_type": "handoff",
+        "from_id": "session:pi-vision-session-ok",
+        "to_id": "session:pi-text-session-ok",
+        "attrs": {
+          "handoff_id": "handoff:vision-0b7e6f52-3c1a-4d8e-9f20-6a1b2c3d4e01-back",
+          "handoff_kind": "vision",
+          "cause": "vision_return",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_4ea76f25bbadfdde9512ff39f1f4d1c4",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 9,
+      "occurred_at": "2026-11-02T21:46:27.979Z",
+      "entity_type": "lineage",
+      "entity_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-out",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "handoff",
+        "node_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-out",
+        "state": "acknowledged",
+        "attrs": {
+          "handoff_kind": "vision",
+          "from_session_id": "session:pi-text-session-partial",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "to_session_id": "session:pi-vision-session-partial",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_97b0b7d38d28a38042cfefb6bcfe8d0b",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 10,
+      "occurred_at": "2026-11-02T21:46:27.979Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-partial",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-text-session-partial",
+        "attrs": {
+          "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_73a25737698755d86e44b855140dce2b",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 11,
+      "occurred_at": "2026-11-02T21:46:27.979Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-vision-session-partial",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-vision-session-partial",
+        "attrs": {
+          "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_515a52e56add71d532d776375ec046d8",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 12,
+      "occurred_at": "2026-11-02T21:46:27.979Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-partial",
+      "event_type": "edge.add",
+      "payload": {
+        "edge_type": "handoff",
+        "from_id": "session:pi-text-session-partial",
+        "to_id": "session:pi-vision-session-partial",
+        "attrs": {
+          "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-out",
+          "handoff_kind": "vision",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_d1fd6132ef8fc81bf5a22409df1f5f68",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 13,
+      "occurred_at": "2026-11-02T21:46:28.104Z",
+      "entity_type": "lineage",
+      "entity_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-back",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "handoff",
+        "node_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-back",
+        "state": "committed",
+        "attrs": {
+          "handoff_kind": "vision_partial",
+          "from_session_id": "session:pi-vision-session-partial",
+          "cause": "vision_return",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "to_session_id": "session:pi-text-session-partial",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_b5c33f835ef035c5db0ac87acc3a50a6",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 14,
+      "occurred_at": "2026-11-02T21:46:28.104Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-vision-session-partial",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-vision-session-partial",
+        "attrs": {
+          "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-back",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_094a5ccec847c3cb70051f82484e6666",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 15,
+      "occurred_at": "2026-11-02T21:46:28.104Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-partial",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-text-session-partial",
+        "attrs": {
+          "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-back",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_bc27f99359f1617da582d3528b78b4ab",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 16,
+      "occurred_at": "2026-11-02T21:46:28.104Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-vision-session-partial",
+      "event_type": "edge.add",
+      "payload": {
+        "edge_type": "handoff",
+        "from_id": "session:pi-vision-session-partial",
+        "to_id": "session:pi-text-session-partial",
+        "attrs": {
+          "handoff_id": "handoff:vision-1c8f7a63-4d2b-4e9f-8a31-7b2c3d4e5f02-back",
+          "handoff_kind": "vision_partial",
+          "cause": "vision_return",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_a4311e3b47f74aac6200e4d4a17d5095",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 17,
+      "occurred_at": "2026-11-02T21:46:28.166Z",
+      "entity_type": "lineage",
+      "entity_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-out",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "handoff",
+        "node_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-out",
+        "state": "acknowledged",
+        "attrs": {
+          "handoff_kind": "vision",
+          "from_session_id": "session:pi-text-session-failed",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "to_session_id": "session:pi-vision-session-failed",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_f113e899fb73564c35be443104b63f2a",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 18,
+      "occurred_at": "2026-11-02T21:46:28.166Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-failed",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-text-session-failed",
+        "attrs": {
+          "handoff_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_3780c4dfd77ee2be1ab0163f590e8b52",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 19,
+      "occurred_at": "2026-11-02T21:46:28.166Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-vision-session-failed",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-vision-session-failed",
+        "attrs": {
+          "handoff_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_2f45329f991e2de8180a318d1018081d",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 20,
+      "occurred_at": "2026-11-02T21:46:28.166Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-failed",
+      "event_type": "edge.add",
+      "payload": {
+        "edge_type": "handoff",
+        "from_id": "session:pi-text-session-failed",
+        "to_id": "session:pi-vision-session-failed",
+        "attrs": {
+          "handoff_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-out",
+          "handoff_kind": "vision",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_58054932f818e0d64176a992091782d5",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 21,
+      "occurred_at": "2026-11-02T21:46:28.249Z",
+      "entity_type": "lineage",
+      "entity_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-back",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "handoff",
+        "node_id": "handoff:vision-2d9a8b74-5e3c-4fa0-9b42-8c3d4e5f6a03-back",
+        "state": "failed",
+        "attrs": {
+          "handoff_kind": "vision_failed",
+          "from_session_id": "session:pi-vision-session-failed",
+          "cause": "vision_return",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "to_session_id": "session:pi-text-session-failed",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_cdf15ef5ed95442cfca7827693622822",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 22,
+      "occurred_at": "2026-11-02T21:46:28.265Z",
+      "entity_type": "lineage",
+      "entity_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-out",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "handoff",
+        "node_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-out",
+        "state": "acknowledged",
+        "attrs": {
+          "handoff_kind": "vision",
+          "from_session_id": "session:pi-text-session-timeout",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "to_session_id": "session:pi-vision-session-timeout",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_30f9b9a2a2ea7797e1ce573ea13e0b92",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 23,
+      "occurred_at": "2026-11-02T21:46:28.265Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-timeout",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-text-session-timeout",
+        "attrs": {
+          "handoff_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_ca376b8cb4893e106a68a85c1cf4d01d",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 24,
+      "occurred_at": "2026-11-02T21:46:28.265Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-vision-session-timeout",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-vision-session-timeout",
+        "attrs": {
+          "handoff_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_93f0ad7391556c6fc0168443726892bd",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 25,
+      "occurred_at": "2026-11-02T21:46:28.265Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-timeout",
+      "event_type": "edge.add",
+      "payload": {
+        "edge_type": "handoff",
+        "from_id": "session:pi-text-session-timeout",
+        "to_id": "session:pi-vision-session-timeout",
+        "attrs": {
+          "handoff_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-out",
+          "handoff_kind": "vision",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_198699d61159fb0d7133b9b84808056d",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 26,
+      "occurred_at": "2026-11-02T21:46:28.349Z",
+      "entity_type": "lineage",
+      "entity_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-back",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "handoff",
+        "node_id": "handoff:vision-3eab9c85-6f4d-4ab1-8c53-9d4e5f6a7b04-back",
+        "state": "failed",
+        "attrs": {
+          "handoff_kind": "vision_timeout",
+          "from_session_id": "session:pi-vision-session-timeout",
+          "cause": "vision_return",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "to_session_id": "session:pi-text-session-timeout",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_4000407858c147386fc95a0652d28d2d",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 27,
+      "occurred_at": "2026-11-02T21:46:28.364Z",
+      "entity_type": "lineage",
+      "entity_id": "handoff:vision-4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05-out",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "handoff",
+        "node_id": "handoff:vision-4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05-out",
+        "state": "acknowledged",
+        "attrs": {
+          "handoff_kind": "vision",
+          "from_session_id": "session:pi-text-session-open",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "to_session_id": "session:pi-vision-session-open",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_9c9865c434e35585c2701b3f81839814",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 28,
+      "occurred_at": "2026-11-02T21:46:28.364Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-open",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-text-session-open",
+        "attrs": {
+          "handoff_id": "handoff:vision-4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_fcdf74725a2036d5ca5cda09b06a22ad",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 29,
+      "occurred_at": "2026-11-02T21:46:28.364Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-vision-session-open",
+      "event_type": "node.upsert",
+      "payload": {
+        "node_type": "session",
+        "node_id": "session:pi-vision-session-open",
+        "attrs": {
+          "handoff_id": "handoff:vision-4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05-out",
+          "instance_id": "pi-workstation-1",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    },
+    {
+      "schema_version": 2,
+      "event_id": "lin_83148c662c5487116fa14e7d8bb1af64",
+      "source": "pi-pi-workstation-5e1f0a2b",
+      "source_sequence": 30,
+      "occurred_at": "2026-11-02T21:46:28.364Z",
+      "entity_type": "lineage",
+      "entity_id": "session:pi-text-session-open",
+      "event_type": "edge.add",
+      "payload": {
+        "edge_type": "handoff",
+        "from_id": "session:pi-text-session-open",
+        "to_id": "session:pi-vision-session-open",
+        "attrs": {
+          "handoff_id": "handoff:vision-4fbcad96-7a5e-4bc2-9d64-ae5f6a7b8c05-out",
+          "handoff_kind": "vision",
+          "cause": "vision_delegate",
+          "from_model": "local/qwen3.6-35b-a3b",
+          "to_model": "google/gemini-3-flash",
+          "host": "pi-workstation-1"
+        }
+      },
+      "visibility_scope": "private",
+      "evidence_refs": []
+    }
+  ]
+}

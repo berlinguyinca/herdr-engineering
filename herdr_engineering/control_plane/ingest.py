@@ -63,11 +63,77 @@ def _git_identity(payload):
     return {"repository_id": next(iter(identities), None), "commit_sha": commit_sha}
 
 
+AI_SYNC_COUNTS = ("ahead", "behind", "drifted_files_count", "skipped_links_count",
+                  "verify_errors_count", "verify_warnings_count")
+AI_SYNC_TEXT = {"ai_sync_version": 40, "last_sync_ts": 40, "branch": 200, "last_error": 500, "verify_checked_at": 40}
+AI_SYNC_VERIFY_CHECKED = ("skills", "agents", "commands", "hooks")
+AI_SYNC_VERIFY_SAMPLE = (10, 200)
+
+
+def validate_ai_sync(entity_id, event_type, payload) -> dict:
+    """Strict allow-list for an ai-sync status report: counts, short names and relative paths only.
+
+    Anything else (notably free-form contents) is rejected rather than stored; returns a clean copy.
+    """
+    if event_type != "status":
+        raise ValueError("ai_sync event_type must be 'status'")
+    if not isinstance(payload, dict):
+        raise ValueError("ai_sync payload must be an object")
+    allowed = {"host_id", "envs_enabled", "drift_sample", "checked_at", "verify_ok", "verify_checked",
+               "verify_error_sample", *AI_SYNC_COUNTS, *AI_SYNC_TEXT}
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"unknown ai_sync field: {unknown[0]}")
+    if payload.get("host_id") != entity_id:
+        raise ValueError("ai_sync host_id must equal entity_id")
+    clean = {"host_id": entity_id}
+    checked_at = payload.get("checked_at")
+    if not isinstance(checked_at, str) or not 0 < len(checked_at) <= 40:
+        raise ValueError("ai_sync checked_at is required")
+    clean["checked_at"] = checked_at
+    for key in AI_SYNC_COUNTS:
+        value = payload.get(key)
+        if value is not None and (type(value) is not int or not 0 <= value < 2**31):
+            raise ValueError(f"ai_sync {key} must be a non-negative integer")
+        clean[key] = value
+    for key, limit in AI_SYNC_TEXT.items():
+        value = payload.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > limit):
+            raise ValueError(f"ai_sync {key} must be a string of at most {limit} characters")
+        clean[key] = value
+    for key, count, limit in (("envs_enabled", 64, 64), ("drift_sample", 20, 300)):
+        values = payload.get(key, [])
+        if (not isinstance(values, list) or len(values) > count
+                or any(not isinstance(v, str) or len(v) > limit for v in values)):
+            raise ValueError(f"ai_sync {key} must be a list of at most {count} strings of at most {limit} characters")
+        clean[key] = list(values)
+    # Optional ai-sync verify result (absent/null = unknown): a verdict, counts and short "path: problem" strings.
+    verify_ok = payload.get("verify_ok")
+    if verify_ok is not None and type(verify_ok) is not bool:
+        raise ValueError("ai_sync verify_ok must be a boolean")
+    clean["verify_ok"] = verify_ok
+    checked = payload.get("verify_checked")
+    if checked is not None:
+        if (not isinstance(checked, dict) or set(checked) != set(AI_SYNC_VERIFY_CHECKED)
+                or any(v is not None and (type(v) is not int or not 0 <= v < 2**31) for v in checked.values())):
+            raise ValueError("ai_sync verify_checked must be skills/agents/commands/hooks non-negative integers")
+        checked = {key: checked[key] for key in AI_SYNC_VERIFY_CHECKED}
+    clean["verify_checked"] = checked
+    sample = payload.get("verify_error_sample")
+    count, limit = AI_SYNC_VERIFY_SAMPLE
+    if sample is not None and (not isinstance(sample, list) or len(sample) > count
+                               or any(not isinstance(v, str) or len(v) > limit for v in sample)):
+        raise ValueError(f"ai_sync verify_error_sample must be a list of at most {count} strings of at most {limit} characters")
+    clean["verify_error_sample"] = None if sample is None else list(sample)
+    return clean
+
+
 # Entity types an ingest principal may write. Dispatched types have handlers; the generic ones are
 # plain activity records nothing authoritative reads back. Adding a type here is a security decision.
 DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
                                      "mission_activity", "test_run", "build", "review",
-                                     "review_finding", "pull_request", "token_usage", "resource_usage"})
+                                     "review_finding", "pull_request", "token_usage", "resource_usage",
+                                     "ai_sync"})
 # ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
 # repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
 # docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
@@ -398,6 +464,8 @@ class IngestService:
             validate_lineage(event_type, payload)
         if entity_type in ("session", "mission"):
             _git_identity(payload)
+        if entity_type == "ai_sync":
+            validate_ai_sync(entity_id, event_type, payload)
         if entity_type == "service" and any(
                 k in payload for k in ("repository_id", "forge_url", "repository_url",
                                        "repo_url", "clone_url", "commit_sha")):
@@ -488,6 +556,10 @@ class IngestService:
                 raise ValueError("invalid mission activity event_type")
             result = self.repo.mission_activity.ingest(entity_id, payload, source=source)
             return {"entity_type": entity_type, "entity_id": entity_id, **result}
+        if entity_type == "ai_sync":
+            # Latest-per-host config-sync status; the event stream is the durable record (repo.list_ai_sync).
+            self.repo.record_event("ai_sync", entity_id, event_type, validate_ai_sync(entity_id, event_type, payload))
+            return {"entity_type": "ai_sync", "entity_id": entity_id, "event_type": event_type}
         if entity_type == "host":
             return self._ingest_host(entity_id, event_type, payload, source)
         if entity_type == "session":

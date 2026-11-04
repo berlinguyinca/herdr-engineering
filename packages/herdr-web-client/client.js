@@ -127,6 +127,19 @@ export class HerdrClient {
     }
   }
 
+  // Memory Explorer (read-only): the control plane authorizes and proxies herdr-memory; the browser holds no memory credentials.
+  exploreMemory(params, { signal } = {}) {
+    return this.request(`/api/v1/memory/search?${params}`, { signal });
+  }
+
+  getMemoryRecord(id, { signal } = {}) {
+    return this.request(`/api/v1/memory/${encodeURIComponent(id)}`, { signal });
+  }
+
+  getMemoryServiceStatus({ signal } = {}) {
+    return this.request('/api/v1/memory/status', { signal });
+  }
+
   getHandoffTree({ signal, sessionId } = {}) {
     return this.request(`/api/v1/handoffs/tree${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, { signal });
   }
@@ -541,6 +554,10 @@ export class HerdrClient {
     return this.request('/api/v1/fabric/services', { signal });
   }
 
+  listAiSync({ signal } = {}) {
+    return this.request('/api/v1/ai-sync', { signal });
+  }
+
   listHosts({ signal } = {}) {
     return this.request('/api/v1/hosts', { signal });
   }
@@ -946,6 +963,25 @@ export class HerdrClient {
   }
   connectorRequest(connectorId, body) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/request`, { method: 'POST', body });
+  }
+  // Read-only graph of the caller's assistants, delegations and the specialists they run on.
+  assistantGraph({ signal } = {}) {
+    return this.request('/api/v1/assistant-graph', { signal });
+  }
+  assistantTypes({ signal } = {}) {
+    return this.request('/api/v1/assistant-types', { signal });
+  }
+  linkAssistant(id, parentId) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/link`, { method: 'POST', body: { parent_id: parentId } });
+  }
+  unlinkAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/unlink`, { method: 'POST', body: {} });
+  }
+  deleteAssistant(id, confirmName) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/delete`, { method: 'POST', body: { confirm_name: confirmName } });
+  }
+  setupAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/setup`, { method: 'POST', body: {} });
   }
   listDelegations() {
     return this.request('/api/v1/assistant-delegations');

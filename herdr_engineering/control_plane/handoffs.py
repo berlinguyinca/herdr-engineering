@@ -28,12 +28,65 @@ CHAIN_MAX = 10
 UNASSIGNED = "Unassigned"
 
 
+_MEM_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
+_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
+MEMORY_REFS_MAX = 100
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_memory_context(block):
+    """Strictly validate the optional additive ``memory_context`` block; ids and counts only, never memory text.
+
+    Returns a normalized copy or raises ValueError. Callers skip this entirely when the block is absent.
+    """
+    if not isinstance(block, dict) or set(block) - {"version", "refs", "snapshot_digest", "checkpoint"}:
+        raise ValueError("memory_context must be an object with only version, refs, snapshot_digest, checkpoint")
+    if not _is_int(block.get("version")) or block["version"] != 1:
+        raise ValueError("memory_context.version must be 1")
+    refs = block.get("refs")
+    if not isinstance(refs, list) or len(refs) > MEMORY_REFS_MAX:
+        raise ValueError("memory_context.refs must be a bounded list")
+    clean = []
+    for ref in refs:
+        if not isinstance(ref, dict) or set(ref) != {"memory_id", "bank_id", "revision"}:
+            raise ValueError("memory_context ref must have exactly memory_id, bank_id, revision")
+        if not all(isinstance(ref[k], str) and _MEM_ID.fullmatch(ref[k]) for k in ("memory_id", "bank_id")):
+            raise ValueError("memory_context ref ids must be safe identifier strings")
+        # herdr-memory CLI emits revision as an integer; producers may also send a safe string.
+        rev = ref["revision"]
+        if not ((isinstance(rev, str) and _MEM_ID.fullmatch(rev)) or (_is_int(rev) and rev >= 0)):
+            raise ValueError("memory_context ref revision must be a safe string or non-negative integer")
+        clean.append({k: ref[k] for k in ("memory_id", "bank_id", "revision")})
+    digest = block.get("snapshot_digest")
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise ValueError("memory_context.snapshot_digest must be sha256:<64 hex>")
+    cp = block.get("checkpoint")
+    if not isinstance(cp, dict) or set(cp) != {"state", "outbox_pending", "at"}:
+        raise ValueError("memory_context.checkpoint must have exactly state, outbox_pending, at")
+    if cp["state"] not in {"synced", "pending"}:
+        raise ValueError("memory_context.checkpoint.state must be synced or pending")
+    if not _is_int(cp["outbox_pending"]) or cp["outbox_pending"] < 0:
+        raise ValueError("memory_context.checkpoint.outbox_pending must be a non-negative integer")
+    if _when(cp["at"]) is None if isinstance(cp["at"], str) else True:
+        raise ValueError("memory_context.checkpoint.at must be an ISO timestamp")
+    return {"version": 1, "refs": clean, "snapshot_digest": digest,
+            "checkpoint": {"state": cp["state"], "outbox_pending": cp["outbox_pending"], "at": cp["at"]}}
+
+
 def _when(text):
     try:
         value = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
     except ValueError:
         return None
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _is_vision(row):
+    """A Pi vision-delegation row (out or back): it carries the vision summary."""
+    return isinstance(row.get("vision"), dict)
 
 
 class HandoffRegistry:
@@ -89,6 +142,9 @@ class HandoffRegistry:
             goal = body.get("goal")
             if not isinstance(goal, str) or not goal.strip() or len(goal) > 12000:
                 raise ValueError("goal must be a non-empty bounded string")
+            memory_context = None
+            if body.get("memory_context") is not None:
+                memory_context = validate_memory_context(body["memory_context"])
             now = self.now()
             row = {
                 "handoff_id": hid, "schema_version": 1, "state": "queued",
@@ -110,6 +166,8 @@ class HandoffRegistry:
                 "fingerprint": fingerprint,
                 "history": [{"state": "queued", "actor": actor, "at": now}],
             }
+            if memory_context is not None:
+                row["memory_context"] = memory_context
             row = copy.deepcopy(row)
             self.repo.record_event("handoff", hid, "HandoffQueued", copy.deepcopy(row),
                                    mission_id=row.get("mission_id"), session_id=row["source"].get("session_id"),
@@ -184,8 +242,13 @@ class HandoffRegistry:
         return merged
 
     def _workspace(self, row):
-        """The group a handoff belongs to: its source session's repository, else working directory, else its mission."""
+        """The group a handoff belongs to: its source session's repository, else working directory, else its mission.
+        A vision BACK row runs from the new vision session to the text session, so it groups by its target (the text session)
+        to share a workspace with its out row; with no target (the pane never started) its source is the text session (H10)."""
         sid = (row.get("source") or {}).get("session_id")
+        vision = row.get("vision")
+        if isinstance(vision, dict) and vision.get("phase") == "back":
+            sid = (row.get("target") or {}).get("session_id") or sid
         session = self.repo.get_session(sid) if sid else None
         if session:
             if session.get("repository_id"):
@@ -206,6 +269,10 @@ class HandoffRegistry:
             return row["state"]
         if self._stalled(row, now):
             return "stalled"
+        vision = row.get("vision")
+        if vision:      # a vision delegation switches models on purpose: only a result that is not whole is worth a look
+            return {"partial": "vision result partial", "failed": "vision delegation failed",
+                    "timeout": "vision delegation timed out", "unknown": "vision result unknown"}.get(vision.get("outcome"))
         if row.get("origin") == "lineage" and row.get("cause") == "context_pressure" and row.get("model_change") == "not_pinned":
             return "successor not pinned to the same model"
         if row.get("origin") == "lineage" and row.get("model_change") == "switched":
@@ -225,7 +292,10 @@ class HandoffRegistry:
                 "completed": len(row.get("completed") or []), "remaining": len(row.get("remaining") or []),
                 "attention": self._needs_attention(row, now), "stalled": self._stalled(row, now),
                 "attention_reason": self._attention_reason(row, now),
-                **({k: row.get(k) for k in ("origin", "cause", "from_model", "to_model", "model_change", "checkpoint")} if row.get("origin") == "lineage" else {"origin": "registry"})}
+                **({"memory_context": row["memory_context"]} if row.get("memory_context") else {}),
+                **({k: row.get(k) for k in ("origin", "cause", "from_model", "to_model", "model_change", "checkpoint")} if row.get("origin") == "lineage" else {"origin": "registry"}),
+                # the page pairs vision round trips from these rows, so the summary carries the vision summary too (vision rows only)
+                **({"vision": row["vision"]} if row.get("origin") == "lineage" and isinstance(row.get("vision"), dict) else {})}
 
     def overview(self, extra=None):
         """Counts by workspace and the few handoffs that need a human; no rows beyond OVERVIEW_ATTENTION."""
@@ -291,7 +361,9 @@ class HandoffRegistry:
     def chain(self, handoff_id, extra=None):
         """The single path of handoffs through this one: backwards to the handoff that delivered the work to its source session,
         forwards to the one that took it on from its target session (the same session ids the Usage tab joins on). A session that
-        received or gave many handoffs contributes only the nearest one in time, so the chain stays a path, not a blob."""
+        received or gave many handoffs contributes only the nearest one in time, so the chain stays a path, not a blob.
+        Vision delegations are side trips, not hops of the work: a walk from a real handoff skips them, and the chain of a vision
+        row is just its out and back pair (the rows sharing its request id, out first) (H8)."""
         with self.repo._event_lock:
             rows = self._with(extra)
             row = rows.get(handoff_id)
@@ -299,8 +371,19 @@ class HandoffRegistry:
                 raise KeyError(handoff_id)
             now = _when(self.now()) or datetime.now(timezone.utc)
             key = lambda r: (r.get("created_at") or "", r["handoff_id"])
+            if _is_vision(row):
+                rid = row["vision"].get("request_id")
+                pair = [row]
+                if isinstance(rid, str) and rid:          # an unparseable id (request_id "") pairs with nothing (H3)
+                    pair = sorted((r for r in rows.values() if _is_vision(r) and r["vision"].get("request_id") == rid),
+                                  key=lambda r: (r["vision"].get("phase") != "out", key(r)))
+                return {"handoff_id": handoff_id, "position": [r["handoff_id"] for r in pair].index(handoff_id),
+                        "more_before": False, "more_after": False,
+                        "chain": [self._summary(r, self._workspace(r), now) for r in pair], "untrusted_text": True}
             by_target, by_source = {}, {}
             for r in rows.values():
+                if _is_vision(r):
+                    continue
                 t, sr = (r.get("target") or {}).get("session_id"), (r.get("source") or {}).get("session_id")
                 if t:
                     by_target.setdefault(t, []).append(r)

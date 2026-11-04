@@ -1,0 +1,291 @@
+"""Assistant types, create, link and unlink (docs/specs/assistant-management-20261031). Real routes, real service."""
+import pytest
+
+from herdr_engineering.control_plane.assistant import assistant_config
+from tests.control_plane.test_assistant_dispatch import world  # noqa: F401
+
+ROLE = {"id": "procedure:secretary-system", "version": "1.0.0",
+        "digest": "sha256:942e5b1002d74a9d52ae2fb7c2f8ef07f4f6b08aa1b9e08a36b8e0504ffab120"}
+
+
+@pytest.fixture()
+def hz(world):  # noqa: F811
+    h, svc, svr = world
+    svc.config["delegation"]["targets"]["pi-secretary"] = {"role_ref": ROLE, "requires": ["os:linux"],
+                                                           "resources": {"cpus": 1, "memory_mb": 1024}}
+    return h, svc
+
+
+def make(h, name, who="alice", **body):
+    st, out = h.call(who, "POST", "/api/v1/assistants", {"name": name, **body})
+    return st, out
+
+
+def link(h, child, parent, who="alice"):
+    return h.call(who, "POST", f"/api/v1/assistants/{child}/link", {"parent_id": parent})
+
+
+def test_types_come_from_configuration_and_report_requirements(hz):
+    h, _ = hz
+    st, out = h.call("alice", "GET", "/api/v1/assistant-types")
+    assert st == 200
+    types = {t["type"]: t for t in out["types"]}
+    assert types["rakazo"]["can_be_parent"] is True and types["rakazo"]["kind"] == "assistant"
+    sec = types["pi-secretary"]
+    assert sec["kind"] == "specialist" and sec["can_be_parent"] is False
+    assert sec["requires"] == ["os:linux"] and sec["resources"] == {"cpus": 1, "memory_mb": 1024}
+    assert sec["role"] == "procedure:secretary-system@1.0.0"
+
+
+def test_target_config_rejects_unknown_capabilities_and_resources():
+    base = {"role_ref": None}
+    cfg = lambda spec: assistant_config({"personal_assistant": {"enabled": True, "delegation": {
+        "targets": {"pi": base, "scout": spec}}}})
+    assert cfg({"role_ref": None, "requires": ["desktop"]})["delegation"]["targets"]["scout"]["requires"] == [
+        "desktop", "display"]                                                    # desktop implies display
+    with pytest.raises(ValueError):
+        cfg({"role_ref": None, "requires": ["displya"]})                         # a typo is an error, not a match
+    with pytest.raises(ValueError):
+        cfg({"role_ref": None, "resources": {"cpus": -1}})
+    with pytest.raises(ValueError):
+        cfg({"role_ref": None, "resources": {"disk": 5}})
+
+
+def test_create_defaults_to_rakazo_and_specialists_need_setup(hz):
+    h, _ = hz
+    st, a = make(h, "Fleet PA")
+    assert st == 201 and a["type"] == "rakazo" and a["parent_id"] is None and a["status"] == "ready"
+    st, s = make(h, "Secretary", type="pi-secretary", parent_id=a["assistant_id"])
+    assert st == 201 and s["type"] == "pi-secretary" and s["parent_id"] == a["assistant_id"]
+    assert s["status"] == "needs_setup"
+    assert make(h, "X", type="no-such-type")[0] == 400
+
+
+def test_create_is_idempotent_and_conflicting_reuse_is_refused(hz):
+    h, svc = hz
+    st1, a = make(h, "Fleet PA", idempotency_key="k1")
+    st2, again = make(h, "Fleet PA", idempotency_key="k1")
+    assert (st1, st2) == (201, 201) and again["assistant_id"] == a["assistant_id"]
+    assert len(svc.store.assistants) == 1
+    assert [e["action"] for e in svc.store.audit].count("assistant.created") == 1
+    assert make(h, "Other name", idempotency_key="k1")[0] == 400
+
+
+def test_link_and_unlink_are_recorded_audited_and_replay_safe(hz):
+    h, svc = hz
+    parent, child = make(h, "Fleet PA")[1], make(h, "Mail assistant")[1]
+    st, out = link(h, child["assistant_id"], parent["assistant_id"])
+    assert st == 200 and out["parent_id"] == parent["assistant_id"] and out["version"] == child["version"] + 1
+    again = link(h, child["assistant_id"], parent["assistant_id"])[1]
+    assert again["version"] == out["version"]                                    # replay changes nothing
+    st, out = h.call("alice", "POST", f"/api/v1/assistants/{child['assistant_id']}/unlink", {})
+    assert st == 200 and out["parent_id"] is None
+    actions = [e["action"] for e in svc.store.audit]
+    assert actions.count("assistant.linked") == 1 and actions.count("assistant.unlinked") == 1
+
+
+def test_link_rules_parent_type_self_cycle_depth_and_archived(hz):
+    h, _ = hz
+    a, b, c, d = (make(h, n)[1]["assistant_id"] for n in "ABCD")
+    spec = make(h, "Secretary", type="pi-secretary")[1]["assistant_id"]
+    assert link(h, a, a)[0] == 400                                               # not its own parent
+    assert link(h, b, spec)[0] == 400                                            # a specialist cannot be a parent
+    assert link(h, b, a)[0] == 200 and link(h, c, b)[0] == 200                   # A <- B <- C is depth 3
+    assert link(h, a, c)[0] == 400                                               # cycle
+    assert link(h, d, c)[0] == 400                                               # depth 4
+    st, _ = h.call("alice", "POST", f"/api/v1/assistants/{d}", {"archive": True})
+    assert st == 200 and link(h, d, a)[0] == 400                                 # archived cannot be linked
+
+
+def test_link_grants_nothing_and_changes_no_connection(hz):
+    h, svc = hz
+    parent, child = make(h, "Fleet PA")[1], make(h, "Secretary", type="pi-secretary")[1]
+    before = (len(svc.store.grants), len(svc.store.approvals), len(svc.store.connectors), len(svc.store.delegations))
+    assert link(h, child["assistant_id"], parent["assistant_id"])[0] == 200
+    after = (len(svc.store.grants), len(svc.store.approvals), len(svc.store.connectors), len(svc.store.delegations))
+    assert before == after
+    st, g = h.call("alice", "GET", "/api/v1/assistant-graph")
+    nodes = {n["id"]: n for n in g["nodes"]}
+    assert nodes[parent["assistant_id"]]["can_delegate"] is False                # still gated by the approval flow
+
+
+def test_other_users_cannot_link_into_or_see_your_tree(hz):
+    h, _ = hz
+    mine, theirs = make(h, "Mine")[1], make(h, "Theirs", who="bea")[1]
+    assert link(h, mine["assistant_id"], theirs["assistant_id"])[0] == 404       # a different tenant's parent
+    assert link(h, mine["assistant_id"], mine["assistant_id"], who="bea")[0] == 404
+
+
+def test_archiving_a_parent_unlinks_its_children(hz):
+    h, svc = hz
+    parent, child = make(h, "Fleet PA")[1], make(h, "Mail")[1]
+    link(h, child["assistant_id"], parent["assistant_id"])
+    assert h.call("alice", "POST", f"/api/v1/assistants/{parent['assistant_id']}", {"archive": True})[0] == 200
+    st, got = h.call("alice", "GET", f"/api/v1/assistants/{child['assistant_id']}")
+    assert st == 200 and got["parent_id"] is None
+
+
+def test_graph_reflects_type_parent_and_linked_edges(hz):
+    h, _ = hz
+    parent, child = make(h, "Fleet PA")[1], make(h, "Secretary", type="pi-secretary")[1]
+    link(h, child["assistant_id"], parent["assistant_id"])
+    st, g = h.call("alice", "GET", "/api/v1/assistant-graph")
+    nodes = {n["id"]: n for n in g["nodes"]}
+    assert nodes[child["assistant_id"]]["type"] == "pi-secretary"
+    assert nodes[child["assistant_id"]]["parent_id"] == parent["assistant_id"]
+    edges = {(e["from"], e["to"], e["kind"]) for e in g["edges"]}
+    assert (parent["assistant_id"], child["assistant_id"], "linked") in edges
+
+
+def test_specialist_setup_steps_report_binding_and_placement_and_change_nothing(hz):
+    h, svc = hz
+    _, s = make(h, "Secretary", type="pi-secretary")
+    before = (len(svc.store.grants), len(svc.store.delegations), len(svc.store.audit))
+    st, g = h.call("alice", "GET", "/api/v1/assistant-graph")
+    node = next(n for n in g["nodes"] if n["id"] == s["assistant_id"])
+    steps = {x["id"]: x for x in node["setup"]}
+    assert st == 200 and node["status"] == "needs_setup"
+    assert steps["binding"]["state"] == "todo"
+    assert steps["placement"]["state"] == "blocked" and "no host can carry it" in steps["placement"]["detail"]
+    assert (len(svc.store.grants), len(svc.store.delegations), len(svc.store.audit)) == before
+
+
+class _FakeSetup:
+    def __init__(self, fail=None):
+        self.fail, self.calls = fail, []
+
+    @staticmethod
+    def supports(type_name):
+        return type_name == "pi-secretary"
+
+    def provision(self, type_name):
+        from herdr_engineering.assistant_self_setup import SelfSetupError
+        self.calls.append(type_name)
+        if self.fail:
+            raise SelfSetupError(self.fail)
+        return {"room_id": "room_1", "agent_id": "agent_1"}
+
+
+def test_setup_endpoint_provisions_audits_and_refuses_what_it_cannot_do(hz):
+    h, svc = hz
+    _, s = make(h, "Secretary", type="pi-secretary")
+    _, r = make(h, "Fleet PA")
+    path = f"/api/v1/assistants/{s['assistant_id']}/setup"
+    assert h.call("alice", "POST", path, {})[0] == 400                          # no collaboration operator wired
+    owner = svc.store.assistants[s["assistant_id"]]
+    svc.self_setup = _FakeSetup()
+    svc._setup_owner = lambda t, u: (t, u) == (owner.tenant_id, owner.user_id)
+    st, out = h.call("alice", "POST", path, {})
+    assert st == 200 and (out["room_id"], out["agent_id"]) == ("room_1", "agent_1")
+    assert svc.self_setup.calls == ["pi-secretary"]
+    assert [e["action"] for e in svc.store.audit].count("assistant.setup") == 1
+    assert h.call("alice", "POST", f"/api/v1/assistants/{r['assistant_id']}/setup", {})[0] == 400   # rakazo needs none
+    svc.self_setup = _FakeSetup(fail="no active agent named pi-secretary is enrolled for you; enroll it first")
+    st, out = h.call("alice", "POST", path, {})
+    assert st == 400 and "enroll it first" in str(out)
+    assert h.call("bea", "POST", path, {})[0] in (403, 404)                     # someone else's assistant
+
+
+def test_rename_validates_and_trims(hz):
+    h, _ = hz
+    _, a = make(h, "Old")
+    path = f"/api/v1/assistants/{a['assistant_id']}"
+    st, out = h.call("alice", "PATCH", path, {"name": "  New name "})
+    assert st == 200 and out["name"] == "New name"
+    for bad in ("", "   ", "x" * 81, "a\nb", 5):
+        assert h.call("alice", "PATCH", path, {"name": bad})[0] == 400
+
+
+def test_delete_needs_archive_first_and_the_exact_name_and_removes_only_its_own_records(hz):
+    h, svc = hz
+    _, keep = make(h, "Keeper")
+    _, gone = make(h, "Doomed")
+    owner = svc.store.assistants[keep["assistant_id"]]
+    for a in (keep, gone):
+        t = svc.create_thread(tenant_id=owner.tenant_id, user_id=owner.user_id, assistant_id=a["assistant_id"])
+        svc.send_message(tenant_id=owner.tenant_id, user_id=owner.user_id, assistant_id=a["assistant_id"],
+                         thread_id=t.thread_id, content="hello")
+    path = f"/api/v1/assistants/{gone['assistant_id']}/delete"
+    st, out = h.call("alice", "POST", path, {"confirm_name": "Doomed"})
+    assert st == 400 and "archive" in str(out)                                   # still enabled
+    assert h.call("alice", "POST", f"/api/v1/assistants/{gone['assistant_id']}", {"archive": True})[0] == 200
+    assert h.call("alice", "POST", path, {"confirm_name": "doomed"})[0] == 400   # exact name only
+    assert h.call("alice", "POST", path, {})[0] == 400
+    assert h.call("bea", "POST", path, {"confirm_name": "Doomed"})[0] in (403, 404)
+    st, out = h.call("alice", "POST", path, {"confirm_name": "Doomed"})
+    assert st == 200 and out["removed"]["assistant"] == 1 and out["removed"]["threads"] == 1
+    assert gone["assistant_id"] not in svc.store.assistants and keep["assistant_id"] in svc.store.assistants
+    assert [t for t in svc.store.threads.values() if t.assistant_id == keep["assistant_id"]]      # the other one is intact
+    assert not [t for t in svc.store.threads.values() if t.assistant_id == gone["assistant_id"]]
+    assert [e["action"] for e in svc.store.audit].count("assistant.deleted") == 1
+    assert h.call("alice", "POST", path, {"confirm_name": "Doomed"})[0] in (404, 400)            # gone for good
+
+
+def test_deleting_a_parent_leaves_no_dangling_link_on_its_children(hz):
+    h, svc = hz
+    _, p = make(h, "Parent")
+    _, c = make(h, "Child", type="pi-secretary", parent_id=p["assistant_id"])
+    h.call("alice", "POST", f"/api/v1/assistants/{p['assistant_id']}", {"archive": True})
+    h.call("alice", "POST", f"/api/v1/assistants/{p['assistant_id']}/delete", {"confirm_name": "Parent"})
+    assert svc.store.assistants[c["assistant_id"]].parent_id is None
+
+
+def test_a_deleted_assistant_stays_gone_in_the_persisted_snapshot(hz):
+    import json
+    h, svc = hz
+    _, a = make(h, "Doomed")
+    h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}", {"archive": True})
+    assert a["assistant_id"] in json.dumps(svc.store.snapshot()["assistants"], default=str)
+    assert h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}/delete", {"confirm_name": "Doomed"})[0] == 200
+    snap = svc.store.snapshot()
+    for table in ("assistants", "threads", "messages", "runs", "grants", "routines"):
+        assert a["assistant_id"] not in json.dumps(snap.get(table, {}), default=str), table
+
+
+def test_delete_unlinks_children_first_and_rechecks_under_the_lock(hz):
+    from herdr_engineering.control_plane.assistant import AssistantError
+    h, svc = hz
+    _, parent = make(h, "Parent")
+    _, child = make(h, "Child", type="pi-secretary", parent_id=parent["assistant_id"])
+    owner = svc.store.assistants[parent["assistant_id"]]
+    # disabled with PATCH (not archived) is still "not enabled": allowed, and the child must not keep a dead link
+    assert h.call("alice", "PATCH", f"/api/v1/assistants/{parent['assistant_id']}", {"enabled": False})[0] == 200
+    assert svc.store.assistants[child["assistant_id"]].parent_id == parent["assistant_id"]
+    assert h.call("alice", "POST", f"/api/v1/assistants/{parent['assistant_id']}/delete", {"confirm_name": "Parent"})[0] == 200
+    assert svc.store.assistants[child["assistant_id"]].parent_id is None
+    # the purge itself refuses an enabled assistant or a wrong name, whatever the caller checked before
+    _, live = make(h, "Live")
+    with pytest.raises(AssistantError):
+        svc.store.purge_assistant(live["assistant_id"], tenant_id=owner.tenant_id, user_id=owner.user_id, confirm_name="Live")
+    assert live["assistant_id"] in svc.store.assistants
+
+
+def test_delete_audits_before_it_purges(hz):
+    h, svc = hz
+    _, a = make(h, "Doomed")
+    h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}", {"archive": True})
+    real = svc.store.audit_record
+
+    def refuse(**kw):
+        if kw.get("action") == "assistant.deleted":
+            raise RuntimeError("audit sink refused")
+        return real(**kw)
+    svc.store.audit_record = refuse
+    h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}/delete", {"confirm_name": "Doomed"})
+    assert a["assistant_id"] in svc.store.assistants                      # nothing was deleted without its audit entry
+
+
+def test_create_validates_the_name_like_update(hz):
+    h, _ = hz
+    for bad in ("x" * 81, "a\nb"):
+        assert make(h, bad)[0] == 400
+    assert make(h, "  Trimmed ")[1]["name"] == "Trimmed"
+
+
+def test_creating_again_after_archiving_makes_a_new_assistant_not_a_replay_of_the_archived_one(hz):
+    h, _ = hz
+    st1, a = make(h, "Again", idempotency_key="cli-same")
+    assert make(h, "Again", idempotency_key="cli-same")[1]["assistant_id"] == a["assistant_id"]      # a live one replays
+    h.call("alice", "POST", f"/api/v1/assistants/{a['assistant_id']}", {"archive": True})
+    st2, b = make(h, "Again", idempotency_key="cli-same")
+    assert st2 == 201 and b["assistant_id"] != a["assistant_id"] and b["enabled"] is True

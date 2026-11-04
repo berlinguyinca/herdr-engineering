@@ -34,7 +34,7 @@ INSIGHTS_KEYS = frozenset({
 ATTN_EVENTS = frozenset({"attn_ack", "attn_snooze", "attn_clear"})
 CATEGORIES = ("review_blocked", "stale_head", "rereview_required", "review_requested", "review_unverifiable",
               "ci_failed", "blocked", "expired_or_stuck", "steering_confirm", "promotion_confirm",
-              "proposal_accept", "consult_request", "suggestion_decide")
+              "proposal_accept", "consult_request", "suggestion_decide", "task_assigned", "task_overdue")
 TITLES = {
     "review_blocked": "Review blocked at the current head", "stale_head": "Pull request head cannot be verified",
     "rereview_required": "Re-review needed: the head moved", "review_requested": "Review requested",
@@ -42,16 +42,18 @@ TITLES = {
     "expired_or_stuck": "Agent or task is stuck or expired", "steering_confirm": "Steering request waits for your confirmation",
     "promotion_confirm": "Fork or promotion waits for your confirmation", "proposal_accept": "Proposal waits for your decision",
     "consult_request": "Someone asked you a question",
-    "suggestion_decide": "A guest's request waits for your decision"}
+    "suggestion_decide": "A guest's request waits for your decision",
+    "task_assigned": "A task is assigned to you", "task_overdue": "A task assigned to a person needs attention"}
 _ACK_KEY = re.compile(r"[a-z_]{1,32}\|[\x21-\x7e]{1,420}\Z")
 _FP = re.compile(r"[0-9a-f]{24}\Z")
 PRIORITY_RULES = [
     {"severity": "error", "means": "something is failing or blocked by a reviewer right now", "categories": ["review_blocked", "ci_failed"]},
     {"severity": "warning", "means": "a head moved, an agent is stuck, work has been blocked a long time",
-     "categories": ["stale_head", "rereview_required", "expired_or_stuck", "blocked (after the escalation time)"]},
+     "categories": ["stale_head", "rereview_required", "expired_or_stuck", "blocked (after the escalation time)",
+                    "task_overdue"]},
     {"severity": "notice", "means": "waiting for a person or a review",
      "categories": ["review_requested", "blocked", "steering_confirm", "promotion_confirm", "proposal_accept", "consult_request",
-                    "suggestion_decide"]},
+                    "suggestion_decide", "task_assigned"]},
     {"severity": "info", "means": "context only", "categories": ["review_unverifiable"]}]
 ORDER_RULE = "severity (error first), then items addressed to you, then the oldest first, then key"
 MAX_SCAN_ROWS = 200      # rows of any one collab-side list examined per read
@@ -328,7 +330,8 @@ class AttentionMixin:
         from .collab import ROLE_ACTIONS
         m = self._member(room, pr.id) or {}
         role = m.get("role")
-        rows: dict[str, list] = {"steer": [], "proposal": [], "consult": [], "agent": [], "suggestion": []}
+        rows: dict[str, list] = {"steer": [], "proposal": [], "consult": [], "agent": [], "suggestion": [], "task": []}
+        rows["task"] = self._tr2_attention_rows(pr, room_id, role)       # team roles slice 2: ids and dates only
         if role == "owner":                     # team rooms slice 1: the Suggest queue is the owner's to decide
             rows["suggestion"] = self._tr_attention_rows(room_id)
         scfg = self.steer_cfg()
@@ -371,7 +374,8 @@ class AttentionMixin:
         def item(category, severity, key_id, subject, fp, since, detail=None, expires=None):
             out.append({"key": f"{category}|{key_id}", "category": category, "severity": severity, "subject": subject,
                         "since": since, "for_you": category in ("steering_confirm", "promotion_confirm", "proposal_accept",
-                                                                 "consult_request", "suggestion_decide"),
+                                                                 "consult_request", "suggestion_decide", "task_assigned",
+                                                                 "task_overdue"),
                         "fp": ins.fingerprint(category, key_id, *fp), "detail": detail, "expires_at": expires})
         for r in rows["steer"]:
             node = graph.node_context(reader, r["node_id"])
@@ -387,6 +391,12 @@ class AttentionMixin:
         for r in rows["suggestion"]:             # ids and dates only: the request's words stay in the queue, never the inbox
             item("suggestion_decide", "notice", r["id"], {"node_id": None, "node_type": "suggestion", "label": None},
                  (r["digest"],), r["at"], {"suggestion_id": r["id"], "tainted": True}, self._iso(r["expires_epoch"]))
+        for r in rows["task"]:                   # ids, role and dates only: the task's words stay in my-tasks
+            overdue = r["kind"] == "task_overdue"
+            item(r["kind"], "warning" if overdue else "notice", r["id"], {"node_id": None, "node_type": "task", "label": None},
+                 (r.get("reason") or "", int(r["expires_epoch"] or 0)), r["at"],
+                 {"task_id": r["id"], "role": r.get("role"), **({"reason": r["reason"]} if r.get("reason") else {})},
+                 self._iso(r["expires_epoch"]) if r.get("expires_epoch") else None)
         for r in rows["consult"]:
             node = graph.node_context(reader, r["node_id"])
             subject = ({"node_id": r["node_id"], "node_type": node["node_type"], "label": ins.clip(node["label"])}

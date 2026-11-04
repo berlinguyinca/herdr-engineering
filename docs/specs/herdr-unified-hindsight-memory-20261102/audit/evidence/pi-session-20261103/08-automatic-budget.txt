@@ -1,0 +1,22 @@
+Measurement probe driving the REAL registerInteractiveMemory hooks with the REAL
+HindsightDurableMemory provider and the REAL herdr-memory CLI (node --experimental-strip-types,
+cwd mapped to the canary project, AUTOMATIC_LOOKUP_MS = 250 in src/blackhole/interactiveMemory.ts):
+
+== live server (real CLI, HTTPS roundtrip to https://memory.local.metabolomics.us) ==
+session_start (automatic recallAll): 231 ms
+before_agent_start (automatic per-turn recall): 214 ms
+
+== slow provider (CLI sleeps 5000 ms) ==
+[warning] Memory: request timed out. Use /memory setup to check your host and key.
+session_start (automatic recallAll): 255 ms
+before_agent_start (automatic per-turn recall): 0 ms        <- 60 s failure backoff engaged
+
+== missing CLI (ENOENT) ==
+session_start (automatic recallAll): 1 ms
+before_agent_start (automatic per-turn recall): 1 ms
+
+Reading: the 250 ms automatic budget is honoured (cut at ~250 ms, turn never waits for the provider),
+every failure fails open, and headless runs emit one telemetry warning per day. The live cross-host
+roundtrip (214-231 ms) sits within ~40 ms of the ceiling, so any slower path silently loses injection.
+Note the 231 ms session_start number is a FAILED call: `recall *` is rejected by the live server with
+HTTP 422, so Pi's recallAll() never returns a count.

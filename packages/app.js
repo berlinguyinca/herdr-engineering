@@ -36,6 +36,7 @@ import { flash, skeleton } from './motion.js';
 import { noteStreamContact, freshnessSources } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountFabricServices } from './fabric-services-view.js';
+import { mountAiSync } from './ai-sync-view.js';
 import { mountPrTrail } from './pr-trail-view.js';
 import { mountTeamMap } from './team-map-view.js';
 import { mountTeams } from './teams-view.js';
@@ -49,6 +50,7 @@ import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-
 import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
 import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
+import { mountMemory } from './memory-view.js';
 import { mountScheduling } from './scheduler-view.js';
 import { mountDeployments } from './deployments-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
@@ -87,7 +89,7 @@ const NAV = [
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
-  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling'] },
+  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
   { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
@@ -95,6 +97,7 @@ const NAV = [
   { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects', '/pr'] },
   { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
   { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
+  { group: 'Code', path: '/memory', label: 'Memory', capability: 'memory_v1' },
   { group: 'Code', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
 ];
 // Handoffs are the thread through the Agents section: who started whom, and why. Topology is no longer listed (the lineage
@@ -102,7 +105,7 @@ const NAV = [
 const SECTION_TABS = [
   [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
   [['/attention', 'Attention'], ['/activity', 'Activity']],
-  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling']],
+  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
   [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
@@ -228,6 +231,7 @@ const ROUTES = {
   '/system-services': viewServices,
   '/local-services': viewServices,
   '/fabric-services': viewFabricServices,
+  '/ai-sync': viewAiSync,
   '/pr/:owner/:repo/:number': viewPrTrail,
   '/teams': viewTeams,
   '/team-map': viewTeamMap,
@@ -251,6 +255,7 @@ const ROUTES = {
   '/publications': viewPublications,
   '/scheduling': viewScheduling,
   '/handoffs': viewHandoffs,
+  '/memory': viewMemory,
 };
 
 // Router rule: render() runs only on a route change (any hash change, query
@@ -444,6 +449,15 @@ async function viewTeamMap() {
 async function viewHandoffs() {
   root.innerHTML = `${liveHead('<h1>Handoffs</h1>')}<div id="handoffs"></div>`;
   return mountHandoffs(root.querySelector('#handoffs'), client, { freshness: chipIn(root), open: route().query.get('open') || '' });
+}
+
+async function viewMemory() {
+  root.innerHTML = `${liveHead('<h1>Memory</h1>')}<div id="memory"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  const view = mountMemory(root.querySelector('#memory'), client, { query: route().query,
+    freshness: (ok, message) => chip.touch(ok, message),
+    setQuery: (o) => history.replaceState(null, '', `#/memory${Object.keys(o).length ? `?${new URLSearchParams(o)}` : ''}`) });
+  return ownPolling(view);   // a live event must not wipe the person's query or the open drawer
 }
 
 // ------------------------------------------------------------- topology
@@ -1005,6 +1019,14 @@ async function viewFabricServices(_parts, revision) {
   const view = mountFabricServices(root, client, data, { search: route().query.get('search') || '' });
   root.querySelector('herdr-freshness')?.touch?.(true);
   return view;
+}
+
+async function viewAiSync(_parts, revision) {
+  const data = await client.listAiSync();
+  if (revision !== renderRevision) return;
+  const stop = mountAiSync(root, client, data);
+  root.querySelector('herdr-freshness')?.touch?.(true);
+  return { refresh() {}, dispose: stop };
 }
 
 async function viewService(parts, revision) {

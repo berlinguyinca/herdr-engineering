@@ -4,7 +4,7 @@ import json
 import threading
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
-from herdr_engineering.control_plane.handoff_lineage import row_from_node, rows_from_nodes
+from herdr_engineering.control_plane.handoff_lineage import _vision, row_from_node, rows_from_nodes
 from herdr_engineering.control_plane.handoffs import HandoffRegistry
 from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
@@ -90,3 +90,146 @@ def test_the_api_serves_only_the_lineage_handoffs_the_caller_may_read():
     status, page = call(instance.port, "operator", "/api/v1/handoffs?limit=10")
     assert status == 200 and any(r["handoff_id"] == "handoff:open" for r in page["handoffs"])
     assert "handoff:secret" not in json.dumps(call(instance.port, "viewer", "/api/v1/handoffs/overview")[1])
+
+
+RID = "3f2b8c1e-9a4d-4e57-b6c0-1d2e3f4a5b6c"
+
+
+def vision_node(suffix, cause, kind, state, **attrs):
+    return node(f"vision-{RID}-{suffix}", state, cause=cause, handoff_kind=kind, from_model="deepseek/text-model",
+                to_model="google/vision-model", **attrs)
+
+
+def test_a_vision_delegate_node_reads_as_a_switch_from_the_text_model_to_the_vision_model():
+    row = row_from_node(vision_node("out", "vision_delegate", "vision", "acknowledged"))
+    assert row["model_change"] == "switched" and "vision" in row["goal"].lower()
+    assert row["vision"] == {"request_id": RID, "phase": "out", "outcome": "ok"}
+
+
+def test_a_vision_return_node_with_kind_vision_partial_reports_outcome_partial():
+    row = row_from_node(vision_node("back", "vision_return", "vision_partial", "committed"))
+    assert row["vision"] == {"request_id": RID, "phase": "back", "outcome": "partial"}
+
+
+def test_kinds_vision_vision_failed_and_vision_timeout_map_to_ok_failed_and_timeout():
+    got = [row_from_node(vision_node("back", "vision_return", k, s))["vision"]["outcome"]
+           for k, s in (("vision", "committed"), ("vision_failed", "failed"), ("vision_timeout", "failed"))]
+    assert got == ["ok", "failed", "timeout"]
+
+
+def test_an_unknown_kind_on_a_vision_return_node_reports_outcome_unknown_and_still_builds_a_row():
+    row = row_from_node(vision_node("back", "vision_return", "vision_weird", "committed"))
+    assert row is not None and row["vision"]["outcome"] == "unknown"
+    assert row_from_node(vision_node("back", "vision_return", None, "committed"))["vision"]["outcome"] == "unknown"
+
+
+def test_the_request_id_is_parsed_from_vision_id_out_and_vision_id_back_with_or_without_the_handoff_prefix():
+    assert _vision(f"handoff:vision-{RID}-out", "vision_delegate", "vision") == {"request_id": RID, "phase": "out", "outcome": "ok"}
+    assert _vision(f"vision-{RID}-back", "vision_return", "vision_failed") == {"request_id": RID, "phase": "back", "outcome": "failed"}
+    assert _vision(f"vision-{RID}-out", "vision_delegate", "vision_failed")["outcome"] == "ok"
+    assert row_from_node(vision_node("back", "vision_return", "vision", "committed"))["vision"]["request_id"] == RID
+    assert _vision("handoff:something-else", "vision_return", "vision")["request_id"] == ""
+    assert _vision(f"vision-{RID}-out", "context_pressure", "vision") is None and _vision(f"vision-{RID}-out", None, None) is None
+
+
+def test_a_non_vision_handoff_row_has_no_vision_key():
+    assert "vision" not in row_from_node(node("h1", cause="context_pressure", from_model="a", to_model="b"))
+    assert "vision" not in row_from_node(node("h2"))
+
+
+def test_vision_rows_do_not_raise_a_model_switch_alarm_when_ok_but_say_why_when_not():
+    reg = HandoffRegistry(ControlPlaneRepo(), now=lambda: NOW)
+    out = row_from_node(vision_node("out", "vision_delegate", "vision", "acknowledged"))
+    ok = row_from_node(vision_node("back", "vision_return", "vision", "committed"))
+    assert out["model_change"] == "switched" and reg._attention_reason(out, None) is None
+    assert reg._attention_reason(ok, None) is None
+    partial = row_from_node(vision_node("back", "vision_return", "vision_partial", "committed"))
+    failed = row_from_node(vision_node("back", "vision_return", "vision_failed", "failed"))
+    timeout = row_from_node(vision_node("back", "vision_return", "vision_timeout", "failed"))
+    unknown = row_from_node(vision_node("back", "vision_return", "vision_weird", "committed"))
+    assert reg._attention_reason(partial, None) == "vision result partial"
+    assert reg._attention_reason(failed, None) == "failed"          # a failed state already names itself
+    assert reg._attention_reason(timeout, None) == "failed"
+    assert reg._attention_reason(unknown, None) == "vision result unknown"
+    failed_state_ok_row = {**failed, "state": "completed"}
+    assert reg._attention_reason(failed_state_ok_row, None) == "vision delegation failed"
+    assert reg._attention_reason({**timeout, "state": "completed"}, None) == "vision delegation timed out"
+
+
+def test_page_and_overview_summaries_carry_the_vision_summary_and_only_on_vision_rows():
+    # The Handoffs page builds its round trips from the page rows (registry._summary), not from the detail row.
+    reg = HandoffRegistry(ControlPlaneRepo(), now=lambda: NOW)
+    extra = rows_from_nodes([vision_node("out", "vision_delegate", "vision", "acknowledged"),
+                             vision_node("back", "vision_return", "vision_partial", "committed"),
+                             node("h1", cause="context_pressure", from_model="a", to_model="a")])
+    page = {r["handoff_id"]: r for r in reg.page(extra=extra)["handoffs"]}
+    assert page[f"handoff:vision-{RID}-out"]["vision"] == {"request_id": RID, "phase": "out", "outcome": "ok"}
+    assert page[f"handoff:vision-{RID}-back"]["vision"]["outcome"] == "partial"
+    assert "vision" not in page["handoff:h1"]
+    assert reg.overview(extra=extra)["attention"][0]["vision"]["phase"] == "back"
+
+
+def timed_node(hid, at, frm, to, state="acknowledged", **attrs):
+    view = node(hid, state, from_session_id=f"session:{frm}", **({"to_session_id": f"session:{to}"} if to else {}), **attrs)
+    if not to:
+        view["attrs"].pop("to_session_id")
+    return {**view, "first_seen_at": at, "last_seen_at": at}
+
+
+def delegations_from(text, n, start_minute=1):
+    """n vision delegations from ``text``: an out row text -> vision and a back row vision -> text, one new vision session each."""
+    views = []
+    for i in range(n):
+        rid = f"0000000{i}-aaaa-4bbb-8ccc-dddddddddddd"
+        at = f"2026-10-30T10:{start_minute + 2 * i:02d}:00+00:00"
+        views.append(timed_node(f"vision-{rid}-out", at, text, f"vis{i}", cause="vision_delegate", handoff_kind="vision"))
+        back = f"2026-10-30T10:{start_minute + 2 * i:02d}:30+00:00"
+        views.append(timed_node(f"vision-{rid}-back", back, f"vis{i}", text, "committed", cause="vision_return", handoff_kind="vision"))
+    return views
+
+
+def test_vision_hops_never_hijack_the_chain_of_real_work_handoffs():
+    # H8: h0 s0 -> s1, six delegations from s1, then the real successor h1 s1 -> s2
+    reg = HandoffRegistry(ControlPlaneRepo(), now=lambda: NOW)
+    extra = rows_from_nodes([timed_node("h0", "2026-10-30T10:00:00+00:00", "s0", "s1", cause="context_pressure", from_model="a", to_model="a"),
+                             *delegations_from("s1", 6),
+                             timed_node("h1", "2026-10-30T10:30:00+00:00", "s1", "s2", cause="context_pressure", from_model="a", to_model="a")])
+    for start, position in (("handoff:h0", 0), ("handoff:h1", 1)):
+        out = reg.chain(start, extra=extra)
+        assert [r["handoff_id"] for r in out["chain"]] == ["handoff:h0", "handoff:h1"], start
+        assert out["position"] == position and not out["more_before"] and not out["more_after"]
+        assert not [r for r in out["chain"] if "vision" in r]
+
+
+def test_the_chain_of_a_vision_row_is_exactly_its_out_and_back_pair():
+    reg = HandoffRegistry(ControlPlaneRepo(), now=lambda: NOW)
+    extra = rows_from_nodes([timed_node("h0", "2026-10-30T10:00:00+00:00", "s0", "s1", cause="context_pressure", from_model="a", to_model="a"),
+                             *delegations_from("s1", 3),
+                             timed_node("h1", "2026-10-30T10:30:00+00:00", "s1", "s2", cause="context_pressure", from_model="a", to_model="a")])
+    rid = "00000001-aaaa-4bbb-8ccc-dddddddddddd"
+    pair = [f"handoff:vision-{rid}-out", f"handoff:vision-{rid}-back"]
+    for position, start in enumerate(pair):
+        out = reg.chain(start, extra=extra)
+        assert [r["handoff_id"] for r in out["chain"]] == pair
+        assert out["position"] == position and not out["more_before"] and not out["more_after"]
+    alone = rows_from_nodes(delegations_from("s1", 1))[:1]                # an open delegation: its out row alone
+    assert [r["handoff_id"] for r in reg.chain(alone[0]["handoff_id"], extra=alone)["chain"]] == [alone[0]["handoff_id"]]
+
+
+def test_both_rows_of_a_delegation_share_the_text_sessions_workspace():
+    # H10: the back row's source is the new vision session; it groups by its target (the text session) instead
+    repo = ControlPlaneRepo()
+    repo.upsert_session("text", repository_id="org/R")
+    repo.upsert_session("vis1", repository_id="org/other")               # known, but elsewhere
+    reg = HandoffRegistry(repo, now=lambda: NOW)
+    views = delegations_from("text", 2)                                   # vis0 unknown, vis1 in org/other
+    views.append(timed_node("vision-0000000x-aaaa-4bbb-8ccc-dddddddddddd-back", "2026-10-30T10:50:00+00:00", "text", None,
+                            "failed", cause="vision_return", handoff_kind="vision_failed"))   # the pane never started: no target
+    extra = rows_from_nodes(views)
+    page = reg.page(workspace="org/R", extra=extra)["handoffs"]
+    assert len(page) == 5 and {r["workspace"] for r in page} == {"org/R"}
+    ov = reg.overview(extra=extra)
+    assert [(w["workspace"], w["total"]) for w in ov["workspaces"]] == [("org/R", 5)]
+    # a non-vision row still groups by its source session
+    plain = rows_from_nodes([timed_node("h9", "2026-10-30T11:00:00+00:00", "vis1", "text", cause="context_pressure", from_model="a", to_model="a")])
+    assert reg.page(extra=plain)["handoffs"][0]["workspace"] == "org/other"

@@ -4,6 +4,10 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
 import { requestErrorDetail } from './dashboard-load-state.js';
 import { mountKeys, roveIndex, TABS } from './personal-assistant-keys.js';
+import { loadAssistantGraph, renderAssistantGraph } from './assistant-graph-view.js';
+import { loadTypes, renderCreateForm, createBody, createCommand } from './assistant-create-form.js';
+import { renderInactive, deleteConfirmed } from './assistant-manage-controls.js';
+import { renderTabs } from './assistant-tabs.js';
 
 function statusClass(status) {
   return { ready: 'pa-status--ready', running: 'pa-status--running', disabled: 'pa-status--disabled',
@@ -52,6 +56,7 @@ function takeSignInReturn(win = typeof window === 'undefined' ? null : window) {
 export function mountPersonalAssistant(container, client, { onFreshness = () => {} } = {}) {
   let disposed = false;
   let state = { assistants: [], selectedId: null, tab: 'General' };
+  let graphState = { phase: 'loading' };
 
   const render = async () => {
     container.innerHTML = skeleton('Personal Assistant');
@@ -76,6 +81,8 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   const stamp = a => Date.parse(a.updated_at || a.created_at || '') || 0;
   const isActive = a => a.enabled !== false && !/archiv|disabled|deleted/i.test(String(a.status || ''));
   let showAll = false, configOpen = false, pending = [];
+  let inactiveOpen = false;
+  const inactiveState = { openDelete: '', error: '' };
   // Coming back from Google's sign-in (/#/personal-assistant?connected=google or ?error=<reason>): open the Connectors tab, say what
   // happened in fixed words (never text from the URL), and drop the query so a reload does not repeat the message.
   let appsFlash = null;
@@ -92,7 +99,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   const focusKey = () => {
     const el = container.ownerDocument.activeElement;
     if (!el || !container.contains(el)) return null;
-    for (const attr of ['data-tab', 'data-select', 'data-config', 'data-keys', 'data-showall', 'data-msg', 'data-new', 'data-newthread']) {
+    for (const attr of ['data-tab', 'data-atab', 'data-select', 'data-config', 'data-keys', 'data-showall', 'data-msg', 'data-new', 'data-newthread']) {
       if (el.hasAttribute(attr)) return { attr, value: el.getAttribute(attr), draft: el.value };
     }
     return null;
@@ -105,6 +112,37 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     el.focus();
   };
 
+  // The graph is read-only context. It shows the last answer at once and refreshes in place, never redrawing the page.
+  let graphBusy = false;
+  const refreshGraph = async () => {
+    if (graphBusy) return;
+    graphBusy = true;
+    try {
+      const out = await loadAssistantGraph(client);
+      graphState = { phase: out.status === 'ok' ? 'ready' : out.status, nodes: out.nodes, edges: out.edges, message: out.message };
+      const el = container.querySelector('#pa-graph');
+      if (el) {
+        el.innerHTML = renderAssistantGraph(graphState);
+        const act = async (fn) => { try { await fn(); } catch { /* the graph refreshes below and shows the truth */ } await render(); };
+        el.querySelectorAll('[data-node-rename]').forEach(b => b.addEventListener('click', () => {
+          state.selectedId = b.dataset.nodeRename; state.tab = 'General'; configOpen = true; draw();
+          container.querySelector('[data-f="name"]')?.focus();
+        }));
+        el.querySelectorAll('[data-node-unlink]').forEach(b => b.addEventListener('click', () => act(() => client.unlinkAssistant(b.dataset.nodeUnlink))));
+        el.querySelectorAll('[data-node-archive]').forEach(b => b.addEventListener('click', () => {
+          const a = state.assistants.find(x => x.assistant_id === b.dataset.nodeArchive);
+          if (a && confirm(`Archive ${a.name}? Its children are unlinked and its permissions revoked.`)) act(() => client.archiveAssistant(a.assistant_id));
+        }));
+        el.querySelectorAll('[data-setup-assistant]').forEach(btn => btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          try { await client.setupAssistant(btn.dataset.setupAssistant); }
+          catch (err) { btn.insertAdjacentHTML('afterend', `<span class="pa-error" role="alert">${esc(String(err?.message || 'setup failed'))}</span>`); btn.disabled = false; return; }
+          refreshGraph();
+        }));
+      }
+    } finally { graphBusy = false; }
+  };
+
   const draw = () => {
     const keep = focusKey();
     const selected = state.assistants.find(a => a.assistant_id === state.selectedId);
@@ -112,15 +150,15 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     const more = Math.max(0, active - list.filter(isActive).length);
     container.innerHTML = `
       <div class="pa-bar">
-        <label class="pa-pick">Assistant
-          <select data-select aria-label="Assistant">${list.map(a => `<option value="${esc(a.assistant_id)}" ${a.assistant_id === state.selectedId ? 'selected' : ''}>${esc(a.name)} · ${esc(statusLabel(a.status))}</option>`).join('')}</select></label>
+        ${renderTabs(list, state.selectedId, statusLabel)}
         ${more > 0 || showAll && active > 3 ? `<button class="hd-linkbtn" data-showall>${showAll ? 'Show recent only' : `Show all ${active}`}</button>` : ''}
         <span class="pa-grow"></span>
         <button class="hd-btn hd-btn--ghost" data-keys aria-haspopup="dialog" title="Keyboard shortcuts (?)">Keys <kbd>?</kbd></button>
         <button class="hd-btn hd-btn--ghost" data-config aria-expanded="${configOpen}" title="Show or hide Configure (,)">Configure</button>
         <button class="hd-btn" data-new>+ New</button>
       </div>
-      ${hidden ? `<p class="pa-muted pa-hidden-note">${hidden} inactive assistant${hidden === 1 ? '' : 's'} not listed.</p>` : ''}
+      ${hidden ? `<p class="pa-muted pa-hidden-note">${hidden} inactive assistant${hidden === 1 ? '' : 's'} not listed. <button type="button" class="hd-linkbtn" data-inactive-toggle aria-expanded="${inactiveOpen}">${inactiveOpen ? 'Hide' : 'Manage'}</button></p>` : ''}
+      ${hidden && inactiveOpen ? `<section class="hd-card pa-inactive-card" aria-label="Inactive assistants" id="pa-inactive">${renderInactive(state.assistants, inactiveState)}</section>` : ''}
       ${selected ? `<div id="pa-strip" class="pa-strip" role="status" ${pending.some(ap => ap.assistant_id === selected.assistant_id) ? '' : 'hidden'}></div>` : ''}
       ${selected ? renderChat(selected) : `<div class="hd-card"><div class="pa-empty">${state.assistants.length ? 'No active assistant. Use Show all, or create one.' : 'No assistants yet. Create one to begin.'}</div></div>`}
       ${selected && configOpen ? `<section class="hd-card pa-config" aria-label="Configure ${esc(selected.name)}">
@@ -128,10 +166,22 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
           <span class="pa-muted">${esc(selected.assistant_id)}</span><span class="pa-badge">${selected.enabled ? 'enabled' : 'disabled'}</span></div>
         <div class="pa-tabs" role="tablist" aria-label="Configure ${esc(selected.name)}">${TABS.map(t =>
           `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" role="tab" id="pa-tab-${t}" aria-selected="${state.tab === t}" aria-controls="pa-panel" tabindex="${state.tab === t ? 0 : -1}" data-tab="${t}">${t}</button>`).join('')}</div>
-        <div id="pa-panel" role="tabpanel" aria-labelledby="pa-tab-${state.tab}">${renderPanel(selected)}</div></section>` : ''}`;
-    container.querySelector('[data-select]')?.addEventListener('change', e => { state.selectedId = e.target.value; draw(); });
+        <div id="pa-panel" role="tabpanel" aria-labelledby="pa-tab-${state.tab}">${renderPanel(selected)}</div></section>` : ''}
+      <section class="hd-card pa-graph-card" aria-label="Assistant graph"><h2 class="pa-graph-heading">Assistant graph</h2><div id="pa-graph">${renderAssistantGraph(graphState)}</div></section>`;
+    container.querySelectorAll('[data-atab]').forEach(el => {
+      el.addEventListener('click', () => { state.selectedId = el.dataset.atab; draw(); });
+      el.addEventListener('keydown', e => {                      // roving focus across every tab, groups included
+        const tabs = [...container.querySelectorAll('[data-atab]')];
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.ctrlKey || e.metaKey || e.altKey) return;
+        const next = roveIndex(e.key, tabs.indexOf(el), tabs.length);
+        if (next === null) return;
+        e.preventDefault(); state.selectedId = tabs[next].dataset.atab; draw();
+        container.querySelector(`[data-atab="${state.selectedId}"]`)?.focus();
+      });
+    });
     container.querySelector('[data-showall]')?.addEventListener('click', () => { showAll = !showAll; draw(); });
     container.querySelector('[data-config]')?.addEventListener('click', () => { configOpen = !configOpen; draw(); });
+    refreshGraph();
     if (selected) drawApprovalStrip(selected);
     container.querySelectorAll('[data-tab]').forEach(el => {
       el.addEventListener('click', () => { state.tab = el.dataset.tab; draw(); });
@@ -145,16 +195,74 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       });
     });
     container.querySelector('[data-keys]')?.addEventListener('click', () => keys.openHelp());
-    container.querySelectorAll('[data-new]').forEach(el => el.addEventListener('click', async () => {
-      const name = prompt('Assistant name', 'Personal Assistant');
-      if (!name) return;
-      await client.createAssistant({ name });
-      await render();
-    }));
+    container.querySelectorAll('[data-new]').forEach(el => el.addEventListener('click', () => openCreate()));
+    container.querySelector('[data-inactive-toggle]')?.addEventListener('click', () => { inactiveOpen = !inactiveOpen; inactiveState.openDelete = ''; draw(); });
+    bindInactive();
     const panel = container.querySelector('#pa-panel');
     if (panel) bindPanel(panel, selected);
     bindChat(container, selected);
     restoreFocus(keep);
+  };
+
+  // Restore or permanently delete an inactive assistant. Deleting asks for the exact name; the server checks it again.
+  const bindInactive = () => {
+    const root = container.querySelector('#pa-inactive');
+    if (!root) return;
+    const byId = id => state.assistants.find(x => x.assistant_id === id);
+    root.querySelectorAll('[data-restore]').forEach(b => b.addEventListener('click', async () => {
+      try { await client.updateAssistant(b.dataset.restore, { enabled: true }); } catch { /* the list refreshes below */ }
+      await render();
+    }));
+    root.querySelectorAll('[data-delete-open]').forEach(b => b.addEventListener('click', () => {
+      inactiveState.openDelete = b.dataset.deleteOpen; inactiveState.error = ''; draw();
+    }));
+    root.querySelectorAll('[data-delete-form]').forEach(form => {
+      const a = byId(form.dataset.deleteForm);
+      const input = form.querySelector('[data-delete-confirm]'), go = form.querySelector('[data-delete-go]');
+      input.addEventListener('input', () => { go.disabled = !deleteConfirmed(a, input.value); });
+      form.querySelector('[data-delete-cancel]').addEventListener('click', () => { inactiveState.openDelete = ''; draw(); });
+      form.addEventListener('submit', async e => {
+        e.preventDefault();
+        if (!deleteConfirmed(a, input.value)) return;
+        try { await client.deleteAssistant(a.assistant_id, input.value); inactiveState.openDelete = ''; inactiveState.error = ''; await render(); }
+        catch (err) { inactiveState.error = String(err?.message || 'could not delete'); draw(); }
+      });
+      input.focus();
+    });
+  };
+
+  // The "+ New" form: the same type, parent and idempotent create the CLI uses, with its equivalent command shown.
+  const openCreate = async () => {
+    const { types } = await loadTypes(client);
+    const values = { name: '', type: 'rakazo', parent_id: '' };
+    const idempotencyKey = (globalThis.crypto?.randomUUID?.() || String(Date.now()) + Math.random().toString(16).slice(2)).slice(0, 60);
+    let error = '';
+    const slot = document.createElement('div');
+    container.querySelector('.pa-bar')?.after(slot);
+    const parentName = () => state.assistants.find(x => x.assistant_id === values.parent_id)?.name;
+    const paint = () => {
+      slot.innerHTML = renderCreateForm({ types, assistants: state.assistants, values, error });
+      const form = slot.querySelector('[data-create-form]');
+      const read = () => {
+        values.name = form.querySelector('[data-create-name]').value;
+        values.type = form.querySelector('[data-create-type]').value;
+        values.parent_id = form.querySelector('[data-create-parent]')?.value || '';
+      };
+      form.querySelector('[data-create-type]').addEventListener('change', () => { read(); values.parent_id = ''; error = ''; paint(); });
+      form.querySelector('[data-create-parent]')?.addEventListener('change', () => { read(); paint(); });
+      form.querySelector('[data-create-name]').addEventListener('input', () => {
+        read();
+        slot.querySelector('[data-create-cli]').textContent = createCommand({ name: values.name, type: values.type, parent: parentName() });
+      });
+      form.querySelector('[data-create-cancel]').addEventListener('click', () => slot.remove());
+      form.addEventListener('submit', async e => {
+        e.preventDefault(); read();
+        try { await client.createAssistant(createBody({ ...values, idempotency_key: idempotencyKey })); slot.remove(); await render(); }
+        catch (err) { error = String(err?.message || 'could not create'); paint(); }
+      });
+      form.querySelector('[data-create-name]').focus();
+    };
+    paint();
   };
 
   // Waiting approvals are the one thing a person must act on here, so they sit above the conversation rather than in a tab.

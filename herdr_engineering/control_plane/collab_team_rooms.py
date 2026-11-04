@@ -148,6 +148,7 @@ class TeamRoomsMixin:
             att = self._tr_attach.get((rid, p["team_id"]))
             if att is not None:
                 att["state"] = "detached"
+            self._tr2_forget_team(rid, p["team_id"])
             for aid in p["agents"]:
                 g = room["grants"].get(aid)
                 if g is not None and g.get("team_id") == p["team_id"]:       # only what the attach made
@@ -205,6 +206,12 @@ class TeamRoomsMixin:
         m = self._member(room, pr.id) if room else None
         if room is None or m is None or m["role"] != "owner":
             if room is not None:
+                if m is not None and self._tc_designated(pr, room_id) is not None:
+                    # slice 3: a designated external coordinator is a known principal; it is told no, and the trail says who
+                    self._audit_denied(pr, audit_action, "coordinator_forbidden", room_id=room_id,
+                                       project_ids=[room["project_id"]], resource_id=room_id)
+                    self.stats["policy_denied"] += 1
+                    raise _err(403, "forbidden: a coordinator cannot perform this operation")
                 self._audit_denied(pr, audit_action, "not_owner" if m else "not_a_member", room_id=room_id,
                                    project_ids=[room["project_id"]], resource_id=room_id)
             self.stats["policy_denied"] += 1
@@ -395,12 +402,16 @@ class TeamRoomsMixin:
             if have is None or have["state"] != "attached":
                 return {"room_id": room_id, "team_id": team_id, "state": "detached", "removed": [], "replayed": True}
             agents = sorted(have["agents"])
+            coord = self._tc_coord.get((room_id, team_id))
+            if coord is not None and coord["kind"] == "agent":           # slice 3: the coordinator's access ends with the team's
+                agents = sorted({*agents, coord["holder"][6:]})
             self._commit("team_detached", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, team_id=team_id, agents=agents,
                 visibility_scope="room", action="team.detach", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=team_id))
             for aid in agents:                                   # helpers under a removed agent end with it, as on remove
                 self._end_dependents(self._actor(pr), aid, "removed from room", {aid}, room=room_id)
+            self._tc_reconcile_team(room_id, team_id)            # slice 3: its open work is cancelled or requeued
             return {"room_id": room_id, "team_id": team_id, "state": "detached", "removed": agents, "replayed": False}
 
     def _tr_attach_view(self, att: dict) -> dict:
@@ -636,6 +647,8 @@ class TeamRoomsMixin:
         not task events (design section 8 and contradiction 8). Off, nothing changes."""
         if pr.is_agent or not self.team_rooms_active():
             return False
+        if self._tr2_visible.get(room["id"]) and self.team_roles_active():
+            return False                  # slice 2: the owner chose member_visibility for this room
         m = self._member(room, pr.id)
         return bool(m and m["role"] == "guest")
 

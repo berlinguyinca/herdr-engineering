@@ -209,6 +209,15 @@ token analytics are per project without hand-sourcing a file. When this stack ru
 A key the host failed to revoke is named on stderr (`key_id`); revoke it with the same endpoint.
 See the README section "Sessions get the LLM env automatically".
 
+## Optional Hindsight shared memory (`memory` profile)
+
+`hindsight-db` and `hindsight-api` are an opt-in compose profile (`memory`), off unless `control_plane.memory.enabled`
+is true **and** `deploy.sh --with-memory` is given (`--memory-checkout PATH` names the herdr-memory clone). The memory
+step runs after the control plane is verified, touches only those two services, and a failure exits 4 without
+affecting the control plane (rollback and first-deploy limits are in the doc). Daily verified backups come from
+`memory-backup.sh` and `herdr-hindsight-backup.{service,timer}`. Setup, key generation, HTTPS exposure through the
+fabric gateway, canary checklist, restore test and what stays manual: `docs/operations/memory-hindsight.md`.
+
 ## Optional agent summary model
 
 Automatic agent summaries can use a separately managed private CPU model. It is

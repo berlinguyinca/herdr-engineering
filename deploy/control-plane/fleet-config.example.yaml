@@ -103,6 +103,23 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+      # OPTIONAL: Hindsight shared memory (compose profile `memory`; docs/operations/memory-hindsight.md). OFF unless
+      # `enabled: true` AND `deploy.sh --with-memory`. Do NOT write the secrets by hand: run
+      #   herdr-eng fleet config memory init --enable --endpoint https://memory.dev.lan --model-dir /abs/path/to/e5-model
+      # which generates db_password and the four tenant keys on this host (0600 file, backup first, values never
+      # printed). The same command publishes the non-secret endpoint to every host as `memory.url`.
+      # memory:
+      #   enabled: false
+      #   image_tag: "5a672f0cdb89f4a3b841770cce2036a5b28b799d"   # tag of herdr-memory-hindsight built by deploy.sh
+      #   model_dir: "/abs/path/to/e5-model"                      # pinned ONNX model directory (mounted read-only)
+      #   port: 8888                                              # loopback-only host publish
+      #   endpoint: "https://memory.dev.lan"                      # https only: the client refuses http off loopback
+      #   db_password: "REDACTED"                                 # generated; applied to an EMPTY volume only
+      #   tenants:                                                # four separate tenants, four different keys
+      #     project: "REDACTED"
+      #     global: "REDACTED"
+      #     infra: "REDACTED"
+      #     personal: "REDACTED"                                  # the personal-assistant tenant: never shared
       # OPTIONAL: artifact share links (/s/ on share.public_url). OFF unless `enabled: true`, which needs the
       # collab marker and a signing_secret: deploy.sh refuses otherwise. share-public gets only the serving keys
       # below plus collab's cognito_pool/cognito_clients/cognito_web_client/cognito_domain (render-share).
