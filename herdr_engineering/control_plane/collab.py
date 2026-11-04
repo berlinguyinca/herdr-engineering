@@ -407,7 +407,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, delegation_enabled: bool = False,
                  summary_fix: dict | None = None, member_group: str | None = None,
-                 member_groups_ttl: float = 24 * 3600.0):
+                 member_groups_ttl: float = 24 * 3600.0, member_groups_path: Any = None):
         self.auth = authenticator
         # Member-owned artifacts (plan 5): the Cognito group whose people own artifacts as ``member:<user_id>``.
         # None = feature off here. Group claims are only seen at sign-in, so the last claims per user are kept in
@@ -420,6 +420,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self.member_group = member_group
         self.member_groups_ttl = float(member_groups_ttl)
         self._user_groups: dict[str, tuple[float, tuple[str, ...]]] = {}
+        # Last-seen claims survive a restart in a private file (0600); a claim older than the TTL is "unknown", never
+        # "removed", so a restart or a quiet day cannot look like leaving the group to the worker.
+        self._groups_path = None if member_groups_path is None else str(member_groups_path)
+        self._groups_io = threading.Lock()
+        self._groups_saved = 0.0
+        if self._groups_path is not None and member_group is not None:
+            self._load_groups()
         self._revocable: dict[str, int] = {}                   # outstanding revocable things per kind (H2), from state
         self._outstanding_key = None
         self.degraded: str | None = None     # set when the durable log failed its startup integrity check
@@ -1364,40 +1371,120 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     # ---------------------------------------------------------- member-owned artifacts (plan 5)
     MAX_NOTED_GROUPS = 64
 
+    MEMBER_FORGET_AFTER = 30 * 24 * 3600.0     # an unrefreshed claim is "unknown" for this long, then forgotten
+    GROUPS_SAVE_EVERY = 300.0
+
     def _note_groups(self, uid: str, groups: Any) -> None:
-        """Remember the group claims of a verified sign-in; wake the feed when the set changed."""
+        """Remember the group claims of a verified sign-in; wake the feed when the set changed.
+
+        An empty claim (Cognito omits ``cognito:groups`` for a token without groups) is no evidence either way: it
+        refreshes nothing, so the stored claim ages into "unknown" instead of reading as "left the group"."""
         clean = tuple(sorted({g for g in (groups if isinstance(groups, (list, tuple, set, frozenset)) else ())
                               if isinstance(g, str) and 0 < len(g) <= 128}))[:self.MAX_NOTED_GROUPS]
+        if not clean:
+            return
         with self._lock:
             old = self._user_groups.get(uid)
-            self._user_groups[uid] = (self._now(), clean)
+            now = self._now()
+            self._user_groups[uid] = (now, clean)
             changed = old is None or old[1] != clean
+            persist = changed or now - self._groups_saved >= self.GROUPS_SAVE_EVERY
+        if persist:
+            self._save_groups()
         bridge = self.artifact_bridge
         if changed and bridge is not None and self.member_group is not None:
             bridge.agents_changed()
 
+    def _save_groups(self) -> None:
+        """Atomically (tmp + fsync + rename, mode 0600) persist the last-seen claims; failure is logged by type only."""
+        path = self._groups_path
+        if path is None:
+            return
+        with self._lock:
+            snap = {u: {"at": at, "groups": list(g)} for u, (at, g) in self._user_groups.items()}
+            self._groups_saved = self._now()
+        data = json.dumps({"version": 1, "users": snap}, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        try:
+            with self._groups_io:
+                directory = os.path.dirname(path) or "."
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                tmp = f"{path}.tmp-{os.getpid()}"
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                try:
+                    os.fchmod(fd, 0o600)
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view):]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(tmp, path)
+        except OSError as exc:
+            print(f"collab: member group claims not saved error={type(exc).__name__}", file=sys.stderr)
+
+    def _load_groups(self) -> None:
+        """Read the persisted claims; a missing or damaged file means no knowledge (everyone starts unseen)."""
+        try:
+            with open(self._groups_path, "rb") as fh:
+                doc = json.loads(fh.read(8 * 1024 * 1024))
+            users = doc["users"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if not isinstance(users, dict):
+            return
+        for uid, row in users.items():
+            try:
+                at, groups = float(row["at"]), row["groups"]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if isinstance(uid, str) and math.isfinite(at) and isinstance(groups, list):
+                clean = tuple(sorted({g for g in groups if isinstance(g, str) and 0 < len(g) <= 128}))[:self.MAX_NOTED_GROUPS]
+                if clean:
+                    self._user_groups[uid] = (at, clean)
+
+    def _member_status(self, uid: str) -> tuple[str, list[str]] | None:
+        """``(status, groups)`` for a user whose claims were ever seen, else None. Caller holds the lock.
+
+        approved/disabled: fresh claims include the member group.  removed: fresh claims do not (positive evidence).
+        unknown: the claims are older than the TTL (or from the future): they prove nothing either way."""
+        seen = self._user_groups.get(uid)
+        if seen is None or self.member_group is None:
+            return None
+        age = self._now() - seen[0]
+        if not 0 <= age <= self.member_groups_ttl:
+            return ("unknown", list(seen[1])) if 0 <= age <= self.MEMBER_FORGET_AFTER else None
+        groups = list(seen[1])
+        if self.member_group not in groups:
+            return "removed", groups
+        if self.approval is not None and uid not in self._users:   # no account record (e.g. log not replayed): no proof
+            return "unknown", groups
+        return ("approved" if self._ok(uid) else "disabled"), groups
+
     def _groups_of(self, uid: str) -> list[str]:
-        """The last-seen groups of ``uid`` (``[]`` when never seen or older than the TTL). Caller holds the lock."""
+        """The fresh last-seen groups of ``uid`` (``[]`` when never seen or older than the TTL). Caller holds the lock."""
         seen = self._user_groups.get(uid)
         if seen is None or not 0 <= self._now() - seen[0] <= self.member_groups_ttl:
             return []
         return list(seen[1])
 
     def member_directory(self) -> dict | None:
-        """``member-directory.json``'s body, or None when no member group is configured. Only users whose
-        last-seen groups include the member group are listed; ``disabled`` is anyone not allowed to use the network."""
+        """``member-directory.json``'s body, or None when no member group is configured.
+
+        Every user whose claims were seen is listed with an explicit status: approved / disabled (in the group),
+        removed (fresh claims without it) or unknown (claims expired). The worker destroys only on disabled/removed."""
         group = self.member_group
         if group is None:
             return None
         users: dict[str, dict] = {}
         with self._lock:
             for uid in list(self._user_groups):
-                groups = self._groups_of(uid)
-                if group not in groups:
+                got = self._member_status(uid)
+                if got is None:
                     continue
-                email = self._user_email.get(uid)
+                status, groups = got
+                email = self._user_email.get(uid) if status != "removed" else None
                 users[uid] = {"email": email, "display_name": email.split("@")[0] if email else uid,
-                              "status": "approved" if self._ok(uid) else "disabled", "groups": groups}
+                              "status": status, "groups": groups}
         return {"group": group, "users": users}
 
     def member_check(self, pr: Principal):
@@ -1416,9 +1503,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 uid = a["owner"]
             else:
                 actor, agents, uid = {"kind": "user", "user_id": pr.id}, {}, pr.id
-            groups = self._groups_of(uid)
-            directory = {uid: {"status": "approved" if self._ok(uid) else "disabled", "groups": groups}} \
-                if groups else {}
+            got = self._member_status(uid)
+            directory = {} if got is None else {uid: {"status": got[0], "groups": got[1]}}
         return member_for_actor(actor, agents=agents, group=group, directory=directory)
 
     def _admit(self, pr: Principal, groups: set) -> None:

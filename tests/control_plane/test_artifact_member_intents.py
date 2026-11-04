@@ -19,6 +19,7 @@ from herdr_engineering.control_plane.artifact_member_intents import (
     MemberRuntime,
     publish_member_views,
     register_member_intents,
+    sweep_disabled_members,
     write_member_view,
 )
 from herdr_engineering.control_plane.artifact_members import member_owner_key
@@ -606,8 +607,70 @@ def test_a_members_staging_is_kept_while_valid_and_swept_after_the_ttl_or_when_d
         assert await sweep(env) == 1 and fresh.is_dir() and not old.exists()
         write_feeds(env, users={"alice": {"status": "disabled"}})
         assert await sweep(env) == 1 and not fresh.exists()
-        _, bobs = stage(env, BK, aid, "c.html", HTML)            # bob is no longer listed at all
+        write_feeds(env, users={"alice": {"status": "removed", "groups": []}, "bob": {"status": "removed"}})
+        _, bobs = stage(env, BK, aid, "c.html", HTML)            # bob is positively listed as removed
         assert await sweep(env) == 1 and not bobs.exists()
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_unlisted_and_unknown_members_keep_their_staging_a_removed_one_loses_it(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env)
+        _, a = stage(env, AK, aid, "a.html", HTML)
+        _, b = stage(env, BK, aid, "b.html", HTML)
+        write_feeds(env, users={})                               # a restarted collab-public lists nobody
+        assert await sweep(env) == 0 and a.is_dir() and b.is_dir()
+        write_feeds(env, users={"alice": {"status": "unknown", "groups": ["lab"]}})
+        assert await sweep(env) == 0 and a.is_dir() and b.is_dir()
+        write_feeds(env, users={"alice": {"status": "removed", "groups": ["other"]}})
+        assert await sweep(env) == 1 and not a.exists() and b.is_dir()
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_a_restart_unknown_or_absent_directory_revokes_nothing_but_removed_and_disabled_do(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, user("alice"))
+        pub = await publish(env, aid)
+        sid = await live_share(env, aid, pub["version_id"], ALICE)
+        pend = await live_share(env, aid, pub["version_id"], ALICE, state="pending", token="b")
+
+        async def states():
+            return {r["share_id"]: r["state"] for r in await sql(env, "SELECT share_id, state FROM artifact_shares")}
+        for users in ({}, {"alice": {"status": "unknown", "groups": ["lab"]}}, {"bob": {"status": "approved"}}):
+            write_feeds(env, users=users)
+            async with env.pool.acquire() as conn:
+                assert await sweep_disabled_members(conn, rt) == 0
+            assert await states() == {sid: "live", pend: "pending"}
+        write_feeds(env, users={"alice": {"status": "removed", "groups": []}})
+        async with env.pool.acquire() as conn:
+            assert await sweep_disabled_members(conn, rt) == 2
+        assert set((await states()).values()) == {"revoked"}
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_a_disabled_member_is_revoked_even_when_the_directory_says_nothing_else(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, user("alice"))
+        pub = await publish(env, aid)
+        sid = await live_share(env, aid, pub["version_id"], ALICE)
+        write_feeds(env, users={"alice": {"status": "disabled", "groups": ["lab"]}})
+        async with env.pool.acquire() as conn:
+            assert await sweep_disabled_members(conn, rt) == 1
+        assert (await sql(env, "SELECT state FROM artifact_shares WHERE share_id=$1", sid))[0]["state"] == "revoked"
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_an_unknown_member_is_refused_new_writes_with_directory_unknown_and_nothing_is_deleted(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, user("alice"))
+        pub = await publish(env, aid)
+        sid = await live_share(env, aid, pub["version_id"], ALICE)
+        write_feeds(env, users={"alice": {"status": "unknown", "groups": ["lab"]}})
+        out = await send(env, user("alice"), "member.artifact_create",
+                         {"title": "T", "filename": "a.html", "profile": "web"})
+        assert out["result"] == "rejected" and out["reason"] == "directory_unknown"
+        assert (await sql(env, "SELECT state FROM artifact_shares WHERE share_id=$1", sid))[0]["state"] == "live"
+        assert len(await sql(env, "SELECT 1 FROM artifacts")) == 1
     mrun(registry_pg, tmp_path, body)
 
 

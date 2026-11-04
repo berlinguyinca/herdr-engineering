@@ -80,13 +80,14 @@ def net(approval_svc, tmp_path):
 
 
 # ------------------------------------------------------------------------------ the member directory
-def test_the_directory_lists_only_group_users_with_email_and_status(net):
+def test_the_directory_lists_group_users_with_email_and_marks_others_removed(net):
     for name in ("op", "lab", "mal", "bob"):
         net.person(name)
     net.bridge.write_agents_feed()
     doc = directory(net.outbox)
     assert doc["group"] == GROUP and doc["updated"] == net.s._now()
-    assert set(doc["users"]) == {"op", "lab"}
+    assert set(doc["users"]) == {"op", "lab", "mal", "adm"}       # bob has no groups claim: no evidence, not listed
+    assert doc["users"]["mal"] == {"email": None, "display_name": "mal", "status": "removed", "groups": ["Users"]}
     assert doc["users"]["op"] == {"email": "op@example.org", "display_name": "op", "status": "approved",
                                   "groups": [GROUP]}
 
@@ -107,27 +108,94 @@ def test_a_user_without_an_email_has_a_null_email_and_the_id_as_display_name(net
                                                      "groups": [GROUP]}
 
 
-def test_losing_the_group_removes_the_user_on_the_next_sign_in(net):
+def test_losing_the_group_marks_the_user_removed_on_the_next_sign_in(net):
     net.person("op")
     net.bridge.write_agents_feed()
-    assert "op" in directory(net.outbox)["users"]
+    assert directory(net.outbox)["users"]["op"]["status"] == "approved"
     TOKENS["t-op"] = ("op", ["Users"])
     try:
         net.bridge._wake.clear()
         net.s.authenticate("Bearer t-op", None)
         assert net.bridge._wake.is_set()                           # the change asks the feed thread for an early rewrite
         net.bridge.write_agents_feed()
-        assert "op" not in directory(net.outbox)["users"]
+        assert directory(net.outbox)["users"]["op"]["status"] == "removed"
     finally:
         TOKENS["t-op"] = ("op", ["local.dev"])
 
 
-def test_group_knowledge_expires_so_a_stale_membership_is_not_published(net):
+def test_expired_group_knowledge_is_published_as_unknown_never_removed(net):
     net.person("op")
     net.bridge.write_agents_feed()
     net.s._now.t += net.s.member_groups_ttl + 1
     net.bridge.write_agents_feed()
-    assert "op" not in directory(net.outbox)["users"]
+    assert directory(net.outbox)["users"]["op"]["status"] == "unknown"
+    net.s._now.t += net.s.MEMBER_FORGET_AFTER
+    net.bridge.write_agents_feed()
+    assert "op" not in directory(net.outbox)["users"]             # forgotten after a month: absence, still no evidence
+
+
+def test_a_token_without_a_groups_claim_refreshes_nothing(net):
+    net.person("op")
+    TOKENS["t-op"] = ("op", [])
+    try:
+        net.s._now.t += net.s.member_groups_ttl - 10
+        net.s.authenticate("Bearer t-op", None)
+        net.s._now.t += 20
+        net.bridge.write_agents_feed()
+        assert directory(net.outbox)["users"]["op"]["status"] == "unknown"   # not "removed", not refreshed
+    finally:
+        TOKENS["t-op"] = ("op", ["local.dev"])
+
+
+def make_service(tmp_path, groups_path):
+    from herdr_engineering.control_plane.collab import ApprovalPolicy, CollabService, FileEventLog
+    from tests.control_plane.test_collab_approval import Clock, OpenAuth
+    return CollabService(OpenAuth(), sink=FileEventLog(str(tmp_path / "log2")), now=Clock(),
+                         approval=ApprovalPolicy(auto_groups=["local.dev"], approver_groups=["Administrators"]),
+                         member_group=GROUP, member_groups_path=groups_path)
+
+
+def test_claims_survive_a_restart_in_a_private_file(net, tmp_path):
+    import os
+    import stat
+    path = tmp_path / "state" / "member-groups.json"
+    first = make_service(tmp_path, path)
+    first.authenticate("Bearer t-op", None)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    again = make_service(tmp_path, path)                           # restart: new instance, empty memory
+    assert again.member_directory()["users"]["op"]["status"] in ("approved", "unknown")
+    assert again.member_directory()["users"]["op"]["groups"] == [GROUP]
+
+
+def test_a_restart_with_no_saved_claims_publishes_nobody_rather_than_everyone_removed(tmp_path):
+    fresh = make_service(tmp_path, tmp_path / "gone" / "member-groups.json")
+    assert fresh.member_directory() == {"group": GROUP, "users": {}}
+
+
+def test_a_damaged_claims_file_is_ignored(tmp_path):
+    bad = tmp_path / "member-groups.json"
+    bad.write_text("{not json")
+    assert make_service(tmp_path, bad).member_directory()["users"] == {}
+
+
+def test_the_directory_file_is_private_and_written_before_the_agents_feed(net):
+    import os
+    import stat
+    net.person("op")
+    net.bridge.write_agents_feed()
+    assert stat.S_IMODE(os.stat(net.outbox / DIRECTORY).st_mode) == 0o600
+    assert os.stat(net.outbox / DIRECTORY).st_mtime_ns <= os.stat(net.outbox / AGENTS_FEED).st_mtime_ns
+
+
+def test_an_unknown_member_is_refused_with_directory_unknown(net):
+    pr = net.person("op")
+    assert net.s.member_check(pr).ok
+    net.s._now.t += net.s.member_groups_ttl + 1                     # the claims age out; no new sign-in
+    verdict = net.s.member_check(pr)
+    assert not verdict.ok and verdict.reason == "directory_unknown"
+    lone = member_for_actor({"kind": "user", "user_id": "op"}, agents={}, group=GROUP,
+                            directory={"op": {"status": "unknown", "groups": [GROUP]}})
+    assert lone.reason == "directory_unknown"
 
 
 def test_no_directory_without_a_configured_group(approval_svc, tmp_path):
@@ -188,7 +256,7 @@ def test_the_worker_reads_both_feeds_and_admits_the_members_agent_only(net):
     ok = member_for_actor({"kind": "agent", "agent_id": a.id}, agents=agents, group=GROUP, directory=loaded)
     assert ok.ok and ok.principal == "member:op"
     no = member_for_actor({"kind": "agent", "agent_id": m.id}, agents=agents, group=GROUP, directory=loaded)
-    assert not no.ok and no.reason == "unknown_user"
+    assert not no.ok and no.reason == "not_in_group"
 
 
 # ------------------------------------------------------------------------------ member_check
@@ -406,6 +474,8 @@ def test_the_service_is_built_with_the_member_group(approval_svc):
     from herdr_engineering import cli
     kwargs = cli._collab_member_kwargs(collab(enabled=True, group="staff", groups_ttl=90))
     assert kwargs == {"member_group": "staff", "member_groups_ttl": 90.0}
+    withdir = cli._collab_member_kwargs(collab(enabled=True, group="staff", groups_ttl=90), state_dir=Path("/var/c"))
+    assert withdir["member_groups_path"] == Path("/var/c/member-groups.json")
     assert cli._collab_member_kwargs({}) == {}
 
 

@@ -1072,12 +1072,15 @@ class CollabArtifactBridge:
         try:
             with self._feed_lock:
                 body = self._feed()
-                atomic_write_json(self.outbox, AGENTS_FEED, body)
-                self._feed_at = body["generated_at"]
                 directory = self.service.member_directory()
+                # Directory first (private, 0600: it carries e-mail addresses), then the agents feed. Two files cannot
+                # be swapped together; both carry the same generated_at/updated, and a reader pairing the new agents
+                # feed with the previous directory only lags one pass (the worker fails closed on a stale one).
                 if directory is not None:
                     atomic_write_json(self.outbox, MEMBER_DIRECTORY_FEED,
-                                      {**directory, "updated": body["generated_at"]})
+                                      {**directory, "updated": body["generated_at"]}, mode=0o600)
+                atomic_write_json(self.outbox, AGENTS_FEED, body)
+                self._feed_at = body["generated_at"]
             self.stats["feed_writes"] += 1
         except Exception as exc:                          # noqa: BLE001 - a feed write never breaks a caller
             self.stats["feed_failures"] += 1

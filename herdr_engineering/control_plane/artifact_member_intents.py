@@ -562,9 +562,11 @@ async def _after(ctx: IntentContext, intent: Intent, out: dict, private: dict) -
 # ----------------------------------------------------------------------------- publisher, sweep, staging
 
 async def sweep_disabled_members(conn: Any, rt: MemberRuntime) -> int:
-    """Revoke the pending and live shares of members that are disabled, left the group, or have sharing disabled.
+    """Revoke the pending and live shares of members that are disabled, removed from the group, or have sharing off.
 
-    Only against a fresh directory: a stale or missing one proves nothing, so nothing is revoked on it."""
+    Only on positive evidence from a fresh directory: a stale or missing file, a member who is absent from it and
+    one marked ``unknown`` prove nothing, so nothing is revoked for them."""
+    from .artifact_members import positively_out
     directory = await asyncio.to_thread(load_directory, rt)
     if directory is None:
         return 0
@@ -575,8 +577,7 @@ async def sweep_disabled_members(conn: Any, rt: MemberRuntime) -> int:
     revoked = 0
     for r in rows:
         entry = directory.get(r["created_by"][len("member:"):])
-        admitted = (entry is not None and entry["status"] == "approved" and rt.group in entry["groups"])
-        if admitted and not r["off"]:
+        if not r["off"] and not positively_out(entry, rt.group):    # absent or "unknown" proves nothing
             continue
         try:
             await revoke_share(conn, rt, r["share_id"], actor="member-disabled")
@@ -604,10 +605,11 @@ async def publish_member_views(conn: Any, rt: MemberRuntime) -> int:
 
 
 def staging_keep(rt: MemberRuntime) -> Callable[[str, Any], Any]:
-    """The ``keep`` predicate for ``m_`` staging dirs: kept while their member is approved in the group.
+    """The ``keep`` predicate for ``m_`` staging dirs: dropped only for a member the directory positively lists as
+    disabled or removed from the group.
 
-    A stale or missing directory proves nothing (True: only the TTL applies); a fresh one that does not list the
-    member, or lists it disabled or outside the group, drops its uploads."""
+    A stale or missing directory, an unlisted member and an ``unknown`` one prove nothing (True: only the TTL
+    applies)."""
     cache: dict[str, Any] = {"at": None, "stat": None, "by_key": None}   # one read and hashing pass per sweep
 
     def stamp() -> tuple[int, int] | None:
@@ -618,7 +620,7 @@ def staging_keep(rt: MemberRuntime) -> Callable[[str, Any], Any]:
         return st.st_mtime_ns, st.st_size
 
     async def keep(owner_key: str, _meta: Any) -> bool:
-        from .artifact_members import member_owner_key, member_principal
+        from .artifact_members import member_owner_key, member_principal, positively_out
         if not rt.enabled:
             return True
         now = rt.clock()
@@ -637,8 +639,7 @@ def staging_keep(rt: MemberRuntime) -> Callable[[str, Any], Any]:
         by_key = cache["by_key"]
         if by_key is None:
             return True
-        entry = by_key.get(owner_key)
-        return entry is not None and entry["status"] == "approved" and rt.group in entry["groups"]
+        return not positively_out(by_key.get(owner_key), rt.group)
     return keep
 
 

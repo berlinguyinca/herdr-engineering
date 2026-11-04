@@ -3998,7 +3998,9 @@ def _cmd_cp_web(args) -> int:
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
                                delegation_enabled=_delegation_switch(args, cp),
                                summary_fix=getattr(args, "collab_summary_fix", None),
-                               **_collab_member_kwargs(cp))
+                               **_collab_member_kwargs(cp, state_dir=(
+                                   os.path.dirname(os.path.abspath(args.collab_log_file))
+                                   if args.collab_only and args.collab_log_file else None)))
         collab.task_lease_seconds = _task_lease(args, cp)
         if args.collab_only:
             collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
@@ -4457,10 +4459,16 @@ def _members_settings(cp) -> dict | None:
     return {"group": group, "groups_ttl": float(ttl), "defaults": defaults}
 
 
-def _collab_member_kwargs(cp) -> dict:
-    """``CollabService`` keyword arguments for the member group (empty when members are off)."""
+def _collab_member_kwargs(cp, *, state_dir=None) -> dict:
+    """``CollabService`` keyword arguments for the member group (empty when members are off). ``state_dir`` (the
+    collab log's directory) holds ``member-groups.json``, the last-seen group claims, so a restart is not amnesia."""
     got = _members_settings(cp)
-    return {} if got is None else {"member_group": got["group"], "member_groups_ttl": got["groups_ttl"]}
+    if got is None:
+        return {}
+    out = {"member_group": got["group"], "member_groups_ttl": got["groups_ttl"]}
+    if state_dir is not None:
+        out["member_groups_path"] = Path(state_dir) / "member-groups.json"
+    return out
 
 
 def _members_runtime(cp, settings: CollabArtifactsSettings):

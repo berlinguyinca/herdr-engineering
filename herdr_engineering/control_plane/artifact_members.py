@@ -72,6 +72,8 @@ def member_for_actor(actor: Mapping[str, Any], *, agents: Mapping[str, Mapping[s
     entry = directory.get(user_id) if isinstance(user_id, str) else None
     if entry is None:
         return _refuse("unknown_user")
+    if entry.get("status") == "unknown":    # claims expired / not seen since a restart: proves nothing, so no new writes
+        return _refuse("directory_unknown")
     groups = entry.get("groups")
     if not isinstance(groups, (list, tuple, set, frozenset)) or group not in groups:
         return _refuse("not_in_group")
@@ -81,6 +83,19 @@ def member_for_actor(actor: Mapping[str, Any], *, agents: Mapping[str, Mapping[s
         return MemberCheck(True, member_principal(user_id), None)
     except ValueError:
         return _refuse("unknown_user")
+
+
+def positively_out(entry: Mapping[str, Any] | None, group: str) -> bool:
+    """True only for POSITIVE evidence that a member is out: the directory says ``disabled`` or ``removed``, or an
+    ``approved`` record whose groups exclude ``group``. A missing entry, ``unknown`` or any other status is not
+    evidence, so callers that destroy anything (revoking shares, dropping uploads) act on this and nothing else."""
+    if entry is None:
+        return False
+    status = entry.get("status")
+    if status in ("disabled", "removed"):
+        return True
+    groups = entry.get("groups")
+    return status == "approved" and isinstance(groups, (list, tuple, set, frozenset)) and group not in groups
 
 
 @dataclass(frozen=True)
