@@ -4570,7 +4570,7 @@ def _make_handler(server, public=False, operator=False):
         def _assistant_judges(self, parts, body=None):
             """Owner-only judge status and a one-shot connectivity check. Same tenant/user scope as the grants routes;
             the endpoint is shown as a host only and no key material or key path ever leaves here."""
-            from .assistant import AssistantNotFound, AssistantUnavailable
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
             from .assistant_hub.judge_admin import check_view, status_view
             if self._require("operator"):
                 return None
@@ -4578,6 +4578,7 @@ def _make_handler(server, public=False, operator=False):
                 server.assistant._require_enabled()
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
                 judge = server.assistant_judge
                 fallback = svc.config.get("judge") or {}
                 if len(parts) == 4 and self.command == "GET":
@@ -4589,6 +4590,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "not found"}, 404)
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
 

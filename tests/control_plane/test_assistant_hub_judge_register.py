@@ -185,15 +185,35 @@ def test_register_refuses_symlink_target(home, tmp_path, keydir, jev):
     no_leak(done, key)
 
 
-def test_register_refuses_world_writable_parent(home, tmp_path, jev):
+@pytest.mark.parametrize("mode", [0o777, 0o775, 0o757, 0o770, 0o722])
+def test_register_refuses_group_or_world_writable_parent(home, tmp_path, jev, mode):
     li = jev(models=["laya-auto"])
     bad = tmp_path / "open"
     bad.mkdir()
-    bad.chmod(0o777)
+    bad.chmod(mode)
     key = new_key()
     done = run_register(home, tmp_path, reg_args(li.port, bad / "jev.key"), key)
     assert done.returncode == 1 and "unsafe_dir" in done.stderr
     assert list(bad.iterdir()) == [] and li.hits == 0
+
+
+def test_write_failure_midway_removes_new_file_even_on_keyboard_interrupt(tmp_path):
+    """Real run of ``register_key`` with a hostile key object: its ``+`` raises KeyboardInterrupt exactly while the
+    key is being written, i.e. after ``PATH.new`` exists.  (No mocks; the cleanup must cover any BaseException.)"""
+    from herdr_engineering.control_plane.assistant_hub.judge_register import register_key
+
+    class Boom(str):
+        def strip(self, *a):
+            return self
+
+        def __add__(self, other):
+            raise KeyboardInterrupt
+
+    d = tmp_path / "k"
+    d.mkdir(mode=0o700)
+    with pytest.raises(KeyboardInterrupt):
+        register_key("http://127.0.0.1:9", str(d / "jev.key"), Boom("tk-abcdef"), "laya-auto")
+    assert list(d.iterdir()) == []
 
 
 def test_register_refuses_stale_new_file_and_relative_path(home, tmp_path, keydir, jev):
@@ -322,6 +342,17 @@ def test_check_failures_are_codes_not_bodies(world):
     world.cfg["enabled"] = False
     out = owner(world.base, "POST", CHECK, {})[1]
     assert out["ok"] is False and out["code"] == "judge_disabled" and world.li.hits == 0
+
+
+def test_routes_share_the_assistant_rate_limit(world):
+    world.svc.config["max_requests_per_minute"] = 3
+    codes = [owner(world.base, "POST", CHECK, {})[0] for _ in range(3)]
+    assert codes == [200, 200, 200]
+    status, out = owner(world.base, "POST", CHECK, {})
+    assert status == 429 and out["code"] == "rate_limited"
+    assert world.li.hits == 3                           # the limited call never reached the judge
+    assert owner(world.base, "GET", STATUS)[0] == 429
+    assert owner(world.base, "GET", STATUS, who="carol")[0] == 200      # per tenant:user
 
 
 def test_status_is_scoped_to_tenant_and_user(world):

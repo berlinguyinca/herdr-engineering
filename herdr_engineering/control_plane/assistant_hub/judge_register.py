@@ -72,7 +72,7 @@ def _check_target(path: Path) -> bool:
         raise RegisterError("bad_path") from None
     if not stat.S_ISDIR(parent.st_mode):
         raise RegisterError("bad_path")
-    if parent.st_mode & 0o002:
+    if parent.st_mode & 0o022:                  # writable by group or others (no sticky-bit exception)
         raise RegisterError("unsafe_dir")
     try:
         st = os.lstat(path)
@@ -95,11 +95,13 @@ def _write_new(tmp: Path, key: str) -> None:
     except OSError:
         raise RegisterError("io") from None
     try:
-        with os.fdopen(fd, "w", encoding="ascii") as handle:
+        with os.fdopen(fd, "w", encoding="ascii") as handle:      # takes ownership of fd, closing it on exit
             handle.write(key + "\n")
-    except OSError:
+    except BaseException as exc:                                   # incl. KeyboardInterrupt: never leave PATH.new behind
         _unlink(tmp)
-        raise RegisterError("io") from None
+        if isinstance(exc, OSError):
+            raise RegisterError("io") from None
+        raise
 
 
 def _unlink(path: Path) -> None:
