@@ -308,11 +308,12 @@ test('CI detail, logs and review reads encode identities and forward cancellatio
   const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{calls.push({url,opts});return {ok:true,status:200,text:async()=>'{}'};}});
   const signal=new AbortController().signal;
   await client.getCi({signal});await client.getCiPipeline('owner/repo & other',12,{signal});
-  await client.getCiLog('owner/repo',12,'step/9',{signal});await client.listReviews({signal});
+  await client.getCiLog('owner/repo',12,'step/9',{signal});await client.listReviews({signal});await client.listWaitingReviews({signal});
   assert.equal(calls[0].url,'/api/v1/ci');
   assert.equal(new URL(calls[1].url,'http://test').searchParams.get('repository'),'owner/repo & other');
   assert.equal(new URL(calls[2].url,'http://test').searchParams.get('step'),'step/9');
   assert.equal(calls[3].url,'/api/v1/reviews');
+  assert.equal(calls[4].url,'/api/v1/reviews?needs_decision=1');
   for(const call of calls)assert.equal(call.opts.signal,signal);
 });
 test('CI mutation uses explicit action POST with the provider run number',async()=>{

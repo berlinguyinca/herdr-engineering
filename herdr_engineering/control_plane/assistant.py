@@ -2790,6 +2790,10 @@ class AssistantService:
                                            list(inf.get("preferred_models") or [])),
                     context_provider=self.fleet_context,
                     context_gate=lambda run: self.fleet_allowed(run.user_id))
+                resolver = self.runner.resolver
+                if resolver is not None:      # off-thread: a slow gateway must never delay startup
+                    threading.Thread(target=resolver.check_configured, args=(str(inf.get("model", "")),),
+                                     name="assistant-model-check", daemon=True).start()
             else:
                 self.runner = LocalRunnerAdapter(self.store)
         self._shell_runner = None  # injected in tests; default uses subprocess
