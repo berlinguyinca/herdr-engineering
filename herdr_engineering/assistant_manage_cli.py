@@ -179,6 +179,16 @@ def run_command(args: argparse.Namespace) -> int:
             result = client.request("/api/v1/assistant-graph")
             if args.tree:
                 tree = render_tree(result)
+        elif op == "brief-offer":
+            # team collaboration slice 4: the brief is derived server-side from the message; this CLI sends no brief text
+            body = {"room_id": args.room, "team_id": args.team, "message_ref": args.message}
+            if args.target:
+                body["target_agent_id"] = args.target
+            result = client.request("/api/v1/assistant-team-briefs", body)
+        elif op == "brief-list":
+            result = client.request("/api/v1/assistant-team-briefs")
+        elif op == "brief-reference":
+            result = client.request("/api/v1/assistant-references/" + quote(args.reference, safe=""))
         else:  # pragma: no cover - argparse constrains this
             raise RefError("unknown assistant operation")
         print(tree if tree is not None else json.dumps(_success(result), indent=2, sort_keys=True))
@@ -247,6 +257,17 @@ def register_management(groups: argparse._SubParsersAction) -> None:
     c.add_argument("--type", required=True)
     c.add_argument("--require", help="extra capabilities, comma separated; can only add to the type's own")
     _common(c, "place")
+    c = groups.add_parser("brief-offer", help="offer a team a DERIVED brief of one of your emails (it waits for your approval)")
+    c.add_argument("room", help="the room you own")
+    c.add_argument("team", help="the team attached to that room")
+    c.add_argument("message", help="the mail message id; it is read by your assistant and never sent to the team")
+    c.add_argument("--target", help="an agent of that team the brief is meant for (never an assistant)")
+    _common(c, "brief-offer")
+    c = groups.add_parser("brief-list", help="the briefs your assistant has offered (no mail pointers)")
+    _common(c, "brief-list")
+    c = groups.add_parser("brief-reference", help="follow a brief's opaque reference back to the message (only you can)")
+    c.add_argument("reference")
+    _common(c, "brief-reference")
     c = groups.add_parser("graph", help="your assistants, delegations and where they run")
     c.add_argument("--tree", action="store_true", help="indented text instead of JSON")
     _common(c, "graph")
