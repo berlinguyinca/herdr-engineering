@@ -326,13 +326,18 @@ def _exit_code(status: int) -> int:
 def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
                  slot: int | None = None, cwd: str | None = None,
                  emit: bool = True, env: dict[str, str] | None = None,
-                 cache: dict[str, Any] | None = None) -> Measured:
+                 cache: dict[str, Any] | None = None,
+                 registry: bool = False) -> Measured:
     """Fork+exec ``cmd``, wait with wait4, return its exit code and metrics.
 
     The caller keeps any lock fds open for the duration of this call (inheritable
     fds are inherited by the child like with exec). SIGINT/SIGTERM received by
     this process are forwarded to the child only. Raises ``OSError`` if the
     command cannot be started (callers map that to exit 127).
+
+    With ``registry`` (opt-in, spec 05) the build is also recorded in the durable
+    build registry with an owner lease; any registry fault is swallowed and named
+    ``registry_unavailable`` in the finished event's ``unavailable`` list.
     """
     unavailable: list[str] = []
     build_id = str(uuid.uuid4())
@@ -340,16 +345,34 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
     kind = classify_cmd(cmd)
     disk0 = _safe(lambda: host_disk_sectors(cwd), None)
     scc0 = _safe(sccache_snapshot, None)
+    run = None
+    extra: dict[str, Any] = {}
+    if registry and state_dir is not None:
+        from .build_registry import BuildRun
+        run = BuildRun.open(
+            state_dir, cwd=os.path.realpath(cwd or os.getcwd()), cmd_kind=kind, host=host,
+            cmd=cmd, build_id=build_id,
+            toolchain_digest=(cache or {}).get("fingerprint"))
+        if run.build_id:
+            build_id = run.build_id
+            extra = run.ids()
     if emit and state_dir is not None:
-        append_event(state_dir, BuildStarted(
+        append_event(state_dir, {**BuildStarted(
             event="build_started", ts=_now_iso(), build_id=build_id, host=host,
-            slot=slot, cmd_kind=kind, cache=cache))
+            slot=slot, cmd_kind=kind, cache=cache), **extra})
 
     t0 = time.monotonic()
-    proc = subprocess.Popen(cmd, cwd=cwd, close_fds=False, env=env)  # may raise OSError
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, close_fds=False, env=env)  # may raise OSError
+    except BaseException:
+        if run is not None:
+            run.on_exit(None, spawn_failed=True)
+        raise
     pid = proc.pid
 
     def forward(signum: int, _frame: Any) -> None:
+        if run is not None:
+            run.note_forwarded_signal()
         try:
             os.kill(pid, signum)
         except OSError:
@@ -359,6 +382,9 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
     if threading.current_thread() is threading.main_thread():
         for s in (signal.SIGINT, signal.SIGTERM):
             old[s] = signal.signal(s, forward)
+
+    if run is not None:
+        run.on_spawn(pid)  # after handlers: a signal during this write is forwarded
 
     seen: dict[int, int] = {}
     stop = threading.Event()
@@ -389,6 +415,10 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
     proc.returncode = 0  # reaped via wait4; keep Popen from re-waiting
     elapsed = time.monotonic() - t0
     code = _exit_code(status)
+    if run is not None:
+        run.on_exit(code, signaled=os.WIFSIGNALED(status))
+        if run.unavailable:
+            unavailable.append("registry_unavailable")
 
     disk1 = _safe(lambda: host_disk_sectors(cwd), None)
     scc1 = _safe(sccache_snapshot, None)
@@ -413,7 +443,7 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
         proc_io_write_bytes=io_bytes, host_disk_write_bytes_delta=host_delta,
         host_disk_scope=scope, sccache_stats=sccache_delta,
         unavailable=sorted(unavailable), cache=cache)
-    out = dict(fin)
+    out = {**fin, **extra}
     if emit and state_dir is not None:
         append_event(state_dir, out)
     return Measured(code, out)

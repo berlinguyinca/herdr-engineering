@@ -600,9 +600,9 @@ class BuildRun:
     @classmethod
     def open(cls, state_dir: str | os.PathLike[str], *, cwd: str, cmd_kind: str,
              host: str, cmd: list[str], toolchain_digest: str | None = None,
-             build_id: str | None = None, ttl_s: float = DEFAULT_LEASE_TTL_S) -> BuildRun:
+             build_id: str | None = None, ttl_s: float | None = None) -> BuildRun:
         run = cls()
-        run._ttl = ttl_s
+        run._ttl = DEFAULT_LEASE_TTL_S if ttl_s is None else ttl_s
         try:
             run.registry = Registry(state_dir)
             repo_id, rev, digest = _identity(cwd)
@@ -615,7 +615,7 @@ class BuildRun:
             run.registry.transition(aid, "classified", "classified")
             run.registry.transition(aid, "admitted", "gate_slot_held")
             try:
-                run.lease = run.registry.acquire_lease(cwd, aid, ttl_s)
+                run.lease = run.registry.acquire_lease(cwd, aid, run._ttl)
             except LeaseHeld:
                 run.joined_unleased = True  # another owner is active; run unfenced
         except Exception:  # noqa: BLE001 - registry failure must never fail a build

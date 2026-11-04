@@ -9,7 +9,8 @@ fixed number of flock-based slots that bound the number of concurrently running
 builds across ALL agents, plus load-aware backoff so new builds wait when the
 machine is already oversubscribed.
 
-Usage (any agent, any shell)::
+Only the Pi agent is wrapped automatically (``deploy/pi-build-gate``); any other
+agent or shell can opt in by invoking the command below::
 
     herdr-eng build-coordinate [--slots 2] [--max-load 1.5] [--wait 0] -- <cmd...>
 
@@ -19,7 +20,8 @@ lifetime of the child command. A slot is released automatically when the child
 currently holds it, for ``--status`` diagnostics.
 
 The lock lives in a shared per-host directory (default
-``~/.cache/herdr-engineering/build-gates/``), so every agent on the machine
+``$HERDR_ENGINEERING_STATE/build-gates`` or
+``~/.local/share/herdr-engineering/state/build-gates``), so every agent on the machine
 contends for the same slots regardless of which repo/worktree it is building.
 """
 from __future__ import annotations
@@ -230,7 +232,7 @@ def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
     from .build_metrics import run_measured
     try:
         return run_measured(cmd, state_dir=state_dir, slot=slot, env=env,
-                            cache=cache).exit_code
+                            cache=cache, registry=True).exit_code
     finally:
         # Held until the child is reaped above; only now may the slot be freed.
         if slot_fd is not None:

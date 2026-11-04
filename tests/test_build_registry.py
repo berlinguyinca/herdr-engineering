@@ -1,6 +1,8 @@
 """Spec 05: durable build registry, leases and fencing. Real sqlite files, real processes."""
+import json
 import multiprocessing as mp
 import os
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -11,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from herdr_engineering import build_registry as br
+from herdr_engineering.build_coord import run_gated
 
 
 class Clock:
@@ -372,3 +375,149 @@ def test_row_cap_prunes_oldest_terminal(tmp_path, clock, monkeypatch):
     br.Registry(tmp_path, now=clock)
     left = [i for i in ids if r.get_build(i)]
     assert left == ids[-5:]
+
+
+# --- build_coord record path (end to end, real processes) ---------------------------
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def _events(state):
+    return [json.loads(x) for x in (state / "builds.jsonl").read_text().splitlines()]
+
+
+def _rec(cmd, state, **kw):
+    return run_gated(cmd, state_dir=state, record=True, slots=2, max_load=0, **kw)
+
+
+def test_recorded_build_completes_and_releases_lease(tmp_path):
+    assert _rec(["sh", "-c", "exit 0"], tmp_path) == 0
+    started, fin = _events(tmp_path)
+    r = br.Registry(tmp_path)
+    for e in (started, fin):
+        assert e["attempt_id"] and len(e["request_key"]) == 64 and e["joined"] is False
+    assert started["build_id"] == fin["build_id"]
+    assert "registry_unavailable" not in fin["unavailable"]
+    build = r.get_build(fin["build_id"])
+    assert build["state"] == "completed" and build["request_key"] == fin["request_key"]
+    att = r.get_attempt(fin["attempt_id"])
+    assert att["state"] == "completed" and att["exit_code"] == 0
+    assert [t["to_state"] for t in r.transitions(fin["attempt_id"])] == [
+        "requested", "classified", "admitted", "running", "completed"]
+    assert r.get_lease(os.getcwd())["released_ts"] is not None
+    assert br.active_scopes(tmp_path) == []
+
+
+def test_failed_build_exit_code_and_state(tmp_path):
+    assert _rec(["sh", "-c", "exit 7"], tmp_path) == 7
+    fin = _events(tmp_path)[-1]
+    r = br.Registry(tmp_path)
+    assert r.get_build(fin["build_id"])["state"] == "failed"
+    assert r.get_attempt(fin["attempt_id"])["exit_code"] == 7
+
+
+def test_missing_binary_is_127_and_attempt_failed(tmp_path):
+    assert _rec(["definitely-not-a-binary-xyz"], tmp_path) == 127
+    r = br.Registry(tmp_path)
+    (row,) = r._all("SELECT * FROM attempts", ())
+    assert row["state"] == "failed"
+    assert br.active_scopes(tmp_path) == []
+
+
+def _wrapper(tmp_path, cmd, preamble=""):
+    script = (
+        f"import sys; sys.path.insert(0, {str(REPO)!r}); "
+        "from herdr_engineering import build_registry as br; " + preamble +
+        "from herdr_engineering.build_coord import run_gated; "
+        f"sys.exit(run_gated({cmd!r}, slots=2, max_load=0, record=True, "
+        f"state_dir={str(tmp_path)!r}))")
+    return subprocess.Popen([sys.executable, "-c", script], cwd=tmp_path)
+
+
+def _wait_running(tmp_path):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            rows = br.Registry(tmp_path)._all(
+                "SELECT * FROM attempts WHERE state='running'", ())
+            if rows:
+                return rows[0]
+        except br.RegistryError:
+            pass
+        time.sleep(0.05)
+    raise AssertionError("attempt never reached running")
+
+
+def test_sigterm_ends_cancelled_and_releases_lease(tmp_path):
+    proc = _wrapper(tmp_path, ["sleep", "30"])
+    try:
+        att = _wait_running(tmp_path)
+        assert br.active_scopes(tmp_path) == [os.path.realpath(tmp_path)]
+        time.sleep(0.3)  # signal handlers are installed right after the fork
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=20) == 128 + signal.SIGTERM
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    r = br.Registry(tmp_path)
+    assert r.get_attempt(att["attempt_id"])["state"] == "cancelled"
+    assert r.get_build(att["build_id"])["state"] == "cancelled"
+    assert br.active_scopes(tmp_path) == []
+
+
+def test_request_cancel_makes_owner_terminate_its_own_child(tmp_path):
+    proc = _wrapper(tmp_path, ["sleep", "30"], preamble="br.DEFAULT_LEASE_TTL_S = 0.3; ")
+    try:
+        att = _wait_running(tmp_path)
+        assert br.Registry(tmp_path).request_cancel(att["build_id"], "operator")
+        assert proc.wait(timeout=20) == 128 + signal.SIGTERM
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    r = br.Registry(tmp_path)
+    assert r.get_attempt(att["attempt_id"])["state"] == "cancelled"
+    assert r.transitions(att["attempt_id"])[-1]["reason"] == "cancel_requested"
+
+
+def test_heartbeat_thread_extends_lease_while_child_runs(tmp_path):
+    proc = _wrapper(tmp_path, ["sleep", "30"], preamble="br.DEFAULT_LEASE_TTL_S = 0.6; ")
+    try:
+        att = _wait_running(tmp_path)
+        r = br.Registry(tmp_path)
+        first = r.get_lease(tmp_path)["heartbeat_ts"]
+        time.sleep(1.5)  # > ttl: only heartbeats keep it valid
+        later = r.get_lease(tmp_path)
+        assert later["heartbeat_ts"] > first
+        assert br.active_scopes(tmp_path) == [os.path.realpath(tmp_path)]
+        assert later["owner_attempt_id"] == att["attempt_id"]
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("breakage", ["garbage", "directory", "readonly"])
+def test_registry_failure_never_fails_the_build(tmp_path, breakage):
+    db = tmp_path / br.DB_NAME
+    if breakage == "garbage":
+        db.write_bytes(b"this is not a sqlite database" * 100)
+    elif breakage == "directory":
+        db.mkdir()
+    else:
+        br.Registry(tmp_path)
+        db.chmod(0o400)
+        for suffix in ("-wal", "-shm"):
+            Path(str(db) + suffix).unlink(missing_ok=True)
+    assert _rec(["sh", "-c", "exit 5"], tmp_path) == 5
+    assert _rec(["sh", "-c", "exit 0"], tmp_path) == 0
+    fin = _events(tmp_path)[-1]
+    assert "registry_unavailable" in fin["unavailable"]
+    assert fin["exit_code"] == 0
+
+
+def test_non_recorded_path_creates_no_registry(tmp_path):
+    script = (
+        f"import sys; sys.path.insert(0, {str(REPO)!r}); "
+        "from herdr_engineering.build_coord import run_gated; "
+        f"sys.exit(run_gated(['true'], slots=2, max_load=0, state_dir={str(tmp_path)!r}))")
+    assert subprocess.run([sys.executable, "-c", script]).returncode == 0
+    assert not (tmp_path / br.DB_NAME).exists()
