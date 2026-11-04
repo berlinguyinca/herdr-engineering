@@ -175,6 +175,11 @@ class ShareStore:
         lab share, an allow-list inside ``member_groups`` / ``member_emails`` (``None`` refuses: fail closed; the caller
         supplies them, nothing is merged in here).  Every member outcome writes an ``artifact_member_events`` row.
         """
+        if isinstance(created_by, str) and created_by.startswith(("collab:", "member:")) \
+                and not is_member_principal(created_by):
+            # collab principals never create shares; a malformed "member:" string must not slip into the operator class
+            # (``live_total_bytes`` splits on the SQL prefix ``member:%``, so the two definitions must not disagree).
+            raise ShareError("not found", code="not_found")
         if not is_member_principal(created_by):
             return await self._create(artifact_id, version_id, audience, allow_emails, allow_groups, expires_at, entry,
                                       title, created_by, None, None)
@@ -190,6 +195,12 @@ class ShareStore:
     async def _create(self, artifact_id, version_id, audience, allow_emails, allow_groups, expires_at, entry, title,
                       created_by, member_groups, member_emails) -> dict:
         member = is_member_principal(created_by)
+        if member:
+            for name, scope in (("member_groups", member_groups), ("member_emails", member_emails)):
+                if isinstance(scope, (str, bytes)):
+                    raise TypeError(f"{name} must be a collection of strings, not a bare string")
+            if member_emails is not None:
+                member_emails = frozenset(e.strip().lower() for e in member_emails)
         if audience not in AUDIENCES:
             raise ShareError("audience must be 'lab' or 'public'")
         emails = _clean_list(allow_emails, "allow_emails", _EMAIL, lower=True)

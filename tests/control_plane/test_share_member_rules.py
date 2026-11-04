@@ -412,3 +412,72 @@ def test_member_and_operator_totals_are_capped_independently(aenv, operator_firs
             env.approve(second, who)
         assert exc.value.status == 400 and "total cap" in exc.value.message
         assert not (env.root / second["share_id"]).exists()
+
+
+# ------------------------------------------------------------------------------------- review fixes
+
+
+@pytest.mark.parametrize("who", ["collab:alice", "collab:", "member:bad user", "member:"])
+def test_collab_and_malformed_member_principals_never_create_shares(migrated, who):
+    async def body(store, conn):
+        aid, vid = await seed(conn, who)          # even the "owner" of the artifact
+        for kw in (pub_kw(aid, vid, who), lab_kw(aid, vid, who)):
+            with pytest.raises(ShareError) as exc:
+                await store.create(**kw)
+            assert exc.value.code == "not_found" and str(exc.value) == "not found"
+        assert await conn.fetchval("SELECT count(*) FROM artifact_shares WHERE artifact_id=$1", aid) == 0
+    run(migrated, body)
+
+
+def test_member_scope_is_case_insensitive_and_refuses_bare_strings(migrated):
+    async def body(store, conn):
+        aid, vid = await seed(conn, "member:alice")
+        row = await store.create(**lab_kw(aid, vid, "member:alice", allow_emails=["A@X.org"],
+                                          member_emails=frozenset({" A@x.ORG "})))
+        assert row["allow_emails"] == ["a@x.org"]
+        for bad in (dict(member_groups="lab"), dict(member_emails="a@x.org")):
+            with pytest.raises(TypeError):
+                await store.create(**lab_kw(aid, vid, "member:alice", **bad))
+    run(migrated, body)
+
+
+class Handler:
+    """The four things ``_create`` uses from the HTTP handler; the store, planner and settings behind it are real."""
+
+    def __init__(self, principal, body):
+        self.headers = {"Content-Type": "application/json"}
+        self._body, self._principal, self.sent = body, principal, None
+
+    def _read_json(self):
+        return self._body
+
+    def _resource_principal(self):
+        return self._principal
+
+    def _json(self, value, status=200):
+        self.sent = (status, value)
+
+
+def test_create_route_member_lab_share_is_refused_without_scope_and_skips_owner_merge(aenv):
+    from herdr_engineering.control_plane.artifact_share_api import _create
+    env = aenv(owner_emails=["boss@x.org"])
+    body = {"version_id": "v_html", "audience": "lab", "allow_emails": ["a@x.org"]}
+    with pytest.raises(ShareError) as exc:       # the HTTP path passes no member scope: fail closed
+        _create(Handler("member:alice", dict(body)), env.server, AID)
+    assert exc.value.code == "member_audience_refused"
+    assert env.adapter("list_for_artifact", AID) == []
+    # the same request by an operator still gets the owner merge
+    h = Handler(OPERATOR, dict(body))
+    _create(h, env.server, AID)
+    assert h.sent[0] == 201 and h.sent[1]["share"]["allow_emails"] == ["a@x.org", "boss@x.org"]
+
+
+def test_create_route_member_public_share_works_and_maps_errors(aenv):
+    from herdr_engineering.control_plane.artifact_share_api import _create
+    env = aenv()
+    h = Handler("member:alice", {"version_id": "v_html", "audience": "public"})
+    _create(h, env.server, AID)
+    assert h.sent[0] == 201 and h.sent[1]["share"]["created_by"] == "member:alice"
+    with pytest.raises(ShareError) as exc:       # bob has no grant on alice's artifact
+        _create(Handler("member:bob", {"version_id": "v_html", "audience": "public"}), env.server, AID)
+    assert exc.value.code == "not_found"
