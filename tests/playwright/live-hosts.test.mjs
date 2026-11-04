@@ -160,6 +160,7 @@ test('host detail refreshes on its own poll with no SSE traffic',async()=>withPa
  await page.locator('[data-section=cpu] .hv-value').waitFor();
  state.hosts[0].latest.cpu=42;
  await pollRefresh(page,POLL);
+ await page.clock.runFor(400);await sleep(30);// the gauge value counts up (Task 10 motion); read it once it has settled
  assert.equal(await page.locator('[data-section=cpu] .hv-value').textContent(),'42%');
 }));
 
