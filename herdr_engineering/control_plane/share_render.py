@@ -203,6 +203,7 @@ def _bound_nesting(text: str) -> str:
     foreign_at: int | None = None  # index of the lowest svg or math on the stack
     work = 0
     tainted = False
+    last_gt = text.rfind(">")  # nothing after it can ever be closed: an unterminated construct ends the scan
     pos = text.find("<")
     while pos >= 0:
         nxt = text[pos + 1 : pos + 2]
@@ -216,11 +217,10 @@ def _bound_nesting(text: str) -> str:
                 pos = text.find("<", pos + 1)
                 continue
         if nxt in ("!", "?") or (nxt == "/" and not text[pos + 2 : pos + 3].isalpha()):
-            end = text.find(">", pos + 1)
-            if end < 0:
+            if pos > last_gt:
                 tainted = True
-                pos = text.find("<", pos + 1)
-                continue
+                break
+            end = text.find(">", pos + 1)
             pos = text.find("<", end + 1)
             continue
         m = _PLAIN_TAG.match(text, pos)

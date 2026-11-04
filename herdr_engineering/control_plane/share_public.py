@@ -740,11 +740,11 @@ def mode_switch_link(depth: int, path: str) -> str:
 
 # One pass over the bytes (no lower-cased copy). Tokens that can hide a tag: comments and the raw-text / RCDATA
 # elements (their bodies run to the matching closer); the three markers we may insert after are `<body`, `<html` and
-# the doctype. Anything unterminated runs to the end of the data, so nothing after it is ever a candidate.
+# the doctype. Anything unterminated (a doctype too, so repeats cannot rescan) runs to the end of the data, so nothing after it is ever a candidate.
 _SCAN = re.compile(
     rb"<!--.*?(?:-->|\Z)"
     rb"|<(?P<raw>script|style|textarea|title)(?=[\s/>])(?:[^>]*>)?.*?(?:</(?P=raw)(?=[\s/>])|\Z)"
-    rb"|<(?P<tag>body|html)(?=[\s/>])|<(?P<doctype>!doctype)[^>]*>", re.I | re.S)
+    rb"|<(?P<tag>body|html)(?=[\s/>])|<(?P<doctype>!doctype)(?:[^>]*>|.*\Z)", re.I | re.S)
 _TAG_END = re.compile(rb"""(?:[^>"']|"[^"]*"|'[^']*')*>""")
 _WIDE_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff", b"\xef\xbb\xbf\x00")
 
@@ -774,8 +774,8 @@ def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
                 return data[:end.end()] + link + data[end.end():]
             if html_end is None:
                 html_end = end.end()
-        elif match.group("doctype") is not None and doctype_end is None:
-            doctype_end = match.end()
+        elif match.group("doctype") is not None and doctype_end is None and data[match.end() - 1 : match.end()] == b">":
+            doctype_end = match.end()  # unterminated: it ran to the end of the data, nothing to anchor on
     cut = html_end if html_end is not None else doctype_end
     return None if cut is None else data[:cut] + link + data[cut:]
 
