@@ -414,7 +414,9 @@ function csrfToken() {
 }
 
 async function send(url, token, payload) {
-  const init = { credentials: 'same-origin', cache: 'no-store', redirect: 'error' };   // the default CORS mode keeps the Origin header on the POST (a 'same-origin' mode sends "null" in Firefox and WebKit)
+  // No explicit mode: with the default (cors) mode the POST keeps its Origin header; mode 'same-origin' made Firefox and
+  // WebKit send "Origin: null" (verified), which the server refuses.
+  const init = { credentials: 'same-origin', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer' };
   if (payload === undefined) {
     init.headers = { Accept: 'application/json' };
   } else {

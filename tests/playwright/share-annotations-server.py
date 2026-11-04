@@ -129,7 +129,7 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def reserve_front(certdir: Path):
+def reserve_front(certdir: Path) -> tuple[int, list[int]]:
     """The TLS front's listener first (the share's configured origin names its port), wired to the share port later."""
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=127.0.0.1",
                     "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", str(certdir / "k.pem"),
@@ -140,7 +140,7 @@ def reserve_front(certdir: Path):
     listener.listen(64)
     target: list[int] = []
 
-    def pump(src, dst):
+    def pump(src: socket.socket | ssl.SSLSocket, dst: socket.socket | ssl.SSLSocket) -> None:
         try:
             while data := src.recv(65536):
                 dst.sendall(data)
@@ -153,7 +153,7 @@ def reserve_front(certdir: Path):
                 except OSError:
                     pass
 
-    def handle(raw):
+    def handle(raw: socket.socket) -> None:
         try:
             client = ctx.wrap_socket(raw, server_side=True)
             upstream = socket.create_connection(("127.0.0.1", target[0]))
@@ -163,7 +163,7 @@ def reserve_front(certdir: Path):
         threading.Thread(target=pump, args=(client, upstream), daemon=True).start()
         threading.Thread(target=pump, args=(upstream, client), daemon=True).start()
 
-    def accept():
+    def accept() -> None:
         while True:
             conn, _ = listener.accept()
             threading.Thread(target=handle, args=(conn,), daemon=True).start()
@@ -254,9 +254,9 @@ class Harness:
         remove_state(self.root, token_hash(SHARES[share]["token"]))
 
 
-def control_handler(h: Harness):
+def control_handler(h: Harness) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             pass
 
         def _send(self, payload: object, status: int = 200) -> None:
@@ -267,10 +267,10 @@ def control_handler(h: Harness):
             self.end_headers()
             self.wfile.write(body)
 
-        def do_GET(self):
+        def do_GET(self) -> None:
             self._send(h.lines() if self.path == "/__lines" else {"error": "unknown"}, 200 if self.path == "/__lines" else 404)
 
-        def do_POST(self):
+        def do_POST(self) -> None:
             parts = self.path.strip("/").split("/")
             try:
                 if parts[0] == "__signin" and len(parts) == 3:

@@ -12,7 +12,7 @@ import * as playwright from 'playwright';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const PYTHON = process.env.PYTHON || (fs.existsSync(path.join(ROOT, '.venv/bin/python')) ? path.join(ROOT, '.venv/bin/python') : 'python3');
-const WANTED = (process.env.BROWSERS || 'chromium').split(',').map((s) => s.trim()).filter(Boolean);
+const WANTED = ['chromium', 'firefox', 'webkit'];
 const CHROMIUM_FALLBACK = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
 const PANEL = 'aside[data-annotate-panel]';
 
@@ -283,8 +283,13 @@ test('selections: spanning elements, RTL, emoji, CR, and a huge selection', asyn
   assert.ok(rtl.exact.includes('مرحبا') && rtl.exact.includes('שלום'));
   const emoji = await take('#emoji', 'emoji');
   assert.ok(emoji.exact.includes('🎉😀') && emoji.exact.includes('👨‍👩‍👧'));
+  // the HTML parser turns CR into LF, so put a real CRLF into the text node the way a script-built page could
+  await page.evaluate(() => {
+    document.getElementById('herdr-content').shadowRoot.querySelector('#cr').firstChild.data = 'carriage\r\nreturn line\u0001';
+  });
+  assert.equal(await page.evaluate(() => document.getElementById('herdr-content').shadowRoot.querySelector('#cr').firstChild.data.includes('\r')), true);
   const cr = await take('#cr', 'carriage');
-  assert.ok(!/\r/.test(JSON.stringify(cr)), 'no carriage return is ever sent');
+  assert.equal(cr.exact, 'carriage\nreturn line ', 'CRLF became LF and the control character became a space');
   const huge = await take('#huge', 'huge selection');
   assert.equal(huge.exact.length, 1000);
   assert.ok(huge.prefix.length <= 64 && huge.suffix.length <= 64);
@@ -425,8 +430,8 @@ test('the CSRF header goes only on same-origin annotation POSTs; nothing else is
     if (isAnnotationPost) assert.equal(header, token);
   }
   assert.ok(seen.requests.some((r) => r.method === 'GET' && r.url.endsWith('/annotations') && r.headers['x-herdr-annotate'] === undefined), 'the list GET carries no token');
-  const storage = await page.evaluate(() => ({ cookie: document.cookie, ls: (() => { try { return localStorage.length; } catch { return -1; } })() }));
-  assert.equal(storage.cookie, '');
+  const storage = await page.evaluate(() => ({ cookie: document.cookie, local: localStorage.length, session: sessionStorage.length }));
+  assert.deepEqual(storage, { cookie: '', local: 0, session: 0 }, 'no cookie and no web storage');
   assert.ok(!JSON.stringify(await page.context().cookies()).includes(token));
   const text = await page.evaluate(() => document.body.innerText + document.querySelector('aside').shadowRoot.textContent);
   assert.ok(!text.includes(token), 'the token is never written into the page text');
