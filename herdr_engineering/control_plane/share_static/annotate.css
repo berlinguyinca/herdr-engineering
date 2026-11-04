@@ -72,3 +72,4 @@ aside[data-annotate-panel] { grid-area: panel; position: sticky; top: 0; z-index
 .herdr-pdf-page .textLayer ::selection { background: rgba(0, 80, 255, .3); }
 .herdr-pdf-page .herdr-region-layer { z-index: 2; }
 .herdr-file-link { margin: 8px 0; }
+.herdr-image-hint { margin: 6px 0 0; font-size: 13px; color: var(--muted); line-height: 1.4; }

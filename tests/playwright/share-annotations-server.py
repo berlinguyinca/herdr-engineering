@@ -10,8 +10,10 @@ default signed-in session per lab share (``v/``, ``a/`` and ``f/`` base URLs) pl
 The control server (plain HTTP, 127.0.0.1, NOT part of the share server):
   GET  /__lines                  the parsed annotations.jsonl lines
   POST /__signin/<share>/<user>  a real session exchange (signed Cognito-shaped tokens) -> {landing, base}
+  POST /__session/<share>/<user> a session minted with the real signing code (no exchange rate limit) -> {base}
   POST /__project                the worker's tick: fold the lines into each viewer's projection file
   POST /__status/<id>/<status>   mark a projected annotation dismissed or addressed (the owner's side)
+  POST /__seed/<share>/<user>/<n>  n projected annotations of the user on big.html
   POST /__revoke/<share>         remove the share's state (the very next request is the uniform 404)
   POST /__break, /__fix          make the annotations file unwritable / writable again (a real 503)
 """
@@ -25,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zlib
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
@@ -43,6 +46,7 @@ from herdr_engineering.control_plane.share_bundle import (  # noqa: E402
     write_state,
 )
 from herdr_engineering.control_plane.share_public import ShareConfig, make_share_server  # noqa: E402
+from herdr_engineering.control_plane.share_session import mint_session  # noqa: E402
 from tests.control_plane.test_share_lab import access, ident, lab_config  # noqa: E402
 
 LISTENER = int(sys.argv[1]) if len(sys.argv) > 1 else 9
@@ -92,6 +96,11 @@ INDEX = ("<!doctype html><html><body><h1>Quarterly notes</h1>"
          "<p id=rtl dir=rtl>مرحبا بالعالم text שלום</p>"
          "<p id=emoji>Party \U0001F389\U0001F600 time \U0001F468‍\U0001F469‍\U0001F467 done.</p>"
          "<p id=cr>carriage&#13;return line</p>"
+         "<style>.h{display:none}</style>"
+         "<p id=hid>Pay <span class=h>NOT</span>five dollars today</p>"
+         "<p id=zero>Before <span style='font-size:0'>INJECT</span>after</p>"
+         "<div id=xb><p>Alpha</p><p>Beta</p></div>"
+         "<p id=lit>Literal &lt;img src=x onerror=window.__x=1&gt; text</p>"
          "<p id=huge>" + " ".join(f"word{i}" for i in range(700)) + "</p>"
          "<p><a id=next href='page2.html'>second page</a></p>"
          "<script>var m=document.createElement('p');m.id='marker';m.textContent='live script ran';document.body.append(m);</script>"
@@ -110,9 +119,17 @@ EVIL = ("<!doctype html><html><head><style>* { display: none !important }</style
         "<div style='position:fixed;inset:0;z-index:2147483647;background:red'>overlay</div>"
         "<p id=evilp onclick=\"alert('click')\">Hostile paragraph with a selectable sentence.</p></body></html>")
 
+def make_big() -> bytes:
+    """About 1.9 MB of paragraphs (the render input limit is 2 MiB) for the performance test."""
+    body = "\n".join(f"<p>Paragraph number {i} has some filler words to make it about one hundred characters long, ok.</p>"
+                     for i in range(BIG_PARAGRAPHS))
+    return f"<!doctype html><html><body>{body}</body></html>".encode()
+
+
+BIG_PARAGRAPHS = 17500
 SHARES: dict[str, dict] = {
     "html": {"id": "shr-html", "token": "H" * 43, "audience": "lab", "entry": "index.html",
-             "files": {"index.html": INDEX.encode(), "page2.html": PAGE2.encode(), "evil.html": EVIL.encode(),
+             "files": {"index.html": INDEX.encode(), "page2.html": PAGE2.encode(), "evil.html": EVIL.encode(), "big.html": make_big(),
                        "cover.html": COVER.encode()}},
     "pdf": {"id": "shr-pdf", "token": "P" * 43, "audience": "lab", "entry": "report.pdf",
             "files": {"report.pdf": make_pdf()}},
@@ -120,6 +137,9 @@ SHARES: dict[str, dict] = {
             "files": {"pic.png": make_png()}},
     "par": {"id": "shr-par", "token": "Q" * 43, "audience": "lab", "entry": "data.parquet",
             "files": {"data.parquet": bytes(range(256)) * 8}},
+    **{f"rv{name}": {"id": f"shr-rv{name}", "token": f"{n}" * 43, "audience": "lab", "entry": "data.parquet",
+                     "files": {"data.parquet": bytes(range(256)) * 8}}
+       for n, name in zip("345", ("chromium", "firefox", "webkit"), strict=True)},
     "pub": {"id": "shr-pub", "token": "U" * 43, "audience": "public", "entry": "index.html",
             "files": {"index.html": b"<!doctype html><html><body><p>public page</p></body></html>"}},
 }
@@ -228,6 +248,14 @@ class Harness:
             raise RuntimeError("unexpected landing")
         return {"landing": landing, "base": self.origin + match.group(1)}
 
+    def session(self, share: str, user: str) -> dict:
+        """A session minted with the real signing code, for tests that need many identities without exceeding the
+        server's session-exchange rate limit (``signin`` is the real exchange)."""
+        info = SHARES[share]
+        session = mint_session(self.config.signing_secret, info["id"], user, time.time() + 3600,
+                               email=f"{user}@lab.example", basis="g")
+        return {"base": f"{self.origin}/s/{info['token']}/k/{session}/"}
+
     def project(self) -> None:
         """The worker's tick (the real one needs PostgreSQL): fold the lines into one projection file per viewer."""
         rows: dict[tuple[str, str], dict[str, dict]] = {}
@@ -249,6 +277,19 @@ class Harness:
                 row.update(self.status.get(aid, {}))
             ordered = sorted(mine.values(), key=lambda r: r["created_at"], reverse=True)
             write_own_projection(self.root, share_id, identity, ordered)
+
+    def seed(self, share: str, user: str, count: int) -> None:
+        """Write ``count`` projected annotations of ``user`` on big.html (the worker's output, without 1000 real POSTs)."""
+        rows = []
+        for i in range(count):
+            k = i * BIG_PARAGRAPHS // count
+            text = f"Paragraph number {k} has some filler words to make it about one hundred characters long, ok."
+            rows.append({"annotation_id": "ann_" + str(i).rjust(22, "x"), "file": "big.html", "body": f"c{i}", "status": "open",
+                         "anchor": {"kind": "text_quote", "file": "big.html", "exact": text[10:40], "prefix": text[:10],
+                                    "suffix": text[40:70]},
+                         "version_number": 1, "addressed_in_version_number": None,
+                         "created_at": f"2026-01-01T00:{i // 60 % 60:02d}:{i % 60:02d}+00:00", "edited_at": None})
+        write_own_projection(self.root, SHARES[share]["id"], user, rows)
 
     def revoke(self, share: str) -> None:
         remove_state(self.root, token_hash(SHARES[share]["token"]))
@@ -275,6 +316,8 @@ def control_handler(h: Harness) -> type[BaseHTTPRequestHandler]:
             try:
                 if parts[0] == "__signin" and len(parts) == 3:
                     return self._send(h.signin(parts[1], parts[2]))
+                if parts[0] == "__session" and len(parts) == 3:
+                    return self._send(h.session(parts[1], parts[2]))
                 if parts[0] == "__project":
                     h.project()
                     return self._send({"ok": True})
@@ -282,6 +325,9 @@ def control_handler(h: Harness) -> type[BaseHTTPRequestHandler]:
                     h.status[parts[1]] = ({"status": "dismissed"} if parts[2] == "dismissed"
                                           else {"status": "addressed", "addressed_in_version_number": 2})
                     h.project()
+                    return self._send({"ok": True})
+                if parts[0] == "__seed" and len(parts) == 4:
+                    h.seed(parts[1], parts[2], int(parts[3]))
                     return self._send({"ok": True})
                 if parts[0] == "__revoke" and len(parts) == 2:
                     h.revoke(parts[1])

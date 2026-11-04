@@ -20,6 +20,17 @@ let server;
 let listener;
 let info;
 const outside = [];
+const ENGINES = WANTED;
+
+// One test per installed engine (a missing engine is skipped, not failed).
+function matrix(title, fn, engines = ENGINES) {
+  for (const name of engines) {
+    test(`${name}: ${title}`, async (t) => {
+      if (!browsers.has(name)) return t.skip(`${name} is not installed`);
+      return fn(name);
+    });
+  }
+}
 const browsers = new Map();
 let userCount = 0;
 
@@ -43,7 +54,8 @@ async function control(method, route) {
 }
 const lines = () => control('GET', '/__lines');
 const project = () => control('POST', '/__project');
-const signin = (share, user) => control('POST', `/__signin/${share}/${user}`);
+const signinReal = (share, user) => control('POST', `/__signin/${share}/${user}`);   // the real session exchange
+const signin = (share, user) => control('POST', `/__session/${share}/${user}`);       // a minted session
 const freshUser = () => `user${Date.now().toString(36)}${userCount++}`;
 
 before(async () => {
@@ -84,8 +96,8 @@ async function newContext(name = 'chromium', viewport = { width: 1100, height: 8
 // A page that records every console error, page error, dialog, popup and request of its context.
 async function open(context, url, { dialogs = 'dismiss' } = {}) {
   const page = await context.newPage();
-  const seen = { errors: [], dialogs: [], requests: [], popups: 0 };
-  page.on('console', (m) => { if (m.type() === 'error') seen.errors.push(m.text()); });
+  const seen = { errors: [], console: [], dialogs: [], requests: [], popups: 0 };
+  page.on('console', (m) => { seen.console.push(m.text()); if (m.type() === 'error') seen.errors.push(m.text()); });
   page.on('pageerror', (e) => seen.errors.push(`pageerror: ${e.message}`));
   page.on('dialog', (d) => { seen.dialogs.push(d.message()); if (dialogs === 'accept') d.accept(); else d.dismiss(); });
   page.on('request', (r) => seen.requests.push({ url: r.url(), method: r.method(), headers: r.headers() }));
@@ -139,11 +151,9 @@ function sameOriginOnly(seen) {
 
 // ------------------------------------------------------------------------------------------------ landing and switch
 
-for (const name of WANTED) {
-  test(`${name}: HTML lands live, runs its own script, and the switch navigates the same tab`, async (t) => {
-    if (!browsers.has(name)) return t.skip(`${name} is not installed`);
+matrix('HTML lands live, runs its own script, and the switch navigates the same tab', async (name) => {
     const context = await newContext(name);
-    const session = await signin('html', freshUser());
+    const session = await signinReal('html', freshUser());
     const { page, seen } = await open(context, `${info.origin}${session.landing}`);
     assert.match(page.url(), /\/f\/index\.html$/);
     await page.locator('#marker').waitFor();
@@ -161,13 +171,12 @@ for (const name of WANTED) {
     await page.waitForURL(/\/f\/index\.html$/);
     await page.locator('[data-herdr-mode-switch]').waitFor();
     await context.close();
-  });
-}
+});
 
-test('other kinds land on v/ and are drawn; the bar switches both ways', async () => {
-  const context = await newContext();
+matrix('other kinds land on v/ and are drawn; the bar switches both ways', async (name) => {
+  const context = await newContext(name);
   const user = freshUser();
-  const png = await signin('png', user);
+  const png = await signinReal('png', user);
   const first = await open(context, `${info.origin}${png.landing}`);
   assert.match(first.page.url(), /\/v\/pic\.png$/);
   await first.page.waitForFunction(() => document.querySelector('#herdr-native img')?.naturalWidth === 200);
@@ -178,7 +187,7 @@ test('other kinds land on v/ and are drawn; the bar switches both ways', async (
   await first.page.waitForURL(/\/v\/pic\.png$/);
   noErrors(first.seen);
 
-  const pdf = await signin('pdf', user);
+  const pdf = await signinReal('pdf', user);
   const second = await open(context, `${info.origin}${pdf.landing}`);
   assert.match(second.page.url(), /\/v\/report\.pdf$/);
   await second.page.locator('.herdr-pdf-page[data-drawn=true] canvas').first().waitFor();
@@ -190,9 +199,7 @@ test('other kinds land on v/ and are drawn; the bar switches both ways', async (
 
 // ------------------------------------------------------------------------------------------------ HTML annotation
 
-for (const name of WANTED) {
-  test(`${name}: select, create, project, reload, edit, delete`, async (t) => {
-    if (!browsers.has(name)) return t.skip(`${name} is not installed`);
+matrix('select, create, project, reload, edit, delete', async (name) => {
     const context = await newContext(name);
     const session = await signin('html', freshUser());
     const { page, seen } = await open(context, annotateUrl(session, 'index.html'));
@@ -239,11 +246,10 @@ for (const name of WANTED) {
     noErrors(seen);
     sameOriginOnly(seen);
     await context.close();
-  });
-}
+});
 
-test('an in-content link on a/ stays on a/ and the next annotation names that file', async () => {
-  const context = await newContext();
+matrix('an in-content link on a/ stays on a/ and the next annotation names that file', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const { page, seen } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
@@ -262,8 +268,8 @@ test('an in-content link on a/ stays on a/ and the next annotation names that fi
   await context.close();
 });
 
-test('selections: spanning elements, RTL, emoji, CR, and a huge selection', async () => {
-  const context = await newContext();
+matrix('selections: spanning elements, RTL, emoji, CR, and a huge selection', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const { page, seen } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
@@ -297,8 +303,8 @@ test('selections: spanning elements, RTL, emoji, CR, and a huge selection', asyn
   await context.close();
 });
 
-test('a triple click (a real pointer selection) is captured', async () => {
-  const context = await newContext();
+matrix('a triple click (a real pointer selection) is captured', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const { page } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
@@ -311,8 +317,8 @@ test('a triple click (a real pointer selection) is captured', async () => {
 
 // ------------------------------------------------------------------------------------------------ hostile content
 
-test('evil.html on a/: no script, no frames, no external request; bar and panel work; submit works', async () => {
-  const context = await newContext();
+matrix('evil.html on a/: no script, no frames, no external request; bar and panel work; submit works', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const before = outside.length;
   const { page, seen } = await open(context, annotateUrl(session, 'evil.html'));
@@ -339,8 +345,8 @@ test('evil.html on a/: no script, no frames, no external request; bar and panel 
   await context.close();
 });
 
-test('evil.html on f/ (the accepted tradeoff): the link is injected once and a/ is reachable by URL', async () => {
-  const context = await newContext();
+matrix('evil.html on f/ (the accepted tradeoff): the link is injected once and a/ is reachable by URL', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const raw = await context.request.get(`${session.base}f/evil.html`, { headers: { 'Sec-Fetch-Dest': 'document' } });
   const body = await raw.text();
@@ -350,8 +356,8 @@ test('evil.html on f/ (the accepted tradeoff): the link is injected once and a/ 
   await context.close();
 });
 
-test('the raw file on f/ cannot forge an annotation or read the annotation page', async () => {
-  const context = await newContext();
+matrix('the raw file on f/ cannot forge an annotation or read the annotation page', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const { page } = await open(context, `${session.base}f/index.html`);
   await page.locator('#marker').waitFor();
@@ -375,8 +381,8 @@ test('the raw file on f/ cannot forge an annotation or read the annotation page'
   await context.close();
 });
 
-test('hostile CSS cannot cover the panel or the bar (hit test)', async () => {
-  const context = await newContext();
+matrix('hostile CSS cannot cover the panel or the bar (hit test)', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   for (const file of ['cover.html', 'evil.html']) {
     const { page } = await open(context, annotateUrl(session, file));
@@ -406,8 +412,8 @@ test('hostile CSS cannot cover the panel or the bar (hit test)', async () => {
 
 // ------------------------------------------------------------------------------------------------ requests and CSRF
 
-test('the CSRF header goes only on same-origin annotation POSTs; nothing else is requested', async () => {
-  const context = await newContext();
+matrix('the CSRF header goes only on same-origin annotation POSTs; nothing else is requested', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const { page, seen } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
@@ -435,13 +441,14 @@ test('the CSRF header goes only on same-origin annotation POSTs; nothing else is
   assert.ok(!JSON.stringify(await page.context().cookies()).includes(token));
   const text = await page.evaluate(() => document.body.innerText + document.querySelector('aside').shadowRoot.textContent);
   assert.ok(!text.includes(token), 'the token is never written into the page text');
+  assert.ok(!seen.console.some((m) => m.includes(token)), 'the token never reaches the console');
   await context.close();
 });
 
 // ------------------------------------------------------------------------------------------------ capture per kind
 
-test('the counter and the maximum length: the character after the limit is refused', async () => {
-  const context = await newContext();
+matrix('the counter and the maximum length: the character after the limit is refused', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const { page } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
@@ -454,8 +461,8 @@ test('the counter and the maximum length: the character after the limit is refus
   await context.close();
 });
 
-test('PDF: page 3 text selection, a region, and isEvalSupported is false', async () => {
-  const context = await newContext();
+matrix('PDF: page 3 text selection, a region, and isEvalSupported is false', async (name) => {
+  const context = await newContext(name);
   const session = await signin('pdf', freshUser());
   const { page, seen } = await open(context, annotateUrl(session, 'report.pdf'));
   await waitPanel(page);
@@ -503,8 +510,8 @@ test('PDF: page 3 text selection, a region, and isEvalSupported is false', async
   await context.close();
 });
 
-test('image: a pointer drag gives an image_region in [0, 1]', async () => {
-  const context = await newContext();
+matrix('image: a pointer drag gives an image_region in [0, 1]', async (name) => {
+  const context = await newContext(name);
   const session = await signin('png', freshUser());
   const { page, seen } = await open(context, annotateUrl(session, 'pic.png'));
   await waitPanel(page);
@@ -526,26 +533,8 @@ test('image: a pointer drag gives an image_region in [0, 1]', async () => {
   await context.close();
 });
 
-for (const name of WANTED.filter((n) => n !== 'chromium')) {
-  test(`${name}: image drag and PDF drawing`, async (t) => {
-    if (!browsers.has(name)) return t.skip(`${name} is not installed`);
-    const context = await newContext(name);
-    const session = await signin('png', freshUser());
-    const { page } = await open(context, annotateUrl(session, 'pic.png'));
-    await waitPanel(page);
-    await page.waitForFunction(() => document.querySelector('#herdr-native img')?.naturalWidth === 200);
-    const rect = await page.locator('.herdr-image-box img').boundingBox();
-    await page.mouse.move(rect.x + rect.width * 0.2, rect.y + rect.height * 0.2);
-    await page.mouse.down();
-    await page.mouse.move(rect.x + rect.width * 0.6, rect.y + rect.height * 0.6, { steps: 4 });
-    await page.mouse.up();
-    await page.locator(`${PANEL} .anchor-title`).filter({ hasText: /Image region/ }).waitFor();
-    await context.close();
-  });
-}
-
-test('a file of another type takes a whole-file comment (document anchor)', async () => {
-  const context = await newContext();
+matrix('a file of another type takes a whole-file comment (document anchor)', async (name) => {
+  const context = await newContext(name);
   const session = await signin('par', freshUser());
   const { page, seen } = await open(context, annotateUrl(session, 'data.parquet'));
   await waitPanel(page);
@@ -560,8 +549,8 @@ test('a file of another type takes a whole-file comment (document anchor)', asyn
 
 // ------------------------------------------------------------------------------------------------ errors and retries
 
-test('503 keeps the text; 409 retries until the row is projected; a dismissed row cannot be changed', async () => {
-  const context = await newContext();
+matrix('503 keeps the text; 409 retries until the row is projected; a dismissed row cannot be changed', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const { page } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
@@ -597,9 +586,9 @@ test('503 keeps the text; 409 retries until the row is projected; a dismissed ro
   await context.close();
 });
 
-test('429 is shown as a fixed message', async () => {
-  const context = await newContext();
-  const session = await signin('html', 'ratelimited');
+matrix('429 is shown as a fixed message', async (name) => {
+  const context = await newContext(name);
+  const session = await signin('html', `ratelimited${name}`);
   const { page } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
   await page.evaluate(async () => {
@@ -616,8 +605,8 @@ test('429 is shown as a fixed message', async () => {
   await context.close();
 });
 
-test('statuses: Open, Addressed in v2, Dismissed, Submitted', async () => {
-  const context = await newContext();
+matrix('statuses: Open, Addressed in v2, Dismissed, Submitted', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const { page } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
@@ -639,8 +628,8 @@ test('statuses: Open, Addressed in v2, Dismissed, Submitted', async () => {
 
 // ------------------------------------------------------------------------------------------------ keyboard, layout
 
-test('keyboard: tab order, Enter submits, Escape cancels an edit and focus returns to Edit', async () => {
-  const context = await newContext();
+matrix('keyboard: tab order, Enter submits, Escape cancels an edit and focus returns to Edit', async (name) => {
+  const context = await newContext(name);
   const session = await signin('html', freshUser());
   const { page } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
@@ -665,8 +654,8 @@ test('keyboard: tab order, Enter submits, Escape cancels an edit and focus retur
   await context.close();
 });
 
-test('narrow viewport: no horizontal scroll and the panel is below the content', async () => {
-  const context = await newContext('chromium', { width: 320, height: 640 });
+matrix('narrow viewport: no horizontal scroll and the panel is below the content', async (name) => {
+  const context = await newContext(name, { width: 320, height: 640 });
   const session = await signin('html', freshUser());
   const { page } = await open(context, annotateUrl(session, 'index.html'));
   await waitPanel(page);
@@ -683,8 +672,8 @@ test('narrow viewport: no horizontal scroll and the panel is below the content',
 
 // ------------------------------------------------------------------------------------------------ public and revoked
 
-test('a public share lands on raw f/ with no link and has no v/ or a/ routes; a forged POST is the 404', async () => {
-  const context = await newContext();
+matrix('a public share lands on raw f/ with no link and has no v/ or a/ routes; a forged POST is the 404', async (name) => {
+  const context = await newContext(name);
   const page = await context.newPage();
   await page.goto(info.public);
   assert.match(page.url(), /\/f\/index\.html$/);
@@ -698,15 +687,203 @@ test('a public share lands on raw f/ with no link and has no v/ or a/ routes; a 
   await context.close();
 });
 
-test('revoking mid-session shows "session ended" and keeps the typed text', async () => {
-  const context = await newContext();
-  const session = await signin('par', freshUser());
+matrix('revoking mid-session shows "session ended" and keeps the typed text', async (name) => {
+  const context = await newContext(name);
+  const session = await signin(`rv${name}`, freshUser());
   const { page } = await open(context, annotateUrl(session, 'data.parquet'));
   await waitPanel(page);
   await page.locator(`${PANEL} textarea#comment`).fill('typed before the revoke');
-  await control('POST', '/__revoke/par');
+  await control('POST', `/__revoke/rv${name}`);
   await page.locator(`${PANEL} button[type=submit]`).click();
   await page.locator(`${PANEL} .message[data-kind=error]`).filter({ hasText: 'session ended' }).waitFor();
   assert.equal(await page.locator(`${PANEL} textarea#comment`).inputValue(), 'typed before the revoke');
+  await context.close();
+});
+
+// ------------------------------------------------------------------------------------------------ review round
+
+matrix('literal markup in the content is captured and shown as text, never parsed', async (name) => {
+  const context = await newContext(name);
+  const session = await signin('html', freshUser());
+  const { page, seen } = await open(context, annotateUrl(session, 'index.html'));
+  await waitPanel(page);
+  await selectAllOf(page, '#lit');
+  const literal = '<img src=x onerror=window.__x=1>';
+  await anchorQuote(page).filter({ hasText: literal }).waitFor();
+  assert.equal(await page.locator(`${PANEL} .anchor-quote img`).count(), 0);
+  assert.equal(await anchorQuote(page).textContent(), 'Literal ' + literal + ' text');
+  await submitComment(page, 'about the literal');
+  await page.locator(`${PANEL} li.row blockquote`).filter({ hasText: literal }).waitFor();
+  assert.equal(await page.locator(`${PANEL} li.row img, ${PANEL} .anchor-quote img`).count(), 0);
+  await page.waitForTimeout(300);
+  assert.equal(await page.evaluate(() => window.__x), undefined);
+  assert.deepEqual(seen.dialogs, []);
+  noErrors(seen);
+  await context.close();
+});
+
+matrix('hidden text (display:none, font-size:0) never reaches a stored anchor', async (name) => {
+  const context = await newContext(name);
+  const session = await signin('html', freshUser());
+  const { page } = await open(context, annotateUrl(session, 'index.html'));
+  await waitPanel(page);
+  const before = (await lines()).length;
+  await selectAllOf(page, '#hid');
+  await anchorQuote(page).filter({ hasText: 'Pay five dollars' }).waitFor();
+  await submitComment(page, 'visible only');
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'visible only' }).waitFor();
+  const made = (await annotationLines(before))[0].anchor;
+  assert.equal(made.exact, 'Pay five dollars today');
+  assert.equal(made.kind, 'text_quote');
+  assert.ok(!/NOT|INJECT/.test(JSON.stringify(made)), 'no hidden text in exact, prefix or suffix');
+
+  // font-size:0 text is still part of what the browser selects, so the capture is refused (and the whole file stays the anchor)
+  await selectAllOf(page, '#zero');
+  await page.locator(`${PANEL} .message[data-kind=error]`).filter({ hasText: 'could not be captured exactly' }).waitFor();
+  await page.waitForTimeout(300);
+  await submitComment(page, 'after a refusal');
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'after a refusal' }).waitFor();
+  const last = (await annotationLines(before)).at(-1);
+  assert.ok(!/INJECT/.test(JSON.stringify(last)));
+  await context.close();
+});
+
+matrix('a selection across blocks stores a newline between them and is found again', async (name) => {
+  const context = await newContext(name);
+  const session = await signin('html', freshUser());
+  const { page } = await open(context, annotateUrl(session, 'index.html'));
+  await waitPanel(page);
+  const before = (await lines()).length;
+  await selectAllOf(page, '#xb');
+  await anchorQuote(page).filter({ hasText: 'Beta' }).waitFor();
+  await submitComment(page, 'across blocks');
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'across blocks' }).waitFor();
+  const made = (await annotationLines(before))[0].anchor;
+  assert.equal(made.exact, 'Alpha\nBeta');
+  await project();
+  await page.reload();
+  await waitPanel(page);
+  await page.locator(`${PANEL} .badge[data-status=open]`).waitFor();
+  await page.waitForFunction(() => [...document.getElementById('herdr-content').shadowRoot.querySelectorAll('mark')].map((m) => m.textContent).join('|') === 'Alpha|Beta');
+  await context.close();
+});
+
+matrix('PDF text anchors are clipped on a code point', async (name) => {
+  const context = await newContext(name);
+  const session = await signin('pdf', freshUser());
+  const { page } = await open(context, annotateUrl(session, 'report.pdf'));
+  await waitPanel(page);
+  await page.locator('.herdr-pdf-page[data-page="1"][data-drawn=true] .textLayer span').first().waitFor({ timeout: 20000 });
+  await page.evaluate(() => {
+    const layer = document.querySelector('.herdr-pdf-page[data-page="1"] .textLayer');
+    const span = document.createElement('span');
+    span.textContent = 'a'.repeat(999) + '\u{1F600}' + 'bbb';
+    layer.replaceChildren(span);
+    document.getSelection().selectAllChildren(layer);
+  });
+  await anchorQuote(page).filter({ hasText: 'aaaa' }).waitFor();
+  const before = (await lines()).length;
+  await submitComment(page, 'emoji boundary');
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'emoji boundary' }).waitFor();
+  const { exact } = (await annotationLines(before))[0].anchor;
+  assert.equal(exact.length, 999, 'the emoji that would straddle the limit is dropped whole');
+  assert.equal(exact, exact.toWellFormed());
+  await context.close();
+});
+
+matrix('in flight: submit, save and delete send one request; a busy row cannot be edited or deleted', async (name) => {
+  const context = await newContext(name);
+  const session = await signin('html', freshUser());
+  const { page } = await open(context, annotateUrl(session, 'index.html'), { dialogs: 'accept' });
+  await waitPanel(page);
+  const before = (await lines()).length;
+  await page.locator(`${PANEL} textarea#comment`).fill('double click');
+  await page.locator(`${PANEL} button[type=submit]`).dblclick();
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'double click' }).waitFor();
+  await page.waitForTimeout(500);
+  assert.equal((await annotationLines(before)).filter((l) => l.op === 'create').length, 1, 'one create');
+  await project();
+  await page.locator(`${PANEL} .badge[data-status=open]`).waitFor({ timeout: 15000 });
+
+  await page.locator(`${PANEL} button:has-text("Edit")`).click();
+  await page.locator(`${PANEL} li.row textarea`).fill('edited once');
+  await page.locator(`${PANEL} button:has-text("Save")`).dblclick();
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'edited once' }).waitFor();
+  await page.waitForTimeout(500);
+  assert.equal((await annotationLines(before)).filter((l) => l.op === 'edit').length, 1, 'one edit');
+  await project();
+  await page.locator(`${PANEL} .badge`).filter({ hasText: 'Open, edited' }).waitFor({ timeout: 15000 });
+
+  await page.route('**/annotations/*/delete', async (route) => { await new Promise((r) => setTimeout(r, 1500)); await route.continue(); });
+  await page.locator(`${PANEL} button:has-text("Delete")`).click();
+  assert.equal(await page.locator(`${PANEL} button:has-text("Edit")`).isDisabled(), true, 'Edit is disabled while the delete is in flight');
+  assert.equal(await page.locator(`${PANEL} button:has-text("Delete")`).isDisabled(), true);
+  await page.locator(`${PANEL} button:has-text("Edit")`).click({ force: true, timeout: 2000 }).catch(() => {});
+  assert.equal(await page.locator(`${PANEL} li.row textarea`).count(), 0, 'no edit box opened on a busy row');
+  await page.locator(`${PANEL} li.empty`).waitFor({ timeout: 15000 });
+  const ops = (await annotationLines(before)).map((l) => l.op);
+  assert.deepEqual(ops, ['create', 'edit', 'delete']);
+  await context.close();
+});
+
+matrix('image: the keyboard alternative marks a region', async (name) => {
+  const context = await newContext(name);
+  const session = await signin('png', freshUser());
+  const { page } = await open(context, annotateUrl(session, 'pic.png'));
+  await waitPanel(page);
+  await page.waitForFunction(() => document.querySelector('#herdr-native img')?.naturalWidth === 200);
+  await page.locator('.herdr-image-box').focus();
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('Shift+ArrowDown');
+  await page.keyboard.press('Enter');
+  await page.locator(`${PANEL} .anchor-title`).filter({ hasText: /Image region/ }).waitFor();
+  assert.equal(await page.evaluate(() => document.querySelector('aside').shadowRoot.activeElement?.id), 'comment', 'focus moves to the comment box');
+  const before = (await lines()).length;
+  await submitComment(page, 'keyboard region');
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'keyboard region' }).waitFor();
+  const made = (await annotationLines(before))[0].anchor;
+  assert.equal(made.kind, 'image_region');
+  assert.ok(Math.abs(made.x - 0.39) < 0.011 && Math.abs(made.w - 0.3) < 0.011 && Math.abs(made.h - 0.32) < 0.011, JSON.stringify(made));
+  assert.ok(made.x + made.w <= 1 && made.y + made.h <= 1);
+  await context.close();
+});
+
+test('chromium: a 2 MB document with 1000 annotations never blocks the main thread for 300 ms', async (t) => {
+  if (!browsers.has('chromium')) return t.skip('Chromium is not installed');
+  const user = freshUser();
+  await control('POST', `/__seed/html/${user}/1000`);
+  const context = await newContext('chromium');
+  const session = await signin('html', user);
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.addInitScript(() => {
+    window.__long = [];
+    new PerformanceObserver((list) => list.getEntries().forEach((e) => window.__long.push({ at: Math.round(e.startTime), ms: Math.round(e.duration) }))).observe({ type: 'longtask', buffered: true });
+  });
+  await page.goto(annotateUrl(session, 'big.html'));
+  await page.locator(`${PANEL} li.row`).first().waitFor({ timeout: 60000 });
+  await page.waitForFunction(() => document.getElementById('herdr-content').shadowRoot.querySelectorAll('mark').length > 10, null, { timeout: 90000 });
+  await page.locator(`${PANEL} button:has-text("Refresh")`).click();
+  await page.waitForTimeout(1500);
+  await page.evaluate(() => {        // a selection across most of the document
+    const root = document.getElementById('herdr-content').shadowRoot;
+    const paragraphs = root.querySelectorAll('p');
+    const a = paragraphs[100].firstChild;
+    const z = paragraphs[paragraphs.length - 100].firstChild;
+    document.getSelection().setBaseAndExtent(a, 3, z, 9);
+  });
+  await anchorQuote(page).filter({ hasText: 'Paragraph' }).waitFor({ timeout: 10000 });
+  await page.waitForTimeout(500);
+  // everything before the list response is the browser parsing and laying out the 2 MB page; our work starts after it
+  const long = await page.evaluate(() => {
+    const listed = performance.getEntriesByType('resource').find((e) => e.name.endsWith('/annotations'));
+    return window.__long.filter((x) => x.at + x.ms > listed.responseEnd);
+  });
+  const marks = await page.evaluate(() => document.getElementById('herdr-content').shadowRoot.querySelectorAll('mark').length);
+  assert.ok(marks >= 10 && marks <= 60, `highlights are capped: ${marks}`);
+  assert.deepEqual(errors, []);
+  assert.ok(long.every((x) => x.ms < 300), `long tasks: ${JSON.stringify(long)}`);
   await context.close();
 });

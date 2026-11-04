@@ -10,8 +10,8 @@
 //  * The shared content lives in a shadow root and is sanitised by the server; this script only reads it, and the
 //    highlights it adds are small wrapper elements made with the Range API (a failure leaves the list as it is).
 import {
-  LIMITS, POLL_DELAYS, RETRY_DELAYS, annotationUrls, cleanRow, cleanText, describeAnchor, errorMessage, findQuote,
-  isRawHref, statusLabel, textQuote, textQuoteFromString, unitBox,
+  LIMITS, POLL_DELAYS, RETRY_DELAYS, annotationUrls, clipHead, cleanRow, cleanText, describeAnchor, errorMessage, findQuote,
+  isRawHref, boxText, statusLabel, textQuote, textQuoteFromString, unitBox,
 } from './anchor.js';
 
 const PDFJS_MODULE = '/s/static/vendor/pdfjs/pdf.min.mjs';
@@ -59,41 +59,182 @@ function mountContentRoot() {
   return root;
 }
 
-// The text nodes of the content that carry visible text, in document order, with their offsets in the joined text.
-function buildIndex(root) {
-  const entries = [];
-  const parts = [];
-  let length = 0;
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode: (node) => (node.parentElement && SKIP_TEXT.has(node.parentElement.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
-  });
-  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    entries.push({ node, start: length });
-    parts.push(node.data);
-    length += node.data.length;
-  }
-  return { entries, text: parts.join(''), byNode: new Map(entries.map((e) => [e.node, e.start])) };
-}
+// ---------------------------------------------------------------------------------------------------- text model
+// One model of "the text of the content" for capture and highlighting, so a stored quote can always be found again:
+// the text nodes a reader can see (not display:none, visibility:hidden or font-size:0, and not in style, script or
+// textarea elements), in document order, with a newline between two blocks (or at a line break). Whitespace-only
+// nodes next to a block are layout, not text. Walking is lazy: capture reads only the selection and its
+// neighbourhood; the whole-document index used for highlights is built in time slices.
+const BLOCK = new Set(['ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DETAILS', 'DIV', 'DL', 'DT', 'FIELDSET', 'FIGCAPTION',
+  'FIGURE', 'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION',
+  'SUMMARY', 'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL']);
+const MAX_SCAN_NODES = 400000;
+const MAX_INDEX_CHARS = 8 * 1024 * 1024;
+const SLICE_MS = 8;
+const yieldToMain = () => new Promise((resolve) => { setTimeout(resolve, 0); });
 
-// The offset in the joined text of a boundary point (container, offset).
-function offsetOf(index, container, offset) {
-  const known = index.byNode.get(container);
-  if (known !== undefined) return known + Math.min(offset, container.data.length);
-  const probe = document.createRange();
-  try {
-    probe.setStart(container, offset);
-  } catch {
-    return -1;
+function makeModel(root) {
+  const shown = new Map();
+  const zeroFont = new Map();
+  function elementShown(el) {
+    let value = shown.get(el);
+    if (value === undefined) {
+      value = true;
+      try {
+        if (typeof el.checkVisibility === 'function') value = el.checkVisibility({ checkVisibilityCSS: true, visibilityProperty: true });
+        else value = getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden';
+      } catch { value = true; }
+      shown.set(el, value);
+    }
+    return value;
   }
-  probe.collapse(true);
-  let lo = 0;
-  let hi = index.entries.length;
-  while (lo < hi) {   // the first text node at or after the boundary
-    const mid = (lo + hi) >> 1;
-    if (probe.comparePoint(index.entries[mid].node, 0) >= 0) hi = mid;
-    else lo = mid + 1;
+  function readable(el) {
+    if (!elementShown(el)) return false;
+    let zero = zeroFont.get(el);
+    if (zero === undefined) {
+      try { zero = getComputedStyle(el).fontSize === '0px'; } catch { zero = false; }
+      zeroFont.set(el, zero);
+    }
+    return !zero;
   }
-  return lo < index.entries.length ? index.entries[lo].start : index.text.length;
+  const isBlock = (node) => !!node && node.nodeType === 1 && BLOCK.has(node.tagName);
+  function textOk(node) {
+    const parent = node.parentElement;
+    if (parent && (SKIP_TEXT.has(parent.tagName) || !readable(parent))) return false;
+    if (node.data.length === 0) return false;
+    if (/^\s*$/.test(node.data) && (isBlock(node.previousSibling) || isBlock(node.nextSibling)
+      || (!node.previousSibling && !node.nextSibling && (!parent || isBlock(parent))))) return false;
+    return true;
+  }
+  const blockOf = (node) => {
+    let el = node.parentElement;
+    while (el && !BLOCK.has(el.tagName)) el = el.parentElement;
+    return el;
+  };
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (node.nodeType === 3) return NodeFilter.FILTER_ACCEPT;
+      if (SKIP_TEXT.has(node.tagName) || !elementShown(node)) return NodeFilter.FILTER_REJECT;
+      return node.tagName === 'BR' ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+    },
+  });
+  // The next (dir > 0) or previous readable text node from the walker's position; `st.br` records a line break passed.
+  function step(dir, st) {
+    for (;;) {
+      const node = dir > 0 ? walker.nextNode() : walker.previousNode();
+      if (!node) return null;
+      if (node.nodeType === 1) { st.br = true; continue; }
+      if (textOk(node)) return node;
+    }
+  }
+  const separator = (a, b, st) => (st.br || blockOf(a) !== blockOf(b) ? '\n' : '');
+  const lastDeep = (node) => { let n = node; while (n.lastChild) n = n.lastChild; return n; };
+  // The first readable text at or after (dir > 0) / last readable text at or before (dir < 0) a boundary point.
+  function seek(dir, container, offset) {
+    const st = { br: false };
+    if (container.nodeType === 3) {
+      if (textOk(container)) return { node: container, off: offset };
+      walker.currentNode = container;
+    } else if (dir > 0) {
+      const child = container.childNodes[offset];
+      walker.currentNode = child || lastDeep(container);
+      if (child && child.nodeType === 3 && textOk(child)) return { node: child, off: 0 };
+    } else {
+      const child = offset > 0 ? container.childNodes[offset - 1] : null;
+      if (child) {
+        const deep = lastDeep(child);
+        walker.currentNode = deep;
+        if (deep.nodeType === 3 && textOk(deep)) return { node: deep, off: deep.data.length };
+      } else {
+        walker.currentNode = container;
+      }
+    }
+    const node = step(dir, st);
+    return node ? { node, off: dir > 0 ? 0 : node.data.length } : null;
+  }
+  // The quote of a selection's two boundary points, reading only the selection and its neighbourhood.
+  function quoteOf(range) {
+    const start = seek(1, range.startContainer, range.startOffset);
+    const end = seek(-1, range.endContainer, range.endOffset);
+    if (!start || !end) return null;
+    const ordered = start.node === end.node ? start.off < end.off
+      : !!(start.node.compareDocumentPosition(end.node) & Node.DOCUMENT_POSITION_FOLLOWING);
+    if (!ordered) return null;
+    const cap = LIMITS.exact + LIMITS.context + 1200;
+    let text = '';
+    let selLen = null;
+    let current = start.node;
+    let from = start.off;
+    let prev = null;
+    const st = { br: false };
+    walker.currentNode = start.node;
+    for (;;) {
+      if (prev) text += separator(prev, current, st);
+      st.br = false;
+      if (current === end.node && selLen === null) {
+        text += current.data.slice(from, end.off);
+        selLen = text.length;
+        text += current.data.slice(end.off);
+      } else {
+        text += current.data.slice(from);
+      }
+      prev = current;
+      from = 0;
+      if (selLen !== null ? text.length >= selLen + LIMITS.context : text.length >= cap) break;
+      current = step(1, st);
+      if (!current) break;
+    }
+    if (selLen === null) selLen = text.length;
+    let before = start.node.data.slice(0, start.off);
+    const back = { br: false };
+    walker.currentNode = start.node;
+    let after = start.node;
+    while (before.length < LIMITS.context * 2) {
+      const node = step(-1, back);
+      if (!node) break;
+      before = node.data + separator(node, after, back) + before;
+      back.br = false;
+      after = node;
+    }
+    return textQuote(before + text, before.length, before.length + selLen);
+  }
+  // The joined text and the (node, start) of each text node, built in slices so no task runs long.
+  async function buildIndex(alive) {
+    walker.currentNode = root;
+    const entries = [];
+    const parts = [];
+    let length = 0;
+    let prev = null;
+    let count = 0;
+    let deadline = performance.now() + SLICE_MS;
+    const st = { br: false };
+    for (;;) {
+      const node = step(1, st);
+      if (!node) break;
+      const sep = prev ? separator(prev, node, st) : '';
+      st.br = false;
+      if (sep) { parts.push(sep); length += sep.length; }
+      entries.push({ node, start: length });
+      parts.push(node.data);
+      length += node.data.length;
+      prev = node;
+      count += 1;
+      if (count > MAX_SCAN_NODES || length > MAX_INDEX_CHARS) break;
+      if (count % 128 === 0 && performance.now() > deadline) {
+        await yieldToMain();
+        if (!alive()) return null;
+        walker.currentNode = node;
+        deadline = performance.now() + SLICE_MS;
+      }
+    }
+    return { entries, text: parts.join('') };
+  }
+  // The fallback for a browser that reports only the host element: the first place the selected string occurs.
+  async function quoteOfString(selected) {
+    const index = await buildIndex(() => true);
+    return index ? textQuoteFromString(index.text, selected) : null;
+  }
+  return { quoteOf, buildIndex, quoteOfString };
 }
 
 // The current selection as two points inside `root`, or null. Browsers differ: composed ranges (Safari, current
@@ -116,26 +257,35 @@ function selectionPoints(root) {
   return null;
 }
 
-function textAnchorFromSelection(root, file) {
+const squash = (text) => text.replace(/\s+/g, '').toLowerCase();
+const REFUSED = 'That selection could not be captured exactly (part of it is hidden or unusual). Select a smaller piece, or comment on the whole file.';
+
+// {anchor} for the current selection inside the content, {refused} when the captured text differs from what the reader
+// selected (so hidden text can never ride along), or null when nothing is selected there.
+async function textAnchorFromSelection(root, model, file) {
   const selection = document.getSelection();
   if (!selection || (selection.isCollapsed && !selection.toString())) return null;
-  const index = buildIndex(root);
   const points = selectionPoints(root);
   let quote = null;
   if (points) {
-    const start = offsetOf(index, points.startContainer, points.startOffset);
-    const end = offsetOf(index, points.endContainer, points.endOffset);
-    if (start >= 0 && end >= 0) quote = textQuote(index.text, start, end);
+    quote = model.quoteOf(points);
   } else if (selection.anchorNode === root.host || selection.focusNode === root.host) {
-    quote = textQuoteFromString(index.text, selection.toString());   // a browser that only reports the host
+    quote = await model.quoteOfString(selection.toString());
+  } else {
+    return null;
   }
-  return quote ? { kind: 'text_quote', file, ...quote } : null;
+  if (!quote) return null;
+  const shown = squash(selection.toString().slice(0, 20000));
+  if (shown && !shown.startsWith(squash(quote.exact))) return { refused: REFUSED };
+  return { anchor: { kind: 'text_quote', file, ...quote } };
 }
 
 // ---------------------------------------------------------------------------------------------------- highlights
 
-function makeHighlighter(root, onPick) {
+function makeHighlighter(root, model, onPick) {
   let marks = [];
+  let token = 0;
+  let lastSignature = null;
   function clear() {
     for (const mark of marks) {
       const parent = mark.parentNode;
@@ -145,25 +295,30 @@ function makeHighlighter(root, onPick) {
     }
     marks = [];
   }
-  function wrap(row) {
-    const index = buildIndex(root);
-    const at = findQuote(index.text, row.anchor);
-    if (at < 0) return;
-    const end = at + row.anchor.exact.length;
-    const hits = index.entries.filter((e) => e.start < end && e.start + e.node.data.length > at);
+  function wrap(span, entries) {
+    let lo = 0;
+    let hi = entries.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (entries[mid].start + entries[mid].node.data.length <= span.at) lo = mid + 1;
+      else hi = mid;
+    }
+    const hits = [];
+    for (let i = lo; i < entries.length && entries[i].start < span.end; i += 1) hits.push(entries[i]);
+    const current = ['open', 'submitted', 'edited'].includes(span.row.status);
     for (const entry of hits.reverse()) {
-      const from = Math.max(0, at - entry.start);
-      const to = Math.min(entry.node.data.length, end - entry.start);
+      const from = Math.max(0, span.at - entry.start);
+      const to = Math.min(entry.node.data.length, span.end - entry.start);
       if (to <= from) continue;
       try {
         const range = document.createRange();
         range.setStart(entry.node, from);
         range.setEnd(entry.node, to);
         const mark = document.createElement('mark');
-        mark.style.setProperty('background', row.status === 'open' || row.status === 'submitted' || row.status === 'edited' ? 'rgba(255, 200, 0, 0.5)' : 'rgba(150, 150, 150, 0.35)');
+        mark.style.setProperty('background', current ? 'rgba(255, 200, 0, 0.5)' : 'rgba(150, 150, 150, 0.35)');
         mark.style.setProperty('color', 'inherit');
         mark.style.setProperty('cursor', 'pointer');
-        mark.addEventListener('click', () => onPick(row.annotation_id));
+        mark.addEventListener('click', () => onPick(span.row.annotation_id));
         range.surroundContents(mark);
         marks.push(mark);
       } catch {
@@ -172,15 +327,38 @@ function makeHighlighter(root, onPick) {
     }
   }
   return {
-    apply(rows, file) {
+    // Highlights the quotes of `rows` in this file. Does nothing when the set did not change since the last call; builds
+    // the text index once; works in time slices; a newer call abandons an older one.
+    async apply(rows, file) {
+      const live = (r) => ['open', 'submitted', 'edited'].includes(r.status);
+      const wanted = rows.filter((r) => r.file === file && r.anchor && r.anchor.kind === 'text_quote' && typeof r.anchor.exact === 'string')
+        .slice(0, MAX_HIGHLIGHTS);
+      const signature = wanted.map((r) => [r.annotation_id, live(r), r.anchor.exact, r.anchor.prefix, r.anchor.suffix].join('\u0001')).join('\u0002');
+      if (signature === lastSignature) return;
+      lastSignature = signature;
+      token += 1;
+      const mine = token;
       clear();
-      let count = 0;
-      for (const row of rows) {
-        if (count >= MAX_HIGHLIGHTS) break;
-        if (row.file === file && row.anchor && row.anchor.kind === 'text_quote' && typeof row.anchor.exact === 'string') {
-          wrap(row);
-          count += 1;
+      if (!wanted.length) return;
+      const index = await model.buildIndex(() => mine === token);
+      if (!index || mine !== token) return;
+      const spans = [];
+      let deadline = performance.now() + SLICE_MS;
+      for (const row of wanted) {
+        const at = findQuote(index.text, row.anchor);
+        if (at >= 0) spans.push({ at, end: at + row.anchor.exact.length, row });
+        if (performance.now() > deadline) {
+          await yieldToMain();
+          if (mine !== token) return;
+          deadline = performance.now() + SLICE_MS;
         }
+      }
+      spans.sort((a, b) => b.at - a.at);
+      let limit = Infinity;
+      for (const span of spans) {
+        if (span.end > limit) continue;     // overlaps a later quote: it stays in the list only
+        limit = span.at;
+        wrap(span, index.entries);
       }
     },
   };
@@ -189,14 +367,17 @@ function makeHighlighter(root, onPick) {
 // ---------------------------------------------------------------------------------------------------- image
 
 function drawImage(native, data, onRegion) {
-  const box = h('div', { class: 'herdr-image-box', tabindex: '0', role: 'img', 'aria-label': `Image ${data.file}` });
+  const box = h('div', { class: 'herdr-image-box', tabindex: '0', role: 'group', 'aria-label': `Image ${data.file}`,
+    'aria-describedby': 'herdr-image-hint' });
+  const hint = h('p', { id: 'herdr-image-hint', class: 'herdr-image-hint', 'aria-live': 'polite',
+    text: onRegion ? 'To mark a region: drag with a pointer, or focus the image and use the arrow keys to move a region, Shift and the arrow keys to resize it, and Enter to comment on it.' : '' });
   const image = h('img', { alt: data.file, draggable: 'false' });
   image.src = data.raw_href;
   const layer = h('div', { class: 'herdr-region-layer', 'aria-hidden': 'true' });
   const live = h('div', { class: 'herdr-region herdr-region-live' });
   live.hidden = true;
   box.append(image, layer, live);
-  native.append(box);
+  native.append(box, hint);
   if (!onRegion) return { setRegions() {} };
   box.classList.add('herdr-annotatable');
   let start = null;
@@ -231,6 +412,35 @@ function drawImage(native, data, onRegion) {
     live.hidden = true;
     if (result) onRegion(result);
   };
+  // Keyboard alternative: arrows move a default region, Shift+arrows resize it, Enter uses it, Escape drops it.
+  let keyed = null;
+  const clampTo = (value, low, high) => Math.min(high, Math.max(low, value));
+  box.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') { keyed = null; live.hidden = true; hint.textContent = 'Region dropped.'; return; }
+    if (event.key === 'Enter' && keyed) {
+      event.preventDefault();
+      const result = unitBox(keyed.x, keyed.y, keyed.x + keyed.w, keyed.y + keyed.h, 1, 1);
+      keyed = null;
+      live.hidden = true;
+      if (result) onRegion(result, true);
+      return;
+    }
+    const delta = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[event.key];
+    if (!delta) return;
+    event.preventDefault();
+    const step = 0.02;
+    keyed = keyed || { x: 0.35, y: 0.35, w: 0.3, h: 0.3 };
+    if (event.shiftKey) {
+      keyed.w = clampTo(keyed.w + delta[0] * step, 0.02, 1 - keyed.x);
+      keyed.h = clampTo(keyed.h + delta[1] * step, 0.02, 1 - keyed.y);
+    } else {
+      keyed.x = clampTo(keyed.x + delta[0] * step, 0, 1 - keyed.w);
+      keyed.y = clampTo(keyed.y + delta[1] * step, 0, 1 - keyed.h);
+    }
+    place(live, keyed);
+    live.hidden = false;
+    hint.textContent = `Region ${boxText(keyed)}. Press Enter to comment on it.`;
+  });
   box.addEventListener('pointerup', (event) => finish(event, true));
   box.addEventListener('pointercancel', (event) => finish(event, false));
   return {
@@ -375,8 +585,8 @@ async function drawPdf(native, data, onAnchor) {
         const selection = document.getSelection();
         if (!selection || selection.isCollapsed || !selection.rangeCount) return;
         const page = pageOf(selection.getRangeAt(0).startContainer);
-        const text = cleanText(selection.toString()).trim();
-        if (page && text) onAnchor({ kind: 'pdf_page', file: data.file, page, exact: text.slice(0, LIMITS.exact) });
+        const text = clipHead(cleanText(selection.toString()).trim(), LIMITS.exact);
+        if (page && text) onAnchor({ kind: 'pdf_page', file: data.file, page, exact: text });
       }, 150);
     });
   }
@@ -414,9 +624,10 @@ function csrfToken() {
 }
 
 async function send(url, token, payload) {
-  // No explicit mode: with the default (cors) mode the POST keeps its Origin header; mode 'same-origin' made Firefox and
-  // WebKit send "Origin: null" (verified), which the server refuses.
-  const init = { credentials: 'same-origin', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer' };
+  // The session is in the URL path, so no credentials are needed. No explicit mode: with the default (cors) mode the POST
+  // keeps its Origin header; an explicit mode 'same-origin' together with the no-referrer policy made Firefox and WebKit
+  // send "Origin: null" (verified), which the server refuses.
+  const init = { credentials: 'omit', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer' };
   if (payload === undefined) {
     init.headers = { Accept: 'application/json' };
   } else {
@@ -447,6 +658,9 @@ function buildPanel(aside, data, hooks) {
   let serverRows = [];
   const overlay = new Map();
   let editing = null;
+  const busy = new Set();      // rows with a request in flight: their buttons are disabled and a second click is ignored
+  let renderToken = 0;
+  let renderSignature = null;
   let deferredRender = false;
   let pollTimer = 0;
   let pollRound = 0;
@@ -532,9 +746,9 @@ function buildPanel(aside, data, hooks) {
     const body = h('p', { class: 'row-body', text: row.body });
     li.append(body);
     if (['open', 'submitted', 'edited'].includes(row.status)) {
-      const editButton = h('button', { type: 'button', text: 'Edit', 'aria-label': 'Edit this annotation' });
+      const editButton = h('button', { type: 'button', text: 'Edit', 'aria-label': 'Edit this annotation', disabled: busy.has(row.annotation_id) });
       editButton.addEventListener('click', () => startEdit(row, li, body, editButton));
-      const removeButton = h('button', { type: 'button', class: 'danger', text: 'Delete', 'aria-label': 'Delete this annotation' });
+      const removeButton = h('button', { type: 'button', class: 'danger', text: 'Delete', 'aria-label': 'Delete this annotation', disabled: busy.has(row.annotation_id) });
       removeButton.addEventListener('click', () => remove(row));
       li.append(h('div', { class: 'actions' }, editButton, removeButton));
     }
@@ -543,8 +757,20 @@ function buildPanel(aside, data, hooks) {
   function render() {
     if (editing) { deferredRender = true; return; }
     const rows = merged();
-    list.replaceChildren(...(rows.length ? rows.map(renderRow) : [h('li', { class: 'empty', text: 'Nothing yet.' })]));
     hooks.rows(rows);
+    const signature = rows.map((r) => [r.annotation_id, r.status, r.body, r.edited_at, r.addressed_in_version_number, busy.has(r.annotation_id)].join('\u0001')).join('\u0002');
+    if (signature === renderSignature) return;     // nothing changed: keep the list (and the reader's focus) as it is
+    renderSignature = signature;
+    renderToken += 1;
+    const mine = renderToken;
+    list.replaceChildren();
+    if (!rows.length) { list.append(h('li', { class: 'empty', text: 'Nothing yet.' })); return; }
+    const addChunk = (from) => {      // a long list is built in chunks so no task runs long
+      if (mine !== renderToken) return;
+      list.append(...rows.slice(from, from + 40).map(renderRow));
+      if (from + 40 < rows.length) setTimeout(() => addChunk(from + 40), 0);
+    };
+    addChunk(0);
   }
 
   async function refresh() {
@@ -588,7 +814,7 @@ function buildPanel(aside, data, hooks) {
   }
 
   function startEdit(row, li, body, editButton) {
-    if (editing) return;
+    if (editing || busy.has(row.annotation_id)) return;
     editing = row.annotation_id;
     const box = h('textarea', { rows: '4', maxlength: String(comment.maxLength), 'aria-label': 'Edit your comment' });
     box.value = row.body;
@@ -614,9 +840,12 @@ function buildPanel(aside, data, hooks) {
     save.addEventListener('click', async () => {
       const text = cleanText(box.value);
       if (!text.trim()) { say(errorMessage(400, 'empty'), 'error'); box.focus(); return; }
+      if (busy.has(row.annotation_id)) return;
+      busy.add(row.annotation_id);
       save.disabled = true;
       say('Saving');
       const result = await change(urls.edit(row.annotation_id), row.annotation_id, { comment: text });
+      busy.delete(row.annotation_id);
       save.disabled = false;
       if (result.status === 202) {
         const extra = overlay.get(row.annotation_id) || {};
@@ -625,6 +854,7 @@ function buildPanel(aside, data, hooks) {
         say('Saved. The change shows as Edited until it is processed.');
         editing = null;
         deferredRender = false;
+        renderSignature = null;
         render();
         expectProjection();
         const again = list.querySelector(`li[data-id="${row.annotation_id}"] button`);
@@ -638,18 +868,25 @@ function buildPanel(aside, data, hooks) {
   }
 
   async function remove(row) {
-    if (!confirm('Delete this annotation?')) return;
+    if (editing === row.annotation_id || busy.has(row.annotation_id)) return;
+    busy.add(row.annotation_id);
+    render();
+    if (!confirm('Delete this annotation?')) { busy.delete(row.annotation_id); render(); return; }
     say('Deleting');
     const result = await change(urls.remove(row.annotation_id), row.annotation_id, {});
+    busy.delete(row.annotation_id);
     if (result.status === 202) {
       const extra = overlay.get(row.annotation_id) || {};
       extra.deleted = true;
       overlay.set(row.annotation_id, extra);
       say('Deleted.');
+      renderSignature = null;
       render();
       expectProjection();
       listHead.focus();
     } else {
+      renderSignature = null;
+      render();
       say(errorMessage(result.status, errorCode(result.json), !serverRows.some((r) => r.annotation_id === row.annotation_id)), 'error');
       if (result.status === 409) refresh();
     }
@@ -698,11 +935,13 @@ function buildPanel(aside, data, hooks) {
   if (!urls || !token) {
     say('Annotations are not available on this page.', 'error');
     submit.disabled = true;
-    return { setAnchor, focusRow() {} };
+    return { setAnchor, say, focusComment() {}, focusRow() {} };
   }
   refresh().then(() => say(''));
   return {
     setAnchor,
+    say,
+    focusComment() { comment.focus(); },
     focusRow(id) {
       const row = list.querySelector(`li[data-id="${id}"]`);
       if (row) { row.scrollIntoView({ block: 'nearest' }); row.focus(); }
@@ -719,10 +958,11 @@ async function start() {
   const annotate = data.mode === 'annotate';
   const aside = annotate ? document.querySelector('aside[data-annotate-panel]') : null;
   const root = mountContentRoot();
+  const model = root ? makeModel(root) : null;
   let panel = null;
   let canvas = { setRegions() {}, regionMode() {} };
   let lastRows = [];
-  const highlighter = root ? makeHighlighter(root, (id) => panel && panel.focusRow(id)) : null;
+  const highlighter = root ? makeHighlighter(root, model, (id) => panel && panel.focusRow(id)) : null;
   const choose = (anchor) => { if (panel) panel.setAnchor(anchor); };
   const hooks = {
     rows(rows) {
@@ -741,17 +981,25 @@ async function start() {
     panel = buildPanel(aside, data, hooks);
     if (root) {
       let timer = 0;
+      let latest = 0;
       document.addEventListener('selectionchange', () => {
         clearTimeout(timer);
-        timer = setTimeout(() => {
-          const anchor = textAnchorFromSelection(root, data.file);
-          if (anchor) panel.setAnchor(anchor);
+        timer = setTimeout(async () => {
+          latest += 1;
+          const mine = latest;
+          const result = await textAnchorFromSelection(root, model, data.file);
+          if (!result || mine !== latest) return;
+          if (result.anchor) panel.setAnchor(result.anchor);
+          else panel.say(result.refused, 'error');
         }, 150);
       });
     }
   }
   if (data.kind === 'image') {
-    canvas = drawImage(native, data, annotate ? (box) => choose({ kind: 'image_region', file: data.file, ...box }) : null);
+    canvas = drawImage(native, data, annotate ? (box, fromKeyboard) => {
+      choose({ kind: 'image_region', file: data.file, ...box });
+      if (fromKeyboard && panel) panel.focusComment();
+    } : null);
   } else if (data.kind === 'pdf') {
     canvas = await drawPdf(native, data, annotate ? choose : null);
   } else if (data.kind === 'document') {
