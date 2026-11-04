@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import signal
 import sqlite3
@@ -192,6 +193,45 @@ def pid_alive(pid: int | None, starttime: int | None = None,
 
 # --- registry -----------------------------------------------------------------
 
+_NETWORK_FS = ("nfs", "nfs4", "cifs", "smb3", "lustre", "beegfs", "gpfs", "ceph", "9p",
+               "afs", "glusterfs")
+
+
+def network_fs(path: str | os.PathLike[str], *, mountinfo: str | None = None) -> str | None:
+    """Filesystem type of ``path`` when it is a network/FUSE filesystem, else None.
+
+    Longest mount-point prefix of ``/proc/self/mountinfo`` wins. Unreadable
+    mountinfo => None (no warning; this is advisory only).
+    """
+    if mountinfo is None:
+        try:
+            mountinfo = Path("/proc/self/mountinfo").read_text()
+        except OSError:
+            return None
+    target = os.path.realpath(path)
+    best, best_type = -1, None
+    for line in mountinfo.splitlines():
+        head, sep, tail = line.partition(" - ")
+        fields = head.split()
+        if not sep or len(fields) < 5 or not tail.split():
+            continue
+        mnt = fields[4]
+        if (target == mnt or mnt == "/" or target.startswith(mnt.rstrip("/") + "/")) \
+                and len(mnt) > best:
+            best, best_type = len(mnt), tail.split()[0]
+    if best_type and (best_type in _NETWORK_FS or best_type.startswith("fuse")):
+        return best_type
+    return None
+
+
+def warn_if_network_fs(state_dir: str | os.PathLike[str], *, mountinfo: str | None = None) -> None:
+    """SQLite WAL is not safe on NFS and similar: say so (never refuse; cleanup stays fail-closed)."""
+    fs = network_fs(state_dir, mountinfo=mountinfo)
+    if fs:
+        logging.getLogger(__name__).warning(
+            "build registry state dir %s is on a network filesystem (%s); SQLite WAL "
+            "locking is unreliable there. Point the state dir at host-local disk.", state_dir, fs)
+
 def db_path(state_dir: str | os.PathLike[str]) -> Path:
     return Path(state_dir) / DB_NAME
 
@@ -219,6 +259,7 @@ class Registry:
         self._now = now
         try:
             Path(state_dir).mkdir(parents=True, exist_ok=True)
+            warn_if_network_fs(state_dir)
             conn = _connect(self.path, create=True)
             try:
                 self._init(conn)

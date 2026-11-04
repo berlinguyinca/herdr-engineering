@@ -574,3 +574,25 @@ def test_halt_stops_heartbeat_and_cancel_signals(tmp_path):
     finally:
         child.kill()
         child.wait()
+
+
+MOUNTINFO = (
+    "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+    "40 22 0:35 / /home rw - nfs4 srv:/home rw\n"
+    "41 22 0:36 / /scratch rw - fuse.beegfs beegfs rw\n"
+    "42 40 0:37 / /home/me/local rw - ext4 /dev/sdb rw\n"
+)
+
+
+@pytest.mark.parametrize("path,fs", [
+    ("/home/u/.local/state", "nfs4"), ("/scratch/x", "fuse.beegfs"),
+    ("/home/me/local/s", None), ("/var/tmp", None), ("/homework", None)])
+def test_network_filesystem_detection(path, fs):
+    assert br.network_fs(path, mountinfo=MOUNTINFO) == fs
+
+
+def test_registry_warns_on_network_state_dir(tmp_path, caplog):
+    import logging
+    br.warn_if_network_fs(tmp_path, mountinfo=f"1 0 0:1 / {tmp_path} rw - nfs4 x rw\n")
+    assert any("network filesystem" in r.message for r in caplog.records
+               if r.levelno == logging.WARNING)

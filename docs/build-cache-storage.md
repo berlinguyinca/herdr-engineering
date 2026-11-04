@@ -1,5 +1,22 @@
 # Build cache central storage (spec 04)
 
+> **Security review update (spec 05 review H1-H3).** The shared S3 level is currently
+> NOT delivered to builds. Credentials in the cargo environment are readable by every
+> build script, proc macro and test binary, and an sccache server fixes config, RW mode
+> and prefix at its first start, so per-build env cannot enforce policy. A fully valid
+> shared request therefore runs with the local cache only and reports
+> `shared_unavailable:shared_requires_server`; no `AWS_*`, `SCCACHE_CONF` or
+> `SCCACHE_S3_RW_MODE` reaches cargo, and `shared.active` is never true. Each policy
+> (mode, writes, namespace, endpoint, toolchain, cache dir/size) gets its own
+> `SCCACHE_SERVER_PORT` (20000-59999) so builds under different policies never share a
+> server. Still to build: an explicit `sccache --start-server` with credentials in the
+> server's env only (file path to server child env), plus server lifetime management
+> (today a server lives until sccache's own idle timeout). The sections below describe
+> the intended config and remain accurate for the rendering functions. The
+> `fabric_build_cache` section is read only from machine-local config
+> (`~/.config/herdr-engineering/config.yaml`, `$HERDR_ENGINEERING_CONFIG`), never from a
+> `herdr-engineering.yaml` in the build's working directory.
+
 Status: code and config rendering done and unit/e2e-tested with fakes. Nothing here has run against a real sccache or a real S3 endpoint (neither exists on this host).
 
 ## Upstream facts (fetched 2026-11-04; latest stable sccache v0.19.0)

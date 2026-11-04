@@ -54,10 +54,12 @@ otherwise, so most agent builds are not deduplicated. `features_digest` and
 trailing slash (the build's working directory) or a named scope. One valid lease per
 scope; expired means `heartbeat_ts + ttl_s < now`. A takeover after expiry bumps the
 epoch; the old holder's `transition`, `finish`, `heartbeat` and `release` raise
-`FencedError`. Mutating a leased attempt without presenting the lease also raises.
+`FencedError`. Mutating an attempt that ever held a lease (recorded in `attempt_leases`), even after a takeover or release, without presenting that lease also raises (no stale-writer bypass by omitting the lease).
 The recording wrapper heartbeats every `ttl/3` (default ttl 30 s) from a daemon
 thread while the child runs. If another owner already holds the workspace lease the
 attempt runs unleased (it is still protected by flock).
+
+The registry records the **child's** pid and start time (`record_pid`, at spawn), not the wrapper's: a SIGKILLed wrapper can leave a live build, and `reconcile()` must follow the build.
 
 `reconcile()` releases an expired lease and fails its attempt with
 `owner_vanished` only if the owner pid is provably gone (kill 0 says no such process,
@@ -84,8 +86,7 @@ toolchains and sccache directories are never candidates.
 
 Registry faults (locked, disk full, corrupt, read-only) never fail or block a build:
 they are swallowed, the finished event lists `registry_unavailable` in `unavailable`,
-and the exit code is the child's. After the first fault the run makes no further
-registry calls. A 0-byte or corrupt db also pauses cleanup (fail closed) until it is
+and the exit code is the child's. After the first fault `unavailable` is set and the event lists `registry_unavailable`; the heartbeat thread and the final `finish` still try (errors stay swallowed), so later calls may succeed. A 0-byte or corrupt db also pauses cleanup (fail closed) until it is
 repaired or deleted.
 
 ## Rollback
@@ -100,3 +101,26 @@ rest of their run (flock protection is unaffected).
 `build_started`/`build_finished` carry `build_id` (the registry build id; shared by
 joined attempts), `attempt_id`, `request_key` and `joined` when the registry is
 available.
+
+## Caveats (security review, spec 05)
+
+* **Signals and pid reuse.** The wrapper waits for the child with `waitid(WNOWAIT)`
+  (child stays a zombie, pid cannot be recycled), stops signal forwarding and the
+  heartbeat/cancel thread (`BuildRun.halt`), and only then reaps with `wait4`.
+* **SQLite on network filesystems.** WAL needs working shared memory and locks; NFS,
+  Lustre, BeeGFS and FUSE mounts do not guarantee them. `Registry` logs a warning when
+  the state dir is on such a mount (`/proc/self/mountinfo`, advisory only, it does not
+  refuse). Use a host-local state dir; never share one registry between hosts (pid
+  checks are host-local).
+* **Record-mode kill semantics.** In record mode (and whenever the build cache is
+  enabled) the build is a child of the wrapper in the same process group. SIGKILL of
+  the wrapper orphans the build: it keeps running and keeps holding its slot and
+  `build-maintenance.lock` (inherited fds), so cleanup stays blocked and the lease
+  expires while the build is alive; `reconcile` then spares it because the child pid is
+  recorded. There is no `PR_SET_PDEATHSIG` (it would need a `preexec_fn` while threads
+  run, or an exec shim); this is documented behaviour, not fixed. Exec mode (no
+  `--record`, cache disabled) is unaffected: the build replaces the wrapper.
+* **Cancel** only SIGTERMs the cargo pid; rustc grandchildren and a SIGTERM-ignoring
+  child are not escalated.
+* **Fenced finish** (takeover, long suspend) still leaves its attempt non-terminal;
+  rows are bounded only by reconcile/prune of terminal builds (open item).
