@@ -6,6 +6,7 @@ import {recordOutcome} from './record-state.js';
 import {prTrailHref} from './entity-links.js';
 import {ciRunKey} from './ci-performance.js';
 import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
+import {reviewsNeedingDecision,reviewTrend,renderReviewDecisions,renderReviewTrend,reviewDecisionStyles} from './review-decisions.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports,ciExplorerTargets} from './ci-insights.js';
 import {renderTestExplorer,testExplorerStyles,explorerTests,testSource} from './ci-test-explorer.js';
 import {renderCiPipeline,renderCiDiagnosis,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
@@ -170,7 +171,7 @@ const commandCenterStyles=`<style>
 export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',provider='',mission='',session='',workspace:startWorkspace=''}={}) {
   const isCi=kind==='ci';
   const tabs=isCi ? [['current','Current'],['failed','Failed'],['finished','Finished']] : [['current','Current'],['changes','Changes requested'],['failed','Failed'],['finished','Finished']];
-  const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,provider,mission,session,page:0,group:'project',branch:'',days:isCi?14:0};
+  const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,provider,mission,session,page:0,group:'project',branch:'',days:isCi?14:0,period:30};
   let related=null,relatedFailed=false,disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
   let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
   let selectedReports=null,selectedReportsError='';
@@ -187,9 +188,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
   const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
-  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+testExplorerStyles+ciPipelineStyles+commandCenterStyles+'<style>'+ciFixStyles+'</style>':''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro"${isCi?' hidden':''}>${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+  container.innerHTML=`${styles}${!isCi?ciChartStyles+reviewDecisionStyles:''}${isCi?ciChartStyles+ciInsightStyles+testExplorerStyles+ciPipelineStyles+commandCenterStyles+'<style>'+ciFixStyles+'</style>':''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro"${isCi?' hidden':''}>${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
-    ${isCi?'<div data-ci-attention></div><div data-ci-observability></div><div data-ci-health></div>':''}
+    ${isCi?'<div data-ci-attention></div><div data-ci-observability></div><div data-ci-health></div>':'<div data-rv-decisions></div><div data-rv-trend></div>'}
     <div class="ig-tabs hd-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
     ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option><option value="30">Last 30 days</option></select></label></div><div data-ci-insights></div>' : ''}
@@ -307,6 +308,15 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   function tick() {
     for(const element of container.querySelectorAll('[data-integration-time]')) element.textContent=formatDuration(Math.max(0,Date.now()-Number(element.dataset.integrationTime)));
   }
+  // The two sections above the list: reviews waiting on the operator, then pass/fail over time. Both read the loaded records only.
+  function drawReviewSections(all) {
+    const loading=!data&&!error,unavailable=!data&&!!error,now=Date.now(),recs=all.map(e=>e.record);
+    const byRecord=new Map(all.map(e=>[e.record,e]));
+    const needed=!data?[]:reviewsNeedingDecision(recs,now);
+    const sections=[['[data-rv-decisions]',renderReviewDecisions(needed,item=>integrationRow({...byRecord.get(item.record),tab:'current'},kind),{loading,unavailable,placeholder:skeleton('reviews waiting for a decision',{rows:1})})],
+      ['[data-rv-trend]',renderReviewTrend(reviewTrend(!data?[]:recs,{period:state.period,now}),{loading,unavailable,placeholder:skeleton('review outcomes',{rows:2})})]];
+    for(const [selector,html] of sections){const host=el(selector);if(host.dataset.signature===html)continue;host.dataset.signature=html;handOff(morph(host,html),()=>null);}
+  }
   function draw() {
     if(disposed)return;
     el('[data-ig-error]').textContent=error;
@@ -315,6 +325,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const healthKey=JSON.stringify([!data&&!!error,data?.status,data?.refreshing,data?.progress,data?.last_success_at,data?.checked_at,data?.error,data?.stale,data?.repo_errors,data?.project_mapping_error]);
     if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;morph(healthElement,health);}
     const all=entries(),filtered=selectIntegrations(all,state),pageSize=20;
+    if(kind==='reviews')drawReviewSections(all);
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
     // Clock advance can change membership even when every provider payload is unchanged.
     const windowMembership=isCi?all.map(entry=>ciRunInWindow(entry.record,state)):null;
@@ -722,7 +733,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       debugSessions=activePiSessions(response.sessions);debugMessage='';{const onBranch=selected?.branch?debugSessions.filter(x=>x.branch===selected.branch):[];if(!debugSessionId && onBranch.length===1){debugSessionId=onBranch[0].session_id;debugOperationId='';fixOperationId='';}}
     },()=>{if(selected?.id===key){debugSessions=[];debugMessage='Pi agents could not load. Reopen this run to retry.';}});
   },{capture:true,signal:listenerController.signal});
-  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-cx-session')){cx.sessionId=event.target.value;cx.sendMessage=cx.sent[cx.selected]?.sessionId===cx.sessionId?cx.sent[cx.selected].message:'';draw();return;}if(event.target.hasAttribute('data-cx-status')){cx.status=event.target.value;draw();return;}if(event.target.hasAttribute('data-cx-sort')){cx.sort=event.target.value;draw();return;}if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';fixOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
+  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-rv-period')){state.period=Number(event.target.value)||30;draw();return;}if(event.target.hasAttribute('data-cx-session')){cx.sessionId=event.target.value;cx.sendMessage=cx.sent[cx.selected]?.sessionId===cx.sessionId?cx.sent[cx.selected].message:'';draw();return;}if(event.target.hasAttribute('data-cx-status')){cx.status=event.target.value;draw();return;}if(event.target.hasAttribute('data-cx-sort')){cx.sort=event.target.value;draw();return;}if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';fixOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
   container.querySelector('.ig-tabs:not(.ci-workspace-tabs)').addEventListener('keydown',event=>{
     if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
     const index=tabs.findIndex(([key])=>key===state.tab);
