@@ -123,6 +123,58 @@ files stay a separate, deliberate step (`export-key`). Its `doctor` can reuse `c
 
 ## Backups
 
+### Private dashboard client runtime
+
+The backend and Memory Explorer use separate deployment steps. Configuring the
+backend does not grant dashboard access. Memory Explorer still requires an
+existing configured viewer and enforces its project/scope permissions; personal
+and assistant banks remain excluded.
+
+When dashboard viewers use the default canonical command, deploy.sh builds a
+small CLI base from the full `dependencies.herdr-memory` lock revision. It
+exports only SDK source, pyproject and README on the host. Git credentials,
+models, client profiles and caches never enter the image context. A disabled
+memory feature or empty viewer map needs no SDK checkout or client credentials.
+An explicit custom command remains operator-managed unless a profile is supplied.
+
+Supply an operator-owned client configuration with `--memory-client-config PATH`
+or the host-only `control_plane.memory.client_config_source` field. The source
+file and referenced credentials must be private user-owned regular files; symlink
+and FIFO inputs are rejected. The canonical pinned `validate-config` action
+checks schema and URL policy offline. Preparation does not contact Hindsight or
+open the operator's cache/outbox.
+
+Only configured engineering projects/scopes and the nonpersonal default-project
+identity anchor are materialized. The existing adapter uses the `codex`
+credential-binding slot; this is not agent-origin provenance. A global-only
+viewer still needs the client's default project identity, but receives no new
+project permission. Unused personal profiles and other harness bindings are not
+exported.
+
+At runtime, credentials go only to the private web container over Docker stdin,
+into root-owned 0700/0600 files under `/run/herdr-memory-client`. The dashboard
+cache is separate at `/state/herdr-memory-explorer`; its status describes that
+client, not the aggregate state of all harnesses. Revoking runtime configuration
+does not delete user caches, accepted outbox entries or source credentials.
+
+Forward and previous profile artifacts are protected separately from the
+fleet-config mounted directories. A failed application rollout restores the
+previous image/config and previous profile; a first activation never sends its
+forward profile to an older image. The optional Hindsight backend phase remains
+independent. Credential rotation still requires updating client profiles after
+the corresponding backend key change.
+
+Use `deploy.sh --dry-run` first. It may create protected transient preparation
+files, as existing config rendering does, but performs no Git cache update,
+Docker build, runtime profile install or viewer grant. This mechanism never adds
+viewer permissions. Configure a viewer explicitly through the existing private
+API policy before activation; do not publish this endpoint or use Funnel.
+
+The client URL must be reachable and trusted inside the web container. A host's
+loopback address refers to the container there; use the existing authenticated
+HTTPS route where appropriate. Preparation validates configuration, not endpoint
+availability or authentication; runtime unavailable/degraded states remain truthful.
+
 `herdr-hindsight-backup.timer` (installed and enabled by `deploy.sh --with-memory`, daily, `Persistent=true`) runs
 `~/.local/share/herdr-engineering/memory-backup.sh backup`: `pg_dump -Fc` of the **whole** database (every tenant
 schema) inside `herdr-hindsight-db` into an owner-only partial file, `pg_restore --list` verifies it, then it is renamed
