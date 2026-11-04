@@ -167,8 +167,12 @@ against the live stack (Hindsight `0.5.0`); nothing here is mocked.
   return the degraded fail-open shape and clear the refused scope's cache; `recall`/`status` drain
   the outbox so recovery needs no hand-run `sync` (D13, D14, D15); `--version` reports client **and**
   contract (D18). `69 passed, 4 skipped, 20 subtests passed`; the 10 new tests fail on `origin/main`
-  (`8 failed, 2 passed`) and pass on the branch; GitGuardian green. **Open, not merged** — awaiting
-  operator go-ahead, then promote the client install on both hosts and re-run #6 there.
+  (`8 failed, 2 passed`) and pass on the branch; GitGuardian green. **Merged** (squash `3e23abf`) and
+  promoted: `0.1.2` is the production client on both hosts — bender
+  `~/.local/share/uv/tools/herdr-memory/bin/herdr-memory` and the Mac
+  `~/.local/bin/herdr-memory` → `~/.venvs/herdr-memory`, each reporting
+  `{"client": "0.1.2", "contract": 1}`. Re-run #6 on the promoted build passed live - see
+  `audit/DRILLS_20261104.md` §11 (D13, D14, D15, D16, D18 closed on production).
 - Production was never mutated for the fix proof: the candidate build ran from
   `~/.venvs/herdr-memory-fix` only. Config restored byte-for-byte from the drill backup (verified),
   `/tmp/hm-drill` deleted, `herdr-eng memory install` re-run (`noop ... [current]` for
@@ -178,6 +182,16 @@ against the live stack (Hindsight `0.5.0`); nothing here is mocked.
   outbox during replay with no `dead_letter`/`delivered` record (20 writes silently), so "never
   delivered" is indistinguishable from "delivered"; needs attempt accounting. Also still unrun: the
   Pi-tool-surface latency and concurrent multi-harness halves of #5.
+- **Found while re-running the drills:** **D19** — `identity`/`namespace` hash the configured
+  `base_url`, so correcting a server address hid queued writes from `pending`, `sync` and
+  `dead_letter` (a production row sat in `outbox` while `status` said `pending: 0`). Fixed by
+  [herdr-memory#6](https://github.com/berlinguyinca/herdr-memory/pull/6) (credential + provenance
+  ownership, `aliases`, `outbox_total`/`outbox_orphans`); the stranded row was adopted and delivered
+  by the PR build. The ledger half of the same issue - `verified` claimed before the server
+  acknowledges - stays open on [herdr-memory#5](https://github.com/berlinguyinca/herdr-memory/issues/5).
+  **D20** - contract-v1 recall results can omit `document_id` (only `memory_id`), so a record cannot
+  be forgotten by the client that wrote it; drill cleanup needed raw `GET /documents` + `DELETE`
+  ([herdr-memory#8](https://github.com/berlinguyinca/herdr-memory/issues/8)).
 - **Operational risk on bender:** `herdr-eng-fleet-update.timer` is `active` but
   `herdr-eng-fleet-update.service` is `failed` (its checkout
   `~/IdeaProjects/herdr-engineering` is dirty), so unattended fleet updates are not applying. It
@@ -186,4 +200,6 @@ against the live stack (Hindsight `0.5.0`); nothing here is mocked.
 
 Filed for tracking: herdr-engineering#570 (D8 client path pinning), #571 (D10 cwd-dependent
 resolution, with the mapped/unmapped `doctor` comparison above), #572 (D9 + the failing fleet
-timer), herdr-memory#4 (D17 attempt accounting after SIGKILL).
+timer), herdr-memory#4 (D17 attempt accounting after SIGKILL), #5 (D19 URL-keyed queue ownership,
+fixed by #6) and #8 (D20 records without `document_id`). Duplicates #573/#574/#575 were closed into
+#570/#571/#572 with their evidence.
