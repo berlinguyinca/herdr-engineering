@@ -1024,7 +1024,7 @@ async function viewFabricServices(_parts, revision) {
 async function viewAiSync(_parts, revision) {
   const data = await client.listAiSync();
   if (revision !== renderRevision) return;
-  const stop = mountAiSync(root, client, data);
+  const stop = mountAiSync(root, client, data, { freshness: (ok, message) => root.querySelector('herdr-freshness')?.touch?.(ok, message) });
   root.querySelector('herdr-freshness')?.touch?.(true);
   return { refresh() {}, dispose: stop };
 }
