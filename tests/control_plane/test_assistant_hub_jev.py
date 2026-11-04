@@ -111,6 +111,11 @@ def test_parse_documented_sample() -> None:
         _mutated(["usage", "output_tokens"], 1.5),
         _mutated(["usage"], KeyError),
         _mutated(["model"], 7),
+        b'{"model":"m","answers":{"destructive":{"type":"noul","noul":' + b"9" * 400 + b'}},"usage":{"input_tokens":1,"output_tokens":1}}',
+        b'{"model":"m","answers":{"destructive":{"type":"noul","noul":0.1}},"usage":{"input_tokens":' + b"9" * 400 + b',"output_tokens":1}}',
+        _mutated(["usage", "input_tokens"], 2**31 + 1),
+        json.dumps(DOCUMENTED).replace('"2": 0.82', '"2": ' + "9" * 400).encode(),
+        json.dumps(DOCUMENTED).replace('"score": 1.78', '"score": -' + "9" * 400).encode(),
         b"[]",
         b"\"x\"",
         b"not json",
@@ -438,3 +443,97 @@ def test_integration_health_and_ask() -> None:
     assert isinstance(res.answers["destructive"], NoulAnswer)
     assert isinstance(res.answers["severity"], ScoreAnswer)
     assert isinstance(res.answers["bucket"], ChoiceAnswer)
+
+
+# ------------------------------------------------------------ review fixes
+
+
+def test_parse_rejects_empty_expected() -> None:
+    with pytest.raises(JudgeUnavailable) as err:
+        parse_response(b'{"model":"m","answers":{},"usage":{"input_tokens":1,"output_tokens":1}}', {})
+    assert err.value.code == "malformed"
+
+
+@pytest.mark.parametrize("t", [0, -1, float("nan"), float("inf"), 601])
+def test_ask_timeout_validated(t: float, key_file: Path) -> None:
+    c = JevClient(f"http://127.0.0.1:{_closed_port()}", str(key_file), "laya-auto", 1.0)
+    with pytest.raises(JudgeUnavailable) as err:
+        c.ask("s", QUESTIONS, timeout=t)
+    assert err.value.code == "config"
+
+
+def _ok_http(body: bytes, rid: str = "") -> bytes:
+    extra = f"X-InferWeave-Request-ID: {rid}\r\n" if rid else ""
+    return b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" + extra.encode() + b"Content-Length: %d\r\n\r\n" % len(body) + body
+
+
+def test_ask_success_over_wire_resolved_model_and_request_id(listener: Any, key_file: Path) -> None:
+    """Success-path body test: the DOCUMENTED sample (not captured) served over a raw socket."""
+    doc = json.loads(json.dumps(DOCUMENTED))
+    doc["model"] = "concrete-checkpoint-id"
+    li = listener(lambda c: c.sendall(_ok_http(_body(doc), "req-42")))
+    res = _client(li, key_file, 3.0).ask({"tool": "Bash"}, QUESTIONS)
+    assert res.model == "concrete-checkpoint-id" and res.request_id == "req-42"
+    assert b"POST /v1/systemone" in li.seen and b'"model":"laya-auto"' in li.seen
+
+
+def test_health_success_over_wire(listener: Any, key_file: Path) -> None:
+    """Success-path: an OpenAI-shaped model list served over a raw socket."""
+    li = listener(lambda c: c.sendall(_ok_http(b'{"object":"list","data":[{"id":"laya-auto"},{"id":"b"}]}')))
+    assert _client(li, key_file, 3.0).health() == ["laya-auto", "b"]
+    assert b"GET /v1/models" in li.seen
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"x" * (64 * 1024 + 1), b'{"data":"nope"}', b'{"data":[{"id":1}]}', b"[]", b'{"data":[{"id":"a"}],"data":[]}', b'{"data":[{"id":"a","id":"b"}]}'],
+)
+def test_health_hostile_bodies(listener: Any, key_file: Path, body: bytes) -> None:
+    li = listener(lambda c: c.sendall(_ok_http(body)))
+    with pytest.raises(JudgeUnavailable) as err:
+        _client(li, key_file, 3.0).health()
+    assert err.value.code in ("malformed", "too_large")
+
+
+def test_key_rotation_between_calls(listener: Any, key_file: Path) -> None:
+    li = listener(lambda c: c.sendall(_ok_http(b'{"data":[{"id":"m"}]}')))
+    client = _client(li, key_file, 3.0)
+    client.health()
+    assert b"Bearer sk-test-not-a-real-key" in li.seen
+    key_file.write_text("sk-rotated-key\n")
+    li.seen = b""
+    client.health()
+    assert b"Bearer sk-rotated-key" in li.seen and b"sk-test-not-a-real-key" not in li.seen
+
+
+def test_slow_connect_bounded_by_deadline(key_file: Path) -> None:
+    """Full-backlog listener makes further SYNs hang; connect must still respect the budget."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(0)
+    port = int(srv.getsockname()[1])
+    fillers = []
+    try:
+        for _ in range(8):
+            f = socket.socket()
+            f.setblocking(False)
+            f.connect_ex(("127.0.0.1", port))
+            fillers.append(f)
+        probe = socket.socket()
+        probe.settimeout(0.3)
+        try:
+            probe.connect(("127.0.0.1", port))
+            pytest.skip("kernel accepted the probe connection; cannot build a hanging connect here")
+        except OSError:
+            pass
+        finally:
+            probe.close()
+        c = JevClient(f"http://127.0.0.1:{port}", str(key_file), "laya-auto", 1.0)
+        t0 = time.monotonic()
+        with pytest.raises(JudgeUnavailable) as err:
+            c.health()
+        assert err.value.code in ("timeout", "connect") and time.monotonic() - t0 < 1.5
+    finally:
+        for f in fillers:
+            f.close()
+        srv.close()

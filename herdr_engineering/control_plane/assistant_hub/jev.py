@@ -129,6 +129,8 @@ def _reject_constant(_name: str) -> Any:
 def _num(v: Any) -> float:
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise _malformed()
+    if isinstance(v, int) and abs(v) > 2**53:
+        raise _malformed()
     f = float(v)
     if not math.isfinite(f):
         raise _malformed()
@@ -154,7 +156,7 @@ def _probabilities(raw: Any, keys: list[str] | None) -> dict[str, float]:
 
 
 def _count(v: Any) -> int:
-    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 2**31:
         raise _malformed()
     return v
 
@@ -172,6 +174,8 @@ def parse_response(
     choice probability keys exactly the criteria names; otherwise score keys must be a contiguous
     ``0..n-1`` range and choice probabilities must contain the chosen name.
     """
+    if not expected:
+        raise _malformed()
     if len(body) > MAX_RESPONSE_BYTES:
         raise JudgeUnavailable("too_large")
     try:
@@ -266,17 +270,19 @@ class JevClient:
         return ids
 
     def ask(self, state: object, questions: Mapping[str, Mapping[str, Any]], *, timeout: float | None = None) -> JudgeResult:
+        eff = self._timeout if timeout is None else timeout
+        if isinstance(eff, bool) or not isinstance(eff, (int, float)) or not math.isfinite(eff) or not 0 < eff <= 600:
+            raise JudgeUnavailable("config")
         try:
             req = build_request(self._model, state, questions)
         except ValueError as exc:
             raise JudgeUnavailable("config") from exc
-        status, body, rid = self._call("POST", "/v1/systemone", req, self._timeout if timeout is None else float(timeout))
+        status, body, rid = self._call("POST", "/v1/systemone", req, float(eff))
         _raise_for_status(status)
         expected = {n: str(q["type"]) for n, q in questions.items()}
-        result = parse_response(body, expected, questions, request_id=rid)
-        if result.model != self._model:
-            raise JudgeUnavailable("model_mismatch")
-        return result
+        # The response model is the resolved checkpoint id (e.g. laya-auto -> concrete id); it is
+        # kept verbatim in the result and only required to be a non-empty string.
+        return parse_response(body, expected, questions, request_id=rid)
 
     # -- internals
 
@@ -288,6 +294,9 @@ class JevClient:
                 raise JudgeUnavailable("config")
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
+                fst = os.fstat(fd)
+                if not stat.S_ISREG(fst.st_mode) or fst.st_uid != os.geteuid() or fst.st_mode & 0o077:
+                    raise JudgeUnavailable("config")
                 raw = os.read(fd, 8192)
             finally:
                 os.close(fd)
@@ -300,16 +309,36 @@ class JevClient:
             raise JudgeUnavailable("config")
         return key
 
+    def _connect(self, conn: http.client.HTTPConnection, deadline: _Deadline) -> None:
+        """Resolve, then try each address against the shared deadline (never a per-address timeout)."""
+        infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
+        last: OSError = OSError("no address")
+        for family, stype, proto, _, addr in infos:
+            if deadline.expired():
+                raise TimeoutError("deadline")
+            sock = socket.socket(family, stype, proto)
+            try:
+                sock.settimeout(max(deadline.remaining(), 0.001))
+                sock.connect(addr)
+                if self._scheme == "https":
+                    sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self._host)
+                conn.sock = sock
+                return
+            except TimeoutError:
+                sock.close()
+                raise
+            except OSError as exc:
+                sock.close()
+                last = exc
+        raise last
+
     def _call(self, method: str, path: str, body: bytes | None, timeout: float) -> tuple[int, bytes, str]:
         key = self._read_key()
         deadline = _Deadline(timeout)
-        conn: http.client.HTTPConnection
-        if self._scheme == "https":
-            conn = http.client.HTTPSConnection(
-                self._host, self._port, timeout=max(deadline.remaining(), 0.001), context=ssl.create_default_context()
-            )
-        else:
-            conn = http.client.HTTPConnection(self._host, self._port, timeout=max(deadline.remaining(), 0.001))
+        conn: http.client.HTTPConnection = (
+            http.client.HTTPSConnection(self._host, self._port) if self._scheme == "https"
+            else http.client.HTTPConnection(self._host, self._port)
+        )
         fired = threading.Event()
 
         def _kill() -> None:
@@ -329,7 +358,7 @@ class JevClient:
             headers["Content-Type"] = "application/json"
         try:
             try:
-                conn.connect()
+                self._connect(conn, deadline)
             except ssl.SSLError as exc:
                 raise JudgeUnavailable("connect") from exc
             except TimeoutError as exc:
