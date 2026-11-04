@@ -141,8 +141,9 @@ Full evidence: [`audit/HARNESS_INSTALL_20261103.md`](audit/HARNESS_INSTALL_20261
 - **New defects D7-D12** (detail in the audit): a *different* `herdr-memory` build labelled `0.1.1`
   was installed on bender with no `retain`/`--scope`/`--evidence`, silently breaking every adapter
   there (fixed by installing the wheel built from herdr-memory `b3c5074`; undetectable through
-  `--version`/`doctor`); `mcp-serve`/`hook` resolve the client by PATH and fail open off a login
-  shell; `default_project` is not a cwd fallback so unmapped directories get no memory; MCP retains
+  `--version`/`doctor`); `mcp-serve`/`hook` resolve the client by PATH (`memory_mcp.py:81`, `:146`) and
+  the hook runner exits 0 silently when the lookup fails; there is no default-project fallback at all,
+  so unmapped directories get a hard error instead of memory; MCP retains
   carry no provenance.
 - **Still open:** #5 failure drill (needs authorization), #10 dashboard, #12 benchmark,
   #4 `correct`/`--as-of` invalidation, and the D3 `recall "*"` HTTP 422 fix in Pi.
@@ -192,14 +193,21 @@ against the live stack (Hindsight `0.5.0`); nothing here is mocked.
   **D20** - contract-v1 recall results can omit `document_id` (only `memory_id`), so a record cannot
   be forgotten by the client that wrote it; drill cleanup needed raw `GET /documents` + `DELETE`
   ([herdr-memory#8](https://github.com/berlinguyinca/herdr-memory/issues/8)).
-- **Operational risk on bender:** `herdr-eng-fleet-update.timer` is `active` but
-  `herdr-eng-fleet-update.service` is `failed` (its checkout
-  `~/IdeaProjects/herdr-engineering` is dirty), so unattended fleet updates are not applying. It
-  must either be cleaned/disabled or made to refuse silently-and-loudly; while broken it also
-  cannot be trusted to preserve a manual client upgrade.
+- **Operational risk on bender:** `herdr-eng-fleet-update.service` exits 1 on every daily run (journal:
+  Nov 1, 2, 3 at 11:59 — `controller checkout is dirty; preserve local work before updating`) while its
+  timer stays `active/waiting`, so unattended fleet updates are not applying. Verified separately:
+  `~/.venvs/herdr-engineering/bin/python` cannot `import herdr_memory`, while the CLI client lives in
+  `~/.local/share/uv/tools/herdr-memory` — which is why `herdr-eng memory doctor` reports
+  `UNKNOWN package_revision` and why the in-process Rakazo memory mirror cannot activate. A dirty
+  checkout must be a reported skip, not a hard failure (herdr-engineering#572); while it fails, a manual
+  client upgrade cannot be trusted to survive the next cycle — `0.1.2` was installed by hand on both
+  hosts.
 
-Filed for tracking: herdr-engineering#570 (D8 client path pinning), #571 (D10 cwd-dependent
-resolution, with the mapped/unmapped `doctor` comparison above), #572 (D9 + the failing fleet
-timer), herdr-memory#4 (D17 attempt accounting after SIGKILL), #5 (D19 URL-keyed queue ownership,
+Filed for tracking: herdr-engineering#570 (D8 runtime PATH resolution + silent hook failure), #571
+(D10 `doctor` cannot see server health/revision outside a mapped project, with the mapped/unmapped
+comparison above), #572 (D9 daily fleet-update failure + herdr-eng env without `herdr_memory`),
+herdr-memory#4 (D17 attempt accounting after SIGKILL), #5 (D19 URL-keyed queue ownership,
 fixed by #6) and #8 (D20 records without `document_id`). Duplicates #573/#574/#575 were closed into
-#570/#571/#572 with their evidence.
+#570/#571/#572; their original bodies were **withdrawn** (written from assumed code paths, incl. a
+module that does not exist) and replaced with reproduced command output, with correction comments on
+all six issues.
