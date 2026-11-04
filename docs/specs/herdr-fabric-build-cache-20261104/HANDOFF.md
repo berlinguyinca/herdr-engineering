@@ -1,5 +1,33 @@
 # HANDOFF (rolling; newest section first)
 
+## Spec 13: failure, security, rollback -- LOCAL SCENARIOS DONE; cluster/S3/sccache rows BLOCKED
+Plan: tests/test_build_chaos.py (real processes, flock, sqlite, sockets, tmp dirs; only sh stand-ins for sccache/rustc/cargo, no mocks); rollback rehearsal; docs/build-cache-rollback.md; matrix evidence below.
+Completed: 27 tests + 7 explicit skips. Outage (closed port, accept-and-close, plaintext 503, hanging listener: bounded, reason `shared_unavailable:*`, exit code kept, no secret in env/events/output); 20-build storm (slots respected via counter file, all complete, registry rows consistent, no leases left, lost/corrupt registry still runs builds); hostile cache (symlinks, fifo, traversal, symlinked cache root never followed or deleted; Slurm `validate_outputs` rejects every hostile shape); SIGKILLed record wrapper (orphan keeps maintenance lock, cleanup/eviction `busy`, lease expiry, reconcile `owner_vanished` only after pid death, stale epoch fenced, nothing deleted); readonly/corrupt/unreadable registry (cleanup fails closed `registry_unreadable`); rollback rehearsal.
+REAL BUG FOUND AND FIXED (commit dd331451, test-first): a read-only state dir made `build-coordinate` exit 1 with an internal error before the build ran. Now it runs the plain command ungated with `gate unavailable (state_dir_unwritable: ...)` on stderr and preserves the exit code.
+Not done / skipped with reason: sccache corrupt object, S3 503/TLS retries inside sccache, Slurm node loss, partition drain, disk-full (needs root loop mount), two-host cross-platform, remote launch after controller restart.
+Risks: the lease-expiry test moves only the reader's clock; ungated fallback also skips cache env (by design); timing assertions (storm < 90 s) are generous but host-load dependent.
+Files: tests/test_build_chaos.py (new), docs/build-cache-rollback.md (new), herdr_engineering/build_coord.py, this file.
+Tests: build_*, config*, api: 508 passed 7 skipped x2; chaos file x5 stable; ruff clean on touched files.
+
+Acceptance matrix (tests/acceptance-matrix.md) evidence:
+1 Baselines: BLOCKED (no sccache; no measured baseline).
+2 Functional correctness: BLOCKED (needs sccache to compare outputs; env wiring covered in specs 03/04 only).
+3 Concurrency: PARTIAL. SIGNED OFF for 20 requests, slot bound, no deadlock, unrelated progress (test_twenty_build_storm_respects_slots_and_completes, test_single_slot_is_strict_mutual_exclusion, test_storm_with_lost_registry_still_runs_every_build). "4 identical, duplicate work bounded" BLOCKED (needs sccache).
+4 Active builds vs cleanup: SIGNED OFF (test_sigkilled_record_wrapper_lease_expiry_reconcile_cleanup_and_fencing, test_cleanup_refuses_on_live_lease_without_wrapper_and_ignores_expired). Source/toolchain/download deletion: not exercised beyond cargo target dirs.
+5 Invalid inputs: PARTIAL. SIGNED OFF for eviction/symlink/traversal and Slurm output digest/size/path (test_eviction_ignores_symlinks_and_specials_and_stays_inside_cache, test_remove_planned_rejects_swapped_symlink_and_traversal, test_symlinked_cache_root_is_refused, test_slurm_output_validation_rejects_every_hostile_shape, test_slurm_staging_refuses_symlinks, test_corrupt_oversized_local_cache_does_not_break_a_build). Untrusted/corrupt sccache object: BLOCKED (no sccache).
+6 Cache outage: PARTIAL. SIGNED OFF for unreachable, TLS failure, plain-503 listener, hang, negative cache, local fallback with exit code (test_unreachable_shared_endpoint_*, test_dead_endpoint_is_negative_cached_*, test_tls_failure_or_hanging_backend_is_bounded_and_reported, test_connection_refused_probe_code). Real S3 503 and sccache retries BLOCKED.
+7 Cross-platform: BLOCKED (second host).
+8 Disk pressure: not re-signed here. Threshold/dry-run logic is spec 07's tests; disk-full simulation BLOCKED (needs root mount).
+9 Control plane restart: PARTIAL. SIGNED OFF for reconcile from state with a fresh Registry handle. "No duplicate remote launch": NOT APPLICABLE (only NullRunner exists; test_slurm_runner_unavailable_never_launches_and_returns_fallback).
+10 Slurm offline: SIGNED OFF for local operation unaffected and NullRunner never launching; no Slurm binary invoked.
+11 Slurm CPU reservation: BLOCKED (no runner, no test partition).
+12 GPU partition: BLOCKED (nothing launches; spec 11 renders no GPU, not re-verified live).
+13 Dashboard/API: NOT SIGNED OFF here (specs 09/10 evidence).
+14 Metrics: NOT SIGNED OFF here (spec 06/08 evidence).
+15 Rollback: SIGNED OFF (test_rollback_rehearsal_returns_to_legacy_exec_path, test_rollback_with_invalid_section_fails_closed_to_legacy; docs/build-cache-rollback.md). Previously active jobs reconciled: via the SIGKILL test.
+16 Performance go/no-go: BLOCKED (no measurement).
+Next: 14-rollout.
+
 ## Spec 12: sccache-dist evaluation -- DOC ONLY; implementation BLOCKED
 Plan: write docs/build-cache-dist-evaluation.md from AUDIT.md and audit/C only (no network); mark unconfirmed upstream claims UNVERIFIED; state decision, preconditions, go/no-go.
 Completed: the document. Decision NOT implemented, NO-GO.
