@@ -61,14 +61,17 @@ def build_argv(tool: str, args: dict, harness: str, exe: str) -> list[str]:
             argv += ["--max-results", str(int(args["max_results"]))]
         return argv
     if tool == "memory_retain":
+        if 'explicit' in args and type(args['explicit']) is not bool:
+            raise ValueError('explicit must be a boolean')
+        explicit = args.get('explicit') is True
         text = str(args.get("text", "")).strip()
         evidence = [str(e) for e in args.get("evidence") or []]
         if not text:
             raise ValueError("text required")
-        if not args.get("explicit") and not evidence:
+        if not explicit and not evidence:
             raise ValueError("retain requires explicit=true or evidence refs")
         argv = [*base, "remember", text, "--scope", scope]
-        if args.get("explicit"):
+        if explicit:
             argv.append("--explicit")
         for ref in evidence:
             argv += ["--evidence", ref]

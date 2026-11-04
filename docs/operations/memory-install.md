@@ -47,6 +47,15 @@ must not be persisted); retain is an explicit MCP/CLI action.
 
 ## MCP surface and scope
 
+Adapter 3 configures Codex's `memory_recall` tool with
+`approval_mode = "approve"` and `memory_retain` with `approval_mode = "prompt"`.
+This permits the installed recall surface in noninteractive sessions without
+changing global approval policy, other MCP servers, or hook trust. Retention
+still follows Codex approval and the explicit/evidence gate. The CLI may retry
+previously accepted outbox operations while reading; the adapter does not label
+the tool read-only to hide that behavior. Codex documents these per-tool settings
+in its [MCP configuration reference](https://learn.chatgpt.com/docs/extend/mcp).
+
 `herdr-eng memory mcp-serve --harness H` is a stdio MCP server with `memory_recall` and
 `memory_retain`. It shells out to the `herdr-memory` CLI (the authoritative client), holds
 no credentials and passes none in argv. Scopes are limited to `project`, `global`,
@@ -59,7 +68,7 @@ needs `herdr-memory` on PATH and a project config, and depends on the P01 contra
 
 ## Pin
 
-`lock/upstreams.yaml` pins `herdr-memory` at `685cf07` (client `0.1.4`, contract v1, private
+`lock/upstreams.yaml` pins `herdr-memory` at `cc20ad4d46845b8257e54596e152846e3ce4a3c2` (client `0.1.6`, contract v1, private
 repo); the same value is `memory_install.PINNED_REVISION` and a test keeps them equal.
 `memory_install.PINNED_CLIENT_VERSION` is the release `herdr-memory --version` is expected to
 report. The installed manifest records the pin used. `scripts/install.sh --with-memory`
