@@ -141,8 +141,9 @@ Full evidence: [`audit/HARNESS_INSTALL_20261103.md`](audit/HARNESS_INSTALL_20261
 - **New defects D7-D12** (detail in the audit): a *different* `herdr-memory` build labelled `0.1.1`
   was installed on bender with no `retain`/`--scope`/`--evidence`, silently breaking every adapter
   there (fixed by installing the wheel built from herdr-memory `b3c5074`; undetectable through
-  `--version`/`doctor`); `mcp-serve`/`hook` resolve the client by PATH and fail open off a login
-  shell; `default_project` is not a cwd fallback so unmapped directories get no memory; MCP retains
+  `--version`/`doctor`); `mcp-serve`/`hook` resolve the client by PATH (`memory_mcp.py:81`, `:146`) and
+  the hook runner exits 0 silently when the lookup fails; there is no default-project fallback at all,
+  so unmapped directories get a hard error instead of memory; MCP retains
   carry no provenance.
 - **Still open:** #5 failure drill (needs authorization), #10 dashboard, #12 benchmark,
   #4 `correct`/`--as-of` invalidation, and the D3 `recall "*"` HTTP 422 fix in Pi.
@@ -167,8 +168,12 @@ against the live stack (Hindsight `0.5.0`); nothing here is mocked.
   return the degraded fail-open shape and clear the refused scope's cache; `recall`/`status` drain
   the outbox so recovery needs no hand-run `sync` (D13, D14, D15); `--version` reports client **and**
   contract (D18). `69 passed, 4 skipped, 20 subtests passed`; the 10 new tests fail on `origin/main`
-  (`8 failed, 2 passed`) and pass on the branch; GitGuardian green. **Open, not merged** — awaiting
-  operator go-ahead, then promote the client install on both hosts and re-run #6 there.
+  (`8 failed, 2 passed`) and pass on the branch; GitGuardian green. **Merged** (squash `3e23abf`) and
+  promoted: `0.1.2` is the production client on both hosts — bender
+  `~/.local/share/uv/tools/herdr-memory/bin/herdr-memory` and the Mac
+  `~/.local/bin/herdr-memory` → `~/.venvs/herdr-memory`, each reporting
+  `{"client": "0.1.2", "contract": 1}`. Re-run #6 on the promoted build passed live - see
+  `audit/DRILLS_20261104.md` §11 (D13, D14, D15, D16, D18 closed on production).
 - Production was never mutated for the fix proof: the candidate build ran from
   `~/.venvs/herdr-memory-fix` only. Config restored byte-for-byte from the drill backup (verified),
   `/tmp/hm-drill` deleted, `herdr-eng memory install` re-run (`noop ... [current]` for
@@ -178,12 +183,31 @@ against the live stack (Hindsight `0.5.0`); nothing here is mocked.
   outbox during replay with no `dead_letter`/`delivered` record (20 writes silently), so "never
   delivered" is indistinguishable from "delivered"; needs attempt accounting. Also still unrun: the
   Pi-tool-surface latency and concurrent multi-harness halves of #5.
-- **Operational risk on bender:** `herdr-eng-fleet-update.timer` is `active` but
-  `herdr-eng-fleet-update.service` is `failed` (its checkout
-  `~/IdeaProjects/herdr-engineering` is dirty), so unattended fleet updates are not applying. It
-  must either be cleaned/disabled or made to refuse silently-and-loudly; while broken it also
-  cannot be trusted to preserve a manual client upgrade.
+- **Found while re-running the drills:** **D19** — `identity`/`namespace` hash the configured
+  `base_url`, so correcting a server address hid queued writes from `pending`, `sync` and
+  `dead_letter` (a production row sat in `outbox` while `status` said `pending: 0`). Fixed by
+  [herdr-memory#6](https://github.com/berlinguyinca/herdr-memory/pull/6) (credential + provenance
+  ownership, `aliases`, `outbox_total`/`outbox_orphans`); the stranded row was adopted and delivered
+  by the PR build. The ledger half of the same issue - `verified` claimed before the server
+  acknowledges - stays open on [herdr-memory#5](https://github.com/berlinguyinca/herdr-memory/issues/5).
+  **D20** - contract-v1 recall results can omit `document_id` (only `memory_id`), so a record cannot
+  be forgotten by the client that wrote it; drill cleanup needed raw `GET /documents` + `DELETE`
+  ([herdr-memory#8](https://github.com/berlinguyinca/herdr-memory/issues/8)).
+- **Operational risk on bender:** `herdr-eng-fleet-update.service` exits 1 on every daily run (journal:
+  Nov 1, 2, 3 at 11:59 — `controller checkout is dirty; preserve local work before updating`) while its
+  timer stays `active/waiting`, so unattended fleet updates are not applying. Verified separately:
+  `~/.venvs/herdr-engineering/bin/python` cannot `import herdr_memory`, while the CLI client lives in
+  `~/.local/share/uv/tools/herdr-memory` — which is why `herdr-eng memory doctor` reports
+  `UNKNOWN package_revision` and why the in-process Rakazo memory mirror cannot activate. A dirty
+  checkout must be a reported skip, not a hard failure (herdr-engineering#572); while it fails, a manual
+  client upgrade cannot be trusted to survive the next cycle — `0.1.2` was installed by hand on both
+  hosts.
 
-Filed for tracking: herdr-engineering#570 (D8 client path pinning), #571 (D10 cwd-dependent
-resolution, with the mapped/unmapped `doctor` comparison above), #572 (D9 + the failing fleet
-timer), herdr-memory#4 (D17 attempt accounting after SIGKILL).
+Filed for tracking: herdr-engineering#570 (D8 runtime PATH resolution + silent hook failure), #571
+(D10 `doctor` cannot see server health/revision outside a mapped project, with the mapped/unmapped
+comparison above), #572 (D9 daily fleet-update failure + herdr-eng env without `herdr_memory`),
+herdr-memory#4 (D17 attempt accounting after SIGKILL), #5 (D19 URL-keyed queue ownership,
+fixed by #6) and #8 (D20 records without `document_id`). Duplicates #573/#574/#575 were closed into
+#570/#571/#572; their original bodies were **withdrawn** (written from assumed code paths, incl. a
+module that does not exist) and replaced with reproduced command output, with correction comments on
+all six issues.
