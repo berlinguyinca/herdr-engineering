@@ -160,7 +160,7 @@ def test_hostile_html_is_sanitised_and_contained_in_the_shadow_root(lab):
 def test_stylesheet_contains_the_content_box(lab):
     css = lab.request("GET", "/s/static/annotate.css")[2].decode()
     rule = re.search(r"#herdr-viewport\s*\{([^}]*)\}", css).group(1)
-    for decl in ("contain: paint", "overflow: clip", "isolation: isolate", "position: relative", "z-index: 0"):
+    for decl in ("contain: paint", "overflow: auto", "isolation: isolate", "position: relative", "z-index: 0"):
         assert decl in rule
     assert re.search(r"nav\[data-mode-switch\]\s*\{[^}]*z-index: 20", css)
 
