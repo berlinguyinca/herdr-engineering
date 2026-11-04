@@ -3787,19 +3787,29 @@ def _require_durable_review_gate(cp: dict, dsn) -> None:
                          "control_plane.pg_dsn, or disable the review gate")
 
 
+def _annotation_wiring(cp: dict, dsn: str | None):
+    """The owner annotation store adapter when control_plane.share.enabled is true (it needs the registry database)."""
+    share = cp.get("share") or {}
+    if not isinstance(share, dict) or share.get("enabled") is not True or not dsn:
+        return None
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_annotation_api import ReconnectingAnnotationStore
+
+    return artifact_adapter.SyncArtifactAdapter(lambda: ReconnectingAnnotationStore(dsn))
+
+
 def _share_wiring(cp: dict, dsn: str | None):
     """(share store adapter, shares root, settings) when control_plane.share.enabled is true, else three Nones.
 
-    Needs the registry database (shares live beside artifacts). Links are issued under control_plane.collab.public_url;
+    Needs the registry database (shares live beside artifacts). Links are issued under control_plane.share.public_url;
     the bundle volume is control_plane.share.shares_dir (default /shares, the container mount). Caps come from the YAML.
     """
     share = cp.get("share") or {}
     if not isinstance(share, dict) or share.get("enabled") is not True or not dsn:
         return None, None, None
     from .control_plane.artifact_share_api import share_settings_config
-    collab = cp.get("collab") if isinstance(cp.get("collab"), dict) else {}
     try:
-        settings = share_settings_config(share, public_url=collab.get("public_url"))
+        settings = share_settings_config(share, public_url=share.get("public_url"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     from .control_plane import artifact_adapter
@@ -4004,6 +4014,7 @@ def _cmd_cp_web(args) -> int:
         artifact_reviews.load(artifact_adapter("load_reviews"))
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
+    annotation_store = _annotation_wiring(cp, dsn)
     collab_grant_store, collab_artifacts_enabled = _collab_grant_wiring(cp, dsn)
     collab = None
     artifact_bridge = None
@@ -4132,6 +4143,7 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
+                             annotation_store=annotation_store,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
@@ -4168,6 +4180,8 @@ def _cmd_cp_web(args) -> int:
             artifact_adapter.close()
         if share_store is not None:
             share_store.close()
+        if annotation_store is not None:
+            annotation_store.close()
         if collab_grant_store is not None:
             collab_grant_store.close()
     return 0
@@ -4217,14 +4231,18 @@ def _share_lab_problems(collab: dict, share: dict) -> list[str]:
     secret = share.get("signing_secret")
     if not isinstance(secret, str) or len(secret.encode("utf-8")) < MIN_SECRET_BYTES:
         problems.append(f"control_plane.share.signing_secret (at least {MIN_SECRET_BYTES} bytes)")
-    for key in ("cognito_web_client", "cognito_domain", "cognito_pool", "public_url"):
+    for key in ("cognito_web_client", "cognito_domain", "cognito_pool"):
         if not isinstance(collab.get(key), str) or not collab.get(key):
             problems.append(f"control_plane.collab.{key}")
+    from .https_origin import https_origin
+    if https_origin(share.get("public_url")) is None:
+        problems.append("control_plane.share.public_url (a bare https origin)")
     return problems
 
 
 def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host, port):
     """Build (not start) the share server from the render-share slice; logs once when lab links are off."""
+    from .control_plane.annotation_anchor import annotation_settings
     from .control_plane.share_public import ShareConfig, make_share_server
     from .fleet_config import FleetConfigError, load_fleet_config
     from .fleet_config_cli import check_share_slice
@@ -4245,16 +4263,17 @@ def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host
         pool_id=collab.get("cognito_pool"),
         client_ids=tuple(c for c in clients if isinstance(c, str)) if isinstance(clients, list) else (),
         web_client_id=collab.get("cognito_web_client"), cognito_domain=collab.get("cognito_domain"),
-        public_url=collab.get("public_url"),
+        public_url=share.get("public_url"),
         signing_secret=secret.encode("utf-8") if isinstance(secret, str) else b"",
-        session_seconds=share.get("session_seconds", 14400))
+        session_seconds=share.get("session_seconds", 14400), annotations=annotation_settings(share.get("annotations")),
+        annotations_path=Path(events_dir) / "annotations.jsonl")
     server = make_share_server(config, host=host, port=port)
     if server.lab is None:
         problems = _share_lab_problems(collab, share)
         log.warning("share-public: lab links are OFF (every lab link answers 404) because these settings are "
                     "missing or invalid: %s; public links are served",
                     ", ".join(problems) or "control_plane.collab Cognito identifiers (pool, web client, https "
-                                           "domain, https public_url)")
+                                           "domain; https control_plane.share.public_url)")
     return server
 
 
@@ -4710,6 +4729,32 @@ def _worker_share_housekeeper(fleet_config_path):
     return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"])
 
 
+def _worker_annotation_housekeeper(fleet_config_path, mirror=None):
+    """The annotation housekeeper when the fleet file enables shares, else None. ``mirror`` is the worker's one shared
+    ``CollabMirror`` (None: the mirror step is skipped)."""
+    from pathlib import Path
+
+    from .control_plane.annotation_anchor import annotation_settings, clean_owner_emails
+    from .control_plane.worker import AnnotationHousekeeper
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    settings = _share_worker_settings(cp)
+    if not settings["enabled"]:
+        return None
+    share = cp.get("share") or {}
+    try:
+        annotations, owners = annotation_settings(share.get("annotations")), clean_owner_emails(share.get("owner_emails"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    return AnnotationHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"], annotations,
+                                 owner_emails=owners, mirror=mirror)
+
+
 def _worker_fabric_compactor(fleet_config_path):
     """The fabric compactor when the fleet file enables it, else None."""
     from pathlib import Path
@@ -4883,19 +4928,27 @@ def _collab_lineage_hook(worker_cfg):
         raise SystemExit(f"control_plane.artifact_worker.lineage: {exc}") from None
 
 
-def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, rustfs, connect, lineage):
-    """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
-    applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
-    and staging owner here)."""
+def _build_collab_mirror(settings: CollabArtifactsSettings, *, rustfs):
+    """The worker's ONE ``CollabMirror``: the bridge loop and the annotation housekeeper share it (a second instance
+    would have its own per-artifact locks and could race ``remove``/``sync``)."""
     import time
 
+    from .control_plane.collab_mirror import CollabMirror
+    return CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=time.time)
+
+
+def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rustfs, connect, lineage):
+    """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
+    applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
+    and staging owner here). ``mirror`` comes from ``_build_collab_mirror``."""
     from .control_plane import worker as cp_worker
+    from .control_plane.annotation_intents import (
+        register_annotation_resolve,  # registers the kind at import
+    )
     from .control_plane.artifact_scope import ArtifactGraphGate
     from .control_plane.collab_intents import CollabIntentApplier
-    from .control_plane.collab_mirror import CollabMirror
-    clock = time.time
+    clock = mirror.clock
     gate = ArtifactGraphGate(None)
-    mirror = CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=clock)
     if lineage is not None:
         post = lineage
 
@@ -4907,6 +4960,7 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, rustfs, conn
                                   spool_dir=settings.spool_dir, lineage=lineage, context_extras={}, clock=clock,
                                   gate=gate)
     applier.register_commit()
+    register_annotation_resolve(applier)
     return cp_worker.CollabBridgeLoop(connect, mirror, applier)
 
 
@@ -4981,16 +5035,29 @@ def _cmd_cp_worker(args) -> int:
                 return await run_one_pass(conn, worker_id=worker_id,
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                           fabric_compactor=compactor, share_housekeeper=share_hk,
+                                          annotation_housekeeper=_worker_annotation_housekeeper(
+                                              getattr(args, "fleet_config", None)),
                                           artifact_reconciler=reconciler)
             stop = asyncio.Event()
             bridge_task = None
+            mirror = None
             if collab_settings.enabled:     # a long-running loop on its own connections; --once never starts it
                 if rustfs is None:
                     raise SystemExit("control_plane.collab_artifacts needs RustFS (control_plane.rustfs_endpoint)")
                 dsn = cp["postgres_dsn"]
-                bridge_loop = _build_collab_bridge_loop(
-                    collab_settings, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
-                    lineage=_collab_lineage_hook(worker_cfg))
+                mirror = _build_collab_mirror(collab_settings, rustfs=rustfs)
+            try:       # everything is validated and built before any task starts
+                annotation_hk = _worker_annotation_housekeeper(getattr(args, "fleet_config", None), mirror)
+                bridge_loop = None
+                if mirror is not None:
+                    bridge_loop = _build_collab_bridge_loop(
+                        collab_settings, mirror=mirror, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
+                        lineage=_collab_lineage_hook(worker_cfg))
+            except BaseException:
+                if mirror is not None:
+                    mirror.close()
+                raise
+            if bridge_loop is not None:
                 bridge_task = asyncio.create_task(bridge_loop.run(stop), name="collab-bridge-loop")
             from .control_plane.projection_refresh import ProjectionRefresh
 
@@ -5007,6 +5074,7 @@ def _cmd_cp_worker(args) -> int:
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                  fabric_compactor=compactor, share_housekeeper=share_hk,
+                                 annotation_housekeeper=annotation_hk,
                                  artifact_reconciler=reconciler)
             finally:
                 stop.set()

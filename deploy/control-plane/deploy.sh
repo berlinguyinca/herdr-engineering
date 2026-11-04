@@ -33,7 +33,9 @@
 #      Share links: control_plane.share is always validated (render-share; `enabled: true` without a
 #      signing_secret is refused before anything runs, the secret never printed). Only when it is enabled
 #      (which needs the collaboration marker) is its slice installed at a stable 0600 path, the edge
-#      nginx.conf rendered with the /s/ location, and share-public force-recreated once, before the edge;
+#      nginx.conf rendered with the share host's own server block (control_plane.share.public_url; the edge
+#      certificate must name that host, or the deploy is refused), and share-public force-recreated once,
+#      before the edge;
 #      disabled, a running share-public is stopped and the edge conf is the repo file unchanged. A rollback
 #      recreates share-public from the previous commit when the restored edge conf routes /s/, else stops it
 #   5. waits for /api/v1/health to report the new commit AND for every recreated
@@ -464,7 +466,7 @@ if [ "$COLLAB" = 1 ]; then
     exit 1
   fi
   export HERDR_COLLAB_CONFIG_DIR="$COLLAB_DIR"
-  # The edge conf for this config: the repo file, plus the /s/ location only when share is enabled.
+  # The edge conf for this config: the repo file, plus the share host server only when share is enabled.
   NEW_EDGE="$ENV_DIR/new/collab-edge/nginx.conf"
   EDGE_TEMPLATE="$WORK/deploy/control-plane/collab-edge/nginx.conf"
   if [ -n "$NEW_SHARE" ]; then
@@ -532,7 +534,7 @@ if [ "$DRY" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; after the build would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
   fi
   if [ "$SHARE" = 1 ]; then
-    echo "[dry-run] share links enabled: rendered the share slice to a temp dir (would install it at ~/.config/herdr-engineering/share/), the edge conf gains /s/, share-public would be force-recreated before the edge"
+    echo "[dry-run] share links enabled: rendered the share slice to a temp dir (would install it at ~/.config/herdr-engineering/share/), the edge conf gains the share host's server block, the edge certificate must name that host, share-public would be force-recreated before the edge"
   fi
   echo "[dry-run] would prewarm the target image checkpoint on an existing deployment when its CLI supports it, before host or service changes"
   echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}}"
@@ -905,8 +907,21 @@ forward() {
     local held=()
     if grep -q -- '--lock-held' "$WORK/deploy/control-plane/collab-sync.sh"; then held=(--lock-held)
     else echo "WARNING: this commit's collab-sync.sh cannot run under the deploy's lock; its refresh is left to the timer" >&2; fi
+    # Shares enabled: the edge serves the share host with this same certificate, so refuse one that does not
+    # name it (checked by collab-sync before it copies, and once more on the staged copy).
+    local share_host=()
+    if [ "$SHARE" = 1 ]; then
+      SHARE_HOST_NAME="$(python3 -c 'import json,sys; from urllib.parse import urlsplit; print(urlsplit(json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["share"]["public_url"]).hostname or "")' "$SHARE_CONFIG")" \
+        && [ -n "$SHARE_HOST_NAME" ] || { echo "cannot read the share host from $SHARE_CONFIG" >&2; return 1; }
+      share_host=(--share-host "$SHARE_HOST_NAME")
+    fi
     "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
-      --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" "${held[@]}" || return 1
+      --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" \
+      "${share_host[@]}" "${held[@]}" || return 1
+    if [ "$SHARE" = 1 ]; then
+      "$WORK/deploy/control-plane/collab-sync.sh" cert-host --config "$COLLAB_CONFIG" --cert-dir "$CERT_DIR_VALUE" \
+        "${share_host[@]}" || return 1
+    fi
     mkdir -p "$(dirname "$HERDR_COLLAB_EDGE_CONF")" || return 1
     write_edge_conf "$NEW_EDGE" || return 1
   fi
@@ -927,7 +942,7 @@ forward() {
   # The edge resolves collab-public once, at (re)load: a recreated collab-public has a
   # new address, so reload the edge after every collab up, not only on a new conf.
   if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi
-  # Shares disabled: the edge no longer routes /s/; stop a share-public a previous deploy started (its
+  # Shares disabled: the edge no longer serves the share host; stop a share-public a previous deploy started (its
   # bundles stay on disk). Never fatal.
   if [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ]; then stop_share_public; fi
   deploy_lock_phase verify || return 1
@@ -938,7 +953,7 @@ forward() {
 rollback_share() {
   local conf="${HERDR_COLLAB_EDGE_CONF:-}"
   SHARE_SERVICE=()
-  if [ "$COLLAB" = 1 ] && [ -f "$conf" ] && grep -q 'location ^~ /s/' "$conf" \
+  if [ "$COLLAB" = 1 ] && [ -f "$conf" ] && grep -Eq 'location (\^~ )?/s/ ' "$conf" \
       && grep -q '^  share-public:' "$PREV_WORK/deploy/control-plane/compose.collab.yaml" 2>/dev/null; then
     SHARE_SERVICE=(share-public)
     compose_up_retry "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" \
@@ -1014,6 +1029,13 @@ if forward; then
   python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
   DEPLOY_FINISHED=1
   echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
+  if [ "$SHARE" = 1 ] && [ -n "${SHARE_HOST_NAME:-}" ]; then
+    # Smoke line, never fatal: an unknown token on the share host's own TLS name answers a bare 404 when the DNS
+    # record, the SNI route, the certificate and the share server all line up.
+    probe="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$SHARE_HOST_NAME/s/probe/" 2>/dev/null || true)"
+    [ "$probe" = 404 ] || echo "WARNING: probe of https://$SHARE_HOST_NAME/s/probe/ answered '${probe:-no response}', expected 404:" \
+      "check DNS, the SNI route to the edge and the certificate for the share host" >&2
+  fi
   if [ "$MEMORY" = 1 ]; then memory_phase || exit 4; fi
   exit 0
 fi

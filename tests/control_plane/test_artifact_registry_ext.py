@@ -319,6 +319,11 @@ def test_resumable_upload_out_of_order_replay_verify_and_cleanup(registry_pg):
         with pytest.raises(ArtifactError, match="idempotency"):
             await store.create_upload(artifact_id, principal_id="o", filename="other", media_type="application/octet-stream",
                                       size_bytes=64, sha256=digest, part_size=20, idempotency_key="idem-1")
+        for bad_media in ("text/html\r\nX-Evil: 1", "text/plain\x00", "a/b\x7f", "application/pdf;a=1,text/html",
+                          'text/html;a="b', "text/html;a=\\b", "no-slash", "a b/c"):
+            with pytest.raises(ArtifactError, match="media_type"):
+                await store.create_upload(artifact_id, principal_id="o", filename="big.bin", media_type=bad_media,
+                                          size_bytes=64, sha256=digest, part_size=20, idempotency_key="idem-bad")
         upload = session["upload_id"]
         chunks = [payload[0:20], payload[20:40], payload[40:60], payload[60:64]]
         with pytest.raises(ArtifactError, match="exactly"):

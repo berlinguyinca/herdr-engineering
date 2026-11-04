@@ -68,8 +68,10 @@ def share_settings_config(raw: dict | None, *, public_url: str | None) -> dict:
     if settings["default_public_days"] > 90:
         raise ValueError("control_plane.share.default_public_days must be 1-90")
     if not isinstance(public_url, str) or not public_url.startswith("https://") or not urlsplit(public_url).netloc:
-        raise ValueError("share links need an https:// control_plane.collab.public_url")
-    return {"public_url": public_url, **settings}
+        raise ValueError("share links need an https:// control_plane.share.public_url")
+    from .annotation_anchor import annotation_settings, clean_owner_emails
+    return {"public_url": public_url, **settings, "annotations": annotation_settings(raw.get("annotations")),
+            "owner_emails": clean_owner_emails(raw.get("owner_emails"))}
 
 
 # ------------------------------------------------------------------------------------------------ helpers
@@ -129,6 +131,31 @@ def _measure(server, item, budget: int) -> int:
     return size
 
 
+def _output_name(output: object) -> str:
+    """The normalised name of one manifest entry (the single normalisation); ``ShareBundleError`` when it has none."""
+    name = output.get("name") if isinstance(output, dict) else None
+    if not isinstance(name, str):
+        raise ShareBundleError("output has no name")
+    return normalise_name(name)
+
+
+def shared_file_names(version: dict) -> frozenset[str]:
+    """The file names a share of this version exposes; depends only on the version row.
+
+    A report version exposes its generated ``PREVIEW_NAME``; any other version its normalised ``output_manifest`` names
+    (an unnamed or unnormalisable entry exposes nothing).
+    """
+    if version.get("report_descriptor"):
+        return frozenset({PREVIEW_NAME})
+    names: set[str] = set()
+    for output in version.get("output_manifest") or []:
+        try:
+            names.add(_output_name(output))
+        except ShareBundleError:
+            continue
+    return frozenset(names)
+
+
 def _plan(server, artifact_id: str, version_id: str, entry: str | None) -> tuple[list[dict], str, list[str]]:
     """Dry run: the files a bundle of this version holds, its entry and warnings. No object bytes are read."""
     registry = server.artifact_store
@@ -147,7 +174,8 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None) -> tuple
         if entry not in (None, PREVIEW_NAME):
             raise ShareHTTPError(400, f"a report share's entry is its generated {PREVIEW_NAME}")
         page = _report_preview(_call(registry, "get_report_descriptor", artifact_id, version_id))
-        files = [{"name": PREVIEW_NAME, "sha256": hashlib.sha256(page).hexdigest(), "size_bytes": len(page),
+        (preview_name,) = shared_file_names(version)
+        files = [{"name": preview_name, "sha256": hashlib.sha256(page).hexdigest(), "size_bytes": len(page),
                   "data": page}]
         return files, PREVIEW_NAME, ["report evidence files are not included; the preview lists them as text"]
     files = []
@@ -156,13 +184,11 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None) -> tuple
             pinned = pinned_output(output, require_size=False)
         except PinnedOutputError as exc:
             raise ShareHTTPError(400, f"output {position}: {exc}; a share needs hash-verifiable outputs") from None
-        name = output.get("name")
-        if not isinstance(name, str):
-            raise ShareHTTPError(400, f"output {position} has no name")
         try:
-            name = normalise_name(name)
+            name = _output_name(output)
         except ShareBundleError as exc:
-            raise ShareHTTPError(400, f"output {position}: {exc}") from None
+            raise ShareHTTPError(400, f"output {position}: {exc}" if output.get("name") is not None
+                                 else f"output {position} has no name") from None
         files.append({**pinned, "name": name})
     names = [f["name"] for f in files]
     try:
@@ -308,6 +334,10 @@ def _create(handler, server, artifact_id):
     allow_emails = body.get("allow_emails")
     if body.get("room_id") is not None:
         allow_emails = _room_emails(server, audience, body["room_id"], allow_emails)
+    owners = server.share_settings.get("owner_emails") or []
+    if audience == "lab" and owners and (allow_emails is None or (
+            isinstance(allow_emails, list) and all(isinstance(e, str) for e in allow_emails))):
+        allow_emails = sorted({e.lower() for e in (*(allow_emails or []), *owners)})   # the owners may always sign in
     files, chosen, warnings = _plan(server, artifact_id, version_id, entry)
     row = _call(server.share_store, "create", artifact_id=artifact_id, version_id=version_id, audience=audience,
                 allow_emails=allow_emails, allow_groups=body.get("allow_groups"),

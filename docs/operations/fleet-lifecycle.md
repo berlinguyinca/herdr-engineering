@@ -217,6 +217,15 @@ macOS has no systemd, so the same job installs as a LaunchAgent
 both platforms; the schedule is read out of `scripts/herdr-eng-fleet-update.timer` rather than
 restated, so the two installers cannot drift (a test asserts they agree).
 
+**That is still the controller only.** The updater runs `fleet_update()`, which needs the controller's
+private inventory (`ansible/inventory/hosts.yml`, gitignored) and `ansible-playbook`. A fleet member that
+is not the controller — a laptop, typically — has neither, and its agent fails every night on the first
+step: `No such file or directory: '<repo>/ansible/inventory/hosts.yml'`. It is also redundant there: the
+controller's run already converges that host through `fleet-sync.yml`. Before installing, check the host
+is the controller — `test -f <checkout>/ansible/inventory/hosts.yml && command -v ansible-playbook` — and
+if it is not, install nothing: `herdr-eng memory doctor` on the controller already reports the nightly run
+(`fleet_update`) for the whole fleet.
+
 ```bash
 scripts/fleet-auto-update-macos.sh install      # write + bootstrap the LaunchAgent
 scripts/fleet-auto-update-macos.sh install --dry-run   # print the plist, write nothing

@@ -15,6 +15,7 @@ import re
 import secrets
 from typing import Any
 
+from ..media_type import canonical_upload_media_type
 from .rustfs import IntegrityError
 
 MAX_PART_BYTES = 64 * 1024 * 1024
@@ -68,7 +69,8 @@ class ArtifactUploadMixin:
             raise ArtifactError(f"size_bytes must be between 1 and {MAX_UPLOAD_BYTES}")
         if not isinstance(sha256, str) or not _SHA256.match(sha256):
             raise ArtifactError("sha256 must be 64 lowercase hex characters")
-        if (not isinstance(media_type, str) or not media_type or len(media_type) > 255
+        media_type = canonical_upload_media_type(media_type)
+        if (media_type is None
                 or not isinstance(filename, str) or not filename or len(filename) > 512
                 or any(ord(c) < 32 for c in filename)):
             raise ArtifactError("filename and media_type are required and bounded")
