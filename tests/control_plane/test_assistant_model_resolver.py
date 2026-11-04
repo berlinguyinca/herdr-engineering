@@ -209,3 +209,17 @@ def test_a_catalog_blip_keeps_the_last_known_models():
     assert r.candidates("auto")[0] == "laya"
     up[0], now[0] = False, 61.0                                  # the cache expired and the gateway blipped
     assert r.candidates("auto")[0] == "laya"                    # still served from what was last seen
+
+
+def test_the_last_known_models_are_dropped_once_the_gateway_has_been_silent_too_long():
+    now, up = [0.0], [True]
+
+    def fetch(url, key, timeout):
+        if not up[0]:
+            raise OSError("down")
+        return json.dumps({"data": [{"id": m} for m in SERVED]}).encode()
+    r = ModelResolver(URL, "k", ["laya"], fetch=fetch, clock=lambda: now[0])
+    r.candidates("auto")
+    up[0] = False
+    now[0] = 700.0
+    assert r.candidates("auto") == []

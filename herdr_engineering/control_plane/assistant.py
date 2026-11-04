@@ -200,7 +200,7 @@ def _context_rejection(exc: Exception) -> bool:
     if getattr(exc, "code", None) != 400 or not callable(getattr(exc, "read", None)):
         return False
     try:
-        return b"context window" in exc.read(300).lower()
+        return b"context window" in exc.read(2000).lower()
     except Exception:  # noqa: BLE001
         return False
 
