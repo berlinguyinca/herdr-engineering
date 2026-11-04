@@ -179,6 +179,31 @@ def _unavailable(code: Code) -> SharedStatus:
     return SharedStatus(False, f"shared_unavailable:{code.value}")
 
 
+def _argv_sets_wrapper(cmd: list[str]) -> bool:
+    """``--config build.rustc-wrapper=...`` (either spelling) on the command line."""
+    return any("rustc-wrapper" in a or "rustc-workspace-wrapper" in a
+               for a in cmd[1:] if "=" in a or a.startswith("--config"))
+
+
+def _config_sets_wrapper(workspace: Path, base_env: Mapping[str, str]) -> bool:
+    """A ``build.rustc-wrapper`` in cargo config: env RUSTC_WRAPPER (ours) would
+    silently override it, so treat it like a user wrapper. Best effort, read-only."""
+    import tomllib
+    dirs = [workspace.resolve(), *workspace.resolve().parents]
+    files = [d / ".cargo" / name for d in dirs for name in ("config.toml", "config")]
+    home = base_env.get("CARGO_HOME") or str(Path.home() / ".cargo")
+    files += [Path(home) / "config.toml", Path(home) / "config"]
+    for f in files:
+        try:
+            build = tomllib.loads(f.read_text()).get("build", {})
+        except (OSError, ValueError):
+            continue
+        if isinstance(build, dict) and (build.get("rustc-wrapper")
+                                        or build.get("rustc-workspace-wrapper")):
+            return True
+    return False
+
+
 def plan(config: BuildCacheConfig, cmd: list[str], base_env: Mapping[str, str],
          tools: Tools, workspace: Path, state_dir: Path,
          shared_reachable: bool | None = None) -> EnvPlan:
@@ -196,7 +221,8 @@ def plan(config: BuildCacheConfig, cmd: list[str], base_env: Mapping[str, str],
         return _no(Reason.HOST_NOT_ALLOWED)
     if classify(cmd) is not CmdClass.CACHEABLE_CARGO:
         return _no(Reason.NOT_CACHEABLE_CMD)
-    if any(base_env.get(v) for v in _WRAPPER_VARS):
+    if (any(base_env.get(v) for v in _WRAPPER_VARS)
+            or _argv_sets_wrapper(cmd) or _config_sets_wrapper(workspace, base_env)):
         return _no(Reason.USER_WRAPPER_PRESENT)
     if tools.sccache is None:
         return _no(Reason.SCCACHE_NOT_FOUND)
@@ -229,6 +255,7 @@ def plan(config: BuildCacheConfig, cmd: list[str], base_env: Mapping[str, str],
     if any(t.startswith("+") for t in cmd[1:2]):
         warnings.append("cargo +toolchain override: fingerprint reflects default rustc")
     env["SCCACHE_SERVER_PORT"] = str(server_port(config, fp, cache_dir))
+    env["SCCACHE_IGNORE_SERVER_IO_ERROR"] = "1"  # server trouble degrades to plain rustc
     shared = _shared(config, tools, fp, state_dir, shared_reachable)
     return EnvPlan(True, env, [Reason.APPLIED.value], warnings, fp, shared)
 
@@ -268,11 +295,13 @@ def server_port(config: BuildCacheConfig, fp: Fingerprint, cache_dir: Path) -> i
     namespace, endpoint, toolchain, cache dir/size) talks to a different server
     and can never reuse one started under another. The server's lifetime is NOT
     managed (it exits on sccache's own idle timeout); a port clash with an
-    unrelated local service is possible but unlikely (40000 slots).
+    unrelated local service is possible (12000 slots); the range sits below the
+    Linux ephemeral range (32768-60999) and sccache I/O errors are ignored, so a
+    clash degrades to an uncached compile instead of failing the build.
     """
     sc = config.shared_cache
     canon = json.dumps([config.effective_mode.value, bool(sc.enabled),
                         bool(config.shared_writes_effective), sc.namespace, sc.endpoint_ref,
                         fp.digest, str(cache_dir), config.local.capacity_gib],
                        separators=(",", ":"))
-    return 20000 + int(hashlib.sha256(canon.encode()).hexdigest()[:8], 16) % 40000
+    return 20000 + int(hashlib.sha256(canon.encode()).hexdigest()[:8], 16) % 12000

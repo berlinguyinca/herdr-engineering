@@ -129,9 +129,24 @@ def test_applied_exact_overrides(tmp_path):
         "SCCACHE_CACHE_SIZE": "7G",
         "CARGO_INCREMENTAL": "0",
         "SCCACHE_SERVER_PORT": p.env_overrides["SCCACHE_SERVER_PORT"],
+        "SCCACHE_IGNORE_SERVER_IO_ERROR": "1",
     }
-    assert 20000 <= int(p.env_overrides["SCCACHE_SERVER_PORT"]) < 60000
+    assert 20000 <= int(p.env_overrides["SCCACHE_SERVER_PORT"]) < 32000
     assert p.fingerprint.digest == bce.fingerprint_from_text(RUSTC_A).digest
+
+
+def test_argv_config_wrapper_is_not_overridden(tmp_path):
+    cmd = ["cargo", "build", "--config=build.rustc-wrapper='/x'"]
+    p = bce.plan(_cfg(), cmd, {}, _tools(tmp_path), tmp_path, tmp_path / "state")
+    assert not p.applied and p.reasons == ["user_wrapper_present"]
+
+
+def test_cargo_config_wrapper_is_not_overridden(tmp_path):
+    (tmp_path / ".cargo").mkdir()
+    (tmp_path / ".cargo/config.toml").write_text('[build]\nrustc-wrapper = "/x"\n')
+    p = bce.plan(_cfg(), ["cargo", "build"], {"CARGO_HOME": str(tmp_path / "nohome")},
+                 _tools(tmp_path), tmp_path, tmp_path / "state")
+    assert not p.applied and p.reasons == ["user_wrapper_present"]
 
 
 def test_fractional_capacity_formatting(tmp_path):
