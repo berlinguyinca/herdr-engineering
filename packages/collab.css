@@ -557,3 +557,18 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .hd-hop small { grid-column: 1 / -1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hd-hop__state { grid-column: 2; grid-row: 1; }
 .hd-chain { gap: 4px; }
+
+/* Team rooms (collab-team-rooms.js): tokens only, spacing on the 4px grid. A guest's words and a task's text are quoted, inert text. */
+.cx-list li.trr-card { display: block; }
+.cx-list li.trr-card > * + * { margin-top: 8px; }
+.trr-cards { gap: 12px; }
+.trr-quote { margin: 0; padding: 8px 12px; border-left: 4px solid var(--status-attention); background: var(--surface-2); border-radius: var(--radius-sm); }
+.trr-quote > .cx-msg { margin: 0 0 4px; }
+.trr-text { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono); font-size: .8125rem; color: var(--text); max-height: 240px; overflow: auto; }
+.trr-text:focus-visible { box-shadow: var(--cx-ring); outline: none; }
+.trr-choice { align-items: flex-start; }
+.trr-limits { margin: 0; padding-left: 20px; font-size: .8125rem; color: var(--text-secondary); }
+.trr-direct { border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 8px 12px; }
+.trr-past > summary, #hcn-tr-mine-d > summary, #hcn-tr-req-d > summary, #hcn-tr-owner-d > summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
+.trr-past > summary:focus-visible, #hcn-tr-mine-d > summary:focus-visible, #hcn-tr-req-d > summary:focus-visible, #hcn-tr-owner-d > summary:focus-visible { box-shadow: var(--cx-ring); outline: none; border-radius: var(--radius-sm); }
+#hcn-tr-owner h5 { margin: 0; }

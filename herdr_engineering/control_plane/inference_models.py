@@ -24,6 +24,7 @@ MAX_BODY = 2_000_000
 MAX_MODELS = 500
 MAX_CANDIDATES = 4
 FAILED_TTL = 5.0
+MAX_STALE = 600.0           # how long the last known models outlive a gateway that stopped answering
 RETRY_CODES = frozenset({404, 429, 500, 502, 503, 504})
 NON_TEXT = re.compile(r"modality-(?!text)|embed|rerank|whisper", re.I)
 
@@ -42,6 +43,7 @@ class ModelResolver:
         self._fetch, self._clock = fetch, clock
         self._lock = threading.Lock()
         self._cache: tuple[float, list[str], float] | None = None
+        self._good_at = 0.0
 
     def served(self) -> list[str]:
         with self._lock:
@@ -56,7 +58,13 @@ class ModelResolver:
         except Exception:  # noqa: BLE001 - an unreachable or odd gateway is an empty catalog, never an error
             ids = []
         with self._lock:
-            self._cache = (self._clock(), ids, TTL if ids else FAILED_TTL)
+            now = self._clock()
+            if not ids and self._cache and self._cache[1] and now - self._good_at < MAX_STALE:
+                self._cache = (now, self._cache[1], FAILED_TTL)       # a blip keeps what was last seen, and is retried soon
+                return list(self._cache[1])
+            if ids:
+                self._good_at = now
+            self._cache = (now, ids, TTL if ids else FAILED_TTL)
         return ids
 
     def candidates(self, wanted: str) -> list[str]:
