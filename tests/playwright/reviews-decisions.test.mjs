@@ -53,7 +53,11 @@ function mix() {
     { review_id: 'u-1', title: 'Mystery review', kind: 'code', status: 'done', repository: 'lab/api', created_at: iso(6 * D), completed_at: iso(5 * D), updated_at: iso(5 * D) },
   ];
 }
-const stub = (page, reviews) => page.route('**/api/v1/reviews', (r) => r.fulfill({ json: { available: true, reviews, checked_at: new Date().toISOString() } }));
+const OPEN = new Set(['starting', 'awaiting_review']);
+async function stub(page, reviews, { hasMore = false, total = reviews.length, waiting = reviews.filter((r) => OPEN.has(r.status)) } = {}) {
+  await page.route('**/api/v1/reviews', (r) => r.fulfill({ json: { available: true, reviews, total, has_more: hasMore, checked_at: new Date().toISOString() } }));
+  await page.route('**/api/v1/reviews?needs_decision=1', (r) => r.fulfill({ json: { available: true, needs_decision: true, reviews: waiting, total: waiting.length, has_more: false, checked_at: new Date().toISOString() } }));
+}
 const rows = (page, sel) => page.locator(`${sel} [data-rv-item]`).evaluateAll((n) => n.map((e) => e.dataset.rvItem));
 const noOverflow = (page) => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth);
 
@@ -74,7 +78,7 @@ test('needs-decision section lists waiting reviews first with reasons and links,
     assert.equal(await first.getByRole('link', { name: 'PR #3 trail' }).getAttribute('href'), '#/pr/lab/api/3');
     assert.ok(await first.getByRole('link', { name: 'Agent', exact: true }).count());
     assert.match(await page.locator('[data-rv-item="p-quiet"]').textContent(), /launcher stopped reporting/);
-    assert.match(await page.locator('[data-rv-item="c-open"]').textContent(), /no later review of the same pull request or agent exists/);
+    assert.match(await page.locator('[data-rv-item="c-open"]').textContent(), /no later completed review of the same pull request or agent exists/);
     // sections are in the stated order on the page
     const order = await page.evaluate(() => ['[data-rv-decisions]', '[data-rv-trend]', '.ig-tabs', '#ig-results'].map((s) => document.querySelector(s).getBoundingClientRect().top));
     assert.deepEqual(order, [...order].sort((a, b) => a - b));
@@ -179,5 +183,65 @@ test('desktop light screenshot and no overflow with a long title', async () => {
     await page.locator('[data-rv-trend] svg').waitFor();
     assert.equal(await noOverflow(page), true);
     if (SHOTS) { fs.mkdirSync(SHOTS, { recursive: true }); await page.screenshot({ path: path.join(SHOTS, 'reviews-desktop-light.png'), fullPage: true }); }
+  });
+});
+
+test('a truncated review list never hides a long-waiting review and never says nothing is waiting', async () => {
+  await withApp(async ({ page, base }) => {
+    const recent = [{ review_id: 'new-ok', title: 'Recent approval', kind: 'plan', status: 'approved', repository: 'lab/api', created_at: iso(2 * H), completed_at: iso(H), updated_at: iso(H) }];
+    const longWait = { review_id: 'long-wait', title: 'Waiting for weeks', kind: 'plan', status: 'awaiting_review', repository: 'lab/api', created_at: iso(30 * D), updated_at: iso(30 * D), review_url: 'https://review.example/long' };
+    await stub(page, recent, { hasMore: true, total: 812, waiting: [longWait] });
+    await page.goto(`${base}/#/reviews`);
+    await page.locator('[data-rv-item="long-wait"]').waitFor();
+    assert.deepEqual(await rows(page, '[data-rv-decisions]'), ['long-wait']);
+    assert.equal(await page.locator('[data-rv-clear]').count(), 0);
+    assert.match(await page.locator('[data-rv-caveat]').textContent(), /1 of 812 reviews are loaded; older reviews may have changes requested that nobody answered/);
+    assert.match(await page.locator('[data-rv-covers]').textContent(), /1 of 812 reviews are loaded; older outcomes are missing/);
+    assert.doesNotMatch(await page.locator('[data-rv-covers]').textContent(), /covers every review/);
+  });
+});
+
+test('with a truncated list and no waiting review the empty state is a caveat, not "nothing is waiting"', async () => {
+  await withApp(async ({ page, base }) => {
+    await stub(page, [{ review_id: 'a', title: 'Approved', kind: 'plan', status: 'approved', repository: 'lab/api', created_at: iso(2 * H), completed_at: iso(H), updated_at: iso(H) }], { hasMore: true, total: 812, waiting: [] });
+    await page.goto(`${base}/#/reviews`);
+    await page.locator('[data-rv-partial]').waitFor();
+    assert.equal(await page.locator('[data-rv-clear]').count(), 0);
+    assert.doesNotMatch(await page.locator('[data-rv-decisions]').textContent(), /Nothing is waiting/);
+    assert.match(await page.locator('[data-rv-decisions]').textContent(), /1 of 812 reviews are loaded/);
+  });
+});
+
+test('the list disclosure owns the review detail: the decision section has none, and one open review stays one across refreshes', async () => {
+  await withApp(async ({ page, base }) => {
+    const reviews = mix();
+    await stub(page, reviews);
+    await page.route('**/api/v1/reviews/p-wait', (r) => r.fulfill({ json: { ...reviews[0], plan: '## Plan\nDetail text' } }));
+    await page.goto(`${base}/#/reviews`);
+    await page.locator('[data-rv-item="p-wait"]').waitFor();
+    assert.equal(await page.locator('[data-rv-decisions] [data-review-details]').count(), 0);
+    assert.ok(await page.locator('[data-rv-item="p-wait"]').getByRole('link', { name: 'Open in Plannotator' }).count());
+    const summary = page.locator('#ig-results [data-review-details="p-wait"] summary');
+    await summary.click();
+    await page.waitForFunction(() => document.querySelector('#ig-results .ig-log')?.textContent.includes('Detail text'));
+    await summary.focus();
+    await page.waitForTimeout(6000);   // at least one real refresh and redraw of both sections
+    assert.equal(await page.locator('[data-review-details][open]').count(), 1);
+    assert.equal(await page.locator('#ig-results [data-review-details="p-wait"]').evaluate((e) => e.open), true);
+    assert.equal(await page.evaluate(() => document.activeElement?.tagName), 'SUMMARY');
+    assert.equal(await page.locator('[data-rv-decisions] [data-review-details]').count(), 0);
+  });
+});
+
+test('the needs-decision count is a status region and the sections use only defined colours', async () => {
+  await withApp(async ({ page, base }) => {
+    await stub(page, mix());
+    await page.goto(`${base}/#/reviews`);
+    await page.locator('[data-rv-trend] svg').waitFor();
+    assert.equal(await page.locator('[data-rv-count]').getAttribute('role'), 'status');
+    const css = await page.evaluate(() => [...document.querySelectorAll('style')].map((s) => s.textContent).join('').match(/\.rv-[^{]+\{[^}]*\}/g).join(''));
+    const vars = [...new Set([...css.matchAll(/var\((--[a-z-]+)\)/g)].map((m) => m[1]).filter((n) => n !== '--chart-color'))];   // --chart-color is set per legend entry
+    const undefinedVars = await page.evaluate((names) => names.filter((n) => !getComputedStyle(document.documentElement).getPropertyValue(n).trim()), vars);
+    assert.deepEqual(undefinedVars, []);
   });
 });

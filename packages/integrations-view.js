@@ -6,7 +6,7 @@ import {recordOutcome} from './record-state.js';
 import {prTrailHref} from './entity-links.js';
 import {ciRunKey} from './ci-performance.js';
 import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
-import {reviewsNeedingDecision,reviewTrend,renderReviewDecisions,renderReviewTrend,reviewDecisionStyles} from './review-decisions.js';
+import {reviewsNeedingDecision,decisionGaps,reviewTrend,renderReviewDecisions,renderReviewTrend,reviewDecisionStyles} from './review-decisions.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports,ciExplorerTargets} from './ci-insights.js';
 import {renderTestExplorer,testExplorerStyles,explorerTests,testSource} from './ci-test-explorer.js';
 import {renderCiPipeline,renderCiDiagnosis,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
@@ -182,7 +182,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let fixAvailable=true,fix=null,fixMessage='',sandboxOperationId='',fixTerminal=null,fixTerminalError='';
   let healthView=null,observabilityView=null,workspace=WORKSPACES.includes(startWorkspace)?startWorkspace:tab==='current'?'overview':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
   const observedDetails=new Map(),repositoryChoices=new Map();
-  let performanceData=null,performanceError='',performanceDays=14;
+  let performanceData=null,performanceError='',performanceDays=14,waiting=null;
   const pending=new Map();
   const listenerController=new AbortController();
   const reviewCache=new Map();
@@ -311,10 +311,16 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   // The two sections above the list: reviews waiting on the operator, then pass/fail over time. Both read the loaded records only.
   function drawReviewSections(all) {
     const loading=!data&&!error,unavailable=!data&&!!error,now=Date.now(),recs=all.map(e=>e.record);
-    const byRecord=new Map(all.map(e=>[e.record,e]));
-    const needed=!data?[]:reviewsNeedingDecision(recs,now);
-    const sections=[['[data-rv-decisions]',renderReviewDecisions(needed,item=>integrationRow({...byRecord.get(item.record),tab:'current'},kind),{loading,unavailable,placeholder:skeleton('reviews waiting for a decision',{rows:1})})],
-      ['[data-rv-trend]',renderReviewTrend(reviewTrend(!data?[]:recs,{period:state.period,now}),{loading,unavailable,placeholder:skeleton('review outcomes',{rows:2})})]];
+    // The page of reviews is the newest few hundred by updated_at; the open ones come from their own complete request, merged in.
+    const waitingRecs=records(waiting?.reviews).filter(r=>!recs.some(x=>String(x.review_id)===String(r.review_id)));
+    const byRecord=new Map([...all.map(e=>[e.record,e]),...waitingRecs.map(r=>[r,{id:String(r.review_id),tab:'current',record:r}])]);
+    const needed=!data?[]:reviewsNeedingDecision([...recs,...waitingRecs],now);
+    const loaded=records(data?.reviews).length,total=Number.isFinite(data?.total)?data.total:null,hasMore=!!data?.has_more;
+    const coverage={hasMore,loaded,total,waitingKnown:!!waiting,waitingHasMore:!!waiting?.has_more,waitingTotal:waiting?.total??null,gaps:decisionGaps(recs)};
+    // The disclosure belongs to the list below: one review must not own two open/focus states, so the section shows the row without it.
+    const rowHtml=item=>integrationRow({...byRecord.get(item.record),tab:'current'},kind).replace(/<details class="ig-review-details"[\s\S]*?<\/details>/,'');
+    const sections=[['[data-rv-decisions]',renderReviewDecisions(needed,rowHtml,{loading,unavailable,coverage,placeholder:skeleton('reviews waiting for a decision',{rows:1})})],
+      ['[data-rv-trend]',renderReviewTrend(reviewTrend(!data?[]:recs,{period:state.period,now}),{loading,unavailable,coverage,placeholder:skeleton('review outcomes',{rows:2})})]];
     for(const [selector,html] of sections){const host=el(selector);if(host.dataset.signature===html)continue;host.dataset.signature=html;handOff(morph(host,html),()=>null);}
   }
   function draw() {
@@ -598,6 +604,10 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       if(!Array.isArray(response?.reports)||!Array.isArray(response?.pipelines))throw new Error('Invalid CI history response');
       reportData=response;reportsError='';chip.ok('reports');
     },failure=>{chip.fail('reports',`CI history: ${failure?.message||'request failed'}`);reportsError=`CI history could not refresh.${reportData?' Showing last received reports.':''}`;});
+    if(kind==='reviews'&&typeof client.listWaitingReviews==='function')request('waiting',signal=>client.listWaitingReviews({signal}),response=>{
+      if(!Array.isArray(response?.reviews))throw new Error('Invalid waiting-review response');
+      waiting=response;
+    },()=>{waiting=null;});
     request('list',signal=>isCi ? client.getCi({signal}) : client.listReviews({signal}),response=>{
       if(!response || (isCi ? typeof response.available!=='boolean' : !Array.isArray(response.reviews)))throw new Error('Invalid integration response');
       data=response;error='';chip.ok('list');
