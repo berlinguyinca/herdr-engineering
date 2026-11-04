@@ -256,6 +256,45 @@ Residual risks:
 - **R-TR15 (Info).** No web UI; an external person reads `my-tasks` (API / CLI). `task_assigned` / `task_overdue` reach only members the
   attention inbox serves, and only with `insights.enabled`.
 
+#### Slice 3: coordinators with limits (`control_plane.collab.coordinators.enabled`, `.external.enabled`; also needs `team_rooms` and `team_roles`)
+Mechanism (`collab_coordinators.py`): owner-only `team_coordinator_set` / `team_coordinator_cleared` / `team_external_coordination_set`
+events; an agent coordinator gets a team-marked grant that cannot be hand-edited; every coordinator-made task goes through
+`_tr2_create` with a per-hour and open cap counted from the replayed log, role-only targeting inside the team, a required
+operator-made accepted root, and a chain-based loop check; revocation is derived from state (`task_requeued` raises `attempt`, so
+the stale run gets 409); independent review also excludes the coordinator chain. Hot YAML flags, off by default, fail closed. Tested
+with real HTTP, a real collab service, real Postgres for the projection, a real assistant service for the approvals refusal and the
+Cognito authenticator for group removal (`test_team_coordinators.py`, `test_team_coordinators_cli.py`); mutation-checked; not deployed.
+
+How the design's rows are met:
+- **T-TC2** (privilege escalation through the coordinator): 10 owner-only routes answer 403 plus an audit event to a coordinator,
+  agent or external, tested for each; the grant has no `grant_agent`, `invite` or `approve`; its roles and team are fixed by the designation.
+- **T-TC3** (unbounded task source): the hourly cap, the open cap, the depth cap and the per-request cap, plus `TASK_RATE` and
+  `MAX_OPEN_TASKS_PER_AGENT` as before; the assistant-loop rule including the third-agent case.
+- **T-TC10, T-TC14, T-TC15, T-TC16** (external coordinator): off by default per team and per service; their own identity; role list and
+  limits set by the owner; assistants and brief references unreachable; status-only tracking; no Suggest decisions; cannot be the
+  independent reviewer of what they assigned.
+- **T-TC12** (revocation lag): instant on the owner's action, the member removal, the detach and the agent revoke; the identity
+  provider's group removal is caught by the sweep within the recheck window.
+
+Residual risks:
+- **R-TC1 (Medium).** An external coordinator can still put arbitrary words in the command text of tasks for the team's agents
+  (within the roles and caps the owner set). That text reaches a model. It is not marked as untrusted data, because it is the
+  coordinator's job to instruct. The mitigations are the opt-in, the roles list, the low cap, the audit trail and instant revocation;
+  not text sanitising. Treat opting a person in as trusting them with the team's agents at that cap.
+- **R-TC2 (Low-Medium).** Caps are counted from the log in one process (like R-TR6). A restart replays them; a second collab
+  process would count alone.
+- **R-TC3 (Low-Medium).** Revocation by the identity provider is as fast as the 60 second group recheck plus `sweep_interval_seconds`;
+  until then the person's token still works. Removing them from the room or turning off the opt-in is immediate.
+- **R-TC4 (Low).** The loop guard is conservative: it refuses an agent-created task aimed at an assistant once an assistant is in
+  the chain, even when no loop would form. It never allows a loop; it may refuse legitimate fan-out through an assistant.
+- **R-TC5 (Medium).** Image rollback: an older image ignores the coordinator events and `task_requeued` (no `attempt` fence, requeued
+  work shows its old requester) and the slice 2 caveat for person tasks still holds (R-TR14). Fail-closed on serving (the old code serves
+  none of a coordinator's tasks), but roll back the flags, not the image.
+- **R-TC6 (Low).** `direct` guests and Suggest requests cannot target a coordinator yet, and the brief-reference refusal in the design
+  is untestable until slice 4 builds the route (the assistant API already rejects collaboration credentials).
+- **R-TC7 (Info).** No web UI; the API and `herdr-eng rooms coordinator|coordination` only. The Work Graph shows the coordinator as a
+  `team_role` fact for display; it never grants.
+
 ## 4. Severity summary (judged from reading; unverified)
 | Id | Severity | One line |
 |---|---|---|
@@ -275,6 +314,9 @@ Residual risks:
 | R-TR9, R-TR10, R-TR11 | Low-Medium / Low | Team roles: one-process sweep; principal-key review independence; task existence in the graph |
 | R-TR14 | Medium | Team roles: image rollback with a person task in the log breaks `room_state` / `room_flow` on the old image |
 | R-TR12, R-TR13, R-TR15 | Low | See section 3.8 |
+| R-TC1, R-TC5 | Medium | Coordinators: an opted-in external person instructs the team's agents; image rollback loses the requeue fence |
+| R-TC2, R-TC3 | Low-Medium | Coordinators: one-process caps; identity-provider revocation lag |
+| R-TC4, R-TC6, R-TC7 | Low / Info | See section 3.8 (slice 3) |
 | R-SH4, R-CL1, R-DP2 | Low-Medium | See sections |
 | R-WG2-4, R-SH5-7, R-ART3, R-RA3, R-TL3, R-CL2 | Low | See sections |
 
@@ -289,6 +331,7 @@ with the flag off (migrations are additive, so the image can be ahead of the fla
 | `control_plane.collab.task_lease_seconds` | absent (off) | Set 60..604800, longer than the longest honest task (R-TL2); restart the process that runs collab | `task.requeue` events, 409 `stale attempt`, duplicate results | Remove the key and restart. Tasks already requeued stay requeued; `attempt` survives replay |
 | `control_plane.collab.team_rooms.enabled` | off | Set `true` (hot, read each request); existing rooms' guests become Suggest unless a room is set `read_only` first | `suggestion_submitted`/`decided` events, 403/404 rates on `/rooms/*/suggestions`, `team_attached` grants | `false` or `kill_switch: true`: routes 404, guests see tasks again. `herdr-eng rooms detach` first if attached teams must go (works with the flag off). See `docs/operations/team-rooms.md` |
 | `control_plane.collab.team_roles.enabled` (also needs `team_rooms`) | off | Set `true` (hot); assign people to roles per room and team; set the policy per team (default escalate) | `task_reminded` / `task_escalated` events, `blocked` tasks in the owner's attention, 409 `no_role_holder` rate | `false` or `kill_switch: true`: new fields unknown, routes 404, sweep stops. Do NOT roll the image back while a person task newer than ~8 days exists (R-TR14); roll back the flag. See `docs/operations/team-rooms.md` |
+| `control_plane.collab.coordinators.enabled` (also needs `team_rooms`, `team_roles`) | off | Set `true` (hot); designate an agent per team; `external.enabled` is a second flag and the per-team opt-in a third | `team_coordinator_set`, `task_requeued` events, 429 `coordinator_rate` / `coordinator_open`, 400 `coordination_loop`, 403 audit events from coordinators | `external-coordination off` per team, then `external.enabled: false`, then `enabled: false`; cancel what you do not want. Do not roll the image back (R-TC5) |
 | Share links `control_plane.share.enabled` (+ `signing_secret`, collab `public_url`) | off | Complete the share block; `deploy.sh` refuses incomplete config, renders the edge with `/s/`, starts `share-public` | share `events` (`opened`, `denied`), 404 rate on `/s/`, live bytes | Revoke individual shares first (`POST .../shares/{sid}/revoke` removes state, then bundle); then `enabled: false` and deploy: the edge stops routing `/s/` and `share-public` is stopped |
 | Per-user rollout | not built | The spec asks for it; every flag today is global | | |
 

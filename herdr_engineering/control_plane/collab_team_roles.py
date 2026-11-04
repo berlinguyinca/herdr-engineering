@@ -216,6 +216,7 @@ class TeamRolesMixin:
     def _tr2_forget_team(self, room_id: str, team_id: str) -> None:
         """A detach takes the team's people out of their roles with it (it removes exactly what the team brought)."""
         self._tr2_people.pop((room_id, team_id), None)
+        self._tc_forget_team(room_id, team_id)
 
     # ----------------------------------------------------------------- views of who holds what
     def _tr2_attached(self, room_id: str, team_id: Any):
@@ -456,7 +457,7 @@ class TeamRolesMixin:
             self._commit("task_updated", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, task_id=task_id, status=status, result=result,
                 target_agent_id=None, target_user_id=pr.id, visibility_scope="room", action="task.respond",
-                outcome="allowed", project_ids=[room["project_id"]], resource_id=task_id))
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=task_id, **self._tc_stamp(pr, room_id)))
             return {"task_id": task_id, "status": status, "replayed": False}
 
     # ----------------------------------------------------------------- routing
@@ -511,6 +512,10 @@ class TeamRolesMixin:
         while cur is not None and id(cur) not in seen:
             seen.add(id(cur))
             why.setdefault(f"{cur['by_kind']}:{cur['by_id']}", "handed out the work")
+            if cur.get("coord"):                        # slice 3: whoever decomposed the work, even after a requeue re-attributed it
+                why.setdefault(cur["coord"]["key"], "handed out the work")
+            if cur.get("adopted_from"):
+                why.setdefault(cur["adopted_from"], "handed out the work")
             cur = self._tasks.get(cur["parent"]) if cur.get("parent") else None
         for group in self._tr2_groups():
             hit = [k for k in group if k in why]
@@ -543,11 +548,16 @@ class TeamRolesMixin:
             self._check_independent_review(pr, room_id, reviewer_id, reviews)
 
     # ----------------------------------------------------------------- create (role or person targets)
-    def _tr2_create(self, pr, room: dict, room_id: str, body: dict) -> dict:
+    def _tr2_create(self, pr, room: dict, room_id: str, body: dict, coord: dict | None = None, first: int = 0) -> dict:
         from .collab import _KEY_RE, MAX_TASK_DEPTH, TASK_RATE, _digest
         cfg = self.team_roles_cfg()
         if set(body) - (_TASK_FIELDS | ROLE_FIELDS):
             raise _err(400, "unknown field")
+        limits = None
+        if coord is not None:                              # slice 3: by role, to this team's holders, within the limits
+            limits = self._tc_limits(coord)
+            self._tc_check_body(pr, room_id, coord, limits, body)
+            body = {**body, "team_id": coord["team_id"]}
         role, uid = body.get("target_role"), body.get("target_user_id")
         if (role is None) == (uid is None) or body.get("target_agent_id") is not None:
             raise _err(400, "name the target one way: target_role, target_user_id or target_agent_id")
@@ -585,13 +595,21 @@ class TeamRolesMixin:
         pt = None
         if pr.is_agent:
             pt = self._tasks.get(parent) if isinstance(parent, str) else None
-            if (not pt or pt["room_id"] != room_id or pt["target"] != pr.id or self._task_status(pt) != "accepted"):
+            if (not pt or pt["room_id"] != room_id or pt["target"] != pr.id or self._task_status(pt) != "accepted"
+                    or (coord is not None and (pt["seq"] < first or not self._creator_valid(pt, room)))):
                 raise _err(400, "agents delegate: parent_task_id must be a task you accepted in this room")
             depth, root = pt["depth"] + 1, pt["root"]
             if depth > MAX_TASK_DEPTH:
                 raise _err(400, "task chain is too deep")
+        elif coord is not None:
+            pt = self._tc_person_parent(pr, room, room_id, parent)
+            depth, root = pt["depth"] + 1, pt["root"]
         elif parent is not None:
             raise _err(400, "parent_task_id is for agents delegating a task")
+        root_id = None
+        if coord is not None:
+            root_id = pt["coord"]["root"] if pt.get("coord") else parent
+            self._tc_check_caps(coord, limits, root_id, depth)
         self._prune()
         work = self._tr2_work(room_id, reviews) if reviews is not None else None
         why = self._tr2_disqualified(work) if work is not None else {}
@@ -602,6 +620,12 @@ class TeamRolesMixin:
             if pr.is_agent:
                 exclude |= {"agent:" + pr.id, f"{pt['by_kind']}:{pt['by_id']}"}
             cands = self._tr2_candidates(room_id, room, team_id, role, exclude=exclude)
+            if cands and (pr.is_agent or coord is not None):       # slice 3: nobody who would close a loop, no assistant by chain
+                loop = self._tc_loop_keys(pr.key, pt, [k for _, k in cands], no_assistants=coord is not None)
+                if loop:
+                    cands = [c for c in cands if c[1] not in loop]
+                    if not cands:
+                        raise _err(400, "every holder of that role would close a loop or is an assistant", code="coordination_loop")
             if not cands:
                 raise _err(409, f"no holder of the role {role} can take this task now", code="no_role_holder")
             key = cands[0][1]
@@ -619,6 +643,8 @@ class TeamRolesMixin:
         now = self._now()
         task_id = ids.new_id("grant")
         extra: dict[str, Any] = {"routed_to": key}
+        if coord is not None:
+            extra.update(origin="coordinator", coordinator_key=coord["key"], coordinator_team=coord["team_id"], root_task_id=root_id)
         if role is not None:
             extra.update(target_role=role, team_id=team_id)
         if key.startswith("user:"):
@@ -702,6 +728,8 @@ class TeamRolesMixin:
             exclude = set(t.get("prior", ())) | {"user:" + t["target_user"]}
             if t.get("reviews") in self._tasks:
                 exclude |= set(self._tr2_disqualified(self._tasks[t["reviews"]]))
+            exclude |= self._tc_loop_keys(f"{t['by_kind']}:{t['by_id']}", self._tasks.get(t.get("parent")),
+                                          self._tr2_holder_keys(t["room_id"], t["team_id"], t["role"]) if t.get("team_id") else [])
             cands = self._tr2_candidates(t["room_id"], room, t["team_id"], t["role"], exclude=exclude) if t.get("team_id") else []
             if cands:
                 key = cands[0][1]

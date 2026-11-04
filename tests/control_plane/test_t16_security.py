@@ -271,7 +271,8 @@ def test_non_safety_writes_stop_before_safety_writes_and_the_tiers_are_ordered()
                              "helpers_paused", "helper_cancelled", "egress_removed",
                              "federation_share_revoked", "federation_peer_disabled",      # ADR-0008 P2
                              "team_detached",                                              # team rooms slice 1
-                             "team_role_cleared"}                                          # team roles slice 2
+                             "team_role_cleared",                                           # team roles slice 2
+                                 "team_coordinator_cleared"}                                   # coordinators slice 3
     svc._log.extend([{}] * (ordinary - len(svc._log)))        # exactly at the ordinary limit
     with pytest.raises(CollabError):
         svc._commit("room_created", {})
@@ -445,16 +446,18 @@ def _switch_values(svc):
         "insights": bool(svc.insights_cfg()["enabled"] and not svc.insights_cfg()["kill_switch"]),
         "team_rooms": svc.team_rooms_active(),
         "team_roles": svc.team_roles_active(),
+        "coordinators": svc.coordinators_active(),
         "delegation_enabled": svc.delegation_enabled,
         "replay_history": svc.replay_history,
     }
 
 
 FEATURES = {"steering": {"enabled": True}, "contextual": {"enabled": True}, "insights": {"enabled": True},
-            "team_rooms": {"enabled": True}, "team_roles": {"enabled": True}, "delegation_enabled": True,
+            "team_rooms": {"enabled": True}, "team_roles": {"enabled": True}, "coordinators": {"enabled": True},
+            "delegation_enabled": True,
             "replay_history": "full"}
 OFF = {"steering": False, "contextual": False, "insights": False, "team_rooms": False, "team_roles": False,
-       "delegation_enabled": False,
+       "coordinators": False, "delegation_enabled": False,
        "replay_history": "since_join"}
 
 
@@ -472,7 +475,8 @@ def test_every_feature_switch_fails_closed_identically_when_the_fleet_file_break
     svc = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
     cli._wire_collab_switches(svc, store)
     assert _switch_values(svc) == {"steering": True, "contextual": True, "insights": True, "team_rooms": True,
-                                   "team_roles": True, "delegation_enabled": True, "replay_history": "full"}
+                                   "team_roles": True, "coordinators": True, "delegation_enabled": True,
+                                   "replay_history": "full"}
     if breakage == "delete":
         path.unlink()
     elif breakage == "garbage":
@@ -485,7 +489,7 @@ def test_every_feature_switch_fails_closed_identically_when_the_fleet_file_break
     else:
         data = yaml.safe_load(path.read_text())
         coll = data["sections"]["control_plane"]["values"]["collab"]
-        for key in ("steering", "contextual", "insights", "team_rooms", "team_roles"):
+        for key in ("steering", "contextual", "insights", "team_rooms", "team_roles", "coordinators"):
             coll[key] = {"kill_switch": "yes"}
         coll["delegation_enabled"] = "yes"
         coll["replay_history"] = "everything"
