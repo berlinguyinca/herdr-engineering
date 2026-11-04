@@ -206,6 +206,12 @@ class TeamRoomsMixin:
         m = self._member(room, pr.id) if room else None
         if room is None or m is None or m["role"] != "owner":
             if room is not None:
+                if m is not None and self._tc_designated(pr, room_id) is not None:
+                    # slice 3: a designated external coordinator is a known principal; it is told no, and the trail says who
+                    self._audit_denied(pr, audit_action, "coordinator_forbidden", room_id=room_id,
+                                       project_ids=[room["project_id"]], resource_id=room_id)
+                    self.stats["policy_denied"] += 1
+                    raise _err(403, "forbidden: a coordinator cannot perform this operation")
                 self._audit_denied(pr, audit_action, "not_owner" if m else "not_a_member", room_id=room_id,
                                    project_ids=[room["project_id"]], resource_id=room_id)
             self.stats["policy_denied"] += 1
@@ -396,12 +402,16 @@ class TeamRoomsMixin:
             if have is None or have["state"] != "attached":
                 return {"room_id": room_id, "team_id": team_id, "state": "detached", "removed": [], "replayed": True}
             agents = sorted(have["agents"])
+            coord = self._tc_coord.get((room_id, team_id))
+            if coord is not None and coord["kind"] == "agent":           # slice 3: the coordinator's access ends with the team's
+                agents = sorted({*agents, coord["holder"][6:]})
             self._commit("team_detached", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, team_id=team_id, agents=agents,
                 visibility_scope="room", action="team.detach", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=team_id))
             for aid in agents:                                   # helpers under a removed agent end with it, as on remove
                 self._end_dependents(self._actor(pr), aid, "removed from room", {aid}, room=room_id)
+            self._tc_reconcile_team(room_id, team_id)            # slice 3: its open work is cancelled or requeued
             return {"room_id": room_id, "team_id": team_id, "state": "detached", "removed": agents, "replayed": False}
 
     def _tr_attach_view(self, att: dict) -> dict:
