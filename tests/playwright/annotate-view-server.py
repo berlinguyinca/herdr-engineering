@@ -26,6 +26,7 @@ COVER = "position:absolute;inset:-9999px;z-index:2147483647;transform:translateZ
         "mix-blend-mode:difference;background:rgba(0,0,255,.5)"
 FILES = {
     "index.html": b"<p>ok</p>",
+    "wide.txt": ("wide " * 400).encode(),
     "host.html": f"<style>{HOST_RULE}</style><p>host</p><script>window.__x=1;alert(1)</script>".encode(),
     "abs.html": f"<style>div{{{COVER}}} p{{position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:2147483647}}"
                 f" p{{background:url({EVIL}/bg.png)}}</style><div>c</div><p onclick=alert(2)>x</p>"
