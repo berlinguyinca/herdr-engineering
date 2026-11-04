@@ -23,13 +23,13 @@ _UNSET: Final[Any] = object()
 
 def member_principal(user_id: str) -> str:
     """The one derivation of a member principal; ``ValueError`` for anything Cognito could not have issued."""
-    if not isinstance(user_id, str) or not _USER_RE.match(user_id):
+    if not isinstance(user_id, str) or not _USER_RE.fullmatch(user_id):
         raise ValueError("invalid member user id")
     return MEMBER_PREFIX + user_id
 
 
 def is_member_principal(p: str | None) -> bool:
-    return isinstance(p, str) and p.startswith(MEMBER_PREFIX) and _USER_RE.match(p[len(MEMBER_PREFIX):]) is not None
+    return isinstance(p, str) and p.startswith(MEMBER_PREFIX) and _USER_RE.fullmatch(p[len(MEMBER_PREFIX):]) is not None
 
 
 def member_owner_key(principal: str) -> str:

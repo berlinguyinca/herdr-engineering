@@ -3,7 +3,7 @@
 -- audit trail of member actions.  Additive and idempotent.  Safe to re-run.
 --
 -- DOWN:
---   DROP TABLE IF EXISTS artifact_member_events, artifact_member_usage;
+--   DROP TABLE IF EXISTS artifact_member_creates, artifact_member_events, artifact_member_usage;
 --   DROP INDEX IF EXISTS ix_artifacts_member_created_by, ix_artifact_shares_member_created_by;
 
 CREATE TABLE IF NOT EXISTS artifact_member_usage (
@@ -43,3 +43,13 @@ CREATE INDEX IF NOT EXISTS ix_artifact_member_events_audience ON artifact_member
 CREATE INDEX IF NOT EXISTS ix_artifacts_member_created_by ON artifacts (created_by) WHERE created_by LIKE 'member:%';
 CREATE INDEX IF NOT EXISTS ix_artifact_shares_member_created_by ON artifact_shares (created_by)
   WHERE created_by LIKE 'member:%';
+
+-- member.artifact_create idempotency: one row per (member, idempotency key), whatever actor (user or agent) sent it.
+CREATE TABLE IF NOT EXISTS artifact_member_creates (
+  member_principal text NOT NULL,
+  idempotency_key  text NOT NULL,
+  request_sha256   text NOT NULL,
+  artifact_id      text NOT NULL,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (member_principal, idempotency_key)
+);

@@ -262,12 +262,80 @@ def test_a_replayed_create_returns_the_same_artifact(registry_pg, tmp_path):
     mrun(registry_pg, tmp_path, body)
 
 
-def test_without_limits_the_twenty_first_artifact_is_created(registry_pg, tmp_path):
+def test_without_limits_the_two_hundredth_artifact_is_created(registry_pg, tmp_path):
     async def body(env, rt):
-        for i in range(21):
-            await create(env, title=f"p{i}")
-        assert len(await sql(env, "SELECT 1 FROM artifacts WHERE created_by=$1", ALICE)) == 21
+        tickets = [env.intent(user("alice"), kind="member.artifact_create", key=f"bulk-{i}",
+                              payload={"title": f"p{i}", "filename": "a.html", "profile": "web"})["ticket"]
+                   for i in range(200)]                       # all through the handler, one settle
+        for _ in range(20):                                   # the applier takes a bounded batch per tick
+            await settle(env)
+            if len(await sql(env, "SELECT 1 FROM artifacts")) == 200:
+                break
+        assert {env.result(t)["result"] for t in tickets} == {"created"}
+        assert len(await sql(env, "SELECT 1 FROM artifacts WHERE created_by=$1", ALICE)) == 200
     mrun(registry_pg, tmp_path, body)
+
+
+def test_create_idempotency_is_per_member_and_payload_across_actors(registry_pg, tmp_path):
+    async def body(env, rt):
+        pl = {"title": "T", "filename": "a.html", "profile": "web"}
+        a = await send(env, user("alice"), "member.artifact_create", pl, key="same")
+        b = await send(env, agent("ag1"), "member.artifact_create", pl, key="same")
+        assert a["result"] == b["result"] == "created" and a["artifact_id"] == b["artifact_id"]
+        c = await send(env, agent("ag1"), "member.artifact_create", {**pl, "title": "other"}, key="same")
+        assert c == {**c, "result": "rejected", "reason": "idempotency_conflict"}
+        d = await send(env, user("bob"), "member.artifact_create", pl, key="same")
+        assert d["result"] == "created" and d["artifact_id"] != a["artifact_id"]      # keys are per member
+        assert len(await sql(env, "SELECT 1 FROM artifacts")) == 2
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_a_replayed_create_or_delete_is_refused_once_the_member_is_gone(registry_pg, tmp_path):
+    async def body(env, rt):
+        pl = {"title": "T", "filename": "a.html", "profile": "web"}
+        a = await send(env, user("alice"), "member.artifact_create", pl, key="r-1")
+        d = await send(env, user("alice"), "member.artifact_delete", {"confirm": True}, aid=a["artifact_id"], key="r-2")
+        assert d["result"] == "deleted"
+        write_feeds(env, users={"alice": {"status": "disabled"}, "bob": {"status": "approved"}})
+        again = await send(env, user("alice"), "member.artifact_create", pl, key="r-1")
+        assert again["result"] == "rejected" and again["reason"] == "user_disabled" and again["artifact_id"] is None
+        gone = await send(env, user("alice"), "member.artifact_delete", {"confirm": True}, aid=a["artifact_id"],
+                          key="r-2")
+        assert gone["result"] == "rejected" and gone["reason"] == "user_disabled"
+        write_feeds(env, directory_age=cbf.FEED_MAX_AGE + 5)
+        stale = await send(env, user("alice"), "member.artifact_create", pl, key="r-1")
+        assert stale["reason"] == "directory_stale"
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_a_replayed_publish_is_refused_once_the_directory_is_stale(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env)
+        payload = publish_payload(env, AK, aid)
+        a = await send(env, user("alice"), "member.publish", payload, aid=aid, key="p-1")
+        assert a["result"] == "created"
+        write_feeds(env, directory_age=cbf.FEED_MAX_AGE + 5)
+        b = await send(env, user("alice"), "member.publish", payload, aid=aid, key="p-1")
+        assert b["result"] == "rejected" and b["reason"] == "directory_stale" and "version_id" not in b
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_conflicting_publishes_with_fresh_content_still_hit_the_member_byte_limit(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env)
+        first = await publish(env, aid, {"index.html": b"<html>0000</html>"})
+        assert first["result"] == "created"
+        reasons = []
+        for i in range(1, 12):                                   # base None is stale: each is a conflict
+            out = await publish(env, aid, {"index.html": b"<html>%04d</html>" % i})
+            reasons.append(out.get("reason") or out["result"])
+            (u,) = await sql(env, "SELECT bytes_used FROM artifact_member_usage WHERE member_principal=$1", ALICE)
+            (blobs,) = await sql(env, "SELECT coalesce(sum(size_bytes),0)::bigint AS n FROM artifact_blobs "
+                                      "WHERE scope=$1", aid)
+            assert u["bytes_used"] == blobs["n"]                 # settled after every publish, whatever its outcome
+        assert reasons[0] == "conflict" and "member_bytes" in reasons
+        assert u["bytes_used"] <= 100
+    mrun(registry_pg, tmp_path, body, defaults={"max_member_bytes": 100})
 
 
 def test_a_max_artifacts_default_refuses_the_next_create(registry_pg, tmp_path):

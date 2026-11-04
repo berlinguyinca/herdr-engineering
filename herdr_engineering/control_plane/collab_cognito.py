@@ -102,7 +102,7 @@ class CognitoAuthenticator:
         if claims.get("token_use") != "access" or not isinstance(client, str) or client not in self.client_ids:
             return None
         user = claims.get("username") or claims.get("sub")
-        if not isinstance(user, str) or not user or not isinstance(groups, list) or not _USER_RE.match(user):
+        if not isinstance(user, str) or not user or not isinstance(groups, list) or not _USER_RE.fullmatch(user):
             return None
         groups = [g for g in groups if isinstance(g, str)][:64]
         if not self.open_signup:
@@ -150,7 +150,7 @@ class CognitoAuthenticator:
 
     def exists(self, user_id: str) -> bool:
         """Known and still in the group (stream/agent re-checks come through here)."""
-        if not isinstance(user_id, str) or not _USER_RE.match(user_id):
+        if not isinstance(user_id, str) or not _USER_RE.fullmatch(user_id):
             return False
         if self.open_signup:
             return True            # the service's approval state decides, not group membership

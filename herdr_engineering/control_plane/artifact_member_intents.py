@@ -22,6 +22,7 @@ verification``). No payload text is ever echoed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -311,13 +312,15 @@ async def handle_create(ctx: IntentContext, intent: Intent) -> dict:
         return refusal
     payload: CreatePayload = intent.payload
     key = intent.idempotency_key or intent.ticket
+    digest = hashlib.sha256(json.dumps([payload.title, payload.filename, payload.profile]).encode()).hexdigest()
     async with ctx.conn.transaction():
-        prior = await ctx.conn.fetchval(
-            "SELECT artifact_id FROM artifacts WHERE created_by=$1 AND payload->>'create_key'=$2",
-            who.principal, key)
-        if prior is not None:                                  # a retry of a create that landed before its outcome
-            return await _conclude(ctx, who, "artifact_create", {"result": "created", "artifact_id": prior},
-                                   artifact_id=prior)
+        prior = await ctx.conn.fetchrow(          # keyed by (member, key): the same whichever actor sends it
+            "SELECT request_sha256, artifact_id FROM artifact_member_creates"
+            " WHERE member_principal=$1 AND idempotency_key=$2", who.principal, key)
+        if prior is not None:                     # after the admission check above, so a removed member gets no replay
+            out = ({"result": "created", "artifact_id": prior["artifact_id"]} if prior["request_sha256"] == digest
+                   else _rejected("idempotency_conflict"))
+            return await _conclude(ctx, who, "artifact_create", out, artifact_id=out.get("artifact_id"))
         try:
             await check_new_artifact(ctx.conn, who.principal, await _limits(ctx, who))
         except QuotaExceeded as exc:
@@ -328,7 +331,10 @@ async def handle_create(ctx: IntentContext, intent: Intent) -> dict:
             aid = made["artifact_id"]
             await ctx.conn.execute(
                 "UPDATE artifacts SET display_name=$2, payload=$3::jsonb WHERE artifact_id=$1", aid, payload.title,
-                json.dumps({"profile": payload.profile, "create_key": key}))
+                json.dumps({"profile": payload.profile}))
+            await ctx.conn.execute(
+                "INSERT INTO artifact_member_creates (member_principal, idempotency_key, request_sha256, artifact_id)"
+                " VALUES ($1,$2,$3,$4)", who.principal, key, digest, aid)
             out = {"result": "created", "artifact_id": aid}
         return await _conclude(ctx, who, "artifact_create", out, artifact_id=out.get("artifact_id"))
 
@@ -389,6 +395,8 @@ async def _publish(ctx: IntentContext, intent: Intent, who: _Who) -> dict:
                                               charge=False, media_type=_media_type(file.name)))
         except UploadRefused as exc:
             return _rejected(exc.reason)
+    async with ctx.conn.transaction():                          # the assembled blobs are durable: count them now, so a
+        await settle(ctx.conn, who.principal)                   # conflict or refusal below cannot leave bytes_used stale
     key = "member-publish:" + (intent.idempotency_key or intent.ticket)
     provenance = {"via": "member_mcp" if who.actor.kind == "agent" else "member_web",
                   "actor": _actor_json(who.actor), "message": payload.message}
@@ -600,21 +608,37 @@ def staging_keep(rt: MemberRuntime) -> Callable[[str, Any], Any]:
 
     A stale or missing directory proves nothing (True: only the TTL applies); a fresh one that does not list the
     member, or lists it disabled or outside the group, drops its uploads."""
+    cache: dict[str, Any] = {"at": None, "stat": None, "by_key": None}   # one read and hashing pass per sweep
+
+    def stamp() -> tuple[int, int] | None:
+        try:
+            st = os.stat(rt.outbox / MEMBER_DIRECTORY)
+        except OSError:
+            return None
+        return st.st_mtime_ns, st.st_size
+
     async def keep(owner_key: str, _meta: Any) -> bool:
         from .artifact_members import member_owner_key, member_principal
         if not rt.enabled:
             return True
-        directory = await asyncio.to_thread(load_directory, rt)
-        if directory is None:
+        now = rt.clock()
+        seen = await asyncio.to_thread(stamp)
+        if cache["at"] is None or seen != cache["stat"] or not 0 <= now - cache["at"] < 5.0:
+            directory = await asyncio.to_thread(load_directory, rt)
+            by_key: dict[str, dict[str, Any]] | None = None
+            if directory is not None:
+                by_key = {}
+                for user_id, entry in directory.items():
+                    try:
+                        by_key[member_owner_key(member_principal(user_id))] = entry
+                    except ValueError:
+                        continue
+            cache["at"], cache["stat"], cache["by_key"] = now, seen, by_key
+        by_key = cache["by_key"]
+        if by_key is None:
             return True
-        for user_id, entry in directory.items():
-            try:
-                principal = member_principal(user_id)
-            except ValueError:
-                continue
-            if member_owner_key(principal) == owner_key:
-                return entry["status"] == "approved" and rt.group in entry["groups"]
-        return False
+        entry = by_key.get(owner_key)
+        return entry is not None and entry["status"] == "approved" and rt.group in entry["groups"]
     return keep
 
 
@@ -628,7 +652,9 @@ def register_member_intents(applier: CollabIntentApplier) -> None:
     """Attach the handlers and the ``m_`` staging rule; the runtime comes from the applier's ``context_extras``."""
     for kind, handler, outcomes in ((KIND_CREATE, handle_create, "created"), (KIND_PUBLISH, handle_publish, "created"),
                                     (KIND_DELETE, handle_delete, "deleted")):
-        applier.register(kind, handler, lane_key=_lane, replay_outcomes=frozenset({outcomes}), after=_after)
+        # No ``replay_outcomes``: the applier would replay a stored result before the handler runs, i.e. before the
+        # directory/admission check. The handlers are idempotent themselves, behind ``_member``.
+        applier.register(kind, handler, lane_key=_lane, after=_after)
     rt = applier.extras.get("members")
     if isinstance(rt, MemberRuntime):
         applier.register_staging_owner("m_", staging_keep(rt))
