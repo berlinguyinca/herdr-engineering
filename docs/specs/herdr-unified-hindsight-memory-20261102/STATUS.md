@@ -233,3 +233,24 @@ for the ledger half after #6 closed the visibility half), #8 (D20 records withou
 #570/#571/#572; their original bodies were **withdrawn** (written from assumed code paths, incl. a
 module that does not exist) and replaced with reproduced command output, with correction comments on
 all six issues.
+
+## Update — memory became reachable from where the harness works (2026-11-04, later)
+
+Answering "what does Pi remember?" exposed the blocking defect: every `herdr-memory` call from
+an unmapped directory - which is where sessions actually run - returned
+`Current directory has no configured project`, so recall was unreachable rather than empty. The
+documented `default_project` fallback had never been implemented
+([herdr-memory#10](https://github.com/berlinguyinca/herdr-memory/issues/10), fixed in
+[herdr-memory#11](https://github.com/berlinguyinca/herdr-memory/pull/11), client `0.1.4`,
+promoted to bender and the Mac; pin now `685cf07` from #580). `doctor` likewise now resolves a
+project **and** a credential before probing health (#579 then #580, which also removed the false
+`FAIL server` that #579 introduced - D22 in
+[`audit/DRILLS_20261104.md`](audit/DRILLS_20261104.md) §13).
+
+With that, durable write/read works from anywhere: five evidenced records (`herdr-global`,
+`canary-facts`) are recalled with `degraded: false` from `~/IdeaProjects` on the Mac and from
+`/tmp` on bender, including a record written on one host and read on the other. The retention
+gate earned its keep - `retain` rejected every write until `--explicit`/`--evidence` were given.
+Full evidence: [`audit/DRILLS_20261104.md`](audit/DRILLS_20261104.md) §14, including the one
+operator action still open (bender's controller checkout is 41 tracked files dirty at
+`06e3d501`, so unattended updates will skip it, not fail it, until it is cleaned).
