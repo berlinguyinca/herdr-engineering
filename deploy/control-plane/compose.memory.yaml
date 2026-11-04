@@ -1,0 +1,14 @@
+# Optional memory integration. The backend stack is private and independently
+# persistent; only the control-plane web process joins its API access bridge.
+services:
+  control-plane-web:
+    ports:
+      - "127.0.0.1:${HERDR_MEMORY_LOCAL_PORT:-18880}:8080"
+    networks:
+      default: {}
+      memory-access: {}
+
+networks:
+  memory-access:
+    external: true
+    name: herdr-memory_access

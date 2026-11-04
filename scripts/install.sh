@@ -96,6 +96,15 @@ fi
 "$ARTIFACT_REPO/install/install.sh"
 printf '  herdr-artifacts %s installed from %s\n' "$ARTIFACT_REF" "$ARTIFACT_REPO"
 
+# Install only when the parent has supplied the reviewed production pin.
+# No retention, harness hooks, backend services or network settings are enabled.
+if [ -f "${HERDR_MEMORY_LOCK_FILE:-$REPO_ROOT/herdr-memory.lock.json}" ]; then
+  step "installing pinned herdr-memory CLI and shared skill (no hooks)"
+  "$REPO_ROOT/deploy/control-plane/prepare-memory-dependency.sh" --host-install "$PY"
+else
+  warn "herdr-memory not installed: reviewed herdr-memory.lock.json not supplied"
+fi
+
 # --- 4. state + artifact directories --------------------------------------
 step "4/8 machine-local state + artifact directories"
 mkdir -p "$STATE_DIR" "$ARTIFACT_DIR"
@@ -236,6 +245,8 @@ if [ -d "$LINK_DIR" ] || mkdir -p "$LINK_DIR" 2>/dev/null; then
   if command -v python3 >/dev/null 2>&1 && case "$PATH" in *"$LINK_DIR"*) true;; *) false;; esac; then
     ln -sf "$VENV/bin/herdr-eng" "$LINK_DIR/herdr-eng"
     printf '  linked %s -> %s\n' "$LINK_DIR/herdr-eng" "$VENV/bin/herdr-eng"
+    # The pinned memory preparer owns its CLI link via its private manifest.
+    # Do not force-link it here: unknown user binaries must remain untouched.
     ln -sf "$VENV/bin/herdr-handoff" "$LINK_DIR/herdr-handoff"
     printf '  linked %s -> %s\n' "$LINK_DIR/herdr-handoff" "$VENV/bin/herdr-handoff"
   else

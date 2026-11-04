@@ -2863,6 +2863,10 @@ def _cmd_cp_web(args) -> int:
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
+    memory_gateway = None
+    if not args.collab_only:
+        from .control_plane.assistant_memory_runtime import build_memory_runtime
+        memory_gateway = build_memory_runtime(dsn, cp.get("memory") or {})
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              federation_source=federation_source,
                              system_graph=system_graph,
@@ -2881,6 +2885,8 @@ def _cmd_cp_web(args) -> int:
                              summary_config=cp.get("agent_summaries") or {},
                              assistant_config={"personal_assistant": cp["personal_assistant"]}
                                  if isinstance(cp.get("personal_assistant"), dict) else None,
+                             memory_gateway=memory_gateway,
+                             memory_dashboard_origins=(cp.get("memory") or {}).get("dashboard_origins", []),
                              review_quorum=_review_quorum_config(cp),
                              usage_retention=usage_retention, attention=attention,
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn,

@@ -12,7 +12,8 @@
 #
 # Build context = repository root:
 #   docker build -f deploy/fabric-stack/Dockerfile .
-FROM python:3.12-slim
+ARG HERDR_RUNTIME_BASE_IMAGE=python:3.12-slim
+FROM ${HERDR_RUNTIME_BASE_IMAGE}
 
 # Optional build stamp surfaced by /api/v1/health (commit=). Passed via
 # `docker compose build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`;

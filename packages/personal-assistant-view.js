@@ -2,6 +2,7 @@
 // Built on the existing vanilla JS / Web Components stack and design tokens.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
+import { mountSharedMemory } from './shared-memory-view.js';
 import { requestErrorDetail } from './dashboard-load-state.js';
 
 function statusClass(status) {
@@ -15,9 +16,11 @@ function statusLabel(status) {
 
 export function mountPersonalAssistant(container, client, { onFreshness = () => {} } = {}) {
   let disposed = false;
+  let memoryView = null;
   let state = { assistants: [], selectedId: null, tab: 'General' };
 
   const render = async () => {
+    memoryView?.dispose(); memoryView = null;
     container.innerHTML = skeleton('Personal Assistant');
     try {
       const { assistants = [] } = await client.listAssistants();
@@ -36,6 +39,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   };
 
   const draw = () => {
+    memoryView?.dispose(); memoryView = null;
     const selected = state.assistants.find(a => a.assistant_id === state.selectedId);
     container.innerHTML = `
       <div class="hd-card" style="margin-bottom:16px">
@@ -176,9 +180,20 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
   };
 
-  const loadMemory = async (el, a) => {
+  const loadMemory = (el, a) => {
+    memoryView?.dispose();
+    memoryView = mountSharedMemory(el, client, {
+      onFreshness,
+      onUnavailable: () => {
+        if (!disposed && container.contains(el)) void loadLegacyMemory(el, a);
+      },
+    });
+  };
+
+  const loadLegacyMemory = async (el, a) => {
     try {
       const { memory = [] } = await client.searchMemory(a.assistant_id, '');
+      if (disposed || !container.contains(el)) return;
       el.innerHTML = `
         <div class="pa-row">
           <input style="flex:1" placeholder="Search memory…" data-mq>
@@ -192,27 +207,29 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       el.querySelector('[data-msearch]').addEventListener('click', async () => {
         const q = el.querySelector('[data-mq]').value;
         const r = await client.searchMemory(a.assistant_id, q);
+        if (disposed || !container.contains(el)) return;
         el.querySelector('#pa-memory-results').innerHTML = r.memory.map(m =>
           `<div class="pa-msg pa-msg--meta">${esc(m.content)} <button class="hd-btn hd-btn--danger hd-btn--sm" data-mforget="${esc(m.memory_id)}">Forget</button></div>`).join('') || '<div class="pa-muted">No results.</div>';
         bindForget(el.querySelector('#pa-memory-results'), a, el);
       });
       el.querySelector('[data-mstore]').addEventListener('click', async () => {
         const content = el.querySelector('[data-mcontent]').value;
-        if (content) { await client.storeMemory(a.assistant_id, { content, source_ref: 'ui' }); el.querySelector('[data-mcontent]').value = ''; await loadMemory(el, a); }
+        if (content) { await client.storeMemory(a.assistant_id, { content, source_ref: 'ui' }); if (disposed || !container.contains(el)) return; el.querySelector('[data-mcontent]').value = ''; await loadLegacyMemory(el, a); }
       });
       el.querySelector('[data-mexport]').addEventListener('click', async () => {
         const r = await client.exportMemory(a.assistant_id);
+        if (disposed || !container.contains(el)) return;
         const blob = new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob); const a2 = document.createElement('a');
         a2.href = url; a2.download = `assistant-${a.assistant_id}-memory.json`; a2.click(); URL.revokeObjectURL(url);
       });
       bindForget(el.querySelector('#pa-memory-results'), a, el);
-    } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
+    } catch (error) { if (disposed || !container.contains(el)) return; el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
   };
 
   const bindForget = (resultsEl, a, el) => {
     resultsEl.querySelectorAll('[data-mforget]').forEach(btn => btn.addEventListener('click', async () => {
-      await client.forgetMemory(btn.dataset.mforget); await loadMemory(el, a);
+      await client.forgetMemory(btn.dataset.mforget); await loadLegacyMemory(el, a);
     }));
   };
 
@@ -418,5 +435,5 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   };
 
   void render();
-  return () => { disposed = true; };
+  return () => { disposed = true; memoryView?.dispose(); };
 }

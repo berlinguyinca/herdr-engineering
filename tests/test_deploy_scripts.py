@@ -2,6 +2,7 @@
 on PATH (nothing real is ever built, started or contacted)."""
 import json
 import os
+import shlex
 import stat
 import subprocess
 from pathlib import Path
@@ -1087,3 +1088,120 @@ def test_collab_sync_install_failure_triggers_rollback(env):
     assert edge.read_text() == "previous nginx conf\n"
     ups = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]
     assert not any(f"tag={_head()} " in ln for ln in ups)     # forward compose never ran
+
+
+def _memory_rollback_harness(e, previous_enabled):
+    """Run the actual flag/compose functions and rollback tail, without deployment.
+
+    Full deploy still needs a committed candidate containing the memory overlay
+    and packaging helper. This harness supplies only disposable prior-parser and
+    renderer modules; docker/curl are the existing subprocess stubs.
+    """
+    source = DEPLOY.read_text()
+    flag_code = source[source.index('# Read only the enabled flag'):source.index('echo "deploying $REF')]
+    compose_code = source[source.index('compose_run() {'):source.index('healthy_commit() {')]
+    rollback_code = source[source.index('echo "rolling back to $PREVIOUS_IMAGE'):]
+    attempt = e['tmp'] / 'memory-attempt'
+    prior_config = attempt / 'previous' / 'fleet-config.yaml'
+    prior_config.parent.mkdir(parents=True)
+    data = yaml.safe_load(e['central'].read_text())
+    data['sections']['control_plane']['values']['memory'] = {'enabled': previous_enabled}
+    prior_config.write_text(yaml.safe_dump(data))
+    workdir = e['tmp'] / 'rollback-test-env'
+    prior_tree = workdir / 'rollback-worktree'
+    package = prior_tree / 'herdr_engineering'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text('')
+    parser_log = e['tmp'] / 'prior-parser.log'
+    (package / 'fleet_config.py').write_text(f'''
+import yaml
+class Config:
+    def __init__(self, data): self.data = data
+    def section_names(self): return self.data['sections']
+    def section(self, key): return self.data['sections'][key]['values']
+def load_fleet_config(path):
+    with open({str(parser_log)!r}, 'a') as log: log.write('prior-parser\\n')
+    return Config(yaml.safe_load(path.read_text()))
+''')
+    (package / 'cli.py').write_text('''
+from pathlib import Path
+import sys
+Path(sys.argv[sys.argv.index('--out')+1]).write_text('HERDR_CP_WEB_PUBLIC_PORT=8080\\n')
+''')
+    compose_dir = prior_tree / 'deploy/control-plane'
+    compose_dir.mkdir(parents=True)
+    for filename in ['compose.yaml', 'compose.memory.yaml']:
+        (compose_dir / filename).write_text('services: {}\n')
+    (attempt / 'rollback-images.json').write_text('{"services":{}}')
+    return flag_code, compose_code, rollback_code, attempt, workdir, parser_log
+
+
+@pytest.mark.parametrize('forward_enabled,previous_enabled', [(True, False), (False, True)])
+def test_memory_rollback_uses_previous_config_and_previous_parser(env, forward_enabled, previous_enabled):
+    data = yaml.safe_load(env['central'].read_text())
+    data['sections']['control_plane']['values']['memory'] = {'enabled': forward_enabled}
+    fcc.write_private_file(env['central'], yaml.safe_dump(data))
+    flag_code, compose_code, rollback_code, attempt, workdir, parser_log = _memory_rollback_harness(env, previous_enabled)
+    variables = {
+        'WORK': str(ROOT), 'CENTRAL': str(env['central']), 'ENV_DIR': str(workdir),
+        'ATTEMPT': str(attempt), 'REPO': str(ROOT), 'PROJECT': 'test-memory-rollback',
+        'FLEET_DIR': str(env['central'].parent), 'LLM_DIR': '', 'COLLAB': '0',
+        'ROLLBACK_IMAGES': '', 'RESTORED': '1', 'PREVIOUS_IMAGE': 'previous-image',
+        'PREV_COMMIT': 'previous-commit', 'PREV_SHA': 'previous', 'PREV_TAG': 'previous',
+        'SHA': 'candidate', 'STATE_HELPER': 'stub-state-helper',
+    }
+    shell = 'set -euo pipefail\n' + '\n'.join(f'{key}={shlex.quote(value)}' for key, value in variables.items())
+    shell += '\nAPP_SERVICES=(control-plane-web control-plane-worker llm-proxy)\nEDGE_SERVICE=()\n'
+    shell += 'git() { return 0; }\nverify() { return 0; }\n'
+    shell += 'python3() { if [ "$1" = "$STATE_HELPER" ]; then return 0; fi; command python3 "$@"; }\n'
+    shell += flag_code + '\n' + compose_code
+    shell += f'\ncompose_up "$WORK" {shlex.quote(str(env["central"]))} candidate candidate\n'
+    shell += rollback_code
+    result = subprocess.run(['bash', '-c', shell], env=env['env'], capture_output=True, text=True, cwd=ROOT, timeout=20)
+    assert result.returncode == 1, result.stderr
+    assert 'and healthy' in result.stderr
+    calls = [line for line in env['log'].read_text().splitlines() if line.startswith('composefiles ')]
+    assert len(calls) == 2
+    assert ('compose.memory.yaml' in calls[0]) == forward_enabled
+    assert ('compose.memory.yaml' in calls[1]) == previous_enabled
+    assert 'rollback-worktree/deploy/control-plane/compose.yaml' in calls[1]
+    assert parser_log.read_text().splitlines() == ['prior-parser']
+
+
+@pytest.mark.parametrize('memory,expected', [
+    ({}, '0'), ({'enabled': False}, '0'), ({'enabled': True}, '1'),
+    ({'enabled': 'false'}, None), ({'enabled': 0}, None),
+    ({'enabled': 1}, None), ({'enabled': None}, None), (None, None),
+])
+def test_memory_enabled_parser_is_strict_and_defaults_disabled(env, memory, expected):
+    data = yaml.safe_load(env['central'].read_text())
+    data['sections']['control_plane']['values']['memory'] = memory
+    fcc.write_private_file(env['central'], yaml.safe_dump(data))
+    source = DEPLOY.read_text()
+    code = source[source.index('# Read only the enabled flag'):source.index('echo "deploying $REF')]
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\nWORK=$1\nCENTRAL=$2\n' + code + '\nprintf %s "$MEMORY_ENABLED"',
+        'memory-flag-test', str(ROOT), str(env['central'])], env=env['env'], capture_output=True, text=True, timeout=10)
+    if expected is None:
+        assert result.returncode != 0
+        assert result.stdout == ''
+        assert 'cannot read boolean control_plane.memory.enabled' in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected
+    assert not env['log'].exists()
+
+
+def test_enabled_memory_cannot_silently_omit_missing_selected_overlay(env):
+    source = DEPLOY.read_text()
+    compose_code = source[source.index('compose_run() {'):source.index('healthy_commit() {')]
+    tree = env['tmp'] / 'without-memory-overlay'
+    tree.mkdir()
+    result = subprocess.run(['bash', '-c', '''set -euo pipefail
+COLLAB=0
+MEMORY_ENABLED=1
+ROLLBACK_IMAGES=''
+''' + compose_code + '\ncompose_run "$1" "$2" previous previous config -q',
+        'missing-memory-overlay', str(tree), str(env['central'])], env=env['env'], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 1
+    assert 'enabled memory requires compose.memory.yaml' in result.stderr
+    assert not env['log'].exists()

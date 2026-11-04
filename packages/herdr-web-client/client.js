@@ -614,6 +614,55 @@ export class HerdrClient {
   forgetMemory(memoryId) {
     return this.request(`/api/v1/assistant-memory/${encodeURIComponent(memoryId)}`, { method: 'DELETE' });
   }
+
+  // -- shared memory (operator gateway) -----------------------------------
+  listMemoryDomains({ signal } = {}) {
+    return this.request('/api/v1/assistant-memory/domains', { signal });
+  }
+
+  listMemoryDocuments(bank, { limit = 20, offset = 0, signal } = {}) {
+    const query = new URLSearchParams({ limit, offset });
+    return this.request(`/api/v1/assistant-memory/operator/v1/default/banks/${encodeURIComponent(bank)}/documents?${query}`, { signal });
+  }
+
+  getMemoryDocument(bank, id, { signal } = {}) {
+    return this.request(`/api/v1/assistant-memory/operator/v1/default/banks/${encodeURIComponent(bank)}/documents/${encodeURIComponent(id)}`, { signal });
+  }
+
+  getMemoryHistory(bank, id, { signal } = {}) {
+    return this.request(`/api/v1/assistant-memory/operator/v1/default/banks/${encodeURIComponent(bank)}/documents/${encodeURIComponent(id)}/history`, { signal });
+  }
+
+  saveMemoryDocument(bank, { document_id, content, base_revision, metadata }, { signal } = {}) {
+    // Fetch normalizes dot segments even when the dots are percent encoded.
+    if (document_id === '.' || document_id === '..') throw new TypeError('Document ID cannot be "." or "..".');
+    return this.request(`/api/v1/assistant-memory/operator/v1/default/banks/${encodeURIComponent(bank)}/memories`, {
+      method: 'POST',
+      body: {
+        items: [{ document_id, content, metadata: { ...metadata, explicit_save: true },
+          ...(base_revision !== undefined ? { base_revision } : {}) }],
+        async: true,
+      },
+      signal,
+    });
+  }
+
+  recallMemoryDocuments(bank, query, { limit = 100, signal } = {}) {
+    return this.request(`/api/v1/assistant-memory/operator/v1/default/banks/${encodeURIComponent(bank)}/memories/recall`, {
+      method: 'POST', body: { query, limit }, signal,
+    });
+  }
+
+  deleteMemoryDocument(bank, id, { base_revision, signal } = {}) {
+    return this.request(`/api/v1/assistant-memory/operator/v1/default/banks/${encodeURIComponent(bank)}/documents/${encodeURIComponent(id)}`, {
+      method: 'DELETE', body: { ...(base_revision !== undefined ? { base_revision } : {}) }, signal,
+    });
+  }
+
+  getMemoryOperation(bank, id, { signal } = {}) {
+    return this.request(`/api/v1/assistant-memory/operator/v1/default/banks/${encodeURIComponent(bank)}/operations/${encodeURIComponent(id)}`, { signal });
+  }
+
   assistantDiagnostics(assistantId, { signal } = {}) {
     return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/diagnostics`, { signal });
   }

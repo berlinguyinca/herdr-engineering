@@ -117,6 +117,28 @@ if ! herdr_eng fleet config validate --path "$CENTRAL" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Read only the enabled flag using the selected commit's central-config parser.
+# Missing memory configuration is disabled; malformed flags fail closed.
+memory_enabled() {   # <selected worktree> <selected fleet config>
+  local tree="$1" config="$2"
+  (cd "$tree" && PYTHONPATH="$tree" python3 - "$config" <<'PYMEM'
+from pathlib import Path
+import sys
+from herdr_engineering.fleet_config import load_fleet_config
+try:
+    config = load_fleet_config(Path(sys.argv[1]))
+    cp = config.section("control_plane") if "control_plane" in config.section_names() else {}
+    memory = cp.get("memory", {})
+    if not isinstance(memory, dict) or type(memory.get("enabled", False)) is not bool:
+        raise ValueError()
+    print("1" if memory.get("enabled", False) else "0")
+except Exception:
+    sys.exit("cannot read boolean control_plane.memory.enabled from central config")
+PYMEM
+  )
+}
+MEMORY_ENABLED="$(memory_enabled "$WORK" "$CENTRAL")"
+
 echo "deploying $REF = $SHA"
 echo "central config: $CENTRAL -> its directory $FLEET_DIR mounted read-only, file at $MOUNT_TARGET"
 COLLAB_FILES=()
@@ -209,6 +231,9 @@ if [ "$COLLAB" = 1 ]; then
 fi
 
 COMPOSE_FILES=(-f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}")
+if [ "$MEMORY_ENABLED" = 1 ]; then
+  COMPOSE_FILES+=(-f "$WORK/deploy/control-plane/compose.memory.yaml")
+fi
 # Every service of ours that runs the herdr-engineering image and reads the fleet
 # config: rolled forward (and back) together on one tag.
 APP_SERVICES=(control-plane-web control-plane-worker llm-proxy)
@@ -233,6 +258,7 @@ if [ "$DRY" = 1 ]; then
   if [ "$COLLAB" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; after the build would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
   fi
+  [ "$MEMORY_ENABLED" = 0 ] || echo "[dry-run] would prepare the pinned private memory runtime base"
   echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}"
   exit 0
 fi
@@ -302,8 +328,15 @@ if [ "$COLLAB" = 1 ]; then
   fi
 fi
 
+# Dependency preparation happens before any rollout state or services change.
+MEMORY_BUILD_ARGS=()
+if [ "$MEMORY_ENABLED" = 1 ]; then
+  MEMORY_BASE="$("$WORK/deploy/control-plane/prepare-memory-dependency.sh")"
+  MEMORY_BUILD_ARGS=(--build-arg "HERDR_RUNTIME_BASE_IMAGE=$MEMORY_BASE")
+fi
+
 # A failed build exits here: nothing on the host has been touched yet.
-docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
+docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" "${MEMORY_BUILD_ARGS[@]}" \
   -t "herdr-engineering:$TAG" "$WORK" >/dev/null
 
 # Use this checkout's helper, not the target commit's possibly older deploy tooling.
@@ -371,6 +404,13 @@ compose_run() {
   local tree="$1" envf="$2" tag="$3" commit="$4"; shift 4
   local files=(-f "$tree/deploy/control-plane/compose.yaml")
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
+  if [ "$MEMORY_ENABLED" = 1 ]; then
+    if [ ! -f "$tree/deploy/control-plane/compose.memory.yaml" ]; then
+      echo "enabled memory requires compose.memory.yaml in the selected commit" >&2
+      return 1
+    fi
+    files+=(-f "$tree/deploy/control-plane/compose.memory.yaml")
+  fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
     HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
@@ -501,6 +541,7 @@ prev_render() {
 if [ "$RESTORED" = 1 ] \
     && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
     && prev_render \
+    && MEMORY_ENABLED="$(memory_enabled "$PREV_WORK" "$PREV_CONFIG")" \
     && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
     && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
     && verify "$PREV_SHA"; then

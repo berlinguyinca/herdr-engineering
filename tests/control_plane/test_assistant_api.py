@@ -587,21 +587,21 @@ def test_tool_loop_executes_read_memory_executor():
     assert "no executor" not in tool_msg["content"]
 
 
-def test_open_listener_identity_headers_share_one_operator_scope():
+def test_open_listener_preserves_legacy_operator_namespace_views():
     service = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}))
+    legacy = service.create_assistant(tenant_id="default", user_id="operator", name="Existing UI profile")
     svr = ControlPlaneServer(ControlPlaneRepo(), assistant_service=service)
     thread = threading.Thread(target=svr.serve, daemon=True)
     thread.start()
     svr.wait_until_ready()
     client = Client(svr.port)
     try:
-        status, body = client.post("/api/v1/assistants", {"name": "Open operator"},
-                                   headers={"X-Herdr-User": "one", "X-Herdr-Tenant": "one"})
-        assert status == 201
-        aid = json.loads(body)["assistant_id"]
-        status, body = client.get(f"/api/v1/assistants/{aid}",
-                                  headers={"X-Herdr-User": "two", "X-Herdr-Tenant": "two"})
+        status, body = client.get(f"/api/v1/assistants/{legacy.assistant_id}",
+                                  headers={"X-Herdr-User": "operator", "X-Herdr-Tenant": "default"})
         assert status == 200
+        assert json.loads(body)["user_id"] == "operator"
+        status, body = client.post("/api/v1/assistants", {"name": "CLI operator"})
+        assert status == 201
         assert json.loads(body)["user_id"] == "open-listener"
         assert json.loads(body)["tenant_id"] == "default"
     finally:

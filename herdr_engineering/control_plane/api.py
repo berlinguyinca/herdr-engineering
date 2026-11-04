@@ -195,6 +195,23 @@ def _content_length(raw):
     return int(raw) if raw.isascii() and raw.isdigit() and len(raw) <= 9 else None
 
 
+def _valid_memory_origin(value):
+    """Strict origin syntax, also used to validate an HTTP Host authority."""
+    if (not isinstance(value, str) or not value or len(value) > 2048
+            or any(ord(char) <= 32 or ord(char) == 127 for char in value)
+            or '\\' in value or '%' in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        parsed.port  # Reject malformed and out-of-range ports.
+        return bool(parsed.scheme in {'http', 'https'} and parsed.hostname
+                    and not parsed.username and not parsed.password
+                    and not parsed.path and not parsed.query and not parsed.fragment
+                    and not parsed.netloc.endswith(':'))
+    except ValueError:
+        return False
+
+
 class _RateLimiter:
     """Tiny in-memory per-client sliding-window limiter (best-effort).
 
@@ -254,7 +271,8 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
-                 assistant_service=None, assistant_config=None):
+                 assistant_service=None, assistant_config=None, memory_gateway=None,
+                 memory_dashboard_origins=()):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -302,6 +320,7 @@ class ControlPlaneServer:
             github_monitor = build_monitor(github_pg_dsn)
         self.github_monitor = github_monitor
         self.dispatcher = dispatcher or self._dispatch_native_message
+        self.memory_gateway = memory_gateway
         if source is not None:
             from .bridge import load_into
             load_into(repo, source)
@@ -407,6 +426,11 @@ class ControlPlaneServer:
         # collab service, so the local owner needs no sign-in.
         self.collab_operator_url = collab_operator_url.rstrip("/") if collab_operator_url else None
         self.collab_dashboard_hosts = frozenset(h.lower() for h in collab_dashboard_hosts)
+        if (not isinstance(memory_dashboard_origins, (list, tuple))
+                or len(memory_dashboard_origins) > 32
+                or not all(_valid_memory_origin(origin) for origin in memory_dashboard_origins)):
+            raise ValueError('memory dashboard origins must be explicit HTTP(S) origins')
+        self.memory_dashboard_origins = frozenset(memory_dashboard_origins)
         # "Let the agent fix this" on a dead session: start a text-only helper through the collab
         # service's summary-fix room (it answers 409 helper_unavailable when none is configured).
         from .summary_fix import http_helper_spawner, inprocess_helper_spawner
@@ -672,6 +696,11 @@ class ControlPlaneServer:
             h["capabilities"].append("collab_v1")
         if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
             h["capabilities"].append("assistant_v1")
+        if self.memory_gateway is not None:
+            h["capabilities"].append("memory_registry_v1")
+            memory_health = getattr(self.memory_gateway, "health", None)
+            if memory_health:
+                h['memory'] = memory_health()
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
@@ -691,6 +720,10 @@ class ControlPlaneServer:
 
     # ------------------------------------------------------------- server
     def serve(self):
+        if not self.collab_only and self.memory_gateway is not None:
+            start_memory = getattr(self.memory_gateway, 'start', None)
+            if start_memory:
+                start_memory()
         if self.collab_only:
             # No operator listener at all: this process serves the public collab surface only.
             self._httpd = _DaemonThreadingServer(
@@ -799,6 +832,10 @@ class ControlPlaneServer:
         if self._httpd:
             self._httpd.shutdown()
             self._httpd.server_close()
+        if self.memory_gateway is not None:
+            close_memory = getattr(self.memory_gateway, 'close', None)
+            if close_memory:
+                close_memory()
 
 
 def _fabric_session(repo, inst):
@@ -1263,6 +1300,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._operator()
             if public:
                 return self._public()
+            if self._is_memory_native_path():
+                return self._memory_native()
             if self._is_federation_path():
                 return self._federation()
             if self._is_collab_path():
@@ -1289,6 +1328,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._operator()
             if public:
                 return self._public()
+            if self._is_memory_native_path():
+                return self._memory_native()
             if self._is_federation_path():
                 return self._federation()        # read-only: answers the same 404 as everything else
             # Unambiguous framing, as on the public/operator listeners: this server reads
@@ -1341,6 +1382,18 @@ def _make_handler(server, public=False, operator=False):
         def do_DELETE(self):
             return self._timed_request(self._mutate_verb)
 
+        def do_PUT(self):
+            return self._timed_request(self._memory_put)
+
+        def _memory_put(self):
+            if operator:
+                return self._operator()
+            if public:
+                return self._public()
+            if self._is_memory_native_path():
+                return self._memory_native()
+            return self._deny(501, "not implemented")
+
         _ASSISTANT_MUTABLE_RESOURCES = {"assistants", "assistant-runs",
                                         "assistant-approvals", "assistant-memory",
                                         "assistant-routines", "assistant-connectors",
@@ -1351,6 +1404,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._operator()
             if public:
                 return self._public()
+            if self._is_memory_native_path():
+                return self._memory_native()
             if self._is_federation_path():
                 return self._federation()
             if self._is_collab_path():
@@ -1375,6 +1430,96 @@ def _make_handler(server, public=False, operator=False):
         # ------------------------------------------------ fleet config (hosts)
         def _path_only(self):
             return self.path.split("?")[0].rstrip("/")
+
+        def _is_memory_native_path(self):
+            path = self.path.split("?")[0]
+            prefixes = ("/api/v1/assistant-memory/hindsight", "/api/v1/assistant-memory/operator")
+            return (any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
+                    or path == "/api/v1/assistant-memory/domains")
+
+        def _memory_native(self):
+            """Private provider alias; its scoped bearer never grants operator access."""
+            gateway = server.memory_gateway
+            if gateway is None:
+                return self._deny(404, "not found")
+            from .assistant_memory_gateway import GatewayError
+            lengths = self.headers.get_all("Content-Length") or []
+            authorization = self.headers.get_all("Authorization") or []
+            length = _content_length(lengths[0] if lengths else None)
+            if (len(lengths) > 1 or len(authorization) > 1
+                    or "Transfer-Encoding" in self.headers or length is None
+                    or (self.command == "GET" and length != 0)):
+                return self._deny(400, "ambiguous request framing")
+            operator_path = self.path.split('?')[0]
+            operator_request = (operator_path == '/api/v1/assistant-memory/domains'
+                                or operator_path == '/api/v1/assistant-memory/operator'
+                                or operator_path.startswith('/api/v1/assistant-memory/operator/'))
+            if operator_request:
+                # This proxy can act as the private owner without a browser
+                # credential. Reuse the collaboration dashboard trust boundary.
+                hosts = self.headers.get_all('Host') or []
+                origins = self.headers.get_all('Origin') or []
+                if (len(hosts) != 1 or not _valid_memory_origin('http://' + hosts[0])
+                        or not _dashboard_host_ok(
+                        hosts[0], server.collab_dashboard_hosts)):
+                    return self._deny(404, 'not found')
+                # This listener is plaintext. TLS termination requires an exact
+                # operator-configured external origin, never forwarded headers.
+                allowed_origins = server.memory_dashboard_origins or {'http://' + hosts[0]}
+                unsafe_origin = bool(origins and (len(origins) != 1
+                    or not _valid_memory_origin(origins[0])
+                    or origins[0] not in allowed_origins
+                    or urlsplit(origins[0]).netloc != hosts[0]))
+                if unsafe_origin:
+                    return self._deny(403, 'cross-origin memory request refused')
+                if self.command in {'POST', 'PUT', 'PATCH'} or length:
+                    content_types = self.headers.get_all('Content-Type') or []
+                    if (len(content_types) != 1 or content_types[0].split(';', 1)[0].strip()
+                            != 'application/json'):
+                        return self._deny(415, 'mutations require application/json')
+            if operator_request and self._require('operator'):
+                return
+            try:
+                actor = (gateway("authorize_operator", self._principal()) if operator_request else
+                         gateway("authorize", authorization[0] if authorization else ""))
+            except GatewayError as error:
+                return self._deny(error.status, error.message)
+            except Exception:
+                return self._deny(503, "memory registry unavailable")
+            if length > 128 * 1024:
+                return self._deny(413, "memory request too large")
+            if self.path.split('?')[0] == '/api/v1/assistant-memory/domains':
+                if self.command != 'GET':
+                    return self._deny(405, 'method not allowed')
+                try:
+                    return self._json({'domains': gateway('operator_domains', actor)})
+                except GatewayError as error:
+                    return self._json({'error': error.message}, error.status)
+                except Exception:
+                    return self._json({'error': 'memory registry unavailable'}, 503)
+            previous_timeout = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(10)
+                body = self._read_json(128 * 1024) if length else None
+                if body is not None and not isinstance(body, dict):
+                    return self._deny(400, "memory request must be an object")
+            except (ValueError, TimeoutError, OSError):
+                return self._deny(400, "invalid memory request body")
+            finally:
+                try:
+                    self.connection.settimeout(previous_timeout)
+                except OSError:
+                    pass
+            prefix = ("/api/v1/assistant-memory/operator" if operator_request else
+                      "/api/v1/assistant-memory/hindsight")
+            path = self.path[len(prefix):] or "/"
+            try:
+                status, response = gateway("native", self.command, path, body, actor)
+                return self._json(response, status)
+            except GatewayError as error:
+                return self._json({"error": error.message}, error.status)
+            except Exception:
+                return self._json({"error": "memory registry unavailable"}, 503)
 
         def _fleet_host(self, cfg):
             """Host id owning the X-Host-Token in ``cfg``, or None. Never reveals why.
@@ -2655,11 +2800,15 @@ def _make_handler(server, public=False, operator=False):
 
         # ------------------------------------------------------------ assistant
         # Herdr Personal Assistant (P1/P2). Canonical owner: server.assistant.
-        # Assistant ownership follows the server-authenticated API-key principal.
-        # Legacy open listeners share one operator identity; neither that identity
-        # nor client-supplied identity headers establish human approval authority.
+        # Keyed ownership follows the server-authenticated principal. In the
+        # explicitly trusted open-operator mode, retain legacy namespace selectors
+        # so existing UI/CLI profiles remain visible; they are not authentication
+        # or a multi-user isolation boundary. Neither mode proves human approval.
         # Collaboration Bearer/Agent authentication belongs to its own dispatch.
         def _assistant_scope(self):
+            if not server._keys:
+                return (self.headers.get("X-Herdr-Tenant") or "default",
+                        self.headers.get("X-Herdr-User") or self._principal()["id"])
             return "default", self._principal()["id"]
 
         def _assistant_get(self, parts, resource):

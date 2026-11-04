@@ -21,6 +21,7 @@ import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArchitecture } from './architecture-view.js';
 import { mountPersonalAssistant } from './personal-assistant-view.js';
+import { mountSharedMemory } from './shared-memory-view.js';
 import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -93,6 +94,7 @@ const NAV = [
   { path: '/publications', label: 'Publications' },
   { path: '/scheduling', label: 'Scheduling' },
   { path: '/handoffs', label: 'Handoffs' },
+  { path: '/memory', label: 'Memory' },
   { path: '/personal-assistant', label: 'Personal Assistant', capability: 'assistant_v1' },
 ];
 
@@ -157,6 +159,7 @@ const ROUTES = {
   '/local-services': viewServices,
   '/services/:id': viewService,
   '/hosts': viewHosts,
+  '/memory': viewMemory,
   '/personal-assistant': viewPersonalAssistant,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
@@ -203,6 +206,13 @@ function matchRoute(parts) {
     if (rp.length !== parts.length) return false;
     return rp.every((rpseg, i) => rpseg.startsWith(':') || rpseg === parts[i]);
   }) || '/overview';
+}
+
+function viewMemory() {
+  root.innerHTML = `${liveHead('<h1>Memory</h1>')}<div id="shared-memory"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  return ownPolling(mountSharedMemory(root.querySelector('#shared-memory'), client,
+    { onFreshness: (ok, message) => chip.touch(ok, message) }));
 }
 
 async function viewPersonalAssistant() {
