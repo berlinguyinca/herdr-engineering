@@ -9,8 +9,9 @@ Routes (all under ``/api/v1/artifacts/``; none takes an artifact id in the path,
 * ``GET tombstoned`` lists tombstoned artifacts; ``GET delete-access`` tells the caller whether it is an owner.
 
 Who may call: only an *owner*. With API keys configured that is an ``operator`` key whose short digest (the one in the
-principal ``api-key:<digest>:operator``) is listed in YAML ``control_plane.artifact_delete.owner_key_digests``; on an
-open (keyless) listener the operator is the owner. Every other caller (other operators, creators, members, viewers) is
+principal ``api-key:<digest>:operator``) is listed in YAML ``control_plane.artifact_delete.owner_key_digests``. A keyless
+listener has no keys to list: its operator is an owner only when YAML ``control_plane.artifact_delete.allow_keyless_owner``
+is true (default false), because a keyless listener is reachable by DNS rebinding. Every other caller (other operators, creators, members, viewers) is
 refused with a fixed 404 that does not depend on any id, so nothing is revealed. Creators and members keep ``retract``.
 
 Any store failure is one fixed 503 body; the driver text stays in the server log.
@@ -21,6 +22,8 @@ import hashlib
 import logging
 import re
 import secrets
+from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 from .artifact_lifecycle import DEFAULT_HOLD_DAYS, MAX_BULK, MAX_REASON
@@ -31,33 +34,76 @@ _ID = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
 _KEY = re.compile(r"[A-Za-z0-9_.:-]{1,120}")
 _DIGEST = re.compile(r"[0-9a-f]{16}")
 _DELETE_FIELDS = frozenset({"ids", "mode", "reason", "hold_days", "request_key", "confirm", "override_legal_hold"})
-_RESTORE_FIELDS = frozenset({"ids", "request_key"})
+_RESTORE_FIELDS = frozenset({"ids", "request_key", "override_legal_hold"})
 _MAX_HOLD_DAYS = 3650
+_KEYLESS_ACTOR = "keyless:operator"
 _BAD = {"error": "invalid request"}
 _UNAVAILABLE = {"error": "artifact store unavailable"}
 
 
-def owner_digests_config(raw: object) -> frozenset[str]:
-    """``control_plane.artifact_delete`` as a set of owner key digests; ``ValueError`` names the bad YAML key."""
+class DeleteOwners(NamedTuple):
+    digests: frozenset[str]
+    allow_keyless: bool
+
+
+def owner_digests_config(raw: object) -> DeleteOwners:
+    """``control_plane.artifact_delete`` as owner key digests plus the keyless opt-in; ``ValueError`` names the bad key."""
     if raw is None:
-        return frozenset()
-    if not isinstance(raw, dict) or set(raw) - {"owner_key_digests"}:
-        raise ValueError("control_plane.artifact_delete must be a mapping with only owner_key_digests")
+        return DeleteOwners(frozenset(), False)
+    if not isinstance(raw, dict) or set(raw) - {"owner_key_digests", "allow_keyless_owner"}:
+        raise ValueError("control_plane.artifact_delete must be a mapping with only owner_key_digests and "
+                         "allow_keyless_owner")
     digests = raw.get("owner_key_digests") or []
     if not isinstance(digests, list) or not all(isinstance(d, str) and _DIGEST.fullmatch(d) for d in digests):
         raise ValueError("control_plane.artifact_delete.owner_key_digests must be a list of 16-hex-digit key digests")
-    return frozenset(digests)
+    keyless = raw.get("allow_keyless_owner", False)
+    if not isinstance(keyless, bool):
+        raise ValueError("control_plane.artifact_delete.allow_keyless_owner must be true or false")
+    return DeleteOwners(frozenset(digests), keyless)
 
 
 def is_owner(handler, server) -> bool:
-    """True for an operator on an open listener, or an operator key whose digest the YAML lists as an owner."""
+    """An operator key whose digest the YAML lists, or the operator of a keyless listener that opted in."""
     if handler._role() != "operator":
         return False
     if not server._keys:
-        return True
+        return bool(getattr(server, "artifact_delete_allow_keyless_owner", False))
     supplied = handler.headers.get("X-API-Key", "")
     digest = hashlib.sha256(supplied.encode()).hexdigest()[:16]
     return any(secrets.compare_digest(digest, owner) for owner in getattr(server, "artifact_delete_owners", ()))
+
+
+def _actor(handler, server) -> str:
+    """The audit actor: the key principal, or ``keyless:operator`` so a keyless owner is not mistaken for a key."""
+    return handler._resource_principal() if server._keys else _KEYLESS_ACTOR
+
+
+def revoke_shares(handler, server, artifact_id: str, actor: str) -> int | None:
+    """Revoke every pending or live share of the artifact and remove its bundle. Returns how many were revoked, or
+    ``None`` when sharing could not be fully revoked (the delete stands; repeat it to retry)."""
+    store, root = getattr(server, "share_store", None), getattr(server, "shares_root", None)
+    if store is None or root is None:
+        return 0
+    from .artifact_share_api import _call
+    from .share_bundle import remove_bundle, remove_state
+    revoked = 0
+    try:
+        for share in _call(store, "list_for_artifact", artifact_id):
+            if share.get("state") == "revoked":
+                continue
+            full = _call(store, "get", share["share_id"]) or share
+            if full.get("token_hash"):
+                remove_state(Path(root), full["token_hash"])        # first: the link stops working at once
+            _call(store, "mark_revoked", share["share_id"], actor=actor)
+            latest = _call(store, "get", share["share_id"]) or {}
+            if latest.get("token_hash") and latest["token_hash"] != full.get("token_hash"):
+                remove_state(Path(root), latest["token_hash"])
+            remove_bundle(Path(root), share["share_id"])
+            revoked += 1
+    except Exception:                                   # noqa: BLE001 - reported as None, detail stays in the log
+        _LOG.exception("revoking the shares of %s failed", artifact_id)
+        return None
+    return revoked
 
 
 class _Bad(ValueError):
@@ -99,10 +145,10 @@ def _parse_delete(body: dict) -> dict:
     if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON:
         raise _Bad("reason")
     hold = body.get("hold_days", DEFAULT_HOLD_DAYS)
-    if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not 0 <= hold <= _MAX_HOLD_DAYS:
+    if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not 1 <= hold <= _MAX_HOLD_DAYS:
         raise _Bad("hold_days")
     override = body.get("override_legal_hold", False)
-    if not isinstance(override, bool) or (override and mode != "purge_now"):
+    if not isinstance(override, bool):
         raise _Bad("override_legal_hold")
     if mode == "purge_now" and body.get("confirm") != str(len(ids)):
         raise _Bad("confirm")
@@ -114,6 +160,8 @@ def _public(result: dict) -> dict:
     """A result row without storage keys: counts only."""
     row = {"artifact_id": result["artifact_id"], "result": result["result"], "reason": result.get("reason"),
            "replayed": bool(result.get("replayed"))}
+    if result.get("shares") is not None:
+        row["shares_revoked"] = result["shares"]
     if "deleted" in result:
         row["objects_deleted"] = len(result["deleted"])
         row["objects_kept_shared"] = len(result["retained_shared"])
@@ -142,6 +190,7 @@ def route_delete(handler, server, parts, resource) -> bool:
         handler._json({"owner": owner})
         return True
     if not owner:
+        _LOG.warning("artifact delete route %s refused for a non-owner (%s)", name, _who(handler))
         handler._deny(404, "not found")
         return True
     origin = handler.headers.get("Origin")
@@ -153,7 +202,10 @@ def route_delete(handler, server, parts, resource) -> bool:
         try:
             body = _body(handler, _DELETE_FIELDS if name == "delete" else _RESTORE_FIELDS)
             args = _parse_delete(body) if name == "delete" else {
-                "ids": _ids(body.get("ids")), "request_key": _request_key(body.get("request_key"))}
+                "ids": _ids(body.get("ids")), "request_key": _request_key(body.get("request_key")),
+                "override": body.get("override_legal_hold", False) is True}
+            if name == "restore" and body.get("override_legal_hold", False) not in (True, False):
+                raise _Bad("override_legal_hold")
         except _Bad as exc:
             if str(exc) == "content type":
                 handler._deny(415, "artifact requests require application/json")
@@ -163,25 +215,39 @@ def route_delete(handler, server, parts, resource) -> bool:
     if server.artifact_store is None:
         handler._json(_UNAVAILABLE, 503)
         return True
-    actor = handler._resource_principal()
+    actor = _actor(handler, server)
     try:
         if name == "tombstoned":
             handler._json({"artifacts": handler._artifact_call("list_tombstoned")})
-        elif name == "restore":
-            rows = [_public(r) for r in handler._artifact_call(
-                "restore_many", args["ids"], actor=actor, request_key=args["request_key"])]
-            _LOG.info("artifact restore by %s: %s", actor, _summary(rows))
-            handler._json({"results": rows, "summary": _summary(rows)})
+            return True
+        if name == "restore":
+            raw = handler._artifact_call("restore_many", args["ids"], actor=actor, request_key=args["request_key"],
+                                         override_legal_hold=args["override"])
         else:
-            rows = [_public(r) for r in handler._artifact_call(
+            raw = handler._artifact_call(
                 "delete_many", args["ids"], mode=args["mode"], actor=actor, reason=args["reason"],
-                request_key=args["request_key"], hold_days=args["hold_days"],
-                override_legal_hold=args["override"])]
-            _LOG.info("artifact %s by %s: %s", args["mode"], actor, _summary(rows))
-            handler._json({"mode": args["mode"], "results": rows, "summary": _summary(rows)})
+                request_key=args["request_key"], hold_days=args["hold_days"], override_legal_hold=args["override"])
     except ArtifactError:
         handler._json(_BAD, 400)
+        return True
     except Exception:
         _LOG.exception("artifact delete store call failed")
         handler._json(_UNAVAILABLE, 503)
+        return True
+    if all(r["result"] == "error" for r in raw):            # nothing could be done: the store is down
+        _LOG.error("artifact delete: every id failed in the store")
+        handler._json(_UNAVAILABLE, 503)
+        return True
+    if name == "delete":
+        for row in raw:
+            if row["result"] in ("tombstoned", "deleted", "already_purged"):
+                row["shares"] = revoke_shares(handler, server, row["artifact_id"], actor)
+    rows = [_public(r) for r in raw]
+    _LOG.info("artifact %s by %s: %s", args.get("mode", "restore"), actor, _summary(rows))
+    handler._json({**({"mode": args["mode"]} if name == "delete" else {}), "results": rows, "summary": _summary(rows)})
     return True
+
+
+def _who(handler) -> str:
+    supplied = handler.headers.get("X-API-Key", "")
+    return "api-key:" + hashlib.sha256(supplied.encode()).hexdigest()[:16] if supplied else "no key"

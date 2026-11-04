@@ -14,7 +14,7 @@ from .artifact_uploads import MAX_PART_BYTES
 
 _LINK_FIELDS = {"task_id", "project_id", "issue_ref", "room_id", "link_kind", "version_id", "source_event_id"}
 _UPLOAD_FIELDS = {"filename", "media_type", "size_bytes", "sha256", "part_size"}
-_LIFECYCLE_FIELDS = {"reason", "request_key", "legal_hold"}
+_LIFECYCLE_FIELDS = {"reason", "request_key", "legal_hold", "override_legal_hold"}
 _NUMBER = re.compile(r"^[0-9]{1,6}$")
 
 
@@ -90,7 +90,25 @@ def route_registry(handler, server, parts, resource):
     artifact_id = parts[4]
     needed = ("read" if (links and method == "GET") else
               "admin" if (lifecycle or history) else "edit")
-    if not _access(handler, artifact_id, needed):
+    if lifecycle or history:
+        # tombstone and restore-from-tombstone are DELETE operations: owner only (a creator or admin grantee keeps
+        # retract). archive is a reversible hide that loses nothing, so admin on the artifact still suffices for it.
+        from .artifact_delete_api import is_owner
+        owner = is_owner(handler, server)
+        try:
+            tombstoned = action == "restore" and handler._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
+        except Exception:                                   # noqa: BLE001 - a dead store answers like any other call
+            tombstoned = False
+        if history:
+            allowed = owner or _access(handler, artifact_id, needed)
+        elif action == "tombstone" or tombstoned:
+            allowed = owner
+        else:
+            allowed = _access(handler, artifact_id, needed)
+        if not allowed:
+            handler._deny(404, "not found")
+            return True
+    elif not _access(handler, artifact_id, needed):
         handler._deny(404, "not found")
         return True
 
@@ -140,7 +158,13 @@ def route_registry(handler, server, parts, resource):
         kwargs = {"actor": principal, "reason": body.get("reason") or "", "request_key": body.get("request_key")}
         if action == "tombstone":
             kwargs["legal_hold"] = bool(body.get("legal_hold", False))
-        handler._json(handler._artifact_call(f"{action}_artifact", artifact_id, **kwargs))
+        if action in {"tombstone", "restore"}:
+            kwargs["override_legal_hold"] = bool(body.get("override_legal_hold", False))
+        result = handler._artifact_call(f"{action}_artifact", artifact_id, **kwargs)
+        if action == "tombstone":
+            from .artifact_delete_api import revoke_shares
+            result["shares_revoked"] = revoke_shares(handler, server, artifact_id, principal)
+        handler._json(result)
         return True
 
     # resumable uploads

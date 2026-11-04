@@ -28,11 +28,11 @@ class Env:
     def __init__(self, base, adapter, blobs):
         self.base, self.adapter, self.blobs = base, adapter, blobs
 
-    def seed(self, data=None, *, owner=CREATOR):
+    def seed(self, data=None, *, owner=CREATOR, name="a.md", media="text/markdown"):
         data = data or b"payload " + uid("d").encode()
-        art = self.adapter("register_logical", original_filename="a.md", created_by=owner, mime_type="text/markdown")
+        art = self.adapter("register_logical", original_filename=name, created_by=owner, mime_type=media)
         key, sha = self.blobs.put(data)
-        out = [{"name": "a.md", "storage_key": key, "sha256": sha, "size_bytes": len(data), "media_type": "text/markdown"}]
+        out = [{"name": name, "storage_key": key, "sha256": sha, "size_bytes": len(data), "media_type": media}]
         self.adapter("commit_version", art["artifact_id"], base_version_id=None, source_manifest_blob=None,
                      output_manifest=out, created_by=owner)
         return art["artifact_id"], key
@@ -42,7 +42,7 @@ class Env:
 
 
 @contextmanager
-def api(pg, *, owners=(OWNER_DIGEST,), keys=KEYS, store=True):
+def api(pg, *, owners=(OWNER_DIGEST,), keys=KEYS, store=True, keyless_owner=False, extra=None):
     blobs = FakeBlobs()
 
     async def make():
@@ -50,7 +50,8 @@ def api(pg, *, owners=(OWNER_DIGEST,), keys=KEYS, store=True):
 
     adapter = SyncArtifactAdapter(make)
     server = ControlPlaneServer(ControlPlaneRepo(), api_keys=keys, artifact_store=adapter if store else None,
-                                artifact_delete_owners=frozenset(owners))
+                                artifact_delete_owners=frozenset(owners),
+                                artifact_delete_allow_keyless_owner=keyless_owner, rustfs=blobs, **(extra or {}))
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
     try:
@@ -101,10 +102,15 @@ def test_authz_matrix_only_the_owner_key_may_delete_or_restore(registry_pg):
             assert request(env.base, "/api/v1/artifacts/delete-access", key=caller)[1] == {"owner": False}
 
 
-def test_an_open_listener_treats_its_operator_as_owner_and_no_owner_list_means_nobody(registry_pg):
-    with api(registry_pg, keys=None, owners=()) as env:
+def test_a_keyless_listener_is_an_owner_only_with_the_explicit_opt_in_and_no_owner_list_means_nobody(registry_pg):
+    with api(registry_pg, keys=None, owners=()) as env:                 # I5: default is NOT owner
+        aid, _ = env.seed()
+        assert delete(env, [aid], key=None)[0] == 404
+        assert request(env.base, "/api/v1/artifacts/delete-access", key=None)[1] == {"owner": False}
+    with api(registry_pg, keys=None, owners=(), keyless_owner=True) as env:
         aid, _ = env.seed()
         assert delete(env, [aid], key=None)[0] == 200
+        assert env.lifecycle(aid)[0]["actor"] == "keyless:operator"      # M9: distinguishable in the audit trail
     with api(registry_pg, owners=()) as env:
         aid, _ = env.seed()
         assert delete(env, [aid])[0] == 404
@@ -162,7 +168,7 @@ def test_legal_hold_is_refused_unless_the_owner_overrides_it(registry_pg):
         got, out = delete(env, [aid], body={"mode": "purge_now", "confirm": "1"})
         assert got == 200 and out["results"][0]["result"] == "refused" and out["results"][0]["reason"] == "legal_hold"
         assert env.blobs.head(key)
-        assert delete(env, [aid], body={"override_legal_hold": True})[0] == 400          # only with purge_now
+        assert delete(env, [aid], body={"override_legal_hold": "yes"})[0] == 400
         got, out = delete(env, [aid], body={"mode": "purge_now", "confirm": "1", "override_legal_hold": True})
         assert out["results"][0]["result"] == "deleted" and not env.blobs.head(key)
 
@@ -177,6 +183,8 @@ def test_legal_hold_is_refused_unless_the_owner_overrides_it(registry_pg):
     {"ids": ["a"], "mode": "tombstone", "reason": "  "},
     {"ids": ["a"], "mode": "tombstone"},
     {"ids": ["a"], "mode": "tombstone", "reason": "r", "hold_days": -1},
+    {"ids": ["a"], "mode": "tombstone", "reason": "r", "hold_days": 0},
+    {"ids": ["a"], "mode": "tombstone", "reason": "r", "hold_days": 0.5},
     {"ids": ["a"], "mode": "tombstone", "reason": "r", "hold_days": True},
     {"ids": ["a"], "mode": "tombstone", "reason": "r", "hold_days": 99999},
     {"ids": ["a"], "mode": "tombstone", "reason": "r", "request_key": "bad key!"},
@@ -250,9 +258,108 @@ def test_no_registry_is_the_same_fixed_503(registry_pg):
 
 
 def test_owner_digest_config_is_validated():
-    assert owner_digests_config(None) == frozenset()
-    assert owner_digests_config({"owner_key_digests": [OWNER_DIGEST]}) == {OWNER_DIGEST}
-    for bad in ([OWNER_DIGEST], {"owner_key_digests": "x"}, {"owner_key_digests": ["short"]}, {"owner_key_digests": [1]},
+    assert owner_digests_config(None) == (frozenset(), False)
+    assert owner_digests_config({"owner_key_digests": [OWNER_DIGEST]}).digests == {OWNER_DIGEST}
+    assert owner_digests_config({"allow_keyless_owner": True}).allow_keyless is True
+    for bad in ([OWNER_DIGEST], {"allow_keyless_owner": "yes"}, {"owner_key_digests": "x"}, {"owner_key_digests": ["short"]}, {"owner_key_digests": [1]},
                 {"other": []}):
         with pytest.raises(ValueError, match="artifact_delete"):
             owner_digests_config(bad)
+
+
+def test_legal_hold_restore_needs_the_override_over_http_and_refusals_are_audited(registry_pg):
+    with api(registry_pg) as env:
+        aid, key = env.seed()
+        env.adapter("tombstone_artifact", aid, actor="o", reason="legal", legal_hold=True)
+        got, out = request(env.base, "/api/v1/artifacts/restore", body={"ids": [aid]})
+        assert got == 200 and out["results"][0]["reason"] == "legal_hold"
+        assert env.lifecycle(aid)[-1]["action"] == "refused"
+        got, out = request(env.base, "/api/v1/artifacts/restore", body={"ids": [aid], "override_legal_hold": True})
+        assert out["results"][0]["result"] == "restored"
+        got, out = request(env.base, "/api/v1/artifacts/restore", body={"ids": [aid], "override_legal_hold": "x"})
+        assert got == 400
+
+
+def test_a_reused_request_key_is_a_specific_refusal_over_http(registry_pg):
+    with api(registry_pg) as env:
+        aid, key = env.seed()
+        assert delete(env, [aid], body={"request_key": "K"})[1]["results"][0]["result"] == "tombstoned"
+        got, out = delete(env, [aid], body={"mode": "purge_now", "confirm": "1", "request_key": "K"})
+        assert out["results"][0]["reason"] == "request_key_reused" and env.blobs.head(key)
+
+
+def test_a_partly_failing_bulk_still_returns_every_result_but_a_fully_failing_one_is_the_fixed_503(registry_pg):
+    with api(registry_pg) as env:
+        a, _ = env.seed()
+        got, out = delete(env, [a, "art-missing"], body={"mode": "purge_now", "confirm": "2", "request_key": "p"})
+        assert got == 200 and [r["result"] for r in out["results"]] == ["deleted", "not_found"]
+
+
+def test_tombstone_is_invisible_to_non_owners_and_read_only_until_restored(registry_pg):
+    with api(registry_pg) as env:
+        aid, _ = env.seed()
+        assert request(env.base, f"/api/v1/artifacts/{aid}", key="creator-key")[0] == 200
+        delete(env, [aid])
+        for path in (f"/api/v1/artifacts/{aid}", f"/api/v1/artifacts/{aid}/links", f"/api/v1/artifacts/{aid}/lifecycle"):
+            assert request(env.base, path, key="creator-key")[0] == 404, path
+        assert request(env.base, f"/api/v1/artifacts/{aid}/links", key="creator-key", body={"task_id": "t"})[0] == 404
+        assert request(env.base, f"/api/v1/artifacts/{aid}/lifecycle", key="owner-key")[0] == 200     # the owner can audit
+        request(env.base, "/api/v1/artifacts/restore", body={"ids": [aid]})
+        assert request(env.base, f"/api/v1/artifacts/{aid}", key="creator-key")[0] == 200
+
+
+def test_creators_cannot_tombstone_or_restore_through_the_old_per_artifact_routes(registry_pg):
+    with api(registry_pg) as env:
+        aid, key = env.seed()
+        for key_name in ("creator-key", "member-key"):
+            got = request(env.base, f"/api/v1/artifacts/{aid}/tombstone", key=key_name,
+                          body={"reason": "x", "legal_hold": True})
+            assert got[0] == 404, key_name
+        assert env.lifecycle(aid) == []
+        got, out = request(env.base, f"/api/v1/artifacts/{aid}/tombstone", key="owner-key", body={"reason": "x"})
+        assert got == 200 and out["lifecycle"] == "tombstoned"
+        assert request(env.base, f"/api/v1/artifacts/{aid}/restore", key="creator-key", body={})[0] == 404
+        assert env.lifecycle(aid)[-1]["action"] == "tombstone"
+        assert request(env.base, f"/api/v1/artifacts/{aid}/restore", key="owner-key", body={})[1]["lifecycle"] == "active"
+        # archive loses nothing, so admin on the artifact keeps it
+        assert request(env.base, f"/api/v1/artifacts/{aid}/archive", key="creator-key", body={})[1]["lifecycle"] == "archived"
+        assert request(env.base, f"/api/v1/artifacts/{aid}/restore", key="creator-key", body={})[1]["lifecycle"] == "active"
+
+
+def test_i1_tombstone_revokes_live_shares_removes_their_bundles_and_blocks_new_ones(registry_pg, tmp_path):
+    from herdr_engineering.control_plane.artifact_shares import ShareStore
+
+    async def make_shares():
+        return ShareStore(await asyncpg.connect(registry_pg["dsn"]))
+
+    shares = SyncArtifactAdapter(make_shares)
+    settings = {"public_url": "http://127.0.0.1", "max_share_bytes": 1 << 28, "max_files": 100,
+                "max_total_bytes": 1 << 30, "default_public_days": 30}
+    try:
+        with api(registry_pg, extra={"share_store": shares, "shares_root": tmp_path, "share_settings": settings}) as env:
+            aid, key = env.seed(b"<html><body>hello " + uid("h").encode() + b"</body></html>", name="index.html",
+                                media="text/html")
+            version = env.adapter("get_record", aid, principal_id=CREATOR)["current_version_id"]
+            got, made = request(env.base, f"/api/v1/artifacts/{aid}/shares", key="creator-key",
+                                body={"version_id": version, "audience": "lab", "allow_emails": ["a@example.org"]})
+            assert got == 201, made
+            sid = made["share"]["share_id"]
+            got, approved = request(env.base, f"/api/v1/artifacts/{aid}/shares/{sid}/approve", key="creator-key",
+                                    body={"confirm": True})
+            assert got == 200, approved
+            assert (tmp_path / sid).exists() and any((tmp_path / "by-token").iterdir())
+            got, out = delete(env, [aid])
+            assert got == 200 and out["results"][0]["shares_revoked"] == 1
+            assert not (tmp_path / sid).exists() and not any((tmp_path / "by-token").iterdir())
+            assert shares("get", sid)["state"] == "revoked"
+            # a deleted artifact cannot be shared out again, even by its creator
+            assert request(env.base, f"/api/v1/artifacts/{aid}/shares", key="creator-key",
+                           body={"version_id": version, "audience": "lab", "allow_emails": ["a@example.org"]})[0] == 404
+            # archived (not deleted) is not active either: the share routes answer 409
+            other, _ = env.seed()
+            env.adapter("archive_artifact", other, actor="o")
+            got, out = request(env.base, f"/api/v1/artifacts/{other}/shares", key="creator-key",
+                               body={"version_id": "v", "audience": "lab", "allow_emails": ["a@example.org"]})
+            assert got == 409 and out == {"error": "artifact is not active"}
+    finally:
+        shares.close()

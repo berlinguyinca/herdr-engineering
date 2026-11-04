@@ -252,11 +252,13 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                     if existing is not None:
                         return existing
             artifact = await self._conn.fetchrow(
-                "SELECT artifact_id, current_version_id, artifact_type FROM artifacts "
+                "SELECT artifact_id, current_version_id, artifact_type, lifecycle FROM artifacts "
                 "WHERE artifact_id=$1 FOR UPDATE", artifact_id,
             )
             if artifact is None:
                 raise ArtifactError(f"no artifact {artifact_id}")
+            if artifact["lifecycle"] == "tombstoned":
+                raise ArtifactError("artifact is deleted: restore it before committing a new version")
             if artifact.get("artifact_type") == "report" and report_descriptor is None:
                 raise ArtifactError("report artifact versions require a report descriptor")
             if idempotency_key:
@@ -438,6 +440,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                 return replay
             if artifact["lifecycle"] == "retracted":
                 raise ArtifactError("artifact is retracted: commit a new artifact instead")
+            if artifact["lifecycle"] == "tombstoned":
+                raise ArtifactError("artifact is deleted: restore it before merging")
             head_id = artifact["current_version_id"]
             base = await self.get_version(base_version_id, artifact_id)
             if base is None:
@@ -616,9 +620,9 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         if not principal_id or permission not in {"read", "edit", "review", "share", "admin"}:
             return False
         artifact = await self._conn.fetchrow(
-            "SELECT created_by FROM artifacts WHERE artifact_id=$1", artifact_id)
-        if artifact is None:
-            return False
+            "SELECT created_by, lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if artifact is None or artifact["lifecycle"] == "tombstoned":
+            return False            # a deleted artifact is invisible and read-only to everyone; the owner restores it first
         if artifact.get("created_by") == principal_id:
             return True
         grant = await self._conn.fetchrow(
@@ -784,6 +788,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             reason = REPORT_READ_ONLY
         elif artifact["lifecycle"] == "retracted":
             reason = "artifact is retracted"
+        elif artifact["lifecycle"] == "tombstoned":
+            reason = "artifact is deleted"
         elif head is None:
             reason = "artifact has no head version"
         elif head["is_report"] or head["built"]:
@@ -969,7 +975,7 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
 
     async def get_record(self, artifact_id: str, *, principal_id: str) -> dict | None:
         row = await self._conn.fetchrow(
-            "SELECT a.* FROM artifacts a WHERE a.artifact_id=$1 AND "
+            "SELECT a.* FROM artifacts a WHERE a.artifact_id=$1 AND a.lifecycle<>'tombstoned' AND "
             "(a.created_by=$2 OR EXISTS (SELECT 1 FROM artifact_acl acl "
             "WHERE acl.artifact_id=a.artifact_id AND acl.principal_id=$2 "
             "AND (acl.expires_at IS NULL OR acl.expires_at > now()) "
@@ -1162,6 +1168,10 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
     async def load_retractions(self) -> list[dict]:
         rows = await self._conn.fetch(
             "SELECT artifact_id, NULL::text AS version_id FROM artifacts WHERE lifecycle='retracted' "
+            # a retracted artifact that was then tombstoned (or purged) stays retracted: the tombstone remembers it
+            "UNION SELECT a.artifact_id, NULL::text FROM artifacts a WHERE a.lifecycle='tombstoned' AND ("
+            " SELECT e.from_state FROM artifact_lifecycle_events e WHERE e.artifact_id=a.artifact_id "
+            " AND e.action='tombstone' ORDER BY e.event_id DESC LIMIT 1)='retracted' "
             "UNION ALL SELECT artifact_id, version_id FROM artifact_versions WHERE state='retracted'")
         return [self._row(row) for row in rows]
 

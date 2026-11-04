@@ -64,16 +64,18 @@ test('the owner selects, deletes, sees the deleted view, restores, and nothing o
     assert.deepEqual([sent.mode, sent.ids.length], ['tombstone', 2]);
     assert.ok(Object.values(await blobs()).every(Boolean), 'a restorable delete keeps every byte');
     await page.locator('[data-artifact-view]').selectOption('deleted');
-    await page.locator('[data-artifact-results] tbody tr').nth(1).waitFor();
+    await page.locator('[data-artifact-results] th', { hasText: 'Purge after' }).waitFor();
+    await page.waitForFunction(() => document.querySelectorAll('[data-artifact-results] tbody tr').length === 2);
     assert.equal(await rows(page).count(), 2);
     assert.equal(await page.locator('[data-artifact-restore]').isVisible(), true);
     assert.equal(await page.locator('[data-artifact-purge]').isVisible(), false);
     await pick(page, 'alpha.md').check();
     await page.locator('[data-artifact-restore]').click();
     await page.locator('[data-artifact-action-state]', { hasText: '1 restored.' }).waitFor();
+    await page.waitForFunction(() => document.querySelectorAll('[data-artifact-results] tbody tr').length === 1);
     assert.equal(await rows(page).count(), 1);
     await page.locator('[data-artifact-view]').selectOption('active');
-    await page.locator('[data-artifact-results] tbody tr').nth(3).waitFor();
+    await page.waitForFunction(() => document.querySelectorAll('[data-artifact-results] tbody tr').length === 4);
     assert.equal(await rows(page).count(), 4);
     assert.ok(await overflow() <= 1);
   });
@@ -107,7 +109,7 @@ test('delete permanently needs the typed count and then really removes the bytes
     assert.equal(stored[fixture.ids['delta.md']], false);
     assert.equal(stored[fixture.ids['alpha.md']], true);
     await page.locator('[data-artifact-view]').selectOption('deleted');
-    await page.locator('[data-artifact-results] tbody tr').nth(1).waitFor();
+    await page.locator('[data-artifact-results] tbody tr', { hasText: '(purged)' }).first().waitFor();
     assert.equal(await page.locator('[data-artifact-select]:not([disabled])').count(), 0, 'purged rows cannot be restored');
   });
 });
@@ -142,5 +144,18 @@ test('a dead store shows one fixed message and changes nothing', async () => {
     const text = await status.textContent();
     assert.doesNotMatch(text, /connection|closed|SQLSTATE|asyncpg|503/i);
     assert.ok(Object.values(await blobs()).every(Boolean));
+  });
+});
+
+test('changing the search prunes hidden selections so the typed count is only what is on screen', async () => {
+  await withDelete(async ({ page, fixture }) => {
+    await openList(page, fixture.base);
+    await pick(page, 'alpha.md').check();
+    await pick(page, 'beta.md').check();
+    await page.locator('[data-artifact-query]').fill('beta');
+    await page.locator('[data-artifact-results] tbody tr').nth(0).waitFor();
+    await page.waitForFunction(() => document.querySelectorAll('[data-artifact-results] tbody tr').length === 1);
+    await page.locator('[data-artifact-purge]').click();
+    assert.equal(await page.locator('[data-artifact-purge-count]').textContent(), '1');
   });
 });

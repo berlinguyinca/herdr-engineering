@@ -97,7 +97,8 @@ def main() -> None:
     server = ControlPlaneServer(
         ControlPlaneRepo(), host="127.0.0.1", port=0, web_root=ROOT / "packages", artifact_store=adapter,
         api_keys={owner_key: "operator", viewer_key: "viewer"} if keyed else None,
-        artifact_delete_owners=frozenset({hashlib.sha256(owner_key.encode()).hexdigest()[:16]}))
+        artifact_delete_owners=frozenset({hashlib.sha256(owner_key.encode()).hexdigest()[:16]}),
+        artifact_delete_allow_keyless_owner=not keyed)      # the open fixture opts in; a keyed one lists its owner
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
 

@@ -51,7 +51,7 @@ def test_purge_now_needs_yes_and_never_reaches_the_server_without_it(registry_pg
 def test_flag_combinations_and_ids_are_checked_before_any_request(registry_pg, capsys):
     with api(registry_pg) as env:
         a, _ = env.seed()
-        assert cli(env, "delete", a, "--override-legal-hold") == 2
+        assert cli(env, "delete", a, "--hold-days", "0") == 2
         assert cli(env, "delete", a, "--purge-now", "--yes", "--hold-days", "3") == 2
         assert cli(env, "delete", "bad/id") == 2
         assert env.lifecycle(a) == []
@@ -79,3 +79,18 @@ def test_an_unreachable_server_is_one_error_without_the_key(registry_pg, capsys,
     assert main(["artifacts", "delete", "a1", "--control-plane", "http://127.0.0.1:1",
                  "--api-key-env", "TEST_OWNER_KEY"]) == 1
     assert "super-secret-owner-key" not in capsys.readouterr().err
+
+
+def test_the_override_flag_reaches_restore_and_a_reused_key_is_reported(registry_pg, capsys):
+    with api(registry_pg) as env:
+        a, ka = env.seed()
+        env.adapter("tombstone_artifact", a, actor="o", reason="legal", legal_hold=True)
+        assert cli(env, "restore", a) == 0
+        row = lines(capsys)[0][0]
+        assert row["result"] == "refused" and row["reason"] == "legal_hold"
+        assert cli(env, "restore", a, "--override-legal-hold") == 0
+        assert lines(capsys)[0][0]["result"] == "restored"
+        assert cli(env, "delete", a, "--request-key", "K") == 0
+        capsys.readouterr()
+        assert cli(env, "delete", a, "--purge-now", "--yes", "--request-key", "K") == 0
+        assert lines(capsys)[0][0]["reason"] == "request_key_reused" and env.blobs.head(ka)

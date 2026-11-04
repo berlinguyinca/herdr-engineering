@@ -36,10 +36,11 @@ def _plan(args):
         return f"not an artifact id: {bad[0][:60]!r}"
     key = args.request_key or uuid.uuid4().hex
     if args.artifacts_command == "restore":
-        return [("/api/v1/artifacts/restore", {"ids": chunk, "request_key": f"{key}-{n}"})
+        return [("/api/v1/artifacts/restore", {"ids": chunk, "request_key": f"{key}-{n}",
+                                               **({"override_legal_hold": True} if args.override_legal_hold else {})})
                 for n, chunk in enumerate(_batches(ids))]
-    if args.override_legal_hold and not args.purge_now:
-        return "--override-legal-hold only applies with --purge-now"
+    if args.hold_days is not None and args.hold_days < 1:
+        return "--hold-days must be at least 1; use --purge-now --yes to delete at once"
     if args.purge_now and not args.yes:
         return f"--purge-now deletes the bytes of {len(ids)} artifact(s) for good; repeat the command with --yes to confirm"
     if args.hold_days is not None and args.purge_now:
@@ -54,6 +55,8 @@ def _plan(args):
                 body["override_legal_hold"] = True
         elif args.hold_days is not None:
             body["hold_days"] = args.hold_days
+        if args.override_legal_hold and not args.purge_now:
+            body["override_legal_hold"] = True
         plan.append(("/api/v1/artifacts/delete", body))
     return plan
 
@@ -101,8 +104,9 @@ def add_delete_subparsers(asub):
     d.add_argument("--hold-days", type=int, help="days a tombstone stays restorable before the worker purges it (default 30)")
     d.add_argument("--purge-now", action="store_true", help="skip the hold and delete the bytes now; needs --yes")
     d.add_argument("--yes", action="store_true", help="confirm --purge-now")
-    d.add_argument("--override-legal-hold", action="store_true", help="with --purge-now: also purge artifacts on legal hold")
+    d.add_argument("--override-legal-hold", action="store_true", help="act on artifacts under legal hold (re-delete, or with --purge-now purge)")
     r = asub.add_parser("restore", help="owner: restore tombstoned artifacts whose bytes are not yet purged")
-    r.set_defaults(artifacts_command="restore", purge_now=False, yes=False, override_legal_hold=False, hold_days=None,
+    r.set_defaults(artifacts_command="restore", purge_now=False, yes=False, hold_days=None,
                    reason=None)
     common(r)
+    r.add_argument("--override-legal-hold", action="store_true", help="restore artifacts under legal hold (recorded)")

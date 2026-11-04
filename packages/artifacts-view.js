@@ -23,7 +23,7 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
   const ownerBar = q('[data-artifact-owner]'), actionState = q('[data-artifact-action-state]'), purgeForm = q('[data-artifact-purge-form]');
   const selected = new Set();
   let owner = false, view = 'active';
-  const SUMMARY = { not_found: 'not found', refused: 'refused', already_purged: 'already purged' };
+  const SUMMARY = { not_found: 'not found', refused: 'refused', already_purged: 'already purged', error: 'failed' };
   const syncOwner = () => {
     const count = selected.size, deleted = view === 'deleted';
     ownerBar.hidden = !owner;
@@ -43,7 +43,7 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
   // One fixed message for every failure: the server's text is never shown.
   const act = async (run, verb) => {
     actionState.textContent = 'Working…';
-    for (const button of ownerBar.querySelectorAll('button')) button.disabled = true;
+    for (const button of [...ownerBar.querySelectorAll('button'), ...purgeForm.querySelectorAll('button')]) button.disabled = true;
     try {
       const out = await run();
       selected.clear();
@@ -53,7 +53,7 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
       await render({ replace: true });
       announce(out?.results, verb);
       return;
-    } catch { actionState.textContent = 'That did not work. Nothing was confirmed; reload and try again.'; }
+    } catch { actionState.textContent = 'That did not work. Some changes may have been applied; reload to see the current state.'; }
     syncOwner();
   };
   const render = async ({ replace = false } = {}) => {
@@ -89,6 +89,7 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
         });
       if (disposed || current !== generation) return;
       if (!Array.isArray(artifacts)) throw new Error('Invalid artifact registry response');
+      { const visible = new Set(artifacts.map(a => a.artifact_id)); for (const id of [...selected]) if (!visible.has(id)) selected.delete(id); }
       morph(results, artifacts.length ? `<div class="hd-table-wrap"><table class="hd-table"><thead><tr>${owner ? '<th><span class="visually-hidden">Select</span></th>' : ''}<th>Name</th><th>Type</th><th>Size</th><th>Status</th><th>Created</th></tr></thead><tbody>${artifacts.map(artifact => `<tr>${owner ? `<td><input type="checkbox" data-artifact-select value="${esc(artifact.artifact_id)}" aria-label="Select ${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}"${selected.has(artifact.artifact_id) ? ' checked' : ''}></td>` : ''}<td><a href="#/artifacts/${encodeURIComponent(artifact.artifact_id)}">${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}</a></td><td>${esc(artifact.artifact_type || 'other')}</td><td>${artifact.size_bytes == null ? '—' : humanSize(artifact.size_bytes)}</td><td>${esc(artifact.status || '—')}</td><td>${esc(artifact.created_at || 'unknown')}</td></tr>`).join('')}</tbody></table></div>` : '<herdr-empty message="No artifacts match the current filters"></herdr-empty>');
       loaded = true; syncOwner();
       state.textContent = artifacts.length === 100 ? 'Showing the first 100 artifacts. Refine the search to narrow results.' : '';
