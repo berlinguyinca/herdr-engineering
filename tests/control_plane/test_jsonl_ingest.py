@@ -106,3 +106,36 @@ def test_rotation_waits_for_rotate_bytes_then_drains_and_deletes_after_grace(tmp
     assert run(ing.ingest_and_rotate(f, m, rotate_bytes=4, now=t0, grace=30)) == 1
     assert not rotated.exists()                                   # drained and quiet for > grace
     assert [p for p, _ in sink.rows] == ["a", "b", "late"]
+
+
+# --- a deterministic non-poison error must be visible, not silent (final opus review m2) --------------------------
+
+class Flaky(Sink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.broken = True
+
+    async def store(self, conn: object, parsed: str, key: str) -> bool:
+        if parsed == "b" and self.broken:
+            raise TypeError("malformed record")
+        return await super().store(conn, parsed, key)
+
+
+def test_a_stuck_line_logs_a_warning_with_a_consecutive_counter_and_clears_on_progress(tmp_path: Path, caplog) -> None:
+    import logging
+
+    import pytest
+    sink, f, m = Flaky(), tmp_path / "e.jsonl", tmp_path / "m.json"
+    f.write_bytes(b"a\nb\nc\n")
+    ing = sink.ingestor()
+    with caplog.at_level(logging.WARNING, logger="herdr_engineering.control_plane.jsonl_ingest"):
+        for attempt in (1, 2, 3):
+            with pytest.raises(TypeError):
+                run(ing.ingest_file(f, m))
+            assert ing.consecutive_aborts(f) == attempt
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(messages) == 3 and "offset 2" in messages[0] and "3 consecutive" in messages[2], messages
+    assert "malformed record" not in " ".join(messages)           # the line's content never reaches a log
+    sink.broken = False
+    assert run(ing.ingest_file(f, m)) == 2                       # a is a replay (same key); b and c are new
+    assert ing.consecutive_aborts(f) == 0

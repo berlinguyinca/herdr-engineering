@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import stat
 import tempfile
@@ -34,6 +35,8 @@ INGEST_ROUNDS = 64
 # What marks ONE line as unusable. Transient server errors are deliberately absent: swallowing them would lose a
 # user's accepted comment for good.
 _POISON = (asyncpg.DataError, asyncpg.IntegrityConstraintViolationError, UnicodeError, ValueError)
+
+_log = logging.getLogger(__name__)
 
 ParseLine = Callable[[bytes], Any | None]
 StoreLine = Callable[[Any, Any, str], Awaitable[bool]]
@@ -114,6 +117,20 @@ class JsonlIngestor:
         self._max_line_bytes = max_line_bytes
         self._max_ingest_bytes = max_ingest_bytes
         self._open = opener
+        self._aborts: dict[str, tuple[int, int]] = {}      # path -> (absolute offset of the failing line, consecutive aborts)
+
+    def consecutive_aborts(self, path: Path) -> int:
+        """How many passes in a row aborted on the same line of ``path`` (0 when the last pass made progress)."""
+        return self._aborts.get(str(path), (0, 0))[1]
+
+    def _note_abort(self, path: Path, offset: int, error: BaseException) -> None:
+        """Operator-visible: a non-poison error aborts the pass and, if it repeats at one offset, wedges the stream.
+        Only the offset, the error class and a counter are logged -- never the line."""
+        last_offset, count = self._aborts.get(str(path), (-1, 0))
+        count = count + 1 if last_offset == offset else 1
+        self._aborts[str(path)] = (offset, count)
+        _log.warning("ingest of %s aborted at offset %d (%s), %d consecutive; the marker did not move, so a "
+                     "deterministic error here stalls every later line", path.name, offset, type(error).__name__, count)
 
     async def ingest_file(self, path: Path, marker: Path) -> int:
         """Ingest complete lines appended to ``path`` since the last run; returns rows inserted."""
@@ -204,6 +221,9 @@ class JsonlIngestor:
                                         inserted += 1
                             except _POISON:
                                 pass  # poison line (bad data, violated constraint): skipped, but consumed below
+                            except Exception as error:
+                                self._note_abort(path, position, error)
+                                raise
                             # anything else (lock or statement timeout, deadlock, serialization, shutdown, lost
                             # connection) propagates: the pass aborts, the marker stays and the next tick retries
                         position += len(raw)
@@ -215,4 +235,5 @@ class JsonlIngestor:
                 return 0, drained, offset, mtime
             new_offset = offset + consumed
             _write_marker(marker, handle, new_offset, skipping)
+            self._aborts.pop(str(path), None)
         return inserted, drained, new_offset, mtime
