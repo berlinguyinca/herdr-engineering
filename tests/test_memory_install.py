@@ -383,6 +383,83 @@ def test_doctor_reports_the_client_version_the_cli_advertises(home):
     assert check["status"] == "warn" and "0.1.2" in check["detail"] and "pinned" in check["detail"]
 
 
+# ---- server probe needs a project (herdr-engineering#571) ------------------
+
+def write_client_config(home, config: dict) -> Path:
+    cfg_dir = home / ".config" / "herdr-memory"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg = cfg_dir / "config.json"
+    cfg.write_text(json.dumps(config))
+    return cfg
+
+
+def _project_config(*, default=None, extra_project=False):
+    projects = {"canary": {"credentials": {"pi": "~/.config/herdr-memory/canary-pi.key"}}}
+    if extra_project:
+        projects["personal"] = {"credentials": {"pi": "~/.config/herdr-memory/personal-pi.key"}}
+    config = {"url": "https://memory.example", "projects": projects}
+    if default:
+        config["default_project"] = default
+    return config
+
+
+def healthy_run(seen):
+    def run(argv, timeout=5.0):
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout='{"healthy": true, "outbox_pending": 0}',
+                                           stderr="")
+    return run
+
+
+def error_run(argv, timeout=5.0):
+    return subprocess.CompletedProcess(argv, 0, stdout='{"error": "Current directory has no '
+                                          'configured project; use --project"}', stderr="")
+
+
+def test_server_probe_passes_the_only_configured_project(home):
+    write_client_config(home, _project_config())
+    seen: list = []
+    i = mi.MemoryInstaller(home, command=CMD, which=which_all, run=healthy_run(seen))
+    check = _check(i.doctor(["claude"]), "server")
+    assert check["status"] == "ok"
+    assert check["data"]["project"] == "canary"
+    assert check["data"]["project_source"] == "only configured project"
+    argv = seen[-1]
+    assert argv[argv.index("--project") + 1] == "canary"
+    assert argv[-1] == "status"
+
+
+def test_server_probe_prefers_default_project(home):
+    write_client_config(home, _project_config(default="personal", extra_project=True))
+    seen: list = []
+    i = mi.MemoryInstaller(home, command=CMD, which=which_all, run=healthy_run(seen))
+    check = _check(i.doctor(["claude"]), "server")
+    assert check["data"]["project"] == "personal"
+    assert check["data"]["project_source"] == "default_project"
+
+
+def test_server_probe_reports_when_no_project_is_resolvable(home):
+    """Several projects and no default: say why, instead of pretending the server is fine."""
+    write_client_config(home, _project_config(extra_project=True))
+    i = mi.MemoryInstaller(home, command=CMD, which=which_all, run=error_run)
+    check = _check(i.doctor(["claude"]), "server")
+    assert check["status"] == "unknown"
+    assert "no project to report on" in check["detail"]
+    assert "default_project" in check["detail"]
+    assert check["data"]["project"] is None
+    assert "no configured project" in check["data"]["error"]
+
+
+def test_probe_project_never_invents_an_unconfigured_project(home):
+    cfg = write_client_config(home, _project_config(default="typo"))
+    assert mi.MemoryInstaller.probe_project(cfg)[1] == "only configured project"
+    cfg.write_text(json.dumps(_project_config(default="typo", extra_project=True)))
+    project, reason = mi.MemoryInstaller.probe_project(cfg)
+    assert project is None and "default_project" in reason
+    missing = home / ".config" / "herdr-memory" / "absent.json"
+    assert mi.MemoryInstaller.probe_project(missing) == (None, "client config unreadable")
+
+
 # ---- CLI -------------------------------------------------------------------
 def test_cli_install_dry_run_and_json(home, monkeypatch, capsys):
     monkeypatch.setattr("shutil.which", which_only("claude"))

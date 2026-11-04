@@ -59,21 +59,37 @@ needs `herdr-memory` on PATH and a project config, and depends on the P01 contra
 
 ## Pin
 
-`lock/upstreams.yaml` pins `herdr-memory` at `b3c5074` (contract v1, private repo); the same
-value is `memory_install.PINNED_REVISION` and a test keeps them equal. The installed
-manifest records the pin used. `scripts/install.sh --with-memory` installs the harness
-adapters only; the herdr-memory package itself must be installed at the pinned revision.
+`lock/upstreams.yaml` pins `herdr-memory` at `89a8529` (client `0.1.3`, contract v1, private
+repo); the same value is `memory_install.PINNED_REVISION` and a test keeps them equal.
+`memory_install.PINNED_CLIENT_VERSION` is the release `herdr-memory --version` is expected to
+report. The installed manifest records the pin used. `scripts/install.sh --with-memory`
+installs the harness adapters only; the herdr-memory package itself must be installed at the
+pinned revision - bumping the pin changes the managed-block marker, so every host needs
+`herdr-eng memory upgrade` afterwards.
 
 ## Doctor
 
 `herdr-eng memory doctor` (also folded into `herdr-eng doctor` once a managed install
 exists) reports: per-unit config validity and drift; manifest pin vs current pin;
-installed `herdr-memory` revision vs pin (from pip `direct_url.json`; `unknown` if
-unknowable); credential files named in `~/.config/herdr-memory/config.json`
-(`projects.*.credentials`, `scopes.*.credentials`) must be mode 0600 in a 0700 parent
-(contents are never read); and server health through `herdr-memory status`. Health is
-`unknown` when the CLI is absent, unreachable, or does not report `healthy` - it is never
-assumed healthy.
+installed `herdr-memory` revision vs pin - read from the install that **owns the CLI**
+(`<prefix>/lib/python*/site-packages/herdr_memory-*.dist-info/direct_url.json`), because
+the wrapper's interpreter usually cannot import the client; `client_version` vs
+`PINNED_CLIENT_VERSION`; the last unattended controller update (`fleet_update`, see
+[`fleet-lifecycle.md`](fleet-lifecycle.md)); credential files named in
+`~/.config/herdr-memory/config.json` (`projects.*.credentials`, `scopes.*.credentials`)
+must be mode 0600 in a 0700 parent (contents are never read); and server health through
+`herdr-memory status`. Health is `unknown` when the CLI is absent, unreachable, or does not
+report `healthy` - it is never assumed healthy.
+
+Because `herdr-memory status` resolves its project from the current directory, `doctor`
+resolves one to ask with (`default_project`, else the only configured project) and passes
+`--project`; the check reports which project it probed and how it was chosen
+(`project`, `project_source`). When neither is resolvable it says so
+(`no project to report on: no default_project and 2 projects configured; ...`) instead of
+reporting `UNKNOWN server` as if the server were broken
+([herdr-engineering#571](https://github.com/berlinguyinca/herdr-engineering/issues/571)).
+Memory itself is unreachable from unmapped directories unless `default_project` is set in
+the client config - see `herdr-memory` `docs/client.md`.
 
 ## Known limits
 
