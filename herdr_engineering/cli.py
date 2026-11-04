@@ -4015,6 +4015,11 @@ def _cmd_cp_web(args) -> int:
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
+    try:
+        from .control_plane.artifact_delete_api import owner_digests_config
+        artifact_delete_owners = owner_digests_config(cp.get("artifact_delete"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     collab_grant_store, collab_artifacts_enabled = _collab_grant_wiring(cp, dsn)
     collab = None
     artifact_bridge = None
@@ -4143,7 +4148,7 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
-                             annotation_store=annotation_store,
+                             annotation_store=annotation_store, artifact_delete_owners=artifact_delete_owners,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read

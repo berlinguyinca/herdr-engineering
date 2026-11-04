@@ -312,6 +312,7 @@ class ControlPlaneServer:
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None,
+                 artifact_delete_owners=frozenset(),
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None):
         """
@@ -452,6 +453,8 @@ class ControlPlaneServer:
         self.share_settings = share_settings
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
+        # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
+        self.artifact_delete_owners = frozenset(artifact_delete_owners)
         # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
         self.collab_grant_store = collab_grant_store
         self.collab_artifacts_enabled = collab_artifacts_enabled
@@ -3072,6 +3075,9 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_delete_api import route_delete
+                if route_delete(self, server, parts, resource):
+                    return None
                 from .artifact_collab_api import route_collab
                 if route_collab(self, server, parts, resource):
                     return None
