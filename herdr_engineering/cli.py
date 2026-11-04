@@ -3502,13 +3502,9 @@ def _annotation_wiring(cp: dict, dsn: str | None):
     if not isinstance(share, dict) or share.get("enabled") is not True or not dsn:
         return None
     from .control_plane import artifact_adapter
-    from .control_plane.artifact_annotations import AnnotationStore
+    from .control_plane.artifact_annotation_api import ReconnectingAnnotationStore
 
-    async def create_annotation_store():
-        import asyncpg
-        return AnnotationStore(await asyncpg.connect(dsn))
-
-    return artifact_adapter.SyncArtifactAdapter(create_annotation_store)
+    return artifact_adapter.SyncArtifactAdapter(lambda: ReconnectingAnnotationStore(dsn))
 
 
 def _share_wiring(cp: dict, dsn: str | None):

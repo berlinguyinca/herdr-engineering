@@ -12,12 +12,16 @@ Every id and query value from the URL is untrusted and checked here before it ca
 """
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
+from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+import asyncpg
+
 from .annotation_anchor import ANNOTATION_ID_RE
-from .artifact_annotations import MAX_LIST, STATUSES, AnnotationError
+from .artifact_annotations import MAX_LIST, STATUSES, AnnotationError, AnnotationStore
 from .artifact_report_api import _access
 from .artifact_share_api import _call, _jsonable
 
@@ -28,6 +32,44 @@ _CURSOR = re.compile(r"(?P<at>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]
 _QUERY_KEYS = frozenset({"status", "limit", "before"})
 _YEARS = range(2000, 3000)
 _DEFAULT_LIMIT = 200
+_LOG = logging.getLogger(__name__)
+_CONNECTION_ERRORS = (asyncpg.InterfaceError, asyncpg.PostgresConnectionError, asyncpg.ConnectionDoesNotExistError, OSError)
+
+
+class ReconnectingAnnotationStore:
+    """``AnnotationStore`` on one lazily opened connection that is dropped on a connection error and reopened by the next call.
+
+    Runs on the ``SyncArtifactAdapter`` thread (calls are serialised there), so no locking is needed.
+    """
+
+    def __init__(self, dsn: str) -> None:
+        self._dsn = dsn
+        self._conn: Any = None
+
+    async def _store(self) -> AnnotationStore:
+        if self._conn is None or self._conn.is_closed():
+            self._conn = await asyncpg.connect(self._dsn)
+        return AnnotationStore(self._conn)
+
+    async def _run(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await getattr(await self._store(), method)(*args, **kwargs)
+        except _CONNECTION_ERRORS:
+            conn, self._conn = self._conn, None
+            if conn is not None:
+                conn.terminate()
+            raise
+
+    async def list_for_artifact(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._run("list_for_artifact", *args, **kwargs)
+
+    async def dismiss(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._run("dismiss", *args, **kwargs)
+
+    async def close(self) -> None:
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
 
 
 class _BadRequest(ValueError):
@@ -63,6 +105,21 @@ def _query(raw: str) -> tuple[str, int, str | None]:
         if stamp is None or stamp.tzinfo is None or stamp.year not in _YEARS:
             raise _BadRequest("before is not a cursor returned by this API")
     return status, limit, before
+
+
+def _guarded(handler, server, method: str, *args: Any, **kwargs: Any) -> tuple[bool, Any]:
+    """``(True, result)``, or ``(False, None)`` after a fixed uniform 503 for any failure but ``AnnotationError``.
+
+    The driver's message and traceback stay in the server log; the client never sees them.
+    """
+    try:
+        return True, _call(server.annotation_store, method, *args, **kwargs)
+    except AnnotationError:
+        raise
+    except Exception:
+        _LOG.exception("annotation store call %s failed", method)
+        handler._json({"error": "annotation store unavailable"}, 503)
+        return False, None
 
 
 def _store_missing(server) -> bool:
@@ -106,11 +163,14 @@ def _list(handler, server, artifact_id: str) -> None:
         handler._json({"error": str(exc)}, 400)
         return
     try:
-        rows, cursor = _call(server.annotation_store, "list_for_artifact", artifact_id, status=status, limit=limit,
-                             before=before)
+        done, page = _guarded(handler, server, "list_for_artifact", artifact_id, status=status, limit=limit,
+                              before=before)
     except AnnotationError as exc:
         handler._json({"error": exc.code}, 400)
         return
+    if not done:
+        return
+    rows, cursor = page
     handler._json({"artifact_id": artifact_id, "annotations": _jsonable(rows), "next": cursor})
 
 
@@ -131,9 +191,14 @@ def _dismiss(handler, server, artifact_id: str, annotation_id: str) -> None:
         handler._json({"error": "dismiss takes an empty JSON object"}, 400)
         return
     try:
-        row = _call(server.annotation_store, "dismiss", artifact_id, annotation_id, actor=handler._resource_principal())
+        done, row = _guarded(handler, server, "dismiss", artifact_id, annotation_id,
+                             actor=handler._resource_principal())
     except AnnotationError as exc:
-        status = {"not_found": 404, "not_open": 409}.get(exc.code, 400)
-        handler._json({"error": "not found" if status == 404 else exc.code}, status)
+        if exc.code == "not_found":
+            handler._deny(404, "not found")
+        else:
+            handler._json({"error": exc.code}, {"not_open": 409}.get(exc.code, 400))
+        return
+    if not done:
         return
     handler._json({"annotation": _jsonable(row)})

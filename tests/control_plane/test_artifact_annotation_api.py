@@ -14,6 +14,7 @@ import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.artifact_adapter import SyncArtifactAdapter
+from herdr_engineering.control_plane.artifact_annotation_api import ReconnectingAnnotationStore
 from herdr_engineering.control_plane.artifact_annotations import AnnotationStore
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane import registry_pg as _registry_pg_module
@@ -45,7 +46,7 @@ class Permissions:
 @contextmanager
 def api(pg):
     perms = Permissions()
-    adapter = SyncArtifactAdapter(lambda: _store(pg["dsn"]))
+    adapter = SyncArtifactAdapter(lambda: ReconnectingAnnotationStore(pg["dsn"]))
     server = ControlPlaneServer(ControlPlaneRepo(), api_keys={"owner-key": "operator", "other-key": "operator"},
                                 artifact_store=perms, annotation_store=adapter)
     threading.Thread(target=server.serve, daemon=True).start()
@@ -55,10 +56,6 @@ def api(pg):
     finally:
         server.shutdown()
         adapter.close()
-
-
-async def _store(dsn):
-    return AnnotationStore(await asyncpg.connect(dsn))
 
 
 def request(base, path, *, key="owner-key", body=None, headers=None, method=None, raw=None):
@@ -286,3 +283,42 @@ def test_cli_annotation_wiring_is_off_unless_shares_are_enabled():
     assert cli._annotation_wiring({}, "postgresql:///x") is None
     assert cli._annotation_wiring({"share": {"enabled": False}}, "postgresql:///x") is None
     assert cli._annotation_wiring({"share": {"enabled": True}}, None) is None
+
+
+def test_a_dead_connection_is_a_uniform_503_and_the_next_request_recovers(registry_pg):
+    aid, _share, ids = with_rows(registry_pg, ingest_rows(1))
+
+    async def kill_backends():
+        conn = await asyncpg.connect(registry_pg["dsn"])
+        try:
+            await conn.fetch("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                             "WHERE datname = current_database() AND pid <> pg_backend_pid()")
+        finally:
+            await conn.close()
+    with api(registry_pg) as (base, perms):
+        perms.owned.add(aid)
+        assert request(base, listing(aid))[0] == 200                      # opens the connection
+        asyncio.run(kill_backends())
+        bodies = []
+        status, body = request(base, listing(aid))
+        bodies.append(body)
+        assert status in (200, 503)
+        if status == 503:
+            assert body == {"error": "annotation store unavailable"}
+        asyncio.run(kill_backends())
+        status, body = request(base, dismiss_path(aid, ids[0]), body={})
+        bodies.append(body)
+        assert status in (200, 503)
+        status, body = request(base, listing(aid, "?status=all"))
+        assert status == 200 and [a["annotation_id"] for a in body["annotations"]] == ids
+        for text in map(json.dumps, bodies):
+            assert "connection" not in text.lower() and "terminat" not in text.lower()
+
+
+def test_an_unknown_annotation_404_is_the_same_denial_as_an_unknown_artifact(registry_pg):
+    aid, _share, _ids = with_rows(registry_pg, ingest_rows(1))
+    with api(registry_pg) as (base, perms):
+        perms.owned.add(aid)
+        known = request(base, dismiss_path(aid, ann_id(77)), body={})
+        assert known == (404, {"error": "not found"})
+        assert request(base, dismiss_path("art_unknown", ann_id(77)), body={}) == known

@@ -17,14 +17,15 @@ test('listArtifactAnnotations defaults to open and encodes ids, status and curso
   const { client, calls } = recorder();
   const controller = new AbortController();
   await client.listArtifactAnnotations('a/1');
+  await client.listArtifactAnnotations('a/1', { before: null });
   await client.listArtifactAnnotations('a/1', { status: 'withdrawn', before: '2026-10-30T10:00:00+00:00|ann_x', signal: controller.signal });
   const base = 'http://h/api/v1/artifacts/a%2F1/annotations';
   assert.deepEqual(calls.map(c => [c.method, c.url]), [
-    ['GET', `${base}?status=open`],
+    ['GET', `${base}?status=open`], ['GET', `${base}?status=open`],
     ['GET', `${base}?status=withdrawn&before=2026-10-30T10%3A00%3A00%2B00%3A00%7Cann_x`],
   ]);
   assert.equal(calls[0].body, undefined);
-  assert.equal(calls[1].signal, controller.signal);
+  assert.equal(calls[2].signal, controller.signal);
 });
 
 test('dismissArtifactAnnotation POSTs an empty object to the encoded dismiss path', async () => {
