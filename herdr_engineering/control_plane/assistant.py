@@ -2132,6 +2132,8 @@ class AssistantStore:
     def add_judge_record(self, record: JudgeRecord) -> bool:
         """Store a record; exactly one per (tenant, request). False when the request already has one."""
         with self._lock:
+            if record.record_id in self.judge_records:
+                return False                      # never overwrite, whichever user wrote it
             if self._judge_by_request(record.tenant_id, record.user_id, record.request_id) is not None:
                 return False
             self._bounded_put(self.judge_records, self._judge_index, record.tenant_id, record.record_id,
@@ -2158,10 +2160,14 @@ class AssistantStore:
         bad = set(changes) - self._JUDGE_LABEL_FIELDS
         if bad:
             raise ValueError(f"not a judge label field: {sorted(bad)}")
+        if changes.get("owner_decision", "") not in ("", "approved", "denied"):
+            raise ValueError("owner_decision must be '', 'approved' or 'denied'")
         with self._lock:
             r = self._judge_by_request(tenant_id, user_id, request_id)
             if r is None:
                 return False
+            if changes.get("owner_decision") and r.owner_decision:
+                return False                      # the first owner label wins
             for name, value in changes.items():
                 setattr(r, name, value)
             self._after_mutation()

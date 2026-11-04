@@ -93,8 +93,13 @@ class ShadowRecorder:
             return False
 
     def start(self) -> None:
+        self._ensure_thread(self._enabled())
+
+    def _ensure_thread(self, enabled: bool) -> None:
+        if not enabled:
+            return
         with self._cond:
-            if self._stopped or self._thread is not None or not self._enabled():
+            if self._stopped or (self._thread is not None and self._thread.is_alive()):
                 return
             self._thread = threading.Thread(target=self._run, name="assistant-shadow-judge", daemon=True)
             self._thread.start()
@@ -108,10 +113,15 @@ class ShadowRecorder:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
 
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
     def submit(self, job: ShadowJob) -> bool:
-        if not self._enabled():
+        enabled = self._enabled()          # the config is read once, outside our condition lock
+        if not enabled:
             return False
-        self.start()
+        self._ensure_thread(enabled)
         with self._cond:
             if self._stopped:
                 return False
@@ -143,11 +153,13 @@ class ShadowRecorder:
         if self._store.get_judge_record_by_request(job.tenant_id, job.user_id, job.request_id) is not None:
             return
         base = JudgeRecord(
-            record_id=f"jr-{job.tenant_id}-{job.request_id}", tenant_id=job.tenant_id, user_id=job.user_id,
+            record_id=f"jr-{job.tenant_id}-{job.user_id}-{job.request_id}", tenant_id=job.tenant_id, user_id=job.user_id,
             worker_id=job.worker_id, session_id=job.session_id, task_id=job.task_id, request_id=job.request_id,
             key_id=job.key.key_id(), verb=job.key.verb.value, risk_class=job.key.risk_class.value,
             model=str(cfg.get("model", "")), created_at=self._now())
         record = self._judge(job, cfg, base)
+        if self._stopped:
+            return                      # stop() was called while the judge call was in flight
         self._store.add_judge_record(record)
 
     def _judge(self, job: ShadowJob, cfg: Mapping[str, object], base: JudgeRecord) -> JudgeRecord:
@@ -170,14 +182,16 @@ def _with(base: JudgeRecord, **changes: object) -> JudgeRecord:
 
 def label_decision(store: AssistantStore, cfg_getter: Callable[[], Mapping[str, object]], tenant_id: str,
                    user_id: str, request_id: str, approved: bool, now: datetime) -> bool:
-    """Record the owner's real decision next to the shadow verdict; ignored when no record exists."""
-    del cfg_getter                      # accepted for call-site symmetry; labelling needs no judge access
+    """Record the owner's real decision next to the shadow verdict.
+
+    The FIRST label wins: ignored (False) when no record exists or it already carries a decision; a later change of
+    mind is expressed with ``mark_regret``.  ``cfg_getter`` is part of the plan's interface but labelling needs no
+    judge access, so it is unused."""
+    del cfg_getter
     return store.update_judge_label(tenant_id, user_id, request_id,
                                     owner_decision="approved" if approved else "denied", decided_at=now)
 
 
-def mark_regret(store: AssistantStore, tenant_id: str, user_id: str, key_id: str, worker_id: str,
-                now: datetime) -> int:
+def mark_regret(store: AssistantStore, tenant_id: str, user_id: str, key_id: str, worker_id: str) -> int:
     """The owner revoked a grant: every record for that key and worker is flagged as a regretted approval."""
-    del now
     return store.mark_judge_regret(tenant_id, key_id, worker_id, user_id=user_id)
