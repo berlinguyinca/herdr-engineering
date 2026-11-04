@@ -164,3 +164,34 @@ def test_owner_ui_listing_flags_blocked_calendars_and_the_model_facing_ones_stay
         w.run("default", "u1", "list_calendars_for_owner_ui", {})
     assert exc.value.reason == "bad_request"
     assert "list_calendars_for_owner_ui" not in TOOL_CATALOG
+
+
+def test_tracking_tables_stay_bounded_and_never_evict_a_held_lock(store):
+    w, g = ws(store)
+    w.MAX_TRACKED = 8
+    for i in range(40):
+        w.invalidate("default", f"user{i}")
+    assert len(w._gen) <= 8 + 1
+    held = w._key_locks.setdefault(("default", "u1"), __import__("threading").Lock())
+    held.acquire()
+    try:
+        for i in range(40):
+            w.invalidate("default", f"more{i}")
+        w.invalidate("default", "u1")
+        assert w._key_locks[("default", "u1")] is held and ("default", "u1") in w._gen
+    finally:
+        held.release()
+    w.run("default", "u2", "search_email", {"query": "x"})
+    assert len(w._key_locks) <= 8 + 2
+
+
+def test_saving_the_client_drops_every_cached_access_token(store):
+    from herdr_engineering.control_plane.assistant_apps import AppsService
+    apps = AppsService(store, redirect_base="https://x", opener=lambda req, t: (_ for _ in ()).throw(OSError("x")))
+    w, g = ws(store)
+    apps.on_client_change = w.invalidate_all
+    w.run("default", "u1", "search_email", {"query": "x"})
+    w.run("default", "u2", "search_email", {"query": "x"})
+    assert w._access
+    apps.save_client("google", "newcid", "newsecret")
+    assert not w._access and not w._policies

@@ -711,6 +711,7 @@ class ControlPlaneServer:
                 from .google_workspace import GoogleWorkspace
                 _gw = GoogleWorkspace(apps=self.apps)
                 self.apps.on_change = _gw.invalidate
+                self.apps.on_client_change = _gw.invalidate_all
                 # Single-operator rule: map the data key (never the approval actor) through the bridge when there is one.
                 self.assistant.google_read = lambda t, u, tool, payload: _gw.run(*self._canonical_person(t, u), tool, payload)
                 self.assistant.google_write = lambda t, u, tool, payload: _gw.write(*self._canonical_person(t, u), tool, payload)

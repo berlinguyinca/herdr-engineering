@@ -156,6 +156,7 @@ class CredentialStore:
         self._conns: dict[tuple[str, str, str], dict] = {}  # (tenant, user, provider) -> row with sealed token
         self._tombstones: set[tuple[str, str, str]] = set()  # deletes the database has not confirmed yet
         self._blocked: dict[tuple[str, str, str], list[str]] = {}
+        self._blocked_corrupt: set[tuple[str, str, str]] = set()      # rows that would not parse: closed for that person until re-saved
         # Each section loads on its own; a section that failed stays "not loaded" and the whole load is retried lazily on use.
         self._section_ok = {"clients": persistence is None, "connections": persistence is None, "blocked": persistence is None}
         self._retry_after = 0.0
@@ -212,7 +213,13 @@ class CredentialStore:
             try:
                 if not self._section_ok["blocked"]:
                     rows = p.load_blocked()
-                    parsed = {(t, u, pr): list(json.loads(ids)) for t, u, pr, ids in rows}
+                    parsed: dict[tuple[str, str, str], list[str]] = {}
+                    for t, u, pr, ids in rows:
+                        try:
+                            parsed[(t, u, pr)] = [str(i) for i in json.loads(ids)]
+                        except Exception:  # noqa: BLE001 - one bad row fails closed for that person only
+                            self._blocked_corrupt.add((t, u, pr))
+                            log.warning("app credentials: a saved blocked-calendar row was unreadable")
                     with self._lock:
                         for k, v in parsed.items():
                             self._blocked.setdefault(k, v)
@@ -325,6 +332,8 @@ class CredentialStore:
         if not self.blocked_loaded and not (self._load() and self.blocked_loaded):
             raise AppsError("unavailable")     # fail closed: an unknown blocked list must never read as "nothing blocked"
         with self._lock:
+            if (tenant, user, provider) in self._blocked_corrupt and (tenant, user, provider) not in self._blocked:
+                raise AppsError("unavailable")     # this person's saved list is unreadable: unknown must not read as "nothing"
             return list(self._blocked.get((tenant, user, provider), []))
 
     @_serialized
@@ -334,4 +343,5 @@ class CredentialStore:
         clean = list(dict.fromkeys(str(i) for i in ids))
         with self._lock:
             self._blocked[(tenant, user, provider)] = clean
+            self._blocked_corrupt.discard((tenant, user, provider))
         self._persist(lambda p: p.save_blocked(tenant, user, provider, clean))
