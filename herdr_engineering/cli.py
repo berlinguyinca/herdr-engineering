@@ -1062,7 +1062,13 @@ def _cmd_host_terminal_relay(args) -> int:
     the control plane could not be reached for the first configuration), 2 only when restarting cannot help (host.json
     missing or incomplete, token revoked). argparse usage errors also exit 2, but never under a unit file."""
     from .herdr_pane_client import HerdrPaneClient
-    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config, host_token
+    from .host_config import (
+        ConfigRefresher,
+        HostConfigUnavailable,
+        exit_unavailable,
+        host_config,
+        host_token,
+    )
     from .terminal_relay import (
         ControlPlaneHttp,
         RelayLocked,
@@ -3754,7 +3760,7 @@ def _share_wiring(cp: dict, dsn: str | None):
 
     async def create_share_store():
         import asyncpg
-        return ShareStore(await asyncpg.connect(dsn))
+        return ShareStore(await asyncpg.connect(dsn), lock_connect=lambda: asyncpg.connect(dsn))
 
     return artifact_adapter.SyncArtifactAdapter(create_share_store), Path(share.get("shares_dir") or "/shares"), settings
 
@@ -4425,7 +4431,7 @@ def _task_lease_value(value) -> float:
 
 
 _MEMBER_KEYS = frozenset({"enabled", "group", "groups_ttl", "removed_grace", "max_artifact_bytes", "max_member_bytes",
-                          "max_artifacts"})
+                          "max_artifacts", "share_limits", "share_creates_per_hour"})
 
 
 def _members_settings(cp) -> dict | None:
@@ -4460,7 +4466,19 @@ def _members_settings(cp) -> dict | None:
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise SystemExit(f"{where}.{key} must be a positive integer or null")
         defaults[key] = value
-    return {"group": group, "groups_ttl": float(ttl), "removed_grace": float(grace), "defaults": defaults}
+    share_limits = raw.get("share_limits", {})
+    share_limits = {} if share_limits is None else share_limits
+    if not isinstance(share_limits, dict) or (bad := sorted(set(share_limits) - {"max_share_bytes", "max_total_bytes"})):
+        raise SystemExit(f"{where}.share_limits must be a mapping with max_share_bytes and max_total_bytes"
+                         + (": unknown keys: " + ", ".join(bad) if isinstance(share_limits, dict) else ""))
+    for key, value in share_limits.items():
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise SystemExit(f"{where}.share_limits.{key} must be a positive integer or null")
+    per_hour = raw.get("share_creates_per_hour", 20)
+    if isinstance(per_hour, bool) or not isinstance(per_hour, int) or per_hour < 1:
+        raise SystemExit(f"{where}.share_creates_per_hour must be a positive integer")
+    return {"group": group, "groups_ttl": float(ttl), "removed_grace": float(grace), "defaults": defaults,
+            "share_limits": dict(share_limits), "share_creates_per_hour": per_hour}
 
 
 def _collab_member_kwargs(cp, *, state_dir=None) -> dict:
@@ -4485,10 +4503,19 @@ def _members_runtime(cp, settings: CollabArtifactsSettings):
     if got is None:
         return None
     share = _share_worker_settings(cp)
+    share_settings = None
+    if share["enabled"]:
+        from .control_plane.artifact_share_api import share_settings_config
+        raw = (cp or {}).get("share") or {}
+        try:
+            share_settings = {**share_settings_config(raw, public_url=raw.get("public_url")),
+                              "member_share_limits": got["share_limits"]}
+        except ValueError as exc:
+            raise SystemExit(f"fleet config {exc}") from None
     return MemberRuntime(outbox=settings.outbox_dir, mirror_root=settings.mirror_dir, group=got["group"], enabled=True,
                          defaults=got["defaults"], removed_grace=got["removed_grace"],
                          shares_root=Path(share["shares_dir"]) if share["enabled"] else None,
-                         clock=time.time)
+                         share_settings=share_settings, clock=time.time)
 
 
 def _task_lease(args, cp):

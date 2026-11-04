@@ -441,3 +441,82 @@ def test_idempotency_keys_reach_the_intent_and_bad_ones_are_400(world):
     for bad in ("short", "x" * 129, "has space in it", 12345678):
         assert refuse(world.ms.create, world.user("op"), "T", "a.html", "web", idempotency_key=bad).status == 400
     assert len(intent_keys(world)) == 3
+
+
+# ---------------------------------------------------------------------------------------------- Task 7: shares
+def secret_file(world, ticket, principal, url):
+    from herdr_engineering.control_plane.collab_bridge_files import link_new_beneath
+    link_new_beneath(world.bridge.outbox, ["secrets"], ticket + ".json",
+                     json.dumps({"ticket": ticket, "principal": principal, "url": url, "at": 1.0}).encode(),
+                     mode=0o600, create_dirs=True, dir_mode=0o700)
+
+
+def live_result(world, ticket, name="op"):
+    atomic_write_json(world.bridge.mirror / "results", f"{ticket}.json",
+                      {"ticket": ticket, "kind": "member.share_approve", "actor": {"kind": "user", "id": name},
+                       "artifact_id": ART, "result": "live", "share_id": "share_" + "a" * 24, "audience": "public",
+                       "secret_result": True})
+
+
+def test_share_create_is_429_after_the_hourly_cap_and_the_window_slides(approval_svc, tmp_path):
+    w = World(approval_svc, tmp_path, share_creates_per_hour=3, writes_per_minute=1000)
+    w.view("op", [ART])
+    try:
+        for _ in range(3):
+            assert w.ms.share_create(w.user("op"), ART, "v_1", "public")["status"] == "pending"
+        assert refuse(w.ms.share_create, w.user("op"), ART, "v_1", "public").status == 429
+        w.s._now.t += 1800
+        w.write_grants()
+        assert refuse(w.ms.share_create, w.user("op"), ART, "v_1", "public").status == 429    # still inside the hour
+        w.s._now.t += 1801
+        w.write_grants()
+        assert w.ms.share_create(w.user("op"), ART, "v_1", "public")["status"] == "pending"
+    finally:
+        w.bridge.stop()
+
+
+def test_share_create_on_an_artifact_outside_the_view_is_the_same_404_as_a_ghost(world):
+    a = refuse(world.ms.share_create, world.user("op"), OTHER, "v_1", "public")
+    b = refuse(world.ms.share_create, world.user("op"), GHOST, "v_1", "public")
+    assert (a.status, a.code, a.message) == (b.status, b.code, b.message) == (404, "not_found", a.message)
+    assert intent_keys(world) == []
+
+
+def test_share_approve_needs_confirm_true(world):
+    for bad in (None, False, "true", 1):
+        assert refuse(world.ms.share_approve, world.user("op"), ART, "share_" + "a" * 24, bad).status == 400
+    assert intent_keys(world) == []
+
+
+def test_the_secret_url_is_returned_exactly_once(world):
+    r = world.ms.share_approve(world.user("op"), ART, "share_" + "a" * 24, True)
+    t = r["ticket"]
+    live_result(world, t)
+    secret_file(world, t, "member:op", "https://s.example/s/TOKEN")
+    first = world.ms.result(world.user("op"), t, 0)
+    assert first["result"] == "live" and first["secret"]["url"] == "https://s.example/s/TOKEN"
+    assert "TOKEN" not in json.dumps({k: v for k, v in first.items() if k != "secret"})
+    second = world.ms.result(world.user("op"), t, 0)
+    assert second["secret"] == {"status": "already_read"}
+    assert "TOKEN" not in json.dumps(second)
+    assert not (world.bridge.outbox / "secrets" / f"{t}.json").exists()
+
+
+def test_a_secret_left_for_another_principal_is_not_handed_out(world):
+    t = world.ms.share_approve(world.user("op"), ART, "share_" + "a" * 24, True)["ticket"]
+    live_result(world, t)
+    secret_file(world, t, "member:lab", "https://s.example/s/OTHER")
+    got = world.ms.result(world.user("op"), t, 0)
+    assert got["secret"] == {"status": "already_read"} and "OTHER" not in json.dumps(got)
+    assert (world.bridge.outbox / "secrets" / f"{t}.json").exists()           # left for its owner
+
+
+def test_share_list_returns_the_view_links_without_urls(world):
+    key = member_owner_key("member:op")
+    doc = json.loads((world.bridge.mirror / "member-views" / f"{key}.json").read_text())
+    doc["links"] = [{"share_id": "share_" + "a" * 24, "artifact_id": ART, "audience": "public", "state": "live"},
+                    {"share_id": "share_" + "b" * 24, "artifact_id": OTHER, "audience": "lab", "state": "live"}]
+    atomic_write_json(world.bridge.mirror / "member-views", f"{key}.json", doc)
+    assert len(world.ms.share_list(world.user("op"))["links"]) == 2
+    assert [r["artifact_id"] for r in world.ms.share_list(world.user("op"), ART)["links"]] == [ART]
+    assert refuse(world.ms.share_list, member_actor(world.people["mal"])).status == 403

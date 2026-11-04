@@ -23,7 +23,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
-from .artifact_member_intents import KIND_CREATE, KIND_DELETE, KIND_PUBLISH, MEMBER_VIEWS_DIR
+from .artifact_member_intents import (
+    KIND_CREATE,
+    KIND_DELETE,
+    KIND_PUBLISH,
+    KIND_SHARE_APPROVE,
+    KIND_SHARE_CREATE,
+    KIND_SHARE_EVENTS,
+    KIND_SHARE_REVOKE,
+    MEMBER_VIEWS_DIR,
+    take_secret,
+)
 from .artifact_members import member_owner_key
 from .collab import CollabError, CollabService, Principal
 from .collab_artifacts import CollabArtifactBridge
@@ -84,6 +94,7 @@ class MembersConfig:
     max_message_chars: int = 500
     chunks_per_minute: int = 1200
     writes_per_minute: int = 30
+    share_creates_per_hour: int = 20
     staging_bytes_per_member: int = _TIB
     result_wait_seconds: float = 5.0
 
@@ -123,7 +134,8 @@ class _Caller:
 def _present(ticket: str, doc: Mapping[str, Any]) -> dict[str, Any]:
     if doc.get("status") == "pending" or "result" not in doc:
         return {"ticket": ticket, "status": "pending"}
-    keep = ("result", "artifact_id", "version_id", "version_number", "head_version_id", "reason")
+    keep = ("result", "artifact_id", "version_id", "version_number", "head_version_id", "reason", "share_id", "audience",
+            "summary", "events")
     return {"ticket": ticket, "status": "done", **{k: doc[k] for k in keep if doc.get(k) is not None}}
 
 
@@ -205,13 +217,13 @@ class MemberService:
             or self._entry(view.get("shared_with_me"), artifact_id) is not None
 
     # ------------------------------------------------------------------------------------------ throttles
-    def _throttle(self, who: _Caller, kind: str, limit: int, n: int = 1) -> None:
-        """``n`` hits against a per-member sliding minute, shared by every channel of the member."""
+    def _throttle(self, who: _Caller, kind: str, limit: int, n: int = 1, window: float = 60.0) -> None:
+        """``n`` hits against a per-member sliding window (a minute unless told), shared by every channel of the member."""
         svc = self.service
         with svc._lock:
             now = svc._now()
             key = f"member{kind}:{who.principal}"
-            hits = [t for t in svc._hits[key] if now - t < 60.0]
+            hits = [t for t in svc._hits[key] if now - t < window]
             if len(hits) + n > limit:
                 svc._hits[key] = hits
                 svc.stats["rate_limited"] += 1
@@ -245,7 +257,13 @@ class MemberService:
                                           still_valid=lambda: self.service.still_valid(who.pr))
         except CollabError as exc:
             raise MemberServiceError(exc.status, _CODES.get(exc.status, "error"), exc.message) from None
-        return _present(ticket, doc)
+        out = _present(ticket, doc)
+        if doc.get("secret_result") is True and out.get("result") == "live":
+            # read once: the URL is in no result file, only in the secret file; whoever unlinks it first gets it
+            url = take_secret(self.bridge.outbox, ticket, who.principal)
+            out["secret"] = ({"url": url, "notice": "shown once; generate a new link to re-share"} if url
+                             else {"status": "already_read"})
+        return out
 
     def create(self, actor: Mapping[str, Any], title: Any, filename: Any, profile: Any,
                idempotency_key: Any = None) -> dict[str, Any]:
@@ -281,6 +299,49 @@ class MemberService:
         if not isinstance(ticket, str):
             raise MemberServiceError(404, "not_found", NOT_FOUND)
         return self._wait(who, ticket, float(seconds))
+
+    # ------------------------------------------------------------------------------------------ shares
+    def _shareable(self, who: _Caller, tool: str, artifact_id: Any) -> None:
+        """Owned, or shared with the caller; the worker re-checks the ``share`` grant, this only spares a ticket."""
+        self._readable(who, tool, artifact_id)
+
+    def share_create(self, actor: Mapping[str, Any], artifact_id: Any, version_id: Any, audience: Any,
+                     allow_groups: Any = None, allow_emails: Any = None, expires_in_days: Any = None,
+                     entry: Any = None, title: Any = None, idempotency_key: Any = None) -> dict[str, Any]:
+        who = self._caller(actor, "share_create")
+        self._shareable(who, "share_create", artifact_id)
+        self._throttle(who, "share_create", self.config.share_creates_per_hour, window=3600.0)
+        payload: dict[str, Any] = {"version_id": version_id, "audience": audience}
+        for k, v in (("allow_groups", allow_groups), ("allow_emails", allow_emails),
+                     ("expires_in_days", expires_in_days), ("entry", entry), ("title", title)):
+            if v is not None:
+                payload[k] = v
+        return self._submit(who, KIND_SHARE_CREATE, payload, artifact_id, "share_create", idempotency_key)
+
+    def share_approve(self, actor: Mapping[str, Any], artifact_id: Any, share_id: Any, confirm: Any,
+                      idempotency_key: Any = None) -> dict[str, Any]:
+        who = self._caller(actor, "share_approve")
+        if confirm is not True:
+            raise MemberServiceError(400, "bad_request", "confirm must be true to make a share link live")
+        self._shareable(who, "share_approve", artifact_id)
+        return self._submit(who, KIND_SHARE_APPROVE, {"share_id": share_id, "confirm": True}, artifact_id,
+                            "share_approve", idempotency_key)
+
+    def share_revoke(self, actor: Mapping[str, Any], artifact_id: Any, share_id: Any) -> dict[str, Any]:
+        who = self._caller(actor, "share_revoke")
+        return self._submit(who, KIND_SHARE_REVOKE, {"share_id": share_id}, artifact_id, "share_revoke")
+
+    def share_events(self, actor: Mapping[str, Any], artifact_id: Any, share_id: Any) -> dict[str, Any]:
+        who = self._caller(actor, "share_events")
+        return self._submit(who, KIND_SHARE_EVENTS, {"share_id": share_id}, artifact_id, "share_events")
+
+    def share_list(self, actor: Mapping[str, Any], artifact_id: Any = None) -> dict[str, Any]:
+        """The caller's share links from its own view (never the URL: it is shown once, at approval)."""
+        who = self._caller(actor, "share_list")
+        links = [row for row in (self._view(who).get("links") or []) if isinstance(row, dict)]
+        if artifact_id is not None:
+            links = [row for row in links if row.get("artifact_id") == artifact_id]
+        return {"links": links}
 
     # ------------------------------------------------------------------------------------------ reads
     def mine(self, actor: Mapping[str, Any]) -> dict[str, Any]:

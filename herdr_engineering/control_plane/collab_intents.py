@@ -231,9 +231,10 @@ GATE_RELOAD = 30.0                  # the worker-local retraction gate is reload
 LINEAGE_QUEUE_MAX = 1000            # versions waiting for lineage emission; the oldest is dropped beyond this
 
 _RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason", "resolved",
-                "skipped", "artifact_id")
+                "skipped", "artifact_id", "share_id", "audience", "secret_result", "summary", "events")
 MAX_RESOLVED = 50                       # annotation_resolve: ids resolved / skipped in one outcome
-_STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id", "artifact_id")
+_STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id", "artifact_id", "share_id", "audience")
+MAX_SHARE_EVENTS = 50                   # member.share_events: rows in one outcome
 _OUTCOME = re.compile(r"[a-z_]{1,32}\Z")
 _INTENT_FILE = re.compile(TICKET_RE[:-2] + r"\.json\Z")
 _KIND_NAME = re.compile(r"[a-z][a-z0-9_.]{0,47}\Z")
@@ -1491,6 +1492,16 @@ def _check_outcome(out) -> None:
                        and isinstance(s.get("reason"), str) and len(s["reason"]) <= 64
                        and (s.get("annotation_id") is None or (isinstance(s["annotation_id"], str)
                                                                and len(s["annotation_id"]) <= 64)) for s in skipped)):
+        raise TypeError("invalid outcome field")
+    secret = out.get("secret_result")
+    if secret is not None and secret is not True:
+        raise TypeError("invalid outcome field")
+    summary = out.get("summary")
+    if summary is not None and not isinstance(summary, dict):
+        raise TypeError("invalid outcome field")
+    events = out.get("events")
+    if events is not None and (not isinstance(events, list) or len(events) > MAX_SHARE_EVENTS
+                               or not all(isinstance(e, dict) for e in events)):
         raise TypeError("invalid outcome field")
     json.dumps(out, ensure_ascii=False, allow_nan=False)   # TypeError/ValueError: not writable as a result
 

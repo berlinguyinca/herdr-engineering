@@ -140,9 +140,16 @@ async def _may_share(conn: Any, artifact_id: str, principal: str) -> bool:
     return "share" in permissions or "admin" in permissions
 
 
+_SPEND_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('artifact_share_live_bytes'))"
+
+
 class ShareStore:
-    def __init__(self, conn: Any):
+    def __init__(self, conn: Any, *, lock_connect: Any = None):
+        """``lock_connect`` (an async callable returning a fresh connection) lets ``acquire_spend`` hold the spend lock
+        on a connection of its own, for a store that sits behind a shared adapter connection."""
         self._conn = conn
+        self._lock_connect = lock_connect
+        self._spend: tuple[Any, Any] | None = None
 
     @asynccontextmanager
     async def spend_lock(self):
@@ -152,8 +159,39 @@ class ShareStore:
         lock cannot serialise their approvals.  Released when the transaction ends.
         """
         async with _transaction(self._conn) as conn:
-            await conn.execute("SELECT pg_advisory_xact_lock(hashtext('artifact_share_live_bytes'))")
+            await conn.execute(_SPEND_LOCK_SQL)
             yield
+
+    async def acquire_spend(self) -> None:
+        """The same lock as ``spend_lock`` for callers that cannot wrap the work in ``async with`` (a synchronous caller
+        on another thread): held until ``release_spend``.  Not re-entrant."""
+        if self._spend is not None:
+            raise RuntimeError("the spend lock is already held by this store")
+        conn = self._conn if self._lock_connect is None else await self._lock_connect()
+        tx = conn.transaction()
+        try:
+            await tx.start()
+            await conn.execute(_SPEND_LOCK_SQL)
+        except BaseException:
+            await self._end_spend(conn, tx)
+            raise
+        self._spend = (conn, tx)
+
+    async def release_spend(self) -> None:
+        """End the transaction ``acquire_spend`` began.  Commit, so audit rows written meanwhile survive."""
+        held, self._spend = self._spend, None
+        if held is not None:
+            await self._end_spend(*held)
+
+    async def _end_spend(self, conn: Any, tx: Any) -> None:
+        try:
+            try:
+                await tx.commit()
+            except Exception:
+                await tx.rollback()
+        finally:
+            if conn is not self._conn:
+                await conn.close()
 
     async def _member_event(self, conn: Any, principal: str, action: str, *, actor: str | None, artifact_id: str | None,
                             share_id: str | None, audience: str | None, outcome: str, code: str | None = None,

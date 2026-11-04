@@ -141,6 +141,12 @@ class Shares:
     def sync_call(self, method, *args, **kwargs):
         return getattr(self, method)(*args, **kwargs)
 
+    def acquire_spend(self):          # the real store's cross-process lock; approvals here are already serialised
+        self.spend_held = getattr(self, "spend_held", 0) + 1
+
+    def release_spend(self):
+        self.spend_held -= 1
+
     def _public(self, row):
         return {k: v for k, v in row.items() if k != "token_hash"}
 

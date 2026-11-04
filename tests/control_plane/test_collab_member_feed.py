@@ -405,7 +405,17 @@ def test_enabled_members_read_group_ttl_and_optional_limits():
     got = cli._members_settings(collab(enabled=True, group="staff", groups_ttl=60, max_member_bytes=10,
                                        max_artifact_bytes=None))
     assert got == {"group": "staff", "groups_ttl": 60.0, "removed_grace": 3600.0,
-                   "defaults": {"max_artifact_bytes": None, "max_member_bytes": 10, "max_artifacts": None}}
+                   "defaults": {"max_artifact_bytes": None, "max_member_bytes": 10, "max_artifacts": None},
+                   "share_limits": {}, "share_creates_per_hour": 20}
+    shares = cli._members_settings(collab(enabled=True, group="staff", share_creates_per_hour=5,
+                                          share_limits={"max_share_bytes": 9, "max_total_bytes": None}))
+    assert shares["share_creates_per_hour"] == 5
+    assert shares["share_limits"] == {"max_share_bytes": 9, "max_total_bytes": None}
+    for bad in ({"share_creates_per_hour": 0}, {"share_creates_per_hour": True}, {"share_limits": []},
+                {"share_limits": {"max_share_bytes": 0}}, {"share_limits": {"max_share_bytes": "9"}},
+                {"share_limits": {"nope": 1}}):
+        with pytest.raises(SystemExit):
+            cli._members_settings(collab(enabled=True, group="staff", **bad))
     plain = cli._members_settings(collab(enabled=True, group="staff"))
     assert cli._members_settings(collab(enabled=True, group="staff", removed_grace=0))["removed_grace"] == 0.0
     with pytest.raises(SystemExit):
@@ -440,14 +450,16 @@ def test_the_worker_runtime_points_at_the_bridge_dirs_and_the_share_dir(tmp_path
     from herdr_engineering import cli
     cp = {"collab_artifacts": {"enabled": True, "mirror_dir": str(tmp_path / "m"), "outbox_dir": str(tmp_path / "o"),
                                "spool_dir": str(tmp_path / "s")},
-          "share": {"enabled": True, "shares_dir": str(tmp_path / "shares")},
-          **collab(enabled=True, group="staff", max_member_bytes=7)}
+          "share": {"enabled": True, "shares_dir": str(tmp_path / "shares"), "public_url": "https://s.example"},
+          **collab(enabled=True, group="staff", max_member_bytes=7, share_limits={"max_share_bytes": 5})}
     settings = cli._collab_artifacts_settings(cp)
     rt = cli._members_runtime(cp, settings)
     assert (rt.group, rt.enabled, rt.outbox, rt.mirror_root) == ("staff", True, tmp_path / "o", tmp_path / "m")
     assert rt.shares_root == tmp_path / "shares" and rt.defaults["max_member_bytes"] == 7
+    assert rt.share_settings["member_share_limits"] == {"max_share_bytes": 5}
+    assert rt.share_settings["default_public_days"] > 0
     no_share = cli._members_runtime({**cp, "share": {"enabled": False}}, settings)
-    assert no_share.shares_root is None
+    assert no_share.shares_root is None and no_share.share_settings is None
     assert cli._members_runtime({"collab_artifacts": cp["collab_artifacts"]}, settings) is None
 
 

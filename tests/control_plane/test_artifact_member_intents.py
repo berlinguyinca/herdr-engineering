@@ -775,7 +775,8 @@ def test_the_view_lists_artifacts_versions_links_usage_and_shared_with_me(regist
         (link,) = view["links"]
         assert link["share_id"] == sid and link["audience"] == "public" and link["state"] == "live"
         assert set(link) == {"share_id", "artifact_id", "version_id", "audience", "state", "expires_at",
-                             "recipients", "created_at"}
+                             "recipients", "created_at", "mine"}
+        assert link["mine"] is True
         mine = json.dumps(view_of(env, BOB))
         assert aid not in mine and "Mine" not in mine and sid not in mine      # bob's view never shows alice's data
     mrun(registry_pg, tmp_path, body)

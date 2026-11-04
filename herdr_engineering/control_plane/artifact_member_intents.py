@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 from .collab_bridge_files import (
     FEED_MAX_AGE,
     MAX_MESSAGE,
+    TICKET_RE,
     UPLOAD_RE,
     Actor,
     BridgeError,
@@ -54,6 +55,7 @@ from .collab_bridge_files import (
     register_intent_kind,
     remove_tree_beneath,
     tree_entry_cap,
+    unlink_beneath,
 )
 from .share_bundle import check_names, normalise_name
 
@@ -65,6 +67,13 @@ log = logging.getLogger(__name__)
 KIND_CREATE = "member.artifact_create"
 KIND_PUBLISH = "member.publish"
 KIND_DELETE = "member.artifact_delete"
+KIND_SHARE_CREATE = "member.share_create"
+KIND_SHARE_APPROVE = "member.share_approve"
+KIND_SHARE_REVOKE = "member.share_revoke"
+KIND_SHARE_EVENTS = "member.share_events"
+SECRETS_DIR = "secrets"          # <outbox>/secrets/<ticket>.json: a share URL, read once by its creator's service
+SECRET_TTL = 60.0                # seconds an unread secret survives
+SECRET_MAX_BYTES = 4096
 MEMBER_DIRECTORY = "member-directory.json"
 MEMBER_VIEWS_DIR = "member-views"
 DIRECTORY_MAX_BYTES = 16 * 1024 * 1024
@@ -105,6 +114,8 @@ class MemberRuntime:
     shares_root: Path | None
     clock: Callable[[], float]
     removed_grace: float = 3600.0      # seconds a member must be continuously listed ``removed`` before anything is revoked
+    share_settings: Mapping[str, Any] | None = None   # ``share_settings_config`` plus ``member_share_limits``; None = off
+    secret_mode: int = 0o600           # file mode of a secret result (the deployment may need a group-readable one)
 
 
 # ----------------------------------------------------------------------------- payloads
@@ -189,7 +200,77 @@ def validate_delete_payload(raw: dict, limits: BridgeLimits) -> DeletePayload:
     return DeletePayload(True)
 
 
+_SHARE_ID = re.compile(r"share_[0-9a-f]{24}\Z")
+_AUDIENCES = ("lab", "public")
+_MAX_ALLOW = 50
+_SHARE_CREATE_KEYS = frozenset({"version_id", "audience", "allow_groups", "allow_emails", "expires_in_days", "entry",
+                                "title"})
+
+
+@dataclass(frozen=True)
+class ShareCreatePayload:
+    version_id: str
+    audience: str
+    allow_groups: tuple[str, ...] | None
+    allow_emails: tuple[str, ...] | None
+    expires_in_days: int | None
+    entry: str | None
+    title: str | None
+
+
+@dataclass(frozen=True)
+class ShareRefPayload:
+    share_id: str
+
+
+def _allow_list(raw: object, what: str) -> tuple[str, ...] | None:
+    """Entries are kept EXACTLY as sent (no stripping): the worker compares them with the member's own audience."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or len(raw) > _MAX_ALLOW:
+        raise _bad(what)
+    for item in raw:
+        if not isinstance(item, str) or not 1 <= len(item) <= 320 or any(ord(c) < 0x20 or ord(c) == 0x7F for c in item):
+            raise _bad(what)
+    return tuple(raw)
+
+
+def validate_share_create_payload(raw: dict, limits: BridgeLimits) -> ShareCreatePayload:
+    what = KIND_SHARE_CREATE
+    if not isinstance(raw, dict) or not {"version_id", "audience"} <= set(raw) <= _SHARE_CREATE_KEYS:
+        raise _bad(what)
+    _check_id(raw["version_id"], "version id")
+    if raw["audience"] not in _AUDIENCES:
+        raise _bad(what)
+    days = raw.get("expires_in_days")
+    if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650):
+        raise _bad(what)
+    entry, title = raw.get("entry"), raw.get("title")
+    if entry is not None:
+        entry = normalise_name(entry)
+    if title is not None:
+        if not isinstance(title, str) or len(title) > 240:
+            raise _bad(what)
+        _check_text(title)
+    return ShareCreatePayload(raw["version_id"], raw["audience"], _allow_list(raw.get("allow_groups"), what),
+                              _allow_list(raw.get("allow_emails"), what), days, entry, title)
+
+
+def _share_ref(kind: str, extra: frozenset[str] = frozenset()):
+    def validate(raw: dict, limits: BridgeLimits) -> ShareRefPayload:
+        if not isinstance(raw, dict) or set(raw) != {"share_id"} | extra or not isinstance(raw["share_id"], str) \
+                or not _SHARE_ID.match(raw["share_id"]) or (extra and raw.get("confirm") is not True):
+            raise _bad(kind)
+        return ShareRefPayload(raw["share_id"])
+    return validate
+
+
 _BOTH = frozenset({"agent", "user"})
+register_intent_kind(KIND_SHARE_CREATE, validate_share_create_payload, actors=_BOTH, requires_artifact=True)
+register_intent_kind(KIND_SHARE_APPROVE, _share_ref(KIND_SHARE_APPROVE, frozenset({"confirm"})), actors=_BOTH,
+                     requires_artifact=True)
+register_intent_kind(KIND_SHARE_REVOKE, _share_ref(KIND_SHARE_REVOKE), actors=_BOTH, requires_artifact=True)
+register_intent_kind(KIND_SHARE_EVENTS, _share_ref(KIND_SHARE_EVENTS), actors=_BOTH, requires_artifact=True)
 register_intent_kind(KIND_CREATE, validate_create_payload, actors=_BOTH, requires_artifact=False)
 register_intent_kind(KIND_PUBLISH, validate_publish_payload, actors=_BOTH, requires_artifact=True)
 register_intent_kind(KIND_DELETE, validate_delete_payload, actors=_BOTH, requires_artifact=True)
@@ -219,6 +300,8 @@ def load_directory(rt: MemberRuntime) -> dict[str, dict[str, Any]] | None:
         groups = entry.get("groups")
         out[user_id] = {"status": entry.get("status"),
                         "groups": groups if isinstance(groups, list) else [rt.group]}
+        if isinstance(entry.get("email"), str):
+            out[user_id]["email"] = entry["email"]
         if "removed_since" in entry:
             out[user_id]["removed_since"] = entry["removed_since"]
     return out
@@ -526,10 +609,11 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
         " AND a.created_by IS DISTINCT FROM $1 AND a.lifecycle='active'"
         " AND (acl.permissions ? 'read' OR acl.permissions ? 'admin')"
         " ORDER BY a.artifact_id LIMIT $2", principal, VIEW_MAX_SHARED)
-    links = await conn.fetch(
-        "SELECT share_id, artifact_id, version_id, audience, state, expires_at, allow_emails, allow_groups, created_at"
-        " FROM artifact_shares WHERE created_by=$1 ORDER BY created_at DESC, share_id LIMIT $2",
-        principal, VIEW_MAX_LINKS)
+    links = await conn.fetch(      # the member's own links, and every link on an artifact it owns (it may revoke those)
+        "SELECT s.share_id, s.artifact_id, s.version_id, s.audience, s.state, s.expires_at, s.allow_emails,"
+        " s.allow_groups, s.created_at, (s.created_by = $1) AS mine FROM artifact_shares s"
+        " WHERE s.created_by=$1 OR s.artifact_id = ANY($3::text[]) ORDER BY s.created_at DESC, s.share_id LIMIT $2",
+        principal, VIEW_MAX_LINKS, [a["artifact_id"] for a in artifacts])
     doc = {
         "principal": principal, "updated": __import__("time").time(),
         "usage": {"bytes_used": usage["bytes_used"], "bytes_retracted": usage["bytes_retracted"],
@@ -544,7 +628,7 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
         "links": [{"share_id": s["share_id"], "artifact_id": s["artifact_id"], "version_id": s["version_id"],
                    "audience": s["audience"], "state": s["state"], "expires_at": _iso(s["expires_at"]),
                    "recipients": [*(s["allow_emails"] or []), *(s["allow_groups"] or [])],
-                   "created_at": _iso(s["created_at"])} for s in links],
+                   "created_at": _iso(s["created_at"]), "mine": s["mine"]} for s in links],
     }
     root = Path(root)
     from .collab_bridge_files import DIR_MODE
@@ -560,6 +644,45 @@ async def _after(ctx: IntentContext, intent: Intent, out: dict, private: dict) -
     principal, rt = private.get("_principal"), ctx.extras.get("members")
     if isinstance(principal, str) and isinstance(rt, MemberRuntime):
         await write_member_view(ctx.conn, principal, rt.mirror_root, defaults=rt.defaults)
+
+
+# ----------------------------------------------------------------------------- secret results
+
+def take_secret(outbox: Path, ticket: str, principal: str) -> str | None:
+    """Read and delete the share URL the worker left for ``ticket``; None when there is none for ``principal``.
+
+    Read once: the reader that wins the unlink gets the URL, any other (or later) reader gets None.  A file that names
+    another principal is left alone.  Blocking; collab-public calls it, the worker never does."""
+    if not isinstance(ticket, str) or not re.match(TICKET_RE, ticket):
+        return None
+    name = ticket + ".json"
+    doc = read_json_beneath(outbox, [SECRETS_DIR, name], max_bytes=SECRET_MAX_BYTES)
+    if doc is None or doc.get("ticket") != ticket or doc.get("principal") != principal:
+        return None
+    url = doc.get("url")
+    if not isinstance(url, str) or not url or not unlink_beneath(outbox, [SECRETS_DIR], name):
+        return None
+    return url
+
+
+def sweep_secrets(rt: MemberRuntime) -> int:
+    """Delete the secret files that stayed unread for ``SECRET_TTL`` seconds (or cannot be read); returns the count.
+    Blocking."""
+    try:
+        listing = list_beneath(rt.outbox, [SECRETS_DIR], max_entries=100_000)
+    except BridgeError:
+        return 0
+    removed = 0
+    now = rt.clock()
+    for name, st in listing or []:
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        doc = read_json_beneath(rt.outbox, [SECRETS_DIR, name], max_bytes=SECRET_MAX_BYTES)
+        at = doc.get("at") if doc else None
+        if _finite(at) and not now - at > SECRET_TTL:
+            continue
+        removed += bool(unlink_beneath(rt.outbox, [SECRETS_DIR], name))
+    return removed
 
 
 # ----------------------------------------------------------------------------- publisher, sweep, staging
@@ -604,6 +727,7 @@ async def publish_member_views(conn: Any, rt: MemberRuntime) -> int:
         except Exception as exc:
             log.error("member view not written (%s)", type(exc).__name__)
     await sweep_disabled_members(conn, rt)
+    await asyncio.to_thread(sweep_secrets, rt)
     return written
 
 
@@ -658,6 +782,12 @@ def register_member_intents(applier: CollabIntentApplier) -> None:
                                     (KIND_DELETE, handle_delete, "deleted")):
         # No ``replay_outcomes``: the applier would replay a stored result before the handler runs, i.e. before the
         # directory/admission check. The handlers are idempotent themselves, behind ``_member``.
+        applier.register(kind, handler, lane_key=_lane, after=_after)
+    from . import (
+        artifact_member_shares as shares,  # the worker only: collab-public never imports the handlers
+    )
+    for kind, handler in ((KIND_SHARE_CREATE, shares.handle_share_create), (KIND_SHARE_APPROVE, shares.handle_share_approve),
+                          (KIND_SHARE_REVOKE, shares.handle_share_revoke), (KIND_SHARE_EVENTS, shares.handle_share_events)):
         applier.register(kind, handler, lane_key=_lane, after=_after)
     rt = applier.extras.get("members")
     if isinstance(rt, MemberRuntime):

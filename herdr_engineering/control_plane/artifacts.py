@@ -80,6 +80,11 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         self._conn = conn
         self._rf = rustfs
 
+    @property
+    def rustfs(self) -> RustFSClient:
+        """The object store this registry reads and writes (the share bundle builder streams from it)."""
+        return self._rf
+
     async def register_logical(self, *, original_filename: str,
                                artifact_type: str = "other",
                                created_by: str | None = None,

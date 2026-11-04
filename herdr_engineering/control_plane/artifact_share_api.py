@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import re
 import threading
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -93,6 +94,16 @@ def _caps(server, created_by) -> tuple[int, int | None]:
         per_share = limits.get("max_share_bytes")
         return (UNBOUNDED if per_share is None else per_share), limits.get("max_total_bytes")
     return settings["max_share_bytes"], settings["max_total_bytes"]
+
+
+@contextmanager
+def _spending(server):
+    """The cross-process spend lock: another process (the worker, the API) cannot read the live total meanwhile."""
+    _call(server.share_store, "acquire_spend")
+    try:
+        yield
+    finally:
+        _call(server.share_store, "release_spend")
 
 
 def _call(store, method, *args, **kwargs):
@@ -265,7 +276,7 @@ def approve_share(server, share: dict, *, approved_by: str | None = None) -> tup
     expires_at = share.get("expires_at")
     if expires_at is not None and expires_at <= datetime.now(UTC):
         raise ShareHTTPError(410, "share expired before approval; create a new share")
-    with _APPROVE_LOCK:
+    with _APPROVE_LOCK, _spending(server):
         creator = share.get("created_by")
         files, entry, warnings = _plan(server, share["artifact_id"], share["version_id"], share.get("entry"), creator)
         _call(server.artifact_store, "verify_share_outputs", share["artifact_id"], share["version_id"])
