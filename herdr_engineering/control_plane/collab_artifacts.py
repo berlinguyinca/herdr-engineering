@@ -122,6 +122,7 @@ from .collab_mirror import ANNOTATIONS_NAME, ARTIFACTS_DIR, BLOBS_DIR, GRANTS_NA
 
 log = logging.getLogger(__name__)
 
+MEMBER_DIRECTORY_FEED = "member-directory.json"   # artifact_member_intents.MEMBER_DIRECTORY (worker side)
 AGENTS_FEED = "agents.json"                 # the worker reads it as collab_intents.AGENTS_FEED
 UNAVAILABLE = "collaboration bridge unavailable"
 NOT_FOUND = "not found"
@@ -1061,6 +1062,7 @@ class CollabArtifactBridge:
                 agents[agent_id] = {
                     "owner": a["owner"], "status": "active" if svc._ok(a["owner"]) else "disabled",
                     "expires_at": a.get("expires_at"), "external": bool(x),
+                    "groups": svc._groups_of(a["owner"]), "harness_type": a.get("harness_type"),
                     "join_id": join_ids.get(a.get("join")) if a.get("join") else None,
                     "hard_expiry": x.get("hard_expiry") if isinstance(x, dict) else None}
         return {"generated_at": self.clock(), "agents": agents}
@@ -1072,6 +1074,10 @@ class CollabArtifactBridge:
                 body = self._feed()
                 atomic_write_json(self.outbox, AGENTS_FEED, body)
                 self._feed_at = body["generated_at"]
+                directory = self.service.member_directory()
+                if directory is not None:
+                    atomic_write_json(self.outbox, MEMBER_DIRECTORY_FEED,
+                                      {**directory, "updated": body["generated_at"]})
             self.stats["feed_writes"] += 1
         except Exception as exc:                          # noqa: BLE001 - a feed write never breaks a caller
             self.stats["feed_failures"] += 1

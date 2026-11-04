@@ -534,6 +534,14 @@ def reset_large_body_admissions() -> None:
 register_large_body_admission(_write_grant_holder, frozenset({"artifact_stage_chunk"}), baseline=True)
 
 
+def _admitted_member(service: CollabService, pr: Any) -> bool:
+    """An internal agent of an approved member (plan 5): the only caller who may send a big member chunk."""
+    return bool(getattr(pr, "is_agent", False)) and service.member_check(pr).ok
+
+
+register_large_body_admission(_admitted_member, frozenset({"artifact_upload_chunk"}), baseline=True)
+
+
 def admitted_tools(service: CollabService, pr: Any) -> frozenset[str]:
     """Union of the tools of every admission that holds for ``pr``. A predicate that raises admits nothing."""
     with _ADMISSIONS_LOCK:

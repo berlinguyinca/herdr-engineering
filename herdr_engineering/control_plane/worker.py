@@ -485,6 +485,8 @@ async def _close_quietly(conn) -> None:
 
 class CollabBridgeLoop:
     """The fast side of the collaborator bridge: up to four independent tasks beside the 30 s worker pass.
+    The optional fourth, **members**, rewrites the member views and sweeps disabled members every ``members_every`` and
+    at once when the grants task saw a grant change (``notify_members``).
 
     * **grants** (own connection, every ``interval``): refreshes the shared retraction gate every
       ``retractions_every``, resolves invite grants from the fresh ``agents.json`` and publishes ``grants.json``
@@ -511,6 +513,7 @@ class CollabBridgeLoop:
         self.gate = applier.gate
         self.rustfs = mirror.rustfs
         self._force: set[str] = set()                    # artifacts the grants task saw change, for the mirror task
+        self._members_wake: asyncio.Event | None = None  # set by notify_members; bound to the running loop lazily
 
     # -- lifecycle ----------------------------------------------------------------------------------------------
     async def run(self, stop: asyncio.Event) -> None:
@@ -555,11 +558,26 @@ class CollabBridgeLoop:
             pass
 
     # -- members ------------------------------------------------------------------------------------------------
+    def notify_members(self) -> None:
+        """Ask the members task for an early pass (a grant changed, so the views may be out of date). Loop thread only."""
+        if self._members_wake is not None:
+            self._members_wake.set()
+
     async def _members(self, conn, stop: asyncio.Event, _pool) -> None:
-        """Every ``members_every``: rewrite the member views and revoke the shares of members no longer admitted."""
+        """Every ``members_every`` or when notified: rewrite the member views and revoke the shares of members no longer
+        admitted."""
+        if self._members_wake is None:
+            self._members_wake = asyncio.Event()
+        wake = self._members_wake
         while not stop.is_set():
+            wake.clear()
             await self.members_publisher(conn)
-            await self._wait(stop, self.members_every)
+            waiting = {asyncio.ensure_future(stop.wait()), asyncio.ensure_future(wake.wait())}
+            try:
+                await asyncio.wait(waiting, timeout=self.members_every, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in waiting:
+                    task.cancel()
 
     # -- grants -------------------------------------------------------------------------------------------------
     async def _grants(self, conn, stop: asyncio.Event, _pool) -> None:
@@ -586,6 +604,7 @@ class CollabBridgeLoop:
             published = await self.mirror.publish_grants(grants, store, heartbeat=self.heartbeat, gate=self.gate)
             if published.changed:
                 self._force |= published.changed           # the mirror task syncs them on its next pass
+                self.notify_members()                      # and the member views (shared with me) are redone now
             await self._wait(stop, self.interval)
 
     def _invite_joins(self) -> dict[str, dict]:

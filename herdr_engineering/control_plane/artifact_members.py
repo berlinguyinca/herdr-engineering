@@ -10,11 +10,12 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Final
-
-import asyncpg
+from typing import TYPE_CHECKING, Any, Final
 
 from .collab_cognito import _USER_RE
+
+if TYPE_CHECKING:        # collab-public imports this module: the runtime side must stay free of asyncpg
+    import asyncpg
 
 MEMBER_PREFIX: Final = "member:"
 _LIMIT_FIELDS: Final = ("max_artifact_bytes", "max_member_bytes", "max_artifacts")

@@ -3997,7 +3997,8 @@ def _cmd_cp_web(args) -> int:
                                       approver_groups=args.collab_approver_group)
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
                                delegation_enabled=_delegation_switch(args, cp),
-                               summary_fix=getattr(args, "collab_summary_fix", None))
+                               summary_fix=getattr(args, "collab_summary_fix", None),
+                               **_collab_member_kwargs(cp))
         collab.task_lease_seconds = _task_lease(args, cp)
         if args.collab_only:
             collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
@@ -4277,6 +4278,7 @@ COLLAB_CONFIG_KEYS = {
     # team collaboration slice 3: the coordinator role with limits; external people only behind a second flag; YAML only, off
     "coordinators": ("collab_coordinators", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
+    "members": ("collab_members", dict),                  # plan 5 member-owned artifacts; YAML only, off by default
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
 }
@@ -4294,6 +4296,10 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
+        if key == "members":
+            _members_settings({"collab": {"members": value}})       # validated here, read again where it is used
+            setattr(args, dest, dict(value))
+            continue
         if kind is dict and key == "summary_fix":
             from .control_plane.collab import summary_fix_config
             try:
@@ -4414,6 +4420,62 @@ def _task_lease_value(value) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 60 <= value <= 7 * 86400:
         raise SystemExit("fleet config control_plane.collab.task_lease_seconds must be a number of seconds, 60 to 604800")
     return float(value)
+
+
+_MEMBER_KEYS = frozenset({"enabled", "group", "groups_ttl", "max_artifact_bytes", "max_member_bytes", "max_artifacts"})
+
+
+def _members_settings(cp) -> dict | None:
+    """``control_plane.collab.members`` (YAML only): None unless ``enabled`` is exactly true. An enabled section needs
+    a ``group`` and may set ``groups_ttl`` (seconds a sign-in's group claims stay valid, default 24 h) and the optional
+    limit defaults (null or a positive integer = unlimited). A bad section stops the start."""
+    collab = cp.get("collab") if isinstance(cp, dict) else None
+    raw = collab.get("members") if isinstance(collab, dict) else None
+    if raw is None:
+        return None
+    where = "fleet config control_plane.collab.members"
+    if not isinstance(raw, dict):
+        raise SystemExit(f"{where} must be a mapping")
+    if "enabled" in raw and not isinstance(raw["enabled"], bool):
+        raise SystemExit(f"{where}.enabled must be true or false")
+    if raw.get("enabled") is not True:
+        return None
+    if unknown := sorted(set(raw) - _MEMBER_KEYS):
+        raise SystemExit(f"{where}: unknown keys: " + ", ".join(unknown))
+    group = raw.get("group")
+    if not isinstance(group, str) or not group.strip():
+        raise SystemExit(f"{where}.group must be a non-empty string")
+    ttl = raw.get("groups_ttl", 24 * 3600.0)
+    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not ttl > 0:
+        raise SystemExit(f"{where}.groups_ttl must be a positive number")
+    defaults = {}
+    for key in ("max_artifact_bytes", "max_member_bytes", "max_artifacts"):
+        value = raw.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise SystemExit(f"{where}.{key} must be a positive integer or null")
+        defaults[key] = value
+    return {"group": group, "groups_ttl": float(ttl), "defaults": defaults}
+
+
+def _collab_member_kwargs(cp) -> dict:
+    """``CollabService`` keyword arguments for the member group (empty when members are off)."""
+    got = _members_settings(cp)
+    return {} if got is None else {"member_group": got["group"], "member_groups_ttl": got["groups_ttl"]}
+
+
+def _members_runtime(cp, settings: CollabArtifactsSettings):
+    """The worker's ``MemberRuntime`` (None when members are off). ``shares_root`` is the share bundle directory only
+    when ``control_plane.share`` is enabled; without it only share rows are revoked."""
+    import time
+
+    from .control_plane.artifact_member_intents import MemberRuntime
+    got = _members_settings(cp)
+    if got is None:
+        return None
+    share = _share_worker_settings(cp)
+    return MemberRuntime(outbox=settings.outbox_dir, mirror_root=settings.mirror_dir, group=got["group"], enabled=True,
+                         defaults=got["defaults"], shares_root=Path(share["shares_dir"]) if share["enabled"] else None,
+                         clock=time.time)
 
 
 def _task_lease(args, cp):
@@ -4877,8 +4939,7 @@ def _build_collab_mirror(settings: CollabArtifactsSettings, *, rustfs):
 def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rustfs, connect, lineage, members=None):
     """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
     applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
-    and staging owner here). ``mirror`` comes from ``_build_collab_mirror``. ``members`` is a ``MemberRuntime`` (config
-    wiring is plan 5 task 5); None leaves the member kinds answering ``members_disabled``."""
+    and staging owner here). ``mirror`` comes from ``_build_collab_mirror``. ``members`` is a ``MemberRuntime`` (``_members_runtime``); None leaves the member kinds answering ``members_disabled``."""
     from .control_plane import worker as cp_worker
     from .control_plane.annotation_intents import (
         register_annotation_resolve,  # registers the kind at import
@@ -4947,7 +5008,9 @@ def _cmd_cp_worker(args) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # validated before anything connects: an invalid collab_artifacts section refuses the start (also with --once)
-    collab_settings = _collab_artifacts_settings(_worker_control_plane_section(getattr(args, "fleet_config", None)))
+    worker_cp = _worker_control_plane_section(getattr(args, "fleet_config", None))
+    collab_settings = _collab_artifacts_settings(worker_cp)
+    member_runtime = _members_runtime(worker_cp, collab_settings) if collab_settings.enabled else None
 
     async def _run():
         cp = _cp_config(getattr(args, "fleet_config", None))
@@ -4993,7 +5056,7 @@ def _cmd_cp_worker(args) -> int:
                 if mirror is not None:
                     bridge_loop = _build_collab_bridge_loop(
                         collab_settings, mirror=mirror, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
-                        lineage=_collab_lineage_hook(worker_cfg))
+                        lineage=_collab_lineage_hook(worker_cfg), members=member_runtime)
             except BaseException:
                 if mirror is not None:
                     mirror.close()

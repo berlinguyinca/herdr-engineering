@@ -406,8 +406,20 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, delegation_enabled: bool = False,
-                 summary_fix: dict | None = None):
+                 summary_fix: dict | None = None, member_group: str | None = None,
+                 member_groups_ttl: float = 24 * 3600.0):
         self.auth = authenticator
+        # Member-owned artifacts (plan 5): the Cognito group whose people own artifacts as ``member:<user_id>``.
+        # None = feature off here. Group claims are only seen at sign-in, so the last claims per user are kept in
+        # memory (never logged) and forgotten after ``member_groups_ttl`` seconds without a sign-in.
+        if member_group is not None and (not isinstance(member_group, str) or not member_group.strip()):
+            raise ValueError("member_group must be a non-empty string")
+        if isinstance(member_groups_ttl, bool) or not isinstance(member_groups_ttl, (int, float)) \
+                or not member_groups_ttl > 0:
+            raise ValueError("member_groups_ttl must be a positive number")
+        self.member_group = member_group
+        self.member_groups_ttl = float(member_groups_ttl)
+        self._user_groups: dict[str, tuple[float, tuple[str, ...]]] = {}
         self._revocable: dict[str, int] = {}                   # outstanding revocable things per kind (H2), from state
         self._outstanding_key = None
         self.degraded: str | None = None     # set when the durable log failed its startup integrity check
@@ -1313,6 +1325,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if self.degraded:                      # only a caller with a VALID token learns that collaboration is down
                 raise CollabError(503, "collaboration is disabled; ask the operator")
             pr = Principal("user", got[0], got[0], exp=got[1])
+            if claims is not None:
+                self._note_groups(got[0], groups)
             if self.approval is not None:
                 self._admit(pr, set(groups))
             return pr
@@ -1346,6 +1360,66 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     _REFUSED = {"denied": "your request to join was declined", "disabled": "your account is disabled",
                 "kicked": "your access was removed"}
+
+    # ---------------------------------------------------------- member-owned artifacts (plan 5)
+    MAX_NOTED_GROUPS = 64
+
+    def _note_groups(self, uid: str, groups: Any) -> None:
+        """Remember the group claims of a verified sign-in; wake the feed when the set changed."""
+        clean = tuple(sorted({g for g in (groups if isinstance(groups, (list, tuple, set, frozenset)) else ())
+                              if isinstance(g, str) and 0 < len(g) <= 128}))[:self.MAX_NOTED_GROUPS]
+        with self._lock:
+            old = self._user_groups.get(uid)
+            self._user_groups[uid] = (self._now(), clean)
+            changed = old is None or old[1] != clean
+        bridge = self.artifact_bridge
+        if changed and bridge is not None and self.member_group is not None:
+            bridge.agents_changed()
+
+    def _groups_of(self, uid: str) -> list[str]:
+        """The last-seen groups of ``uid`` (``[]`` when never seen or older than the TTL). Caller holds the lock."""
+        seen = self._user_groups.get(uid)
+        if seen is None or not 0 <= self._now() - seen[0] <= self.member_groups_ttl:
+            return []
+        return list(seen[1])
+
+    def member_directory(self) -> dict | None:
+        """``member-directory.json``'s body, or None when no member group is configured. Only users whose
+        last-seen groups include the member group are listed; ``disabled`` is anyone not allowed to use the network."""
+        group = self.member_group
+        if group is None:
+            return None
+        users: dict[str, dict] = {}
+        with self._lock:
+            for uid in list(self._user_groups):
+                groups = self._groups_of(uid)
+                if group not in groups:
+                    continue
+                email = self._user_email.get(uid)
+                users[uid] = {"email": email, "display_name": email.split("@")[0] if email else uid,
+                              "status": "approved" if self._ok(uid) else "disabled", "groups": groups}
+        return {"group": group, "users": users}
+
+    def member_check(self, pr: Principal):
+        """The ``member_for_actor`` verdict for an authenticated principal (an agent is judged by its owner)."""
+        from .artifact_members import MemberCheck, member_for_actor
+        group = self.member_group
+        if group is None:
+            return MemberCheck(False, None, "members_disabled")
+        with self._lock:
+            if pr.is_agent:
+                a = self._agents.get(pr.id)
+                if a is None:
+                    return MemberCheck(False, None, "unknown_agent")
+                actor = {"kind": "agent", "agent_id": pr.id}
+                agents = {pr.id: {"owner": a["owner"], "status": a.get("status"), "external": bool(a.get("external"))}}
+                uid = a["owner"]
+            else:
+                actor, agents, uid = {"kind": "user", "user_id": pr.id}, {}, pr.id
+            groups = self._groups_of(uid)
+            directory = {uid: {"status": "approved" if self._ok(uid) else "disabled", "groups": groups}} \
+                if groups else {}
+        return member_for_actor(actor, agents=agents, group=group, directory=directory)
 
     def _admit(self, pr: Principal, groups: set) -> None:
         """Approval mode: record a first sign-in, apply the automatic rules, refuse the refused. Someone
