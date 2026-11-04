@@ -59,7 +59,7 @@ def member_for_actor(actor: Mapping[str, Any], *, agents: Mapping[str, Mapping[s
         agent = agents.get(str(actor.get("agent_id")))
         if agent is None:
             return _refuse("unknown_agent")
-        if agent.get("external"):
+        if agent.get("external") is not False:  # fail closed: a feed entry without the flag is not admitted
             return _refuse("external_agent")
         if agent.get("status") != "active":
             return _refuse("agent_inactive")
@@ -71,7 +71,8 @@ def member_for_actor(actor: Mapping[str, Any], *, agents: Mapping[str, Mapping[s
     entry = directory.get(user_id) if isinstance(user_id, str) else None
     if entry is None:
         return _refuse("unknown_user")
-    if group not in (entry.get("groups") or ()):
+    groups = entry.get("groups")
+    if not isinstance(groups, (list, tuple, set, frozenset)) or group not in groups:
         return _refuse("not_in_group")
     if entry.get("status") != "approved":
         return _refuse("user_disabled")
@@ -95,11 +96,14 @@ class MemberLimits:
         return MemberLimits(**picked)
 
 
+_MAX_LIMIT: Final = {"max_artifact_bytes": 2**63 - 1, "max_member_bytes": 2**63 - 1, "max_artifacts": 2**31 - 1}
+
+
 def _positive(name: str, value: Any) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer or None")
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= _MAX_LIMIT[name]:
+        raise ValueError(f"{name} must be a positive integer within range, or None")
     return value
 
 
