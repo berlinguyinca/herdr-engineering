@@ -229,6 +229,11 @@ scripts/fleet-auto-update-macos.sh uninstall    # bootout + remove the plist
 one it does, and prints a NOTE when the checkout is not clean on `main` — because a skipped run
 exits 0 and `launchctl` reports nothing.
 
+`herdr-eng fleet update` refreshes whichever updater the controller has already loaded — the systemd
+timer on Linux (`systemctl --user is-enabled`), the LaunchAgent on macOS (`launchctl print
+gui/<uid>/com.herdr-engineering.fleet-auto-update`) — so template changes (schedule, working
+directory) converge on both. An updater the operator never enabled is never installed behind them.
+
 ### Optional hosts (laptops)
 
 A host that comes and goes can be marked optional in the private inventory, either
