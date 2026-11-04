@@ -3496,6 +3496,21 @@ def _require_durable_review_gate(cp: dict, dsn) -> None:
                          "control_plane.pg_dsn, or disable the review gate")
 
 
+def _annotation_wiring(cp: dict, dsn: str | None):
+    """The owner annotation store adapter when control_plane.share.enabled is true (it needs the registry database)."""
+    share = cp.get("share") or {}
+    if not isinstance(share, dict) or share.get("enabled") is not True or not dsn:
+        return None
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_annotations import AnnotationStore
+
+    async def create_annotation_store():
+        import asyncpg
+        return AnnotationStore(await asyncpg.connect(dsn))
+
+    return artifact_adapter.SyncArtifactAdapter(create_annotation_store)
+
+
 def _share_wiring(cp: dict, dsn: str | None):
     """(share store adapter, shares root, settings) when control_plane.share.enabled is true, else three Nones.
 
@@ -3712,6 +3727,7 @@ def _cmd_cp_web(args) -> int:
         artifact_reviews.load(artifact_adapter("load_reviews"))
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
+    annotation_store = _annotation_wiring(cp, dsn)
     collab_grant_store, collab_artifacts_enabled = _collab_grant_wiring(cp, dsn)
     collab = None
     artifact_bridge = None
@@ -3836,6 +3852,7 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
+                             annotation_store=annotation_store,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
@@ -3872,6 +3889,8 @@ def _cmd_cp_web(args) -> int:
             artifact_adapter.close()
         if share_store is not None:
             share_store.close()
+        if annotation_store is not None:
+            annotation_store.close()
         if collab_grant_store is not None:
             collab_grant_store.close()
     return 0

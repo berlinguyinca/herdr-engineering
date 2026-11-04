@@ -250,6 +250,18 @@ export class HerdrClient {
     return this.request(`${this.artifactSharesPath(id, shareId)}/events`, { signal });
   }
 
+  /** Annotations on an artifact's shares (owner view): one page, newest first; pass the returned `next` as `before`. */
+  listArtifactAnnotations(id, { status = 'open', before, signal } = {}) {
+    const query = new URLSearchParams({ status });
+    if (before !== undefined) query.set('before', before);
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/annotations?${query}`, { signal });
+  }
+
+  dismissArtifactAnnotation(id, annotationId, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/annotations/${encodeURIComponent(annotationId)}/dismiss`,
+      { method: 'POST', body: {}, signal });
+  }
+
   // Artifact collaborators (owner view): grants for agents, one-time invite grants, activity, version diffs.
   artifactCollabPath(id, tail = '') {
     return `/api/v1/artifacts/${encodeURIComponent(id)}${tail}`;

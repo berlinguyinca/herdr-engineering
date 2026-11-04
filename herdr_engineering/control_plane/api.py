@@ -308,7 +308,7 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None):
         """
@@ -447,6 +447,8 @@ class ControlPlaneServer:
         self.share_store = share_store
         self.shares_root = shares_root
         self.share_settings = share_settings
+        # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
+        self.annotation_store = annotation_store
         # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
         self.collab_grant_store = collab_grant_store
         self.collab_artifacts_enabled = collab_artifacts_enabled
@@ -3007,6 +3009,9 @@ def _make_handler(server, public=False, operator=False):
                     return None
                 from .artifact_share_api import route_share
                 if route_share(self, server, parts, resource):
+                    return None
+                from .artifact_annotation_api import route_annotations
+                if route_annotations(self, server, parts, resource):
                     return None
                 from .artifact_registry_api import route_registry
                 if route_registry(self, server, parts, resource):
