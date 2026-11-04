@@ -780,6 +780,7 @@ def test_dry_run_with_share_enabled_validates_and_never_prints_the_secret(env):
 
 def test_real_deploy_with_share_enabled_installs_the_slice_and_edge_and_recreates_share_public(env):
     _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
+    _live_cert(env, "mcp.example.test", SHARE_HOST)
     r = _ds.deploy(env)
     assert r.returncode == 0, r.stdout + r.stderr
     assert SECRET not in r.stdout + r.stderr
@@ -956,3 +957,92 @@ def test_share_locations_refuse_raw_paths_that_differ_from_the_normalised_one_an
     assert share.count("if ($share_raw_path_ok = 0) { return 404; }") == 2       # /s/ and the annotation location
     ann = _brace_block(share, share.index('$" {'))
     assert "if ($share_read_with_body) { return 404; }" in ann
+
+
+# ------------------------------------------------------------- the edge certificate must name the share host
+
+def _make_cert(directory: Path, *names: str) -> Path:
+    """A real self-signed certificate (openssl) whose subjectAltName lists ``names``; returns fullchain.pem."""
+    directory.mkdir(parents=True, exist_ok=True)
+    pem, key = directory / "fullchain.pem", directory / "privkey.pem"
+    san = ",".join(f"DNS:{n}" for n in names)
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "60", "-subj",
+                    f"/CN={names[0]}", "-addext", f"subjectAltName={san}", "-keyout", str(key), "-out", str(pem)],
+                   check=True, capture_output=True)
+    return pem
+
+
+SYNC = CP / "collab-sync.sh"
+
+
+def _cert_host(env_, config, cert_dir, host):
+    return subprocess.run([str(SYNC), "cert-host", "--config", str(config), "--cert-dir", str(cert_dir),
+                           "--share-host", host], env=env_["env"], capture_output=True, text=True)
+
+
+@pytest.mark.parametrize(("sans", "ok"), [
+    (("mcp.example.test", "artifacts.example.test"), True),
+    (("mcp.example.test", "*.example.test"), True),
+    (("mcp.example.test",), False),
+    (("mcp.example.test", "*.other.test"), False),
+    (("mcp.example.test", "*.example.test"), True),
+])
+def test_collab_sync_cert_host_checks_the_subject_alternative_names(env, tmp_path, sans, ok):
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
+    config = tmp_path / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(env["central"]), config)
+    certs = tmp_path / "certs"
+    _make_cert(certs, *sans)
+    r = _cert_host(env, config, certs, SHARE_HOST)
+    assert (r.returncode == 0) is ok, r.stderr
+    if not ok:
+        assert SHARE_HOST in r.stderr and "certbot" in r.stderr
+
+
+def test_a_wildcard_does_not_cover_a_deeper_name(env, tmp_path):
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
+    config = tmp_path / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(env["central"]), config)
+    _make_cert(tmp_path / "certs", "*.example.test")
+    assert _cert_host(env, config, tmp_path / "certs", "a.b.example.test").returncode != 0
+
+
+def _live_cert(e, *names):
+    live = e["home"] / ".local/share/herdr-engineering/collab-acme/config/live/localdev.mcp.metabolomics.us"
+    _make_cert(live, *names)
+
+
+def test_deploy_with_shares_fails_when_the_edge_certificate_lacks_the_share_host(env):
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
+    _live_cert(env, "mcp.example.test")
+    r = _ds.deploy(env)
+    assert r.returncode != 0
+    assert SHARE_HOST in r.stderr and "certificate" in r.stderr
+    assert not (env["tmp"] / "edge-certs" / "fullchain.pem").exists()   # the unusable cert never reached the edge
+
+
+def test_deploy_with_shares_passes_when_the_certificate_names_the_share_host(env):
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
+    _live_cert(env, "mcp.example.test", SHARE_HOST)
+    r = _ds.deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    unit = (env["home"] / ".config/systemd/user/herdr-collab-sync.service").read_text()
+    assert f'--share-host {SHARE_HOST}' in unit          # the minute timer keeps checking renewals
+    assert (env["tmp"] / "edge-certs" / "fullchain.pem").is_file()
+
+
+def test_deploy_without_shares_does_not_look_at_the_certificate_names(env):
+    _set_share(env, {"enabled": False})
+    _live_cert(env, "mcp.example.test")
+    r = _ds.deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--share-host" not in (env["home"] / ".config/systemd/user/herdr-collab-sync.service").read_text()
+
+
+def test_deploy_with_shares_probes_the_share_host_and_only_warns(env):
+    _set_share(env, {"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
+    _live_cert(env, "mcp.example.test", SHARE_HOST)
+    r = _ds.deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr          # the stub curl answers no 404: a warning, not a failure
+    assert f"curl https://{SHARE_HOST}/s/probe/" in env["log"].read_text()
+    assert f"probe of https://{SHARE_HOST}/s/probe/" in r.stderr

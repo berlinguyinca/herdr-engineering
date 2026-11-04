@@ -815,8 +815,21 @@ forward() {
     local held=()
     if grep -q -- '--lock-held' "$WORK/deploy/control-plane/collab-sync.sh"; then held=(--lock-held)
     else echo "WARNING: this commit's collab-sync.sh cannot run under the deploy's lock; its refresh is left to the timer" >&2; fi
+    # Shares enabled: the edge serves the share host with this same certificate, so refuse one that does not
+    # name it (checked by collab-sync before it copies, and once more on the staged copy).
+    local share_host=()
+    if [ "$SHARE" = 1 ]; then
+      SHARE_HOST_NAME="$(python3 -c 'import json,sys; from urllib.parse import urlsplit; print(urlsplit(json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["share"]["public_url"]).hostname or "")' "$SHARE_CONFIG")" \
+        && [ -n "$SHARE_HOST_NAME" ] || { echo "cannot read the share host from $SHARE_CONFIG" >&2; return 1; }
+      share_host=(--share-host "$SHARE_HOST_NAME")
+    fi
     "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
-      --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" "${held[@]}" || return 1
+      --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" \
+      "${share_host[@]}" "${held[@]}" || return 1
+    if [ "$SHARE" = 1 ]; then
+      "$WORK/deploy/control-plane/collab-sync.sh" cert-host --config "$COLLAB_CONFIG" --cert-dir "$CERT_DIR_VALUE" \
+        "${share_host[@]}" || return 1
+    fi
     mkdir -p "$(dirname "$HERDR_COLLAB_EDGE_CONF")" || return 1
     write_edge_conf "$NEW_EDGE" || return 1
   fi
@@ -851,6 +864,13 @@ if forward; then
     "herdr-engineering:$TAG" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)"
   python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
   echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
+  if [ "$SHARE" = 1 ] && [ -n "${SHARE_HOST_NAME:-}" ]; then
+    # Smoke line, never fatal: an unknown token on the share host's own TLS name answers a bare 404 when the DNS
+    # record, the SNI route, the certificate and the share server all line up.
+    probe="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$SHARE_HOST_NAME/s/probe/" 2>/dev/null || true)"
+    [ "$probe" = 404 ] || echo "WARNING: probe of https://$SHARE_HOST_NAME/s/probe/ answered '${probe:-no response}', expected 404:" \
+      "check DNS, the SNI route to the edge and the certificate for the share host" >&2
+  fi
   if [ "$MEMORY" = 1 ]; then memory_phase || exit 4; fi
   exit 0
 fi
