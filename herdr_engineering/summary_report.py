@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -223,27 +224,69 @@ def _post_publish(cfg, body, *, timeout=15):
             return exc.code, {}
 
 
+def _viewer_argv(file, pane_id):
+    """The command a pane runs to read ``file``: rendered, paged, and the pane closes when the pager quits.
+
+    It uses this interpreter rather than whatever ``herdr-eng`` PATH finds, so the viewer always matches the
+    code that published the report.
+    """
+    return [sys.executable, "-m", "herdr_engineering.cli", "summary", "view", str(file), "--close-pane", pane_id]
+
+
 def _open_side_pane(file, pane_id, env, run, herdr="herdr"):
-    """Show the report in a pane to the right of the caller's own pane, reusing the one a previous run made."""
+    """Show the report in a pane to the right of the caller's own.
+
+    The viewer closes its pane when the reader quits, so a pane that is still alive is one still being read:
+    it is replaced rather than typed into (keystrokes sent to a running pager would be read as pager commands).
+    """
     sidecar = Path(str(file) + ".pane")
     try:
         previous = sidecar.read_text().strip() if sidecar.is_file() else ""
-        target = None
         if previous:
             alive = run([herdr, "pane", "get", previous], capture_output=True, text=True, timeout=10, env=env)
-            target = previous if alive.returncode == 0 else None
-        if target is None:
-            split = run([herdr, "pane", "split", "--pane", pane_id, "--direction", "right", "--no-focus",
-                         "--cwd", str(Path(file).parent)], capture_output=True, text=True, timeout=10, env=env)
-            if split.returncode != 0:
-                return {"ok": False, "error": "split_failed"}
-            target = json.loads(split.stdout)["result"]["pane"]["pane_id"]
-            sidecar.write_text(target)
-        shown = run([herdr, "pane", "run", target, "less", "-R", str(file)], capture_output=True, text=True,
+            if alive.returncode == 0:
+                run([herdr, "pane", "close", previous], capture_output=True, text=True, timeout=10, env=env)
+        split = run([herdr, "pane", "split", "--pane", pane_id, "--direction", "right", "--no-focus",
+                     "--cwd", str(Path(file).parent)], capture_output=True, text=True, timeout=10, env=env)
+        if split.returncode != 0:
+            return {"ok": False, "error": "split_failed"}
+        target = json.loads(split.stdout)["result"]["pane"]["pane_id"]
+        sidecar.write_text(target)
+        shown = run([herdr, "pane", "run", target, *_viewer_argv(file, target)], capture_output=True, text=True,
                     timeout=10, env=env)
         return {"ok": shown.returncode == 0, "pane_id": target} if shown.returncode == 0 else {"ok": False, "error": "run_failed"}
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
         return {"ok": False, "error": "herdr_unavailable"}
+
+
+def view_report(file, *, close_pane=None, run=subprocess.run, out=None, width=None, herdr="herdr"):
+    """Render the Markdown report ``file`` and page it; then close ``close_pane`` (the pane showing it).
+
+    Closing happens in ``finally`` so Ctrl-C or a pager failure still leaves no empty pane behind. When stdout is
+    not a terminal the rendered text is just written out.
+    """
+    from .md_render import render_markdown
+    out = out or sys.stdout
+    try:
+        text = Path(file).read_text()
+        cols = width or min(max(shutil.get_terminal_size((100, 24)).columns - 2, 40), 110)
+        rendered = render_markdown(text, width=cols, color=os.environ.get("NO_COLOR") is None)
+        if not out.isatty():
+            out.write(rendered + "\n")
+            return 0
+        pager = shutil.which("less")
+        if pager:
+            prompt = " session summary \u00b7 q closes this pane \u00b7 space/arrows scroll \u00b7 / searches"
+            run([pager, "-R", "-Pm" + prompt, "-PM" + prompt], input=rendered + "\n", text=True)
+        else:
+            out.write(rendered + "\n")
+            input("\nPress Enter to close ")
+        return 0
+    except (OSError, KeyboardInterrupt):
+        return 1
+    finally:
+        if close_pane:
+            run([herdr, "pane", "close", close_pane], capture_output=True, text=True, timeout=10)
 
 
 def publish_report(agent, session_id, text, *, home=None, environ=None, run=subprocess.run,

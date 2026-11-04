@@ -168,8 +168,11 @@ It publishes the report and prints one line:
   becomes the session's `full_report` with `source: "terminal"`. The dashboard names the agent by its recorded
   identity; zero or several matching dashboard sessions are refused (`no_session`, `ambiguous_session`) rather
   than guessed, and a running dashboard job is not cancelled.
-- It opens, or reuses, a read-only `less -R` side pane to the right of the agent (`--no-focus`), remembering
-  the pane in a sidecar file. `--no-pane` and `--no-dashboard` turn either half off.
+- It opens a side pane to the right of the agent (`--no-focus`) that runs `herdr-eng summary view FILE
+  --close-pane ID`: the report rendered as styled terminal text (`md_render.py`, no dependencies; `NO_COLOR` turns
+  colour off), paged with `less`, and the pane closes itself when the pager exits. A pane from an earlier run
+  that is still open is replaced, because keystrokes sent to a running pager would be pager commands. The pane id
+  is kept in a sidecar file. `--no-pane` and `--no-dashboard` turn either half off.
 - If publishing fails, the skill prints the complete report so nothing is lost. Target mode and prepared
   evidence runs never publish.
 

@@ -252,18 +252,88 @@ def test_publish_sends_to_the_dashboard_and_a_side_pane_and_prints_one_line(tmp_
     split = next(c for c in calls if c[1:3] == ["pane", "split"])
     assert split[split.index("--pane") + 1] == "w1:p1" and "--no-focus" in split and "right" in split
     shown = next(c for c in calls if c[1:3] == ["pane", "run"])
-    assert shown[3] == "w1:p9" and shown[4:] == ["less", "-R", out["file"]]
+    assert shown[3] == "w1:p9"
+    # the pane runs the viewer on the report and tells it which pane to close when the reader quits
+    assert shown[4:6] == [sys.executable, "-m"] and shown[-5:] == ["summary", "view", out["file"], "--close-pane", "w1:p9"]
     assert (Path(out["file"]).stat().st_mode & 0o777) == 0o600
 
 
-def test_publish_reuses_the_pane_it_opened_before(tmp_path):
+def test_publish_replaces_a_pane_that_is_still_open_rather_than_typing_into_it(tmp_path):
     calls = []
     kw = dict(home=tmp_path, environ={"HERDR_PANE_ID": "w1:p1"}, run=_fake_herdr(calls), load_config=lambda: _Cfg,
               post=lambda cfg, body: (200, {}))
     sr.publish_report("claude", "abc-123", REPORT, **kw)
+    assert not any(c[1:3] == ["pane", "close"] for c in calls)
     sr.publish_report("claude", "abc-123", REPORT, **kw)
-    assert sum(1 for c in calls if c[1:3] == ["pane", "split"]) == 1
+    # a live pane is a pager still being read; keystrokes sent to it would be pager commands
+    assert [c[3] for c in calls if c[1:3] == ["pane", "close"]] == ["w1:p9"]
+    assert sum(1 for c in calls if c[1:3] == ["pane", "split"]) == 2
     assert sum(1 for c in calls if c[1:3] == ["pane", "run"]) == 2
+
+
+def test_publish_opens_a_new_pane_when_the_old_one_was_closed(tmp_path):
+    calls = []
+    kw = dict(home=tmp_path, environ={"HERDR_PANE_ID": "w1:p1"}, run=_fake_herdr(calls, alive=False),
+              load_config=lambda: _Cfg, post=lambda cfg, body: (200, {}))
+    sr.publish_report("claude", "abc-123", REPORT, **kw)
+    sr.publish_report("claude", "abc-123", REPORT, **kw)
+    assert not any(c[1:3] == ["pane", "close"] for c in calls)
+    assert sum(1 for c in calls if c[1:3] == ["pane", "split"]) == 2
+
+
+class _Tty:
+    def __init__(self, tty):
+        self.tty, self.text = tty, ""
+
+    def isatty(self):
+        return self.tty
+
+    def write(self, s):
+        self.text += s
+
+
+def test_view_pages_the_rendered_report_then_closes_its_pane(tmp_path):
+    f = tmp_path / "r.md"
+    f.write_text("# Title\n\nSome **bold** text.\n")
+    calls = []
+
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    assert sr.view_report(f, close_pane="w1:p9", run=run, out=_Tty(True), width=60) == 0
+    pager, closer = calls
+    assert pager[0][0].endswith("less") and "-R" in pager[0]
+    assert "**" not in pager[1]["input"] and "# " not in pager[1]["input"] and "\x1b[" in pager[1]["input"]
+    assert closer[0] == ["herdr", "pane", "close", "w1:p9"]
+
+
+def test_view_still_closes_its_pane_when_the_pager_is_interrupted(tmp_path):
+    f = tmp_path / "r.md"
+    f.write_text("# Title\n")
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if argv[0].endswith("less"):
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    assert sr.view_report(f, close_pane="w1:p9", run=run, out=_Tty(True)) == 1
+    assert calls[-1] == ["herdr", "pane", "close", "w1:p9"]
+
+
+def test_view_without_a_terminal_prints_and_leaves_no_pane_to_close(tmp_path):
+    f = tmp_path / "r.md"
+    f.write_text("# Title\n")
+    out, calls = _Tty(False), []
+    assert sr.view_report(f, run=lambda argv, **kw: calls.append(argv), out=out) == 0
+    assert "Title" in out.text and calls == []
+
+
+def test_view_closes_its_pane_even_if_the_report_is_missing(tmp_path):
+    calls = []
+    sr.view_report(tmp_path / "gone.md", close_pane="w1:p9",
+                   run=lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0), out=_Tty(True))
+    assert calls == [["herdr", "pane", "close", "w1:p9"]]
 
 
 def test_publish_one_destination_failing_still_reports_the_other(tmp_path):
