@@ -11,6 +11,8 @@ import time
 
 import pytest
 
+_REPO_ROOT = str(__import__('pathlib').Path(__file__).resolve().parents[1])
+
 from herdr_engineering.build_coord import (
     BuildGate,
     _default_slots,
@@ -106,7 +108,7 @@ def test_holds_slot_across_exec(gate_dir):
     """The flock must survive execvp so it's held for the child's lifetime."""
     env = dict(os.environ, HERDR_ENGINEERING_STATE=str(gate_dir))
     script = (
-        "import sys; sys.path.insert(0, '/home/wohlgemuth/IdeaProjects/herdr-engineering'); "
+        "import sys; sys.path.insert(0, " + repr(_REPO_ROOT) + "); "
         "from herdr_engineering.build_coord import run_gated; "
         "sys.exit(run_gated(['sleep', '2'], slots=2, max_load=0))"
     )
@@ -140,7 +142,7 @@ def test_bypass_on_timeout_runs_ungated(tmp_path):
     fd, _ = gate._try_acquire(0, ["hold"])
     try:
         script = (
-            "import sys; sys.path.insert(0, '/home/wohlgemuth/IdeaProjects/herdr-engineering'); "
+            "import sys; sys.path.insert(0, " + repr(_REPO_ROOT) + "); "
             "from herdr_engineering.build_coord import run_gated; "
             "sys.exit(run_gated(['python3', '-c', 'print(\"BYPA$$ED\")'], "
             "slots=1, max_load=0, wait_seconds=0.5, "
