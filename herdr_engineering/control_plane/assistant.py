@@ -194,6 +194,17 @@ def _delegation_pi_bindings(value: Any) -> list[dict[str, str]]:
 _TENANT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}\Z")
 
 
+def _context_rejection(exc: Exception) -> bool:
+    """The gateway's 400 for a prompt larger than one model's window ("request exceeds available context windows"): a model with
+    a bigger window can still answer it. Any other 400 is a bad request and fails fast."""
+    if getattr(exc, "code", None) != 400 or not callable(getattr(exc, "read", None)):
+        return False
+    try:
+        return b"context window" in exc.read(2000).lower()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _model_preferences(value: Any) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
         raise ValueError("control_plane.personal_assistant.inference.preferred_models must be a list of model ids or patterns")
@@ -1628,7 +1639,7 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
                 code = getattr(exc, "code", None)
                 if code is None and not isinstance(exc, OSError):      # timeouts and resets are OSErrors; a bug is not
                     raise
-                if code is not None and code not in RETRY_CODES:
+                if code is not None and code not in RETRY_CODES and not _context_rejection(exc):
                     raise
                 _log.warning("assistant model %r failed (%s); trying the next", model,
                              code if code is not None else type(exc).__name__)
