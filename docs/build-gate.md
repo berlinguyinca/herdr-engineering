@@ -132,6 +132,25 @@ Rust cache maintenance uses the same per-host state directory and a shared build
 lock. See [automatic Rust build-cache cleanup](build-cleanup.md) for configuration,
 process checks, and the optional Herdr server companion.
 
+## Agent build interception and trace (spec 08)
+
+The Pi extension (`deploy/pi-build-gate/build-gate.ts`) still gates heavy
+`cargo`/`tsc` commands exactly as before. It additionally routes light, SIMPLE
+`cargo build|check|test|clippy|nextest` and `rustc` commands through
+`herdr-eng build-coordinate --record --require-cache-enabled`. With
+`fabric_build_cache` disabled that flag makes `herdr-eng` exec the original
+command (no slot, no lock, no events). "Simple" is a character allowlist, not a
+shell parser: any quote, `| & ; < > ( ) $ \` ~ * ! # { }`, newline or leading
+`VAR=value` leaves the command untouched (fail open to the original). Commands
+already using `build-coordinate`/`sccache`, or run with a `RUSTC_WRAPPER`-style
+variable set, are never wrapped again (`herdr-eng` also refuses to nest a gate).
+
+`--trace-session` / `--trace-mission` (non-secret ids, `[A-Za-z0-9._:-]`, max 64,
+credential-looking values dropped) add `trace: {session, mission?, source:"pi"}`
+to the recorded events and fill `owner_session`/`mission_id` in the registry.
+The extension takes them from `HERDR_SESSION_ID`/`HERDR_MISSION_ID` (existing
+context variables), else a per-process id. argv and env values are never traced.
+
 ## Checking it
 
 The `build-gate` skill (`skills/build-gate/`) wraps this check: `bash skills/build-gate/scripts/status.sh` reports whether `herdr-eng` is on PATH, whether the extension is installed, live slot occupancy and host load, and exits nonzero when gating is not active.
