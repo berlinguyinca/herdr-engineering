@@ -232,6 +232,14 @@ def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
         os.execvp(cmd[0], cmd)
         raise AssertionError("unreachable")  # pragma: no cover
     from .build_metrics import run_measured
+    # The wrapper alone holds the locks; make that explicit so no child tree
+    # (even via a future spawn path) can inherit them.
+    for lock_fd in (slot_fd,):
+        if lock_fd is not None:
+            try:
+                os.set_inheritable(lock_fd, False)
+            except OSError:
+                pass
     try:
         return run_measured(cmd, state_dir=state_dir, slot=slot, env=env,
                             cache=cache, registry=True, trace=trace).exit_code
@@ -407,6 +415,8 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
         except BaseException:
             os.close(maintenance_fd)
             raise
+    if maintenance_fd is not None and record:
+        os.set_inheritable(maintenance_fd, False)  # wrapper-held only (no exec)
     try:
         return _run_gated(cmd, slots=slots, max_load=max_load,
                           wait_seconds=wait_seconds, json_out=json_out,
