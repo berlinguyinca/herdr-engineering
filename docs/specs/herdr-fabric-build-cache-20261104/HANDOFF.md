@@ -1,5 +1,13 @@
 # HANDOFF (rolling; newest section first)
 
+## Spec 14: rollout -- DOCS ONLY; no pilot run, no measurement
+Plan: write docs/build-cache-deployment.md (staged runbook), IMPLEMENTATION_REPORT.md; no code, no deploy, no network.
+Completed: both documents. Test re-run at 1f5bab30: 522 passed, 7 skipped.
+Not done: Bender pilot, any cold/warm measurement, shared canary, second host, Slurm, metrics export (Grafana push is NOT implemented). Exit criterion (proof of reduced writes/elapsed time) NOT met: no measured baseline exists.
+Risks: runbook commands are from code, never executed; whether build_bench reads sccache deltas through build-coordinate is UNVERIFIED; Stage 2 cannot deliver shared hits until the credentialed sccache server exists.
+Files: docs/build-cache-deployment.md, IMPLEMENTATION_REPORT.md, this file.
+Next: none.
+
 ## Spec 13: failure, security, rollback -- LOCAL SCENARIOS DONE; cluster/S3/sccache rows BLOCKED
 Plan: tests/test_build_chaos.py (real processes, flock, sqlite, sockets, tmp dirs; only sh stand-ins for sccache/rustc/cargo, no mocks); rollback rehearsal; docs/build-cache-rollback.md; matrix evidence below.
 Completed: 27 tests + 7 explicit skips. Outage (closed port, accept-and-close, plaintext 503, hanging listener: bounded, reason `shared_unavailable:*`, exit code kept, no secret in env/events/output); 20-build storm (slots respected via counter file, all complete, registry rows consistent, no leases left, lost/corrupt registry still runs builds); hostile cache (symlinks, fifo, traversal, symlinked cache root never followed or deleted; Slurm `validate_outputs` rejects every hostile shape); SIGKILLed record wrapper (orphan keeps maintenance lock, cleanup/eviction `busy`, lease expiry, reconcile `owner_vanished` only after pid death, stale epoch fenced, nothing deleted); readonly/corrupt/unreadable registry (cleanup fails closed `registry_unreadable`); rollback rehearsal.
