@@ -17,6 +17,11 @@ from collections.abc import Callable
 from typing import Any
 
 DEFAULT_HOLD_DAYS = 30.0
+MAX_BULK = 200
+MAX_REASON = 1000
+DELETE_MODES = ("tombstone", "purge_now")
+_NOT_PURGED = ("NOT EXISTS (SELECT 1 FROM artifact_lifecycle_events pe WHERE pe.artifact_id=a.artifact_id "
+               "AND pe.action='purge')")
 _TRANSITIONS = {
     "archive": ({"active"}, "archived"),
     "restore": ({"archived", "tombstoned"}, "active"),
@@ -61,9 +66,13 @@ class ArtifactLifecycleMixin:
                 await self._conn.execute(
                     "UPDATE artifacts SET lifecycle='archived', archived_at=now() WHERE artifact_id=$1", artifact_id)
             elif action == "restore":
+                if current == "tombstoned" and await self._conn.fetchval(
+                        "SELECT from_state FROM artifact_lifecycle_events WHERE artifact_id=$1 AND action='tombstone' "
+                        "ORDER BY event_id DESC LIMIT 1", artifact_id) == "retracted":
+                    to_state = "retracted"          # a hidden artifact must not reappear because it was tombstoned
                 await self._conn.execute(
-                    "UPDATE artifacts SET lifecycle='active', archived_at=NULL, tombstoned_at=NULL, purge_after=NULL "
-                    "WHERE artifact_id=$1", artifact_id)
+                    "UPDATE artifacts SET lifecycle=$2, archived_at=NULL, tombstoned_at=NULL, purge_after=NULL "
+                    "WHERE artifact_id=$1", artifact_id, to_state)
             else:
                 days = None if hold_days is None else float(max(0.0, hold_days))
                 await self._conn.execute(
@@ -121,8 +130,8 @@ class ArtifactLifecycleMixin:
         """True when a live artifact other than this one still references the content-addressed key."""
         digest = self._digest_of(key)
         row = await self._conn.fetchrow(
-            "SELECT 1 AS x FROM artifact_versions v JOIN artifacts a ON a.artifact_id=v.artifact_id "
-            "WHERE a.artifact_id<>$1 AND a.lifecycle<>'tombstoned' AND v.purged_at IS NULL AND ("
+            f"SELECT 1 AS x FROM artifact_versions v JOIN artifacts a ON a.artifact_id=v.artifact_id "
+            f"WHERE a.artifact_id<>$1 AND {_NOT_PURGED} AND v.purged_at IS NULL AND ("
             " v.output_manifest @> jsonb_build_array(jsonb_build_object('storage_key', $2::text))"
             " OR v.output_manifest @> jsonb_build_array(jsonb_build_object('blob_sha256', $3::text))"
             " OR v.output_manifest @> jsonb_build_array(jsonb_build_object('sha256', $3::text))"
@@ -131,12 +140,12 @@ class ArtifactLifecycleMixin:
             return True
         row = await self._conn.fetchrow(
             "SELECT 1 AS x FROM artifact_blobs b JOIN artifacts a ON a.artifact_id=b.scope "
-            "WHERE b.scope<>$1 AND b.storage_key=$2 AND a.lifecycle<>'tombstoned' LIMIT 1", artifact_id, key)
+            f"WHERE b.scope<>$1 AND b.storage_key=$2 AND {_NOT_PURGED} LIMIT 1", artifact_id, key)
         if row:
             return True
         row = await self._conn.fetchrow(
-            "SELECT 1 AS x FROM artifacts a WHERE a.artifact_id<>$1 AND a.storage_key=$2 "
-            "AND a.lifecycle<>'tombstoned' LIMIT 1", artifact_id, key)
+            f"SELECT 1 AS x FROM artifacts a WHERE a.artifact_id<>$1 AND a.storage_key=$2 "
+            f"AND {_NOT_PURGED} LIMIT 1", artifact_id, key)
         return row is not None
 
     async def purge_due(self, *, limit: int = 20) -> list[dict]:
@@ -155,42 +164,175 @@ class ArtifactLifecycleMixin:
                     "SELECT lifecycle FROM artifacts WHERE artifact_id=$1 FOR UPDATE", artifact_id)
                 if locked is None or locked["lifecycle"] != "tombstoned":
                     continue
-                versions = [self._row(v) for v in await self._conn.fetch(
-                    "SELECT * FROM artifact_versions WHERE artifact_id=$1 AND purged_at IS NULL", artifact_id)]
-                keys: set[str] = set()
-                for version in versions:
-                    keys |= self._version_keys(version)
-                for blob in await self._conn.fetch(
-                        "SELECT storage_key FROM artifact_blobs WHERE scope=$1", artifact_id):
-                    keys.add(blob["storage_key"])
-                legacy = await self._conn.fetchrow("SELECT storage_key FROM artifacts WHERE artifact_id=$1", artifact_id)
-                if legacy and legacy["storage_key"]:
-                    keys.add(legacy["storage_key"])
-                deleted, retained = [], []
-                for key in sorted(keys):
-                    if not key.startswith("sha256/"):
-                        digest = self._digest_of(key)
-                        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}" if len(digest) == 64 else key
-                    if not key.startswith("sha256/"):
-                        continue
-                    if await self._key_shared(artifact_id, key):
-                        retained.append(key)
-                        continue
-                    try:
-                        self._rf.delete(key)
-                        deleted.append(key)
-                    except Exception:                       # noqa: BLE001 - recorded, retried next sweep
-                        retained.append(key)
-                await self._conn.execute(
-                    "UPDATE artifact_versions SET state='purged', purged_at=now() "
-                    "WHERE artifact_id=$1 AND purged_at IS NULL", artifact_id)
-                await self._conn.execute("DELETE FROM artifact_blobs WHERE scope=$1", artifact_id)
-                await self._conn.execute(
-                    "INSERT INTO artifact_lifecycle_events (artifact_id, action, from_state, to_state, actor, reason, "
-                    "detail) VALUES ($1,'purge','tombstoned','tombstoned','system','hold window elapsed',$2::jsonb)",
-                    artifact_id, json.dumps({"deleted": deleted, "retained_shared": retained}))
-            results.append({"artifact_id": artifact_id, "deleted": deleted, "retained_shared": retained})
+                results.append(await self._purge_locked(artifact_id, actor="system", reason="hold window elapsed"))
         return results
+
+    async def _purge_locked(self, artifact_id: str, *, actor: str, reason: str, request_key: str | None = None,
+                            extra: dict | None = None) -> dict:
+        """Delete the unshared bytes of a tombstoned artifact. The caller holds the artifact row lock in a transaction."""
+        versions = [self._row(v) for v in await self._conn.fetch(
+            "SELECT * FROM artifact_versions WHERE artifact_id=$1 AND purged_at IS NULL", artifact_id)]
+        keys: set[str] = set()
+        for version in versions:
+            keys |= self._version_keys(version)
+        for blob in await self._conn.fetch("SELECT storage_key FROM artifact_blobs WHERE scope=$1", artifact_id):
+            keys.add(blob["storage_key"])
+        legacy = await self._conn.fetchrow("SELECT storage_key FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if legacy and legacy["storage_key"]:
+            keys.add(legacy["storage_key"])
+        deleted, retained = [], []
+        for key in sorted(keys):
+            if not key.startswith("sha256/"):
+                digest = self._digest_of(key)
+                key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}" if len(digest) == 64 else key
+            if not key.startswith("sha256/"):
+                continue
+            if await self._key_shared(artifact_id, key):
+                retained.append(key)
+                continue
+            try:
+                self._rf.delete(key)
+                deleted.append(key)
+            except Exception:                           # noqa: BLE001 - recorded, retried next sweep
+                retained.append(key)
+        await self._conn.execute(
+            "UPDATE artifact_versions SET state='purged', purged_at=now() WHERE artifact_id=$1 AND purged_at IS NULL",
+            artifact_id)
+        await self._conn.execute("DELETE FROM artifact_blobs WHERE scope=$1", artifact_id)
+        await self._conn.execute(
+            "INSERT INTO artifact_lifecycle_events (artifact_id, action, from_state, to_state, actor, reason, "
+            "request_key, detail) VALUES ($1,'purge','tombstoned','tombstoned',$2,$3,$4,$5::jsonb)",
+            artifact_id, actor, reason, request_key,
+            json.dumps({"deleted": deleted, "retained_shared": retained, **(extra or {})}))
+        return {"artifact_id": artifact_id, "deleted": deleted, "retained_shared": retained}
+
+    # ------------------------------------------------------- owner delete / restore
+    @staticmethod
+    def _delete_args(actor: str, reason: str) -> str:
+        from .artifacts import ArtifactError
+        reason = " ".join((reason or "").split())[:MAX_REASON]
+        if not actor:
+            raise ArtifactError("actor is required")
+        if not reason:
+            raise ArtifactError("a reason is required")
+        return reason
+
+    async def purge_now(self, artifact_id: str, *, actor: str, reason: str, request_key: str | None = None,
+                        override_legal_hold: bool = False) -> dict:
+        """Tombstone (when needed) and purge immediately, in one transaction. Hashes, provenance and audit stay.
+
+        ``result`` is ``deleted``, ``already_purged``, ``not_found`` or ``refused`` (``reason`` is then a fixed code:
+        ``legal_hold`` for a tombstone without a purge date, unless ``override_legal_hold``). A repeated
+        ``request_key`` is answered from the audit trail and changes nothing."""
+        from .artifacts import _transaction
+        reason = self._delete_args(actor, reason)
+        out = {"artifact_id": artifact_id, "result": "not_found", "reason": None, "replayed": False,
+               "deleted": [], "retained_shared": []}
+        async with _transaction(self._conn):
+            row = await self._conn.fetchrow(
+                "SELECT lifecycle, purge_after FROM artifacts WHERE artifact_id=$1 FOR UPDATE", artifact_id)
+            if row is None:
+                return out
+            prior = await self._conn.fetchrow(
+                "SELECT request_key FROM artifact_lifecycle_events WHERE artifact_id=$1 AND action='purge' "
+                "ORDER BY (request_key IS NOT DISTINCT FROM $2) DESC, event_id LIMIT 1", artifact_id, request_key)
+            if prior is not None:
+                return {**out, "result": "already_purged",
+                        "replayed": bool(request_key) and prior["request_key"] == request_key}
+            held = row["lifecycle"] == "tombstoned" and row["purge_after"] is None
+            if held and not override_legal_hold:
+                return {**out, "result": "refused", "reason": "legal_hold"}
+            if row["lifecycle"] != "tombstoned":
+                await self._lifecycle("tombstone", artifact_id, actor=actor, reason=reason, hold_days=0.0)
+            purged = await self._purge_locked(
+                artifact_id, actor=actor, reason=reason, request_key=request_key,
+                extra={"legal_hold_overridden": True} if held else None)
+        return {**out, "result": "deleted", "deleted": purged["deleted"], "retained_shared": purged["retained_shared"]}
+
+    async def delete_many(self, artifact_ids: list[str], *, mode: str, actor: str, reason: str,
+                          request_key: str | None = None, hold_days: float = DEFAULT_HOLD_DAYS,
+                          override_legal_hold: bool = False) -> list[dict]:
+        """``tombstone`` or ``purge_now`` every distinct id (at most ``MAX_BULK``); one result per id, in order."""
+        from .artifacts import ArtifactError
+        if mode not in DELETE_MODES:
+            raise ArtifactError("mode must be tombstone or purge_now")
+        reason = self._delete_args(actor, reason)
+        ids = self._bulk_ids(artifact_ids)
+        results = []
+        for artifact_id in ids:
+            if mode == "purge_now":
+                results.append(await self.purge_now(
+                    artifact_id, actor=actor, reason=reason, request_key=request_key,
+                    override_legal_hold=override_legal_hold))
+            else:
+                results.append(await self._tombstone_result(artifact_id, actor, reason, request_key, hold_days))
+        return results
+
+    @staticmethod
+    def _bulk_ids(artifact_ids: list[str]) -> list[str]:
+        from .artifacts import ArtifactError
+        ids = list(dict.fromkeys(artifact_ids))
+        if not ids:
+            raise ArtifactError("at least one artifact id is required")
+        if len(ids) > MAX_BULK:
+            raise ArtifactError(f"at most {MAX_BULK} artifacts per request")
+        return ids
+
+    async def _tombstone_result(self, artifact_id: str, actor: str, reason: str, request_key: str | None,
+                                hold_days: float) -> dict:
+        from .artifacts import ArtifactError
+        out = {"artifact_id": artifact_id, "result": "tombstoned", "reason": None, "replayed": False,
+               "unchanged": False}
+        row = await self._conn.fetchrow("SELECT lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if row is None:
+            return {**out, "result": "not_found"}
+        if row["lifecycle"] == "tombstoned" and not await self._conn.fetchrow(
+                "SELECT 1 AS x FROM artifact_lifecycle_events WHERE artifact_id=$1 AND request_key=$2",
+                artifact_id, request_key):
+            purged = await self._conn.fetchrow(
+                "SELECT 1 AS x FROM artifact_lifecycle_events WHERE artifact_id=$1 AND action='purge'", artifact_id)
+            return {**out, "result": "already_purged" if purged else "tombstoned", "unchanged": True}
+        try:
+            done = await self.tombstone_artifact(artifact_id, actor=actor, reason=reason, request_key=request_key,
+                                                 hold_days=hold_days)
+        except ArtifactError:
+            return {**out, "result": "refused", "reason": "not_allowed"}
+        return {**out, "replayed": done["replayed"]}
+
+    async def restore_many(self, artifact_ids: list[str], *, actor: str, request_key: str | None = None) -> list[dict]:
+        """Restore tombstoned artifacts whose bytes are not purged; one result per distinct id (at most ``MAX_BULK``)."""
+        from .artifacts import ArtifactError
+        results = []
+        for artifact_id in self._bulk_ids(artifact_ids):
+            out = {"artifact_id": artifact_id, "result": "restored", "reason": None, "replayed": False}
+            row = await self._conn.fetchrow("SELECT lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id)
+            prior = row is not None and request_key and await self._conn.fetchrow(
+                "SELECT 1 AS x FROM artifact_lifecycle_events WHERE artifact_id=$1 AND request_key=$2 "
+                "AND action='restore'", artifact_id, request_key)
+            if row is None:
+                out["result"] = "not_found"
+            elif prior:
+                out["replayed"] = True
+            elif row["lifecycle"] != "tombstoned":
+                out.update(result="refused", reason="not_tombstoned")
+            else:
+                try:
+                    await self.restore_artifact(artifact_id, actor=actor, reason="restored by owner",
+                                                request_key=request_key)
+                except ArtifactError:
+                    out.update(result="refused", reason="purged")
+            results.append(out)
+        return results
+
+    async def list_tombstoned(self, *, limit: int = MAX_BULK) -> list[dict]:
+        """Tombstoned artifacts (newest first) with their hold, for the owner's restore view."""
+        rows = await self._conn.fetch(
+            "SELECT a.artifact_id, a.original_filename, a.artifact_type, a.tombstoned_at, a.purge_after, "
+            f"NOT ({_NOT_PURGED}) AS purged, (SELECT e.reason FROM artifact_lifecycle_events e "
+            "WHERE e.artifact_id=a.artifact_id AND e.action='tombstone' ORDER BY e.event_id DESC LIMIT 1) AS reason "
+            "FROM artifacts a WHERE a.lifecycle='tombstoned' ORDER BY a.tombstoned_at DESC LIMIT $1",
+            max(1, min(MAX_BULK, int(limit))))
+        return [self._jsonable(dict(row)) for row in rows]
 
     # -------------------------------------------------------------- reconcile
     async def mark_linked(self, version_id: str, *, error: str | None = None) -> None:
@@ -255,4 +397,4 @@ class ArtifactLifecycleMixin:
         return [self._jsonable(dict(row)) for row in rows]
 
 
-__all__ = ["ArtifactLifecycleMixin", "DEFAULT_HOLD_DAYS"]
+__all__ = ["ArtifactLifecycleMixin", "DEFAULT_HOLD_DAYS", "MAX_BULK"]

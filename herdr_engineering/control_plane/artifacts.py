@@ -945,6 +945,7 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                            artifact_type: str | None = None, status: str | None = None,
                            limit: int = 200, offset: int = 0) -> list[dict]:
         clauses = [
+            "a.lifecycle<>'tombstoned'",       # a deleted artifact leaves every list; the owner restores it from its own view
             "(a.created_by=$1 OR EXISTS (SELECT 1 FROM artifact_acl acl "
             "WHERE acl.artifact_id=a.artifact_id AND acl.principal_id=$1 "
             "AND (acl.expires_at IS NULL OR acl.expires_at > now()) "
