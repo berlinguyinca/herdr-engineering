@@ -118,10 +118,9 @@ def test_triple_to_os_arch_has_no_hostnames():
 def test_prefix_from_plan_differs_by_toolchain(tmp_path):
     a = _plan(tmp_path, _cfg(tmp_path), reachable=True)
     b = _plan(tmp_path, _cfg(tmp_path), reachable=True, rustc=RUSTC_B)
-    assert a.shared.active and b.shared.active
+    assert a.shared.reason == "shared_unavailable:shared_requires_server" and not a.shared.active
     assert a.shared.namespace_digest != b.shared.namespace_digest
-    assert a.shared_toml != b.shared_toml
-    assert socket.gethostname() not in a.shared_toml
+    assert a.env_overrides["SCCACHE_SERVER_PORT"] != b.env_overrides["SCCACHE_SERVER_PORT"]
 
 
 # --- registry -----------------------------------------------------------------
@@ -232,10 +231,9 @@ def test_toml_matches_verified_schema_and_parses(tmp_path):
 
 
 def test_toml_has_no_credentials_or_rw_mode(tmp_path):
-    cfg = _cfg(tmp_path)
-    p = _plan(tmp_path, cfg, reachable=True)
+    toml = bcs.render_sccache_config(_inputs(tmp_path))
     for needle in (SECRET, KEY_ID, TOKEN, "AWS_", "secret_", "token", "rw_mode"):
-        assert needle not in p.shared_toml
+        assert needle not in toml
 
 
 def test_plaintext_refused_when_tls_required(tmp_path):
@@ -256,61 +254,29 @@ def test_plaintext_allowed_only_for_local_test_ref(tmp_path):
                    "    region: us-east-1\n    bucket: bkt\n    use_ssl: false\n")
     cfg = _cfg(tmp_path, registry=reg, ref="box.local-test", tls=False)
     p = _plan(tmp_path, cfg, reachable=True)
-    assert p.shared.active and "use_ssl = false" in p.shared_toml
+    assert p.shared.reason == "shared_unavailable:shared_requires_server"  # validated, then degraded
+    assert "use_ssl = false" in bcs.render_sccache_config(_inputs(tmp_path, ssl_=False, tls=False))
 
 
-def test_writes_disabled_sets_documented_read_only_env(tmp_path):
-    ro = _plan(tmp_path, _cfg(tmp_path, writes=False), reachable=True)
-    rw = _plan(tmp_path, _cfg(tmp_path, writes=True), reachable=True)
-    assert ro.env_overrides["SCCACHE_S3_RW_MODE"] == "READ_ONLY"
-    assert "SCCACHE_S3_RW_MODE" not in rw.env_overrides
-    assert ro.env_overrides["SCCACHE_CONF"] == str(tmp_path / "state/sccache/sccache.toml")
+def test_shared_never_puts_conf_rw_mode_or_credentials_in_cargo_env(tmp_path):
+    for writes in (False, True):
+        p = _plan(tmp_path, _cfg(tmp_path, writes=writes), reachable=True)
+        assert not p.shared.active
+        assert not (set(p.env_overrides) & {"SCCACHE_CONF", "SCCACHE_S3_RW_MODE"})
+        assert not any(k.startswith("AWS_") for k in p.env_overrides)
+        assert SECRET not in repr(p) and KEY_ID not in repr(p)
+        assert not hasattr(p, "secret_env")
 
 
-# --- atomic write / materialize ----------------------------------------------
-
-def test_write_atomic_mode_and_replace(tmp_path):
-    target = tmp_path / "d/sccache/sccache.toml"
-    bcs.write_config_atomic(target, "a = 1\n")
-    bcs.write_config_atomic(target, "a = 2\n")
-    assert target.read_text() == "a = 2\n"
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
-    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
-    assert [p.name for p in target.parent.iterdir()] == ["sccache.toml"]
-
-
-def test_write_failure_keeps_old_file_and_no_temp(tmp_path):
-    target = tmp_path / "sccache.toml"
-    bcs.write_config_atomic(target, "old = 1\n")
-    tmp_path.chmod(0o500)
-    try:
-        with pytest.raises(OSError):
-            bcs.write_config_atomic(target, "new = 1\n")
-    finally:
-        tmp_path.chmod(0o700)
-    assert target.read_text() == "old = 1\n"
-    assert [p.name for p in tmp_path.iterdir()] == ["sccache.toml"]
-
-
-def test_materialize_writes_and_plan_is_pure(tmp_path):
-    cfg = _cfg(tmp_path)
-    before = sorted(tmp_path.rglob("*"))
-    a, b = _plan(tmp_path, cfg, reachable=True), _plan(tmp_path, cfg, reachable=True)
-    assert a == b and sorted(tmp_path.rglob("*")) == before
-    assert not (tmp_path / "state").exists()
-    out = bce.materialize(a, tmp_path / "state")
-    conf = tmp_path / "state/sccache/sccache.toml"
-    assert out == a and tomllib.loads(conf.read_text())["cache"]["s3"]["bucket"] == "sccache-bucket"
-
-
-def test_materialize_failure_degrades_to_local(tmp_path):
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "sccache").write_text("i am a file, not a dir")
-    out = bce.materialize(_plan(tmp_path, _cfg(tmp_path), reachable=True), state)
-    assert out.applied and not out.shared.active
-    assert out.shared.reason == "shared_unavailable:config_write_failed"
-    assert "SCCACHE_CONF" not in out.env_overrides and not out.secret_env
+def test_server_port_is_per_policy(tmp_path):
+    def port(**kw):
+        return _plan(tmp_path, _cfg(tmp_path, **kw), reachable=True).env_overrides["SCCACHE_SERVER_PORT"]
+    ro, rw = port(writes=False), port(writes=True)
+    assert ro != rw
+    assert ro == port(writes=False)  # deterministic
+    assert port(mode="local_only") != ro
+    other_ns = _plan(tmp_path, _cfg(tmp_path), reachable=True, rustc=RUSTC_B)
+    assert other_ns.env_overrides["SCCACHE_SERVER_PORT"] != ro
 
 
 # --- version gate / plan fallbacks -------------------------------------------
@@ -321,25 +287,17 @@ def test_materialize_failure_degrades_to_local(tmp_path):
 def test_version_gate(tmp_path, text, ok):
     p = _plan(tmp_path, _cfg(tmp_path), reachable=True, tools=_tools(tmp_path, text))
     assert p.applied  # the local cache is unaffected
-    assert p.shared.active is ok
-    if not ok:
+    assert not p.shared.active
+    if ok:
+        assert p.shared.reason == "shared_unavailable:shared_requires_server"
+    else:
         want = "sccache_version_unknown" if parse_none(text) else "sccache_version_unsupported"
         assert p.shared.reason == f"shared_unavailable:{want}"
-        assert "SCCACHE_CONF" not in p.env_overrides and not p.secret_env
+        assert "SCCACHE_CONF" not in p.env_overrides
 
 
 def parse_none(text):
     return bcs.parse_sccache_version(text) is None
-
-
-def test_plan_active_secret_only_in_secret_env(tmp_path):
-    p = _plan(tmp_path, _cfg(tmp_path), reachable=True)
-    assert p.shared.active and p.shared.reason == "active"
-    assert p.secret_env["AWS_SECRET_ACCESS_KEY"] == SECRET
-    blob = json.dumps([p.env_overrides, p.reasons, p.warnings, p.shared.as_event()])
-    for s in (SECRET, KEY_ID, TOKEN, "s3.example.org", "sccache-bucket"):
-        assert s not in blob
-    assert SECRET not in repr(p) and KEY_ID not in repr(p)
 
 
 @pytest.mark.parametrize("kw,code", [
@@ -569,7 +527,7 @@ def _everything_text(tmp_path):
         (tmp_path / "state/sccache/sccache.toml").read_text()
 
 
-def test_e2e_shared_active_secret_only_in_child_env(tmp_path, monkeypatch, cert, capfd):
+def test_e2e_shared_request_never_leaks_credentials_to_cargo(tmp_path, monkeypatch, cert, capfd):
     out = _fake(tmp_path, monkeypatch)
     srv = _Server(cert)
     monkeypatch.setenv("SSL_CERT_FILE", str(cert[0]))
@@ -581,17 +539,19 @@ def test_e2e_shared_active_secret_only_in_child_env(tmp_path, monkeypatch, cert,
         srv.close()
     assert rc == 3  # child exit code preserved
     seen = json.loads(out.read_text())
-    assert seen["env"]["AWS_SECRET_ACCESS_KEY"] == SECRET and seen["env"]["AWS_ACCESS_KEY_ID"] == KEY_ID
-    assert seen["env"]["SCCACHE_S3_RW_MODE"] == "READ_ONLY"
-    assert seen["mode"] == "0o600" and tomllib.loads(seen["toml"])["cache"]["s3"]["use_ssl"] is True
-    assert SECRET not in os.environ.get("AWS_SECRET_ACCESS_KEY", "")  # parent env untouched
+    assert not any(k.startswith("AWS_") for k in seen["env"])
+    assert "SCCACHE_CONF" not in seen["env"] and "SCCACHE_S3_RW_MODE" not in seen["env"]
+    assert seen["env"]["SCCACHE_DIR"] == str(tmp_path / "state/sccache")  # local cache
+    assert "SCCACHE_SERVER_PORT" in seen["env"]
     ev = _events(tmp_path)[-1]["cache"]
-    assert ev["shared"]["active"] is True and ev["shared"]["reason"] == "active"
-    assert len(ev["shared"]["namespace_digest"]) == 16
+    assert ev["shared"]["active"] is False
+    assert ev["shared"]["reason"] == "shared_unavailable:shared_requires_server"
     captured = capfd.readouterr()
-    for blob in (_everything_text(tmp_path), captured.out, captured.err):
-        for s in (SECRET, KEY_ID, TOKEN):
-            assert s not in blob
+    blob = "\n".join(p.read_text(errors="replace") for p in (tmp_path / "state").rglob("*")
+                     if p.is_file())
+    for b_ in (blob, captured.out, captured.err):
+        for s_ in (SECRET, KEY_ID, TOKEN):
+            assert s_ not in b_
 
 
 def test_e2e_dead_endpoint_falls_back_to_local_and_keeps_exit_code(tmp_path, monkeypatch, capfd):

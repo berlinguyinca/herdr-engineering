@@ -128,7 +128,9 @@ def test_applied_exact_overrides(tmp_path):
         "SCCACHE_DIR": str(tmp_path / "state/sccache"),
         "SCCACHE_CACHE_SIZE": "7G",
         "CARGO_INCREMENTAL": "0",
+        "SCCACHE_SERVER_PORT": p.env_overrides["SCCACHE_SERVER_PORT"],
     }
+    assert 20000 <= int(p.env_overrides["SCCACHE_SERVER_PORT"]) < 60000
     assert p.fingerprint.digest == bce.fingerprint_from_text(RUSTC_A).digest
 
 

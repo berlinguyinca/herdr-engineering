@@ -65,6 +65,10 @@ class Code(StrEnum):
     ENDPOINT_UNREACHABLE = "endpoint_unreachable"
     CONFIG_WRITE_FAILED = "config_write_failed"
     NO_FINGERPRINT = "no_fingerprint"
+    # Credentials must never reach cargo/rustc/build scripts; until an explicit
+    # sccache server start (credentials in the SERVER env only) exists, a fully
+    # valid shared request runs with the local cache only.
+    SHARED_REQUIRES_SERVER = "shared_requires_server"
 
 
 class StorageError(Exception):

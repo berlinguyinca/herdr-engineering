@@ -12,14 +12,13 @@ Cache keys are sccache's job: it hashes the compiler, flags, profile and
 features itself, so cargo profile/features are deliberately NOT parsed here and
 no hand-written cache namespace is added. The toolchain fingerprint exists only
 to record/compare which compiler produced a build (events, spec 04 namespaces).
-Shared (S3) level (spec 04): ``plan`` only DECIDES and renders text; the sccache
-TOML is written by :func:`materialize` (called from ``run_gated``), and
-credentials travel only in ``EnvPlan.secret_env`` (hidden from repr), never in
-``env_overrides``, reasons, warnings or events.
+Shared (S3) level (spec 04): ``plan`` only DECIDES. Credentials are never part
+of the cargo environment (review H2); the shared level stays inactive with
+reason ``shared_unavailable:shared_requires_server`` until an explicit sccache
+server start exists. Each policy gets its own ``SCCACHE_SERVER_PORT`` (H3).
 """
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import shutil
@@ -31,14 +30,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from .build_cache_config import BuildCacheConfig, Mode
-from .build_cache_storage import (
-    SHARED_ENV_KEYS,
-    Code,
-    StorageError,
-    prepare_shared,
-    shared_env,
-    write_config_atomic,
-)
+from .build_cache_storage import Code, StorageError, prepare_shared
 from .build_metrics import classify_cmd
 
 TOOL_TIMEOUT_S = 3.0
@@ -106,8 +98,6 @@ class EnvPlan:
     warnings: list[str] = field(default_factory=list)
     fingerprint: Fingerprint | None = None
     shared: SharedStatus = NOT_REQUESTED
-    secret_env: dict[str, str] = field(default_factory=dict, repr=False)
-    shared_toml: str | None = field(default=None, repr=False)
 
 
 def _run_text(argv: list[str]) -> str | None:
@@ -238,41 +228,51 @@ def plan(config: BuildCacheConfig, cmd: list[str], base_env: Mapping[str, str],
         warnings.append("ram_scratch not implemented")
     if any(t.startswith("+") for t in cmd[1:2]):
         warnings.append("cargo +toolchain override: fingerprint reflects default rustc")
-    shared, secret, toml = _shared(config, tools, fp, state_dir, shared_reachable, env)
-    return EnvPlan(True, env, [Reason.APPLIED.value], warnings, fp, shared, secret, toml)
+    env["SCCACHE_SERVER_PORT"] = str(server_port(config, fp, cache_dir))
+    shared = _shared(config, tools, fp, state_dir, shared_reachable)
+    return EnvPlan(True, env, [Reason.APPLIED.value], warnings, fp, shared)
 
 
 def _shared(config: BuildCacheConfig, tools: Tools, fp: Fingerprint, state_dir: Path,
-            reachable: bool | None, env: dict[str, str]
-            ) -> tuple[SharedStatus, dict[str, str], str | None]:
-    """Add the shared level to ``env`` (in place) or explain why not. Never raises."""
+            reachable: bool | None) -> SharedStatus:
+    """Decide the shared level's status. Never raises, never yields secrets.
+
+    Review H2/H3: credentials must not be in the environment of cargo/rustc/
+    build scripts, and an sccache server fixes its config at first start. The
+    only safe delivery is an explicitly started per-policy server whose own env
+    holds the credentials; that start is NOT implemented, so a fully valid
+    shared request degrades to the local cache (``shared_requires_server``).
+    Everything else (bad registry, credentials, TLS, version, unreachable)
+    still reports its specific reason first. Nothing shared is "active".
+    """
     if not config.shared_cache.enabled:
-        return NOT_REQUESTED, {}, None
+        return NOT_REQUESTED
     if config.effective_mode is not Mode.SHARED_CACHE:
-        return _unavailable(Code.NOT_SHARED_MODE), {}, None
+        return _unavailable(Code.NOT_SHARED_MODE)
     try:
         setup = prepare_shared(config, sccache_version=tools.sccache_version,
                                toolchain_digest=fp.digest, host_triple=fp.host,
                                state_dir=state_dir, reachable=reachable)
     except StorageError as exc:
-        return _unavailable(exc.code), {}, None
-    env.update(shared_env(setup.inputs, setup.conf_path))
-    return (SharedStatus(True, "active", setup.namespace_digest),
-            setup.credentials.as_child_env(), setup.toml)
+        return _unavailable(exc.code)
+    return SharedStatus(False, f"shared_unavailable:{Code.SHARED_REQUIRES_SERVER.value}",
+                        setup.namespace_digest)
 
 
-def materialize(p: EnvPlan, state_dir: Path) -> EnvPlan:
-    """Write the sccache TOML for an active shared plan (0600, atomic).
+def server_port(config: BuildCacheConfig, fp: Fingerprint, cache_dir: Path) -> int:
+    """Per-policy ``SCCACHE_SERVER_PORT`` (review H3).
 
-    On any failure the shared parts are removed and the build proceeds with the
-    local cache only (reason ``shared_unavailable:config_write_failed``).
+    An sccache server reads its config (dir, size, S3, RW mode, prefix) once, at
+    first start, and serves every client on its port. Deriving the port from the
+    effective policy means a build under a different policy (mode, writes,
+    namespace, endpoint, toolchain, cache dir/size) talks to a different server
+    and can never reuse one started under another. The server's lifetime is NOT
+    managed (it exits on sccache's own idle timeout); a port clash with an
+    unrelated local service is possible but unlikely (40000 slots).
     """
-    if p.shared_toml is None or not p.shared.active:
-        return p
-    try:
-        write_config_atomic(state_dir / "sccache" / "sccache.toml", p.shared_toml)
-    except OSError:
-        env = {k: v for k, v in p.env_overrides.items() if k not in SHARED_ENV_KEYS}
-        return dataclasses.replace(p, env_overrides=env, secret_env={}, shared_toml=None,
-                                   shared=_unavailable(Code.CONFIG_WRITE_FAILED))
-    return p
+    sc = config.shared_cache
+    canon = json.dumps([config.effective_mode.value, bool(sc.enabled),
+                        bool(config.shared_writes_effective), sc.namespace, sc.endpoint_ref,
+                        fp.digest, str(cache_dir), config.local.capacity_gib],
+                       separators=(",", ":"))
+    return 20000 + int(hashlib.sha256(canon.encode()).hexdigest()[:8], 16) % 40000
