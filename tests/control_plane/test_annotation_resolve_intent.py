@@ -275,16 +275,46 @@ def test_a_grant_revoked_after_the_intent_was_written_rejects(registry_pg, tmp_p
     resolving(registry_pg, tmp_path, body)
 
 
-def test_a_read_grant_cannot_resolve(registry_pg, tmp_path):
+async def regrant(env, aid, a, permission, days):
+    await grant(env, aid, a, permission, days=days)
+
+
+def test_a_grant_downgraded_to_read_after_the_agent_committed_cannot_resolve(registry_pg, tmp_path):
+    """The agent holds its OWN version, so only the permission check can refuse."""
     async def body(env, a):
         aid, v1 = await seed(env)
-        await grant(env, aid, a, permission="read")
+        await grant(env, aid, a)
         sid = await make_share(env, aid, v1)
         ident = await annotate(env, sid, 1)
-        raw = resolve_raw(env, a, aid, v1, [ident])
+        mine = await agent_version(env, a, aid, v1)
+        await regrant(env, aid, a, "read", 1.0)
+        raw = resolve_raw(env, a, aid, mine, [ident])
         await settle(env)
-        assert env.result(raw["ticket"])["result"] == "rejected"
+        doc = env.result(raw["ticket"])
+        assert doc["result"] == "rejected" and doc["reason"] == "no write grant"
         assert (await status_of(env, ident))["status"] == "open"
+    resolving(registry_pg, tmp_path, body)
+
+
+@pytest.mark.parametrize("days,allowed", [(-1.0, False), (0.0, False), (1 / 24, True)],
+                         ids=["past", "boundary_now", "future_hour"])
+def test_grant_expiry_is_enforced_by_the_handler(registry_pg, tmp_path, days, allowed):
+    """past and ``expires == now`` (already behind the clock by the time the handler runs) refuse; a future one works."""
+    async def body(env, a):
+        aid, v1 = await seed(env)
+        await grant(env, aid, a)
+        sid = await make_share(env, aid, v1)
+        ident = await annotate(env, sid, 1)
+        mine = await agent_version(env, a, aid, v1)
+        await regrant(env, aid, a, "write", days)
+        raw = resolve_raw(env, a, aid, mine, [ident])
+        await settle(env)
+        doc = env.result(raw["ticket"])
+        if allowed:
+            assert doc["result"] == "resolved" and doc["resolved"] == [ident]
+        else:
+            assert doc["result"] == "rejected" and doc["reason"] == "no write grant"
+            assert (await status_of(env, ident))["status"] == "open"
     resolving(registry_pg, tmp_path, body)
 
 
@@ -415,6 +445,14 @@ def test_removing_the_artifact_removes_the_annotations_file(tmp_path):
     assert not (mirror.root / "artifacts" / "art_rm").exists()
     assert asyncio.run(mirror.publish_annotations("art_rm", [{"annotation_id": IDS[0]}])) is False
     assert not (mirror.root / "artifacts" / "art_rm").exists()
+
+
+def test_importing_collab_artifacts_registers_the_kind():
+    code = ("from herdr_engineering.control_plane import collab_artifacts, collab_bridge_files as c; "
+            "print(sorted(c._INTENT_KINDS))")
+    proc = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "['annotation_resolve', 'commit']"
 
 
 def test_the_module_registers_its_kind_once():

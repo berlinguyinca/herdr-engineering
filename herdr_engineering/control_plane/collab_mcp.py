@@ -360,7 +360,7 @@ def _annotation_resolve(bridge, pr, artifact_id: str, args: dict) -> dict:
             raise CollabError(400, f"{key} is invalid")
         _need_str(args, key, max_len=_MAX_ID)
     ids = args.get("annotation_ids")
-    if not isinstance(ids, list) or not 1 <= len(ids) <= 50 or not all(isinstance(i, str) and i for i in ids) \
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 50 or not all(isinstance(i, str) and 0 < len(i) <= 64 for i in ids) \
             or len(set(ids)) != len(ids):
         raise CollabError(400, "annotation_ids is invalid")
     submitted = bridge.resolve_annotations(pr, args)

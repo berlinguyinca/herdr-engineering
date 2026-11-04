@@ -62,7 +62,10 @@ async def handle_annotation_resolve(ctx: IntentContext, intent: Intent) -> dict:
 
     The registry's generic steps do not check grants or the idempotency key, so this does.  A crash between this
     return and ``record_outcome`` makes the retry report ``skipped: not_open`` for rows the first run resolved; the
-    agent still reads the result file the FIRST run wrote (``_settle_from_row`` keeps an existing result file)."""
+    agent still reads the result file the FIRST run wrote (``_settle_from_row`` keeps an existing result file).
+
+    Accepted window: ``grant_for`` runs outside the ``AnnotationStore.resolve`` transaction, so a revoke or expiry
+    that lands in those few milliseconds still resolves rows the agent's own version addresses."""
     from .artifact_annotations import (  # lazy: asyncpg-free import of this module
         AnnotationError,
         AnnotationStore,
