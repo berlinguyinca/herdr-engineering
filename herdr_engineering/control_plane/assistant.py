@@ -405,7 +405,7 @@ def _judge_number(value: Any, where: str, low: float, high: float, *, low_open: 
     if not ok:
         bound = f"above {low:g}" if low_open else f"at least {low:g}"
         raise ValueError(f"{where} must be a number {bound} and at most {high:g}")
-    return float(value)
+    return float(value) + 0.0
 
 
 def _judge_sub(raw: Any, where: str, allowed: set[str]) -> dict[str, Any]:
@@ -424,6 +424,8 @@ def _judge_endpoint(value: Any, where: str) -> str:
     value = value.strip()
     if not value:
         return ""
+    if any(ch.isspace() or ord(ch) < 32 for ch in value):
+        raise ValueError(f"{where} must not contain whitespace or control characters")
     try:
         parts = urlsplit(value)
         host = parts.hostname
@@ -432,7 +434,7 @@ def _judge_endpoint(value: Any, where: str) -> str:
         raise ValueError(f"{where} is not a valid URL: {exc}") from exc
     if parts.username is not None or parts.password is not None or "@" in parts.netloc:
         raise ValueError(f"{where} must not contain user info")
-    if parts.query or parts.fragment:
+    if "?" in value or "#" in value:
         raise ValueError(f"{where} must not contain a query or fragment")
     if not host:
         raise ValueError(f"{where} needs a host")
@@ -440,7 +442,7 @@ def _judge_endpoint(value: Any, where: str) -> str:
         raise ValueError(f"{where} must use https:// (http:// is allowed only for loopback hosts)")
     if parts.scheme not in ("http", "https"):
         raise ValueError(f"{where} must be an https:// URL")
-    return value
+    return parts.scheme + value[len(parts.scheme):]
 
 
 def _judge_config(raw: Any) -> dict[str, Any]:

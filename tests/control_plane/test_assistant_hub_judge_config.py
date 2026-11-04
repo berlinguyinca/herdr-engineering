@@ -64,6 +64,9 @@ def test_judge_inline_secret_rejected(name: str) -> None:
     {"thresholds": {"destructive": 0}}, {"thresholds": {"destructive": 1.1}}, {"thresholds": {"irreversible": True}},
     {"thresholds": {"severity_score": -0.1}}, {"thresholds": {"severity_score": 3.1}}, {"thresholds": [1]},
     {"calibration": {"min_labeled_decisions": 19}}, {"calibration": {"min_labeled_decisions": True}},
+    {"thresholds": {"destructive": float("nan")}}, {"thresholds": {"severity_score": float("inf")}},
+    {"thresholds": {"irreversible": float("-inf")}}, {"calibration": {"max_false_negative_bound": float("nan")}},
+    {"calibration": [1]}, {"endpoint": 5}, {"api_key_file": 5},
     {"calibration": {"max_false_negative_bound": 0}}, {"calibration": {"max_false_negative_bound": 0.51}},
 ])
 def test_judge_bad_values_rejected(bad: dict[str, Any]) -> None:
@@ -74,7 +77,9 @@ def test_judge_bad_values_rejected(bad: dict[str, Any]) -> None:
 @pytest.mark.parametrize("override", [
     {"endpoint": ""}, {"endpoint": "http://jev.example.org/v1"}, {"endpoint": "https://u:p@jev.example.org/v1"},
     {"endpoint": "https://jev.example.org/v1?x=1"}, {"endpoint": "https://jev.example.org/v1#f"},
-    {"endpoint": "ftp://jev.example.org"}, {"endpoint": "https://"}, {"api_key_file": ""},
+    {"endpoint": "https://jev.example.org/v1?"}, {"endpoint": "https://jev.example.org/v1#"},
+    {"endpoint": "https://jev.example.org/v 1"}, {"endpoint": "https://jev.example.org/v1\n"[:-2] + "\t/x"},
+    {"endpoint": 5}, {"endpoint": "ftp://jev.example.org"}, {"endpoint": "https://"}, {"api_key_file": ""},
     {"api_key_file": "rel/key"},
 ])
 def test_judge_enabled_requires_safe_endpoint_and_key_file(override: dict[str, Any]) -> None:
@@ -97,3 +102,18 @@ def test_judge_version_stable_and_sensitive(monkeypatch: pytest.MonkeyPatch) -> 
         assert jv.judge_version(_judge({"thresholds": {k: 0.1}})) != v
     monkeypatch.setattr(jv, "QUESTION_SET_VERSION", jv.QUESTION_SET_VERSION + 1)
     assert jv.judge_version(base) != v
+
+
+def test_judge_endpoint_scheme_lowercased_and_zero_normalised() -> None:
+    assert _judge(_on(endpoint="HTTPS://jev.example.org/v1"))["endpoint"] == "https://jev.example.org/v1"
+    t = _judge({"thresholds": {"severity_score": -0.0}})["thresholds"]["severity_score"]
+    assert str(t) == "0.0"
+
+
+def test_judge_version_ignores_endpoint_and_calibration_and_int_float() -> None:
+    v = jv.judge_version(_judge())
+    other = _judge({"calibration": {"min_labeled_decisions": 50}, "backend_confirmed": True})
+    assert jv.judge_version(other) == v
+    assert jv.judge_version(_judge(_on(endpoint="https://other.example.org"))) == v
+    assert jv.judge_version({"model": "laya-auto", "thresholds": {"destructive": 0.3, "irreversible": 0.3,
+                                                                  "severity_score": 2}}) == v
