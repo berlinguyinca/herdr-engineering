@@ -212,6 +212,7 @@ class ControlPlaneRepo:
         self._missions = {}
         self._sessions = {}
         self._services = {}
+        self._listener_journaled = {}  # service_id -> (material facts, monotonic time) of the last journaled observation
         self._service_archive_days = validate_archive_days(service_archive_days)
         self._hosts = {}
         self._artifacts = {}
@@ -935,10 +936,34 @@ class ControlPlaneRepo:
             candidate["status"] = "healthy"
         candidate.update(updated_at=stamp, metadata_updated_at=stamp, metadata_observation=observation,
                          endpoint_scope="local_only", route=None, url=None)
-        self.record_event("service", service_id, "ServiceListenerObserved", _deep_copy(candidate),
-                          session_id=candidate.get("session_id"), publish=False)
+        if not self._listener_repeat(service_id, candidate, observation):
+            self.record_event("service", service_id, "ServiceListenerObserved", _deep_copy(candidate),
+                              session_id=candidate.get("session_id"), publish=False)
         self._services[service_id] = candidate
         return self.get_service(service_id)
+
+    # A listener that re-reports unchanged facts is a heartbeat: the projection still advances, but it is journaled
+    # at most this often. It stays well inside the observation's 90 s staleness window, so a replay never reads a
+    # live listener as stale.
+    _LISTENER_HEARTBEAT_JOURNAL_SECONDS = 30.0
+
+    def _listener_repeat(self, service_id, candidate, observation):
+        """True when this observation repeats the last journaled one and need not be journaled again yet."""
+        if observation["state"] != "observed":
+            self._listener_journaled.pop(service_id, None)
+            return False
+        material = {key: value for key, value in candidate.items()
+                    if key not in {"updated_at", "metadata_updated_at", "metadata_observation"}}
+        if isinstance(material.get("verified_origin"), dict):
+            material["verified_origin"] = {key: value for key, value in material["verified_origin"].items()
+                                           if key != "verified_at"}
+        facts = json.dumps(material, sort_keys=True, default=str)
+        now = time.monotonic()
+        last = self._listener_journaled.get(service_id)
+        if last is not None and last[0] == facts and now - last[1] < self._LISTENER_HEARTBEAT_JOURNAL_SECONDS:
+            return True
+        self._listener_journaled[service_id] = (facts, now)
+        return False
 
     def _ensure_service_desc(self, rec):
         """Guarantee ``rec`` carries a non-empty human description.
@@ -2959,6 +2984,17 @@ class ControlPlaneRepo:
                     "has_more": start > 0, "next_cursor": next_cursor,
                     "latest_sequence": latest.get("sequence"), "last_event_id": latest.get("event_id")}
 
+    def list_ai_sync(self, host_id=None):
+        """Latest ai-sync status per host (newest ``status`` event of each ``ai_sync`` stream), sorted by host."""
+        latest = []
+        for eid in sorted(self.entity_ids("ai_sync")):
+            if host_id is not None and eid != host_id:
+                continue
+            stream = self.stream("ai_sync", eid)
+            if stream:
+                latest.append({k: v for k, v in stream[-1]["payload"].items() if not k.startswith("_")})
+        return latest
+
     def entity_ids(self, entity_type):
         """Ids of every entity of ``entity_type`` that has at least one event."""
         with self._event_lock:
@@ -3052,11 +3088,14 @@ class ControlPlaneRepo:
                   "key_id": _usage_str(row.get("key_id"), 128),
                   "duration_ms": _usage_int(row.get("duration_ms"))}
         tokens = [_usage_int(row.get(k)) for k in _TOKEN_FIELDS]
+        source = (row.get("source") if row.get("source") in ("llm-proxy", "transcript", "llm-gateway")
+                  else "llm-proxy")
         if row.get("schema") != 2:
             return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
                                            cache_read_tokens=tokens[3],
                                            cache_write_tokens=tokens[4],
-                                           success=row.get("success", True), **common)
+                                           success=row.get("success", True), source=source,
+                                           **common)
         status = _usage_int(row.get("status"))
         error_class = row.get("error_class") if row.get("error_class") in USAGE_ERROR_CLASSES else None
         success = row.get("success")
@@ -3072,7 +3111,6 @@ class ControlPlaneRepo:
             v2[k] = row[k] if isinstance(row.get(k), bool) else None
         for k in ("queue_ms", "ttft_ms", "gen_ms"):
             v2[k] = _usage_int(row.get(k))
-        source = row.get("source") if row.get("source") in ("llm-proxy", "transcript") else "llm-proxy"
         return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
                                        cache_read_tokens=tokens[3],
                                        cache_write_tokens=tokens[4], success=success,

@@ -127,6 +127,19 @@ export class HerdrClient {
     }
   }
 
+  // Memory Explorer (read-only): the control plane authorizes and proxies herdr-memory; the browser holds no memory credentials.
+  exploreMemory(params, { signal } = {}) {
+    return this.request(`/api/v1/memory/search?${params}`, { signal });
+  }
+
+  getMemoryRecord(id, { signal } = {}) {
+    return this.request(`/api/v1/memory/${encodeURIComponent(id)}`, { signal });
+  }
+
+  getMemoryServiceStatus({ signal } = {}) {
+    return this.request('/api/v1/memory/status', { signal });
+  }
+
   getHandoffTree({ signal, sessionId } = {}) {
     return this.request(`/api/v1/handoffs/tree${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, { signal });
   }
@@ -248,6 +261,39 @@ export class HerdrClient {
 
   artifactShareEvents(id, shareId, { signal } = {}) {
     return this.request(`${this.artifactSharesPath(id, shareId)}/events`, { signal });
+  }
+
+  // Artifact collaborators (owner view): grants for agents, one-time invite grants, activity, version diffs.
+  artifactCollabPath(id, tail = '') {
+    return `/api/v1/artifacts/${encodeURIComponent(id)}${tail}`;
+  }
+
+  listArtifactCollaborators(id, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collaborators'), { signal });
+  }
+
+  grantArtifactCollaborator(id, body, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collaborators'), { method: 'POST', body, signal });
+  }
+
+  revokeArtifactCollaborator(id, agentId, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, `/collaborators/${encodeURIComponent(agentId)}/revoke`), { method: 'POST', body: {}, signal });
+  }
+
+  grantArtifactInvite(id, body, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collaborators/invite-grant'), { method: 'POST', body, signal });
+  }
+
+  artifactCollabActivity(id, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collab-activity'), { signal });
+  }
+
+  artifactVersionDiff(id, versionId, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, `/versions/${encodeURIComponent(versionId)}/diff`), { signal });
+  }
+
+  restrictArtifactCollab(id, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collab-restrict'), { method: 'POST', body: {}, signal });
   }
 
   async restoreArtifactVersion(id, versionId, { signal } = {}) {
@@ -468,6 +514,10 @@ export class HerdrClient {
 
   listFabricServices({ signal } = {}) {
     return this.request('/api/v1/fabric/services', { signal });
+  }
+
+  listAiSync({ signal } = {}) {
+    return this.request('/api/v1/ai-sync', { signal });
   }
 
   listHosts({ signal } = {}) {
@@ -746,6 +796,11 @@ export class HerdrClient {
     return this.request('/api/v1/reviews', { signal });
   }
 
+  // Every open review, not limited to the newest page: a long-waiting review is the one that page drops.
+  listWaitingReviews({ signal } = {}) {
+    return this.request('/api/v1/reviews?needs_decision=1', { signal });
+  }
+
   getTests() {
     return this.request('/api/v1/tests');
   }
@@ -875,6 +930,25 @@ export class HerdrClient {
   }
   connectorRequest(connectorId, body) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/request`, { method: 'POST', body });
+  }
+  // Read-only graph of the caller's assistants, delegations and the specialists they run on.
+  assistantGraph({ signal } = {}) {
+    return this.request('/api/v1/assistant-graph', { signal });
+  }
+  assistantTypes({ signal } = {}) {
+    return this.request('/api/v1/assistant-types', { signal });
+  }
+  linkAssistant(id, parentId) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/link`, { method: 'POST', body: { parent_id: parentId } });
+  }
+  unlinkAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/unlink`, { method: 'POST', body: {} });
+  }
+  deleteAssistant(id, confirmName) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/delete`, { method: 'POST', body: { confirm_name: confirmName } });
+  }
+  setupAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/setup`, { method: 'POST', body: {} });
   }
   listDelegations() {
     return this.request('/api/v1/assistant-delegations');

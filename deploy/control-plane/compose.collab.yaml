@@ -81,11 +81,23 @@ services:
       - "8082"
       - "--collab-operator-host"
       - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_COLLAB_OPERATOR_PORT:-9482}"
+      # Collaborator bridge mounts, static: they do nothing unless the rendered slice says
+      # collab_artifacts.enabled: true (control_plane.collab_artifacts.enabled in the central file).
+      - "--collab-artifacts-mirror"
+      - "/collab-mirror"
+      - "--collab-artifacts-outbox"
+      - "/collab-outbox"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
     volumes:
       - ${HERDR_COLLAB_DATA_DIR:?run deploy.sh}:/data
+      # Collaborator bridge. The mirror is the worker's read-only publication; the outbox is collab-public's ONLY
+      # new writable mount and its OWN bind mount (a sibling of the data dir, never nested in another rw mount),
+      # so a compromised collab-public cannot hardlink or rename across trust zones. ONE collab-public per outbox.
+      # The worker's private spool is deliberately not mounted here.
+      - ${HERDR_COLLAB_MIRROR_DIR:?run deploy.sh}:/collab-mirror:ro
+      - ${HERDR_COLLAB_OUTBOX_DIR:?run deploy.sh}:/collab-outbox
       - ${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/sync:ro   # Cognito keys + members, written by collab-sync.sh
       - ${HERDR_COLLAB_CONFIG_DIR:?run deploy.sh}:/etc/herdr/collab:ro   # holds only the control_plane.collab slice
     # Internal network: no route out at all (keys and group membership arrive as files), and not on
@@ -169,8 +181,9 @@ services:
     user: "${HERDR_COLLAB_CERT_UID:-1000}:${HERDR_COLLAB_CERT_UID:-1000}"
     read_only: true
     tmpfs:
-      - /run:uid=${HERDR_COLLAB_CERT_UID:-1000}
-      - /var/cache/nginx:uid=${HERDR_COLLAB_CERT_UID:-1000}
+      - /run:uid=${HERDR_COLLAB_CERT_UID:-1000},size=8m
+      # nginx spools request bodies above 16 KiB here: 128 concurrent /mcp requests with a 768 KiB body = 96 MiB (nginx.conf)
+      - /var/cache/nginx:uid=${HERDR_COLLAB_CERT_UID:-1000},size=96m
     volumes:
       # deploy.sh installs this to a stable path (the build worktree is temporary)
       - ${HERDR_COLLAB_EDGE_CONF:?run deploy.sh}:/etc/nginx/nginx.conf:ro
@@ -183,7 +196,7 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 128
-    mem_limit: 128m
+    mem_limit: 384m          # tmpfs pages count here: 96m body spool + 8m /run + nginx's own buffers and zones
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}

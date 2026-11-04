@@ -142,7 +142,9 @@ print(json.dumps({'decision':'annotated','feedback':'Add the missing test'}))
         assert rows[0]["status"] == "changes_requested"
         assert rows[0]["review_url"] == "http://fixture.lan:49175"
         assert "feedback" not in rows[0]
-        detail = _get(base, "/api/v1/reviews/" + rows[0]["review_id"])
+        waiting = _get(base, "/api/v1/reviews?needs_decision=1")
+        assert waiting["needs_decision"] is True and waiting["reviews"] == [] and waiting["total"] == 0 and waiting["has_more"] is False
+        detail =_get(base, "/api/v1/reviews/" + rows[0]["review_id"])
         assert detail["feedback"] == "Add the missing test"
         assert acknowledged_sink.events[-1]["event_type"] == "PlannotatorReviewCompleted"
         restored = ControlPlaneRepo(sink=acknowledged_sink)
@@ -200,3 +202,28 @@ def test_ingest_key_cannot_forge_provider_outcomes(entity_type, acknowledged_sin
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_waiting_reviews_are_listed_in_full_even_when_the_newest_window_would_drop_them(acknowledged_sink):
+    """A long-waiting review has an old updated_at (heartbeats do not bump it), so it falls out of the newest-N list."""
+    clock = [1000.0]
+    service = ReviewService(ControlPlaneRepo(now=lambda: clock[0], sink=acknowledged_sink))
+    waiting = service.register(dict(review_id="old-wait", instance_id="i0", kind="plan", plan="p", revision="r"))
+    service.heartbeat("old-wait", dict(binding(waiting), review_url="http://bender.lan:49187"))
+    for n in range(5):
+        clock[0] += 10
+        row = service.register(dict(review_id=f"done-{n}", instance_id=f"i{n + 1}", kind="plan", plan="p", revision="r"))
+        service.complete(row["review_id"], dict(binding(row), result={"decision": "approved"}))
+    assert [r["review_id"] for r in service.list_reviews()][-1] == "old-wait"   # the oldest by updated_at
+    page = service.list_waiting(limit=2)
+    assert [r["review_id"] for r in page["reviews"]] == ["old-wait"]
+    assert page["total"] == 1 and page["has_more"] is False
+    assert all(r["status"] in {"starting", "awaiting_review"} for r in page["reviews"])
+
+
+def test_waiting_list_is_bounded_and_reports_its_own_total(acknowledged_sink):
+    service = ReviewService(ControlPlaneRepo(sink=acknowledged_sink))
+    for n in range(5):
+        service.register(dict(review_id=f"w{n}", instance_id=f"i{n}", kind="plan", plan="p", revision="r"))
+    page = service.list_waiting(limit=3)
+    assert len(page["reviews"]) == 3 and page["total"] == 5 and page["has_more"] is True

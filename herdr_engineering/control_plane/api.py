@@ -33,6 +33,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
+from .artifact_acl import is_agent_collaborator
 from .artifacts import ArtifactConflict, ArtifactError
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
@@ -50,6 +51,8 @@ log = logging.getLogger(__name__)
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
 _HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
+# Terminal broker, host side: the relay's output POST (per-host token like the fleet routes, never an API key).
+_HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
@@ -299,10 +302,12 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, evolution=None, learning=None, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256, single_operator=False,
-                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
+                 assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
+                 fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
-                 unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None,
+                 collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None, assistant_judge=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
@@ -440,6 +445,9 @@ class ControlPlaneServer:
         self.share_store = share_store
         self.shares_root = shares_root
         self.share_settings = share_settings
+        # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
+        self.collab_grant_store = collab_grant_store
+        self.collab_artifacts_enabled = collab_artifacts_enabled
         self.attachment_dedupe: dict = {}      # redelivery guard for the email-attachment route; lost on restart
         from .artifact_scope import install_gate
         self.artifact_graph_gate = install_gate(repo.graph, artifact_acl)   # None without an ACL: nodes stay private
@@ -476,8 +484,16 @@ class ControlPlaneServer:
         if assistant_service is None:
             from .assistant import AssistantService
             from .assistant import assistant_config as _build_assistant_config
+            _cfg = _build_assistant_config(assistant_config or {})
+            _resolver = None
+            if _cfg["delegation"]["pi_bindings"]:
+                if assistant_delegation_adapter is not None:
+                    raise ValueError("configure a delegation adapter or pi_bindings, not both")
+                from ..assistant_pi_delegate import build_pi_delegation_resolver
+                _resolver = build_pi_delegation_resolver(_cfg["delegation"]["pi_bindings"])
             self.assistant = AssistantService(
-                config=_build_assistant_config(assistant_config or {}), repo=repo)
+                config=_cfg, repo=repo, delegation_adapter=assistant_delegation_adapter,
+                delegation_adapter_resolver=_resolver)
         else:
             self.assistant = assistant_service
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
@@ -524,6 +540,9 @@ class ControlPlaneServer:
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
         self._ingest_limiter = _RateLimiter(max_requests=6000)
+        # POST /mcp: chunked artifact staging legitimately sends many requests; the edge (25 r/s per IP) is the
+        # binding per-client ceiling, this one is a sanity backstop above it.
+        self._mcp_limiter = _RateLimiter(max_requests=1800)
         self._stream_limiter = _RateLimiter(max_requests=120)
         # Fail-closed (Spec §104): never default a blank/missing role to
         # "operator". Keep roles verbatim after strip; empty/None/unknown
@@ -559,6 +578,8 @@ class ControlPlaneServer:
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
         self.fleet_config = fleet_config
+        from .memory_explorer import MemoryExplorer
+        self.memory = MemoryExplorer(repo, lambda: memory_config if memory_config is not None else self._control_plane_value(fleet_config, "memory"), memory_adapter)
         # callable(urls, source_machine) -> {'resolutions': [...]}; None when no fabric gateway is configured
         self.fabric_resolver = fabric_resolver
         self.fabric_services = fabric_services      # callable() -> {'leases': [...]} | None
@@ -570,6 +591,9 @@ class ControlPlaneServer:
         from .single_flight_cache import SingleFlightCache
         self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
+        if self.assistant.host_candidates is None:       # looked up per call: `collab` may be swapped after startup
+            self.assistant.host_candidates = lambda: (
+                self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
         self.collab_require_https = collab_require_https
         # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
         # `control_plane.federation` on; the gateway is rebuilt if `collab` is swapped (tests do).
@@ -587,6 +611,14 @@ class ControlPlaneServer:
         self.operator_port, self.operator_user = operator_port, operator_user
         self.operator_email = operator_email
         self.operator_hosts = frozenset(h.lower() for h in operator_hosts)
+        # Rakazo sets specialists up for the dashboard's one owner, acting as the collaboration operator the dashboard
+        # already uses for rooms. Without that operator (or collaboration) nothing is wired and setup answers 400.
+        if self.collab is not None and self.operator_user and self.single_operator and self.assistant.self_setup is None:
+            from ..assistant_self_setup import SelfSetup
+            _owner_tenant = self.assistant.tenant_for("open-listener")
+            self.assistant.attach_self_setup(
+                SelfSetup(self.collab, self.operator_user),
+                lambda tenant, user: (tenant, user) == (_owner_tenant, "open-listener"))
         self._operator_httpd = None
         # Dashboard side: forward /api/v1/collab/* to the operator listener of the isolated
         # collab service, so the local owner needs no sign-in.
@@ -664,6 +696,8 @@ class ControlPlaneServer:
         self._pr_lister = SharedCredentialPrLister()
         self.intelligence.single_operator_fn = lambda: self.single_operator
         if self.rakazo is not None:
+            self.rakazo.agents.repo = self.repo
+            self.rakazo.terminal.repo = self.repo
             self.rakazo.desk.routes = self.intelligence      # board proposals as phone cards (scope: assistant_viewers)
             self.intelligence.board.on_new = self.rakazo.notify_proposal      # and as push notifications
             self.intelligence.push_status_fn = lambda: dict(self.rakazo.push.counters, enabled=self.rakazo.push.enabled)
@@ -678,6 +712,7 @@ class ControlPlaneServer:
                 from .google_workspace import GoogleWorkspace
                 _gw = GoogleWorkspace(apps=self.apps)
                 self.apps.on_change = _gw.invalidate
+                self.apps.on_client_change = _gw.invalidate_all
                 # Single-operator rule: map the data key (never the approval actor) through the bridge when there is one.
                 self.assistant.google_read = lambda t, u, tool, payload: _gw.run(*self._canonical_person(t, u), tool, payload)
                 self.assistant.google_write = lambda t, u, tool, payload: _gw.write(*self._canonical_person(t, u), tool, payload)
@@ -689,6 +724,14 @@ class ControlPlaneServer:
             self.assistant.lineage_emit = ActionLineageEmitter(self.ingest, principal_resolver(self._keys)).emit
             self.assistant.review_rereview = rereview_hook(self)
             self.assistant.comment_poster = comment_hook(self)
+            if self.assistant.config["team_briefs"]["enabled"]:
+                # team collaboration slice 4: wired ONLY when the flag is on, so a deployment that never sets it has no hook at all
+                from .assistant_adapters import brief_hook
+                self.assistant.brief_submitter = brief_hook(self)
+                if self.collab is not None:
+                    self.collab.assistant_briefs_source = lambda: self.assistant.config["team_briefs"]
+                if getattr(self, "google", None) is not None and self.assistant.mail_source is None:
+                    self.assistant.mail_source = lambda t, u, mid: self.google.get_raw_message(*self._canonical_person(t, u), mid)
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
             self.assistant.ci_rerun_request = self.intelligence.assistant_ci_rerun
@@ -1541,8 +1584,12 @@ class ControlPlaneServer:
             caps.append("collab_v1")
         if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
             caps.append("assistant_v1")
+            if self.assistant.team_briefs.enabled():
+                caps.append("assistant_team_briefs")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             caps.append("project_intelligence_v1")
+        if getattr(self, "memory", None) is not None and self.memory.enabled():
+            caps.append("memory_v1")
         if getattr(self, "unified_workspace_enabled", False):
             caps.append("unified_workspace_v1")
         if getattr(self, "skills", None) is not None:
@@ -1656,6 +1703,7 @@ class ControlPlaneServer:
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
             self._summary_scanner.start()
         self._start_background_thread(self._sweep_loop)
+        self._start_background_thread(self._team_roles_loop)
         self._start_background_thread(self._deployments_loop)
         if getattr(self, "ci_watch", None) is not None and self.ci_watch.config["enabled"]:
             self._start_background_thread(self.ci_watch.run)
@@ -1667,6 +1715,21 @@ class ControlPlaneServer:
             self._start_background_thread(self._link_flush_loop)
         self._ready.set()
         return self._httpd
+
+    def _team_roles_loop(self):
+        """Team collaboration slice 2: the server-side clock for tasks held by people. It evaluates leases whether or not the
+        assignee ever polls; the sweep is idempotent, crash-safe (state is replayed from the log) and a no-op while the flag is off."""
+        while not self._maintenance_stop.is_set():
+            interval = 30
+            collab = self.collab
+            if collab is not None:
+                try:
+                    collab.sweep_team_roles()
+                    collab.sweep_coordinators()
+                    interval = collab.team_roles_cfg()["sweep_interval_seconds"]
+                except Exception as exc:                        # noqa: BLE001 - a sweep failure must never stop the loop
+                    log.warning("team roles sweep failed: %s", type(exc).__name__)
+            self._maintenance_stop.wait(interval)
 
     def _sweep_loop(self, interval=300):
         """Periodic retention, starting at once so re-hydrated expired rows do not linger."""
@@ -1696,6 +1759,11 @@ class ControlPlaneServer:
             self.learning_trails.sweep()
         except Exception as exc:
             log.warning("learning trail sweep failed: %s", type(exc).__name__)
+        try:
+            if self.assistant.config.get("enabled"):
+                self.assistant.maintain_delegations()
+        except Exception as exc:
+            log.warning("assistant delegation maintenance failed: %s", type(exc).__name__)
 
     def _link_flush_loop(self, interval=30):
         """T14: tell the lineage graph what it missed about cross-workspace links (a retraction the graph was down
@@ -1871,6 +1939,7 @@ _PUBLIC_STATIC = {
     "/collab-context.js": ("collab-context.js", "text/javascript"),
     "/collab-helpers.js": ("collab-helpers.js", "text/javascript"),
     "/collab-workbench.js": ("collab-workbench.js", "text/javascript"),
+    "/collab-team-rooms.js": ("collab-team-rooms.js", "text/javascript"),
     "/motion.js": ("motion.js", "text/javascript"),
     "/patch.js": ("patch.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
@@ -2169,6 +2238,20 @@ def _make_handler(server, public=False, operator=False):
             from . import collab_mcp
             return self._jsonrpc(collab_mcp.handle, "MCP")
 
+        def handle_expect_100(self):
+            """``Expect: 100-continue`` on POST /mcp is answered only after the large-body gate has decided (see
+            ``_continue_100``); inviting the body first would defeat the pre-authentication gate."""
+            if self.command == "POST" and self.path.split("?")[0] == "/mcp":
+                self._expect_100_pending = True
+                return True
+            return super().handle_expect_100()
+
+        def _continue_100(self):
+            if getattr(self, "_expect_100_pending", False):
+                self._expect_100_pending = False
+                self.send_response_only(100)
+                self.end_headers()
+
         def _jsonrpc(self, handle, label):
             from .collab import MAX_BODY
             if server.collab is None:
@@ -2185,17 +2268,45 @@ def _make_handler(server, public=False, operator=False):
             if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                 return self._deny(415, "application/json required")
             length = _content_length(self.headers.get("Content-Length"))
-            if length is None or length <= 0 or length > MAX_BODY:
+            principal, big_tools = None, None
+            if length is None or length <= 0:
                 return self._deny(413, "request body size not allowed")
+            if length > MAX_BODY:
+                if label != "MCP":
+                    return self._deny(413, "request body size not allowed")
+                from . import collab_mcp
+                from .collab_bridge_files import MCP_UPLOAD_MAX_BODY
+                if length > MCP_UPLOAD_MAX_BODY:
+                    return self._deny(413, "request body size not allowed")
+                # Pre-authentication large-body gate: nothing above MAX_BODY is read for a caller who is not an
+                # authenticated agent admitted by a registered predicate (every refusal closes the connection).
+                if (len(self.headers.get_all("Content-Length") or []) != 1
+                        or "Transfer-Encoding" in self.headers):
+                    return self._deny(400, "ambiguous request framing")
+                try:
+                    principal = server.collab.authenticate(
+                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"))
+                    big_tools = collab_mcp.admitted_tools(server.collab, principal) if principal.is_agent else frozenset()
+                except Exception:
+                    big_tools = frozenset()
+                if not big_tools:
+                    return self._deny(413, "request body size not allowed")
+            self._continue_100()
             try:
                 message = json.loads(self.rfile.read(length))
             except (ValueError, RecursionError):
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32700, "message": "parse error"}}, 400)
             try:
+                if big_tools is not None:
+                    from . import collab_mcp
+                    refusal = collab_mcp.oversize_refusal(message, big_tools)
+                    if refusal is not None:
+                        return self._json(refusal[1], refusal[0])
+                extra = {} if principal is None else {"principal": principal}
                 status, payload = handle(
                     server.collab, message, self.headers.get("Authorization", ""),
-                    self.headers.get("X-Herdr-Device"))
+                    self.headers.get("X-Herdr-Device"), **extra)
             except Exception:
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32603, "message": "internal error"}}, 500)
@@ -2286,6 +2397,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._fleet_config_get()
             if self._path_only() in _DEPLOYMENT_HOST_GET_PATHS:      # host token, not X-API-Key
                 return self._deployment_host_get(_DEPLOYMENT_HOST_GET_PATHS[self._path_only()])
+            if self._path_only() == "/api/v1/host/terminal/wait":      # host token, not X-API-Key
+                return self._host_terminal(None)
             if self._path_only() == "/api/v1/health" and "probe" in parse_qs(urlsplit(self.path).query):
                 # Cheap liveness+capability probe (?probe=1): O(1), no repo counters,
                 # no inspector O(total-events) scan, no metrics snapshot. Used by
@@ -2347,25 +2460,31 @@ def _make_handler(server, public=False, operator=False):
             path = self.path.split("?")[0]
             # Decide on the DECODED resource: routing unquotes each segment, so a raw
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
-            segs = path.split("/")
-            res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
+            segs = [unquote(seg) for seg in path.split("/")]
+            # What the router matches: every guard below tests THIS, never the raw path. A decoded %2F stays inside its
+            # segment (the router keeps ``a/b`` as ONE part), so it is masked and ``[^/]+`` still matches it.
+            dpath = "/".join(seg.replace("/", "\x00") for seg in segs)
+            res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
-                                    "assistant-action-requests", "assistant-grants", "assistant-judges"}
+                                    "assistant-action-requests", "assistant-grants", "assistant-judges",
+                                    "assistant-team-briefs"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
-                    or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
-                    or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
+                    or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
+                    or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
+                    or _is_rereview(path)):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
-            if path.split("/")[3:4] and path.split("/")[3] in {
-                    "artifacts", "artifact-reports", "artifact-jobs", "artifact-reviews", "publications"}:
+            if res in {"artifacts", "artifact-reports", "artifact-jobs", "artifact-reviews", "publications"}:
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin artifact mutation refused")
+            if _HOST_TERMINAL_OUT.match(dpath):      # host token, not X-API-Key (like the fleet routes above)
+                return self._host_terminal(unquote(dpath.split("/")[5]), post=True)
             min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path) or _is_rereview(path)
                         or _HOST_REPORT.match(path)
                        else "operator")
@@ -2913,6 +3032,8 @@ def _make_handler(server, public=False, operator=False):
                 limiter = server._stream_limiter
             elif self.command == "POST" and path == "/api/v1/ingest":
                 limiter = server._ingest_limiter
+            elif self.command == "POST" and path == "/mcp":
+                limiter = server._mcp_limiter
             else:
                 limiter = server._limiter
             if limiter.allow(who):
@@ -2941,6 +3062,9 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_collab_api import route_collab
+                if route_collab(self, server, parts, resource):
+                    return None
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
                     return None
@@ -2994,6 +3118,12 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "reviews":
                     return self._send_json(503, {"error": "Review persistence is unavailable; no launch or decision was acknowledged."})
                 return self._send_json(503, {"error": "Integration service is unavailable."})
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                # The client gave up before the reply was written; the work is
+                # done, and a 500 or traceback would misreport it as a failure.
+                self._request_cause = type(exc).__name__
+                self.close_connection = True
+                return None
             except Exception as exc:  # never drop a connection: surface 500
                 self._request_cause = type(exc).__name__
                 if resource == "ingest":
@@ -3297,6 +3427,11 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server._health())
             if resource == "architecture":
                 return self._architecture_get(parts)
+            if resource == "memory":
+                status, body = server.memory.get(
+                    parts[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},
+                    self._principal(), self._role())
+                return self._json(body, status)
             if resource == "intelligence":
                 status, body = server.intelligence.get(
                     parts[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},
@@ -3429,6 +3564,17 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server.fleet_config.status())
             if resource == "fleet" and len(parts) == 5 and parts[4] == "inventory":
                 return self._json(r.fleet_inventory())
+            if resource == "ai-sync" and parts[4:] == ["config"]:
+                # Read-only, from the central fleet YAML; an unusable or invalid section reads as not configured.
+                from .ai_sync_config import parse_ai_sync
+                raw = server._control_plane_value(server.fleet_config, "ai_sync")
+                try:
+                    return self._json(parse_ai_sync(raw)) if raw is not None else self._json(
+                        {"error": "not configured"}, 404)
+                except ValueError:
+                    return self._json({"error": "not configured"}, 404)
+            if resource == "ai-sync" and len(parts) == 4:
+                return self._etag_json({"hosts": r.list_ai_sync(_q(self.path, "host_id"))})
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
                     rng = _q(self.path, "range")
@@ -3717,6 +3863,12 @@ def _make_handler(server, public=False, operator=False):
                 if len(parts) > 4:
                     record = reviews.get(parts[4])
                     return self._json(record) if record else self._json({"error": "not found"}, 404)
+                hidden = {"plan", "feedback", "receipt", "instance_id"}
+                if _q(self.path, "needs_decision") == "1":
+                    page = reviews.list_waiting(limit=min(200, max(1, _qint(self.path, "limit", 200))))
+                    return self._json({"available": True, "needs_decision": True, "total": page["total"], "has_more": page["has_more"],
+                                       "reviews": [{k: v for k, v in row.items() if k not in hidden} for row in page["reviews"]],
+                                       "checked_at": r._stamp()})
                 rows = reviews.list_reviews()
                 offset = max(0, _qint(self.path, "offset", 0))
                 limit = min(500, max(1, _qint(self.path, "limit", 500)))
@@ -3738,7 +3890,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource)
             if resource == "assistant-judges":
                 return self._assistant_judges(parts)
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
+            if resource in ("assistant-team-briefs", "assistant-references"):
+                return self._assistant_briefs(parts, resource, None)
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
@@ -3786,6 +3940,8 @@ def _make_handler(server, public=False, operator=False):
                 if not self._artifact_allowed(parts[4], 'admin'):
                     return self._artifact_forbidden()
                 body = self._read_json() or {}
+                if is_agent_collaborator(str(body.get("principal_id") or "")):
+                    return self._json({"error": "collaborator grants use the collaborators route"}, 400)
                 permissions = set(body.get("permissions") or [])
                 grant = server.artifact_acl.grant(
                     parts[4], str(body.get("principal_id") or ""), permissions,
@@ -3796,6 +3952,8 @@ def _make_handler(server, public=False, operator=False):
                 if not self._artifact_allowed(parts[4], 'admin'):
                     return self._artifact_forbidden()
                 body = self._read_json() or {}
+                if is_agent_collaborator(str(body.get("principal_id") or "")):
+                    return self._json({"error": "collaborator grants use the collaborators route"}, 400)
                 server.artifact_acl.revoke(parts[4], str(body.get("principal_id") or ""))
                 return self._json({"ok": True})
             if resource == "artifacts" and server.artifact_graph_gate is not None and len(parts) == 6 \
@@ -3810,6 +3968,10 @@ def _make_handler(server, public=False, operator=False):
             if resource == "artifact-jobs" and server.artifact_graph_gate is not None \
                     and server.artifact_store is not None and len(parts) == 6 and parts[5] == "lineage":
                 return self._artifact_job_lineage(parts[4])
+            if resource == "artifacts" and server.artifact_graph_gate is not None \
+                    and server.artifact_store is not None and len(parts) == 8 and parts[5] == "versions" \
+                    and parts[7] == "collab-lineage":
+                return self._artifact_collab_lineage(parts[4], parts[6])
             if resource == "artifacts" and server.artifact_store is not None and len(parts) == 6 and parts[5] == "versions":
                 if not self._artifact_allowed(parts[4], 'edit'):
                     return self._artifact_forbidden()
@@ -4076,11 +4238,7 @@ def _make_handler(server, public=False, operator=False):
                 host_id = body.get("host_id") if isinstance(body, dict) else None
                 if not isinstance(host_id, str) or not host_id or len(host_id) > 253:
                     return self._json({"ok": False, "error": "host_id is required"}, 400)
-                # A key bound in control_plane.architecture.agent_hosts acts only for its own hosts.
-                bound = (server.architecture_agent_hosts.get(self._principal()["id"])
-                         if self._role() in ("agent", "ingest") else None)
-                if (bound is None and self._role() == "agent" and server.architecture_require_host_binding
-                        or bound is not None and host_id not in bound):
+                if not self._host_key_allowed(host_id):
                     return self._json({"ok": False, "error": "this API key may not act for that host"}, 403)
                 if reports is None or not reports.enabled:
                     if parts[5] == "publish":
@@ -4208,6 +4366,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource, body)
             if resource == "assistant-judges":
                 return self._assistant_judges(parts, body)
+            if resource == "assistant-team-briefs":
+                return self._assistant_briefs(parts, resource, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4598,8 +4758,68 @@ def _make_handler(server, public=False, operator=False):
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
 
+        def _assistant_briefs(self, parts, resource, body):
+            """Team collaboration slice 4 (assistant_briefs.py): the operator's assistant offers a team a derived brief.
+
+            POST /api/v1/assistant-team-briefs  {room_id, team_id, message_ref[, assistant_id, target_agent_id]}
+            GET  /api/v1/assistant-team-briefs  the caller's own briefs (no mail pointers)
+            GET  /api/v1/assistant-references/<id>  the caller's own reference, resolved. Anyone else, or a wrong id, is one 404.
+
+            The scope is the authenticated API-key principal's own ``(tenant, user)``; collaboration credentials do not
+            authenticate here. Off (the flag, or the assistant) answers like a route that does not exist."""
+            from .assistant import (
+                AssistantError,
+                AssistantForbidden,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
+            from .assistant_briefs import TeamBriefError
+            try:
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                svc._require_enabled()
+                briefs = svc.team_briefs
+                briefs._require_enabled()
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                if resource == "assistant-references" and len(parts) == 5 and self.command == "GET":
+                    return self._json(briefs.reference(parts[4], tenant_id=tenant_id, user_id=user_id))
+                if resource == "assistant-team-briefs" and len(parts) == 4 and self.command == "GET":
+                    return self._json({"briefs": briefs.list(tenant_id=tenant_id, user_id=user_id)})
+                if resource == "assistant-team-briefs" and len(parts) == 4 and self.command == "POST":
+                    body = body if isinstance(body, dict) else {}
+                    if set(body) - {"room_id", "team_id", "message_ref", "assistant_id", "target_agent_id"}:
+                        return self._json({"error": "unknown field"}, 400)
+                    for key in ("room_id", "team_id", "message_ref"):
+                        if not isinstance(body.get(key), str) or not body[key]:
+                            return self._json({"error": f"{key} is required"}, 400)
+                    for key in ("assistant_id", "target_agent_id"):
+                        if body.get(key) is not None and not isinstance(body[key], str):
+                            return self._json({"error": f"{key} must be a string"}, 400)
+                    assistant_id = body.get("assistant_id") or next(
+                        (a.assistant_id for a in svc.store.list_assistants(tenant_id=tenant_id, user_id=user_id) if a.enabled), "")
+                    brief = briefs.process_message(
+                        tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id, message_ref=body["message_ref"],
+                        room_id=body["room_id"], team_id=body["team_id"], target_agent_id=body.get("target_agent_id"))
+                    if brief is None:
+                        return self._json({"brief": None, "result": "no_topic"})
+                    return self._json({"brief": brief}, 200 if brief["replayed"] else 201)
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except AssistantForbidden:
+                return self._json({"error": "forbidden"}, 403)
+            except TeamBriefError as exc:
+                return self._json({"error": str(exc)}, exc.status)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except (AssistantError, ValueError) as exc:
+                return self._json({"error": str(exc)}, 400)
+
         def _assistant_get(self, parts, resource):
-            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant
@@ -4701,6 +4921,23 @@ def _make_handler(server, public=False, operator=False):
                                                         svc.list_connectors(tenant_id=tenant_id, user_id=user_id)]})
                 if resource == "assistant-connectors" and len(parts) == 5:
                     return self._json(svc.get_connector(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-types" and len(parts) == 4:
+                    svc._require_enabled()
+                    return self._json({"types": svc.assistant_types()})
+                if resource == "assistant-placement" and len(parts) == 4:
+                    query = parse_qs(urlsplit(self.path).query)
+                    extra = [c for raw in query.get("require", []) for c in raw.split(",") if c]
+                    kind = (query.get("type") or [""])[0]
+                    svc._require_enabled()
+                    return self._json(svc.resolve_placement(kind, require=extra))
+                if resource == "assistant-route" and len(parts) == 4:
+                    query = parse_qs(urlsplit(self.path).query)
+                    svc._require_enabled()
+                    return self._json(svc.route_delegation(
+                        (query.get("task") or [""])[0][:8000], tenant_id=tenant_id, user_id=user_id,
+                        hint=(query.get("target") or [None])[0]))
+                if resource == "assistant-graph" and len(parts) == 4:
+                    return self._json(svc.assistant_graph(tenant_id=tenant_id, user_id=user_id))
                 if resource == "assistant-delegations" and len(parts) == 4:
                     return self._json({"delegations": [d.as_dict() for d in
                                                          svc.list_delegations(tenant_id=tenant_id, user_id=user_id)]})
@@ -4713,7 +4950,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc), "code": "rate_limited"}, 429)
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
-            except ValueError as exc:
+            except (AssistantError, ValueError) as exc:         # a refused request (for example an unknown capability)
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_post(self, parts, resource, body):
@@ -4738,8 +4975,23 @@ def _make_handler(server, public=False, operator=False):
                             persona=body.get("persona", "helpful"),
                             instructions=body.get("instructions", ""),
                             model_policy=body.get("model_policy", "auto"),
-                            enabled=bool(body.get("enabled", True)))
+                            enabled=bool(body.get("enabled", True)),
+                            type=body.get("type", "rakazo"), parent_id=body.get("parent_id"),
+                            idempotency_key=body.get("idempotency_key", ""))
                         return self._json(created.as_dict(), 201)
+                    if len(parts) == 6 and parts[5] == "link" and self.command == "POST":
+                        return self._json(svc.link_assistant(
+                            parts[4], tenant_id=tenant_id, user_id=user_id,
+                            parent_id=str(body.get("parent_id", ""))).as_dict())
+                    if len(parts) == 6 and parts[5] == "delete" and self.command == "POST":
+                        return self._json({"removed": svc.delete_assistant(
+                            parts[4], tenant_id=tenant_id, user_id=user_id,
+                            confirm_name=str(body.get("confirm_name", "")))})
+                    if len(parts) == 6 and parts[5] == "setup" and self.command == "POST":
+                        return self._json(svc.setup_specialist(parts[4], tenant_id=tenant_id, user_id=user_id))
+                    if len(parts) == 6 and parts[5] == "unlink" and self.command == "POST":
+                        return self._json(svc.unlink_assistant(
+                            parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
                     if len(parts) == 5 and self.command in ("PATCH", "POST"):
                         if body.get("archive"):
                             svc.archive_assistant(parts[4], tenant_id=tenant_id, user_id=user_id)
@@ -4950,6 +5202,9 @@ def _make_handler(server, public=False, operator=False):
                                      assistant_id=body.get("assistant_id", ""),
                                      task=body.get("task", ""),
                                      target_system=body.get("target_system", "pi"),
+                                     context=body.get("context"),
+                                     source_refs=body.get("source_refs"),
+                                     idempotency_key=body.get("idempotency_key", ""),
                                      actor=user_id)
                     return self._json(d.as_dict(), 201)
                 if resource == "assistant-delegations" and len(parts) == 6 and parts[5] == "cancel":
@@ -4975,6 +5230,72 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc)}, 400)
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
+
+        def _host_key_allowed(self, host_id):
+            """May this key act for ``host_id``? A key bound in control_plane.architecture.agent_hosts acts only for its own
+            hosts. An unbound key is trusted to name any host (keys carry a role only; there is no per-host enrollment),
+            except an unbound ``agent`` key under require_host_binding. (The terminal relay does not use this: it
+            authenticates with the per-host token.)"""
+            role = self._role()
+            bound = (server.architecture_agent_hosts.get(self._principal()["id"])
+                     if role in ("agent", "ingest") else None)
+            if bound is not None:
+                return host_id in bound
+            return not (server.architecture_require_host_binding and role == "agent")
+
+        def _host_terminal(self, terminal_id, post=False):
+            """Terminal broker, host side. ``GET /api/v1/host/terminal/wait?timeout=&after=`` long-polls for commands (``after``
+            acknowledges up to that command id); ``POST /api/v1/host/terminal/<id>/output`` pushes screen frames. The only
+            credential is the per-host ``X-Host-Token`` of the fleet file (what ``herdr-eng fleet join`` puts in host.json),
+            checked like the other host routes, so it works in open mode and needs no control-plane configuration. The
+            host id comes from the TOKEN; a ``host_id`` in the query or body is never trusted and must equal it. API keys
+            of every role are refused, and so is the open listener without a token."""
+            from ..fleet_config import FleetConfigError
+            from .rakazo_terminal import HostError
+            broker = server.rakazo.terminal if server.rakazo is not None else None
+            if broker is None:
+                return self._deny(404, "not found")
+            tokens = self.headers.get_all("X-Host-Token") or []
+            host = None
+            if len(tokens) == 1 and server.fleet_config is not None:
+                try:
+                    host = self._fleet_host(server.fleet_config.current())
+                except FleetConfigError:
+                    host = None
+            if host is None:
+                return self._deny(403, "the terminal relay needs a host token")
+            given = _q(self.path, "host_id")
+            body = None
+            if post:
+                try:
+                    body = self._read_json() or {}
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+                if given is None and isinstance(body, dict):
+                    given = body.get("host_id")
+            if given is not None and given != host:
+                return self._json({"error": "this host token is not for that host"}, 403)
+            try:
+                if not post:
+                    try:
+                        timeout = float(_q(self.path, "timeout") or 25)
+                    except ValueError:
+                        timeout = -1
+                    after = _q(self.path, "after")
+                    if not 0 <= timeout < float("inf"):
+                        return self._json({"error": "timeout must be a number of seconds"}, 400)
+                    if after is not None and not re.fullmatch(r"[0-9a-f]{8}-\d{1,20}-[A-Za-z0-9_-]{1,64}", after):
+                        return self._json({"error": "after must be a command id"}, 400)
+                    commands = broker.wait_commands(host, timeout, after)
+                    # Serialised here, not by _json's redaction pass: that one rewrites strings that look like credentials,
+                    # and a corrupted base64 input would type the wrong keys.
+                    return self._json(None, payload=json.dumps({"commands": commands}).encode())
+                if not isinstance(body, dict):
+                    return self._json({"error": "body must be an object"}, 400)
+                broker.accept_frames(host, terminal_id, body.get("frames"))
+                return self._json({"ok": True})
+            except HostError as exc:
+                return self._json({"error": exc.message}, exc.status, headers=exc.headers)
 
         def _steering(self, parts, body=None):
             """T12 delivery to the emitter that owns a steering target (keyed API; no browser, no HCN credential).
@@ -5463,7 +5784,7 @@ def _make_handler(server, public=False, operator=False):
                 self.close_connection = True
                 raise
 
-        def _json(self, data, status=200, *, etag=None, payload=None):
+        def _json(self, data, status=200, *, etag=None, payload=None, headers=None):
             if server.ci_fix is not None and payload is None:
                 data = server.ci_fix.redact(data)
             payload = json.dumps(data).encode() if payload is None else payload
@@ -5473,6 +5794,8 @@ def _make_handler(server, public=False, operator=False):
             self.send_header("Content-Length", str(len(payload)))
             if etag and status == 200:
                 self.send_header("ETag", etag)
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -5481,13 +5804,20 @@ def _make_handler(server, public=False, operator=False):
 
         # ----------------------------------------------------- artifact <-> lineage graph routes
         def _artifact_retract(self, artifact_id):
-            """POST /api/v1/artifacts/<id>/retract {"version_id"?, "reason"?}: hide the artifact (or one version) from
-            every graph reader, durably. ``admin`` on the artifact, like the ACL routes."""
+            """POST /api/v1/artifacts/<id>/retract {"version_id"?, "reason"?, "restrict_all"?}: hide the artifact (or one
+            version) from every graph reader, durably. ``admin`` on the artifact, like the ACL routes.
+
+            Fail-safe: when the retraction could not be persisted (hidden in memory only) the artifact's collaborator WRITE
+            grants are revoked. ``restrict_all: true`` additionally revokes its read grants, on that failed path only;
+            without the flag read grants are never touched and the 500 offers it (``restrict_all_offered``)."""
             if not self._artifact_allowed(artifact_id, "admin"):
                 return self._artifact_forbidden()
             body = self._read_json() or {}
-            if not isinstance(body, dict) or set(body) - {"version_id", "reason"}:
-                return self._json({"error": "body may only carry version_id and reason"}, 400)
+            if not isinstance(body, dict) or set(body) - {"version_id", "reason", "restrict_all"}:
+                return self._json({"error": "body may only carry version_id, reason and restrict_all"}, 400)
+            restrict_all = body.get("restrict_all", False)
+            if not isinstance(restrict_all, bool):
+                return self._json({"error": "restrict_all must be a boolean"}, 400)
             version_id = body.get("version_id")
             if version_id is not None and (not isinstance(version_id, str) or not version_id):
                 return self._json({"error": "version_id must be a non-empty string"}, 400)
@@ -5501,9 +5831,30 @@ def _make_handler(server, public=False, operator=False):
             if server.artifact_store is not None:
                 def persist(aid, vid, why):
                     self._artifact_call("record_retraction", aid, vid, why)
+            grants = server.collab_grant_store if server.collab_artifacts_enabled else None
+            on_unpersisted, pending = None, {}
+            if grants is not None:
+                def on_unpersisted(aid):
+                    counts = grants("revoke_grants", aid, write_only=True)
+                    pending["write"] = counts["pending_invites"]
+                    return counts["grants"]
             result = retract(gate=server.artifact_graph_gate, ingest=server.ingest, principal=self._principal(),
                              artifact_id=artifact_id, version_id=version_id, reason=body.get("reason"),
-                             persist=persist)
+                             persist=persist, on_unpersisted=on_unpersisted)
+            result["restrict_all_applied"] = False
+            if result["error"]:
+                result["restrict_all_offered"] = True
+                if "write" in pending:
+                    result["pending_invites_revoked"] = pending["write"]
+                if restrict_all and grants is not None:       # operator-requested, after the write-grant fail-safe
+                    result["collab_all_grants_revoked"], result["collab_restrict_error"] = None, None
+                    try:
+                        counts = grants("revoke_grants", artifact_id, write_only=False)
+                        result["collab_all_grants_revoked"] = counts["grants"]
+                        result["pending_invites_revoked"] = pending.get("write", 0) + counts["pending_invites"]
+                        result["restrict_all_applied"] = True
+                    except Exception as exc:                  # noqa: BLE001 - type name only; the 500 stands
+                        result["collab_restrict_error"] = type(exc).__name__
             return self._json(result, 500 if result["error"] else 200)
 
         def _artifact_backfill(self, artifact_id):
@@ -5536,6 +5887,28 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             if version.get("job_id") != job_id:
                 return self._json({"error": "that version was not committed by this job"}, 409)
+            if server.artifact_graph_gate.version_retracted(artifact_id, version_id):
+                return self._json({"error": "artifact or version is retracted"}, 409)
+            from .artifact_lineage import emit_version_lineage
+            from .artifact_scope import visibility_fields
+            result = emit_version_lineage(server.ingest, {**version, "artifact_id": artifact_id}, self._principal(),
+                                          scope=visibility_fields(gated=True))
+            return self._json(result, 502 if result["error"] else 200)
+
+        def _artifact_collab_lineage(self, artifact_id, version_id):
+            """POST /api/v1/artifacts/<id>/versions/<vid>/collab-lineage {}: the collaborator applier reports a merge
+            version. The body carries nothing; the server reads the version from the registry. A caller without ``edit``
+            and an unknown version are both 404, so existence is not leaked."""
+            body = self._read_json() or {}
+            if not isinstance(body, dict) or body:
+                return self._json({"error": "body must be exactly {}"}, 400)
+            if not self._artifact_allowed(artifact_id, "edit"):
+                return self._deny(404, "not found")
+            version = self._artifact_call("get_version", version_id, artifact_id)
+            if version is None:
+                return self._deny(404, "not found")
+            if version.get("created_via") != "collaborator":
+                return self._json({"error": "that version was not committed by a collaborator"}, 409)
             if server.artifact_graph_gate.version_retracted(artifact_id, version_id):
                 return self._json({"error": "artifact or version is retracted"}, 409)
             from .artifact_lineage import emit_version_lineage

@@ -18,33 +18,33 @@ after(async () => { await browser?.close(); });
 const FLOOR = { 'dashboard-missions': { controls: 10, text: 40 }, 'dashboard-assistant-proposals': { controls: 25, text: 60 },
   'dashboard-assistant-notifications': { controls: 20, text: 45 }, 'dashboard-assistant-approvals': { controls: 20, text: 45 },
   'dashboard-assistant-connectors': { controls: 40, text: 83 } };
-const KNOWN = {   // slug -> run label -> rule -> recorded count (measured 2026-10-29; color-contrast lowered by 1 on every state after the shared button style, #406, 2026-10-30; the chat input got a label and the Configure tabs became a real tablist, which removed name-role-value, label and one focus-visible on every assistant tab; the Keys button is hidden on phones, one more focus-visible fewer there, 2026-10-31)
+const KNOWN = {   // slug -> run label -> rule -> recorded count (measured 2026-10-29; color-contrast lowered by 1 on every state after the shared button style, #406, 2026-10-30; the chat input got a label and the Configure tabs became a real tablist, which removed name-role-value, label and one focus-visible on every assistant tab; the Keys button is hidden on phones, one more focus-visible fewer there, 2026-10-31; the assistant picker became a tab group, which removed the select's one focus-indicator-contrast finding on every assistant surface, 2026-11-01)
   'dashboard-missions': {
     'desktop light': {'color-contrast': 2, 'focus-indicator-contrast': 12},
     'desktop dark': {'color-contrast': 1},
     'phone (375px) light': {'color-contrast': 2, 'focus-indicator-contrast': 12},
   },
   'dashboard-assistant-proposals': {
-    'desktop light': {'heading-order': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 16},
+    'desktop light': {'heading-order': 1, 'color-contrast': 3, 'focus-visible': 16},
     'desktop dark': {'heading-order': 1, 'color-contrast': 1, 'focus-visible': 16},
-    'phone (375px) light': {'heading-order': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 15},
+    'phone (375px) light': {'heading-order': 1, 'color-contrast': 3, 'focus-visible': 15},
   },
   'dashboard-assistant-notifications': {
-    'desktop light': {'color-contrast': 5, 'focus-indicator-contrast': 1, 'focus-visible': 9},
+    'desktop light': {'color-contrast': 5, 'focus-visible': 9},
     'desktop dark': {'color-contrast': 1, 'focus-visible': 9},
-    'phone (375px) light': {'color-contrast': 5, 'focus-indicator-contrast': 1, 'focus-visible': 8},
+    'phone (375px) light': {'color-contrast': 5, 'focus-visible': 8},
   },
   'dashboard-assistant-approvals': {
-    'desktop light': {'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 9},
+    'desktop light': {'color-contrast': 3, 'focus-visible': 9},
     'desktop dark': {'color-contrast': 1, 'focus-visible': 9},
-    'phone (375px) light': {'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 8},
+    'phone (375px) light': {'color-contrast': 3, 'focus-visible': 8},
   },
   // Apps, blocked calendars, Drafts, Reminders and the generic connector list (measured 2026-10-30). Same page-level findings as the other
   // assistant tabs (the unlabelled chat input, h1 then h3, the shared button focus ring and muted-text contrast); nothing of its own.
   'dashboard-assistant-connectors': {
-    'desktop light': {'heading-order': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 19},
+    'desktop light': {'heading-order': 1, 'color-contrast': 3, 'focus-visible': 19},
     'desktop dark': {'heading-order': 1, 'color-contrast': 1, 'focus-visible': 19},
-    'phone (375px) light': {'heading-order': 1, 'color-contrast': 3, 'focus-indicator-contrast': 1, 'focus-visible': 18},
+    'phone (375px) light': {'heading-order': 1, 'color-contrast': 3, 'focus-visible': 18},
   },
 };
 const RUNS = [['desktop light', 'desktop', 'light'], ['desktop dark', 'desktop', 'dark'], ['phone (375px) light', 'mobile', 'light']];

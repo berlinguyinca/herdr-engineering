@@ -32,6 +32,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import project_intelligence as pi
+from . import rakazo_agents
+from . import rakazo_terminal
 from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_cognito as cognito
@@ -68,6 +70,16 @@ SLOW_CALL_MS = 300           # a call slower than this is logged (name + duratio
 VERY_SLOW_CALL_MS = 2000      # ... as a warning
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
+# The networks an open owner session may come from: this machine and the tailnet (Tailscale's IPv4 CGNAT range and its IPv6
+# ULA prefix). LAN and container ranges (RFC 1918, other unique-local) are deliberately absent: a docker bridge peer or a
+# neighbour on the Wi-Fi is not the owner, and this session reaches the terminal. Explicit on purpose: ``is_private`` also
+# covers Teredo, 6to4, documentation and link-local ranges.
+OPEN_OWNER_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"))
+# Procedures that ride the keystroke stream: already bounded by their sequence number, the 64 KB cap and the session cap,
+# so the shared per-account request limiter (which would drop typing after 120 calls a minute) does not meter them.
+_UNMETERED = frozenset({"terminal/input", "terminal/resize"})
+_OPEN_OWNER_INTERVAL = 30.0          # seconds between open sessions from one address: they evict the owner's older tokens
 _MAX_N = 2 ** 17                     # 128 MiB: a hash in the YAML cannot make one sign-in allocate more than this
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
 _COLLAB_USER = re.compile(r"[A-Za-z0-9._@+:-]{1,200}\Z")
@@ -81,6 +93,7 @@ MAX_SENDS = 4
 MAX_NONCES = 512
 # Tools a phone operator's bots get on first use (preauthorized=False: every sensitive one still needs an approval card).
 # send_email is deliberately absent. Override with control_plane.rakazo_bridge.default_tools; [] disables.
+GRANT_RECHECK_SECONDS = 3600.0      # how often a bot's lapsed default grants are looked at again
 DEFAULT_TOOLS = ("set_reminder", "list_reminders", "cancel_reminder", "search_email", "read_email", "list_calendar_events",
                  "find_free_time", "create_email_draft", "create_calendar_event")
 # default_tools may only name these: tools that stay behind an approval card or touch only the person's own data.
@@ -182,7 +195,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
-                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push", "default_tools"})
+                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push", "default_tools", "open_owner"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -249,7 +262,12 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         if link is not None and (not isinstance(link, str) or not _COLLAB_USER.match(link)):
             raise ValueError(f"{where}.collab_user must be a collaboration user id (letters, digits and . _ @ + : -)")
         accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff, link))
-    return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
+    open_owner = raw.get("open_owner", False)
+    if not isinstance(open_owner, bool):
+        raise ValueError("control_plane.rakazo_bridge.open_owner must be true or false")
+    if open_owner and not any(a.role == "operator" for a in accounts):
+        raise ValueError("control_plane.rakazo_bridge.open_owner needs an account with role operator to act as")
+    return {"enabled": True, "open_owner": open_owner, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
             "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join), "default_tools": tuple(dict.fromkeys(tools)),
             "cognito": cognito_cfg, "push": _push_config(raw.get("push"))}
@@ -655,6 +673,7 @@ class _Ctx:
     accepts_stream: bool
     space: str = sp.DEFAULT_SPACE_ID
     base_tenant: str = ""
+    principal: str = ""    # the phone account's own principal; ``user`` is the owner key, which differs for a mapped operator
 
 
 # --------------------------------------------------------------------------------------------- the bridge
@@ -670,6 +689,9 @@ class RakazoBridge:
         self.svc = assistant
         self.version = version
         self.accounts: list[Account] = list(config["accounts"])
+        self.open_owner = bool(config.get("open_owner"))
+        self._open_lock = threading.Lock()
+        self._open_last: dict[str, float] = {}
         self._by_principal = {a.principal_id: a for a in self.accounts}
         self._by_id = {a.account_id: a for a in self.accounts}
         self._cognito_users: dict[str, str] = {}      # account id -> Cognito username, for pool members who signed in
@@ -692,6 +714,7 @@ class RakazoBridge:
         self._nonces: OrderedDict[tuple, dict[str, Any]] = OrderedDict()      # recent sends, by clientNonce
         self._create_lock = threading.Lock()
         self._grant_lock = threading.Lock()
+        self._grant_checked: dict[str, float] = {}      # bot id -> monotonic time of its last default-grant pass
         self._closed = threading.Event()
         self._monotonic = monotonic
         self.thread_factory = threading.Thread      # tests swap it to make a thread start fail
@@ -722,6 +745,10 @@ class RakazoBridge:
         self.auto_join_rooms = tuple(config.get("auto_join_rooms", ()))
         self.rooms = rooms.Rooms(self, BridgeError)
         self._procs.update(self.rooms.procs())
+        self.agents = rakazo_agents.Agents(self, BridgeError)       # the API glue sets .repo
+        self._procs.update(self.agents.procs())
+        self.terminal = rakazo_terminal.Terminal(self, BridgeError)   # the API glue sets .repo
+        self._procs.update(self.terminal.procs())
         self.max_bots = MAX_BOTS
         self.bots = bots.Bots(self, BridgeError)
         self.memory = memory.Memory(self, BridgeError)
@@ -773,6 +800,10 @@ class RakazoBridge:
 
     def close(self) -> None:
         self._closed.set()
+        try:
+            self.terminal.close_all()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("rakazo bridge: closing the terminals failed (%s)", type(exc).__name__)
         self.desk.close()
         self.push.close()
 
@@ -782,7 +813,7 @@ class RakazoBridge:
         for account in self.accounts:
             base = self.svc.tenant_for(account.principal_id)
             for space_id in [sp.DEFAULT_SPACE_ID] + [s.space_id for s in self.spaces.list(account.account_id)]:
-                ctx = _Ctx(account, sp.space_tenant(base, space_id), account.principal_id, "", False, space_id, base)
+                ctx = self._ctx(account, sp.space_tenant(base, space_id), "", False, space_id, base)
                 try:
                     started += self.routines.run_due(ctx)
                 except Exception as exc:  # noqa: BLE001 - keep the loop alive
@@ -828,7 +859,7 @@ class RakazoBridge:
         ip = self.client_address(peer, headers.get("x-forwarded-for", ""))
         try:
             if path.startswith("/api/auth/"):
-                return self._auth(method, path[len("/api/auth/"):], headers, body, ip)
+                return self._auth(method, path[len("/api/auth/"):], headers, body, ip, peer)
             return self._rpc(method, path[len("/rpc/"):], headers, body, ip)
         except BridgeError as err:
             return _rpc_error(err) if path.startswith("/rpc/") else _auth_error(err.status, err.code, err.message,
@@ -839,7 +870,7 @@ class RakazoBridge:
             return _rpc_error(fail) if path.startswith("/rpc/") else _auth_error(500, fail.code, fail.message)
 
     # auth ------------------------------------------------------------------------------------------------------
-    def _auth(self, method: str, name: str, headers, body: bytes, ip: str) -> BridgeResponse:
+    def _auth(self, method: str, name: str, headers, body: bytes, ip: str, peer: str = "") -> BridgeResponse:
         if method == "GET" and name == "capabilities":
             # email + password only: no sign-up, one-time codes, passkeys, SSO or reset mail
             return _json_response(200, {"sso": None, "passwordAuth": True, "passwordReset": False, "resetUrl": None,
@@ -847,6 +878,8 @@ class RakazoBridge:
                                         "nativePasskeys": {"ios": False, "android": False}, "crispWebsiteId": None})
         if method == "POST" and name == "sign-in/email":
             return self._sign_in(body, ip)
+        if method == "POST" and name == "open" and self.open_owner:
+            return self._open_owner(headers, ip, peer)
         if method == "POST" and name == "sign-out":
             token = self._bearer(headers)
             account = self._by_id.get(self.tokens.lookup(token, ip) or "") if token else None
@@ -910,12 +943,50 @@ class RakazoBridge:
         self.limiter.success(ip)
         return self._finish_sign_in(matched, ip)
 
-    def _finish_sign_in(self, matched: Account, ip: str) -> BridgeResponse:
+    def _open_owner(self, headers, ip: str, peer: str) -> BridgeResponse:
+        """A session for the first operator account with no password, for one-person setups where the network is the
+        credential. Allowed only from this machine or the tailnet (not LAN or container networks), and only from the app itself
+        (its ``rakazo://`` origin, which a web page cannot send). Never enable it behind a reverse proxy or NAT that does
+        not set X-Forwarded-For: the proxy's own address would then count as the caller."""
+        refuse = BridgeError(403, "FORBIDDEN", "This server only opens a session from your own network.")
+        if headers.get("origin", "") != "rakazo://":
+            raise refuse
+        try:
+            addr = ipaddress.ip_address(ip)
+            peer_addr = ipaddress.ip_address(peer) if peer else None
+        except ValueError:
+            raise refuse from None
+        addr = getattr(addr, "ipv4_mapped", None) or addr
+        if headers.get("x-forwarded-for") and peer_addr is not None:
+            direct = getattr(peer_addr, "ipv4_mapped", None) or peer_addr
+            if not (direct.is_loopback or any(peer_addr in net for net in self.trusted_proxies)):
+                # a proxy we do not trust relayed this: its forwarded value is never the client
+                log.warning("rakazo bridge: refused an open owner session with X-Forwarded-For from untrusted peer %s", peer[:64])
+                raise refuse
+        if peer_addr is not None and any(peer_addr in net for net in self.trusted_proxies) and ip == str(peer_addr):
+            log.warning("rakazo bridge: refused an open owner session relayed by %s without a client address", ip[:64])
+            raise refuse                                      # a configured proxy that named no client
+        if not any(addr in net for net in OPEN_OWNER_NETWORKS):
+            log.warning("rakazo bridge: refused an open owner session from %s", ip[:64])
+            raise refuse
+        now = self._monotonic()
+        with self._open_lock:
+            last = self._open_last.get(ip)
+            if last is not None and now - last < _OPEN_OWNER_INTERVAL:
+                raise BridgeError(429, "TOO_MANY_REQUESTS", "Try again in a moment.", {"Retry-After": "30"})
+            if len(self._open_last) > 256:
+                self._open_last = {k: v for k, v in self._open_last.items() if now - v < _OPEN_OWNER_INTERVAL}
+            self._open_last[ip] = now
+        owner = next(a for a in self.accounts if a.role == "operator")
+        log.info("rakazo bridge: open owner session for %s from %s", owner.account_id, ip[:64])
+        return self._finish_sign_in(owner, ip, "rakazo.bridge.open_owner")
+
+    def _finish_sign_in(self, matched: Account, ip: str, action: str = "rakazo.bridge.sign_in") -> BridgeResponse:
         try:
             token = self.tokens.mint(matched.account_id, ip)
         except TokenStoreError:
             raise BridgeError(500, "INTERNAL_SERVER_ERROR", "Could not start a session. Try again later.") from None
-        self._audit(matched, "rakazo.bridge.sign_in")
+        self._audit(matched, action)
         return _json_response(200, {"token": token, "redirect": False,
                                     "user": {"id": matched.principal_id, "email": matched.email,
                                              "name": matched.email.split("@", 1)[0]}},
@@ -941,11 +1012,12 @@ class RakazoBridge:
             self._cognito_users[account_id] = who["user"]
         return account
 
-    def _audit(self, account: Account, action: str) -> None:
+    def _audit(self, account: Account, action: str, subject: str | None = None, detail: str = "") -> None:
         """Best effort: signing in must not depend on the audit store, but a refusal is logged (never any secret)."""
         try:
             self.svc.store.audit_record(tenant_id=self.svc.tenant_for(account.principal_id), user_id=account.principal_id,
-                                        actor=account.principal_id, action=action, subject_id=account.account_id)
+                                        actor=account.principal_id, action=action,
+                                        subject_id=subject or account.account_id, detail=detail)
         except Exception as exc:  # noqa: BLE001
             log.warning("rakazo bridge: could not write the audit entry %s (%s)", action, type(exc).__name__)
 
@@ -981,10 +1053,10 @@ class RakazoBridge:
             # another account's space, a deleted one and a made-up one all look the same: not found
             raise BridgeError(404, "NOT_FOUND", "Not found")
         tenant = sp.space_tenant(base, space_id)
-        ctx = _Ctx(account, tenant, account.principal_id, token,
-                   "text/event-stream" in headers.get("accept", ""), space_id, base)
+        ctx = self._ctx(account, tenant, token, "text/event-stream" in headers.get("accept", ""), space_id, base)
         try:
-            self.svc.check_rate_limit(key=f"{tenant}:{ctx.user}")
+            if proc not in _UNMETERED:
+                self.svc.check_rate_limit(key=f"{tenant}:{ctx.user}")
             result = handler(ctx, inp)
         except AssistantNotFound:
             raise BridgeError(404, "NOT_FOUND", "Not found.") from None
@@ -1018,24 +1090,44 @@ class RakazoBridge:
         return assistant
 
     def _ensure_default_grants(self, ctx: _Ctx, assistant) -> None:
-        """Once per bot, give a real operator phone's assistant the default tools (never preauthorized, so sensitive tools
-        still need an approval card). The meta flag makes a later revoke stick; a tool that already has any grant record is
-        skipped. Never raises: chat must not break over this."""
+        """Give a real operator phone's assistant the default tools (never preauthorized, so sensitive tools still need an
+        approval card). First use grants every tool that has no record; the meta flag makes a later revoke (or delete) stick.
+        Grants lapse after ``grant_max_ttl_seconds``, so at most once per ``GRANT_RECHECK_SECONDS`` per bot a default tool
+        whose records are all expired (none revoked) gets a fresh grant. Never raises: chat must not break over this."""
         try:
             if not self.default_tools or ctx.account.role != "operator":
                 return
             if self.canonical_person(ctx.tenant, ctx.user) != (ctx.tenant, OPEN_LISTENER_USER):
                 return
             bot_id = assistant.assistant_id
+            now = self._monotonic()
+            last = self._grant_checked.get(bot_id)
+            if last is not None and now - last < GRANT_RECHECK_SECONDS:
+                return
             with self._grant_lock:      # concurrent first requests must not each grant every tool
-                if self.bots.meta(ctx, bot_id).get("default_tools_applied"):
+                last = self._grant_checked.get(bot_id)
+                if last is not None and now - last < GRANT_RECHECK_SECONDS:
                     return
-                have = {g.tool_id for g in self.svc.store.list_grants(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id)}
+                applied = bool(self.bots.meta(ctx, bot_id).get("default_tools_applied"))
+                by_tool: dict[str, list] = {}
+                for g in self.svc.store.list_grants(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id):
+                    by_tool.setdefault(g.tool_id, []).append(g)
+                wall = self.svc.now()
                 for tool in self.default_tools:
-                    if tool in ALLOWED_DEFAULT_TOOLS and tool not in have:
-                        self.svc.grant_tool(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id, tool_id=tool,
-                                            scope="*", preauthorized=False)
-                self.bots._put_meta(ctx, bot_id, {"default_tools_applied": True})
+                    if tool not in ALLOWED_DEFAULT_TOOLS:
+                        continue
+                    records = by_tool.get(tool, [])
+                    if records:
+                        # renew only a lapsed tool: any revoked or still-active record means "leave it alone"
+                        if applied is False or any(g.revoked_at is not None or g.active(wall) for g in records):
+                            continue
+                    elif applied:
+                        continue
+                    self.svc.grant_tool(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id, tool_id=tool,
+                                        scope="*", preauthorized=False)
+                if not applied:
+                    self.bots._put_meta(ctx, bot_id, {"default_tools_applied": True})
+                self._grant_checked[bot_id] = now
         except Exception as exc:  # noqa: BLE001 - a grant failure must never break chat
             log.warning("rakazo bridge: default tool grants failed (%s)", type(exc).__name__)
 
@@ -1111,7 +1203,11 @@ class RakazoBridge:
         return self.rest.me(ctx)
 
     def _in_space(self, ctx: _Ctx, space_id: str) -> _Ctx:
-        return replace(ctx, space=space_id, tenant=sp.space_tenant(ctx.base_tenant, space_id))
+        tenant = sp.space_tenant(ctx.base_tenant, space_id)
+        # The owner key depends on the space: a mapped operator owns the default space as the dashboard operator and every
+        # other space as the phone's own principal, so crossing spaces must recompute it, never carry it over.
+        owner = self._ctx(ctx.account, tenant, ctx.token, ctx.accepts_stream, space_id, ctx.base_tenant).user
+        return replace(ctx, space=space_id, tenant=tenant, user=owner)
 
     def _space_entry(self, ctx: _Ctx, space_id: str, name: str, owned: bool) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         bots = self._bots(self._in_space(ctx, space_id))
@@ -1372,11 +1468,11 @@ class RakazoBridge:
         # the EXISTING rules decide: owner/approver, expiry, and approver != requester for a sensitive tool unless the
         # operator's YAML (allow_self_approval, or single_operator) says otherwise
         decided = self.svc.decide_approval(approval_id, tenant_id=ctx.tenant, user_id=ctx.user, decision=decision,
-                                           actor=ctx.user)
+                                           actor=ctx.principal or ctx.user)
         if decided.decision == "approved" and self.svc.config["actions"]["auto_execute"]:
             try:
                 self.svc.execute_approved_action(decided.action_id, tenant_id=ctx.tenant, user_id=ctx.user,
-                                                 actor=ctx.user)
+                                                 actor=ctx.principal or ctx.user)
             except AssistantError as exc:        # the approval stands; the card shows the action did not run
                 log.info("rakazo bridge: approved action not executed: %s", redact_secrets(str(exc)))
         return {"ok": True}
@@ -1476,7 +1572,7 @@ class RakazoBridge:
         account = self._by_id.get(account_id)
         if account is None:
             return None
-        ctx = _Ctx(account, self.svc.tenant_for(account.principal_id), account.principal_id, "", False)
+        ctx = self._ctx(account, self.svc.tenant_for(account.principal_id), "", False)
         bot_id = self._first_bot(ctx)
         if bot_id is None:
             return None
@@ -1487,11 +1583,33 @@ class RakazoBridge:
         with self._accounts_lock:
             return list(self._by_id.values())
 
+    def _ctx(self, account: Account, tenant: str, token: str, accepts_stream: bool,
+             space: str = sp.DEFAULT_SPACE_ID, base: str = "") -> _Ctx:
+        """The request context. In the default space a mapped operator phone (``canonical_person``) owns its assistants,
+        threads, runs, grants and approvals as the dashboard operator, so the phone and the dashboard show one set; every
+        other account, and every non-default space, keeps the phone's own principal."""
+        owner = account.principal_id
+        if space == sp.DEFAULT_SPACE_ID:
+            owner = self.canonical_person(tenant, owner)[1]
+        return _Ctx(account, tenant, owner, token, accepts_stream, space, base, account.principal_id)
+
+    def legacy_phone_assistants(self) -> list[dict[str, str]]:
+        """Assistants still owned by a mapped operator phone's own principal, created before the phone and the dashboard
+        shared one owner. They are not shown to either surface until moved; this only reports them, it moves nothing."""
+        found: list[dict[str, str]] = []
+        for account in self._operator_accounts():
+            tenant = self.svc.tenant_for(account.principal_id)
+            if self.canonical_person(tenant, account.principal_id)[1] != OPEN_LISTENER_USER:
+                continue
+            found += [{"assistant_id": a.assistant_id, "name": a.name, "owner": account.principal_id, "tenant": tenant}
+                      for a in self.svc.list_assistants(tenant_id=tenant, user_id=account.principal_id)]
+        return found
+
     def canonical_person(self, tenant: str, user: str) -> tuple[str, str]:
         """The single-operator rule: in single-operator mode a Rakazo phone account configured in YAML with role
         ``operator`` is the same human as the dashboard operator (``open-listener``), so its per-person DATA (Google
         connection, blocked calendars, reminders) is keyed by ``(tenant, open-listener)``. Only the data key changes:
-        approvals, audit and grants keep the real phone principal. Fails closed (returned unchanged) when the server is
+        approvals and executions record the real phone principal as the actor. Fails closed (returned unchanged) when the server is
         not in single-operator mode, the tenant is not the dashboard operator's, the account is not a YAML account
         (Cognito-derived accounts never map, whatever their role), is no longer a member, is not an operator, or on error."""
         if not isinstance(user, str) or not user.startswith("rakazo:") or not self.single_operator_fn():
@@ -1508,6 +1626,15 @@ class RakazoBridge:
         except Exception:  # noqa: BLE001 - never widen access on an error
             log.warning("rakazo: canonical_person lookup failed; person left unchanged")
         return tenant, user
+
+    def is_owner(self, account) -> bool:
+        """The terminal gate. A shell on every fleet host is more than any operator role grants, so only the owner passes:
+        the account ``open_owner`` acts as (the first YAML operator), never a Cognito-derived account and never an account
+        that is no longer the configured object (a removed or replaced one)."""
+        with self._accounts_lock:
+            owner = next((a for a in self.accounts if a.role == "operator"), None)
+            return (owner is not None and account is owner and self._by_id.get(account.account_id) is account
+                    and account.account_id not in self._cognito_users)
 
     def _operator_accounts(self) -> list[Any]:
         """The accounts a board proposal (and, for the open-listener operator, a reminder) is pushed to."""

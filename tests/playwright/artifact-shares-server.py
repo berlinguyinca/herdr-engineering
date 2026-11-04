@@ -9,11 +9,17 @@ real under a temporary ``shares_root`` removed on exit. Share links are issued u
 
 Environment: ``RESTORE_CONFLICT=1`` makes every version commit fail with a stale-head 409;
 ``APPROVE_DELAY=<seconds>`` slows approve down so a second click lands while the first is in flight.
+``COLLAB_DISABLED=1`` makes every collaborator/activity/diff route answer 503 (the real route's "not enabled" answer).
+The collaborator routes themselves are the production ``artifact_collab_api.route_collab``; ``CollabFixture`` is the
+in-memory grant store behind them, and ``FakeCollabOperator`` stands in for the collab service the dashboard proxies
+``/api/v1/collab/*`` to (agents, rooms, one-time invite creation).
 Stdout carries ``PORT=n`` and one ``MARK_LIVE <share_id>`` line per share made live (never a token or URL).
 """
 import asyncio
 import copy
 import hashlib
+import http.server
+import json
 import os
 import re
 import secrets
@@ -31,10 +37,15 @@ sys.path.insert(0, str(ROOT))
 
 from herdr_engineering.control_plane.api import ControlPlaneServer  # noqa: E402
 from herdr_engineering.control_plane.artifact_shares import ShareError  # noqa: E402
+from herdr_engineering.control_plane.artifact_bundle import ArtifactBundle  # noqa: E402
+from herdr_engineering.control_plane.artifact_collab_store import InviteGrantConflict  # noqa: E402
 from herdr_engineering.control_plane.artifacts import ArtifactConflict  # noqa: E402
+from herdr_engineering.control_plane.collab_mirror import REPORT_READ_ONLY  # noqa: E402
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
 
 HOSTILE = '"><img src=x onerror=window.__x=1>'
+HOSTILE_TAG = '<img src=x onerror=window.__x=1>'
+INVITE_CODE = "hcn_invite_ONE-TIME-CODE-7f3a9c2e51b84d60"
 _EMAIL = re.compile(r"[!-?A-~]+@[!-?A-~]+\Z", re.ASCII)   # artifact_shares._EMAIL
 _LOCK = threading.RLock()
 
@@ -61,10 +72,15 @@ class ArtifactFixture:
                          "original_filename": "Latency report", "mime_type": "text/html", "status": "available",
                          "current_version_id": "report_v1"},
         }
-        self.versions = {"web_1": [], "report_1": []}
+        self.records["collab_1"] = {
+            "artifact_id": "collab_1", "artifact_type": "web", "display_name": "Collaboration notes",
+            "original_filename": "collab.zip", "mime_type": "application/zip", "status": "available",
+            "current_version_id": "c1_v4"}
+        self.versions = {"web_1": [], "report_1": [], "collab_1": []}
         for number in (1, 2, 3):
             self.versions["web_1"].append(self._web_version("web_1", number,
                                                             f"version_{number - 1}" if number > 1 else None))
+        self._seed_collab_history()
         csv = b"measurement,value\nsample,1\n"
         descriptor = {   # the shape artifact-reports-server.py uses (a valid descriptor for the preview renderer)
             "schema_version": 1, "title": "Latency investigation", "summary": "Explanation of the timing study.",
@@ -86,6 +102,34 @@ class ArtifactFixture:
             "committed_at": "2026-10-30T10:00:00+00:00", "report_descriptor": descriptor, "output_manifest": [],
             "source_manifest_blob": None, "validation": {"status": "passed"}})
         self.commits = 0
+
+    def _version(self, artifact_id, number, parents, files, *, message=None, author="api-key:author:local"):
+        outputs = []
+        for name, data, media in files:
+            ref = _blob(data)
+            self.blobs[ref["storage_key"]] = data
+            outputs.append({"name": name, "media_type": media, **ref})
+        prefix = "c1" if artifact_id == "collab_1" else artifact_id
+        return {"version_id": f"{prefix}_v{number}", "artifact_id": artifact_id, "version_number": number,
+                "parent_version_id": parents[0] if parents else None, "parent_version_ids": list(parents),
+                "created_by": author, "state": "ready", "created_at": f"2026-10-30T1{number}:00:00+00:00",
+                "committed_at": f"2026-10-30T1{number}:00:00+00:00", "report_descriptor": None,
+                "output_manifest": outputs, "source_manifest_blob": None, "provenance": {}, "message": message}
+
+    def _seed_collab_history(self):
+        """v1 root; v2 and v3 both branch from it; v4 merges them. v4 against its first parent (v2) changes a text file,
+        adds a binary file and adds a text file whose name is hostile."""
+        text = "text/html"
+        v1 = self._version("collab_1", 1, [], [("index.html", b"<p>one</p>\n", text)], message="first draft")
+        v2 = self._version("collab_1", 2, ["c1_v1"], [("index.html", b"<p>one</p>\n<p>two</p>\n", text)])
+        v3 = self._version("collab_1", 3, ["c1_v1"], [("index.html", b"<p>one</p>\n<p>side</p>\n", text)],
+                           author="collab:agent-codex")
+        v4 = self._version("collab_1", 4, ["c1_v2", "c1_v3"], [
+            ("index.html", b"<p>one</p>\n<p>two</p>\n<p>side</p>\n", text),
+            ("logo.png", b"\x89PNG\r\n\x1a\n\x00\x00", "image/png"),
+            (f"{HOSTILE_TAG}.txt", b"hostile file body\n", "text/plain")],
+            message=f"merge {HOSTILE_TAG}", author="collab:agent-codex")
+        self.versions["collab_1"] = [v1, v2, v3, v4]
 
     def _web_version(self, artifact_id, number, parent):
         page = f"<!doctype html><title>Notes v{number}</title><p>Revision {number}</p>".encode()
@@ -128,8 +172,42 @@ class ArtifactFixture:
     async def list_version_summaries(self, artifact_id):   # ArtifactStore.list_version_summaries columns
         keys = ("version_id", "artifact_id", "version_number", "parent_version_id", "created_by", "state",
                 "created_at", "committed_at")
-        return [{**{k: row[k] for k in keys}, "is_report": row["report_descriptor"] is not None}
+        return [{**{k: row[k] for k in keys}, "is_report": row["report_descriptor"] is not None,
+                 **({"parent_version_ids": row["parent_version_ids"]} if "parent_version_ids" in row else {}),
+                 **({"message": row["message"]} if row.get("message") else {})}
                 for row in await self.list_versions(artifact_id)]
+
+    async def collab_state(self, artifact_id):   # ArtifactStore.collab_state: owner and writability
+        if artifact_id not in self.records:
+            return None
+        reason = REPORT_READ_ONLY if self.records[artifact_id]["artifact_type"] == "report" else None
+        return {"created_by": "api-key:owner:local", "writable": reason is None, "writable_reason": reason}
+
+    async def version_text_diff(self, artifact_id, version_id):   # ArtifactStore.version_text_diff, same item shape
+        version = await self.get_version(version_id, artifact_id)
+        if version is None:
+            return None
+        parents = version.get("parent_version_ids") or ([version["parent_version_id"]] if version["parent_version_id"] else [])
+        parent = await self.get_version(parents[0], artifact_id) if parents else None
+        new_files = {e["name"]: e for e in version["output_manifest"]}
+        old_files = {e["name"]: e for e in (parent["output_manifest"] if parent else [])}
+        out = []
+        for name in sorted(set(new_files) | set(old_files)):
+            old, new = old_files.get(name), new_files.get(name)
+            change = ("added" if old is None else "deleted" if new is None
+                      else "unchanged" if old["sha256"] == new["sha256"] else "modified")
+            item = {"name": name, "change": change, "diff": None}
+            out.append(item)
+            if change == "unchanged":
+                continue
+            media = (new or old)["media_type"]
+            if not (media.startswith("text/") or media == "application/json"):
+                item["reason"] = "binary"
+                continue
+            left = self.blobs[old["storage_key"]] if old else b""
+            right = self.blobs[new["storage_key"]] if new else b""
+            item["diff"] = ArtifactBundle.diff(left, right, media_type=media)
+        return {"version_id": version_id, "against": parents[0] if parents else None, "files": out}
 
     async def report_permission(self, artifact_id, principal_id, permission):
         return artifact_id in self.records
@@ -321,6 +399,107 @@ class ShareFixture:
             return copy.deepcopy([e for e in self.log if e["share_id"] == share_id][:limit])
 
 
+class CollabFixture:
+    """In-memory ``CollabGrantStore`` behind the adapter call path: ``store("grant", artifact_id, ...)``."""
+
+    def __init__(self):
+        self.grants: dict[tuple[str, str], dict] = {}
+        self.invites: dict[str, dict] = {}
+        self.attempts = [
+            {"ticket_id": "t2", "artifact_id": "collab_1", "outcome": "rejected", "actor_id": "agent-evil",
+             "received_at": "2026-10-30T14:05:00+00:00", "conflict_names": [],
+             "reason": f"stale base {HOSTILE_TAG}"},
+            {"ticket_id": "t1", "artifact_id": "collab_1", "outcome": "conflict", "actor_id": "agent-codex",
+             "received_at": "2026-10-30T14:00:00+00:00", "conflict_names": ["index.html", f"{HOSTILE_TAG}.txt"],
+             "reason": None},
+        ]
+
+    def __call__(self, method, *args, **kwargs):
+        with _LOCK:
+            return getattr(self, "_" + method)(*args, **kwargs)
+
+    def _collaborators(self, artifact_id):
+        return [{**row, "last_used_at": None, "commits": 0, "conflicts": 0, "rejected": 0}
+                for (art, _agent), row in sorted(self.grants.items()) if art == artifact_id]
+
+    def _pending_invite_grants(self, artifact_id):
+        return [dict(row) for row in self.invites.values() if row["artifact_id"] == artifact_id]
+
+    def _grant(self, artifact_id, agent_id, permission, *, expires_at, granted_by):
+        row = {"artifact_id": artifact_id, "agent_id": agent_id, "permission": permission, "expires_at": expires_at}
+        self.grants[(artifact_id, agent_id)] = row
+        return dict(row)
+
+    def _revoke(self, artifact_id, agent_id):
+        return self.grants.pop((artifact_id, agent_id), None) is not None
+
+    def _revoke_grants(self, artifact_id, *, write_only):
+        gone = [k for k, v in self.grants.items() if k[0] == artifact_id and (not write_only or v["permission"] == "write")]
+        for key in gone:
+            del self.grants[key]
+        pend = [k for k, v in self.invites.items()
+                if v["artifact_id"] == artifact_id and (not write_only or v["permission"] == "write")]
+        for key in pend:
+            del self.invites[key]
+        return {"grants": len(gone), "pending_invites": len(pend)}
+
+    def _add_invite_grant(self, invite_id, artifact_id, permission, *, expires_at, granted_by):
+        if invite_id in self.invites:
+            raise InviteGrantConflict("invite already registered")
+        row = {"invite_id": invite_id, "artifact_id": artifact_id, "permission": permission,
+               "expires_at": expires_at, "granted_by": granted_by}
+        self.invites[invite_id] = row
+        return dict(row)
+
+    def _attempts(self, artifact_id, *, limit=100):
+        return [dict(a) for a in self.attempts if a["artifact_id"] == artifact_id]
+
+
+class FakeCollabOperator:
+    """The collab service's operator listener, as far as the Collaborators tab uses it (the dashboard proxies to it)."""
+
+    AGENTS = [{"agent_id": "agent-codex", "name": "Codex"},
+              {"agent_id": "agent-evil", "name": f"Evil {HOSTILE_TAG}"}]
+    ROOMS = [{"room_id": "room-1", "name": "Lab room"}]
+
+    def __init__(self):
+        self.invites_made = 0
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return None
+
+            def _send(self, status, payload):
+                data = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                if self.path == "/api/v1/collab/agents":
+                    self._send(200, {"agents": outer.AGENTS})
+                elif self.path == "/api/v1/collab/rooms":
+                    self._send(200, {"rooms": outer.ROOMS})
+                else:
+                    self._send(404, {"error": "not found"})
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if re.fullmatch(r"/api/v1/collab/rooms/[^/]+/externals/invites", self.path):
+                    outer.invites_made += 1
+                    self._send(200, {"invite_id": f"inv-{outer.invites_made}", "code": INVITE_CODE,
+                                     "expires_at": (_now() + timedelta(hours=1)).isoformat()})
+                else:
+                    self._send(404, {"error": "not found"})
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+
 if __name__ == "__main__":
     shares_root = Path(tempfile.mkdtemp(prefix="herdr-share-fixture-"))
 
@@ -331,9 +510,13 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
     artifacts = ArtifactFixture()
+    operator = FakeCollabOperator()
     server = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, web_root=ROOT / "packages",
                                 artifact_store=artifacts, rustfs=artifacts,
-                                share_store=ShareFixture(artifacts), shares_root=shares_root)
+                                share_store=ShareFixture(artifacts), shares_root=shares_root,
+                                collab_grant_store=CollabFixture(),
+                                collab_artifacts_enabled=not os.environ.get("COLLAB_DISABLED"),
+                                collab_operator_url=operator.url)
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
     # share_settings_config insists on https; this loopback fixture issues links under its own http address.

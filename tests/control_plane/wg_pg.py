@@ -68,7 +68,7 @@ def wg_pg():
         def pg_ctl(*args):
             subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), *args], check=True, capture_output=True)
 
-        pg_ctl("-l", str(area / "server.log"), "-o", f"-c listen_addresses='' -k {area} -c fsync=off", "-w", "start")
+        pg_ctl("-l", str(area / "server.log"), "-o", f"-c listen_addresses='' -k {area} -c fsync=off -c dynamic_shared_memory_type=mmap", "-w", "start")
         try:
             dsn = f"postgresql:///postgres?host={area}"
             asyncio.run(_migrate(dsn))

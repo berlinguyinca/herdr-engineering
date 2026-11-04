@@ -524,3 +524,47 @@ def test_rollback_stops_share_public_when_the_restored_edge_does_not_route_s(env
     recreated = [nxt for cur, nxt in _log_pairs(env)
                  if cur.startswith("docker compose") and cur.endswith("--force-recreate share-public")]
     assert not any(f" tag={prev_tag} " in n for n in recreated)
+
+
+def _brace_block(text, start):
+    """The text of the {...} block whose opening brace is the first one at/after ``start``."""
+    i = text.index("{", start)
+    depth = 0
+    for j in range(i, len(text)):
+        depth += (text[j] == "{") - (text[j] == "}")
+        if depth == 0:
+            return text[i:j + 1]
+    raise AssertionError("unbalanced braces")
+
+
+def test_edge_mcp_location_alone_has_the_chunk_body_cap_and_its_own_rate_zone():
+    conf = EDGE.read_text()
+    mcp = _brace_block(conf, conf.index("location = /mcp"))
+    assert "client_max_body_size 768k;" in mcp and "limit_req zone=hcn_mcp burst=100 nodelay;" in mcp
+    # the 768k cap and the hcn_mcp zone appear nowhere else
+    assert conf.count("client_max_body_size 768k") == 1 and conf.count("768k;") == 1 and conf.count("zone=hcn_mcp") == 2        # the definition + the one use
+    assert len(re.findall(r"zone=hcn_mcp:10m rate=25r/s;", conf)) == 1
+    http_head = conf[:conf.index("server {")]
+    assert "limit_req_zone $remote_addr zone=hcn_mcp:10m rate=25r/s;" in http_head
+    # everything else keeps the 64k body cap and the shared 10 r/s zone
+    assert "limit_req_zone $remote_addr zone=hcn_req:10m rate=10r/s;" in http_head
+    assert conf.count("client_max_body_size 64k;") == 2
+    assert conf.count("limit_req zone=hcn_req burst=40 nodelay;") == 2
+    assert "zone=hcn_req" not in mcp
+    other = conf.replace(mcp, "")
+    assert "hcn_mcp" not in other.replace("limit_req_zone $remote_addr zone=hcn_mcp:10m rate=25r/s;", "")
+
+
+def test_edge_mcp_body_spool_is_bounded_by_connection_limits_and_an_explicit_tmpfs():
+    conf = EDGE.read_text()
+    mcp = _brace_block(conf, conf.index("location = /mcp"))
+    assert "limit_conn mcpconn 32;" in mcp and "limit_conn mcptotal 128;" in mcp
+    assert "limit_conn_status 429;" in mcp
+    assert "limit_conn_zone $remote_addr zone=mcpconn:" in conf
+    assert "limit_conn_zone $server_name zone=mcptotal:" in conf
+    edge = yaml.safe_load((CP / "compose.collab.yaml").read_text())["services"]["collab-edge"]
+    sizes = {t.split(":")[0]: t for t in edge["tmpfs"]}
+    assert "size=96m" in sizes["/var/cache/nginx"] and "size=8m" in sizes["/run"]
+    spool_mib = 128 * 768 / 1024                                # every in-flight /mcp body, worst case
+    assert spool_mib <= 96
+    assert edge["mem_limit"] == "384m"

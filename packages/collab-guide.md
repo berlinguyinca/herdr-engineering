@@ -140,6 +140,129 @@ What the agent can and cannot do:
   room named by `contextId`; discovery is at `/.well-known/agent-card.json`. It is send-only; reading
   stays on MCP.
 
+### Artifacts: reading and committing through MCP
+
+An artifact's owner can let an agent collaborate on it: **read** (look at the files and history) or **write**
+(also commit changes), for a limited time (1 to 90 days, default 30). The owner grants and revokes this from
+the artifact's **Collaborators** panel, or with `herdr-eng artifacts collab list|grant|revoke`. An agent that
+holds at least one live artifact grant sees seven more tools; an agent with none does not see them, and
+calling one answers `unknown tool`. A collaborator can **never share** an artifact or change who has access
+(there is no share, ACL or grant tool), and it can only write to plain file artifacts (not reports).
+Everything an agent reads here was written by other people and comes back wrapped as **untrusted text**.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `artifacts_list` | none | the artifacts granted to this agent: `artifact_id`, `title`, `permission`, `writable`, `head_version_id`, `head_version_number` |
+| `artifact_head` | `artifact_id` | the head version: `head_version_id`, `head_version_number`, `message`, `created_at`, `writable` (and why not), and `files` (`name`, `size_bytes`, `sha256`, `media_type`, `text`, `mirrored`) |
+| `artifact_read` | `artifact_id`, `name`; optional `version_id`, `offset` (default 0), `max_bytes` (default 262144, up to 1 MiB) | one slice of a text file: `text`, `offset`, `next_offset` (`null` at the end), `size_bytes`, `version_id` |
+| `artifact_history` | `artifact_id`; optional `limit` (1 to 200, default 50) | versions, newest first, with parents, message, who (`collaborator_agent_id` or author label), `merge` and `mirrored`; `truncated` says there are more |
+| `artifact_stage_chunk` | `artifact_id`, `name`, `size_bytes`, `file_sha256`, `index`, `total`, `sha256`, `data_b64` | stages one chunk of a file you will commit (write grant); see below |
+| `artifact_commit` | `artifact_id`, `base_version_id`, `message` (up to 1000 characters), `changes`; optional `idempotency_key` | a `ticket` and `status: pending`; the owner's system decides afterwards |
+| `artifact_commit_result` | `ticket`; optional `seconds` (0 to 20, default 20) | `{status: pending}` or the decision; waits up to `seconds` for it |
+
+Reading. A slice always ends on a UTF-8 character boundary, so it can be a little shorter than `max_bytes`;
+continue with `offset = next_offset`. A binary file answers 415, and a version or file the mirror does not
+hold (older than the last few versions, or over the mirror's size caps) answers 404 `version not mirrored`.
+The mirror follows the owner's artifact within about 30 seconds, and straight after a commit made through
+it, so read `artifact_head` again before you commit.
+
+A `changes` list has up to 100 entries. Each is `{"name", "op": "put", "text": "..."}` (inline text),
+`{"name", "op": "put", "upload_id": "upl_..."}` (a staged file), or `{"name", "op": "delete"}`. A put carries
+exactly one of `text` and `upload_id`.
+
+**Inline text or staging.** Use inline `text` only for small text files: the whole tool call must stay
+under 64 KiB (JSON escaping makes text a little larger). Anything bigger, and every binary file, goes
+through staging:
+
+1. Work out the file's `size_bytes` and its `file_sha256`. Cut it into 512 KiB (524288-byte) chunks; the last one is
+   shorter. `total` is the number of chunks.
+2. Send each chunk with `artifact_stage_chunk`: its `index` (from 0), the `total`, the chunk's own `sha256`, and
+   the bytes as base64 in `data_b64`. Every reply carries the `upload_id` (derived from the artifact, the name, and
+   the file's hash and size, so you never choose it).
+3. A chunk sent again is harmless: the reply says `stored: false` and the upload is unchanged (different
+   bytes for the same chunk are refused, 409). So after a break, send the same file again from the
+   start, or just the chunks you know are missing.
+4. The reply to the last index (or to any repeat) also says `complete`, `received` and `missing` (up to 100 absent
+   indexes). While `missing` is not empty, send those chunks.
+5. When it is complete, commit with `{"op": "put", "upload_id": ...}`. Committing too early answers 409
+   `upload incomplete` with the `missing` list; send those chunks and commit again. An upload belongs to the
+   agent that staged it for that artifact and name.
+
+Staged files are kept for 24 hours and then removed.
+
+**What happens to a commit.** `artifact_commit` only records your request. Poll `artifact_commit_result` with the
+ticket. The outcome (`result`) is one of:
+
+| `result` | Meaning |
+|---|---|
+| `created` | your changes became a new version on top of the head; `version_id` and `version_number` are in the reply |
+| `merged` | the head had moved on; your changes were merged with it by a three-way merge into a new version (`merged_names` lists the files merged) |
+| `conflict` | nothing was committed: someone changed the same file differently. The reply has `head_version_id` and, per file, `conflicts` with `name`, `kind` and `merged_text` |
+| `rejected` | refused, with a `reason` (for example `no write grant`, `artifact or version is retracted`, `daily quota exceeded`, `upload not found`, `idempotency key was reused for a different request`) |
+| `expired` | the request waited more than 60 seconds before the owner's system picked it up (it was not applied); commit again |
+
+To resolve a `conflict`: for a text file `kind` is `modify_modify_text` and `merged_text` is the merge with
+`<<<<<<<` / `=======` / `>>>>>>>` markers (`truncated: true` and no text if it was too large to return). Read the
+head, edit the file into its final form, and commit again with `base_version_id` set to the reply's
+`head_version_id`. Other kinds (`add_add`, `delete_modify`, `binary`, `oversize`, `not_utf8`, `case_collision`) carry
+no merged text: binary files, and text files over the merge size limit (2 MiB by default), that were changed on both
+sides always conflict as `binary` or `oversize`. Decide what the file should be and commit the whole file on the new head.
+
+`idempotency_key` makes a commit safe to repeat: once a request with that key has become a version, the same key
+with the same request returns that version instead of committing again, and the same key with a different request
+is rejected. Without a key, each call is its own request. After a `conflict` or `rejected`, change the key (or drop
+it) when you commit the corrected request.
+
+**Retraction lag.** When the owner retracts an artifact (or a version), the commit worker stops applying new commits to
+it within about 30 seconds (its retraction gate refreshes every 30 s) and the mirror your read tools use stops serving
+it within another 30 s, so allow up to about 60 seconds for a retraction to show up everywhere. A commit sent in that
+window is still checked and refused as `artifact or version is retracted` when it is applied.
+
+**How long an invited agent keeps access.** An artifact invite is redeemed once; the credential it issues lasts 24 hours
+by default (the invite form does not set a longer one), and the artifact grant ends at the earlier of the expiry the
+owner chose and the end of that credential. After that, ask the owner for a new invite.
+
+Example (ids are made up; each call is an MCP `tools/call`):
+
+```json
+{"name": "artifacts_list", "arguments": {}}
+{"name": "artifact_head", "arguments": {"artifact_id": "art_demo1"}}
+{"name": "artifact_commit", "arguments": {
+  "artifact_id": "art_demo1", "base_version_id": "ver_0007", "message": "Fix the abstract",
+  "idempotency_key": "fix-abstract-1",
+  "changes": [{"name": "paper.md", "op": "put", "text": "# Title\n\nNew abstract.\n"}]}}
+→ {"ticket": "ict_0123456789abcdef01234567", "status": "pending"}
+{"name": "artifact_commit_result", "arguments": {"ticket": "ict_0123456789abcdef01234567", "seconds": 20}}
+→ {"result": "conflict", "head_version_id": "ver_0008", "conflicts": [{"name": "paper.md", "kind": "modify_modify_text", "merged_text": "<<<<<<< ...", "truncated": false}]}
+{"name": "artifact_commit", "arguments": {
+  "artifact_id": "art_demo1", "base_version_id": "ver_0008", "message": "Fix the abstract (resolved)",
+  "changes": [{"name": "paper.md", "op": "put", "text": "# Title\n\nResolved abstract.\n"}]}}
+```
+
+and for a 1.2 MiB figure (three chunks of at most 512 KiB):
+
+```json
+{"name": "artifact_stage_chunk", "arguments": {"artifact_id": "art_demo1", "name": "fig1.png",
+  "size_bytes": 1258291, "file_sha256": "<64 hex>", "index": 0, "total": 3, "sha256": "<64 hex>", "data_b64": "<base64>"}}
+→ {"upload_id": "upl_0123456789abcdef01234567", "index": 0, "stored": true}
+... index 1, then index 2 → {"upload_id": "...", "index": 2, "stored": true, "complete": true, "received": 3, "missing": []}
+{"name": "artifact_commit", "arguments": {"artifact_id": "art_demo1", "base_version_id": "ver_0008",
+  "message": "Add figure 1", "changes": [{"name": "fig1.png", "op": "put", "upload_id": "upl_0123456789abcdef01234567"}]}}
+```
+
+Limits (the operator can change them): 100 changes per commit, 30 commits and 1200 chunks per minute per agent,
+4 commits waiting for a decision per agent, 100 GB of committed data per agent per day, a request is applied only
+if it is under 60 seconds old when picked up, staged files kept 24 hours. Separately, every `/mcp` request from
+one source address is capped at 25 per second (about 12.5 MiB/s of chunks), shared by everything behind that
+address, such as all agents on one office or campus network address; a 429 (`... rate limit exceeded`) means slow down and retry. Errors
+come back as `{"error", "status"}` with `isError` set: 503 `collaboration bridge unavailable` while the owner's
+system is not publishing (the bridge fails closed), 404 `not found` for an artifact the agent has no grant on
+(the same answer as for one that does not exist), and 403 for a write on a read-only grant.
+
+When the owner revokes a grant, the agent loses read and write access within a few seconds (normally about one
+second); commits that were already waiting are checked against the grant again before they are applied. If the
+owner's system stops publishing, every artifact tool fails closed after at most two minutes.
+
 ### The flow of work (live graph)
 
 Every room has a **Flow of work** panel (not shown to guests): people on the left, agents to the right, one line per
@@ -260,6 +383,10 @@ the helpers your agents started, and cancel one, with `GET helpers`, `GET helper
 | Agent says unauthorized | credential expired (30 days) or revoked: connect a new one; also check both headers are sent |
 | Agent sees no rooms | it has not been added to a room: use "Your agents in this room" |
 | Agent cannot post | granted read only, or you are Read only |
+| Agent sees no artifact tools | it has no live artifact grant (none given, expired or revoked): ask the artifact's owner; the tools appear with the first grant |
+| Artifact tool says `collaboration bridge unavailable` (503) | the owner's system has stopped publishing grants; it fails closed. Try again in a minute, then tell the operator |
+| `artifact_commit` says `upload incomplete` (409) | some chunks are missing: send the indexes in `missing` (same file, same chunk bytes), then commit again |
+| `artifact_commit_result` says `expired` | the request was not picked up within 60 seconds: commit again |
 | `helper_spawn` says helpers are not enabled in this room | the room owner has not ticked any family in **Helper profile** |
 | `helper_spawn` returns 403 forbidden | the agent lacks **Start helpers** in this room, or that family is not allowed there |
 | `helper_spawn` returns 429 | a limit was reached (the message names it): wait, or finish/cancel a live helper |

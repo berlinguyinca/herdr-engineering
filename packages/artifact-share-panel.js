@@ -5,6 +5,9 @@
 // The approve URL exists only in controller.state.link and in the value of the one dialog input; it never appears in
 // any rendered HTML string, attribute, storage, URL or log, and closing or disposing the panel drops it.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { CollabApi } from './herdr-web-client/collab.js';
+import { mountCollaborators } from './artifact-collaborators.js';
+import { mountActivity } from './artifact-activity.js';
 
 export const AUDIENCES = [['private', 'Private'], ['lab', 'Group (lab)'], ['public', 'Public']];
 const AUDIENCE_LABEL = Object.fromEntries(AUDIENCES);
@@ -352,8 +355,12 @@ export function createShareController(client, artifactId, { versions = [], headV
 
 // ------------------------------------------------------------------------------------------------ mount
 
-export function mountSharePanel(container, client, artifactId, { versions = [], headVersionId, signal, allowEntry = true } = {}) {
-  container.innerHTML = '<section data-share-panel><p class="hd-note">Viewer links give people outside this dashboard read-only access to one pinned version.</p><div data-share-form-region></div><div role="status" data-share-status></div><div data-share-review-region></div><div data-share-link-region></div><h3>Links</h3><div data-share-list-region></div></section>';
+const TABS = [['links', 'Links'], ['collaborators', 'Collaborators'], ['activity', 'Activity']];
+const TAB_BAR = `<div role="tablist" aria-label="Sharing" data-panel-tabs>${TABS.map(([key, label], i) => `<button type="button" role="tab" class="hd-btn" data-panel-tab="${key}" aria-selected="${i === 0}">${label}</button>`).join('')}</div>`;
+
+// `collabApi` defaults to the same-origin, token-less mode: the dashboard proxy authenticates the call.
+export function mountSharePanel(container, client, artifactId, { versions = [], headVersionId, signal, allowEntry = true, collabApi = new CollabApi(null) } = {}) {
+  container.innerHTML = TAB_BAR + '<div role="tabpanel" data-panel-pane="links"><section data-share-panel><p class="hd-note">Viewer links give people outside this dashboard read-only access to one pinned version.</p><div data-share-form-region></div><div role="status" data-share-status></div><div data-share-review-region></div><div data-share-link-region></div><h3>Links</h3><div data-share-list-region></div></section></div><div role="tabpanel" data-panel-pane="collaborators" hidden></div><div role="tabpanel" data-panel-pane="activity" hidden></div>';
   const region = name => container.querySelector(`[data-share-${name}-region]`);
   const status = container.querySelector('[data-share-status]');
   let formKey = null, shownLink = null;
@@ -387,7 +394,31 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
 
   const ctrl = createShareController(client, artifactId, { versions, headVersionId, allowEntry, signal, onChange: render });
 
+  // Collaborators and Activity mount on first use; each owns its pane, listeners and one-time values.
+  const mounted = {};
+  let activityHandle = null, currentTab = 'links';
+  const showTab = key => {
+    const pane = name => container.querySelector?.(`[data-panel-pane="${name}"]`);
+    if (!pane(key)) return;
+    // Leaving Collaborators drops the one-time invite code and disarms the Restrict all confirm.
+    if (currentTab === 'collaborators' && key !== 'collaborators') {
+      mounted.collaborators?.controller.closeInvite();
+      mounted.collaborators?.controller.cancelRestrict();
+    }
+    currentTab = key;
+    if (key === 'collaborators' && !mounted.collaborators) mounted.collaborators = mountCollaborators(pane(key), client, collabApi, artifactId, { signal });
+    if (key === 'activity' && !mounted.activity) mounted.activity = activityHandle = mountActivity(pane(key), client, artifactId, { versions: ctrl.state.versions, signal });
+    for (const [name] of TABS) {
+      const shown = name === key;
+      const element = pane(name);
+      if (element) element.hidden = !shown;
+      container.querySelector(`[data-panel-tab="${name}"]`)?.setAttribute('aria-selected', String(shown));
+    }
+  };
+
   const onClick = event => {
+    const tab = event.target.closest?.('[data-panel-tab]');
+    if (tab?.dataset?.panelTab) { showTab(tab.dataset.panelTab); return; }
     const button = event.target.closest?.('[data-share-action]');
     if (!button || !container.contains(button) || button.disabled) return;
     const id = button.dataset.shareId;
@@ -425,6 +456,7 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
 
   const dispose = () => {
     ctrl.dispose();
+    for (const handle of Object.values(mounted)) handle.dispose();
     container.removeEventListener('click', onClick);
     container.removeEventListener('input', onField);
     container.removeEventListener('change', onField);
@@ -432,7 +464,7 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
     // Removing the panel removes the one-time URL with it.
     container.replaceChildren();
   };
-  const setVersions = (nextVersions, nextHead) => { formKey = null; ctrl.setVersions(nextVersions, nextHead); };
+  const setVersions = (nextVersions, nextHead) => { formKey = null; ctrl.setVersions(nextVersions, nextHead); activityHandle?.setVersions(nextVersions); };
   if (signal?.aborted) { dispose(); return { dispose, controller: ctrl, setVersions }; }
   signal?.addEventListener?.('abort', dispose, { once: true });
   render();

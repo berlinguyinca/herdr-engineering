@@ -1,0 +1,4 @@
+Env claude: local-only=1 remote-only=0 both-changed=0 staged-pending=0
+Local changes:
+  A claude/commands/sync.md
+Excluded: 0 files (not in sync manifest)

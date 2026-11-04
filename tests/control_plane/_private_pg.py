@@ -26,7 +26,7 @@ def private_postgres(*sql_files):
         data, sock = Path(tmp, "data"), Path(tmp, "sock")
         sock.mkdir()
         subprocess.run([initdb, "-D", str(data), "-A", "trust", "-U", "t"], check=True, capture_output=True)
-        opts = f"-c listen_addresses= -c unix_socket_directories={sock} -c fsync=off"
+        opts = f"-c listen_addresses= -c unix_socket_directories={sock} -c fsync=off -c dynamic_shared_memory_type=mmap"
         subprocess.run([pg_ctl, "-D", str(data), "-o", opts, "-w", "start", "-l", str(Path(tmp, "log"))], check=True, capture_output=True)
         try:
             for f in sql_files:

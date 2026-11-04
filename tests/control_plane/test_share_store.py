@@ -42,7 +42,7 @@ def share_postgres():
         subprocess.run([str(initdb), "-D", str(data), "-A", "trust", "--no-locale", "-E", "UTF8", "--no-sync"],
                        check=True, capture_output=True)
         subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-l", str(area / "server.log"),
-                        "-o", f"-c listen_addresses='' -k {area}", "-w", "start"],
+                        "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap", "-w", "start"],
                        check=True, capture_output=True)
         try:
             dsn = f"postgresql:///postgres?host={area}"

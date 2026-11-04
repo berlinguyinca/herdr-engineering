@@ -17,6 +17,19 @@ from tests.control_plane import test_artifact_version_parents as _parents
 _Blobs = _parents._Blobs
 parents_postgres = _parents.parents_postgres  # the isolated 0043 Postgres fixture, shared
 
+
+@pytest.fixture(scope="module")
+def merge_pg(parents_postgres):
+    """The 0043 fixture plus 0045, whose ``artifact_collab_attempts.ticket_id`` ``merge_commit`` writes."""
+    async def migrate():
+        conn = await asyncpg.connect(parents_postgres)
+        try:
+            await conn.execute((_parents.MIGRATIONS / "0045_artifact_collab_bridge.sql").read_text())
+        finally:
+            await conn.close()
+    asyncio.run(migrate())
+    return parents_postgres
+
 AGENT = "agent-c"
 COLLAB = f"collab:{AGENT}"
 
@@ -87,7 +100,7 @@ async def attempts(conn, aid):
     return await conn.fetch("SELECT * FROM artifact_collab_attempts WHERE artifact_id=$1", aid)
 
 
-def test_fast_forward_is_created_with_head_as_sole_parent(parents_postgres):
+def test_fast_forward_is_created_with_head_as_sole_parent(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -102,10 +115,10 @@ def test_fast_forward_is_created_with_head_as_sole_parent(parents_postgres):
         row = await conn.fetchrow("SELECT current_version_id FROM artifacts WHERE artifact_id=$1", aid)
         assert row["current_version_id"] == version["version_id"]
         assert texts.stored == []
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_stale_base_with_disjoint_edits_merges_with_two_parents(parents_postgres):
+def test_stale_base_with_disjoint_edits_merges_with_two_parents(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -125,10 +138,10 @@ def test_stale_base_with_disjoint_edits_merges_with_two_parents(parents_postgres
         assert entry["size_bytes"] == len(merged.encode()) and "text" not in entry
         assert (await store.get_version(version["version_id"]))["provenance"]["message"] == "collab edit"
         assert await attempts(conn, aid) == []
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_overlapping_edits_conflict_store_nothing_and_log_one_attempt(parents_postgres):
+def test_overlapping_edits_conflict_store_nothing_and_log_one_attempt(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -153,10 +166,45 @@ def test_overlapping_edits_conflict_store_nothing_and_log_one_attempt(parents_po
         assert attempt["base_version_id"] == v1["version_id"] and attempt["head_version_id"] == v2["version_id"]
         assert attempt["message"] == "collab edit"
         assert json.loads(attempt["conflict_names"]) == [{"name": "doc.md", "kind": "modify_modify_text"}]
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_delete_versus_modify_is_a_conflict(parents_postgres):
+def test_a_conflict_records_its_ticket_and_names_its_attempt_row(merge_pg):
+    texts = Texts()
+
+    async def body(store, conn):
+        aid, v1 = await setup(store, texts)
+        await owner_commit(store, aid, v1["version_id"], [texts.entry("doc.md", edit(BASE_DOC, 5, "owner"))])
+        change = [{"name": "doc.md", "op": "put", "entry": texts.entry("doc.md", edit(BASE_DOC, 5, "mine"))}]
+        with pytest.raises(ArtifactMergeConflict) as caught:
+            await merge(store, texts, aid, v1["version_id"], change, ticket_id="ict_" + "a" * 24)
+        (row,) = await attempts(conn, aid)
+        assert row["ticket_id"] == "ict_" + "a" * 24
+        assert caught.value.attempt_id == row["attempt_id"]
+        with pytest.raises(ArtifactMergeConflict) as again:
+            await merge(store, texts, aid, v1["version_id"], change)
+        untagged = [r for r in await attempts(conn, aid) if r["attempt_id"] == again.value.attempt_id]
+        assert len(untagged) == 1 and untagged[0]["ticket_id"] is None
+        assert ArtifactMergeConflict("v", [], []).attempt_id is None
+    run(merge_pg, body)
+
+
+@pytest.mark.parametrize("which", ["base", "head"])
+def test_a_retracted_base_or_head_version_refuses_merge(merge_pg, which):
+    texts = Texts()
+
+    async def body(store, conn):
+        aid, v1 = await setup(store, texts)
+        v2 = await owner_commit(store, aid, v1["version_id"], [texts.entry("doc.md", edit(BASE_DOC, 2, "owner"))])
+        await store.record_retraction(aid, (v1 if which == "base" else v2)["version_id"])
+        mine = texts.entry("doc.md", edit(BASE_DOC, 9, "mine"))
+        with pytest.raises(ArtifactError, match="retracted"):
+            await merge(store, texts, aid, v1["version_id"], [{"name": "doc.md", "op": "put", "entry": mine}])
+        assert len(await store.list_versions(aid)) == 2
+    run(merge_pg, body)
+
+
+def test_delete_versus_modify_is_a_conflict(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -170,10 +218,10 @@ def test_delete_versus_modify_is_a_conflict(parents_postgres):
         assert caught.value.head_version_id == v2["version_id"]
         assert caught.value.clean_names == ["notes.txt"]
         assert len(await attempts(conn, aid)) == 1
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_no_effective_change_is_refused_and_put_needs_entry(parents_postgres):
+def test_no_effective_change_is_refused_and_put_needs_entry(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -193,10 +241,10 @@ def test_no_effective_change_is_refused_and_put_needs_entry(parents_postgres):
             await merge(store, texts, aid, out["version"]["version_id"],
                         [{"name": "x.md", "op": "put", "entry": texts.entry("y.md", "y\n")}])
         assert len(await store.list_versions(aid)) == 2 and await attempts(conn, aid) == []
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_replay_with_same_idempotency_key_returns_same_version(parents_postgres):
+def test_replay_with_same_idempotency_key_returns_same_version(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -212,10 +260,10 @@ def test_replay_with_same_idempotency_key_returns_same_version(parents_postgres)
         with pytest.raises(ArtifactError, match="idempotency"):
             await merge(store, texts, aid, v1["version_id"], [{"name": "doc.md", "op": "delete"}],
                         idempotency_key="k1")
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_replay_after_head_already_has_the_change_returns_the_stored_version(parents_postgres):
+def test_replay_after_head_already_has_the_change_returns_the_stored_version(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -229,10 +277,10 @@ def test_replay_after_head_already_has_the_change_returns_the_stored_version(par
         assert again["version"]["version_id"] == first["version"]["version_id"]
         assert again["result"] == "created" and again["merged_names"] == []
         assert len(await store.list_versions(aid)) == 2 and await attempts(conn, aid) == []
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_duplicate_names_in_a_stored_manifest_are_refused(parents_postgres):
+def test_duplicate_names_in_a_stored_manifest_are_refused(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -241,10 +289,10 @@ def test_duplicate_names_in_a_stored_manifest_are_refused(parents_postgres):
             await merge(store, texts, aid, v1["version_id"], [{"name": "x.md", "op": "delete"},
                                                               {"name": "doc.md", "op": "delete"}])
         assert await attempts(conn, aid) == []
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_lying_size_bytes_is_an_oversize_conflict(parents_postgres):
+def test_lying_size_bytes_is_an_oversize_conflict(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -257,15 +305,15 @@ def test_lying_size_bytes_is_an_oversize_conflict(parents_postgres):
                         max_text_bytes=40)
         assert [(c.name, c.kind) for c in caught.value.conflicts] == [("doc.md", "oversize")]
         assert caught.value.head_version_id == v2["version_id"] and len(await attempts(conn, aid)) == 1
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_concurrent_identical_calls_produce_one_version(parents_postgres):
+def test_concurrent_identical_calls_produce_one_version(merge_pg):
     texts = Texts()
 
     async def go():
-        a = await asyncpg.connect(parents_postgres)
-        b = await asyncpg.connect(parents_postgres)
+        a = await asyncpg.connect(merge_pg)
+        b = await asyncpg.connect(merge_pg)
         try:
             sa, sb = ArtifactStore(a, _Blobs()), ArtifactStore(b, _Blobs())
             aid, v1 = await setup(sa, texts)
@@ -282,7 +330,7 @@ def test_concurrent_identical_calls_produce_one_version(parents_postgres):
     asyncio.run(go())
 
 
-def test_report_and_renderer_artifacts_are_not_writable(parents_postgres):
+def test_report_and_renderer_artifacts_are_not_writable(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -297,10 +345,10 @@ def test_report_and_renderer_artifacts_are_not_writable(parents_postgres):
         with pytest.raises(ArtifactError, match="not writable by collaboration"):
             await merge(store, texts, rendered, r1["version_id"], [{"name": "r.md", "op": "delete"}])
         assert await attempts(conn, aid) == [] and await attempts(conn, rendered) == []
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_retracted_artifact_refuses_merge(parents_postgres):
+def test_retracted_artifact_refuses_merge(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -309,10 +357,10 @@ def test_retracted_artifact_refuses_merge(parents_postgres):
         with pytest.raises(ArtifactError, match="retracted"):
             await merge(store, texts, aid, v1["version_id"], [{"name": "doc.md", "op": "delete"}])
         assert len(await store.list_versions(aid)) == 1
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
-def test_base_must_belong_to_the_artifact(parents_postgres):
+def test_base_must_belong_to_the_artifact(merge_pg):
     texts = Texts()
 
     async def body(store, conn):
@@ -320,7 +368,7 @@ def test_base_must_belong_to_the_artifact(parents_postgres):
         other, o1 = await setup(store, texts)
         with pytest.raises(ArtifactError):
             await merge(store, texts, aid, o1["version_id"], [{"name": "doc.md", "op": "delete"}])
-    run(parents_postgres, body)
+    run(merge_pg, body)
 
 
 # -- the default (RustFS) adapters -------------------------------------------------------------------------
@@ -381,7 +429,7 @@ async def rf_merge(store, aid, base, changes):
 
 
 @pytest.mark.parametrize("media_type", [None, "text/markdown"])
-def test_default_adapters_merge_and_scope_the_merged_blob(parents_postgres, media_type):
+def test_default_adapters_merge_and_scope_the_merged_blob(merge_pg, media_type):
     async def body(store, conn, rf):
         aid, v1, v2 = await rf_seed(store, rf, media_type)
         mine = rf_entry(rf, "doc.md", edit(BASE_DOC, 9, "mine"), media_type)
@@ -395,10 +443,10 @@ def test_default_adapters_merge_and_scope_the_merged_blob(parents_postgres, medi
                                   aid, entry["sha256"])
         assert row["media_type"] == entry["media_type"] and row["size_bytes"] == entry["size_bytes"]
         assert await store.verify_share_outputs(aid, out["version"]["version_id"]) == 1
-    run_rf(parents_postgres, body)
+    run_rf(merge_pg, body)
 
 
-def test_unverified_blob_is_a_validation_conflict(parents_postgres):
+def test_unverified_blob_is_a_validation_conflict(merge_pg):
     async def body(store, conn, rf):
         aid, v1, v2 = await rf_seed(store, rf)
         ghost = {"name": "new.md", "media_type": "text/markdown", "sha256": "a" * 64, "size_bytes": 3,
@@ -416,10 +464,10 @@ def test_unverified_blob_is_a_validation_conflict(parents_postgres):
         assert await conn.fetchval("SELECT count(*) FROM artifact_blobs WHERE scope=$1", aid) == 0
         assert (await conn.fetchrow("SELECT current_version_id FROM artifacts WHERE artifact_id=$1", aid)
                 )["current_version_id"] == v2["version_id"]
-    run_rf(parents_postgres, body)
+    run_rf(merge_pg, body)
 
 
-def test_unreadable_blob_is_a_plain_error(parents_postgres):
+def test_unreadable_blob_is_a_plain_error(merge_pg):
     async def body(store, conn, rf):
         aid, v1, v2 = await rf_seed(store, rf)
         mine = rf_entry(rf, "doc.md", edit(BASE_DOC, 9, "mine"))
@@ -429,4 +477,4 @@ def test_unreadable_blob_is_a_plain_error(parents_postgres):
         assert not isinstance(caught.value, ArtifactMergeConflict)
         assert "cannot read" in str(caught.value)
         assert await attempts(conn, aid) == [] and len(await store.list_versions(aid)) == 2
-    run_rf(parents_postgres, body)
+    run_rf(merge_pg, body)

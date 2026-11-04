@@ -638,3 +638,30 @@ def test_read_memory_executor_honors_query_and_namespace_schema():
                      thread_id=th.thread_id, content="when is deploy?")
     tool_msg = [m for m in runner.seen[1]["messages"] if m.get("role") == "tool"][0]
     assert "deploy window is Friday" in tool_msg["content"]
+
+
+def test_delegation_api_idempotency_uses_authenticated_scope_and_ignores_run_override(server):
+    status, raw = server.post("/api/v1/assistants", {"name": "Root"}, headers=_uid())
+    assert status == 201
+    assistant_id = json.loads(raw)["assistant_id"]
+    body = {
+        "assistant_id": assistant_id,
+        "task": "Ask for the missing city only.",
+        "target_system": "pi",
+        "context": {"known": ["8 adults"]},
+        "source_refs": ["event:request-1"],
+        "idempotency_key": "delegation-api-1",
+        "run_id": "forged-run-must-be-ignored",
+    }
+    status, raw = server.post("/api/v1/assistant-delegations", body, headers=_uid())
+    assert status == 201
+    first = json.loads(raw)
+    assert first["run_id"] == ""
+    status, raw = server.post("/api/v1/assistant-delegations", body, headers=_uid())
+    assert status == 201 and json.loads(raw)["delegation_id"] == first["delegation_id"]
+    status, _ = server.post("/api/v1/assistant-delegations", {**body, "task": "changed"}, headers=_uid())
+    assert status == 400
+    status, _ = server.get(
+        f"/api/v1/assistant-delegations/{first['delegation_id']}", headers=_uid(user="u2")
+    )
+    assert status == 404

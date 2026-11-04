@@ -1,0 +1,8 @@
+Captured inside a real `pi --mode json` session, pi-engineering loaded with `--no-extensions -e <worktree>`
+(NO PI_ENGINEERING_RUNTIME_SOURCE, so the host ran the installed pinned runtime 0.2.0-2dbef666d458, which predates pi#559):
+
+  recall * --max-results 50 --scope project --timeout-ms 5000
+  retain Synthetic canary session note: the fixture spillway width is 2.5 m. --scope project --provenance {"source_system":"pi-engineering","evidence_refs":["user-request:pi-note-1d64cd9b-1745-47d0-b88e-d5fa30ef0b3c"]} --timeout-ms 5000
+
+  -> retain exits 2 ("unrecognized arguments: --timeout-ms 5000"), no --evidence flag, session reports
+     "Memory save was rejected or not confirmed."  (see 02-remember-rejected-stale-runtime.jsonl)

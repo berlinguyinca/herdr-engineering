@@ -28,18 +28,29 @@ def _marker(ingest, principal: dict, node_id: str, source: str, reason: str, sco
 
 
 def retract(*, gate, ingest, principal: dict, artifact_id: str, version_id: str | None, reason: str,
-            persist=None) -> dict:
-    """Hide first (fail closed), then persist, then mark. Returns ``{"hidden", "persisted", "marker_error", "error"}``."""
+            persist=None, on_unpersisted=None) -> dict:
+    """Hide first (fail closed), then persist, then mark. Returns ``{"hidden", "persisted", "marker_error", "error",
+    "collab_write_grants_revoked", "collab_revoke_error"}``.
+
+    ``on_unpersisted(artifact_id) -> int`` is the fail-safe for a retraction that is hidden in memory only: it runs ONLY
+    when ``persist`` raised (version retractions too). A failing callback is reported by exception type name and never
+    masks the persist error."""
     why = " ".join(str(reason or "").split())[:MAX_REASON] or "retracted"
     gate.retract(artifact_id, version_id)
     out = {"artifact_id": artifact_id, "version_id": version_id, "hidden": True, "persisted": False,
-           "marker_error": None, "error": None}
+           "marker_error": None, "error": None,
+           "collab_write_grants_revoked": None, "collab_revoke_error": None}
     if persist is not None:
         try:
             persist(artifact_id, version_id, why)
             out["persisted"] = True
         except Exception as exc:                            # noqa: BLE001 - stays hidden in memory; say it is not durable
             out["error"] = f"hidden, but the retraction was not persisted: {str(exc) or type(exc).__name__}"
+            if on_unpersisted is not None:
+                try:
+                    out["collab_write_grants_revoked"] = on_unpersisted(artifact_id)
+                except Exception as revoke_exc:             # noqa: BLE001 - reported by type name, never raised
+                    out["collab_revoke_error"] = type(revoke_exc).__name__
     scope = visibility_fields(gated=True)
     node = f"artifact:{artifact_id}@{version_id}" if version_id else f"artifact:{artifact_id}"
     out["marker_error"] = _marker(ingest, principal, node, source_name("artret", node.removeprefix("artifact:")),

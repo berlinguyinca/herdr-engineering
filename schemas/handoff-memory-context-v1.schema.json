@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/handoff-memory-context-v1.schema.json",
+  "title": "HerdR handoff memory_context v1 (optional, additive)",
+  "$comment": "Ids and counts only: no memory text, no secrets. Absent on pre-memory packages. Enforced at runtime by herdr_engineering.control_plane.handoffs.validate_memory_context.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "refs", "snapshot_digest", "checkpoint"],
+  "properties": {
+    "version": {"const": 1},
+    "refs": {
+      "type": "array", "maxItems": 100,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["memory_id", "bank_id", "revision"],
+        "properties": {
+          "memory_id": {"$ref": "#/$defs/id"},
+          "bank_id": {"$ref": "#/$defs/id"},
+          "revision": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "integer", "minimum": 0}]}
+        }
+      }
+    },
+    "snapshot_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "checkpoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "outbox_pending", "at"],
+      "properties": {
+        "state": {"enum": ["synced", "pending"]},
+        "outbox_pending": {"type": "integer", "minimum": 0},
+        "at": {"type": "string", "format": "date-time"}
+      }
+    }
+  },
+  "$defs": {"id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$"}}
+}

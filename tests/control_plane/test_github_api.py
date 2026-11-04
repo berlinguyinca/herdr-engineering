@@ -1,4 +1,5 @@
 """Read-only GitHub routes validate and bound queries before using the monitor."""
+import time
 import json
 import threading
 import urllib.error
@@ -174,7 +175,12 @@ def test_real_monitor_surfaces_scope_and_invalid_config_in_the_list_bodies(serve
     try:
         real.refresh()
         for path in ("github", "github/issues"):
+            # the first GET starts the monitor's background loop, whose own pass reports "syncing" for a moment
+            deadline = time.monotonic() + 10
             status, body = request(server, path)
+            while body.get("status") == "syncing" and time.monotonic() < deadline:
+                time.sleep(0.05)
+                status, body = request(server, path)
             assert status == 200 and body["status"] == "ready"
             assert body["scope"] == {"owners": ["acme"], "excluded_repositories": 1, "restricted": True}
         allow[0] = "acme"  # not a list

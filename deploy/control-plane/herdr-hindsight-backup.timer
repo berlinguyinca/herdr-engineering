@@ -1,0 +1,13 @@
+# Daily; Persistent so a run missed while the host was off happens at the next boot. Not enabled by anything but
+# `deploy.sh --with-memory` / `memory-backup.sh install`.
+[Unit]
+Description=Daily private Herdr memory backup
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15m
+Persistent=true
+Unit=herdr-hindsight-backup.service
+
+[Install]
+WantedBy=timers.target

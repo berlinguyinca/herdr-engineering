@@ -62,7 +62,10 @@ def _config(central, envfile, *files, fmt=None, extra_env=None):
                HERDR_CP_APPS_DIR=str(central.parent / "apps"),
                HERDR_CP_PIPELINES_DIR=str(central.parent / "pipelines"),
                HERDR_SHARES_DIR=str(central.parent / "shares"),
-               HERDR_SHARE_EVENTS_DIR=str(central.parent / "share-events"), **(extra_env or {}))
+               HERDR_SHARE_EVENTS_DIR=str(central.parent / "share-events"),
+               HERDR_COLLAB_MIRROR_DIR=str(central.parent / "collab-mirror"),
+               HERDR_COLLAB_OUTBOX_DIR=str(central.parent / "collab-outbox"),
+               HERDR_COLLAB_SPOOL_DIR=str(central.parent / "collab-spool"), **(extra_env or {}))
     return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
 
 
@@ -110,6 +113,76 @@ def test_rendered_env_validates_with_the_collab_overlay(tmp_path):
     assert any(v["source"] == str(tmp_path / "acme") for v in edge["volumes"])
     assert any(p.get("host_ip") == "127.0.0.1" and str(p.get("published")) == "9555"
                and p.get("target") == 8082 for p in edge["ports"])
+
+
+def _collab_model(tmp_path):
+    central, envfile = _render(tmp_path, lambda c: c.update(HERDR_COLLAB_CERT_DIR=str(tmp_path / "acme")))
+    data = yaml.safe_load(central.read_text())
+    data["sections"]["control_plane"]["values"]["collab"] = {"cognito_pool": "us-west-2_TEST",
+                                                             "operator_user": "owner-test"}
+    central.unlink()
+    fcc.write_private_file(central, yaml.safe_dump(data, sort_keys=False))
+    slice_ = tmp_path / "collab" / "collab-config.json"
+    fcc.render_collab(load_fleet_config(central), slice_)
+    extra = {"HERDR_COLLAB_CONFIG_DIR": str(slice_.parent), "HERDR_COLLAB_DATA_DIR": str(tmp_path / "data"),
+             "HERDR_COLLAB_SYNC_DIR": str(tmp_path / "sync"), "HERDR_SHARE_CONFIG_DIR": str(tmp_path / "share"),
+             "HERDR_COLLAB_EDGE_CONF": str(CP / "collab-edge" / "nginx.conf")}
+    r = _config(central, envfile, "compose.yaml", "compose.collab.yaml", fmt="json", extra_env=extra)
+    assert r.returncode == 0, r.stderr
+    return central, json.loads(r.stdout)
+
+
+def _mounts(svc):
+    return {v["target"]: (v["source"], bool(v.get("read_only"))) for v in svc["volumes"]}
+
+
+def test_bridge_mounts_follow_the_trust_zones(tmp_path):
+    central, model = _collab_model(tmp_path)
+    worker = _mounts(model["services"]["control-plane-worker"])
+    pub = model["services"]["collab-public"]
+    pubm = _mounts(pub)
+    d = central.parent
+    assert worker["/collab-mirror"] == (str(d / "collab-mirror"), False)
+    assert worker["/collab-outbox"] == (str(d / "collab-outbox"), False)
+    assert worker["/collab-spool"] == (str(d / "collab-spool"), False)
+    assert pubm["/collab-mirror"] == (str(d / "collab-mirror"), True)
+    assert pubm["/collab-outbox"] == (str(d / "collab-outbox"), False)
+    # the spool (assembled uploads) is the worker's alone
+    assert "/collab-spool" not in pubm and str(d / "collab-spool") not in {s for s, _ in pubm.values()}
+    # collab-public stays an island: no env_file, no Postgres/RustFS network, no capabilities
+    assert "env_file" not in pub and not pub.get("environment")
+    assert set(pub["networks"]) == {"collab"}
+    assert pub["cap_drop"] == ["ALL"] and not pub.get("cap_add") and not pub.get("privileged")
+    assert not any(k in pub for k in ("depends_on", "ports"))
+    # the worker runs as root (no user:) so it can write the mirror and unlink in a uid-owned outbox
+    assert "user" not in model["services"]["control-plane-worker"]
+    # the web service sees none of the bridge directories
+    assert not {"/collab-mirror", "/collab-outbox", "/collab-spool"} & set(_mounts(model["services"]["control-plane-web"]))
+    for name in ("postgres", "rustfs", "llm-proxy", "share-public", "collab-edge"):
+        assert not {"/collab-mirror", "/collab-outbox", "/collab-spool"} & set(_mounts(model["services"][name])), name
+
+
+def test_collab_public_rw_mount_sources_are_pairwise_disjoint(tmp_path):
+    """A compromised collab-public must not be able to hardlink or rename across trust zones: its
+    writable mounts are separate sources and none is nested inside another (the outbox is its own
+    bind mount, not a subdirectory of the data volume or the mirror)."""
+    _, model = _collab_model(tmp_path)
+    pub = model["services"]["collab-public"]
+    rw = [Path(v["source"]) for v in pub["volumes"] if not v.get("read_only")]
+    assert Path(_mounts(pub)["/collab-outbox"][0]) in rw and len(rw) >= 2
+    every = [Path(v["source"]) for v in pub["volumes"]]
+    assert len(set(every)) == len(every)
+    for a in rw:
+        for b in every:
+            if a != b:
+                assert a not in b.parents and b not in a.parents, (a, b)
+
+
+def test_collab_public_command_carries_the_two_static_bridge_flags(tmp_path):
+    _, model = _collab_model(tmp_path)
+    cmd = model["services"]["collab-public"]["command"]
+    assert cmd[cmd.index("--collab-artifacts-mirror") + 1] == "/collab-mirror"
+    assert cmd[cmd.index("--collab-artifacts-outbox") + 1] == "/collab-outbox"
 
 
 def test_gateway_bind_single_for_loopback_and_pair_for_tailnet(tmp_path):

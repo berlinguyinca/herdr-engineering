@@ -46,6 +46,11 @@
     - name: "Converge the host cleanup companion and preserve its policy"
       ansible.builtin.include_tasks: ../tasks/build-cleanup.yml
 
+    - name: "Converge the read-only ai-sync status reporter"
+      ansible.builtin.include_tasks: ../tasks/ai-sync-feed.yml
+    - name: "Converge ai-sync enforcement (opt-in per host, never on the publisher)"
+      ansible.builtin.include_tasks: ../tasks/ai-sync-enforce.yml
+
     - name: "Converge pi build-gate extension"
       ansible.builtin.include_tasks: ../tasks/pi-build-gate.yml
 

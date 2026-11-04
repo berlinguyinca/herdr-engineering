@@ -1,0 +1,12 @@
+[Unit]
+Description=HerdR ai-sync enforcement (force-pull the shared standard, then verify it loads)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+ExecStart=%h/.venvs/herdr-engineering/bin/python -m herdr_engineering.ai_sync_enforce --env claude
+TimeoutStartSec=600
+Nice=10
+UMask=0077
+NoNewPrivileges=true

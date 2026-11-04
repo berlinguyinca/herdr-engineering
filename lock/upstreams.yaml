@@ -11,13 +11,28 @@ dependencies:
     license: "MIT"
     maintenance: "active; standalone artifact skill"
     note: "Required cross-harness artifact skill, installed into the same four harnesses as herdr-handoff."
+  herdr-memory:
+    source: "berlinguyinca/herdr-memory"
+    revision: "cc20ad4d46845b8257e54596e152846e3ce4a3c2"
+    decision: ADOPT
+    license: "private"
+    maintenance: "active; private Hindsight-backed memory client (contract v1, client 0.1.6)"
+    note: "Optional (opt-in `scripts/install.sh --with-memory`); managed harness config via `herdr-eng memory install`. Pin must match herdr_engineering.memory_install.PINNED_REVISION (and PINNED_CLIENT_VERSION, 0.1.6). 0.1.6 verifies Git worktree registration before inheriting a project and preserves the explicit default_project fallback (herdr-memory#13)."
+  herdr-memory-deploy:
+    source: "berlinguyinca/herdr-memory"
+    revision: "c4e0c64"
+    checkout: "~/.local/share/herdr-engineering/herdr-memory"
+    decision: OPTIONAL
+    license: "private"
+    maintenance: "active; private Hindsight deployment candidate (deploy/{compose.yaml,Dockerfile,build.sh})"
+    note: "Build pin for `deploy/control-plane/deploy.sh --with-memory` (amd64 only): deploy.sh exports exactly this revision from the clone at `checkout` (override: --memory-checkout / HERDR_MEMORY_CHECKOUT) and runs its deploy/build.sh. Distinct from the client pin of `herdr-memory` (herdr_engineering.memory_install.PINNED_REVISION); bump both deliberately."
   herdr-handoff:
     source: "berlinguyinca/herdr-handoff"
-    revision: "3051d8c"
+    revision: "2bbae4db4da0569241a8d377baea108157efd0f8"
     decision: ADOPT
     license: "MIT"
     maintenance: "active; standalone cross-harness handoff contract"
-    note: "Required operational dependency. Install the pinned CLI and all four harness skills before strict validation."
+    note: "Required operational dependency. Includes memory-context handoffs and the engineering-memory namespace routes (herdr-handoff#1, #3). Install the pinned CLI and all four harness skills before strict validation."
   herdr:
     source: "official (local binary)"
     revision: "0.9.1"

@@ -168,38 +168,76 @@ def lineage_emitter(ingest, principal: dict, *, scope: dict | None = None):
 _POSTER_KEYS = frozenset({"api_url", "key_file", "timeout_seconds"})
 
 
+def _poster_settings(section, *, where: str) -> tuple[str, str, float] | None:
+    """Validate a YAML poster section (``api_url``, ``key_file``, optional ``timeout_seconds``) and return
+    ``(url, key, timeout)``, or None when the section is absent. ``where`` names the section in error messages. The key
+    is read from the FILE (never from the environment, never inlined in YAML) and never appears in an error."""
+    if not section:
+        return None
+    from pathlib import Path
+    from urllib.parse import urlsplit
+    if not isinstance(section, dict) or set(section) - _POSTER_KEYS:
+        raise ValueError(f"{where}: allowed keys are {sorted(_POSTER_KEYS)}")
+    url, key_file = section.get("api_url"), section.get("key_file")
+    if not isinstance(url, str) or urlsplit(url).scheme not in {"http", "https"} or not isinstance(key_file, str):
+        raise ValueError(f"{where} needs an http(s) api_url and a key_file path")
+    timeout = section.get("timeout_seconds", 10)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 120:
+        raise ValueError(f"{where}.timeout_seconds must be a number in (0, 120]")
+    key = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
+    if not key:
+        raise ValueError(f"{where}.key_file is empty")
+    return url, key, timeout
+
+
+def _post_json(url: str, key: str, timeout: float, body: dict):
+    import json
+    import urllib.request
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                     headers={"X-API-Key": key, "Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:     # noqa: S310 - scheme checked by the caller
+        return json.loads(response.read())
+
+
+_POSTER_WHERE = "artifact_worker.lineage"
+
+
 def lineage_poster_from_section(section):
     """Build the render worker's lineage hook from YAML ``control_plane.artifact_worker.lineage`` (``api_url``, ``key_file``,
     optional ``timeout_seconds``), or None when the section is absent. The key is read from the FILE at start-up (never from
     the environment, never inlined in YAML). The hook POSTs ``{"version_id"}`` to the control plane's authenticated
     ``/api/v1/artifact-jobs/<job>/lineage`` route: the server re-reads the version from the registry and applies the ACL
     write gate, so the worker has no graph channel of its own and cannot assert facts."""
-    if not section:
+    settings = _poster_settings(section, where=_POSTER_WHERE)
+    if settings is None:
         return None
-    import json
-    import urllib.request
-    from pathlib import Path
-    from urllib.parse import quote, urlsplit
-    if not isinstance(section, dict) or set(section) - _POSTER_KEYS:
-        raise ValueError(f"artifact_worker.lineage: allowed keys are {sorted(_POSTER_KEYS)}")
-    url, key_file = section.get("api_url"), section.get("key_file")
-    if not isinstance(url, str) or urlsplit(url).scheme not in {"http", "https"} or not isinstance(key_file, str):
-        raise ValueError("artifact_worker.lineage needs an http(s) api_url and a key_file path")
-    timeout = section.get("timeout_seconds", 10)
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 120:
-        raise ValueError("artifact_worker.lineage.timeout_seconds must be a number in (0, 120]")
-    key = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
-    if not key:
-        raise ValueError("artifact_worker.lineage.key_file is empty")
+    from urllib.parse import quote
+    url, key, timeout = settings
 
     def post(version: dict):
         job_id, version_id = version.get("job_id"), version.get("version_id")
         if not job_id or not version_id:
             return {"skipped": "version has no job_id/version_id"}
-        request = urllib.request.Request(
-            f"{url.rstrip('/')}/api/v1/artifact-jobs/{quote(str(job_id), safe='')}/lineage",
-            data=json.dumps({"version_id": version_id}).encode(), method="POST",
-            headers={"X-API-Key": key, "Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=timeout) as response:     # noqa: S310 - scheme checked above
-            return json.loads(response.read())
+        return _post_json(f"{url.rstrip('/')}/api/v1/artifact-jobs/{quote(str(job_id), safe='')}/lineage", key, timeout,
+                          {"version_id": version_id})
+    return post
+
+
+def collab_lineage_poster_from_section(section):
+    """Build the collaborator applier's ``lineage`` hook from the same YAML section as the render worker's
+    (``control_plane.artifact_worker.lineage``), or None when it is absent; the same strict validation. The hook takes
+    the version dict ``merge_commit`` returns and POSTs ``{}`` to the authenticated
+    ``/api/v1/artifacts/<id>/versions/<vid>/collab-lineage`` route, which re-reads the version from the registry."""
+    settings = _poster_settings(section, where=_POSTER_WHERE)
+    if settings is None:
+        return None
+    from urllib.parse import quote
+    url, key, timeout = settings
+
+    def post(version: dict):
+        artifact_id, version_id = version.get("artifact_id"), version.get("version_id")
+        if not artifact_id or not version_id:
+            return {"skipped": "version has no artifact_id/version_id"}
+        return _post_json(f"{url.rstrip('/')}/api/v1/artifacts/{quote(str(artifact_id), safe='')}/versions/"
+                          f"{quote(str(version_id), safe='')}/collab-lineage", key, timeout, {})
     return post

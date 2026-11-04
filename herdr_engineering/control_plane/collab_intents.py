@@ -1,0 +1,1597 @@
+"""The worker-side intent applier of the collab artifact bridge (plan 3, Tasks 5a–5d).
+
+``collab-public`` writes ``intents/<ticket>.json`` into the outbox; this module consumes them. Everything in an intent
+file is untrusted: the ticket comes only from a file name that matched ``TICKET_RE``, the envelope and payload are
+re-validated with ``validate_intent`` (Task 3), and nothing from a rejected intent is copied into a result or a log line
+except an actor that passes the Task 3 actor check on its own.
+
+Per intent file, at scan time (before any lane wait), for every kind (Task 5a):
+
+1. A ticket already decided in the ledger gets its result file (kept if present, else rewritten from the row) and the
+   intent is unlinked.
+2. The intent is validated; an invalid one or a kind with no registered handler is ``rejected`` with a fixed reason.
+3. A decided ticket of the same actor, kind and idempotency key (``idempotency_key or ticket``) with one of the kind's
+   ``replay_outcomes`` is replayed when its ``request_sha256`` matches, else this ticket is ``rejected`` "idempotency
+   key was reused for a different request". This runs before any upload lookup.
+4. With no ledger row, an intent older than ``INTENT_MAX_AGE`` is ``expired`` (recorded with 0 bytes, so it is never
+   charged against the quota) and one with a ``submitted_at`` too far ahead is ``rejected``, both even while the
+   received set is full (deciding them needs no memory); otherwise its ``received`` row is written, and from then on
+   no age check applies, so an intent queued behind its own lane's multi-GB assembly never expires. A ``received`` row
+   whose ``request_sha256``, actor, kind or idempotency key differ from the re-validated file is ``rejected``: a
+   rewritten file never inherits the exemption. ``request_sha256`` (``request_digest``) covers kind, actor,
+   artifact_id and payload only; the key and ``submitted_at`` are compared separately, the key against the row and
+   ``submitted_at`` against the received record (the row does not store it; see the lane below).
+5. An agent actor must be ``active`` and unexpired in a fresh ``agents.json`` (``FEED_MAX_AGE``).
+
+The intent then waits for its lane (``lane_key``; default one lane per actor). Lanes run concurrently up to
+``limits.apply_concurrency``; within a lane intents run oldest first, never two at once; a lane still busy from an
+earlier tick is skipped, never awaited. Only a small record of a received ticket is kept in memory (no payload; the
+set is capped). In the lane, under session advisory locks on the lane and on the idempotency key (Postgres, so a second
+worker process cannot interleave), the file is re-read and re-validated; it is ``rejected`` "intent changed after it
+was received" unless its digest, kind, actor and key equal the ledger row's and the record's (the key is what the
+advisory lock and the replay lookup are keyed on, so a moved key would be applied twice) and its ``submitted_at``
+equals the record's (it decided the lane order and the age check); a withdrawn file is forgotten, and steps 1, 3 and 5
+are checked again just before the handler runs: the store does not enforce key uniqueness or quota itself.
+
+The handler returns ``{result, version_id?, reason?, attempt_id?, …}``; the applier records it with ``record_outcome``
+(which decides once: if another path decided first, the decided row is what gets written), writes
+``results/<ticket>.json`` into the mirror with ``atomic_write_json`` and unlinks the intent with ``unlink_beneath``.
+Every outbox access is fd-relative and no-follow (``list_beneath``/``read_json_beneath``/``unlink_beneath``); all
+blocking file I/O runs in worker threads. Log lines carry only ticket, kind, actor, artifact and outcome.
+
+The ``commit`` kind (Task 5b; ``register_commit``) runs in the lane as ``collab:<agent_id>``:
+
+5b. A version already committed for ``(collab:<agent_id>, key)`` (``merge_commit_for_key``; the kind's
+   ``early_replay``) decides the ticket before step 5 and every check below. It runs at scan time for a ticket that
+   already has a ``received`` row (a rediscovery after a restart) and in the lane right after step 3: a crash between
+   ``merge_commit`` and ``record_outcome`` must report that one version, even if the feed went stale, the agent was
+   deactivated, the grant was revoked, the head moved or the quota filled since. Only the actor's own principal is
+   looked up, so it never reports another agent's work. It is replayed (``created`` / ``merged``) when the
+   ledger row of the ticket it was committed for has this ticket's ``request_sha256``, else ``rejected`` "idempotency
+   key was reused for a different request".
+6. ``grant_for`` must show ``write``, unexpired, re-read now (a grant revoked after the intent was written is "no write
+   grant", whatever its staging holds). It, and the agent's feed status, are checked once more right before
+   ``merge_commit`` (after assembly and inline storing), so a revocation during a long assembly stops the commit.
+7. The artifact must exist and be writable (not a report, no ``report_descriptor`` / ``source_manifest_blob`` on base
+   or head); neither it nor its base or head version may be retracted, by ``lifecycle`` / ``state`` or by the worker's
+   ``ArtifactGraphGate`` (reloaded with ``load_retractions`` at least every ``GATE_RELOAD`` s). Put names must not clash
+   clash (``check_names``: duplicates and file/directory prefixes) within the contributor's tree (base with the
+   changes applied) nor with the head's remaining files; base and head are not checked against each other, so a
+   head that replaced ``a`` with ``a/b`` does not refuse a clean stale-base commit.
+8. Each staged put is resolved (Task 5c): a ``verified_upload(agent, upload_id)`` row of the same artifact and name
+   is reused as is (no staging read, no charge); otherwise the upload's ``meta.json`` is read no-follow from
+   ``staging/<agent>/<upload_id>/`` (derived from the intent's agent, so another agent's upload id is never found) and
+   must name this artifact and file, else ``rejected`` "upload not found".
+9. Daily quota: ``bytes_last_24h(agent, exclude_ticket=ticket, count_received=False) + inline_bytes + declared
+   size_bytes of the unverified uploads <= daily_bytes_per_agent``, before any RustFS call. Only DECIDED non-rejected
+   tickets (and charged verified uploads) are counted: queued ``received`` tickets stored nothing yet, so a burst of
+   large tickets cannot reject an older one, and each ticket is judged against what was stored before it in its
+   lane (an agent's tickets run one at a time). The ticket's own bytes are added once (its ``received`` row is
+   excluded) and a verified upload is already counted once, so a crash-retry or re-commit is never counted twice.
+10. Staged puts go through ``ctx.assemble(..., charge=True)`` first (``UploadRefused`` gives "upload incomplete" /
+    "upload failed verification"; see ``_assemble``), then inline text is stored with ``rustfs.put`` and
+    ``register_report_blob``, so a refused upload leaves no inline bytes behind.
+11. ``merge_commit`` (no outer transaction, so a conflict's attempt row persists) with ``ticket_id`` and
+    ``max_text_bytes = limits.max_text_merge_bytes``; ``ArtifactMergeConflict`` is ``conflict`` (its ``attempt_id``
+    goes on the ledger row; ``merged_text`` capped at ``max_conflict_text_bytes`` per result, measured as encoded
+    JSON), any other ``ArtifactError`` is ``rejected`` with its message.
+    A handler exception from infrastructure (asyncpg, OSError, S3 transport, TimeoutError) does not decide the ticket:
+    it stays ``received`` and its lane stops there, so the next tick retries it in order (at most once per tick), until
+    ``INTENT_MAX_AGE`` after its first such failure; then it is ``rejected`` "internal error" like any other error. A
+    failure after ``merge_commit`` (recording the outcome, writing the result) leaves the ticket ``received`` too, and
+    the retry settles it from the committed version through the kind's ``early_replay``.
+12. After the outcome is recorded and published, the lane only hands off: the artifact id to a background mirror
+    refresher (the lane never waits behind the mirror's lock; a failed refresh is kept for ``take_mirror_force``,
+    which the mirror task passes to ``sync(force=...)``) and the version to a background lineage task (its poster may
+    take minutes; the queue keeps at most ``LINEAGE_QUEUE_MAX`` versions, dropping the oldest). Neither can fail the
+    tick, and neither holds the lane's semaphore slot, connection or advisory locks. Lineage is emitted for the
+    version as committed; Task 9's ``lineage`` wiring should skip a version the gate marks retracted by then.
+
+Staging sweep (Task 5d): ``sweep_staging`` removes upload dirs past the TTL, of revoked agents, without a live write
+grant, or with no valid ``meta.json`` past a 60 s grace, never one a pending intent names; owner dirs under a prefix
+from ``register_staging_owner`` follow their ``keep`` predicate and the TTL only. See its docstring.
+
+Wiring (Task 9): the scan must never wait for a lane's connection, or fresh intents stop being received while every
+lane is busy and then expire. The mirror refresher takes one connection from the lanes' ``acquire`` (the latest
+tick's) while it runs; lineage takes none. So with ``tick(..., scan_acquire=...)`` over a dedicated connection the
+lanes' pool needs at least ``limits.apply_concurrency + 1`` connections, and with one shared pool at least
+``limits.apply_concurrency + 2``.
+"""
+from __future__ import annotations
+
+import asyncio
+import collections
+import functools
+import inspect
+import json
+import logging
+import math
+import mimetypes
+import os
+import re
+import stat
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from types import MappingProxyType
+
+import asyncpg
+
+from .artifact_collab_store import CollabGrantStore
+from .artifact_scope import ArtifactGraphGate
+from .artifacts import ArtifactError, ArtifactMergeConflict, ArtifactStore
+from .collab_bridge_files import (
+    CHUNK_BYTES,
+    DIR_MODE,
+    FEED_MAX_AGE,
+    INTENT_MAX_AGE,
+    TICKET_RE,
+    VERIFIED_MARKER,
+    Actor,
+    BridgeError,
+    BridgeLimits,
+    Intent,
+    IntentError,
+    StagedUpload,
+    _validate_actor,
+    _walk_dirs,
+    agent_owner_key,
+    atomic_write_json,
+    ensure_dir,
+    file_exists_beneath,
+    list_beneath,
+    list_parts,
+    open_beneath,
+    read_bytes_beneath,
+    read_json_beneath,
+    read_staged_meta,
+    remove_tree_beneath,
+    staging_parts,
+    tree_entry_cap,
+    unlink_beneath,
+    validate_intent,
+    write_marker_beneath,
+)
+from .rustfs import IntegrityError
+from .share_bundle import ShareBundleError, check_names
+
+log = logging.getLogger(__name__)
+
+try:                                                  # S3 transport errors (boto3 is optional in tests)
+    from botocore.exceptions import BotoCoreError, ClientError
+    _STORAGE_ERRORS: tuple[type[BaseException], ...] = (BotoCoreError, ClientError)
+except ImportError:  # pragma: no cover
+    _STORAGE_ERRORS = ()
+# The scan connection is gone (restart, idle kill, reset): it is replaced, never reused.
+_CONN_LOST: tuple[type[BaseException], ...] = (asyncpg.PostgresConnectionError, asyncpg.InterfaceError,
+                                               ConnectionError)
+# Infrastructure errors in a lane: the ticket is left ``received`` and retried on a later tick (for at most
+# ``INTENT_MAX_AGE`` after the first failure), never decided "internal error" at once. Everything else is deterministic.
+_TRANSIENT: tuple[type[BaseException], ...] = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError,
+                                               *_STORAGE_ERRORS)
+
+
+class _ScanConnectionLost(Exception):
+    """Internal: carries a connection-level scan error out of the scan lease so the connection is replaced."""
+
+
+INTENTS_DIR = "intents"
+AGENTS_FEED = "agents.json"
+RESULTS_DIR = "results"
+AGENTS_FEED_MAX_BYTES = 4 * 1024 * 1024
+# A commit body is capped at 64 KiB on the wire, but JSON escaping can grow text up to 6x; plan 4/5 kinds are small.
+INTENT_MAX_BYTES = 1024 * 1024
+INTENTS_MIN_ENTRIES = 4096
+# collab-public's own clock may run ahead a little; a submitted_at further in the future is refused (never received).
+INTENT_FUTURE_SKEW = 60.0
+# Stray regular files in intents/ (stale .tmp-* of an interrupted atomic write, junk) older than this are removed.
+STRAY_MAX_AGE = 3600.0
+STRAY_SWEEP_BATCH = 10_000      # deletions per tick
+STRAY_SCAN_ENTRIES = 50_000     # entries one stray pass looks at (it streams; nothing is held in memory)
+# sweep_results deletes at most this many files per call (the results dir is the worker's own tree: no cap, no
+# fail-closed listing; an oversized backlog drains over successive calls).
+RESULTS_SWEEP_BATCH = 10_000
+# Received-but-unfinished tickets are remembered as small records (no payload), at most
+# max(RECEIVED_MIN_CAP, agents x RECEIVED_PER_AGENT); past that, new tickets stay on disk un-received (fail closed) and
+# are retried once there is room. The base is injectable (``received_min_cap``) so tests can fill the set cheaply.
+RECEIVED_MIN_CAP = 4096
+RECEIVED_PER_AGENT = 8
+# sweep_staging: an upload dir with no valid meta.json is junk only past this age (collab-public creates the dir, then
+# links meta.json), and the no-follow listings of staging/ are bounded (fail closed past the cap, per owner).
+STAGING_META_GRACE = 60.0
+STAGING_MIN_OWNERS = 4096
+STAGING_SCAN_ENTRIES = 50_000       # entries of one owner dir read per sweep
+_STAGING_PREFIX = re.compile(r"m_[A-Za-z0-9_.@-]{0,126}\Z")
+
+REASON_UNREADABLE = "intent is not readable"
+REASON_UNKNOWN_KIND = "unknown intent kind"
+REASON_KEY_REUSED = "idempotency key was reused for a different request"
+REASON_CHANGED = "intent changed after it was received"
+REASON_EXPIRED = "intent expired"
+REASON_FEED_STALE = "agent feed stale"
+REASON_AGENT = "agent not active"
+REASON_INTERNAL = "internal error"
+REASON_FUTURE = "invalid submitted_at"
+REASON_NO_GRANT = "no write grant"
+REASON_NO_ARTIFACT = "artifact not found"
+REASON_RETRACTED = "artifact or version is retracted"
+REASON_NOT_WRITABLE = "not writable by collaboration"
+REASON_NAMES = "invalid or clashing file names"
+REASON_QUOTA = "daily quota exceeded"
+REASON_UPLOAD_NOT_FOUND = "upload not found"
+REASON_UPLOAD_INCOMPLETE = "upload incomplete"
+REASON_UPLOAD_FAILED = "upload failed verification"
+REASON_BASE = "base version does not belong to the artifact"
+REASON_NO_HEAD = "artifact has no head version"
+REASON_MAX = 300                    # an ArtifactError message on a result is cut to this many characters
+COMMIT_OUTCOMES = frozenset({"created", "merged"})
+GATE_RELOAD = 30.0                  # the worker-local retraction gate is reloaded at least this often (seconds)
+LINEAGE_QUEUE_MAX = 1000            # versions waiting for lineage emission; the oldest is dropped beyond this
+
+_RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason")
+_STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id")
+_OUTCOME = re.compile(r"[a-z_]{1,32}\Z")
+_INTENT_FILE = re.compile(TICKET_RE[:-2] + r"\.json\Z")
+_KIND_NAME = re.compile(r"[a-z][a-z0-9_.]{0,47}\Z")
+_LOCK_SALT = "herdr.collab-intents:"
+
+
+class UploadRefused(Exception):
+    """``IntentContext.assemble`` refused a staged upload; ``reason`` is a fixed text fit for a result."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass
+class IntentContext:
+    actor: Actor
+    agent: dict | None
+    conn: object
+    store: ArtifactStore
+    grants: CollabGrantStore
+    limits: BridgeLimits
+    assemble: Callable[..., Awaitable[dict]]
+    extras: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class _Kind:
+    handler: Callable[[IntentContext, Intent], Awaitable[dict]]
+    lane_key: Callable[[Intent, dict | None], str] | None
+    replay_outcomes: frozenset[str]
+    after: Callable[[IntentContext, Intent, dict, dict], Awaitable[None]] | None = None
+    early_replay: Callable[[IntentContext, Intent], Awaitable[dict | None]] | None = None
+
+
+@dataclass(frozen=True)
+class _Received:
+    """What the applier remembers of a received ticket: identifiers and order only, never the payload. The lane
+    re-reads and re-validates the file and checks its digest, kind, actor and key against the ledger row and this
+    record, and its ``submitted_at`` against this record, before applying it."""
+    ticket: str
+    name: str
+    kind: str
+    actor: Actor
+    key: str
+    lane: str
+    submitted_at: float
+    mtime: float
+    request_sha256: str
+
+    def order(self) -> tuple:
+        return (self.submitted_at, self.mtime, self.ticket)
+
+
+def _default_lane(intent: Intent, _agent: dict | None) -> str:
+    return f"{intent.actor.kind}:{intent.actor.id}"
+
+
+def _finite(value) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def _epoch(value) -> float | None:
+    if isinstance(value, datetime):
+        return value.timestamp()
+    return float(value) if _finite(value) else None
+
+
+def _safe_actor(raw) -> dict | None:
+    """The raw intent's actor only if it passes the Task 3 check on its own; otherwise nothing is echoed."""
+    try:
+        actor = _validate_actor(raw.get("actor") if isinstance(raw, dict) else None)
+    except IntentError:
+        return None
+    return {"kind": actor.kind, "id": actor.id}
+
+
+class CollabIntentApplier:
+    def __init__(self, outbox: Path, mirror, *, rustfs, limits: BridgeLimits, spool_dir: Path,
+                 lineage: Callable[[dict], dict] | None = None, context_extras: Mapping[str, object] | None = None,
+                 clock: Callable[[], float] = time.time, max_per_tick: int = 20,
+                 received_min_cap: int | None = None, gate: ArtifactGraphGate | None = None):
+        self.outbox = Path(outbox)
+        self.mirror = mirror
+        self.rustfs = rustfs
+        self.limits = limits
+        self.spool_dir = Path(spool_dir)
+        self.lineage = lineage
+        self.extras = MappingProxyType(dict(context_extras or {}))
+        self.clock = clock
+        self.max_per_tick = max_per_tick
+        self._kinds: dict[str, _Kind] = {}
+        self._busy: dict[str, asyncio.Task] = {}
+        self._inflight: set[str] = set()
+        self._received: dict[str, _Received] = {}   # received (ledger row written) but not yet finished
+        self._transient_since: dict[str, float] = {}   # ticket -> clock() of its first transient lane failure
+        self._received_min_cap = received_min_cap
+        self._received_cap = self._min_cap()
+        self._feed: dict | None = None
+        self._sem = asyncio.Semaphore(limits.apply_concurrency)
+        self._counts = self._zero()
+        # the worker's retraction gate (shared with the mirror when Task 9 passes one), reloaded every GATE_RELOAD s
+        self.gate = gate if gate is not None else ArtifactGraphGate(None)
+        self._gate_loaded: float | None = None
+        self._acquire = None                               # the latest tick's acquire, for the mirror refresher
+        self._refresh_due: set[str] = set()
+        self._mirror_force: set[str] = set()
+        self._refresher: asyncio.Task | None = None
+        self._lineage_due: collections.deque[tuple[str, str, dict]] = collections.deque()
+        self._lineage_task: asyncio.Task | None = None
+        self._staging_owners: dict[str, Callable[[str, StagedUpload], Awaitable[bool]]] = {}
+        self.staging_scan_entries = STAGING_SCAN_ENTRIES
+
+    # -- registry ---------------------------------------------------------------------------------------------
+    def register(self, kind: str, handler: Callable[[IntentContext, Intent], Awaitable[dict]], *,
+                 lane_key: Callable[[Intent, dict | None], str] | None = None,
+                 replay_outcomes: frozenset[str] = frozenset(),
+                 after: Callable[[IntentContext, Intent, dict, dict], Awaitable[None]] | None = None,
+                 early_replay: Callable[[IntentContext, Intent], Awaitable[dict | None]] | None = None) -> None:
+        """Attach the handler of an intent kind (its validator is registered with ``register_intent_kind``).
+
+        A handler must be idempotent on ``(actor, kind, idempotency key)``: a crash between its return and
+        ``record_outcome`` leaves the ticket ``received``, and the restarted worker runs the handler again (age-exempt).
+        ``commit`` gets that from ``merge_commit``'s own idempotency key.
+
+        Keys of the handler's return value that start with ``_`` are private: they are never recorded or published
+        (``_zero_bytes: True`` records the ticket with 0 inline bytes), and are handed to
+        ``after(ctx, intent, out, private)``, which runs only once this call decided the ticket and
+        its result is written. Errors in ``after`` are logged (type only) and never change the outcome.
+
+        ``early_replay(ctx, intent)`` (``ctx.agent`` is None) runs before the step-5 agent check, at scan time for a
+        ticket that already has a ``received`` row and again in the lane: an outcome it returns (same shape as the
+        handler's) decides the ticket, None continues. It must only report what this actor's own earlier request
+        already did, so a crash-retry is not refused by a feed that went stale or an agent deactivated since.
+        """
+        if not isinstance(kind, str) or not _KIND_NAME.match(kind):
+            raise ValueError("invalid intent kind name")
+        if kind in self._kinds:
+            raise ValueError("intent kind already has a handler")
+        if not callable(handler) or any(f is not None and not callable(f) for f in (lane_key, after, early_replay)):
+            raise ValueError("handler, lane_key, after and early_replay must be callable")
+        outcomes = frozenset(replay_outcomes)
+        if not all(isinstance(o, str) and _OUTCOME.match(o) for o in outcomes):
+            raise ValueError("invalid replay outcome")
+        self._kinds[kind] = _Kind(handler, lane_key, outcomes, after, early_replay)
+
+    def register_commit(self) -> None:
+        """Register plan 3's ``commit`` kind (steps 6-12; replays ``created`` / ``merged``)."""
+        self.register("commit", self._commit, replay_outcomes=COMMIT_OUTCOMES, after=self._after_commit,
+                      early_replay=self._commit_replay)
+
+    def register_staging_owner(self, prefix: str, keep: Callable[[str, StagedUpload], Awaitable[bool]]) -> None:
+        """Exempt the staging owner dirs whose key starts with ``prefix`` from ``sweep_staging``'s agent and grant
+        rules: such a dir is deleted only past ``staging_ttl_seconds`` or when ``await keep(owner_key, meta)`` is
+        False. ``prefix`` must start with ``m_`` (the prefix ``agent_owner_key`` reserves, so no agent dir can ever
+        match) and must not overlap an earlier prefix. Plan 3 registers none."""
+        if not isinstance(prefix, str) or not _STAGING_PREFIX.match(prefix) or not callable(keep):
+            raise ValueError("invalid staging owner")
+        if any(prefix.startswith(p) or p.startswith(prefix) for p in self._staging_owners):
+            raise ValueError("staging owner prefix overlaps an earlier one")
+        self._staging_owners[prefix] = keep
+
+    def take_mirror_force(self) -> set[str]:
+        """Artifact ids whose post-commit mirror refresh failed; the mirror task passes them to ``sync(force=...)``."""
+        due, self._mirror_force = self._mirror_force, set()
+        return due
+
+    # -- the tick ---------------------------------------------------------------------------------------------
+    @staticmethod
+    def _zero() -> dict:
+        return {"applied": 0, "conflicts": 0, "rejected": 0, "skipped": 0}
+
+    def _count(self, outcome: str) -> None:
+        if outcome == "conflict":
+            self._counts["conflicts"] += 1
+        elif outcome in ("rejected", "expired"):
+            self._counts["rejected"] += 1
+        else:
+            self._counts["applied"] += 1
+
+    def _take_counts(self) -> dict:
+        counts, self._counts = self._counts, self._zero()
+        return counts
+
+    async def tick(self, acquire, *, scan_acquire=None, wait: float = 1.0) -> dict:
+        """Scan the outbox once and start the free lanes; returns the outcomes decided since the previous tick.
+
+        ``acquire()`` is an async context manager yielding a connection of the applier's own pool; each running lane
+        holds one (at most ``limits.apply_concurrency`` at once). The scan uses ``scan_acquire()`` (default:
+        ``acquire``). **Pool sizing:** the scan must never wait for a lane's connection, or fresh intents stop being
+        received while every lane is busy and expire. Either pass ``scan_acquire`` over a dedicated connection, or
+        size ``acquire``'s pool to at least ``apply_concurrency + 1``.
+
+        The per-tick scan budget (``max_per_tick``) goes only to files with no known ``received`` row (only they are on
+        the age clock). A received ticket is remembered as a small record (capped; see ``RECEIVED_MIN_CAP``) and not
+        rescanned: when its lane is free, the lane starts with ALL of its received tickets, oldest first
+        (``submitted_at``, then mtime, then ticket), so in steady state a fresh ticket always runs behind its lane's
+        older ones. After a restart the received rows are rediscovered in mtime order under the scan budget, so until
+        all are rediscovered the order follows mtime. Lanes started here are awaited for at most ``wait`` seconds; a longer one keeps running and its lane is
+        skipped by later ticks until it finishes (``drain`` awaits them all).
+        """
+        self._acquire = acquire
+        feed, listing = await asyncio.to_thread(self._load_outbox)
+        self._feed = feed
+        if listing is None:
+            return self._take_counts()
+        mtimes = {name: st.st_mtime for name, st in listing
+                  if stat.S_ISREG(st.st_mode) and _INTENT_FILE.match(name) and name[:-5] not in self._inflight}
+        present = {name[:-5] for name in mtimes}
+        self._received = {t: rec for t, rec in self._received.items() if t in present or t in self._inflight}
+        fresh = sorted((n for n in mtimes if n[:-5] not in self._received), key=lambda n: (mtimes[n], n))
+        names = fresh[:self.max_per_tick]
+        raws = await asyncio.to_thread(self._read_intents, names) if names else {}
+        try:
+            async with (scan_acquire or acquire)() as conn:
+                for name in names:
+                    try:
+                        job = await self._scan(conn, name, raws.get(name))
+                    except asyncio.CancelledError:
+                        raise
+                    except _CONN_LOST as exc:
+                        raise _ScanConnectionLost from exc     # leaves the lease with the error: it is replaced
+                    except Exception as exc:  # one bad intent never stops the scan; retried next tick
+                        log.error("collab intent %s: scan failed (%s)", name[:-5], type(exc).__name__)
+                        continue
+                    if job is not None:
+                        rec = self._remember(job, mtimes[name])
+                        if rec.lane in self._busy:
+                            self._counts["skipped"] += 1
+        except _ScanConnectionLost as lost:
+            # a connection-level failure (or storage blip): the rest of the scan is retried next tick on a fresh
+            # connection; lanes already waiting still start below
+            log.error("collab intents: scan connection failed (%s); retrying next tick",
+                      type(lost.__cause__).__name__)
+        lanes: dict[str, list[_Received]] = {}
+        for ticket, rec in self._received.items():
+            if ticket not in self._inflight and rec.lane not in self._busy:
+                lanes.setdefault(rec.lane, []).append(rec)
+        started = []
+        for lane, jobs in lanes.items():
+            jobs.sort(key=_Received.order)
+            self._inflight.update(j.ticket for j in jobs)
+            task = asyncio.create_task(self._run_lane(lane, jobs, acquire))
+            self._busy[lane] = task
+            started.append(task)
+        if started and wait > 0:
+            await asyncio.wait(started, timeout=wait)
+        return self._take_counts()
+
+    async def drain(self, timeout: float | None = None) -> None:
+        """Await every running lane, then the mirror refresher and the lineage task (shutdown and tests)."""
+        tasks = list(self._busy.values())
+        if tasks:
+            await asyncio.wait(tasks, timeout=timeout)
+        background = [t for t in (self._refresher, self._lineage_task) if t is not None and not t.done()]
+        if background:
+            await asyncio.wait(background, timeout=timeout)
+
+    async def aclose(self, timeout: float = 5.0) -> None:
+        """Let running lanes finish for ``timeout`` seconds, then cancel the rest (their intents stay ``received``
+        and are picked up again, age-exempt, after a restart)."""
+        await self.drain(timeout)
+        tasks = list(self._busy.values())
+        tasks += [t for t in (self._refresher, self._lineage_task) if t is not None and not t.done()]
+        if self._lineage_task is not None and not self._lineage_task.done():
+            log.warning("collab intents: closing with lineage still running, %d more queued (not emitted)",
+                        len(self._lineage_due))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks)
+
+    def _min_cap(self) -> int:
+        return RECEIVED_MIN_CAP if self._received_min_cap is None else self._received_min_cap
+
+    def _load_outbox(self):
+        self._sweep_strays()
+        feed = read_json_beneath(self.outbox, [AGENTS_FEED], max_bytes=AGENTS_FEED_MAX_BYTES)
+        agents = feed.get("agents") if isinstance(feed, dict) else None
+        self._received_cap = max(self._min_cap(), (len(agents) if isinstance(agents, dict) else 0) * RECEIVED_PER_AGENT)
+        cap = max(INTENTS_MIN_ENTRIES,
+                  (len(agents) if isinstance(agents, dict) else 0) * self.limits.max_pending_intents_per_agent * 2)
+        try:
+            listing = list_beneath(self.outbox, [INTENTS_DIR], max_entries=cap)
+        except BridgeError:
+            log.warning("collab intents: outbox intents dir has too many entries; tick skipped")
+            return feed, None
+        return feed, listing
+
+    def _sweep_strays(self) -> int:
+        """Remove stale stray regular files (``.tmp-*`` of an interrupted write, junk) from ``intents/``.
+
+        It runs before, and independently of, the capped listing, so strays alone can never wedge an over-cap dir:
+        a bounded streaming pass (``STRAY_SCAN_ENTRIES`` entries, ``STRAY_SWEEP_BATCH`` deletions) over the
+        no-follow-opened dir fd. A ticket-named file, a symlink, a directory or anything younger than
+        ``STRAY_MAX_AGE`` is never touched; ``unlinkat`` never follows a link.
+        """
+        dfd = _walk_dirs(self.outbox, [INTENTS_DIR])
+        if dfd is None:
+            return 0
+        cutoff, seen, removed = self.clock() - STRAY_MAX_AGE, 0, 0
+        try:
+            with os.scandir(dfd) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > STRAY_SCAN_ENTRIES or removed >= STRAY_SWEEP_BATCH:
+                        break
+                    if _INTENT_FILE.match(entry.name):
+                        continue
+                    try:
+                        st = os.stat(entry.name, dir_fd=dfd, follow_symlinks=False)
+                        if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                            os.unlink(entry.name, dir_fd=dfd)
+                            removed += 1
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        finally:
+            os.close(dfd)
+        return removed
+
+    def _reread(self, name: str) -> tuple[bool, dict | None]:
+        """``(present, raw)``: a file unlinked between the existence check and the read counts as absent (forgotten),
+        never as a rewritten one; a present file that does not parse is ``(True, None)``."""
+        if not file_exists_beneath(self.outbox, [INTENTS_DIR], name):
+            return False, None
+        raw = read_json_beneath(self.outbox, [INTENTS_DIR, name], max_bytes=INTENT_MAX_BYTES)
+        if raw is None and not file_exists_beneath(self.outbox, [INTENTS_DIR], name):
+            return False, None
+        return True, raw
+
+    def _read_intents(self, names: list[str]) -> dict[str, dict | None]:
+        return {n: read_json_beneath(self.outbox, [INTENTS_DIR, n], max_bytes=INTENT_MAX_BYTES) for n in names}
+
+    # -- generic steps 1-5 (scan time) ------------------------------------------------------------------------
+    async def _scan(self, conn, name: str, raw: dict | None) -> tuple[str, Intent, str] | None:
+        ticket = name[:-5]
+        grants = CollabGrantStore(conn)
+        row = await self._ledger(conn, ticket)
+        if row is not None and row["outcome"] != "received":                                        # step 1
+            await self._settle_from_row(name, row)
+            return None
+        if raw is None:                                                                             # step 2
+            await self._reject_unvalidated(conn, name, row, None, REASON_UNREADABLE)
+            return None
+        try:
+            intent = validate_intent(raw, filename=name, limits=self.limits)
+        except IntentError as exc:
+            await self._reject_unvalidated(conn, name, row, raw, exc.reason)
+            return None
+        spec = self._kinds.get(intent.kind)
+        if spec is None:
+            await self._decide(conn, intent, row, {"result": "rejected", "reason": REASON_UNKNOWN_KIND})
+            return None
+        if row is not None and not self._row_matches(row, intent):
+            await self._decide(conn, intent, row, {"result": "rejected", "reason": REASON_CHANGED})
+            return None
+        if await self._replayed(conn, name, intent, spec, row):                                       # step 3
+            return None
+        if row is None:                                                                             # step 4
+            if intent.submitted_at > self.clock() + INTENT_FUTURE_SKEW:
+                await self._decide(conn, intent, None, {"result": "rejected", "reason": REASON_FUTURE}, charge=False)
+                return None
+            if self.clock() - intent.submitted_at > INTENT_MAX_AGE:
+                await self._decide(conn, intent, None, {"result": "expired", "reason": REASON_EXPIRED}, charge=False)
+                return None
+        if ticket not in self._received and len(self._received) >= self._received_cap:
+            return None                                    # full: stays on disk un-received, retried with room
+        if row is None:
+            existing = await grants.record_received(
+                intent.ticket, intent.kind, intent.actor, intent.artifact_id, _base_of(intent), self._key(intent),
+                intent.request_sha256, _inline_bytes(intent))
+            if existing is not None:                       # another worker received it first: start over next tick
+                return None
+        elif await self._early_replayed(conn, name, intent, spec):                                  # step 5b, early
+            return None
+        agent, reason = self._agent_for(intent)                                                      # step 5
+        if reason is not None:
+            await self._finish(conn, name, intent, {"result": "rejected", "reason": reason})
+            return None
+        try:
+            lane = (spec.lane_key or _default_lane)(intent, agent)
+            if not isinstance(lane, str) or not lane:
+                raise ValueError("lane key must be a non-empty string")
+        except Exception as exc:
+            log.error("collab intent %s: lane key failed (%s)", ticket, type(exc).__name__)
+            await self._finish(conn, name, intent, {"result": "rejected", "reason": REASON_INTERNAL})
+            return None
+        return name, intent, lane
+
+    def _remember(self, job: tuple[str, Intent, str], mtime: float) -> _Received:
+        name, intent, lane = job
+        rec = _Received(ticket=intent.ticket, name=name, kind=intent.kind, actor=intent.actor, key=self._key(intent),
+                        lane=lane, submitted_at=intent.submitted_at, mtime=mtime,
+                        request_sha256=intent.request_sha256)
+        self._received[intent.ticket] = rec
+        return rec
+
+    @staticmethod
+    def _key(intent: Intent) -> str:
+        return intent.idempotency_key or intent.ticket
+
+    @classmethod
+    def _row_matches(cls, row: dict, intent: Intent) -> bool:
+        """The re-validated file is the request its ``received`` row was written for: same digest (kind, actor,
+        artifact, payload), kind and actor (named in the row on their own) and idempotency key (not in the digest; it
+        keys the advisory lock and the replay lookup, so a moved key would run the handler twice)."""
+        return (row["request_sha256"] == intent.request_sha256 and row["kind"] == intent.kind
+                and (row["actor_kind"], row["actor_id"]) == (intent.actor.kind, intent.actor.id)
+                and row["idempotency_key"] == cls._key(intent))
+
+    def _agent_for(self, intent: Intent) -> tuple[dict | None, str | None]:
+        """Step 5: the actor's ``agents.json`` row, or the rejection reason. User actors skip it (their handler
+        authenticates them)."""
+        if intent.actor.kind != "agent":
+            return None, None
+        feed = self._feed
+        now = self.clock()
+        generated = feed.get("generated_at") if isinstance(feed, dict) else None
+        agents = feed.get("agents") if isinstance(feed, dict) else None
+        if not _finite(generated) or now - generated > FEED_MAX_AGE or not isinstance(agents, dict):
+            return None, REASON_FEED_STALE
+        row = agents.get(intent.actor.id)
+        if not isinstance(row, dict) or row.get("status") != "active":
+            return None, REASON_AGENT
+        expires, hard = row.get("expires_at"), row.get("hard_expiry")
+        if not _finite(expires) or expires <= now or (hard is not None and (not _finite(hard) or hard <= now)):
+            return None, REASON_AGENT
+        return dict(row), None
+
+    async def _replayed(self, conn, name: str, intent: Intent, spec: _Kind, row: dict | None) -> bool:
+        """Step 3: True when this ticket was settled by an earlier decided ticket with the same key."""
+        if not spec.replay_outcomes:
+            return False
+        prior = await CollabGrantStore(conn).decided_for_key(intent.actor, intent.kind, self._key(intent),
+                                                             spec.replay_outcomes)
+        if prior is None or prior["ticket_id"] == intent.ticket:
+            return False
+        if prior["request_sha256"] != intent.request_sha256:
+            out = {"result": "rejected", "reason": REASON_KEY_REUSED}
+        else:
+            out = await asyncio.to_thread(self._result_of_row, prior)
+            out = {k: v for k, v in out.items() if k == "result" or k in _RESULT_KEYS}
+            out["attempt_id"] = prior.get("attempt_id")
+        await self._decide(conn, intent, row, out, charge=False, name=name, zero_bytes=True)
+        return True
+
+    # -- lanes ------------------------------------------------------------------------------------------------
+    async def _run_lane(self, lane: str, jobs: list[_Received], acquire) -> None:
+        try:
+            for index, job in enumerate(jobs):
+                async with self._sem:
+                    ran = await self._apply(job, acquire)
+                self._inflight.discard(job.ticket)
+                if not ran:                                # locked elsewhere: keep the lane's order, retry next tick
+                    self._counts["skipped"] += len(jobs) - index
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("collab intents: lane failed (%s)", type(exc).__name__)
+        finally:
+            for job in jobs:
+                self._inflight.discard(job.ticket)
+            if self._busy.get(lane) is asyncio.current_task():
+                del self._busy[lane]
+
+    async def _apply(self, job: _Received, acquire) -> bool:
+        async with acquire() as conn:
+            locks = [_LOCK_SALT + "lane:" + job.lane,
+                     _LOCK_SALT + f"key:{job.actor.kind}:{job.actor.id}:{job.kind}:{job.key}"]
+            held = []
+            try:
+                for lock in locks:
+                    if not await conn.fetchval("SELECT pg_try_advisory_lock(hashtextextended($1, 0))", lock):
+                        return False
+                    held.append(lock)
+                return await self._apply_locked(conn, job) is not False
+            finally:
+                for lock in reversed(held):
+                    try:
+                        await conn.fetchval("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock)
+                    except Exception as exc:  # a broken connection drops its session locks anyway
+                        log.warning("collab intents: advisory unlock failed (%s)", type(exc).__name__)
+
+    async def _apply_locked(self, conn, job: _Received) -> bool | None:
+        """Apply one ticket under its locks. False: leave it ``received`` for a later tick (a transient failure), and
+        the lane stops there so its order holds; anything else: done with it for now."""
+        name = job.name
+        row = await self._ledger(conn, job.ticket)
+        if row is None:                                    # the received row vanished: forget it; a later scan
+            self._received.pop(job.ticket, None)           # treats the file as fresh (age clock and all)
+            return
+        if row["outcome"] != "received":
+            await self._settle_from_row(name, row)
+            return
+        present, raw = await asyncio.to_thread(self._reread, name)
+        if not present:                                    # withdrawn (even mid-reread) or now a non-file: forgotten
+            self._received.pop(job.ticket, None)
+            return
+        try:
+            intent = validate_intent(raw, filename=name, limits=self.limits) if raw is not None else None
+        except IntentError:
+            intent = None
+        spec = self._kinds.get(intent.kind) if intent is not None else None
+        # The file must still be the request the row and the record were made for: digest, kind, actor and key
+        # against both (the lock just taken is on the record's key), submitted_at against the record (it set the
+        # lane order and passed the age check; the row does not store it).
+        if (intent is None or spec is None or not self._row_matches(row, intent)
+                or (job.kind, job.actor, job.key, job.submitted_at)
+                != (intent.kind, intent.actor, self._key(intent), intent.submitted_at)):
+            await self._reject_unvalidated(conn, name, row, None, REASON_CHANGED)
+            return
+        if await self._replayed(conn, name, intent, spec, row):
+            return
+        if await self._early_replayed(conn, name, intent, spec):
+            return
+        agent, reason = self._agent_for(intent)            # the newest feed: revoked while queued is still refused
+        if reason is not None:
+            await self._finish(conn, name, intent, {"result": "rejected", "reason": reason})
+            return
+        ctx = self._context(conn, intent, agent)
+        try:
+            out, private = _split(await spec.handler(ctx, intent))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("collab intent %s (%s): handler failed (%s)", intent.ticket, intent.kind, type(exc).__name__)
+            if isinstance(exc, _TRANSIENT) and self._may_retry(intent.ticket):
+                return False                   # undecided: the lane stops, the next tick runs it again
+            out, private = {"result": "rejected", "reason": REASON_INTERNAL}, {}
+        await self._conclude(conn, name, intent, spec, ctx, out, private)
+        return None
+
+    def _may_retry(self, ticket: str) -> bool:
+        """True while a ticket whose handler hit a transient error is within ``INTENT_MAX_AGE`` of its first such
+        failure; past that it is decided like any other failure (no ticket holds its lane forever)."""
+        first = self._transient_since.setdefault(ticket, self.clock())
+        return self.clock() - first <= INTENT_MAX_AGE
+
+    def _context(self, conn, intent: Intent, agent: dict | None) -> IntentContext:
+        return IntentContext(actor=intent.actor, agent=agent, conn=conn, store=ArtifactStore(conn, self.rustfs),
+                             grants=CollabGrantStore(conn), limits=self.limits,
+                             assemble=functools.partial(self._assemble, conn), extras=self.extras)
+
+    async def _early_replayed(self, conn, name: str, intent: Intent, spec: _Kind) -> bool:
+        """The kind's ``early_replay``, before the agent check; True when it decided the ticket. A failure is logged
+        and the normal steps continue."""
+        if spec.early_replay is None:
+            return False
+        ctx = self._context(conn, intent, None)
+        try:
+            found = await spec.early_replay(ctx, intent)
+            if found is None:
+                return False
+            out, private = _split(found)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("collab intent %s (%s): early replay failed (%s)", intent.ticket, intent.kind,
+                      type(exc).__name__)
+            return False
+        await self._conclude(conn, name, intent, spec, ctx, out, private)
+        return True
+
+    async def _conclude(self, conn, name: str, intent: Intent, spec: _Kind, ctx: IntentContext, out: dict,
+                        private: dict) -> None:
+        """Record and publish a checked outcome, then run the kind's after-hook if this call decided the ticket."""
+        if await self._finish(conn, name, intent, out, zero_bytes=private.get("_zero_bytes") is True) \
+                and spec.after is not None:
+            try:
+                await spec.after(ctx, intent, out, private)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # the outcome is durable and published: a hook never changes it
+                log.error("collab intent %s (%s): after-hook failed (%s)", intent.ticket, intent.kind,
+                          type(exc).__name__)
+
+    # -- deciding and results ---------------------------------------------------------------------------------
+    @staticmethod
+    async def _ledger(conn, ticket: str) -> dict | None:
+        row = await conn.fetchrow("SELECT * FROM artifact_collab_intents WHERE ticket_id=$1", ticket)
+        return dict(row) if row else None
+
+    async def _decide(self, conn, intent: Intent, row: dict | None, out: dict, *, charge: bool = True,
+                      name: str | None = None, zero_bytes: bool = False) -> None:
+        """Record a validated intent's outcome (writing its ``received`` row first when it has none) and finish it."""
+        if row is None:
+            existing = await CollabGrantStore(conn).record_received(
+                intent.ticket, intent.kind, intent.actor, intent.artifact_id, _base_of(intent), self._key(intent),
+                intent.request_sha256, _inline_bytes(intent) if charge else 0)
+            if existing is not None and existing["outcome"] != "received":
+                await self._settle_from_row(name or intent.ticket + ".json", existing)
+                return
+        await self._finish(conn, name or intent.ticket + ".json", intent, out, zero_bytes=zero_bytes)
+
+    async def _finish(self, conn, name: str, intent: Intent, out: dict, *, zero_bytes: bool = False) -> bool:
+        """Record and publish ``out``, which ``_check_outcome`` accepts (the applier's own outcomes always do); True
+        when this call decided the ticket."""
+        result = out["result"]
+        decided = await CollabGrantStore(conn).record_outcome(
+            intent.ticket, result, version_id=out.get("version_id"), attempt_id=out.get("attempt_id"),
+            reason=out.get("reason"), bytes=0 if zero_bytes else None)
+        if not decided:                                    # decided elsewhere first: that decision is the result
+            row = await self._ledger(conn, intent.ticket)
+            if row is not None and row["outcome"] != "received":
+                await self._settle_from_row(name, row)
+            return False
+        doc = {"ticket": intent.ticket, "kind": intent.kind,
+               "actor": {"kind": intent.actor.kind, "id": intent.actor.id}, "artifact_id": intent.artifact_id,
+               "result": result}
+        doc.update({k: out[k] for k in _RESULT_KEYS if out.get(k) is not None})
+        doc["decided_at"] = self.clock()
+        await asyncio.to_thread(self._write_and_consume, name, doc)
+        self._done(intent.ticket, intent.kind, intent.actor.kind, intent.actor.id, intent.artifact_id, result)
+        return True
+
+    async def _reject_unvalidated(self, conn, name: str, row: dict | None, raw, reason: str) -> None:
+        """An intent that failed validation: nothing of its content is kept except an independently valid actor."""
+        ticket = name[:-5]
+        if row is not None:                                # received earlier, rewritten since: decide that row
+            await CollabGrantStore(conn).record_outcome(ticket, "rejected", reason=reason)
+            row = await self._ledger(conn, ticket)
+            if row is not None and row["outcome"] != "received":
+                await self._settle_from_row(name, row)
+            return
+        doc = {"ticket": ticket, "kind": None, "actor": _safe_actor(raw), "artifact_id": None, "result": "rejected",
+               "reason": reason, "decided_at": self.clock()}
+        await asyncio.to_thread(self._write_and_consume, name, doc)
+        actor = doc["actor"] or {}
+        self._done(ticket, None, actor.get("kind"), actor.get("id"), None, "rejected")
+
+    async def _settle_from_row(self, name: str, row: dict) -> None:
+        """Step 1: a decided ticket keeps the result file it has; one with none is rewritten from its row."""
+        def go() -> None:
+            existing = self._read_result(row["ticket_id"])
+            if existing is None or existing.get("result") != row["outcome"]:
+                self._write_result(self._doc_of_row(row))
+            self._consume(name)
+        await asyncio.to_thread(go)
+        self._done(row["ticket_id"], row["kind"], row["actor_kind"], row["actor_id"], row["artifact_id"],
+                   row["outcome"])
+
+    def _doc_of_row(self, row: dict) -> dict:
+        doc = {"ticket": row["ticket_id"], "kind": row["kind"],
+               "actor": {"kind": row["actor_kind"], "id": row["actor_id"]}, "artifact_id": row["artifact_id"]}
+        doc.update(self._result_of_row(row))
+        doc["decided_at"] = _epoch(row.get("decided_at")) or self.clock()
+        return doc
+
+    def _result_of_row(self, row: dict) -> dict:
+        """``{result, …}`` for a decided row: its own result file's details when that file agrees, else the row."""
+        out = {"result": row["outcome"]}
+        existing = self._read_result(row["ticket_id"])
+        if existing is not None and existing.get("result") == row["outcome"]:
+            out.update({k: existing[k] for k in _RESULT_KEYS if existing.get(k) is not None})
+        else:
+            if row.get("version_id"):
+                out["version_id"] = row["version_id"]
+            if row.get("reason"):
+                out["reason"] = row["reason"]
+        return out
+
+    def _read_result(self, ticket: str) -> dict | None:
+        return read_json_beneath(self.mirror.root, [RESULTS_DIR, ticket + ".json"],
+                                 max_bytes=self.limits.max_conflict_text_bytes + 1_048_576)
+
+    def _write_result(self, doc: dict) -> None:
+        ensure_dir(Path(self.mirror.root), mode=DIR_MODE, public_mode=True)
+        atomic_write_json(Path(self.mirror.root) / RESULTS_DIR, doc["ticket"] + ".json", doc)
+
+    def _consume(self, name: str) -> None:
+        unlink_beneath(self.outbox, [INTENTS_DIR], name)
+
+    def _write_and_consume(self, name: str, doc: dict) -> None:
+        self._write_result(doc)
+        self._consume(name)
+
+    def _done(self, ticket, kind, actor_kind, actor_id, artifact_id, outcome: str) -> None:
+        self._transient_since.pop(ticket, None)
+        self._received.pop(ticket, None)
+        self._count(outcome)
+        log.info("collab intent %s kind=%s actor=%s:%s artifact=%s outcome=%s",
+                 ticket, kind, actor_kind, actor_id, artifact_id, outcome)
+
+    # -- the commit kind (Task 5b) -----------------------------------------------------------------------------
+    async def _commit(self, ctx: IntentContext, intent: Intent) -> dict:
+        """Steps 6-11 (5b ran as ``_commit_replay`` before the agent check). Every refusal before ``merge_commit``
+        stores nothing (no blob, no scoped row)."""
+        agent_id, aid, payload = intent.actor.id, intent.artifact_id, intent.payload
+        store = ctx.store
+        if not await self._has_write_grant(ctx, aid, agent_id):                                     # step 6
+            return _rejected(REASON_NO_GRANT)
+        artifact = await store.get(aid)                                                             # step 7
+        if artifact is None:
+            return _rejected(REASON_NO_ARTIFACT)
+        await self._load_gate(store)
+        if artifact["lifecycle"] == "retracted" or self.gate.artifact_retracted(aid):
+            return _rejected(REASON_RETRACTED)
+        base = await store.get_version(payload.base_version_id, aid)
+        if base is None:
+            return _rejected(REASON_BASE)
+        head_id = artifact["current_version_id"]
+        head = base if head_id == base["version_id"] else (
+            await store.get_version(head_id, aid) if head_id else None)
+        if head is None:
+            return _rejected(REASON_NO_HEAD)
+        if any(v.get("state") == "retracted" or self.gate.version_retracted(aid, v["version_id"]) for v in (base, head)):
+            return _rejected(REASON_RETRACTED)
+        if artifact["artifact_type"] == "report" or any(
+                v.get("report_descriptor") or v.get("source_manifest_blob") for v in (base, head)):
+            return _rejected(REASON_NOT_WRITABLE)
+        head_files = _files_of(head)
+        if not _names_fit(payload.changes, _files_of(base), head_files):
+            return _rejected(REASON_NAMES)
+        owner = agent_owner_key(agent_id)
+        uploads = [c for c in payload.changes if c.op == "put" and c.upload_id is not None]
+        unverified = 0
+        for change in uploads:                                                                      # step 8
+            try:
+                row, meta = await self._resolve_upload(ctx.grants, owner, change.upload_id, artifact_id=aid,
+                                                       name=change.name)
+            except UploadRefused as exc:
+                return _rejected(exc.reason)
+            if row is None:
+                unverified += meta.size_bytes
+        used = await ctx.grants.bytes_last_24h(agent_id, exclude_ticket=intent.ticket, count_received=False)  # step 9
+        if used + payload.inline_bytes + unverified > ctx.limits.daily_bytes_per_agent:
+            return _rejected(REASON_QUOTA)
+        entries: dict[str, dict] = {}                                                               # step 10
+        for change in uploads:             # staged first: a refused upload leaves no inline bytes behind either
+            try:
+                entries[change.name] = await ctx.assemble(
+                    owner, change.upload_id, artifact_id=aid, name=change.name, charge=True,
+                    media_type=(head_files.get(change.name) or {}).get("media_type"))
+            except UploadRefused as exc:
+                return _rejected(exc.reason)
+        changes = []
+        for change in payload.changes:
+            if change.op == "delete":
+                changes.append({"name": change.name, "op": "delete"})
+            elif change.text is not None:
+                changes.append({"name": change.name, "op": "put",
+                                "entry": await self._store_inline(ctx, aid, change.name, change.text, head_files)})
+            else:
+                changes.append({"name": change.name, "op": "put", "entry": entries[change.name]})
+        # Assembly can take a minute and inline storing is I/O: the write grant and the agent are checked once more,
+        # right before the commit, so a revocation during the assembly stops it (the early replay already ran, so a
+        # commit that did land is still reported).
+        _, reason = self._agent_for(intent)
+        if reason is not None:
+            return _rejected(reason)
+        if not await self._has_write_grant(ctx, aid, agent_id):
+            return _rejected(REASON_NO_GRANT)
+        try:                                                                                        # step 11
+            out = await store.merge_commit(
+                aid, base_version_id=base["version_id"], changes=changes, message=payload.message,
+                created_by=f"collab:{agent_id}", collaborator_agent_id=agent_id, idempotency_key=self._key(intent),
+                ticket_id=intent.ticket, max_text_bytes=ctx.limits.max_text_merge_bytes)
+        except ArtifactMergeConflict as exc:
+            return {"result": "conflict", "head_version_id": exc.head_version_id, "attempt_id": exc.attempt_id,
+                    "conflicts": _conflicts(exc.conflicts, ctx.limits.max_conflict_text_bytes)}
+        except ArtifactError as exc:
+            return _rejected(str(exc)[:REASON_MAX] or "commit refused")
+        return _committed(out)
+
+    async def _has_write_grant(self, ctx: IntentContext, aid: str, agent_id: str) -> bool:
+        """``grant_for`` re-read now: a ``write`` grant that has not expired."""
+        grant = await ctx.grants.grant_for(aid, agent_id)
+        expires = _epoch(grant["expires_at"]) if grant is not None else None
+        return grant is not None and grant["permission"] == "write" and expires is not None and expires > self.clock()
+
+    async def _commit_replay(self, ctx: IntentContext, intent: Intent) -> dict | None:
+        """Step 5b: the version already committed for ``(collab:<actor>, key)``, or None. Only the actor's own
+        principal is looked up; a version with no ``collab_ticket_id`` is left to ``merge_commit``'s own replay."""
+        prior = await ctx.store.merge_commit_for_key(f"collab:{intent.actor.id}", self._key(intent))
+        if prior is None or prior["ticket_id"] is None:
+            return None
+        return await self._replay_commit(ctx, intent, prior)
+
+    async def _replay_commit(self, ctx: IntentContext, intent: Intent, prior: dict) -> dict:
+        """Step 5b: the version this key already committed, if it was committed for this same request. Another
+        ticket's version stored nothing for this one, so this ticket is recorded with 0 bytes (as in step 3)."""
+        ticket = prior["ticket_id"]
+        own = await self._ledger(ctx.conn, intent.ticket)
+        origin = own if ticket == intent.ticket else await self._ledger(ctx.conn, ticket)
+        if (own is None or origin is None or origin["request_sha256"] != own["request_sha256"]
+                or prior["version"].get("artifact_id") != intent.artifact_id):
+            return _rejected(REASON_KEY_REUSED)
+        out = _committed(prior)
+        if ticket != intent.ticket:
+            out["_zero_bytes"] = True
+        return out
+
+    async def _store_inline(self, ctx: IntentContext, aid: str, name: str, text: str, head_files: dict) -> dict:
+        """An inline put's entry: the bytes go to RustFS and are registered as a blob scoped to this artifact."""
+        data = text.encode("utf-8")
+        key, digest = await asyncio.to_thread(self.rustfs.put, data)
+        # the scoped row is immutable per (artifact, digest): reuse its media type so the entry always matches it
+        media_type = await ctx.store.scoped_blob_media_type(aid, digest) \
+            or (head_files.get(name) or {}).get("media_type") or mimetypes.guess_type(name)[0] or "text/plain"
+        await ctx.store.register_report_blob(aid, storage_key=key, sha256=digest, size_bytes=len(data),
+                                             media_type=media_type)
+        return {"name": name, "media_type": media_type, "sha256": digest, "size_bytes": len(data), "storage_key": key}
+
+    # -- staged uploads (Task 5c) ------------------------------------------------------------------------------
+    async def _resolve_upload(self, grants: CollabGrantStore, owner_key: str, upload_id: str, *, artifact_id: str,
+                              name: str):
+        """Step 8: ``(verified row, None)`` for an upload the worker already verified for this artifact and name,
+        else ``(None, meta)`` from the upload's own ``meta.json`` under ``staging/<owner_key>/`` (the path is derived
+        from the caller, so another owner's upload is never found); ``UploadRefused`` "upload not found" otherwise."""
+        row = await grants.verified_upload(owner_key, upload_id)
+        if row is not None:
+            if row["artifact_id"] != artifact_id or row["name"] != name:
+                raise UploadRefused(REASON_UPLOAD_NOT_FOUND)
+            return row, None
+        meta = await asyncio.to_thread(read_staged_meta, self.outbox, owner_key, upload_id, self.limits)
+        if meta is None or meta.artifact_id != artifact_id or meta.name != name:
+            raise UploadRefused(REASON_UPLOAD_NOT_FOUND)
+        return None, meta
+
+    async def _assemble(self, conn, owner_key: str, upload_id: str, *, artifact_id: str, name: str, charge: bool,
+                        media_type: str | None = None) -> dict:
+        """``IntentContext.assemble``: the entry of a staged upload, verified by the worker itself.
+
+        A verified upload (``artifact_collab_uploads`` row) of this artifact and name is reused as is: no staging
+        read, no RustFS call, no charge. Otherwise every part ``0..total-1`` must be a regular single-linked file
+        (else "upload incomplete"; the ``verified`` marker is never trusted). The parts are streamed in order
+        through ``open_beneath`` into ``rustfs.put_stream`` (in a thread, spooled into ``spool_dir``), which checks
+        the declared sha256 and size; a mismatch, or a part that vanished or grew, is "upload failed verification"
+        and the whole upload dir is deleted. Then ``register_report_blob``, ``record_verified_upload(charged=charge)``,
+        the ``verified`` marker, and the parts (and stale ``.tmp-*``) are deleted, leaving ``meta.json``, ``audited``
+        and ``verified``. ``media_type`` is the preferred type (the head entry's) when this artifact has no scoped
+        blob for these bytes yet. Raises ``UploadRefused``; the caller does the quota check before calling."""
+        grants, store = CollabGrantStore(conn), ArtifactStore(conn, self.rustfs)
+        row, meta = await self._resolve_upload(grants, owner_key, upload_id, artifact_id=artifact_id, name=name)
+        if row is not None:
+            return _entry_of_upload(row)
+        parts = staging_parts(owner_key, upload_id)
+        try:
+            present = await asyncio.to_thread(list_parts, self.outbox, owner_key, upload_id, max_parts=meta.total)
+        except BridgeError:
+            present = []
+        if present != list(range(meta.total)):
+            raise UploadRefused(REASON_UPLOAD_INCOMPLETE)
+        media = await store.scoped_blob_media_type(artifact_id, meta.file_sha256) or media_type \
+            or mimetypes.guess_type(name)[0] or "application/octet-stream"
+        try:
+            stored = await asyncio.to_thread(self._stream_upload, parts, meta, media)
+        except (IntegrityError, BridgeError):
+            log.warning("collab upload %s owner=%s artifact=%s: failed verification, deleted", upload_id, owner_key,
+                        artifact_id)
+            await asyncio.to_thread(remove_tree_beneath, self.outbox, parts, max_entries=tree_entry_cap(self.limits))
+            raise UploadRefused(REASON_UPLOAD_FAILED) from None
+        await store.register_report_blob(artifact_id, storage_key=stored["key"], sha256=stored["sha256"],
+                                         size_bytes=stored["size"], media_type=media)
+        row = await grants.record_verified_upload(owner_key, upload_id, artifact_id=artifact_id, name=name,
+                                                  sha256=stored["sha256"], size_bytes=stored["size"],
+                                                  storage_key=stored["key"], media_type=media, charged=charge)
+        await asyncio.to_thread(self._settle_staging, parts, meta.total)
+        log.info("collab upload %s owner=%s artifact=%s: verified charged=%s", upload_id, owner_key, artifact_id,
+                 bool(row["charged"]))
+        return _entry_of_upload(row)
+
+    def _stream_upload(self, parts: list[str], meta, media_type: str) -> dict:
+        os.makedirs(self.spool_dir, mode=0o700, exist_ok=True)
+        reader = _PartsReader(self.outbox, parts, meta.total)
+        try:
+            return self.rustfs.put_stream(reader, expected_sha256=meta.file_sha256, expected_size=meta.size_bytes,
+                                          media_type=media_type, spool_dir=self.spool_dir)
+        finally:
+            reader.close()
+
+    def _settle_staging(self, parts: list[str], total: int) -> None:
+        """After the row is durable: the ``verified`` marker, then the parts and stale ``.tmp-*`` go (no-follow)."""
+        write_marker_beneath(self.outbox, parts, VERIFIED_MARKER)
+        for index in range(total):
+            unlink_beneath(self.outbox, parts, _part_name(index))
+        try:
+            listing = list_beneath(self.outbox, parts, max_entries=tree_entry_cap(self.limits)) or []
+        except BridgeError:
+            listing = []
+        for entry, st in listing:
+            if entry.startswith(".tmp-") and stat.S_ISREG(st.st_mode):
+                unlink_beneath(self.outbox, parts, entry)
+
+    async def _load_gate(self, store: ArtifactStore) -> None:
+        now = self.clock()
+        if self._gate_loaded is None or now - self._gate_loaded >= GATE_RELOAD or now < self._gate_loaded:
+            self.gate.load_retractions(await store.load_retractions())
+            self._gate_loaded = now
+
+    async def _after_commit(self, ctx: IntentContext, intent: Intent, out: dict, private: dict) -> None:
+        """Step 12, once the outcome is durable and published: mirror refresh and lineage, both handed off."""
+        if out.get("result") not in COMMIT_OUTCOMES:
+            return
+        self._schedule_refresh(intent.artifact_id)
+        version = private.get("_version")
+        if self.lineage is None or not isinstance(version, dict):
+            return
+        if len(self._lineage_due) >= LINEAGE_QUEUE_MAX:
+            dropped, artifact_id, _ = self._lineage_due.popleft()
+            log.warning("collab intent %s: lineage queue full, emission dropped artifact=%s", dropped, artifact_id)
+        self._lineage_due.append((intent.ticket, intent.artifact_id, version))
+        if self._lineage_task is None or self._lineage_task.done():
+            self._lineage_task = asyncio.create_task(self._run_lineage())
+
+    async def _run_lineage(self) -> None:
+        """Emit lineage for each queued version, oldest first, off the lanes (no connection, no lock)."""
+        while self._lineage_due:
+            ticket, artifact_id, version = self._lineage_due.popleft()
+            try:
+                emitted = await asyncio.to_thread(self.lineage, version)
+                if inspect.isawaitable(emitted):
+                    await emitted
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("collab intent %s: lineage emission failed artifact=%s (%s)", ticket, artifact_id,
+                            type(exc).__name__)
+
+    def _schedule_refresh(self, artifact_id: str) -> None:
+        self._refresh_due.add(artifact_id)
+        if self._refresher is None or self._refresher.done():
+            self._refresher = asyncio.create_task(self._run_refreshes())
+
+    async def _run_refreshes(self) -> None:
+        """Refresh each due artifact on a connection of its own, off the lanes; a failure is kept for the mirror
+        task's next ``sync(force=...)``."""
+        while self._refresh_due:
+            artifact_id = min(self._refresh_due)
+            self._refresh_due.discard(artifact_id)
+            try:
+                async with self._acquire() as conn:
+                    await self.mirror.refresh(ArtifactStore(conn, self.rustfs), artifact_id, gate=self.gate)
+            except asyncio.CancelledError:
+                self._mirror_force.add(artifact_id)
+                self._mirror_force.update(self._refresh_due)
+                raise
+            except Exception as exc:
+                log.warning("collab mirror refresh after commit failed artifact=%s (%s)", artifact_id,
+                            type(exc).__name__)
+                self._mirror_force.add(artifact_id)
+
+    # -- staging sweep (Task 5d) --------------------------------------------------------------------------------
+    async def sweep_staging(self, conn, *, agents: dict, grants: list[dict]) -> int:
+        """Delete stale upload dirs under ``staging/<owner>/<upload_id>/``; returns how many were removed.
+
+        An upload dir goes when (every deletion is ``remove_tree_beneath``, in a worker thread):
+
+        * it is older than ``limits.staging_ttl_seconds`` by its newest regular file (parts, ``meta.json``, markers);
+        * its ``meta.json`` is missing or invalid and the dir is older than ``STAGING_META_GRACE`` (collab-public
+          creates the dir before it links ``meta.json``);
+        * (agent owner dirs only) the agent is not ``active`` in ``agents``, or has no live ``write`` grant on the
+          upload's ``artifact_id`` in ``grants`` (``CollabGrantStore.live_grants()``);
+        * (registered-prefix owner dirs only, ``register_staging_owner``) ``keep`` returns False. A ``keep`` that
+          raises keeps the upload.
+
+        **The agent and grant rules apply only when they are proven current**: ``agents.json`` is read here and must
+        be fresh (``FEED_MAX_AGE``, the check ``_agent_for`` makes), ``agents`` a mapping and ``grants`` a list;
+        otherwise (stale or missing feed, a feed listing NO agents at all (a degraded control-plane feed), a bad
+        argument) only the TTL and grace rules run, so a forgotten or failed
+        feed refresh can never make every agent's staging look revoked. Before an owner's deletions, the pending
+        intents are read again (an upload one names is kept, whatever rule matched), a "no grant" verdict is
+        re-confirmed with ``grant_for`` on ``conn`` and an "agent not active" verdict with a fresh read of
+        ``agents.json``, so a commit that arrived, or a grant or agent restored, since the snapshot keeps its upload.
+        If ``intents/`` or any intent file in it cannot be listed or read right now (not merely malformed or
+        oversize), nothing more is deleted. An inactive agent's owner dir is removed once empty.
+
+        Symlinked or non-directory owner and upload entries are skipped, never followed. A broken entry
+        (``BridgeError``, ``OSError``) is logged by its ids and left; a listing past its cap fails closed. An owner
+        dir is read up to ``staging_scan_entries`` entries per sweep (a huge one drains over successive sweeps, like
+        ``_sweep_strays``). Logs carry owner keys, upload ids and counts only.
+        """
+        n_agents = len(agents) if isinstance(agents, Mapping) else 0
+        rules = (isinstance(agents, Mapping) and bool(agents) and isinstance(grants, list)
+                 and bool(await asyncio.to_thread(self.fresh_feed_agents)))
+        if not rules:
+            log.warning("collab staging sweep: no fresh agent feed or bad arguments; agent and grant rules skipped")
+        live = self._live_write_grants(grants) if rules else set()
+        prefixes = sorted(self._staging_owners.items(), key=lambda item: -len(item[0]))
+        try:
+            owners = await asyncio.to_thread(
+                list_beneath, self.outbox, ["staging"], max_entries=max(STAGING_MIN_OWNERS, n_agents * 4))
+        except BridgeError:
+            log.warning("collab staging sweep: staging dir has too many entries; skipped")
+            return 0
+        removed = 0
+        for owner, st in owners or []:
+            if not stat.S_ISDIR(st.st_mode):
+                continue
+            keep = next((fn for pre, fn in prefixes if owner.startswith(pre)), None)
+            try:
+                found = await asyncio.to_thread(self._scan_owner_staging, owner)
+            except (BridgeError, OSError):
+                log.warning("collab staging sweep: owner=%s unreadable, left", owner)
+                continue
+            doomed: list[tuple[str, str, StagedUpload | None]] = []
+            for upload_id, meta, age in found:
+                try:
+                    reason = await self._stage_doomed(owner, meta, age, keep, agents if rules else None, live)
+                except Exception as exc:
+                    log.warning("collab staging sweep: owner=%s upload=%s check failed (%s)", owner, upload_id,
+                                type(exc).__name__)
+                    continue
+                if reason:
+                    doomed.append((upload_id, reason, meta))
+            inactive = rules and keep is None and not self._agent_active(agents, owner)
+            if doomed:
+                try:
+                    refs = await asyncio.to_thread(self._pending_upload_ids, n_agents)
+                except BridgeError:
+                    log.warning("collab staging sweep: intents unreadable or over cap; nothing more deleted")
+                    return removed
+                for upload_id, reason, meta in doomed:
+                    if upload_id in refs or not await self._still_doomed(conn, owner, reason, meta):
+                        continue
+                    if await asyncio.to_thread(self._remove_upload, owner, upload_id):
+                        removed += 1
+            if inactive and await asyncio.to_thread(self._agent_inactive_now, owner):
+                await asyncio.to_thread(self._remove_if_empty, owner)
+        if removed:
+            log.info("collab staging sweep: removed=%d", removed)
+        return removed
+
+    @staticmethod
+    def _agent_active(agents, owner: str) -> bool:
+        row = agents.get(owner) if isinstance(agents, Mapping) else None
+        return isinstance(row, Mapping) and row.get("status") == "active"
+
+    def fresh_feed_agents(self) -> dict | None:
+        """The ``agents`` of ``agents.json`` if it is fresh (the ``_agent_for`` check), else None; blocking."""
+        feed = read_json_beneath(self.outbox, [AGENTS_FEED], max_bytes=AGENTS_FEED_MAX_BYTES)
+        generated = feed.get("generated_at") if isinstance(feed, dict) else None
+        agents = feed.get("agents") if isinstance(feed, dict) else None
+        if not _finite(generated) or self.clock() - generated > FEED_MAX_AGE or not isinstance(agents, dict):
+            return None
+        return agents
+
+    def _agent_inactive_now(self, owner: str) -> bool:
+        """True only when a fresh ``agents.json`` read now shows the agent not active; blocking."""
+        agents = self.fresh_feed_agents()
+        return agents is not None and not self._agent_active(agents, owner)
+
+    async def _still_doomed(self, conn, owner: str, reason: str, meta: StagedUpload | None) -> bool:
+        """Re-confirm a snapshot-based verdict just before deleting; False keeps the upload."""
+        if reason == "agent":
+            return await asyncio.to_thread(self._agent_inactive_now, owner)
+        if reason == "grant":
+            if conn is None or meta is None:
+                return False
+            grant = await CollabGrantStore(conn).grant_for(meta.artifact_id, owner)
+            expires = _epoch(grant["expires_at"]) if grant is not None else None
+            live = (grant is not None and grant["permission"] == "write" and expires is not None
+                    and expires > self.clock())
+            return not live
+        return True
+
+    def _live_write_grants(self, grants: list) -> set[tuple[str, str]]:
+        now, out = self.clock(), set()
+        for g in grants:
+            if not isinstance(g, dict) or g.get("permission") != "write":
+                continue
+            if "expires_at" in g:
+                expires = _epoch(g["expires_at"])
+                if expires is None or expires <= now:
+                    continue
+            out.add((g.get("agent_id"), g.get("artifact_id")))
+        return out
+
+    def _scan_owner_staging(self, owner: str) -> list[tuple[str, StagedUpload | None, float]]:
+        """``(upload_id, meta or None, age)`` for the real upload dirs of ``staging/<owner>/`` (at most
+        ``staging_scan_entries`` entries are read); blocking. Age is by the newest regular file, streamed, never
+        sorted. A symlink or non-directory is skipped; one broken entry is logged and left."""
+        dfd = _walk_dirs(self.outbox, ["staging", owner])
+        if dfd is None:
+            return []
+        names: list[str] = []
+        try:
+            with os.scandir(dfd) as it:
+                for seen, entry in enumerate(it):
+                    if seen >= self.staging_scan_entries:
+                        break
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            names.append(entry.name)
+                    except OSError:
+                        continue
+        finally:
+            os.close(dfd)
+        now, out = self.clock(), []
+        for upload_id in names:
+            try:
+                newest = self._newest_mtime(owner, upload_id)
+                if newest is None:
+                    continue
+                meta = read_staged_meta(self.outbox, owner, upload_id, self.limits)
+            except (BridgeError, OSError):
+                log.warning("collab staging sweep: owner=%s upload=%s unreadable, left", owner, upload_id)
+                continue
+            out.append((upload_id, meta, now - newest))
+        return out
+
+    def _newest_mtime(self, owner: str, upload_id: str) -> float | None:
+        """The newest mtime among the regular files of the upload dir (its own mtime if it has none), streamed;
+        None if the dir is gone or unsafe. ``BridgeError`` past ``tree_entry_cap`` entries."""
+        ufd = _walk_dirs(self.outbox, ["staging", owner, upload_id])
+        if ufd is None:
+            return None
+        cap = tree_entry_cap(self.limits)
+        try:
+            newest = os.fstat(ufd).st_mtime
+            seen_file = False
+            with os.scandir(ufd) as it:
+                for seen, entry in enumerate(it):
+                    if seen >= cap:
+                        raise BridgeError("too many entries")
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(st.st_mode):
+                        newest = st.st_mtime if not seen_file else max(newest, st.st_mtime)
+                        seen_file = True
+            return newest
+        finally:
+            os.close(ufd)
+
+    async def _stage_doomed(self, owner: str, meta: StagedUpload | None, age: float, keep, agents, live) -> str | None:
+        """Why this upload should go (``ttl``, ``agent``, ``grace``, ``grant``, ``keep``), or None. ``agents`` is
+        None when the agent and grant rules are off."""
+        if age > self.limits.staging_ttl_seconds:
+            return "ttl"
+        if keep is None and agents is not None and not self._agent_active(agents, owner):
+            return "agent"
+        if meta is None:
+            return "grace" if age > STAGING_META_GRACE else None
+        if keep is not None:
+            return None if await keep(owner, meta) else "keep"
+        if agents is not None and (owner, meta.artifact_id) not in live:
+            return "grant"
+        return None
+
+    def _pending_upload_ids(self, n_agents: int) -> set[str]:
+        """The ``upload_id`` of every put in every intent file still in ``intents/`` (any actor, any kind); blocking.
+        ``BridgeError`` (so the caller deletes nothing) if the dir is over its cap, exists but cannot be listed, or
+        an intent file within the size limit cannot be read right now. Malformed and oversize files are skipped."""
+        cap = max(INTENTS_MIN_ENTRIES, n_agents * self.limits.max_pending_intents_per_agent * 2)
+        listing = list_beneath(self.outbox, [INTENTS_DIR], max_entries=cap)
+        if listing is None:
+            if os.path.lexists(self.outbox / INTENTS_DIR):
+                raise BridgeError("intents dir cannot be listed")
+            return set()
+        out: set[str] = set()
+        for name, st in listing:
+            if (not stat.S_ISREG(st.st_mode) or not _INTENT_FILE.match(name) or st.st_size > INTENT_MAX_BYTES
+                    or st.st_nlink != 1):                   # the applier cannot read these either
+                continue
+            data = read_bytes_beneath(self.outbox, [INTENTS_DIR, name], max_bytes=INTENT_MAX_BYTES)
+            if data is None:
+                try:
+                    os.stat(self.outbox / INTENTS_DIR / name, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue                                # withdrawn since the listing
+                except OSError:
+                    pass
+                raise BridgeError("intent cannot be read")
+            try:
+                raw = json.loads(data)
+            except ValueError:
+                continue
+            payload = raw.get("payload") if isinstance(raw, dict) else None
+            changes = payload.get("changes") if isinstance(payload, dict) else None
+            for change in changes if isinstance(changes, list) else ():
+                upload_id = change.get("upload_id") if isinstance(change, dict) else None
+                if isinstance(upload_id, str):
+                    out.add(upload_id)
+        return out
+
+    def _remove_upload(self, owner: str, upload_id: str) -> bool:
+        try:
+            ok = remove_tree_beneath(self.outbox, ["staging", owner, upload_id],
+                                     max_entries=tree_entry_cap(self.limits))
+        except (BridgeError, OSError):
+            ok = False
+        if not ok:
+            log.warning("collab staging sweep: owner=%s upload=%s could not be removed", owner, upload_id)
+        return ok
+
+    def _remove_if_empty(self, owner: str) -> None:
+        """Remove ``staging/<owner>`` if it holds nothing (``max_entries=0`` fails on any entry)."""
+        try:
+            remove_tree_beneath(self.outbox, ["staging", owner], max_entries=0)
+        except (BridgeError, OSError):
+            pass
+
+    # -- results sweep ----------------------------------------------------------------------------------------
+    async def sweep_results(self, max_age: float = 3600) -> int:
+        """Delete result files older than ``max_age`` seconds (by mtime), at most ``RESULTS_SWEEP_BATCH`` per call;
+        returns how many. The results dir is the worker's own tree, so it streams the directory with no entry cap
+        (nothing is held in memory) instead of failing closed: a backlog drains over successive calls."""
+        def go() -> int:
+            try:
+                dfd = os.open(Path(self.mirror.root) / RESULTS_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError:
+                return 0
+            cutoff, removed = self.clock() - max_age, 0
+            try:
+                with os.scandir(dfd) as entries:
+                    for entry in entries:
+                        if removed >= RESULTS_SWEEP_BATCH:
+                            break
+                        if not _INTENT_FILE.match(entry.name):
+                            continue
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                            if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                                os.unlink(entry.name, dir_fd=dfd)
+                                removed += 1
+                        except OSError:
+                            continue
+            finally:
+                os.close(dfd)
+            return removed
+        return await asyncio.to_thread(go)
+
+
+def _check_outcome(out) -> None:
+    """A handler's return value, or ``TypeError``: checked before ``record_outcome`` so ledger and result agree."""
+    if not isinstance(out, dict) or not isinstance(out.get("result"), str) or not _OUTCOME.match(out["result"]) \
+            or out["result"] == "received":
+        raise TypeError("invalid outcome")
+    for key in _STR_KEYS:
+        if out.get(key) is not None and not isinstance(out[key], str):
+            raise TypeError("invalid outcome field")
+    number = out.get("version_number")
+    if number is not None and (isinstance(number, bool) or not isinstance(number, int)):
+        raise TypeError("invalid outcome field")
+    names = out.get("merged_names")
+    if names is not None and (not isinstance(names, list) or not all(isinstance(n, str) for n in names)):
+        raise TypeError("invalid outcome field")
+    conflicts = out.get("conflicts")
+    if conflicts is not None and (not isinstance(conflicts, list) or not all(isinstance(c, dict) for c in conflicts)):
+        raise TypeError("invalid outcome field")
+    json.dumps(out, ensure_ascii=False, allow_nan=False)   # TypeError/ValueError: not writable as a result
+
+
+def _part_name(index: int) -> str:
+    return f"{index:07d}"
+
+
+class _PartsReader:
+    """A file-like reader over an upload's parts in index order, each opened only when reached with ``open_beneath``
+    (no-follow, single-linked, at most ``CHUNK_BYTES``). A part that is missing or unsafe at that point raises
+    ``BridgeError``, as one that grows past its cap does; never an empty read before the last part is done."""
+
+    def __init__(self, root: Path, parts: list[str], total: int):
+        self._root, self._parts, self._total = root, parts, total
+        self._index, self._current = 0, None
+
+    def read(self, size: int = -1) -> bytes:
+        want = size if size is not None and size > 0 else CHUNK_BYTES
+        while self._index < self._total:
+            if self._current is None:
+                self._current = open_beneath(self._root, [*self._parts, _part_name(self._index)],
+                                             max_bytes=CHUNK_BYTES)
+                if self._current is None:
+                    raise BridgeError("upload part missing or unsafe")
+            data = self._current.read(want)
+            if data:
+                return data
+            self._current.close()
+            self._current, self._index = None, self._index + 1
+        return b""
+
+    def close(self) -> None:
+        if self._current is not None:
+            self._current.close()
+            self._current = None
+
+
+def _entry_of_upload(row: dict) -> dict:
+    return {"name": row["name"], "media_type": row["media_type"], "sha256": row["sha256"],
+            "size_bytes": int(row["size_bytes"]), "storage_key": row["storage_key"]}
+
+
+def _rejected(reason: str) -> dict:
+    return {"result": "rejected", "reason": reason}
+
+
+def _files_of(version: dict) -> dict[str, dict]:
+    manifest = version.get("output_manifest")
+    return {e["name"]: e for e in manifest if isinstance(e, dict) and isinstance(e.get("name"), str)} \
+        if isinstance(manifest, list) else {}
+
+
+def _names_fit(changes, base_files: dict, head_files: dict) -> bool:
+    """The contributor's tree (base with the changes applied) and the puts over the head's remaining files are each
+    free of duplicates and file/directory clashes. Base and head are never checked against each other: the head may
+    have replaced a base file ``a`` with ``a/b``, and the merge decides what that means."""
+    deleted = {c.name for c in changes if c.op == "delete"}
+    puts = {c.name for c in changes if c.op == "put"}
+    try:
+        for side in (base_files, head_files):
+            check_names(sorted((set(side) - deleted - puts) | puts))
+    except ShareBundleError:
+        return False
+    return True
+
+
+def _split(out) -> tuple[dict, dict]:
+    """A handler's return value as ``(outcome, private)`` (keys starting with ``_``); ``TypeError`` if invalid."""
+    private = {k: out[k] for k in out if isinstance(k, str) and k.startswith("_")} if isinstance(out, dict) else {}
+    if isinstance(out, dict):
+        out = {k: v for k, v in out.items() if k not in private}
+    _check_outcome(out)
+    return out, private
+
+
+def _committed(out: dict) -> dict:
+    """A ``merge_commit`` (or ``merge_commit_for_key``) result as the commit kind's outcome; the version itself goes
+    to the after-hook as private ``_version``."""
+    version = out["version"]
+    result = {"result": out["result"], "version_id": version["version_id"],
+              "merged_names": [n for n in out.get("merged_names") or [] if isinstance(n, str)],
+              "_version": dict(version)}
+    number = version.get("version_number")
+    if isinstance(number, int) and not isinstance(number, bool):
+        result["version_number"] = number
+    return result
+
+
+def _conflicts(conflicts, cap: int) -> list[dict]:
+    """``[{name, kind, merged_text, truncated}]``; all merged text of one result fits ``cap`` bytes as written (JSON,
+    so escaping counts), else that file's text is left out and marked ``truncated``."""
+    out, budget = [], cap
+    for c in conflicts:
+        text = c.merged_text if c.kind == "modify_modify_text" and isinstance(c.merged_text, str) else None
+        item = {"name": c.name, "kind": c.kind, "merged_text": None, "truncated": False}
+        if text is not None:
+            size = len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
+            if size <= budget:
+                item["merged_text"], budget = text, budget - size
+            else:
+                item["truncated"] = True
+        out.append(item)
+    return out
+
+
+def _base_of(intent: Intent) -> str | None:
+    base = getattr(intent.payload, "base_version_id", None)
+    return base if isinstance(base, str) else None
+
+
+def _inline_bytes(intent: Intent) -> int:
+    if intent.kind != "commit":
+        return 0
+    value = getattr(intent.payload, "inline_bytes", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+__all__ = ["CollabIntentApplier", "IntentContext", "UploadRefused", "INTENT_MAX_BYTES", "RESULTS_DIR", "INTENTS_DIR", "AGENTS_FEED"]

@@ -1,0 +1,149 @@
+# HANDOFF — Herdr Unified Hindsight Memory (for Pi)
+
+Written 2026-11-03 when the previous session ran out of usage. Read STATUS.md next to this file for the full history.
+Never print or commit secrets (tenant keys, DB password, fleet-config values). The fleet config on bender holds them.
+
+## Goal
+One shared Hindsight memory for all Herdr harnesses (Pi, Claude Code, Codex, OpenCode) and hosts. Release is BLOCKED for
+fleet-wide use until acceptance runs with REAL harness sessions on two hosts. Never claim completion on mocked tests alone.
+
+## State right now
+- Hindsight (API + pgvector DB) runs on bender as compose services (profile `memory`) in project `herdr-control-plane`,
+  loopback only on 127.0.0.1:8897. HTTPS route: https://memory.local.metabolomics.us (public cert, works anywhere) and
+  https://memory.dev.lan (private CA). Fabric agent excludes 8897 from the tailnet mirror.
+- Merged: herdr-memory #1 #2 (client contract v1; main = b3c5074), herdr-handoff #1, pi-engineering #556,
+  herdr-engineering #560 #562 #563 #564 #565 #566.
+- bender REDEPLOY DONE and VERIFIED (2026-11-03 18:06Z): control plane + memory at herdr-engineering 492445c9
+  (`deploy.sh --with-memory`, exit 0, log ~/.local/state/herdr-engineering/deploy-memory-20261103b.log). First attempt failed in the
+  memory image step (`uv: command not found` on the non-interactive ssh PATH) and auto-rolled back cleanly; the retry with
+  `export PATH=$HOME/.local/bin:$PATH` succeeded. ALWAYS export that PATH before `deploy.sh --with-memory` over ssh.
+  Needs the herdr-memory clone at ~/.local/share/herdr-engineering/herdr-memory (now present, gh-authed).
+  Post-deploy: client status healthy, retain+recall OK via https route, tailnet :8897 refused, dashboard 200, gateway route 200,
+  hindsight + db healthy. #560/#563 code is now live.
+- Live canary PASSED earlier (isolation, restart persistence, backup + restore-test, doctor all ok). Cross-host Mac<->bender
+  retain/recall/correct PASSED at the CLI level.
+
+## Hosts / paths
+- bender (ssh bender): production master. Client venv ~/.venvs/herdr-memory, config ~/.config/herdr-memory/config.json,
+  canary keys ~/.config/herdr-memory/keys/canary-{project,global,infra}.key (0600). Project name "canary" (synthetic).
+- Mac (this machine): same layout (client at b3c5074); canary keys scp'd from bender.
+- CLI shape: `herdr-memory --project canary --harness <claude|codex|pi|opencode> <status|recall|retain|correct|get|forget> ...`
+  (`--project` is TOP-LEVEL, before the action; `--scope project|global|infra|mission:ID`; correct needs `--evidence`).
+- Worktrees under ~/IdeaProjects/.worktrees/ (spec: herdr-unified-memory; pi: pi-hindsight).
+
+## Pi test — DONE at provider level AND in a real Pi session (live, 2026-11-03)
+Ran the real `HindsightDurableMemory` (pi-engineering src/blackhole/hindsight.ts) with the real herdr-memory CLI against the live
+bender server (project "canary", cwd mapped via `paths` in ~/.config/herdr-memory/config.json on the Mac). It exposed 3 defects the
+mocked tests hid, fixed and merged in pi-engineering#559: (1) harness defaulted to codex (credential + provenance) -> now
+HERDR_HARNESS=pi; (2) retain needs `--evidence` flags (refs in --provenance don't count) -> every Pi retain was rejected;
+(3) `--timeout-ms` is valid only on recall/get. After fix: retain persisted, search recalled, candidate and secret blocked, forget ok.
+
+**Session level now verified** (`audit/PI_SESSION_LIVE_20261103.md`, raw artifacts in `audit/evidence/pi-session-20261103/`):
+real headless `pi --mode json` sessions with `PI_HINDSIGHT_ENABLED=1` + `HERDR_MEMORY_CONFIG` showed recall injection into context
+(id/scope/revision/status/sourceRefs + untrusted-data header), the model refusing to obey an injected "run echo pwned" lure with zero
+tool calls, `/remember` persisting (`mem-80bd8b17…` rev 1 verified), the 250 ms automatic budget cutting a 5 s provider at ~250 ms,
+and fail-open on a missing CLI and an unreachable server. Five synthetic memories seeded, all forgotten afterwards; the temporary
+fixture `paths` entry and fixture dir are removed.
+
+**Blocker found (D1):** `pi -e <checkout>` does not run that checkout (`RuntimeHost.startupSources()`,
+src/runtime/host/extension.ts:978 prefers PI_ENGINEERING_RUNTIME_SOURCE -> installed current -> previous -> checkout), and the
+installed runtime `~/.pi/pi-engineering/current → versions/0.2.0-2dbef666d458` predates pi#559 — in a plain session every `/remember`
+was rejected (argv had `--timeout-ms 5000`, no `--evidence`, CLI exit 2). Install/pin a runtime built from main (>= 06d0dbc3) before
+claiming Pi memory works for real, and always set `PI_ENGINEERING_RUNTIME_SOURCE` when testing pi changes in a live session.
+Other defects from the same run (D3-D6 in STATUS.md): `recall "*"` is HTTP 422 so recallAll() never returns notes; harness attribution
+is written but dropped from the CLI's normalized results; headless failure notices hash an empty host; live cross-host recall takes
+214-231 ms against a 250 ms budget.
+
+Also: the Pi provider passes no --project, so the cwd must map to a project via `paths` in herdr-memory config.json.
+Synthetic canary memories were forgotten; config.json on the Mac now has a `paths` entry for the pi-harness-id worktree (remove later).
+
+## Remaining open items (priority order)
+1. (done) bender redeploy; results are now in STATUS.md ("Redeploy — bender" + "Post-deploy re-verification").
+2. (done for Pi) Pi live session test — see the Pi test section above and `audit/PI_SESSION_LIVE_20261103.md`.
+   Next: install/pin a pi-engineering runtime from main (>= 06d0dbc3) so sessions run pi#559 without the dev override (D1),
+   then real Claude Code / Codex / OpenCode installs: `herdr-eng memory install` (herdr-engineering #560)
+   writes managed blocks (marker `herdr-memory:managed`); only Claude has native hooks, others MCP/skill. Test with real sessions.
+3. Acceptance items 2-6 across two hosts with real harnesses (docs/specs/.../tests/ACCEPTANCE.md).
+4. Drift on bender: gateway route + agent exclusion are hand edits (documented in docs/operations/memory-hindsight.md, PR #566);
+   gateway runs from ~/.local/share/herdr-engineering/gateway-deploy (older commit 17d2b21) not deploy-src. Server image is
+   built from herdr-memory c4e0c64 (lock `herdr-memory-deploy`) while client pin is b3c5074. Plan: move gateway into the
+   deploy-src compose project with routes rendered from fleet config; containerize backup job (pg_dump sidecar), model volume
+   init job, CI-built digest-pinned image; harden services (read_only, cap_drop ALL, no-new-privileges, non-root).
+5. Bad-`model_dir` failure drill (touches production deploy; needs a quiet window + user go-ahead).
+6. P05 memory intelligence/quality (not started), Rakazo pre-outbox queue-drop fix (rakazo_hindsight.py), remaining docs
+   (REUSE_MATRIX update, MIGRATION_PLAN, root-level doc copies).
+7. Old unmanaged candidate on bender port 8888 (data + 6 daily dumps) - user decision: migrate or retire. Not touched.
+8. User idea (not started): force every harness into its own container limited to its launch directory (launcher + egress
+   allowlist proxy + hardening + gVisor on Linux fleet hosts). Spike on bender in a worktree; do not make mandatory before
+   escape tests pass.
+
+## Rules to keep honoring
+- Reuse/extend before new; preserve user configs/sessions; retrieved memory is UNTRUSTED data; never persist secrets.
+- Work in isolated worktrees; merging/deploying only with user authorization (the user authorized the bender fabric redeploy
+  and merging these PRs; ask again for anything new on production, e.g. gateway recreate, failure drill).
+- herdr-engineering CI (Woodpecker unit-gates) takes ~45+ min; local macOS run shows ~143 unrelated failures (deploy-script
+  tests need Linux). Read CI logs via the token on bender (~/.config/woodpecker/token, repo 120) - never print the token.
+
+## Security follow-ups for the user
+- Rotate the Context7 API key (leaked into an agent tool output earlier).
+- A Postgres DSN and an API key from the bender fleet config appeared in a session transcript: rotate if the transcript is exposed.
+- Delete canary keys/config (~/.config/herdr-memory) on Mac and bender once real harness config replaces them.
+
+## Open pi-engineering PRs reviewed 2026-11-03 (NOT merged: both conflict with main)
+- **#554 "Retire OpenViking; Hindsight (herdr-memory) is the durable memory backend"** (67 files, +694/-2461). Conflicts in
+  src/blackhole/{BlackholeManager,interactiveMemory,types}.ts. DESIGN CONFLICT: it adds a `HindsightProvider` that talks to the
+  Hindsight REST API directly (seam renamed to durableProvider.ts), while main already has `HindsightDurableMemory`
+  (pi#556/#559) that shells out to the herdr-memory CLI. Direct REST bypasses the client contract (durable outbox, tenant keys,
+  tombstones, evidence gate, untrusted-data wrapping, corrections ledger) - contradicts the spec's reuse rule. Recommended
+  resolution: rebase #554 onto main, KEEP its OpenViking removal (services/openviking, deploy scripts, docs, env vars), DROP its
+  REST provider and make `HindsightDurableMemory` the default provider (still honoring fail-closed when herdr-memory is missing),
+  then run the real-CLI e2e from this handoff and `npm ci && npm run test:unit`. Do this only after the real Pi session test passes.
+- **#558 "make priorart a required external MCP tool"** (unrelated to memory). Conflicts in .pi/engineering.yaml,
+  src/artifacts/ArtifactStore.ts, src/orchestration/observability/types.ts. The ArtifactStore conflicts are in integrity/locking
+  code (assertCategoryPinned vs assertUnchangedContent): needs its author or a careful review, not a blind resolution.
+- herdr-engineering #522 (ai-sync fabric status) is also open and unrelated.
+
+### #554 reconciliation - IN PROGRESS (not merged, tree does not typecheck)
+WIP branch `rebase/retire-openviking` in berlinguyinca/pi-engineering (worktree ~/IdeaProjects/.worktrees/pi-retire = #554's branch +
+merge of origin/main, with `npm ci` done). Done: the 3 conflicts (types.ts, BlackholeManager.ts, interactiveMemory.ts) resolved
+toward ONE backend = `HindsightDurableMemory` (CLI), durable kinds memory|shared-file|hindsight(cli,scopes,timeoutMs), OpenViking gone,
+unconfigured = off (opt-in PI_HINDSIGHT_ENABLED kept; do not enable by default without the user).
+Remaining (`npx tsc --noEmit -p .` shows 9 errors, plus test fallout):
+- src/blackhole/hindsight.ts and test/unit/hindsight-memory.test.ts import './OpenViking.ts' -> now './durableProvider.ts'.
+- src/blackhole/config.ts: remove REST validation (`baseUrl`, `project`) for kind "hindsight"; validate cli/scopes/timeoutMs instead.
+- DELETE the REST layer: `HindsightProvider`, `HindsightRequestError`, `mapRecallItem` in durable.ts; src/blackhole/envConfig.ts
+  (+ test/unit/blackhole-envconfig.test.ts); test/support/hindsightServer.ts (fake REST server).
+- `hindsightBlackholeOption` (extensions/index.ts:387) -> build `{enabled:true, durable:{kind:"hindsight", cli, scopes, timeoutMs}}` from
+  hindsight.ts `resolveHindsightFromEnv`.
+- src/blackhole/connectionSetup.ts is an interactive host-URL + token wizard for the REST design; credentials now live in
+  herdr-memory's config. Replace with a check that `herdr-memory status` works (and a pointer to `herdr-eng memory install`);
+  rewrite test/unit/memory-setup.test.ts, interactive-memory.test.ts, everyday-memory integration test, telemetry-sink/blackhole tests,
+  scripts/fresh-review-blackhole-sharing.ts, test/fixtures/public-exports.txt, docs. interactiveMemory.ts:206 has a TS error:
+  type the failure code union explicitly (auth/forbidden no longer occur).
+- Then: `npm run test:unit`, real-CLI e2e (see Pi test section), update #554 (push to its branch) and merge.
+
+### 2026-11-03 (evening) — adapters live on both hosts, Pi runtime pinned
+Done: `herdr-eng memory install` on Mac (pi/claude/codex/opencode) and bender (pi/claude/codex,
+opencode absent), idempotent and non-clobbering; Pi runtime pinned to
+`~/.pi/pi-engineering/versions/0.2.0-06d0dbc3784f` via `~/.pi/agent/settings.json` (backup
+`settings.json.bak-d1-20261103T191741Z`, previous value in `_d1_previous_packages`) → D1 closed, live
+`/remember` persists; real Codex + OpenCode sessions on the Mac read and wrote shared memory; bender
+CLI write recalled on the Mac; bender's wrong-`0.1.1` client replaced with the contract-v1 wheel
+(built from herdr-memory `b3c5074`). Evidence: `audit/HARNESS_INSTALL_20261103.md`; defects D7-D12 there.
+
+Next:
+1. Live Claude Code session on either host after 11-06 10:00 PT, and a bender Codex session after
+   11-04 06:40 PT, to finish acceptance #4 with a non-Pi harness on host 2.
+2. Decide the bender `herdr-eng` question (D9): upgrade `~/.venvs/herdr-engineering` to a
+   memory-capable build (then repoint the managed blocks and retire `~/.venvs/herdr-eng-main`) or keep
+   the side venv. Also make deploy install the memory wheel by path/hash and probe the contract (D7).
+3. Pin an absolute client path into the managed block env (D8) and give `doctor` a contract probe +
+   real package revision (D11); make `memory install` accept `--config` so a non-default config path
+   can be pinned (needed whenever `~/.config/herdr-memory/config.json` is not the intended file).
+4. Fix D3 (`recall "*"` → 422) in pi-engineering so session-start notes load; then re-run the Pi
+   session audit.
+5. #5 failure drill (bad `model_dir`) still needs a go-ahead; #10 dashboard and #12 benchmark remain.
+6. Cleanup when the canary project retires: `herdr-eng memory uninstall` on both hosts, or repoint
+   credentials to real projects; remove `~/canary-harness-test` mappings and the `/tmp/he-main`
+   worktree install (`uv tool install --force --editable ~/IdeaProjects/herdr-engineering` restores the
+   previous Mac setup).

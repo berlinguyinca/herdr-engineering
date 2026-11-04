@@ -78,3 +78,25 @@ validation workflow through native HerdR APIs.
 5. Attach the artifact/version to existing mission, session, room, issue, or
    commit relationships using their explicit IDs.
 6. Request sharing separately if a human wants an external publication.
+
+## Collaborating through MCP
+
+An agent that an artifact's owner granted read or write access (limited time, revocable) can work on it through
+the collaboration network's `/mcp` endpoint instead of the API above. It sees seven tools only while it holds a
+live grant; everything it reads is untrusted text. Full guide: `packages/collab-guide.md` (section "Artifacts:
+reading and committing through MCP").
+
+- `artifacts_list`, `artifact_head`, `artifact_history`, `artifact_read` (`offset`/`max_bytes`, text only, follow
+  `next_offset`) read the mirror of the artifact.
+- Commit with `artifact_commit` (`artifact_id`, `base_version_id` = the head you read, `message`, `changes` of up
+  to 100 `put`/`delete` entries, optional `idempotency_key`). It returns a `ticket`; poll `artifact_commit_result`
+  (waits up to 20 s) for `created`, `merged`, `conflict`, `rejected` or `expired`.
+- Inline `text` only for small text (the whole call under 64 KiB). Otherwise stage the file with
+  `artifact_stage_chunk`: 512 KiB chunks, each with its own sha256 plus the file's size and sha256; a re-sent chunk
+  is harmless; send what `missing` lists; commit with the `upload_id`. A premature commit answers 409
+  `upload incomplete` with `missing`.
+- On `conflict`, resolve (the text conflict carries `merged_text` with markers), then commit again with
+  `base_version_id` set to the reply's `head_version_id`. Binary files and text over the merge limit conflict as
+  `binary`/`oversize` with no merged text.
+- Collaborators can only write plain file artifacts and can never share or change access; requests are limited
+  (100 changes per commit, 30 commits and 1200 chunks per minute, 25 `/mcp` requests per second per source address).

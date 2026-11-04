@@ -199,6 +199,160 @@ Residual risks:
   extra keys.
 - **R-DP3 (Info).** Flags are read at start, so each change is a restart, not a hot toggle.
 
+### 3.8 Team rooms, guest levels, Suggest queue (`control_plane.collab.team_rooms.enabled`, slice 1)
+Mechanism (`collab_team_rooms.py`, wired in `collab.py`): the owner attaches a team to a room as separate `team_attached` /
+`team_detached` events; the team's agents become ordinary room grants marked with the team id (fixed role actions, no expiry);
+a per-room guest level (`read_only` | `suggest` | `direct`, default `suggest`); a guest files a request that waits as `pending`;
+only the owner approves, which creates a NEW task (`origin: suggestion`) whose command is the owner's and whose request rides as
+quoted data tainted `external-source:guest`. Hot YAML flag, off by default, fails closed on an unreadable config. Tested with a
+real Postgres, real collab service and real HTTP (`tests/control_plane/test_team_rooms.py`); not deployed, not run live.
+
+Residual risks:
+- **R-TR1 (Medium).** `direct` is stored and validated but behaves as `suggest`. It fails closed; the risk is a reader assuming it
+  is enforced as a limit. Slices 2 and 3 must define it before it does anything.
+- **R-TR2 (Medium).** The quoted request still reaches a language model in the target agent's `tasks_inbox`. Taint labels and the
+  fixed "untrusted data" note reduce, but do not remove, prompt injection by an approved guest request; approval authorises work,
+  it does not sanitise text. The owner can trim it (`edited_text`) before approving.
+- **R-TR3 (Low-Medium).** Before this flag, a guest could read the task list and task events (design contradiction 8 said
+  otherwise and was wrong). They are hidden only while `team_rooms` is on; with it off the earlier visibility returns.
+- **R-TR4 (Low-Medium).** In collab-only mode (no Work Graph) a team id is checked for shape only (`verified: false`); the owner
+  can attach a well-formed id of a team that does not exist. The attached agents are still the owner's own.
+- **R-TR5 (Low).** Team grants have no expiry; they end only with `detach`. An older image ignores `team_detached` and keeps the
+  grants, so detach before rolling the image back.
+- **R-TR6 (Low).** Per-guest and per-room caps and rate limits are counted from the log in one process; a restart replays them,
+  but multiple collab processes would each count alone.
+- **R-TR7 (Info).** No web UI, no fleet-wide operator inbox: pending requests show only through the API, CLI and the room attention
+  category `suggestion_decide`.
+
+#### Slice 2: roles, people as role holders, leases (`control_plane.collab.team_roles.enabled`, also needs `team_rooms`)
+Mechanism (`collab_team_roles.py`): owner-only `team_role_assigned` / `team_role_cleared` bind people to roles per (room, team);
+`create_task` routes by role (fewest open tasks, then principal key; the holder is written into the event; no eligible holder is 409
+and writes nothing); a task for a person has no agent target and is read only by the assignee, the owner and its creator; a
+server-side sweep applies reminders and the reassign / escalate / wait policy from state replayed out of the log; review independence
+is checked over `agent:` / `user:` keys. Hot YAML flag, off by default, fails closed. Tested with a real Postgres, real collab
+service and real HTTP (`test_team_roles.py`, `test_team_roles_cli.py`), with mutation checks; not deployed, not run live.
+
+Residual risks:
+- **R-TR8 (Medium).** The assignee, possibly an external person, reads the command text of their task. Its words come from the owner
+  or a contributor, never from a guest request (approval still targets agents only), but a contributor can put sensitive text in a
+  task for an external person. Same trust as telling that person in chat; the owner sees every task.
+- **R-TR9 (Low-Medium).** The sweep runs in the one process that holds the collab log. While that process is down nothing is
+  reminded or escalated; the first sweep after a restart escalates what expired (it does not send reminders for a lapsed lease).
+  Latency is up to `sweep_interval_seconds`. There is no second process to fail over to.
+- **R-TR10 (Low-Medium).** Reviewer independence compares principal keys. A person and the agents they own are different principals
+  (the same as two agents of one owner already were), so one operator can review their own agents' work as a person. Close it with
+  `reviewer_groups` if you want it closed; a sole developer has no one else.
+- **R-TR11 (Low).** The Work Graph shows that a task for a person exists in the room (a `task` node with no words, no assignee, no
+  `assigned_to` edge); room readers of the graph learn the count and status, not the content.
+- **R-TR12 (Low).** `reviewer` and `issue_writer` agents cannot be routed tasks (no `execute`); the request fails closed instead of
+  widening them. A person can hold those roles.
+- **R-TR13 (Low).** A declined person task is terminal and not re-routed; an escalated one waits for the owner. Nothing is dropped
+  silently, but nothing re-issues it either.
+- **R-TR14 (Medium).** An image without this code cannot be rolled back to while the log holds a task for a person newer than about
+  8 days (any status): the old code replays it with no agent target, shows its text to every reader of the task list, and
+  `room_state` / `room_flow` raise `TypeError` for owners and contributors of the room (reproduced by replaying such a log into
+  `origin/main`). Roll back the flag, not the image. With the flag off, tasks for people already in the log stay, are not chased (no
+  reminder or escalation) and stay hidden from everyone except assignee, owner and creator.
+- **R-TR15 (Info).** No web UI; an external person reads `my-tasks` (API / CLI). `task_assigned` / `task_overdue` reach only members the
+  attention inbox serves, and only with `insights.enabled`.
+
+#### Slice 3: coordinators with limits (`control_plane.collab.coordinators.enabled`, `.external.enabled`; also needs `team_rooms` and `team_roles`)
+Mechanism (`collab_coordinators.py`): owner-only `team_coordinator_set` / `team_coordinator_cleared` / `team_external_coordination_set`
+events; an agent coordinator gets a team-marked grant that cannot be hand-edited; every coordinator-made task goes through
+`_tr2_create` with a per-hour and open cap counted from the replayed log, role-only targeting inside the team, a required
+operator-made accepted root, and a chain-based loop check; revocation is derived from state (`task_requeued` raises `attempt`, so
+the stale run gets 409); independent review also excludes the coordinator chain. Hot YAML flags, off by default, fail closed. Tested
+with real HTTP, a real collab service, real Postgres for the projection, a real assistant service for the approvals refusal and the
+Cognito authenticator for group removal (`test_team_coordinators.py`, `test_team_coordinators_cli.py`); mutation-checked; not deployed.
+
+How the design's rows are met:
+- **T-TC2** (privilege escalation through the coordinator): 10 owner-only routes answer 403 plus an audit event to a coordinator,
+  agent or external, tested for each; the grant has no `grant_agent`, `invite` or `approve`; its roles and team are fixed by the designation.
+- **T-TC3** (unbounded task source): the hourly cap, the open cap, the depth cap and the per-request cap, plus `TASK_RATE` and
+  `MAX_OPEN_TASKS_PER_AGENT` as before; the assistant-loop rule including the third-agent case.
+- **T-TC10, T-TC14, T-TC15, T-TC16** (external coordinator): off by default per team and per service; their own identity; role list and
+  limits set by the owner; assistants and brief references unreachable; status-only tracking; no Suggest decisions; cannot be the
+  independent reviewer of what they assigned.
+- **T-TC12** (revocation lag): instant on the owner's action, the member removal, the detach and the agent revoke; the identity
+  provider's group removal is caught by the sweep within the recheck window.
+
+Residual risks:
+- **R-TC1 (Medium).** An external coordinator can still put arbitrary words in the command text of tasks for the team's agents
+  (within the roles and caps the owner set). That text reaches a model. It is not marked as untrusted data, because it is the
+  coordinator's job to instruct. The mitigations are the opt-in, the roles list, the low cap, the audit trail and instant revocation;
+  not text sanitising. Treat opting a person in as trusting them with the team's agents at that cap.
+- **R-TC2 (Low-Medium).** Caps are counted from the log in one process (like R-TR6). A restart replays them; a second collab
+  process would count alone.
+- **R-TC3 (Low-Medium).** Revocation by the identity provider is as fast as the 60 second group recheck plus `sweep_interval_seconds`;
+  until then the person's token still works. Removing them from the room or turning off the opt-in is immediate.
+- **R-TC4 (Low).** The loop guard is conservative: it refuses an agent-created task aimed at an assistant once an assistant is in
+  the chain, even when no loop would form. It never allows a loop; it may refuse legitimate fan-out through an assistant.
+- **R-TC5 (Medium).** Image rollback: an older image ignores the coordinator events and `task_requeued` (no `attempt` fence, requeued
+  work shows its old requester) and the slice 2 caveat for person tasks still holds (R-TR14). Fail-closed on serving (the old code serves
+  none of a coordinator's tasks), but roll back the flags, not the image.
+- **R-TC6 (Low, updated by slice 4).** `direct` guests cannot target a coordinator yet. Slice 4 built the brief route, so the
+  brief-reference refusal is now tested (see R-TB8), and an owner's approval of a Suggest request (a guest's or a brief) CAN
+  hand the root task to the team's own coordinator (tested: the coordinator accepts it and decomposes by role).
+- **R-TC7 (Info).** No web UI; the API and `herdr-eng rooms coordinator|coordination` only. The Work Graph shows the coordinator as a
+  `team_role` fact for display; it never grants.
+
+#### Slice 4: the assistant hands a team a derived brief (`control_plane.personal_assistant.team_briefs.enabled`; also needs `personal_assistant.enabled` and `team_rooms`)
+Mechanism (`assistant_briefs.py`, `collab_team_briefs.py`, `assistant_adapters.brief_hook`): the operator's assistant derives a brief
+from NAMED fields of a Gmail message (topic from the operator's list, a capped and redacted summary, a sender class, an attachment
+count, a flag from the `intel_gmail` injection scan) and makes a private record (message id, thread id, sender, subject) behind an
+opaque `bref-` reference in the assistant store (`pa_store_snapshot`, `(tenant, user)` scoped, acknowledged write). The brief is filed
+in process as an ordinary `suggestion_submitted` event (same queue, same digest-bound decision, same new operator-origin task with the
+brief as quoted data) with the taint `external-source:email` set by the collab service itself, never by the caller. There is no
+collab HTTP route and no MCP tool that files a brief or resolves a reference. `brief_key = sha256(user | provider | message id)` is
+indexed globally from the replayed log, so the same email is one request across ticks, restarts and crashes. Configuration has no key
+that approves, trusts or skips: an unknown key stops startup. Hot-read on the collab side, off by default, fails closed. Tested with a
+real collab service and event log, a real assistant service on a real Postgres snapshot, real HTTP, recorded Gmail dicts through the
+real normaliser (`test_assistant_briefs_derive.py`, `test_assistant_team_briefs.py`, `test_assistant_team_briefs_cli.py`); mutation
+checked; not deployed, not run live.
+
+How the design's rows are met:
+- **T-TC1** (prompt injection via email): derived fields only; taint sticky and set server-side; admission still refuses a tainted
+  task (tested against `team_tasks.admit`); approval makes a NEW operator-origin task whose command is a fixed sentence; instruction-
+  like text (body OR subject OR the summary) is flagged on the card and in the brief; the operator always decides first.
+- **T-TC6** (data leakage through briefs): a canary sweep for the message id, thread id, sender address, Message-ID header, an
+  attachment name, a secret and a recipient address finds none of them in the collab log bytes, any response a team agent, guest or
+  contributor can fetch, the assistant audit log, the Work Graph dump or `fabric_events`; the reference answers one 404 to everyone but
+  its owner.
+- **T-TC9** (duplicates): see above, plus a crash test in both orders (record durable but nothing filed; filed but the record not
+  updated).
+- **T-TC13** (cost): `briefs_per_hour` and `briefs_per_topic_per_hour`, counted from the replayed log.
+- **T-TC4/T-TC5, T-TC14 to T-TC16**: a brief is filed only by the room owner's mapped user; an external coordinator reads only the
+  approved text, cannot decide, cannot follow the reference.
+
+Residual risks:
+- **R-TB1 (Medium).** Prompt injection via email is reduced, not removed. The brief text reaches a model (team agents read it as quoted
+  data; an opted-in external coordinator reads it too) and "this is data" is advice to that model, not a mechanism. The coordinator can
+  paraphrase hostile content into a child task of its own: coordinator-made tasks are not tainted (R-TC1 says why). The operator sees
+  the exact card first and can trim it; nothing leaves the system without a person (slice 5 is not built, so today nothing can).
+- **R-TB2 (Medium).** The summary is a bounded excerpt of the body (default 400 characters), not a semantic summary: secrets
+  matching `redact.py` patterns are masked, addresses and links become `[address]` / `[link]`, quoted reply lines are dropped, but names,
+  amounts, project words and anything an attacker phrases around the patterns pass through. Lowering `summary_max_chars` is the dial;
+  the operator's trim on the card is the control.
+- **R-TB3 (Low-Medium).** The assistant record keeps sender address, subject, message id, thread id and Message-ID header (not the
+  body) in the assistant snapshot. Anyone with read access to that Postgres row or an assistant backup has them. The same snapshot
+  already holds the assistant's messages and memory.
+- **R-TB4 (Low).** `brief_key` is a plain SHA-256 of three guessable parts; someone holding the log and the user id could confirm a
+  guessed message id (not recover an unknown one). The design chose this key; an HMAC with a stored secret would close it.
+- **R-TB5 (Medium).** Image rollback: the collab log replays cleanly into the previous image (checked: not degraded, `room_state`,
+  `room_flow`, `list_tasks` answer, a brief shows as an ordinary pending or materialized request with its email taint). The previous
+  assistant code does not know `team_briefs`, so its next snapshot write DROPS every brief record: references stop resolving even after
+  rolling forward, while the room keeps the briefs. Roll back the flag, not the image.
+- **R-TB6 (Low).** Caps and the brief index live in the one process that holds the collab log (like R-TR6 and R-TC2).
+- **R-TB7 (Info).** Not built: automatic scanning. `TeamBriefService.process_message` is the single entry point for the operator's HTTP
+  route and CLI; the inbox watch does not call it. The live Gmail fetch (`GoogleWorkspace.get_raw_message`) is wired but was not
+  exercised against Gmail; tests feed recorded dicts at that one seam. No web UI. `sender_class` is `known` or `unknown`; the design's
+  `topic-trusted` is deliberately never produced.
+- **R-TB8 (Low).** Collaboration credentials (agent, guest, external coordinator, the operator's own collab token) cannot
+  authenticate on the assistant API at all, so they get 401 or 403 on the reference route rather than the 404 a second API-key user
+  gets. The existence of a reference is not revealed; the existence of the route is.
+- **R-TB9 (Low).** A brief is filed even into a `read_only` room (it is the operator's own assistant, not a guest) and counts against
+  the room's pending cap, so a flood of briefs can crowd out guest requests until the operator decides some.
+
 ## 4. Severity summary (judged from reading; unverified)
 | Id | Severity | One line |
 |---|---|---|
@@ -211,6 +365,19 @@ Residual risks:
 | R-ART2 | Medium | ACL is an in-memory index; write-through drift shows at restart |
 | R-TL2 | Medium | No lease heartbeat: a long task is requeued and can run twice (R-TL1, the opt-in fence, is resolved) |
 | R-DP1 | Medium | Image rollback does not roll back the schema |
+| R-TR1, R-TR2 | Medium | Team rooms: `direct` acts as suggest; approved guest text still reaches a model as quoted data |
+| R-TR3, R-TR4 | Low-Medium | Guest task visibility only hidden with the flag on; collab-only cannot verify a team exists |
+| R-TR5-7 | Low | See section 3.8 |
+| R-TR8 | Medium | Team roles: an external assignee reads their task's command text |
+| R-TR9, R-TR10, R-TR11 | Low-Medium / Low | Team roles: one-process sweep; principal-key review independence; task existence in the graph |
+| R-TR14 | Medium | Team roles: image rollback with a person task in the log breaks `room_state` / `room_flow` on the old image |
+| R-TR12, R-TR13, R-TR15 | Low | See section 3.8 |
+| R-TC1, R-TC5 | Medium | Coordinators: an opted-in external person instructs the team's agents; image rollback loses the requeue fence |
+| R-TC2, R-TC3 | Low-Medium | Coordinators: one-process caps; identity-provider revocation lag |
+| R-TC4, R-TC6, R-TC7 | Low / Info | See section 3.8 (slice 3) |
+| R-TB1, R-TB2, R-TB5 | Medium | Assistant briefs: injection via the brief text, free text through the excerpt, image rollback drops references |
+| R-TB3, R-TB4, R-TB6, R-TB8, R-TB9 | Low-Medium / Low | See section 3.8 (slice 4) |
+| R-TB7 | Info | No automatic scan, no web UI, live Gmail fetch not exercised |
 | R-SH4, R-CL1, R-DP2 | Low-Medium | See sections |
 | R-WG2-4, R-SH5-7, R-ART3, R-RA3, R-TL3, R-CL2 | Low | See sections |
 
@@ -223,6 +390,10 @@ with the flag off (migrations are additive, so the image can be ahead of the fla
 | `control_plane.unified_workspace.enabled` | off | Migration 0034 applies at start; set `true`; restart control-plane-web. Operator calls `POST /api/v1/graph/work/reconcile`, then reads `/api/v1/graph/work/status` | `status` worker `last_error`, gaps, 5xx on `/graph/work/*`; read as a non-operator key to confirm room rows stay hidden | `false` and restart: routes return 404 again; data stays. Drop tables per 0034 `-- DOWN:` only if they must go |
 | `control_plane.unified_workspace.room_artifact_access` (also needs `enabled`) | off | First settle R-RA4 (collab and artifact store in one process); set `true`; restart. Startup syncs every room | grants with `granted_by` `room:*` vs membership; a removed test member's read must fail within one sync interval | `false` and restart stops new grants but does NOT remove written ones. Revoke grants whose `granted_by` starts with `room:` (`herdr-eng control-plane revoke-room-grants --apply`, then restart; see `docs/artifacts/room-access-maintenance.md`) |
 | `control_plane.collab.task_lease_seconds` | absent (off) | Set 60..604800, longer than the longest honest task (R-TL2); restart the process that runs collab | `task.requeue` events, 409 `stale attempt`, duplicate results | Remove the key and restart. Tasks already requeued stay requeued; `attempt` survives replay |
+| `control_plane.collab.team_rooms.enabled` | off | Set `true` (hot, read each request); existing rooms' guests become Suggest unless a room is set `read_only` first | `suggestion_submitted`/`decided` events, 403/404 rates on `/rooms/*/suggestions`, `team_attached` grants | `false` or `kill_switch: true`: routes 404, guests see tasks again. `herdr-eng rooms detach` first if attached teams must go (works with the flag off). See `docs/operations/team-rooms.md` |
+| `control_plane.collab.team_roles.enabled` (also needs `team_rooms`) | off | Set `true` (hot); assign people to roles per room and team; set the policy per team (default escalate) | `task_reminded` / `task_escalated` events, `blocked` tasks in the owner's attention, 409 `no_role_holder` rate | `false` or `kill_switch: true`: new fields unknown, routes 404, sweep stops. Do NOT roll the image back while a person task newer than ~8 days exists (R-TR14); roll back the flag. See `docs/operations/team-rooms.md` |
+| `control_plane.collab.coordinators.enabled` (also needs `team_rooms`, `team_roles`) | off | Set `true` (hot); designate an agent per team; `external.enabled` is a second flag and the per-team opt-in a third | `team_coordinator_set`, `task_requeued` events, 429 `coordinator_rate` / `coordinator_open`, 400 `coordination_loop`, 403 audit events from coordinators | `external-coordination off` per team, then `external.enabled: false`, then `enabled: false`; cancel what you do not want. Do not roll the image back (R-TC5) |
+| `control_plane.personal_assistant.team_briefs.enabled` (also needs `personal_assistant.enabled`, a persistence DSN, `team_rooms`) | off | Set `true` with a topic list; restart the control plane (read at start); attach a team to a room first | `suggestion_submitted` events with `source: assistant_brief`, 429 `brief_rate`, pending queue age, assistant audit `assistant.team_brief.*` | `false` and restart: both routes 404, the in-process door closes, briefs already filed stay in the queue (decide or reject them). Do NOT roll the image back (R-TB5). See `docs/operations/team-rooms.md` |
 | Share links `control_plane.share.enabled` (+ `signing_secret`, collab `public_url`) | off | Complete the share block; `deploy.sh` refuses incomplete config, renders the edge with `/s/`, starts `share-public` | share `events` (`opened`, `denied`), 404 rate on `/s/`, live bytes | Revoke individual shares first (`POST .../shares/{sid}/revoke` removes state, then bundle); then `enabled: false` and deploy: the edge stops routing `/s/` and `share-public` is stopped |
 | Per-user rollout | not built | The spec asks for it; every flag today is global | | |
 

@@ -1,0 +1,1055 @@
+"""The ``collab-public`` side of the artifact collaboration bridge (plan 3, Tasks 7a-7c).
+
+``collab-public`` has no database: it reads the worker's read-only mirror (``grants.json``, ``artifacts/<id>/head.json``
+and content-addressed ``blobs/<sha256>``, see ``collab_mirror``) and writes the outbox (``agents.json``, the staged
+uploads under ``staging/<owner_key>/<upload_id>/`` (Task 7b), and intents in Task 7c).
+
+Isolation is enforced HERE. The mirror is one shared tree, so every method re-reads ``grants.json`` and checks the grant
+for exactly that agent and artifact, failing closed. A missing grant, an ungranted artifact and an unknown artifact all
+give the identical 404 "not found" (audited ``audit_denied`` with one reason, ``no_grant``), so existence never leaks.
+A stale (older than ``FEED_MAX_AGE``), missing or invalid ``grants.json`` makes every tool method 503
+"collaboration bridge unavailable".
+
+Every mirror access goes through the no-follow helpers of ``collab_bridge_files`` with the trusted mount point as root.
+Blob reads verify the sha256 against the manifest; a successful verification is cached per
+``(path, st_ino, st_size, st_mtime_ns)`` so repeated slices of one large blob are hashed once.
+
+Allowed calls are audited ``artifact_tool_used`` at most once per ``AUDIT_EVERY`` s per (agent, artifact, tool); the
+event carries ``calls`` = the calls since the previous event, this one included. If that event cannot be written the
+call is refused (503), never served unaudited. No artifact text, credential or name of a file is ever logged.
+
+Chunk staging (Task 7b). ``stage_chunk`` is the agent tool: a live ``write`` grant on a ``writable`` artifact, then the
+per-agent ``chunks_per_minute`` throttle, then ``validate_chunk`` (strict base64, the chunk's own sha256, length, index
+and total, name, declared size), all before anything touches the disk. ``stage_chunk_for`` is the owner-keyed core with
+no principal and no grant check (plan 5 calls it with member keys). The ``upload_id`` and the owner key are derived,
+never taken from the caller, and every staging write is a no-follow ``link_new_beneath`` from the trusted outbox root,
+so a part or ``meta.json`` is never partial and never replaced.
+
+* The first chunk of an upload reserves its declared ``size_bytes`` against ``staging_cap`` (that owner) and
+  ``limits.staging_bytes_total`` (all owners), and counts against the owner's upload-count cap
+  (``max_uploads_per_owner``, default ``STAGING_UPLOADS_PER_OWNER``; every upload dir counts, verified or not, because
+  that is what bounds a listing). An owner's usage is the declared size of its upload dirs with a valid ``meta.json``
+  and no ``verified`` marker (a verified upload's parts are gone). Usage is kept per owner in memory, rescanned at most
+  once per ``staging_index_ttl`` s and bumped by this bridge's own reservations; only this process creates uploads and
+  the worker only removes them, so a stale entry over-counts (conservative), never under-counts. An owner dir that
+  cannot be listed (over ``max_uploads_per_owner + ENTRY_SLACK`` entries, or unsafe) is full for that owner and counts
+  as ``max(last known, staging_bytes_per_agent)`` bytes towards the whole-volume sum, so it never blocks other owners.
+  ``staging/`` itself past ``STAGING_OWNERS_MAX`` owners refuses every reservation (owners are bounded by agents).
+  Reservation and the ``meta.json`` link run under one per-bridge lock, so concurrent first chunks in this process can
+  never exceed a cap. Residuals: the lock and the usage index are per process (a second ``collab-public`` process on
+  the same outbox could over-reserve by its own in-flight first chunks), a meta-less dir (a crash between ``mkdirat``
+  and the ``meta.json`` link) is counted only after a rescan, and a part written in the instant between the worker's
+  ``verified`` marker and its part unlinks stays until the TTL sweep. Each part is bounded by its validated length, so
+  the bytes on disk never exceed the declared sizes. A first chunk costs one listing of ``staging/`` plus, per owner
+  whose entry is older than the TTL, one bounded scan (at most ``max_uploads_per_owner + ENTRY_SLACK`` metas).
+* A plain chunk costs a ``meta.json`` read, a ``verified`` stat and the part write; only the last index or a replay
+  scans the upload dir (``list_parts``) for ``complete``/``received``/``missing`` (at most ``MAX_MISSING``).
+* A scan that sees the upload complete links the ``audited`` marker and only then commits ``artifact_upload_staged``
+  (ids and size, never the file name or bytes), so the event is emitted once per upload across restarts; if the event
+  cannot be written the marker is removed again and the call is 503, so a retry audits it. Residual: a crash between
+  the marker and the event loses that one event.
+
+Intents and results (Task 7c). ``append_intent`` is the generic intent write (any registered kind, agent or user actor);
+``commit`` authorizes an agent's commit (write grant, ``writable``, ``commits_per_minute``, pending cap, ``validate_changes``,
+and for every staged put the caller's OWN complete upload) and then calls it. An intent is a JSON envelope
+(``validate_intent`` shape) holding the actor's kind and id and the payload: never a credential, digest, device id or
+staged bytes. ``read_result`` is the generic long-poll over ``results/<ticket>.json`` of the mirror: ownership is checked
+twice (the in-memory, LRU-bounded ticket map, then the ``actor`` inside the result file) and a mismatch, an unknown or an
+evicted ticket is the identical 404 ``not found``, also after waiting. The poll sleeps in steps of at most 0.5 s on a
+server thread, so it is capped at 20 s, holds a ``collab_waiters`` slot and ends early when the principal is no longer
+valid. Residuals: the ticket map and the pending count are per process (a restart forgets which ticket was whose, so a
+result can no longer be fetched; a second process could exceed the pending cap by its own in-flight intents), and intent
+writes of one process are serialized by one lock (a write is a few ms).
+
+The methods are synchronous and do blocking file I/O and hashing: an async caller runs them on an executor
+(``asyncio.to_thread``), never on the event loop.
+"""
+from __future__ import annotations
+
+import collections
+import dataclasses
+import errno
+import hashlib
+import json
+import logging
+import math
+import os
+import re
+import stat
+import threading
+import time
+from collections.abc import Callable
+from pathlib import Path
+
+from . import collab_waiters
+from .collab import CollabError, Principal
+from .collab_bridge_files import (
+    AUDITED_MARKER,
+    CHUNK_BYTES,
+    ENTRY_SLACK,
+    FEED_MAX_AGE,
+    MEMBER_PREFIX,
+    META_NAME,
+    SHA_RE,
+    STAGING_DIR,
+    TICKET_RE,
+    VERIFIED_MARKER,
+    Actor,
+    BridgeError,
+    BridgeLimits,
+    Chunk,
+    StagedUpload,
+    agent_owner_key,
+    atomic_write_json,
+    file_exists_beneath,
+    link_new_beneath,
+    list_beneath,
+    list_parts,
+    new_ticket,
+    open_beneath,
+    read_bytes_beneath,
+    read_json_beneath,
+    read_json_cached,
+    read_staged_meta,
+    staging_parts,
+    unlink_beneath,
+    upload_id_for,
+    validate_changes,
+    validate_chunk,
+    validate_intent,
+)
+from .collab_mirror import ARTIFACTS_DIR, BLOBS_DIR, GRANTS_NAME, HEAD_NAME
+
+log = logging.getLogger(__name__)
+
+AGENTS_FEED = "agents.json"                 # the worker reads it as collab_intents.AGENTS_FEED
+UNAVAILABLE = "collaboration bridge unavailable"
+NOT_FOUND = "not found"
+NOT_MIRRORED = "version not mirrored"
+BINARY = "binary files are not readable through collaboration"
+INTEGRITY = "mirror integrity"
+AUDIT_EVERY = 600.0
+MAX_READ_BYTES = 1024 * 1024
+DEFAULT_READ_BYTES = 262_144
+MAX_HISTORY = 200
+FEED_INTERVAL = 15.0
+GRANTS_MAX_BYTES = 64 * 1024 * 1024
+HEAD_MAX_BYTES = 256 * 1024 * 1024
+MAX_NAME = 1024
+_HASH_BLOCK = 1 << 20
+_ARTIFACT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")   # collab_mirror's artifact id rule
+_VERSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")
+_SHA = re.compile(SHA_RE)
+_GRANT_PERMISSIONS = frozenset({"read", "write"})
+_TOOL_ACTIONS = {"artifacts_list": "artifact.list", "artifact_head": "artifact.head",
+                 "artifact_read": "artifact.read", "artifact_history": "artifact.history"}
+
+READ_ONLY = "read-only grant"
+NOT_WRITABLE = "artifact is not writable through collaboration"
+STAGING_FULL = "staging space full; commit or wait"
+CHUNK_CONFLICT = "chunk already staged with different content"
+META_MISMATCH = "staged upload metadata does not match"
+UPLOAD_GONE = "staged upload was removed; send the chunk again"
+STAGING_INVALID = "staged upload directory is invalid"
+STAGING_UNAVAILABLE = "staging unavailable"
+BAD_CHUNK_ARGS = "chunk arguments are missing or unknown"
+MAX_MISSING = 100
+STAGING_OWNERS_MAX = 100_000        # entries of staging/ one reservation reads (fail closed past it, for everyone)
+STAGING_UPLOADS_PER_OWNER = 4096    # upload dirs one owner may hold (the TTL sweep frees them)
+INTENTS_DIR = "intents"             # collab_intents.INTENTS_DIR
+RESULTS_DIR = "results"             # collab_intents.RESULTS_DIR
+INTENT_MAX_BYTES = 1024 * 1024      # collab_intents.INTENT_MAX_BYTES: the worker ignores a larger intent file
+FEED_REFRESH_AGE = 15.0             # an intent write refreshes agents.json when it is older than this
+RESULT_WAIT_MAX = 20.0
+RESULT_POLL_STEP = 0.5
+RESULT_EXTRA_BYTES = 1_048_576      # result file cap = limits.max_conflict_text_bytes + this
+TICKET_MAP_MAX = 10_000
+PENDING_ACTORS_MAX = 10_000
+TOO_MANY_PENDING = "too many pending intents; wait for a result"
+INTENT_TOO_LARGE = "intent is too large; stage large files with artifact_stage_chunk"
+INTENTS_UNAVAILABLE = "intents unavailable"
+UPLOAD_NOT_FOUND = "upload not found"
+UPLOAD_INCOMPLETE = "upload incomplete"
+STAGING_INDEX_TTL = 30.0            # seconds an owner's cached staging usage is trusted before a rescan
+
+
+class UploadIncomplete(CollabError):
+    """409 "upload incomplete": ``missing`` lists the first ``MAX_MISSING`` absent part indices."""
+
+    def __init__(self, missing: list[int]):
+        super().__init__(409, UPLOAD_INCOMPLETE)
+        self.missing = list(missing)
+
+
+@dataclasses.dataclass(frozen=True)
+class _OwnerUsage:
+    size_bytes: int       # declared bytes of its unverified uploads
+    uploads: int          # upload dirs, verified or not
+    at: float             # when scanned (a bump keeps the scan time)
+    full: bool = False    # the dir could not be listed: no new upload for this owner
+
+
+def _finite(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _utf8_slice(buf: bytes, max_bytes: int) -> int:
+    """How many leading bytes of ``buf`` to return: at most ``max_bytes``, ending on a UTF-8 boundary. When
+    ``max_bytes`` is smaller than the first character, that whole character (so a slice is never empty)."""
+    if len(buf) <= max_bytes:
+        return len(buf)
+    end = max_bytes
+    while end > 0 and (buf[end] & 0xC0) == 0x80:
+        end -= 1
+    if end == 0:
+        end = 1
+        while end < len(buf) and (buf[end] & 0xC0) == 0x80:
+            end += 1
+    return end
+
+
+class CollabArtifactBridge:
+    VERIFY_CACHE_MAX = 4096
+    USE_COUNTER_MAX = 50_000
+
+    def __init__(self, service, mirror: Path, outbox: Path, *, clock: Callable[[], float] = time.time,
+                 feed_interval: float = FEED_INTERVAL, max_uploads_per_owner: int = STAGING_UPLOADS_PER_OWNER,
+                 staging_index_ttl: float = STAGING_INDEX_TTL,
+                 monotonic: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep):
+        self.service = service
+        self.mirror = Path(mirror)
+        self.outbox = Path(outbox)
+        self.clock = clock
+        self.feed_interval = float(feed_interval)
+        self.stats: collections.Counter = collections.Counter()
+        self._verified: collections.OrderedDict = collections.OrderedDict()
+        self._verified_lock = threading.Lock()
+        # (agent id, artifact id, tool) -> [last event time, calls since]; guarded by the service lock
+        self._uses: collections.OrderedDict = collections.OrderedDict()
+        self._feed_lock = threading.Lock()
+        self._staging_lock = threading.Lock()
+        if isinstance(max_uploads_per_owner, bool) or not isinstance(max_uploads_per_owner, int) \
+                or max_uploads_per_owner < 1:
+            raise ValueError("max_uploads_per_owner must be a positive integer")
+        self.max_uploads_per_owner = max_uploads_per_owner
+        self.staging_index_ttl = float(staging_index_ttl)
+        self._owner_usage: dict[str, _OwnerUsage] = {}            # guarded by _staging_lock
+        self.monotonic, self.sleep = monotonic, sleep          # the result long-poll's own (injectable) wall time
+        self.TICKET_MAP_MAX = TICKET_MAP_MAX                   # per instance, so a test can shrink it
+        self._tickets: collections.OrderedDict = collections.OrderedDict()   # ticket -> (actor kind, id); LRU
+        self._tickets_lock = threading.Lock()
+        self._pending: dict[tuple[str, str], dict[str, None]] = {}   # actor -> tickets of intents not yet consumed
+        self._intent_lock = threading.Lock()
+        self._feed_at: float | None = None                     # generated_at of this process's last feed write
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # -- grants.json ------------------------------------------------------------------------------------------
+    def _grants(self) -> tuple[dict, BridgeLimits] | None:
+        """The fresh ``grants.json`` agents map and its limits, or None (missing, stale, invalid)."""
+        doc = read_json_cached(self.mirror, [GRANTS_NAME], max_bytes=GRANTS_MAX_BYTES)
+        if doc is None:
+            return None
+        generated, agents = doc.get("generated_at"), doc.get("agents")
+        if not _finite(generated) or self.clock() - generated > FEED_MAX_AGE or not isinstance(agents, dict):
+            return None
+        try:
+            limits = BridgeLimits.from_mapping(doc.get("limits"))
+        except (BridgeError, TypeError):
+            return None
+        return agents, limits
+
+    def _require(self) -> tuple[dict, BridgeLimits]:
+        got = self._grants()
+        if got is None:
+            raise CollabError(503, UNAVAILABLE)
+        return got
+
+    def _live_grants(self, agents: dict, pr: Principal) -> dict[str, str]:
+        """artifact id -> permission for every unexpired, well-formed grant of exactly this agent."""
+        if not isinstance(pr, Principal) or not pr.is_agent:
+            return {}
+        mine = agents.get(pr.id)
+        if not isinstance(mine, dict):
+            return {}
+        now, out = self.clock(), {}
+        for artifact_id, grant in mine.items():
+            if not isinstance(artifact_id, str) or not _ARTIFACT_ID.match(artifact_id) or not isinstance(grant, dict):
+                continue
+            permission, expires = grant.get("permission"), grant.get("expires_at")
+            if permission in _GRANT_PERMISSIONS and _finite(expires) and expires > now:
+                out[artifact_id] = permission
+        return out
+
+    def available(self) -> bool:
+        return self._grants() is not None
+
+    def limits(self) -> BridgeLimits:
+        return self._require()[1]
+
+    def has_grants(self, pr: Principal) -> bool:
+        got = self._grants()
+        return got is not None and bool(self._live_grants(got[0], pr))
+
+    def has_write_grant(self, pr: Principal) -> bool:
+        got = self._grants()
+        return got is not None and "write" in self._live_grants(got[0], pr).values()
+
+    # -- access -----------------------------------------------------------------------------------------------
+    def _deny(self, pr: Principal, tool: str, artifact_id) -> CollabError:
+        resource = artifact_id[:128] if isinstance(artifact_id, str) else None
+        if isinstance(pr, Principal):
+            self.service._audit_denied(pr, f"artifact.{tool}", "no_grant", resource_id=resource,
+                                       agent_id=pr.id if pr.is_agent else None)
+        self.service.stats["policy_denied"] += 1
+        return CollabError(404, NOT_FOUND)
+
+    def _head_doc(self, artifact_id: str) -> dict | None:
+        doc = read_json_cached(self.mirror, [ARTIFACTS_DIR, artifact_id, HEAD_NAME], max_bytes=HEAD_MAX_BYTES)
+        if doc is None:
+            return None
+        head, versions = doc.get("head"), doc.get("versions")
+        if not isinstance(head, dict) or not isinstance(versions, list) or not versions \
+                or not all(isinstance(v, dict) and isinstance(v.get("files"), list) for v in versions):
+            log.warning("collab artifacts: malformed head.json artifact=%s", artifact_id)
+            raise CollabError(502, INTEGRITY)
+        return doc
+
+    def _open(self, pr: Principal, tool: str, artifact_id) -> tuple[str, dict]:
+        """Step order for every per-artifact method: availability (503), then agent, id shape, grant and a listed
+        ``head.json``, all failing with the same audited 404. Returns (permission, head document)."""
+        permission, doc, _limits = self._open_with_limits(pr, tool, artifact_id)
+        return permission, doc
+
+    def _open_with_limits(self, pr: Principal, tool: str, artifact_id) -> tuple[str, dict, BridgeLimits]:
+        """``_open`` that also returns the limits of the same ``grants.json`` read."""
+        agents, limits = self._require()
+        if not isinstance(artifact_id, str) or not _ARTIFACT_ID.match(artifact_id):
+            raise self._deny(pr, tool, artifact_id)
+        permission = self._live_grants(agents, pr).get(artifact_id)
+        if permission is None:
+            raise self._deny(pr, tool, artifact_id)
+        doc = self._head_doc(artifact_id)
+        if doc is None:
+            raise self._deny(pr, tool, artifact_id)
+        return permission, doc, limits
+
+    def _refuse(self, pr: Principal, tool: str, artifact_id: str, reason: str, status: int,
+                message: str) -> CollabError:
+        """A disclosed refusal on an artifact the agent can see (e.g. a read-only grant), audited ``audit_denied``."""
+        self.service._audit_denied(pr, f"artifact.{tool}", reason, resource_id=artifact_id, agent_id=pr.id)
+        self.service.stats["policy_denied"] += 1
+        return CollabError(status, message)
+
+    def _used(self, pr: Principal, artifact_id: str, tool: str) -> None:
+        """Audit an allowed call, coalesced per (agent, artifact, tool) per ``AUDIT_EVERY`` s. Raises 503 (and leaves
+        the counter as it was) when the event cannot be written."""
+        svc = self.service
+        with svc._lock:
+            key = (pr.id, artifact_id, tool)
+            now = self.clock()
+            state = self._uses.get(key)
+            if state is not None and now - state[0] < AUDIT_EVERY:
+                state[1] += 1
+                self._uses.move_to_end(key)
+                return
+            calls = (state[1] if state is not None else 0) + 1
+            svc._commit("artifact_tool_used", svc._actor(
+                pr, action=_TOOL_ACTIONS[tool], outcome="allowed", tool=tool, calls=calls, artifact_id=artifact_id or None,
+                resource_id=artifact_id or None, project_ids=[]))
+            self._uses[key] = [now, 0]
+            self._uses.move_to_end(key)
+            while len(self._uses) > self.USE_COUNTER_MAX:     # an evicted key's suppressed calls are dropped
+                self._uses.popitem(last=False)
+                self.stats["use_counter_evicted"] += 1
+
+    def _audit_coalesced(self, kind: str, owner: str, artifact_id: str, event_type: str, make_payload,
+                         window: float) -> bool:
+        """Commit ``event_type`` at most once per ``window`` s per (kind, owner, artifact); the others only bump a
+        counter that the next emitted event carries as ``calls``. A write-grant agent therefore cannot exhaust the
+        lifetime audit log by looping. Raises (counter unchanged) when the event cannot be written. True when emitted."""
+        svc = self.service
+        with svc._lock:
+            key = (owner, artifact_id, kind)
+            now = self.clock()
+            state = self._uses.get(key)
+            if state is not None and now - state[0] < window:
+                state[1] += 1
+                self._uses.move_to_end(key)
+                return False
+            payload = make_payload()
+            payload["calls"] = (state[1] if state is not None else 0) + 1
+            svc._commit(event_type, payload)
+            self._uses[key] = [now, 0]
+            self._uses.move_to_end(key)
+            while len(self._uses) > self.USE_COUNTER_MAX:
+                self._uses.popitem(last=False)
+                self.stats["use_counter_evicted"] += 1
+            return True
+
+    def _coalesce_window(self) -> float:
+        got = self._grants()
+        return float(got[1].audit_coalesce_seconds) if got is not None else float(BridgeLimits().audit_coalesce_seconds)
+
+    # -- tools ------------------------------------------------------------------------------------------------
+    def list(self, pr: Principal) -> dict:
+        agents, _limits = self._require()
+        out = []
+        for artifact_id, permission in sorted(self._live_grants(agents, pr).items()):
+            try:
+                doc = self._head_doc(artifact_id)
+            except CollabError:
+                continue                                  # one malformed head.json never hides the others
+            if doc is None:
+                continue                                  # not mirrored (yet): not listed
+            head = doc["head"]
+            out.append({"artifact_id": artifact_id, "title": doc.get("title"), "permission": permission,
+                        "writable": permission == "write" and doc.get("writable") is True,
+                        "head_version_id": head.get("version_id"), "head_version_number": head.get("version_number")})
+        if isinstance(pr, Principal) and pr.is_agent:
+            self._used(pr, "", "artifacts_list")
+        return {"artifacts": out}
+
+    @staticmethod
+    def _file_view(f: dict) -> dict:
+        return {"name": f.get("name"), "size_bytes": f.get("size_bytes"), "sha256": f.get("sha256"),
+                "media_type": f.get("media_type"), "text": f.get("text") is True, "mirrored": f.get("mirrored") is True}
+
+    @staticmethod
+    def _head_version(doc: dict) -> dict:
+        head_id = doc["head"].get("version_id")
+        version = next((v for v in doc["versions"] if v.get("version_id") == head_id), None)
+        if version is None:
+            raise CollabError(502, INTEGRITY)
+        return version
+
+    def head(self, pr: Principal, artifact_id: str) -> dict:
+        permission, doc = self._open(pr, "head", artifact_id)
+        version = self._head_version(doc)
+        out = {"artifact_id": artifact_id, "title": doc.get("title"), "artifact_type": doc.get("artifact_type"),
+               "permission": permission, "writable": permission == "write" and doc.get("writable") is True,
+               "writable_reason": doc.get("writable_reason"),
+               "head_version_id": version.get("version_id"), "head_version_number": version.get("version_number"),
+               "parent_version_ids": list(version.get("parent_version_ids") or []),
+               "message": version.get("message"), "created_at": version.get("created_at"),
+               "files": [self._file_view(f) for f in version["files"] if isinstance(f, dict)]}
+        self._used(pr, artifact_id, "artifact_head")
+        return out
+
+    def history(self, pr: Principal, artifact_id: str, *, limit: int = 50) -> dict:
+        _permission, doc = self._open(pr, "history", artifact_id)
+        if not _int(limit) or not 1 <= limit <= MAX_HISTORY:
+            raise CollabError(400, f"limit must be an integer from 1 to {MAX_HISTORY}")
+        versions = []
+        for v in doc["versions"][:limit]:
+            versions.append({
+                "version_id": v.get("version_id"), "version_number": v.get("version_number"),
+                "parent_version_ids": list(v.get("parent_version_ids") or []),
+                "created_via": v.get("created_via"), "collaborator_agent_id": v.get("collaborator_agent_id"),
+                "author_label": v.get("author_label"), "message": v.get("message"),
+                "created_at": v.get("created_at"), "merge": v.get("merge") is True,
+                "mirrored": v.get("mirrored") is True,
+                "files": [{"name": f.get("name"), "size_bytes": f.get("size_bytes"), "text": f.get("text") is True,
+                           "mirrored": f.get("mirrored") is True} for f in v["files"] if isinstance(f, dict)]})
+        out = {"artifact_id": artifact_id, "head_version_id": doc["head"].get("version_id"), "versions": versions,
+               "truncated": len(doc["versions"]) > limit}
+        self._used(pr, artifact_id, "artifact_history")
+        return out
+
+    def read(self, pr: Principal, artifact_id: str, name: str, *, version_id: str | None = None, offset: int = 0,
+             max_bytes: int = DEFAULT_READ_BYTES) -> dict:
+        _permission, doc = self._open(pr, "read", artifact_id)
+        if not isinstance(name, str) or not name or len(name) > MAX_NAME:
+            raise CollabError(400, "name must be a file name of the artifact")
+        if version_id is not None and (not isinstance(version_id, str) or not _VERSION_ID.match(version_id)):
+            raise CollabError(400, "version_id is invalid")
+        if not _int(offset) or offset < 0:
+            raise CollabError(400, "offset must be a non-negative integer")
+        if not _int(max_bytes) or not 1 <= max_bytes <= MAX_READ_BYTES:
+            raise CollabError(400, f"max_bytes must be an integer from 1 to {MAX_READ_BYTES}")
+        for attempt in range(2):
+            if attempt:                                   # the blob was collected after the head read: look again
+                doc = self._head_doc(artifact_id)
+                if doc is None:
+                    raise self._deny(pr, "read", artifact_id)
+            vid = doc["head"].get("version_id") if version_id is None else version_id
+            version = next((v for v in doc["versions"] if v.get("version_id") == vid), None)
+            f = None if version is None else next(
+                (f for f in version["files"] if isinstance(f, dict) and f.get("name") == name), None)
+            if f is None:
+                raise CollabError(404, NOT_FOUND)
+            if f.get("text") is not True:
+                raise CollabError(415, BINARY)
+            if version.get("mirrored") is not True or f.get("mirrored") is not True:
+                raise CollabError(404, NOT_MIRRORED)
+            sha, size = f.get("sha256"), f.get("size_bytes")
+            if not isinstance(sha, str) or not _SHA.match(sha) or not _int(size) or size < 0:
+                log.warning("collab artifacts: malformed manifest entry artifact=%s", artifact_id)
+                raise CollabError(502, INTEGRITY)
+            got = self._slice(artifact_id, sha, size, offset, max_bytes)
+            if got is None:
+                continue
+            text, next_offset = got
+            out = {"name": name, "version_id": vid, "size_bytes": size, "offset": offset, "text": text,
+                   "next_offset": next_offset}
+            self._used(pr, artifact_id, "artifact_read")
+            return out
+        raise CollabError(404, NOT_MIRRORED)
+
+    # -- chunk staging (Task 7b) -------------------------------------------------------------------------------
+    def stage_chunk(self, pr: Principal, args) -> dict:
+        """The ``artifact_stage_chunk`` tool: grant, writability, throttle and validation, then ``stage_chunk_for``
+        under the agent's own owner key."""
+        if not isinstance(args, dict):
+            raise CollabError(400, BAD_CHUNK_ARGS)
+        artifact_id = args.get("artifact_id")
+        permission, doc, limits = self._open_with_limits(pr, "stage_chunk", artifact_id)
+        if permission != "write":
+            raise self._refuse(pr, "stage_chunk", artifact_id, "read_only", 403, READ_ONLY)
+        if doc.get("writable") is not True:
+            raise self._refuse(pr, "stage_chunk", artifact_id, "not_writable", 403, NOT_WRITABLE)
+        svc = self.service
+        with svc._lock:
+            svc._throttle("artchunk:" + pr.id, limits.chunks_per_minute, 60.0, "chunk")
+        try:
+            chunk = validate_chunk(args, limits)
+            owner_key = agent_owner_key(pr.id)
+        except BridgeError as exc:
+            raise CollabError(400, exc.reason) from None
+        return self.stage_chunk_for(owner_key, chunk, limits=limits, staging_cap=limits.staging_bytes_per_agent)
+
+    def stage_chunk_for(self, owner_key: str, chunk: Chunk, *, limits: BridgeLimits, staging_cap: int) -> dict:
+        """Stage one validated chunk under ``staging/<owner_key>/<upload_id>/``. No principal and no grant check:
+        authorization is the caller's job. Returns ``{upload_id, index, stored}``, plus ``complete``, ``received``
+        and ``missing`` (the first ``MAX_MISSING`` absent indices) for the last index or a replay."""
+        if not isinstance(chunk, Chunk) or not isinstance(limits, BridgeLimits) \
+                or isinstance(staging_cap, bool) or not isinstance(staging_cap, int) or staging_cap < 1:
+            raise CollabError(400, BAD_CHUNK_ARGS)
+        # a Chunk normally comes from validate_chunk; re-check what the reservation bound relies on (callers such as
+        # plan 5 may build one themselves): the index, the total and the exact part length
+        total, index = chunk.total, chunk.index
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in (total, index, chunk.size_bytes)) \
+                or not isinstance(chunk.data, bytes) or not 1 <= chunk.size_bytes <= limits.max_file_bytes \
+                or total != -(-chunk.size_bytes // CHUNK_BYTES) or not 0 <= index < total \
+                or len(chunk.data) != (CHUNK_BYTES if index < total - 1 else chunk.size_bytes - CHUNK_BYTES * (total - 1)):
+            raise CollabError(400, BAD_CHUNK_ARGS)
+        try:
+            upload_id = upload_id_for(owner_key, chunk.artifact_id, chunk.name, chunk.file_sha256, chunk.size_bytes)
+            parts = staging_parts(owner_key, upload_id)
+        except BridgeError as exc:
+            raise CollabError(400, exc.reason) from None
+        try:
+            return self._stage(owner_key, upload_id, parts, chunk, limits, staging_cap)
+        except OSError as exc:
+            self.stats["staging_failures"] += 1
+            log.warning("collab upload %s owner=%s artifact=%s: staging failed error=%s", upload_id, owner_key,
+                        chunk.artifact_id, errno.errorcode.get(exc.errno, type(exc).__name__))
+            raise CollabError(503, STAGING_UNAVAILABLE) from None
+
+    def _stage(self, owner_key: str, upload_id: str, parts: list[str], chunk: Chunk, limits: BridgeLimits,
+               staging_cap: int) -> dict:
+        meta = read_staged_meta(self.outbox, owner_key, upload_id, limits)
+        if meta is None:
+            meta = self._reserve(owner_key, upload_id, parts, chunk, limits, staging_cap)
+        if (meta.artifact_id, meta.name, meta.size_bytes, meta.file_sha256, meta.total) != (
+                chunk.artifact_id, chunk.name, chunk.size_bytes, chunk.file_sha256, chunk.total):
+            raise CollabError(409, META_MISMATCH)
+        out = {"upload_id": upload_id, "index": chunk.index}
+        if file_exists_beneath(self.outbox, parts, VERIFIED_MARKER):
+            self._note_complete(owner_key, upload_id, meta)          # the worker consumed it: nothing to write
+            out.update(stored=False, complete=True, received=meta.total, missing=[])
+            return out
+        out["stored"] = stored = self._write_part(parts, f"{chunk.index:07d}", chunk.data)
+        if chunk.index == chunk.total - 1 or not stored:
+            out.update(self._progress(owner_key, upload_id, meta))
+        else:
+            self.stats["chunks_staged"] += 1
+        return out
+
+    def _reserve(self, owner_key: str, upload_id: str, parts: list[str], chunk: Chunk, limits: BridgeLimits,
+                 staging_cap: int) -> StagedUpload:
+        """The first chunk: check both caps and link ``meta.json``, all under the staging lock."""
+        with self._staging_lock:
+            meta = read_staged_meta(self.outbox, owner_key, upload_id, limits)
+            if meta is not None:
+                return meta                                          # another thread linked it first
+            if file_exists_beneath(self.outbox, parts, META_NAME):
+                raise CollabError(409, META_MISMATCH)                # present but invalid: never relinked
+            own, everyone = self._reserved(owner_key, limits)
+            if own.full or own.uploads >= self.max_uploads_per_owner \
+                    or own.size_bytes + chunk.size_bytes > staging_cap \
+                    or everyone + chunk.size_bytes > limits.staging_bytes_total:
+                self.stats["staging_full"] += 1
+                raise CollabError(429, STAGING_FULL)
+            meta = StagedUpload(upload_id=upload_id, owner_key=owner_key, artifact_id=chunk.artifact_id,
+                                name=chunk.name, size_bytes=chunk.size_bytes, file_sha256=chunk.file_sha256,
+                                total=chunk.total, created_at=float(self.clock()))
+            body = json.dumps(meta.to_dict(), ensure_ascii=False, allow_nan=False).encode("utf-8")
+            if link_new_beneath(self.outbox, parts, META_NAME, body, create_dirs=True):
+                self.stats["uploads_started"] += 1
+                self._owner_usage[owner_key] = dataclasses.replace(
+                    own, size_bytes=own.size_bytes + chunk.size_bytes, uploads=own.uploads + 1)
+                return meta
+            again = read_staged_meta(self.outbox, owner_key, upload_id, limits)   # another process linked it
+            if again is None:
+                raise CollabError(409, META_MISMATCH)
+            return again
+
+    def _reserved(self, owner_key: str, limits: BridgeLimits) -> tuple[_OwnerUsage, int]:
+        """(``owner_key``'s usage, declared bytes staged by every owner); call under ``_staging_lock``. Fails closed
+        (429, for everyone) only when ``staging/`` itself is over ``STAGING_OWNERS_MAX`` entries."""
+        self.stats["reservation_scans"] += 1
+        now = self.clock()
+        try:
+            owners = list_beneath(self.outbox, [STAGING_DIR], max_entries=STAGING_OWNERS_MAX) or []
+        except BridgeError:
+            self.stats["staging_full"] += 1
+            raise CollabError(429, STAGING_FULL) from None
+        own, everyone, seen = _OwnerUsage(0, 0, now), 0, set()
+        for owner, st in owners:
+            if not stat.S_ISDIR(st.st_mode):
+                continue                                             # never follow a symlinked owner entry
+            seen.add(owner)
+            usage = self._usage(owner, limits, now)
+            everyone += usage.size_bytes
+            if owner == owner_key:
+                own = usage
+        for gone in [k for k in self._owner_usage if k not in seen]:
+            del self._owner_usage[gone]                              # removed by the worker's sweep
+        return own, everyone
+
+    def _usage(self, owner: str, limits: BridgeLimits, now: float) -> _OwnerUsage:
+        """One owner's cached usage, rescanned when older than ``staging_index_ttl``. An owner dir that cannot be
+        listed is ``full`` and counted as ``max(last known, staging_bytes_per_agent)`` bytes."""
+        cached = self._owner_usage.get(owner)
+        if cached is not None and now - cached.at < self.staging_index_ttl:
+            return cached
+        self.stats["owner_scans"] += 1
+        try:
+            uploads = list_beneath(self.outbox, [STAGING_DIR, owner],
+                                   max_entries=self.max_uploads_per_owner + ENTRY_SLACK)
+        except BridgeError:
+            uploads = None
+        if uploads is None:
+            self.stats["owner_unlistable"] += 1
+            log.warning("collab staging owner=%s: cannot be listed; counted full", owner)
+            usage = _OwnerUsage(max(cached.size_bytes if cached else 0, limits.staging_bytes_per_agent),
+                                self.max_uploads_per_owner, now, full=True)
+        else:
+            size = count = 0
+            for upload_id, ust in uploads:
+                if not stat.S_ISDIR(ust.st_mode):
+                    continue
+                count += 1
+                meta = read_staged_meta(self.outbox, owner, upload_id, limits)
+                if meta is not None and not file_exists_beneath(self.outbox, [STAGING_DIR, owner, upload_id],
+                                                                VERIFIED_MARKER):
+                    size += meta.size_bytes
+            usage = _OwnerUsage(size, count, now)
+        self._owner_usage[owner] = usage
+        return usage
+
+    def _write_part(self, parts: list[str], name: str, data: bytes) -> bool:
+        """True when the part was linked now, False for a replay of the same bytes; 409 for different bytes."""
+        existing = read_bytes_beneath(self.outbox, [*parts, name], max_bytes=CHUNK_BYTES)
+        if existing is None:
+            try:
+                if link_new_beneath(self.outbox, parts, name, data):
+                    return True
+            except BridgeError:
+                raise CollabError(409, UPLOAD_GONE) from None        # swept since the meta read: start over
+            for _ in range(2):                                       # the fallback link's brief nlink == 2
+                existing = read_bytes_beneath(self.outbox, [*parts, name], max_bytes=CHUNK_BYTES)
+                if existing is not None:
+                    break
+                time.sleep(0.01)
+        if existing is not None and existing == data:
+            self.stats["chunk_replays"] += 1
+            return False
+        raise CollabError(409, CHUNK_CONFLICT)
+
+    def _progress(self, owner_key: str, upload_id: str, meta: StagedUpload) -> dict:
+        """One scan of the upload dir: ``complete``, ``received`` and the first ``MAX_MISSING`` ``missing``."""
+        self.stats["progress_scans"] += 1
+        try:
+            present = list_parts(self.outbox, owner_key, upload_id, max_parts=meta.total)
+        except BridgeError:
+            raise CollabError(409, STAGING_INVALID) from None
+        missing, have = [], iter(present)
+        nxt = next(have, None)
+        for index in range(meta.total):
+            if nxt == index:
+                nxt = next(have, None)
+                continue
+            missing.append(index)
+            if len(missing) >= MAX_MISSING:
+                break
+        complete = len(present) == meta.total
+        if complete:
+            self._note_complete(owner_key, upload_id, meta)
+        return {"complete": complete, "received": len(present), "missing": missing}
+
+    def _note_complete(self, owner_key: str, upload_id: str, meta: StagedUpload) -> bool:
+        """Audit ``artifact_upload_staged`` once per upload: only when this call creates the ``audited`` marker.
+        If the event cannot be written the marker is removed again and the 503 propagates, so a retry audits it.
+        Task 7c's ``commit()`` precheck calls this too. True when the event was emitted now."""
+        parts = staging_parts(owner_key, upload_id)
+        if file_exists_beneath(self.outbox, parts, AUDITED_MARKER):
+            return False                                             # the common replay: no tmpfile, no fsync
+        try:
+            if not link_new_beneath(self.outbox, parts, AUDITED_MARKER, b""):
+                return False
+        except BridgeError:
+            return False                                             # swept meanwhile: nothing to audit here
+        svc = self.service
+        member = owner_key.startswith(MEMBER_PREFIX)
+        with svc._lock:
+            agent = None if member else svc._agents.get(owner_key)
+        owner = agent.get("owner") if isinstance(agent, dict) else None
+        actor = Principal("member" if member else "agent", owner_key, owner)
+        actor.external = isinstance(agent, dict) and bool(agent.get("external"))
+        try:
+            self._audit_coalesced(
+                "stage", owner_key, meta.artifact_id, "artifact_upload_staged",
+                lambda: svc._actor(actor, action="artifact.stage_chunk", outcome="allowed", owner_key=owner_key,
+                                   upload_id=upload_id, artifact_id=meta.artifact_id, resource_id=meta.artifact_id,
+                                   size_bytes=meta.size_bytes, project_ids=[]),
+                self._coalesce_window())
+        except BaseException:
+            unlink_beneath(self.outbox, parts, AUDITED_MARKER)
+            raise
+        log.info("collab upload %s owner=%s artifact=%s: staged complete", upload_id, owner_key, meta.artifact_id)
+        return True
+
+    # -- intents and results (Task 7c) --------------------------------------------------------------------------
+    @staticmethod
+    def _actor_key(actor: Actor) -> tuple[str, str]:
+        return actor.kind, actor.id
+
+    def _refresh_feed(self) -> None:
+        """Rewrite ``agents.json`` when this process wrote it more than ``FEED_REFRESH_AGE`` s ago (or never): the
+        worker rejects an agent intent when the feed is stale, so an idle-but-for-commits bridge must not rely on its
+        timer thread alone."""
+        at = self._feed_at
+        age = None if at is None else self.clock() - at
+        if age is None or not 0 <= age <= FEED_REFRESH_AGE:
+            self.write_agents_feed()
+
+    def _live_pending(self, key: tuple[str, str]) -> dict[str, None]:
+        """The tickets of ``key`` whose intent file still exists (the worker unlinks it when it decides). Under
+        ``_intent_lock``."""
+        live = {t: None for t in self._pending.get(key, ()) if file_exists_beneath(self.outbox, [INTENTS_DIR], t + ".json")}
+        if live:
+            self._pending[key] = live
+        else:
+            self._pending.pop(key, None)
+        return live
+
+    def _check_pending(self, key: tuple[str, str], limits: BridgeLimits) -> None:
+        if len(self._live_pending(key)) >= limits.max_pending_intents_per_agent:
+            self.service.stats["rate_limited"] += 1
+            raise CollabError(429, TOO_MANY_PENDING)
+
+    def _remember_ticket(self, ticket: str, key: tuple[str, str]) -> None:
+        with self._tickets_lock:
+            self._tickets[ticket] = key
+            self._tickets.move_to_end(ticket)
+            while len(self._tickets) > self.TICKET_MAP_MAX:
+                self._tickets.popitem(last=False)
+                self.stats["tickets_evicted"] += 1
+
+    def append_intent(self, actor: Actor, kind: str, payload: dict, *, artifact_id: str | None,
+                      idempotency_key: str | None, ticket: str | None = None) -> str:
+        """Write one intent for ``actor`` and return its ticket. The CALLER authorizes (``commit`` does for agents).
+        The envelope is checked with the worker's own ``validate_intent`` (registered kind, allowed actor, payload) and
+        the per-actor ``max_pending_intents_per_agent`` cap, all before anything is written; an agent actor first
+        refreshes ``agents.json`` when it is older than ``FEED_REFRESH_AGE`` s."""
+        _agents, limits = self._require()
+        if not isinstance(actor, Actor):
+            raise CollabError(400, "invalid actor")
+        ticket = ticket or new_ticket()
+        raw = {"ticket": ticket, "kind": kind, "actor": {"kind": actor.kind, "id": actor.id},
+               "submitted_at": float(self.clock()), "payload": payload}
+        if artifact_id is not None:
+            raw["artifact_id"] = artifact_id
+        if idempotency_key is not None:
+            raw["idempotency_key"] = idempotency_key
+        try:
+            validate_intent(raw, filename=ticket + ".json", limits=limits)
+            size = len(json.dumps(raw, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        except (BridgeError, ValueError, TypeError, UnicodeError) as exc:
+            raise CollabError(400, exc.reason if isinstance(exc, BridgeError) else "invalid intent") from None
+        if size > INTENT_MAX_BYTES:
+            raise CollabError(413, INTENT_TOO_LARGE)
+        if actor.kind == "agent":
+            self._refresh_feed()
+        key = self._actor_key(actor)
+        with self._intent_lock:
+            self._check_pending(key, limits)
+            try:
+                atomic_write_json(self.outbox / INTENTS_DIR, ticket + ".json", raw)
+            except (OSError, BridgeError) as exc:
+                self.stats["intent_failures"] += 1
+                log.warning("collab artifacts: intent write failed ticket=%s error=%s", ticket,
+                            errno.errorcode.get(getattr(exc, "errno", None), type(exc).__name__))
+                raise CollabError(503, INTENTS_UNAVAILABLE) from None
+            self._pending.setdefault(key, {})[ticket] = None
+            if len(self._pending) > PENDING_ACTORS_MAX:
+                for stale in [k for k in self._pending if k != key]:
+                    self._live_pending(stale)
+        self._remember_ticket(ticket, key)
+        self.stats["intents_written"] += 1
+        log.info("collab intent %s kind=%s actor=%s:%s: written", ticket, kind, actor.kind, actor.id)
+        return ticket
+
+    def read_result(self, actor: Actor, ticket: str, *, wait: float, still_valid: Callable[[], bool]) -> dict:
+        """``{"status": "pending"}`` or the worker's ``results/<ticket>.json`` for a ticket ``actor`` submitted.
+        Waits up to ``wait`` s (at most ``RESULT_WAIT_MAX``) in steps of at most ``RESULT_POLL_STEP`` s, holding a
+        ``collab_waiters`` slot of the actor, and stops early when ``still_valid()`` turns false."""
+        key = self._actor_key(actor) if isinstance(actor, Actor) else None
+        if not isinstance(ticket, str) or not re.match(TICKET_RE, ticket) or key is None:
+            raise CollabError(404, NOT_FOUND)
+        with self._tickets_lock:
+            owner = self._tickets.get(ticket)
+            if owner is not None:
+                self._tickets.move_to_end(ticket)
+        if owner != key:
+            raise CollabError(404, NOT_FOUND)                  # unknown, evicted or someone else's: one answer
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait):
+            raise CollabError(400, "wait must be a number of seconds")
+        wait = min(max(float(wait), 0.0), RESULT_WAIT_MAX)
+        _agents, limits = self._require()
+        cap = limits.max_conflict_text_bytes + RESULT_EXTRA_BYTES
+        if not wait:
+            return self._result_once(key, ticket, cap) or {"status": "pending"}
+        with collab_waiters.waiter_slot(f"artifact_result:{key[0]}:{key[1]}") as acquired:
+            if not acquired:
+                raise CollabError(429, "too many waiting calls")
+            deadline = self.monotonic() + wait
+            while True:
+                found = self._result_once(key, ticket, cap)
+                if found is not None:
+                    return found
+                left = deadline - self.monotonic()
+                if left <= 0 or not still_valid():
+                    return {"status": "pending"}
+                self.sleep(min(RESULT_POLL_STEP, left))
+
+    def _result_once(self, key: tuple[str, str], ticket: str, cap: int) -> dict | None:
+        name = ticket + ".json"
+        doc = read_json_beneath(self.mirror, [RESULTS_DIR, name], max_bytes=cap)
+        if doc is None:
+            if file_exists_beneath(self.mirror, [RESULTS_DIR], name):     # there, but oversize or not a JSON object
+                self.stats["result_unreadable"] += 1
+                log.warning("collab artifacts: unreadable result ticket=%s", ticket)
+                raise CollabError(502, INTEGRITY)
+            return None
+        actor = doc.get("actor")
+        if doc.get("ticket") != ticket or not isinstance(actor, dict) or (actor.get("kind"), actor.get("id")) != key:
+            raise CollabError(404, NOT_FOUND)
+        return doc
+
+    # -- commit (Task 7c) ----------------------------------------------------------------------------------------
+    _COMMIT_KEYS = frozenset({"artifact_id", "base_version_id", "message", "changes", "idempotency_key"})
+
+    def commit(self, pr: Principal, args) -> dict:
+        """The ``artifact_commit`` tool. Returns ``{ticket, status: "pending"}``; the worker decides later."""
+        if not isinstance(args, dict) or not set(args) <= self._COMMIT_KEYS:
+            raise CollabError(400, "commit arguments are missing or unknown")
+        artifact_id = args.get("artifact_id")
+        permission, doc, limits = self._open_with_limits(pr, "commit", artifact_id)
+        if permission != "write":
+            raise self._refuse(pr, "commit", artifact_id, "read_only", 403, READ_ONLY)
+        if doc.get("writable") is not True:
+            raise self._refuse(pr, "commit", artifact_id, "not_writable", 403, NOT_WRITABLE)
+        svc = self.service
+        with svc._lock:
+            svc._throttle("artcommit:" + pr.id, limits.commits_per_minute, 60.0, "commit")
+        actor = Actor("agent", pr.id)
+        with self._intent_lock:
+            self._check_pending(self._actor_key(actor), limits)
+        changes = args.get("changes")
+        try:
+            checked = validate_changes(changes, limits)
+        except (BridgeError, TypeError, ValueError):
+            raise CollabError(400, "invalid changes") from None
+        staged_bytes = self._check_uploads(pr, artifact_id, checked, limits)
+        payload = {"base_version_id": args.get("base_version_id"), "changes": changes}
+        if "message" in args:
+            payload["message"] = args["message"]
+        inline = sum(len(c.text.encode("utf-8")) for c in checked if c.text is not None)
+        ticket = new_ticket()
+        # audited before the intent exists (a refused audit refuses the commit), coalesced per (agent, artifact)
+        self._audit_coalesced(
+            "commit", pr.id, artifact_id, "artifact_commit_submitted",
+            lambda: svc._actor(
+                pr, action="artifact.commit", outcome="allowed", ticket=ticket, artifact_id=artifact_id,
+                resource_id=artifact_id, size_bytes=inline + staged_bytes, changes=len(checked), project_ids=[]),
+            float(limits.audit_coalesce_seconds))
+        self.append_intent(actor, "commit", payload, artifact_id=artifact_id,
+                           idempotency_key=args.get("idempotency_key"), ticket=ticket)
+        return {"ticket": ticket, "status": "pending"}
+
+    def _check_uploads(self, pr: Principal, artifact_id: str, changes, limits: BridgeLimits) -> int:
+        """Every staged put must be the CALLER's own complete upload for this artifact and name. Returns the declared
+        bytes of the distinct uploads. A complete upload not yet audited is audited here (exactly once)."""
+        try:
+            owner_key = agent_owner_key(pr.id)
+        except BridgeError as exc:
+            raise CollabError(400, exc.reason) from None
+        seen: dict[str, int] = {}
+        for change in changes:
+            upload_id = change.upload_id
+            if upload_id is None or upload_id in seen:
+                continue
+            try:
+                meta = read_staged_meta(self.outbox, owner_key, upload_id, limits)
+            except BridgeError:
+                meta = None
+            if meta is None or meta.artifact_id != artifact_id or meta.name != change.name:
+                raise CollabError(404, UPLOAD_NOT_FOUND)
+            if not file_exists_beneath(self.outbox, staging_parts(owner_key, upload_id), VERIFIED_MARKER):
+                progress = self._progress(owner_key, upload_id, meta)      # audits when complete
+                if not progress["complete"]:
+                    raise UploadIncomplete(progress["missing"])
+            else:
+                self._note_complete(owner_key, upload_id, meta)
+            seen[upload_id] = meta.size_bytes
+        return sum(seen.values())
+
+    def result(self, pr: Principal, ticket: str, *, wait: float) -> dict:
+        """The ``artifact_commit_result`` tool: ``read_result`` for the calling agent's own tickets."""
+        if not isinstance(pr, Principal) or not pr.is_agent:
+            raise CollabError(404, NOT_FOUND)
+        return self.read_result(Actor("agent", pr.id), ticket, wait=wait,
+                                still_valid=lambda: self.service.still_valid(pr))
+
+    # -- blobs ------------------------------------------------------------------------------------------------
+    def _remember_verified(self, key: tuple) -> None:
+        with self._verified_lock:
+            self._verified[key] = True
+            self._verified.move_to_end(key)
+            while len(self._verified) > self.VERIFY_CACHE_MAX:
+                self._verified.popitem(last=False)
+
+    def _is_verified(self, key: tuple) -> bool:
+        with self._verified_lock:
+            if key in self._verified:
+                self._verified.move_to_end(key)
+                return True
+            return False
+
+    def _hash_fd(self, fd: int) -> str:
+        self.stats["blob_hashes"] += 1
+        h, pos = hashlib.sha256(), 0
+        while True:
+            block = os.pread(fd, _HASH_BLOCK, pos)
+            if not block:
+                return h.hexdigest()
+            h.update(block)
+            pos += len(block)
+
+    def _slice(self, artifact_id: str, sha: str, size: int, offset: int, max_bytes: int) -> tuple[str, int | None] | None:
+        """The verified slice of blob ``sha`` and the next offset; None when the blob is gone (collected)."""
+        parts = [ARTIFACTS_DIR, artifact_id, BLOBS_DIR, sha]
+        fh = open_beneath(self.mirror, parts)
+        if fh is None:
+            return None
+        with fh:
+            fd = fh.fileno()
+            st = os.fstat(fd)
+            if st.st_size != size:
+                log.warning("collab artifacts: blob size mismatch artifact=%s sha256=%s", artifact_id, sha)
+                raise CollabError(502, INTEGRITY)
+            key = ("/".join(parts), st.st_ino, st.st_size, st.st_mtime_ns)
+            if not self._is_verified(key):
+                if self._hash_fd(fd) != sha:
+                    log.warning("collab artifacts: blob digest mismatch artifact=%s sha256=%s", artifact_id, sha)
+                    raise CollabError(502, INTEGRITY)
+                self._remember_verified(key)
+            if offset > size:
+                raise CollabError(400, "offset is past the end of the file")
+            buf = os.pread(fd, max_bytes + 4, offset)
+        if buf and (buf[0] & 0xC0) == 0x80:
+            raise CollabError(400, "offset is not on a character boundary")
+        end = _utf8_slice(buf, max_bytes)
+        try:
+            text = buf[:end].decode("utf-8")
+        except UnicodeDecodeError:
+            log.warning("collab artifacts: blob is not UTF-8 artifact=%s sha256=%s", artifact_id, sha)
+            raise CollabError(502, INTEGRITY) from None
+        stop = offset + end
+        return text, (stop if stop < size else None)
+
+    # -- agents.json ------------------------------------------------------------------------------------------
+    def _feed(self) -> dict:
+        """The feed body, snapshotted under the service lock. Only non-revoked agents are listed (a missing agent
+        is not active to the worker), which keeps the feed bounded; an agent whose owner may not use the network
+        (disabled, kicked, denied) is listed ``disabled``."""
+        svc = self.service
+        with svc._lock:
+            join_ids = {digest: jid for jid, digest in svc._joins_by_id.items()}
+            agents = {}
+            for agent_id, a in svc._agents.items():
+                if a.get("status") != "active":
+                    continue
+                x = a.get("external")
+                agents[agent_id] = {
+                    "owner": a["owner"], "status": "active" if svc._ok(a["owner"]) else "disabled",
+                    "expires_at": a.get("expires_at"), "external": bool(x),
+                    "join_id": join_ids.get(a.get("join")) if a.get("join") else None,
+                    "hard_expiry": x.get("hard_expiry") if isinstance(x, dict) else None}
+        return {"generated_at": self.clock(), "agents": agents}
+
+    def write_agents_feed(self) -> None:
+        """Atomically (tmp + rename in the outbox) rewrite ``agents.json``. Never raises: a failure is logged by type."""
+        try:
+            with self._feed_lock:
+                body = self._feed()
+                atomic_write_json(self.outbox, AGENTS_FEED, body)
+                self._feed_at = body["generated_at"]
+            self.stats["feed_writes"] += 1
+        except Exception as exc:                          # noqa: BLE001 - a feed write never breaks a caller
+            self.stats["feed_failures"] += 1
+            log.warning("collab artifacts: agents feed write failed error=%s", type(exc).__name__)
+
+    def agents_changed(self) -> None:
+        """Wake the feed thread for an early rewrite (cheap; safe under the service lock)."""
+        self._wake.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(self.feed_interval)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
+            self.write_agents_feed()
+
+    def start(self) -> None:
+        """Write the feed now and start the daemon thread that rewrites it every ``feed_interval`` s (idempotent)."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self.write_agents_feed()
+        self._thread = threading.Thread(target=self._run, name="collab-agents-feed", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=10)
+
+    def feed_thread_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+
+__all__ = ["AGENTS_FEED", "INTENT_MAX_BYTES", "UploadIncomplete", "AUDIT_EVERY", "BINARY", "CHUNK_CONFLICT", "CollabArtifactBridge", "INTEGRITY",
+           "MAX_MISSING", "MAX_READ_BYTES", "META_MISMATCH", "NOT_FOUND", "NOT_MIRRORED", "NOT_WRITABLE", "READ_ONLY",
+           "STAGING_FULL", "STAGING_INDEX_TTL", "STAGING_UPLOADS_PER_OWNER", "UNAVAILABLE"]

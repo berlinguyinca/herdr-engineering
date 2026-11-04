@@ -452,6 +452,118 @@ def test_collab_overlay_reads_only_the_collab_slice():
     assert "environment" not in edge and "env_file" not in edge
 
 
+def _volume_map(svc):
+    out = {}
+    for v in svc["volumes"]:
+        if "}:" not in v:      # a named volume (src:target)
+            continue
+        src, rest = v.split("}:", 1)
+        target, *mode = rest.split(":")
+        out[target] = (src + "}", mode)
+    return out
+
+
+def test_bridge_mounts_and_static_flags_in_the_compose_files():
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())
+    base = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    worker = _volume_map(base["services"]["control-plane-worker"])
+    pub_svc = doc["services"]["collab-public"]
+    pub = _volume_map(pub_svc)
+    assert worker["/collab-mirror"] == ("${HERDR_COLLAB_MIRROR_DIR:?run deploy.sh}", [])
+    assert worker["/collab-outbox"] == ("${HERDR_COLLAB_OUTBOX_DIR:?run deploy.sh}", [])
+    assert worker["/collab-spool"] == ("${HERDR_COLLAB_SPOOL_DIR:?run deploy.sh}", [])
+    assert pub["/collab-mirror"] == ("${HERDR_COLLAB_MIRROR_DIR:?run deploy.sh}", ["ro"])
+    assert pub["/collab-outbox"] == ("${HERDR_COLLAB_OUTBOX_DIR:?run deploy.sh}", [])
+    assert "/collab-spool" not in pub and not any("SPOOL" in v for v in pub_svc["volumes"])
+    assert "user" not in base["services"]["control-plane-worker"]      # root: writes the mirror, unlinks in the outbox
+    cmd = pub_svc["command"]
+    assert cmd[cmd.index("--collab-artifacts-mirror") + 1] == "/collab-mirror"
+    assert cmd[cmd.index("--collab-artifacts-outbox") + 1] == "/collab-outbox"
+    assert "environment" not in pub_svc and "env_file" not in pub_svc and "cap_add" not in pub_svc
+    assert not any("/collab-" in v for v in base["services"]["control-plane-web"]["volumes"])
+
+
+def test_example_config_documents_every_bridge_key_with_its_default():
+    import dataclasses
+
+    from herdr_engineering.control_plane.collab_bridge_files import BridgeLimits
+    lines = (ROOT / "deploy/control-plane/fleet-config.example.yaml").read_text().splitlines()
+    start = lines.index("      # collab_artifacts:")
+    block = []
+    for ln in lines[start:]:
+        if not ln.startswith("      #   ") and ln != "      # collab_artifacts:":
+            break
+        block.append(ln.replace("# ", "", 1) if ln.startswith("      # ") else ln)
+    section = yaml.safe_load("\n".join(block))["collab_artifacts"]
+    assert section.pop("enabled") is False
+    defaults = {f.name: getattr(BridgeLimits(), f.name) for f in dataclasses.fields(BridgeLimits)}
+    assert section == defaults
+    text = "\n".join(lines[start:start + 40])
+    assert "ONE collab-public per outbox" in text and "LARGE storage" in text
+
+
+def _bridge_dirs(e):
+    root = e["home"] / ".local/share/herdr-engineering"
+    return root / "collab-mirror", root / "collab-outbox", root / "collab-spool"
+
+
+def test_deploy_always_creates_the_bridge_directories_with_pinned_modes(env):
+    # no collab marker at all: the worker mounts the three directories regardless
+    r = deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    mirror, outbox, spool = _bridge_dirs(env)
+    assert [stat.S_IMODE(p.stat().st_mode) for p in (mirror, outbox, spool)] == [0o755, 0o755, 0o700]
+    assert all(p.stat().st_uid == os.getuid() for p in (mirror, outbox, spool))
+    # beside the share dirs on the same storage, pairwise disjoint (none nested in another or in collab-public's data dir)
+    shares = env["home"] / ".local/share/herdr-engineering"
+    assert (shares / "shares").is_dir() and (shares / "share-events").is_dir()
+    dirs = [mirror, outbox, spool, shares / "collab"]
+    assert all(a == b or a not in b.parents for a in dirs for b in dirs)
+    # re-deploying over existing dirs keeps working and does not loosen the spool
+    os.chmod(spool, 0o700)
+    assert deploy(env).returncode == 0
+    assert stat.S_IMODE(spool.stat().st_mode) == 0o700
+
+
+def test_deploy_exports_the_three_bridge_variables():
+    text = (ROOT / "deploy/control-plane/deploy.sh").read_text()
+    for var, leaf in (("MIRROR", "collab-mirror"), ("OUTBOX", "collab-outbox"), ("SPOOL", "collab-spool")):
+        assert f'export HERDR_COLLAB_{var}_DIR="$HOME/.local/share/herdr-engineering/{leaf}"' in text
+        assert f'export HERDR_COLLAB_{var}_DIR="$ENV_DIR/{leaf}"' in text      # dry run: throwaway
+
+
+def test_deploy_warns_when_collab_public_would_not_own_the_outbox(env):
+    _with_collab(env)
+    data = yaml.safe_load(env["central"].read_text())
+    data["sections"]["control_plane"]["values"]["compose"]["HERDR_COLLAB_CERT_UID"] = str(os.getuid() + 1)
+    env["central"].unlink()
+    fcc.write_private_file(env["central"], yaml.safe_dump(data, sort_keys=False))
+    r = deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    mirror, outbox, _ = _bridge_dirs(env)
+    assert f"WARNING: collab-public runs as uid {os.getuid() + 1}" in r.stderr
+    assert str(outbox) in r.stderr and str(mirror) in r.stderr
+
+
+def test_worker_modes_on_the_bridge_directories_hold_under_a_hostile_umask(tmp_path):
+    """The root worker writes mirror files 0644 / dirs 0755 (collab-public's uid reads them), reads
+    0600 staged parts and unlinks in the outbox, whatever the umask."""
+    from herdr_engineering.control_plane import collab_bridge_files as cbf
+    mirror, outbox = tmp_path / "mirror", tmp_path / "outbox"
+    mirror.mkdir(mode=0o755), outbox.mkdir(mode=0o755)
+    old = os.umask(0o077)
+    try:
+        cbf.atomic_write_bytes(mirror, "grants.json", b"{}")
+        assert cbf.link_new_bytes(outbox, "part-1", b"x")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((mirror / "grants.json").stat().st_mode) == 0o644
+    assert cbf.DIR_MODE == 0o755
+    assert stat.S_IMODE((outbox / "part-1").stat().st_mode) == 0o600
+    assert (outbox / "part-1").read_bytes() == b"x"
+    (outbox / "part-1").unlink()
+
+
 COLLAB = {"cognito_pool": "us-west-2_TESTPOOL", "cognito_clients": ["client-a"],
           "cognito_group": "team.test", "operator_user": "owner-test"}
 
