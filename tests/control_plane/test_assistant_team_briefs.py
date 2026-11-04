@@ -575,6 +575,22 @@ def test_the_per_topic_cap_is_separate(tmp_path, wg_pg):
         w.srv.shutdown()
 
 
+def test_an_approved_brief_is_a_valid_root_for_the_operator_owned_coordinator(world):
+    """Design section 11: the approval creates the root task addressed to the coordinator, which accepts it and decomposes by role.
+    The children do not inherit the taint as a command: they are the coordinator's own tasks under the operator-made root."""
+    w = world
+    held, rev, coord = team_up(w)
+    sid = w.brief()[1]["brief"]["suggestion_id"]
+    [row] = w.queue("pending")[1]["suggestions"]
+    assert w.decide(sid, decision="approve", expected_digest=row["digest"], target_agent_id=coord["agent_id"])[0] == 200
+    [root] = w.inbox(coord)
+    assert root["origin"] == "suggestion" and root["quoted_source"]["taint"] == ["external-source:email"]
+    w.accept(coord, root["task_id"])
+    s, child = w.make(coord, target_role="implementer", parent_task_id=root["task_id"], text="draft the issue for the billing topic")
+    assert s == 201, child
+    assert fx.BODY_PHRASE not in json.dumps(child) and fx.MESSAGE_ID not in json.dumps(child)
+
+
 def test_a_brief_cannot_name_an_assistant_kind_target_or_an_agent_off_the_team(world):
     w = world
     held, rev, coord = team_up(w)
