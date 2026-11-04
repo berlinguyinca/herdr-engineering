@@ -1,0 +1,32 @@
+{
+  "actor": {
+    "id": "alice",
+    "kind": "user"
+  },
+  "agent_id": "urn:herdr:agent:8c5e40ce-33f8-5830-a425-edd19caa98b7",
+  "aliases": [
+    {
+      "system": "hcn",
+      "value": "agent_session-1"
+    }
+  ],
+  "causation_id": "ev-0",
+  "correlation_id": "co-1",
+  "created_at": "2026-10-28T12:00:00Z",
+  "etag": "sha256:e435a5863cc45ebc88d90d52940fd4d0da71c4c3fe90a4bc9385d1d564305bfe",
+  "id": "urn:herdr:agent_session:3c43470d-3c91-54d1-89f1-aa3e56c0ae77",
+  "kind": "agent_session",
+  "refs": [
+    "herdr://rooms/room-1"
+  ],
+  "scope": {
+    "room_id": "room-1",
+    "tenant_id": "t1",
+    "visibility": "room"
+  },
+  "source_sequence": 7,
+  "state": "detached",
+  "trace_id": "tr-1",
+  "updated_at": "2026-10-28T12:00:00Z",
+  "version": 1
+}

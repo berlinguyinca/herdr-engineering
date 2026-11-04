@@ -39,16 +39,39 @@ class Limits:
 
 
 @functools.lru_cache(maxsize=1)
-def _network_wrapper() -> tuple[str, ...]:
-    """``unshare -rn`` when unprivileged user namespaces work; else none (reported to the caller)."""
-    unshare = shutil.which("unshare")
-    if not unshare:
-        return ()
-    try:
-        ok = subprocess.run([unshare, "-rn", "true"], capture_output=True, timeout=10).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        ok = False
-    return (unshare, "-rn", "--") if ok else ()
+def _mechanism() -> str | None:
+    """Which no-network sandbox works for an unprivileged user here: ``bwrap`` first (it also makes the filesystem
+    read-only), then ``unshare -rn``; None when neither does (reported to the caller as network_isolated: false).
+
+    Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor, which blocks a bare ``unshare`` but allows
+    ``bwrap`` under its own profile, so the probe is the real command rather than a sysctl guess."""
+    probes = (("bwrap", ["--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev", "true"]),
+              ("unshare", ["-rn", "true"]))
+    for name, args in probes:
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        try:
+            if subprocess.run([exe, *args], capture_output=True, timeout=10).returncode == 0:
+                return name
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
+def _sandbox_prefix(scratch: str, writable: tuple[str, ...] = ()) -> tuple[list[str], str | None]:
+    """The command prefix that cuts the network (and, with bwrap, makes everything but ``scratch`` and ``writable``
+    read-only), and the mechanism name."""
+    mech = _mechanism()
+    if mech == "bwrap":
+        cmd = [shutil.which("bwrap"), "--unshare-net", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev",
+               "--proc", "/proc", "--bind", scratch, scratch]
+        for path in writable:
+            cmd += ["--bind", path, path]
+        return cmd + ["--chdir", scratch, "--"], mech
+    if mech == "unshare":
+        return [shutil.which("unshare"), "-rn", "--"], mech
+    return [], None
 
 
 def _limiter(lim: Limits):
@@ -68,8 +91,13 @@ def run_isolated(repo_path: str, rev: str, host_id: str, repository_id: str, *, 
     """Analyse ``rev`` of ``repo_path``. Returns {"snapshot", "graph", "sandbox"}."""
     req = {"repo_path": os.path.realpath(repo_path), "rev": rev, "host_id": host_id,
            "repository_id": repository_id, "worktree_id": worktree_id, **(config or {})}
-    net = list(_network_wrapper())
+    cache = (config or {}).get("cache_dir")
+    writable = ()
+    if cache:
+        os.makedirs(cache, mode=0o700, exist_ok=True)       # the sandbox bind-mounts it, so it must exist
+        writable = (os.path.realpath(cache),)
     with tempfile.TemporaryDirectory(prefix="herdr-arch-") as cwd:
+        net, mechanism = _sandbox_prefix(os.path.realpath(cwd), writable)
         env = gitsource.clean_env(home=cwd)
         cmd = [*net, sys.executable, "-I", _WORKER]
         proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -105,7 +133,8 @@ def run_isolated(repo_path: str, rev: str, host_id: str, repository_id: str, *, 
     if len(data) > MAX_OUTPUT:
         raise AnalysisError("analysis output exceeded the size limit")
     result = json.loads(data)
-    result["sandbox"] = {"network_isolated": bool(net), "limits": limits.__dict__}
+    result["sandbox"] = {"network_isolated": bool(net), "mechanism": mechanism,
+                         "read_only_filesystem": mechanism == "bwrap", "limits": limits.__dict__}
     return result
 
 

@@ -7,8 +7,8 @@ do not resolve inside the analysed tree (stdlib, third party, other
 repositories) produce no edge; they are counted in diagnostics instead, so no
 edge is ever invented.
 
-Not supported here (reported as diagnostics, snapshot is then ``partial``):
-``calls`` edges (needs a language server) and every language except Python.
+Python ``calls`` edges are resolved by name only (callgraph.py); JavaScript/TypeScript symbols and calls come from a scanner
+(jssyntax.py). Every other language is reported as a diagnostic and the snapshot is then ``partial``.
 """
 from __future__ import annotations
 
@@ -20,10 +20,12 @@ from dataclasses import dataclass
 from ._vendor.codeboarding_content_hash import (
     SOURCE_DECODE_ERRORS, SOURCE_ENCODING, MethodSpan, hash_file_residual, hash_method_body,
     hash_whole_file, tree_hash_from_file_hashes)
+from . import callgraph, jssyntax
 from .identity import GRAPH_SCHEMA
 
 EXTRACTOR_IMPORTS = "python-ast-import/1"
 EXTRACTOR_SYMBOLS = "python-ast-symbols/1"
+EXTRACTOR_CALLS = callgraph.EXTRACTOR_CALLS
 EXTRACTOR_JS = "js-import-regex/1"      # module-level imports only; regex, so confidence < 1
 NODE_KINDS = ("repo", "service", "package", "module", "class", "function", "file", "endpoint")
 EDGE_KINDS = ("contains", "imports", "calls", "implements", "depends_on", "exposes", "consumes")
@@ -39,11 +41,13 @@ class Config:
     max_file_bytes: int = 1_000_000
     max_files: int = 20_000
     max_nodes: int = 200_000
+    max_call_edges: int = 50_000      # measured ~485 B per call edge: ~24 MB at the cap, so calls cannot alone exceed the runner's 64 MiB output cap
 
     def as_dict(self) -> dict:
-        return {"languages": ["python", "javascript-imports"], "max_file_bytes": self.max_file_bytes,
-                "max_files": self.max_files, "max_nodes": self.max_nodes,
-                "extractors": [EXTRACTOR_SYMBOLS, EXTRACTOR_IMPORTS]}
+        return {"languages": ["python", "javascript-scan"], "max_file_bytes": self.max_file_bytes,
+                "max_files": self.max_files, "max_nodes": self.max_nodes, "max_call_edges": self.max_call_edges,
+                "extractors": [EXTRACTOR_SYMBOLS, EXTRACTOR_IMPORTS, EXTRACTOR_CALLS, jssyntax.EXTRACTOR_JS_SYMBOLS,
+                                jssyntax.EXTRACTOR_JS_CALLS]}
 
 
 def module_name(path: str) -> str:
@@ -118,6 +122,7 @@ def extract_file_facts(path: str, raw: bytes) -> dict:
             line = text.count("\n", 0, pos) + 1
             imps.append({"line": line, "col": pos - (text.rfind("\n", 0, pos) + 1) + 1, "spec": spec})
         facts["imports"] = imps
+        facts.update(jssyntax.scan(text, path, hash_method_body, lines))
         return facts
     try:
         tree = ast.parse(text, filename=path)
@@ -125,6 +130,7 @@ def extract_file_facts(path: str, raw: bytes) -> dict:
         facts["parse_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
         return facts
     syms: list[dict] = []
+    sym_of: dict[int, int] = {}      # id(ast node) -> index in syms, for attributing call sites
 
     def visit(body, parent_idx, prefix, in_class):
         for st in body:
@@ -139,6 +145,7 @@ def extract_file_facts(path: str, raw: bytes) -> dict:
                 else:
                     meta["async"] = isinstance(st, ast.AsyncFunctionDef)
                     meta["method"] = in_class
+                sym_of[id(st)] = len(syms)
                 syms.append({"kind": "class" if is_cls else "function", "name": st.name, "qname": q, "parent": parent_idx,
                              "start": start, "end": end, "col": st.col_offset + 1, "meta": meta})
                 if is_cls:
@@ -155,14 +162,19 @@ def extract_file_facts(path: str, raw: bytes) -> dict:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imps.append({"line": node.lineno, "end": node.end_lineno or node.lineno, "col": node.col_offset + 1,
-                         "kind": "import", "level": 0, "module": None, "names": [a.name for a in node.names]})
+                         "kind": "import", "level": 0, "module": None, "names": [a.name for a in node.names],
+                         "asnames": [a.asname for a in node.names]})
         elif isinstance(node, ast.ImportFrom):
             imps.append({"line": node.lineno, "end": node.end_lineno or node.lineno, "col": node.col_offset + 1,
-                         "kind": "from", "level": node.level, "module": node.module, "names": [a.name for a in node.names]})
+                         "kind": "from", "level": node.level, "module": node.module, "names": [a.name for a in node.names],
+                         "asnames": [a.asname for a in node.names]})
     imps.sort(key=lambda i: (i["line"], i["col"]))
     top = [s for s in syms if s["parent"] == -1]
     spans = [MethodSpan(s["start"], s["end"]) for s in top]
-    facts.update(symbols=syms, imports=imps, residual_hash=hash_file_residual(lines, spans))
+    calls, calls_truncated = callgraph.collect_calls(tree, sym_of)
+    facts.update(symbols=syms, imports=imps, calls=calls, residual_hash=hash_file_residual(lines, spans))
+    if calls_truncated:
+        facts["calls_truncated"] = True
     return facts
 
 
@@ -204,6 +216,7 @@ def assemble(facts: list[dict], repository_id: str, cfg: Config = Config(), skip
     js_files = {f["path"] for f in facts if f["lang"] == "js"}
     file_hashes = {f["path"]: f["content_hash"] for f in facts}
     pkg_ids: dict[str, str] = {}
+    sym_ids: dict[str, dict[int, str]] = {}
     ext_counts: dict[str, int] = {}
     parse_errors = 0
     node_cap = False
@@ -227,6 +240,16 @@ def assemble(facts: list[dict], repository_id: str, cfg: Config = Config(), skip
                          {"content_hash": f["content_hash"], "lines": f["lines"], "language": "javascript"}, nid=f"module:{path}")
             b.nodes[mid]["confidence"] = JS_CONFIDENCE
             b.edge("contains", parent, mid, {"path": path, "line_start": 1}, EXTRACTOR_JS, path)
+            idx_to_id = {-1: mid}
+            sym_ids[path] = idx_to_id
+            for i, sy in enumerate(f.get("symbols", [])):
+                nid = b.node(sy["kind"], sy["qname"], idx_to_id[sy["parent"]], path, sy["start"], sy["end"],
+                             jssyntax.EXTRACTOR_JS_SYMBOLS, dict(sy["meta"]))
+                b.nodes[nid]["confidence"] = jssyntax.JS_SYMBOL_CONFIDENCE
+                idx_to_id[i] = nid
+                b.edge("contains", idx_to_id[sy["parent"]], nid,
+                       {"path": path, "line_start": sy["start"], "line_end": sy["end"], "col": sy["col"]},
+                       jssyntax.EXTRACTOR_JS_SYMBOLS, f"{path}#L{sy['start']}", confidence=jssyntax.JS_SYMBOL_CONFIDENCE)
             continue
         mq = module_name(path)
         if not mq:
@@ -241,6 +264,7 @@ def assemble(facts: list[dict], repository_id: str, cfg: Config = Config(), skip
         mid = b.node("module", mq, parent, path, 1, max(f["lines"], 1), EXTRACTOR_SYMBOLS, meta)
         b.edge("contains", parent, mid, {"path": path, "line_start": 1}, EXTRACTOR_SYMBOLS, path)
         idx_to_id: dict[int, str] = {-1: mid}
+        sym_ids[path] = idx_to_id
         for i, s in enumerate(f.get("symbols", [])):
             nid = b.node(s["kind"], s["qname"], idx_to_id[s["parent"]], path, s["start"], s["end"], EXTRACTOR_SYMBOLS,
                          dict(s["meta"]))
@@ -256,6 +280,7 @@ def assemble(facts: list[dict], repository_id: str, cfg: Config = Config(), skip
             break
 
     ext_by_module: dict[str, list] = {}
+    call_stats = js_calls = {"calls_seen": 0, "calls_resolved": 0}
     if not node_cap:
         for f in facts:
             path = f["path"]
@@ -326,15 +351,42 @@ def assemble(facts: list[dict], repository_id: str, cfg: Config = Config(), skip
                     uniq.setdefault(e["name"], e["line"])
                 b.nodes[mid]["metadata"]["external_imports"] = [{"name": n, "line": l} for n, l in sorted(uniq.items())][:MAX_EXTERNAL_PER_MODULE]
 
+    call_budget = {"left": cfg.max_call_edges, "cut": False}
+
+    def call_edge(a, c, span, ev, meta, conf, extractor):
+        if call_budget["left"] <= 0:
+            call_budget["cut"] = True
+            return
+        call_budget["left"] -= 1
+        b.edge("calls", a, c, span, extractor, ev, meta, conf)
+
+    if not node_cap:
+        py_facts = [f for f in facts if f["lang"] == "py" and f["path"] in sym_ids]
+        call_stats = callgraph.resolve_calls(
+            py_facts, sym_ids, set(py_modules),
+            lambda p: module_name(p) if _is_package_init(p) else module_name(p).rpartition(".")[0],
+            lambda a, c, span, ev, meta, conf: call_edge(a, c, span, ev, meta, conf, EXTRACTOR_CALLS))
+        js_calls = jssyntax.resolve_js(
+            [f for f in facts if f["lang"] == "js" and f["path"] in sym_ids], sym_ids, js_files, _js_resolve,
+            lambda a, c, span, ev, meta: call_edge(a, c, span, ev, meta, jssyntax.JS_SYMBOL_CONFIDENCE,
+                                                   jssyntax.EXTRACTOR_JS_CALLS))
     for lang, n in sorted(unsupported.items()):
         b.diag.append({"severity": "info", "code": "unsupported_language", "language": lang, "files": n,
                        "message": f"{n} {lang} file(s) are not analysed"})
     if js_files:
-        b.diag.append({"severity": "info", "code": "js_imports_only", "files": len(js_files),
-                       "message": "JavaScript/TypeScript: module-level imports only (regex, confidence "
-                                  f"{JS_CONFIDENCE}); no symbols, no call edges"})
-    b.diag.append({"severity": "info", "code": "unsupported_edge_kind", "edge_kind": "calls",
-                   "message": "call edges need a language server; none were produced"})
+        b.diag.append({"severity": "info", "code": "js_scanned_not_parsed", "files": len(js_files), **{f"js_{k}": v for k, v in js_calls.items()},
+                       "message": "JavaScript/TypeScript: imports, top-level functions/classes/methods and calls are found by a "
+                                  f"scanner, not a parser (confidence {jssyntax.JS_SYMBOL_CONFIDENCE}); object-literal methods, nested "
+                                  "functions and re-exports are missed"})
+    b.diag.append({"severity": "info", "code": "calls_by_name_only", "edge_kind": "calls", **call_stats,
+                   "message": "Python call edges are resolved by name only (same module, imports, self.method); dynamic "
+                              "dispatch, inherited methods and calls on values produce no edge"})
+    if call_budget["cut"]:
+        b.diag.append({"severity": "warning", "code": "max_call_edges",
+                       "message": f"call edge limit {cfg.max_call_edges} reached; later files' calls are missing"})
+    if any(f.get("calls_truncated") for f in facts):
+        b.diag.append({"severity": "warning", "code": "calls_truncated",
+                       "message": f"files with more than {callgraph.MAX_CALLS_PER_FILE} calls were cut short"})
     for key, label in (("skipped_symlinks", "symlink"), ("skipped_submodules", "submodule"),
                        ("skipped_oversize", "oversize file")):
         if skipped.get(key):
@@ -347,7 +399,7 @@ def assemble(facts: list[dict], repository_id: str, cfg: Config = Config(), skip
     b.diag.sort(key=lambda d: (d["code"], d.get("path", ""), d.get("language", ""), d.get("edge_kind", "")))
     nodes = sorted(b.nodes.values(), key=lambda n: n["node_id"])
     edges = sorted(b.edges, key=lambda e: (e["kind"], e["from_id"], e["to_id"], e["edge_id"]))
-    complete = not (unsupported or truncated or parse_errors or skipped.get("skipped_oversize") or js_files)
+    complete = not (unsupported or truncated or call_budget["cut"] or parse_errors or skipped.get("skipped_oversize") or js_files)
     return {"schema": GRAPH_SCHEMA, "nodes": nodes, "edges": edges, "diagnostics": b.diag,
             "completeness": "complete" if complete else "partial",
             "source_tree_hash": tree_hash_from_file_hashes(file_hashes),

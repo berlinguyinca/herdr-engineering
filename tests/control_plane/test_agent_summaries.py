@@ -600,3 +600,37 @@ def test_fabric_transport_errors_do_not_expose_credentials_or_response(monkeypat
             'herdr_summary_session_id': 'a' * 64}}, timeout=2)
     assert str(error.value) == 'fabric summary request failed'
     assert error.value.__suppress_context__
+
+
+def test_summary_source_is_memoized_until_new_events(repo):
+    """The projection is reused across polls while the session is unchanged, and
+    recomputed once a new event lands (newest_seq is a sound staleness key)."""
+    feed(repo, msg('hello'), msg('world', 'assistant'))
+    svc = make_service(repo)
+    first = svc.summary_source(SID)
+    second = svc.summary_source(SID)
+    assert first is second  # cached: no new events since last computation
+    feed(repo, msg('another'))
+    third = svc.summary_source(SID)
+    assert third is not first  # newest_seq advanced -> recomputed
+    texts = [m['text'] for m in third['messages']]
+    assert 'another' in texts
+    # And it is stable again after the recompute.
+    assert svc.summary_source(SID) is third
+
+
+def test_summary_source_memo_is_bounded(repo):
+    """The LRU cap is enforced so a long-lived control plane cannot grow the
+    source memo without limit."""
+    feed(repo, msg('seed'))
+    svc = make_service(repo)
+    svc._source_cache_max = 2
+    svc.summary_source(SID)
+    assert len(svc._source_cache) == 1
+    for n in range(5):
+        other = SimpleNamespace(inspector=repo.inspector, get_session=repo.get_session)
+        feed(repo, msg(f'sid-{n}'))
+        other_sid = f'other-{n}'
+        AgentSummaryService(other, svc.config).summary_source(other_sid)
+    # distinct sessions -> bounded by cap
+    assert len(svc._source_cache) <= svc._source_cache_max

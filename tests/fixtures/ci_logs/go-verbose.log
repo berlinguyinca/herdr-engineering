@@ -1,0 +1,31 @@
+assistant: retrying postgres start after a transient failure (attempt 2/3): run postgres: generic container: start container: container start: Error response from daemon: failed to set up container ne
+assistant: retrying postgres start after a transient failure (attempt 1/3): run postgres: generic container: start container: container start: Error response from daemon: failed to set up container ne
+assistant: retrying postgres start after a transient failure (attempt 2/3): run postgres: generic container: start container: container start: Error response from daemon: failed to set up container ne
+--- FAIL: TestCompoundReaderUsesReadOnlyTransactionAndThreeSecondTimeout (32.99s)
+    diagnostics_compound_test.go:323: 
+        	Error Trace:	/tmp/woodpecker-local-3939036862/workspace/go-query/query/assistant/diagnostics_compound_test.go:323
+        	Error:      	"29.284299171s" is not less than "4s"
+        	Test:       	TestCompoundReaderUsesReadOnlyTransactionAndThreeSecondTimeout
+FAIL
+FAIL	github.com/example-org/go-modules/go-query/query/assistant	501.529s
+ok  	github.com/example-org/go-modules/go-query/query/audit	11.195s
+ok  	github.com/example-org/go-modules/go-query/query/chemical	0.009s
+ok  	github.com/example-org/go-modules/go-query/query/compound	42.004s
+ok  	github.com/example-org/go-modules/go-query/query/configuration	11.352s
+=== RUN   TestBackfillCoordinatorPublishesGroupsAndAdvancesKeyset
+{"level":"info","time":"2026-10-28T17:15:28Z","message":"metadata backfill creating durable run"}
+{"level":"info","time":"2026-10-28T17:15:28Z","message":"metadata backfill durable run operation returned"}
+{"level":"info","claimed":true,"run_id":"00000000-0000-0000-0000-000000000000","time":"2026-10-28T17:15:28Z","message":"metadata backfill lease operation returned"}
+{"level":"info","candidates":2,"after_sample_id":"","time":"2026-10-28T17:15:28Z","message":"metadata backfill candidate page returned"}
+{"level":"info","candidates":0,"after_sample_id":"S2","time":"2026-10-28T17:15:28Z","message":"metadata backfill candidate page returned"}
+--- PASS: TestBackfillCoordinatorPublishesGroupsAndAdvancesKeyset (0.00s)
+=== RUN   TestMetadataExecutorRequiresExactIdentityInputs
+--- PASS: TestMetadataExecutorRequiresExactIdentityInputs (0.00s)
+=== RUN   TestMetadataExecutorPassesPrimaryAndBackfillIdentity
+{"level":"debug","time":"2026-10-28T17:15:28Z","message":"SLURM_JOB_ID is set to 25186803, since it's running on a cluster"}
+{"level":"debug","time":"2026-10-28T17:15:28Z","message":"job_id is 25186803"}
+--- PASS: TestMetadataExecutorPassesPrimaryAndBackfillIdentity (0.00s)
+=== RUN   TestMetadataExecutorReturnsTaskFailure
+{"level":"debug","time":"2026-10-28T17:15:28Z","message":"SLURM_JOB_ID is set to 25186803, since it's running on a cluster"}
+{"level":"debug","time":"2026-10-28T17:15:28Z","message":"job_id is 25186803"}
+--- PASS: TestMetadataExecutorReturnsTaskFailure (0.00s)

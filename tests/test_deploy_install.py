@@ -96,13 +96,14 @@ def test_installer_refuses_missing_legacy_before_any_installation(installation):
     assert not (home / ".local").exists()
 
 
-def test_installer_does_not_run_during_rollout(installation):
+@pytest.mark.parametrize("lock_name", ["rollout.lock", "deploy.lock"])
+def test_installer_does_not_run_during_rollout(installation, lock_name):
     import fcntl
 
     _, _, home, legacy, body = installation
     state = home / ".local/state/herdr-engineering/deploys"
     state.mkdir(parents=True)
-    with (state / "rollout.lock").open("a") as handle:
+    with (state / lock_name).open("a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         result = install(installation)
     assert result.returncode == 75

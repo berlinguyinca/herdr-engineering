@@ -15,6 +15,7 @@ from datetime import datetime
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from . import review_refs
 from .redact import redact_text
 
 ENTITY = "plannotator_review"
@@ -105,6 +106,19 @@ class ReviewService:
             key=lambda r: (r["updated_at"], r["review_id"]), reverse=True,
         )
 
+    def list_waiting(self, *, limit=200):
+        """Every review still open (starting or awaiting a decision), longest-waiting first, bounded by `limit`.
+
+        list_reviews() orders by updated_at and the API returns only the newest page, but a heartbeat does not bump
+        updated_at, so a review that has waited longest is exactly the one that page drops. This list is not windowed.
+        """
+        limit = max(1, int(limit))
+        with self.repo._event_lock:
+            ids = [key for kind, key in self.repo._events if kind == ENTITY]
+            records = [self.get(key) for key in ids]
+        waiting = sorted((r for r in records if r["status"] not in TERMINAL), key=lambda r: (r["created_at"], r["review_id"]))
+        return {"reviews": waiting[:limit], "total": len(waiting), "has_more": len(waiting) > limit}
+
     def register(self, payload):
         if not isinstance(payload, dict):
             raise ValueError("review must be an object")
@@ -131,10 +145,16 @@ class ReviewService:
         }
         for key in ("repository", "project_id", "revision", "mission_id", "session_id", "candidate_id", "host_id"):
             record[key] = _text(payload.get(key), key)
+        # Optional and never guessed: absent means no pull request is named.
+        record["pull_request_number"] = review_refs.pull_request_number(payload.get("pull_request_number"))
+        if record["pull_request_number"] is not None:
+            if not record["repository"]:
+                raise ValueError("pull_request_number needs the repository it belongs to")
+            review_refs.repository(payload.get("repository"))   # a number is only kept with a repository the PR trail can read
         with self.repo._event_lock:
             existing = _snapshot(self.repo, rid)
             if existing:
-                fields = ("kind", "instance_id", "plan_digest", "repository", "revision", "project_id", "mission_id", "session_id")
+                fields = ("kind", "instance_id", "plan_digest", "repository", "revision", "project_id", "mission_id", "session_id", "pull_request_number")
                 if any(existing.get(k) != record.get(k) for k in fields):
                     raise ValueError("review_id already belongs to another launch or revision")
                 return self.get(rid)

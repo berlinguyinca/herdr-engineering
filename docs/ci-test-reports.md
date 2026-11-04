@@ -40,6 +40,49 @@ The uploader reads the following environment defaults; explicit options override
 
 Repository, positive run number, branch and revision are required. The provider repository ID is recommended to distinguish repositories with equal names on different forges. It must match the identity reported by Woodpecker. If omitted, HerdR links the report only when the retained observations uniquely match its exact repository, run number, branch and revision. Reports uploaded before a run is observed can link on a later refresh. Ambiguous or unmatched reports remain explicitly unlinked; HerdR never chooses a provider by name alone. The report must be UTF-8 XML of at most 1 MiB, with at most 5,000 cases and no DTD/entity declarations. The response is bounded to 2 MiB; network operations use a 15-second timeout.
 
+## Zero-config counts from CI logs
+
+A project that uploads nothing still gets test counts. After each poll the control plane reads the step logs of recently finished
+Woodpecker runs itself, with its own server-side token, and keeps what the test runners printed. Nothing is added to a pipeline and no
+credential goes into CI, so it works for any project whose runs the control plane can see.
+
+What is read, and what is kept:
+
+- Each runner is recognised only by its own summary line: pytest, `node --test` and other TAP (bats, prove), cargo, `go test -v`,
+  jest and vitest, surefire, ScalaTest/sbt, gradle, Karma and `unittest`. Output that matches none of them yields nothing; a count is
+  never guessed from words such as "passed".
+- The counts of every recognised summary in a run are **summed** across its steps and across the suites inside a step. The sum is a
+  heuristic: a project that prints one suite twice, or runs the same tests in two steps, counts them twice.
+- For runners that print one line per test (TAP, cargo, `go test -v`, pytest `-v`, jest/vitest verbose, ScalaTest, gradle; surefire names only its failures) HerdR also keeps an
+  index of up to 5,000 tests per run: name, suite, status, duration when printed, step and the line range in that step's log. Runners
+  that print only totals (Karma, `unittest`) show counts and say "counts only".
+- **No log text is stored.** Only counts, runner names and redacted, bounded test names are kept, alongside the run's identity.
+- A log larger than `max_log_mib` is not parsed (its summary sits at the end, so a cut log would give wrong numbers). The step is listed
+  as not counted.
+
+Clicking a test fetches that step's log live, redacts it, and shows the lines around the range. If the log is shorter than the stored
+range, or the test's name is not where the index says, no excerpt is shown and the page says why.
+
+Only the newest 40 analysed runs keep their per-test index in memory; older runs keep their counts only, which bounds the control plane's footprint.
+
+An uploaded JUnit report for the same run always replaces the parsed counts, and parsed reports never use up the retention of uploaded
+ones. Parsed tests do not feed flakiness or test-history analysis, because a name read from a log is not a stable identity; JUnit upload
+remains the way to get exact per-test results, failure messages and traces, and cross-run history.
+
+Configure it in the central fleet file (no environment variables). Every key is optional and the defaults are shown:
+
+```yaml
+control_plane:
+  ci_log_tests:
+    enabled: true
+    runs_per_cycle: 10   # finished runs analysed per poll, newest first, each run once
+    max_log_mib: 4       # a step log larger than this is skipped
+    window_days: 14      # only runs that finished this recently
+```
+
+A run whose logs held no tests is remembered and not read again; if it had finished less than an hour before it was read, it is read once
+more after six hours.
+
 ## Woodpecker: publish even when tests fail
 
 Keep test execution and upload in separate steps. The test command keeps its real exit status, and the report step runs for either success or failure using Woodpecker’s [status condition](https://woodpecker-ci.org/docs/usage/workflow-syntax#status). This example assumes the HerdR package is already available to the Python image through your approved installation/build process; replace the test command and report path for the project.

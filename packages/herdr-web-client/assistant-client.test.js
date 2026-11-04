@@ -120,3 +120,70 @@ test('registerDelegationArtifact POSTs to the artifact endpoint', async () => {
   assert.equal(calls[0].url, '/api/v1/assistant-delegations/dlg1/artifact');
   assert.equal(JSON.parse(calls[0].opts.body).artifact_ref, 'artifact://mission/MSN-1');
 });
+
+test('testConnector posts the assistant to the gated test route (not the bare request route)', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.testConnector('conn 1', { assistant_id: 'asst1' });
+  assert.equal(calls[0].url, '/api/v1/assistant-connectors/conn%201/test');
+  assert.equal(calls[0].opts.method, 'POST');
+  assert.equal(JSON.parse(calls[0].opts.body).assistant_id, 'asst1');
+});
+
+test('proposal, execute and notification calls hit the documented routes', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.listProposals('approved');
+  await c.previewProposal('p1');
+  await c.decideProposal('p1', 'rejected');
+  await c.executeProposal('p1');
+  await c.executeApproval('a1');
+  await c.listNotifications('ready');
+  await c.ackNotification('n1');
+  assert.deepEqual(calls.map(x => [x.opts.method, x.url]), [
+    ['GET', '/api/v1/assistant-proposals?status=approved'],
+    ['GET', '/api/v1/assistant-proposals/p1/preview'],
+    ['POST', '/api/v1/assistant-proposals/p1/decision'],
+    ['POST', '/api/v1/assistant-proposals/p1/execute'],
+    ['POST', '/api/v1/assistant-approvals/a1/execute'],
+    ['GET', '/api/v1/assistant-notifications?state=ready'],
+    ['POST', '/api/v1/assistant-notifications/n1/ack'],
+  ]);
+  assert.equal(JSON.parse(calls[2].opts.body).decision, 'rejected');
+});
+
+test('assistant apps client: exact URL, verb and JSON body for every method', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.listApps();
+  await c.saveAppClient('google', 'cid.apps', 's3cret');
+  await c.connectApp('google');
+  await c.disconnectApp('google');
+  await c.listCalendars('google');
+  await c.setBlockedCalendars('google', ['a@x.org', 'b@x.org']);
+  await c.listDrafts('google');
+  await c.discardDraft('google', 'r-1');
+  await c.listReminders();
+  await c.cancelReminder('rem_1');
+  const seen = calls.map((x) => [x.opts.method, x.url, x.opts.body === undefined ? undefined : JSON.parse(x.opts.body)]);
+  assert.deepEqual(seen, [
+    ['GET', '/api/v1/assistant-apps', undefined],
+    ['PUT', '/api/v1/assistant-apps/google/client', { client_id: 'cid.apps', client_secret: 's3cret' }],
+    ['POST', '/api/v1/assistant-apps/google/connect', {}],
+    ['DELETE', '/api/v1/assistant-apps/google', undefined],
+    ['GET', '/api/v1/assistant-apps/google/calendars', undefined],
+    ['PUT', '/api/v1/assistant-apps/google/blocked-calendars', { ids: ['a@x.org', 'b@x.org'] }],
+    ['GET', '/api/v1/assistant-apps/google/drafts', undefined],
+    ['DELETE', '/api/v1/assistant-apps/google/drafts/r-1', undefined],
+    ['GET', '/api/v1/assistant-reminders', undefined],
+    ['DELETE', '/api/v1/assistant-reminders/rem_1', undefined],
+  ]);
+  assert.equal(calls[1].opts.headers['Content-Type'], 'application/json');
+});
+
+test('assistant apps client: ids are path-encoded', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.discardDraft('google', 'a/b');
+  assert.equal(calls[0].url, '/api/v1/assistant-apps/google/drafts/a%2Fb');
+});

@@ -50,7 +50,8 @@ start real Python servers, launch Chromium and push 10,000-node graphs with 600 
 | Surface | Gate |
 |---|---|
 | Rooms, chat, tabs, remote agent tabs (T08, T10) | accessibility audit (light and dark, owner and viewer), tablist arrow keys, no tab trap, screenshot at 3 viewports x 2 schemes |
-| Lineage, Gantt, replay (T09) | keyboard graph (one Tab stop, arrow keys), table alternative above the draw cap, replay by keyboard, stale-evidence edges drawn differently, perf at 2k to 10k nodes |
+| Mission Workbench (S5): inspector facts, pan/zoom/focus, status strip, 64-session chain, 1500 nodes, 375 and 320px | `ui-gates-workbench.test.mjs` on the `workbench` fixture (`real_server.py`), screenshots `collab-workbench*` |
+| Lineage, Gantt, replay (T09) | keyboard graph (one Tab stop, arrow keys), bounded graph viewport (at most 240 nodes drawn at any zoom) with the table alternative, replay by keyboard, stale-evidence edges drawn differently, perf at 2k to 10k nodes |
 | Comments, steering, forks (T12, T13) | keyboard-only comment, propose redirect, propose fork, owner confirms what was proposed by someone else; focus is never dropped to the body |
 | Proposals and quarantine (T11) | untrusted content is inert (hostile markup is text), reject by keyboard through the confirm dialog, focus kept |
 | Context, consult, links (T14) | audit, 320px reflow with 300-character unbroken labels, screenshot |
@@ -165,8 +166,10 @@ treat the numbers as an upper bound and re-measure on an idle machine or the CI 
 | 10,000 | 3.4 s | 896 ms | 458 / 1197 ms | 22 / 32 ms | 2 (323 ms) | 8 MB |
 
 (An earlier run on the same loaded host gave first renders of 473, 394 and 988 ms and key-to-frame p95 of 38, 108 and 40 ms; the
-spread between runs is the host load.) The first page is about 147 KB (200 nodes drawn as SVG). Above 300 loaded nodes the SVG is
-skipped (the page says "more than the 300 drawn") and the table alternative is shown, at most 1000 rows per table.
+spread between runs is the host load.) The first page is about 147 KB. These figures were measured when the SVG was skipped above 300
+loaded nodes; since the Mission Workbench change (S5) the graph is a viewport that draws at most 240 nodes and 480 links at any zoom, the
+table alternative is still at most 1000 rows per table, and the layout is cached by content (a pan, zoom or selection never lays it out
+again). The figures above have not been re-measured for the viewport.
 
 Before the fixes below, typing in the lineage filter took p50 482 ms / p95 611 ms per key at 2,000 nodes and p95 2417 ms at 10,000.
 
@@ -192,12 +195,14 @@ data URLs for capture only (`bypassCSP`, because the page CSP is `default-src 'n
 (it was U+FF0B, which only a CJK font has). `assertBundledFonts` walks EVERY element and ::before/::after of the page through the
 DevTools protocol (`CSS.getPlatformFontsForNode`) and fails the capture if any glyph was painted by a host font; its own test puts a
 host-font span (and an emoji) on the page and requires the failure. **What that proves, and what it does not:** the visual suite runs
-`baselines:check` in a child process under a `FONTCONFIG_FILE` that lists only `tests/playwright/fonts` (plus `/etc/fonts/conf.d`
-for rendering settings) and requires the whole suite to pass; `fc-list` under that file shows only the four bundled families. So the
-screenshots do not depend on which FONTS the host has installed. They do still depend on the host's fontconfig RENDERING settings
-(hinting, antialiasing, subpixel order, in `/etc/fonts/conf.d`): with no `conf.d` at all the check fails. A host with other
-settings, another Chromium build or another operating system has not been tried; the first run on the CI agent is that test (see
-"CI" below).
+`baselines:check` in a child process under a host `FONTCONFIG_FILE` that lists only `tests/playwright/fonts` and renders with the
+OPPOSITE settings to the baselines (no hinting, grayscale) and requires the whole suite to pass; `fc-list` under that file shows only
+the four bundled families. The browser does not read the host's fontconfig at all: `launch()` in `ui-gates-lib.mjs` starts Chromium
+under a generated `FONTCONFIG_FILE` with the bundled fonts and the rendering settings pinned to the ones the baselines were made with
+(`hintslight`, `rgb` sub-pixel order, anti-aliasing on, `lcddefault`). So the screenshots depend on neither the fonts nor the
+rendering settings of the host. This was added after the first Woodpecker run, where a host with other `conf.d` settings moved all 88
+baselines by 1-11% of their pixels; before the pin, the same check under the opposite settings failed 88 of 88 on the workstation,
+after it 0 of 88. Another Chromium build or another operating system has not been tried.
 
 The suite has teeth (18 injected defects, each of which must fail on the page or the component): hidden edges, transparent
 inspector text, hidden logo and glyphs, missing badges, an invisible Send button, a +7 colour shift, a 1px shift, a 1px wider button,
@@ -213,10 +218,9 @@ Baseline policy:
   writes nothing and exits 1. It also writes nothing if any surface failed to capture, so a failed update never leaves a half
   rewritten set. A test pins the projection.
 - Baselines are tied to the Chromium build Playwright resolves (its FreeType and Skia) and to the bundled fonts. No glyph may fall
-  back to a host font (asserted per element). What a baseline can STILL depend on, honestly: the host's fontconfig RENDERING
-  settings (hinting level, anti-aliasing, sub-pixel layout: they come from `/etc/fonts/conf.d`, are not fonts, and were left
-  as the system has them in the portability run), device scale factor 1, and the Chromium build. A machine with different
-  rendering settings, or another Chromium build, needs an `update` with the PNG diff reviewed. An emoji on a surface would fail the
+  back to a host font (asserted per element). The fontconfig rendering settings (hinting level, anti-aliasing, sub-pixel layout)
+  are pinned by `launch()`, not read from the host. What a baseline can STILL depend on, honestly: device scale factor 1 and the
+  Chromium build. Another Chromium build needs an `update` with the PNG diff reviewed. An emoji on a surface would fail the
   font assertion rather than silently paint with a colour-emoji font.
 - `check` fails on an orphan PNG (a baseline no surface produces); `update` and `check` exit 2 on a slug that matches nothing.
 - A miss writes `<name>.actual.png` and `<name>.diff.png` under `.autospec/reports/visual/` (not committed).
@@ -319,7 +323,7 @@ Found by the round-3 review's gates (fourth round):
   stepped-back replay state (a poll can put the view back to live between two lines of the test); it is gone, and the
   `aria-pressed` on Live is required in the live table state instead.
 - **N5b** (the Pause motion label gone, an empty box) was invisible to every gate until the flow surface joined the visual suite.
-- **Not covered by the pixel gate:** a change of one colour step (+1 per channel); a host whose fontconfig rendering settings differ.
+- **Not covered by the pixel gate:** a change of one colour step (+1 per channel).
 - **Search is client-side** and covers only loaded nodes; the server caps lineage paging at 3,000 nodes.
 - **Performance numbers come from a loaded host** (see above).
 - **Screenshot determinism is bounded, not proven exact.** The determinism test allows half the page budget between fresh loads. The deterministic server stamps
@@ -337,16 +341,42 @@ Found by the round-3 review's gates (fourth round):
 then fails on any change under `docs/assets/screenshots`) on Woodpecker, for pull requests that touch the page, its tests, the control
 plane or the baselines, and by hand. GitHub Actions is disabled organisation-wide and is not used. The definition follows the shape of
 the organisation's other pipelines that were read (`image: bash`, `skip_clone` plus a plain git checkout, step logic in a script in
-the repository, no docker, apt or sudo on the exec hosts). **It has not been run on a Woodpecker agent.** Whether an exec host has
-Chromium's shared libraries and a Debian-style fontconfig is unknown, and the first run is the real test of the screenshots there.
+the repository, no docker, apt or sudo on the exec hosts). It has run on a Woodpecker agent: the first run failed
+`baselines:check` on all 88 pages because that host's fontconfig rendering settings differed from the workstation's; `launch()` now pins
+them (see the fonts section above).
 
 What the host must already have, because the screenshots are compared pixel for pixel and the script installs nothing system-wide:
 
 - Node 22 and Python 3.12 with `venv`; `git`; a writable checkout. The script installs the Python package into a venv, runs `npm ci`
   and `npx playwright install chromium` (the Chromium of Playwright 1.64 is the build the baselines came from);
 - Chromium's shared libraries (what Playwright's own `install-deps` would add);
-- fontconfig with `/etc/fonts/conf.d` as shipped by Debian/Ubuntu (`10-hinting-slight`, `10-sub-pixel-rgb`, `10-yes-antialias`,
-  `11-lcdfilter-default`): fonts do not matter, these rendering settings do. A host whose settings differ fails `baselines:check`
-  while every other gate passes; fix the host (or, after reviewing the diff images, run `update` from a commit and say why).
+- `/etc/fonts/conf.d` must exist (the script checks it), but its contents do not matter: the browser runs under its own pinned
+  fontconfig, so neither the host's fonts nor its rendering settings reach a screenshot.
 
 The suite takes about ten minutes on a workstation and runs one test at a time; give the step that much and one CPU core per Chromium.
+
+### Load tolerance
+
+The real-page gates wait for elements with Playwright's 30 s default and with explicit budgets (15 s for a room to open, 5-8 s in several
+interaction tests). `tests/playwright/ui-gates-lib.mjs` stretches both by the host's 1-minute load average per CPU (`loadScale`, clamped
+to 1x-3x): `openReal` sets the page default from it, and every explicit `waitFor`/`waitForFunction` budget in the harness is written
+`scaled(ms)`. Write new waits the same way: a bare `timeout: 5000` is the thing that flakes on a shared CI host (a page default does not
+override an explicit timeout, which is how the first version of this change missed most of the failures). On an idle host nothing changes. A pipeline that fails with a handful of 30-45 s `waitFor` timeouts and
+passes on a re-run of the same commit was load, not a regression; a failure that repeats on every run is not covered by this.
+A whole-suite retry was considered and rejected: it doubles the time of every failed run and can hide a real flaky test.
+
+### Time budgets and stale bases
+
+A healthy CI run is about 11 minutes (`ui-gates`) and the check itself is about a minute. `scripts/ci/ui-gates.sh` therefore fails fast:
+the suite has a 1500 s budget (`UI_GATES_SUITE_BUDGET_SECONDS`) and `baselines:check` has 300 s (`UI_GATES_BASELINES_BUDGET_SECONDS`).
+Exceeding a budget names the phase and exits non-zero. There is deliberately no per-test limit: `node --test --test-timeout` applies to
+each test *file* as a whole, and `tests/visual/ui-gates-visual.test.mjs` legitimately runs for several minutes (a 300 s limit cancelled
+it on the first attempt at this change). On 2026-10-28 a
+`networkidle` wait on a polling page added ~10 s to each of 268 captures: 11 min became 49 min, nothing failed, and the slowdown was
+mistaken for a contended host. A budget turns that into a clear red run the first time it happens.
+
+Each phase also prints `took Ns (budget Ms)`, so a creeping run is visible before it trips. Woodpecker checks out the PR head commit, not
+a merge with `main`, so a run measures the branch as it forked. The script therefore compares the fork point with the current `main` for
+the harness files (`.woodpecker`, `scripts/ci`, `tests/playwright/ui-gates-lib.mjs`, `tests/visual`, `package.json`) and prints a NOTICE
+listing what `main` has changed since. When a fix to the harness has merged, merge `main` into your branch and push before trusting a
+red or slow run: Woodpecker does not re-run a pipeline when only `main` moves.

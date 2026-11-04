@@ -10,6 +10,25 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-28-herdr-performance-design.md`
 
+## Integration rulings (2026-11-04)
+
+- Merge current main before release: production and upstream gained substantial
+  UI, private deployment, naming and recovery changes after the original base.
+  Preserve those flows and treat complete projection recovery as a compatible
+  successor, retaining the shipped recovery fallback.
+- Build the position index concurrently after additive DDL commits. Bootstrap
+  the exact legacy count from the unlocked repeatable-read snapshot and reconcile
+  intervening legacy deletions before publication; never scan the journal while
+  holding its ALTER TABLE lock.
+- Measured active five-minute histories exceed the dirty-stream scan budget:
+  service 386,173 rows, session 267,497, inspector 730,567. Verified monotonic
+  append-only tails therefore advance explicit owner/event projections directly;
+  ambiguous, backdated or structural changes retain authoritative replay. The
+  commit-fenced admission position remains the global coverage boundary.
+- Preserve highest operator host-policy revisions and complete global inspector
+  preference history explicitly. Independent review reproduced data/state loss
+  without those dependencies; regression tests cover both.
+
 ## Global Constraints
 
 - Preserve all retained raw events, identities, privacy boundaries, and legacy API shapes.

@@ -50,33 +50,6 @@ def test_unowned_listener_never_probes_git_or_cwd(monkeypatch):
     cwd.assert_not_called()
 
 
-def test_listener_git_metadata_handles_high_numbered_pipe(tmp_path, monkeypatch):
-    fcntl = pytest.importorskip('fcntl')
-    resource = pytest.importorskip('resource')
-    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1024:
-        pytest.skip('process descriptor limit cannot exercise descriptors above select FD_SETSIZE')
-    repo = tmp_path / 'repo'
-    sha = checkout(repo, 'https://github.com/org/app.git')
-    proof = listener(monkeypatch, repo)
-    popen = subprocess.Popen
-    descriptors = []
-
-    def high_pipe(*args, **kwargs):
-        process = popen(*args, **kwargs)
-        descriptor = fcntl.fcntl(process.stdout.fileno(), fcntl.F_DUPFD, 1024)
-        os.set_inheritable(descriptor, False)
-        process.stdout.close()
-        process.stdout = os.fdopen(descriptor, 'rb')
-        descriptors.append(descriptor)
-        return process
-
-    monkeypatch.setattr(fa.subprocess, 'Popen', high_pipe)
-    assert fa.ListenerGitMetadata().read(300, proof, timeout=1) == {
-        'repository_id': 'github.com/org/app', 'commit_sha': sha,
-    }
-    assert len(descriptors) == 2 and all(descriptor >= 1024 for descriptor in descriptors)
-
-
 def test_missing_git_or_non_checkout_is_optional_metadata(tmp_path, monkeypatch):
     proof = listener(monkeypatch, tmp_path)
     assert fa.ListenerGitMetadata().read(300, proof) == {}
@@ -92,6 +65,36 @@ def test_pid_reuse_never_reuses_previous_git_cache(tmp_path, monkeypatch):
     assert reader.read(300, proof)['repository_id'] == 'github.com/org/app'
     monkeypatch.setattr(fa, '_process_identity', lambda pid, **kwargs: {'parent_pid': 100, 'start': 'reused'})
     assert reader.read(300, proof) == {}
+
+
+def test_listener_git_metadata_handles_high_numbered_pipe(tmp_path, monkeypatch):
+    fcntl = pytest.importorskip('fcntl')
+    resource = pytest.importorskip('resource')
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1024:
+        pytest.skip('process descriptor limit cannot exercise descriptors above select FD_SETSIZE')
+    repo = tmp_path / 'repo'
+    sha = checkout(repo, 'https://github.com/org/app.git')
+    proof = listener(monkeypatch, repo)
+    popen = subprocess.Popen
+    descriptors = []
+    pipes = []
+
+    def high_pipe(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        descriptor = fcntl.fcntl(process.stdout.fileno(), fcntl.F_DUPFD, 1024)
+        os.set_inheritable(descriptor, False)
+        process.stdout.close()
+        process.stdout = os.fdopen(descriptor, 'rb')
+        descriptors.append(descriptor)
+        pipes.append(process.stdout)
+        return process
+
+    monkeypatch.setattr(fa.subprocess, 'Popen', high_pipe)
+    assert fa.ListenerGitMetadata().read(300, proof, timeout=1) == {
+        'repository_id': 'github.com/org/app', 'commit_sha': sha,
+    }
+    assert len(descriptors) == 2 and all(descriptor >= 1024 for descriptor in descriptors)
+    assert all(pipe.closed for pipe in pipes)
 
 
 def test_live_report_without_proof_clears_old_git_metadata(tmp_path, monkeypatch):

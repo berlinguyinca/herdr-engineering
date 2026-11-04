@@ -15,6 +15,7 @@
 dev.lan:53 {
     bind 127.0.0.1 {{GATEWAY_TAILNET_IP}}
     errors
+    loadbalance round_robin
     log
     file /etc/coredns/dev.lan.zone dev.lan
     ready

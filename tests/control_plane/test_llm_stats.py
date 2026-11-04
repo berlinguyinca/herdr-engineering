@@ -201,8 +201,28 @@ def test_routes_on_the_operator_listener():
         svr.shutdown()
 
 
+def test_spend_route_is_off_without_a_price_table_and_priced_with_one():
+    repo, clock = _repo()
+    _seed(repo, clock, [_row()])
+    off = ControlPlaneServer(repo, host="127.0.0.1", port=0, allow_open=True)
+    on = ControlPlaneServer(repo, host="127.0.0.1", port=0, allow_open=True,
+                            usage_prices=[{"model": "*", "input": 1.0, "output": 1.0, "cached": None, "cached_in_input": False}])
+    for svr in (off, on):
+        threading.Thread(target=svr.serve, daemon=True).start()
+        svr.wait_until_ready()
+    try:
+        assert _get(off, "/api/v1/llm/spend?window=24h") == (200, {"configured": False})
+        st, body = _get(on, "/api/v1/llm/spend?window=24h")
+        assert st == 200 and body["configured"] and body["estimate"] and body["source"] == "llm-proxy"
+        assert body["unpriced"] == [] and body["days"] and body["total"] >= 0
+        assert _get(on, "/api/v1/llm/spend?window=2h")[0] == 400
+    finally:
+        off.shutdown()
+        on.shutdown()
+
+
 @pytest.mark.parametrize("path", ["/api/v1/llm/stats", "/api/v1/llm/stats?window=24h", "/api/v1/llm/timeseries",
-                                  "/api/v1/llm/errors", "/api/v1/llm/sessions/s-1", "/api/v1/llm/samples",
+                                  "/api/v1/llm/errors", "/api/v1/llm/spend", "/api/v1/llm/sessions/s-1", "/api/v1/llm/samples",
                                   "/llm-view.js", "/llm"])
 def test_llm_routes_do_not_exist_on_the_public_listener(stack, path):
     status, _ = stack.pub.call("GET", path)
@@ -259,3 +279,15 @@ def test_transcript_usage_outside_the_window_is_left_out():
     repo.inspector.ingest("t-1", {"events": [{"kind": "usage", "ts": "2026-10-10T00:00:00Z", "output_tokens": 5}]})
     assert repo.llm_stats("24h", group="all")["groups"] == []
     assert repo.llm_stats("30d", group="all")["groups"][0]["tokens"]["output"] == 5
+
+
+def test_group_by_mission_queue_series_and_the_previous_window():
+    repo, clock = _repo()
+    _seed(repo, clock, [_row(mission_id="m-1", queue_ms=40) for _ in range(5)] + [_row(), _row(mission_id="m-2")], ago=30)
+    _seed(repo, clock, [_row(mission_id="m-1") for _ in range(2)], ago=30 * HOUR)       # before the 24h window, inside the one before
+    groups = {g["key"]: g["requests"] for g in repo.llm_stats("24h", "mission", source="llm-proxy")["groups"]}
+    assert groups == {"m-1": 5, "m-2": 1}                       # a row with no mission is left out of this grouping
+    assert repo.llm_stats("24h", "all")["groups"][0]["requests"] == 7
+    assert repo.llm_stats("24h", "all", previous="1")["groups"][0]["requests"] == 2
+    queue = [p["v"] for p in repo.llm_timeseries("24h", "1h", "queue_p95")["points"] if p["v"] is not None]
+    assert queue and all(v >= 40 for v in queue)

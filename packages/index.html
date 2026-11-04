@@ -9,7 +9,9 @@
 <link rel="stylesheet" href="herdr-web-components/components.css">
 <link rel="stylesheet" href="collab.css">
 <link rel="stylesheet" href="architecture.css">
+<link rel="stylesheet" href="team-map.css">
 <link rel="stylesheet" href="personal-assistant.css">
+<link rel="stylesheet" href="memory.css">
 <link rel="stylesheet" href="motion.css">
 <script>
   // CSP note: this inline script needs 'unsafe-inline' or a hash/nonce if a strict script-src is ever added.
@@ -25,18 +27,13 @@
   })();
 </script>
 <style>
-  .hd-btn {
-    background: var(--accent); color: var(--text-on-accent); border: none;
-    padding: 8px 14px; border-radius: var(--radius-sm); font-weight: 500;
-    cursor: pointer; font-family: var(--font-sans);
-  }
-  .hd-btn:hover { background: var(--accent-hover); }
   .hd-inline { display: flex; gap: 8px; }
   code { font-family: var(--font-mono); }
 </style>
 </head>
 <body>
   <herdr-app-shell id="shell">
+    <nav id="subnav" class="hd-subnav" aria-label="Section views" hidden></nav>
     <div id="view"></div>
   </herdr-app-shell>
   <script type="module">

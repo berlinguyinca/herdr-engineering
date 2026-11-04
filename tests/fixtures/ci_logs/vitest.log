@@ -1,0 +1,21 @@
+ [32m✓[39m src/renderer/tabs/LiveMonitor/__tests__/openRun.test.tsx [2m ([22m[2m1 test[22m[2m)[22m[33m 650[2mms[22m[39m
+ [32m✓[39m src/renderer/components/__tests__/BoxPlotKinds.test.tsx [2m ([22m[2m3 tests[22m[2m)[22m[90m 116[2mms[22m[39m
+ [32m✓[39m src/renderer/styles/__tests__/tokens.test.ts [2m ([22m[2m45 tests[22m[2m)[22m[90m 22[2mms[22m[39m
+ [32m✓[39m src/renderer/tabs/LiveMonitor/__tests__/effectiveVerdicts.test.ts [2m ([22m[2m14 tests[22m[2m)[22m[90m 9[2mms[22m[39m
+ [32m✓[39m src/renderer/tabs/History/__tests__/IsMedianPanel.test.tsx [2m ([22m[2m1 test[22m[2m)[22m[90m 78[2mms[22m[39m
+ [32m✓[39m src/renderer/tabs/History/__tests__/pca-compute.test.ts [2m ([22m[2m14 tests[22m[2m)[22m[90m 17[2mms[22m[39m
+ [32m✓[39m src/renderer/tabs/History/__tests__/isMedian.test.ts [2m ([22m[2m11 tests[22m[2m)[22m[90m 9[2mms[22m[39m
+ [32m✓[39m src/renderer/tabs/History/__tests__/Westgard.test.ts [2m ([22m[2m17 tests[22m[2m)[22m[90m 11[2mms[22m[39m
+ [32m✓[39m src/renderer/tabs/LiveMonitor/__tests__/exportSummary.test.ts [2m ([22m[2m9 tests[22m[2m)[22m[90m 10[2mms[22m[39m
+ [32m✓[39m src/renderer/styles/__tests__/controls.test.ts [2m ([22m[2m15 tests[22m[2m)[22m[90m 14[2mms[22m[39m
+ [32m✓[39m src/renderer/tabs/LiveMonitor/__tests__/relativeTime.test.ts [2m ([22m[2m9 tests[22m[2m)[22m[90m 6[2mms[22m[39m
+ [32m✓[39m src/renderer/__tests__/main-imports.test.ts [2m ([22m[2m3 tests[22m[2m)[22m[90m 4[2mms[22m[39m
+ [32m✓[39m src/renderer/styles/__tests__/print.test.ts [2m ([22m[2m4 tests[22m[2m)[22m[90m 4[2mms[22m[39m
+ [32m✓[39m src/renderer/styles/__tests__/container.test.ts [2m ([22m[2m5 tests[22m[2m)[22m[90m 4[2mms[22m[39m
+[2m Test Files [22m [1m[32m66 passed[39m[22m[90m (66)[39m
+[2m      Tests [22m [1m[32m721 passed[39m[22m[90m (721)[39m
+[2m   Start at [22m 23:06:45
+[2m   Duration [22m 71.74s[2m (transform 1.61s, setup 10ms, collect 11.83s, tests 55.41s, environment 50.77s, prepare 7.19s)[22m
+JSON report written to /woodpecker/src/github.com/example-org/RTQC_v0/test-results/ci/renderer/tests.json
+JUNIT report written to /woodpecker/src/github.com/example-org/RTQC_v0/test-results/ci/renderer/junit.xml
+[34m % [39m[2mCoverage report from [22m[33mv8[39m

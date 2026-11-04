@@ -20,7 +20,8 @@ ENTITY = "attention"
 STREAM = "operator"
 SEVERITIES = ("critical", "warning", "info")
 KINDS = ("mission_attention", "mission_failed", "agent_failed", "agent_blocked", "ci_failed", "review_changes",
-         "service_down", "host_stale", "control_plane", "fleet_drift", "llm_problems", "ci_fix", "source_unavailable")
+         "service_down", "host_stale", "control_plane", "fleet_drift", "llm_problems", "ci_fix", "deployment_escalation",
+         "source_unavailable")
 STATES = ("open", "acknowledged", "snoozed")
 MAX_ITEMS = 200
 MAX_PER_KIND = 50
@@ -40,9 +41,11 @@ _CI_DONE = frozenset(("success", "passed", "finished", "complete", "completed", 
 _REVIEW_CHANGES = frozenset(("changes_requested", "request_changes", "rejected", "annotated", "denied"))
 _CI_OUTAGE = frozenset(("unavailable", "auth_error", "partial"))
 _SOURCE_PAGES = {"missions": "#/missions", "sessions": "#/herd", "summaries": "#/herd", "llm": "#/llm", "ci": "#/ci", "ci_fix": "#/ci", "reviews": "#/reviews",
-                 "services": "#/services", "hosts": "#/hosts", "health": "#/topology", "fleet": "#/hosts"}
+                 "services": "#/services", "hosts": "#/hosts", "health": "#/topology", "fleet": "#/hosts",
+                 "deployments": "#/deployments"}
 _SOURCE_LABELS = {"missions": "Missions", "sessions": "Agents", "summaries": "Agent summaries", "llm": "LLM usage", "ci": "CI", "ci_fix": "CI fixes", "reviews": "Reviews",
-                  "services": "Services", "hosts": "Hosts", "health": "Control plane", "fleet": "Fleet versions"}
+                  "services": "Services", "hosts": "Hosts", "health": "Control plane", "fleet": "Fleet versions",
+                  "deployments": "Deployments"}
 _RANK = {name: index for index, name in enumerate(SEVERITIES)}
 
 
@@ -73,7 +76,7 @@ def attention_config(raw):
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError("control_plane.attention.enabled must be true or false")
-    unknown = sorted(set(raw) - {"enabled", "snooze", "thresholds", "notify", "resolved"})
+    unknown = sorted(set(raw) - {"enabled", "snooze", "thresholds", "notify", "resolved", "expected_offline_hosts"})
     if unknown:
         raise ValueError(f"control_plane.attention has unknown keys: {', '.join(unknown)}")
     snooze = section("snooze", {"min_seconds": 3600, "max_seconds": 604800})
@@ -105,8 +108,14 @@ def attention_config(raw):
     resolved = section("resolved", {"keep_hours": 24, "max_items": 100})
     number("resolved.keep_hours", resolved["keep_hours"], 1)
     number("resolved.max_items", resolved["max_items"], 1, 1000)
+    expected = raw.get("expected_offline_hosts")
+    if expected is None:
+        expected = []
+    if (not isinstance(expected, list) or len(expected) > 200
+            or any(not isinstance(name, str) or not name.strip() or len(name) > 200 for name in expected)):
+        raise ValueError("control_plane.attention.expected_offline_hosts must be a list of host names or ids")
     return {"enabled": enabled, "snooze": snooze, "thresholds": thresholds, "notify": notify,
-            "resolved": resolved}
+            "resolved": resolved, "expected_offline_hosts": [name.strip() for name in expected]}
 
 
 def _norm(value):
@@ -195,8 +204,9 @@ def _item(key, kind, severity, title, detail, href, source, condition, *, seen=N
 class AttentionInbox:
     """Derive the open attention items and fold the operator's acknowledge/snooze events."""
 
-    def __init__(self, repo, *, config=None, ci_snapshot=None, health=None, now=None, ci_fix=None):
+    def __init__(self, repo, *, config=None, ci_snapshot=None, health=None, now=None, ci_fix=None, handoffs=None):
         self.repo = repo
+        self._handoffs = handoffs        # callable returning the handoff registry (it is built after the inbox)
         self._ci_fix = ci_fix
         self.config = attention_config(config)
         self._ci_snapshot = ci_snapshot
@@ -212,6 +222,8 @@ class AttentionInbox:
                         "health": self._control_plane, "fleet": self._fleet, "llm": self._llm}
         if ci_fix is not None:
             self.sources["ci_fix"] = self._ci_fixes
+        if getattr(repo, "deployment_escalations", None) is not None:
+            self.sources["deployments"] = self._deployments
 
     # ------------------------------------------------------------- sources
     def _missions(self, now):
@@ -253,6 +265,32 @@ class AttentionInbox:
                                    action="Open mission"))
         return items
 
+    def _handoff_context(self, session_id):
+        """The handoffs that moved work into or out of this agent, newest first, so an item can say how the agent got its task.
+
+        Facts only: what the registry recorded. An agent with no recorded handoff gets an empty list, never a guess.
+        """
+        registry = self._handoffs() if callable(self._handoffs) else None
+        if registry is None:
+            return []
+        out = []
+        for row in registry.list(limit=200):
+            source, target = row.get("source") or {}, row.get("target") or {}
+            if session_id == target.get("session_id"):
+                direction, other = "in", source
+            elif session_id == source.get("session_id"):
+                direction, other = "out", target
+            else:
+                continue
+            other_session = other.get("session_id")
+            out.append({"handoff_id": row.get("handoff_id"), "direction": direction, "state": row.get("state"),
+                        "goal": _short(row.get("goal"), 160), "agent": other.get("agent_id") or other.get("harness"),
+                        "href": f"#/herd/session/{_enc(other_session)}" if other_session else None,
+                        "at": _iso(row.get("updated_at")) if isinstance(row.get("updated_at"), (int, float)) else row.get("updated_at")})
+            if len(out) >= 3:
+                break
+        return out
+
     def _sessions(self, now):
         failed_after = now - float(self.config["thresholds"]["failed_window_hours"]) * 3600
         items = []
@@ -264,8 +302,10 @@ class AttentionInbox:
             if seen is not None and seen < failed_after:
                 continue
             name = session.get("display_name") or session.get("title") or session.get("agent_role") or "Failed agent"
-            items.append(_item(f"session:{sid}", "agent_failed", "critical", name, "Agent reported failed",
-                               f"#/herd/session/{_enc(sid)}", "sessions", "failed", seen=seen, action="Open agent"))
+            item = _item(f"session:{sid}", "agent_failed", "critical", name, "Agent reported failed",
+                         f"#/herd/session/{_enc(sid)}", "sessions", "failed", seen=seen, action="Open agent")
+            item["handoffs"] = self._handoff_context(sid)
+            items.append(item)
         return items
 
     def _blocked(self, now):
@@ -284,9 +324,11 @@ class AttentionInbox:
             sid = session["session_id"]
             name = session.get("display_name") or session.get("title") or session.get("agent_role") or "Agent"
             extra = f" (+{len(blockers) - 1} more)" if len(blockers) > 1 else ""
-            items.append(_item(f"blocked:{sid}", "agent_blocked", "warning", f"Agent blocked · {name}",
-                               blockers[0] + extra, f"#/herd/session/{_enc(sid)}", "summaries",
-                               "\n".join(blockers), seen=generated, action="Open agent"))
+            item = _item(f"blocked:{sid}", "agent_blocked", "warning", f"Agent blocked · {name}",
+                         blockers[0] + extra, f"#/herd/session/{_enc(sid)}", "summaries",
+                         "\n".join(blockers), seen=generated, action="Open agent")
+            item["handoffs"] = self._handoff_context(sid)
+            items.append(item)
         return items
 
     def _ci(self, now):
@@ -350,14 +392,47 @@ class AttentionInbox:
                                    seen=_epoch(service.get("updated_at")), action="Open service"))
         return items
 
-    def _hosts(self, now):
+    def _expected_off(self, host):
+        """True when the operator listed this host (by id or name, any case) as expected to be offline."""
+        names = {n.lower() for n in self.config["expected_offline_hosts"]}
+        return bool(names) and any(isinstance(v, str) and v.strip().lower() in names
+                                   for v in (host.get("host_id"), host.get("host_name")))
+
+    def _host_down(self, host, now):
+        """"down", "stale" or None for a host that reports fine."""
         limit = float(self.config["thresholds"]["host_stale_seconds"])
+        seen = _epoch(host.get("last_seen") or host.get("updated_at"))
+        if str(host.get("status") or "").lower() in ("unavailable", "offline", "failed"):
+            return "down"
+        return "stale" if seen is None or now - seen > limit else None
+
+    def expected_off(self, now=None):
+        """Listed hosts that are offline right now: shown quietly, never as attention items. A listed host that
+        reports healthy is absent from this list and from the items alike. An unreadable host list gives []:
+        the hosts source already reports itself unavailable."""
+        now = self._now() if now is None else now
+        if not self.config["expected_offline_hosts"]:
+            return []
+        try:
+            hosts = list(self.repo.list_hosts())
+        except Exception:
+            return []
+        out = []
+        for host in hosts:
+            if host.get("host_id") and self._expected_off(host) and (state := self._host_down(host, now)):
+                seen = _epoch(host.get("last_seen") or host.get("updated_at"))
+                out.append({"host_id": host["host_id"], "name": _short(host.get("host_name") or host["host_id"], 120),
+                            "state": state, "last_seen": _iso(seen) if seen is not None else None})
+        return sorted(out, key=lambda h: h["name"].lower())
+
+    def _hosts(self, now):
         items = []
         for host in self.repo.list_hosts():
             hid = host.get("host_id")
             seen = _epoch(host.get("last_seen") or host.get("updated_at"))
-            down = str(host.get("status") or "").lower() in ("unavailable", "offline", "failed")
-            if hid and (down or seen is None or now - seen > limit):
+            state = self._host_down(host, now)
+            down = state == "down"
+            if hid and state and not self._expected_off(host):
                 items.append(_item(f"host:{hid}", "host_stale", "warning", host.get("host_name") or hid,
                                    "No recent healthy host report", f"#/hosts/{_enc(hid)}", "hosts",
                                    "down" if down else "stale", seen=seen, action="Open host"))
@@ -414,6 +489,12 @@ class AttentionInbox:
             items.append(_item(f"cifix:{fix['id']}", "ci_fix", severity, title, detail, "#/ci",
                                "ci_fix", condition, seen=ended, action="Open CI"))
         return items
+
+    def _deployments(self, now):
+        """Open deployment escalations (deploy-4 Task 8): the herdr notification for a failed
+        component, read later by the operator and the assistant. Validated fields only."""
+        from .deployment_escalation import attention_items
+        return attention_items(self.repo.deployment_escalations, _item)
 
     def _control_plane(self, now):
         status = (self._health() or {}).get("status")
@@ -527,7 +608,7 @@ class AttentionInbox:
             capped.append(item)
         body = {"items": capped, "counts": counts, "partial": bool(unavailable), "unavailable": unavailable,
                 "truncated": len(capped) < len(shown), "generated_at": _iso(now),
-                "notify": copy.deepcopy(self.config["notify"])}
+                "notify": copy.deepcopy(self.config["notify"]), "expected_off": self.expected_off(now)}
         if state == "all":
             body["resolved"] = copy.deepcopy(resolved)
         return body

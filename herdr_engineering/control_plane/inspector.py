@@ -33,7 +33,14 @@ from .envelope import (
     _checkpoint_stamp,
     _checkpoint_time,
 )
-from .redact import redact_payload, redact_text
+from .redact import redact_payload, redact_text, rules_fingerprint
+
+#: Bump when the replayed projection changes shape or meaning, so older snapshots are replayed from events instead.
+SNAPSHOT_VERSION = 1
+
+
+class SnapshotStale(Exception):
+    """A stored snapshot cannot be used; the caller must replay the full event log instead."""
 
 KINDS = frozenset({
     "capabilities", "message", "reasoning", "tool", "file", "test", "usage",
@@ -290,6 +297,10 @@ class InspectorStore:
         self._lock = threading.RLock()
         self.stats = {"accepted": 0, "duplicates": 0, "rejected": 0,
                       "evicted_events": 0, "evicted_sessions": 0}
+        # Replay cursor: the largest replay order key, fabric sequence and event count that hydrate() has consumed.
+        self._replay_key: tuple | None = None
+        self._replay_watermark = -1
+        self._replay_count = 0
 
     def export_checkpoint(self) -> dict:
         """Explicit JSON state; indexes encode references, never duplicate entries.
@@ -313,10 +324,21 @@ class InspectorStore:
                     "tests": {key: entry["seq"] for key, entry in sess.tests.items()},
                 })
             return _checkpoint_json({"version": 1, "domain": "inspector", "sessions": sessions,
-                                     "global_prefs": self._global_prefs, "stats": self.stats})
+                                     "global_prefs": self._global_prefs, "stats": self.stats,
+                                     "replay": {"key": list(self._replay_key) if self._replay_key is not None else None,
+                                                "watermark": self._replay_watermark,
+                                                "count": self._replay_count}})
 
     def restore_checkpoint(self, state) -> None:
-        state = _checkpoint_header(state, "inspector", ("sessions", "global_prefs", "stats"))
+        state = _checkpoint_header(state, "inspector", ("sessions", "global_prefs", "stats", "replay"))
+        replay = state['replay']
+        _checkpoint_object(replay, ('key', 'watermark', 'count'))
+        _checkpoint_require(type(replay['watermark']) is int and replay['watermark'] >= -1)
+        _checkpoint_int(replay['count'])
+        if replay['key'] is not None:
+            _checkpoint_require(type(replay['key']) is list and len(replay['key']) == 2)
+            for value in replay['key']:
+                _checkpoint_require(type(value) in (int, float) and math.isfinite(value))
         _checkpoint_require(type(state["sessions"]) is list)
         _checkpoint_object(state["stats"], ("accepted", "duplicates", "rejected", "evicted_events", "evicted_sessions"))
         for value in state["stats"].values():
@@ -420,6 +442,8 @@ class InspectorStore:
                     sub.close()
             self._sessions, self._global_prefs = restored._sessions, restored._global_prefs
             self.stats = restored.stats
+            self._replay_key = tuple(replay['key']) if replay['key'] is not None else None
+            self._replay_watermark, self._replay_count = replay['watermark'], replay['count']
             self.epoch = restored.epoch
             self._lock = threading.RLock()
 
@@ -619,7 +643,7 @@ class InspectorStore:
         """Return (redacted+truncated text, truncated, redacted)."""
         if value is None:
             return None, False, False
-        raw = value if isinstance(value, str) else str(value)
+        raw = (value if isinstance(value, str) else str(value)).replace("\x00", "")     # Postgres jsonb refuses \u0000
         cap = max_bytes or self.limits["max_body_bytes"]
         # Bound the work redaction does (and the lock hold time) before scanning.
         pre, pre_trunc = truncate_text(raw, cap * 2)
@@ -1001,6 +1025,12 @@ class InspectorStore:
             "model", "message", "call_id", "run_id", "branch", "worktree")) + " " + " ".join(
             f"{f.get('name')} {f.get('message')}" for f in d.get("failures", []))
 
+    def newest_seq(self, session_id: str) -> int | None:
+        """Sequence number of the newest recorded event, or None when nothing is recorded."""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            return sess.next_seq - 1 if sess is not None and sess.next_seq > 0 else None
+
     def query(self, session_id: str, role: str = "viewer", *, view: str = "all",
               q: str | None = None, agent_id: str | None = None, status: str | None = None,
               since_rev: int = 0, limit: int = 200, before_seq: int | None = None) -> dict:
@@ -1044,6 +1074,52 @@ class InspectorStore:
                 "capabilities": self._caps(sess),
                 "prefs": self.get_prefs(session_id),
             }
+
+    def events_after(self, session_id: str, after_rev: int, role: str = "viewer",
+                     limit: int = 200) -> list[dict]:
+        """Events whose revision is newer than ``after_rev``, ascending by revision, rendered for ``role``.
+
+        Tool and test events are updated in place (same ``seq``, higher ``rev``), so the revision, not the
+        sequence number, is the cursor that delivers a finished tool call after its running frame."""
+        limit = max(1, min(int(limit), 200))
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                raise KeyError(session_id)
+            newer = sorted((e for e in sess.events if e["rev"] > after_rev), key=lambda e: e["rev"])
+            return [self._render(e, role, full=False) for e in newer[:limit]]
+
+    def phone_digest(self, session_ids, role: str = "viewer") -> dict[str, tuple[int | None, str | None]]:
+        """``(newest_seq, last_message)`` for each id, taking the lock once for all of them."""
+        out: dict[str, tuple[int | None, str | None]] = {}
+        with self._lock:
+            for sid in session_ids:
+                sess = self._sessions.get(sid)
+                if sess is None:
+                    out[sid] = (None, None)
+                    continue
+                newest = sess.next_seq - 1 if sess.next_seq > 0 else None
+                out[sid] = (newest, self._last_message_locked(sess, role))
+        return out
+
+    def _last_message_locked(self, sess: _Session, role: str) -> str | None:
+        for e in reversed(sess.events):
+            if e["kind"] != "message" or e["data"].get("role") != "assistant":
+                continue
+            if not self._allowed(e, role):
+                continue
+            text = self._render(e, role, full=False)["data"].get("text")
+            if isinstance(text, str):
+                return redact_text(text)[:160]
+        return None
+
+    def last_message(self, session_id: str, role: str = "viewer") -> str | None:
+        """Newest assistant message text the role may read, redacted and cut to 160 chars."""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                raise KeyError(session_id)
+            return self._last_message_locked(sess, role)
 
     def get_event(self, session_id: str, seq: int, role: str = "viewer") -> dict:
         with self._lock:
@@ -1164,32 +1240,139 @@ class InspectorStore:
             return session_id in self._sessions
 
     # ------------------------------------------------------------- hydrate
+    def _received_at(self, ev: dict) -> float:
+        p = ev.get("payload")
+        value = p.get("_received_at") if isinstance(p, dict) else None
+        if _finite(value):
+            return min(value, self._clock())
+        for key in ("ingest_timestamp", "source_timestamp"):
+            raw = _iso_of(ev.get(key))
+            if raw:
+                try:
+                    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    return min(dt.replace(tzinfo=dt.tzinfo or UTC).timestamp(), self._clock())
+                except (ValueError, OverflowError, OSError):
+                    pass
+        return self._clock()
+
+    def _replay_order(self, ev: dict) -> tuple:
+        p = ev.get("payload")
+        seq = p.get("_sequence") if isinstance(p, dict) else None
+        if not _finite(seq):
+            seq = ev.get("sequence")
+        return self._received_at(ev), seq if _finite(seq) else 0
+
+    # --- replay snapshots ---------------------------------------------------
+    def snapshot_fingerprint(self) -> str:
+        """Everything besides the events that decides what replay produces. A different value means the snapshot
+        was built under other limits, roles or redaction rules and must not be reused."""
+        import hashlib
+        import json
+        doc = {"version": SNAPSHOT_VERSION, "limits": self.limits, "min_reasoning": self._min_reasoning,
+               "min_sensitive": self._min_sensitive, "store_reasoning": self.store_reasoning,
+               "redaction": rules_fingerprint()}
+        return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()
+
+    @property
+    def replay_watermark(self) -> int:
+        """Largest fabric sequence among the events hydrate() consumed (-1 = none)."""
+        return self._replay_watermark
+
+    @property
+    def replay_count(self) -> int:
+        return self._replay_count
+
+    def export_state(self) -> dict:
+        """JSON-safe copy of what replay built. Only call on a store fed by hydrate(): a live store also holds
+        kinds that are deliberately not durable (reasoning), and those must never reach a snapshot."""
+        import copy
+        with self._lock:
+            sessions = []
+            for sess in self._sessions.values():
+                sessions.append({
+                    "session_id": sess.session_id,
+                    "events": copy.deepcopy(list(sess.events)),
+                    "bytes": sess.bytes, "next_seq": sess.next_seq, "rev": sess.rev,
+                    "dropped_ring": sess.dropped_ring, "client_dropped": sess.client_dropped,
+                    "seen": list(sess.seen), "capabilities": copy.deepcopy(sess.capabilities),
+                    "assoc": copy.deepcopy(sess.assoc), "models": copy.deepcopy(list(sess.models)),
+                    "usage_totals": dict(sess.usage_totals), "usage_latest": copy.deepcopy(sess.usage_latest),
+                    "last_event": sess.last_event, "last_ingest": sess.last_ingest, "ended": sess.ended,
+                    "prefs": copy.deepcopy(sess.prefs), "evicted_to": sess.evicted_to,
+                    "tools": {cid: e["seq"] for cid, e in sess.tools.items()},
+                    "tests": {rid: e["seq"] for rid, e in sess.tests.items()},
+                })
+            return {"version": SNAPSHOT_VERSION, "fingerprint": self.snapshot_fingerprint(),
+                    "watermark": self._replay_watermark, "count": self._replay_count,
+                    "key": list(self._replay_key) if self._replay_key is not None else None,
+                    "global_prefs": copy.deepcopy(self._global_prefs), "stats": dict(self.stats),
+                    "sessions": sessions}
+
+    def load_state(self, state: dict) -> None:
+        """Replace this store's projection with a snapshot. Raises :class:`SnapshotStale` and leaves the store
+        untouched when the snapshot is unusable."""
+        try:
+            if state.get("version") != SNAPSHOT_VERSION:
+                raise SnapshotStale("snapshot version differs")
+            if state.get("fingerprint") != self.snapshot_fingerprint():
+                raise SnapshotStale("limits, roles or redaction rules changed since the snapshot")
+            sessions: OrderedDict[str, _Session] = OrderedDict()
+            for row in state["sessions"]:
+                sess = _Session(row["session_id"])
+                sess.events = deque(row["events"])
+                sess.by_seq = {e["seq"]: e for e in sess.events}
+                sess.bytes, sess.next_seq, sess.rev = int(row["bytes"]), int(row["next_seq"]), int(row["rev"])
+                sess.dropped_ring, sess.client_dropped = int(row["dropped_ring"]), int(row["client_dropped"])
+                sess.seen = OrderedDict((k, True) for k in row["seen"])
+                sess.capabilities, sess.assoc = row["capabilities"], dict(row["assoc"])
+                sess.models = deque(row["models"], maxlen=20)
+                sess.usage_totals = {k: int(v) for k, v in row["usage_totals"].items()}
+                sess.usage_latest = row["usage_latest"]
+                sess.last_event, sess.last_ingest, sess.ended = row["last_event"], row["last_ingest"], bool(row["ended"])
+                sess.prefs, sess.evicted_to = dict(row["prefs"]), int(row["evicted_to"])
+                sess.tools = {cid: sess.by_seq[seq] for cid, seq in row["tools"].items()}   # KeyError = corrupt
+                sess.tests = {rid: sess.by_seq[seq] for rid, seq in row["tests"].items()}
+                sessions[sess.session_id] = sess
+            key = state.get("key")
+            watermark, count = int(state["watermark"]), int(state["count"])
+            global_prefs, stats = dict(state["global_prefs"]), dict(state["stats"])
+        except SnapshotStale:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise SnapshotStale(f"snapshot is malformed ({type(exc).__name__}: {exc})") from exc
+        with self._lock:
+            self._sessions, self._global_prefs, self.stats = sessions, global_prefs, {**self.stats, **stats}
+            self._replay_key = tuple(key) if key is not None else None
+            self._replay_watermark, self._replay_count = watermark, count
+            self.sweep()          # retention is relative to now, exactly as a full replay at this moment would apply it
+
+    def reset_replay(self) -> None:
+        """Back to an empty projection, for a boot that decided not to trust a snapshot."""
+        with self._lock:
+            self._sessions = OrderedDict()
+            self._global_prefs = {}
+            self.stats = {"accepted": 0, "duplicates": 0, "rejected": 0, "evicted_events": 0, "evicted_sessions": 0}
+            self._replay_key, self._replay_watermark, self._replay_count = None, -1, 0
+
+    def hydrate_delta(self, events: list[dict]) -> int:
+        """Replay events that came AFTER the loaded snapshot. Equivalent to a full replay only when none of them
+        orders before what the snapshot already consumed, so anything else is refused."""
+        if events and self._replay_key is not None and min(self._replay_order(e) for e in events) < self._replay_key:
+            raise SnapshotStale("an event orders before the snapshot's cursor")
+        return self.hydrate(events)
+
     def hydrate(self, events: list[dict]) -> int:
         """Restore bounded capture and summaries in original receive/mutation order."""
-        def received_at(ev):
-            p = ev.get("payload")
-            value = p.get("_received_at") if isinstance(p, dict) else None
-            if _finite(value):
-                return min(value, self._clock())
-            for key in ("ingest_timestamp", "source_timestamp"):
-                raw = _iso_of(ev.get(key))
-                if raw:
-                    try:
-                        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                        return min(dt.replace(tzinfo=dt.tzinfo or UTC).timestamp(), self._clock())
-                    except (ValueError, OverflowError, OSError):
-                        pass
-            return self._clock()
-
-        def order(ev):
-            p = ev.get("payload")
-            seq = p.get("_sequence") if isinstance(p, dict) else None
-            if not _finite(seq):
-                seq = ev.get("sequence")
-            return received_at(ev), seq if _finite(seq) else 0
-
+        received_at, order = self._received_at, self._replay_order
         n = 0
         for ev in sorted(events, key=order):
+            key = order(ev)
+            if self._replay_key is None or key > self._replay_key:
+                self._replay_key = key
+            fabric_seq = ev.get("sequence")
+            if isinstance(fabric_seq, int) and fabric_seq > self._replay_watermark:
+                self._replay_watermark = fabric_seq
+            self._replay_count += 1
             p = ev.get("payload") or {}
             if not isinstance(p, dict):
                 continue

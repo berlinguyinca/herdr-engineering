@@ -224,6 +224,7 @@ def id_token(user="alice", email="alice@example.org", **over):
     lambda: id_token(user="mallory"),                  # someone else's id token
     lambda: id_token(exp=time.time() - 1),
     lambda: id_token(email=None),
+    lambda: id_token(email="\u212aim@example.org"),     # KELVIN SIGN: .lower() would make it "kim@example.org"
     lambda: "junk",
 ])
 def test_id_token_linking_rejects_bad_tokens(bad):

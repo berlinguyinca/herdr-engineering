@@ -38,3 +38,16 @@ test('fabric routes preserve encoded identities, filters, cancellation and write
   ]);
   assert.equal(client.artifactDownloadUrl('a/b'), '/fabric/api/v1/artifacts/a%2Fb/download');
 });
+
+test('handoff overview, paging, detail and chain routes encode their inputs', async () => {
+  const calls = [];
+  const client = new HerdrClient('/fabric', { fetchImpl: async (url) => { calls.push(url); return { ok: true, text: async () => '{}' }; } });
+  await client.getHandoffOverview();
+  await client.pageHandoffs({ workspace: 'org/app & co', state: 'failed', attention: true, cursor: 'a|b', limit: 25 });
+  await client.pageHandoffs();
+  await client.getHandoff('h/1');
+  await client.getHandoffChain('h/1');
+  assert.deepEqual(calls, ['/fabric/api/v1/handoffs/overview',
+    '/fabric/api/v1/handoffs?limit=25&state=failed&workspace=org%2Fapp+%26+co&attention=1&cursor=a%7Cb',
+    '/fabric/api/v1/handoffs?limit=50', '/fabric/api/v1/handoffs/h%2F1', '/fabric/api/v1/handoffs/h%2F1/chain']);
+});

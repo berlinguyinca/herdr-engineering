@@ -240,17 +240,22 @@ test('editor JSON format and find replace are undoable and preview is safely ren
   const input = page.getByRole('combobox', { name: 'Message' });
   await input.fill('{"a":1}');
   await page.getByRole('button', { name: 'Expand editor' }).click();
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));   // secondary tools sit behind More
   await page.getByRole('button', { name: 'Format JSON' }).click();
   assert.equal(await input.inputValue(), '{\n  "a": 1\n}');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Undo', exact: true }).click();
   assert.equal(await input.inputValue(), '{"a":1}');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Redo', exact: true }).click();
   assert.equal(await input.inputValue(), '{\n  "a": 1\n}');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Find and replace' }).click();
   await page.getByRole('textbox', { name: 'Find text', exact: true }).fill('a');
   await page.getByRole('textbox', { name: 'Replace with', exact: true }).fill('b');
   await page.getByRole('button', { name: 'Replace all', exact: true }).click();
   assert.ok((await input.inputValue()).includes('"b"'));
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Undo', exact: true }).click();
   assert.ok((await input.inputValue()).includes('"a"'));
   await input.fill('{bad');
@@ -258,10 +263,35 @@ test('editor JSON format and find replace are undoable and preview is safely ren
   await page.getByRole('alert').filter({ hasText: 'Invalid JSON' }).waitFor();
   assert.equal(await input.inputValue(), '{bad');
   await input.fill('# Heading\n\n<script>bad()</script>');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Split preview', exact: true }).click();
   assert.equal(await page.locator('.conversation-editor-preview h1').innerText(), 'Heading');
   assert.equal(await page.locator('.conversation-editor-preview script').count(), 0);
   assert.deepEqual(await page.evaluate(() => window.sent), []);
+}));
+
+test('preview links fabric addresses through options.urls and never edits the draft', async () => withComposer(async (page) => {
+  const o = 'http://localhost:3188/app';
+  await page.evaluate((url) => {
+    window.prefetched = [];
+    window.mount({ urls: { prefetch: (t) => window.prefetched.push(t), resolver: { resolve: (u) => (u === url
+      ? { original: u, canonical: 'https://dev.lan:3188/app', status: 'resolved', service: 'web', host: '127.0.0.1' } : null) } } });
+  }, o);
+  const input = page.getByRole('combobox', { name: 'Message' });
+  await input.fill(`try ${o} now`);
+  await page.getByRole('button', { name: 'Expand editor' }).click();
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
+  await page.getByRole('button', { name: 'Split preview', exact: true }).click();
+  const link = page.locator('.conversation-editor-preview a.md-fabric-link');
+  assert.equal(await link.getAttribute('href'), 'https://dev.lan:3188/app');
+  assert.equal(await input.inputValue(), `try ${o} now`);          // the draft keeps the address as typed
+  assert.ok((await page.evaluate(() => window.prefetched)).some((t) => t.includes('localhost:3188')));
+  await page.evaluate(() => window.mount());                       // without a resolver the preview is unchanged
+  await page.getByRole('combobox', { name: 'Message' }).fill(`try ${o} now`);
+  await page.getByRole('button', { name: 'Expand editor' }).click();
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
+  await page.getByRole('button', { name: 'Split preview', exact: true }).click();
+  assert.equal(await page.locator('.conversation-editor-preview a.md-fabric-link').count(), 0);
 }));
 
 test('JSON viewer toggles raw content and handles clipboard denial', async () => withComposer(async (page) => {
@@ -293,6 +323,7 @@ test('expanded keyboard editing, indentation and previews never submit implicitl
   assert.equal(await input.isVisible(), false);
   await page.getByRole('button', { name: 'Edit', exact: true }).click();
   assert.equal(await input.inputValue(), 'one\ntwo\nx');
+  await page.evaluate(() => document.querySelectorAll('.conversation-more').forEach((d) => { d.open = true; }));
   await page.getByRole('button', { name: 'Find and replace' }).click();
   await page.getByRole('textbox', { name: 'Find text', exact: true }).fill('two');
   await page.getByRole('textbox', { name: 'Find text', exact: true }).press('Enter');

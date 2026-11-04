@@ -38,7 +38,7 @@
 .arch-left { min-width: 0; }
 .arch-graph { overflow: auto; border: 1px solid var(--a-border); border-radius: var(--radius-sm, 4px); max-height: 60vh; margin-bottom: 12px; }
 .arch-graph svg { display: block; }
-.arch-edge { fill: none; stroke: var(--a-edge); stroke-width: 1.2; opacity: .7; } .arch-edge.back { stroke-dasharray: 5 3; }
+.arch-edge { fill: none; stroke: var(--a-edge); stroke-width: 1.2; opacity: .7; } .arch-edge.back { stroke-dasharray: 5 3; } .arch-edge.calls { stroke-dasharray: 2 3; } .arch-edgekind { display: inline-block; margin: 0 0 .4rem; font-size: .85rem; }
 .arch-graph marker path { fill: var(--a-edge); }
 .arch-node rect { fill: var(--a-node); stroke: var(--a-border); stroke-width: 1; cursor: pointer; }
 .arch-node:hover rect, .arch-node:focus rect { stroke: var(--a-accent); stroke-width: 2; } .arch-node:focus { outline: none; }

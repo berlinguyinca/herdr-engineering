@@ -98,3 +98,15 @@ test('a panel whose first load failed shows its error, never a loading skeleton'
     assert.match(render({ data: null, error: null }), /data-skeleton/, 'still loading: skeleton');
   }
 });
+
+test('delivery metrics show unknown as unknown, never as zero, and escape every text field', () => {
+  const h = renderAnalytics({ data: { scope: { min_group_size: 5 }, delivery: {
+    accepted_changes: { count: 'unknown', reason: XSS }, gate_failures: { count: 3, basis: XSS },
+    handoffs: { total: 4, outcomes: { success: 2, failed: 1, pending: 1 } }, review_findings: { total: 6, open: 2 } } } });
+  assert.match(h, /Accepted changes<\/th><td>Unknown/);
+  assert.match(h, /Gate failures<\/th><td>3/);
+  assert.match(h, /4 total: 2 succeeded, 1 failed, 1 pending/);
+  assert.match(h, /6 total, 2 open/);
+  assert.ok(!h.includes('<img'));
+  assert.equal(renderAnalytics({ data: { scope: { min_group_size: 5 } } }).includes('Accepted changes'), false);
+});

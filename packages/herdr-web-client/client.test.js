@@ -5,6 +5,13 @@ import {createServer} from 'node:http';
 import { HerdrClient, ApiError } from './client.js';
 import { connectEvents } from './events.js';
 
+test('getSessionCommits asks for the encoded session commit links', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async url => { calls.push(url); return { ok: true, status: 200, text: async () => '{}' }; } });
+  await client.getSessionCommits('a:b');
+  assert.deepEqual(calls, ['/api/v1/sessions/a%3Ab/commits']);
+});
+
 test('agent summary and rename requests preserve encoded identity and version', async () => {
   const calls = [];
   const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
@@ -214,6 +221,16 @@ test('getCi requests /api/v1/ci', async () => {
   assert.equal(r.available, false);
 });
 
+test('getDeployments requests /api/v1/deployments', async () => {
+  const calls = [];
+  const client = new HerdrClient('', {
+    fetchImpl: async (url) => { calls.push(url); return { ok: true, text: async () => '{"plans": []}' }; },
+  });
+  const r = await client.getDeployments();
+  assert.equal(calls[0], '/api/v1/deployments');
+  assert.deepEqual(r.plans, []);
+});
+
 test('getTests requests /api/v1/tests', async () => {
   const calls = [];
   const client = new HerdrClient('', {
@@ -291,11 +308,12 @@ test('CI detail, logs and review reads encode identities and forward cancellatio
   const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{calls.push({url,opts});return {ok:true,status:200,text:async()=>'{}'};}});
   const signal=new AbortController().signal;
   await client.getCi({signal});await client.getCiPipeline('owner/repo & other',12,{signal});
-  await client.getCiLog('owner/repo',12,'step/9',{signal});await client.listReviews({signal});
+  await client.getCiLog('owner/repo',12,'step/9',{signal});await client.listReviews({signal});await client.listWaitingReviews({signal});
   assert.equal(calls[0].url,'/api/v1/ci');
   assert.equal(new URL(calls[1].url,'http://test').searchParams.get('repository'),'owner/repo & other');
   assert.equal(new URL(calls[2].url,'http://test').searchParams.get('step'),'step/9');
   assert.equal(calls[3].url,'/api/v1/reviews');
+  assert.equal(calls[4].url,'/api/v1/reviews?needs_decision=1');
   for(const call of calls)assert.equal(call.opts.signal,signal);
 });
 test('CI mutation uses explicit action POST with the provider run number',async()=>{
@@ -577,4 +595,13 @@ test('catalog paging is opt in, encoded and abortable; detail reads only one ser
   assert.equal(calls[1].signal,controller.signal);
   assert.equal(calls[2].url,'/api/v1/services/a%2Fb%3F%23');
   assert.equal(calls[2].signal,controller.signal);
+});
+
+test('the log slice request names the step, the line range and the test it expects there',async()=>{
+ const calls=[];
+ const client=new HerdrClient('',{fetchImpl:async url=>{calls.push(url);return {ok:true,status:200,text:async()=>'{}'};}});
+ await client.getCiLogSlice('17',12,'4',{start:10,end:14,expect:'TestBeta',providerUrl:'https://ci.example'});
+ const query=new URL(calls[0],'http://test');
+ assert.equal(query.pathname,'/api/v1/ci/log-slice');
+ assert.deepEqual(Object.fromEntries(query.searchParams),{repository:'17',number:'12',step:'4',start:'10',end:'14',context:'40',expect:'TestBeta',provider_url:'https://ci.example'});
 });

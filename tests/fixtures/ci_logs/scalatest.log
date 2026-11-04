@@ -1,0 +1,30 @@
+Run starting. Expected test count is: 0
+DiscoverySuite:
+Run completed in 65 milliseconds.
+Total number of tests run: 0
+Suites: completed 1, aborted 0
+Tests: succeeded 0, failed 0, canceled 0, ignored 0, pending 0
+No tests were executed.
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+ :: Spring Boot ::                (v3.2.2)
+2026-10-28T14:08:55.875-07:00  INFO 422343 --- [ ScalaTest-main] ToJSONSerializationAutoConfigurationTest : Starting CaseClassToJSONSerializationAutoConfigurationTest using Java 21.0.12.1 with PID 422
+2026-10-28T14:08:55.876-07:00  INFO 422343 --- [ ScalaTest-main] ToJSONSerializationAutoConfigurationTest : No active profile set, falling back to 1 default profile: "default"
+2026-10-28T14:08:56.254-07:00  INFO 422343 --- [ ScalaTest-main] izationAutoConfiguration$$SpringCGLIB$$0 : creating custom object mapper...
+2026-10-28T14:08:56.352-07:00  INFO 422343 --- [ ScalaTest-main] izationAutoConfiguration$$SpringCGLIB$$0 : creating custom template with Jackson for scala support
+2026-10-28T14:08:56.479-07:00  INFO 422343 --- [ ScalaTest-main] ToJSONSerializationAutoConfigurationTest : Started CaseClassToJSONSerializationAutoConfigurationTest in 0.762 seconds (process running 
+Discovery completed in 1 second, 144 milliseconds.
+Run starting. Expected test count is: 1
+CaseClassToJSONSerializationAutoConfigurationTest:
+- testObjectMapper
+Run completed in 1 second, 250 milliseconds.
+Total number of tests run: 1
+Suites: completed 2, aborted 0
+Tests: succeeded 1, failed 0, canceled 0, ignored 0, pending 0
+All tests passed.
+[INFO] 
+[INFO] --- jar:3.5.0:jar (default-jar) @ casetojson ---
+[INFO] Downloading from Example Nexus Repository: http://nexus.example.org:55000/content/groups/public/org/apache/maven/maven-archiver/3.6.5/maven-archiver-3.6.5.pom
+[INFO] Downloaded from Example Nexus Repository: http://nexus.example.org:55000/content/groups/public/org/apache/maven/maven-archiver/3.6.5/maven-archiver-3.6.5.pom (4.7 kB at 263 kB/s)
+[INFO] Downloading from Example Nexus Repository: http://nexus.example.org:55000/content/groups/public/org/codehaus/plexus/plexus-archiver/4.10.2/plexus-archiver-4.10.2.pom

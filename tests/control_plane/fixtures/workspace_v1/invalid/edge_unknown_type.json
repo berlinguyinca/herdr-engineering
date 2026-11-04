@@ -1,0 +1,18 @@
+{
+  "doc": {
+    "created_at": "2026-10-28T12:00:00Z",
+    "from_id": "urn:herdr:project:b242429a-a320-5d91-88fc-6067745899c6",
+    "id": "urn:herdr:edge:931bf266-16f1-5be1-820a-2fd260a9a0c7",
+    "revision": 1,
+    "scope": {
+      "room_id": "room-1",
+      "tenant_id": "t1",
+      "visibility": "room"
+    },
+    "source_event_id": "ev-1",
+    "to_id": "urn:herdr:task:dd9c5159-f7b9-561a-8620-284e9b6fd32b",
+    "type": "related_to"
+  },
+  "expect_keyword": "enum",
+  "schema": "edge"
+}

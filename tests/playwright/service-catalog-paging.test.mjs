@@ -290,3 +290,50 @@ for(const status of ['current','all'])test(`local expiry conserves exact counts 
   await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
   assert.equal(await page.locator('#sc-counts strong').textContent(),'2');
 }));
+
+test('shared first-load progress is indeterminate and delayed',()=>withComponents(async page=>{
+  await page.evaluate(async()=>{
+    const {skeleton}=await import('/motion.js');
+    document.querySelector('#services').innerHTML=skeleton('page content',{rows:7,height:64,bare:false});
+  });
+  assert.equal(await page.locator('[data-skeleton]').getAttribute('aria-busy'),'true');
+  await page.clock.runFor(400);
+  assert.equal(await page.locator('progress').isVisible(),true);
+  assert.equal(await page.locator('progress').getAttribute('value'),null);
+}));
+
+test('slow load-more shares progress, blocks duplicate requests and retains rows on error at mobile width',()=>withComponents(async page=>{
+  await page.setViewportSize({width:320,height:700});
+  await mountPaged(page);
+  await page.evaluate(()=>{
+    window.client.listServiceCatalog=options=>{
+      window.requests.push(options);
+      return new Promise((resolve,reject)=>{window.finishLoad=resolve;window.failLoad=reject;});
+    };
+  });
+  assert.match(await page.locator('#sc-result').textContent(),/2 of 10 loaded/);
+  await page.locator('#sc-load-more').click();
+  await page.clock.runFor(400);
+  assert.equal(await page.locator('#services').getAttribute('aria-busy'),'true');
+  assert.equal(await page.locator('#sc-results').getAttribute('aria-busy'),'true');
+  assert.equal(await page.locator('#sc-loading progress').isVisible(),true);
+  assert.equal(await page.locator('#sc-loading progress').getAttribute('value'),null);
+  assert.equal(await page.locator('#sc-load-more').getAttribute('aria-disabled'),'true');
+  await page.locator('#sc-load-more').evaluate(button=>{button.click();button.click();});
+  assert.equal(await page.evaluate(()=>window.requests.length),1);
+  assert.equal(await page.locator('.sc-row').count(),2);
+  await page.evaluate(()=>window.failLoad(new Error('offline')));
+  await page.waitForFunction(()=>document.querySelector('#services').getAttribute('aria-busy')==='false');
+  assert.equal(await page.locator('#sc-results').getAttribute('aria-busy'),'false');
+  assert.equal(await page.locator('#sc-loading progress').count(),0);
+  assert.equal(await page.locator('#sc-load-more').getAttribute('aria-disabled'),'false');
+  assert.match(await page.locator('#sc-error').textContent(),/last received catalog/);
+  assert.equal(await page.locator('.sc-row').count(),2);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+  assert.equal(await page.locator('#sc-load-more').evaluate(button=>button.classList.contains('hd-btn--secondary')),true);
+  await page.locator('#sc-load-more').click();
+  await page.evaluate(()=>window.finishLoad(window.body(['c','d'])));
+  await page.waitForSelector('[data-service-id="d"]');
+  assert.match(await page.locator('#sc-result').textContent(),/4 of 10 loaded/);
+  assert.equal(await page.locator('#sc-error').textContent(),'');
+}));

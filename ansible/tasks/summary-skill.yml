@@ -1,0 +1,25 @@
+# Converge the canonical `summary` skill (/summary in Pi, Claude Code and
+# OpenCode; $summary in Codex) for the fleet user on every host.
+#
+# Runs as the fleet (connection) user (become: false) from the selected
+# installed release, so the skill always matches the release's herdr-eng.
+# The installer never overwrites a customized skill or command: a preserved
+# file is reported as "preserved" and is not a failure.
+- name: "Converge summary skill"
+  become: false
+  block:
+    - name: "Install or upgrade the summary skill from the selected release"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -m
+          - herdr_engineering.cli
+          - summary
+          - install
+          - --json
+          - --home
+          - "{{ fleet_home }}"
+      environment:
+        PYTHONPATH: "{{ herdr_engineering_checkout }}"
+      register: summary_install
+      changed_when: "'\"action\": \"installed\"' in summary_install.stdout or '\"action\": \"upgraded\"' in summary_install.stdout"

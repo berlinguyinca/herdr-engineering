@@ -3,7 +3,11 @@ Description=HerdR Engineering unattended fleet update
 
 [Service]
 Type=oneshot
-WorkingDirectory=__REPO__
+# Not the checkout. `python -m` puts the working directory first on sys.path and this project is
+# flat-layout (`herdr_engineering/` at the repository root), so a working directory of <checkout>
+# makes the updater import - and run - the checkout instead of the installed build. The updater
+# that is supposed to fast-forward a checkout must not be that checkout's code (#584).
+WorkingDirectory=%h
 Environment=__REPO_ENV__
 Environment=__PATH_ENV__
 ExecStart=/usr/bin/env __PYTHON__ -m herdr_engineering.fleet_autoupdate

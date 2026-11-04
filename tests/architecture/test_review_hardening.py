@@ -164,7 +164,7 @@ def test_unbound_agent_keys_are_trusted_for_host_id_bound_keys_are_not(snap):
         assert call(base, SNAPS, snap, key="free")[0] == 201
     finally:
         svr.shutdown()
-    with pytest.raises(ValueError, match="agent role"):
+    with pytest.raises(ValueError, match="agent or ingest role"):
         ControlPlaneServer(ControlPlaneRepo(), api_keys={"o": "operator"},
                            architecture_options={"agent_hosts": {"o": ["h1"]}})
 

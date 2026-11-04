@@ -162,3 +162,17 @@ test('host detail refreshes on its own poll with no SSE traffic',async()=>withPa
  await pollRefresh(page,POLL);
  assert.equal(await page.locator('[data-section=cpu] .hv-value').textContent(),'42%');
 }));
+
+test('hosts that never reported sit in their own collapsed list; the main grid keeps the reporting ones',async()=>withPage(async(page,base)=>{
+ const state=hostsState();
+ state.hosts.push({host_id:'ghost1',host_name:'ghost1',status:'unknown',problems:[]},{host_id:'ghost2',host_name:'ghost2',status:'unknown',problems:[]});
+ await boot(page,base,'/hosts',api(state));
+ await until(()=>page.locator('[data-hosts-grid] [data-host-card]').count().then(n=>n===3),'reporting hosts');
+ assert.equal(await page.locator('[data-hosts-silent] [data-host-card]').count(),2);
+ const wrap=page.locator('[data-hosts-silent-wrap]');
+ assert.equal(await wrap.evaluate(d=>d.open),false,'collapsed by default');
+ assert.match(await page.locator('[data-hosts-silent-label]').textContent(),/2 hosts registered but never reported/);
+ state.hosts.splice(3,2);                       // none left: the disclosure disappears
+ await pollRefresh(page,POLL);
+ await until(()=>wrap.evaluate(d=>d.hidden),'disclosure hidden');
+}));

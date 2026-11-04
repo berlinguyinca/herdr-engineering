@@ -17,8 +17,8 @@ STEPS = {"5m": 300, "1h": 3600, "1d": 86400}
 MAX_POINTS = 500
 MIN_SAMPLES = 5
 MIN_GEN_MS = 50          # a shorter generation phase makes tokens/s meaningless
-GROUPS = ("all", "model", "project", "session", "route")
-METRICS = ("requests", "tokens_out", "errors", "ttft_p95", "speed_p50")
+GROUPS = ("all", "model", "project", "session", "route", "mission")
+METRICS = ("requests", "tokens_out", "errors", "ttft_p95", "speed_p50", "queue_p95")
 # Log-spaced bucket upper bounds, 10 ms .. 600 s for latencies (about 12% apart), and
 # 0.1 .. 10 000 for tokens/s. A percentile is the upper bound of the bucket holding
 # that rank, so it is exact to within one bucket.
@@ -159,6 +159,8 @@ def group_key(by, p, resolve):
         return p.get("project") or "unknown"
     if by == "route":
         return p.get("route") or "unknown"
+    if by == "mission":      # a record that belongs to no mission is left out, like one without a session
+        return p.get("mission_id") or None
     raw = p.get("session_id")
     if not raw:
         return None
@@ -179,6 +181,8 @@ def select(events, payload_of, *, since, until=None, project=None, model=None, s
         p = payload_of(ev)
         if not p.get("session_id") and ev.get("session_id"):
             p = {**p, "session_id": ev["session_id"]}
+        if not p.get("mission_id") and ev.get("mission_id"):
+            p = {**p, "mission_id": ev["mission_id"]}
         if project and p.get("project") != project:
             continue
         if model and p.get("model") != model:
@@ -228,6 +232,8 @@ def timeseries(records, metric, *, since, until, step):
             value = b.tokens["output"]
         elif metric == "ttft_p95":
             value = b.ttft.summary()["p95"]
+        elif metric == "queue_p95":
+            value = b.queue.summary()["p95"]
         else:
             value = b.speed.summary()["p50"]
         points.append({"t": _iso(since + i * step), "v": value,

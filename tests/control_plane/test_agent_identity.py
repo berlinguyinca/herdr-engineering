@@ -116,6 +116,35 @@ def test_replay_restores_names_versions_and_old_name_reservations():
     assert registry.allocate('three', 'Grace')['display_name'] != 'Grace'
 
 
+def test_acknowledged_global_record_wins_over_tentative_local_allocation():
+    canonical = {'identity': 'one', 'display_name': 'Ada Amber', 'handle': 'ada-amber',
+                 'version': 2, 'reserved_names': ['ada-amber', 'ada amber'],
+                 'reserved_handles': ['ada-amber']}
+    registry = AgentIdentityRegistry(persist=lambda event: canonical if event['entity_id'] == 'one' else None)
+    assert registry.allocate('one', 'Ada') == {key: canonical[key]
+                                             for key in ('identity', 'display_name', 'handle', 'version')}
+    assert registry.allocate('two', 'Ada Amber')['display_name'] != 'Ada Amber'
+
+
+def test_explicit_legacy_reset_quarantine_keeps_aliases_and_requires_a_versioned_choice():
+    events = []
+    for name in ('Ada', 'Grace'):
+        AgentIdentityRegistry(persist=events.append).allocate('one', name)
+    restored = AgentIdentityRegistry(persist=events.append)
+    restored.hydrate(events, quarantine_conflicts=True, tolerate_version_resets=True)
+    assert restored.is_conflicted('one')
+    with pytest.raises(AgentIdentityConflict):
+        restored.allocate('one')
+    assert restored.allocate('other', 'Ada')['display_name'] != 'Ada'
+    assert restored.allocate('third', 'Grace')['display_name'] != 'Grace'
+    choice = restored.get('one')['display_name']
+    renamed = restored.rename('one', choice, 1)
+    assert renamed['version'] == 2 and not restored.is_conflicted('one')
+    replayed = AgentIdentityRegistry()
+    replayed.hydrate(events, quarantine_conflicts=True, tolerate_version_resets=True)
+    assert replayed.get('one') == renamed and not replayed.is_conflicted('one')
+
+
 def test_replay_ignores_unrelated_events_but_rejects_conflicting_reservations():
     events = []
     original = AgentIdentityRegistry(persist=events.append)

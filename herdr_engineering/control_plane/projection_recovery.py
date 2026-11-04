@@ -1,7 +1,6 @@
 """Recover every durable projection from a verified prefix and affected streams."""
 from __future__ import annotations
 
-import copy
 import logging
 import time
 
@@ -12,6 +11,7 @@ from .projection_checkpoint import (
     PreparedSource,
     capture_projection,
     code_fingerprint,
+    event_time,
     policy_fingerprint,
     restore_projection,
 )
@@ -68,6 +68,11 @@ async def _read_prepared_once(source, code, policy):
         structured = {name:[dict(row) for row in await conn.fetch(f'SELECT * FROM {name}')]
                       for name in ('missions','sessions','services','hosts')}
         candidates = await store.candidates(code, policy)
+        # Retain the shipped row-selection/inspector optimization until an
+        # explicit materializer has prepared a compatible complete capsule.
+        if not candidates and not source.checkpoint_publish:
+            if await conn.fetchval('SELECT EXISTS(SELECT 1 FROM recovery_checkpoint_active)'):
+                return None
         for candidate in candidates:
             try:
                 checkpoint = decode_checkpoint(bytes(candidate['state']), candidate['checksum'])
@@ -86,7 +91,42 @@ async def _read_prepared_once(source, code, policy):
                 legacy = prefix['legacy_rows'] - sum(row['operation']=='D' and row['had_position'] is None for row in changes)
                 if legacy != point['legacy_rows']:
                     raise CheckpointInvalid('legacy prefix coverage changed unexpectedly')
+                inserted = [row['position'] for row in changes if row['operation']=='I']
+                raw_tail = await _rows(conn, 'SELECT * FROM fabric_events WHERE projection_position=ANY($1::bigint[]) '
+                                       'ORDER BY projection_position', inserted) if inserted else []
+                tail_by_pair, changes_by_pair = {}, {}
+                for row in raw_tail:
+                    tail_by_pair.setdefault((row['entity_type'], row['entity_id']), []).append(row)
+                for row in changes:
+                    changes_by_pair.setdefault((row['entity_type'], row['entity_id']), []).append(row)
+                private_changes = [row for row in changes if row['entity_type'] == 'inspector']
+                inspector_append = False
+                if private_changes:
+                    order = InspectorStore(clock=getattr(source, '_checkpoint_inspector_clock', time.time))._replay_order
+                    tail = [row for row in raw_tail if row['entity_type'] == 'inspector']
+                    key = checkpoint['inspector']['replay']['key']
+                    inspector_append = (all(row['operation']=='I' for row in private_changes)
+                        and len(tail)==len(private_changes)
+                        and (key is None or min(order(row) for row in tail) > tuple(key)))
+                    if not inspector_append:
+                        raise CheckpointInvalid('inspector mutation requires complete authoritative replay')
                 pairs = sorted({(row['entity_type'],row['entity_id']) for row in changes})
+                if inspector_append:
+                    pairs = [pair for pair in pairs if pair[0] != 'inspector']
+                append_pairs = set()
+                cursors = checkpoint.get('core_cursors', {})
+                for kind, identity in pairs:
+                    if kind not in COMPACT_TYPES:
+                        continue
+                    key = f'{kind}|{identity}'
+                    tail = tail_by_pair.get((kind, identity), [])
+                    operations = changes_by_pair[(kind, identity)]
+                    previous = cursors.get(key)
+                    if (all(row['operation']=='I' for row in operations) and len(tail)==len(operations)
+                            and ((previous is None and key not in checkpoint['repo']['events'])
+                                 or (previous is not None and min(event_time(row) for row in tail)>previous))):
+                        append_pairs.add((kind,identity))
+                pairs = [pair for pair in pairs if pair not in append_pairs]
                 if any(not kind or not identity for kind,identity in pairs):
                     raise CheckpointInvalid('untyped durable changes require complete replay')
                 streams = {pair:[] for pair in pairs}
@@ -99,9 +139,6 @@ async def _read_prepared_once(source, code, policy):
                         [p[0] for p in pairs],[p[1] for p in pairs],maximum=MAX_DIRTY_ROWS)
                     for row in raw:
                         streams[(row['entity_type'],row['entity_id'])].append(public_event(row))
-                inserted = [row['position'] for row in changes if row['operation']=='I']
-                raw_tail = await _rows(conn, 'SELECT * FROM fabric_events WHERE projection_position=ANY($1::bigint[]) '
-                                       'ORDER BY projection_position', inserted) if inserted else []
                 coverage = {**point,
                     'raw_rows': prefix['raw_rows'] + sum(1 if row['operation']=='I' else -1 for row in changes),
                     'public_rows': prefix['public_rows'] + sum((1 if row['operation']=='I' else -1)
@@ -148,8 +185,8 @@ def recover_repository(repo, source):
 
 def _validate_publication(repo, capsule, structured):
     """Exercise every restore codec on a detached repository before publishing."""
-    from .repo import ControlPlaneRepo
     from .projection_store import encode_checkpoint
+    from .repo import ControlPlaneRepo
     packed, checksum = encode_checkpoint(capsule)
     decoded = decode_checkpoint(packed, checksum)
     detached = ControlPlaneRepo(now=repo._now, service_archive_days=repo._service_archive_days,
@@ -165,6 +202,7 @@ def _validate_publication(repo, capsule, structured):
 def _recover_repository(repo, source):
     from .bridge import _load_full_into
     start = time.monotonic()
+    source._checkpoint_inspector_clock = repo.inspector._clock
     code,policy = code_fingerprint(),policy_fingerprint(repo)
     prepared = source._run(_read_prepared(source,code,policy))
     if prepared is None:
@@ -186,6 +224,11 @@ def _recover_repository(repo, source):
         rows = prepared.pop('rows')
         ledger = SourceLedger(now=repo._now)
         ledger.hydrate(rows,preserve_order=True)
+        # Admission order is authoritative for the ledger. Business reducers
+        # retain the legacy deterministic ingest/sequence/event-ID ordering,
+        # including equal-sequence rows admitted by different principals.
+        rows.sort(key=lambda row: (row['ingest_timestamp'].isoformat(), row['sequence'],
+                                  row['event_id'], str((row.get('actor') or {}).get('id') or '')))
         counts = _load_full_into(repo,PreparedSource(prepared['structured'],rows,
             source_ledger=ledger.export_checkpoint()),capture_event_core=True)
         mode='full_replay'

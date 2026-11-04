@@ -136,6 +136,22 @@ class AgentSummaryConfig:
             raise ValueError('retry_max_seconds must be >= retry_initial_seconds')
 
 
+def _session_identity(repo, session_id):
+    """Stable digest of the session's conversation identity.
+
+    Cheap (a session dict lookup + hash of a few fields) and independent of event
+    seq, so it can be part of a source-memo cache key that must also notice an
+    identity change that does not append a new event.
+    """
+    session = repo.get_session(session_id) or {}
+    identity = {key: session.get(key) for key in
+                ('agent_session', 'conversation_id', 'thread_id') if session.get(key)}
+    if isinstance(identity.get('agent_session'), dict):
+        identity['agent_session'] = {key: identity['agent_session'].get(key)
+                                     for key in ('agent', 'kind', 'value')}
+    return _digest([session_id, identity])
+
+
 def summary_source(repo, session_id, config=None):
     """Read only public messages, preserving full bodies until our explicit budget.
 
@@ -144,13 +160,8 @@ def summary_source(repo, session_id, config=None):
     occurrence distinguishes repeated turns without depending on tool revisions.
     """
     config = config or AgentSummaryConfig()
+    identity_digest = _session_identity(repo, session_id)
     session = repo.get_session(session_id) or {}
-    identity = {key: session.get(key) for key in
-                ('agent_session', 'conversation_id', 'thread_id') if session.get(key)}
-    if isinstance(identity.get('agent_session'), dict):
-        identity['agent_session'] = {key: identity['agent_session'].get(key)
-                                     for key in ('agent', 'kind', 'value')}
-    identity_digest = _digest([session_id, identity])
     messages, occurrences = [], {}
     transcript = session.get('transcript') or {}
     reasons = []
@@ -332,9 +343,36 @@ class AgentSummaryService:
         self._thread = None
         self._active = None
         self._active_key = None
+        # Bounded per-session memo of the expensive projection. Events are
+        # append-only, so an unchanged newest event seq means the source is
+        # unchanged; reusing it avoids re-running inspector queries + per-message
+        # redaction + transcript hashing on every frontend poll. This was a
+        # GIL-bound hot path (py-spy showed summary_source/redact_text under load).
+        self._source_cache = OrderedDict()
+        self._source_cache_lock = threading.Lock()
+        self._source_cache_max = 2048
 
     def summary_source(self, session_id):
-        return summary_source(self.repo, session_id, self.config)
+        try:
+            newest = self.repo.inspector.newest_seq(session_id)
+        except KeyError:
+            newest = None
+        # newest_seq catches new events; the identity digest catches a session
+        # identity change (agent_session/conversation_id/thread_id) that does not
+        # append an event but still alters the projection.
+        key = (session_id, newest, _session_identity(self.repo, session_id))
+        with self._source_cache_lock:
+            cached = self._source_cache.get(key)
+            if cached is not None:
+                self._source_cache.move_to_end(key)
+                return cached
+        result = summary_source(self.repo, session_id, self.config)
+        with self._source_cache_lock:
+            self._source_cache[key] = result
+            self._source_cache.move_to_end(key)
+            while len(self._source_cache) > self._source_cache_max:
+                self._source_cache.popitem(last=False)
+        return result
 
     def _cache_key(self, source):
         return _digest([source['fingerprint'], self.config.endpoint.rstrip('/'), self.config.model,

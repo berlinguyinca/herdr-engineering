@@ -110,6 +110,18 @@ def _apply_listener_pids(result, owners, unknown):
     return result
 
 
+def _own_net_namespace() -> str | None:
+    """Identity of this process's network namespace (Linux), e.g. ``net:[4026531840]``; None where unknown.
+
+    The agent scans listeners with ``ss`` in its own namespace, so that namespace is where every loopback port it
+    discovers lives.
+    """
+    try:
+        return os.readlink("/proc/self/ns/net")
+    except OSError:
+        return None
+
+
 def _scan_linux() -> dict[int, dict[str, Any]]:
     """Parse ``ss -ltnpH`` into {port: {"addrs": set, "process": str|None}}."""
     exe = shutil.which("ss")
@@ -518,7 +530,7 @@ class AgentForwarder:
 
     def __init__(self, bind_host: str, target_port: int,
                  bind_port: int = 0, private_only: bool = True,
-                 fabric_names: frozenset[str] = frozenset()) -> None:
+                 fabric_names: frozenset[str] = frozenset(), fabric_domains: frozenset[str] = frozenset()) -> None:
         self.bind_host = bind_host
         self.target_port = target_port
         # Host names the fabric itself owns (the control-plane host, the
@@ -527,6 +539,7 @@ class AgentForwarder:
         # DNS-rebinding guard accepts, so nobody configures the app with the
         # fabric's names. Any other Host is forwarded untouched.
         self.fabric_names = frozenset(n.lower() for n in fabric_names)
+        self.fabric_domains = frozenset(d.lower().strip(".") for d in fabric_domains)
         # bind_port=0 => OS-allocated ephemeral port; a specific bind_port
         # makes the forwarder reuse the SAME port so port-matching works
         # (localhost:4040 -> dev.lan:4040). Callers fall back to 0 on EADDRINUSE.
@@ -611,7 +624,7 @@ class AgentForwarder:
         One overall deadline, not one per read, so a trickle cannot hold the
         connection. Whatever arrived is returned and forwarded either way.
         """
-        if not self.fabric_names:
+        if not self.fabric_names and not self.fabric_domains:
             return b""
         buf = b""
         deadline = time.monotonic() + self._HEAD_DEADLINE
@@ -673,7 +686,8 @@ class AgentForwarder:
                 host = (v[1:].split("]")[0] if v.startswith("[")
                         else v.split(":")[0])
                 host = host.rstrip(".")
-        if host_at is None or host not in self.fabric_names:
+        if host_at is None or not (host in self.fabric_names or any(
+                host == d or host.endswith("." + d) for d in self.fabric_domains)):
             return data
         lines[host_at] = f"Host: 127.0.0.1:{self.target_port}".encode()
         lines = [ln for ln in lines
@@ -768,6 +782,9 @@ class AgentConfig:
     # services to, so every dev:<port> lease shows up on the fleet Services
     # page with a clickable route. Empty = reporting disabled.
     control_plane_url: str = ""
+    # Fleet domains (local.metabolomics.us, legacy dev.lan): a Host that is one of them or a subdomain is the
+    # fabric's, so an app behind the forwarder sees 127.0.0.1 and its own rebinding guard accepts the request.
+    fabric_domains: tuple[str, ...] = ()
     # Host telemetry heartbeat (cpu/mem/disk/gpu/...) cadence, and how often the
     # slow package-update / tool-version data rides along on it.
     host_report_interval: float = 30.0
@@ -787,6 +804,9 @@ class AgentConfig:
                 names.add(host)
         return frozenset(n.lower() for n in names if n)
 
+    def domains(self) -> frozenset[str]:
+        return frozenset(d.lower().strip(".") for d in self.fabric_domains if d)
+
 
 class FabricAgent:
     """Detects web services on this host and keeps the gateway's lease set in
@@ -799,6 +819,8 @@ class FabricAgent:
         self._machine = socket.gethostname()
         self._ownership = ListenerOwnership(self._machine)
         self._git_metadata = ListenerGitMetadata()
+        self._resource_probe = None
+        self._resource_report_at = 0.0
         self._store: dict[str, dict[str, Any]] = self._load_store()
         self._forwards: dict[int, AgentForwarder] = {}
         self._warned_unleased: set[int] = set()
@@ -819,7 +841,7 @@ class FabricAgent:
         for port_s, entry in self._store.items():
             if entry.get("fwd_port"):
                 fwd = AgentForwarder(config.tailnet_ip, int(port_s),
-                                     fabric_names=config.fabric_names())
+                                     fabric_names=config.fabric_names(), fabric_domains=config.domains())
                 try:
                     fwd.start()
                     # Rebind to the remembered port when still free so the
@@ -1123,7 +1145,7 @@ class FabricAgent:
                 try:
                     fwd = AgentForwarder(self.cfg.tailnet_ip, port,
                                          bind_port=bind_port,
-                                         fabric_names=self.cfg.fabric_names()
+                                         fabric_names=self.cfg.fabric_names(), fabric_domains=self.cfg.domains()
                                          ).start()
                     break
                 except OSError:
@@ -1138,7 +1160,9 @@ class FabricAgent:
             result = self._client.register(
                 target_machine_id=self._machine, target_host=target_host,
                 target_port=target_port, protocol="http", label=label,
-                owner_process_id=process or "")
+                owner_process_id=process or "",
+                origin_port=port if target_port != port else None,
+                network_namespace=_own_net_namespace())
         except Exception as exc:  # gateway down / rejected: retry next cycle
             log.warning("register failed for port %d: %s", port, exc)
             if fwd is not None:
@@ -1318,6 +1342,25 @@ class FabricAgent:
             log.warning("host telemetry report failed: %s", exc)
             return None
 
+    def _report_resources(self):
+        if not self.cfg.control_plane_url or time.monotonic() - self._resource_report_at < 15:
+            return
+        self._resource_report_at = time.monotonic()
+        try:
+            from .host_config import _default_fetch, _read_host_json, host_config
+            from .resource_probe import ResourceProbe
+            if host_config().get("scheduler.telemetry", True) is not True:
+                return
+            host = _read_host_json(Path.home())
+            if self._resource_probe is None:
+                self._resource_probe = ResourceProbe(
+                    self.cfg.store_path.parent / "scheduler-host-identity", Path.home())
+            _default_fetch(host["control_plane_url"] + "/api/v1/fleet/config/telemetry",
+                           token=host["token"], method="POST", body=self._resource_probe.sample(), timeout=2)
+        except Exception:
+            # Metric collection failure must not interrupt service leases.
+            log.debug("resource telemetry unavailable")
+
     def _host_tick(self, now: float | None = None) -> bool:
         """One fast sample + post. Slow data rides along when it is new, and
         again every ``host_slow_interval``. Never raises."""
@@ -1334,6 +1377,7 @@ class FabricAgent:
             slow is not self._slow_handled
             or self._slow_sent is None
             or now - self._slow_sent >= self.cfg.host_slow_interval)
+        self._report_resources()
         status = self._report_host(telemetry, slow_due)
         ok = status is not None and 200 <= status < 300
         if slow_due and (ok or (status is not None and 400 <= status < 500)):

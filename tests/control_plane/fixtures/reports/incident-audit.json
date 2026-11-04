@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "title": "Qualitative incident-response audit example",
+  "questions": [{"id": "question-1", "text": "Which response responsibilities remain unclear?"}],
+  "evidence": [{"id": "evidence-1", "title": "Incident description A", "description": "The supplied description reports that two teams each expected the other to contact the customer; no timestamps were supplied."}],
+  "findings": [{"id": "finding-1", "title": "Ownership needs clarification", "statement": "The description supports investigating ambiguous handoff responsibility, but does not establish the incident cause.", "question_ids": ["question-1"], "evidence_ids": ["evidence-1"], "limitations": ["Selection and representativeness of the description are unknown."], "next_steps": ["Compare both workflow proposals against the original handoff record."]}],
+  "figures": [],
+  "assets": [],
+  "analysis": {"method": "Citation-backed qualitative review", "configuration": {}},
+  "limitations": ["No duration estimates or causal confidence scores can be derived."],
+  "next_steps": ["Obtain the workflow definitions and corroborating observations."]
+}

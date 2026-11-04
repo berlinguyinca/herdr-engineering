@@ -222,6 +222,62 @@ class Seeder:
         with s._lock:
             s._file_request(a.id, self.room, out["agent_id"], ["read", "post"])
 
+    def workbench(self):
+        """A realistic Mission Workbench scenario, sent through the real ingest path: one Pi agent that rolled over through 12 sessions
+        (a handoff record and a handoff edge between each pair), then forked at the last session into an independent Claude feature
+        branch and a Pi next-phase continuation, with a PR, CI, reviews (one stale), checkpoint and report artifacts, a blocked task
+        and a merge gate waiting for approval. Every id and sha is fixed so screenshots are deterministic."""
+        sha = lambda ch: ch * 40  # noqa: E731
+        self.node("mission:wb", "running", "Parser rewrite mission", {"mission_id": "wb", "next_action": "Approve the merge gate once CI is green"})
+        self.node("agent:pi-lead", "running", "Pi lead agent", {"harness": "pi", "mission_id": "wb"})
+        self.node("attempt:wb1", "running", "Attempt 1 (Pi)", {"agent_id": "pi-lead", "mission_id": "wb"})
+        self.edge("spawn", "mission:wb", "agent:pi-lead")
+        self.edge("spawn", "agent:pi-lead", "attempt:wb1")
+        n = int(self.cfg.get("chain") or 12)
+        for i in range(1, n + 1):
+            self.node(f"session:pi-{i}", "running" if i == n else "done", f"Pi session {i}", {"attempt_id": "wb1", "agent_id": "pi-lead", "mission_id": "wb", "host": "bender"})
+            self.edge("spawn", "attempt:wb1", f"session:pi-{i}")
+            if i > 1:
+                hid = f"handoff:pi-{i - 1}-{i}"
+                self.node(hid, "committed", f"Handoff {i - 1} to {i}", {"from_session_id": f"session:pi-{i - 1}", "to_session_id": f"session:pi-{i}",
+                                                                      "checkpoint_sha": f"{i:x}" * 40 if i < 16 else sha("a"), "handoff_kind": "context_rollover"})
+                self.edge("handoff", f"session:pi-{i - 1}", f"session:pi-{i}", {"handoff_id": hid, "handoff_kind": "context_rollover", "cause": "context_threshold"})
+        # an independent Claude feature branch and a Pi next-phase continuation, both forked from the last session
+        self.node("agent:claude-feature", "running", "Claude feature agent", {"harness": "claude", "mission_id": "wb"})
+        self.node("attempt:claude-1", "running", "Attempt 2 (Claude branch)", {"agent_id": "claude-feature", "mission_id": "wb", "branch": "feat/parser-claude", "head_sha": sha("b")})
+        self.node("session:claude-1", "running", "Claude session 1", {"attempt_id": "claude-1", "agent_id": "claude-feature", "mission_id": "wb", "host": "beast"})
+        self.node("attempt:pi-phase2", "running", "Attempt 3 (Pi next phase)", {"agent_id": "pi-lead", "mission_id": "wb", "branch": "feat/parser-phase2", "head_sha": sha("d")})
+        self.node("session:pi-13", "running", "Pi session 13", {"attempt_id": "pi-phase2", "agent_id": "pi-lead", "mission_id": "wb", "host": "bender"})
+        self.edge("fork", f"session:pi-{n}", "attempt:claude-1")
+        self.edge("fork", f"session:pi-{n}", "attempt:pi-phase2")
+        self.edge("spawn", "agent:claude-feature", "attempt:claude-1")
+        self.edge("spawn", "attempt:claude-1", "session:claude-1")
+        self.edge("spawn", "attempt:pi-phase2", "session:pi-13")
+        self.node("handoff:pi-12-13", "committed", "Handoff 12 to 13", {"from_session_id": "session:pi-12", "to_session_id": "session:pi-13", "checkpoint_sha": sha("c"), "handoff_kind": "phase_boundary"})
+        self.edge("handoff", "session:pi-12", "session:pi-13", {"handoff_id": "handoff:pi-12-13", "handoff_kind": "phase_boundary", "cause": "phase_boundary"})
+        # delivery: commit, PR, CI, reviews (the first review is for an older head, so it is stale), artifacts
+        self.node("commit:" + sha("b"), "done", "Claude branch head", {})
+        self.node("pr:github.com/acme/parser#42", "open", "PR 42: parser rewrite", {"head": sha("b")})
+        self.node("ci:run-117", "failed", "CI run 117", {"commit": sha("b")})
+        self.node("ci:run-118", "passed", "CI run 118", {"commit": sha("b")})
+        self.node("review:rv-1", "done", "Independent review", {})
+        self.node("task:fix-ci", "blocked", "Fix parser fixture", {"mission_id": "wb", "next_action": "Rerun CI after the fixture fix"})
+        self.send("node.state", {"node_id": "task:fix-ci", "state": "blocked", "reason": "CI run 117 failed on the parser fixture"})
+        self.node("gate:merge", "pending", "Merge approval", {"plan_digest": "wb-merge-1"})
+        self.edge("produced", "attempt:claude-1", "commit:" + sha("b"), {"commit": sha("b")})
+        self.edge("issue_link", "commit:" + sha("b"), "pr:github.com/acme/parser#42")
+        self.edge("validated", "ci:run-118", "pr:github.com/acme/parser#42", {"commit": sha("b")})
+        self.edge("reviewed", "review:rv-1", "pr:github.com/acme/parser#42", {"commit": sha("9")})
+        self.edge("reviewed", "review:rv-1", "pr:github.com/acme/parser#42", {"commit": sha("b")})
+        self.edge("blocked_by", "task:fix-ci", "ci:run-117")
+        self.edge("dependency", "gate:merge", "pr:github.com/acme/parser#42")
+        self.edge("spawn", "mission:wb", "task:fix-ci")
+        self.node("artifact:checkpoint-11", "done", "Checkpoint 11", {"kind": "checkpoint", "sequence": 11, "commit": sha("b")})
+        self.node("artifact:report-parser", "ready", "Parser report v2", {"kind": "report", "version_number": 2, "version_id": "ver_report_2", "source": "artifact-registry",
+                                                                       "content_digests": ["sha256:" + "5e" * 32], "storage_uri": "s3://private-bucket/parser/report-v2.html", "blob_url": "https://blob.invalid/report-v2"})
+        self.edge("produced", "attempt:wb1", "artifact:checkpoint-11", {"commit": sha("b")})
+        self.edge("produced", "attempt:claude-1", "artifact:report-parser")
+
     def long_labels(self):
         """Unbroken 300-character text in every place a person can type, so the 320px reflow gate meets what real users paste
         (a URL, a hash, a path). Nothing here can wrap at a space."""
@@ -290,6 +346,8 @@ def main():
     seeder = Seeder(cfg)
     if not cfg.get("empty"):
         seeder.seed()
+    if cfg.get("workbench"):
+        seeder.workbench()
     took = bulk_graph(seeder, int(cfg.get("graph_nodes", 0))) if cfg.get("graph_nodes") else 0.0
     print(json.dumps({"base": seeder.base, "room": seeder.room, "room2": seeder.room2, "tokens": seeder.tokens,
                       "ingest_key": seeder.ingest_key, "agent_id": getattr(seeder, "agent_id", None),

@@ -72,3 +72,42 @@ def test_one_hundred_concurrent_reservations_never_overcommit():
     assert len(queued) == 80
     assert sum(r.requested_cpu for r in reserved) <= 20
 
+
+def test_owner_and_project_budgets_apply_even_when_host_has_capacity():
+    current, capacity = host("a", cpu=100)
+    scheduler = Scheduler(lambda: [(current, capacity)], owner_concurrency_limit=1)
+    assert scheduler.reserve(request("owner-first", owner="alice")).state == "reserved"
+    queued = scheduler.reserve(request("owner-second", owner="alice"))
+    assert queued.state == "queued"
+    assert "USER_QUOTA" in queued.decision.explanations["a"]["reason_codes"]
+    assert scheduler.reserve(request("other-owner", owner="bob")).state == "reserved"
+
+
+def test_project_budget_cannot_be_bypassed_by_another_owner():
+    from dataclasses import replace
+    current, capacity = host("a", cpu=100)
+    scheduler = Scheduler(lambda: [(current, capacity)], project_concurrency_limit=1)
+    first = replace(request("p-first", owner="alice"), project_id="project")
+    second = replace(request("p-second", owner="bob"), project_id="project")
+    scheduler.reserve(first)
+    queued = scheduler.reserve(second)
+    assert queued.state == "queued"
+    assert "PROJECT_QUOTA" in queued.decision.explanations["a"]["reason_codes"]
+
+
+def test_legacy_active_reservation_requires_reconciliation_before_new_admission():
+    snapshot, capacity = host("a", cpu=100)
+    source = Scheduler(lambda: [(snapshot, capacity)])
+    row = source.reserve(request("legacy-writer")).to_dict()
+    row.pop("request_snapshot")
+    row.pop("queued_at")
+    restored = Scheduler(lambda: [(snapshot, capacity)])
+    restored.restore([row])
+    decision = restored.plan(request("new-writer"))
+    assert decision.state == "queued"
+    assert "LEGACY_CONTEXT_UNKNOWN" in decision.explanations["a"]["reason_codes"]
+    with pytest.raises(RuntimeError, match="reconciliation"):
+        restored.commit(row["reservation_id"])
+    restored.release(row["reservation_id"], state="cancelled")
+    assert restored.plan(request("after-reconciliation")).state == "planned"
+

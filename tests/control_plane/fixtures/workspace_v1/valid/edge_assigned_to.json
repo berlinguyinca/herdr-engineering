@@ -1,0 +1,14 @@
+{
+  "created_at": "2026-10-28T12:00:00Z",
+  "from_id": "urn:herdr:task:dd9c5159-f7b9-561a-8620-284e9b6fd32b",
+  "id": "urn:herdr:edge:5c5c6eb8-09ea-5786-b439-ab735737f2f4",
+  "revision": 1,
+  "scope": {
+    "room_id": "room-1",
+    "tenant_id": "t1",
+    "visibility": "room"
+  },
+  "source_event_id": "ev-1",
+  "to_id": "urn:herdr:agent:5f2b2897-e58c-547b-bbf0-6f246bb349c3",
+  "type": "assigned_to"
+}

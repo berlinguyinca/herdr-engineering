@@ -1,8 +1,10 @@
 """Tests for the one-command fleet onboarding (herdr_engineering/fleet.py)."""
 import hashlib
+from pathlib import Path
 from unittest.mock import patch
 
 from herdr_engineering import fleet
+from herdr_engineering.fleet import LAUNCHD_LABEL
 
 REVISION = "a" * 40
 GATE_CHECKSUM = hashlib.md5(b"test gate").hexdigest()
@@ -222,6 +224,9 @@ def test_update_refreshes_installed_timer(tmp_path, monkeypatch):
     (repo / 'scripts').mkdir()
     (repo / 'scripts/fleet-auto-update.sh').write_text('#!/bin/sh\n')
     monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    # The systemd path is gated on the platform; every _run here is a stub, so pinning it keeps
+    # the assertion meaningful on a macOS controller instead of failing for the wrong reason.
+    monkeypatch.setattr(fleet.sys, 'platform', 'linux')
     calls = []
     def run(cmd, **kwargs):
         calls.append(cmd)
@@ -231,6 +236,49 @@ def test_update_refreshes_installed_timer(tmp_path, monkeypatch):
     result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
     assert result['ok']
     assert any(str(repo / 'scripts/fleet-auto-update.sh') in cmd for cmd in calls)
+
+
+def test_update_refreshes_installed_launchd_agent_on_macos(tmp_path, monkeypatch):
+    """macOS is a controller too (#583): the LaunchAgent must converge like the systemd timer."""
+    repo = _fake_repo(tmp_path)
+    (repo / 'scripts').mkdir()
+    (repo / 'scripts/fleet-auto-update-macos.sh').write_text('#!/bin/sh\n')
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    monkeypatch.setattr(fleet.sys, 'platform', 'darwin')
+    calls, probed = [], []
+    def run(cmd, **kwargs):
+        (calls if cmd[:1] != ['launchctl'] else probed).append(cmd)
+        return _success(cmd, **kwargs)
+    monkeypatch.setattr(fleet, '_run', run)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert result['ok']
+    assert LAUNCHD_LABEL in ' '.join(probed[0]), probed
+    assert [c for c in calls if 'fleet-auto-update-macos.sh' in ' '.join(c)] == [
+        ['bash', str(repo / 'scripts/fleet-auto-update-macos.sh'), 'install']]
+
+
+def test_update_does_not_install_a_launchd_agent_the_operator_did_not_enable(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    (repo / 'scripts').mkdir()
+    (repo / 'scripts/fleet-auto-update-macos.sh').write_text('#!/bin/sh\n')
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    monkeypatch.setattr(fleet.sys, 'platform', 'darwin')
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return (1, '', 'Could not find service') if cmd[:1] == ['launchctl'] else _success(cmd, **kwargs)
+    monkeypatch.setattr(fleet, '_run', run)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
+    assert fleet.fleet_update(pull_controller=False, reinstall_local=False)['ok']
+    assert not any('fleet-auto-update-macos.sh' in ' '.join(cmd) for cmd in calls)
+
+
+def test_launchd_label_matches_the_macos_installer():
+    """`fleet update` probes the label the LaunchAgent actually uses (D23's drift class)."""
+    source = Path(__file__).resolve().parents[1]
+    script = (source / 'scripts' / 'fleet-auto-update-macos.sh').read_text()
+    assert f'LABEL="${{HERDR_ENG_LABEL:-{LAUNCHD_LABEL}}}"' in script
 
 
 def test_update_rejects_unpublished_commits(tmp_path, monkeypatch):
@@ -274,6 +322,7 @@ def test_update_stops_disabled_local_cleanup(tmp_path, monkeypatch):
     monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
     from herdr_engineering import config
     monkeypatch.setattr(config, 'load_config', lambda: {'build_cleanup': {'enabled': False, 'roots': []}})
+    monkeypatch.setattr(fleet.sys, 'platform', 'linux')   # systemd path, stubbed `_run`
     calls = []
     def run(cmd, **kwargs):
         calls.append(cmd)
@@ -492,3 +541,21 @@ def test_naming_an_optional_host_explicitly_is_not_tolerated(tmp_path, monkeypat
     result = fleet.fleet_update(host='mac', pull_controller=False, reinstall_local=False)
     assert not result['ok'] and result['absent_optional'] == []
     assert not any(c[0] == 'ansible' for c in calls)
+
+
+def test_fleet_status_reports_summary_skill_state_without_gating(tmp_path, monkeypatch):
+    import hashlib
+    repo = _fake_repo(tmp_path)
+    (repo / 'skills' / 'summary').mkdir(parents=True)
+    (repo / 'skills' / 'summary' / 'SKILL.md').write_text('canonical')
+    want = hashlib.sha256(b'canonical').hexdigest()
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    base = ('"msg": "fry | herdr-eng=herdr-eng 0.1.0 | build-gate=' + 'b' * 32
+            + ' | agent=active | revision=' + REVISION + ' | cleanup=inactive | pi-revision='
+            + REVISION + ' | pi-path=/p | autospec-revision=x | autospec-cli=y')
+    for tail, expected in ((f' | summary={want}"', 'current'), (' | summary=' + 'c' * 64 + '"', 'differs'),
+                           (' | summary=MISSING"', 'MISSING'), ('"', 'unknown')):
+        monkeypatch.setattr(fleet, '_run', lambda *a, _o=base + tail, **kw: (0, _o, ''))
+        host = fleet.fleet_status()['hosts'][0]
+        assert host['summary'] == expected
+        assert host['build_gate'] == 'b' * 32 and host['pi_path'] == '/p'

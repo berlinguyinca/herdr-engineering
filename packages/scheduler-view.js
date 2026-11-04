@@ -67,7 +67,8 @@ export function mountScheduling(container, client, { freshness = () => null } = 
 
 export function renderSchedulingView(payload, now = Date.now()) {
   const hosts = payload?.hosts ?? [];
-  const eligible = hosts.filter((h) => h.policy?.mode === 'automatic' && h.trusted && h.owned && h.reachable).length;
+  const eligible = hosts.filter((h) => h.policy?.mode === 'automatic' && h.trusted && h.owned && h.reachable
+    && Number.isFinite(h.telemetry?.freshness_seconds) && h.telemetry.freshness_seconds <= 60).length;
   const unavailable = hosts.length - eligible;
   const cards = hosts.map((host) => {
     const stale = host.telemetry?.freshness_seconds == null || Number(host.telemetry.freshness_seconds) > 60;
@@ -86,7 +87,7 @@ export function renderSchedulingView(payload, now = Date.now()) {
       <herdr-metric label="Eligible hosts" value="${eligible}"></herdr-metric>
       <herdr-metric label="Unavailable" value="${unavailable}"></herdr-metric>
       <herdr-metric label="Queued agents" value="${esc(text(payload?.queued_agents, '0'))}"></herdr-metric>
-      <herdr-metric label="Running agents" value="${esc(text(payload?.running_agents, '0'))}"></herdr-metric>
+      <herdr-metric label="Claimed executions" value="${esc(text(payload?.claimed_executions, 'unknown'))}"></herdr-metric>
     </div>
     <p class="hd-card__sub">Placement decisions are dry-run explainable; stale telemetry is not treated as zero load.</p>
     <form class="hd-card" data-scheduler-plan aria-label="Preview agent placement">

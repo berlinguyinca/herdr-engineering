@@ -27,7 +27,7 @@ VISIBILITY_SCOPES = ("private", "mission", "room", "org")
 DEFAULT_FRESHNESS_SECONDS = 300
 MAX_EVIDENCE_REFS = 64
 _ID_FIELDS = ("mission_id", "org_id", "project_id", "room_id", "workspace_id",
-              "task_id", "agent_id", "correlation_id", "causation_id")
+              "task_id", "agent_id", "correlation_id", "causation_id", "trace_id")
 _SOURCE_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _MAX_STR = 512
 
@@ -179,7 +179,7 @@ def envelope_event_fields(env: dict) -> dict:
     return {name: env.get(name) for name in (
         "source", "source_sequence", "causation_id", "correlation_id", "actor",
         "visibility_scope", "evidence_refs", "org_id", "project_id", "room_id",
-        "workspace_id", "task_id", "agent_id")}
+        "workspace_id", "task_id", "agent_id", "trace_id")}
 
 
 def _actor_id(actor: Any) -> str:
@@ -493,9 +493,11 @@ class SourceLedger:
                         meta = {}
                 digest = ((meta.get("_envelope") or {}).get("content_sha256")
                           if isinstance(meta, dict) else None)
+                received = e.get("ingest_timestamp")
+                received = received.isoformat() if isinstance(received, datetime) else str(received or "")
                 env = {"event_id": e["event_id"], "source": e["source"], "actor": e.get("actor"),
                        "source_sequence": int(e["source_sequence"]),
-                       "content_hash": digest, "received_at": str(e.get("ingest_timestamp") or "")}
+                       "content_hash": digest, "received_at": received}
                 self.commit(env, persist=False)
 
     # ---------------------------------------------------------------- views

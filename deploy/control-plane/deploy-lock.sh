@@ -44,3 +44,23 @@ deploy_lock_cleanup() {
   # Let process exit close descriptors, after *all* worktree/temp cleanup. An
   # inherited wrapper may still own the same open-file description afterwards.
 }
+
+# Bridge upstream launchers/wrappers that still use deploy.lock. Adopt a proven
+# inherited open-file description instead of deadlocking against our own wrapper.
+# Dynamic FDs avoid clobbering an inherited rollout.lock on fd 7 or 8.
+deploy_compat_lock_acquire() {
+  local candidate fd
+  DEPLOY_COMPAT_LOCK_FD=""
+  : >> "$STATE_DIR/deploy.lock"
+  chmod 600 "$STATE_DIR/deploy.lock"
+  for candidate in /proc/"$$"/fd/*; do
+    fd="${candidate##*/}"
+    if ! [[ "$fd" =~ ^[0-9]+$ ]] || [ "$fd" -lt 3 ]; then continue; fi
+    if [ "$candidate" -ef "$STATE_DIR/deploy.lock" ] && flock -n "$fd" 2>/dev/null; then
+      DEPLOY_COMPAT_LOCK_FD="$fd"
+      return 0
+    fi
+  done
+  exec {DEPLOY_COMPAT_LOCK_FD}>>"$STATE_DIR/deploy.lock"
+  flock -w "$DEPLOY_LOCK_WAIT" "$DEPLOY_COMPAT_LOCK_FD"
+}

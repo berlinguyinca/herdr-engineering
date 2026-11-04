@@ -48,25 +48,39 @@ class RustFSClient:
         self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
         return key, digest
 
+    def put_at(self, key: str, data: bytes) -> str:
+        """Write a mutable staging object (resumable upload parts) under a ``staging/`` key.
+
+        Content-addressed keys are shared between artifacts and must never be rewritten or deleted per upload, so
+        staging data lives under its own prefix and is the only thing an upload may overwrite or delete.
+        """
+        if not key.startswith("staging/") or ".." in key.split("/"):
+            raise ValueError("put_at only writes under the staging/ prefix")
+        self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
+        return key
+
     @staticmethod
     def _key_for_digest(digest: str) -> str:
         return f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
 
     def put_stream(self, stream: Any, *, expected_sha256: str | None = None,
                    expected_size: int | None = None, media_type: str | None = None,
-                   chunk_size: int = 1024 * 1024) -> dict[str, Any]:
+                   chunk_size: int = 1024 * 1024, spool_dir: Any = None) -> dict[str, Any]:
         """Upload a stream with bounded memory and verified content identity.
 
         The payload is spooled to a temporary file so large uploads never need
         to be held in RAM. The S3 client receives a seekable file object through
         ``upload_fileobj`` when available (boto3/MinIO/RustFS); the fallback
         ``put_object`` path keeps compatibility with small test clients.
+
+        ``spool_dir`` is where the spool file is created (default: the system temp dir); callers streaming very
+        large uploads pass a directory on large storage.
         """
         if chunk_size < 1:
             raise ValueError("chunk_size must be positive")
         digest = self._sha()
         size = 0
-        with tempfile.NamedTemporaryFile(mode="w+b") as spool:
+        with tempfile.NamedTemporaryFile(mode="w+b", dir=spool_dir) as spool:
             while True:
                 chunk = stream.read(chunk_size)
                 if not chunk:

@@ -17,8 +17,13 @@ const body = (items = [item()], over = {}) => ({
 
 test('renders an open item with its evidence link, owner link and controls', () => {
   const html = renderAttention({ body: body() }, now);
-  assert.match(html, /<span class="at-sev">critical<\/span> <strong><a href="#\/herd\/session\/a">Amber Swift<\/a><\/strong>/);
-  assert.match(html, /class="at-action" href="#\/herd\/session\/a">Open agent/);
+  assert.match(html, /<span class="at-sr">critical<\/span><strong>Amber Swift<\/strong>/);
+  assert.doesNotMatch(html, /data-attention-inspector/, 'details are folded until asked for');
+  const open = renderAttention({ body: body(), expanded: new Set(['session:a']) }, now);
+  assert.match(open, /aria-expanded="true"/);
+  assert.match(open, /data-attention-inspector="session:a"/);
+  assert.match(open, /class="at-action" href="#\/herd\/session\/a">Open</);
+  assert.equal((open.match(/href="#\/herd\/session\/a"/g) || []).length, 1, 'an action to the same place is not repeated');
   assert.match(html, /data-ack data-key="session:a" data-fingerprint="f1"/);
   for (const [seconds] of SNOOZE_CHOICES) assert.match(html, new RegExp(`<option value="${seconds}">`));
   assert.match(html, /<strong>1<\/strong> open/);
@@ -58,7 +63,7 @@ test('filters narrow the list by severity and kind', () => {
 test('remote text is escaped and only internal hash links become hrefs', () => {
   const evil = item({ title: '<img src=x onerror=alert(1)>', detail: '"><script>x</script>', href: 'javascript:alert(1)', key: 'k"><b>',
     actions: [{ label: 'Go', href: 'https://evil.example/' }, { label: 'Ok', href: '#/hosts/h' }] });
-  const html = renderAttention({ body: body([evil]) }, now);
+  const html = renderAttention({ body: body([evil]), expanded: new Set([evil.key]) }, now);
   assert.doesNotMatch(html, /<img|<script|<b>|javascript:|evil\.example/);
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.match(html, /href="#\/hosts\/h">Ok/);
@@ -111,4 +116,49 @@ test('the overview falls back to the browser projection and says so when the ser
   assert.match(disabled, /Browser-only agent/);
   assert.doesNotMatch(disabled, /computed in this browser/);
   assert.match(overview(data, { sessions: { loaded: true } }), /Browser-only agent/);   // legacy callers without the new source
+});
+
+test('a long open list folds into one section per severity and kind, worst first, with the rest behind Show all', () => {
+  const many = [
+    ...Array.from({ length: 12 }, (_, n) => item({ key: `ci:${n}`, kind: 'ci_failed', severity: 'critical', title: `CI ${n}` })),
+    ...Array.from({ length: 2 }, (_, n) => item({ key: `h:${n}`, kind: 'host_silent', severity: 'warning', title: `Host ${n}` })),
+  ];
+  const html = renderAttention({ body: body(many) }, now);
+  assert.equal((html.match(/class="at-kind at-kind-/g) || []).length, 2);
+  assert.ok(html.indexOf('at-kind-critical') < html.indexOf('at-kind-warning'));
+  assert.match(html, /12 × CI failed/);
+  assert.equal((html.match(/data-attention-row="/g) || []).length, 14);      // nothing is dropped, only folded
+  assert.ok(!html.includes('Show all 2<'));                                    // a section of three or fewer has nothing to fold
+});
+
+test('a short open list stays flat', () => {
+  const html = renderAttention({ body: body(Array.from({ length: 8 }, (_, n) => item({ key: `k:${n}`, kind: `kind${n % 4}`, title: `T${n}` }))) }, now);
+  assert.ok(!html.includes('<h2 class="at-kind-title"'));
+});
+
+test('a fold carries a stable id so it can stay open across refreshes, and chips are told apart by value', () => {
+  const many = Array.from({ length: 5 }, (_, n) => item({ key: `ci:${n}`, kind: 'ci_failed', severity: 'critical', title: `CI ${n}` }));
+  const html = renderAttention({ body: body(many) }, now);
+  assert.match(html, /<details data-fold="critical\|ci_failed">/);
+  assert.match(html, /data-filter="severity" data-value="critical"/);
+});
+
+test('the inspector says which handoff gave an agent its task, escaped, and omits the list when none is recorded', () => {
+  const agent = item({ key: 'session:a', handoffs: [{ direction: 'in', state: 'accepted', goal: '<b>Fix</b> it', agent: 'planner', href: '#/herd/session/p' },
+    { direction: 'out', state: 'queued', goal: '', agent: 'x', href: 'javascript:alert(1)' }] });
+  const html = renderAttention({ body: body([agent]), expanded: new Set(['session:a']) }, now);
+  assert.match(html, /Received from <a href="#\/herd\/session\/p">planner<\/a>: &lt;b&gt;Fix&lt;\/b&gt; it/);
+  assert.match(html, /Handed off to x/);
+  assert.doesNotMatch(html, /javascript:|<b>Fix/);
+  const none = renderAttention({ body: body([item({ key: 'session:a', handoffs: [] })]), expanded: new Set(['session:a']) }, now);
+  assert.doesNotMatch(none, /<ul class="at-handoffs"/);
+});
+
+test('hosts expected offline are named quietly and never counted', () => {
+  const html = renderAttention({ body: body([], { counts: { open: 0, acknowledged: 0, snoozed: 0, resolved: 0, critical: 0 },
+    expected_off: [{ host_id: 'h1', name: 'bender <1>', state: 'stale', last_seen: '2026-10-24T09:00:00Z' }, { host_id: 'h2', name: 'beast', state: 'down', last_seen: null }] }) }, now);
+  assert.match(html, /data-expected-off>Expected offline: bender &lt;1&gt; \(last seen [^)]+ ago\), beast\./);
+  assert.match(html, /<strong>0<\/strong> open/);
+  assert.doesNotMatch(renderAttention({ body: body() }, now), /data-expected-off/);
+  assert.doesNotMatch(renderAttention({ body: body([], { expected_off: [] }) }, now), /data-expected-off/);
 });

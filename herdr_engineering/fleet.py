@@ -23,6 +23,10 @@ from pathlib import Path
 
 from .herdr_adapter import NativeHerdrAdapter
 
+#: LaunchAgent installed by `scripts/fleet-auto-update-macos.sh`; a test holds the two together so
+#: `fleet update` cannot look for a label the installer never writes.
+LAUNCHD_LABEL = "com.herdr-engineering.fleet-auto-update"
+
 try:  # reuse the private-inventory helper from scripts/ (may live beside repo)
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     from fleet_inventory import add_host, list_hosts, write_host_vars
@@ -383,12 +387,23 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
             if not ok:
                 return report
 
-    timer_installer = root / "scripts" / "fleet-auto-update.sh"
-    if timer_installer.exists() and sys.platform.startswith("linux"):
+    # Refresh whichever unattended updater the controller actually has loaded - the installer
+    # holds the unit/plist templates, so a schedule or working-directory change reaches a host
+    # through this step and nothing else. The gate is the same on both platforms: refresh what is
+    # already enabled, never install an unattended job the operator has not turned on.
+    timer_linux = root / "scripts" / "fleet-auto-update.sh"
+    timer_macos = root / "scripts" / "fleet-auto-update-macos.sh"
+    if sys.platform.startswith("linux") and timer_linux.exists():
         enabled, _, _ = _run(["systemctl", "--user", "is-enabled", "--quiet",
                               "herdr-eng-fleet-update.timer"], timeout=30)
         if enabled == 0:
-            ok, _ = step("controller_update_timer", ["bash", str(timer_installer)], 120)
+            ok, _ = step("controller_update_timer", ["bash", str(timer_linux)], 120)
+            if not ok:
+                return report
+    elif sys.platform == "darwin" and timer_macos.exists():
+        loaded, _, _ = _run(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], timeout=30)
+        if loaded == 0:
+            ok, _ = step("controller_update_timer", ["bash", str(timer_macos), "install"], 120)
             if not ok:
                 return report
 
@@ -438,8 +453,25 @@ def fleet_status(*, inventory: Path | None = None, host: str | None = None) -> d
                           "revision": _clean(parts[4]).removeprefix("revision=") if len(parts) > 4 else "unknown",
                           "cleanup": _clean(parts[5]).removeprefix("cleanup=") if len(parts) > 5 else "unknown",
                           "pi_revision": _clean(parts[6]).removeprefix("pi-revision=") if len(parts) > 6 else "unknown",
-                          "pi_path": _clean(parts[7]).removeprefix("pi-path=") if len(parts) > 7 else ""})
+                          "pi_path": _clean(parts[7]).removeprefix("pi-path=") if len(parts) > 7 else "",
+                          "summary": _summary_state(parts, root)})
     return {"rc": rc, "hosts": hosts, "stderr": err.strip()[-300:] or None}
+
+
+def _summary_state(parts: list[str], root: Path) -> str:
+    """Informational: is the host's /summary skill the controller's? Never gates parity,
+    because a customized skill is deliberately preserved. Old fingerprints report 'unknown'."""
+    raw = next((p.strip().rstrip('"').strip() for p in parts if p.strip().startswith("summary=")), None)
+    if raw is None:
+        return "unknown"
+    sha = raw.removeprefix("summary=")
+    if sha == "MISSING":
+        return "MISSING"
+    try:
+        want = hashlib.sha256((root / "skills" / "summary" / "SKILL.md").read_bytes()).hexdigest()
+    except OSError:
+        return "unknown"
+    return "current" if sha == want else "differs"
 
 
 def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None) -> dict:

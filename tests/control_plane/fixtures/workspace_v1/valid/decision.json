@@ -1,0 +1,35 @@
+{
+  "actor": {
+    "id": "alice",
+    "kind": "user"
+  },
+  "aliases": [
+    {
+      "system": "hcn",
+      "value": "decision-1"
+    }
+  ],
+  "causation_id": "ev-0",
+  "correlation_id": "co-1",
+  "created_at": "2026-10-28T12:00:00Z",
+  "decided_by": {
+    "id": "alice",
+    "kind": "user"
+  },
+  "etag": "sha256:a3b1f9e15d77e608039e5db2877f0617ba07778df50677af4ca1d39a3d835e18",
+  "id": "urn:herdr:decision:65b3c7e9-5084-5275-b853-8b47b692c18f",
+  "kind": "decision",
+  "refs": [
+    "herdr://rooms/room-1"
+  ],
+  "scope": {
+    "room_id": "room-1",
+    "tenant_id": "t1",
+    "visibility": "room"
+  },
+  "source_sequence": 7,
+  "title": "Ship fix",
+  "trace_id": "tr-1",
+  "updated_at": "2026-10-28T12:00:00Z",
+  "version": 1
+}

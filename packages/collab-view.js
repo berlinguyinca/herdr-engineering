@@ -9,11 +9,12 @@ import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
 import {
-  MAX_RENDER_NODES, filterGraph, focusKey, focusSelector, focusSuccessor, layoutGraph, mergePages, nextNode, pagesTruncated, renderLineage, replayTarget,
+  VIEW_H, minimapTarget, workspaceLinkFor, viewportSize, centerOn, clampView, filterGraph, fitView, focusKey, focusSelector, focusSubgraph, focusSuccessor, isVisible, layoutCached, mergePages, nextNode, panBy, zoomAt, pagesTruncated, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
 import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
 import { commentBody, freshDraft, proposalBody, renderWorkbench } from './collab-workbench.js';
+import { mountTeamRoom } from './collab-team-rooms.js';
 import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
@@ -254,9 +255,9 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
           <span class="cx-row cx-row--between">${pill(roleLabel(r.role), r.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}<span class="hd-card__sub">Open →</span></span></button>`).join('')}</div>`
         : '<div class="hd-empty">No rooms yet. Create your first one below.</div>'}
       ${operator ? '<div id="hcn-helpers-panel"></div>' : ''}
-      <section class="cx-section"><h2>New room</h2>
+      <details class="cx-section cx-newroom"${rooms.length ? '' : ' open'}><summary>New room</summary>
         <form id="hcn-new" class="hd-card cx-form"><label class="cx-field">Room name<input name="name" required maxlength="120" placeholder="e.g. Metabolomics review"></label>
-          <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></section>`, strip);
+          <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></details>`, strip);
     document.querySelectorAll('#hcn-rooms [data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
     if (operator && $('hcn-helpers-panel')) {   // all rooms' host requests, helpers and the panic switch; the operator is rarely a member of the rooms asking
       const panel = createHelpersPanel({ container: $('hcn-helpers-panel'), api, operator, getRooms: async () => (await api.rooms()).rooms || [], go, hidden: () => document.hidden });
@@ -625,12 +626,20 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
     const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
+    // Collaboration is where people and agents talk and where work is assigned to agents: those four tabs lead, the rest are
+    // supporting views shown quieter (still reachable, still tabs).
+    const MAJOR_SUBS = ['chat', 'tasks', 'agents', 'lineage'];
+    const SUB_USE = { chat: 'Talk with the people and agents in this room', tasks: 'Assign work to an agent and follow it', agents: 'Who is in the room and what they may do',
+      lineage: 'How work started and moved between agents', flow: 'Who is handing work to whom, as a graph', tabs: 'Agents by terminal tab, and remote-agent invites',
+      attention: 'Items in this room that need a person', progress: 'How far assigned work has come', links: 'Workspaces linked to this room',
+      proposals: 'Changes agents propose, held until reviewed', people: 'Members, invitations and team-room controls' };
+    const order = (list) => [...list.filter(([k]) => MAJOR_SUBS.includes(k)), ...list.filter(([k]) => !MAJOR_SUBS.includes(k))];
+    const tabs = order([['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])]);
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
     frame('/rooms', `<div class="cx-roomhead"><h1>${esc(info.name)}</h1>${pill(roleLabel(info.role), 'var(--accent)')}</div>
-      <div class="cx-stabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab" role="tab" id="hcn-st-${k}" aria-controls="hcn-p-${k}" data-sub="${k}" data-label="${l}" aria-label="${l}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" aria-hidden="true" hidden></span></button>`).join('')}</div>
+      <div class="cx-stabs hd-tabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab${MAJOR_SUBS.includes(k) ? '' : ' cx-stab--minor'}" title="${esc(SUB_USE[k] || '')}" role="tab" id="hcn-st-${k}" aria-controls="hcn-p-${k}" data-sub="${k}" data-label="${l}" aria-label="${l}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" aria-hidden="true" hidden></span></button>`).join('')}</div>
       <section class="hd-card cx-chat cx-panel" id="hcn-p-chat" aria-label="Conversation">
         <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
         <button type="button" id="hcn-jump" class="hd-btn hd-btn--sm cx-jump" hidden>↓ New messages</button>
@@ -640,7 +649,9 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span><button type="button" id="hcn-flow-still" class="hd-btn hd-btn--ghost hd-btn--sm" aria-pressed="false">Pause motion</button></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
       <section class="cx-panel cx-cols" id="hcn-p-tasks" hidden>
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Give a task</div><form id="hcn-task" class="cx-stack"><label class="cx-field">To<select name="target" id="hcn-task-target"></select></label><label class="cx-field">What should it do?<textarea class="cx-input" name="text" required maxlength="4000" rows="4"></textarea></label><button class="hd-btn" type="submit">Send task</button><span id="hcn-task-msg" class="cx-msg" role="alert"></span></form></div>' : ''}
-        <div class="hd-card cx-stack"><div class="hd-card__title">Tasks</div><div id="hcn-tasks"></div></div></section>
+        <div class="hd-card cx-stack"><div class="hd-card__title">Tasks</div><div id="hcn-tasks"></div></div>
+        <div class="hd-card cx-stack"><details id="hcn-tr-mine-d"><summary>Tasks assigned to you</summary><div id="hcn-tr-mine"></div></details>
+          ${guest ? '<details id="hcn-tr-req-d"><summary>Your requests to the room owner</summary><div id="hcn-tr-req"></div></details>' : ''}</div></section>
       ${guest ? '' : `<section class="cx-panel cx-cols" id="hcn-p-agents" hidden>
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
@@ -688,7 +699,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
-          <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div></section>` : ''}`, strip);
+          <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div>
+        <div class="hd-card cx-stack"><details id="hcn-tr-owner-d"><summary>Team room: teams, guests, requests, roles and coordinators</summary><div id="hcn-tr-owner"></div></details></div></section>` : ''}`, strip);
 
     const stillBtn = $('hcn-flow-still');      // WCAG 2.2.2: moving lines run for longer than 5 s, so they can be paused
     if (stillBtn) {
@@ -715,7 +727,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const stale = new Set();               // panels whose redraw was held back because you were typing in them
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
-    teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    let teamRoom = null;
+    teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); teamRoom?.dispose(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
@@ -739,6 +752,12 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       return true;
     };
     root.addEventListener('focusout', () => setTimeout(() => { if (stale.size && alive) paint(); }, 0));
+    // Team rooms (slices 1-3): three collapsed sections that ask the server nothing until someone opens them, so a server with the
+    // flags off never sees a request from a room nobody opened this in.
+    teamRoom = mountTeamRoom({ root, api, roomId, put, sections: {
+      mine: { details: 'hcn-tr-mine-d', body: 'hcn-tr-mine' },
+      ...(guest ? { requests: { details: 'hcn-tr-req-d', body: 'hcn-tr-req' } } : {}),
+      ...(canInvite ? { owner: { details: 'hcn-tr-owner-d', body: 'hcn-tr-owner' } } : {}) } });
     // after an inline edit the panel's markup no longer matches what `put` remembers: forget it and refetch
     const redraw = (id) => () => { const el = $(id); if (el) delete el.dataset.h; stale.delete(id); kick(); };
 
@@ -1109,14 +1128,63 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       const html = renderInbox({ ...ctxModel(), enabled: CTX.features.consultation });
       if (h.dataset.h !== html) { h.dataset.h = html; handOff(morph(h, html), () => null); }
     }
-    const LIN = { step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
+    // layout preferences (view, mode, clock) live in this browser only, apart from anything the server holds about the mission
+    const PREF_KEY = 'hcn.lineage.prefs';
+    const readPrefs = () => { try { const p = JSON.parse(window.localStorage.getItem(PREF_KEY) || '{}'); return { view: p.view === 'gantt' ? 'gantt' : 'graph', mode: p.mode === 'table' ? 'table' : 'visual', clock: p.clock === 'reported' ? 'reported' : 'recorded' }; } catch { return {}; } };
+    const savePrefs = () => { try { window.localStorage.setItem(PREF_KEY, JSON.stringify({ view: LIN.view, mode: LIN.mode, clock: LIN.clock })); } catch { /* storage may be off: the layout is just not remembered */ } };
+    const LIN = { vp: null, focusId: null, vpW: 0, vpH: 0, step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
       truncated: null, asOf: null, timeline: null, error: null, timelineError: null, html: '', pending: null, fails: 0, notice: null, busy: false, at: 0, seq: 0, bound: false, layout: null,
       filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' } };
+    Object.assign(LIN, readPrefs());
+    // The terminal link: only the operator on the dashboard, only for a session the dashboard itself lists. It goes to the dashboard's
+    // session page, whose Terminal button is the existing authorized route; nothing here builds or sends a command.
+    const SESS = { ids: null, at: 0 };
+    const refreshSessions = () => {
+      if (!operator || standalone || !fabricSessions || Date.now() - SESS.at < 30000) return;
+      SESS.at = Date.now();
+      Promise.resolve().then(fabricSessions).then((r) => { SESS.ids = new Set((Array.isArray(r) ? r : (r && r.sessions) || []).map((x) => x.session_id)); if (alive && LIN.sel) drawLineage(true); }).catch(() => { SESS.ids = null; });
+    };
+    const terminalFor = (id) => {
+      const tail = typeof id === 'string' && id.startsWith('session:') ? id.slice(8) : null;
+      return tail && SESS.ids && SESS.ids.has(tail) ? { href: `/#/herd/session/${encodeURIComponent(tail)}` } : null;
+    };
+    // Operator-only: the server is asked (the real authorize route) whether the operator may use the terminal of the workspace this node belongs to.
+    // Nothing is rendered for anyone else, so there is also no handler to reach: the click path re-checks the same condition.
+    const TERM = { result: null, busy: false };
+    const termAuthFor = (id) => {
+      if (!operator || standalone || !id) return null;
+      const node = mergePages(LIN.pages).nodes.find((n) => n.id === id);
+      const link = workspaceLinkFor(S.links, node);
+      return link && link.can_terminal === true ? { link, result: TERM.result, busy: TERM.busy } : null;
+    };
+    async function termAuth(linkId) {
+      const t = termAuthFor(LIN.sel);
+      if (!t || t.link.link_id !== linkId || TERM.busy) return;                  // only the control that is on screen, only for the operator
+      TERM.busy = true; TERM.result = null; drawLineage(true);
+      try { await api.authorizeWorkspace(roomId, linkId, 'terminal'); TERM.result = { link_id: linkId, ok: true }; }
+      catch (e) { TERM.result = { link_id: linkId, ok: false, reason: e && e.status ? `HTTP ${e.status}` : 'forbidden' }; }
+      TERM.busy = false;
+      if (alive) drawLineage(true);
+    }
+    const vpSize = () => {
+      const box = $('hcn-lineage');
+      // a hidden panel measures 0: fall back to the window, never to a desktop width on a phone
+      const total = (box && box.clientWidth) || Math.max(280, window.innerWidth - 32);
+      const side = total >= 760 ? 336 : 0;            // the inspector sits beside the graph from 761px (collab.css), below it under 760
+      const w = Math.min(1200, Math.max(280, Math.floor((total || 960) - side)));
+      return { w, h: w < 520 ? 360 : VIEW_H };
+    };
     const linModel = () => {
       const graphAll = mergePages(LIN.pages);
-      const filtered = filterGraph(graphAll, LIN.filters);
-      return { graphAll, filtered, asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
-        mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, total: LIN.total,
+      const found = filterGraph(graphAll, LIN.filters);
+      const filtered = LIN.focusId && found.nodes.some((n) => n.id === LIN.focusId) ? { ...found, ...focusSubgraph(found, LIN.focusId) } : found;
+      const layout = LIN.mode !== 'table' ? layoutCached(filtered) : null;
+      const max = vpSize();
+      const sz = viewportSize(layout, max.w, max.h);
+      LIN.vpW = sz.w; LIN.vpH = sz.h;
+      if (LIN.vp && layout) LIN.vp = clampView(LIN.vp, layout, sz.w, sz.h);
+      return { graphAll, filtered, vp: LIN.vp, focusId: LIN.focusId, vpW: sz.w, vpH: sz.h, terminal: terminalFor(LIN.sel), termAuth: termAuthFor(LIN.sel), asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
+        mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, filtersOpen: LIN.filtersOpen ?? window.innerWidth > 760, total: LIN.total,
         workbench: LIN.sel ? renderWorkbench(wbModel()) + renderContextPanel(ctxModel()) : '',
         graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : (LIN.truncated || null), graphMore: LIN.next !== null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
     };
@@ -1244,7 +1312,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       const m = linModel();
       // the layout feeds the SVG's arrow-key navigation only; above the draw cap there is no SVG, and laying out thousands of
       // nodes on every keystroke of the filter box cost 0.5-2.4 s per key (T16 large-graph gate)
-      LIN.layout = m.filtered.nodes.length <= MAX_RENDER_NODES && LIN.mode !== 'table' ? layoutGraph(m.filtered) : null;
+      LIN.layout = LIN.mode !== 'table' ? layoutCached(m.filtered) : null;
+      refreshSessions();
       const html = renderLineage(m);
       drawConsults();
       if (LIN.html === html && box.innerHTML !== '') return;
@@ -1272,9 +1341,95 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       }
       if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && (el.type === 'search' || el.type === 'textarea' || el.type === 'text')) try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
     }
+    // ---- pan / zoom of the graph viewport. The view is plain state; every change re-draws only the nodes now in view.
+    const curView = () => LIN.vp || (LIN.layout ? fitView(LIN.layout, LIN.vpW, LIN.vpH) : null);
+    const setView = (v) => { if (!LIN.layout || !v) return; LIN.vp = clampView(v, LIN.layout, LIN.vpW, LIN.vpH); drawLineage(true); };
+    const revealNode = (id) => {
+      const p = LIN.layout && LIN.layout.placed.get(id);
+      const v = curView();
+      if (p && v && !isVisible(v, p, LIN.vpW, LIN.vpH)) LIN.vp = clampView(centerOn(v, p, LIN.vpW, LIN.vpH), LIN.layout, LIN.vpW, LIN.vpH);
+    };
+    function vpAct(act) {
+      const v = curView();
+      // After a focus change the selected node is centred in the new layout, so it is never left off-screen
+      const recentre = () => {
+        const m = linModel(); const lay = layoutCached(m.filtered); const p = LIN.sel && lay.placed.get(LIN.sel);
+        const base = fitView(lay, LIN.vpW, LIN.vpH);
+        LIN.vp = p ? clampView(centerOn(base, p, LIN.vpW, LIN.vpH), lay, LIN.vpW, LIN.vpH) : null;
+      };
+      if (act === 'focus') { if (LIN.sel) { LIN.focusId = LIN.sel; recentre(); drawLineage(true); } return; }
+      if (act === 'unfocus') { LIN.focusId = null; recentre(); drawLineage(true); return; }
+      if (!v) return;
+      if (act === 'fit') { LIN.vp = null; drawLineage(true); }
+      else if (act === 'end') { const last = LIN.layout && LIN.layout.columns.at(-1); const p = last && LIN.layout.placed.get(last[0]); if (p) setView(centerOn(v, p, LIN.vpW, LIN.vpH)); }
+      else if (act === 'in') setView(zoomAt(v, 1.25, LIN.vpW / 2, LIN.vpH / 2));
+      else if (act === 'out') setView(zoomAt(v, 1 / 1.25, LIN.vpW / 2, LIN.vpH / 2));
+    }
+    function bindViewport(box) {
+      // The pointer and the wheel act on the viewport; nodes keep their own click. A drag that starts on a node is a click.
+      let drag = null;
+      let lastDraw = 0;
+      const scaleOf = (svg) => { const r = svg.getBoundingClientRect(); return r.width && LIN.vpW ? r.width / LIN.vpW : 1; };
+      box.addEventListener('pointerdown', (e) => {
+        const vpEl = e.target.closest && e.target.closest('[data-viewport]');
+        if (!vpEl || e.button !== 0) return;
+        const svg = vpEl.querySelector('svg.lin-svg'); const v = curView();
+        if (!svg || !v) return;
+        drag = { x: e.clientX, y: e.clientY, v, s: scaleOf(svg), svg, id: e.pointerId, moved: false, el: vpEl };
+      });
+      box.addEventListener('pointermove', (e) => {
+        if (!drag || e.pointerId !== drag.id) return;
+        if (e.buttons === 0) { drag = null; return; }       // released outside the page: never keep panning
+        const dx = (e.clientX - drag.x) / drag.s; const dy = (e.clientY - drag.y) / drag.s;
+        if (!drag.moved && Math.hypot(dx, dy) < 3) return;
+        if (!drag.moved) {
+          // Capture only once it is a drag: capturing at pointerdown would send a plain click on a node to the viewport instead of the node.
+          try { drag.el.setPointerCapture(e.pointerId); } catch { /* capture is a nicety */ }
+          drag.el.classList.add('lin-viewport--drag');
+        }
+        drag.moved = true;
+        LIN.vp = clampView(panBy(drag.v, -dx, -dy), LIN.layout, LIN.vpW, LIN.vpH);
+        drag.svg.setAttribute('viewBox', `${LIN.vp.x} ${LIN.vp.y} ${LIN.vpW / LIN.vp.k} ${LIN.vpH / LIN.vp.k}`);
+        if (Date.now() - lastDraw > 120) { lastDraw = Date.now(); drawLineage(true); drag.svg = box.querySelector('[data-viewport] svg.lin-svg') || drag.svg; }
+      });
+      const end = (e) => {
+        if (!drag || e.pointerId !== drag.id) return;
+        const was = drag; drag = null;
+        const vpEl = box.querySelector('[data-viewport]'); if (vpEl) vpEl.classList.remove('lin-viewport--drag');
+        if (was.moved) drawLineage(true);
+      };
+      box.addEventListener('pointerup', end); box.addEventListener('pointercancel', end);
+      // Plain wheel scrolls the page; the wheel with Ctrl, Cmd or Alt zooms around the pointer.
+      box.addEventListener('wheel', (e) => {
+        const vpEl = e.target.closest && e.target.closest('[data-viewport]');
+        if (!vpEl || !(e.ctrlKey || e.metaKey || e.altKey)) return;
+        const svg = vpEl.querySelector('svg.lin-svg'); const v = curView();
+        if (!svg || !v) return;
+        e.preventDefault();
+        const r = svg.getBoundingClientRect(); const s = scaleOf(svg);
+        setView(zoomAt(v, e.deltaY < 0 ? 1.15 : 1 / 1.15, (e.clientX - r.left) / s, (e.clientY - r.top) / s));
+      }, { passive: false });
+    }
     function bindLineage(box) {
       LIN.bound = true;
+      if (typeof ResizeObserver === 'function') {            // the viewport follows the panel: a rotated phone or a resized window redraws at its new width
+        let lastW = box.clientWidth; let timer = 0;
+        new ResizeObserver(() => { if (Math.abs(box.clientWidth - lastW) < 8 || !box.clientWidth) return; lastW = box.clientWidth; clearTimeout(timer); timer = setTimeout(() => { if (alive) drawLineage(true); }, 120); }).observe(box);
+      }
+      bindViewport(box);
       let slide = 0;
+      // A node that takes focus (Tab into the single tab stop, a click on a list) is brought into view first: focus is never off screen.
+      box.addEventListener('focusin', (e) => {
+        const n = e.target.closest && e.target.closest('g[data-node]');
+        const p = n && LIN.layout && LIN.layout.placed.get(n.dataset.node);
+        const v = p && curView();
+        if (p && v && !isVisible(v, p, LIN.vpW, LIN.vpH)) {
+          // move the window now (the focused node is already in the DOM, so nothing is replaced under focus), re-cull a moment later
+          revealNode(n.dataset.node);
+          const svg = n.closest('svg'); if (svg && LIN.vp) svg.setAttribute('viewBox', `${LIN.vp.x} ${LIN.vp.y} ${LIN.vpW / LIN.vp.k} ${LIN.vpH / LIN.vp.k}`);
+          clearTimeout(LIN.revealTimer); LIN.revealTimer = setTimeout(() => { if (alive) drawLineage(true); }, 200);
+        }
+      });
       const goStep = (t) => {
         const step = t === 'live' ? null : t;
         if (LIN.busy) { LIN.pending = { step }; drawLineage(true); return; }      // keep the LATEST choice, apply it next
@@ -1292,17 +1447,29 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
           return;
         }
         if (wb) { wbAct(wb.dataset.wbAct, wb.dataset.wbId); return; }
+        const ta = e.target.closest('[data-term-auth]');
+        if (ta) { termAuth(ta.dataset.termAuth); return; }
+        const mm = e.target.closest('svg.lin-mm');
+        if (mm && LIN.layout) {
+          const r = mm.getBoundingClientRect(); const v = curView();
+          if (r.width && r.height && v) { const t = minimapTarget(LIN.layout, (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height); setView({ ...v, x: t.x - LIN.vpW / v.k / 2, y: t.y - LIN.vpH / v.k / 2 }); }
+          return;
+        }
+        const vpb = e.target.closest('[data-vp]');
+        if (vpb) { vpAct(vpb.dataset.vp); return; }
         const n = e.target.closest('[data-node]');
-        if (n) { pickNode(n.dataset.node); drawLineage(true); return; }
+        if (n) { pickNode(n.dataset.node); if (!n.closest('svg')) revealNode(n.dataset.node); drawLineage(true); return; }
         const r = e.target.closest('[data-replay]');
         if (e.target.closest('[data-retry]')) { loadLineage(); return; }
         if (r && r.dataset.replay !== 'slider') { goStep(replayTarget(LIN.asOf, r.dataset.replay)); return; }
         const v = e.target.closest('[data-view]');
-        if (v) { LIN.view = v.dataset.view; if (LIN.view === 'gantt' && !LIN.timeline) loadLineage(); else drawLineage(true); return; }
+        if (v) { LIN.view = v.dataset.view; savePrefs(); if (LIN.view === 'gantt' && !LIN.timeline) loadLineage(); else drawLineage(true); return; }
         const md = e.target.closest('[data-mode]');
-        if (md) { LIN.mode = md.dataset.mode; drawLineage(true); return; }
+        if (md) { LIN.mode = md.dataset.mode; savePrefs(); drawLineage(true); return; }
         if (e.target.closest('[data-more]') && !LIN.busy) loadLineage(true);
       });
+      // `toggle` does not bubble: capture it, so the person's choice survives every redraw
+      box.addEventListener('toggle', (e) => { if (e.target.matches && e.target.matches('details[data-filterbox]')) LIN.filtersOpen = e.target.open; }, true);
       box.addEventListener('submit', (e) => {
         e.preventDefault();                                              // Enter in the search box filters; it never navigates
         const cf = e.target.closest && e.target.closest('[data-ctx-form]');
@@ -1321,11 +1488,11 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         }
         const f = e.target.dataset.filter;
         if (f === 'q') {
-          LIN.filters.q = e.target.value;
+          LIN.filters.q = e.target.value; LIN.vp = null;      // a different set of nodes: start from the fitted view
           // Above the draw cap one redraw rebuilds thousands of table rows: coalesce a burst of keystrokes into one redraw so
           // typing itself stays responsive. Small graphs redraw at once, as before.
           const loaded = LIN.pages.reduce((n, p) => n + ((p && p.nodes) || []).length, 0);
-          if (loaded > MAX_RENDER_NODES) { clearTimeout(LIN.qTimer); LIN.qTimer = setTimeout(() => { if (alive) drawLineage(true); }, 250); } else drawLineage(true);
+          if (loaded > 300) { clearTimeout(LIN.qTimer); LIN.qTimer = setTimeout(() => { if (alive) drawLineage(true); }, 250); } else drawLineage(true);
         }
         else if (e.target.dataset.replay === 'slider') {
           const out = box.querySelector('.lin-replay__status');
@@ -1336,21 +1503,31 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         const t = e.target;
         if (t.dataset.wbField === 'action') { WB.draft.action = t.value; drawLineage(true); return; }
         if (t.dataset.replay === 'slider') { clearTimeout(slide); const v = t.value; slide = setTimeout(() => goStep(replayTarget(LIN.asOf, 'slider', v)), 150); return; }
-        if (t.dataset.clock !== undefined) { LIN.clock = t.value; drawLineage(true); return; }
+        if (t.dataset.clock !== undefined) { LIN.clock = t.value; savePrefs(); drawLineage(true); return; }
         const f = t.dataset.filter;
         if (f === 'type' || f === 'etype') {
           const set = f === 'type' ? LIN.filters.types : LIN.filters.edgeTypes;
           if (t.checked) set.add(t.value); else set.delete(t.value);
-          drawLineage(true);
-        } else if (f === 'state') { LIN.filters.state = t.value; drawLineage(true); }
+          LIN.vp = null; drawLineage(true);
+        } else if (f === 'state') { LIN.filters.state = t.value; LIN.vp = null; drawLineage(true); }
       });
       box.addEventListener('keydown', (e) => {
         const n = e.target.closest && e.target.closest('g[data-node]');
+        const inVp = e.target.closest && e.target.closest('[data-viewport]');
+        if (inVp && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          const v = curView();
+          const step = 80;
+          const pan = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
+          if (v && (e.key === '+' || e.key === '=')) { e.preventDefault(); setView(zoomAt(v, 1.25, LIN.vpW / 2, LIN.vpH / 2)); return; }
+          if (v && (e.key === '-' || e.key === '_')) { e.preventDefault(); setView(zoomAt(v, 1 / 1.25, LIN.vpW / 2, LIN.vpH / 2)); return; }
+          if (e.key === '0') { e.preventDefault(); LIN.vp = null; drawLineage(true); return; }
+          if (v && pan && (e.shiftKey || !n)) { e.preventDefault(); setView(panBy(v, pan[0], pan[1])); return; }
+        }
         if (n) {
           if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pickNode(n.dataset.node); drawLineage(true); return; }
           if (e.key === 'Escape') { pickNode(null); drawLineage(true); return; }
           const to = LIN.layout && nextNode(LIN.layout, n.dataset.node, e.key);
-          if (to) { e.preventDefault(); LIN.focus = to; drawLineage(true); box.querySelector(`g[data-node="${CSS.escape(to)}"]`)?.focus(); }
+          if (to) { e.preventDefault(); LIN.focus = to; revealNode(to); drawLineage(true); box.querySelector(`g[data-node="${CSS.escape(to)}"]`)?.focus(); }
           return;
         }
         const tab = e.target.closest && e.target.closest('[data-view]');

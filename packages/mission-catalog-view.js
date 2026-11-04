@@ -139,9 +139,9 @@ function resultLine(summary) {
 
 const styles = `<style>.mc-result strong{font-weight:600}.mc-result[data-result=succeeded]{color:var(--status-ok,#1a7f37)}.mc-result[data-result=failed]{color:var(--status-error,#cf222e)}
 .mc-counts[hidden],.mc-controls label[hidden]{display:none}
-.mc-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0;border-bottom:1px solid var(--border)}.mc-tabs button{font:inherit;background:none;border:0;border-bottom:3px solid transparent;color:var(--text-secondary);padding:9px 11px;cursor:pointer}.mc-tabs button[aria-selected=true]{color:var(--text);border-bottom-color:var(--accent)}.mc-tabs span{font-size:12px;margin-left:5px}.mc-tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.mc-tabs{margin:10px 0}.mc-tabs span{font-size:12px}
 .mc-intro{color:var(--text-secondary);line-height:1.5;max-width:80ch}.mc-counts{display:flex;flex-wrap:wrap;gap:7px;margin:10px 0}
-.mc-counts button{font:inherit;font-size:12px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:8px 11px;cursor:pointer}.mc-counts strong{font-size:18px;margin-right:5px}.mc-counts button[aria-pressed=true]{border-color:var(--accent)}
+.mc-counts button{font:inherit;font-size:12px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--control-radius);padding:8px 11px;cursor:pointer}.mc-counts strong{font-size:18px;margin-right:5px}.mc-counts button[aria-pressed=true]{border-color:var(--accent)}
 .mc-controls{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.mc-controls label{display:flex;flex-direction:column;gap:4px;font-size:12px}.mc-search{flex:1;min-width:180px}.mc-controls input,.mc-controls select{padding:7px 9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}
 .mc-group{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin:14px 0;overflow:hidden}.mc-group>summary{padding:15px;cursor:pointer;font-weight:600}.mc-group>summary span{font-size:12px;font-weight:400;color:var(--text-secondary);margin-left:8px}.mc-group[data-group=attention]>summary{color:var(--status-attention)}
 .mc-note{color:var(--text-secondary);font-size:12px;padding:0 12px 9px;margin:0}.mc-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);gap:14px;padding:10px 12px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.mc-main{min-width:0}
@@ -158,7 +158,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
   const state = {search:'',host:'',result:'all',repository:'',status:tab==='current'&&GROUPS.some(([key])=>key===status&&currentGroup(key))?status:'all',tab:TABS.some(([key])=>key===tab)?tab:'current'};
   const opened = new Map(), limits = new Map();
   container.innerHTML = `${styles}<p class="mc-intro">See what needs attention and what is running. Current shows missions with recent reports. Older and missing reports move to Unconfirmed; Failed and Finished retain their outcomes.</p>
-    <div class="mc-tabs" id="mc-tabs" role="tablist" aria-label="Mission outcome"></div><div class="mc-counts" id="mc-counts"></div><div class="mc-controls">
+    <div class="mc-tabs hd-tabs" id="mc-tabs" role="tablist" aria-label="Mission outcome"></div><div class="mc-counts" id="mc-counts"></div><div class="mc-controls">
       <label class="mc-search">Search missions<input id="mc-search" type="search" placeholder="Title, objective, activity or mission ID"></label>
       <label>Host<select id="mc-host"><option value="">All hosts</option></select></label>
       <label>Result<select id="mc-result-filter"><option value="all">Any result</option>${RESULTS.map(r=>`<option value="${r}">${RESULT_LABEL[r]}</option>`).join('')}</select></label>

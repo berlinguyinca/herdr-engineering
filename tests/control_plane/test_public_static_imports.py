@@ -31,18 +31,46 @@ def _resolve(name: str, ref: str) -> str:
     return posixpath.normpath(posixpath.join("/" + posixpath.dirname(name), ref))
 
 
-def unserved_imports(table=_PUBLIC_STATIC):
-    missing = []
-    for _url, (name, _ctype) in table.items():
+def public_imports(table=_PUBLIC_STATIC):
+    # Follow package files even when a dependency is absent from the API allowlist.
+    pending = {name for name, _ctype in table.values()}
+    visited = set()
+    imports = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
         for ref in _refs(name):
             target = _resolve(name, ref)
-            if target not in table:
-                missing.append(f"{name} -> {target}")
-    return sorted(missing)
+            imports.add((name, target))
+            pending.add(target.lstrip("/"))
+    return sorted(imports)
+
+
+def unserved_imports(table=_PUBLIC_STATIC):
+    return [f"{name} -> {target}" for name, target in public_imports(table) if target not in table]
+
+
+def blocked_by_edge(config, table=_PUBLIC_STATIC):
+    pattern = re.search(r'location ~ (\S+) \{', config).group(1)
+    paths = set(table) | {target for _name, target in public_imports(table)}
+    return sorted(path for path in paths
+                  if f'location = {path} ' not in config and not re.fullmatch(pattern, path))
 
 
 def test_every_public_static_file_exists():
     assert [name for name, _ in _PUBLIC_STATIC.values() if not (PACKAGES / name).is_file()] == []
+
+
+def test_public_edge_serves_the_complete_public_asset_graph():
+    config = (PACKAGES.parent / 'deploy/control-plane/collab-edge/nginx.conf').read_text()
+    pattern = re.search(r'location ~ (\S+) \{', config).group(1)
+    blocked = blocked_by_edge(config)
+    assert blocked == [], f'Public modules blocked by edge allowlist: {blocked}'
+    assert not re.fullmatch(pattern, '/app.js')
+    assert not re.fullmatch(pattern, '/herdr-web-client/client.js')
+    assert not re.fullmatch(pattern, '/api/v1/missions')
 
 
 def test_every_import_of_every_public_module_is_served():
@@ -53,3 +81,13 @@ def test_the_walk_catches_an_unserved_import():
     # Positive control: drop motion.js from the table and the walk must report collab-view's import.
     table = {k: v for k, v in _PUBLIC_STATIC.items() if k != "/motion.js"}
     assert "collab-view.js -> /motion.js" in unserved_imports(table)
+
+
+def test_the_walk_follows_modules_missing_from_both_allowlists():
+    # A missing intermediate module must not hide its own missing dependencies.
+    table = {k: v for k, v in _PUBLIC_STATIC.items() if k not in {"/collab-view.js", "/patch.js"}}
+    config = (PACKAGES.parent / 'deploy/control-plane/collab-edge/nginx.conf').read_text()
+    config = config.replace(r'|patch\.js', '')
+    assert "collab-app.js -> /collab-view.js" in unserved_imports(table)
+    assert "collab-view.js -> /patch.js" in unserved_imports(table)
+    assert "/patch.js" in blocked_by_edge(config, table)

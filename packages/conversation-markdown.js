@@ -50,12 +50,37 @@ function anchor(url, innerHtml, title) {
   return `<a href="${esc(url.href)}" target="_blank" rel="${REL}" title="${esc(title)}">${innerHtml}</a>`;
 }
 
+// ---- Fabric URL resolution (render-time only; the stored text is never changed) --------------------------
+// `urls.resolve(href)` returns null (not a fabric candidate) or {status, canonical, reason, service, host}.
+// The anchor target comes from the resolver and is re-validated here; it is never taken from the text.
+const REASON = { unmapped: 'No fabric service is registered for this address.', ambiguous: 'More than one host serves this port.',
+  expired: 'The service registration has expired.', unhealthy: 'The service is registered but not responding.',
+  unavailable: 'The fabric gateway could not be reached.' };
+const detail = (info, original) => [`Original: ${original}`, info.canonical ? `Fabric: ${info.canonical}` : '', info.service ? `Service: ${info.service}` : '',
+  info.host ? `Host: ${info.host}` : '', info.status !== 'resolved' ? (info.reason || REASON[info.status] || '') : ''].filter(Boolean).join('\n');
+
+function fabricAnchor(original, label, urls) {
+  let info = null;
+  try { info = urls?.resolve ? urls.resolve(original) : null; } catch { info = null; }
+  if (!info || typeof info !== 'object' || info.status === 'not_loopback') return null;
+  const target = info.status === 'resolved' ? parseWebUrl(info.canonical) : null;
+  if (target) {
+    const copy = (kind, text, value) => `<button type="button" class="md-fabric-copy" data-copy="${esc(value)}" aria-label="${esc(text)}" title="${esc(text)}">${kind}</button>`;
+    return `<a class="md-fabric-link" href="${esc(target.href)}" target="_blank" rel="${REL}" data-original="${esc(original)}" title="${esc(detail(info, original))}">${label}</a>`
+      + `<span class="md-fabric-actions">${copy('Copy original', 'Copy the original URL', original)}${copy('Copy fabric URL', 'Copy the fabric URL', target.href)}</span>`;
+  }
+  // An address that only works on the agent's own machine is not a link anywhere else: say why instead of a dead link.
+  return `<span class="md-link-unreachable" tabindex="0" title="${esc(detail(info, original))}">${label}</span>`;
+}
+
 // Bare URL in text -> anchor showing the (capped) URL; IDN hosts also show punycode.
-export function linkifyBare(raw) {
+export function linkifyBare(raw, urls = null) {
   const [candidate, tail] = splitTrailingPunctuation(raw);
   const url = parseWebUrl(candidate);
   if (!url) return null;
   const shown = cap(candidate, MAX_DISPLAY);
+  const fabric = urls ? fabricAnchor(candidate, esc(shown), urls) : null;
+  if (fabric) return fabric + esc(tail);
   const puny = isLookalikeHost(url, candidate) ? ` <span class="md-link-host">(${esc(hostLabel(url))})</span>` : '';
   return anchor(url, esc(shown), url.href) + puny + esc(tail);
 }
@@ -66,9 +91,11 @@ function safeLink(value) {
   return parseWebUrl(value) !== null || /^mailto:[^\s@]+@[^\s@]+$/i.test(value) && value.length <= MAX_URL;
 }
 
-function markdownLink(label, target, depth) {
+function markdownLink(label, target, depth, urls = null) {
   const web = parseWebUrl(target);
   const labelHtml = inline(cap(label, MAX_LINK_TEXT), depth + 1, true);
+  const fabric = web && urls ? fabricAnchor(target, labelHtml, urls) : null;
+  if (fabric) return fabric;
   if (!web) {
     // Internal route, root path or mailto: keep the existing behaviour.
     const internal = target.startsWith('#') || target.startsWith('/');
@@ -104,8 +131,21 @@ function referenceLink(kind, raw, references) {
   return `<a class="md-entity-ref" href="${esc(target.href)}" title="${esc(`${kind}:${id}`)}">${esc(label)}</a>${esc(tail)}`;
 }
 
-function inline(text, depth = 0, noLinks = false, references = null) {
+// Terminal hyperlinks (OSC 8: ESC ] 8 ; params ; URL ST label ESC ] 8 ; ; ST) in pasted terminal output become ordinary links,
+// so they pass the same safety checks and the same fabric resolution. Only http(s) targets survive; any other escape is dropped.
+const OSC8 = /\u001b\]8;[^;\u0007\u001b]*;([^\u0007\u001b]{0,2100})(?:\u0007|\u001b\\)([^\u001b]{0,500})\u001b\]8;;(?:\u0007|\u001b\\)/g;
+export function osc8ToMarkdown(text) {
+  if (!text.includes('\u001b]')) return text;
+  const converted = text.replace(OSC8, (_, url, label) => {
+    const clean = label.replace(/[\[\]\n]/g, ' ').trim() || url;
+    return parseWebUrl(url) && !/[()]/.test(url) ? `[${clean}](${url})` : label;
+  });
+  return converted.replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '');
+}
+
+function inline(text, depth = 0, noLinks = false, references = null, urls = null) {
   if (depth > 4) return esc(text);
+  if (depth === 0) text = osc8ToMarkdown(text);
   // The markdown-link alternative scans up to ~2600 characters per '[': only try it when a link can exist and the
   // text is of chat size, so a 100k-character "[[[[" message cannot make the page stall.
   const links = text.length <= LINK_SYNTAX_MAX && text.includes('](') && text.includes(')');
@@ -115,24 +155,34 @@ function inline(text, depth = 0, noLinks = false, references = null) {
   for (const m of text.matchAll(token)) {
     out += esc(text.slice(end, m.index));
     if (m[1] !== undefined) out += `<code>${esc(m[1])}</code>`;
-    else if (m[2] !== undefined) out += !noLinks && safeLink(m[3]) ? markdownLink(m[2], m[3], depth) : esc(m[0]);
-    else if (m[4] !== undefined) out += `<strong>${inline(m[4], depth + 1, noLinks, references)}</strong>`;
-    else if (m[5] !== undefined) out += `<em>${inline(m[5], depth + 1, noLinks, references)}</em>`;
-    else if (m[6] !== undefined) out += `<del>${inline(m[6], depth + 1, noLinks, references)}</del>`;
-    else if (m[7] !== undefined) out += (noLinks ? null : linkifyBare(m[7])) ?? esc(m[0]);
+    else if (m[2] !== undefined) out += !noLinks && safeLink(m[3]) ? markdownLink(m[2], m[3], depth, urls) : esc(m[0]);
+    else if (m[4] !== undefined) out += `<strong>${inline(m[4], depth + 1, noLinks, references, urls)}</strong>`;
+    else if (m[5] !== undefined) out += `<em>${inline(m[5], depth + 1, noLinks, references, urls)}</em>`;
+    else if (m[6] !== undefined) out += `<del>${inline(m[6], depth + 1, noLinks, references, urls)}</del>`;
+    else if (m[7] !== undefined) out += (noLinks ? null : linkifyBare(m[7], urls)) ?? esc(m[0]);
     else out += referenceLink(m[8], m[9], references) ?? esc(m[0]);
     end = m.index + m[0].length;
   }
   return out + esc(text.slice(end));
 }
 
-export function renderMarkdown(value, { references = null } = {}) {
+// While a message is still streaming its last URL may be a prefix (`http://localhost:31` on the way to `:3188`). With
+// `openEnd` that trailing URL is rendered as written; everything before it resolves normally. Once the stream settles the
+// caller renders again without `openEnd` and the complete URL is resolved.
+export function trailingOpenUrl(text) {
+  const m = /https?:\/\/[^\s<>`*"\\]*$/i.exec(text);
+  return m ? m[0] : null;
+}
+
+export function renderMarkdown(value, { references = null, urls = null, openEnd = false } = {}) {
   const text = String(value ?? '');
+  const held = openEnd && urls ? trailingOpenUrl(text) : null;
+  if (held) { const inner = urls; urls = { resolve: (u) => (held.startsWith(u) && /^[.,;:!?'"}>]*$/.test(held.slice(u.length)) ? null : inner.resolve(u)) }; }
   const lines = text.slice(0, 200000).replace(/\r\n?/g, '\n').split('\n');
   const out = [];
   let paragraph = [], list = [], listType = '', fence = null, code = [];
-  const flushParagraph = () => { if (paragraph.length) out.push(`<p>${paragraph.map((s) => inline(s, 0, false, references)).join('<br>')}</p>`); paragraph = []; };
-  const flushList = () => { if (list.length) out.push(`<${listType}>${list.map((s) => `<li>${/^\[[ xX]\] /.test(s) ? `<input type="checkbox" disabled${/^\[[xX]\]/.test(s) ? ' checked' : ''}> ${inline(s.slice(4), 0, false, references)}` : inline(s, 0, false, references)}</li>`).join('')}</${listType}>`); list = []; listType = ''; };
+  const flushParagraph = () => { if (paragraph.length) out.push(`<p>${paragraph.map((s) => inline(s, 0, false, references, urls)).join('<br>')}</p>`); paragraph = []; };
+  const flushList = () => { if (list.length) out.push(`<${listType}>${list.map((s) => `<li>${/^\[[ xX]\] /.test(s) ? `<input type="checkbox" disabled${/^\[[xX]\]/.test(s) ? ' checked' : ''}> ${inline(s.slice(4), 0, false, references, urls)}` : inline(s, 0, false, references, urls)}</li>`).join('')}</${listType}>`); list = []; listType = ''; };
   const cells = (line) => line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map((s) => s.trim().replace(/\\\|/g, '|'));
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
@@ -149,17 +199,17 @@ export function renderMarkdown(value, { references = null } = {}) {
     if (separators.length && separators.length <= 64 && separators.every((cell) => /^:?-{3,}:?$/.test(cell)) && cells(line).length === separators.length) {
       flushParagraph(); flushList();
       const align = separators.map((cell) => cell.startsWith(':') && cell.endsWith(':') ? 'center' : cell.endsWith(':') ? 'right' : 'left');
-      const row = (values, tag) => '<tr>' + separators.map((_, i) => `<${tag} style="text-align:${align[i]}">${inline(values[i] || '', 0, false, references)}</${tag}>`).join('') + '</tr>';
+      const row = (values, tag) => '<tr>' + separators.map((_, i) => `<${tag} style="text-align:${align[i]}">${inline(values[i] || '', 0, false, references, urls)}</${tag}>`).join('') + '</tr>';
       const rows = []; index++;
       while (rows.length < 500 && index + 1 < lines.length && lines[index + 1].includes('|') && lines[index + 1].trim()) rows.push(row(cells(lines[++index]), 'td'));
       out.push(`<div class="conversation-table"><table><thead>${row(cells(line), 'th')}</thead><tbody>${rows.join('')}</tbody></table></div>`); continue;
     }
     const heading = /^(#{1,6})\s+(.+)$/.exec(line);
-    if (heading) { flushParagraph(); flushList(); out.push(`<h${heading[1].length}>${inline(heading[2], 0, false, references)}</h${heading[1].length}>`); continue; }
+    if (heading) { flushParagraph(); flushList(); out.push(`<h${heading[1].length}>${inline(heading[2], 0, false, references, urls)}</h${heading[1].length}>`); continue; }
     const item = /^\s{0,3}(?:([-+*])|\d+[.)])\s+(.+)$/.exec(line);
     if (item) { flushParagraph(); const type = item[1] ? 'ul' : 'ol'; if (type !== listType) flushList(); listType = type; list.push(item[2]); continue; }
     flushList();
-    if (/^>\s?/.test(line)) { flushParagraph(); out.push(`<blockquote>${inline(line.replace(/^>\s?/, ''), 0, false, references)}</blockquote>`); }
+    if (/^>\s?/.test(line)) { flushParagraph(); out.push(`<blockquote>${inline(line.replace(/^>\s?/, ''), 0, false, references, urls)}</blockquote>`); }
     else paragraph.push(line);
   }
   if (fence !== null) out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`);

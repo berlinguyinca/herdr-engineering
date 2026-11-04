@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { normalizeRecord, createTranscriptCollector, resolveTranscript } from './session-transcript.js';
 
 const id = '12345678-1234-1234-1234-123456789abc';
@@ -315,4 +315,74 @@ test('moved Codex panes recover through matching ancestor and descendant inherit
   writeFileSync(join(procRoot,'42','environ'),`HERDR_PANE_ID=original:pane\0CODEX_THREAD_ID=${id}\0`);
   writeFileSync(join(procRoot,'43','environ'),'HERDR_PANE_ID=original:pane\0');
   assert.equal(await resolveTranscript('codex',null,options),null,'ancestor thread identity is still ignored');
+});
+
+
+// ---- Codex idle panes: identity from Codex's own PID-keyed log database ----
+async function codexLogFixture(t,{pid=42,started=1000,rows=[]}={}) {
+  const { DatabaseSync } = await import('node:sqlite');
+  const f=fixture(t);
+  const database=join(f.home,'.codex','logs_2.sqlite');
+  const db=new DatabaseSync(database);
+  db.exec('CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, thread_id TEXT, process_uuid TEXT)');
+  const insert=db.prepare('INSERT INTO logs (ts, thread_id, process_uuid) VALUES (?, ?, ?)');
+  for(const [ts,thread,owner] of rows) insert.run(ts,thread,owner ?? `pid:${pid}:abc`);
+  db.close();
+  const procRoot=join(f.home,'proc');mkdirSync(join(procRoot,String(pid)),{recursive:true});
+  writeFileSync(join(procRoot,'stat'),'cpu 1 2 3\nbtime 900\n');
+  // starttime is field 22: 19 fields follow the state field after "(codex)"
+  writeFileSync(join(procRoot,String(pid),'stat'),`${pid} (codex) S ${Array(18).fill('0').join(' ')} ${Math.round((started-900)*100)} 0`);
+  return {...f,procRoot,pid};
+}
+const meta=(threadId,source='cli')=>lines([{type:'session_meta',payload:{id:threadId,source}},message('hello')]);
+
+test('Codex idle pane resolves from the process-keyed log database',async t=>{
+  const f=await codexLogFixture(t,{rows:[[1500,id]]});writeFileSync(f.path,meta(id));
+  assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot:f.procRoot,pids:[f.pid]}),f.path);
+  const captured=await createTranscriptCollector({home:f.home,procRoot:f.procRoot,queryProcess:async()=>({result:{process_info:{foreground_processes:[{pid:f.pid}]}}})})('d',{...f.pane,agent_session:null},'s');
+  assert.equal(captured.status,'recording');
+  assert.equal(captured.envelopes[0].payload.events[0].text,'hello');
+});
+
+test('Codex log identity rejects rows older than the process (reused PID)',async t=>{
+  const f=await codexLogFixture(t,{started:2000,rows:[[1500,id]]});writeFileSync(f.path,meta(id));
+  assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot:f.procRoot,pids:[f.pid]}),null);
+});
+
+test('Codex log identity needs a readable process start time and ignores other pids and null threads',async t=>{
+  const f=await codexLogFixture(t,{rows:[[1500,id,'pid:99:zzz'],[1500,null]]});writeFileSync(f.path,meta(id));
+  assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot:f.procRoot,pids:[f.pid]}),null);
+  const g=await codexLogFixture(t,{rows:[[1500,id]]});writeFileSync(g.path,meta(id));
+  rmSync(join(g.procRoot,String(g.pid),'stat'));
+  assert.equal(await resolveTranscript('codex',null,{home:g.home,procRoot:g.procRoot,pids:[g.pid]}),null,'unknown process lifetime is not evidence');
+});
+
+test('Codex log identity never promotes a helper thread and never guesses a tie',async t=>{
+  const f=await codexLogFixture(t,{rows:[[1500,id]]});
+  writeFileSync(f.path,lines([{type:'session_meta',payload:{id,source:{subagent:{thread_spawn:{parent_thread_id:'other'}}}}},message('helper')]));
+  assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot:f.procRoot,pids:[f.pid]}),null);
+  const other='019aaaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee';
+  const g=await codexLogFixture(t,{rows:[[1500,id],[1500,other]]});
+  writeFileSync(g.path,meta(id));
+  const second=join(dirname(g.path),`rollout-2026-10-23T00-00-00-${other}.jsonl`);writeFileSync(second,meta(other));
+  assert.equal(await resolveTranscript('codex',null,{home:g.home,procRoot:g.procRoot,pids:[g.pid]}),null,'equal newest activity is ambiguous');
+  const db=new (await import('node:sqlite')).DatabaseSync(join(g.home,'.codex','logs_2.sqlite'));
+  db.prepare('INSERT INTO logs (ts, thread_id, process_uuid) VALUES (?, ?, ?)').run(1600,other,`pid:${g.pid}:abc`);db.close();
+  assert.equal(await resolveTranscript('codex',null,{home:g.home,procRoot:g.procRoot,pids:[g.pid]}),second,'the newer primary conversation wins after /new');
+});
+
+test('Codex log identity is the weakest evidence and does not touch other agents',async t=>{
+  const f=await codexLogFixture(t,{rows:[[1500,id]]});writeFileSync(f.path,meta(id));
+  const explicit=await resolveTranscript('codex',{kind:'path',value:f.path},{home:f.home,procRoot:f.procRoot,pids:[]});
+  assert.equal(explicit,f.path);
+  assert.equal(await resolveTranscript('pi',null,{home:f.home,procRoot:f.procRoot,pids:[f.pid]}),null);
+  assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot:f.procRoot,pids:[]}),null);
+});
+
+test('missing or unreadable Codex log database degrades to identity_unavailable',async t=>{
+  const f=fixture(t);writeFileSync(f.path,meta(id));
+  const procRoot=join(f.home,'proc');mkdirSync(join(procRoot,'42'),{recursive:true});
+  assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot,pids:[42]}),null);
+  mkdirSync(join(f.home,'.codex'),{recursive:true});writeFileSync(join(f.home,'.codex','logs_2.sqlite'),'not a database');
+  assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot,pids:[42]}),null);
 });

@@ -19,11 +19,14 @@ def test_checkpoint_store_is_private_atomic_and_digest_verified(tmp_path):
         lease=lease(), payload=b"private session state",
     )
     assert manifest.sha256
-    assert (tmp_path / "cp-1.json").stat().st_mode & 0o077 == 0
+    assert (tmp_path / "cp-1.checkpoint").stat().st_mode & 0o077 == 0
     assert store.get("cp-1", owner_id="alice") == b"private session state"
     with pytest.raises(CheckpointError, match="owner"):
         store.get("cp-1", owner_id="mallory")
-    (tmp_path / "cp-1.bin").write_bytes(b"tampered")
+    path = tmp_path / "cp-1.checkpoint"
+    damaged = bytearray(path.read_bytes())
+    damaged[-1] ^= 1
+    path.write_bytes(damaged)
     with pytest.raises(CheckpointError, match="digest"):
         store.get("cp-1", owner_id="alice")
 

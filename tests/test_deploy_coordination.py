@@ -24,6 +24,11 @@ from tests.test_deploy_scripts import (
 # Re-export the existing disposable deployment fixtures for pytest.
 __all__ = ["candidate_ref", "env"]
 
+# Complete candidate CLI imports and Git worktree cleanup can exceed 30s on the
+# shared integration host. Keep the real process checks bounded without changing
+# the separate 10s contention checks or any state/ownership assertions.
+DEPLOY_TIMEOUT = 90
+
 
 def state(e):
     return e["home"] / ".local/state/herdr-engineering/deploys"
@@ -35,7 +40,7 @@ def command(e, script=DEPLOY):
 
 
 def wait_for(path, proc):
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 60
     while not path.exists():
         if proc.poll() is not None:
             out, err = proc.communicate()
@@ -73,7 +78,7 @@ def first(e, prefix=()):
         (e["tmp"] / "release").touch()
         if proc.poll() is None:
             try:
-                proc.communicate(timeout=30)
+                proc.communicate(timeout=DEPLOY_TIMEOUT)
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.communicate()
@@ -122,15 +127,16 @@ def test_two_entrypoints_contend_before_any_docker_or_host_mutation(env, phase):
             with pytest.raises(BlockingIOError):
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         release.touch()
-        out, err = proc.communicate(timeout=30)
+        out, err = proc.communicate(timeout=DEPLOY_TIMEOUT)
         assert proc.returncode == (1 if phase == "rollback" else 0), out + err
     assert not (state(env) / "rollout-owner.json").exists()
     assert (state(env) / "rollout.lock").exists()
 
 
-def test_outer_flock_wrapper_is_adopted(env):
+@pytest.mark.parametrize("lock_name", ["rollout.lock", "deploy.lock"])
+def test_outer_flock_wrapper_is_adopted(env, lock_name):
     state(env).mkdir(parents=True)
-    lock = state(env) / "rollout.lock"
+    lock = state(env) / lock_name
     lock.touch()
     inode = lock.stat().st_ino
     entered, release = barrier(env, "docker", '[ "$1" = build ]')
@@ -139,7 +145,7 @@ def test_outer_flock_wrapper_is_adopted(env):
         result = deploy(env)
         assert result.returncode == 75, result.stderr
         release.touch()
-        out, err = proc.communicate(timeout=30)
+        out, err = proc.communicate(timeout=DEPLOY_TIMEOUT)
         assert proc.returncode == 0, out + err
     assert lock.stat().st_ino == inode
 
@@ -186,7 +192,7 @@ def test_interrupt_rolls_back_under_lock_before_release(env, signum, process_gro
             proc.send_signal(signum)
         assert deploy(env).returncode == 75
         release.touch()
-        out, err = proc.communicate(timeout=30)
+        out, err = proc.communicate(timeout=DEPLOY_TIMEOUT)
         assert proc.returncode == 128 + signum, out + err
         assert "and healthy" in err
     metadata = json.loads(next(state(env).glob("attempt-*/metadata.json")).read_text())
@@ -232,13 +238,13 @@ def test_unlocked_matching_fd_is_acquired_not_blindly_trusted(env):
             wait_for(entered, proc)
             assert deploy(env).returncode == 75
             release.touch()
-            out, err = proc.communicate(timeout=30)
+            out, err = proc.communicate(timeout=DEPLOY_TIMEOUT)
             assert proc.returncode == 0, out + err
             # Closing our inherited copy must not unlock the outer owner's FD.
             assert deploy(env).returncode == 75
         finally:
             release.touch()
-            proc.communicate(timeout=30)
+            proc.communicate(timeout=DEPLOY_TIMEOUT)
     assert deploy(env).returncode == 0
 
 
@@ -263,7 +269,7 @@ def test_interrupt_before_host_mutation_does_not_roll_back(env, signum):
         wait_for(entered, proc)
         proc.send_signal(signum)
         release.touch()
-        out, err = proc.communicate(timeout=30)
+        out, err = proc.communicate(timeout=DEPLOY_TIMEOUT)
         assert proc.returncode == 128 + signum, out + err
         assert "rolling back" not in err
         assert not list(state(env).glob("attempt-*"))
@@ -288,7 +294,7 @@ def test_interrupt_recovery_keeps_lock_and_ignores_repeated_termination(env):
             assert result.returncode == 75 and "phase=rollback" in result.stderr
             assert env["log"].read_bytes() == before
             continue_rollback.touch()
-            out, err = proc.communicate(timeout=30)
+            out, err = proc.communicate(timeout=DEPLOY_TIMEOUT)
             assert proc.returncode == 143 and "and healthy" in err, out + err
         finally:
             continue_verify.touch()
@@ -311,7 +317,7 @@ def test_canonical_symlink_resolves_helpers_and_repository(env):
     launcher.parent.mkdir(parents=True)
     launcher.symlink_to(DEPLOY)
     result = subprocess.run([str(launcher), *command(env)[2:]], cwd=env["home"],
-                            env=env["env"], capture_output=True, text=True, timeout=30)
+                            env=env["env"], capture_output=True, text=True, timeout=DEPLOY_TIMEOUT)
     assert result.returncode == 0, result.stdout + result.stderr
     assert (state(env) / f'{env["ref"][:12]}.json').exists()
 
@@ -330,7 +336,7 @@ exec '{real_git}' "$@"
     args = command(env)
     args.remove("--no-fetch")
     result = subprocess.run([*args, "--dry-run"], cwd=ROOT, env=env["env"],
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, timeout=DEPLOY_TIMEOUT)
     assert result.returncode == 0, result.stdout + result.stderr
     assert not forbidden.exists()
     assert not (env["home"] / ".local").exists()
@@ -366,7 +372,7 @@ def test_installed_routes_resolve_head_in_proven_caller_worktree(env, tool_route
     entry = launcher if route == "canonical" else legacy
     result = subprocess.run([str(entry), "--no-fetch", "--ref", ref,
                              "--fleet-config", str(env["central"])],
-                            cwd=caller / "deploy/control-plane", env=env["env"], capture_output=True, text=True, timeout=30)
+                            cwd=caller / "deploy/control-plane", env=env["env"], capture_output=True, text=True, timeout=DEPLOY_TIMEOUT)
     assert result.returncode == 0, result.stdout + result.stderr
     receipt = state(env) / f'{env["ref"][:12]}.json'
     assert receipt.exists(), "caller HEAD was silently replaced by canonical tool HEAD"
@@ -382,12 +388,12 @@ def test_installed_head_refuses_unproven_caller_but_full_sha_is_unambiguous(env,
     cwd = env["home"] if outside_repo else ROOT
     result = subprocess.run([str(launcher), "--no-fetch", "--ref", ref,
                              "--fleet-config", str(env["central"])],
-                            cwd=cwd, env=env["env"], capture_output=True, text=True, timeout=30)
+                            cwd=cwd, env=env["env"], capture_output=True, text=True, timeout=DEPLOY_TIMEOUT)
     assert result.returncode != 0
     assert "full commit SHA" in result.stderr and "published ref" in result.stderr
     assert not env["log"].exists()
     result = subprocess.run([str(launcher), *command(env)[2:]], cwd=cwd, env=env["env"],
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, timeout=DEPLOY_TIMEOUT)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -425,7 +431,7 @@ def test_forward_requires_verified_deployed_commit_ancestry(env, tool_routes, re
     # Deliberate divergence is explicitly authorized by this CLI flag only.
     args = [str(launcher), *command(env)[2:], *(["--allow-divergent"] if override else [])]
     result = subprocess.run(args, cwd=ROOT, env=env["env"], capture_output=True,
-                            text=True, timeout=30)
+                            text=True, timeout=DEPLOY_TIMEOUT)
     if relation in ("ancestor", "same") or override:
         assert result.returncode == 0, result.stdout + result.stderr
         receipt = json.loads((state(env) / f'{env["ref"][:12]}.json').read_text())
@@ -451,7 +457,7 @@ def test_explicit_divergent_forward_failure_uses_protected_automatic_rollback(en
                       STUB_PREVIOUS_TAG=tag, STUB_PREVIOUS_COMMIT=previous,
                       STUB_UNHEALTHY_TAGS=env["ref"][:12])
     result = subprocess.run([str(launcher), *command(env)[2:], "--allow-divergent"],
-                            cwd=ROOT, env=env["env"], capture_output=True, text=True, timeout=30)
+                            cwd=ROOT, env=env["env"], capture_output=True, text=True, timeout=DEPLOY_TIMEOUT)
     assert result.returncode == 1 and "and healthy" in result.stderr, result.stdout + result.stderr
     metadata = json.loads(next(state(env).glob("attempt-*/metadata.json")).read_text())
     assert metadata["outcome"] == "rolled_back"
@@ -472,11 +478,81 @@ def test_forward_refuses_unavailable_verified_history_before_build(env, tool_rou
     env["env"].update(STUB_RUNNING_IMAGE=f"herdr-engineering:{tag}",
                       STUB_PREVIOUS_TAG=tag, STUB_PREVIOUS_COMMIT=previous)
     result = subprocess.run([str(launcher), *command(env)[2:]], cwd=ROOT,
-                            env=env["env"], capture_output=True, text=True, timeout=30)
+                            env=env["env"], capture_output=True, text=True, timeout=DEPLOY_TIMEOUT)
     assert result.returncode != 0
     assert "does not descend" in result.stderr
     assert "--allow-divergent" in result.stderr
     assert "docker build" not in env["log"].read_text()
     assert " up " not in env["log"].read_text()
     assert not list(state(env).glob("attempt-*"))
+    assert not (state(env) / "rollout-owner.json").exists()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_target_image_checkpoint_precedes_host_and_service_changes(env, fail):
+    _seed_previous(env, _layout_commit())
+    docker = env["tmp"] / "bin/docker"
+    original = docker.with_suffix(".prewarm-original")
+    docker.rename(original)
+    docker.write_text(f'''#!/usr/bin/env bash
+if [ "$1" = run ]; then
+  for path in "$HOME/.config/herdr-engineering/github-app" "$HOME/.config/herdr-engineering/apps" "$HOME/.local/share/herdr-engineering/pipelines"; do
+    [ ! -e "$path" ] || exit 98
+  done
+  echo 'prewarm-before-host-changes' >> '{env["log"]}'
+  if [ "${{STUB_PREWARM_FAIL:-}}" = 1 ]; then
+    echo 'PREWARM-SECRET-MUST-NOT-LEAK' >&2
+    echo 'PREWARM-SECRET-MUST-NOT-LEAK'
+    exit 1
+  fi
+  echo '{{"ok": true, "rows_scanned": 7}}'
+fi
+exec '{original}' "$@"
+''')
+    docker.chmod(0o755)
+    if fail:
+        env["env"]["STUB_PREWARM_FAIL"] = "1"
+    result = deploy(env)
+    log = env["log"].read_text()
+    assert "prewarm-before-host-changes" in log
+    assert "PREWARM-SECRET" not in result.stdout + result.stderr
+    metadata_path = next(state(env).glob("attempt-*/metadata.json"))
+    metadata = json.loads(metadata_path.read_text())
+    prewarm_log = metadata_path.parent / "checkpoint-prewarm.log"
+    assert stat.S_IMODE(prewarm_log.stat().st_mode) == 0o600
+    assert str(prewarm_log) in result.stdout + result.stderr
+    if fail:
+        assert "PREWARM-SECRET-MUST-NOT-LEAK" in prewarm_log.read_text()
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert metadata["outcome"] == "prewarm_failed"
+        assert " up " not in log
+        assert not (env["home"] / ".config").exists()
+        assert not (state(env) / f'{env["ref"][:12]}.json').exists()
+    else:
+        assert json.loads(prewarm_log.read_text())["rows_scanned"] == 7
+        assert result.returncode == 0, result.stdout + result.stderr
+        runs = [line for line in log.splitlines() if line.startswith("docker run ")]
+        assert len(runs) == 1
+        run = runs[0]
+        assert "--network container:herdr-cp-web" in run
+        assert "--entrypoint herdr-eng" in run
+        assert "sha256:" + "b" * 64 in run
+        assert "control-plane checkpoint --fleet-config /etc/herdr/fleet/fleet-config.yaml" in run
+        assert "--migrations /app/control-plane/migrations" in run
+        assert f"src={metadata_path.parent}/candidate,dst=/etc/herdr/fleet,readonly" in run
+        assert log.index("docker run ") < log.index(" up ")
+    assert not (state(env) / "rollout-owner.json").exists()
+
+
+def test_initially_absent_web_skips_prewarm_network_and_is_recreated(env):
+    _seed_previous(env, _layout_commit())
+    missing = env["tmp"] / "missing"
+    missing.write_text("herdr-cp-web")
+    result = deploy(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "projection checkpoint prewarm skipped" in result.stdout
+    assert "docker run " not in env["log"].read_text()
+    assert missing.read_text().split() == []
+    metadata = json.loads(next(state(env).glob("attempt-*/metadata.json")).read_text())
+    assert metadata["outcome"] == "succeeded"
     assert not (state(env) / "rollout-owner.json").exists()

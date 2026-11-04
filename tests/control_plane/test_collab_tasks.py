@@ -286,6 +286,56 @@ def test_parent_must_be_my_accepted_task_in_this_room(w):
     w.s.create_task(a1, w.room, {"target_agent_id": i2["agent_id"], "text": "y", "parent_task_id": t1})
 
 
+def test_task_idempotency_survives_hydration(w):
+    _, target = w.agent("alice")
+    body = {"target_agent_id": target["agent_id"], "text": "once",
+            "idempotency_key": "durable-task"}
+    first = w.s.create_task(w.bob, w.room, body)
+
+    restored = CollabService(
+        StaticTokenAuthenticator({user_id: _digest(token) for user_id, token in USERS.items()}),
+        now=w.s.clock,
+    )
+    restored.hydrate(list(w.s._log))
+    replay = restored.create_task(user(restored, "bob"), w.room, body)
+    assert replay == {"task_id": first["task_id"], "status": "pending", "replayed": True}
+    assert len(restored._tasks) == len(w.s._tasks)
+
+
+def test_agent_task_idempotency_binds_and_revalidates_parent(w):
+    boss, boss_info = w.agent("bob", ("read", "execute", "instruct"))
+    _, target_info = w.agent("alice", ("read", "execute"))
+    parents = [w.s.create_task(w.bob, w.room, {
+        "target_agent_id": boss_info["agent_id"], "text": f"parent {i}"})["task_id"]
+        for i in range(2)]
+    for parent in parents:
+        w.s.update_task(boss, parent, {"status": "accepted"})
+    first_body = {"target_agent_id": target_info["agent_id"], "text": "child",
+                  "parent_task_id": parents[0], "idempotency_key": "parent-bound"}
+    first = w.s.create_task(boss, w.room, first_body)
+    assert w.s.create_task(boss, w.room, first_body)["task_id"] == first["task_id"]
+    assert code(w.s.create_task, boss, w.room, {
+        **first_body, "parent_task_id": parents[1]}) == 409
+    w.s.update_task(boss, parents[0], {"status": "done"})
+    assert code(w.s.create_task, boss, w.room, first_body) == 400
+
+
+def test_agent_task_replay_does_not_cross_a_new_grant_epoch(w):
+    boss, boss_info = w.agent("bob", ("read", "execute", "instruct"))
+    _, target_info = w.agent("alice", ("read", "execute"))
+    parent = w.s.create_task(w.bob, w.room, {
+        "target_agent_id": boss_info["agent_id"], "text": "parent"})["task_id"]
+    w.s.update_task(boss, parent, {"status": "accepted"})
+    body = {"target_agent_id": target_info["agent_id"], "text": "child",
+            "parent_task_id": parent, "idempotency_key": "grant-bound"}
+    w.s.create_task(boss, w.room, body)
+    w.s.remove_agent_from_room(w.alice, w.room, boss_info["agent_id"])
+    request = w.s.grant_agent(w.bob, w.room, {
+        "agent_id": boss_info["agent_id"], "actions": ["read", "execute", "instruct"]})
+    w.s.decide_agent_request(w.alice, w.room, request["request_id"], {"decision": "approve"})
+    assert code(w.s.create_task, boss, w.room, body) == 400
+
+
 def test_task_rate_and_queue_are_bounded(w):
     _, a = w.agent("alice")
     for _ in range(MAX_OPEN_TASKS_PER_AGENT):

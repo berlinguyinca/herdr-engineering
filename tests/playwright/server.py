@@ -203,8 +203,13 @@ def main():
     if os.environ.get("MISSION_STORY_SEED") == "1":
         _seed_missions(repo, _m1, _s1)
 
-    svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
-                             web_root=_REPO / "packages")
+    # A fixture price table for the Usage page's spend estimate (production reads control_plane.usage.prices from YAML).
+    usage_prices = ([{"model": "qwen*", "input": 100.0, "output": 200.0, "cached": None, "cached_in_input": False}]
+                    if os.environ.get("USAGE_PRICES_SEED") == "1" else None)
+    # No quiet hours: the production default (22:00-07:00 on the browser's clock) would hold notifications back, so
+    # a browser test would pass in the evening and fail at night.
+    svr = ControlPlaneServer(repo, host="127.0.0.1", port=0, usage_prices=usage_prices,
+                             attention={"notify": {"quiet_hours": None}}, web_root=_REPO / "packages")
     # Stricter than the production default (600/min): a throttled live-
     # refreshing dashboard must respect a finite per-IP budget. This makes the
     # rate-limit regression test fast and unambiguous (an un-throttled client
@@ -217,6 +222,44 @@ def main():
                 time.sleep(0.1)
             _seed_attention(repo)
         threading.Thread(target=_wait_for_trigger, daemon=True).start()
+    if os.environ.get("PR_TRAIL_SEED") == "1":
+        # org/app#214 (RELATED_SEED) was produced by the dashboard agent; it handed work to a Claude agent, which accepted, and a second
+        # handoff was rejected.
+        actor = {"actor_id": "fixture", "kind": "agent"}
+        base = {"source_harness": "pi", "target_harness": "claude", "source_session_id": _s1, "mission_id": _m1}
+        svr.handoffs.create({**base, "handoff_id": "h-ok", "target_session_id": "s-claude", "goal": "write the parser tests"}, actor)
+        for state in ("claimed", "accepted", "in_progress"):
+            svr.handoffs.transition("h-ok", state, actor)
+        svr.handoffs.create({**base, "handoff_id": "h-no", "target_session_id": "s-other", "goal": "port it to Rust"}, actor)
+        for state in ("claimed", "rejected"):
+            svr.handoffs.transition("h-no", state, actor)
+    if os.environ.get("AGENT_EVOLUTION_SEED") == "1":
+        # The dashboard agent (with RELATED_SEED: org/app, fix/parser) was handed work by a Claude agent, failed once and was restarted;
+        # its tool calls form two runs with a long silence between them, and one failed call was repeated (a retry).
+        from datetime import UTC, datetime, timedelta
+        actor = {"actor_id": "fixture", "kind": "agent"}
+        svr.handoffs.create({"handoff_id": "h-in", "source_harness": "claude", "target_harness": "pi", "source_session_id": "s-claude", "target_session_id": _s1,
+                             "goal": "fix the parser crash on empty input", "completed": ["reproduced the crash"], "remaining": ["patch", "tests"],
+                             "decisions": ["keep the public API"], "mission_id": _m1}, actor)
+        for state in ("claimed", "accepted"):
+            svr.handoffs.transition("h-in", state, actor)
+        for status in ("failed", "running"):
+            repo.upsert_session(_s1, host_id="beast", status=status)
+        now = datetime.now(UTC)
+
+        def at(minutes_ago):
+            return (now - timedelta(minutes=minutes_ago)).isoformat()
+
+        def tool(call, minutes_ago, phase, **kw):
+            return {"kind": "tool", "call_id": call, "phase": phase, "ts": at(minutes_ago), **kw}
+        repo.inspector.ingest(_s1, {"events": [
+            tool("e1", 90, "start", tool="bash", args_preview="pytest -q tests/test_parser.py"),
+            tool("e1", 90, "end", output="1 failed", exit_code=1, is_error=True, duration_ms=1200),
+            tool("e2", 88, "start", tool="bash", args_preview="pytest -q tests/test_parser.py"),
+            tool("e2", 88, "end", output="1 passed", exit_code=0, duration_ms=900),
+            tool("e3", 20, "start", tool="edit", args_preview="src/parser.py"),
+            tool("e3", 20, "end", output="ok", exit_code=0, duration_ms=50),
+        ]})
     if os.environ.get("CI_OFFLINE") == "1":
         # The host may have a real Woodpecker token; a hermetic page must not list real runs.
         svr.ci_monitor._factory = lambda: type("Offline", (), {"available": False})()

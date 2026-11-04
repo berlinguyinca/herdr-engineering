@@ -16,12 +16,109 @@ import copy
 import datetime as _dt
 import json
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
 from .envelope import ENVELOPE_ONLY_TYPES
 from .events import V2_COLUMNS
 from .service_catalog import normalize_project, normalize_source_port, track_availability
+
+
+def _recovery_events_sql(table: str, skip_inspector_upto: int | None = None) -> str:
+    """Read all streams, eliding only interior, equivalent snapshot heartbeats.
+
+    Latest-per-type alone is unsafe: historical rows can contain partial fields,
+    counter increments, transitions, or replay identities. Instead, retain both
+    ends of each consecutive equivalent snapshot run. Observation clock fields
+    are ignored ONLY in the comparison; the original first/last rows preserve
+    their exact clocks, explicit clears and identity/observation-state changes.
+    Every non-snapshot row is a barrier, including ALL v2 envelopes (ledger hashes, gaps, actor domains).
+    Original rows/IDs/sequences are returned; this never rewrites durable history.
+    Window only identities/signatures, then fetch retained rows by their physical
+    locations within this same MVCC statement. The TID scan avoids sorting wide
+    event/envelope rows or transferring discarded payloads to Python. This query
+    targets the ordinary (non-partitioned) fabric_events table in our migrations.
+
+    Fold complete entity partitions through indexed lateral reads, so a large
+    journal does not require one global window sort. The original stream index
+    supports the lookup; migration 0014 supplies arrival order within each stream.
+    OFFSET 0 keeps signature calculation below the window rather than
+    evaluating JSON normalization separately for lag/lead/current expressions.
+    Other streams bypass the window entirely. This is not a hard startup bound:
+    changing observations and append-only/private histories still cost O(history).
+    Startup is read-only: it must never create an index on production.
+
+    ``skip_inspector_upto``: a verified inspector snapshot already holds the effect of those rows (envelope rows still
+    load: the ledger replays them and the snapshot never covered them).
+    """
+    skip = ""
+    if skip_inspector_upto is not None:
+        skip = (f"AND NOT (entity_type = 'inspector' AND sequence <= {int(skip_inspector_upto)} "
+                "AND (source IS NULL OR source_sequence IS NULL))")
+    return f"""
+        WITH streams AS (
+            SELECT DISTINCT entity_type, entity_id FROM {table}
+            WHERE entity_type IN ('service', 'session', 'host') AND entity_id IS NOT NULL
+        ), neighbors AS (
+            SELECT partition_rows.* FROM streams
+            CROSS JOIN LATERAL (
+                SELECT snapshots.*, lag(recovery_snapshot) OVER arrival AS recovery_previous,
+                       lead(recovery_snapshot) OVER arrival AS recovery_next,
+                       max(sequence) OVER arrival AS recovery_max
+                FROM (
+                    SELECT ctid AS recovery_tid, entity_type, entity_id, ingest_timestamp, sequence, event_id,
+                           CASE WHEN schema_version = 1
+                        AND num_nonnulls({', '.join(V2_COLUMNS)}) = 0
+                        AND (
+                            (entity_type = 'service' AND event_type = 'ServiceUpdated'
+                             AND payload ?& ARRAY['service_name', 'host_id', 'port', 'status',
+                                 'route', 'description', 'owner', 'session_id', 'ownership',
+                                 'unavailable_since', 'metadata_updated_at'])
+                            OR (entity_type = 'service' AND event_type = 'ServiceMetadataObserved'
+                                AND payload ?& ARRAY['host_id', 'source_port', 'ownership', 'session_id',
+                                    'verified_origin', 'repository_id', 'commit_sha', 'listener_identity',
+                                    'metadata_observation', 'metadata_updated_at', 'service_created_at', 'service_updated_at'])
+                            OR (entity_type = 'service' AND event_type = 'ServiceListenerObserved'
+                                AND payload ?& ARRAY['service_id', 'host_id', 'source_port', 'port', 'status',
+                                    'discovery_source', 'endpoint_scope', 'created_at', 'updated_at',
+                                    'ownership', 'session_id', 'verified_origin', 'listener_identity',
+                                    'metadata_observation', 'metadata_updated_at'])
+                            OR (entity_type = 'session' AND event_type = 'SessionUpdated'
+                                AND payload ?& ARRAY['host_id', 'mission_id', 'agent_role', 'model', 'status'])
+                            OR (entity_type = 'host' AND event_type = 'HostHeartbeat'
+                                AND payload ?& ARRAY['host_name', 'tailnet_ip', 'cpu', 'mem'])
+                        ) THEN jsonb_build_array(event_type, mission_id, session_id,
+                            CASE WHEN entity_type = 'service' THEN
+                                payload - ARRAY['metadata_updated_at', 'updated_at']
+                                  #- '{{metadata_observation,observed_at}}'
+                                  #- '{{ownership,observed_at}}'
+                                  #- '{{verified_origin,verified_at}}'
+                                  #- '{{verified_origin,ownership,observed_at}}'
+                                 ELSE payload END)
+                        END AS recovery_snapshot
+                    FROM {table} e
+                    WHERE e.entity_type = streams.entity_type AND e.entity_id = streams.entity_id
+                    ORDER BY ingest_timestamp, sequence, event_id
+                    OFFSET 0
+                ) snapshots
+                WINDOW arrival AS (ORDER BY ingest_timestamp, sequence, event_id
+                                   ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+            ) partition_rows
+        )
+        SELECT * FROM {table} WHERE ctid = ANY(ARRAY(
+          SELECT ctid FROM {table}
+          WHERE entity_type NOT IN ('service', 'session', 'host')
+             OR entity_type IS NULL OR entity_id IS NULL
+          UNION ALL
+          SELECT recovery_tid FROM neighbors
+          WHERE recovery_snapshot IS NULL
+           OR recovery_snapshot IS DISTINCT FROM recovery_previous
+           OR recovery_snapshot IS DISTINCT FROM recovery_next
+           OR sequence = recovery_max
+        )) {skip}
+        ORDER BY ingest_timestamp, sequence, event_id
+    """
 
 
 def _iso(value: Any):
@@ -77,7 +174,8 @@ class PostgresSource(DurableSource):
 
     def __init__(self, conn: Any = None, *, run: Callable | None = None,
                  events_table: str = "fabric_events", dsn: str | None = None,
-                 use_checkpoints: bool = True, checkpoint_publish: bool = False):
+                 use_checkpoints: bool = True, checkpoint_publish: bool = False,
+                 inspector_snapshots: bool = False):
         self._owned_runner = None
         if run is None:
             self._owned_runner = _LoopRunner()
@@ -86,7 +184,10 @@ class PostgresSource(DurableSource):
         self._dsn = dsn
         self._run = run
         self._events_table = events_table
+        self._inspector_snapshots = inspector_snapshots
         self._cache: dict | None = None
+        self.recovery_metrics: dict = {}
+        self._query_lock = threading.RLock()
         self.checkpoint_enabled = bool(use_checkpoints and dsn and events_table == 'fabric_events')
         self.checkpoint_publish = checkpoint_publish
         self.recovery_info = None
@@ -121,9 +222,10 @@ class PostgresSource(DurableSource):
             self._owned_runner._thread.join(timeout=3)
 
     def _load(self) -> dict:
-        if self._cache is None:
-            self._cache = self._run(self._fetch_all())
-        return self._cache
+        with self._query_lock:
+            if self._cache is None:
+                self._cache = self._run(self._fetch_all())
+            return self._cache
 
     async def _fetch_all(self) -> dict:
         if self._conn is None:
@@ -133,26 +235,44 @@ class PostgresSource(DurableSource):
             self._conn = await asyncpg.connect(self._dsn)
         conn = self._conn
         use_cursor = callable(getattr(conn, "cursor", None)) and callable(getattr(conn, "transaction", None))
-        if use_cursor:
+        if callable(getattr(conn, "transaction", None)):
             # Entity rows and the complete event log must share one snapshot.
             # asyncpg cursors require a transaction; keep all work on our loop.
             async with conn.transaction(isolation="repeatable_read", readonly=True):
-                return await self._fetch_snapshot(use_cursor=True)
+                return await self._fetch_snapshot(use_cursor=use_cursor)
         # Lightweight fetch-only connections remain supported by the bridge tests.
         return await self._fetch_snapshot(use_cursor=False)
 
     async def _fetch_snapshot(self, *, use_cursor: bool) -> dict:
+        from .repo import _BootPhases
+        phase = _BootPhases("event load")
         conn = self._conn
+        recovery_started = time.monotonic()
         snapshot = {
             "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
             "sessions": [dict(r) for r in await conn.fetch("SELECT * FROM sessions")],
             "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
             "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
         }
-        query = f"SELECT * FROM {self._events_table} ORDER BY ingest_timestamp, sequence"
+        phase("entity tables")
+        from .recovery_checkpoint import load_checkpoint_events
+        checkpoint = (await load_checkpoint_events(conn)
+                      if self._events_table == "fabric_events" else None)
+        if checkpoint is not None:
+            # The checkpoint carries every inspector row, so nothing is skipped; the snapshot still saves the replay of
+            # the rows below its watermark (the repo counts them in the loaded events and refuses a mismatch).
+            snapshot["events"], self.recovery_metrics = checkpoint
+            row, _ = await self._inspector_snapshot_row(conn)
+            snapshot["inspector_snapshot"] = (
+                {k: v for k, v in row.items() if k not in ("covered_count", "skipped_upto")} if row else None)
+            return snapshot
+        inspector_row, skip_upto = await self._inspector_snapshot_row(conn)
+        query = _recovery_events_sql(self._events_table, skip_upto)
         if use_cursor:
             events = []
+            decode = 0.0
             async for row in conn.cursor(query, prefetch=1000):
+                started = time.perf_counter()
                 event = dict(row)
                 # Decode while each bounded batch is alive so the complete raw
                 # JSON text never coexists with the complete decoded replay.
@@ -161,10 +281,67 @@ class PostgresSource(DurableSource):
                     if name in event:
                         event[name] = _v2_value(name, event[name])
                 events.append(event)
+                decode += time.perf_counter() - started
+            phase(f"event rows streamed ({len(events)} rows; {decode:.1f}s of it decoding in Python, the rest waiting on Postgres)")
         else:
             events = [dict(row) for row in await conn.fetch(query)]
         snapshot["events"] = events
+        self.recovery_metrics = {
+            "mode": "full", "loaded_events": len(events),
+            "elapsed_seconds": round(time.monotonic() - recovery_started, 3),
+        }
+        snapshot["inspector_snapshot"] = inspector_row
         return snapshot
+
+    async def _inspector_snapshot_row(self, conn) -> tuple[dict | None, int | None]:
+        """The stored inspector snapshot and, when the event log below its watermark is verifiably the one it
+        consumed, that watermark (the boot then does not load those rows). An optimisation only: a missing table
+        or row, or any doubt, means every row loads and the repo replays them all."""
+        if not self._inspector_snapshots:
+            return None, None
+        try:
+            row = await conn.fetchrow("SELECT schema_version, fingerprint, watermark, event_count, body "
+                                      "FROM inspector_snapshots WHERE id = 1")
+            if row is None:
+                return None, None
+            row = dict(row)
+            covered = await conn.fetchval(
+                f"SELECT count(*) FROM {self._events_table} WHERE entity_type = 'inspector' AND entity_id IS NOT NULL "
+                "AND entity_id <> '' AND sequence <= $1", int(row["watermark"]))
+            row["covered_count"] = int(covered)
+            if int(covered) != int(row["event_count"]):
+                return row, None
+            row["skipped_upto"] = int(row["watermark"])
+            return row, int(row["watermark"])
+        except Exception:  # noqa: BLE001
+            return None, None
+
+    def inspector_backfill(self) -> list[dict]:
+        """The inspector rows a boot skipped because a snapshot covered them, for the case where the repo refuses
+        that snapshot. Same shape as the rows the boot normally loads."""
+        row = self._load().get("inspector_snapshot") or {}
+        upto = row.get("skipped_upto")
+        if upto is None:
+            return []
+        return self._run(self._fetch_backfill(int(upto)))
+
+    async def _fetch_backfill(self, upto: int) -> list[dict]:
+        if self._conn is None:
+            import asyncpg
+            self._conn = await asyncpg.connect(self._dsn)
+        rows = await self._conn.fetch(
+            f"SELECT * FROM {self._events_table} WHERE entity_type = 'inspector' AND sequence <= $1 "
+            "AND (source IS NULL OR source_sequence IS NULL) ORDER BY ingest_timestamp, sequence", upto)
+        out = []
+        for r in rows:
+            event = dict(r)
+            event["payload"] = _ev_payload(event)
+            for name in ("actor", "evidence_refs"):
+                if name in event:
+                    event[name] = _v2_value(name, event[name])
+            out.append(event)
+        streams, _ = _rebuild_events(out, reuse=True)
+        return [e for stream in streams.values() for e in stream]
 
     def missions(self) -> list[dict]:
         return self._load()["missions"]
@@ -179,16 +356,33 @@ class PostgresSource(DurableSource):
         return self._load()["hosts"]
 
     def events(self) -> list[dict]:
-        if "events" not in self._load():
-            # load_into consumes the heavy event cache. Explicit later event
-            # reads get a fresh complete snapshot, never an empty placeholder.
-            self._cache = self._run(self._fetch_all())
-        return self._cache["events"]
+        with self._query_lock:
+            if "events" not in self._load():
+                # Replay consumes the heavy cache. Later explicit reads get a
+                # fresh recovery snapshot, never an empty placeholder.
+                self._cache = self._run(self._fetch_all())
+            return self._cache["events"]
+
+    def inspector_snapshot(self) -> dict | None:
+        return self._load().get("inspector_snapshot")
 
     def take_events(self) -> list[dict]:
         """Transfer event-row ownership to replay; retain cheap resource reads."""
-        self.events()
-        return self._cache.pop("events")
+        with self._query_lock:
+            self.events()
+            return self._cache.pop("events")
+
+    def history_page(self, entity_type, entity_id, *, limit=50, before=None):
+        from .durable_history import DurableHistoryReader
+        with self._query_lock:
+            return self._run(DurableHistoryReader(self._conn, events_table=self._events_table).page(
+                entity_type, entity_id, limit=limit, before=before))
+
+    def history_stream(self, entity_type, entity_id):
+        from .durable_history import DurableHistoryReader
+        with self._query_lock:
+            return self._run(DurableHistoryReader(self._conn, events_table=self._events_table).stream(
+                entity_type, entity_id))
 
 
 def _v2_value(name: str, value: Any) -> Any:
@@ -248,7 +442,8 @@ def _ev_payload(event: dict) -> dict:
     return p
 
 
-def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dict]:
+def _reconstruct_from_events(streams: dict, *, initial_core=None,
+                             initial_operator_policies=None) -> tuple[dict, dict, dict, dict, dict]:
     """Replay the event log to rebuild hosts/missions/sessions/services/artifacts.
 
     ``streams`` is the ``{stream: [events]}`` dict from ``_rebuild_events``.
@@ -257,16 +452,20 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
     restart even though only ``fabric_events`` is written to. Returns
     ``(missions, sessions, hosts, services, artifacts)`` dicts keyed by id.
     """
-    missions: dict = {}
-    sessions: dict = {}
-    hosts: dict = {}
-    services: dict = {}
-    artifacts: dict = {}
+    import copy
+    seed = initial_core or {}
+    missions: dict = copy.deepcopy(seed.get('missions', {}))
+    sessions: dict = copy.deepcopy(seed.get('sessions', {}))
+    hosts: dict = copy.deepcopy(seed.get('hosts', {}))
+    services: dict = copy.deepcopy(seed.get('services', {}))
+    artifacts: dict = copy.deepcopy(seed.get('artifacts', {}))
+    operator_policies: dict = copy.deepcopy(initial_operator_policies or {})
     flat: list[dict] = []
     for stream in streams.values():
         flat.extend(stream)
     flat.sort(key=lambda e: (e.get("ingest_timestamp") or "",
-                             e.get("sequence") or 0))
+                             e.get("sequence") or 0, e.get('event_id') or '',
+                             str((e.get('actor') or {}).get('id') or '')))
     for ev in flat:
         et, eid = ev.get("entity_type"), ev.get("entity_id")
         if not et or not eid:
@@ -278,6 +477,11 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
         etype = ev.get("event_type") or ""
         if et == "host":
             if etype == "HostPolicyChanged":
+                if "_envelope" in p:
+                    continue
+                previous = operator_policies.get(eid) or {}
+                if p.get('revision', -1) >= previous.get('revision', -1):
+                    operator_policies[eid] = p
                 # Policy edits are not evidence that the host is alive.
                 host = hosts.get(eid)
                 if host is not None:
@@ -349,7 +553,7 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                     s[k] = p[k]
             for k in ("pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
                       "revision", "interactive_ready", "launch_pending", "state_change_seq",
-                      "repository_id", "commit_sha", "mission_key", "mission_source",
+                      "repository_id", "commit_sha", "worktree_id", "mission_key", "mission_source",
                       "transcript", "parent_session_id", "name", "runtime"):
                 if p.get(k) is not None or (k == "commit_sha" and k in p):
                     s[k] = p[k]
@@ -393,13 +597,18 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                     if key in p:
                         svc[key] = p[key]
                 continue
-            svc = services.setdefault(eid, {
+            defaults = {
                 "service_id": eid, "service_name": eid, "host_id": None,
                 "port": 0, "session_id": None, "route": None,
                 "description": None, "owner": None,
                 "status": "healthy",
                 "created_at": ts, "updated_at": ts,
-            })
+            }
+            svc = services.setdefault(eid, defaults)
+            # A metadata/retirement event may precede the first health report.
+            # Fill its missing shape without overwriting observed metadata.
+            for key, value in defaults.items():
+                svc.setdefault(key, value)
             if p.get("host_id"):
                 svc["host_id"] = p["host_id"]
             if p.get("service_name"):
@@ -438,6 +647,10 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 else svc["status"]
             svc["url"] = None if svc.get("endpoint_scope") == "local_only" else (svc["route"] or f"http://{svc['host_id']}:{svc['port']}")
             svc["updated_at"] = ts
+    for hid, policy in operator_policies.items():
+        host = hosts.setdefault(hid, {'host_id': hid, 'host_name': hid})
+        if policy.get('revision', -1) >= (host.get('scheduler_policy') or {}).get('revision', -1):
+            host['scheduler_policy'] = policy
     for sid, s in sessions.items():
         mid = s.get("mission_key", s.get("mission_id"))
         if mid and mid in missions and sid not in missions[mid]["sessions"]:
@@ -461,9 +674,12 @@ def _load_full_into(repo, source: DurableSource, *, core_override=None,
     Designed for a fresh repo at server startup: replaces all structured state
     with the durable view so the API/UI read exactly what Postgres holds.
     """
+    from .repo import _BootPhases
+    phase = _BootPhases("load_into")
     if isinstance(source, PostgresSource):
         # Refresh a previously consumed snapshot BEFORE reading its tables.
         source.events()
+        phase("Postgres fetch and decode (see 'event load' lines above for the split)")
     missions: dict = {}
     for row in source.missions():
         mid = row["mission_id"]
@@ -533,6 +749,7 @@ def _load_full_into(repo, source: DurableSource, *, core_override=None,
         events, event_order = _rebuild_events(source.take_events(), reuse=True)
     else:
         events, event_order = _rebuild_events(source.events())
+    phase("group rows into streams")
 
     # Reconstruct the ingestion-managed entities from the event log so durable
     # events (the only thing the write-through sink persists) survive restart.
@@ -560,6 +777,7 @@ def _load_full_into(repo, source: DurableSource, *, core_override=None,
         repo._checkpoint_event_core = copy.deepcopy(dict(zip(
             ('missions','sessions','hosts','services','artifacts'),
             (rmissions,rsessions,rhosts,rservices,rartifacts))))
+    phase("reconstruct entities from events")
     for mid, m in rmissions.items():
         _overlay(missions.setdefault(mid, m), m)
     for sid, s in rsessions.items():
@@ -626,13 +844,35 @@ def _load_full_into(repo, source: DurableSource, *, core_override=None,
         "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
         "telemetry": (projection_state or {}).get('telemetry', {}),
         "events": events, "event_order": event_order,
+        "inspector_snapshot": source.inspector_snapshot() if isinstance(source, PostgresSource) else None,
+        "inspector_backfill": source.inspector_backfill if isinstance(source, PostgresSource) else None,
     }
     for key in ('leases', 'scheduler_reservations', 'scheduler_leases'):
         if key in (projection_state or {}):
             restored_state[key] = projection_state[key]
     if getattr(source, 'source_ledger', None) is not None:
         restored_state['source_ledger'] = source.source_ledger
+    if capture_event_core:
+        from .projection_checkpoint import (
+            COMPACT_TYPES,
+            PRIVATE_REPLAY_TYPES,
+            event_time,
+            operator_policies,
+        )
+        repo._checkpoint_core_cursors = {key: max(event_time(row) for row in stream)
+            for key, stream in events.items() if key.split('|', 1)[0] in COMPACT_TYPES and stream}
+        repo._checkpoint_operator_policies = operator_policies(
+            [row for key, stream in events.items() if key.startswith('host|') for row in stream])
+        repo._checkpoint_inspector_preferences = [copy.deepcopy(row)
+            for stream in events.values() for row in stream
+            if row.get('entity_type') == 'inspector' and row.get('event_type') == 'inspector.preferences'
+            and (row.get('payload') or {}).get('scope') == 'global']
+        repo._checkpoint_private_streams = {
+            key: copy.deepcopy(rows) for key, rows in events.items()
+            if key.split('|', 1)[0] in PRIVATE_REPLAY_TYPES}
     repo.import_state(restored_state)
+    # Compact projection recovery must not truncate the raw history API.
+    repo._durable_history = source if isinstance(source, PostgresSource) else None
     return {"missions": len(missions), "sessions": len(sessions),
             "services": len(services), "hosts": len(hosts),
             "events": len(event_order), "artifacts": len(artifacts)}

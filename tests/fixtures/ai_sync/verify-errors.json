@@ -1,0 +1,1 @@
+{"ok":false,"env":"claude","configDir":"/home/user/.claude","checked":{"skills":12,"agents":4,"commands":9,"hooks":3,"settings":true},"errors":[{"path":"skills/x/SKILL.md","problem":"missing frontmatter field: description"},{"path":"settings.json","problem":"invalid JSON at line 4"}],"warnings":[{"path":"hooks/pre.sh","problem":"not executable"}]}

@@ -1,6 +1,6 @@
 // Bounded native transcript capture. Only explicit native identity or process
 // evidence may associate a log with a pane; cwd and file age are never evidence.
-import { closeSync, fstatSync, statSync, openSync, readSync, realpathSync, opendirSync, readlinkSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { closeSync, fstatSync, statSync, openSync, readSync, realpathSync, opendirSync, readdirSync, readlinkSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
@@ -256,6 +256,61 @@ function currentClaudeProcess(descriptor,pid,procRoot,platform,machineIdPath) {
   return true;
 }
 
+
+// Codex keeps no rollout file open between writes, so an idle pane has no fd and no
+// descendant to read an identity from. Codex does record the owning process and the
+// conversation for every log line in its own state database ("pid:<pid>:<uuid>" and
+// thread_id); that is process evidence, read-only, and only trusted when the row is
+// at least as new as the process (a reused PID cannot inherit an older conversation).
+const CLOCK_TICKS = 100;
+let sqliteModule;
+async function sqlite() {
+  sqliteModule ??= import('node:sqlite').catch(() => null);
+  return sqliteModule;
+}
+function processStartSeconds(pid, procRoot) {
+  const stat = procText(join(procRoot, String(pid), 'stat'));
+  if (!stat.startsWith(`${pid} (`)) return null;
+  const ticks = Number(stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[19]);
+  const boot = Number(procText(join(procRoot, 'stat')).match(/^btime (\d+)$/m)?.[1]);
+  return Number.isSafeInteger(ticks) && Number.isSafeInteger(boot) ? boot + ticks / CLOCK_TICKS : null;
+}
+function codexLogDatabase(home) {
+  const dir = join(home, '.codex');
+  try {
+    const names = readdirSync(dir).map(n => n.match(/^logs_(\d+)\.sqlite$/)).filter(Boolean)
+      .sort((a, b) => Number(b[1]) - Number(a[1]));
+    return names.length ? join(dir, names[0][0]) : null;
+  } catch { return null; }
+}
+async function codexLogIdentity(processIds, root, { home, procRoot }) {
+  const database = codexLogDatabase(home);
+  const module = database ? await sqlite() : null;
+  if (!module) return null;
+  let db;
+  const main = [];
+  try {
+    db = new module.DatabaseSync(database, { readOnly: true });
+    db.exec('PRAGMA busy_timeout = 500');
+    const query = db.prepare('SELECT thread_id, MAX(ts) AS last FROM logs WHERE process_uuid LIKE ? AND thread_id IS NOT NULL AND ts >= ? GROUP BY thread_id ORDER BY last DESC LIMIT 16');
+    for (const pid of processIds) {
+      const started = processStartSeconds(pid, procRoot);
+      if (started === null) continue;
+      for (const row of query.all(`pid:${pid}:%`, Math.floor(started) - 2)) {
+        if (!ID.test(row.thread_id || '')) continue;
+        const file = findIdentity(root, row.thread_id, 'codex');
+        const header = file ? nativeHeader(file) : null;
+        // Only a primary conversation: a helper thread never becomes the pane's identity.
+        if (header?.type === 'session_meta' && header.payload?.id === row.thread_id && typeof header.payload?.source === 'string') main.push({ file, last: Number(row.last) });
+      }
+    }
+  } catch { return null; } finally { try { db?.close(); } catch { /* read-only handle */ } }
+  main.sort((a, b) => b.last - a.last);
+  // Several primary conversations in one process (for example after /new) resolve to the
+  // newest, but a tie is ambiguous and is never guessed.
+  return main.length && (main.length === 1 || main[0].last > main[1].last || main[0].file === main[1].file) ? main[0].file : null;
+}
+
 export async function resolveTranscript(agent, evidence, {home=homedir(),env=process.env,pids=[],procRoot='/proc',paneId,platform=process.platform,machineIdPath='/etc/machine-id'}={}) {
   const root=rootFor(agent,home);
   if(!root) return null;
@@ -286,6 +341,8 @@ export async function resolveTranscript(agent, evidence, {home=homedir(),env=pro
     const header=nativeHeader(file);
     if(header?.type==='session_meta' && header.payload?.id===id && typeof header.payload?.source==='string')candidates.add(file);
   }
+  // Weakest evidence last: only when no fd, descendant or native identity named a conversation.
+  if(agent==='codex' && candidates.size===0 && processIds.size) {const file=await codexLogIdentity(processIds,root,{home,procRoot});if(file)candidates.add(file);}
   return candidates.size===1 ? [...candidates][0] : null;
 }
 

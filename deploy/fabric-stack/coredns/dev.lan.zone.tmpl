@@ -9,6 +9,8 @@ $TTL 60
         60 )       ; minimum
     IN NS  ns.dev.lan.
     IN A   {{GATEWAY_TAILNET_IP}}
+{{PEER_APEX_RECORD}}
 
 ns  IN A   {{GATEWAY_TAILNET_IP}}
 *   IN A   {{GATEWAY_TAILNET_IP}}
+{{PEER_WILDCARD_RECORD}}

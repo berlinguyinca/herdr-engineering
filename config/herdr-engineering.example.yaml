@@ -40,17 +40,14 @@ fabric:
   # empty token = control API unauthenticated (fine on a private tailnet;
   # set one before exposing the control port further)
 
-# Fabric scheduler rollout switches. Telemetry is safe read-only collection;
-# admission/all-spawn integration remain opt-in until the canary gates pass.
+# Host-visible central scheduler settings. Server admission and limits belong
+# in the central control_plane section (scheduler_admission defaults false).
+# See docs/operations/fabric-scheduler.md for effective flags and rollout gates.
 scheduler:
   telemetry: true
-  policy_enforcement: true
-  plan_only: true
-  admission: false
-  all_spawns: false
-  migration: false
-  telemetry_freshness_seconds: 60
-  reservation_ttl_seconds: 90
+
+# The lineage merge-gate evidence block (control_plane.graph_merge_gate) lives in the CENTRAL fleet file, not this
+# per-host file: see deploy/control-plane/fleet-config.example.yaml. It is off by default.
 
 tests:
   adapters: [pytest, go, cargo, junit, scala]

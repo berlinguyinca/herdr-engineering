@@ -112,6 +112,19 @@ def test_cp_config_takes_dsn_from_fleet_file(tmp_path, old_env):
     assert cli._cp_config(str(path))["postgres_dsn"] == dsn
 
 
+def test_cp_config_takes_rustfs_endpoint_and_credentials_from_fleet_file(tmp_path, old_env):
+    path = make_file(tmp_path)
+    doc = yaml.safe_load(path.read_text())
+    values = doc["sections"]["control_plane"]["values"]
+    values.update({"rustfs_endpoint": "http://rustfs:9000", "rustfs_bucket": "b", "minio_user": "u", "minio_password": "p"})
+    path.write_text(yaml.safe_dump(doc))
+    path.chmod(0o600)
+    cfg = cli._cp_config(str(path))
+    assert (cfg["rustfs_endpoint"], cfg["rustfs_bucket"], cfg["minio_user"], cfg["minio_password"]) == (
+        "http://rustfs:9000", "b", "u", "p")
+    assert cli._cp_config(None).get("minio_user") is None     # no fleet file: no invented credentials
+
+
 # ------------------------------------------------------------------ web / rustfs
 
 def test_rustfs_client_not_built_from_env(old_env, monkeypatch):
@@ -146,7 +159,7 @@ def _run_web(monkeypatch, path, **overrides):
     import herdr_engineering.control_plane.sink as sink
     monkeypatch.setattr(api, "ControlPlaneServer", FakeServer)
     monkeypatch.setattr(sink, "DurableEventSink", lambda dsn: seen.setdefault("sink_dsn", dsn))
-    monkeypatch.setattr(cli, "_maybe_pg_source", lambda dsn: None)
+    monkeypatch.setattr(cli, "_maybe_pg_source", lambda dsn, **_: None)
     monkeypatch.setattr(cli, "_maybe_rustfs_client", lambda cp: seen.setdefault("rustfs_cp", cp) and None)
     monkeypatch.setattr(cli, "_self_report_services",
                         lambda repo, **kw: seen.setdefault("self_report", kw))
@@ -255,11 +268,68 @@ def test_render_collab_slice_holds_only_the_collab_mapping(tmp_path):
     assert oct(out.stat().st_mode & 0o777) == "0o600"
     text = out.read_text()
     data = yaml.safe_load(text)
-    assert data["sections"]["control_plane"]["values"] == {"collab": COLLAB}
+    assert data["sections"]["control_plane"]["values"] == {"collab": COLLAB, "collab_artifacts": {"enabled": False}}
     assert data["hosts"] == {}
     cp = yaml.safe_load(central.read_text())["sections"]["control_plane"]["values"]
     for secret in (cp["pg_dsn"], cp["minio_password"], *cp["api_keys"]):
         assert secret not in text
+
+
+def _artifacts_slice(tmp_path, **cp_extra):
+    central = make_file(tmp_path, collab=dict(COLLAB), **cp_extra)
+    out = tmp_path / "slice" / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(central), out)
+    return out, yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"]
+
+
+@pytest.mark.parametrize("section, expected", [
+    (None, False), ({}, False), ({"enabled": False}, False), ({"enabled": True}, True),
+    ({"enabled": "true"}, False), ({"enabled": 1}, False), ({"enabled": None}, False), ("enabled", False)])
+def test_render_collab_renders_collab_artifacts_enabled_only_for_exactly_true(tmp_path, section, expected):
+    extra = {} if section is None else {"collab_artifacts": section}
+    _, values = _artifacts_slice(tmp_path, **extra)
+    assert values["collab_artifacts"] == {"enabled": expected}
+    assert set(values) == {"collab", "collab_artifacts"}
+
+
+def test_render_collab_carries_no_collab_artifacts_limit_or_path(tmp_path):
+    _, values = _artifacts_slice(tmp_path, collab_artifacts={"enabled": True, "daily_bytes_per_agent": 7,
+                                                             "mirror_dir": "/secret-path"})
+    assert values["collab_artifacts"] == {"enabled": True}
+
+
+def _bridge_run(tmp_path, monkeypatch, old_env, *, enabled, mirror=True, outbox=True, slice_values=None):
+    import herdr_engineering.control_plane.collab_cognito as cc
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    extra = {} if enabled is None else {"collab_artifacts": {"enabled": enabled}}
+    out, _ = _artifacts_slice(tmp_path, **extra)
+    (tmp_path / "mirror").mkdir()
+    (tmp_path / "outbox").mkdir()
+    seen = _run_web(monkeypatch, out, **_collab_only_args(tmp_path),
+                    collab_artifacts_mirror=str(tmp_path / "mirror") if mirror else None,
+                    collab_artifacts_outbox=str(tmp_path / "outbox") if outbox else None)
+    return seen["server_kw"]["collab"]
+
+
+def test_collab_public_builds_the_bridge_only_with_the_slice_enabled_and_both_flags(tmp_path, monkeypatch, old_env, capsys):
+    from herdr_engineering.control_plane.collab_artifacts import CollabArtifactBridge
+    service = _bridge_run(tmp_path, monkeypatch, old_env, enabled=True)
+    assert isinstance(service.artifact_bridge, CollabArtifactBridge)
+    assert (tmp_path / "outbox" / "agents.json").exists()          # started: the feed is written
+
+
+@pytest.mark.parametrize("enabled, mirror, outbox", [(False, True, True), (None, True, True),
+                                                      (True, False, True), (True, True, False),
+                                                      (True, False, False)])
+def test_collab_public_builds_no_bridge_otherwise(tmp_path, monkeypatch, old_env, capsys, enabled, mirror, outbox):
+    service = _bridge_run(tmp_path, monkeypatch, old_env, enabled=enabled, mirror=mirror, outbox=outbox)
+    assert service.artifact_bridge is None
+    assert not (tmp_path / "outbox" / "agents.json").exists()
+
+
+def test_collab_public_stops_the_bridge_feed_thread_at_shutdown(tmp_path, monkeypatch, old_env, capsys):
+    service = _bridge_run(tmp_path, monkeypatch, old_env, enabled=True)
+    assert service.artifact_bridge.feed_thread_alive() is False
 
 
 def test_render_collab_refuses_missing_or_unknown_keys(tmp_path):
@@ -689,6 +759,73 @@ def test_insights_settings_are_yaml_only_validated_and_off_by_default(tmp_path, 
         cli._apply_collab_config(argparse.Namespace(), {"collab": {"insights": {"kill_switch": "no"}}})
 
 
+def test_team_rooms_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    import pytest as _pytest
+
+    from herdr_engineering.control_plane.collab_team_rooms import normalize_team_rooms
+    assert "team_rooms" in fcc.COLLAB_KEYS and "team_rooms" in cli.COLLAB_CONFIG_KEYS
+    assert "team_rooms" in cli.HOT_COLLAB_SWITCHES                                  # read per request, fail closed
+    assert normalize_team_rooms(None)["enabled"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, team_rooms={"enabled": True, "default_guest_level": "read_only"}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["team_rooms"]["default_guest_level"] == "read_only"
+    args = argparse.Namespace(collab_team_rooms=None)
+    cli._apply_collab_config(args, {"collab": {"team_rooms": {"enabled": True}}})
+    assert args.collab_team_rooms == {"enabled": True}
+    for bad in ({"default_guest_level": "direct"}, {"kill_switch": "no"}, {"unknown": 1}):
+        with _pytest.raises(SystemExit):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"team_rooms": bad}})
+        with _pytest.raises(fcc.FleetConfigError):
+            fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, team_rooms=bad))))
+
+
+def test_team_roles_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    import pytest as _pytest
+
+    from herdr_engineering.control_plane.collab_team_roles import normalize_team_roles
+    assert "team_roles" in fcc.COLLAB_KEYS and "team_roles" in cli.COLLAB_CONFIG_KEYS
+    assert "team_roles" in cli.HOT_COLLAB_SWITCHES                                  # read per request, fail closed
+    assert normalize_team_roles(None)["enabled"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, team_roles={"enabled": True, "default_no_response_policy": "wait"}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["team_roles"]["default_no_response_policy"] == "wait"
+    args = argparse.Namespace(collab_team_roles=None)
+    cli._apply_collab_config(args, {"collab": {"team_roles": {"enabled": True}}})
+    assert args.collab_team_roles == {"enabled": True}
+    for bad in ({"default_no_response_policy": "drop"}, {"kill_switch": "no"}, {"unknown": 1}, {"person_lease_seconds": 5}):
+        with _pytest.raises(SystemExit):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"team_roles": bad}})
+        with _pytest.raises(fcc.FleetConfigError):
+            fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, team_roles=bad))))
+
+
+def test_coordinators_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    import pytest as _pytest
+
+    from herdr_engineering.control_plane.collab_coordinators import normalize_coordinators
+    assert "coordinators" in fcc.COLLAB_KEYS and "coordinators" in cli.COLLAB_CONFIG_KEYS
+    assert "coordinators" in cli.HOT_COLLAB_SWITCHES                                # read per request, fail closed
+    cfg = normalize_coordinators(None)
+    assert cfg["enabled"] is False and cfg["external"]["enabled"] is False
+    assert cfg["tasks_per_hour"] == 20 and cfg["external"]["tasks_per_hour"] == 5
+    good = {"enabled": True, "tasks_per_hour": 10, "external": {"enabled": True, "tasks_per_hour": 3}}
+    central = make_file(tmp_path, collab=dict(COLLAB, coordinators=good))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["coordinators"]["external"]["tasks_per_hour"] == 3
+    args = argparse.Namespace(collab_coordinators=None)
+    cli._apply_collab_config(args, {"collab": {"coordinators": good}})
+    assert args.collab_coordinators == good
+    for bad in ({"kill_switch": "no"}, {"unknown": 1}, {"tasks_per_hour": 0}, {"external": {"enabled": "yes"}},
+                {"external": {"tasks_per_hour": 20}}, {"external": {"nope": 1}}, {"tasks_per_hour": 4, "external": {"tasks_per_hour": 4}}):
+        with _pytest.raises(SystemExit):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"coordinators": bad}})
+        with _pytest.raises(fcc.FleetConfigError):
+            fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, coordinators=bad))))
+
+
 def test_collab_skills_slice_is_accepted_and_forwarded(tmp_path):
     central = make_file(tmp_path, collab=dict(COLLAB, skills={"enabled": True}))
     values = fcc.collab_values(fcc.load_fleet_config(central))
@@ -828,3 +965,29 @@ def test_web_starts_enabled_review_gate_with_a_dsn(tmp_path, monkeypatch, old_en
 def test_web_without_dsn_is_fine_when_review_gate_disabled(tmp_path, monkeypatch, old_env):
     path = make_file(tmp_path, pg_dsn=None, review_gate=_gate(tmp_path, enabled=False))
     assert "sink_dsn" not in _run_web(monkeypatch, path)
+
+
+# ------------------------------------------------- P05 crash takeover lease (YAML only, default off)
+def test_task_lease_is_a_validated_startup_collab_key_and_off_by_default():
+    import argparse
+    assert "task_lease_seconds" in fcc.COLLAB_KEYS and "task_lease_seconds" in cli.COLLAB_CONFIG_KEYS
+    assert "task_lease_seconds" in cli.STARTUP_ONLY_COLLAB_KEYS
+    assert cli._task_lease(argparse.Namespace(), {}) is None
+    assert cli._task_lease(argparse.Namespace(), {"collab": {"task_lease_seconds": 900}}) == 900.0
+    args = argparse.Namespace(collab_task_lease_seconds=None)
+    cli._apply_collab_config(args, {"collab": {"task_lease_seconds": 1800}})
+    assert args.collab_task_lease_seconds == 1800.0 and cli._task_lease(args, {}) == 1800.0
+    for bad in (True, "600", 10, 10 * 86400):
+        with pytest.raises(SystemExit):
+            cli._task_lease(argparse.Namespace(), {"collab": {"task_lease_seconds": bad}})
+
+
+def test_render_collab_slice_never_carries_rakazo_settings(tmp_path):
+    # The public --collab-only container refuses any setting beyond control_plane.collab: a Rakazo key in the slice
+    # crash-loops it (seen on the 2026-10-30 deploy).
+    central = make_file(tmp_path, collab=dict(COLLAB), rakazo_bridge={"enabled": True, "cognito": {
+        "pool_id": "us-west-2_TESTPOOL", "client_ids": ["clientabc123456"], "required_group": "rakazo-users",
+        "sync_dir": "/etc/herdr/collab-sync"}})
+    out = tmp_path / "s" / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(central), out)
+    assert yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"] == {"collab": COLLAB, "collab_artifacts": {"enabled": False}}

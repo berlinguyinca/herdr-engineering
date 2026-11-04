@@ -9,6 +9,7 @@ import pytest
 from herdr_engineering.control_plane.projection_store import (
     CheckpointInvalid,
     ProjectionStore,
+    SnapshotChanged,
     decode_checkpoint,
     encode_checkpoint,
 )
@@ -35,6 +36,7 @@ def test_checkpoint_json_integrity_and_compatibility():
 @asynccontextmanager
 async def database():
     import asyncpg
+
     from herdr_engineering.control_plane.db import Migrator
 
     admin = await asyncpg.connect(DSN)
@@ -198,4 +200,54 @@ def test_frontier_does_not_regress_when_change_metadata_is_pruned():
             async with store.snapshot() as next_point:
                 assert next_point['position'] == frontier
             assert await conn.fetchval('SELECT count(*) FROM fabric_events') == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not DSN, reason='dedicated HERDR_PERF_PG_DSN required')
+def test_lazy_legacy_count_reconciles_deletes_after_unlocked_snapshot():
+    async def scenario():
+        import asyncpg
+        async with database() as (schema, conn):
+            # Simulate retained pre-migration rows without rewriting production.
+            await conn.execute('ALTER TABLE fabric_events DISABLE TRIGGER projection_position_before_write')
+            await conn.execute('ALTER TABLE fabric_events DISABLE TRIGGER projection_change_after_write')
+            await append(conn, 'old-one')
+            await append(conn, 'old-two', 1)
+            await conn.execute('ALTER TABLE fabric_events ENABLE TRIGGER projection_position_before_write')
+            await conn.execute('ALTER TABLE fabric_events ENABLE TRIGGER projection_change_after_write')
+            other = await asyncpg.connect(DSN, server_settings={'search_path': schema})
+            try:
+                store = ProjectionStore(conn)
+                assert await conn.fetchval('SELECT legacy_rows FROM projection_checkpoint_control') is None
+                async with store.snapshot() as point:
+                    assert point['legacy_rows'] == 2
+                    await other.execute("DELETE FROM fabric_events WHERE event_id='old-one'")
+                await store.publish('code', 'policy', point['position'], {'schema': 1, 'coverage': point})
+                assert await conn.fetchval('SELECT legacy_rows FROM projection_checkpoint_control') == 1
+                async with store.snapshot() as next_point:
+                    assert next_point['legacy_rows'] == 1
+                await store.ensure_indexes()
+                assert await conn.fetchval("SELECT indisvalid FROM pg_index WHERE indexrelid='idx_fabric_events_projection_position'::regclass")
+            finally:
+                await other.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not DSN, reason='dedicated HERDR_PERF_PG_DSN required')
+def test_truncate_before_first_journal_read_rejects_mixed_snapshot():
+    async def scenario():
+        import asyncpg
+        async with database() as (schema, conn):
+            await append(conn, 'one')
+            await conn.execute('UPDATE projection_checkpoint_control SET legacy_rows=0')
+            other = await asyncpg.connect(DSN, server_settings={'search_path': schema})
+            try:
+                with pytest.raises(SnapshotChanged, match='truncated'):
+                    async with ProjectionStore(conn).snapshot():
+                        await asyncio.wait_for(other.execute('TRUNCATE fabric_events'), 2)
+                        # PostgreSQL TRUNCATE is not MVCC safe: this old snapshot
+                        # can now see zero rows. It must never be published.
+                        assert await conn.fetchval('SELECT count(*) FROM fabric_events') == 0
+            finally:
+                await other.close()
     asyncio.run(scenario())

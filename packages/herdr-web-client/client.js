@@ -16,11 +16,12 @@ export class ApiError extends Error {
 const CONDITIONAL_ENTRIES = 64;
 
 export class HerdrClient {
-  constructor(baseUrl = '', { fetchImpl = fetch, user = 'operator', tenant = 'default' } = {}) {
+  constructor(baseUrl = '', { fetchImpl = fetch, user = 'operator', tenant = 'default', headers = {} } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.fetch = fetchImpl;
     this.user = user;
     this.tenant = tenant;
+    this.headers = { ...headers };  // extra headers (e.g. API key) sent on every request
     this.conditional = new Map();  // url -> { etag, text } (bounded by CONDITIONAL_ENTRIES)
   }
 
@@ -31,7 +32,7 @@ export class HerdrClient {
     const doFetch = this.fetch;
     for (let attempt = 0; attempt < 2; attempt++) {
       const held = attempt === 0 ? this.conditional.get(url) : undefined;
-      const headers = { Accept: 'application/json' };
+      const headers = { ...this.headers, Accept: 'application/json' };
       if (held) headers['If-None-Match'] = held.etag;
       const res = await doFetch(url, { method: 'GET', headers, signal });
       const current = () => this.conditional.get(url) === held;
@@ -65,7 +66,7 @@ export class HerdrClient {
   async request(path, { method = 'GET', body, signal = AbortSignal.timeout(15000) } = {}) {
     const startedAt = Date.now();
     const url = `${this.base}${path}`;
-    const headers = { Accept: 'application/json', 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant };
+    const headers = { ...this.headers, Accept: 'application/json', 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant };
     let payload;
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -126,8 +127,42 @@ export class HerdrClient {
     }
   }
 
-  getHandoffTree({ signal } = {}) {
-    return this.request('/api/v1/handoffs/tree', { signal });
+  // Memory Explorer (read-only): the control plane authorizes and proxies herdr-memory; the browser holds no memory credentials.
+  exploreMemory(params, { signal } = {}) {
+    return this.request(`/api/v1/memory/search?${params}`, { signal });
+  }
+
+  getMemoryRecord(id, { signal } = {}) {
+    return this.request(`/api/v1/memory/${encodeURIComponent(id)}`, { signal });
+  }
+
+  getMemoryServiceStatus({ signal } = {}) {
+    return this.request('/api/v1/memory/status', { signal });
+  }
+
+  getHandoffTree({ signal, sessionId } = {}) {
+    return this.request(`/api/v1/handoffs/tree${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, { signal });
+  }
+
+  getHandoffOverview({ signal } = {}) {
+    return this.request('/api/v1/handoffs/overview', { signal });
+  }
+
+  pageHandoffs({ state, workspace, attention, cursor, limit = 50, signal } = {}) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (state) query.set('state', state);
+    if (workspace) query.set('workspace', workspace);
+    if (attention) query.set('attention', '1');
+    if (cursor) query.set('cursor', cursor);
+    return this.request(`/api/v1/handoffs?${query}`, { signal });
+  }
+
+  getHandoff(id, { signal } = {}) {
+    return this.request(`/api/v1/handoffs/${encodeURIComponent(id)}`, { signal });
+  }
+
+  getHandoffChain(id, { signal } = {}) {
+    return this.request(`/api/v1/handoffs/${encodeURIComponent(id)}/chain`, { signal });
   }
 
   listHandoffs(state, { signal } = {}) {
@@ -143,6 +178,46 @@ export class HerdrClient {
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
   }
 
+  // Artifacts bound to a project, issue, task or room (P03). The server filters by what the caller may read.
+  artifactsForContext(kind, ref, { q, mediaType, limit, cursor, signal } = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries({ q, media_type: mediaType, limit, cursor })) {
+      if (value != null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/artifacts/for/${encodeURIComponent(kind)}/${encodeURIComponent(ref)}${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  artifactLinks(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/links`, { signal });
+  }
+
+  // The persistent Work Graph (unified workspace P02/P06). 404 while control_plane.unified_workspace is off.
+  workGraphSnapshot(root, { depth = 2, maxNodes = 200, asOf, signal } = {}) {
+    const query = new URLSearchParams({ root, depth: String(depth), max_nodes: String(maxNodes) });
+    if (asOf) query.set('as_of', asOf);
+    return this.request(`/api/v1/graph/work/snapshot?${query}`, { signal });
+  }
+
+  workGraphLayout(ref, { which = 'effective', signal } = {}) {
+    return this.request(`/api/v1/graph/work/layout?${new URLSearchParams({ ref, which })}`, { signal });
+  }
+
+  saveWorkGraphLayout(ref, document, { shared = false, ifMatch, signal } = {}) {
+    return this.request('/api/v1/graph/work/layout', {
+      method: 'PUT', body: { ref, document, shared, ...(ifMatch ? { if_match: ifMatch } : {}) }, signal,
+    });
+  }
+
+  // The teams the caller may see (explicit teams plus each project's own). status: active (default), archived or all.
+  workGraphTeams({ status, limit, cursor, signal } = {}) {
+    const query = new URLSearchParams();
+    if (status) query.set('status', status);
+    if (limit) query.set('limit', String(limit));
+    if (cursor) query.set('cursor', cursor);
+    const qs = query.toString();
+    return this.request(`/api/v1/graph/work/teams${qs ? `?${qs}` : ''}`, { signal });
+  }
+
   getArtifact(id, { signal } = {}) {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}`, { signal });
   }
@@ -151,12 +226,94 @@ export class HerdrClient {
     return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/download`;
   }
 
-  artifactVersions(id, { signal } = {}) {
-    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions`, { signal });
+  artifactVersions(id, { signal, summary = false } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions${summary ? '?summary=true' : ''}`, { signal });
   }
 
   artifactVersion(id, versionId, { signal } = {}) {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}`, { signal });
+  }
+
+  artifactSharesPath(id, shareId) {
+    const base = `/api/v1/artifacts/${encodeURIComponent(id)}/shares`;
+    return shareId === undefined ? base : `${base}/${encodeURIComponent(shareId)}`;
+  }
+
+  listArtifactShares(id, { signal } = {}) {
+    return this.request(this.artifactSharesPath(id), { signal });
+  }
+
+  createArtifactShare(id, body, { signal } = {}) {
+    return this.request(this.artifactSharesPath(id), { method: 'POST', body, signal });
+  }
+
+  getArtifactShare(id, shareId, { signal } = {}) {
+    return this.request(this.artifactSharesPath(id, shareId), { signal });
+  }
+
+  approveArtifactShare(id, shareId, { signal } = {}) {
+    return this.request(`${this.artifactSharesPath(id, shareId)}/approve`, { method: 'POST', body: { confirm: true }, signal });
+  }
+
+  revokeArtifactShare(id, shareId, { signal } = {}) {
+    return this.request(`${this.artifactSharesPath(id, shareId)}/revoke`, { method: 'POST', body: {}, signal });
+  }
+
+  artifactShareEvents(id, shareId, { signal } = {}) {
+    return this.request(`${this.artifactSharesPath(id, shareId)}/events`, { signal });
+  }
+
+  // Artifact collaborators (owner view): grants for agents, one-time invite grants, activity, version diffs.
+  artifactCollabPath(id, tail = '') {
+    return `/api/v1/artifacts/${encodeURIComponent(id)}${tail}`;
+  }
+
+  listArtifactCollaborators(id, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collaborators'), { signal });
+  }
+
+  grantArtifactCollaborator(id, body, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collaborators'), { method: 'POST', body, signal });
+  }
+
+  revokeArtifactCollaborator(id, agentId, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, `/collaborators/${encodeURIComponent(agentId)}/revoke`), { method: 'POST', body: {}, signal });
+  }
+
+  grantArtifactInvite(id, body, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collaborators/invite-grant'), { method: 'POST', body, signal });
+  }
+
+  artifactCollabActivity(id, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collab-activity'), { signal });
+  }
+
+  artifactVersionDiff(id, versionId, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, `/versions/${encodeURIComponent(versionId)}/diff`), { signal });
+  }
+
+  restrictArtifactCollab(id, { signal } = {}) {
+    return this.request(this.artifactCollabPath(id, '/collab-restrict'), { method: 'POST', body: {}, signal });
+  }
+
+  async restoreArtifactVersion(id, versionId, { signal } = {}) {
+    const unsupported = () => Object.assign(new Error('Restore is not supported for report artifacts'), { code: 'restore_unsupported' });
+    const artifact = await this.getArtifact(id, { signal });
+    if (artifact.artifact_type === 'report') throw unsupported();
+    const version = await this.artifactVersion(id, versionId, { signal });
+    if (version.report_descriptor) throw unsupported();
+    const head = artifact.current_version_id;
+    if (!head) throw Object.assign(new Error('Artifact has no head version to restore onto'), { code: 'restore_no_head' });
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions`, {
+      method: 'POST', signal,
+      body: {
+        base_version_id: head,
+        source_manifest_blob: version.source_manifest_blob,
+        output_manifest: version.output_manifest,
+        provenance: { restored_from: versionId },
+        idempotency_key: `restore-${versionId}-${head}`,
+      },
+    });
   }
 
   artifactReviews(id, { signal } = {}) {
@@ -173,6 +330,61 @@ export class HerdrClient {
     return this.request(`/api/v1/artifact-reviews/${encodeURIComponent(reviewId)}/complete`, {
       method: 'POST', body: { decision, comments }, signal,
     });
+  }
+
+  artifactReport(id, versionId, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/report`, { signal });
+  }
+
+  artifactReportPath(id, versionId) {
+    return `/api/v1/artifacts/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}`;
+  }
+
+  artifactReportDiff(id, versionId, baseVersionId, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/diff?base_version_id=${encodeURIComponent(baseVersionId)}`, { signal });
+  }
+
+  artifactReportFeedback(id, versionId, { signal, limit, offset } = {}) {
+    const query = new URLSearchParams();
+    if (limit != null) query.set('limit', String(limit));
+    if (offset != null) query.set('offset', String(offset));
+    return this.request(`${this.artifactReportPath(id, versionId)}/feedback${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  addArtifactReportFeedback(id, versionId, body, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/feedback`, { method: 'POST', body, signal });
+  }
+
+  recordArtifactReportCheck(id, versionId, body, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/checks`, { method: 'POST', body, signal });
+  }
+
+  artifactReportAssetUrl(id, versionId, assetId) {
+    return `${this.base}${this.artifactReportPath(id, versionId)}/assets/${encodeURIComponent(assetId)}`;
+  }
+
+  artifactReportPreview(id, versionId, { signal } = {}) {
+    return this.artifactReportContent(`${this.artifactReportPath(id, versionId)}/preview`, 'text', signal);
+  }
+
+  downloadArtifactReportAsset(id, versionId, assetId, { signal } = {}) {
+    return this.artifactReportContent(`${this.artifactReportPath(id, versionId)}/assets/${encodeURIComponent(assetId)}`, 'blob', signal);
+  }
+
+  async artifactReportContent(path, kind, signal) {
+    const doFetch = this.fetch;
+    const response = await doFetch(`${this.base}${path}`, {
+      headers: { ...this.headers, 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant, Accept: kind === 'text' ? 'text/html' : 'application/octet-stream' }, signal,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = { raw: text }; }
+      const error = new ApiError(response.status, body, body?.error || `HTTP ${response.status}`);
+      error.requestId = response.headers?.get?.('X-Request-ID') || '';
+      throw error;
+    }
+    return kind === 'text' ? response.text() : response.blob();
   }
 
   listPublications({ signal } = {}) {
@@ -247,6 +459,11 @@ export class HerdrClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
   }
 
+  // Commits and pull requests the server can attribute to this agent without guessing (state: linked | ambiguous | none).
+  getSessionCommits(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/commits`, { signal });
+  }
+
   getAgentSummary(id, { signal } = {}) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { signal });
   }
@@ -261,6 +478,11 @@ export class HerdrClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary/fix`, {
       method: 'POST', body: { list, index, text },
     });
+  }
+
+  // Start the full /summary report for one session; the result arrives as `full_report` on getAgentSummary.
+  startSummaryReport(id) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary/report`, { method: 'POST', body: {} });
   }
 
   // Terminal button: the server builds the attach command from the session record; the
@@ -291,6 +513,24 @@ export class HerdrClient {
 
   getService(serviceId, {signal} = {}) {
     return this.request(`/api/v1/services/${encodeURIComponent(serviceId)}`, {signal});
+  }
+
+  /** Canonical fabric URLs for URLs in agent output (read-only; originals are never changed). */
+  resolveFabricUrls(urls, sourceMachine = null, { signal } = {}) {
+    return this.request('/api/v1/fabric/resolve-urls', { method: 'POST', body: { urls, source_machine: sourceMachine }, signal });
+  }
+
+  /** Names that mark a URL as the fabric's (public fleet name, legacy aliases). */
+  getFabricNames({ signal } = {}) {
+    return this.request('/api/v1/fabric/names', { signal });
+  }
+
+  listFabricServices({ signal } = {}) {
+    return this.request('/api/v1/fabric/services', { signal });
+  }
+
+  listAiSync({ signal } = {}) {
+    return this.request('/api/v1/ai-sync', { signal });
   }
 
   listHosts({ signal } = {}) {
@@ -445,6 +685,7 @@ export class HerdrClient {
   getArchitectureNode(sid, nid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}`, {}, signal); }
   expandArchitectureNode(sid, nid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/edges`, params, signal); }
   diffArchitecture(base, head, { signal, ...params } = {}) { return this._arch('diff', { base, head, ...params }, signal); }
+  getArchitectureBase(sid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/base`, {}, signal); }
   getArchitectureOverlays(sid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/overlays`, {}, signal); }
   getArchitectureCorrelations(sid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/correlations`, params, signal); }
   getArchitectureNodeRooms(sid, nid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/rooms`, {}, signal); }
@@ -468,6 +709,11 @@ export class HerdrClient {
   // -- ci / test runs (leaf types for the topology view) -------------------
   getCi({ signal } = {}) {
     return this.request('/api/v1/ci', { signal });
+  }
+
+  // -- deployments (read-only staged rollout view) --------------------------
+  getDeployments({ signal } = {}) {
+    return this.request('/api/v1/deployments', { signal });
   }
 
   getCiReports({ signal, compact = false, provider_url, provider_repo_id, repository, run_number } = {}) {
@@ -517,15 +763,21 @@ export class HerdrClient {
     return this.request(`/api/v1/ci/log?${query}`, { signal });
   }
 
+  // Lines of one step's live log around an indexed test; the server says plainly when the range is gone.
+  getCiLogSlice(repository, number, step, { start, end, context = 40, expect = '', signal, providerUrl } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number), step: String(step), start: String(start), end: String(end), context: String(context), ...(expect ? { expect: String(expect).slice(0, 500) } : {}), ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) });
+    return this.request(`/api/v1/ci/log-slice?${query}`, { signal });
+  }
+
   ciAction(repository, number, action, { signal, providerUrl } = {}) {
     return this.request('/api/v1/ci/actions', {
       method: 'POST', body: { repository, number, action, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
     });
   }
 
-  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode } = {}) {
+  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode, test } = {}) {
     return this.request('/api/v1/ci/debug', {
-      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'?{mode}:{}) }, signal,
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'||mode==='test'?{mode}:{}), ...(mode==='test'&&test?{test}:{}) }, signal,
     });
   }
 
@@ -557,13 +809,20 @@ export class HerdrClient {
     return this.request('/api/v1/reviews', { signal });
   }
 
+  // Every open review, not limited to the newest page: a long-waiting review is the one that page drops.
+  listWaitingReviews({ signal } = {}) {
+    return this.request('/api/v1/reviews?needs_decision=1', { signal });
+  }
+
   getTests() {
     return this.request('/api/v1/tests');
   }
 
   // -- health / self-observability -----------------------------------------
-  health({ signal } = {}) {
-    return this.request('/api/v1/health', { signal });
+  health({ signal, probe } = {}) {
+    // probe=true requests the O(1) liveness+capability shape (?probe=1) so the
+    // nav probe on first paint never drags the heavy inspector/metrics payload.
+    return this.request(probe ? '/api/v1/health?probe=1' : '/api/v1/health', { signal });
   }
 
   // -- Herdr Personal Assistant (Rakazo integration) -----------------------
@@ -654,8 +913,55 @@ export class HerdrClient {
   archiveConnector(connectorId) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}`, { method: 'DELETE' });
   }
+  // The dashboard's connector check: the server opens its own bookkeeping run and takes the normal tool gate, so the
+  // answer is a result, a refusal, or a 403 ``approval_needed`` (with the approval id and the dry-run text).
+  testConnector(connectorId, body) {
+    return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/test`, { method: 'POST', body });
+  }
+  executeApproval(approvalId) {
+    return this.request(`/api/v1/assistant-approvals/${encodeURIComponent(approvalId)}/execute`, { method: 'POST', body: {} });
+  }
+  listProposals(status) {
+    const q = status ? `?status=${encodeURIComponent(status)}` : '';
+    return this.request(`/api/v1/assistant-proposals${q}`);
+  }
+  previewProposal(proposalId) {
+    return this.request(`/api/v1/assistant-proposals/${encodeURIComponent(proposalId)}/preview`);
+  }
+  decideProposal(proposalId, decision) {
+    return this.request(`/api/v1/assistant-proposals/${encodeURIComponent(proposalId)}/decision`, { method: 'POST', body: { decision } });
+  }
+  executeProposal(proposalId) {
+    return this.request(`/api/v1/assistant-proposals/${encodeURIComponent(proposalId)}/execute`, { method: 'POST', body: {} });
+  }
+  listNotifications(state) {
+    const q = state ? `?state=${encodeURIComponent(state)}` : '';
+    return this.request(`/api/v1/assistant-notifications${q}`);
+  }
+  ackNotification(notificationId) {
+    return this.request(`/api/v1/assistant-notifications/${encodeURIComponent(notificationId)}/ack`, { method: 'POST', body: {} });
+  }
   connectorRequest(connectorId, body) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/request`, { method: 'POST', body });
+  }
+  // Read-only graph of the caller's assistants, delegations and the specialists they run on.
+  assistantGraph({ signal } = {}) {
+    return this.request('/api/v1/assistant-graph', { signal });
+  }
+  assistantTypes({ signal } = {}) {
+    return this.request('/api/v1/assistant-types', { signal });
+  }
+  linkAssistant(id, parentId) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/link`, { method: 'POST', body: { parent_id: parentId } });
+  }
+  unlinkAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/unlink`, { method: 'POST', body: {} });
+  }
+  deleteAssistant(id, confirmName) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/delete`, { method: 'POST', body: { confirm_name: confirmName } });
+  }
+  setupAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}/setup`, { method: 'POST', body: {} });
   }
   listDelegations() {
     return this.request('/api/v1/assistant-delegations');
@@ -668,5 +974,36 @@ export class HerdrClient {
   }
   registerDelegationArtifact(delegationId, artifactRef) {
     return this.request(`/api/v1/assistant-delegations/${encodeURIComponent(delegationId)}/artifact`, { method: 'POST', body: { artifact_ref: artifactRef } });
+  }
+  // ---- Assistant apps (Gmail, Google Calendar), drafts and reminders. The client secret goes out in saveAppClient and never comes back.
+  listApps() {
+    return this.request('/api/v1/assistant-apps');
+  }
+  saveAppClient(provider, clientId, clientSecret) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/client`, { method: 'PUT', body: { client_id: clientId, client_secret: clientSecret } });
+  }
+  connectApp(provider) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/connect`, { method: 'POST', body: {} });
+  }
+  disconnectApp(provider) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}`, { method: 'DELETE' });
+  }
+  listCalendars(provider = 'google') {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/calendars`);
+  }
+  setBlockedCalendars(provider, ids) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/blocked-calendars`, { method: 'PUT', body: { ids } });
+  }
+  listDrafts(provider = 'google') {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/drafts`);
+  }
+  discardDraft(provider, draftId) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/drafts/${encodeURIComponent(draftId)}`, { method: 'DELETE' });
+  }
+  listReminders() {
+    return this.request('/api/v1/assistant-reminders');
+  }
+  cancelReminder(reminderId) {
+    return this.request(`/api/v1/assistant-reminders/${encodeURIComponent(reminderId)}`, { method: 'DELETE' });
   }
 }

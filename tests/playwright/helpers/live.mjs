@@ -71,3 +71,9 @@ export async function pollRefresh(page,ms){
  await chipMoved(page,before,'poll refresh applied');
  await sleep(50);
 }
+
+// The CI Health filter bar sits in a disclosure that is closed by default; tests that drive its controls open it first.
+export const openHealthFilters=async page=>{
+ await page.locator('[data-health-filters]').waitFor({state:'attached',timeout:15000});
+ await page.evaluate(()=>{const d=document.querySelector('[data-health-filters]');if(d)d.open=true;});
+};

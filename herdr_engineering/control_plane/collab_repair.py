@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import logfile_lock
+from .events import V2_COLUMNS
 
 log = logging.getLogger(__name__)
 
@@ -269,7 +270,11 @@ def repair_file(path: str, *, apply: bool = False, confirmed: bool = False, cut_
 
 
 _PG_COLUMNS = ("ctid::text AS tid, event_id, entity_id, sequence, event_type, payload, source, source_sequence, "
-               "actor, source_timestamp, ingest_timestamp")
+               "actor, source_timestamp, ingest_timestamp, recovery_instance")
+_PG_ARCHIVE_COLUMNS = ", ".join((
+    "event_id", "sequence", "event_type", "entity_type", "entity_id", "mission_id", "session_id",
+    "payload", "source_timestamp", "ingest_timestamp", "schema_version", *V2_COLUMNS, "recovery_instance",
+))
 
 
 def _tid(text: str) -> tuple[int, int]:
@@ -309,12 +314,17 @@ async def repair_postgres(conn, *, apply: bool = False, confirmed: bool = False,
         await conn.execute("CREATE TABLE IF NOT EXISTS fabric_events_quarantine (LIKE fabric_events)")
         await conn.execute("ALTER TABLE fabric_events_quarantine ADD COLUMN IF NOT EXISTS quarantine_reason text, "
                            "ADD COLUMN IF NOT EXISTS quarantined_at timestamptz DEFAULT now()")
+        # Archives created before migration0015 have a different physical column
+        # order. Upgrade them and archive by name, never with positional moved.*.
+        await conn.execute("ALTER TABLE fabric_events_quarantine ADD COLUMN IF NOT EXISTS recovery_instance uuid")
         by_reason: dict[str, list[tuple[int, int]]] = {}
         for r, why in bad:
             by_reason.setdefault(why, []).append(_tid(r["tid"]))
         for why, tids in by_reason.items():
             await conn.execute(
                 "WITH moved AS (DELETE FROM fabric_events WHERE entity_type = 'collab' AND ctid = ANY($1::tid[]) "
-                "RETURNING *), ins AS (INSERT INTO fabric_events_quarantine SELECT moved.*, $2::text, now() "
-                "FROM moved RETURNING 1) SELECT count(*) FROM ins", tids, why)
+                "RETURNING *), ins AS (INSERT INTO fabric_events_quarantine "
+                f"({_PG_ARCHIVE_COLUMNS}, quarantine_reason, quarantined_at) "
+                f"SELECT {_PG_ARCHIVE_COLUMNS}, $2::text, now() FROM moved "
+                "RETURNING 1) SELECT count(*) FROM ins", tids, why)
     return report

@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 
-ANALYZER_VERSION = "herdr-arch-python-ast/2"
+ANALYZER_VERSION = "herdr-arch-python-ast/3"
 GRAPH_SCHEMA = "herdr.architecture.graph.v1"
 SNAPSHOT_KEY_FIELDS = ("host_id", "repository_id", "commit_sha", "worktree_id",
                        "analyzer_version", "config_hash", "toolchain_hash")

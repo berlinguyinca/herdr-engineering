@@ -21,18 +21,26 @@ import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArchitecture } from './architecture-view.js';
 import { mountPersonalAssistant } from './personal-assistant-view.js';
+import { mountProjectIntelligence } from './project-intelligence-view.js';
 import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
+import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
 import { mountHosts, loadHosts } from './hosts-view.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
-import { mountAnalytics, loadAnalytics } from './analytics-view.js';
+import { mountAnalytics, loadAnalytics, usageStrip } from './analytics-view.js';
 import { morph, patchText } from './patch.js';
 import { flash, skeleton } from './motion.js';
 import { noteStreamContact, freshnessSources } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
+import { mountFabricServices } from './fabric-services-view.js';
+import { mountAiSync } from './ai-sync-view.js';
+import { mountPrTrail } from './pr-trail-view.js';
+import { mountTeamMap } from './team-map-view.js';
+import { mountTeams } from './teams-view.js';
+import { mountAgentEvolution, tabsHtml, TABS_STYLE, wireTabs } from './agent-evolution-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
 import { createAttentionNotifier } from './attention-notify.js';
@@ -42,7 +50,9 @@ import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-
 import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
 import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
+import { mountMemory } from './memory-view.js';
 import { mountScheduling } from './scheduler-view.js';
+import { mountDeployments } from './deployments-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 import { mountEventHistory } from './event-history.js';
 
@@ -69,41 +79,105 @@ defineComponents();
 const client = new HerdrClient('');
 const root = document.getElementById('view');
 
+// Sidebar sections. A `tabs` entry owns a section whose other pages show as a tab strip above the page (SECTION_TABS), so
+// related pages (the four service views, plan reviews + review gate, ...) take one sidebar row instead of several.
 const NAV = [
-  { path: '/overview', label: 'Overview' },
-  { path: '/attention', label: 'Attention' },
-  { path: '/topology', label: 'Topology' },
-  { path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
-  { path: '/missions', label: 'Missions' },
-  { path: '/herd', label: 'Agents' },
-  { path: '/services', label: 'Services' },
-  { path: '/local-services', label: 'Local services' },
-  { path: '/system-services', label: 'System services' },
-  { path: '/github/projects', label: 'Project boards' },
-  { path: '/github', label: 'Projects' },
-  { path: '/ci', label: 'CI' },
-  { path: '/reviews', label: 'Reviews' },
-  { path: '/review-gate', label: 'Review gate' },
-  { path: '/hosts', label: 'Hosts' },
-  { path: '/activity', label: 'Activity' },
-  { path: '/analytics', label: 'Analytics' },
-  { path: '/llm', label: 'LLM' },
-  { path: '/collab', label: 'Collaboration' },
-  { path: '/artifacts', label: 'Artifacts' },
-  { path: '/publications', label: 'Publications' },
-  { path: '/scheduling', label: 'Scheduling' },
-  { path: '/handoffs', label: 'Handoffs' },
-  { path: '/personal-assistant', label: 'Personal Assistant', capability: 'assistant_v1' },
+  { group: 'Monitor', path: '/overview', label: 'Overview' },
+  { group: 'Monitor', path: '/attention', label: 'Attention', match: ['/activity'] },
+  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
+  { group: 'Agents', path: '/collab', label: 'Collaboration' },
+  { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
+  { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
+  { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
+  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync'] },
+  { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
+  { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
+  { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
+  { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
+  { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects', '/pr'] },
+  { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
+  { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
+  { group: 'Code', path: '/memory', label: 'Memory', capability: 'memory_v1' },
+  { group: 'Code', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
+];
+// Handoffs are the thread through the Agents section: who started whom, and why. Topology is no longer listed (the lineage
+// graph replaces it); its route still answers for old links.
+const SECTION_TABS = [
+  [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
+  [['/attention', 'Attention'], ['/activity', 'Activity']],
+  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync']],
+  [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
+  [['/ci', 'CI'], ['/deployments', 'Deployments']],
+  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
+  [['/github', 'Issues'], ['/github/projects', 'Boards']],
+  [['/artifacts', 'Artifacts'], ['/publications', 'Publications']],
 ];
 
 const SHELL = document.getElementById('shell');
-SHELL.setAttribute('routes', JSON.stringify(visibleNav(NAV, [])));
-// Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
-// Re-set only when the list changes: every set re-renders the shell's nav.
-client.health().then((h) => {
-  const routes = JSON.stringify(visibleNav(NAV, h?.capabilities));
+// A page is listed only while it works. `hd-freshness` reports each page's last load: a missing backend (404/501, "not enabled",
+// "disabled") marks that exact page or tab, a later success clears it, and timeouts or other errors never mark anything (they are
+// transient). Only a page's own route counts: a detail route (/missions/x, /hosts/y) failing says nothing about its section. A
+// sidebar entry disappears only when its own page and every tab of its section are marked, and a marked tab drops out of the tab
+// strip. "Show unavailable" in the display footer lists everything again. Last-known state lives in localStorage.
+const UNAVAILABLE_KEY = 'herdr-unavailable-pages';
+let capabilities = [];
+let unavailable = new Set();
+let showUnavailable = false;
+try { unavailable = new Set(JSON.parse(window.localStorage.getItem(UNAVAILABLE_KEY) || '[]')); } catch { /* Nothing is hidden then. */ }
+const MISSING = /not found|\b(404|501)\b|not implemented|not enabled|is disabled/i;
+const routePath = () => (window.location.hash.replace(/^#/, '') || '/overview').split('?')[0];
+const KNOWN_PAGES = new Set([...NAV.flatMap((e) => [e.path, ...(e.match || [])]), ...SECTION_TABS.flat().map(([p]) => p)]);
+const entryPages = (entry) => [entry.path, ...(entry.match || [])].filter((p) => KNOWN_PAGES.has(p));
+const SUBNAV = document.getElementById('subnav');
+function renderSubnav() {
+  const path = (window.location.hash.replace(/^#/, '') || '/overview').split('?')[0];
+  const tabs = SECTION_TABS.find((t) => t.some(([p]) => path === p || path.startsWith(p + '/')));
+  if (!tabs || !SUBNAV) { if (SUBNAV) { SUBNAV.hidden = true; SUBNAV.textContent = ''; } return; }
+  // The longest matching path wins, so /github/projects is not also an active "Issues" tab.
+  const current = tabs.map(([p]) => p).filter((p) => path === p || path.startsWith(p + '/')).sort((x, y) => y.length - x.length)[0];
+  SUBNAV.hidden = false;
+  const listed = tabs.filter(([p]) => showUnavailable || p === current || !unavailable.has(p));
+  SUBNAV.hidden = listed.length < 2;
+  SUBNAV.innerHTML = listed.map(([p, label]) => `<a href="#${p}"${p === current ? ' aria-current="page"' : ''}>${label}</a>`).join('');
+}
+function currentNavPath() {
+  const path = routePath();
+  return NAV.find((e) => [e.path, ...(e.match || [])].some((p) => path === p || path.startsWith(p + '/')))?.path || '';
+}
+function navRoutes() {
+  const list = visibleNav(NAV, capabilities);
+  if (showUnavailable) return list;
+  const here = currentNavPath();
+  return list.filter((entry) => entry.path === here || !entryPages(entry).every((p) => unavailable.has(p)));
+}
+function applyRoutes() {
+  const routes = JSON.stringify(navRoutes());
   if (routes !== SHELL.getAttribute('routes')) SHELL.setAttribute('routes', routes);
-}).catch(() => { /* optional tabs stay hidden */ });
+  const toggle = document.getElementById('show-unavailable');
+  if (toggle) { toggle.hidden = !unavailable.size; toggle.textContent = showUnavailable ? 'Hide unavailable' : `Show unavailable (${unavailable.size})`; }
+  renderSubnav();
+}
+function markAvailability(ok, message) {
+  const path = routePath();
+  if (!KNOWN_PAGES.has(path) || path === '/overview' || path === '/attention') return;
+  const missing = !ok && MISSING.test(message || '');
+  if (!ok && !missing) return;
+  if (missing === unavailable.has(path)) return;
+  if (missing) unavailable.add(path); else unavailable.delete(path);
+  try { window.localStorage.setItem(UNAVAILABLE_KEY, JSON.stringify([...unavailable])); } catch { /* Kept for this page only. */ }
+  applyRoutes();
+}
+root.addEventListener('hd-freshness', (event) => markAvailability(event.detail.ok, event.detail.message));
+{
+  const toggle = document.createElement('button');
+  toggle.type = 'button'; toggle.id = 'show-unavailable'; toggle.slot = 'controls'; toggle.hidden = true; toggle.className = 'hd-linkbtn';
+  toggle.addEventListener('click', () => { showUnavailable = !showUnavailable; applyRoutes(); });
+  SHELL.append(toggle);
+}
+window.addEventListener('hashchange', applyRoutes);   // the entry you are on stays listed; leaving it lets it go
+applyRoutes();
+// Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
+client.health({ probe: true }).then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
 // The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
@@ -142,6 +216,7 @@ const ROUTES = {
   '/github': viewGithub,
   '/collab': viewCollab,
   '/ci': viewIntegrations,
+  '/deployments': viewDeployments,
   '/reviews': viewIntegrations,
   '/review-gate': viewReviewGate,
   '/topology': viewTopology,
@@ -155,9 +230,15 @@ const ROUTES = {
   '/services': viewServices,
   '/system-services': viewServices,
   '/local-services': viewServices,
+  '/fabric-services': viewFabricServices,
+  '/ai-sync': viewAiSync,
+  '/pr/:owner/:repo/:number': viewPrTrail,
+  '/teams': viewTeams,
+  '/team-map': viewTeamMap,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/personal-assistant': viewPersonalAssistant,
+  '/intelligence': viewIntelligence,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,
@@ -174,6 +255,7 @@ const ROUTES = {
   '/publications': viewPublications,
   '/scheduling': viewScheduling,
   '/handoffs': viewHandoffs,
+  '/memory': viewMemory,
 };
 
 // Router rule: render() runs only on a route change (any hash change, query
@@ -210,6 +292,15 @@ async function viewPersonalAssistant() {
   const chip = root.querySelector('herdr-freshness');
   return { dispose: mountPersonalAssistant(root.querySelector('#personal-assistant'), client,
     { onFreshness: (ok, message) => chip.touch(ok, message) }) };
+}
+
+async function viewIntelligence() {
+  root.innerHTML = `${liveHead('<h1>Project intelligence</h1>')}<div id="project-intelligence"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  const view = mountProjectIntelligence(root.querySelector('#project-intelligence'), client, { query: route().query,
+    onFreshness: (ok, message) => chip.touch(ok, message),
+    setQuery: (o) => history.replaceState(null, '', `#/intelligence${Object.keys(o).length ? `?${new URLSearchParams(o)}` : ''}`) });
+  return { dispose: view.dispose, refresh: view.refresh };
 }
 
 function mountView(view) {
@@ -297,9 +388,9 @@ function statusPage(html, ok, message) {
 // so the page does not jump on arrival.
 const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
 function routeSkeleton(match, parts) {
-  const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
+  const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' || match.startsWith('/analytics') || match.startsWith('/pr/') ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
   const piMission = match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:');
-  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' || match === '/deployments' || match === '/ai-sync' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match === '/fabric-services' || match.startsWith('/pr/') ? 2 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
   return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
@@ -316,7 +407,7 @@ async function viewArtifact(parts, revision) {
   const controller = new AbortController();
   const chip = root.querySelector('herdr-freshness');
   // Mount immediately so navigation can cancel the pending detail read.
-  void renderArtifactDetail(container, client, id, { signal: controller.signal })
+  void renderArtifactDetail(container, client, id, { signal: controller.signal, versionId: route().query.get('version') || undefined })
     .then(result => { if (!controller.signal.aborted && revision === renderRevision) chip.touch(!result?.errors?.length, result?.errors?.join('; ')); })
     .catch(error => { if (!controller.signal.aborted && revision === renderRevision) { container.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error><button type="button" data-route-retry>Retry</button>`; chip.touch(false, error.message); } });
   return { refresh() {}, dispose: () => controller.abort() };
@@ -332,9 +423,41 @@ async function viewScheduling() {
   return mountScheduling(root.querySelector('#scheduler'), client, { freshness: chipIn(root) });
 }
 
+async function viewDeployments() {
+  root.innerHTML = `${liveHead('<h1>Deployments</h1>')}<div id="deployments"></div>`;
+  return mountDeployments(root.querySelector('#deployments'), client, { freshness: chipIn(root) });
+}
+
+async function viewPrTrail(parts) {
+  const [, owner, repo, number] = parts.map((p) => safeDecode(p) || '');
+  root.innerHTML = `<p style="font-size:13px"><a href="#/github">← Projects</a></p>${liveHead('<h1>How this pull request got here</h1>')}<div id="pr-trail"></div>`;
+  return mountPrTrail(root.querySelector('#pr-trail'), client, { owner, repo, number, host: route().query.get('host') || '', freshness: chipIn(root) });
+}
+
+async function viewTeams() {
+  root.innerHTML = `${liveHead('<h1>Your teams</h1>')}<div id="teams"></div>`;
+  return mountTeams(root.querySelector('#teams'), client, { freshness: chipIn(root) });
+}
+
+async function viewTeamMap() {
+  root.innerHTML = `${liveHead('<h1>Team map</h1>')}<div id="team-map"></div>`;
+  const view = mountTeamMap(root.querySelector('#team-map'), client, { root: route().query.get('root') || '', freshness: chipIn(root),
+    onRoot: (r) => history.replaceState(null, '', `#/team-map${r ? `?root=${encodeURIComponent(r)}` : ''}`) });
+  return ownPolling(view);   // positions the person moved must survive a live event, so only the Open button reloads
+}
+
 async function viewHandoffs() {
   root.innerHTML = `${liveHead('<h1>Handoffs</h1>')}<div id="handoffs"></div>`;
-  return mountHandoffs(root.querySelector('#handoffs'), client, { freshness: chipIn(root) });
+  return mountHandoffs(root.querySelector('#handoffs'), client, { freshness: chipIn(root), open: route().query.get('open') || '' });
+}
+
+async function viewMemory() {
+  root.innerHTML = `${liveHead('<h1>Memory</h1>')}<div id="memory"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  const view = mountMemory(root.querySelector('#memory'), client, { query: route().query,
+    freshness: (ok, message) => chip.touch(ok, message),
+    setQuery: (o) => history.replaceState(null, '', `#/memory${Object.keys(o).length ? `?${new URLSearchParams(o)}` : ''}`) });
+  return ownPolling(view);   // a live event must not wipe the person's query or the open drawer
 }
 
 // ------------------------------------------------------------- topology
@@ -389,7 +512,7 @@ async function viewReviewGate() {
 async function viewIntegrations(parts) {
   const query = route().query;
   return ownPolling(mountIntegrations(root, client, {
-    kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '',
+    kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '', workspace: query.get('workspace') || '',
     repository: query.get('repository') || '', provider: query.get('provider') || '', mission: query.get('mission') || '', session: query.get('session') || '',
   }));
 }
@@ -760,6 +883,7 @@ async function viewSession(parts, revision) {
     if (revision !== renderRevision || controller.signal.aborted) return;
     if (!s) { statusPage('<herdr-error message="Agent not found"></herdr-error>', true); return; }
     const outcome = recordOutcome(s);
+    const activeTab = route().query.get('tab') === 'evolution' ? 'evolution' : 'overview';
     const terminal = outcome === 'failed' || outcome === 'finished';
     const clip = value => typeof value === 'string' ? value.slice(0, 180) : '';
     const project = typeof s.cwd === 'string' ? s.cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
@@ -768,15 +892,26 @@ async function viewSession(parts, revision) {
       <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
       ${liveHead(`<h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>`)}
       <div class="sd-head"><strong data-session-head><span data-session-status>${esc(sessionStatusText(s))}</span> · <span data-session-updated>${esc(formatTimestamp(s.updated_at))}</span></strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
-      <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.` : 'Agent status reflects the last report; it is not a live process check.'}</p>
-      ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
+       ${terminal ? `<p class="sd-meta">${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.</p>` : ''}
+       ${TABS_STYLE}${tabsHtml(activeTab)}
+      <div id="agent-panel-overview" role="tabpanel" tabindex="0" aria-labelledby="agent-tab-overview"${activeTab === 'overview' ? '' : ' hidden'}>
+       <div id="session-story"></div>
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       <div id="related-panel"></div>
       <div id="session-terminal" class="sd-details"></div>
       <details class="hd-card sd-details" id="session-details"><summary>Agent details</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}</details>
       <div id="session-workspace-host"></div>
       <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
-      <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>`;
+      <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>
+      </div>
+      <div id="agent-panel-evolution" role="tabpanel" tabindex="0" aria-labelledby="agent-tab-evolution"${activeTab === 'evolution' ? '' : ' hidden'}></div>`;
+    // The story shows how the agent began and any handoff in or out; without handoff data it is the start and the last report.
+    const storyHost = document.getElementById('session-story');
+    let storyTree = {}, storyLinks = client.getSessionCommits ? 'loading' : null;
+    const drawStory = () => { if (storyHost.isConnected) storyHost.innerHTML = renderStory(agentStory(s, storyTree, Date.now(), storyLinks)); };
+    drawStory();
+    client.getHandoffTree?.({signal: controller.signal, sessionId: s.session_id}).then(tree => { storyTree = tree; drawStory(); }).catch(() => { /* the story keeps start and last report */ });
+    client.getSessionCommits?.(s.session_id, {signal: controller.signal}).then(links => { storyLinks = links; drawStory(); }).catch(() => { storyLinks = 'error'; drawStory(); });
     const relatedDispose = showRelated('session', s.session_id, null, relatedIntegrationLinks(s,'session',s.session_id), { sessionId: s.session_id });
     const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});
     let disposeAdvanced = null;
@@ -786,7 +921,25 @@ async function viewSession(parts, revision) {
       else if (!advanced.open && disposeAdvanced) { disposeAdvanced(); disposeAdvanced = null; document.getElementById('inspector-host').replaceChildren(); }
     });
     const disposeTerminal = mountTerminalAttach(document.getElementById('session-terminal'), client, s, {copyText});
-    const disposeSession = combineDisposers(relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.());
+    // Evolution is read from the server the first time its tab opens, not when the page loads.
+    let evolution = null;
+    const startEvolution = () => {
+      if (evolution) { evolution.show(); return; }
+      evolution = mountAgentEvolution(document.getElementById('agent-panel-evolution'), client, {sessionId: s.session_id, isActive: () => !document.getElementById('agent-panel-evolution')?.hidden});
+    };
+    wireTabs(root, {
+      onSelect: key => { if (key === 'evolution') startEvolution(); },
+      // The address follows the tab without a re-render (replaceState raises no hashchange).
+      setQuery: key => {
+        const at = location.hash.indexOf('?');
+        const base = at < 0 ? location.hash : location.hash.slice(0, at), query = at < 0 ? '' : location.hash.slice(at + 1);
+        const params = new URLSearchParams(query);
+        if (key === 'evolution') params.set('tab', key); else params.delete('tab');
+        history.replaceState(null, '', `${base}${params.toString() ? `?${params}` : ''}`);
+      },
+    });
+    if (activeTab === 'evolution') startEvolution();
+    const disposeSession = combineDisposers(relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.(), () => evolution?.dispose());
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();
@@ -864,6 +1017,22 @@ async function viewServices(_parts, revision) {
   return mountServices(root, client, body.page ? body : body.services, {scope,showAll,status});
 }
 
+async function viewFabricServices(_parts, revision) {
+  const data = await client.listFabricServices();
+  if (revision !== renderRevision) return;
+  const view = mountFabricServices(root, client, data, { search: route().query.get('search') || '' });
+  root.querySelector('herdr-freshness')?.touch?.(true);
+  return view;
+}
+
+async function viewAiSync(_parts, revision) {
+  const data = await client.listAiSync();
+  if (revision !== renderRevision) return;
+  const stop = mountAiSync(root, client, data, { freshness: (ok, message) => root.querySelector('herdr-freshness')?.touch?.(ok, message) });
+  root.querySelector('herdr-freshness')?.touch?.(true);
+  return { refresh() {}, dispose: stop };
+}
+
 async function viewService(parts, revision) {
   const svc = await client.request(`/api/v1/services/${encodeURIComponent(decodeURIComponent(parts[1]))}`);
   if (revision !== renderRevision) return;
@@ -922,11 +1091,11 @@ function addSnapshotChip() {
 async function viewLlm(_parts, revision) {
   const q = route().query;
   const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
-  const filters = { project: q.get('project') || '', model: q.get('model') || '' };
+  const filters = { project: q.get('project') || '', model: q.get('model') || '', mission: q.get('mission') || '' };
   const f = { window: window_, ...filters };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions] = await Promise.all([
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet, previous, missions, queue, handoffs, spend] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }),
     client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
     client.llm('stats', { ...f, group: 'session' }),
@@ -934,6 +1103,12 @@ async function viewLlm(_parts, revision) {
     client.llm('stats', { window: window_, group: 'project' }),
     series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
     client.listSessions().catch(() => ({ sessions: [] })),
+    loadAnalytics(client, '').catch(() => null),
+    client.llm('stats', { ...f, group: 'all', previous: 1 }).catch(() => null),
+    client.llm('stats', { window: window_, project: filters.project, group: 'mission' }).catch(() => null),
+    series('queue_p95').catch(() => null),
+    client.listHandoffs().catch(() => null),
+    client.llm('spend', f).catch(() => null),
   ]);
   if (revision !== renderRevision) return NO_REFRESH;
   const names = {};
@@ -942,7 +1117,9 @@ async function viewLlm(_parts, revision) {
     window: window_, filters, names,
     projects: projects.groups.map((g) => g.key),
     modelNames: [...new Set(models.groups.map((g) => g.key))],
-  }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+    missionNames: (missions?.groups || []).map((g) => g.key),
+  }, { total, models, agents, problems, previous, missions, spend, handoffs: handoffs?.handoffs, series: { requests, errors, ttft, speed, queue } });
+  if (fleet) root.insertAdjacentHTML('beforeend', usageStrip(fleet));
   addSnapshotChip();
   root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
     window.location.hash = `#/llm?${llmQuery({ window: window_, ...filters, [el.dataset.llmFilter]: el.value })}`;
@@ -957,20 +1134,27 @@ async function viewLlmSession(parts, revision) {
   const f = { window: window_, session: id };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, problems, requests, errors, ttft, speed, session] = await Promise.all([
+  const [total, models, problems, requests, errors, ttft, speed, session, previous, queue, handoffs, agents, sessions] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }), client.llm('stats', { ...f, group: 'model' }),
     client.llm('errors', f), series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
     client.getSession(id).catch(() => null),
+    client.llm('stats', { ...f, group: 'all', previous: 1 }).catch(() => null),
+    series('queue_p95').catch(() => null),
+    client.listHandoffs().catch(() => null),
+    client.llm('stats', { window: window_, group: 'session' }).catch(() => null),
+    client.listSessions().catch(() => ({ sessions: [] })),
   ]);
+  const names = {};
+  for (const s of sessions.sessions || []) if (s.display_name) names[s.session_id] = s.display_name;
   if (revision !== renderRevision) return NO_REFRESH;
   root.innerHTML = renderLlmSession({
-    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
-  }, { total, models, problems, series: { requests, errors, ttft, speed } });
+    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '', names,
+  }, { total, models, problems, previous, handoffs: handoffs?.handoffs, agents, series: { requests, errors, ttft, speed, queue } });
   addSnapshotChip();
   if (session) {
     const slot = document.createElement('div'); slot.id = 'related-panel';
     root.querySelector('.hd-live-head').after(slot);
-    return { refresh() {}, dispose: showRelated('session', id, slot) };
+    return { refresh() {}, dispose: showRelated('session', id, slot, '', { compact: true }) };
   }
   return NO_REFRESH;
 }

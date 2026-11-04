@@ -19,7 +19,7 @@ from . import extract, gitsource, identity
 
 def toolchain() -> dict:
     return {"python": f"{sys.version_info[0]}.{sys.version_info[1]}", "impl": platform.python_implementation(),
-            "parser": "ast+js-import-regex"}
+            "parser": "ast+js-scan"}
 
 
 class FactsCache:

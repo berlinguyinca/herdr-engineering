@@ -139,6 +139,7 @@ def test_migration_file_follows_numbering():
     names = sorted(p.name for p in _MIGRATION.parent.glob("*.sql"))
     assert names.index("0006_github_catalog.sql") < names.index("0007_github_issue_details.sql")
     assert "0008_github_projects.sql" in names
+    assert names.index("0015_recovery_checkpoints.sql") < names.index("0016_recovery_instance_index.sql")
     assert names.index("0007_github_issue_details.sql") < names.index("0008_github_projects.sql")
     assert "CONCURRENTLY" not in _MIGRATION.read_text()
     assert "CONCURRENTLY" not in _DETAIL_MIGRATION.read_text()

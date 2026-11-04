@@ -18,6 +18,8 @@ When enabled, `/api/v1/health` advertises `assistant_v1`, which makes the
 **Personal Assistant** nav entry appear. When disabled, the entry is hidden and
 every assistant endpoint returns `503 {"code":"unavailable"}`; nothing runs.
 
+> The tailnet-only MCP hub for coding agents is documented in [`docs/operations/assistant-hub.md`](../../operations/assistant-hub.md).
+
 ## Use
 
 1. **Settings → Personal Assistant** (or the sidebar entry) opens the assistant

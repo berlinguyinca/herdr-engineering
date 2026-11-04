@@ -252,7 +252,7 @@ class WoodpeckerProvider:
                 and not url.username and not url.password and not url.query and not url.fragment)
 
     def _request(self, path: str, *, method: str = "GET", raw: bool = False,
-                 log_preview: bool = False):
+                 log_preview: bool = False, text_limit: int | None = None):
         if not self.available:
             return None
         req = urllib.request.Request(self.base_url + path, method=method, headers={
@@ -266,6 +266,13 @@ class WoodpeckerProvider:
             with opener(req, timeout=timeout) as resp:
                 # Read enough overlap to redact a credential crossing the preview
                 # boundary, while keeping download reads independent of log size.
+                if text_limit is not None:
+                    # Bounded whole-log read: (redacted text, truncated?), no marker appended.
+                    body = resp.read(text_limit + len(self.token or "") + 1)
+                    if "text/html" in getattr(resp, "headers", {}).get("Content-Type", "").lower():
+                        raise CIProviderError("invalid_response")
+                    text = self._redact(body.decode("utf-8", "replace"))
+                    return text[:text_limit], len(body) > text_limit + len(self.token or "") or len(text) > text_limit
                 limit = _MAX_LOG_CHARS + len(self.token or "") if log_preview else _MAX_RESPONSE_BYTES
                 body = resp.read(limit + 1)
                 if log_preview:
@@ -482,6 +489,22 @@ class WoodpeckerProvider:
                 break
         output = "\n".join(parts)
         return output + ("\n[log truncated; open CI for the full log]" if truncated else "")
+
+    def step_log_text(self, repository: str, number: int, step: str, *, max_chars: int) -> tuple[str, bool] | None:
+        """The whole stored log of one step as redacted text, and whether it was cut at `max_chars`.
+
+        Unlike `step_log`, which keeps the START of a log for display, test summaries sit at the END, so a cut log is
+        reported as truncated for the caller to refuse rather than to parse. Lines are the text split on newlines.
+        """
+        if not self.available:
+            return None
+        rid = self._repo_id(repository)
+        number = _positive_id(number)
+        step_id = str(step)
+        if not step_id.isascii() or not step_id.isdigit():
+            raise InvalidError("Use a numeric CI step ID")
+        path = f"/api/repos/{rid}/logs/{number}/{_positive_id(step_id)}/download"
+        return self._request(path, raw=True, text_limit=max(1, int(max_chars)))
 
     def retry(self, repository: str, pipeline_id: str, authorized: bool = False) -> bool:
         """Restart a pipeline by its run number (legacy parameter name retained)."""

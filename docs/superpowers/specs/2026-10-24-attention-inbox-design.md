@@ -143,6 +143,7 @@ sections:
         enabled: true
         snooze: {min_seconds: 3600, max_seconds: 604800}
         thresholds: {host_stale_seconds: 600, llm_error_count: 20, llm_window: 24h}
+        expected_offline_hosts: []   # host names or ids that are meant to be off (benchmark hosts, powered-off machines): no host_stale item, listed quietly as "Expected offline"
         notify: {browser: true, min_severity: critical, quiet_hours: {start: 22, end: 7}}
         resolved: {keep_hours: 24, max_items: 100}
 ```

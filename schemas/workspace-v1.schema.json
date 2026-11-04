@@ -1,0 +1,1877 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/workspace-v1.schema.json",
+  "title": "Herdr unified workspace contracts v1",
+  "$comment": "Capability flag unified_workspace_v1 (default off). Validate one kind with {**root, '$ref': '#/$defs/<kind>'}. Endpoint-kind rules for edges and kind->graph mapping live in herdr_engineering/control_plane/workspace_contracts.py.",
+  "$defs": {
+    "kind": {
+      "enum": [
+        "project",
+        "team",
+        "room",
+        "mission",
+        "issue",
+        "task",
+        "agent",
+        "agent_session",
+        "host",
+        "artifact",
+        "artifact_version",
+        "review",
+        "decision",
+        "external_action"
+      ]
+    },
+    "urn": {
+      "type": "string",
+      "pattern": "^urn:herdr:(project|team|room|mission|issue|task|agent|agent_session|host|artifact|artifact_version|review|decision|external_action):[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 128
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+-]\\d{2}:\\d{2})$",
+      "maxLength": 40
+    },
+    "etag": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "traceId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+    },
+    "refUri": {
+      "type": "string",
+      "pattern": "^(herdr://|urn:herdr:|https://)[^\\s]{1,2000}$",
+      "maxLength": 2048,
+      "description": "Concrete reference. Only herdr://, urn:herdr: and https:// are accepted; javascript:, file:, data: and http: are not."
+    },
+    "alias": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "system",
+        "value"
+      ],
+      "properties": {
+        "system": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "user",
+            "agent",
+            "service",
+            "operator",
+            "system"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "on_behalf_of": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tenant_id",
+        "visibility"
+      ],
+      "description": "visibility reuses graph.SCOPE_RANK keys (private<mission<room<org); room_id/mission_id/workspace_ids are the contextual label resolved against HCN membership at read time (graph._ctx_visible).",
+      "properties": {
+        "tenant_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "user_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "visibility": {
+          "enum": [
+            "private",
+            "mission",
+            "room",
+            "org"
+          ]
+        },
+        "room_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "mission_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "workspace_ids": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "project_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "team_id": {
+          "$ref": "#/$defs/urn"
+        }
+      }
+    },
+    "tombstone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deleted_at",
+        "reason"
+      ],
+      "properties": {
+        "deleted_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "event_id": {
+          "type": "string",
+          "maxLength": 128
+        }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:project:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "project"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      }
+    },
+    "team": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:team:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "team"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "member_ids": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "type": "string",
+            "maxLength": 256
+          }
+        }
+      }
+    },
+    "room": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:room:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "room"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "project_id": {
+          "$ref": "#/$defs/urn"
+        }
+      }
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "title"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:mission:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "mission"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "room_id": {
+          "$ref": "#/$defs/urn"
+        }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "title"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:issue:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "issue"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "tracker": {
+          "enum": [
+            "github",
+            "other"
+          ]
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "state": {
+          "enum": [
+            "open",
+            "closed"
+          ]
+        },
+        "project_id": {
+          "$ref": "#/$defs/urn"
+        }
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "title",
+        "state"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:task:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "task"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "state": {
+          "enum": [
+            "submitted",
+            "authorized",
+            "queued",
+            "running",
+            "waiting_for_approval",
+            "completed",
+            "failed",
+            "cancelled",
+            "recovering"
+          ]
+        },
+        "room_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "issue_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "project_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "collab_task_id": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:agent:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "agent"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "runtime": {
+          "type": "string",
+          "maxLength": 64
+        }
+      }
+    },
+    "agent_session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "agent_id",
+        "state"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:agent_session:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "agent_session"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "agent_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "host_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "room_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "state": {
+          "enum": [
+            "starting",
+            "running",
+            "detached",
+            "ended",
+            "failed"
+          ]
+        }
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "hostname"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:host:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "host"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "hostname": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:artifact:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "artifact"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "artifact_type": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "current_version_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "project_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "task_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "issue_id": {
+          "$ref": "#/$defs/urn"
+        }
+      }
+    },
+    "artifact_version": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "artifact_id",
+        "ordinal",
+        "blob_sha256",
+        "immutable"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:artifact_version:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "artifact_version"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "blob_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "immutable": {
+          "const": true
+        },
+        "base_version_id": {
+          "$ref": "#/$defs/urn"
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "subject_id",
+        "verdict"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:review:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "review"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "subject_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "verdict": {
+          "enum": [
+            "pending",
+            "approved",
+            "changes_requested",
+            "rejected"
+          ]
+        },
+        "reviewer_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "commit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{7,64}$"
+            },
+            "plan_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "artifact_version_id": {
+              "$ref": "#/$defs/urn"
+            }
+          }
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "title",
+        "decided_by"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:decision:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "decision"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "outcome": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "decided_by": {
+          "$ref": "#/$defs/actor"
+        }
+      }
+    },
+    "external_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "version",
+        "etag",
+        "created_at",
+        "updated_at",
+        "actor",
+        "tool_id",
+        "state",
+        "request_hash",
+        "idempotency_key"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:external_action:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "kind": {
+          "const": "external_action"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/alias"
+          },
+          "description": "External aliases (HCN room id, artifact_id, github issue ref). Native ids win: the urn is uuid5 over (kind,native id)."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "etag": {
+          "$ref": "#/$defs/etag"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "status": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/refUri"
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Kind-specific extension bag; never holds secrets."
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        },
+        "tool_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "channel": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "state": {
+          "enum": [
+            "proposed",
+            "awaiting_approval",
+            "approved",
+            "sending",
+            "sent",
+            "failed",
+            "denied",
+            "expired"
+          ]
+        },
+        "request_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "approval_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "provider_ref": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "schema_version",
+        "source",
+        "source_sequence",
+        "actor_id",
+        "scope",
+        "occurred_at",
+        "received_at",
+        "correlation_id",
+        "entity_refs",
+        "event_type"
+      ],
+      "description": "Projection of events.Event envelope v2 (+actor_id from actor.id). trace_id is OPTIONAL: events.py has no trace_id column today (P02 gap).",
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "event_type": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actor_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "received_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "entity_refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/urn"
+          }
+        },
+        "payload_ref": {
+          "$ref": "#/$defs/refUri"
+        },
+        "supersedes_event_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "tombstone_of": {
+          "type": "string",
+          "maxLength": 128
+        }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "from_id",
+        "to_id",
+        "type",
+        "source_event_id",
+        "created_at",
+        "scope",
+        "revision"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^urn:herdr:edge:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "from_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "to_id": {
+          "$ref": "#/$defs/urn"
+        },
+        "type": {
+          "enum": [
+            "contains",
+            "assigned_to",
+            "depends_on",
+            "delegated_to",
+            "spawned",
+            "reviews",
+            "implements",
+            "produced",
+            "derived_from",
+            "discussed_in",
+            "supersedes",
+            "references",
+            "approved_by",
+            "notified_via"
+          ]
+        },
+        "source_event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "trace_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/traceId"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 32
+        },
+        "tombstone": {
+          "$ref": "#/$defs/tombstone"
+        }
+      }
+    }
+  }
+}

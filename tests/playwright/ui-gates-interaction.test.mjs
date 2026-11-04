@@ -6,7 +6,7 @@
 // Run: node --test --test-concurrency=1 tests/playwright/ui-gates-interaction.test.mjs
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
+import { launch, openReal, openSub, startRealServer, scaled } from './ui-gates-lib.mjs';
 import { openMention } from './ui-gates-states.mjs';
 
 let srv; let browser;
@@ -44,7 +44,7 @@ test('a node of the flow diagram answers Enter and answers Space', async () => {
     await nodes.nth(1).focus();
     const before = await page.locator('#hcn-flow-detail').innerText();
     await page.keyboard.press(key);
-    await page.waitForFunction((b) => document.querySelector('#hcn-flow-detail').innerText !== b, before, { timeout: 5000 }).catch(() => assert.fail(`${key} on a flow node did nothing`));
+    await page.waitForFunction((b) => document.querySelector('#hcn-flow-detail').innerText !== b, before, { timeout: scaled(5000) }).catch(() => assert.fail(`${key} on a flow node did nothing`));
     await ctx.close();
   }
 });
@@ -88,11 +88,11 @@ test('the disclosure for acknowledged attention items says what it is: aria-expa
   const count = () => page.locator('#hcn-p-attention [data-attn-quiet], #hcn-p-attention .cx-attn-quiet').count();
   const closedItems = await page.locator('#hcn-p-attention .cx-attn-item').count();
   await toggle.click();
-  await page.locator('[data-attn-act="toggle-quiet"][aria-expanded="true"]').waitFor({ timeout: 5000 }).catch(() => assert.fail('aria-expanded did not become true after the click'));
+  await page.locator('[data-attn-act="toggle-quiet"][aria-expanded="true"]').waitFor({ timeout: scaled(5000) }).catch(() => assert.fail('aria-expanded did not become true after the click'));
   const openItems = await page.locator('#hcn-p-attention .cx-attn-item').count();
   assert.ok(openItems > closedItems, `expanding shows the acknowledged items (${closedItems} -> ${openItems})`);
   await page.locator('[data-attn-act="toggle-quiet"]').click();
-  await page.locator('[data-attn-act="toggle-quiet"][aria-expanded="false"]').waitFor({ timeout: 5000 }).catch(() => assert.fail('aria-expanded did not return to false'));
+  await page.locator('[data-attn-act="toggle-quiet"][aria-expanded="false"]').waitFor({ timeout: scaled(5000) }).catch(() => assert.fail('aria-expanded did not return to false'));
   assert.equal(await page.locator('#hcn-p-attention .cx-attn-item').count(), closedItems, 'and the items are hidden again');
   void count;
   await ctx.close();

@@ -11,6 +11,7 @@ herdr:
   tests/e2e/test_s5_steering_forks.py: {scenario: s5, min_tests: 15, max_xfail: 1}
   tests/e2e/test_s6_chaos.py: {scenario: s6, min_tests: 27}
   tests/e2e/test_s7_integrity.py: {scenario: s7, min_tests: 23}
+  tests/e2e/test_artifact_collab_bridge.py: {scenario: collab, min_tests: 1}
 pi:
   test/e2e/smoke-plane.e2e.test.ts: {scenario: harness, min_tests: 2}
   test/e2e/s1-standalone-mission.e2e.test.ts: {scenario: s1, min_tests: 16, max_gap: 2}

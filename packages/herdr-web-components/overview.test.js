@@ -133,10 +133,10 @@ test('attention uses recency within severity and actionability and retains faile
 
 test('overview preferences discard unknown and fixed cards and restore omitted cards safely', () => {
   assert.deepEqual(overview.sanitizeOverviewPreferences({order:['ci','ci','attention','bogus','health'],hidden:['ci','attention','health','bogus']}),{
-    order:['ci','missions','fleet','sessions','reviews','services','hosts','activity'],hidden:['ci'],
+    order:['ci','sessions','missions','fleet','reviews','services','hosts','activity'],hidden:['ci'],
   });
   for(const value of [null,42,'bad',[],{order:'ci',hidden:{ci:true}}]) {
-    assert.deepEqual(overview.sanitizeOverviewPreferences(value),{order:['missions','fleet','sessions','ci','reviews','services','hosts','activity'],hidden:[]});
+    assert.deepEqual(overview.sanitizeOverviewPreferences(value),{order:['sessions','missions','fleet','ci','reviews','services','hosts','activity'],hidden:[]});
   }
 });
 
@@ -181,16 +181,16 @@ test('CI attention destinations retain provider identity when repository IDs and
   for(const url of destinations)assert.equal(url.searchParams.get('repository'),'7');
 });
 
-test('large attention queues show only the six highest ranked items until expanded',()=>{
+test('large attention queues show only the three highest ranked items until expanded',()=>{
   const missions=Array.from({length:196},(_,index)=>({mission_id:`failure-${index}`,title:`Failure ${index}`,status:'failed',updated_at:new Date(now-index*1000).toISOString()}));
   const data={missions};
   const collapsed=renderOverviewSection('attention',data,{},now,now);
   assert.equal(overview.overviewAttention(data,{},now,now).items.length,196);
-  assert.equal((collapsed.match(/data-attention-key=/g)||[]).length,6);
-  assert.match(collapsed,/Showing 6 of 196 observed items/);
+  assert.equal((collapsed.match(/data-attention-key=/g)||[]).length,3);
+  assert.match(collapsed,/Showing 3 of 196 observed items/);
   assert.match(collapsed,/aria-expanded="false" aria-controls="ov-attention-items"/);
   assert.match(collapsed,/#\/missions\/failure-0/);
-  assert.doesNotMatch(collapsed,/#\/missions\/failure-6/);
+  assert.doesNotMatch(collapsed,/#\/missions\/failure-3/);
   assert.match(collapsed,/Partial coverage/);
   const expanded=renderOverviewSection('attention',{...data,attentionExpanded:true},{},now,now);
   assert.equal((expanded.match(/data-attention-key=/g)||[]).length,196);
@@ -203,4 +203,30 @@ test('short attention queues do not offer a redundant expansion control',()=>{
   const html=renderOverviewSection('attention',{missions:[{mission_id:'one',title:'Failure',status:'failed'}]}, {},now,now);
   assert.equal((html.match(/data-attention-key=/g)||[]).length,1);
   assert.doesNotMatch(html,/data-attention-toggle/);
+});
+
+test('a failed CI run is dropped once a later run of the same branch passed', async () => {
+  const { unresolvedCiFailures } = await import('../overview-view.js');
+  const e = (state, at, branch = 'main') => ({ tab: state === 'failure' ? 'failed' : 'finished', record: { repository: 'r', branch, state, updated_at: at } });
+  const out = unresolvedCiFailures([e('success', '2026-10-28T10:00:00Z'), e('failure', '2026-10-28T09:00:00Z'), e('failure', '2026-10-28T08:00:00Z', 'dev'), e('failure', '2026-10-28T11:00:00Z')]);
+  assert.equal(out.length, 2);
+  assert.ok(!out.some(x => x.record.updated_at === '2026-10-28T09:00:00Z'));
+});
+
+test('a failed pull-request run is dropped once main passed a run that names the merged PR', async () => {
+  const { unresolvedCiFailures } = await import('../overview-view.js');
+  const run = (state, at, extra) => ({ tab: state === 'failure' ? 'failed' : 'finished', record: { repository: 'r', state, updated_at: at, ...extra } });
+  const out = unresolvedCiFailures([
+    run('success', '2026-10-28T12:00:00Z', { branch: 'main', message: 'Fix thing (#42)' }),
+    run('failure', '2026-10-28T09:00:00Z', { branch: 'fix', ref: 'refs/pull/42/head' }),
+    run('failure', '2026-10-28T09:30:00Z', { branch: 'other', ref: 'refs/pull/43/head' }),
+  ]);
+  assert.deepEqual(out.map(x => x.record.branch), ['other']);
+});
+
+test('a pass on another pull request does not clear a failing pull request', async () => {
+  const { unresolvedCiFailures } = await import('../overview-view.js');
+  const run = (state, at, ref) => ({ tab: state === 'failure' ? 'failed' : 'finished', record: { repository: 'r', branch: 'main', event: 'pull_request', state, updated_at: at, ref } });
+  const out = unresolvedCiFailures([run('success', '2026-10-28T12:00:00Z', 'refs/pull/9/head'), run('failure', '2026-10-28T09:00:00Z', 'refs/pull/8/head')]);
+  assert.equal(out.length, 1);
 });

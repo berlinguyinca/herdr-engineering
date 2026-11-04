@@ -349,6 +349,17 @@ def test_redact_delivery_redacts_a_secret_in_a_passed_value():
     assert "abcDEF123456" not in out["passed"]
 
 
+def test_passed_exception_is_numeric_only_and_never_global():
+    from herdr_engineering.control_plane.redact import redact_delivery, redact_payload
+
+    unclassified = 'unclassified-credential-value'
+    assert redact_payload({'passed': 3})['passed'] == '[REDACTED]'
+    assert redact_delivery({'passed': unclassified})['passed'] == '[REDACTED]'
+    assert redact_delivery({'results': [{'passed': {'value': unclassified}}]})['results'][0]['passed'] == '[REDACTED]'
+    for count in (None, 0, 3, 3.0):
+        assert redact_delivery({'passed': count})['passed'] == count
+
+
 def test_redact_delivery_redacts_a_shared_string_object_on_every_occurrence():
     from herdr_engineering.control_plane.redact import redact_delivery
     # The same string object appearing in several places must be redacted on

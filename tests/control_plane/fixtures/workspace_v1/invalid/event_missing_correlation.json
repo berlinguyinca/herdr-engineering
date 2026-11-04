@@ -1,0 +1,29 @@
+{
+  "doc": {
+    "actor": {
+      "id": "alice",
+      "kind": "user"
+    },
+    "actor_id": "alice",
+    "causation_id": "ev-0",
+    "entity_refs": [
+      "urn:herdr:task:dd9c5159-f7b9-561a-8620-284e9b6fd32b"
+    ],
+    "event_id": "ev-1",
+    "event_type": "task.updated",
+    "occurred_at": "2026-10-28T12:00:00Z",
+    "payload_ref": "herdr://events/ev-1",
+    "received_at": "2026-10-28T12:00:00Z",
+    "schema_version": 2,
+    "scope": {
+      "room_id": "room-1",
+      "tenant_id": "t1",
+      "visibility": "room"
+    },
+    "source": "hcn",
+    "source_sequence": 12,
+    "trace_id": "tr-1"
+  },
+  "expect_keyword": "required",
+  "schema": "event"
+}

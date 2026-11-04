@@ -12,6 +12,10 @@ log = logging.getLogger(__name__)
 REFRESH_INTERVAL = 300.0
 
 
+class CheckpointNotPublished(RuntimeError):
+    """Recovery completed without publishing a durable projection checkpoint."""
+
+
 def refresh_checkpoint(dsn, *, host_aliases=None, inspector_limits=None):
     """Build the same projection policy as the web host; always release the source."""
     repo = ControlPlaneRepo(host_aliases=host_aliases, inspector_limits=inspector_limits)
@@ -20,10 +24,16 @@ def refresh_checkpoint(dsn, *, host_aliases=None, inspector_limits=None):
         counts = bridge.load_into(repo, source)
         # Only known modes and numeric counters cross the CLI/log boundary.
         info = source.recovery_info or {}
+        # The publishing recovery path sets this receipt only after publish()
+        # succeeds. Legacy replay can load successfully without creating a CP.
+        if (info.get('mode') not in {'checkpoint', 'full_replay'}
+                or type(info.get('frontier')) is not int or info['frontier'] < 0
+                or 'reason' in info):
+            raise CheckpointNotPublished('projection checkpoint was not published')
         recovery = {key: value for key, value in info.items()
                     if key in {'frontier', 'tail_events', 'event_rows_scanned', 'elapsed_ms'}
                     and type(value) in (int, float) and math.isfinite(value)}
-        if info.get('mode') in {'checkpoint', 'full_replay', 'legacy_full_replay'}:
+        if info.get('mode') in {'checkpoint', 'full_replay'}:
             recovery['mode'] = info['mode']
         return {'counts': {key: value for key, value in counts.items()
                            if key in {'missions', 'sessions', 'services', 'hosts', 'events'}

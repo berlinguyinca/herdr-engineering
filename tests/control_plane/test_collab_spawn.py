@@ -541,6 +541,83 @@ def test_helpers_started_under_an_agent_split_its_tab_and_are_linked_as_its_chil
     assert named.state(where)["tabs"][tab["tab_id"]]["label"] == pname
 
 
+def test_helpers_reroute_when_parent_host_opts_out_before_request(named):
+    (parent_name, parent), = spawned(named, count=1).items()
+    where = host_of(named, parent_name)
+    parent_host, parent_pane = runner.link_target(parent["instance_id"])
+    other_host = "beast" if parent_host == "bender" else "bender"
+    before = named.state(where)
+    named.w.s.set_fleet_host(named.w.alice, parent_host, {"auto_agents": False})
+    spawn = named.w.s.request_spawn(named.w.alice, {
+        "harness_type": "claude-code", "name_prefix": "helper", "count": 1,
+        "parent_agent_id": parent["agent_id"],
+    })
+
+    named.r.once()
+
+    done = next(row for row in named.w.s.list_spawns(named.w.alice)["spawns"]
+                if row["spawn_id"] == spawn["spawn_id"])
+    assert done["status"] == "done"
+    assert [(p["name"], p["host"], p["status"]) for p in done["placements"]] == [
+        ("helper-1", other_host, "started"),
+    ]
+    links = {agent["name"]: agent for agent in named.w.s.agent_links(named.w.alice)["agents"]}
+    assert links["helper-1"]["parent_agent_id"] == parent["agent_id"]
+    assert runner.link_target(links["helper-1"]["instance_id"])[0] == other_host
+    assert links[parent_name]["instance_id"] == parent["instance_id"]
+    after = named.state(where)
+    assert after["panes"][parent_pane] == before["panes"][parent_pane]
+    assert after["panes"] == before["panes"]
+    assert after["tabs"] == before["tabs"]
+
+
+def test_helpers_reroute_when_parent_host_opts_out_after_first_child(named, monkeypatch):
+    (parent_name, parent), = spawned(named, count=1).items()
+    where = host_of(named, parent_name)
+    parent_host, parent_pane = runner.link_target(parent["instance_id"])
+    other_host = "beast" if parent_host == "bender" else "bender"
+    before = named.state(where)
+    real_place = named.r.place
+    placed, after_first = [], []
+
+    def opt_out_after_first_child(host, agent, *args, **kwargs):
+        result = real_place(host, agent, *args, **kwargs)
+        placed.append((agent["name"], host))
+        if len(placed) == 1:
+            after_first.append(named.state(where))
+            named.w.s.set_fleet_host(named.w.alice, parent_host, {"auto_agents": False})
+        return result
+
+    # Install only after parent setup, so the policy flips between child placements.
+    monkeypatch.setattr(named.r, "place", opt_out_after_first_child)
+    spawn = named.w.s.request_spawn(named.w.alice, {
+        "harness_type": "claude-code", "name_prefix": "helper", "count": 2,
+        "parent_agent_id": parent["agent_id"],
+    })
+
+    named.r.once()
+
+    assert placed == [("helper-1", parent_host), ("helper-2", other_host)]
+    done = next(row for row in named.w.s.list_spawns(named.w.alice)["spawns"]
+                if row["spawn_id"] == spawn["spawn_id"])
+    assert done["status"] == "done"
+    assert len(done["placements"]) == 2
+    assert all(p["status"] == "started" for p in done["placements"])
+    links = {agent["name"]: agent for agent in named.w.s.agent_links(named.w.alice)["agents"]}
+    for name, host in placed:
+        assert links[name]["parent_agent_id"] == parent["agent_id"]
+        assert runner.link_target(links[name]["instance_id"])[0] == host
+    assert links[parent_name]["instance_id"] == parent["instance_id"]
+    after = named.state(where)
+    assert after["panes"][parent_pane] == before["panes"][parent_pane]
+    assert after["panes"] == after_first[0]["panes"]
+    assert after["tabs"] == after_first[0]["tabs"]
+    parent_tab = before["panes"][parent_pane]["tab_id"]
+    first_child_pane = runner.link_target(links["helper-1"]["instance_id"])[1]
+    assert after["panes"][first_child_pane]["tab_id"] == parent_tab
+    assert after["tabs"][parent_tab]["pane_count"] == 2
+
+
 def test_helpers_need_a_parent_the_runner_can_see(named):
     info = named.w.s.connect_agent(named.w.alice, {"name": "nowhere"})
     named.w.s.request_spawn(named.w.alice, {"harness_type": "claude-code", "name_prefix": "helper", "count": 1,

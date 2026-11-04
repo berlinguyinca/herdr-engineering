@@ -8,7 +8,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { CFG, REPO, launch, openReal, openSub, settled, startRealServer } from './ui-gates-lib.mjs';
+import { CFG, REPO, launch, openReal, openSub, settled, startRealServer, scaled } from './ui-gates-lib.mjs';
 import { staticAudit, focusIndicatorAudit, tabTrapAudit, overflowAudit, overflowFailure, motionAudit, liveAnnouncementAudit, summarize } from './a11y-checks.mjs';
 import { STATES } from './ui-gates-states.mjs';
 
@@ -31,7 +31,7 @@ const render = async (page, sub, user = 'alice') => {
   await openSub(page, sub);
   // a viewer sees a different set of items (e.g. no steering request waits for them), so only the owner's content is pinned
   const re = user === 'alice' || ['chat', 'lineage', 'tabs', 'links'].includes(sub) ? PROOF[sub].source : '\\S{3}';
-  await page.waitForFunction(([id, re]) => new RegExp(re, 'i').test(document.querySelector(`#hcn-p-${id}`)?.innerText || ''), [sub, re], { timeout: 10000 });
+  await page.waitForFunction(([id, re]) => new RegExp(re, 'i').test(document.querySelector(`#hcn-p-${id}`)?.innerText || ''), [sub, re], { timeout: scaled(10000) });
   if (sub === 'lineage') await page.locator('svg.lin-svg g[data-node]').first().waitFor();
   await settled(page);
 };
@@ -277,7 +277,7 @@ test('review evidence bound to an older commit than the PR head is shown as stal
   await render(page, 'lineage');
   await page.locator('g[data-node="pr:github.com/o/r#1"]').focus();
   await page.keyboard.press('Enter');
-  await page.waitForFunction(() => /stale/i.test(document.querySelector('#hcn-lineage aside')?.innerText || ''), null, { timeout: 8000 });
+  await page.waitForFunction(() => /stale/i.test(document.querySelector('#hcn-lineage aside')?.innerText || ''), null, { timeout: scaled(8000) });
   const t = await page.locator('#hcn-lineage aside').innerText();
   assert.match(t, /stale/i);
   await ctx.close();

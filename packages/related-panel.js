@@ -2,7 +2,7 @@
 // only through entity-links.js; labels are untrusted strings and are escaped. Groups with nothing
 // are omitted; a failed or partial answer says so instead of looking like "none".
 import { escapeHtml as esc } from './herdr-web-components/util.js';
-import { entityHref, forgePrUrl } from './entity-links.js';
+import { entityHref, forgePrUrl, prTrailHref } from './entity-links.js';
 
 const GROUPS = [
   ['mission', 'Mission', 'mission'], ['agents', 'Agents', 'session'], ['host', 'Host', 'host'], ['service', 'Services', 'service'],
@@ -12,6 +12,7 @@ const SOURCE_NAME = { sessions: 'agents', missions: 'missions', ci: 'CI', servic
 
 export const relatedStyles = `<style>.rel{margin:14px 0}.rel h2{font-size:15px;margin:0 0 8px}.rel dl{display:grid;grid-template-columns:minmax(80px,auto) minmax(0,1fr);gap:6px 14px;margin:0}
 .rel dt{color:var(--text-secondary)}.rel dd{margin:0;display:flex;flex-wrap:wrap;gap:4px 12px;overflow-wrap:anywhere}.rel .rel-state{color:var(--text-secondary);font-size:12px}
+.rel--compact{margin:8px 0}.rel--compact dl{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:13px}.rel--compact dd{margin:0 14px 0 0}
 .rel .rel-note{color:var(--text-secondary);font-size:13px;margin:8px 0 0}.rel .hd-inline{margin-top:10px}@media(max-width:600px){.rel dl{display:block}.rel dd{margin:2px 0 10px}}</style>`;
 
 function link(group, kind, item) {
@@ -21,8 +22,8 @@ function link(group, kind, item) {
   let href = null;
   if (kind === 'ci') href = entityHref('ci', item.run_number ?? item.id, { repository: item.repo_filter });
   else if (kind === 'pr') {
-    const url = forgePrUrl(item.repository, item.number);
-    return url ? `<span><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${label}</a> <span class="rel-state">external${item.state ? ` · ${esc(item.state)}` : ''}</span></span>` : `<span>${label}${state}</span>`;
+    const url = forgePrUrl(item.repository, item.number), trail = prTrailHref(item.repository, item.number);
+    return url ? `<span><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${label}</a> <span class="rel-state">external${item.state ? ` · ${esc(item.state)}` : ''}</span>${trail ? ` <a href="${esc(trail)}" data-pr-trail>trail</a>` : ''}</span>` : `<span>${label}${state}</span>`;
   } else href = entityHref(kind, item.id);
   return href ? `<span><a href="${esc(href)}">${label}</a>${state}${relation}</span>` : `<span>${label}${state}</span>`;
 }
@@ -35,7 +36,7 @@ function llmRow(llm, sessionId) {
 }
 
 /** `answer` is the /api/v1/related body, or null while loading; `error` is a failure message. */
-export function renderRelated(answer, { error = null, footer = '', sessionId = null } = {}) {
+export function renderRelated(answer, { error = null, footer = '', sessionId = null, compact = false } = {}) {
   if (error) return `${relatedStyles}<section class="rel" aria-label="Related items"><h2>Related</h2><p class="rel-note" role="status">Related items could not be loaded.</p>${footer}</section>`;
   if (!answer) return `${relatedStyles}<section class="rel" aria-label="Related items"><h2>Related</h2><p class="rel-note" role="status">Loading related items…</p>${footer}</section>`;
   const rel = answer.relations || {};
@@ -46,11 +47,11 @@ export function renderRelated(answer, { error = null, footer = '', sessionId = n
     const extra = moreFor(key) ? `<span class="rel-state">+${esc(moreFor(key))} more</span>` : '';
     return `<dt>${esc(title)}</dt><dd>${itemsFor(key).map((item) => link(key, kind, item)).join('')}${extra}</dd>`;
   });
-  const llm = llmRow(rel.llm, sessionId);
+  const llm = compact ? '' : llmRow(rel.llm, sessionId);
   const partial = Array.isArray(answer.partial) && answer.partial.length
     ? `<p class="rel-note" role="status">Could not read ${answer.partial.map((s) => esc(SOURCE_NAME[s] || s)).join(', ')}; related items from there may be missing.</p>` : '';
   const body = rows.length || llm ? `<dl>${rows.join('')}${llm}</dl>` : '<p class="rel-note">Nothing else is linked to this yet.</p>';
-  return `${relatedStyles}<section class="rel" aria-label="Related items"><h2>Related</h2>${body}${partial}${footer}</section>`;
+  return `${relatedStyles}<section class="rel${compact ? ' rel--compact' : ''}" aria-label="Related items">${compact ? '' : '<h2>Related</h2>'}${body}${partial}${footer}</section>`;
 }
 
 /** Fetch and render into `el`; returns a disposer. A stale answer never overwrites a newer render. */

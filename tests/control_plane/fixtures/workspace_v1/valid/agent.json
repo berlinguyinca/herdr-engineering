@@ -1,0 +1,32 @@
+{
+  "actor": {
+    "id": "alice",
+    "kind": "user"
+  },
+  "aliases": [
+    {
+      "system": "hcn",
+      "value": "agent-1"
+    }
+  ],
+  "causation_id": "ev-0",
+  "correlation_id": "co-1",
+  "created_at": "2026-10-28T12:00:00Z",
+  "etag": "sha256:7ce0d2d6ccd488a60928f141194803d662e4776bf066256f10c56c0903bde7d3",
+  "id": "urn:herdr:agent:5f2b2897-e58c-547b-bbf0-6f246bb349c3",
+  "kind": "agent",
+  "name": "coder",
+  "refs": [
+    "herdr://rooms/room-1"
+  ],
+  "runtime": "pi",
+  "scope": {
+    "room_id": "room-1",
+    "tenant_id": "t1",
+    "visibility": "room"
+  },
+  "source_sequence": 7,
+  "trace_id": "tr-1",
+  "updated_at": "2026-10-28T12:00:00Z",
+  "version": 1
+}

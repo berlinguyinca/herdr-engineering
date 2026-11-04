@@ -5,15 +5,15 @@ writer's transaction lock, never by a column default evaluated before that lock.
 """
 from __future__ import annotations
 
-import hashlib
 import asyncio
+import hashlib
 import json
 import zlib
 from contextlib import asynccontextmanager
 
 FORMAT_VERSION = 1
 FENCE_NAMESPACE = 1213355076
-MAX_CHECKPOINT_BYTES = 256 * 1024 * 1024
+MAX_CHECKPOINT_BYTES = 1024 * 1024 * 1024
 
 
 class CheckpointInvalid(ValueError):
@@ -54,6 +54,17 @@ class ProjectionStore:
         self.conn = conn
         self.fence_timeout = fence_timeout
 
+    async def ensure_indexes(self):
+        """Explicit preparation only; never called by read-only web startup."""
+        if self.conn.is_in_transaction():
+            raise RuntimeError('concurrent checkpoint index preparation requires autocommit')
+        valid = await self.conn.fetchval("SELECT indisvalid AND indisready FROM pg_index "
+            "WHERE indexrelid=to_regclass('idx_fabric_events_projection_position')")
+        if valid is False:
+            await self.conn.execute('DROP INDEX CONCURRENTLY idx_fabric_events_projection_position')
+        await self.conn.execute('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_fabric_events_projection_position '
+            'ON fabric_events(projection_position) WHERE projection_position IS NOT NULL')
+
     @asynccontextmanager
     async def publisher(self):
         """One materializer per database schema; readers never take this lock."""
@@ -80,7 +91,9 @@ class ProjectionStore:
             "AND tgname IN ('projection_position_before_write','projection_change_after_write',"
             "'projection_change_after_truncate') AND tgenabled IN ('O','A'))=3 "
             "AND EXISTS(SELECT 1 FROM pg_sequences WHERE schemaname=current_schema() "
-            "AND sequencename='projection_position_seq' AND cache_size=1)"))
+            "AND sequencename='projection_position_seq' AND cache_size=1) "
+            "AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('fabric_events') "
+            "AND tgname='fabric_event_recovery_instance' AND tgenabled IN ('O','A'))"))
 
     @asynccontextmanager
     async def snapshot(self):
@@ -108,6 +121,10 @@ class ProjectionStore:
             await conn.execute('SELECT pg_advisory_unlock($1::int,$2::int)', FENCE_NAMESPACE, key)
             locked = False
             legacy = await conn.fetchval('SELECT legacy_rows FROM projection_checkpoint_control WHERE singleton')
+            if legacy is None:
+                # Bootstrap outside the DDL lock and writer fence. The RR view
+                # is exact; publication reconciles intervening legacy deletions.
+                legacy = await conn.fetchval('SELECT count(*) FROM fabric_events WHERE projection_position IS NULL')
             floor = await conn.fetchval('SELECT replay_floor FROM projection_checkpoint_control WHERE singleton')
             yield {'position': int(frontier), 'legacy_rows': int(legacy), 'replay_floor': int(floor)}
             await transaction.commit()
@@ -135,6 +152,12 @@ class ProjectionStore:
         packed, checksum = encode_checkpoint(value)
         decode_checkpoint(packed, checksum)
         async with self.conn.transaction():
+            legacy = await self.conn.fetchval('SELECT legacy_rows FROM projection_checkpoint_control WHERE singleton FOR UPDATE')
+            if legacy is None and isinstance(value.get('coverage'), dict):
+                removed = await self.conn.fetchval("SELECT count(*) FROM projection_event_changes "
+                    "WHERE position>$1 AND operation IN ('D','U') AND had_position IS NULL", frontier)
+                await self.conn.execute('UPDATE projection_checkpoint_control SET legacy_rows=$1 WHERE singleton',
+                                        value['coverage']['legacy_rows'] - removed)
             await self.conn.execute(
                 'INSERT INTO projection_checkpoints(code_fingerprint,policy_fingerprint,frontier,format_version,state,checksum) '
                 'VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(code_fingerprint,policy_fingerprint,frontier) '

@@ -1,0 +1,36 @@
+/* Memory Explorer. Design tokens only (herdr-design-system/theme.css): no literal colours or fonts. */
+.mem { color: var(--text); min-width: 0; }
+.mem-bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin: 0 0 12px; }
+.mem-bar label { display: flex; flex-direction: column; gap: 4px; font-size: 0.8125rem; color: var(--text-secondary); min-width: 0; }
+.mem-bar .mem-q { flex: 1 1 280px; }
+.mem-bar input, .mem-bar select { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px; font: inherit; min-height: 44px; max-width: 100%; }
+.mem-bar .hd-btn, .mem-pager .hd-btn, .mem-drawer .hd-btn { min-height: 44px; min-width: 44px; }
+.mem :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.mem-state { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 16px; color: var(--text-secondary); }
+.mem-state--forbidden, .mem-state--unavailable, .mem-state--error { border-color: var(--status-attention); }
+.mem-state p { margin: 4px 0 0; }
+.mem-note { font-size: 0.8125rem; color: var(--text-secondary); margin: 8px 0; }
+.mem-banner { border: 1px solid var(--status-attention); border-radius: var(--radius-sm); padding: 8px 12px; background: var(--surface); }
+.mem-list { list-style: none; padding: 0; margin: 8px 0; display: flex; flex-direction: column; gap: 8px; }
+.mem-row { display: grid; gap: 4px; width: 100%; text-align: left; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; font: inherit; cursor: pointer; min-height: 44px; }
+.mem-row:hover { background: var(--surface-hover); }
+.mem-row__text { overflow-wrap: anywhere; }
+.mem-row__meta { color: var(--text-secondary); overflow-wrap: anywhere; }
+.mem-chip { display: inline-block; justify-self: start; font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border-subtle); color: var(--text-secondary); background: var(--surface); }
+.mem-chip--verified { border-color: var(--status-ok); }
+.mem-chip--candidate { border-color: var(--status-waiting); }
+.mem-chip--superseded, .mem-chip--retracted { border-color: var(--status-attention); }
+.mem-pager { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 12px 0; }
+.mem-drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100vw); overflow: auto; background: var(--surface); border-left: 1px solid var(--border); box-shadow: var(--shadow-lg); padding: 16px; z-index: 20; }
+.mem-drawer[hidden] { display: none; }
+.mem-drawer__head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.mem-drawer h3 { font-size: 0.9375rem; margin: 16px 0 4px; }
+.mem-text { margin: 12px 0; padding: 8px 12px; border-left: 3px solid var(--border); background: var(--surface-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.mem-dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 8px 0; }
+.mem-dl dt { color: var(--text-secondary); }
+.mem-dl dd { margin: 0; overflow-wrap: anywhere; }
+.mem-links, .mem-revs { padding-left: 20px; }
+.mem-status { margin-top: 24px; border-top: 1px solid var(--border-subtle); padding-top: 8px; }
+.mem-table { border-collapse: collapse; width: 100%; }
+.mem-table th, .mem-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-subtle); }
+@media (max-width: 640px) { .mem-bar { flex-direction: column; align-items: stretch; } .mem-dl { grid-template-columns: 1fr; } .mem-drawer { width: 100vw; } }

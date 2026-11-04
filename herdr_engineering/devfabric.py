@@ -6,11 +6,13 @@ reconciliation, idempotent registration and private-only addressing.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import socket
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -81,6 +83,9 @@ def _normalize_routes(routes):
     return [Route(**r) if isinstance(r, dict) else r for r in (routes or [])]
 
 
+_LEASE_FIELDS = frozenset(f.name for f in dataclasses.fields(DevServiceLease))
+
+
 def _parse_leases(data: dict) -> dict[str, DevServiceLease]:
     """Parse a store payload into leases.
 
@@ -101,9 +106,12 @@ def _parse_leases(data: dict) -> dict[str, DevServiceLease]:
         d.setdefault("owner_repository", owner.get("repository"))
         d.setdefault("owner_worktree_id", owner.get("worktree_id"))
         d.setdefault("owner_process_id", owner.get("process_id"))
+        # A store written by a NEWER version may carry fields this version does not know. Keep the lease and ignore the
+        # extras: dropping it would empty the table on a rollback (and on an older standby mirroring a newer active).
+        d = {k: v for k, v in d.items() if k in _LEASE_FIELDS}
         try:
             lease = DevServiceLease(**d)
-        except TypeError:
+        except (TypeError, ValueError):
             continue  # skip malformed entries rather than losing the whole store
         leases[lease.id] = lease
     return leases
@@ -120,6 +128,9 @@ class DevServiceRegistry:
                            str(Path.home() / ".local/share/herdr-engineering/state"))) / "leases.json"
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lo, self._hi = port_range
+        # "Is this external port usable here?" Defaults to a loopback probe; the gateway swaps in a probe of the
+        # addresses its router really binds (the tailnet IP can be held by another gateway while loopback is free).
+        self.port_free: Callable[[int], bool] = _os_port_free
         self._ttl = lease_ttl_seconds
         self._leases: dict[str, DevServiceLease] = {}
         self._lock = threading.RLock()
@@ -201,6 +212,28 @@ class DevServiceRegistry:
             self._leases = _parse_leases(data)
         self._prune_expired()
         return True
+
+    def replace_from_peer(self, leases: list[dict]) -> int:
+        """Mirror the active gateway's lease table (standby only). Returns how many leases were taken."""
+        cleaned = [{k: v for k, v in dict(lz).items() if k != "url"} for lz in leases]
+        parsed = _parse_leases({"leases": cleaned})
+        with self._lock:
+            self._leases = parsed
+            self._persist()
+        return len(parsed)
+
+    def renew_all(self) -> int:
+        """Give every active lease a fresh TTL (used on promotion so agents have time to re-heartbeat)."""
+        now = _now_iso()
+        n = 0
+        with self._lock:
+            for lease in self._leases.values():
+                if lease.state == "active":
+                    lease.renewed_at = now
+                    lease.expires_at = _add_seconds(now, self._ttl)
+                    n += 1
+            self._persist()
+        return n
 
     def gc(self) -> dict:
         """Drop expired/failed leases past the retention window and persist.
@@ -294,10 +327,10 @@ class DevServiceRegistry:
         if preferred is not None:
             if (preferred >= 1024
                     and not self._is_port_taken(preferred, exclude_id)
-                    and _os_port_free(preferred)):
+                    and self.port_free(preferred)):
                 return preferred
         for port in range(self._lo, self._hi + 1):
-            if not self._is_port_taken(port, exclude_id) and _os_port_free(port):
+            if not self._is_port_taken(port, exclude_id) and self.port_free(port):
                 return port
         raise ConflictError("no free external dev port in configured range")
 
@@ -307,7 +340,8 @@ class DevServiceRegistry:
                  owner_process_id: str | None = None, label: str | None = None,
                  lease_id: str | None = None,
                  preferred_port: int | None = None,
-                 routes: list | None = None) -> DevServiceLease:
+                 routes: list | None = None, origin_port: int | None = None,
+                 network_namespace: str | None = None) -> DevServiceLease:
         """Register (or idempotently renew) a lease. Allocates a collision-free port."""
         now = _now_iso()
         # Idempotent registration for a stable owner/process identity.
@@ -344,6 +378,7 @@ class DevServiceRegistry:
                 id=lid, external_port=port, protocol=protocol,
                 target_machine_id=target_machine_id, target_host=target_host,
                 target_port=target_port, routes=routes,
+                origin_port=origin_port, network_namespace=network_namespace,
                 owner_herdr_session_id=owner_herdr_session_id,
                 owner_repository=owner_repository,
                 owner_worktree_id=owner_worktree_id,
@@ -826,13 +861,22 @@ def _read_head(sock: socket.socket) -> tuple[bytes, bytes]:
     return buf[: idx + 4], buf[idx + 4:]
 
 
-def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str) -> None:
+def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str,
+                   *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None) -> None:
     """Byte-pipe that filters the headers of the origin's responses.
 
     Each exchange is forced to ``Connection: close`` so every response passes the
     head filter. Upgrade requests (websockets) are passed through untouched."""
-    from .urlrewrite import force_close, is_upgrade, rewrite_response_head
+    from .urlrewrite import force_close, inject_request_headers, is_upgrade, rewrite_response_head
     req_head, rest = _read_head(client)
+    if tls and req_head.endswith(b"\r\n\r\n"):
+        # TLS ends here: tell the origin the browser spoke https and which name it used.
+        host = next((ln.split(b":", 1)[1].strip().decode("latin-1") for ln in req_head.split(b"\r\n")[1:]
+                     if ln.lower().startswith(b"host:")), external)
+        pairs = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": host}
+        if forwarded_for:
+            pairs["X-Forwarded-For"] = forwarded_for
+        req_head = inject_request_headers(req_head[:-4], pairs) + b"\r\n\r\n"
     upgrade = is_upgrade(req_head)
     if not upgrade and req_head.endswith(b"\r\n\r\n"):
         req_head = force_close(req_head[:-4]) + b"\r\n\r\n"
@@ -863,8 +907,9 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
     t.start()
     try:
         resp_head, body = _read_head(target)
-        if resp_head.endswith(b"\r\n\r\n"):
-            resp_head = rewrite_response_head(resp_head[:-4], port, external) + b"\r\n\r\n"
+        if rewrite_head and resp_head.endswith(b"\r\n\r\n"):
+            resp_head = rewrite_response_head(resp_head[:-4], port, external,
+                                              "https" if tls else None) + b"\r\n\r\n"
         client.sendall(resp_head + body)
         while True:
             data = target.recv(65536)

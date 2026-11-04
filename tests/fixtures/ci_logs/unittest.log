@@ -1,0 +1,9 @@
++ set -eu
++ bash ops/ci/network-gates.sh
+................
+----------------------------------------------------------------------
+Ran 16 tests in 0.029s
+OK
+Verified 5 history-preserving imports
+Verified 11 imported files from c1693d9e8ba178a5b6173b2440d14e49983f6df7
+journal: /home/ci/woodpecker/logs/example-cluster-gates-1dff4925f9906f8edd991a52a5caa2fbe62e9302-1792820694.log

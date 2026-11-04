@@ -13,7 +13,7 @@
 // Run: node --test --test-concurrency=1 tests/playwright/ui-gates-xss.test.mjs
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { launch, openReal, openSub, settled, startRealServer } from './ui-gates-lib.mjs';
+import { launch, openReal, openSub, settled, startRealServer, scaled } from './ui-gates-lib.mjs';
 import { STATES } from './ui-gates-states.mjs';
 import { URLS, UNREAD, tag, taint } from './ui-gates-taint.mjs';
 
@@ -123,7 +123,7 @@ for (const [, what, sel, canary, open] of PLACEMENTS) {
   test(`a canary is visible, as text, in ${what}`, async () => {
     const { ctx, page } = await hostile(browser);
     await open(page);
-    await page.waitForFunction(([s, c]) => (document.querySelector(s)?.innerText || '').includes(c), [sel, canary], { timeout: 5000 }).catch(() => {});
+    await page.waitForFunction(([s, c]) => (document.querySelector(s)?.innerText || '').includes(c), [sel, canary], { timeout: scaled(5000) }).catch(() => {});
     const shown = await page.locator(sel).first().innerText();
     assert.ok(shown.includes(canary), `${canary} is not on screen inside ${sel}: ${shown.slice(0, 120)}`);
     note(`placement: ${what}`, await shownKeys(page));
@@ -136,9 +136,9 @@ for (const [, what, sel, canary, open] of PLACEMENTS) {
 
 // Fields the server sends and the proxy taints that no surface or state of THIS fixture paints. Every one is covered somewhere else
 // (ui-gates-render-xss.test.mjs): a renderer prints it (error, method, milestone, paths: the canary is asserted visible when a complete
-// model is rendered), it is drawn only as a number (progress), or no page source reads it at all (UNREAD, scanned there). The list
+// model is rendered), it is drawn only as a number (progress, count: the delivery metrics), or no page source reads it at all (UNREAD, scanned there). The list
 // must match what the run finds: a field that starts to render here must be removed, a new one added on purpose.
-const UNRENDERED = ['error', 'method', 'milestone', 'paths', 'progress', ...Object.keys(UNREAD).map(tag)].sort();
+const UNRENDERED = ['count', 'error', 'method', 'milestone', 'paths', 'progress', ...Object.keys(UNREAD).map(tag)].sort();
 
 test('the canaries really reached the screen for a wide set of fields (otherwise "inert" proves nothing)', () => {
   const table = [...seen].map(([k, w]) => `${k}: ${[...w].map((x) => x.slice(0, 24)).join(' | ')}`).sort();

@@ -1,0 +1,24 @@
+     Running iw-gateway::autoscale_pool_e2e (/tmp/woodpecker-cache/target-86dfd2f461717587c83b3f7a7cc78e4e51597689/debug/deps/autoscale_pool_e2e-ce321f68c6c15b46)
+running 3 tests
+test a_cold_request_loads_its_model_and_is_served has been running for over 60 seconds
+test a_demanded_model_displaces_an_idle_one_and_the_card_stays_held has been running for over 60 seconds
+test a_model_that_cannot_start_is_rolled_back_onto_the_same_card has been running for over 60 seconds
+test a_cold_request_loads_its_model_and_is_served ... ok
+test a_demanded_model_displaces_an_idle_one_and_the_card_stays_held ... ok
+test a_model_that_cannot_start_is_rolled_back_onto_the_same_card ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 228.94s
+     Running iw-gateway::lib (/tmp/woodpecker-cache/target-86dfd2f461717587c83b3f7a7cc78e4e51597689/debug/deps/iw_gateway-dd332fffc4ab3ad6)
+running 1054 tests
+test adaptive::alias_inventory::tests::a_node_leaving_drops_its_observations ... ok
+test adaptive::alias_inventory::tests::a_cordon_reads_like_a_hold_in_the_logical_inventory_and_prefix_views ... ok
+test adaptive::alias_inventory::tests::a_producer_that_only_advertises_never_makes_the_row_ready ... ok
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests iw_weight_fetch
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests schema_gen
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+FAIL: iw-cli::old_names
+note: cargo test exited 1; the verdict below still reports what ran
+== verdict ==

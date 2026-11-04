@@ -72,9 +72,14 @@ def install(repo, ref, home, legacy):
     state = home / ".local/state/herdr-engineering/deploys"
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_fd = os.open(state / "rollout.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    compatibility_fd = None
     try:
         # Same immutable inode as deploy.sh; never unlink it, including on errors.
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Also exclude an upstream deploy that predates rollout.lock. Keep the
+        # acquisition order identical to deploy.sh and never replace either inode.
+        compatibility_fd = os.open(state / "deploy.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(compatibility_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if tree.exists():
             if (git(tree, "rev-parse", "HEAD") != commit
                     or git(tree, "status", "--porcelain", "--untracked-files=all")):
@@ -104,6 +109,8 @@ def install(repo, ref, home, legacy):
                 atomic_write(backup, body, mode & 0o700)
             atomic_write(path, shim + body, mode)
     finally:
+        if compatibility_fd is not None:
+            os.close(compatibility_fd)
         os.close(lock_fd)
 
 

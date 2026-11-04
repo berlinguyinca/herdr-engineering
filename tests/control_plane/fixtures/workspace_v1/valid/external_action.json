@@ -1,0 +1,35 @@
+{
+  "actor": {
+    "id": "alice",
+    "kind": "user"
+  },
+  "aliases": [
+    {
+      "system": "hcn",
+      "value": "external_action-1"
+    }
+  ],
+  "causation_id": "ev-0",
+  "channel": "email",
+  "correlation_id": "co-1",
+  "created_at": "2026-10-28T12:00:00Z",
+  "etag": "sha256:0dfafb7cd07ead18565330a4dfd7b231866c22dacfec6896e82663a42ce1167f",
+  "id": "urn:herdr:external_action:fc9ac56d-3553-5a62-aff9-f1268662814d",
+  "idempotency_key": "k1",
+  "kind": "external_action",
+  "refs": [
+    "herdr://rooms/room-1"
+  ],
+  "request_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "scope": {
+    "room_id": "room-1",
+    "tenant_id": "t1",
+    "visibility": "room"
+  },
+  "source_sequence": 7,
+  "state": "awaiting_approval",
+  "tool_id": "send_message",
+  "trace_id": "tr-1",
+  "updated_at": "2026-10-28T12:00:00Z",
+  "version": 1
+}

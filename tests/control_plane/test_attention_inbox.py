@@ -85,6 +85,38 @@ def test_failed_agent_service_host_and_review_each_make_their_item():
     assert review["href"] == "#/reviews?tab=changes&search=rev1" and review["severity"] == "warning"
 
 
+def _fleet(inbox_config=None):
+    repo, inbox, clock, _ = _world(config=inbox_config)
+    for hid, name in (("h-bender", "bender"), ("h-beast", "Beast"), ("h-zapp", "zapp")):
+        repo.upsert_host(hid, name, "100.1.1.1")
+        repo._hosts[hid]["last_seen"] = _iso(NOW - 2 * HOUR)       # all three silent
+    return repo, inbox
+
+
+def test_hosts_listed_as_expected_off_raise_nothing_but_are_listed_quietly():
+    _, inbox = _fleet({"expected_offline_hosts": ["bender", "h-beast"]})
+    body = inbox.snapshot(state="all")
+    assert [i["title"] for i in body["items"] if i["kind"] == "host_stale"] == ["zapp"]   # an unlisted host still alerts
+    assert body["counts"]["open"] == 1
+    assert [(h["name"], h["state"]) for h in body["expected_off"]] == [("Beast", "stale"), ("bender", "stale")]   # id or name, any case
+    assert {h["host_id"] for h in body["expected_off"]} == {"h-bender", "h-beast"} and all(h["last_seen"] for h in body["expected_off"])
+
+
+def test_default_config_keeps_every_silent_host_an_item_and_lists_nothing():
+    _, inbox = _fleet()
+    body = inbox.snapshot()
+    assert len([i for i in body["items"] if i["kind"] == "host_stale"]) == 3 and body["expected_off"] == []
+
+
+def test_an_expected_off_host_that_reports_again_is_not_listed_and_one_reported_down_is_down():
+    repo, inbox = _fleet({"expected_offline_hosts": ["bender", "beast"]})
+    repo._hosts["h-bender"]["last_seen"] = _iso(NOW - 5)
+    repo._hosts["h-beast"]["status"] = "offline"
+    body = inbox.snapshot()
+    assert [(h["name"], h["state"]) for h in body["expected_off"]] == [("Beast", "down")]
+    assert [i["title"] for i in body["items"] if i["kind"] == "host_stale"] == ["zapp"]
+
+
 def test_only_herdr_scope_unavailable_services_count():
     repo, inbox, _, _ = _world()
 
@@ -422,11 +454,14 @@ def test_config_defaults_and_validation():
     assert cfg["notify"]["quiet_hours"] == {"start": 22, "end": 7} and cfg["resolved"]["max_items"] == 100
     assert cfg["thresholds"] == {"host_stale_seconds": 600, "llm_error_count": 20, "llm_window": "24h",
                                  "failed_window_hours": 168, "blocked_window_hours": 24}
+    assert cfg["expected_offline_hosts"] == []
+    assert attention_config({"expected_offline_hosts": [" bender ", "beast"]})["expected_offline_hosts"] == ["bender", "beast"]
     assert attention_config({"enabled": False})["enabled"] is False
     for bad in ({"enabled": "yes"}, {"bogus": 1}, {"snooze": {"min_seconds": 0}},
                 {"snooze": {"min_seconds": 100, "max_seconds": 50}}, {"snooze": {"nope": 1}},
                 {"thresholds": {"llm_window": "30d"}}, {"thresholds": {"blocked_window_hours": 0}}, {"notify": {"min_severity": "loud"}},
-                {"notify": {"quiet_hours": {"start": 24, "end": 7}}}, {"resolved": {"max_items": 0}}, []):
+                {"notify": {"quiet_hours": {"start": 24, "end": 7}}}, {"resolved": {"max_items": 0}}, [],
+                {"expected_offline_hosts": "bender"}, {"expected_offline_hosts": [""]}, {"expected_offline_hosts": [3]}):
         with pytest.raises(ValueError):
             attention_config(bad)
 
@@ -473,6 +508,19 @@ def test_routes_on_the_operator_listener():
         assert _call(svr, "POST", "/api/v1/attention/bogus", pair)[0] == 404
         (event,) = [e for e in repo.attention_events() if e["event_type"] == "attention_ack"]
         assert event["payload"]["actor"].startswith("operator:")
+    finally:
+        svr.shutdown()
+
+
+def test_the_api_carries_the_expected_offline_list_from_the_yaml_config():
+    repo = ControlPlaneRepo()
+    repo.upsert_host("h-bender", "bender", "100.1.1.1")
+    repo._hosts["h-bender"]["status"] = "offline"
+    svr = _serve(repo, allow_open=True, attention={"expected_offline_hosts": ["bender"]})
+    try:
+        st, body = _call(svr, "GET", "/api/v1/attention")
+        assert st == 200 and [i for i in body["items"] if i["kind"] == "host_stale"] == []
+        assert [h["name"] for h in body["expected_off"]] == ["bender"] and body["expected_off"][0]["state"] == "down"
     finally:
         svr.shutdown()
 
@@ -568,3 +616,21 @@ def test_without_the_ci_fix_service_there_is_no_source_and_a_broken_one_is_parti
     service.list = boom
     body = inbox2.snapshot()
     assert body["unavailable"] == ["ci_fix"] and body["items"][0]["key"] == "source:ci_fix"
+
+
+def test_an_agent_item_names_the_handoff_that_gave_it_its_task_and_only_recorded_ones():
+    from herdr_engineering.control_plane.handoffs import HandoffRegistry
+    repo, _, clock, view = _world()
+    registry = HandoffRegistry(repo, now=lambda: clock[0])
+    inbox = AttentionInbox(repo, ci_snapshot=lambda: view, now=lambda: clock[0], handoffs=lambda: registry)
+    receiver = repo.create_session(agent_role="coder")
+    stray = repo.create_session(agent_role="reviewer")
+    repo._sessions[receiver]["status"] = "failed"
+    repo._sessions[stray]["status"] = "failed"
+    registry.create({"handoff_id": "h-1", "source_harness": "claude", "target_harness": "codex", "source_agent_id": "planner",
+                     "source_session_id": "planner-session", "target_session_id": receiver, "goal": "Fix the parser"}, "tester")
+    items = {i["key"]: i for i in inbox.snapshot()["items"]}
+    (link,) = items[f"session:{receiver}"]["handoffs"]
+    assert (link["direction"], link["state"], link["goal"], link["agent"]) == ("in", "queued", "Fix the parser", "planner")
+    assert link["href"] == "#/herd/session/planner-session"
+    assert items[f"session:{stray}"]["handoffs"] == []        # no recorded handoff: nothing is guessed

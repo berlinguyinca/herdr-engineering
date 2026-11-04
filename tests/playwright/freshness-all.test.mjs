@@ -12,7 +12,7 @@ const ROUTES=appRoutes();
 
 const service={service_id:'svc-1',name:'web',host_id:'h-1',status:'running',kind:'service',observed_at:'2026-01-01T00:00:00Z',updated_at:'2026-01-01T00:00:00Z'};
 // One body that satisfies every view's response validator (lists empty, objects well-formed).
-const OK={projects:[],assistants:[],items:[],groups:[],snapshots:[],analyses:[],artifacts:[],versions:[],publications:[],nodes:[],edges:[],missions:[],sessions:[],services:[service],hosts:[],activities:[],events:[],timeline:[],available:true,reviews:[],
+const OK={projects:[],assistants:[],items:[],groups:[],snapshots:[],analyses:[],artifacts:[],versions:[],publications:[],nodes:[],edges:[],workspaces:[],missions:[],sessions:[],services:[service],hosts:[],activities:[],events:[],timeline:[],available:true,reviews:[],
  repositories:[],issues:[],counts:{},pagination:{},status:'ready',components:[],summary:{},reports:[],pipelines:[],samples:[],
  total:0,completed:0,completion_rate:0,by_stage:{},models:{},total_sessions:0,healthy:0,unavailable:0,
  mission_id:'m-1',session_id:'s-1',host_id:'h-1',title:'Mission',display_name:'Agent'};

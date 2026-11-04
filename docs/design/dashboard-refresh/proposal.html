@@ -1,0 +1,109 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dashboard use cases and simplification</title><style>
+:root{--bg:#f6f6f7;--fg:#1b1d21;--mut:#5b6068;--card:#fff;--line:#dcdfe4;--acc:#0b8f6c;--warn:#b45309;--bad:#b42318}
+@media(prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e8eaed;--mut:#9aa1ab;--card:#1c1f25;--line:#2c3038;--acc:#3ccf9f;--warn:#f0a35b;--bad:#f2766b}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:24px 20px 80px}h1{font-size:28px;margin:.2em 0}h2{font-size:21px;margin:2em 0 .4em;padding-top:.6em;border-top:1px solid var(--line)}h3{font-size:16px;margin:1.4em 0 .3em}
+p,li{max-width:78ch}.mut{color:var(--mut)}code{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:13px}
+nav.toc{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:14px;margin:10px 0 0}a{color:var(--acc)}
+table{border-collapse:collapse;width:100%;font-size:14px;background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.k{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600;border:1px solid var(--line)}.keep{color:var(--acc)}.merge{color:var(--warn)}.cut{color:var(--bad)}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}@media(max-width:860px){.cols{grid-template-columns:1fr}}
+figure{margin:12px 0;background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden}figure img{display:block;width:100%;height:auto}figcaption{padding:8px 12px;font-size:13px;color:var(--mut);border-top:1px solid var(--line)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:12px 0}.card h4{margin:0 0 4px;font-size:14px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+.wf{display:grid;gap:8px;background:var(--card);border:1px dashed var(--line);border-radius:8px;padding:10px;font-size:13px}.wf>div{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 10px}.wf .hi{border-color:var(--acc);color:var(--acc)}.wf .row{display:flex;gap:8px;flex-wrap:wrap}.wf .row>div{flex:1;min-width:110px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+.stat{display:inline-block;margin:2px 12px 2px 0;font-size:14px}.stat b{font-size:20px}
+</style></head><body><main>
+<h1>Dashboard: use cases, busyness, and what to merge or drop</h1>
+<p class="mut">Based on the live production dashboard (read-only), every page at desktop, dark and mobile. Numbers are measured on the first full-page render at 1440 px. Use cases are my reading of what each page is for; <b>I have no usage analytics, so the cut proposals below are judgement and need your confirmation.</b></p>
+<nav class="toc"><a href="#principles">Principles</a><a href="#busy">How busy</a><a href="#collab">Collaboration</a><a href="#sessions">Sessions</a><a href="#pa">Personal Assistant</a><a href="#all">Every page: use case and verdict</a><a href="#nav">Resulting navigation</a><a href="#next">Order of work</a></nav>
+
+<h2 id="principles">Rules every page should follow</h2>
+<ol>
+<li><b>One page, one question.</b> If a page answers two different questions, it is two pages or one page with a clear primary and a hidden secondary.</li>
+<li><b>One primary action</b> per screen; everything else lives in a menu, a drawer, or a second tab.</li>
+<li><b>Three levels of navigation at most</b> (sidebar, page tabs, view toggle). The collaboration room currently has five.</li>
+<li><b>Empty and healthy things take one line</b>, not a dashed box. Errors and things needing a decision get the space.</li>
+<li><b>One card level.</b> No panel inside a panel inside a panel (the CI page has four).</li>
+<li><b>Spacing scale</b> of 4 / 8 / 16 / 24 / 32 px used everywhere, one 12 px floor for text, and a reading width of about 75 characters for prose.</li>
+<li><b>Page header pattern:</b> title, a status chip, one line of description, actions on the right. No paragraph-length intros; the long text moves behind an info disclosure.</li>
+</ol>
+
+<h2 id="busy">How busy each page is today</h2>
+<p>Interactive controls visible and characters of text on the full page. Higher on both means harder to scan.</p>
+<table><thead><tr><th>Page</th><th>Controls</th><th>Characters</th><th>Page height (px)</th></tr></thead><tbody><tr><td>/ci</td><td>1710</td><td>14,316</td><td>2,134</td></tr><tr><td>/attention</td><td>167</td><td>3,293</td><td>1,889</td></tr><tr><td>/artifacts</td><td>100</td><td>5,811</td><td>3,389</td></tr><tr><td>/overview</td><td>100</td><td>3,578</td><td>1,936</td></tr><tr><td>/herd</td><td>89</td><td>3,605</td><td>2,371</td></tr><tr><td>/llm</td><td>65</td><td>4,315</td><td>2,531</td></tr><tr><td>/activity</td><td>27</td><td>4,028</td><td>2,137</td></tr><tr><td>/agent detail</td><td>54</td><td>1,320</td><td>1,580</td></tr><tr><td>/hosts</td><td>31</td><td>2,193</td><td>1,389</td></tr><tr><td>/topology</td><td>37</td><td>1,358</td><td>1,084</td></tr><tr><td>/personal-assistant</td><td>42</td><td>750</td><td>927</td></tr><tr><td>/services</td><td>38</td><td>858</td><td>900</td></tr><tr><td>/scheduling</td><td>26</td><td>1,505</td><td>900</td></tr><tr><td>/missions</td><td>34</td><td>894</td><td>900</td></tr><tr><td>/collab</td><td>31</td><td>416</td><td>900</td></tr><tr><td>/analytics</td><td>26</td><td>666</td><td>900</td></tr><tr><td>/reviews</td><td>29</td><td>476</td><td>900</td></tr><tr><td>/github/projects</td><td>25</td><td>492</td><td>900</td></tr><tr><td>/github/projects</td><td>25</td><td>492</td><td>900</td></tr><tr><td>/review-gate</td><td>23</td><td>331</td><td>1,045</td></tr><tr><td>/publications</td><td>23</td><td>202</td><td>900</td></tr><tr><td>/handoffs</td><td>21</td><td>211</td><td>900</td></tr><tr><td>/architecture</td><td>21</td><td>164</td><td>900</td></tr></tbody></table>
+
+<h2 id="collab">Collaboration</h2>
+<div class="cols"><figure><img src="img/ev-collab-landing.jpg" alt="Collaboration landing"><figcaption>Landing: rooms, then a Helpers section made of three empty dashed boxes, then a New room form.</figcaption></figure>
+<figure><img src="img/ev-collab-room.jpg" alt="A room"><figcaption>Inside a room: five navigation layers, 54 controls, a 13-button editor toolbar over a chat message box, and a log mostly made of "agent granted / revoked" pills.</figcaption></figure></div>
+<div class="card"><h4>Use case</h4><p><b>Who:</b> an operator working with colleagues and their agents. <b>Question:</b> "What did we say, who is doing what, and what needs me in this room?" <b>Done when:</b> a task is handed to an agent or person and I can see it finish.</p></div>
+<h3>What makes it busy</h3>
+<ul>
+<li><b>Five navigation layers:</b> sidebar, room tabs (test, review, + New room), a second right-aligned pair (People, AI agents), ten view tabs (Chat, Flow, Tasks, Agents, Tabs, Lineage, Attention, Progress, Workspaces, Proposals, People), and an editor toolbar.</li>
+<li><b>People appears twice</b> (top right and as a tab), and AI agents is both a top-level tab and a room tab (Agents).</li>
+<li><b>System noise in the conversation:</b> access grants and revocations are the same size as messages. In the test room they push the real messages out of the first screen.</li>
+<li><b>The composer is a text editor:</b> Expand, Edit, Preview, Split preview, Bold, List, Code, Indent, Outdent, Undo, Redo, Find and replace, Format JSON, Wrap, before you can type "ok".</li>
+<li><b>Landing page:</b> three empty "no X" boxes take more room than the rooms themselves; creating a room is a permanent form.</li>
+</ul>
+<h3>Proposal</h3>
+<div class="cols"><div class="wf"><div class="hi">Room switcher ▾ (a dropdown once there are more than 4 rooms) · + New room (opens a small dialog)</div><div class="row"><div class="hi">Conversation</div><div>Work</div><div>Members &amp; access</div><div>More ▾ (Lineage, Workspaces, Tabs)</div></div><div>Conversation: messages full width, tasks for this room as a collapsible right panel with count badge; access changes collapse to "12 access changes"</div><div>Composer: one line, Send, a "Format ▾" menu and an expand button</div></div>
+<div class="wf"><div class="hi">Work = Tasks + Flow + Progress + Proposals</div><div>Task board by state (waiting, running, done, failed); Flow is a "Graph" view toggle on the same data, not a separate tab</div><div>Members &amp; access = People + Agents + invitations + host access requests</div><div>Room attention items go to the global Attention inbox with a room filter, so the Attention tab goes away</div></div></div>
+<p><b>Result:</b> 11 view tabs become 3 plus a menu; two top-right links disappear; the composer shrinks from 14 controls to 3. Landing page: rooms as a list, "Helpers" as one line ("No helpers running") that expands only when something is running.</p>
+<p class="mut"><b>Open question:</b> I cannot tell what the <code>Tabs</code> tab is for from the UI or guide. If nobody uses it, drop it.</p>
+
+<h2 id="sessions">Sessions (Agents list and agent detail)</h2>
+<div class="cols"><figure><img src="img/ev-agents.jpg" alt="Agents list"><figcaption>List: each row spends three lines on the right on host, "LLM usage" and model, repeated for all 31 rows.</figcaption></figure>
+<figure><img src="img/ev-session.jpg" alt="Agent detail"><figcaption>Detail: nine separate things above the conversation (breadcrumb, title, status, a standing disclaimer, summary line, mission, related links, Terminal, details), then the name again with three buttons.</figcaption></figure></div>
+<div class="card"><h4>Use case, list</h4><p><b>Question:</b> "Which agents are working right now, and is any of them stuck or failed?" <b>Done when:</b> I open the one that needs me.</p></div>
+<div class="card"><h4>Use case, detail</h4><p><b>Question:</b> "What is this agent doing, and can I steer it?" <b>Done when:</b> I sent it a message or opened its terminal.</p></div>
+<h3>Proposal: list</h3>
+<ul><li>Rows: name, one-line task, state chip, host and model as one muted line, age. Per-row "LLM usage" links go to the detail page.</li>
+<li>Tabs Current / Unconfirmed / Failed / Finished become <b>Current</b> (default) and <b>History</b> with a status filter. 396 of the 427 agents are history.</li>
+<li>Missions, Topology and Handoffs fold in here (see the table below): a "Group by" menu offers project, host and mission.</li></ul>
+<h3>Proposal: detail</h3>
+<div class="wf"><div class="hi">← Agents · <b>Patient Maple Amber</b> · [● working] · bender · claude-sonnet-5-5 · 14s ago &nbsp;&nbsp; [Terminal] [⋯ Rename, LLM usage, Fullscreen]</div><div>AI summary: two lines with a small "Regenerate"; a failed summary is a muted line, not a card</div><div class="row"><div class="hi">Conversation (wide) with composer</div><div>Activity (tab or right drawer, not a 50/50 split)</div></div><div>Related (mission, reviews, CI) as chips in the header; "Advanced inspection" and "Recorded event stream" merge into one <b>Debug</b> tab</div></div>
+<p><b>Result:</b> conversation starts about 300 px higher; the repeated title row and the permanent "status reflects the last report" sentence go (it becomes a tooltip on the state chip).</p>
+
+<h2 id="pa">Personal Assistant</h2>
+<figure><img src="img/ev-pa.jpg" alt="Personal Assistant"><figcaption>Three columns: a list of nine assistants, an eight-tab settings form in two rows, and a 200 px chat. (The HTTP 405 on chat is my read-only proxy blocking POST, not a production fault.)</figcaption></figure>
+<div class="card"><h4>Use case</h4><p><b>Who:</b> the operator. <b>Question:</b> "Ask my assistant to do something, and approve or refuse what it wants to do." <b>Configuration is rare;</b> chatting and approving is daily. Today the layout gives the rare job the centre of the screen and the daily job a narrow strip.</p></div>
+<h3>What makes it busy</h3>
+<ul><li>Nine assistants listed, eight of them look like test fixtures (PA Smoke ×2, Tool PA ×3, Iso PA, Iso2 ×2, Smoke, Fleet PA). In production they are noise.</li>
+<li>Eight settings tabs (General, Permissions, Memory, Routines, Connectors, Delegations, Approvals, Diagnostics) wrapped onto two rows.</li>
+<li>Chat is the smallest panel and the "Approvals" tab, the thing that needs action, is buried in the second row.</li></ul>
+<h3>Proposal</h3>
+<div class="wf"><div class="hi">Assistant ▾ (dropdown) · [Needs your approval · 2] · [⚙ Configure]</div><div>Chat: full width, thread list in a thin left rail, composer at the bottom</div><div>Approvals: a strip above the chat when something is waiting, not a tab</div><div>Configure (right drawer): <b>Identity</b> (General) · <b>Access</b> (Permissions, Connectors, Memory) · <b>Automation</b> (Routines, Delegations) · <b>Audit</b> (Approvals history, Diagnostics)</div></div>
+<p><b>Result:</b> 8 tabs become 4 sections inside one drawer; the daily job gets about 70% of the screen. Archiving the eight test assistants needs your explicit OK (I will not delete anything without it).</p>
+
+<h2 id="all">Every page: use case and verdict</h2>
+<table><thead><tr><th>Page</th><th>Use case (the one question)</th><th>Verdict</th><th>Why / what changes</th></tr></thead><tbody>
+<tr><td>Overview</td><td>"Is anything wrong, or waiting for me?"</td><td><span class="k keep">keep, slim</span></td><td>Keep Attention (top 5) and four tiles: agents working, CI failing, hosts down, reviews waiting. Remove the eight mini-lists; each repeats a page one click away.</td></tr>
+<tr><td>Attention</td><td>"What do I need to act on?"</td><td><span class="k keep">keep</span></td><td>Already grouped. Add Activity as its second tab.</td></tr>
+<tr><td>Activity</td><td>"What changed recently?"</td><td><span class="k merge">merge into Attention</span></td><td>Same question family; Overview already has "Recent changes".</td></tr>
+<tr><td>Missions</td><td>"Which goals are running or stuck?"</td><td><span class="k merge">merge into Agents</span></td><td>A mission is a group of agents. "Group by mission" replaces a page. Mission detail (tests, reviews) stays as a detail page.</td></tr>
+<tr><td>Agents</td><td>"Which agents are working or stuck?"</td><td><span class="k keep">keep, becomes "Work"</span></td><td>See Sessions above.</td></tr>
+<tr><td>Topology</td><td>"What runs where?"</td><td><span class="k cut">eliminate</span></td><td>It is Agents and Services grouped by host. "Group by host" in Agents and the Hosts page cover it.</td></tr>
+<tr><td>Handoffs</td><td>"Move an agent's work to another harness or host."</td><td><span class="k merge">merge into Agents</span></td><td>An action on an agent plus a History list. Rare; does not need a sidebar row.</td></tr>
+<tr><td>Hosts</td><td>"Is each machine healthy, and on the right versions?"</td><td><span class="k keep">keep</span></td><td>Cards and the Fleet versions table become two tabs. Scheduling's placement preview can join here.</td></tr>
+<tr><td>Scheduling</td><td>"Where will queued work run?"</td><td><span class="k merge">merge into Hosts, or cut</span></td><td>Niche. <b>Needs your call:</b> if you never open it, cut it.</td></tr>
+<tr><td>Services</td><td>"What is running, and where do I open it?"</td><td><span class="k keep">keep</span></td><td>Four tabs (Catalog, Fabric, Local, System) become filter chips on one page once the empty states are one line.</td></tr>
+<tr><td>LLM</td><td>"Are models healthy and fast; who is using them?"</td><td><span class="k merge">merge with Analytics models/tokens</span></td><td>Two places answer model and token questions. One "Usage" page with Models, Agents, Problems.</td></tr>
+<tr><td>Analytics</td><td>"How are missions and the fleet doing over time?"</td><td><span class="k merge">keep, minus models/tokens</span></td><td>Missions, Completion, Stages stay; models and tokens move to Usage.</td></tr>
+<tr><td>CI</td><td>"Are builds green; which project is failing?"</td><td><span class="k keep">keep, restructure</span></td><td>Four nested panels become: failures first, then a project table, then a project drawer with tests and history. The explanatory sentences move behind info icons.</td></tr>
+<tr><td>Reviews / Review gate</td><td>"Which plans or PRs wait for my decision?"</td><td><span class="k keep">keep as tabs</span></td><td>Already one sidebar row. Review gate currently errors in production ("failed after 1s"); worth a separate look.</td></tr>
+<tr><td>Projects / Boards</td><td>"What should be worked on next?"</td><td><span class="k keep">keep as tabs</span></td><td>Already one row.</td></tr>
+<tr><td>Architecture</td><td>"How is this code structured?"</td><td><span class="k keep">keep</span></td><td>Behind a flag; separate app view.</td></tr>
+<tr><td>Project intelligence</td><td>(unclear)</td><td><span class="k cut">cut unless used</span></td><td>Returns 404 in production and is behind a flag. <b>Needs your call.</b></td></tr>
+<tr><td>Collaboration</td><td>See above</td><td><span class="k keep">keep, simplify</span></td><td>11 tabs to 3 plus a menu.</td></tr>
+<tr><td>Personal Assistant</td><td>See above</td><td><span class="k keep">keep, chat first</span></td><td>Settings into a drawer.</td></tr>
+<tr><td>Artifacts / Publications</td><td>"Find a file or report an agent produced, and share it."</td><td><span class="k keep">keep as tabs</span></td><td>Already one row.</td></tr>
+</tbody></table>
+
+<h2 id="nav">Resulting navigation</h2>
+<p><b>Today: 25 entries. After this proposal: 13.</b></p>
+<div class="wf"><div class="row"><div><b>Monitor</b><br>Overview<br>Attention <span class="mut">(+ Activity)</span></div><div><b>Work</b><br>Agents <span class="mut">(+ Missions, Handoffs)</span><br>Collaboration<br>Assistant</div><div><b>Fabric</b><br>Hosts <span class="mut">(+ Scheduling)</span><br>Services<br>Usage <span class="mut">(LLM + models/tokens)</span></div><div><b>Delivery</b><br>CI<br>Reviews<br>Projects<br>Architecture</div><div><b>Library</b><br>Artifacts</div></div></div>
+
+<h2 id="next">Order of work (if you agree)</h2>
+<ol><li><b>Agent detail and list</b> (highest daily use, clear win).</li><li><b>Collaboration room</b>: tab consolidation, composer, system-event collapse.</li><li><b>Personal Assistant</b>: chat first, settings drawer.</li><li><b>CI page</b> restructure.</li><li><b>Merges</b>: Missions/Topology/Handoffs into Agents; LLM + Analytics into Usage; Activity under Attention.</li><li><b>Overview</b> slimming last, once the pages it links to are settled.</li></ol>
+<h3>Decisions I need from you</h3>
+<ul><li>Cut <b>Topology</b>? (I recommend yes.)</li><li>Cut <b>Scheduling</b> and <b>Project intelligence</b>, or keep? (I cannot see usage.)</li><li>Archive the eight test assistants in production's Personal Assistant?</li><li>What is the collaboration <b>Tabs</b> tab for?</li></ul>
+</main></body></html>

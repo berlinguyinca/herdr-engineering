@@ -1052,3 +1052,54 @@ def test_main_verifier_runs_each_tick_and_a_fault_does_not_stop_pr_handling():
     counts = svc.tick()
     assert counts["errors"] == 1 and counts["main_errors"] == 2
     assert [c[0] for c in main.calls[-2:]] == [REPO, OTHER]
+
+
+# ---- repair-flow policy hook: scoped to herdr-ci-fix/ branches, off by default, fails closed ----------------
+
+def _approved_pr_service(ref, gate=None):
+    svc, app, store, _, _, ci = make()
+    if gate is not None:
+        svc._repair_gate = gate
+    app.prs[REPO] = [pr(ref=ref)]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    approve(store, KEY, A)
+    return svc, app, store
+
+
+def test_repair_branch_merges_as_before_when_no_policy_is_configured():
+    svc, app, _ = _approved_pr_service("herdr-ci-fix/r9-abc1234")
+    assert svc.tick()["merged"] == 1 and app.named("merge_pr")
+
+
+def test_repair_policy_can_withhold_but_only_for_repair_branches():
+    calls = []
+    def deny(enrollment, pr_, checks):
+        calls.append(pr_.head_ref)
+        return "wait", ("human approval required",)
+    svc, app, store = _approved_pr_service("herdr-ci-fix/r9-abc1234", deny)
+    assert svc.tick()["merged"] == 0 and not app.named("merge_pr") and calls
+    assert any(c[0] == "set_status" and c[3] == "pending" and "repair policy" in c[4] for c in app.calls)
+    svc2, app2, _ = _approved_pr_service("feat/ordinary", deny)           # ordinary PRs never see the hook
+    assert svc2.tick()["merged"] == 1 and app2.named("merge_pr")
+
+
+def test_repair_policy_error_or_reject_fails_closed():
+    def boom(*a):
+        raise RuntimeError("policy backend down")
+    svc, app, _ = _approved_pr_service("herdr-ci-fix/r9-abc1234", boom)
+    assert svc.tick()["merged"] == 0 and not app.named("merge_pr")
+    svc2, app2, _ = _approved_pr_service("herdr-ci-fix/r9-abc1234", lambda *a: ("reject", ("critical path",)))
+    svc2.tick()
+    assert not app2.named("merge_pr") and any(c[0] == "set_status" and c[3] == "failure" for c in app2.calls)
+
+
+def test_repair_policy_allow_cannot_override_a_failing_check():
+    svc, app, store = _approved_pr_service("herdr-ci-fix/r9-abc1234", lambda *a: ("allow", ()))
+    svc._ci_snapshot.set(ci_row(A, "failure"))          # CI turns red after approval: decide_merge rejects first
+    assert svc.tick()["merged"] == 0 and not app.named("merge_pr")
+
+
+def test_repair_policy_allow_merges_when_every_existing_gate_passes():
+    svc, app, _ = _approved_pr_service("herdr-ci-fix/r9-abc1234", lambda *a: ("allow", ()))
+    assert svc.tick()["merged"] == 1 and app.named("merge_pr")

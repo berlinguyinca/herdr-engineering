@@ -50,6 +50,7 @@ import secrets
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -62,6 +63,8 @@ NODE_TYPES = frozenset(
     # default to per-writer ownership exactly like the existing non-commons kinds.
     "repository branch service endpoint deployment host gpu model worker request "
     "span queue dataset memory_reference external_dependency module symbol package trace "
+    # unified workspace (P02, docs/contracts/unified-workspace-v1.md): OWNED kinds, never COMMONS.
+    "project team artifact_version external_action "
     # ADR-0008 P1: the reserved `peer:<peer>.` namespace a federated peer's mirror lives in. Ingest lets ONLY that
     # peer write it (ingest.py:_check_peer_namespace); it never takes part in local gate staleness (_peer_edge).
     "peer".split())
@@ -72,7 +75,9 @@ EDGE_TYPES = frozenset(
     # existing kinds above (depends_on->dependency, handoff_to->handoff,
     # reviews->reviewed, produced->produced, spawned_by->spawn, supersedes->supersession).
     "calls observed_in belongs_to blocked_by implements references runs_on "
-    "serves deploys_to assigned_to precedes imports routes_to queued_on".split())
+    "serves deploys_to assigned_to precedes imports routes_to queued_on "
+    # unified workspace (P02): the five edge kinds the contract adds on top of the existing vocabulary.
+    "contains derived_from discussed_in approved_by notified_via".split())
 # T14: edge kinds only the HCN service may write (as a `collab` principal, after it has checked the asking person
 # and the room). `cross_link` joins two nodes of different workspaces of one room; a `consultation` edge from a
 # service-written `thread:hcn-consult.*` node records a peer consultation. Everybody else is refused with the one
@@ -593,6 +598,7 @@ class _Claims:
         self.scope: str | None = None
         self.claim: tuple | None = None    # (rank, actor_id, is_operator) of the first admitted event
         self.first = self.last = None      # (rank, event_id)
+        self.first_at = self.last_at = None  # ingest time (epoch seconds) of the events behind first / last
         self.sources: set[tuple] = set()   # (source, actor) pairs that wrote a register
         self.attrs: dict[str, _Reg] = {}
         self._w: frozenset | None = None   # cached writers()
@@ -608,8 +614,10 @@ class _Claims:
             self._w = None
         if self.first is None or rank < self.first[0]:
             self.first = (rank, ev["event_id"])
+            self.first_at = _ts(ev) or None
         if self.last is None or rank > self.last[0]:
             self.last = (rank, ev["event_id"])
+            self.last_at = _ts(ev) or None
 
     def owner(self) -> str | None:
         """Actor of the FIRST admitted event, whatever its role (pinned: admission
@@ -755,6 +763,14 @@ def from_stored(event: dict) -> dict:
 class GraphProjection:
     """Thread-safe lineage graph. Mutated only through :meth:`apply`."""
 
+    def set_write_gate(self, node_type: str, gate) -> None:
+        """Admission-time gate: a field-bearing write to a node of this type needs ``gate(actor, node_id)``."""
+        self._write_gates[node_type] = gate
+
+    def set_node_gate(self, node_type: str, gate) -> None:
+        """Install a read-time gate for one node type. It can only narrow what the scope label allows."""
+        self._node_gates[node_type] = gate
+
     def __init__(self, *, keep_log: bool = True, gate: GraphProjection | None = None):
         self._lock = threading.RLock()
         # T09: every applied (non-noop) lineage event with its validated op, in apply order, plus an index by
@@ -767,6 +783,10 @@ class GraphProjection:
         # a replayed projection reads through the CURRENT projection: nothing is visible in the past
         # that the reader cannot see now (no widening by replay)
         self._gate = gate
+        # read-time node gates by node_type: ``fn(principal, node) -> bool`` is ANDed with the scope check, so it can
+        # only narrow (e.g. artifact ACLs, artifact_scope.py). Never persisted, never part of replay.
+        self._node_gates: dict[str, Callable] = {}
+        self._write_gates: dict[str, Callable] = {}    # node_type -> fn(actor, node_id) -> bool, checked at admission
         self._replay_lock = threading.Lock()
         self._replay_cache: dict[tuple, GraphProjection] = {}
         self._cursor_key = secrets.token_bytes(32)
@@ -825,6 +845,10 @@ class GraphProjection:
                 raise deny
             at_quota = not operator and self._owned.get(aid, 0) >= MAX_OBJECTS_PER_PRINCIPAL
             if op["op"] in ("node.upsert", "node.state"):
+                write_gate = self._write_gates.get(op["node_type"])
+                if write_gate is not None and not (op["op"] == "node.upsert" and op["ensure"]) \
+                        and not write_gate(actor, op["node_id"]):
+                    raise deny
                 rec = self._nodes.get(op["node_id"])
                 exists = rec is not None and rec.claim is not None
                 if not exists:
@@ -1361,6 +1385,9 @@ class GraphProjection:
             "visibility_scope": _base(scope or "private"),
             "first_event_id": ids[0],
             "last_event_id": ids[1],
+            # when the control plane received those events; dropped together with the id by the history gates
+            "first_seen_at": self._at(node.first_at) if ids[0] and not node.commons else None,
+            "last_seen_at": self._at(node.last_at) if ids[1] and not node.commons else None,
             "source": ids[2],
         }
         if contrib:
@@ -1408,6 +1435,9 @@ class GraphProjection:
         if node is None:
             return False
         if self._gate is not None and not self._gate._node_visible(principal, self._gate._nodes.get(node.id)):
+            return False
+        read_gate = self._node_gates.get(node.node_type)
+        if read_gate is not None and not read_gate(principal, node):
             return False
         if node.commons:
             # as visible as its most visible writer (see _Node.eff_scope); fields gate separately
@@ -1702,6 +1732,41 @@ class GraphProjection:
                     "head_visible": head_visible,
                     "reviews": reviews, "authors": sorted(authors)}
 
+    def edges_into_by_writers(self, principal, to_id: str, edge_type: str, writers, *,
+                              include_removed: bool = False, limit: int = 256) -> list:
+        """Views of the visible ``edge_type`` edges INTO ``to_id`` whose current add was written by one of ``writers``.
+
+        Unlike ``neighborhood`` this is not an incident-edge scan under a budget that other principals can spend: the
+        candidates come from the configured writers' own by-owner index (or the node's in-edges when that is smaller), and
+        the writer is checked on every one, so a flood of junk edges from other principals cannot push a trusted writer's
+        edge out of view. KeyError if ``to_id`` is absent or hidden from ``principal``. At most ``limit`` views."""
+        writers = frozenset(writers)
+        with self._lock:
+            if not self._node_visible(principal, self._nodes.get(to_id)):
+                raise KeyError(to_id)
+            ins = self._in.get(to_id, {})
+            mine = [set(self._edges_by_owner.get(w, ())) for w in sorted(writers)]
+            if sum(len(m) for m in mine) <= len(ins):
+                keys = [k for m in mine for k in m if k in ins]
+            else:
+                keys = list(ins)
+            ctx, out = {}, []
+            for key in keys:
+                edge = self._edges.get(key)
+                if edge is None or edge.edge_type != edge_type or not self._live(edge):
+                    continue
+                if edge.adds.best()[4][1] not in writers:
+                    continue
+                if not include_removed and self._is_removed(edge):
+                    continue
+                if not (can_see(principal, edge.scope or "private", edge.writers())
+                        and self._node_visible(principal, self._nodes.get(edge.from_id))):
+                    continue
+                out.append(self._edge_view(edge, principal, ctx))
+                if len(out) >= limit:
+                    break
+            return out
+
     def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
                    limit: int = DEFAULT_NODES, contexts: frozenset | None = None) -> dict:
         """The nodes of one type the caller may see (first-seen order, at most ``limit``), plus the visible
@@ -1908,6 +1973,10 @@ class GraphProjection:
         if len(got) > LEDGER_SCAN_BUDGET or (i > 0 and len(got) >= LEDGER_SCAN_BUDGET):
             trimmed = True
         return got[:LEDGER_SCAN_BUDGET][::-1], trimmed
+
+    @staticmethod
+    def _at(epoch: float | None) -> str | None:
+        return datetime.fromtimestamp(epoch, UTC).isoformat() if epoch else None
 
     @staticmethod
     def _iso(value: Any) -> str | None:
@@ -2143,9 +2212,9 @@ class GraphProjection:
                 if "admitted_at" in d:
                     d["admitted_at"] = None
         for n in out.get("nodes", ()):
-            for k in ("first_event_id", "last_event_id"):
+            for k, t in (("first_event_id", "first_seen_at"), ("last_event_id", "last_seen_at")):
                 if n.get(k) is not None and n[k] not in post:
-                    n[k] = None
+                    n[k] = n[t] = None
             f = n.get("fields") or {}
             for v in (f.get("label"), f.get("state"), *(f.get("attrs") or {}).values()):
                 fix(v)
@@ -2198,6 +2267,8 @@ class GraphProjection:
             for k in ("event_id", "first_event_id", "last_event_id"):
                 if d.get(k) is not None and pre(d[k]):
                     d[k] = None
+                    if k != "event_id":
+                        d["first_seen_at" if k == "first_event_id" else "last_seen_at"] = None
                     if k == "event_id":
                         for extra in ("admitted_at", "reason", "source_sequence"):
                             if extra in d:

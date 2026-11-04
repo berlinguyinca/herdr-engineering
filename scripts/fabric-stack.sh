@@ -9,7 +9,11 @@
 #   ./scripts/fabric-stack.sh            # detect IP, write .env, build+up
 #   ./scripts/fabric-stack.sh --replace  # also stop the OLD host-run services
 #   ./scripts/fabric-stack.sh down       # stop the stack
-#   ./scripts/fabric-stack.sh status     # show container + healthz state
+#   ./scripts/fabric-stack.sh status     # show container + healthz state (+ Hindsight memory, when deployed)
+#   ./scripts/fabric-stack.sh memory-route enable|disable|status
+#                                        # route https://memory.<domain> and https://memory.dev.lan to the loopback
+#                                        # Hindsight API through the gateway (deploy/fabric-stack/config.yaml `routes`);
+#                                        # edits the file only, then prints the gateway recreate command to run
 set -euo pipefail
 
 STACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../deploy/fabric-stack" && pwd)"
@@ -51,8 +55,16 @@ gen_coredns() {
     local gen="$STACK_DIR/coredns/generated"
     mkdir -p "$gen"
     sed "s/{{GATEWAY_TAILNET_IP}}/$IP/g" "$STACK_DIR/coredns/Corefile.tmpl" > "$gen/Corefile"
-    sed "s/{{GATEWAY_TAILNET_IP}}/$IP/g" "$STACK_DIR/coredns/dev.lan.zone.tmpl" > "$gen/dev.lan.zone"
-    say "Rendered CoreDNS config (dev.lan -> $IP): $gen"
+    # Optional standby gateway (HA pair): GATEWAY_PEER_TAILNET_IP adds a second A record for dev.lan and *.dev.lan.
+    # Clients try both addresses; the one without a listener refuses and they fall through to the active gateway.
+    local peer_apex="" peer_wild=""
+    if [ -n "${GATEWAY_PEER_TAILNET_IP:-}" ]; then
+        peer_apex="    IN A   ${GATEWAY_PEER_TAILNET_IP}"
+        peer_wild="*   IN A   ${GATEWAY_PEER_TAILNET_IP}"
+    fi
+    sed -e "s/{{GATEWAY_TAILNET_IP}}/$IP/g" -e "s|{{PEER_APEX_RECORD}}|$peer_apex|" -e "s|{{PEER_WILDCARD_RECORD}}|$peer_wild|" \
+        "$STACK_DIR/coredns/dev.lan.zone.tmpl" > "$gen/dev.lan.zone"
+    say "Rendered CoreDNS config (dev.lan -> $IP${GATEWAY_PEER_TAILNET_IP:+, $GATEWAY_PEER_TAILNET_IP}): $gen"
 }
 
 stop_old_host_services() {
@@ -75,12 +87,51 @@ up() {
     write_env
     gen_coredns
     "${COMPOSE[@]}" build fabric-gateway
-    "${COMPOSE[@]}" up -d --remove-orphans
+    # The optional Hindsight memory containers belong to compose profile `memory`, managed by deploy.sh --with-memory.
+    # While they exist, never ask compose to remove "orphans": this script's env file carries no memory variables.
+    local orphans=(--remove-orphans)
+    if docker inspect herdr-hindsight >/dev/null 2>&1 || docker inspect herdr-hindsight-db >/dev/null 2>&1; then
+        orphans=()
+        warn "Hindsight memory containers present: not using --remove-orphans (managed by deploy.sh --with-memory)"
+    fi
+    "${COMPOSE[@]}" up -d ${orphans[@]+"${orphans[@]}"}
     "${COMPOSE[@]}" ps
+}
+
+memory_status() {
+    # Read-only. UNKNOWN when docker cannot answer; never a guess.
+    local name state
+    for name in herdr-hindsight-db herdr-hindsight; do
+        state="$(docker inspect -f '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$name" 2>&1)" || {
+            case "$state" in *"No such"*) continue ;; *) echo "$name: UNKNOWN (docker did not answer)"; continue ;; esac; }
+        echo "$name: $state"
+    done
+}
+
+memory_route() {
+    local cfg="$STACK_DIR/config.yaml" mark='# herdr-memory-route'
+    case "${1:-status}" in
+        enable)
+            sed -i.bak -E "/$mark\$/ s/^( *)# - /\1- /" "$cfg" && rm -f "$cfg.bak"
+            say "memory routes enabled in $cfg (https://memory.<domain> and https://memory.dev.lan -> 127.0.0.1:<memory port>)"
+            say "apply: recreate the fabric-gateway container the way you normally do (deploy/fabric-stack/README.md, 'HTTPS on 443');"
+            say "       it needs the compose variables deploy.sh renders (GATEWAY_BIND ...), so use the same invocation as for any gateway change"
+            ;;
+        disable)
+            sed -i.bak -E "/$mark\$/ s/^( *)- /\1# - /" "$cfg" && rm -f "$cfg.bak"
+            say "memory routes disabled in $cfg; apply by recreating fabric-gateway (deploy/fabric-stack/README.md)"
+            ;;
+        status)
+            grep "$mark" "$cfg" || echo "(no memory route lines in $cfg)"
+            ;;
+        *) echo "usage: $0 memory-route enable|disable|status" >&2; exit 2 ;;
+    esac
 }
 
 status() {
     "${COMPOSE[@]}" ps 2>/dev/null || { echo "stack not running"; exit 0; }
+    say "hindsight memory (optional profile):"
+    memory_status
     say "gateway healthz:"
     curl -fsS "http://127.0.0.1:29999/healthz" || echo "(unreachable)"
     echo
@@ -112,8 +163,12 @@ case "$cmd" in
     stop-old)
         stop_old_host_services
         ;;
+    memory-route)
+        memory_route "${2:-status}"
+        exit 0
+        ;;
     *)
-        echo "usage: $0 [up|up-replace|down|status|stop-old]" >&2
+        echo "usage: $0 [up|up-replace|down|status|stop-old|memory-route enable|disable|status]" >&2
         exit 2
         ;;
 esac

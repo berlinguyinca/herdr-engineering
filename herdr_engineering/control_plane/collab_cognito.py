@@ -28,7 +28,7 @@ class CognitoAuthenticator:
                  jwks_fetch: Callable[[], dict] | None = None,
                  group_lookup: Callable[[str], list[str] | None] | None = None,
                  recheck_seconds: float = 60.0, now: Callable[[], float] = time.time,
-                 open_signup: bool = False):
+                 open_signup: bool = False, lookup_grace: float = 5.0):
         m = _POOL_RE.match(pool_id or "")
         if not m or not client_ids or not (required_group or open_signup):
             raise ValueError("pool_id, client_ids and required_group are required")
@@ -45,6 +45,9 @@ class CognitoAuthenticator:
         self._fetch = jwks_fetch or self._fetch_jwks
         self._lookup = group_lookup
         self._recheck = recheck_seconds
+        # How many recheck periods a cached "allowed" survives a failing lookup (an AWS outage).
+        # 0 = fail closed at once, for lookups that fail only when their data went stale.
+        self._grace = lookup_grace
         self._now = now
         self._keys: dict[str, dict] = {}
         self._keys_at = -1e18
@@ -109,7 +112,7 @@ class CognitoAuthenticator:
         return {"user": user, "exp": float(claims["exp"]), "groups": groups}
 
     def verify_id_token(self, token: str, *, user: str) -> str | None:
-        """Verified, lower-cased email from an ID token that belongs to ``user``.
+        """Verified, lower-cased, ASCII-only email from an ID token that belongs to ``user``.
 
         Used only to link a person's email to their (already authenticated) user id so
         they can be invited by email. The ID token must be ours (signature, issuer,
@@ -132,6 +135,8 @@ class CognitoAuthenticator:
         verified = claims.get("email_verified") in (True, "true")
         if (claims.get("token_use") != "id" or not verified or not isinstance(email, str)
                 or (claims.get("cognito:username") or claims.get("sub")) != user):
+            return None
+        if not email.isascii():   # str.lower folds e.g. U+212A KELVIN SIGN to "k": it could match another address
             return None
         return email.strip().lower()
 
@@ -165,7 +170,7 @@ class CognitoAuthenticator:
         except Exception:
             groups = None  # fail closed: an unreachable directory grants nothing new
             if hit:
-                return hit[1] and now - hit[0] < 5 * self._recheck
+                return hit[1] and now - hit[0] < self._grace * self._recheck
         ok = bool(groups) and self.required_group in groups
         if len(self._checked) >= _MAX_CHECKED:   # bounded: drop the oldest tenth
             for k, _ in sorted(self._checked.items(), key=lambda kv: kv[1][0])[:_MAX_CHECKED // 10]:

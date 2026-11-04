@@ -1051,6 +1051,23 @@ def test_scoped_picker_stops_after_verified_reload_without_guessing(tmp_path):
     ]
 
 
+def _node_imports_typescript() -> bool:
+    """Plain `node` imports .ts files only with type stripping (22.18+ by default); older hosts cannot run this transport."""
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    if not shutil.which("node"):
+        return False
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "m.ts").write_text("export const x: number = 1;\n")
+        probe = "import {pathToFileURL} from 'node:url'; await import(pathToFileURL(process.argv[1]).href);"
+        return subprocess.run(["node", "--input-type=module", "-e", probe, str(Path(d) / "m.ts")],
+                              capture_output=True, timeout=30).returncode == 0
+
+
+@pytest.mark.skipif(not _node_imports_typescript(), reason="this host's node cannot import .ts files (needs type stripping)")
 def test_target_lookup_preserves_native_default_legacy_root_discovery(tmp_path):
     from herdr_engineering.pi_recovery import RecoveryTransport
 

@@ -197,9 +197,19 @@ class DevServiceLease:
     expires_at: str = field(default_factory=_now)
     health_last_ok_at: str | None = None
     health_last_error: str | None = None
+    # The port the application itself listens on, when it differs from target_port (a forwarder that could not
+    # reuse the port bound an ephemeral one). Loopback URLs name this port, so it is what URL resolution matches.
+    origin_port: int | None = None
+    # Identity of the network namespace whose loopback the app lives in (e.g. ``net:[4026531840]``). Two
+    # namespaces on one machine can both have a ``localhost:3000``; this keeps them apart.
+    network_namespace: str | None = None
 
     def __post_init__(self) -> None:
         _validate_id("id", self.id)
+        if self.origin_port is not None and not (0 < int(self.origin_port) < 65536):
+            raise ValueError("origin_port out of range")
+        if self.network_namespace is not None and not re.fullmatch(r"[A-Za-z0-9:\[\]._-]{1,64}", self.network_namespace):
+            raise ValueError("invalid network_namespace")
         if self.state not in _LEASE_STATES:
             raise ValueError(f"unknown state {self.state}")
         if self.protocol not in _PROTOCOLS:

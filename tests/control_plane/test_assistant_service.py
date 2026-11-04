@@ -36,7 +36,7 @@ from herdr_engineering.control_plane.assistant import (
 
 
 def make_service(**kwargs):
-    cfg = assistant_config({"personal_assistant": {"enabled": True}})
+    cfg = assistant_config({"personal_assistant": {"enabled": True, "actions": {"allow_self_approval": True}}})
     cfg.update(kwargs)
     return AssistantService(config=cfg)
 
@@ -222,12 +222,13 @@ def test_sensitive_tool_preauthorized_skips_approval():
     svc = make_service()
     a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
     svc.grant_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
-                   tool_id="send_message", scope="*", preauthorized=True)
+                   tool_id="edit_shared", scope="*", preauthorized=True,
+                   principal={"kind": "operator", "id": "key:op", "authenticated_by": "api_key"})
     t = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
     run = svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
                            thread_id=t.thread_id, content="hi")
     action = svc.request_tool_action(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
-                                     tool_id="send_message", scope="*", run_id=run.run_id,
+                                     tool_id="edit_shared", scope="*", run_id=run.run_id,
                                      idempotency_key="k1", request_payload={}, actor="u1")
     assert action.status == "approved"
 
@@ -716,6 +717,23 @@ def test_durable_store_survives_restart(tmp_path):
     assert len(store2.runs) == 1  # the run survived
 
 
+def test_persisted_snapshot_is_owner_only_even_over_a_loose_existing_file(tmp_path):
+    path = tmp_path / "pa.json"
+    path.write_text("{}")
+    path.chmod(0o644)
+    store = AssistantStore(persist_path=str(path))
+    store.persist()
+    assert (path.stat().st_mode & 0o777) == 0o600
+    fresh = tmp_path / "fresh.json"
+    old_umask = os.umask(0o000)
+    try:
+        AssistantStore(persist_path=str(fresh)).persist()
+    finally:
+        os.umask(old_umask)
+    assert (fresh.stat().st_mode & 0o777) == 0o600
+    assert not (tmp_path / "fresh.json.tmp").exists()
+
+
 def test_durable_snapshot_roundtrip(tmp_path):
     path = tmp_path / "pa.json"
     store = AssistantStore(persist_path=str(path))
@@ -921,3 +939,14 @@ def test_postgres_backend_real_roundtrip():
     fresh = AssistantStore(persist_backend=PostgresStoreBackend(dsn))
     fresh.load_persisted()
     assert any(x.name == "ITest" for x in fresh.assistants.values())
+
+
+def test_run_shell_denied_when_allowlist_empty():
+    """An enabled shell with no allowlisted commands must fail closed."""
+    cfg = assistant_config({"personal_assistant": {"enabled": True,
+                                                   "computer": {"allow_shell": True}}})
+    svc = AssistantService(config=cfg)
+    svc._shell_runner = lambda command, timeout: {"exit_code": 0, "stdout": "ran", "stderr": ""}
+    res = svc.run_shell_tool(tenant_id="t1", user_id="u1", command="/bin/echo hi")
+    assert res["denied"] is True
+    assert "allowlist" in res["reason"]

@@ -2,7 +2,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { reportFreshness } from './record-state.js';
 import { formatTimestamp, formatDuration } from './herdr-web-components/format.js';
-import { snapshotText, animateChanges } from './motion.js';
+import { snapshotText, animateChanges, loadingProgress } from './motion.js';
 import { patchText } from './patch.js';
 import './freshness.js';
 
@@ -118,13 +118,14 @@ const styles = `<style>
 .sc-intro {color:var(--text-secondary); max-width:80ch; line-height:1.6}
 .sc-history>summary {cursor:pointer;color:var(--text-secondary);font-size:13px}.sc-history .sc-counts {margin:12px 0}
 .sc-counts {display:flex; flex-wrap:wrap; gap:8px; margin:12px 0}
-.sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px;font-size:13px}
+.sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:var(--control-radius);padding:10px 14px;font-size:13px}
 .sc-counts strong {font-size:20px;margin-right:5px}
 .sc-controls {display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:12px 0}
 .sc-controls label {display:flex;flex-direction:column;gap:5px;font-size:13px}
 .sc-controls input[type=search],.sc-controls select {border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px;background:var(--surface);color:var(--text);font:inherit;max-width:100%}
 .sc-controls .sc-search {flex:1;min-width:190px}.sc-controls .sc-check {flex-direction:row;align-items:center;min-height:38px}
 .sc-toolbar {display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin:15px 0;font-size:13px}
+.sc-toolbar>div {display:flex;flex-wrap:wrap;gap:8px;min-width:0}.sc-toolbar>span {min-width:0;overflow-wrap:anywhere}.sc-controls label {min-width:0}.sc-loading {max-width:100%;overflow-wrap:anywhere}.sc-loading:empty {display:none}
 .sc-group {border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);margin:12px 0;overflow:hidden}
 .sc-group>summary {cursor:pointer;padding:11px 13px;font-weight:600;overflow-wrap:anywhere}
 .sc-group>summary span {font-weight:400;font-size:12px;color:var(--text-secondary);margin-left:12px}
@@ -236,12 +237,20 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       <label>Group by<select id="sc-group"><option value="project">Project / repository</option><option value="host">Host</option><option value="type">Service type</option></select></label>
       <label class="sc-check"><input type="checkbox" id="sc-archived">Include archived</label>
     </div>
-    <div class="sc-toolbar"><span id="sc-result" role="status"></span><div><button class="hd-btn" id="sc-expand">Expand groups</button> <button class="hd-btn" id="sc-collapse">Collapse groups</button></div></div>
-    <p id="sc-error" role="status" class="sc-meta"></p><div id="sc-results"></div>${paged ? '<button class="hd-btn" id="sc-load-more" type="button">Load more</button>' : ''}`;
+    <div class="sc-toolbar"><span id="sc-result" role="status"></span><div><button class="hd-btn hd-btn--secondary" id="sc-expand">Expand groups</button> <button class="hd-btn hd-btn--secondary" id="sc-collapse">Collapse groups</button></div></div>
+    <p id="sc-error" role="status" class="sc-meta"></p><div id="sc-loading" class="sc-loading" role="status"></div><div id="sc-results" aria-busy="false"></div>${paged ? '<button class="hd-btn hd-btn--secondary" id="sc-load-more" type="button">Load more</button>' : ''}`;
   const el = id => root.querySelector(`#sc-${id}`);
   el('status').value = state.status; el('archived').checked = state.archived; el('group').value = state.group;
   const filterKey=node=>node.closest('[data-filter]')?.dataset.filter;
   const serviceKey=node=>node.closest('[data-service-id]')?.dataset.serviceId;
+  function loading() {
+    root.setAttribute('aria-busy',String(pending));
+    el('results').setAttribute('aria-busy',String(pending));
+    if(pending) {
+      if(!el('loading').firstChild)el('loading').innerHTML=loadingProgress('services');
+    } else el('loading').replaceChildren();
+    if(paged)el('load-more').setAttribute('aria-disabled',String(pending));
+  }
   function draw() {
     const focused=document.activeElement;
     const focusedRow=root.contains(focused) ? focused.closest('[data-service-id]') : null;
@@ -294,7 +303,7 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       return (state.archived || current!=='archived') && (state.status==='all' || current===state.status);
     }) : selectServices(services,state);
     const groups=groupServices(selected,state.group,paged);
-    el('result').textContent=paged ? `${counts.matching_total} matching services · ${counts.matching_groups} groups · ${selected.length} loaded`
+    el('result').textContent=paged ? `${counts.matching_total} matching services · ${counts.matching_groups} groups · ${selected.length} of ${counts.matching_total} loaded`
       : `${selected.length} matching services · ${groups.length} groups`;
     if(paged) {el('load-more').hidden=!metadata.page.has_more;el('load-more').setAttribute('aria-disabled',String(pending));}
     el('results').innerHTML=groups.length ? groups.map(g=>{
@@ -355,19 +364,19 @@ export function mountServices(root, client, initial, {showAll = false, status, s
   async function refresh({reset=false,append=false} = {}) {
     if(disposed||document.hidden||(!paged&&pending)||(paged&&append&&pending))return;
     if(!paged) {
-      pending=true;
+      pending=true;loading();
       try {
         const data=await client.listServices();
         if(disposed)return;
         services=data.services;el('error').textContent='';chip()?.touch(true);draw();
       } catch(error) {
         if(!disposed){el('error').textContent='Could not refresh services. Showing the last received catalog.';chip()?.touch(false,error?.message||'request failed');}
-      } finally {pending=false;}
+      } finally {pending=false;if(!disposed)loading();}
       return;
     }
     controller?.abort();
     const request=new AbortController(), version=++generation;
-    controller=request;pending=true;el('load-more').setAttribute('aria-disabled','true');
+    controller=request;pending=true;loading();
     const timeout=setTimeout(()=>request.abort(),12000);
     const options={scope:SCOPE_OF[state.scope],status:state.status,includeArchived:state.archived,
       search:state.search,hostId:state.host,groupBy:state.group,limit:metadata.page.limit,signal:request.signal};
@@ -400,6 +409,8 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       if(!append)groupMetadata.clear();
       for(const [key,group] of groups)groupMetadata.set(key,group);
       loadedPages=append ? loadedPages+pages : pages;
+      // New rows are not a local expiry; start the clock from this received window.
+      classification=services.map(service=>serviceState(service)).join(',');
       el('error').textContent='';chip()?.touch(true);draw();
     } catch(error) {
       if(!disposed&&version===generation) {
@@ -408,11 +419,11 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       }
     } finally {
       clearTimeout(timeout);
-      if(version===generation){pending=false;controller=null;if(!disposed)el('load-more').setAttribute('aria-disabled','false');}
+      if(version===generation){pending=false;controller=null;if(!disposed)loading();}
     }
   }
   if(paged)el('load-more').addEventListener('click',()=>refresh({append:true}));
-  draw();
+  draw();loading();
   // The catalog arrived with the route; the chip starts fresh and follows each 30 s poll.
   const chip=()=>root.querySelector('herdr-freshness');
   chip()?.touch(true);

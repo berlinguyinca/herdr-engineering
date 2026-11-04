@@ -8,7 +8,8 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 PRIVATE_TYPES = frozenset({'lineage', 'review_request', 'inspector', 'host_metrics',
-                           'agent_identity', 'agent_summary'})
+                           'agent_identity', 'agent_summary', 'deployment', 'deployment_plan',
+                           'deployment_request', 'deployment_escalation'})
 ENVELOPE_ONLY = ('host', 'session', 'mission', 'service', 'inspector', 'mission_activity', 'lineage')
 
 
@@ -46,7 +47,11 @@ def _row_key(row):
 
 
 def _event_digest(row):
-    return _b64(hashlib.sha256(json.dumps(public_event(row), sort_keys=True, separators=(',', ':')).encode()).digest())
+    # Internal row-instance UUID changes on every UPDATE. Never expose an
+    # unkeyed digest of payload text: it could become a secret-guessing oracle.
+    value = [str(row.get('recovery_instance') or ''), row['event_id'],
+             row['sequence'], _micros(row['ingest_timestamp'])]
+    return _b64(hashlib.sha256(json.dumps(value, separators=(',', ':')).encode()).digest())
 
 
 def _micros(stamp):
@@ -98,6 +103,7 @@ class PostgresHistory:
 
     async def _get_pool(self):
         import asyncio
+
         import asyncpg
         if self._closed:
             raise RuntimeError('durable history is closed')
@@ -145,7 +151,8 @@ class PostgresHistory:
                 if value[0]==1:
                     anchor=await conn.fetchrow(f'SELECT * FROM {self.table} WHERE entity_type=$1 AND entity_id=$2 '
                         f'ORDER BY {order} OFFSET $3 LIMIT 1',kind,identity,value[1])
-                    matches=anchor is not None and _unb64(_event_digest(anchor)).hex()==value[3]
+                    from .history_cursor import fingerprint
+                    matches=anchor is not None and fingerprint(public_event(anchor))==value[3]
                 else:
                     principal = "COALESCE(actor->>'id','')"
                     key = f"sha256(convert_to(length({principal})::text||':'||{principal}||event_id,'UTF8'))"
@@ -210,5 +217,11 @@ class PostgresHistory:
     def close(self):
         with self._close_lock:
             if self._pool is not None:
-                self.run(self._pool.close())
+                async def close_pool():
+                    import asyncio
+                    try:
+                        await asyncio.wait_for(self._pool.close(), timeout=5)
+                    except TimeoutError:
+                        self._pool.terminate()
+                self.run(close_pool())
             self._closed = True

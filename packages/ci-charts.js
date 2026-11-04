@@ -33,19 +33,26 @@ const number=value=>Math.round(value*100)/100;
 const runLabel=run=>`${run.repository} · Run #${run.runNumber ?? 'unknown'}`;
 const utc=value=>new Date(value).toISOString().replace('T',' ').replace(/\.\d{3}Z$/,' UTC');
 const table=(headers,rows)=>`<div class="ci-chart-table"><table><thead><tr>${headers.map(h=>`<th scope="col">${h}</th>`).join('')}</tr></thead><tbody>${rows.map(row=>`<tr>${row.map(v=>`<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
-function outcomePlot(days) {
-  if(!days.length)return '<p class="ci-chart-note">No dated runs in this selection.</p>';
-  const maximum=Math.max(...days.map(day=>day.current+day.failed+day.finished));
+// One stacked bar per UTC day. `series` lists the stacked keys bottom to top; the same plot draws the CI outcomes and the review decisions.
+export function stackedDayPlot(days,series,{id,title,desc,empty}) {
+  if(!days.length)return `<p class="ci-chart-note">${esc(empty)}</p>`;
+  const total=day=>series.reduce((sum,s)=>sum+day[s.key],0);
+  const maximum=Math.max(...days.map(total));
   const width=300/days.length, barWidth=Math.min(28,width*.7);
   const bars=days.map((day,index)=>{
     let y=130;
-    return ['finished','failed','current'].map(tab=>{
-      const height=day[tab]/maximum*100;y-=height;
-      return day[tab] ? `<rect x="${number(42+index*width+(width-barWidth)/2)}" y="${number(y)}" width="${number(barWidth)}" height="${number(height)}" fill="${colors[tab]}"><title>${day.day}: ${day[tab]} ${labels[tab]}</title></rect>` : '';
+    return series.map(s=>{
+      const height=day[s.key]/maximum*100;y-=height;
+      return day[s.key] ? `<rect x="${number(42+index*width+(width-barWidth)/2)}" y="${number(y)}" width="${number(barWidth)}" height="${number(height)}" fill="${s.color}"><title>${day.day}: ${day[s.key]} ${s.label}</title></rect>` : '';
     }).join('');
   }).join('');
   const ticks=[...new Set([0,Math.floor((days.length-1)/2),days.length-1])].map(i=>`<text x="${number(42+(i+.5)*width)}" y="150" text-anchor="middle">${days[i].day.slice(5)}</text>`).join('');
-  return `<svg viewBox="0 0 360 165" role="img" aria-labelledby="ci-outcomes-title ci-outcomes-desc"><title id="ci-outcomes-title">Observed run outcomes by UTC creation day</title><desc id="ci-outcomes-desc">${days.length} reported dates. Stacked counts distinguish finished, failed and open or unknown runs. Exact counts follow in Chart data.</desc><line x1="42" y1="130" x2="342" y2="130"/><text x="34" y="34" text-anchor="end">${maximum}</text><text x="34" y="134" text-anchor="end">0</text>${bars}${ticks}</svg>`;
+  return `<svg viewBox="0 0 360 165" role="img" aria-labelledby="${id}-title ${id}-desc"><title id="${id}-title">${esc(title)}</title><desc id="${id}-desc">${days.length} ${esc(desc)}</desc><line x1="42" y1="130" x2="342" y2="130"/><text x="34" y="34" text-anchor="end">${maximum}</text><text x="34" y="134" text-anchor="end">0</text>${bars}${ticks}</svg>`;
+}
+export {table as chartTable};
+function outcomePlot(days) {
+  return stackedDayPlot(days,['finished','failed','current'].map(key=>({key,label:labels[key],color:colors[key]})),{id:'ci-outcomes',title:'Observed run outcomes by UTC creation day',
+    desc:'reported dates. Stacked counts distinguish finished, failed and open or unknown runs. Exact counts follow in Chart data.',empty:'No dated runs in this selection.'});
 }
 function durationPlot(points) {
   if(!points.length)return '<p class="ci-chart-note">No completed run has valid start and finish times in this selection.</p>';

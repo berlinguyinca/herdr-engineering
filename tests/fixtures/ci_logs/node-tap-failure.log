@@ -1,0 +1,44 @@
+# Subtest: the font assertion looks at every element: a host font on ANY element fails the capture
+ok 269 - the font assertion looks at every element: a host font on ANY element fails the capture
+  ---
+  duration_ms: 1193.202826
+  ...
+# Subtest: the baselines do not depend on the host: the whole suite passes under a host fontconfig that knows ONLY the bundled fonts and renders with other settings
+not ok 270 - the baselines do not depend on the host: the whole suite passes under a host fontconfig that knows ONLY the bundled fonts and renders with other settings
+  ---
+  duration_ms: 154577.432694
+  location: '/tmp/woodpecker-local-1487533088/workspace/tests/visual/ui-gates-visual.test.mjs:102:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    baselines:check under the bundled-fonts-only fontconfig failed:
+    FAIL collab-rooms__desktop: 0.2184% of pixels differ (budget 0.01%)
+    FAIL collab-rooms__desktop-dark: 0.2182% of pixels differ (budget 0.01%)
+    FAIL collab-rooms__tablet: 0.4025% of pixels differ (budget 0.01%)
+    FAIL collab-rooms__tablet-dark: 0.4050% of pixels differ (budget 0.01%)
+    FAIL collab-rooms__mobile: 22.4400% of pixels differ (budget 0.01%)
+    FAIL collab-rooms__mobile-dark: 22.5175% of pixels differ (budget 0.01%)
+    FAIL collab-chat__desktop: 2.5905% of pixels differ (budget 0.01%)
+    FAIL collab-chat--subtabs__desktop: 82.3219% of pixels differ (budget 0.05%)
+    FAIL collab-chat__desktop-dark: 2.5995% of pixels differ (budget 0.01%)
+    FAIL collab-chat--subtabs__desktop-dark: 82.6156% of pixels differ (budget 0.05%)
+    FAIL collab-chat__tablet: 15.0800% of pixels differ (budget 0.01%)
+    FAIL collab-chat__tablet-dark: 15.1376% of pixels differ (budget 0.01%)
+    FAIL collab-chat__mobile: 20.4702% of pixels differ (budget 0.01%)
+    FAIL collab-chat__mobile-dark: 20.5581% of pixels differ (budget 0.01%)
+    FAIL collab-tabs__desktop: 5.2103% of pixels differ (budget 0.01%)
+    FAIL collab-tabs__desktop-dark: 5.2271% of pixels differ (budget 0.01%)
+  stack: |-
+    TestContext.<anonymous> (file:///tmp/woodpecker-local-1487533088/workspace/tests/visual/ui-gates-visual.test.mjs:173:14)
+    async Test.run (node:internal/test_runner/test:932:9)
+    async Test.processPendingSubtests (node:internal/test_runner/test:629:7)
+  ...
+1..298
+# tests 298
+# suites 0
+# pass 291
+# fail 7
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 671173.56899
+ui-gates: test:ui-gates took 671s (budget 1500s)

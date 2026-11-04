@@ -212,3 +212,29 @@ def test_store_picks_up_a_rename_replace(tmp_path):
     os.replace(tmp, p)
     assert store.current().revision != old
     assert "beast" not in store.current().status()["hosts"]
+
+
+def _with_github_app(app):
+    data = base()
+    data["sections"]["github"] = {"roles": ["ci"], "values": {"token": "", "app": app}}
+    return data
+
+
+def test_a_github_app_block_survives_the_loader_and_the_host_slice(tmp_path):
+    from herdr_engineering.github_auth import parse_app_config
+    from herdr_engineering.host_config import HostConfig
+
+    app = {"app_id": 123456, "private_key_file": "/etc/herdr/github-app.pem",
+           "installations": {"InferWeave": 11, "berlinguyinca": "auto"}}
+    cfg = load_fleet_config(write(tmp_path, _with_github_app(app)))
+    values = json.loads(json.dumps(cfg.slice_for("beast")))  # the host cache is JSON
+    host = HostConfig("http://cp", "beast", cfg.revision, values)
+    assert host.get("github.app") == app
+    assert parse_app_config(host.get("github.app")).owners == ("berlinguyinca", "inferweave")
+
+
+@pytest.mark.parametrize("app", [{"app_id": "x"}, {"app_id": 1, "private_key_file": "rel.pem",
+                                                   "installations": {"a": 1}}, "yes"])
+def test_an_invalid_github_app_block_is_refused_by_the_loader(tmp_path, app):
+    with pytest.raises(FleetConfigError, match="section github: github.app is invalid"):
+        load_fleet_config(write(tmp_path, _with_github_app(app)))

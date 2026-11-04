@@ -267,7 +267,8 @@ def test_install_fleet_host_config_reads_the_fleet_file(tmp_path, monkeypatch):
     path = fcc.init_config(tmp_path / "fleet.yaml", {
         "public_url": "https://cp.test", "llm_upstream_url": "https://llm.test",
         "llm_upstream_key": "k", "ci_url": "https://ci.test", "ci_token": "ci-t",
-        "github_token": "gh-t", "fabric_url": "http://fab:29999", "hosts": {"h": ["ci"]}},
+        "github_token": "gh-t", "fabric_url": "http://fab:29999", "hosts": {"h": ["ci"]},
+        "gateway_tailnet_ip": "127.0.0.1"},         # else it defaults to `tailscale ip -4`, which hosts without tailscale lack
         prompt=lambda *_: "", secret_prompt=lambda *_: "")
     monkeypatch.setattr(hc, "host_config", _REAL_HOST_CONFIG)
     _install_fleet_host_config(FleetConfigStore(path))
