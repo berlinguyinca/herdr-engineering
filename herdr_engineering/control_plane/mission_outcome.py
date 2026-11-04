@@ -229,6 +229,7 @@ def outcome_summaries(repo):
     """Per mission key, a small summary of its latest stored outcome (for catalog rows). Newest outcome wins;
     a mission reopened since its outcome has none."""
     out = {}
+    prs = _pr_refs_by_mission(repo)
     for mission in repo.list_missions()[:MAX_SUMMARIES]:
         key = mission_key(mission)
         event = last_outcome(repo, key)
@@ -240,8 +241,25 @@ def outcome_summaries(repo):
         p = event["payload"]
         out[key] = {"result": RESULT.get(p.get("final_stage"), "unknown"), "final_stage": p.get("final_stage"),
                     "inferred": bool(p.get("inferred")), "ended_at": p.get("ended_at"), "duration_s": p.get("duration_s"),
-                    "agent_count": p.get("agent_count"), "repository": p.get("repository"), "last_event": last_event(p)}
+                    "agent_count": p.get("agent_count"), "repository": p.get("repository"), "last_event": last_event(p),
+                    "prs": prs.get(key, [])}
     return out
+
+
+def _pr_refs_by_mission(repo):
+    """One bulk read of the PR records, grouped by the exact mission key (namespaces never mix): {key: [{repository, number}]},
+    sorted by (repository, number) so the order is deterministic. A failing read yields no refs, never a failed list."""
+    grouped = {}
+    try:
+        records = repo.list_pull_requests()
+    except Exception:  # noqa: BLE001 - refs are a convenience on a list; the list itself must still answer
+        return grouped
+    for rec in records:
+        number, repository = rec.get("number"), rec.get("repository")
+        if rec.get("mission_id") is None or not isinstance(number, int) or isinstance(number, bool) or not isinstance(repository, str):
+            continue
+        grouped.setdefault(rec["mission_id"], set()).add((_text(repository, 120), number))
+    return {k: [{"repository": r, "number": n} for r, n in sorted(v)] for k, v in grouped.items()}
 
 
 class MissionOutcomes:
