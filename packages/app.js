@@ -482,9 +482,12 @@ async function viewArchitecture() {
 }
 
 async function viewOverview() {
+  // Show the page frame and a skeleton straight away; the capability wait (bounded) must not leave the generic page skeleton up.
+  root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard">${skeleton('overview', { rows: 8, height: 64 })}</div>`;
+  const host = document.getElementById('overview-dashboard');
   const workCenter = await workCenterOn();
-  root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard"></div>`;
-  return ownPolling(mountOverview(document.getElementById('overview-dashboard'), client, { freshness: chipIn(root), workCenter }));
+  if (!host.isConnected) return { refresh() {}, dispose() {} };   // navigated away while the capability probe was pending
+  return ownPolling(mountOverview(host, client, { freshness: chipIn(root), workCenter }));
 }
 
 async function viewAttention() {
@@ -512,7 +515,11 @@ async function viewGithubProjects() {
   const query = route().query;
   // WC-005b: one read on mount of the mission PR refs (no polling); a failed read marks the Herdr data partial.
   // Flag off: no read at all and no refs, exactly the board before the Work Command Center.
+  // Same frame as the board's own first paint (heading + board skeleton), so the capability wait does not leave the generic page skeleton up.
+  root.innerHTML = `<div class="hd-live-head"><h1>Project boards</h1></div>${skeleton('project board', { rows: 2, height: 64 })}`;
+  const frame = root.firstElementChild;
   const workCenter = await workCenterOn();
+  if (!frame.isConnected) return { refresh() {}, dispose() {} };   // navigated away while the capability probe was pending
   let herdrRefs = workCenter ? [] : null;
   let herdrRefsFailed = false;
   if (workCenter) try {
