@@ -26,7 +26,7 @@
 - `/api/v1` tests need `asyncpg`: `PYTHONPATH=/tmp/claude-1000/-home-wohlgemuth-IdeaProjects/a8939f5b-bb45-4f5f-a41d-65023acf9586/scratchpad/deps`.
 - The API key is read from a file path only (`api_key_file`), never inline in YAML, never in audit/logs/snapshot/MCP output/exception text/`repr`. Only a short fingerprint (first 8 hex of sha256) may be shown.
 - Judge input is the canonical `ActionKey` facts (tool, verb, resource_scope, flag_class, risk_class) plus owner-authored context only. Command text, `display`, tool output, PR bodies, chat text, worker hints and `argv` digests/targets are NEVER sent to the judge.
-- Fail closed everywhere: judge disabled, unconfigured, unreachable, slow, malformed, mismatched model => no autonomy (`pending`). The judge can only escalate; it never turns `pending` into `authorized`.
+- Fail closed everywhere: judge disabled, unconfigured, unreachable, slow, malformed, empty model id => no autonomy (a resolved checkpoint id that differs from the configured model is expected and recorded, not an error) (`pending`). The judge can only escalate; it never turns `pending` into `authorized`.
 - Judge version = sha256 of (model id, thresholds, question-set version); any change resets ACTIVE/PROPOSED grants to SHADOW and invalidates calibration labels of the old version (spec 6.2).
 - Defaults (spec 7.1, builder's calls): `timeout_seconds: 5`, `destructive: 0.30`, `irreversible: 0.30`, `severity_score: 2.0`, `min_labeled_decisions: 200`, `max_false_negative_bound: 0.05` (95% one-sided Clopper-Pearson upper bound, per risk class), `backend_confirmed: false`, `model: laya-auto`.
 - The canary prompt (spec 7.4, marked droppable) is NOT built in this phase; documented as deferred.
