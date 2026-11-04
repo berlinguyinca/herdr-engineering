@@ -1,0 +1,19 @@
+{
+  "README.md": "49b2de34079bfcf79622d5c97fbefd75fbfd501d0f358d25d2602504f5a97238",
+  "agent-prompt.md": "cdbdfaa159796a3035f2f150b655a5b0b88c4515c521408b4b76cfa92b3f0704",
+  "architecture/01-boundaries.md": "978cf5d71ad0807f2d150819c91aedd09dffd0be6a597ddd684b9a1837efbc71",
+  "architecture/02-storage-and-lifecycle.md": "57ea0dae4df11cd56c72133d78e13e734872210584fea505769ce6a5e247f276",
+  "architecture/03-artifact-engine.md": "540eee83286944dce26f7d6cc1b2c7318e0c6a0b75e28d7555e8cfcf4cf1babb",
+  "architecture/04-public-exposure.md": "d61ceb15f1aabb065f84205ad477c9e96c01fffbccd5889e116fa0878153165a",
+  "architecture/05-dashboard.md": "83b11590457e3b029249cb2c82f8528423cafe091da8fc472a7467cc541891e3",
+  "contracts/01-api.md": "132134fd0a0537707f3ff6d4406134288324aded92e23e95535a486e17777da1",
+  "contracts/02-examples.yaml": "b151a7aca7a7b4083a3ca391b0f51b19361b7d75fb737ba23f500673482e73f4",
+  "decision-log.md": "2eb2ed4acb56db5714579dfd443a2164c27cf1f707cbf9a62fdf625b936775ef",
+  "plans/00-audit-and-decisions.md": "b913ca2cadd053fb9981004b95c0b67ea536d5c2766295a1928db7c17da3953a",
+  "plans/01-registry-and-authoring.md": "fea1efdef4ed8b10da19534b1716fc37a56e0dd0cc97c85ceb287e7aa178444a",
+  "plans/02-studio-collaboration.md": "6006cf423a676265d1256286736c75c12ba11e72a041b8bee14819a502cfed67",
+  "plans/03-publication.md": "6b82e187acdbdd303ffe50fd7e3caad45e7e6167115ec45ba1cbca8cb264cc0f",
+  "plans/04-live-and-multiprovider.md": "3c9ce5702de104e8aa60f0641760ed0e6b320d53335f7e2907629e5a5f678072",
+  "qa/acceptance.md": "35c1d01838db27058b4bfff09eb672f2232e423e1a3f9c7a0d11bf783d5613a1",
+  "security/threat-model.md": "6c1c957706ca3ac7cf17a0975d4f70a2fefe40fba4e026d1764b36d6a97ede47"
+}

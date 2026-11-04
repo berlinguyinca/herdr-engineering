@@ -97,9 +97,9 @@ export class CollabApi {
   createProject(name) { return this.call('POST', '/projects', { name }); }
   createRoom(project, name) { return this.call('POST', `/projects/${encodeURIComponent(project)}/rooms`, { name }); }
   events(id, cursor) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/events?cursor=${cursor}&limit=200`); }
-  say(id, text) {
+  say(id, text, artifactIds = []) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/messages`,
-      { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}` });
+      { text, artifact_ids: artifactIds, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}` });
   }
   agents() { return this.call('GET', '/agents'); }
   connectAgent(name) {

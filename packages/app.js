@@ -15,12 +15,17 @@ import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountTopology } from './topology-view.js';
+import { mountHandoffs } from './handoffs-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
+import { renderSchedulingView } from './scheduler-view.js';
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
+import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
+import { mountPublications } from './publications-view.js';
+import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -48,6 +53,7 @@ const root = document.getElementById('view');
 const NAV = [
   { path: '/overview', label: 'Overview' },
   { path: '/topology', label: 'Topology' },
+  { path: '/handoffs', label: 'Handoffs' },
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Sessions' },
   { path: '/services', label: 'Services' },
@@ -57,9 +63,12 @@ const NAV = [
   { path: '/ci', label: 'CI' },
   { path: '/reviews', label: 'Reviews' },
   { path: '/hosts', label: 'Hosts' },
+  { path: '/scheduling', label: 'Scheduling' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
   { path: '/collab', label: 'Collaboration' },
+  { path: '/artifacts', label: 'Artifacts' },
+  { path: '/publications', label: 'Publications' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -77,9 +86,13 @@ const ROUTES = {
   '/overview': viewOverview,
   '/github': viewGithub,
   '/collab': viewCollab,
+  '/artifacts': viewArtifacts,
+  '/artifacts/:id': viewArtifact,
+  '/publications': viewPublications,
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
   '/topology': viewTopology,
+  '/handoffs': viewHandoffs,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
   '/herd': viewSessions,
@@ -89,6 +102,7 @@ const ROUTES = {
   '/local-services': viewServices,
   '/services/:id': viewService,
   '/hosts': viewHosts,
+  '/scheduling': viewScheduling,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,
@@ -111,6 +125,7 @@ const onSessionPage = () => route().parts[0] === 'herd' && route().parts[1] === 
 
 async function render() {
   const revision = ++renderRevision;
+  const startedAt = Date.now();
   refreshMissionHistory = null;
   if (dashboardView) { dashboardView.dispose(); dashboardView = null; }
   if (sessionRequest) { sessionRequest.abort(); sessionRequest = null; }
@@ -129,7 +144,9 @@ async function render() {
     await ROUTES[match || '/overview'](parts, revision);
   } catch (err) {
     if (revision !== renderRevision) return;
-    root.innerHTML = `<herdr-error message="${esc(err.message || 'request failed')}"></herdr-error>`;
+    const detail = classifyDashboardError(err, Date.now() - startedAt);
+    detail.requestId = err?.requestId || '';
+    root.innerHTML = `<herdr-error message="${esc(dashboardErrorMessage('This page', detail))}"></herdr-error><p class="hd-note">The page could not load completely. <button type="button" data-route-retry>Retry</button>${detail.requestId ? ` Request ${esc(detail.requestId)}` : ''}</p>`;
   }
 }
 
@@ -139,6 +156,10 @@ async function viewTopology() {
   dashboardView = mountTopology(root, client, {status: route().query.get('status') || 'current'});
 }
 
+async function viewHandoffs() {
+  dashboardView = mountHandoffs(root, client);
+}
+
 async function viewOverview() {
   root.innerHTML = '<h1>Overview</h1><div id="overview-dashboard"></div>';
   dashboardView = mountOverview(document.getElementById('overview-dashboard'), client);
@@ -146,6 +167,24 @@ async function viewOverview() {
 
 async function viewCollab() {
   dashboardView = mountCollab(root, { fabricSessions: () => client.listSessions('active') });
+}
+
+async function viewArtifacts() {
+  root.innerHTML = '<h1>Artifacts</h1><div id="artifact-registry"></div>';
+  dashboardView = { dispose: mountArtifacts(document.getElementById('artifact-registry'), client) };
+}
+
+async function viewArtifact(parts) {
+  const view = renderArtifactDetail(root, client, parts[1], {
+    versionId: route().query.get('version') || undefined,
+  });
+  dashboardView = view;
+  await view.ready;
+}
+
+async function viewPublications() {
+  root.innerHTML = '<h1>Publications</h1><div id="publication-registry"></div>';
+  dashboardView = { dispose: mountPublications(document.getElementById('publication-registry'), client) };
 }
 
 async function viewGithub() {
@@ -364,6 +403,79 @@ async function viewHosts() {
     ${renderFleetMatrix(matrix, { driftedOnly })}`;
 }
 
+async function viewScheduling() {
+  const payload = await client.schedulerOverview();
+  root.innerHTML = `<h1>Scheduling</h1>${renderSchedulingView(payload)}`;
+  // Preserve policy edits and preview inputs when global SSE events arrive.
+  dashboardView = {dispose() {}};
+  const simulator = root.querySelector('[data-scheduler-simulator]');
+  simulator.addEventListener('submit', async event => {
+    event.preventDefault();
+    const output = simulator.querySelector('output');
+    const values = new FormData(simulator);
+    output.textContent = 'Replaying recorded placements…';
+    try {
+      const result = await client.previewSchedulerSimulation({days:Number(values.get('days')),
+        cpu_weight:Number(values.get('cpu_weight')), memory_weight:Number(values.get('memory_weight'))});
+      output.textContent = `${result.observed_decisions} observed decisions; ${result.changed_placements} changed placements; ${result.queued} queued; ${result.incomplete_snapshots} incomplete snapshots. ${result.limitations.join(' ')}`;
+    } catch (error) { output.textContent = `Simulation unavailable: ${error.message}`; }
+  });
+  for (const button of root.querySelectorAll('[data-retry-placement]')) {
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      const output = button.parentElement.querySelector('output');
+      try {
+        const result = await client.retrySchedulerReservation(button.dataset.retryPlacement);
+        output.textContent = `Placement ${result.state}${result.host_uid ? ` on ${result.host_uid}` : ''}.`;
+        if (result.state !== 'queued') button.hidden = true;
+      } catch (error) { output.textContent = `Retry failed: ${error.message}`; }
+      finally { button.disabled = false; }
+    });
+  }
+  for (const policyForm of root.querySelectorAll('[data-host-policy]')) {
+    policyForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const output = policyForm.querySelector('output');
+      const button = policyForm.querySelector('button');
+      const values = new FormData(policyForm);
+      if (!values.get('confirm')) return;
+      button.disabled = true;
+      try {
+        const updated = await client.setSchedulerHostPolicy({
+          host_uid: policyForm.dataset.hostPolicy,
+          expected_revision: Number(policyForm.dataset.revision), mode: values.get('mode'),
+          reason: 'Explicit dashboard operator selection',
+        });
+        policyForm.dataset.revision = String(updated.revision);
+        output.textContent = `Saved ${updated.mode}; revision ${updated.revision}.`;
+        policyForm.querySelector('[name="confirm"]').checked = false;
+      } catch (error) {
+        output.textContent = `Policy unchanged: ${error.message}. Refresh to obtain the current revision.`;
+      } finally { button.disabled = false; }
+    });
+  }
+  const form = root.querySelector('[data-scheduler-plan]');
+  const result = root.querySelector('[data-scheduler-plan-result]');
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const values = new FormData(form);
+    result.textContent = 'Planning…';
+    try {
+      const decision = await client.schedulerPlan({
+        request_id: values.get('request_id'), agent_family: values.get('agent_family'),
+        placement_mode: 'automatic',
+        resource_profile: { class: 'coding', cpu_cores: Number(values.get('cpu_cores')), memory_gib: Number(values.get('memory_gib')) },
+      });
+      const selected = decision.selected_host_uid || 'queued';
+      const reasons = Object.entries(decision.explanations || {}).map(([host, explanation]) =>
+        `${host}: ${(explanation.reason_codes || []).join(', ') || `score ${explanation.score}`}`).join(' · ');
+      result.textContent = `Selected: ${selected}. ${reasons}`;
+    } catch (error) {
+      result.textContent = `Placement preview failed: ${error.message}`;
+    }
+  });
+}
+
 async function viewHost(parts) {
   const h = await client.request(`/api/v1/hosts/${esc(parts[1])}`);
   if (!h || h.error) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
@@ -559,6 +671,9 @@ connectEvents({
   onError: () => { /* keep last view; the client auto-reconnects */ },
 });
 
+document.addEventListener('click', event => {
+  if (event.target.closest?.('[data-route-retry]')) render();
+});
 window.addEventListener('hashchange', () => {
   if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
   lastLiveRender = Date.now(); render();

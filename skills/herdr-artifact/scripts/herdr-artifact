@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+# Native harness wrapper. Keep this intentionally thin: authentication,
+# private control-plane routing, and artifact authorization stay in herdr-eng.
+command=${1:-}
+[ "$#" -gt 0 ] && shift
+
+case "$command" in
+  create|upload)
+    exec herdr-eng artifacts upload "$@"
+    ;;
+  history)
+    artifact_id=${1:?usage: herdr-artifact history ARTIFACT_ID [--control-plane URL]}
+    shift
+    base=${HERDR_CONTROL_PLANE_URL:-}
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --control-plane) base=$2; shift 2 ;;
+        *) break ;;
+      esac
+    done
+    [ -n "$base" ] || { echo "control-plane URL required" >&2; exit 2; }
+    exec curl --fail --silent --show-error \
+      "$base/api/v1/artifacts/$artifact_id/versions"
+    ;;
+  share-request)
+    artifact_id=${1:?usage: herdr-artifact share-request ARTIFACT_ID VERSION_ID [options]}
+    version_id=${2:?usage: herdr-artifact share-request ARTIFACT_ID VERSION_ID [options]}
+    shift 2
+    base=${HERDR_CONTROL_PLANE_URL:-}
+    audience=unlisted_link
+    expires_at=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --control-plane) base=$2; shift 2 ;;
+        --audience) audience=$2; shift 2 ;;
+        --expires-at) expires_at=$2; shift 2 ;;
+        *) echo "unknown share-request option: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$base" ] || { echo "control-plane URL required" >&2; exit 2; }
+    [ -n "$expires_at" ] || { echo "--expires-at is required" >&2; exit 2; }
+    body=$(python3 - "$artifact_id" "$version_id" "$audience" "$expires_at" <<'PY'
+import json
+import sys
+print(json.dumps({"resource_id": sys.argv[1], "version_id": sys.argv[2],
+                  "audience": sys.argv[3], "expires_at": float(sys.argv[4])}))
+PY
+)
+    exec curl --fail --silent --show-error -H 'Content-Type: application/json' \
+      -X POST --data "$body" "$base/api/v1/publications/requests"
+    ;;
+  *)
+    echo "usage: herdr-artifact {create|upload|history|share-request} ..." >&2
+    exit 2
+    ;;
+esac

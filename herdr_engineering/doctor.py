@@ -83,7 +83,7 @@ def _tailscale_up() -> bool:
 
 
 def run_doctor(config: dict[str, Any] | None = None,
-               herdr_adapter=None, herdr_bin: str = "herdr") -> DoctorReport:
+               herdr_adapter=None, herdr_bin: str = "herdr", strict: bool = False) -> DoctorReport:
     report = DoctorReport()
     report.platform = platform.platform()
     report.python = platform.python_version()
@@ -168,6 +168,12 @@ def run_doctor(config: dict[str, Any] | None = None,
                f"{len(adopted)} adopted plugin(s): {', '.join(adopted)}",
                {"adopted": adopted})
 
+    from .handoff_dependency import check_handoff_dependency
+    handoff = check_handoff_dependency()
+    report.add("handoff", handoff.status if strict else ("ok" if handoff.status == "ok" else "warn"),
+               handoff.detail, {"missing_harnesses": handoff.missing_harnesses,
+                                "executable": handoff.executable})
+
     # external providers
     ci_offline = not (config or {}).get("ci", {}).get("provider")
     report.add("ci_provider", "warn" if ci_offline else "ok",
@@ -195,7 +201,7 @@ def _adopted_plugins(lock_path: str) -> list[str]:
 def doctor_main(args) -> int:
     # Pass config=None so run_doctor performs default discovery and reports
     # which config file (if any) is actually in effect.
-    report = run_doctor()
+    report = run_doctor(strict=getattr(args, "strict", False))
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     else:

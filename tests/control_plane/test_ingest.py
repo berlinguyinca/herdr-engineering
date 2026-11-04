@@ -9,6 +9,32 @@ def make_svc(repo=None):
     return IngestService(repo or ControlPlaneRepo())
 
 
+@pytest.mark.parametrize("kind", ["scheduler_reservation", "scheduler_lease", "scheduler_recovery",
+                                 "scheduler_execution", "scheduler_observation", "workspace_manifest"])
+def test_generic_ingestion_cannot_forge_scheduler_authority_streams(kind):
+    repo = ControlPlaneRepo()
+    with pytest.raises(ValueError, match="provider-owned"):
+        make_svc(repo).ingest({"entity_type": kind, "entity_id": "forged",
+                              "event_type": "ForgedAuthority", "payload": {"state": "committed"}})
+    assert repo.stream(kind, "forged") == []
+
+
+def test_generic_host_telemetry_cannot_grant_scheduler_authority():
+    repo = ControlPlaneRepo()
+    repo.upsert_host("mac", "mac", None, host_uid="trusted-mac",
+                     scheduler_owned=True, scheduler_trusted=True,
+                     scheduler_policy={"mode": "manual_only", "revision": 3})
+    make_svc(repo).ingest({"entity_type": "host", "entity_id": "mac",
+                          "event_type": "host.heartbeat", "payload": {
+                              "host_uid": "replacement", "scheduler_owned": False,
+                              "scheduler_trusted": False,
+                              "scheduler_policy": {"mode": "automatic", "revision": 4}}})
+    host = repo.get_host("mac")
+    assert host["host_uid"] == "trusted-mac"
+    assert host["scheduler_policy"] == {"mode": "manual_only", "revision": 3}
+    assert host["scheduler_owned"] is True and host["scheduler_trusted"] is True
+
+
 def test_host_upsert_is_idempotent_across_heartbeats():
     repo = ControlPlaneRepo()
     svc = make_svc(repo)

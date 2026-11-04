@@ -7,6 +7,9 @@ import urllib.request
 import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
+from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+from herdr_engineering.control_plane.artifact_jobs import ArtifactJobManager
+from herdr_engineering.control_plane.publication import FakeExposureProvider, PublicationController
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 
@@ -17,6 +20,9 @@ class _VersionApiStore:
     async def list_versions(self, artifact_id):
         return [{"version_id": "ver_1", "artifact_id": artifact_id,
                  "version_number": 1, "state": "ready"}]
+
+    async def report_permission(self, artifact_id, principal_id, permission):
+        return artifact_id == "artifact_1"
 
     async def get_version(self, version_id, artifact_id=None):
         if artifact_id is not None and artifact_id != "artifact_1":
@@ -131,6 +137,25 @@ def test_artifact_recorded_with_sha256_and_session_binding(server):
     assert art["mime_type"] == "text/plain"
 
 
+def test_artifact_catalog_lists_registered_records(server):
+    base, _ = server
+    upload(base, b"cataloged", filename="catalog.txt", mime="text/plain")
+    with urllib.request.urlopen(f"{base}/api/v1/artifacts") as response:
+        payload = json.loads(response.read())
+    assert len(payload["artifacts"]) == 1
+    assert payload["artifacts"][0]["original_filename"] == "catalog.txt"
+
+
+def test_artifact_catalog_filters_server_side_before_returning_records(server):
+    base, repo = server
+    upload(base, b"one", filename="alpha.html", mime="text/html")
+    upload(base, b"two", filename="beta.pdf", mime="application/pdf")
+    with urllib.request.urlopen(f"{base}/api/v1/artifacts?q=alpha&type=other") as response:
+        payload = json.loads(response.read())
+    assert len(payload["artifacts"]) == 1
+    assert payload["artifacts"][0]["original_filename"] == "alpha.html"
+
+
 # ---- durable object-store wiring -------------------------------------------
 
 
@@ -201,5 +226,86 @@ def test_version_history_and_commit_use_the_existing_control_plane(server):
         with urllib.request.urlopen(request) as response:
             assert response.status == 201
             assert json.loads(response.read())["version_id"] == "ver_2"
+    finally:
+        svr.shutdown()
+
+
+def test_publication_request_and_approval_use_control_plane_routes():
+    repo = ControlPlaneRepo()
+    controller = PublicationController(provider=FakeExposureProvider())
+    svr = ControlPlaneServer(repo, publication_controller=controller)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    api = f"http://127.0.0.1:{svr.port}"
+    try:
+        body = json.dumps({"resource_id": "artifact_1", "version_id": "version_1",
+                           "audience": "unlisted_link",
+                           "expires_at": __import__("time").time() + 3600}).encode()
+        request = urllib.request.Request(
+            f"{api}/api/v1/publications/requests", data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request) as response:
+            pending = json.loads(response.read())
+            assert response.status == 201
+            assert pending["state"] == "requested"
+        approve = urllib.request.Request(
+            f"{api}/api/v1/publications/{pending['publication_id']}/approve",
+            data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(approve) as response:
+            assert json.loads(response.read())["state"] == "active"
+    finally:
+        svr.shutdown()
+
+
+def test_artifact_job_submit_get_and_cancel_routes():
+    repo = ControlPlaneRepo()
+    jobs = ArtifactJobManager()
+    svr = ControlPlaneServer(repo, artifact_job_manager=jobs)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    api = f"http://127.0.0.1:{svr.port}"
+    try:
+        body = json.dumps({"profile": "web", "artifact_id": "artifact_1",
+                           "base_version_id": None, "request": {}}).encode()
+        create = urllib.request.Request(
+            f"{api}/api/v1/artifact-jobs", data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(create) as response:
+            job = json.loads(response.read())
+            assert response.status == 201
+        with urllib.request.urlopen(f"{api}/api/v1/artifact-jobs/{job['job_id']}") as response:
+            assert json.loads(response.read())["status"] == "queued"
+        cancel = urllib.request.Request(
+            f"{api}/api/v1/artifact-jobs/{job['job_id']}/cancel",
+            data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(cancel) as response:
+            assert json.loads(response.read())["status"] == "cancelled"
+    finally:
+        svr.shutdown()
+
+
+def test_artifact_catalog_applies_acl_before_returning_records():
+    repo = ControlPlaneRepo()
+    artifact_id = repo.register_artifact(original_filename="private.txt", data=b"private",
+                                          mime_type="text/plain")
+    acl = ArtifactAcl()
+    svr = ControlPlaneServer(repo, api_keys={"secret": "viewer"}, artifact_acl=acl)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    api = f"http://127.0.0.1:{svr.port}"
+    try:
+        request = urllib.request.Request(f"{api}/api/v1/artifacts",
+                                         headers={"X-API-Key": "secret"})
+        with urllib.request.urlopen(request) as response:
+            assert json.loads(response.read())["artifacts"] == []
+        principal = "api-key:"
+        import hashlib
+        principal += hashlib.sha256(b"secret").hexdigest()[:16] + ":viewer"
+        acl.grant(artifact_id, principal, {"read"})
+        with urllib.request.urlopen(request) as response:
+            assert json.loads(response.read())["artifacts"][0]["artifact_id"] == artifact_id
     finally:
         svr.shutdown()

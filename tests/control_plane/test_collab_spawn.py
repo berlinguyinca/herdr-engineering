@@ -152,6 +152,24 @@ def calls(rig, which="herdr"):
     return p.read_text().splitlines() if p.exists() else []
 
 
+def test_scheduler_native_timeout_retains_capacity_and_agent_identity(rig, monkeypatch):
+    rig.r.scheduler_enabled = True
+    rig.r.families = {"bender": ["claude-code"]}
+    monkeypatch.setattr(rig.r, "scheduler_host", lambda *_: ("bender", "reservation-test"))
+    def uncertain(*args):
+        raise runner.Failure("native timeout")
+    monkeypatch.setattr(rig.r, "place", uncertain)
+    released, forgotten = [], []
+    monkeypatch.setattr(rig.r, "scheduler_release", lambda *args: released.append(args))
+    monkeypatch.setattr(rig.r, "forget", lambda *args: forgotten.append(args))
+    spec = ask(rig, count=1)
+    claimed = rig.w.s.claim_spawn(rig.w.alice, spec["spawn_id"])
+    rig.r.handle(claimed, ["bender"])
+    assert released == [] and forgotten == []
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert "reconciliation required" in done["placements"][0]["error"]
+
+
 def test_a_request_is_spread_round_robin_and_workers_start_in_herdr(rig):
     sp = ask(rig)
     rig.r.once()
@@ -534,6 +552,22 @@ def test_helpers_started_under_an_agent_split_its_tab_and_are_linked_as_its_chil
     assert links["helper-1"]["parent_agent_id"] == pagent["agent_id"] and links["helper-1"]["instance_id"].startswith(f"pane:{'bender' if where == 'local' else where}:")
     named.r.once()                                                            # a sync pass keeps the tab named after the parent
     assert named.state(where)["tabs"][tab["tab_id"]]["label"] == pname
+
+
+def test_helpers_cannot_inherit_an_opted_out_parent_host(named):
+    parent = spawned(named, count=1)
+    (name, agent), = parent.items()
+    where = host_of(named, name)
+    excluded = "bender" if where == "local" else where
+    named.w.s.set_fleet_host(named.w.alice, excluded, {"auto_agents": False})
+    named.w.s.request_spawn(named.w.alice, {"harness_type": "claude-code", "name_prefix": "helper",
+                                          "count": 2, "parent_agent_id": agent["agent_id"]})
+    named.r.once()
+    helpers = [agent for agent in named.w.s.agent_links(named.w.alice)["agents"]
+               if agent["name"].startswith("helper-")]
+    assert len(helpers) == 2
+    assert all(not helper["instance_id"].startswith(f"pane:{excluded}:") for helper in helpers)
+    assert all(helper["parent_agent_id"] == agent["agent_id"] for helper in helpers)
 
 
 def test_helpers_need_a_parent_the_runner_can_see(named):

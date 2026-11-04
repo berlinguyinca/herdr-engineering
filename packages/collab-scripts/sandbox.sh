@@ -57,6 +57,9 @@ args+=(--bind "$WORK" "$WORK" --chdir "$WORK"
 # of this user, so the process and memory caps are a systemd scope instead (a fork bomb stops at the cap).
 ulimit -n 1024 -f "${HERDR_SANDBOX_FILE_KB:-1048576}" -c 0 2>/dev/null || true
 run=("$BWRAP" "${args[@]}" -- /usr/bin/env bash -c "$CMD")
+if [ "${HERDR_SANDBOX_EXTERNAL_SCOPE:-0}" = 1 ]; then
+  exec "${run[@]}"
+fi
 if systemd-run --user --scope -q -p TasksMax=1000 true 2>/dev/null; then
   exec systemd-run --user --scope -q -p TasksMax="${HERDR_SANDBOX_TASKS:-512}" -p MemoryMax="${HERDR_SANDBOX_MEM:-8G}" -- "${run[@]}"
 fi

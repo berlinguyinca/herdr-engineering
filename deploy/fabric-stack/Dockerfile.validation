@@ -1,0 +1,12 @@
+# Fast source-validation image. It deliberately reuses an installed HerdR
+# runtime and overlays the current checkout; it never replaces production tags.
+ARG BASE_IMAGE=herdr-engineering:52bb3070bec6
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+COPY herdr_engineering/ ./herdr_engineering/
+COPY packages/ ./packages/
+COPY deploy/control-plane/migrations/ ./control-plane/migrations/
+ARG GIT_COMMIT=validation
+ENV HERDR_ENGINEERING_COMMIT=$GIT_COMMIT
+ENV PYTHONPATH=/app

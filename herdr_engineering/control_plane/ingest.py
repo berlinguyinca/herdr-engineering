@@ -68,7 +68,9 @@ class IngestService:
 
         # Provider-owned observations and review outcomes have dedicated,
         # authenticated adapters; generic telemetry cannot forge those streams.
-        if entity_type in {"plannotator_review", "ci_pipeline"}:
+        if entity_type in {"plannotator_review", "ci_pipeline", "scheduler_reservation",
+                           "scheduler_lease", "scheduler_recovery", "scheduler_execution",
+                           "scheduler_observation", "workspace_manifest"}:
             raise ValueError("provider-owned entity type is not accepted by generic ingestion")
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
@@ -109,14 +111,20 @@ class IngestService:
             payload.get("host_name") or payload.get("name") or entity_id,
             payload.get("tailnet_ip") or payload.get("ip"),
             cpu=payload.get("cpu"), mem=payload.get("mem"), status=status,
-            inventory=payload.get("inventory"))
+            inventory=payload.get("inventory"),
+            aliases=payload.get("aliases"),
+            platform=payload.get("platform"))
         sample = {k: payload[k] for k in ("cpu", "mem", "disk")
                   if isinstance(payload.get(k), (int, float))
                   and not isinstance(payload.get(k), bool)}
         if sample:
             self.repo.record_telemetry(entity_id, {
                 "cpu_pct": sample.get("cpu"), "mem_pct": sample.get("mem"),
-                "disk_pct": sample.get("disk")})
+                "disk_pct": sample.get("disk"),
+                "sequence": payload.get("sequence"),
+                "freshness_seconds": payload.get("freshness_seconds"),
+                "confidence": payload.get("confidence", "legacy"),
+            })
         return host
 
     def _ingest_session(self, entity_id, event_type, payload,

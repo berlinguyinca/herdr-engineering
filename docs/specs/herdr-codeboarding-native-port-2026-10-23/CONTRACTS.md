@@ -1,0 +1,8 @@
+# Proposed contracts — adapt to existing conventions
+Snapshot: snapshot_id, host_id, repository_id, commit_sha, worktree_id, analyzer_version, config_hash, toolchain_hash, status, completeness, artifact_ref, created_at.
+Node: snapshot_id, node_id, kind(repo/service/package/module/class/function/file/endpoint), qualified_name, parent_id, repository_id, relative_path, line_start, line_end, extractor, confidence, metadata.
+Edge: snapshot_id, edge_id, from_id, to_id, kind(contains/imports/calls/implements/depends_on/exposes/consumes), source_span, evidence_ref, extractor, inferred, confidence.
+Correlation: snapshot_id, node_or_edge_id, mission_id, run_id, task_id, worker_id, parent_worker_id, session_id, worktree_id, host_id, commit_sha, issue_ref, pr_ref, plan_ref, autospec_ref, room_ref, evidence_ref.
+Events: architecture.analysis.requested/started/progress/completed/failed/cancelled; architecture.snapshot.published; architecture.diff.completed. Reuse Herdr Event envelope and existing idempotent ingestion; no secrets/source blobs in events.
+Candidate API operations (not necessarily new routes): request analysis, query job progress, list snapshots, search nodes, bounded edge expansion, diff snapshots, query mission/PR/collaboration correlations. Must reuse existing routes if they already provide functionality; auth scope includes host/repo/workspace/guest. Cursor pagination, limits, explicit incomplete diagnostics.
+Identity: symbol IDs stable where possible across revisions; mark ambiguous rename/move resolution. Cross-repo IDs canonicalize registered repository identity. Snapshot immutable; no branch-only cache keys.

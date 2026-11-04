@@ -48,3 +48,29 @@ def test_worker_loop_obeys_stop_and_swallows_errors():
                                 service_store=_Bad())
 
     _run(main())  # must terminate and not raise
+
+
+def test_artifact_job_pass_claims_one_job_and_records_completion():
+    class _Conn:
+        def __init__(self):
+            self.executed = []
+
+        async def fetchrow(self, sql, *args):
+            if "FOR UPDATE SKIP LOCKED" in sql:
+                return {"job_id": "job_1", "artifact_id": "artifact_1",
+                        "base_version_id": "version_1", "profile": "web",
+                        "request": {}}
+            return None
+
+        async def execute(self, sql, *args):
+            self.executed.append((sql, args))
+
+    async def runner(job):
+        return {"version_id": "version_2", "outputs": [{"blob_sha256": "sha"}],
+                "validation": {"status": "passed"}}
+
+    conn = _Conn()
+    summary = _run(worker.run_one_pass(conn, worker_id="host-a",
+                                       artifact_job_runner=runner))
+    assert summary["artifact_jobs_completed"] == 1
+    assert any("status='completed'" in sql for sql, _ in conn.executed)

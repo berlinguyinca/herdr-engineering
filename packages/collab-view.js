@@ -833,13 +833,13 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           id: a.agent_id, label: `@${a.name}`, insertText: `@${a.name}`,
           detail: `${a.harness_type} · ${names.get(a.owner_user_id) || shortId(a.owner_user_id)}`,
         })),
-        onSend: async (text) => {
+        onSend: async (text, attachments = []) => {
           const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
           if (mention) { // Preserve the room's authenticated leading-agent task contract.
             const hits = S.agents.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
             if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks tab` : `No agent named @${mention[1]} in this room accepts tasks`);
             await api.createTask(roomId, hits[0].agent_id, mention[2]);
-          } else await api.say(roomId, text);
+          } else await api.say(roomId, text, attachments.map(attachment => attachment.artifact_id || attachment.artifactId || attachment.id).filter(Boolean));
           if (alive) { kick(); log.scrollTop = log.scrollHeight; }
           return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };
         },

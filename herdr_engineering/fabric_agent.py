@@ -738,6 +738,8 @@ class FabricAgent:
         self._client = client
         self.cfg = config
         self._machine = socket.gethostname()
+        self._resource_probe = None
+        self._resource_report_at = 0.0
         self._ownership = ListenerOwnership(self._machine)
         self._git_metadata = ListenerGitMetadata()
         self._store: dict[str, dict[str, Any]] = self._load_store()
@@ -927,6 +929,7 @@ class FabricAgent:
         # Reporting must never delay the next lease's gateway heartbeat. It has
         # its own slower cadence and a bounded batch/failure budget.
         self._report_services(listeners)
+        self._report_resources()
 
         # 4) surface listeners that look like dev services but hold no lease
         # (probe failed, gateway rejected, no forwarder possible): warn once per
@@ -1280,6 +1283,25 @@ class FabricAgent:
             if after_cycle is not None:
                 after_cycle()  # may raise HostConfigUnavailable (revoked): ends the run
             stop.wait(self.cfg.interval)
+
+    def _report_resources(self):
+        if not self.cfg.control_plane_url or time.monotonic() - self._resource_report_at < 15:
+            return
+        self._resource_report_at = time.monotonic()
+        try:
+            from .host_config import _default_fetch, _read_host_json, host_config
+            from .resource_probe import ResourceProbe
+            if host_config().get("scheduler.telemetry", True) is not True:
+                return
+            host = _read_host_json(Path.home())
+            if self._resource_probe is None:
+                self._resource_probe = ResourceProbe(
+                    self.cfg.store_path.parent / "scheduler-host-identity", Path.home())
+            _default_fetch(host["control_plane_url"] + "/api/v1/fleet/config/telemetry",
+                           token=host["token"], method="POST", body=self._resource_probe.sample(), timeout=2)
+        except Exception:
+            # Metric collection failure must not interrupt service leases.
+            log.debug("resource telemetry unavailable")
 
     def _watchdog(self, stop: threading.Event, cycle_timeout: float,
                   poll: float) -> None:

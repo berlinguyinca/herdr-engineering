@@ -40,6 +40,18 @@ fabric:
   # empty token = control API unauthenticated (fine on a private tailnet;
   # set one before exposing the control port further)
 
+# Fabric scheduler rollout switches. Telemetry is safe read-only collection;
+# admission/all-spawn integration remain opt-in until the canary gates pass.
+scheduler:
+  telemetry: true
+  policy_enforcement: true
+  plan_only: true
+  admission: false
+  all_spawns: false
+  migration: false
+  telemetry_freshness_seconds: 60
+  reservation_ttl_seconds: 90
+
 tests:
   adapters: [pytest, go, cargo, junit, scala]
 

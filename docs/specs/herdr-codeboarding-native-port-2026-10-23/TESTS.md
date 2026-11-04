@@ -1,0 +1,11 @@
+# Acceptance gates
+- Full baseline graph of representative Herdr/Pi repository with verified symbol-to-source links; visible in Herdr Workbench without opening another UI.
+- Same source SHA/config yields identical normalized graph hash. Parallel worktrees produce isolated, correct snapshots.
+- Full vs incremental parity on fixtures covering file changes, deletes, moves, dependency changes, language config and cache invalidation.
+- PR diff correctly identifies added/removed/changed nodes and edges, with provenance and uncertainty warnings.
+- Mission/worker/worktree/parent-worker/issue links trace to existing Pi/Herdr identities; autospec and non-autospec flows work.
+- Unauthorized guests cannot view private graph/source, invoke analysis or comment; authorized collaborators can perform only allowed actions.
+- Malicious repository fixture tests path traversal, symlinks, prompt injection, secrets, subprocess isolation, cancellation and resource limits.
+- UI Playwright coverage for loading/empty/error/stale/partial states, keyboard accessibility, light/dark, narrow/wide layouts.
+- Benchmarks record cold/warm time, incremental time, peak memory, graph size, query latency and error rates; report actual measurements rather than invented thresholds.
+- CI green, reversible migrations, feature flag off switch, pinned upstream revision and third-party notices.
