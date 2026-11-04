@@ -42,6 +42,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.events import WorkerEvent, event_size
@@ -255,6 +256,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "hub": _hub_config(section.get("hub"), default_tenant),
         # Earned per-user action grants for hub workers (shadow period, approval thresholds, extra vetoes).
         "grants": _grants_config(section.get("grants")),
+        # Action judge (jev): off unless enabled; the API key is read from api_key_file, never inline.
+        "judge": _judge_config(section.get("judge")),
     }
 
 
@@ -386,6 +389,119 @@ def _grants_config(raw: Any) -> dict[str, Any]:
         "grant_ttl_days": _hub_pos_int(raw.get("grant_ttl_days", 30), f"{where}.grant_ttl_days"),
         "extra_vetoes": _grants_extra_vetoes(raw.get("extra_vetoes", []), f"{where}.extra_vetoes"),
         "policy_version": _hub_pos_int(raw.get("policy_version", 1), f"{where}.policy_version"),
+    }
+
+
+_JUDGE_KEYS = {"enabled", "provider", "endpoint", "model", "api_key_file", "timeout_seconds", "fail_mode",
+               "backend_confirmed", "thresholds", "calibration"}
+_JUDGE_INLINE_SECRETS = {"api_key", "key", "token", "secret"}
+_JUDGE_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+_JUDGE_THRESHOLDS = {"destructive": 0.30, "irreversible": 0.30, "severity_score": 2.0}
+
+
+def _judge_number(value: Any, where: str, low: float, high: float, *, low_open: bool) -> float:
+    ok = not isinstance(value, bool) and isinstance(value, (int, float)) and (
+        (value > low if low_open else value >= low) and value <= high)
+    if not ok:
+        bound = f"above {low:g}" if low_open else f"at least {low:g}"
+        raise ValueError(f"{where} must be a number {bound} and at most {high:g}")
+    return float(value)
+
+
+def _judge_sub(raw: Any, where: str, allowed: set[str]) -> dict[str, Any]:
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    return raw
+
+
+def _judge_endpoint(value: Any, where: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{where} must be a string")
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError as exc:
+        raise ValueError(f"{where} is not a valid URL: {exc}") from exc
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ValueError(f"{where} must not contain user info")
+    if parts.query or parts.fragment:
+        raise ValueError(f"{where} must not contain a query or fragment")
+    if not host:
+        raise ValueError(f"{where} needs a host")
+    if parts.scheme == "http" and host not in _JUDGE_LOOPBACK:
+        raise ValueError(f"{where} must use https:// (http:// is allowed only for loopback hosts)")
+    if parts.scheme not in ("http", "https"):
+        raise ValueError(f"{where} must be an https:// URL")
+    return value
+
+
+def _judge_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.judge``. Off by default; secrets only via ``api_key_file``."""
+    where = "control_plane.personal_assistant.judge"
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    inline = sorted(set(raw) & _JUDGE_INLINE_SECRETS)
+    if inline:
+        raise ValueError(f"{where} must not hold secrets inline ({inline}); put the key in a file and set api_key_file")
+    unknown = set(raw) - _JUDGE_KEYS
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    flags: dict[str, bool] = {}
+    for name in ("enabled", "backend_confirmed"):
+        flags[name] = raw.get(name, False)
+        if not isinstance(flags[name], bool):
+            raise ValueError(f"{where}.{name} must be true or false (not a string)")
+    if raw.get("provider", "jev") != "jev":
+        raise ValueError(f"{where}.provider must be 'jev'")
+    if raw.get("fail_mode", "closed") != "closed":
+        raise ValueError(f"{where}.fail_mode must be 'closed'")
+    model = raw.get("model", "laya-auto")
+    if not isinstance(model, str) or not model.strip() or len(model) > 200:
+        raise ValueError(f"{where}.model must be a non-empty string of at most 200 characters")
+    timeout = raw.get("timeout_seconds", 5)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 60:
+        raise ValueError(f"{where}.timeout_seconds must be an integer between 1 and 60")
+    endpoint = _judge_endpoint(raw.get("endpoint", ""), f"{where}.endpoint")
+    key_file = raw.get("api_key_file", "")
+    if not isinstance(key_file, str):
+        raise ValueError(f"{where}.api_key_file must be a path string")
+    key_file = key_file.strip()
+    if key_file and not key_file.startswith("/"):
+        raise ValueError(f"{where}.api_key_file must be an absolute path")
+    if flags["enabled"] and not endpoint:
+        raise ValueError(f"{where}.endpoint is required when the judge is enabled")
+    if flags["enabled"] and not key_file:
+        raise ValueError(f"{where}.api_key_file is required when the judge is enabled")
+    th = _judge_sub(raw.get("thresholds"), f"{where}.thresholds", set(_JUDGE_THRESHOLDS))
+    thresholds = {k: _judge_number(th.get(k, d), f"{where}.thresholds.{k}", 0.0, 3.0 if k == "severity_score" else 1.0,
+                                   low_open=k != "severity_score") for k, d in _JUDGE_THRESHOLDS.items()}
+    cal = _judge_sub(raw.get("calibration"), f"{where}.calibration", {"min_labeled_decisions", "max_false_negative_bound"})
+    labeled = cal.get("min_labeled_decisions", 200)
+    if isinstance(labeled, bool) or not isinstance(labeled, int) or labeled < 20:
+        raise ValueError(f"{where}.calibration.min_labeled_decisions must be an integer of at least 20")
+    return {
+        "enabled": flags["enabled"],
+        "provider": "jev",
+        "endpoint": endpoint,
+        "model": model.strip(),
+        "api_key_file": key_file,
+        "timeout_seconds": timeout,
+        "fail_mode": "closed",
+        "backend_confirmed": flags["backend_confirmed"],
+        "thresholds": thresholds,
+        "calibration": {"min_labeled_decisions": labeled,
+                        "max_false_negative_bound": _judge_number(cal.get("max_false_negative_bound", 0.05),
+                                                                  f"{where}.calibration.max_false_negative_bound",
+                                                                  0.0, 0.5, low_open=True)},
     }
 
 
