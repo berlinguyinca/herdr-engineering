@@ -411,6 +411,10 @@ export class HerdrClient {
     return this.request('/api/v1/scheduler/plan', { method: 'POST', body: request, signal });
   }
 
+  schedulerSetHostPolicy(request, { signal } = {}) {
+    return this.request('/api/v1/scheduler/host-policy', { method: 'POST', body: request, signal });
+  }
+
   // -- missions -----------------------------------------------------------
   listMissions(status, { signal } = {}) {
     const q = status ? `?status=${encodeURIComponent(status)}` : '';
