@@ -229,6 +229,12 @@ scripts/fleet-auto-update-macos.sh uninstall    # bootout + remove the plist
 one it does, and prints a NOTE when the checkout is not clean on `main` — because a skipped run
 exits 0 and `launchctl` reports nothing.
 
+The `Label` is read with `plutil` when it exists and with stdlib `plistlib` when it does not (#588).
+Reading it with `plutil` alone was a macOS-only assumption: on Linux the read returned nothing, the script
+treated the agent it had installed itself as somebody else's and refused to replace it, and the Linux unit
+gate went red while every macOS test stayed green (D28). A test pins the fallback with a `plutil` that
+always fails, so the path Linux takes is exercised on macOS as well.
+
 `herdr-eng fleet update` refreshes whichever updater the controller has already loaded — the systemd
 timer on Linux (`systemctl --user is-enabled`), the LaunchAgent on macOS (`launchctl print
 gui/<uid>/com.herdr-engineering.fleet-auto-update`) — so template changes (schedule, working
