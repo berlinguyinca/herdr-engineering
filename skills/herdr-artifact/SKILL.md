@@ -82,12 +82,15 @@ validation workflow through native HerdR APIs.
 ## Collaborating through MCP
 
 An agent that an artifact's owner granted read or write access (limited time, revocable) can work on it through
-the collaboration network's `/mcp` endpoint instead of the API above. It sees seven tools only while it holds a
+the collaboration network's `/mcp` endpoint instead of the API above. It sees nine tools only while it holds a
 live grant; everything it reads is untrusted text. Full guide: `packages/collab-guide.md` (section "Artifacts:
 reading and committing through MCP").
 
 - `artifacts_list`, `artifact_head`, `artifact_history`, `artifact_read` (`offset`/`max_bytes`, text only, follow
   `next_offset`) read the mirror of the artifact.
+- `artifact_annotations` lists the open annotations people left (untrusted feedback, no author identity); after
+  committing the fix, `artifact_annotation_resolve` (`artifact_id`, `version_id` of YOUR commit, up to 50
+  `annotation_ids`, `idempotency_key`) marks them addressed. Nothing goes live automatically.
 - Commit with `artifact_commit` (`artifact_id`, `base_version_id` = the head you read, `message`, `changes` of up
   to 100 `put`/`delete` entries, optional `idempotency_key`). It returns a `ticket`; poll `artifact_commit_result`
   (waits up to 20 s) for `created`, `merged`, `conflict`, `rejected` or `expired`.

@@ -12,10 +12,20 @@ from herdr_engineering.control_plane.annotation_anchor import (
     ANNOTATION_DEFAULTS,
     annotation_settings,
 )
+from herdr_engineering.control_plane.collab_bridge_files import BridgeLimits
+from herdr_engineering.control_plane.collab_mirror import CollabMirror
 from herdr_engineering.control_plane.share_bundle import write_own_projection
 from herdr_engineering.control_plane.worker import AnnotationHousekeeper
 
-from .test_artifact_annotations_store import _fresh_ids, ann_id, create, registry_pg, run, seed  # noqa: F401
+from .registry_pg import FakeBlobs
+from .test_artifact_annotations_store import (  # noqa: F401
+    _fresh_ids,
+    ann_id,
+    create,
+    registry_pg,
+    run,
+    seed,
+)
 
 OWNERS = frozenset({"boss@x.org"})
 
@@ -35,14 +45,18 @@ def projection(root: Path, share_id: str, identity: str) -> dict | None:
     return json.loads(path.read_text()) if path.exists() else None
 
 
-class Recorder:
-    """A real object with the mirror's ``publish_annotations`` shape; Task 15 adds the production one."""
+def real_mirror(tmp_path, *artifact_ids: str) -> CollabMirror:
+    """The production mirror over a temp dir; each listed artifact gets the ``head.json`` that marks it mirrored."""
+    mirror = CollabMirror(tmp_path / "mirror", rustfs=FakeBlobs(), limits=BridgeLimits())
+    for artifact_id in artifact_ids:
+        (mirror.root / "artifacts" / artifact_id).mkdir(parents=True, exist_ok=True)
+        (mirror.root / "artifacts" / artifact_id / "head.json").write_text("{}")
+    return mirror
 
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, list[dict]]] = []
 
-    async def publish_annotations(self, artifact_id: str, rows: list[dict]) -> None:
-        self.calls.append((artifact_id, rows))
+def mirrored(mirror: CollabMirror, artifact_id: str) -> dict | None:
+    path = mirror.root / "artifacts" / artifact_id / "annotations.json"
+    return json.loads(path.read_text()) if path.exists() else None
 
 
 def housekeeper(tmp_path, **over):
@@ -170,12 +184,13 @@ def test_only_touched_shares_are_rewritten_after_the_first_tick(registry_pg, tmp
 def test_mirror_gets_touched_artifacts_and_no_mirror_skips_the_step(registry_pg, tmp_path):
     async def body(store, conn):
         aid, _, sid = await seed(conn)
-        mirror = Recorder()
+        mirror = real_mirror(tmp_path, aid)
         hk = housekeeper(tmp_path, mirror=mirror)
         append(tmp_path / "events" / "annotations.jsonl", create(sid, 5))
         out = await hk.tick(conn)
-        calls = {a: rows for a, rows in mirror.calls}
-        assert [r["body"] for r in calls[aid]] == ["note"] and "author_email" not in calls[aid][0]
+        doc = mirrored(mirror, aid)
+        assert [r["body"] for r in doc["annotations"]] == ["note"] and doc["artifact_id"] == aid
+        assert "author_email" not in doc["annotations"][0] and "author_identity" not in doc["annotations"][0]
         assert out["published"] >= 1
         bare = housekeeper(tmp_path / "bare")
         assert (await bare.tick(conn))["published"] == 0
@@ -187,8 +202,8 @@ def test_tick_is_rate_limited_never_raises_and_honours_enabled(registry_pg, tmp_
         hk = housekeeper(tmp_path, interval=3600.0, clock=lambda: 1000.0)
         assert isinstance(await hk.tick(conn), dict)
         assert await hk.tick(conn) == "skipped"
-        broken = housekeeper(tmp_path / "x", mirror=object())               # no publish_annotations: logged, not raised
         _, _, sid = await seed(conn)
+        broken = housekeeper(tmp_path / "x", mirror=real_mirror(tmp_path / "x"))   # nothing mirrored: a no-op, not raised
         append(tmp_path / "x" / "events" / "annotations.jsonl", create(sid, 6))
         assert isinstance(await broken.tick(conn), dict)
         off = AnnotationHousekeeper(tmp_path / "shares", tmp_path / "events", tmp_path / "markers",
@@ -211,55 +226,33 @@ def test_settings_accept_the_cap_itself():
     assert annotation_settings({"max_per_share": 10**9})["max_per_share"] == 10**9
 
 
-class Flaky:
-    """TASK 15 MUST REPLACE this double with a real CollabMirror: it exists only because ``publish_annotations`` does
-    not exist yet, to exercise the housekeeper's own dirty-set and backoff seam."""
-
-    def __init__(self) -> None:
-        self.fail = True
-        self.calls: list[str] = []
-
-    async def publish_annotations(self, artifact_id: str, rows: list[dict]) -> None:
-        self.calls.append(artifact_id)
-        if self.fail:
-            raise OSError("disk full")
-
-
 def test_failed_publishes_stay_dirty_back_off_and_retry_without_holding_the_window(registry_pg, tmp_path, caplog):
     async def body(store, conn):
         aid, _, sid = await seed(conn)
         (tmp_path / "shares").mkdir()
         (tmp_path / "shares" / sid).mkdir()
         now = [1000.0]
-        mirror = Flaky()
+        mirror = real_mirror(tmp_path, aid)
+        target = mirror.root / "artifacts" / aid / "annotations.json"
+        target.mkdir()                                  # a directory where the file goes: the real write fails
         hk = housekeeper(tmp_path, mirror=mirror, interval=15.0, clock=lambda: now[0])
         append(tmp_path / "events" / "annotations.jsonl", create(sid, 7))
         out = await hk.tick(conn)
-        assert out["published"] == 0 and hk._dirty_artifacts == {aid} and mirror.calls == [aid]
+        assert out["published"] == 0 and hk._dirty_artifacts == {aid}
         assert hk._since is not None                                           # the projection window advanced
-        assert any(aid in r.getMessage() and "OSError" in r.getMessage() and r.exc_info is None
+        assert any(aid in r.getMessage() and "IsADirectoryError" in r.getMessage() and r.exc_info is None
                    for r in caplog.records)
         now[0] += 15.0
         await hk.tick(conn)
-        assert mirror.calls == [aid]                                           # still backing off
+        assert hk._dirty_artifacts == {aid} and hk._backoff[aid][1] == 1       # still backing off: no second attempt
         now[0] += 400.0
         await hk.tick(conn)
-        assert len(mirror.calls) == 2
-        mirror.fail = False
+        assert hk._backoff[aid][1] == 2                                         # retried after the delay, failed again
+        target.rmdir()                                                          # the fault clears
         now[0] += 400.0
         out = await hk.tick(conn)
         assert out["published"] == 1 and hk._dirty_artifacts == set()
-        assert len(mirror.calls) == 3
-    run(registry_pg, body)
-
-
-def test_a_mirror_without_publish_annotations_is_skipped_quietly(registry_pg, tmp_path, caplog):
-    async def body(store, conn):
-        _, _, sid = await seed(conn)
-        hk = housekeeper(tmp_path, mirror=object())
-        append(tmp_path / "events" / "annotations.jsonl", create(sid, 8))
-        assert (await hk.tick(conn))["published"] == 0
-        assert not [r for r in caplog.records if r.levelname in ("WARNING", "ERROR")]
+        assert [r["body"] for r in mirrored(mirror, aid)["annotations"]] == ["note"]
     run(registry_pg, body)
 
 

@@ -81,7 +81,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import collab_waiters
+from . import annotation_intents, collab_waiters
 from .collab import CollabError, Principal
 from .collab_bridge_files import (
     AUDITED_MARKER,
@@ -118,7 +118,7 @@ from .collab_bridge_files import (
     validate_chunk,
     validate_intent,
 )
-from .collab_mirror import ARTIFACTS_DIR, BLOBS_DIR, GRANTS_NAME, HEAD_NAME
+from .collab_mirror import ANNOTATIONS_NAME, ARTIFACTS_DIR, BLOBS_DIR, GRANTS_NAME, HEAD_NAME
 
 log = logging.getLogger(__name__)
 
@@ -142,7 +142,8 @@ _VERSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")
 _SHA = re.compile(SHA_RE)
 _GRANT_PERMISSIONS = frozenset({"read", "write"})
 _TOOL_ACTIONS = {"artifacts_list": "artifact.list", "artifact_head": "artifact.head",
-                 "artifact_read": "artifact.read", "artifact_history": "artifact.history"}
+                 "artifact_read": "artifact.read", "artifact_history": "artifact.history",
+                 "artifact_annotations": "artifact.annotations"}
 
 READ_ONLY = "read-only grant"
 NOT_WRITABLE = "artifact is not writable through collaboration"
@@ -921,6 +922,64 @@ class CollabArtifactBridge:
                 self._note_complete(owner_key, upload_id, meta)
             seen[upload_id] = meta.size_bytes
         return sum(seen.values())
+
+    # -- annotations -------------------------------------------------------------------------------------------
+    _ANNOTATION_KEYS = ("annotation_id", "version_id", "version_number", "file", "anchor", "body", "author_role",
+                        "created_at", "edited_at")
+    _ANCHOR_KEYS = ("kind", "file", "exact", "prefix", "suffix", "page", "region", "x", "y", "w", "h")
+    ANNOTATIONS_MAX_BYTES = 2 * 1024 * 1024
+    _RESOLVE_KEYS = frozenset({"artifact_id", "version_id", "annotation_ids", "idempotency_key"})
+
+    @classmethod
+    def _annotation_view(cls, row) -> dict | None:
+        """One mirrored annotation projected to the allowed keys; whatever else the file carries (an author's email
+        or identity included) is dropped.  The text is people's feedback: untrusted data, never instructions."""
+        if not isinstance(row, dict):
+            return None
+        out = {k: row[k] for k in cls._ANNOTATION_KEYS if isinstance(row.get(k), (str, int, float, dict, type(None)))
+               and not isinstance(row.get(k), bool)}
+        if isinstance(out.get("anchor"), dict):
+            anchor = {k: v for k, v in out["anchor"].items() if k in cls._ANCHOR_KEYS
+                      and isinstance(v, (str, int, float, dict)) and not isinstance(v, bool)}
+            if isinstance(anchor.get("region"), dict):
+                anchor["region"] = {k: v for k, v in anchor["region"].items() if k in ("x", "y", "w", "h")
+                                    and isinstance(v, (int, float)) and not isinstance(v, bool)}
+            out["anchor"] = anchor
+        return out
+
+    def annotations(self, pr: Principal, artifact_id, *, limit: int = 200) -> dict:
+        """The ``artifact_annotations`` tool: the open annotations the worker mirrored for a granted artifact."""
+        _permission, _doc = self._open(pr, "annotations", artifact_id)
+        if not _int(limit) or not 1 <= limit <= MAX_HISTORY:
+            raise CollabError(400, f"limit must be an integer from 1 to {MAX_HISTORY}")
+        doc = read_json_cached(self.mirror, [ARTIFACTS_DIR, artifact_id, ANNOTATIONS_NAME],
+                               max_bytes=self.ANNOTATIONS_MAX_BYTES)
+        rows = doc.get("annotations") if isinstance(doc, dict) else None
+        if not isinstance(rows, list):
+            self._used(pr, artifact_id, "artifact_annotations")
+            return {"annotations": [], "note": "no annotations mirrored"}
+        views = [v for v in (self._annotation_view(r) for r in rows[:limit]) if v is not None]
+        out = {"artifact_id": artifact_id, "annotations": views,
+               "truncated": doc.get("truncated") is True or len(rows) > limit}
+        self._used(pr, artifact_id, "artifact_annotations")
+        return out
+
+    def resolve_annotations(self, pr: Principal, args) -> dict:
+        """The ``artifact_annotation_resolve`` tool: ``{ticket, status: "pending"}``; the worker decides later."""
+        if not isinstance(args, dict) or set(args) != self._RESOLVE_KEYS:
+            raise CollabError(400, "annotation resolve arguments are missing or unknown")
+        artifact_id = args["artifact_id"]
+        permission, _doc, _limits = self._open_with_limits(pr, "annotation_resolve", artifact_id)
+        if permission != "write":      # per artifact: a write grant on another artifact authorises nothing here
+            raise self._refuse(pr, "annotation_resolve", artifact_id, "read_only", 403, READ_ONLY)
+        svc = self.service
+        with svc._lock:
+            svc._throttle("artresolve:" + pr.id, 30, 60.0, "annotation resolve")
+        ticket = self.append_intent(
+            Actor("agent", pr.id), annotation_intents.KIND,
+            {"version_id": args["version_id"], "annotation_ids": args["annotation_ids"]},
+            artifact_id=artifact_id, idempotency_key=args["idempotency_key"])
+        return {"ticket": ticket, "status": "pending"}
 
     def result(self, pr: Principal, ticket: str, *, wait: float) -> dict:
         """The ``artifact_commit_result`` tool: ``read_result`` for the calling agent's own tickets."""

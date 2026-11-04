@@ -230,7 +230,9 @@ COMMIT_OUTCOMES = frozenset({"created", "merged"})
 GATE_RELOAD = 30.0                  # the worker-local retraction gate is reloaded at least this often (seconds)
 LINEAGE_QUEUE_MAX = 1000            # versions waiting for lineage emission; the oldest is dropped beyond this
 
-_RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason")
+_RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason", "resolved",
+                "skipped")
+MAX_RESOLVED = 50                       # annotation_resolve: ids resolved / skipped in one outcome
 _STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id")
 _OUTCOME = re.compile(r"[a-z_]{1,32}\Z")
 _INTENT_FILE = re.compile(TICKET_RE[:-2] + r"\.json\Z")
@@ -1476,6 +1478,18 @@ def _check_outcome(out) -> None:
         raise TypeError("invalid outcome field")
     conflicts = out.get("conflicts")
     if conflicts is not None and (not isinstance(conflicts, list) or not all(isinstance(c, dict) for c in conflicts)):
+        raise TypeError("invalid outcome field")
+    resolved = out.get("resolved")
+    if resolved is not None and (not isinstance(resolved, list) or len(resolved) > MAX_RESOLVED
+                                 or not all(isinstance(r, str) for r in resolved)):
+        raise TypeError("invalid outcome field")
+    skipped = out.get("skipped")
+    if skipped is not None and (
+            not isinstance(skipped, list) or len(skipped) > MAX_RESOLVED
+            or not all(isinstance(s, dict) and set(s) <= {"annotation_id", "reason"}
+                       and isinstance(s.get("reason"), str) and len(s["reason"]) <= 64
+                       and (s.get("annotation_id") is None or (isinstance(s["annotation_id"], str)
+                                                               and len(s["annotation_id"]) <= 64)) for s in skipped)):
         raise TypeError("invalid outcome field")
     json.dumps(out, ensure_ascii=False, allow_nan=False)   # TypeError/ValueError: not writable as a result
 

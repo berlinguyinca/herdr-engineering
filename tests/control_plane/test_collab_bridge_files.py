@@ -715,7 +715,15 @@ def test_registered_kind_uses_its_own_validator(registry):
 
 
 def test_only_commit_is_registered_by_plan_3():
-    assert set(cbf._INTENT_KINDS) == {"commit"}
+    """In a fresh process: other tests import annotation_intents, which registers its own kind."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    code = ("from herdr_engineering.control_plane import collab_bridge_files as c; print(sorted(c._INTENT_KINDS))")
+    proc = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[2], capture_output=True,
+                          text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "['commit']"
 
 
 def test_request_digest_ignores_ticket_and_time():

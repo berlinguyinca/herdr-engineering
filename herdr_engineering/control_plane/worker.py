@@ -162,7 +162,6 @@ class AnnotationHousekeeper:
         self._since: datetime | None = None
         self._dirty_artifacts: set[str] = set()
         self._backoff: dict[str, tuple[float, int]] = {}
-        self._warned_no_publish = False
 
     async def tick(self, conn) -> dict | str:
         if not self.settings["enabled"]:
@@ -225,18 +224,12 @@ class AnnotationHousekeeper:
         if self.mirror is None:
             return 0
         self._dirty_artifacts |= touched
-        publish = getattr(self.mirror, "publish_annotations", None)
-        if publish is None:
-            if not self._warned_no_publish:
-                self._warned_no_publish = True
-                log.debug("mirror has no publish_annotations yet; annotations are not mirrored")
-            return 0
         published = 0
         for artifact_id in sorted(self._dirty_artifacts):
             if now < self._backoff.get(artifact_id, (0.0, 0))[0]:   # (the overlap margin re-touches: no reset)
                 continue
             try:
-                await publish(artifact_id, await store.open_for_agents(artifact_id))
+                await self.mirror.publish_annotations(artifact_id, await store.open_for_agents(artifact_id))
             except Exception as exc:  # noqa: BLE001
                 failures = self._backoff.get(artifact_id, (0.0, 0))[1] + 1
                 delay = min(self.interval * 2 ** failures, ANNOTATION_MAX_BACKOFF)

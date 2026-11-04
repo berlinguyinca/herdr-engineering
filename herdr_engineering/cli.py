@@ -4636,6 +4636,9 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rust
     applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
     and staging owner here). ``mirror`` comes from ``_build_collab_mirror``."""
     from .control_plane import worker as cp_worker
+    from .control_plane.annotation_intents import (
+        register_annotation_resolve,  # registers the kind at import
+    )
     from .control_plane.artifact_scope import ArtifactGraphGate
     from .control_plane.collab_intents import CollabIntentApplier
     clock = mirror.clock
@@ -4651,6 +4654,7 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rust
                                   spool_dir=settings.spool_dir, lineage=lineage, context_extras={}, clock=clock,
                                   gate=gate)
     applier.register_commit()
+    register_annotation_resolve(applier)
     return cp_worker.CollabBridgeLoop(connect, mirror, applier)
 
 
