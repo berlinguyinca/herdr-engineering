@@ -1715,6 +1715,7 @@ class ControlPlaneServer:
                 try:
                     collab.sweep_team_roles()
                     collab.sweep_coordinators()
+                    collab.sweep_direct()
                     interval = collab.team_roles_cfg()["sweep_interval_seconds"]
                 except Exception as exc:                        # noqa: BLE001 - a sweep failure must never stop the loop
                     log.warning("team roles sweep failed: %s", type(exc).__name__)
