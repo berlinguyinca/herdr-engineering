@@ -251,9 +251,13 @@ With that, durable write/read works from anywhere: five evidenced records (`herd
 `canary-facts`) are recalled with `degraded: false` from `~/IdeaProjects` on the Mac and from
 `/tmp` on bender, including a record written on one host and read on the other. The retention
 gate earned its keep - `retain` rejected every write until `--explicit`/`--evidence` were given.
-Full evidence: [`audit/DRILLS_20261104.md`](audit/DRILLS_20261104.md) §14, including the one
-operator action still open - and it is self-blocking: bender's controller checkout is 41 tracked
-files dirty at `06e3d501`, and that checkout *is* the nightly runner, so #572's `skip` behaviour
-is not in the code that runs there yet. bender keeps failing nightly until the operator cleans
-and fast-forwards it, or removes it from `controller_updates` and lets the pinned install path own
-the tooling.
+Full evidence: [`audit/DRILLS_20261104.md`](audit/DRILLS_20261104.md) §14, including the
+self-blocking fleet defect and how it closed. bender's controller checkout is 41 tracked files dirty
+at `06e3d501`, and that checkout *is* the nightly runner, so #572's `skip` behaviour was not in the
+code that fired there. The operator action taken 2026-11-04 was to **unpin** bender
+(`systemctl --user disable --now` on the timer and service, unit files kept on disk): it no longer
+fails nightly and no longer takes unattended updates, so the pinned install path owns its tooling
+until the checkout is cleaned. macOS gained the counterpart installer that never existed
+(`scripts/fleet-auto-update-macos.sh`), and D23 records why two drafts of §14.4 described the unit
+wrongly - the schedule now comes from the systemd template, with a test holding the two installers
+together.
