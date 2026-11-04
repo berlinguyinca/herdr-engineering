@@ -197,7 +197,10 @@ directories; writes a private-by-default machine-local config at
 `~/.config/herdr-engineering/config.yaml` (preserved if present); enrolls this
 machine (detected host + OS) into the private fleet inventory
 (`ansible/inventory/hosts.yml`); puts `herdr-eng` on PATH via
-`~/.local/bin`; and runs `herdr-eng doctor` to confirm.
+`~/.local/bin`; installs the build-cache toolchain (a checksum-pinned sccache
+0.19.0 into `~/.local/bin`, per-user, no root; non-fatal, skip with
+`--no-build-cache-tools`, run alone with `--build-cache-tools-only`; it does not
+enable the build cache); and runs `herdr-eng doctor` to confirm.
 
 ### Manual setup (equivalent)
 

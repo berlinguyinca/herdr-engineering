@@ -39,20 +39,26 @@ No-go: CI red, or the ui-gates failing on `build-cache-view.js`.
 
 ## Stage 1: Bender local pilot
 
-Needs explicit operator approval: **installing sccache 0.19.0** on bender (a host
-change; it is absent today). The code requires >= 0.19.0 (`MIN_SCCACHE_VERSION`).
+sccache 0.19.0 is now installed by the installer (operator-approved 2026-11-04; done on
+bender). The code requires >= 0.19.0 (`MIN_SCCACHE_VERSION`). Installing it changes
+nothing until `fabric_build_cache.enabled` is set.
 
 Also choose the pilot project (a Rust workspace that builds offline or whose
 dependencies are already fetched). Do the benchmark in the throwaway copy that
 `--copy` creates, never in a live worktree.
 
-Install (operator's method), then verify:
+Install (per-user, no root; SHA-256 pinned in `scripts/sccache-checksums.txt`; also
+runs as step 2b of a full `scripts/install.sh`; `--no-build-cache-tools` skips it), then verify:
 
 ```bash
-cargo install sccache --locked --version 0.19.0     # or the distro package
+scripts/install.sh --build-cache-tools-only         # -> ~/.local/bin/sccache
+herdr-eng doctor                                    # build_cache_sccache / _rust / _python_deps
 sccache --version                                   # expect 0.19.0 or newer
 rustc -vV && cargo --version
 ```
+
+sccache does not cache incremental builds or binary crates: use `CARGO_INCREMENTAL=0`
+and measure libraries.
 
 Config (everything else stays default-off):
 

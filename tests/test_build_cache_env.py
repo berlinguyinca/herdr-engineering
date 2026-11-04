@@ -338,6 +338,10 @@ def test_cache_config_none_child_env_unchanged(tmp_path, monkeypatch):
 def test_sccache_absent_build_proceeds_uncached(tmp_path, monkeypatch):
     out = _fake_env(tmp_path, monkeypatch)
     (tmp_path / "bin/sccache").unlink()
+    # hermetic: a real sccache installed on this host (e.g. ~/.local/bin) must not leak in
+    monkeypatch.setenv("PATH", os.pathsep.join(
+        d for d in os.environ["PATH"].split(os.pathsep)
+        if not (Path(d) / "sccache").exists()))
     rc = _sub(["cargo", "build"], tmp_path, {"enabled": True})
     assert rc == 0 and _seen(out)["WRAP"] == "-"
     assert not (tmp_path / "state/builds.jsonl").exists()  # exec path: no events, as today

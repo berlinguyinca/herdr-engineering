@@ -73,9 +73,18 @@ sccache hit rate observed, no write reduction or elapsed-time change measured. T
 spec 14 exit criterion ("proof of reduced real writes or elapsed build times") is NOT
 met. Any such number must come from Stage 1 of the runbook; none is estimated here.
 
+## sccache install and smoke (2026-11-04)
+
+sccache 0.19.0 installed on bender: **yes, 2026-11-04**, via `scripts/install.sh
+--build-cache-tools-only` (checksum-pinned, `~/.local/bin/sccache`, `--version` = 0.19.0;
+`herdr-eng doctor` build_cache_* all ok). Real smoke (tmp lib crate, `CARGO_INCREMENTAL=0`,
+tmp `SCCACHE_DIR`, `cargo clean` between builds): first build 1 executed / 0 hits / 1 miss;
+second build 2 executed / 1 hit / 1 miss, hit rate 50.00 %. This proves local sccache
+works; it is NOT the spec-14 baseline. Still not done: shared S3, real baseline.
+
 ## What was never run
 
-Real sccache (not installed on bender); real S3 or any shared endpoint; two hosts; any
+Real S3 or any shared endpoint; two hosts; any
 Slurm command or partition; the Playwright ui-gates for the panel in CI; Grafana
 push; a real Pi session; `tsc` on the Pi extension.
 
@@ -172,7 +181,7 @@ run, no real Pi run). Nothing here was run against a real sccache or Slurm.
 
 ## Operator decisions needed
 
-1. Install sccache 0.19.0 on bender (Stage 1 approval).
+1. (Done 2026-11-04) sccache 0.19.0 installed on bender.
 2. Pilot project for the cold/warm benchmark.
 3. TLS S3 endpoint, bucket, scoped 0600 read-only credentials, registry file (Stage 2),
    and approval to build the credentialed sccache server (the open gap).

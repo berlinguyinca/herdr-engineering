@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Installer: checksum-pinned sccache 0.19.0 for the fabric build cache
+- `scripts/install.sh` step 2b runs `scripts/install-sccache.sh`: downloads the upstream mozilla/sccache 0.19.0 tarball for this os/arch (Linux x86_64/aarch64 musl, macOS arm64/x86_64), verifies SHA-256 against `scripts/sccache-checksums.txt` (fails closed if absent or mismatched), installs only the binary to `~/.local/bin/sccache` (0755, no root), skips when >= 0.19.0 is present. Failure is non-fatal with a loud warning. `--no-build-cache-tools` skips, `--build-cache-tools-only` runs just this step. `herdr-eng doctor` gains `build_cache_sccache`, `build_cache_rust`, `build_cache_python_deps` (read-only warnings with the fix command). The feature stays default-off.
+
 ### CI: the ui-gates focus-audit floor is back at 480
 - Commit 643d2b5f lowered the owner `focused` floor in `ui-gates-states.test.mjs` from 480 to 470, blaming the Usage page's new tabs. The Usage page is not audited by that test (every state's scope is a workbench panel, `#hcn-p-*`); the real drift was the phone's closed Filters disclosure, which 8cbeff9b fixed by opening it in every lineage state (498 focused before the drift, 479 during). The floor is 480 again and the stale comment is replaced. `ui-gates-floor.test.mjs` reads the floors from source and fails if any drops below its recorded minimum (runs without a browser). Not verified locally: Playwright is not installed here, so only a green ui-gates run proves the owner total reaches 480; do not merge before it.
 

@@ -1,4 +1,7 @@
 # HANDOFF (rolling; newest section first)
+## Update 2026-11-04: sccache installer
+
+`scripts/install-sccache.sh` (called by `install.sh` step 2b, or `install.sh --build-cache-tools-only`) installs checksum-pinned sccache 0.19.0 per-user; `doctor` reports `build_cache_*` checks. Run on bender 2026-11-04 (operator-approved). Feature still default-off. Tests: `tests/test_install_sccache.py`, `tests/test_doctor.py`.
 
 ## Spec 14: rollout -- DOCS ONLY; no pilot run, no measurement
 Plan: write docs/build-cache-deployment.md (staged runbook), IMPLEMENTATION_REPORT.md; no code, no deploy, no network.
