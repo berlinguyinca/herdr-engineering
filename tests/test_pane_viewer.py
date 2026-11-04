@@ -2,7 +2,7 @@
 import fcntl
 import os
 import pty
-import select
+import selectors
 import struct
 import sys
 import termios
@@ -47,7 +47,7 @@ class Session:
         while time.time() < end:
             if needle in self.out[since:]:
                 return True
-            if select.select([self.fd], [], [], 0.1)[0]:
+            if self._readable(0.1):
                 try:
                     chunk = os.read(self.fd, 65536)
                 except OSError:
@@ -56,6 +56,11 @@ class Session:
                     break
                 self.out += chunk
         return needle in self.out[since:]
+
+    def _readable(self, timeout):
+        with selectors.DefaultSelector() as sel:             # epoll/poll: select() cannot take fds >= 1024
+            sel.register(self.fd, selectors.EVENT_READ)
+            return bool(sel.select(timeout))
 
     def resize(self, cols, rows):
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -175,3 +180,17 @@ def test_non_scrolling_document_ignores_scroll_keys(make):
     assert b"L099" not in s.out and b"L030" not in s.out
     s.send(b"q")
     assert s.finish() == 0
+
+
+def test_session_helper_works_when_the_test_process_holds_over_a_thousand_descriptors(tmp_path):
+    held = []
+    try:
+        while len(held) < 1100:                              # a long suite leaks enough to push new fds past FD_SETSIZE
+            held.append(os.dup(2))
+        s = Session(tmp_path)
+        assert s.read_until(b"q closes this pane")
+        s.send(b"q")
+        assert s.finish() == 0
+    finally:
+        for fd in held:
+            os.close(fd)
