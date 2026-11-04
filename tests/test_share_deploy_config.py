@@ -372,21 +372,198 @@ def test_render_edge_uses_the_configured_share_origin(tmp_path):
     assert out2.read_text() == EDGE.read_text()
 
 
-@pytest.mark.skipif(shutil.which("nginx") is None, reason="nginx is not installed")
-def test_rendered_edge_passes_nginx_t(tmp_path):
-    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
-    acme = tmp_path / "acme"
-    acme.mkdir()
+NGINX_IMAGE = "nginx:1.27-alpine"
+
+
+def _docker_ready() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    return subprocess.run(["docker", "image", "inspect", NGINX_IMAGE], capture_output=True).returncode == 0
+
+
+needs_nginx = pytest.mark.skipif(shutil.which("nginx") is None and not _docker_ready(),
+                                 reason="neither nginx nor docker with the nginx image is available")
+needs_docker = pytest.mark.skipif(not _docker_ready(), reason="docker with the nginx image is not available")
+
+
+def _dummy_certs(acme: Path) -> None:
+    acme.mkdir(parents=True, exist_ok=True)
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=t",
                     "-keyout", str(acme / "privkey.pem"), "-out", str(acme / "fullchain.pem")],
                    check=True, capture_output=True)
-    conf = conf.replace("/etc/acme", str(acme)).replace("pid /run/nginx.pid;", f"pid {tmp_path}/n.pid;")
-    conf = re.sub(r"server (collab-public|share-public):\d+", "server 127.0.0.1:9", conf)
-    conf = conf.replace("resolver 127.0.0.11 valid=10s ipv6=off;", "").replace(" resolve max_conns", " max_conns")
-    (tmp_path / "nginx.conf").write_text(conf)
-    r = subprocess.run(["nginx", "-t", "-c", str(tmp_path / "nginx.conf"), "-e", "/dev/stderr"],
-                       capture_output=True, text=True)
+
+
+def _testable_conf(acme_dir: str, pid: str, upstream: str = "127.0.0.1:9") -> str:
+    """The rendered edge, with only what a test box cannot provide swapped: cert dir, pid, upstream addresses."""
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
+    conf = conf.replace("/etc/acme", acme_dir).replace("pid /run/nginx.pid;", f"pid {pid};")
+    conf = re.sub(r"server (collab-public|share-public):\d+", f"server {upstream}", conf)
+    return conf.replace("resolver 127.0.0.11 valid=10s ipv6=off;", "").replace(" resolve max_conns", " max_conns")
+
+
+@needs_nginx
+def test_rendered_edge_passes_nginx_t(tmp_path):
+    _dummy_certs(tmp_path / "acme")
+    if shutil.which("nginx"):
+        (tmp_path / "nginx.conf").write_text(_testable_conf(str(tmp_path / "acme"), f"{tmp_path}/n.pid"))
+        cmd = ["nginx", "-t", "-c", str(tmp_path / "nginx.conf"), "-e", "/dev/stderr"]
+    else:
+        (tmp_path / "nginx.conf").write_text(_testable_conf("/c", "/tmp/n.pid"))
+        cmd = ["docker", "run", "--rm", "-v", f"{tmp_path}/nginx.conf:/etc/nginx/nginx.conf:ro",
+               "-v", f"{tmp_path}/acme:/c:ro", NGINX_IMAGE, "nginx", "-t"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+# ---- behaviour against a real nginx (docker, host network) and a tiny echo upstream
+
+TOKEN = "A" * 43
+SESSION = "sess-1"
+ANN = f"/s/{TOKEN}/k/{SESSION}/annotations"
+MCP_HOST = "localdev.mcp.metabolomics.us"
+
+
+@pytest.fixture(scope="module")
+def live_edge(tmp_path_factory):
+    import http.server
+    import socket
+    import threading
+    import time
+    if not _docker_ready():
+        pytest.skip("docker with the nginx image is not available")
+    tmp = tmp_path_factory.mktemp("edge")
+    _dummy_certs(tmp / "acme")
+
+    class Echo(http.server.BaseHTTPRequestHandler):
+        def do(self):
+            n = int(self.headers.get("content-length") or 0)
+            body = self.rfile.read(n) if n else b""
+            out = json.dumps({"m": self.command, "path": self.path, "blen": len(body)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(out)
+        do_GET = do_POST = do_HEAD = do_PUT = do_OPTIONS = do
+
+        def log_message(self, *a):
+            pass
+
+    def free_port():
+        with socket.socket() as sk:
+            sk.bind(("127.0.0.1", 0))
+            return sk.getsockname()[1]
+    up_port, edge_port = free_port(), free_port()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", up_port), Echo)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    conf = _testable_conf("/c", "/tmp/n.pid", upstream=f"127.0.0.1:{up_port}")
+    # what a test box has no equivalent of: the PROXY protocol header and the LAN edge address
+    conf = conf.replace("listen 8443 ssl proxy_protocol", f"listen {edge_port} ssl")
+    conf = conf.replace("real_ip_header proxy_protocol;", "").replace("set_real_ip_from 192.168.137.250;", "")
+    conf = conf.replace("map $realip_remote_addr $hcn_from_edge { default 0; 192.168.137.250 1; }",
+                        "map $remote_addr $hcn_from_edge { default 1; }")
+    conf = conf.replace("listen 8082;", f"listen {free_port()};")
+    (tmp / "nginx.conf").write_text(conf)
+    name = f"herdr-edge-test-{secrets.token_hex(4)}"
+    subprocess.run(["docker", "run", "-d", "--rm", "--name", name, "--network", "host",
+                    "-v", f"{tmp}/nginx.conf:/etc/nginx/nginx.conf:ro", "-v", f"{tmp}/acme:/c:ro",
+                    NGINX_IMAGE, "nginx", "-g", "daemon off;"], check=True, capture_output=True)
+    try:
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", edge_port), timeout=0.2).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        yield edge_port
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        server.shutdown()
+
+
+def _request(port, method, path, *, sni=SHARE_HOST, host=None, body=b"", headers=None):
+    """(status, body) or (None, b"") when the server closed the connection; the path is sent raw."""
+    import http.client
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    raw = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=10)
+    raw.sock = ctx.wrap_socket(__import__("socket").create_connection(("127.0.0.1", port), timeout=10),
+                               server_hostname=sni)
+    try:
+        raw.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        raw.putheader("Host", host or sni)
+        for k, v in (headers or {}).items():
+            raw.putheader(k, v)
+        if body or method in ("POST", "PUT"):
+            raw.putheader("Content-Length", str(len(body)))
+        raw.endheaders(body)
+        resp = raw.getresponse()
+        return resp.status, resp.read()
+    except (ConnectionError, http.client.RemoteDisconnected):
+        return None, b""
+    finally:
+        raw.close()
+
+
+@needs_docker
+@pytest.mark.parametrize("method,path,kw,expect", [
+    ("GET", f"/s/{TOKEN}/f/index.html", {}, 200),
+    ("GET", f"/s/{TOKEN}/f/my%20file.csv", {}, 200),
+    ("GET", "/s/static/vendor/pdfjs/pdf.min.mjs", {}, 200),
+    ("GET", ANN, {}, 200),
+    ("POST", ANN, {"body": b"x" * 31 * 1024, "headers": {"Content-Type": "application/json"}}, 200),
+    ("POST", ANN, {"body": b"x" * 33 * 1024, "headers": {"Content-Type": "application/json"}}, 413),
+    ("PUT", ANN, {"body": b"{}"}, 404),
+    ("DELETE", ANN, {}, 404),
+    ("GET", ANN, {"headers": {"Content-Length": "5"}, "body": b"hello"}, 404),
+    ("POST", f"/s/{TOKEN}/f/x", {"body": b"{}"}, 404),
+    ("GET", "/", {}, 404),
+    ("GET", "/api/v1/collab/config", {}, 404),
+    ("GET", f"/s/{TOKEN}/k/{SESSION}/y/../annotations", {}, 404),
+    ("POST", f"/s/{TOKEN}/k/{SESSION}/y/../annotations", {"body": b"{}"}, 404),
+    ("POST", f"//s/{TOKEN}/k/{SESSION}/annotations", {"body": b"{}"}, 404),
+    ("GET", f"/s/{TOKEN}/f/./index.html", {}, 404),
+    ("GET", f"/s/{TOKEN}/f/a%2fb", {}, 404),
+    ("GET", f"/s/{TOKEN}/f/a%2Eb", {}, 404),
+    ("GET", f"/s/{TOKEN}/f/a%5cb", {}, 404),
+    ("GET", f"/s/{TOKEN}/f/a\\b", {}, 404),
+    ("GET", f"/s/{TOKEN}/f/x/..", {}, 404),
+])
+def test_share_host_behaviour(live_edge, method, path, kw, expect):
+    body = kw.get("body", b"")
+    headers = dict(kw.get("headers") or {})
+    headers.pop("Content-Length", None)
+    status, _ = _request(live_edge, method, path, body=body, headers=headers)
+    assert status == expect
+
+
+@needs_docker
+def test_mcp_host_serves_no_s_and_unknown_host_is_dropped(live_edge):
+    assert _request(live_edge, "GET", f"/s/{TOKEN}/f/index.html", sni=MCP_HOST)[0] == 404
+    assert _request(live_edge, "POST", ANN, sni=MCP_HOST, body=b"{}")[0] == 404
+    assert _request(live_edge, "GET", "/", host="unknown.example.test")[0] in (None, 444)
+
+
+@needs_docker
+def test_share_host_forwards_the_raw_path_and_keeps_upstream_headers(live_edge):
+    import http.client
+    import ssl
+    status, body = _request(live_edge, "GET", f"/s/{TOKEN}/f/my%20file.csv")
+    assert status == 200 and json.loads(body)["path"] == f"/s/{TOKEN}/f/my%20file.csv"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection("127.0.0.1", live_edge, context=ctx)
+    conn.sock = ctx.wrap_socket(__import__("socket").create_connection(("127.0.0.1", live_edge)),
+                                server_hostname=SHARE_HOST)
+    conn.request("GET", ANN, headers={"Host": SHARE_HOST})
+    resp = conn.getresponse()
+    resp.read()
+    assert resp.getheader("Cache-Control") == "no-store"          # no caching layer defeats it
+    assert resp.getheader("Strict-Transport-Security")
+    conn.close()
 
 
 def test_share_method_map_allows_reads_and_only_the_body_less_session_post():
@@ -770,3 +947,12 @@ def test_lab_problems_names_a_share_url_the_server_would_reject(url):
     share = {"signing_secret": SECRET, "public_url": url}
     assert any("control_plane.share.public_url" in p for p in _share_lab_problems(COLLAB, share))
     assert not any("public_url" in p for p in _share_lab_problems(COLLAB, {**share, "public_url": SHARE_URL}))
+
+
+def test_share_locations_refuse_raw_paths_that_differ_from_the_normalised_one_and_reads_with_a_body():
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
+    assert "map $request_uri $share_raw_path_ok {" in conf
+    share = _server_block(conf, f"server_name {SHARE_HOST};")
+    assert share.count("if ($share_raw_path_ok = 0) { return 404; }") == 2       # /s/ and the annotation location
+    ann = _brace_block(share, share.index('$" {'))
+    assert "if ($share_read_with_body) { return 404; }" in ann
