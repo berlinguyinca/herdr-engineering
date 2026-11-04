@@ -593,3 +593,433 @@ def test_the_work_graph_shows_the_coordinator_as_a_team_role_fact(tmp_path, wg, 
         assert held == {f"agent:{impl['agent_id']}"}
     finally:
         srv.shutdown()
+
+
+# ============================================================== (b) external coordinators
+EXT_LIMITS = {"roles": ["implementer", "reviewer"]}
+
+
+def ext_team(p, impls=1, limits=None, team=TEAM2, who="dave"):
+    """A team with NO operator-owned coordinator, opted in for external coordination and coordinated by ``who``."""
+    held = [p.agent(name=f"eimpl{i}") for i in range(impls)]
+    rev = p.agent(name="erev")
+    s, out = p.attach({"implementer": [a["agent_id"] for a in held], "reviewer": [rev["agent_id"]]}, team=team)
+    assert s == 200, out
+    s, out = p.ext(True, limits or EXT_LIMITS, team=team)
+    assert s == 200 and out["enabled"] is True, out
+    s, out = p.set_coord("user:" + who, team=team)
+    assert s == 200 and out["kind"] == "external", out
+    return held, rev
+
+
+def ext_root(p, user="dave", text="build the thing", by="alice"):
+    """The operator's own root task for the external coordinator, accepted by them."""
+    s, out = p.make(by, target_user_id=user, text=text)
+    assert s == 201, out
+    s, out2 = p.respond(user, out["task_id"], "accepted")
+    assert s == 200, out2
+    return out["task_id"]
+
+
+def child(p, root, user="dave", role="implementer", **body):
+    return p.make(user, target_role=role, parent_task_id=root, **body)
+
+
+def test_the_opt_in_is_the_owners_alone_and_off_by_default(cp):
+    p = cp
+    held = [p.agent(name="w")]
+    assert p.attach({"implementer": [held[0]["agent_id"]]}, team=TEAM2)[0] == 200
+    assert p.view_coord(team=TEAM2)[1]["external"]["enabled"] is False
+    s, out = p.set_coord("user:dave", team=TEAM2)
+    assert s == 409 and out["code"] == "external_opt_in_required"
+    for user in ("bob", "carol", "dave", "erin", "mallory"):
+        assert p.ext(True, EXT_LIMITS, team=TEAM2, user=user)[0] == 404, user
+    assert not p.events("team_external_coordination_set")
+    # the owner's limits are validated against the service-wide ceiling
+    for bad in (None, {}, {"roles": []}, {"roles": ["coordinator"]}, {"roles": ["implementer"], "tasks_per_hour": 99},
+                {"roles": ["implementer"], "max_open": 0}, {"roles": ["implementer"], "nope": 1},
+                {"roles": ["implementer"], "max_depth": 3}):
+        assert p.ext(True, bad, team=TEAM2)[0] == 400, bad
+    s, out = p.ext(True, {"roles": ["implementer"], "tasks_per_hour": 2}, team=TEAM2)
+    assert s == 200 and out["limits"]["roles"] == ["implementer"] and out["replayed"] is False
+    assert p.ext(True, {"roles": ["implementer"], "tasks_per_hour": 2}, team=TEAM2)[1]["replayed"] is True
+    # who may be designated once the opt-in is on
+    assert p.set_coord("user:alice", team=TEAM2)[0] == 400
+    assert p.set_coord("user:bob", team=TEAM2)[0] == 400                      # a contributor already holds grant_agent
+    assert p.set_coord("user:carol", team=TEAM2)[0] == 400                    # a viewer is not a guest
+    assert p.set_coord("user:mallory", team=TEAM2)[0] == 400                  # not a member
+    assert p.set_coord("user:dave", team=TEAM2)[0] == 200
+    # the coordinator can neither widen nor switch off the opt-in, and an agent gets 403
+    for body in ({"enabled": True, "limits": {"roles": ["implementer", "tester"], "tasks_per_hour": 5}}, {"enabled": False}):
+        before = len(p.denials(actor_user_id="dave"))
+        p.clock.t += 61
+        assert p.c("dave", "POST", f"{BASE}/rooms/{p.room}/teams/{TEAM2}/external-coordination", body)[0] == 403
+        assert len(p.denials(actor_user_id="dave")) == before + 1
+    agent = p.agent(name="x")
+    assert p.a(agent, "POST", f"{BASE}/rooms/{p.room}/teams/{TEAM2}/external-coordination", {"enabled": False})[0] == 404
+    assert [e["payload"]["enabled"] for e in p.events("team_external_coordination_set")] == [True]
+    assert p.view_coord(team=TEAM2)[1]["external"]["enabled"] is True
+
+
+def test_an_external_coordinator_acts_as_themselves_and_the_chain_really_runs(cp):
+    p = cp
+    (impl,), rev = ext_team(p)
+    root = ext_root(p)
+    mark = len(p.svc._log)
+    s, out = child(p, root, text="part one")
+    assert s == 201 and out["routed_to"] == "agent:" + impl["agent_id"], out
+    caused = [e for e in p.svc._log[mark:]]
+    assert [e["event_type"] for e in caused] == ["task_created"]
+    pl = caused[0]["payload"]
+    assert pl["actor_user_id"] == "dave" and pl["created_by_kind"] == "user" and pl["created_by_id"] == "dave"
+    assert pl["origin"] == "coordinator" and pl["coordinator_key"] == "user:dave" and pl["root_user_id"] == "alice"
+    assert "alice" not in json.dumps({k: v for k, v in pl.items() if k != "root_user_id"})   # never attributed to the operator
+    t = p.svc._tasks[out["task_id"]]
+    assert (t["by_kind"], t["by_id"]) == ("user", "dave")
+    # the assignee sees it, accepts it, finishes it: a guest-made task is really served
+    assert [x["task_id"] for x in p.inbox(impl)] == [out["task_id"]]
+    p.accept(impl, out["task_id"])
+    assert p.update(impl, out["task_id"], "done", result="a secret result")[0] == 200
+    # tracking is status only: no result, no task list, no task by id
+    s, view = p.coordination("dave")
+    assert s == 200 and view["kind"] == "external" and view["usage"]["created_last_hour"] == 1
+    assert view["tasks"][0]["status"] == "done" and "result" not in view["tasks"][0]
+    assert "a secret result" not in json.dumps(view)
+    assert p.c("dave", "GET", f"{BASE}/rooms/{p.room}/tasks")[1]["tasks"] == []
+    assert p.task("dave", out["task_id"])[0] == 404
+    assert p.task("erin", out["task_id"])[0] == 404
+    assert p.task("alice", out["task_id"])[0] == 200
+    # a coordinator's own audit trail is attributed to them with the marker
+    for e in p.svc._log[mark:]:
+        if e["event_type"] == "audit_denied":
+            assert e["payload"]["actor_user_id"] == "dave" and e["payload"]["origin"] == "coordinator"
+
+
+def test_an_external_coordinator_stays_inside_the_team_roles_and_limits(cp):
+    p = cp
+    p.svc.coordinators = normalize_coordinators({**COORD, "external": {"enabled": True, "tasks_per_hour": 3, "max_open": 4,
+                                                                         "max_items_per_request": 3}})
+    (impl,), rev = ext_team(p, limits={"roles": ["implementer"], "max_items_per_request": 2})
+    root = ext_root(p)
+    bobs = p.make("bob", target_user_id="dave", text="bob's own idea")[1]["task_id"]         # a task a contributor made
+    p.respond("dave", bobs, "accepted")
+    assert child(p, bobs)[0] == 400                                                          # no operator-made root: refused
+    assert p.make("dave", target_role="implementer")[0] == 400                                # no root at all
+    # a role outside the list, another team, a named agent or person, a foreign agent: refused, and audited under dave
+    p.clock.t += 61
+    n = len(p.denials(actor_user_id="dave"))
+    assert child(p, root, role="reviewer")[0] == 403
+    assert child(p, root, team_id=TEAM)[0] == 403
+    assert len(p.denials(actor_user_id="dave")) == n + 2
+    inv = p.svc.create_external_invite(p.svc.authenticate(f"Bearer {USERS['alice']}", None), p.room, {"label": "foreign"})
+    foreign = p.svc.redeem_join_token({"token": inv["code"]})
+    for body in ({"target_agent_id": impl["agent_id"]}, {"target_agent_id": foreign["agent_id"]}, {"target_user_id": "erin"},
+                 {"target_role": "implementer", "lease_seconds": 100}):
+        assert p.make("dave", parent_task_id=root, **body)[0] == 400, body
+    # items per request: the 3rd child of one root is the cap's doing
+    assert child(p, root, text="a")[0] == 201 and child(p, root, text="b")[0] == 201
+    s, out = child(p, root, text="c")
+    assert s == 429 and out["code"] == "coordinator_items", out
+    # a child of a child is not a root: the chain cannot be extended past the operator's task
+    first = p.svc._tasks[next(iter(p.svc._tc_tasks[(p.room, TEAM2)]))]
+    assert first["depth"] == 1
+    # the person's own created tasks never made a task for a different room
+    assert child(p, root, room=p.room2)[0] in (403, 404)
+
+
+def test_an_external_coordinator_cannot_target_an_assistant_that_holds_a_role_in_their_team(cp):
+    p = cp
+    (asst,) = _assistants(p, 1, plain_grants=())
+    impl = p.agent(name="eimpl")
+    assert p.attach({"implementer": [impl["agent_id"]], "tester": [asst["agent_id"]]}, team=TEAM2)[0] == 200
+    assert p.ext(True, {"roles": ["implementer", "tester"]}, team=TEAM2)[0] == 200
+    assert p.set_coord("user:dave", team=TEAM2)[0] == 200
+    root = ext_root(p)
+    s, out = child(p, root, role="tester")
+    assert s == 400 and out["code"] == "coordination_loop", out
+    assert child(p, root, role="implementer")[0] == 201
+
+
+def test_the_external_cap_is_lower_than_the_operator_owned_cap_at_the_same_moment(cp):
+    p = cp
+    held, rev, coord = crew(p, impls=3)                                       # TEAM, operator-owned, cap 4
+    (eimpl,), erev = ext_team(p, limits={"roles": ["implementer"], "max_open": 3})
+    oroot, eroot = root_for(p, coord), ext_root(p)
+    for i in range(2):
+        assert child(p, eroot, text=f"e{i}")[0] == 201
+    s, out = child(p, eroot, text="e2")
+    assert s == 429 and out["code"] == "coordinator_rate", out                # (cap = 2) + 1
+    for i in range(3):                                                         # the operator-owned coordinator, same instant
+        assert p.make(coord, target_role="implementer", parent_task_id=oroot, text=f"o{i}")[0] == 201
+    # the per-team limit can only go down from the service-wide ceiling, also when the ceiling is lowered later
+    p.clock.t += 3601
+    p.svc.coordinators = normalize_coordinators({**COORD, "external": {"enabled": True, "tasks_per_hour": 1, "max_open": 3}})
+    assert child(p, eroot, text="late")[0] == 201
+    assert child(p, eroot, text="later")[1]["code"] == "coordinator_rate"
+
+
+def test_the_open_limit_for_an_external_coordinator_is_its_own_code(cp):
+    p = cp
+    p.svc.coordinators = normalize_coordinators({**COORD, "external": {"enabled": True, "tasks_per_hour": 3, "max_open": 3}})
+    ext_team(p, limits={"roles": ["implementer"], "max_open": 1})
+    root = ext_root(p)
+    assert child(p, root, text="one")[0] == 201
+    s, out = child(p, root, text="two")
+    assert s == 429 and out["code"] == "coordinator_open", out
+
+
+def test_everything_an_external_coordinator_must_not_do_is_403_with_an_audit_denial_under_their_identity(cp):
+    p = cp
+    held, rev, coord = crew(p)
+    ext_team(p)
+    spare = p.agent(name="spare")
+    s, out = p.suggest_as_erin = p.c("erin", "POST", f"{BASE}/rooms/{p.room}/suggestions", {"text": "please"})
+    sg = out["suggestion_id"] if s == 201 else None
+    tries = {
+        "grant": ("POST", f"/rooms/{p.room}/agents", {"agent_id": spare["agent_id"], "actions": ["read", "post"]}),
+        "invite": ("POST", f"/rooms/{p.room}/invites", {"email": "x@example.com", "role": "guest"}),
+        "add_member": ("POST", f"/rooms/{p.room}/members", {"user_id": "mallory", "role": "guest"}),
+        "role_assign": ("POST", f"/rooms/{p.room}/teams/{TEAM2}/roles", {"role": "tester", "holder": "user:dave"}),
+        "coordinator_set": ("POST", f"/rooms/{p.room}/teams/{TEAM}/coordinator", {"holder": "agent:" + spare["agent_id"]}),
+        "coordinator_clear": ("POST", f"/rooms/{p.room}/teams/{TEAM2}/coordinator/clear", {}),
+        "guest_level": ("POST", f"/rooms/{p.room}/guest-level", {"level": "read_only"}),
+        "optin": ("POST", f"/rooms/{p.room}/teams/{TEAM2}/external-coordination", {"enabled": False}),
+        "attach": ("POST", f"/rooms/{p.room}/teams/{'team-' + 'f' * 20}/attach", {"roles": {"implementer": [spare["agent_id"]]}}),
+        "detach": ("POST", f"/rooms/{p.room}/teams/{TEAM2}/detach", {}),
+        "decide": ("POST", f"/rooms/{p.room}/suggestions/{sg}/decide", {"decision": "reject", "expected_digest": "0" * 64}),
+        "policy": ("POST", f"/rooms/{p.room}/teams/{TEAM2}/policy", {"no_response_policy": "wait"}),
+        "visibility": ("POST", f"/rooms/{p.room}/member-visibility", {"enabled": True}),
+    }
+    for name, (method, path, body) in tries.items():
+        before = len(p.denials(actor_user_id="dave"))
+        p.clock.t += 61
+        s, _ = p.c("dave", method, BASE + path, body)
+        assert s == 403, (name, s)
+        assert len(p.denials(actor_user_id="dave")) == before + 1, name
+    assert all(e["payload"]["origin"] == "coordinator" for e in p.denials(actor_user_id="dave"))
+    assert p.view_coord(team=TEAM2)[1]["holder"] == "user:dave" and not p.events("team_detached")
+    assert not p.events("team_role_assigned") and not p.events("invite_created")
+    assert p.c("alice", "GET", f"{BASE}/rooms/{p.room}/guest-level")[1]["explicit"] is False
+    # erin, a plain guest, still gets the old 404 from the owner-only routes (the 403 is for a known coordinator)
+    assert p.c("erin", "POST", f"{BASE}/rooms/{p.room}/guest-level", {"level": "read_only"})[0] == 404
+
+
+def _http(port, method, path, body=None, headers=None):
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    h = {"Content-Type": "application/json", **(headers or {})}
+    conn.request(method, path, body=json.dumps(body) if body is not None else None, headers=h)
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+    try:
+        return resp.status, json.loads(raw)
+    except ValueError:
+        return resp.status, None
+
+
+def test_no_coordinator_can_approve_an_external_action_only_the_owner_decides(tmp_path):
+    """A real assistant service on the same server: a pending approval, decided over real HTTP. The collaboration credentials
+    (an agent's, an external person's) do not authenticate on the assistant API at all, and the approval stays pending."""
+    from herdr_engineering.control_plane.assistant import AssistantService, assistant_config
+    clock = Clock()
+    svc = _service(tmp_path, clock)
+    asvc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True,
+                                                                           "actions": {"allow_self_approval": True}}}))
+    srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc, assistant_service=asvc,
+                             api_keys={"op-key": "operator"})
+    threading.Thread(target=srv.serve, daemon=True).start()
+    srv.wait_until_ready()
+    svc.work_graph_handle = None
+    try:
+        p = CPlane(svc, srv, clock)
+        held, rev, coord = crew(p)
+        ext_team(p)
+        op = {"X-API-Key": "op-key"}
+        s, a = _http(srv.port, "POST", "/api/v1/assistants", {"name": "A"}, op)
+        assert s in (200, 201), a
+        aid = a["assistant_id"]
+        _, t = _http(srv.port, "POST", f"/api/v1/assistants/{aid}/threads", {}, op)
+        _, r = _http(srv.port, "POST", f"/api/v1/assistants/{aid}/threads/{t['thread_id']}/messages", {"content": "hi"}, op)
+        run = r["run"]["run_id"]
+        assert _http(srv.port, "POST", f"/api/v1/assistants/{aid}/permissions", {"tool_id": "edit_shared", "scope": "rec"}, op)[0] == 201
+        s, need = _http(srv.port, "POST", f"/api/v1/assistant-runs/{run}/tool",
+                        {"tool_id": "edit_shared", "scope": "rec", "idempotency_key": "k1",
+                         "payload": {"record": "rec", "field": "f", "value": "v"}}, op)
+        assert s == 403 and need.get("approval_id"), need
+        path = f"/api/v1/assistant-approvals/{need['approval_id']}/decision"
+        agent_headers = {"Authorization": f"Agent {coord['credential']}", "X-Herdr-Device": coord["device_id"]}
+        for headers in (agent_headers, {"Authorization": f"Bearer {USERS['dave']}"}, {"Authorization": f"Bearer {USERS['alice']}"}, {}):
+            s, _ = _http(srv.port, "POST", path, {"decision": "approved"}, headers)
+            assert s in (401, 403, 404), headers
+        for route in ("/api/v1/assistants", "/api/v1/assistant-approvals", "/api/v1/assistant-memory"):
+            assert _http(srv.port, "GET", route, None, {"Authorization": f"Bearer {USERS['dave']}"})[0] in (401, 403, 404), route
+            assert _http(srv.port, "GET", route, None, agent_headers)[0] in (401, 403, 404), route
+        _, listing = _http(srv.port, "GET", "/api/v1/assistant-approvals", None, op)
+        assert [x["decision"] for x in listing["approvals"]] == ["pending"]
+        s, done = _http(srv.port, "POST", path, {"decision": "approved"}, op)
+        assert s == 200 and done["decision"] == "approved", done
+    finally:
+        srv.shutdown()
+
+
+# -- revocation: the opt-in, the removal, the identity provider, a detach
+def two_children(p, root):
+    c1 = child(p, root, text="one")[1]
+    c2 = child(p, root, text="two")[1]
+    return c1["task_id"], c2["task_id"]
+
+
+def test_turning_the_opt_in_off_ends_the_coordinator_requeues_their_work_and_fences_the_old_run(cp):
+    p = cp
+    (impl,), rev = ext_team(p)
+    root = ext_root(p)
+    c1, c2 = two_children(p, root)
+    p.accept(impl, c1)                                                       # one is running, one is waiting
+    s, out = p.ext(False, team=TEAM2)
+    assert s == 200 and out["enabled"] is False and sorted(out["requeued"]) == sorted([c1, c2]) and out["cancelled"] == []
+    assert [e["payload"]["enabled"] for e in p.events("team_external_coordination_set")] == [True, False]
+    assert p.events("team_coordinator_cleared")[0]["payload"]["reason"] == "external_coordination_off"
+    assert len(p.events("task_requeued")) == 2
+    # the work goes back to the role queue under the operator, with a higher attempt, and is still served
+    for tid in (c1, c2):
+        t = p.svc._tasks[tid]
+        assert t["status"] == "pending" and t["attempt"] == 2 and t["by_id"] == "alice" and t["adopted_from"] == "user:dave"
+    assert sorted(x["task_id"] for x in p.inbox(impl)) == sorted([c1, c2]) and {x["attempt"] for x in p.inbox(impl)} == {2}
+    # the old run cannot finish it: with the old attempt, or with none
+    assert p.update(impl, c1, "done", attempt=1)[0] == 409
+    assert p.update(impl, c1, "accepted")[0] == 409
+    assert p.update(impl, c1, "accepted", attempt=2)[0] == 200 and p.update(impl, c1, "done", result="ok", attempt=2)[0] == 200
+    # dave's credential no longer authorizes coordinate
+    p.clock.t += 61
+    s, _ = child(p, root, text="again")
+    assert s == 403 and p.denials("task.create", actor_user_id="dave")
+    assert p.coordination("dave")[0] == 404
+    # repeating the revocation changes nothing
+    n = len(p.svc._log)
+    s, out = p.ext(False, team=TEAM2)
+    assert s == 200 and out["replayed"] is True and len(p.svc._log) == n
+    assert p.clear_coord(team=TEAM2)[1]["replayed"] is True and len(p.svc._log) == n
+    # and a re-grant starts clean: the old tasks are the operator's now, not the coordinator's
+    assert p.ext(True, EXT_LIMITS, team=TEAM2)[0] == 200 and p.set_coord("user:dave", team=TEAM2)[0] == 200
+    assert p.coordination("dave")[1]["tasks"] == [] or all(t["adopted"] for t in p.coordination("dave")[1]["tasks"])
+
+
+def test_a_requeued_task_still_excludes_the_revoked_coordinator_as_its_reviewer(cp):
+    p = cp
+    (impl,), rev = ext_team(p)
+    p.c("alice", "POST", f"{BASE}/rooms/{p.room}/teams/{TEAM2}/roles", {"role": "reviewer", "holder": "user:erin"})
+    root = ext_root(p)
+    c1 = child(p, root)[1]["task_id"]
+    assert p.ext(False, team=TEAM2)[0] == 200
+    s, out = p.make("alice", target_user_id="dave", reviews_task_id=c1, text="review")
+    assert s == 400, out                                                      # the one who decomposed it, even after the requeue
+    assert p.make("alice", target_user_id="erin", reviews_task_id=c1, text="review")[0] == 201
+
+
+def test_removing_the_person_from_the_room_requeues_their_work_at_once(cp):
+    p = cp
+    (impl,), rev = ext_team(p)
+    root = ext_root(p)
+    c1, c2 = two_children(p, root)
+    assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/members/dave/remove", {})[0] == 200
+    assert [p.svc._tasks[t]["attempt"] for t in (c1, c2)] == [2, 2]
+    assert p.update(impl, c1, "accepted")[0] == 409
+    p.clock.t += 61
+    assert p.c("dave", "POST", f"{BASE}/rooms/{p.room}/tasks", {"target_role": "implementer", "parent_task_id": root,
+                                                                "text": "x"})[0] == 404
+
+
+def test_detaching_the_team_cancels_what_cannot_be_requeued(cp):
+    p = cp
+    (impl,), rev = ext_team(p)
+    root = ext_root(p)
+    c1, c2 = two_children(p, root)
+    assert p.detach(team=TEAM2)[0] == 200
+    assert [p.svc._tasks[t]["status"] for t in (c1, c2)] == ["cancelled", "cancelled"]
+
+
+def test_with_the_second_flag_off_a_coordinators_tasks_are_no_longer_served_but_the_owner_can_still_revoke(cp):
+    p = cp
+    (impl,), rev = ext_team(p)
+    root = ext_root(p)
+    c1 = child(p, root)[1]["task_id"]
+    p.svc.coordinators = normalize_coordinators({**COORD, "external": {"enabled": False, "tasks_per_hour": 2}})
+    p.clock.t += 61
+    assert child(p, root)[0] == 403
+    assert p.inbox(impl) == []                                               # authority withdrawn: nothing is handed to the agent
+    assert p.svc.sweep_coordinators()["requeued"] == 1                        # the withdrawn authority is requeued by the sweep
+    assert p.svc._tasks[c1]["attempt"] == 2 and p.svc._tasks[c1]["by_id"] == "alice"
+    assert [x["task_id"] for x in p.inbox(impl)] == [c1]                       # and served again, under the operator
+    s, out = p.ext(False, team=TEAM2)                                         # the OFF direction stays reachable
+    assert s == 200 and out["requeued"] == []
+    assert p.ext(True, EXT_LIMITS, team=TEAM2)[0] == 404
+
+
+def test_a_restart_keeps_the_opt_in_the_cap_and_a_finished_requeue(cp, tmp_path):
+    p = cp
+    (impl,), rev = ext_team(p)
+    root = ext_root(p)
+    c1, c2 = two_children(p, root)
+    again = reborn(p, tmp_path)
+    row = again.view_team_coordinator(owner_pr(again), p.room, TEAM2)
+    assert row["holder"] == "user:dave" and row["external"]["enabled"] is True and row["usage"]["created_last_hour"] == 2
+    pr = again.authenticate(f"Bearer {USERS['dave']}", None)
+    from herdr_engineering.control_plane.collab import CollabError
+    with pytest.raises(CollabError) as ei:
+        again.create_task(pr, p.room, {"target_role": "implementer", "parent_task_id": root, "text": "x"})
+    assert ei.value.code == "coordinator_rate"
+    p.ext(False, team=TEAM2)
+    final = reborn(p, tmp_path)
+    assert [final._tasks[t]["attempt"] for t in (c1, c2)] == [2, 2] and final._tc_coord == {}
+
+
+# -- the identity provider (Cognito) drops the person's group
+def test_the_identity_provider_group_removal_ends_access_within_its_window_and_the_requeue_still_runs(tmp_path):
+    from tests.control_plane.test_collab_cognito import auth, token
+    clock = Clock()
+    groups = {u: ["dev"] for u in ("alice", "dave")}
+    a = auth(group_lookup=lambda u: groups.get(u), now=clock)
+    svc = CollabService(a, sink=FileEventLog(str(tmp_path / "cog")), now=clock, max_agents_per_user=20)
+    svc.team_rooms = normalize_team_rooms({"enabled": True})
+    svc.team_roles = normalize_team_roles(ROLES)
+    svc.coordinators = normalize_coordinators(COORD)
+    srv = _serve(svc)
+    api = Api(srv.port)
+
+    def call(user, method, path, body=None):
+        return api.call(method, path, body, headers={"Authorization": f"Bearer {token(user, exp=9_999_999_999)}"})
+    try:
+        s, pr = call("alice", "POST", f"{BASE}/projects", {"name": "p"})
+        s, r = call("alice", "POST", f"{BASE}/projects/{pr['project_id']}/rooms", {"name": "r"})
+        room = r["room_id"]
+        assert call("alice", "POST", f"{BASE}/rooms/{room}/members", {"user_id": "dave", "role": "guest"})[0] == 201
+        s, impl = call("alice", "POST", f"{BASE}/agents/connect", {"harness_type": "claude-code", "name": "i"})
+        assert call("alice", "POST", f"{BASE}/rooms/{room}/teams/{TEAM2}/attach", {"roles": {"implementer": [impl["agent_id"]]}})[0] == 200
+        assert call("alice", "POST", f"{BASE}/rooms/{room}/teams/{TEAM2}/external-coordination",
+                    {"enabled": True, "limits": {"roles": ["implementer"]}})[0] == 200
+        assert call("alice", "POST", f"{BASE}/rooms/{room}/teams/{TEAM2}/coordinator", {"holder": "user:dave"})[0] == 200
+        s, root = call("alice", "POST", f"{BASE}/rooms/{room}/tasks", {"target_user_id": "dave", "text": "go"})
+        assert s == 201
+        assert call("dave", "POST", f"{BASE}/rooms/{room}/tasks/{root['task_id']}/respond", {"status": "accepted"})[0] == 200
+        s, c1 = call("dave", "POST", f"{BASE}/rooms/{room}/tasks",
+                     {"target_role": "implementer", "parent_task_id": root["task_id"], "text": "one"})
+        assert s == 201, c1
+        inbox = lambda: api.call("GET", f"{BASE}/tasks/inbox", agent=impl)[1]["tasks"]  # noqa: E731
+        assert [t["task_id"] for t in inbox()] == [c1["task_id"]]
+        # the group is removed: inside the recheck window nothing has changed yet
+        groups["dave"] = []
+        assert svc.sweep_coordinators()["requeued"] == 0
+        # past the window the person's token and their coordinate right are gone, without any request of theirs
+        clock.t += 61
+        assert call("dave", "GET", f"{BASE}/rooms/{room}/coordination")[0] == 401
+        assert inbox() == []                                                 # their task is no longer handed out
+        out = svc.sweep_coordinators()
+        assert out["requeued"] == 1
+        t = svc._tasks[c1["task_id"]]
+        assert t["attempt"] == 2 and t["adopted_from"] == "user:dave" and t["by_id"] == "alice"
+        assert [x["task_id"] for x in inbox()] == [c1["task_id"]]            # and it is served again, under the operator
+        assert api.call("POST", f"{BASE}/tasks/{c1['task_id']}/update", {"status": "accepted", "attempt": 1}, agent=impl)[0] == 409
+        assert svc.sweep_coordinators()["requeued"] == 0                      # repeating changes nothing
+    finally:
+        srv.shutdown()
