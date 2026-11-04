@@ -59,7 +59,7 @@ needs `herdr-memory` on PATH and a project config, and depends on the P01 contra
 
 ## Pin
 
-`lock/upstreams.yaml` pins `herdr-memory` at `89a8529` (client `0.1.3`, contract v1, private
+`lock/upstreams.yaml` pins `herdr-memory` at `685cf07` (client `0.1.4`, contract v1, private
 repo); the same value is `memory_install.PINNED_REVISION` and a test keeps them equal.
 `memory_install.PINNED_CLIENT_VERSION` is the release `herdr-memory --version` is expected to
 report. The installed manifest records the pin used. `scripts/install.sh --with-memory`
@@ -83,8 +83,12 @@ report `healthy` - it is never assumed healthy.
 
 Because `herdr-memory status` resolves its project from the current directory, `doctor`
 resolves one to ask with (`default_project`, else the only configured project) and passes
-`--project`; the check reports which project it probed and how it was chosen
-(`project`, `project_source`). When neither is resolvable it says so
+`--project`; and because the client defaults to `codex` - a harness a project may have no
+key for, which the client reports as `unreachable` - it also selects a harness the project
+has a credential for (a harness `doctor` is managing, else any configured credential) and
+passes `--harness`. The check reports what it probed and how both were chosen (`project`,
+`project_source`, `harness`, `harness_source`). A project with no credentials at all yields
+`unknown - cannot probe without a credential`, never a FAIL that blames the server. When neither is resolvable it says so
 (`no project to report on: no default_project and 2 projects configured; ...`) instead of
 reporting `UNKNOWN server` as if the server were broken
 ([herdr-engineering#571](https://github.com/berlinguyinca/herdr-engineering/issues/571)).
