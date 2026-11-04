@@ -403,31 +403,45 @@ def check_share_slice(cfg: FleetConfig) -> None:
                                "Cognito identifiers); this file carries more (mount the slice, not the central file)")
 
 
-# Marker lines in collab-edge/nginx.conf replaced by the share snippets when shares are enabled. Disabled, the
-# rendered file is the template byte for byte (and names no share-public upstream nginx would have to resolve).
-EDGE_SHARE_MARKERS = {
-    "  # @share-http@ (deploy.sh: share-http.conf when control_plane.share.enabled)\n": "share-http.conf",
-    "    # @share-location@ (deploy.sh: share-location.conf when control_plane.share.enabled)\n": "share-location.conf"}
+# Marker line in collab-edge/nginx.conf replaced by the share snippet (zones, upstream and the share host's own
+# server block) when shares are enabled. Disabled, the rendered file is the template byte for byte (and names no
+# share-public upstream nginx would have to resolve).
+EDGE_SHARE_MARKER = "  # @share-http@ (deploy.sh: share-http.conf when control_plane.share.enabled: zones, upstream, the share host's server)\n"
+EDGE_SHARE_SNIPPET = "share-http.conf"
+EDGE_SHARE_HOST_MARKER = "@share_host@"
 
 
-def render_edge_conf(template: str, *, share: bool, snippets_dir: Path | None = None) -> str:
-    """The edge's nginx.conf: the template, plus the /s/ zones, upstream and location when ``share`` is true."""
+def render_edge_conf(template: str, *, share: bool, share_host: str | None = None,
+                     snippets_dir: Path | None = None) -> str:
+    """The edge's nginx.conf: the template, plus the share host's zones, upstream and server when ``share`` is true.
+
+    ``share_host`` (required then) is the share origin's host, lowercase, a port allowed; the server answers to the
+    hostname (nginx matches ``server_name`` without the port)."""
     if not share:
         return template
+    if not isinstance(share_host, str) or https_origin("https://" + share_host) != "https://" + share_host:
+        raise FleetConfigError("the edge needs the share host (a lowercase hostname, port allowed) when shares are "
+                               f"enabled, got {share_host!r}")
     base = Path(snippets_dir) if snippets_dir else (
         Path(__file__).resolve().parents[1] / "deploy" / "control-plane" / "collab-edge")
-    out = template
-    for marker, name in EDGE_SHARE_MARKERS.items():
-        if out.count(marker) != 1:
-            raise FleetConfigError(f"edge template must hold the marker line {marker.strip()!r} exactly once")
-        out = out.replace(marker, (base / name).read_text(encoding="utf-8"))
-    return out
+    if template.count(EDGE_SHARE_MARKER) != 1:
+        raise FleetConfigError(f"edge template must hold the marker line {EDGE_SHARE_MARKER.strip()!r} exactly once")
+    snippet = (base / EDGE_SHARE_SNIPPET).read_text(encoding="utf-8")
+    if EDGE_SHARE_HOST_MARKER not in snippet:
+        raise FleetConfigError(f"{EDGE_SHARE_SNIPPET} must hold {EDGE_SHARE_HOST_MARKER}")
+    snippet = snippet.replace(EDGE_SHARE_HOST_MARKER, share_host.split(":")[0])
+    return template.replace(EDGE_SHARE_MARKER, snippet)
 
 
 def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
     """Write the edge nginx.conf (0644: it holds no secret) rendered for this fleet config."""
     template = Path(template)
-    text = render_edge_conf(template.read_text(encoding="utf-8"), share=share_enabled(cfg),
+    share = share_enabled(cfg)
+    share_host = None
+    if share:
+        origin = https_origin(share_values(cfg)["share"]["public_url"])
+        share_host = origin.removeprefix("https://") if origin else None
+    text = render_edge_conf(template.read_text(encoding="utf-8"), share=share, share_host=share_host,
                             snippets_dir=template.parent)
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)

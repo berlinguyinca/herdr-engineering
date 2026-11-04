@@ -145,6 +145,12 @@ TLS, rate and connection limits and a 64 KB body cap.
 - **Certificate:** certbot lineage `localdev.mcp.metabolomics.us` (DNS-01, Route53) in the host's acme dir
   (`control_plane.compose.HERDR_COLLAB_CERT_DIR` in the central file); the renewal hook also reloads the edge.
 - **Router:** a hostname rule on the router sends `localdev.mcp.metabolomics.us` to the edge's published port.
+- **Share host (only with `control_plane.share.enabled`):** artifact share links live on their own host
+  (`control_plane.share.public_url`), a second `server` in the same edge; the MCP host serves no `/s/`. It uses the
+  same certificate, so the existing lineage must name both hosts (`certbot certonly --cert-name
+  localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d <share host>`, repeating every name the
+  lineage already has), and the router / SNI front must send the share host to the same edge port. Details in
+  `deploy/control-plane/COLLAB.md`.
 - **Sign-in:** Cognito Hosted UI (app client `herdr-collab-web`); access requires the `local.dev` group.
   Removing someone takes effect at token expiry (at most 1 hour).
 - **Connect Claude Code:** sign in, press *Connect Claude Code* under "Your AI agents", run the shown

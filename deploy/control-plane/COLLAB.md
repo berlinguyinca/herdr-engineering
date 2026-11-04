@@ -69,7 +69,7 @@ Artifact share links are served by `herdr-share-public` behind the same edge, un
 `control_plane.share.enabled: true` in the central fleet config; enabling them needs the collab marker.
 
 ```
-edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, internal; no DB, RustFS,
+edge (nginx, the share host's own server: /s/ only) -> herdr-share-public:8083 (network `share`, internal; no DB, RustFS,
                                        control plane or outbound route)
 ```
 
@@ -111,17 +111,28 @@ edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, 
 - Edge resilience: share-public is resolved at run time (`resolver 127.0.0.11`, `server ... resolve` in a
   zoned upstream, `max_conns=100` under share-public's 128-connection cap), so the edge starts and reloads
   (certificate renewals included) while share-public is down; `/s/` then answers 502.
-- Edge: with shares enabled the edge's `nginx.conf` gains exactly one location, `^~ /s/` (snippets
-  `collab-edge/share-http.conf` and `share-location.conf`): GET/HEAD/OPTIONS, plus POST only on
-  `/s/<token>/session` (the body-less lab sign-in exchange); any request with a body is refused; its own
-  `limit_req`/`limit_conn` zones; `proxy_buffering off`; `proxy_read_timeout 600s`; no access log (tokens and
-  session HMACs are in the path). Disabled, the edge conf is the repo file unchanged and a running
-  share-public is stopped (its bundles stay on disk).
+- Edge: with shares enabled the edge's `nginx.conf` gains the zones, upstream and a `server` for the share host
+  (snippet `collab-edge/share-http.conf`; `@share_host@` is the host of `control_plane.share.public_url`, rendered by
+  `herdr-eng fleet config render-edge`). The MCP host serves no `/s/` at all (404). The share server proxies only
+  `/s/`; everything else is a 404. `location /s/`: GET/HEAD/OPTIONS, plus POST only on `/s/<token>/session` (the
+  body-less lab sign-in exchange); any request with a body is refused. The annotation endpoints
+  (`/s/<token>/k/<session>/annotations[/ann_<id>/edit|delete]`) are a separate location: GET and POST only, a 32k
+  body cap, their own `share_annotate` zone (5 r/s, burst 30). Both have `limit_conn share_conn 16`,
+  `proxy_buffering off`, and no access log (tokens and session HMACs are in the path). The edge adds no caching and
+  no response headers beyond HSTS, so share-public's CSP and `Cache-Control: no-store` reach the browser unchanged;
+  `Origin`, `Sec-Fetch-Dest`, `Range` and `Content-Length` are passed on, `X-Forwarded-Host` is dropped. Disabled, the
+  edge conf is the repo file unchanged and a running share-public is stopped (its bundles stay on disk).
+- Certificate: the edge presents ONE certificate for both hosts (`/etc/acme`); `collab-sync.sh` is unchanged and
+  still manages one lineage. Before enabling shares, add the share host to the existing lineage once, on the
+  certbot host, with the same DNS-01 plugin and flags the lineage was created with:
+  `certbot certonly --cert-name localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d <share host>`
+  (every name the lineage already has must be repeated). Renewals then cover both names. The router and SNI front
+  must also send the share host's name to the edge's port.
 - Edge limits (trade-off): `/s/` allows 100 requests/s per client address with a burst of 300 (parquet range
   reads come in bursts, and campus NAT puts many people behind one address) and 16 concurrent connections per
   address. The total is capped only by the upstream's `max_conns=100` (share-public refuses past 128): a
   handful of heavy clients can take most of it and other viewers then wait or get 502, without a log line
-  per refusal. Lower the rate in `collab-edge/share-http.conf` / `share-location.conf` if abuse shows up.
+  per refusal. Lower the rate in `collab-edge/share-http.conf` if abuse shows up.
 - Edge logging: `/s/` has no access log, but a request nginx refuses before it reaches the `/s/` location
   (malformed request line, oversized headers, TLS or PROXY-protocol errors) can appear in the edge's access or
   error log with its request line, which may contain a token.
@@ -300,5 +311,5 @@ curl -s https://localdev.mcp.metabolomics.us/api/v1/collab/config        # 200
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/collab/rooms   # 401
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/hosts          # 404
 curl -s http://<tailnet-ip>:9482/api/v1/collab/config                    # operator block present
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (shares on or off)
+curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (the MCP host serves no /s/)
 ```

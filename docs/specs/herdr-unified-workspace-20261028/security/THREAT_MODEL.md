@@ -31,8 +31,8 @@ Paths below are relative to `herdr_engineering/control_plane/` unless they start
 ## 2. Trust boundaries
 1. Internet -> `collab-edge` nginx (TLS, rate limits, route allow-list) -> `collab-public` container started `--collab-only`,
    with no Postgres or object-store credentials (`deploy/control-plane/compose.collab.yaml`, `collab-edge/nginx.conf`).
-2. Internet -> `/s/` on the same edge -> `share-public` (`share_public.py`), a database-free process that reads a read-only
-   volume (`deploy/control-plane/collab-edge/share-location.conf`).
+2. Internet -> the share host's own server on the same edge (`/s/` only; the MCP host serves no `/s/`) -> `share-public`
+   (`share_public.py`), a database-free process that reads a read-only volume (`deploy/control-plane/collab-edge/share-http.conf`).
 3. Tailnet operator -> `control-plane-web` (keyed `/api/v1/*`, roles viewer/operator) and the operator listener (`:8082`),
    which refuses the share network's subnet (`nginx.conf`, `deny 172.31.251.0/28`).
 4. Signed-in person (Cognito) vs agent (enrolled credential) vs guest (expiring membership) inside collab (`collab.py`
@@ -133,7 +133,7 @@ Mitigations (read in code):
   (`sandbox allow-scripts allow-downloads`, fetch directives limited to `'self'`, `form-action 'none'`); the lab viewer page has a
   strict CSP with no inline script (`share_public.py` `_CSP_TEMPLATE`, `VIEWER_CSP`). Tokens live only in `sessionStorage`
   (`share_static/share.js`) and are not logged; nginx has `access_log off` on `/s/` and enforces method, body and rate limits
-  (`share-location.conf`).
+  (`share-http.conf`).
 - Per-share bytes, file counts and total live bytes are capped (`DEFAULTS` in `artifact_share_api.py`).
 - `share-public` has no database and no registry access; the operator listener refuses the share network.
 

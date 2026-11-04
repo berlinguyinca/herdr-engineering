@@ -4,11 +4,13 @@ share-public compose service and deploy.sh's gate (spec 2026-10-30-artifact-shar
 Nothing here starts a container or contacts anything: compose files are linted as YAML,
 deploy.sh runs with the stub docker of test_deploy_scripts.py."""
 import importlib.util
-import secrets
 import json
 import logging
 import re
+import secrets
+import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -35,6 +37,7 @@ COLLAB = {"cognito_pool": "us-west-2_TESTPOOL", "cognito_clients": ["client-a"],
           "cognito_domain": "https://pool.auth.us-west-2.amazoncognito.com",
           "public_url": "https://mcp.example.test/", "operator_user": "owner-test"}
 SHARE_URL = "https://artifacts.example.test/"
+SHARE_HOST = "artifacts.example.test"
 
 
 def _central(tmp_path, share=None, collab=COLLAB):
@@ -243,7 +246,7 @@ def test_share_public_refuses_a_disabled_slice(tmp_path):
 # ------------------------------------------------------------------------------- (a) the rendered edge
 
 def _locations(conf: str) -> list[str]:
-    return [m.group(1).strip() for m in re.finditer(r"^\s*location\s+([^{]+)\{", conf, re.M)]
+    return [m.group(1).strip() for m in re.finditer(r'^\s*location\s+((?:"[^"]*"|[^{"])+)\{', conf, re.M)]
 
 
 BASE_LOCATIONS = ["= /mcp", "= /a2a", "= /.well-known/agent-card.json", "/api/v1/collab/", "= /", "= /guide",
@@ -256,37 +259,138 @@ def test_disabled_share_renders_the_edge_conf_unchanged():
     assert "share" not in "".join(ln for ln in template.splitlines() if not ln.lstrip().startswith("#"))
 
 
-def test_enabled_share_adds_exactly_the_s_location():
+def test_enabled_share_adds_a_share_host_server_with_only_s_locations():
     template = EDGE.read_text()
-    conf = fcc.render_edge_conf(template, share=True)
-    before, after = _locations(template), _locations(conf)
-    added = list(after)
-    for loc in before:
-        added.remove(loc)
-    assert added == ["^~ /s/"]
-    assert len(before) == len(BASE_LOCATIONS)
-    block = conf[conf.index("location ^~ /s/"):]
-    block = block[:block.index("\n    }\n")]
+    conf = fcc.render_edge_conf(template, share=True, share_host=SHARE_HOST)
+    mcp = _server_block(conf, "server_name localdev.mcp.metabolomics.us;")
+    assert "/s/" not in mcp and "proxy_pass http://share" not in mcp and "return 308" not in mcp
+    assert "location ^~ /s/" not in conf
+    share = _server_block(conf, f"server_name {SHARE_HOST};")
+    assert _locations(share) == ["/s/", '~ "^/s/[A-Za-z0-9_-]{43}/k/[A-Za-z0-9_.-]{1,768}/annotations'
+                                 '(/ann_[A-Za-z0-9_-]{22}/(edit|delete))?$"', "/"]
+    assert "location / { return 404; }" in share
+    block = _brace_block(share, share.index("location /s/"))
     for needle in ("proxy_pass http://share;", "proxy_buffering off;", "proxy_read_timeout 600s;", "access_log off;",
-                   "limit_req zone=share_req", "limit_conn share_conn", "proxy_pass_request_body off;",
+                   "error_log /dev/stderr crit;", "limit_req zone=share_req burst=300 nodelay;",
+                   "limit_conn share_conn 16;", "proxy_pass_request_body off;", "client_max_body_size 1k;",
                    "if ($share_method_ok = 0)", "if ($share_has_body)"):
         assert needle in block, needle
     assert "client_max_body_size 0" not in conf          # 0 = unlimited in nginx
-    # its own zones and upstream, keepalive pool well under share-public's 128 connections
     assert re.search(r"limit_req_zone \S+ zone=share_req:", conf)
     assert re.search(r"limit_conn_zone \S+ zone=share_conn:", conf)
     upstream = re.search(r"upstream share \{ zone share_up \d+k; server share-public:8083 resolve max_conns=(\d+); "
                          r"keepalive (\d+); \}", conf)
     assert upstream and int(upstream.group(1)) < 128 and int(upstream.group(2)) <= 32
-    # server-level timeouts the /s/ location inherits
-    assert "client_header_timeout 10s;" in conf and "client_body_timeout 10s;" in conf
-    # the operator listener (tailnet) never gets /s/
+    assert "client_header_timeout 10s;" in share and "client_body_timeout 10s;" in share
     operator = conf[conf.index("listen 8082;"):]
     assert "/s/" not in operator
 
 
+def _depth_at(conf: str, needle: str) -> int:
+    pos = conf.index(needle)
+    return conf.count("{", 0, pos) - conf.count("}", 0, pos)
+
+
+def test_annotations_location_is_flat_and_the_only_one_that_takes_a_body():
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
+    share = _server_block(conf, f"server_name {SHARE_HOST};")
+    assert _depth_at(conf, "location ~ \"^/s/") == 2 == _depth_at(conf, "location /s/") == _depth_at(conf, "location / {")
+    ann = _brace_block(share, share.index('$" {'))
+    for needle in ("proxy_pass_request_body on;", "client_max_body_size 32k;", "limit_req zone=share_annotate burst=30 nodelay;",
+                   "limit_conn share_conn 16;", "proxy_pass http://share;", "access_log off;",
+                   "error_log /dev/stderr crit;", "if ($request_method !~ ^(GET|POST)$) { return 404; }"):
+        assert needle in ann, needle
+    assert share.count("proxy_pass_request_body on") == 1
+    assert re.search(r"limit_req_zone \$remote_addr zone=share_annotate:10m rate=5r/s;", conf)
+    assert "share_annotate" not in "".join(ln for ln in conf.splitlines() if "hcn_" in ln or "/mcp" in ln)
+    assert "zone=share_annotate" not in _server_block(conf, "server_name localdev.mcp.metabolomics.us;")
+
+
+def test_share_host_proxy_hygiene_and_headers():
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
+    share = _server_block(conf, f"server_name {SHARE_HOST};")
+    for needle in ("proxy_set_header Host $host;", "proxy_set_header Origin $http_origin;",
+                   "proxy_set_header Sec-Fetch-Dest $http_sec_fetch_dest;", "proxy_set_header X-Forwarded-Proto https;",
+                   "proxy_set_header X-Forwarded-For $remote_addr;", 'proxy_set_header X-Forwarded-Host "";',
+                   'proxy_set_header Forwarded "";', "proxy_http_version 1.1;", 'proxy_set_header Connection "";',
+                   'add_header Strict-Transport-Security "max-age=31536000" always;',
+                   "if ($hcn_from_edge = 0) { return 444; }", "limit_req_status 429;", "limit_conn_status 429;",
+                   "proxy_connect_timeout 3s;", "send_timeout 30s;", "ssl_protocols TLSv1.2 TLSv1.3;"):
+        assert needle in share, needle
+    # what share-public sets must reach the browser untouched; the client's Range / Content-Length are not stripped
+    for forbidden in ("proxy_hide_header", "add_header Content-Security", "add_header Cache-Control", "expires",
+                      "proxy_cache", "proxy_set_header Range", "proxy_set_header Content-Length",
+                      "proxy_set_header Content-Type", "proxy_set_header Sec-Fetch-Mode", "proxy_set_header Sec-Fetch-Site"):
+        assert forbidden not in share, forbidden
+    assert share.count("add_header") == 1
+
+
+def test_share_and_mcp_servers_present_the_same_certificate():
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
+    paths = []
+    for listen in ("server_name localdev.mcp.metabolomics.us;", f"server_name {SHARE_HOST};"):
+        blk = _server_block(conf, listen)
+        paths.append((re.search(r"ssl_certificate\s+(\S+);", blk).group(1),
+                      re.search(r"ssl_certificate_key\s+(\S+);", blk).group(1)))
+    assert paths[0] == paths[1] == ("/etc/acme/fullchain.pem", "/etc/acme/privkey.pem")
+    assert conf.count("listen 8443 ssl proxy_protocol") == 3     # default reject, MCP, share
+
+
+def test_mcp_server_keeps_its_mcp_limits_when_shares_are_on():
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
+    mcp = _server_block(conf, "server_name localdev.mcp.metabolomics.us;")
+    for needle in ("limit_conn mcpconn 32;", "limit_conn mcptotal 128;", "limit_conn_status 429;",
+                   "limit_req zone=hcn_mcp burst=100 nodelay;", "limit_req_status 429;"):
+        assert needle in mcp, needle
+
+
+def test_share_location_snippet_is_gone_and_unreferenced():
+    assert not (CP / "collab-edge" / "share-location.conf").exists()
+    assert "@share-location@" not in EDGE.read_text()
+    assert "share-location" not in (CP / "collab-edge" / "share-http.conf").read_text()
+
+
+def test_share_host_is_required_validated_and_replaced():
+    template = EDGE.read_text()
+    with pytest.raises(FleetConfigError, match="share host"):
+        fcc.render_edge_conf(template, share=True)
+    for bad in ("Artifacts.example.test", "a b", "x.test/", "", "https://x.test"):
+        with pytest.raises(FleetConfigError):
+            fcc.render_edge_conf(template, share=True, share_host=bad)
+    conf = fcc.render_edge_conf(template, share=True, share_host="artifacts.example.test:8443")
+    assert "server_name artifacts.example.test;" in conf and "@share_host@" not in conf
+
+
+def test_render_edge_uses_the_configured_share_origin(tmp_path):
+    central = _central(tmp_path, share={"enabled": True, "signing_secret": SECRET, "public_url": SHARE_URL})
+    out = tmp_path / "out" / "nginx.conf"
+    fcc.render_edge(load_fleet_config(central), EDGE, out)
+    assert "server_name artifacts.example.test;" in out.read_text()
+    off = _central(tmp_path / "off", share={"enabled": False})
+    out2 = tmp_path / "out2" / "nginx.conf"
+    fcc.render_edge(load_fleet_config(off), EDGE, out2)
+    assert out2.read_text() == EDGE.read_text()
+
+
+@pytest.mark.skipif(shutil.which("nginx") is None, reason="nginx is not installed")
+def test_rendered_edge_passes_nginx_t(tmp_path):
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
+    acme = tmp_path / "acme"
+    acme.mkdir()
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=t",
+                    "-keyout", str(acme / "privkey.pem"), "-out", str(acme / "fullchain.pem")],
+                   check=True, capture_output=True)
+    conf = conf.replace("/etc/acme", str(acme)).replace("pid /run/nginx.pid;", f"pid {tmp_path}/n.pid;")
+    conf = re.sub(r"server (collab-public|share-public):\d+", "server 127.0.0.1:9", conf)
+    conf = conf.replace("resolver 127.0.0.11 valid=10s ipv6=off;", "").replace(" resolve max_conns", " max_conns")
+    (tmp_path / "nginx.conf").write_text(conf)
+    r = subprocess.run(["nginx", "-t", "-c", str(tmp_path / "nginx.conf"), "-e", "/dev/stderr"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
 def test_share_method_map_allows_reads_and_only_the_body_less_session_post():
-    conf = fcc.render_edge_conf(EDGE.read_text(), share=True)
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
     m = re.search(r'map "\$request_method:\$uri" \$share_method_ok \{\n(.*?)\n  \}', conf, re.S)
     assert m, "method map missing"
     rules = re.findall(r'"~([^"]+)"\s+1;', m.group(1))
@@ -310,7 +414,7 @@ def test_share_method_map_allows_reads_and_only_the_body_less_session_post():
 
 def test_share_rate_limit_tolerates_range_reads_and_campus_nat():
     """A parquet viewer issues many small range requests, and a campus NAT puts many people behind one address."""
-    conf = fcc.render_edge_conf(EDGE.read_text(), share=True)
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
     rate = re.search(r"limit_req_zone \$remote_addr zone=share_req:\d+m rate=(\d+)r/s;", conf)
     burst = re.search(r"limit_req zone=share_req burst=(\d+) nodelay;", conf)
     assert rate and int(rate.group(1)) >= 100
@@ -322,7 +426,7 @@ def test_share_rate_limit_tolerates_range_reads_and_campus_nat():
 def test_share_public_is_never_a_start_time_dependency_of_the_edge():
     """nginx resolves a plain upstream host at start and at every reload: a down share-public would take the whole
     collab edge (and its certificate reloads) down. share-public must be resolved at run time only."""
-    conf = fcc.render_edge_conf(EDGE.read_text(), share=True)
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
     names = re.findall(r"server\s+share-public:\d+([^;]*);", conf)
     assert names and all(" resolve" in rest for rest in names)
     assert re.search(r"^\s*resolver 127\.0\.0\.11\b", conf, re.M)
@@ -370,7 +474,7 @@ def test_operator_listener_refuses_the_share_network(share):
     assert subnet.is_private and subnet.prefixlen >= 24
     assert not subnet.overlaps(ipaddress.ip_network("192.168.137.0/24"))     # the LAN the SNI edge lives on
     assert not subnet.overlaps(ipaddress.ip_network("100.64.0.0/10"))        # tailnet
-    conf = fcc.render_edge_conf(EDGE.read_text(), share=share)
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=share, share_host=SHARE_HOST if share else None)
     operator = _server_block(conf, "listen 8082;")
     rules = re.findall(r"^\s*(allow|deny)\s+([^;]+);", operator, re.M)
     assert rules and rules[0] == ("deny", str(subnet)), rules
@@ -509,7 +613,7 @@ def test_real_deploy_with_share_enabled_installs_the_slice_and_edge_and_recreate
     assert (home / ".local/share/herdr-engineering/shares").is_dir()
     assert (home / ".local/share/herdr-engineering/share-events").is_dir()
     edge = (home / ".config/herdr-engineering/collab-edge/nginx.conf").read_text()
-    assert "location ^~ /s/" in edge
+    assert "location /s/" in edge and "server_name artifacts.example.test;" in edge
     log = env["log"].read_text().splitlines()
     ups = [ln for ln in log if ln.startswith("docker compose") and " up " in ln]
     share_ups = [ln for ln in ups if "share-public" in ln]
@@ -547,7 +651,7 @@ def _rollback_target_with_share_public():
 def _seed_share_edge(e, with_s):
     edge = e["home"] / ".config/herdr-engineering/collab-edge/nginx.conf"
     edge.parent.mkdir(parents=True, exist_ok=True)
-    edge.write_text(fcc.render_edge_conf(EDGE.read_text(), share=with_s))
+    edge.write_text(fcc.render_edge_conf(EDGE.read_text(), share=with_s, share_host=SHARE_HOST if with_s else None))
     return edge
 
 
