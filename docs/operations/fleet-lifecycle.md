@@ -267,6 +267,12 @@ the fleet updater is running from <checkout>, the checkout it would update; run 
 `herdr-eng fleet update`, or give the unit a working directory outside the checkout
 ```
 
+The check reads the interpreter's own `sys.path[0]` as captured by `herdr_engineering/_entry.py`,
+*before* `.fleet` is imported - `fleet.py` does `sys.path.insert(0, <checkout>/scripts)` to reach
+`fleet_inventory.py`, so a call-time read sees that directory instead of where the process began, and
+an empty entry is the sentinel `python -m`/`-c` use for the working directory. Both mistakes were found
+by running the guard on bender, not by the unit tests, which stayed green through them.
+
 That is only one of two routes. The other is an **editable install of the controller checkout**:
 bender's `.venv` carries `__editable__.herdr_engineering-0.1.0.pth`, so its nightly runner *is* the
 checkout whatever the working directory says. That route is not refused - for a clean checkout the

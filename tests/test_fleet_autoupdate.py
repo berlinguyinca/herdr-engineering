@@ -118,6 +118,49 @@ def test_missing_repository_setting_fails_closed(monkeypatch, capsys):
     update.assert_not_called()
 
 
+def test_run_update_refuses_the_sentinel_form_python_m_actually_produces(checkout, monkeypatch,
+                                                                        capsys):
+    """`python -m` leaves `sys.path[0] == ""`; that sentinel is the working directory.
+
+    This is the shape bender's unit produced (`WorkingDirectory=<checkout>` + `-m`). The first version
+    of `shadowed()` returned False for an empty entry, so the real invocation went past the guard -
+    caught by running the new code in a clean main checkout on bender, not by the unit tests.
+    """
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    monkeypatch.setattr(fleet_autoupdate, "package_root", lambda: checkout)
+    monkeypatch.setattr(fleet_autoupdate, "ENTRY_PATH_ZERO", "")
+    monkeypatch.chdir(checkout)
+    with patch.object(fleet_autoupdate, "fleet_update") as update:
+        assert fleet_autoupdate.main() == 1
+    assert "checkout it would update" in json.loads(capsys.readouterr().out)["error"]
+    update.assert_not_called()
+
+
+def test_entry_captures_the_path_before_fleet_rewrites_it():
+    """`herdr_engineering.fleet` inserts `<checkout>/scripts` at `sys.path[0]` when it imports.
+
+    A guard reading `sys.path[0]` at call time therefore never sees the cwd sentinel - the mistake
+    that let bender's `python -m` invocation through (#584). `_entry` is imported before `.fleet`, so
+    its value is what the interpreter started with. Proven in a fresh interpreter: in-process the
+    order depends on which test imported the package first.
+    """
+    from pathlib import Path
+
+    from herdr_engineering import fleet_autoupdate
+
+    checkout = Path(fleet_autoupdate.__file__).resolve().parent.parent
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import herdr_engineering._entry as e, herdr_engineering.fleet, sys;"
+         "print(e.PATH_ZERO or '<cwd-sentinel>'); print(sys.path[0])"],
+        cwd=str(checkout), capture_output=True, text=True, check=True)
+    captured, after = probe.stdout.split()
+    assert captured != after
+    assert after.endswith("scripts")
+
+
 def test_every_run_records_which_code_executed_it(checkout, capsys, monkeypatch):
     """The state file says which code performed the update, and whether that was the checkout."""
     from herdr_engineering import fleet_autoupdate
@@ -232,8 +275,31 @@ def test_shadowing_is_only_cwd_shadowing():
     assert shadowed(target, "/home/operator/.local/bin", target) is False
     # Running the installed build from inside the checkout is also fine.
     assert shadowed(Path("/opt/herdr-engineering"), "/srv/controller", target) is False
-    # A relative or missing sys.path[0] cannot be resolved, so it cannot be blamed.
+    # A sentinel sys.path[0] means the current directory; under pytest that is not /srv/controller.
+    # (Its cwd-dependence is pinned in the next test - the first predicate excused the sentinel
+    # altogether, and the sentinel is the shape `python -m` actually produces.)
     assert shadowed(target, "", target) is False
+
+
+def test_the_sentinel_sys_path_entry_is_the_working_directory(tmp_path, monkeypatch):
+    """`python -m` puts the sentinel `""` at `sys.path[0]`, and that sentinel means the cwd.
+
+    Read back on bender with the new code in a clean main checkout: `-m herdr_engineering.fleet_autoupdate`
+    ran with `sys.path[0] == ''` and the package inside the checkout, and the first version of
+    `shadowed()` answered "not shadowing" - so the guard existed while the production shape walked past
+    it. The predicate must resolve the sentinel against the process working directory.
+    """
+    from herdr_engineering.fleet_autoupdate import shadowed
+
+    target = (tmp_path / "controller").resolve()
+    target.mkdir()
+
+    monkeypatch.chdir(target)
+    assert shadowed(target, "", target) is True                    # -m from inside the checkout
+    monkeypatch.chdir(tmp_path)
+    assert shadowed(target, "", target) is False                   # -m from a neutral directory
+    assert shadowed(target, str(target), target) is True           # cwd spelled absolutely
+    assert shadowed(target, str(tmp_path / "bin"), target) is False  # console script
 
 
 def test_run_update_refuses_to_update_the_checkout_it_imported(checkout, monkeypatch, tmp_path,
@@ -242,7 +308,7 @@ def test_run_update_refuses_to_update_the_checkout_it_imported(checkout, monkeyp
 
     monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
     monkeypatch.setattr(fleet_autoupdate, "package_root", lambda: checkout)
-    monkeypatch.setattr(sys, "path", [str(checkout), *sys.path[1:]])
+    monkeypatch.setattr(fleet_autoupdate, "ENTRY_PATH_ZERO", str(checkout))
     with patch.object(fleet_autoupdate, "fleet_update") as update:
         assert fleet_autoupdate.main() == 1
     error = json.loads(capsys.readouterr().out)["error"]

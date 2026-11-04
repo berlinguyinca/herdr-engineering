@@ -21,10 +21,15 @@ import fcntl
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
+# Imported before `.fleet`, which rewrites sys.path at import time (see herdr_engineering/_entry.py).
+from . import _entry
 from .fleet import fleet_update
+
+#: The interpreter's own `sys.path[0]`, captured before `.fleet` could replace it with the checkout's
+#: `scripts/` directory. This is what `shadowed()` is allowed to reason about.
+ENTRY_PATH_ZERO = _entry.PATH_ZERO
 
 #: How many dirty paths to name in a skip report (the count is always exact).
 SKIP_PREVIEW_FILES = 8
@@ -130,13 +135,18 @@ def shadowed(module_root: Path, entry: str, target: Path) -> bool:
 
     Only cwd shadowing is refused: an editable install reached through the `herdr-eng` console
     script (or `python -m` from a neutral directory) is the operator's own checkout by choice.
+
+    `sys.path[0]` is the sentinel `""` for `python -m` and `python -c` on CPython 3.12 - read back on
+    bender, the host this defect was found on - and the sentinel *means* the working directory. So an
+    empty entry is resolved against `Path.cwd()` rather than excused: the first version of this
+    predicate returned False for it, which let the exact production shape (`-m`, a unit whose working
+    directory is inside the checkout) walk past the guard on a real host.
     """
-    if not entry:
-        return False
     try:
         # Not strict: the working directory can be a path that no longer exists, and a checkout
         # that has vanished cannot be updated by anyone.
-        return Path(entry).resolve() == target and module_root.resolve() == target
+        origin = Path(entry).resolve() if entry else Path.cwd().resolve()
+        return origin == target and module_root.resolve() == target
     except OSError:
         return False
 
@@ -170,7 +180,7 @@ def controller_root() -> Path:
 def run_update() -> dict:
     """Run the normal updater only for an explicitly configured clean main checkout."""
     root = controller_root()
-    if shadowed(package_root(), sys.path[0] if sys.path else "", root):
+    if shadowed(package_root(), ENTRY_PATH_ZERO, root):
         raise RuntimeError(
             f"the fleet updater is running from {package_root()}, the checkout it would update; "
             "run the installed `herdr-eng fleet update`, or give the unit a working directory "
