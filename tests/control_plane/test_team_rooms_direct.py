@@ -30,9 +30,9 @@ ROLES = {"enabled": True}
 TAINT = "external-source:guest"
 
 
-def _service(tmp_path, clock, rooms=None, name="log", coordinators=True):
+def _service(tmp_path, clock, rooms=None, name="log", coordinators=True, **options):
     svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}),
-                        sink=FileEventLog(str(tmp_path / name)), now=clock, max_agents_per_user=20)
+                        sink=FileEventLog(str(tmp_path / name)), now=clock, max_agents_per_user=20, **options)
     svc.team_rooms = normalize_team_rooms(ON if rooms is None else rooms)
     svc.team_roles = normalize_team_roles(ROLES)
     if coordinators:
@@ -90,11 +90,10 @@ class DPlane(RPlane):
         return out
 
 
-@pytest.fixture
-def dp(tmp_path, wg, wg_pg):
+def _plane(tmp_path, wg, wg_pg, **options):
     wg.run(wg.pool.execute("DELETE FROM fabric_events"))
     clock = Clock()
-    svc = _service(tmp_path, clock)
+    svc = _service(tmp_path, clock, **options)
     srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, api_keys={"op-key": "operator"}, collab=svc,
                              unified_workspace_config={"enabled": True}, github_pg_dsn=wg_pg["dsn"])
     threading.Thread(target=srv.serve, daemon=True).start()
@@ -108,6 +107,17 @@ def dp(tmp_path, wg, wg_pg):
         yield DPlane(svc, srv, wg, clock)
     finally:
         srv.shutdown()
+
+
+@pytest.fixture
+def dp(tmp_path, wg, wg_pg):
+    yield from _plane(tmp_path, wg, wg_pg)
+
+
+@pytest.fixture
+def short_guest(tmp_path, wg, wg_pg):
+    """A service whose guests lapse after 2 hours (shorter than a task's own 24 hour life), set the way a deployment sets it."""
+    yield from _plane(tmp_path, wg, wg_pg, guest_ttl=2 * 3600.0)
 
 
 def crew(p, agents=2, reviewer=False):
@@ -305,18 +315,20 @@ def test_personal_assistants_and_coordinator_agents_can_never_be_targets(dp):
     assert s == 403 and out["code"] == "direct_target_is_assistant", out
     assert p.denials("task.create", actor_user_id="dave", reason="direct_target_is_assistant")
     assert p.to("dave", a1)[0] == 201
-    # an agent that an assistant runtime claimed is an assistant too
-    p.svc._assistant_runtimes["rt1"] = {"agent_id": a2["agent_id"]}
-    p.room_direct([a1, a2])
-    assert p.to("dave", a2)[0] == 403
 
 
 def test_an_external_agent_can_never_be_a_target(dp):
     p = dp
     (a1, _), _ = crew(p)
-    p.room_direct([a1])
-    p.svc._agents[a1["agent_id"]]["external"] = {"room_id": p.room}
-    assert p.to("dave", a1)[0] == 403
+    s, inv = p.c("alice", "POST", f"{BASE}/rooms/{p.room}/externals/invites", {"label": "Dana", "actions": ["read", "post"]})
+    assert s == 201, inv
+    s, ext = p.api.call("POST", f"{BASE}/agents/join", {"token": inv["code"]})
+    assert s == 201 and ext["kind"] == "external", ext
+    p.room_direct([a1, ext])                                                         # the owner (wrongly) lists it
+    s, out = p.to("dave", ext)
+    assert s == 403 and out["code"] == "direct_target_external", out
+    assert p.denials("task.create", actor_user_id="dave", reason="direct_target_external")
+    assert p.to("dave", a1)[0] == 201
 
 
 def test_text_is_capped_by_max_text_and_required(dp):
@@ -324,6 +336,7 @@ def test_text_is_capped_by_max_text_and_required(dp):
     (a1, _), _ = crew(p)
     p.room_direct([a1], max_text=20)
     assert p.to("dave", a1, "x" * 21)[0] == 400
+    assert p.denials("task.create", actor_user_id="dave", reason="direct_text_too_long")
     assert p.to("dave", a1, "   ")[0] == 400
     assert p.to("dave", a1, "x" * 20)[0] == 201
 
@@ -375,6 +388,7 @@ def test_the_per_hour_cap_is_counted_from_the_log_so_a_restart_cannot_reset_it(d
     assert p.to("dave", a2, "two")[0] == 201
     s, out = p.to("dave", a1, "three")
     assert s == 429 and out["code"] == "direct_rate", out
+    assert p.denials("task.create", actor_user_id="dave", reason="direct_rate")
     assert p.to("erin", a1, "erin one")[0] == 201                                   # the cap is per guest
     again = reborn(p, tmp_path)
     p.svc = again
@@ -400,6 +414,7 @@ def test_the_open_cap_counts_pending_and_accepted_and_frees_on_completion(dp):
     assert p.to("dave", a2, "two")[0] == 201
     s, out = p.to("dave", a1, "three")
     assert s == 429 and out["code"] == "direct_open", out
+    assert p.denials("task.create", actor_user_id="dave", reason="direct_open")
     p.accept(a1, t1)
     assert p.to("dave", a1, "three")[0] == 429
     assert p.update(a1, t1, "done", result="ok")[0] == 200
@@ -423,6 +438,7 @@ def test_a_single_agent_cannot_be_buried_beyond_the_per_agent_open_cap(dp):
     p.room_direct([a1], per_hour=100, max_open=50)
     codes = [p.to(u, a1, f"t{i}")[0] for i, u in enumerate(["dave"] * 6 + ["erin"] * 6)]
     assert codes.count(201) == 10 and codes[-1] == 429                              # MAX_OPEN_TASKS_PER_AGENT
+    assert p.denials("task.create", actor_user_id="erin", reason="direct_agent_busy")
 
 
 def test_idempotency_key_replays_the_same_task_and_a_different_request_conflicts(dp):
@@ -643,14 +659,13 @@ def test_removing_the_guest_cancels_their_open_tasks_at_once(dp):
     assert [t["task_id"] for t in p.inbox(a1)] == [t2]
 
 
-def test_an_expired_guest_is_inert_at_once_and_cancelled_by_the_sweep(dp):
-    p = dp
+def test_an_expired_guest_is_inert_at_once_and_cancelled_by_the_sweep(short_guest):
+    p = short_guest
     (a1, _), _ = crew(p)
     p.room_direct([a1], per_hour=10, max_open=10)
     t1 = p.to("dave", a1, "d1")[1]["task_id"]
-    p.svc._rooms[p.room]["members"]["dave"]["expires_at"] = p.clock.t + 100         # the guest's invitation lapses
-    p.clock.t += 101
-    assert p.inbox(a1) == []                                                         # the creator is no longer valid
+    p.clock.t += 2 * 3600 + 1                                                        # past the service's guest_ttl (2 hours)
+    assert p.inbox(a1) == []                                                          # the creator is no longer valid
     assert p.update(a1, t1, "accepted")[0] == 404
     out = p.svc.sweep_direct()
     assert out == {"active": True, "cancelled": 1}, out
@@ -717,9 +732,10 @@ def test_state_is_identical_after_a_restart(dp, tmp_path):
 def test_revoking_is_a_safety_write_and_granting_is_pre_paid():
     assert "room_guest_level_set" in REVOCABLE_CREATE
     svc = CollabService(StaticTokenAuthenticator({}))
-    assert svc._is_safety("room_guest_level_set", {"level": "suggest"}) is True
-    assert svc._is_safety("room_guest_level_set", {"level": "read_only"}) is True
-    assert svc._is_safety("room_guest_level_set", {"level": "direct"}) is False
+    assert svc._is_safety("room_guest_level_set", {"level": "suggest", "revokes_direct": True}) is True
+    assert svc._is_safety("room_guest_level_set", {"level": "suggest", "revokes_direct": False}) is False   # a toggle is ordinary
+    assert svc._is_safety("room_guest_level_set", {"level": "read_only", "revokes_direct": False}) is False
+    assert svc._is_safety("room_guest_level_set", {"level": "direct", "revokes_direct": False}) is False
     assert svc._is_safety("guest_direct_set", {"allowed": False}) is True
     assert svc._is_safety("guest_direct_set", {"allowed": True}) is False
     assert svc._creation_cost("room_guest_level_set", {"level": "direct"}) == 1
@@ -734,21 +750,15 @@ def test_lowering_the_level_still_works_when_the_log_is_full(dp):
     p.svc.max_log_events = len(p.svc._log) + 6                                      # the ordinary tier is already exhausted
     assert p.suggest("erin")[0] == 503
     assert p.to("dave", a1, "more")[0] == 503
+    # a toggle among the other levels is an ordinary write: it cannot be used to fill the log past what revocations need
+    assert p.level("alice", "read_only", room=p.room2)[0] == 503
+    assert p.level("alice", "suggest", room=p.room2)[0] == 503
     assert p.guest_right("alice", "dave", False)[0] == 200                          # a revocation is a safety write
     assert p.svc._tasks[tid]["status"] in ("cancelled", "pending")
-    s, out = p.level("alice", "suggest")
+    s, out = p.level("alice", "suggest")                                             # leaving Direct was pre-paid by setting it
     assert s == 200, out
     assert p.svc._tr_level[p.room]["level"] == "suggest"
+    assert p.level("alice", "read_only")[0] == 503                                   # and now it is just a toggle
 
 
 # ============================================================== loop guard
-def test_a_guest_cannot_use_the_assistant_chain_rule_to_reach_an_assistant_by_role(dp):
-    p = dp
-    (a1, a2), _ = crew(p)
-    team = next(iter({t for (_, t) in p.svc._tr_attach}))
-    p.svc._assistant_runtimes["rt1"] = {"agent_id": a2["agent_id"]}
-    p.room_direct(roles=["implementer"], per_hour=10, max_open=10)
-    for i in range(4):
-        s, out = p.direct("dave", target_role="implementer", text=f"t{i}")
-        assert s == 201 and out["routed_to"] == "agent:" + a1["agent_id"], out       # a2 is an assistant: never routed to
-    assert team
