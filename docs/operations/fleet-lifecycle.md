@@ -229,6 +229,17 @@ scripts/fleet-auto-update-macos.sh uninstall    # bootout + remove the plist
 one it does, and prints a NOTE when the checkout is not clean on `main` — because a skipped run
 exits 0 and `launchctl` reports nothing.
 
+The `Label` is read with `plutil` when it exists and with stdlib `plistlib` when it does not (#588).
+Reading it with `plutil` alone was a macOS-only assumption: on Linux the read returned nothing, the script
+treated the agent it had installed itself as somebody else's and refused to replace it, and the Linux unit
+gate went red while every macOS test stayed green (D28). A test pins the fallback with a `plutil` that
+always fails, so the path Linux takes is exercised on macOS as well.
+
+`herdr-eng fleet update` refreshes whichever updater the controller has already loaded — the systemd
+timer on Linux (`systemctl --user is-enabled`), the LaunchAgent on macOS (`launchctl print
+gui/<uid>/com.herdr-engineering.fleet-auto-update`) — so template changes (schedule, working
+directory) converge on both. An updater the operator never enabled is never installed behind them.
+
 ### Optional hosts (laptops)
 
 A host that comes and goes can be marked optional in the private inventory, either
@@ -247,6 +258,36 @@ private inventory; install it on the controller only, not every fleet host.
 Automatic updates require a clean `main` checkout, fetch `origin/main`, reject
 unpublished/divergent commits, and fast-forward before reinstalling. Ignored
 private inventory is retained. A lock prevents overlapping scheduled runs.
+
+**The updater must not run from the checkout it updates.** Both installers give it a neutral working
+directory (`WorkingDirectory=%h` on systemd, `WorkingDirectory=$HOME` in the LaunchAgent), because
+for `python -m` the working directory is `sys.path[0]` and this repository is flat-layout: with the
+checkout as working directory, `import herdr_engineering` resolves to the checkout and the nightly
+job runs whatever revision that checkout holds - so an updater fix could only arrive on a host after
+that host had already been updated, which is the condition it exists to survive
+([herdr-engineering#584](https://github.com/berlinguyinca/herdr-engineering/issues/584)). The updater
+checks this itself and refuses, rather than running stale code silently:
+
+```
+the fleet updater is running from <checkout>, the checkout it would update; run the installed
+`herdr-eng fleet update`, or give the unit a working directory outside the checkout
+```
+
+The check reads the interpreter's own `sys.path[0]` as captured by `herdr_engineering/_entry.py`,
+*before* `.fleet` is imported - `fleet.py` does `sys.path.insert(0, <checkout>/scripts)` to reach
+`fleet_inventory.py`, so a call-time read sees that directory instead of where the process began, and
+an empty entry is the sentinel `python -m`/`-c` use for the working directory. Both mistakes were found
+by running the guard on bender, not by the unit tests, which stayed green through them.
+
+That is only one of two routes. The other is an **editable install of the controller checkout**:
+bender's `.venv` carries `__editable__.herdr_engineering-0.1.0.pth`, so its nightly runner *is* the
+checkout whatever the working directory says. That route is not refused - for a clean checkout the
+fast-forward updates the code the next run uses, and refusing it would break the ordinary
+controller-on-a-checkout flow - but it is recorded: every run writes `runner_module` and
+`runner_is_checkout` to `fleet-auto-update.json`, so a runner that updates its own source is visible
+to `herdr-eng memory doctor` rather than assumed. A host whose checkout is *dirty* still needs one
+manual act - clean it, or point `HERDR_ENGINEERING_REPO` at a dedicated clean checkout - and the
+rendered unit on disk is replaced only when the installer runs again.
 
 Failures divide in two, and the difference is what makes the job safe to leave switched on:
 
@@ -272,7 +313,10 @@ scripts/fleet-auto-update-macos.sh uninstall                                    
 
 Re-enable with the installer above. Check with `systemctl --user is-enabled
 herdr-eng-fleet-update.timer`, `scripts/fleet-auto-update-macos.sh status`, and
-`herdr-eng memory doctor` (`fleet_update`). SSH authentication must remain valid
+`herdr-eng memory doctor` (`fleet_update`). Re-enabling does not update the checkout, so the host's
+`herdr-eng` stays at whatever the pinned install provides until the checkout is cleaned and
+fast-forwarded once by hand - bender is in exactly that state (units `disabled`, `herdr-eng 0.1.0`,
+checkout `06e3d501` with 42 modified tracked files) and its tooling is owned by `~/.venvs/herdr-engineering`. SSH authentication must remain valid
 for unattended access. Hosts requiring an interactive Tailscale SSH check will
 fail that deployment and be retried by a later scheduled run.
 

@@ -40,8 +40,6 @@ path = os.pathsep.join([
 ])
 replacements = {
     "__PYTHON__": quote(executable.absolute(), command=True),
-    # WorkingDirectory takes the raw path, unlike ExecStart/Environment.
-    "__REPO__": str(root).replace("%", "%%"),
     "__REPO_ENV__": quote("HERDR_ENGINEERING_REPO=" + str(root)),
     "__PATH_ENV__": quote("PATH=" + path),
 }
