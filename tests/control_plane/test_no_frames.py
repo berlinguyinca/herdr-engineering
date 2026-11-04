@@ -198,7 +198,7 @@ def test_share_host_pages_views_assets_and_annotations_are_frame_free(lab):
     # the annotations JSON, with a row whose text names frames: the host escapes "<", so the body is still markup-free
     comment = "see " + "<" + "iframe src=x></" + "iframe> and " + "<" + "object data=y>"
     sa.seed(lab, "alice", [sa.row(sa.AID, body=comment)])
-    status, _, body = lab.request("GET", sa.api(sess))
+    status, _, body = sa.aget(lab, sess)
     assert status == 200 and json.loads(body)["annotations"][0]["body"] == comment      # same value for every client
     _frame_free("annotations", body)
 
