@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import re
 import threading
 import time
 from collections.abc import Callable
 from urllib.request import Request, urlopen
+
+log = logging.getLogger(__name__)
 
 TTL = 60.0
 TIMEOUT = 3.0
@@ -65,3 +68,20 @@ class ModelResolver:
             out += [m for m in served if fnmatch.fnmatchcase(m, pattern)]
         out += [m for m in served if not NON_TEXT.search(m)]
         return list(dict.fromkeys(out))[:MAX_CANDIDATES]
+
+    def check_configured(self, wanted: str) -> bool:
+        """Startup check: warn when a pinned model is not in the gateway's catalog (a renamed model made every chat fail with
+        'inference unavailable'). Best effort: an unreachable gateway or an odd answer is silent, nothing here raises, and
+        only the model and a few catalog ids are logged, never the key. True when there is nothing to report."""
+        try:
+            if wanted in ("", "auto"):
+                return True
+            served = self.served()
+            if not served or wanted in served:
+                return True
+            log.warning("assistant inference.model %r is not served by the gateway (%d models, e.g. %s); "
+                        "chats will use preferred_models or any served text model, or fail if none match",
+                        wanted[:120], len(served), ", ".join(repr(m[:80]) for m in served[:5]))
+            return False
+        except Exception:  # noqa: BLE001 - a health check must never break startup
+            return True
