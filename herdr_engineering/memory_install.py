@@ -35,9 +35,9 @@ from typing import Any
 MARKER = "herdr-memory:managed"
 ADAPTER_VERSION = 2
 # Pinned herdr-memory revision; must match lock/upstreams.yaml (tested).
-PINNED_REVISION = "e483bda"
+PINNED_REVISION = "cc20ad4d46845b8257e54596e152846e3ce4a3c2"
 #: Client release the fleet is expected to run (`herdr-memory --version`).
-PINNED_CLIENT_VERSION = "0.1.5"
+PINNED_CLIENT_VERSION = "0.1.6"
 #: An unattended controller update older than this looks like a timer that stopped landing.
 FRESH_UPDATE_HOURS = 26
 SERVER_NAME = "herdr-memory"
@@ -760,19 +760,9 @@ class MemoryInstaller:
         return None
 
     def _client_dist_infos(self) -> list[Path]:
-        """Candidate `herdr_memory-*.dist-info` directories, this interpreter first."""
-        infos: list[Path] = []
-        try:
-            from importlib import metadata
-            own = getattr(metadata.distribution("herdr-memory"), "_path", None)
-            if own:
-                infos.append(Path(own))
-        except Exception:
-            pass
+        """Metadata belonging to the CLI, never an unrelated wrapper interpreter."""
         site = self._client_site_packages()
-        if site:
-            infos.extend(sorted(site.glob("herdr_memory-*.dist-info")))
-        return infos
+        return sorted(site.glob("herdr_memory-*.dist-info")) if site else []
 
     def installed_revision(self) -> str | None:
         """Revision of the installed ``herdr-memory`` package, or None if unknowable."""

@@ -369,6 +369,23 @@ def test_wheel_install_without_provenance_is_reported_unknown_with_its_version(h
     assert check["status"] == "unknown" and "0.1.3" in check["detail"]
 
 
+def test_cli_provenance_never_comes_from_another_interpreter(home, monkeypatch):
+    from importlib import metadata
+    from types import SimpleNamespace
+
+    stale = home / 'wrapper' / 'herdr_memory-0.0.1.dist-info'
+    stale.mkdir(parents=True)
+    (stale / 'direct_url.json').write_text(json.dumps({'vcs_info': {'commit_id': 'old-wrapper'}}))
+    monkeypatch.setattr(metadata, 'distribution', lambda _: SimpleNamespace(_path=stale))
+    exe = _client_install(home)
+    installer = mi.MemoryInstaller(home, command=CMD,
+        which=lambda name: exe if name == 'herdr-memory' else None, run=fake_run)
+    assert installer.installed_version() == mi.PINNED_CLIENT_VERSION
+    assert installer.installed_revision() == mi.PINNED_REVISION + '0' * (40 - len(mi.PINNED_REVISION))
+    missing = mi.MemoryInstaller(home, command=CMD, which=lambda _: None, run=fake_run)
+    assert missing.installed_version() is None and missing.installed_revision() is None
+
+
 def test_doctor_reports_the_client_version_the_cli_advertises(home):
     exe = _client_install(home)
     pinned = mi.PINNED_CLIENT_VERSION           # the fake must follow the pin, not hardcode it
@@ -558,6 +575,37 @@ def test_mcp_serve_roundtrip():
     assert {t["name"] for t in replies[1]["result"]["tools"]} == {"memory_recall", "memory_retain"}
     assert replies[2]["result"]["isError"] is False and len(calls) == 1
     assert replies[3]["result"]["isError"] is True
+
+
+@pytest.mark.parametrize('explicit', ['false', 'true', 1, 0, [], {}, None])
+@pytest.mark.parametrize('evidence', [[], ['git:revision:file']])
+def test_mcp_serve_rejects_non_boolean_save_intent_before_running_cli(explicit, evidence):
+    import io
+    calls = []
+
+    def run(argv, timeout):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout='{"outcome":"persisted"}', stderr='')
+
+    message = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
+        'name': 'memory_retain', 'arguments': {'text': 'Save only with real intent',
+                                             'explicit': explicit, 'evidence': evidence}}}
+    output = io.StringIO()
+    mcp.serve(io.StringIO(json.dumps(message) + '\n'), output, 'claude',
+              run=run, which=lambda _: '/x/herdr-memory')
+    response = json.loads(output.getvalue())
+    assert response['result']['isError'] is True
+    assert calls == []
+
+
+def test_mcp_boolean_false_needs_evidence_and_true_is_forwarded():
+    with pytest.raises(ValueError, match='explicit=true or evidence'):
+        mcp.build_argv('memory_retain', {'text': 'note', 'explicit': False}, 'pi', '/cli')
+    argv = mcp.build_argv('memory_retain', {'text': 'note', 'explicit': True}, 'pi', '/cli')
+    assert '--explicit' in argv
+    argv = mcp.build_argv('memory_retain', {'text': 'note', 'explicit': False,
+        'evidence': ['git:revision:file']}, 'pi', '/cli')
+    assert '--explicit' not in argv and '--evidence' in argv
 
 
 def test_hook_labels_untrusted_and_fails_silent():
