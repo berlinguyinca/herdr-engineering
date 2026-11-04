@@ -326,9 +326,8 @@ if [ "$MEMORY" = 1 ]; then
 fi
 if [ "$MEMORY" = 1 ]; then memory_preflight || exit 1; fi
 
-# A CLI dependency for the read-only explorer and an explicit private profile.
-# This uses
-# the same rollout, lock and rollback as the app, not the backend memory step.
+# The read-only explorer's CLI/profile use the app's existing rollout, lock
+# and rollback, independently of the optional backend memory step.
 MEMORY_CLIENT_LIB="$WORK/deploy/control-plane/memory-client-deploy.sh"
 [ -f "$MEMORY_CLIENT_LIB" ] || MEMORY_CLIENT_LIB="$HERE/memory-client-deploy.sh"
 . "$MEMORY_CLIENT_LIB"

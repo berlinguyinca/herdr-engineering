@@ -121,9 +121,7 @@ What the install branch should do once both are merged: call `discover_endpoint(
 `url` into `~/.config/herdr-memory/config.json` only if that file has none, and report `problem` otherwise. Credential
 files stay a separate, deliberate step (`export-key`). Its `doctor` can reuse `check_memory_backend()`.
 
-## Backups
-
-### Private dashboard client runtime
+## Private dashboard client runtime
 
 The backend and Memory Explorer use separate deployment steps. Configuring the
 backend does not grant dashboard access. Memory Explorer still requires an
@@ -174,6 +172,8 @@ The client URL must be reachable and trusted inside the web container. A host's
 loopback address refers to the container there; use the existing authenticated
 HTTPS route where appropriate. Preparation validates configuration, not endpoint
 availability or authentication; runtime unavailable/degraded states remain truthful.
+
+## Backups
 
 `herdr-hindsight-backup.timer` (installed and enabled by `deploy.sh --with-memory`, daily, `Persistent=true`) runs
 `~/.local/share/herdr-engineering/memory-backup.sh backup`: `pg_dump -Fc` of the **whole** database (every tenant
