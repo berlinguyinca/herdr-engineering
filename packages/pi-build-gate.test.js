@@ -14,7 +14,14 @@ const TS = path.resolve("deploy/pi-build-gate/build-gate.ts");
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-gate-"));
 const log = path.join(dir, "argv.log");
 const fake = path.join(dir, "herdr-eng");
-fs.writeFileSync(fake, `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a"; done > "${log}"\n`, { mode: 0o755 });
+const NEW_HELP = "usage: herdr-eng build-coordinate [--record] [--require-cache-enabled] [--trace-session ID] [--trace-mission ID]";
+const OLD_HELP = "usage: herdr-eng build-coordinate [--slots N] [--max-load F] [--record]";
+// A real executable that answers `build-coordinate --help` like a given CLI version and otherwise records argv.
+function writeStub(file, help, exitCode = 0) {
+  fs.writeFileSync(file, `#!/bin/sh\ncase " $* " in *" --help "*) echo '${help}'; exit ${exitCode};; esac\n` +
+    `for a in "$@"; do printf '%s\\n' "$a"; done > "${log}"\n`, { mode: 0o755 });
+}
+writeStub(fake, NEW_HELP);
 process.env.PATH = `${dir}${path.delimiter}${process.env.PATH}`;
 delete process.env.HERDR_BUILD_GATE_DISABLE;
 
@@ -92,7 +99,7 @@ test("light simple cargo/rustc commands are wrapped, require cache enabled, carr
   const out = handlerFor()("cargo nextest run -p foo");
   delete process.env.HERDR_SESSION_ID;
   delete process.env.HERDR_MISSION_ID;
-  assert.equal(out, `${fake} build-coordinate --max-load 3 --wait 900 --bypass-on-timeout --record ` +
+  assert.equal(out, `${fake} build-coordinate --max-load 3 --wait 5 --bypass-on-timeout --record ` +
     `--require-cache-enabled --trace-session sess-77 --trace-mission mission-5 -- cargo nextest run -p foo`);
 });
 
@@ -141,4 +148,45 @@ test("disable switch still wins", { skip }, () => {
   process.env.HERDR_BUILD_GATE_DISABLE = "1";
   try { assert.equal(handlerFor()("cargo build -p x"), "cargo build -p x"); }
   finally { delete process.env.HERDR_BUILD_GATE_DISABLE; }
+});
+
+// Load a fresh copy of the extension with `herdr-eng` stubbed as the given CLI version.
+async function loadWith(help, exitCode = 0) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "pi-gate-skew-"));
+  const bin = path.join(d, "herdr-eng");
+  writeStub(bin, help, exitCode);
+  const saved = process.env.PATH;
+  process.env.PATH = `${d}${path.delimiter}${saved}`;
+  try {
+    const m = await import(`${pathToFileURL(TS).href}?skew=${d}`);
+    let handler;
+    m.default({ on: (_n, fn) => { handler = fn; } });
+    return { bin, run: (command) => { const e = { type: "tool_call", toolName: "bash", input: { command } }; handler(e); return e.input.command; } };
+  } finally { process.env.PATH = saved; }
+}
+
+test("old herdr-eng (no new flags): light path skipped, heavy path byte-identical", { skip }, async () => {
+  const { bin, run } = await loadWith(OLD_HELP);
+  assert.equal(run("cargo build -p x"), "cargo build -p x");
+  assert.equal(run("rustc main.rs"), "rustc main.rs");
+  assert.equal(run("cargo check --workspace --tests"),
+    `${bin} build-coordinate --max-load 3 --wait 900 --bypass-on-timeout -- cargo check --workspace --tests`);
+});
+
+test("failing or missing probe also disables only the light path", { skip }, async () => {
+  const { run } = await loadWith(NEW_HELP, 2);
+  assert.equal(run("cargo test -p x"), "cargo test -p x");
+});
+
+test("new herdr-eng: light path enabled", { skip }, async () => {
+  const { bin, run } = await loadWith(NEW_HELP);
+  assert.match(run("cargo test -p x"), new RegExp(`^${bin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} build-coordinate .*--require-cache-enabled`));
+});
+
+test("a herdr-eng path with spaces is shell-quoted; slots must be digits", { skip }, () => {
+  assert.equal(mod.shellQuote("/a b/herdr-eng"), "'/a b/herdr-eng'");
+  assert.equal(mod.shellQuote("/usr/bin/herdr-eng"), "/usr/bin/herdr-eng");
+  process.env.HERDR_BUILD_GATE_SLOTS = "\n5";
+  try { assert.ok(!handlerFor()("cargo check --workspace").includes("--slots")); }
+  finally { delete process.env.HERDR_BUILD_GATE_SLOTS; }
 });

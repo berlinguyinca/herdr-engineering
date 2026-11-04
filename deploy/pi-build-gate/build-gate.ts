@@ -36,9 +36,20 @@
  * are never wrapped again. Each wrapped call carries a non-secret trace (session
  * id from HERDR_SESSION_ID or a per-process id, optional HERDR_MISSION_ID);
  * argv and env values are never sent in it.
+ *
+ * Version skew: the extension and `herdr-eng` are installed separately. At load
+ * the extension runs `herdr-eng build-coordinate --help` once; unless it lists
+ * --require-cache-enabled and --trace-session/--trace-mission (or the probe
+ * fails or times out) the light path is skipped entirely and behaviour is
+ * identical to the pre-spec-08 extension (heavy commands only).
+ *
+ * Light commands wait at most HERDR_BUILD_GATE_LIGHT_WAIT seconds (default 5) for
+ * a slot, then run ungated, so trivial calls never queue for 15 minutes behind
+ * heavy builds. HERDR_ENG is shell-quoted when needed.
  */
 
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -72,6 +83,25 @@ const HERDR_ENG: string | null = (() => {
 	return null;
 })();
 
+const NEW_FLAGS = ["--require-cache-enabled", "--trace-session", "--trace-mission"];
+
+/** True only if this herdr-eng's build-coordinate lists every spec-08 flag. Never throws. */
+export function supportsLightPath(bin: string): boolean {
+	try {
+		const r = spawnSync(bin, ["build-coordinate", "--help"], { encoding: "utf8", timeout: 5000 });
+		if (r.error || r.status !== 0) return false;
+		const text = `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
+		return NEW_FLAGS.every((f) => text.includes(f));
+	} catch {
+		return false;
+	}
+}
+
+/** Single-quote a path unless it is made of plainly safe characters. */
+export function shellQuote(value: string): string {
+	return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 function envNum(name: string, fallback: number): number {
 
 	const raw = process.env[name];
@@ -86,7 +116,7 @@ function envNum(name: string, fallback: number): number {
 function slotsFlag(): string {
 
 	const raw = process.env.HERDR_BUILD_GATE_SLOTS;
-	if (raw === undefined || raw === "" || !Number.isFinite(Number(raw))) return "";
+	if (raw === undefined || !/^[0-9]{1,3}$/.test(raw)) return "";
 	return ` --slots ${raw}`;
 }
 
@@ -172,6 +202,11 @@ export default function (pi: ExtensionAPI) {
 		);
 		return; // don't register the handler; no-op extension
 	}
+	const lightPath = supportsLightPath(HERDR_ENG);
+	if (!lightPath) {
+		console.warn("[build-gate] herdr-eng lacks the spec-08 flags (or probe failed); light cargo/rustc wrap disabled.");
+	}
+	const eng = shellQuote(HERDR_ENG);
 
 	pi.on("tool_call", (event) => {
 		if (event.type !== "tool_call" || event.toolName !== "bash") return;
@@ -185,13 +220,15 @@ export default function (pi: ExtensionAPI) {
 		const wait = envNum("HERDR_BUILD_GATE_WAIT", 900);
 
 		if (!shouldGate(cmd)) {
+			if (!lightPath) return; // old herdr-eng: legacy behaviour, byte-identical
 			if (simpleKind(parseSimpleCommand(cmd)) === null) return;
 			// Light simple build: herdr-eng coordinates only if fabric_build_cache
 			// is enabled, otherwise it execs the original command unchanged.
 			const trace = traceArgs(currentTrace()).join(" ");
+			const lightWait = Math.min(wait, envNum("HERDR_BUILD_GATE_LIGHT_WAIT", 5));
 			event.input.command =
-				`${HERDR_ENG} build-coordinate${slotsFlag()} ` +
-				`--max-load ${maxLoad} --wait ${wait} --bypass-on-timeout --record ` +
+				`${eng} build-coordinate${slotsFlag()} ` +
+				`--max-load ${maxLoad} --wait ${lightWait} --bypass-on-timeout --record ` +
 				`--require-cache-enabled${trace === "" ? "" : ` ${trace}`} -- ${cmd}`;
 			return;
 		}
@@ -201,7 +238,7 @@ export default function (pi: ExtensionAPI) {
 		// so pipelines keep working. --slots is omitted unless the operator
 		// pinned HERDR_BUILD_GATE_SLOTS, so herdr-eng scales slots with cores.
 		event.input.command =
-			`${HERDR_ENG} build-coordinate${slotsFlag()} ` +
+			`${eng} build-coordinate${slotsFlag()} ` +
 			`--max-load ${maxLoad} --wait ${wait} --bypass-on-timeout -- ${cmd}`;
 	});
 }
