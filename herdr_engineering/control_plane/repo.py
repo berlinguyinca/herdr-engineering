@@ -3565,7 +3565,8 @@ class ControlPlaneRepo:
             "event_order": list(event_order),
             "ci_sequence": self._ci_sequence,
             "ci_history_truncated": sorted(self._ci_history_truncated),
-            "agent_projections": copy.deepcopy(list(self._agent_records.values())),
+            "agent_projections": copy.deepcopy([self._agent_records[key]
+                                                for key in sorted(self._agent_records)]),
             "agent_identity_history": copy.deepcopy(self._agent_identity_history),
         }
 

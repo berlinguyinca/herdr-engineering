@@ -69,3 +69,28 @@ def test_backdated_fallback_keeps_maximum_sequence_for_subsequent_writes(kind):
     expected = replay(full)
     assert restored.record_event(kind, 'h', 'Observation', {})['sequence'] == (
         expected.record_event(kind, 'h', 'Observation', {})['sequence']) == 101
+
+
+def test_scheduler_observation_telemetry_is_replayed_once_across_checkpoint_cycles():
+    host = {'host_id': 'h', 'host_name': 'h', 'scheduler_policy': {'revision': 0, 'mode': 'manual_only'}}
+    sample = {'sequence': 1, 'cpu_pct': 5, 'at': '1970-01-01T00:00:01+00:00'}
+    observation = event('observation', 1, 1, {'host': host, 'sample': sample},
+                        'SchedulerHostObserved', 'scheduler_observation')
+    reference = replay([observation])
+    checkpoint = capsule(reference)
+    for _ in range(3):
+        restored = append(checkpoint, [])
+        assert restored.list_telemetry('h') == reference.list_telemetry('h')
+        assert len(restored.list_telemetry('h')) == 1
+        checkpoint = capsule(restored)
+
+
+def test_agent_projection_export_does_not_depend_on_mapping_insertion_order():
+    repo = ControlPlaneRepo(now=lambda: 1000)
+    repo.upsert_session('b', name='Beta')
+    repo.upsert_session('a', name='Alpha')
+    repo.list_sessions()
+    expected = repo.export_state()['agent_projections']
+    assert len(expected) == 2
+    repo._agent_records = dict(reversed(list(repo._agent_records.items())))
+    assert repo.export_state()['agent_projections'] == expected

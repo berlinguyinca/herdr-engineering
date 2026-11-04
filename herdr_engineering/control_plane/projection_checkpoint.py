@@ -169,6 +169,10 @@ def restore_projection(repo, checkpoint, *, full_streams, tail_rows, structured,
     # every restore; carrying the prefix dictionaries would suppress tail replay.
     state.pop('scheduler_reservations', None)
     state.pop('scheduler_leases', None)
+    # Observation capsules regenerate their telemetry. Importing both the
+    # derived prefix and its latest observation would append a duplicate sample.
+    state.pop('scheduler_observations', None)
+    state['telemetry'] = {}
     event_core = {name: state[name] for name in CORE_FIELDS}
     cursors = copy.deepcopy(checkpoint.get('core_cursors', {}))
     policies = copy.deepcopy(checkpoint.get('operator_policies', {}))
