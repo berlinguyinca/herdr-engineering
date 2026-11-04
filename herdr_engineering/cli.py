@@ -83,6 +83,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="the build command to run, e.g. `-- cargo check -j 4 --workspace --tests`")
     p.set_defaults(func=_cmd_build_coordinate)
 
+    p = sub.add_parser("build-cache-inventory",
+                       help="read-only: this host's build-cache capability record "
+                            "(spec 06; nothing when fabric_build_cache is disabled)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=_cmd_build_cache_inventory)
+
     # doctor ---------------------------------------------------------------
     p = sub.add_parser("doctor", help="capability/health checks (spec 0050/0170)")
     p.add_argument("--json", action="store_true", help="stable machine-readable output")
@@ -2790,6 +2796,20 @@ def _build_cache_config():
         print(f"build-coordinate: build cache config ignored: {exc}", file=sys.stderr)
         return None
     return cfg if cfg is not None and cfg.enabled else None
+
+
+def _cmd_build_cache_inventory(args) -> int:
+    from .build_cache_config import validate
+    from .build_cache_inventory import collect, inventory_view
+    from .config import load_config
+    try:
+        cfg = validate(load_config().get("fabric_build_cache"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"build-cache-inventory: invalid config: {exc}", file=sys.stderr)
+        return 1
+    cap = collect(cfg)
+    _print_json(inventory_view(cfg, [cap] if cap else []))
+    return 0
 
 
 def _cmd_build_cleanup(args) -> int:
