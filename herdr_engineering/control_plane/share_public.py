@@ -138,7 +138,8 @@ VENDOR_MAX_BYTES = 4 * 1024 * 1024   # the vendored pdf.js worker is ~1.4 MB
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parent / "share_static"
 VIEWER_FILE = "viewer.html"
 STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8",
-                "annotate.js": "text/javascript; charset=utf-8", "annotate.css": "text/css; charset=utf-8"}
+                "annotate.js": "text/javascript; charset=utf-8", "anchor.js": "text/javascript; charset=utf-8",
+                "annotate.css": "text/css; charset=utf-8"}
 VIEW_FILE = "view.html"
 ANNOTATIONS_MAX_BYTES = 32 * 1024 * 1024     # the annotations file cap (the worker rotates it long before)
 ANNOTATION_LINE_MAX = 65536                  # the worker's max_line_bytes: a longer line would be dropped at ingest

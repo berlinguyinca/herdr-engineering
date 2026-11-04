@@ -1,12 +1,74 @@
-:root { color-scheme: light dark; }
+:root { color-scheme: light dark; --accent: #1f4fd1; --line: #8884; --muted: #6668; }
 body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
 nav[data-mode-switch] { position: relative; z-index: 20; background: Canvas; display: flex; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #8884; }
 nav[data-mode-switch] a { padding: 4px 10px; border-radius: 6px; color: inherit; text-decoration: none; }
 nav[data-mode-switch] a[aria-current="page"] { background: #1f4fd1; color: #fff; }
-#herdr-stage { padding: 12px; contain: paint; }
+nav[data-mode-switch] a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#herdr-stage { padding: 12px; contain: paint; min-width: 0; }
 /* The content's own styles (even a :host rule with !important, which beats this sheet) can restyle only the shadow
    host inside this box. The box clips and paints that host, and its stacking context stays below the bar and panel. */
 #herdr-viewport { position: relative; z-index: 0; isolation: isolate; contain: paint; overflow: clip; }
-aside[data-annotate-panel] { position: relative; z-index: 20; }
 .herdr-static-note { margin: 0 0 8px; font-size: 13px; opacity: .75; }
 #herdr-native img { max-width: 100%; height: auto; }
+
+/* Annotation mode: content on the left, the panel beside it; stacked below the content on a narrow screen. */
+body[data-mode="annotate"] { display: grid; grid-template-columns: minmax(0, 1fr) 22rem; grid-template-areas: "bar bar" "stage panel"; align-items: start; }
+body[data-mode="annotate"] > nav[data-mode-switch] { grid-area: bar; }
+body[data-mode="annotate"] > #herdr-stage { grid-area: stage; }
+aside[data-annotate-panel] { grid-area: panel; position: sticky; top: 0; z-index: 20; box-sizing: border-box; max-height: 100vh; overflow: auto;
+  background: Canvas; color: CanvasText; border-left: 1px solid #8884; }
+@media (max-width: 640px) {
+  body[data-mode="annotate"] { grid-template-columns: minmax(0, 1fr); grid-template-areas: "bar" "stage" "panel"; }
+  aside[data-annotate-panel] { position: relative; max-height: none; border-left: 0; border-top: 1px solid #8884; }
+}
+
+/* The panel's own tree (an open shadow root) loads this same sheet; these rules match inside it. */
+:host { display: block; }
+.panel { padding: 12px 14px 24px; font: 15px/1.45 system-ui, sans-serif; overflow-wrap: anywhere; }
+.panel h2 { margin: 0 0 6px; font-size: 1.1rem; }
+.panel h3 { margin: 0; font-size: 1rem; }
+.panel .note { margin: 0 0 10px; font-size: 13px; color: var(--muted); }
+.panel .anchor-title { margin: 8px 0 4px; font-weight: 600; }
+.panel blockquote { margin: 4px 0; padding: 4px 8px; border-left: 3px solid var(--accent); max-height: 9rem; overflow: auto; white-space: pre-wrap; background: #8881; }
+.panel .actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.panel label { display: block; margin: 10px 0 4px; font-weight: 600; }
+.panel textarea { box-sizing: border-box; width: 100%; font: inherit; padding: 6px; resize: vertical; color: inherit; background: Field; border: 1px solid var(--line); border-radius: 6px; }
+.panel .meta { display: flex; justify-content: space-between; align-items: center; margin-top: 4px; }
+.panel .count { font-size: 13px; color: var(--muted); }
+.panel button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: ButtonFace; color: ButtonText; cursor: pointer; }
+.panel button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.panel button.danger { color: #b3261e; }
+.panel button.quiet { border-color: transparent; background: transparent; text-decoration: underline; }
+.panel button:disabled { opacity: .5; cursor: default; }
+.panel button[aria-pressed="true"] { background: #1f4fd122; border-color: var(--accent); }
+.panel :is(button, textarea, blockquote, h2, h3, li):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.panel .message { min-height: 1.4em; margin: 8px 0; font-size: 14px; }
+.panel .message[data-kind="error"] { color: #b3261e; }
+.panel .list-head { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; }
+.panel .rows { list-style: none; margin: 8px 0 0; padding: 0; }
+.panel .row { padding: 8px 0; border-top: 1px solid var(--line); }
+.panel .row-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.panel .badge { font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: #8883; }
+.panel .badge[data-status="open"], .panel .badge[data-status="submitted"], .panel .badge[data-status="edited"] { background: #1f4fd133; }
+.panel .badge[data-status="addressed"] { background: #1a7f3733; }
+.panel .file, .panel .row-anchor { font-size: 13px; color: var(--muted); margin: 2px 0; }
+.panel .row-body { margin: 4px 0; white-space: pre-wrap; }
+.panel .empty { color: var(--muted); }
+
+/* Image and PDF drawing (annotation and live mode). */
+.herdr-image-box { position: relative; display: inline-block; max-width: 100%; line-height: 0; }
+.herdr-image-box.herdr-annotatable { cursor: crosshair; touch-action: none; user-select: none; }
+.herdr-image-box:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.herdr-region-layer, .herdr-region-layer .herdr-region { pointer-events: none; }
+.herdr-region-layer { position: absolute; inset: 0; }
+.herdr-region { position: absolute; box-sizing: border-box; border: 2px solid #ffb300; background: #ffb30033; }
+.herdr-region-live { pointer-events: none; border-style: dashed; }
+.herdr-pdf-status { margin: 8px 0; font-size: 14px; }
+.herdr-pdf-page { position: relative; margin: 0 auto 12px; background: #fff; box-shadow: 0 1px 4px #0005; }
+.herdr-pdf-page canvas { display: block; }
+.herdr-pdf-pages.herdr-region-mode .herdr-pdf-page { cursor: crosshair; touch-action: none; }
+.herdr-pdf-page .textLayer { position: absolute; inset: 0; overflow: clip; line-height: 1; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; z-index: 1; }
+.herdr-pdf-page .textLayer :is(span, br) { position: absolute; color: transparent; white-space: pre; cursor: text; transform-origin: 0 0; }
+.herdr-pdf-page .textLayer ::selection { background: rgba(0, 80, 255, .3); }
+.herdr-pdf-page .herdr-region-layer { z-index: 2; }
+.herdr-file-link { margin: 8px 0; }
