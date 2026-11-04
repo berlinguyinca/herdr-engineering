@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fabric build cache: the shared tier works against the herdr rustfs server
+- `herdr-eng build-cache-rustfs-provision` (dry-run default, `--apply`): additive, idempotent creation of bucket `herdr-build-cache` (hard quota), read/write and read-only users with bucket-limited policies, and 0600 credential/registry files. Admin credential from the central fleet config, never echoed; MinIO client runs in the container with a private removed config dir; never touches `herdr-artifacts`; no delete path.
+- `build-coordinate` now starts or reuses a per-policy sccache server before cargo with the credentials in the SERVER environment only (cargo/rustc/build scripts get just the port), `close_fds=True`, idle-timeout reaping. `cache.shared.active` is true only after the server is verified (signed list request + `--show-stats` bucket/prefix). New reasons: `server_start_failed`, `server_not_shared`, `credentials_rejected`. `shared_requires_server` is now only the transient validated state.
+- Plain HTTP is accepted for loopback and tailnet hosts (127/8, `::1`, 100.64.0.0/10, `*.ts.net`, MagicDNS names); other hosts still need TLS. Config key names keep their S3 spelling for compatibility; user-visible text says rustfs.
+- Fix: the generated sccache TOML was rejected by sccache 0.19.0 (`[cache.s3]` needs `no_credentials = false`). `sccache --show-stats` for a build event now queries the policy server (child env) instead of the default port, and the delta includes per-level `multi_level` counters.
+- Measured with real sccache 0.19.0 and the real local rustfs: cold build writes to the namespace prefix, a clean build with a new local cache hits from rustfs, another namespace misses, the read-only user cannot write. Not measured: a real second host; the tailnet address (the fabric agent forwarder rejects valid SigV4 requests).
+
 ### Installer: checksum-pinned sccache 0.19.0 for the fabric build cache
 - `scripts/install.sh` step 2b runs `scripts/install-sccache.sh`: downloads the upstream mozilla/sccache 0.19.0 tarball for this os/arch (Linux x86_64/aarch64 musl, macOS arm64/x86_64), verifies SHA-256 against `scripts/sccache-checksums.txt` (fails closed if absent or mismatched), installs only the binary to `~/.local/bin/sccache` (0755, no root), skips when >= 0.19.0 is present. Failure is non-fatal with a loud warning. `--no-build-cache-tools` skips, `--build-cache-tools-only` runs just this step. `herdr-eng doctor` gains `build_cache_sccache`, `build_cache_rust`, `build_cache_python_deps` (read-only warnings with the fix command). The feature stays default-off.
 

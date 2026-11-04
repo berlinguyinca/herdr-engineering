@@ -29,7 +29,7 @@ a second host. Other counts quoted from HANDOFF.md (not re-run here): Playwright
 | Component | Status | Notes |
 |---|---|---|
 | A local sccache (specs 01-03, 06-08) | complete+tested, not deployed | env wiring, measurement, fingerprint, quota/eviction planning, Pi gate; never run against a real sccache |
-| B shared S3 (spec 04) | partial | config, rendering, health probe, fallback tested; shared level not delivered to builds (`shared_requires_server`); no real S3 |
+| B shared tier on rustfs (spec 04) | complete+tested on one host | provisioning, credentialed server start, verified `active`, fallback; measured against real sccache 0.19 + real rustfs (cold write, warm hit, namespace miss, RO denied); no second host; tailnet address rejects SigV4 |
 | C coordination/leases (spec 05) | complete+tested, not deployed | `reconcile` has no caller |
 | D dashboard + metrics (specs 09, 10) | partial | API, SSE, panel done (local host data only); metrics export to Grafana not implemented |
 | E Slurm (specs 11, 12) | blocked | adapter contract only (NullRunner); dist is NO-GO doc; any real runner awaiting approval |
@@ -100,8 +100,9 @@ telemetry is `builds.jsonl`, the host-local API/SSE and the dashboard panel.
 - SSE has no `id:`/Last-Event-ID; no resume beyond the shared stream's last-100 replay.
 - No ingest of other hosts' builds; API/panel show the control-plane host only; no migration 0046.
 - Missing events: `cache_stats_updated`, `storage_degraded`, `lease_changed`, `cleanup_completed`.
-- `shared_requires_server`: shared S3 is inert until a credentialed per-policy
-  `sccache --start-server` and server lifetime management exist.
+- (Closed 2026-11-04) the credentialed per-policy server start exists
+  (`build_cache_server.py`). Remaining: tailnet endpoint rejects valid SigV4 (fabric agent
+  forwarder); sccache does not authenticate objects; same-uid code can read server env.
 - `slurm.*` overlaps `execution.slurm_enabled/allowed_partitions`; authority unsettled.
 - Dashboard table is cramped on mobile (tables scroll in focusable regions).
 - ui-gates not run; typecheck of the Pi extension not run.
@@ -158,7 +159,7 @@ recheck, L3 two dry-run knobs, L5 hosts() stampede, L7 check order, L8 adaptive 
 parent directories.
 
 Spec-05 HIGHs re-checked by the reviewer and CLOSED: H1 (repo-local config cannot select
-policy), H2 (no credentials in cargo env; shared mode degrades to `shared_requires_server`),
+policy), H2 (no credentials in cargo env; credentials only in the explicitly started server env),
 H3 (per-policy port; server lock-fd inheritance and port range now also fixed).
 
 Status caveat: spec 08 stays "partial" (python + node tests pass; TypeScript typecheck not
@@ -183,8 +184,9 @@ run, no real Pi run). Nothing here was run against a real sccache or Slurm.
 
 1. (Done 2026-11-04) sccache 0.19.0 installed on bender.
 2. Pilot project for the cold/warm benchmark.
-3. TLS S3 endpoint, bucket, scoped 0600 read-only credentials, registry file (Stage 2),
-   and approval to build the credentialed sccache server (the open gap).
-4. Slurm: partition, account, and a verified runner (separate approval); settle the config overlap.
+3. Enable the Stage 2 canary on bender (rustfs is provisioned; publish it on the tailnet
+   address or fix the forwarder before any second host); the second-host stage is
+   operator-performed.
+4. Slurm stays parked (separate approval); settle the config overlap.
 5. Metrics: whether to implement a Grafana/remote_write export.
 6. Merge and push of `feat/fabric-build-cache`; deploy order herdr-eng then Pi extension.

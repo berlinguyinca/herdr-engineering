@@ -74,3 +74,18 @@ and the last block of the rollback rehearsal.
 A read-only or unwritable state dir no longer blocks a build: `build-coordinate`
 prints `gate unavailable (state_dir_unwritable: ...); running ungated` and runs the
 plain command with its exit code (fix commit dd331451).
+
+## 6. Shared tier (rustfs) rollback
+
+1. Set `fabric_build_cache.shared_cache.enabled: false` (or `mode: local_only`). The next
+   build no longer starts a shared server and uses the local cache; nothing else changes.
+2. A running shared sccache server exits by itself after its idle timeout (600 s). To stop
+   it now: `SCCACHE_SERVER_PORT=<policy port> sccache --stop-server` (the port is
+   deterministic per policy; `ss -ltnp | grep sccache` lists it).
+3. Server-side objects stay in bucket `herdr-build-cache` (hard quota 50 GiB). Nothing is
+   deleted automatically. To remove the credentials, the operator deletes the two users
+   `herdr-build-cache-rw`/`-ro` and the 0600 files in `~/.config/herdr-engineering/`
+   (`build-cache-rustfs*.cred`, `build-cache-rustfs-registry.yaml`) by hand; the
+   provisioning command has no delete path. Rotating a credential: rerun the provisioning
+   command with `--rotate` (re-issues both users, rewrites the files).
+4. `herdr-artifacts` is never touched by any of this.

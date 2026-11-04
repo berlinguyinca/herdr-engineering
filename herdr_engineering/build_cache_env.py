@@ -30,7 +30,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from .build_cache_config import BuildCacheConfig, Mode
-from .build_cache_storage import Code, StorageError, prepare_shared
+from .build_cache_storage import Code, SharedSetup, StorageError, prepare_shared
 from .build_metrics import classify_cmd
 
 TOOL_TIMEOUT_S = 3.0
@@ -98,7 +98,9 @@ class EnvPlan:
     warnings: list[str] = field(default_factory=list)
     fingerprint: Fingerprint | None = None
     shared: SharedStatus = NOT_REQUESTED
-
+    # Set when the shared request validated: the caller must start the server
+    # (build_cache_server.activate) before it may report the tier active.
+    shared_setup: SharedSetup | None = None
 
 def _run_text(argv: list[str]) -> str | None:
     try:
@@ -256,34 +258,62 @@ def plan(config: BuildCacheConfig, cmd: list[str], base_env: Mapping[str, str],
         warnings.append("cargo +toolchain override: fingerprint reflects default rustc")
     env["SCCACHE_SERVER_PORT"] = str(server_port(config, fp, cache_dir))
     env["SCCACHE_IGNORE_SERVER_IO_ERROR"] = "1"  # server trouble degrades to plain rustc
-    shared = _shared(config, tools, fp, state_dir, shared_reachable)
-    return EnvPlan(True, env, [Reason.APPLIED.value], warnings, fp, shared)
+    shared, setup = _shared(config, tools, fp, state_dir, shared_reachable)
+    return EnvPlan(True, env, [Reason.APPLIED.value], warnings, fp, shared, setup)
 
 
 def _shared(config: BuildCacheConfig, tools: Tools, fp: Fingerprint, state_dir: Path,
-            reachable: bool | None) -> SharedStatus:
+            reachable: bool | None) -> tuple[SharedStatus, SharedSetup | None]:
     """Decide the shared level's status. Never raises, never yields secrets.
 
-    Review H2/H3: credentials must not be in the environment of cargo/rustc/
-    build scripts, and an sccache server fixes its config at first start. The
-    only safe delivery is an explicitly started per-policy server whose own env
-    holds the credentials; that start is NOT implemented, so a fully valid
-    shared request degrades to the local cache (``shared_requires_server``).
-    Everything else (bad registry, credentials, TLS, version, unreachable)
-    still reports its specific reason first. Nothing shared is "active".
+    Credentials must not be in the environment of cargo/rustc/build scripts, and
+    an sccache server fixes its config at first start. ``plan`` therefore only
+    validates: a fully valid request yields ``shared_requires_server`` plus the
+    :class:`SharedSetup`, and :func:`activate_shared` starts the per-policy
+    server (credentials in ITS env only) and upgrades the status to active once
+    the running server is verified. Every other problem keeps its own reason.
     """
     if not config.shared_cache.enabled:
-        return NOT_REQUESTED
+        return NOT_REQUESTED, None
     if config.effective_mode is not Mode.SHARED_CACHE:
-        return _unavailable(Code.NOT_SHARED_MODE)
+        return _unavailable(Code.NOT_SHARED_MODE), None
     try:
         setup = prepare_shared(config, sccache_version=tools.sccache_version,
                                toolchain_digest=fp.digest, host_triple=fp.host,
                                state_dir=state_dir, reachable=reachable)
     except StorageError as exc:
-        return _unavailable(exc.code)
-    return SharedStatus(False, f"shared_unavailable:{Code.SHARED_REQUIRES_SERVER.value}",
-                        setup.namespace_digest)
+        return _unavailable(exc.code), None
+    return (SharedStatus(False, f"shared_unavailable:{Code.SHARED_REQUIRES_SERVER.value}",
+                         setup.namespace_digest), setup)
+
+
+def activate_shared(p: EnvPlan, tools: Tools, base_env: Mapping[str, str]) -> EnvPlan:
+    """Start/verify the shared server for a validated plan; never raises.
+
+    On success the plan is returned with ``shared.active`` true (env unchanged:
+    the child only knows the port). On failure the child is moved to a distinct
+    local-tier port so it can never reach a half-configured server, and the
+    reason names the failure.
+    """
+    from dataclasses import replace
+
+    from .build_cache_server import ensure_shared_server, local_fallback_port
+    setup = p.shared_setup
+    if setup is None or tools.sccache is None or not p.applied:
+        return p
+    try:
+        port = int(p.env_overrides["SCCACHE_SERVER_PORT"])
+        result = ensure_shared_server(setup, base_env, str(tools.sccache), port)
+    except Exception:  # noqa: BLE001 - never break a build
+        result = None
+    digest = setup.namespace_digest
+    if result is not None and result.ok:
+        return replace(p, shared=SharedStatus(True, "active", digest), shared_setup=None)
+    code = result.code if result is not None and result.code else Code.SERVER_START_FAILED
+    env = dict(p.env_overrides)
+    env["SCCACHE_SERVER_PORT"] = str(local_fallback_port(port))
+    return replace(p, env_overrides=env, shared_setup=None,
+                   shared=SharedStatus(False, f"shared_unavailable:{code.value}", digest))
 
 
 def server_port(config: BuildCacheConfig, fp: Fingerprint, cache_dir: Path) -> int:

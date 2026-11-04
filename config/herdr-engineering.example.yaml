@@ -90,7 +90,8 @@ fabric_build_cache:
     namespace: trusted-dev
     writes_enabled: false     # default false: read-only unless explicitly enabled
     max_total_gib: 250
-    tls_required: true        # default true; false only for endpoint_ref "*.local-test"
+    tls_required: true        # default true; false only for endpoint_ref "*.local-test". Plain HTTP to loopback/tailnet hosts is accepted regardless
+    # Key names keep their S3 spelling for compatibility; the only shared backend is the herdr rustfs server (bucket herdr-build-cache).
     credentials_file: null    # absolute path, mode 0600, owned by the service user
     registry_file: null       # absolute path, mode 0600: YAML service registry mapping endpoint_ref -> host/region/bucket
   local:

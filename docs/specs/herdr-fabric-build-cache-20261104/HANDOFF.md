@@ -1,4 +1,11 @@
 # HANDOFF (rolling; newest section first)
+## Update 2026-11-04: shared tier on rustfs
+
+Done: provisioning command (`build_cache_rustfs.py`, applied once on bender: bucket `herdr-build-cache`, users `herdr-build-cache-rw`/`-ro`), explicit per-policy sccache server start (`build_cache_server.py`, credentials in the server env only), trusted-plaintext (loopback/tailnet) validation, TOML fix (`no_credentials = false`), policy-port stats in build events, honest `cache.shared.active`. Tests: `tests/test_build_cache_rustfs.py`, `test_build_cache_server.py`, `test_build_cache_rustfs_live.py` (real sccache + real rustfs; skips when absent).
+Measured (same host, loopback): cold write, warm hit from rustfs after cargo clean + new local dir, other namespace misses, RO user denied. NOT tested: a real second host (two-state-dir run is a simulation), tailnet endpoint (`100.104.39.6:9000` is the fabric agent forwarder; valid SigV4 requests are rejected through it, cause not isolated), toolchain-digest isolation end to end, concurrency.
+Operator: publish rustfs on the tailnet address or fix the forwarder; approve enabling the canary; second-host stage is operator-performed; Slurm stays parked. Operator-decision lists no longer contain "S3 endpoint" or "Slurm partition".
+Risks: sccache does not authenticate objects (RW holders can poison); same-uid code can read server env and creds file; `max_total_gib` unenforced by herdr (bucket quota 50 GiB is).
+
 ## Update 2026-11-04: sccache installer
 
 `scripts/install-sccache.sh` (called by `install.sh` step 2b, or `install.sh --build-cache-tools-only`) installs checksum-pinned sccache 0.19.0 per-user; `doctor` reports `build_cache_*` checks. Run on bender 2026-11-04 (operator-approved). Feature still default-off. Tests: `tests/test_install_sccache.py`, `tests/test_doctor.py`.

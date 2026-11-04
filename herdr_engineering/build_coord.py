@@ -361,14 +361,16 @@ def _cache_env(cfg: BuildCacheConfig, cmd: list[str], state_dir: Path | None):
     The child env is a COPY of os.environ plus overrides (None => inherit as
     today). Planning failure never blocks a build: it just runs uncached.
     """
-    from .build_cache_env import NOT_REQUESTED, detect_tools, plan
+    from .build_cache_env import NOT_REQUESTED, activate_shared, detect_tools, plan
     from .build_cache_storage import check_shared
     directory = Path(state_dir) if state_dir is not None else _default_state_dir()
     try:
         env = dict(os.environ)
         reachable = check_shared(cfg, directory)  # bounded probe, negative-cached
-        p = plan(cfg, cmd, env, detect_tools(env.get("PATH")), Path.cwd(),
-                 directory, reachable)
+        tools = detect_tools(env.get("PATH"))
+        p = plan(cfg, cmd, env, tools, Path.cwd(), directory, reachable)
+        if p.shared_setup is not None:
+            p = activate_shared(p, tools, env)  # credentials: server env only
     except Exception as exc:  # noqa: BLE001 - never break a build
         print(f"build-coordinate: cache planning failed ({type(exc).__name__}); uncached",
               file=sys.stderr)

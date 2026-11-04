@@ -2,9 +2,10 @@
 
 Status of this document: written from the code and tests in branch
 `feat/fabric-build-cache`. **Nothing here has been run on a real host.** No sccache,
-no S3 endpoint, no second host, no Slurm was available to the implementation. Every
-"expected" outcome below is a contract from the code and tests, not an observation.
-There is no measured baseline and no measured saving; do not quote one until Stage 1
+second host and no Slurm was available to the implementation. The shared tier has been
+measured on one host against the real herdr rustfs (see `docs/build-cache-storage.md`,
+"Measured on rustfs"); everything else below is a contract from the code and tests, not
+an observation. There is no measured baseline saving; do not quote one until Stage 1
 produces it (see `IMPLEMENTATION_REPORT.md`).
 
 Rules that apply to every stage:
@@ -121,32 +122,22 @@ upstream, so a partial hit rate is expected; do not call it a failure without da
 Operator approves explicitly: sccache install, which host, which project, merge/push
 already done in Stage 0. Rollback: Stage 1 section below.
 
-## Stage 2: shared canary (read-only first)
+## Stage 2: shared canary on rustfs (read-only first)
 
-Needs explicit operator decisions that the implementation will not make:
+The only shared backend is the herdr rustfs server (`herdr-cp-rustfs`, a MinIO drop-in).
+No AWS or other S3 service. The operator provisions it once, then enables one host:
 
-1. A TLS S3-compatible endpoint (hostname, region) and a bucket. The loopback MinIO
-   in `deploy/control-plane/compose.yaml` is not a shared endpoint.
-2. A scoped credentials file, mode 0600, owned by the service user, absolute path.
-   Read-only credentials for the canary. Write credentials only at the later
-   writes step, and separately approved.
-3. A protected service registry YAML (mode 0600) mapping `endpoint_ref` to
-   host/region/bucket (`shared_cache.registry_file`). `endpoint_ref` is an
-   identifier, never a URL; no secret goes in the YAML or in GitHub.
+1. `herdr-eng build-cache-rustfs-provision` (dry-run), review, then `--apply`. This creates
+   bucket `herdr-build-cache` (hard quota 50 GiB by default), users `herdr-build-cache-rw`
+   and `herdr-build-cache-ro`, and the 0600 files `build-cache-rustfs.cred`,
+   `build-cache-rustfs-ro.cred`, `build-cache-rustfs-registry.yaml` in
+   `~/.config/herdr-engineering/`. It does not touch `herdr-artifacts` and deletes nothing.
+   Done on bender on 2026-11-04.
+2. Config key names keep their S3 spelling for compatibility (`endpoint_ref`,
+   `registry_file`, `credentials_file`); they refer to rustfs's S3 API.
+3. Plain HTTP to loopback or tailnet hosts is accepted by validation; any other host needs TLS.
 
-**REMAINING IMPLEMENTATION GAP (read before approving Stage 2).** Today a fully valid
-shared request does NOT reach the S3 level. After the security review (H2, H3) it
-runs on the local cache only and reports `shared_unavailable:shared_requires_server`;
-`shared.active` is never true, and no `AWS_*`, `SCCACHE_CONF` or
-`SCCACHE_S3_RW_MODE` is put in cargo's environment (build scripts and proc macros
-could read it). Delivering shared reads needs code that does not exist yet: an
-explicit `sccache --start-server` per policy with the credentials file read into the
-server child's environment only, plus server lifetime management. Until that is
-built, reviewed and tested, Stage 2 cannot produce a shared hit and must not be
-approved as a performance step. What can be checked now is only that configuration
-validates and the degradation is reported correctly.
-
-Config for when the gap is closed (read-only canary on one host):
+Canary config (read-only, one host):
 
 ```yaml
 fabric_build_cache:
@@ -155,38 +146,53 @@ fabric_build_cache:
   allowed_hosts: [bender]
   shared_cache:
     enabled: true
-    endpoint_ref: <registry id chosen by the operator>
+    endpoint_ref: build-cache
     namespace: trusted-dev
     writes_enabled: false
     tls_required: true
-    credentials_file: /absolute/path/readonly-creds   # 0600
-    registry_file: /absolute/path/registry.yaml       # 0600
+    credentials_file: ~/.config/herdr-engineering/build-cache-rustfs-ro.cred   # absolute path in practice
+    registry_file: ~/.config/herdr-engineering/build-cache-rustfs-registry.yaml
 ```
 
-Checks (read-only): `herdr-eng build-cache-inventory --json` reports the shared
-policy; the build event `cache.shared` shows `{active, reason}`; a wrong namespace
-must miss; stopping the endpoint must leave the build correct with
-`shared_unavailable:*` and the same exit code (covered by chaos tests against
-fake listeners only). Verify against the live endpoint, which no test has done:
-read-only enforcement (`SCCACHE_S3_RW_MODE`), TOML `region`, `key_prefix`
-normalisation, path-style addressing, behaviour on a refused read. Herdr-side
-quarantine of corrupt entries is NOT implemented; sccache's own behaviour is
-undocumented.
+(Use absolute paths.) For the writer host use the `-rw` credentials file with
+`writes_enabled: true`, as a second, separately approved step.
 
-Go evidence: shared hit observed on a second build after a different build wrote the
-entry (needs a writer, so only after writes are separately approved); read-only
-credentials proven unable to write; outputs match baseline; outage drill leaves
-builds correct. Bucket-side quota is the operator's: `max_total_gib` is not enforced
-anywhere.
-No-go: any credential appearing in env, events, logs or API output; a wrong-namespace
-hit; read-only credentials able to write.
+How it works and what is verified: `build-coordinate` starts or reuses a per-policy sccache
+server before cargo with the credentials in the SERVER environment only; the tier is
+reported `active` only after the server is verified (bucket and prefix from
+`--show-stats`, credentials from a signed list request). See
+`docs/build-cache-storage.md` for the measured cold/warm/other-namespace/read-only runs.
+
+Checks: `herdr-eng build-cache-inventory --json` reports the shared policy (configured
+intent); the build event `cache.shared` shows `{active, reason}` (truth); a different
+namespace must miss; unreachable rustfs leaves the build correct with
+`shared_unavailable:endpoint_unreachable` and the same exit code (tested against
+`100.64.0.1:9` with real sccache and cargo).
+
+Known blocker for other hosts: the tailnet address `100.104.39.6:9000` currently rejects
+valid SigV4 requests (it is the fabric agent's forwarder, rustfs is published on loopback
+only). The operator must publish rustfs on the tailnet address or fix the forwarder before
+a second host can use the shared tier.
+
+Go evidence: shared hit on a build with an empty local cache (measured on one host);
+read-only credentials unable to write (measured); outputs match baseline; outage drill
+leaves builds correct. The bucket quota is enforced by rustfs (50 GiB hard);
+`max_total_gib` in the config is still not enforced by herdr.
+No-go: any credential appearing in env of cargo, events, logs or API output; a
+wrong-namespace hit; read-only credentials able to write.
+
+Limits to accept knowingly: sccache does not authenticate cached objects (write access
+means cache poisoning), and same-user code can read the server's environment and the
+credentials file. Use the RO user for anything untrusted.
 
 Enable writes for Bender (spec phase 3) only as a second, separately approved step.
 
 ## Stage 3: second host
 
 Needs an operator-chosen second host with a matching OS/arch and toolchain, and
-verified host identity. Not available to the implementation. Install sccache 0.19.0
+verified host identity, performed by the operator (not available to the implementation;
+the "second cache dir" run in the storage doc is a same-host simulation only). It also
+needs the tailnet endpoint to work (Stage 2 blocker). Install sccache 0.19.0
 there (approval again), run `build-cache-inventory --json` on both hosts and compare
 `compat_key`: equal keys mean addressable objects, a mismatch lists the reason.
 Reuse proof (a build on host B hitting entries written by host A) is the exit

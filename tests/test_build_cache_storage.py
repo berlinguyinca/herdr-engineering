@@ -226,7 +226,7 @@ def test_toml_matches_verified_schema_and_parses(tmp_path):
     assert doc["cache"]["disk"] == {"dir": str(tmp_path / "cache"), "size": 20 * 1024 ** 3}
     assert doc["cache"]["s3"] == {"bucket": "bkt", "endpoint": "s3.example.org:9000",
                                   "region": "us-east-1", "key_prefix": "ns/linux-x86_64/" + "a" * 16 + "/",
-                                  "use_ssl": True}
+                                  "use_ssl": True, "no_credentials": False}
     assert set(doc) == {"cache"}
 
 
@@ -545,7 +545,10 @@ def test_e2e_shared_request_never_leaks_credentials_to_cargo(tmp_path, monkeypat
     assert "SCCACHE_SERVER_PORT" in seen["env"]
     ev = _events(tmp_path)[-1]["cache"]
     assert ev["shared"]["active"] is False
-    assert ev["shared"]["reason"] == "shared_unavailable:shared_requires_server"
+    # the fake endpoint never answers a signed request (it only completes the TLS
+    # handshake): the access check fails, the tier is never reported active and the
+    # child stays on the local tier
+    assert ev["shared"]["reason"] == "shared_unavailable:endpoint_unreachable"
     captured = capfd.readouterr()
     blob = "\n".join(p.read_text(errors="replace") for p in (tmp_path / "state").rglob("*")
                      if p.is_file())

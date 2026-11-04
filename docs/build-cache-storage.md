@@ -1,23 +1,43 @@
 # Build cache central storage (spec 04)
 
-> **Security review update (spec 05 review H1-H3).** The shared S3 level is currently
-> NOT delivered to builds. Credentials in the cargo environment are readable by every
-> build script, proc macro and test binary, and an sccache server fixes config, RW mode
-> and prefix at its first start, so per-build env cannot enforce policy. A fully valid
-> shared request therefore runs with the local cache only and reports
-> `shared_unavailable:shared_requires_server`; no `AWS_*`, `SCCACHE_CONF` or
-> `SCCACHE_S3_RW_MODE` reaches cargo, and `shared.active` is never true. Each policy
-> (mode, writes, namespace, endpoint, toolchain, cache dir/size) gets its own
-> `SCCACHE_SERVER_PORT` (20000-59999) so builds under different policies never share a
-> server. Still to build: an explicit `sccache --start-server` with credentials in the
-> server's env only (file path to server child env), plus server lifetime management
-> (today a server lives until sccache's own idle timeout). The sections below describe
-> the intended config and remain accurate for the rendering functions. The
-> `fabric_build_cache` section is read only from machine-local config
+> **Shared tier = the herdr rustfs server (2026-11-04 operator decision).** The only
+> shared backend is the rustfs (MinIO drop-in) container `herdr-cp-rustfs`, bucket
+> `herdr-build-cache`. No AWS or other S3 service is used. The configuration keys keep
+> their historical S3-flavoured names (`endpoint_ref`, `registry_file`,
+> `credentials_file`, `SCCACHE_S3_RW_MODE`, `[cache.s3]` in the sccache TOML) because
+> sccache speaks the S3 protocol and renaming would break existing configs; "S3" in
+> a key name means "the S3 API of rustfs".
+>
+> **Delivery.** `build-coordinate` starts or reuses a per-policy sccache server on the
+> policy port BEFORE cargo (`herdr_engineering/build_cache_server.py`). The credentials
+> and the rustfs settings are in THAT server's environment only (`AWS_*`,
+> `SCCACHE_CONF`, `SCCACHE_S3_RW_MODE`, `SCCACHE_IDLE_TIMEOUT`); cargo, rustc and build
+> scripts get only the port. The server is started with `close_fds=True` (no slot or
+> maintenance lock fd) and is reaped by `SCCACHE_IDLE_TIMEOUT` (600 s). A signed
+> list request (SigV4) first proves the credentials work; a server already on the port
+> is trusted only when `--show-stats` reports a multilevel chain whose last level is the
+> expected bucket and key prefix, otherwise it is stopped and restarted. `cache.shared`
+> is `active: true` only after that check. Any failure builds on the local cache on a
+> distinct fallback port with `shared_unavailable:<code>`.
+>
+> **Plain HTTP is accepted only for trusted transports:** loopback (127.0.0.0/8, `::1`,
+> `localhost`) and the tailnet (100.64.0.0/10, `*.ts.net`, single-label MagicDNS
+> names). Any other host needs TLS (`tls_required: false` stays limited to endpoint refs
+> ending `.local-test`). Names are not resolved.
+>
+> **Known limits (measured/by design).** sccache does not authenticate cached objects:
+> anyone with write access to the namespace can poison it (a garbage object is treated
+> as a miss and overwritten; a *valid* poisoned object is trusted). Code running as the
+> same user can read the server's `/proc/<pid>/environ` and the 0600 credentials file,
+> so a hostile build script is not stopped by the server-env design; mitigations are the
+> bucket-limited dedicated user, the bucket quota, and the read-only user for untrusted
+> canaries. The `fabric_build_cache` section is read only from machine-local config
 > (`~/.config/herdr-engineering/config.yaml`, `$HERDR_ENGINEERING_CONFIG`), never from a
 > `herdr-engineering.yaml` in the build's working directory.
 
-Status: code and config rendering done and unit/e2e-tested with fakes. Nothing here has run against a real sccache or a real S3 endpoint (neither exists on this host).
+Status: measured against a REAL sccache 0.19.0 and the REAL local rustfs on 2026-11-04
+(see "Measured on rustfs" below). Not measured: a second physical host, the tailnet
+endpoint (see "Tailnet endpoint gap").
 
 ## Upstream facts (fetched 2026-11-04; latest stable sccache v0.19.0)
 
@@ -105,7 +125,7 @@ The existing `DevServiceRegistry` (devfabric.py) is a lease/port registry for de
 
 ## Fallback behaviour (implemented)
 
-The shared level is used only when: cache enabled, `mode: shared_cache`, `shared_cache.enabled`, sccache version >= 0.19.0, registry entry resolves, TLS satisfied (`tls_required` rejects `use_ssl: false`), credentials file readable with mode 0600, and a pre-build TCP+TLS probe (2 s, no S3 call, no credentials) succeeded. Otherwise the build runs with the local cache and the event records `cache.shared = {active:false, reason:"shared_unavailable:<code>", namespace_digest:null}`. Codes: `mode_not_shared, not_enabled, registry_not_configured, registry_unreadable, registry_invalid, unknown_endpoint, tls_required, credentials_not_configured, credentials_unreadable, credentials_invalid, sccache_version_unknown, sccache_version_unsupported, endpoint_unreachable, config_write_failed, no_fingerprint`. A failed probe is remembered 30 s in `<state_dir>/sccache/health-down-*` so a dead endpoint costs one probe per 30 s. Storage problems never change the build's exit code.
+The shared level is used only when: cache enabled, `mode: shared_cache`, `shared_cache.enabled`, sccache version >= 0.19.0, registry entry resolves, TLS satisfied (`tls_required` rejects `use_ssl: false` except for loopback/tailnet hosts), credentials file readable with mode 0600, and a pre-build TCP+TLS probe (2 s, no S3 call, no credentials) succeeded. Otherwise the build runs with the local cache and the event records `cache.shared = {active:false, reason:"shared_unavailable:<code>", namespace_digest:null}`. Codes: `mode_not_shared, not_enabled, registry_not_configured, registry_unreadable, registry_invalid, unknown_endpoint, tls_required, credentials_not_configured, credentials_unreadable, credentials_invalid, sccache_version_unknown, sccache_version_unsupported, endpoint_unreachable, config_write_failed, no_fingerprint`. A failed probe is remembered 30 s in `<state_dir>/sccache/health-down-*` so a dead endpoint costs one probe per 30 s. Storage problems never change the build's exit code.
 
 ## What the operator must provide (not available here)
 
@@ -129,3 +149,56 @@ aws s3 ls s3://BUCKET/<namespace>/ --recursive | wc -l   # unchanged after a col
 ```
 
 Exit criteria "canary Bender shared reads/writes" and "corrupt entry rejection" remain NOT DONE.
+
+## Provisioning (operator, once per rustfs)
+
+`herdr-eng build-cache-rustfs-provision` (dry-run by default; `--apply` to act) creates,
+additively and idempotently: bucket `herdr-build-cache` with a hard quota (default 50 GiB),
+user+policy `herdr-build-cache-rw` (bucket-limited read/write/list/delete) and
+`herdr-build-cache-ro` (read/list only), and 0600 files in `~/.config/herdr-engineering/`:
+`build-cache-rustfs.cred`, `build-cache-rustfs-ro.cred`, `build-cache-rustfs-registry.yaml`.
+The admin credential comes from the central fleet config (`control_plane` section) and is
+never printed or put in argv; the MinIO client runs in the container with a private,
+removed config dir. It never touches `herdr-artifacts`, and has no delete path. Use the
+RW credentials file with `writes_enabled: true`; use the RO file with `writes_enabled:
+false` (belt and braces: the server also gets `SCCACHE_S3_RW_MODE=READ_ONLY`).
+
+## Measured on rustfs (sccache 0.19.0, 2026-11-04, same host, loopback endpoint)
+
+`tests/test_build_cache_rustfs_live.py` builds a tiny library crate (`CARGO_INCREMENTAL=0`;
+sccache does not cache bin crates) through `build-coordinate --record` with a temp config:
+
+| Step | Result |
+|---|---|
+| (a) cold build, state dir A | `cache.shared = {active:true, reason:"active"}`; 1 object under `<namespace>/linux-x86_64/<digest>/`; L1(s3) misses 1, writes 1 |
+| (b) `cargo clean` + brand-new state/disk dir B | L1(s3) hits 1, L0(disk) backfills_to 1; `cache_hits.counts.Rust` 1 |
+| (c) other namespace | L1 misses 1, writes 1: no hit (prefix isolation) |
+| (d) read-only user | `put_object` -> AccessDenied; a build with the RO file and `writes_enabled:false` is `active:true`, exit 0, writes no object |
+
+Other facts measured against the real binary: `SCCACHE_S3_RW_MODE=READ_ONLY` really stops
+writes (but `effective_cache_mode` in `--show-stats` still says ReadWrite, so it is not a
+verification signal); a corrupt object is a miss (build exits 0, sccache overwrites it);
+the TOML needs `no_credentials = false` under `[cache.s3]` or sccache 0.19.0 rejects the
+file; `region`, `key_prefix` (trailing slash, no doubling), `use_ssl=false` and path-style
+addressing all work against rustfs; sccache starts happily with rejected credentials and
+only fails writes quietly (hence the signed pre-check); L1 `writes` counters lag by 1-2 s;
+a bare client-spawned local-only server on the policy port is detected and replaced;
+`SCCACHE_IDLE_TIMEOUT` reaps the server (tested at 6 s). The server also writes a
+`.sccache_check` object under its prefix at start. The build event's `sccache_stats` now
+includes per-level deltas (`multi_level.L1 (s3).hits`, ...) and comes from the policy
+server's port, not the default one.
+
+NOT measured: a real second host (the (b) run is a same-host simulation with two state
+dirs), a different toolchain fingerprint (isolation by namespace was measured; by
+toolchain digest only unit-tested), the tailnet endpoint, concurrent builders.
+
+## Tailnet endpoint gap
+
+`100.104.39.6:9000` is held by the fabric agent (`herdr-eng devfabric agent`, a Host-aware
+forwarder), not by Docker; the compose file publishes rustfs on `127.0.0.1` only. A SigV4
+list request signed for `100.104.39.6:9000` with valid credentials is rejected through that
+forwarder (`credentials_rejected` here) while the same request on loopback succeeds. The
+cause was not isolated (suspect: the forwarder alters the signed request). Until the
+operator publishes rustfs on the tailnet address (compose binding) or fixes the forwarder,
+other hosts cannot use the shared tier, and the build reports
+`shared_unavailable:credentials_rejected` and builds locally.

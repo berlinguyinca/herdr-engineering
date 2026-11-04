@@ -202,6 +202,13 @@ machine (detected host + OS) into the private fleet inventory
 `--no-build-cache-tools`, run alone with `--build-cache-tools-only`; it does not
 enable the build cache); and runs `herdr-eng doctor` to confirm.
 
+Fabric build cache, shared tier: the only shared backend is the herdr rustfs server
+(`herdr-cp-rustfs`, bucket `herdr-build-cache`). `herdr-eng build-cache-rustfs-provision`
+creates the bucket, a bucket-limited read/write user and a read-only user (dry-run by
+default, `--apply` to act). The config keys keep their S3-flavoured names for
+compatibility. Plain HTTP is accepted for loopback and tailnet hosts only. See
+`docs/build-cache-storage.md` and `docs/build-cache-deployment.md`.
+
 ### Manual setup (equivalent)
 
 ```bash

@@ -245,13 +245,15 @@ def host_disk_sectors(cwd: str | os.PathLike[str] | None = None) -> tuple[str, i
     return ("host_wide_physical_ish", total) if found else None
 
 
-def sccache_snapshot(timeout: float = SCCACHE_TIMEOUT_S) -> dict[str, Any] | None:
+def sccache_snapshot(timeout: float = SCCACHE_TIMEOUT_S,
+                     env: dict[str, str] | None = None) -> dict[str, Any] | None:
+    """``--show-stats`` JSON. ``env`` selects the policy server (its port)."""
     exe = shutil.which("sccache")
     if not exe:
         return None
     try:
         r = subprocess.run([exe, "--show-stats", "--stats-format", "json"],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout, env=env)
         if r.returncode != 0:
             return None
         data = json.loads(r.stdout)
@@ -265,6 +267,11 @@ def _numeric_leaves(obj: Any, prefix: str = "") -> dict[str, float]:
     if isinstance(obj, dict):
         for k, v in obj.items():
             out.update(_numeric_leaves(v, f"{prefix}.{k}" if prefix else str(k)))
+    elif isinstance(obj, list):
+        # e.g. stats.multi_level[]: key entries by their name (L0/L1 levels), else index
+        for i, v in enumerate(obj):
+            tag = v.get("name") if isinstance(v, dict) and isinstance(v.get("name"), str) else i
+            out.update(_numeric_leaves(v, f"{prefix}.{tag}"))
     elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
         out[prefix] = obj
     return out
@@ -390,7 +397,7 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
     host = _safe(socket.gethostname, "unknown")
     kind = classify_cmd(cmd)
     disk0 = _safe(lambda: host_disk_sectors(cwd), None)
-    scc0 = _safe(sccache_snapshot, None)
+    scc0 = _safe(lambda: sccache_snapshot(env=env), None)
     run = None
     extra: dict[str, Any] = {}
     if registry and state_dir is not None:
@@ -488,7 +495,7 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
             unavailable.append("registry_unavailable")
 
     disk1 = _safe(lambda: host_disk_sectors(cwd), None)
-    scc1 = _safe(sccache_snapshot, None)
+    scc1 = _safe(lambda: sccache_snapshot(env=env), None)
     sccache_delta = None
     if scc0 is not None and scc1 is not None:
         sccache_delta = _safe(lambda: diff_stats(scc0, scc1), None)
