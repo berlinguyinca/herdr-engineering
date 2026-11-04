@@ -808,13 +808,13 @@ def test_operator_html_is_byte_identical_and_non_html_stays_raw(tmp_path):
     try:
         status, h, body = op.request("GET", f("index.html"))
         assert body == SCRIPTY and h["etag"] == '"%s"' % hashlib.sha256(SCRIPTY).hexdigest() and "accept-ranges" in h
+        assert op.request("GET", f("pic.svg"))[2] == BANNER_FILES["pic.svg"]      # operator links may carry SVG (unlabelled)
     finally:
         op.close()
     (tmp_path / "m").mkdir()
     e = banner_env(tmp_path / "m")
     try:
         assert e.request("GET", f("n.txt"))[2] == BANNER_FILES["n.txt"]
-        assert e.request("GET", f("pic.svg"))[2] == BANNER_FILES["pic.svg"]
     finally:
         e.close()
 
@@ -828,6 +828,10 @@ def test_bar_head_etag_range_and_conditional_requests(tmp_path):
         rs, rh, rb = e.request("GET", f("index.html"), {"Range": "bytes=0-9"})
         assert rs == 200 and rb == body                                  # a range is ignored for an injected page
         assert e.request("GET", f("index.html"), {"If-None-Match": h["etag"]})[0] == 304
+        raw = '"%s"' % hashlib.sha256(SCRIPTY).hexdigest()
+        st, _, labelled = e.request("GET", f("index.html"), {"If-None-Match": raw})
+        assert st == 200 and labelled == body                              # the unlabelled ETag never revalidates to a bare page
+        assert e.request("GET", f("index.html"), {"If-Match": raw})[0] == 412
     finally:
         e.close()
 
@@ -843,3 +847,96 @@ def test_lab_member_html_first_page_shows_the_bar(tmp_path):
         assert BAR_MARK not in env.request("GET", base(kind="f") + "n.txt")[2]
     finally:
         env.close()
+
+
+# ---------------------------------------------------------------------------- the bar must be effective, or the page is a 404
+
+DECOYS = {
+    "attribute": b'<div title="<body>">x</div><body><p>real</p></body>',
+    "template": b"<template><body></template><p>real</p>",
+    "noscript": b"<noscript><body></noscript><p>real</p>",
+    "xmp": b"<xmp><body></xmp><p>real</p>",
+    "iframe": b"<iframe><body></iframe><p>real</p>",
+    "select": b"<select><body></select><p>real</p>",
+    "cdata": b"<svg><![CDATA[<body>]]></svg><p>real</p>",
+    "pi": b"<?pi <body> ?><p>real</p>",
+    "double-escaped-script": b"<script><!--<script></script><body>--></script><p>real</p>",
+    "plaintext": b"<plaintext><body><p>real</p>",
+    "frameset": b"<html><frameset><body></frameset>",
+    "svg-open": b"<svg><body></svg><p>real</p>",
+    "math-open": b"<math><body></math><p>real</p>",
+}
+
+
+def _effective_or_404(env, name):
+    status, _, body = env.request("GET", f(name))
+    assert status == 404 or (status == 200 and body.count(BAR_MARK) == 1), (status, body[:200])
+    return status
+
+
+@pytest.mark.parametrize("decoy", sorted(DECOYS))
+def test_decoys_never_give_a_200_without_an_effective_bar(tmp_path, decoy):
+    e = Env(tmp_path, files={"index.html": DECOYS[decoy]}, state_extra={"shared_by": "Al"})
+    try:
+        status = _effective_or_404(e, "index.html")
+        # a bogus comment (<?...>) ends at its first ">", so the bar after that "<body>" is outside it and effective
+        assert status == (200 if decoy == "pi" else 404)
+    finally:
+        e.close()
+
+
+def test_uppercase_tags_without_attributes_and_an_empty_file(tmp_path):
+    files = {"index.html": b"<!DOCTYPE HTML><HTML><HEAD><TITLE>t</TITLE></HEAD><BODY><P>x</P></BODY></HTML>",
+             "empty.html": b""}
+    e = Env(tmp_path, files=files, state_extra={"shared_by": "Al"})
+    try:
+        body = e.request("GET", f("index.html"))[2]
+        assert body.count(BAR_MARK) == 1 and body.index(b"<BODY>") < body.index(BAR_MARK) < body.index(b"<P>")
+        assert e.request("GET", f("empty.html"))[2].count(BAR_MARK) == 1
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("name,data", [
+    ("utf16", "<html><body>hi</body></html>".encode("utf-16")),
+    ("utf32", "<html><body>hi</body></html>".encode("utf-32")),
+    ("nul", b"\x00<html><body>hi</body></html>"),
+    ("over-cap", b"<html><body>" + b"x" * (share_public.MODE_SWITCH_MAX_BYTES + 1) + b"</body></html>")])
+def test_unlabelable_html_is_a_404_not_an_unlabelled_page(tmp_path, name, data):
+    e = Env(tmp_path, files={"index.html": data}, state_extra={"shared_by": "Al"})
+    op = Env(tmp_path / "op", files={"index.html": data}) if (tmp_path / "op").mkdir() is None else None
+    try:
+        assert e.request("GET", f("index.html"))[0] == 404
+        assert op.request("GET", f("index.html"))[2] == data           # an operator link is untouched
+    finally:
+        e.close()
+        op.close()
+
+
+FUZZ_PIECES = [b"<html>", b"<head>", b"</head>", b"<body>", b"<BODY a='1'>", b"</body>", b"<!--", b"-->", b"<script>",
+               b"</script>", b"<style>", b"</style>", b"<template>", b"</template>", b"<noscript>", b"<xmp>", b"<iframe>",
+               b"<select>", b"<svg>", b"<![CDATA[", b"]]>", b'<div title="', b'">', b"'", b'"', b"<textarea>",
+               b"</textarea>", b"<title>", b"</title>", b"<p>", b"text", b"<?", b"?>", b"<!doctype html>", b"<plaintext>",
+               b"<math>", b"<object>", b"<frameset>", b"<", b">", b"&lt;body&gt;", b"<!--<script>"]
+
+
+def test_fuzz_corpus_accepted_pages_have_exactly_one_effective_bar():
+    import random
+
+    import nh3
+    bar = share_public.shared_by_bar("Al")
+    rng = random.Random(8)
+    accepted = rejected = 0
+    for _ in range(4000):
+        data = b"".join(rng.choice(FUZZ_PIECES) for _ in range(rng.randint(0, 9)))
+        out = share_public.labelled_html(data, "text/html; charset=utf-8", bar)
+        if out is None:
+            rejected += 1
+            continue
+        accepted += 1
+        assert out.count(b"data-herdr-shared-by") == 1
+        # independent oracle: html5ever (nh3) must still see the bar as an element of the cleaned document
+        cleaned = nh3.clean(out.decode(), tags={"div", "html", "body", "head", "p"},
+                            attributes={"div": {"data-herdr-shared-by"}}, strip_comments=True)
+        assert cleaned.count("data-herdr-shared-by") == 1, out
+    assert accepted > 200 and rejected > 200

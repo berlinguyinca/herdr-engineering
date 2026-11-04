@@ -321,7 +321,7 @@ def aenv(migrated, tmp_path):
             await conn.execute("DELETE FROM artifact_versions WHERE artifact_id=$1", AID)
             await conn.execute("DELETE FROM artifacts WHERE artifact_id=$1", AID)
             await conn.execute("INSERT INTO artifacts (artifact_id,created_by) VALUES ($1,'member:alice')", AID)
-            for number, vid in enumerate(("v_html", "v_pdf"), 1):
+            for number, vid in enumerate(("v_html", "v_pdf", "v_svg", "v_xhtml", "v_big", "v_utf16", "v_utf32", "v_hidden", "v_upper"), 1):
                 await conn.execute("INSERT INTO artifact_versions (version_id,artifact_id,version_number,state) "
                                    "VALUES ($1,$2,$3,'ready')", vid, AID, number)
         finally:
@@ -400,10 +400,10 @@ def test_null_share_limits_do_not_apply_global_caps_to_members(aenv):
 
 @pytest.mark.parametrize("operator_first", [True, False])
 def test_member_and_operator_totals_are_capped_independently(aenv, operator_first):
-    one = 13   # v_pdf is 13 bytes
+    one = 68 + 17 + 48   # v_html: index.html + js/app.js + the parquet (a member share may hold no PDF)
     env = aenv(max_total_bytes=one, member_share_limits={"max_share_bytes": None, "max_total_bytes": one})
-    m1, m2 = env.create("member:alice", version_id="v_pdf"), env.create("member:alice", version_id="v_pdf")
-    o1, o2 = env.create(OPERATOR, version_id="v_pdf"), env.create(OPERATOR, version_id="v_pdf")
+    m1, m2 = env.create("member:alice", version_id="v_html"), env.create("member:alice", version_id="v_html")
+    o1, o2 = env.create(OPERATOR, version_id="v_html"), env.create(OPERATOR, version_id="v_html")
     first = [(o1, OPERATOR), (m1, "member:alice")]
     for row, who in (first if operator_first else first[::-1]):
         env.approve(row, who)                 # neither class eats the other's budget, in either order
@@ -523,3 +523,59 @@ def test_operator_links_get_no_shared_by_even_on_a_member_owned_artifact(aenv):
     row = env.create(OPERATOR)
     approve_share(env.server, env.adapter("get", row["share_id"]), approved_by=OPERATOR, shared_by_name="Alice")
     assert "shared_by" not in stored_state(env, row)
+
+
+# ------------------------------------------------------------------------- unlabelable content (Task 8 fix round)
+
+from herdr_engineering.control_plane.artifact_share_api import _plan  # noqa: E402
+
+
+@pytest.mark.parametrize("vid", ["v_svg", "v_xhtml", "v_pdf"])
+def test_member_plan_and_approve_refuse_active_documents_with_unsupported_type(aenv, vid):
+    env = aenv()
+    with pytest.raises(ShareHTTPError) as exc:                          # the create route plans first
+        _plan(env.server, AID, vid, None, "member:alice")
+    assert exc.value.status == 400 and exc.value.message.startswith("unsupported_type")
+    row = env.create("member:alice", version_id=vid)
+    with pytest.raises(ShareHTTPError) as exc:                          # and the approve route plans again
+        env.approve(row, "member:alice")
+    assert exc.value.status == 400 and exc.value.message.startswith("unsupported_type")
+    assert env.adapter("get", row["share_id"])["state"] == "pending" and not (env.root / row["share_id"]).exists()
+
+
+@pytest.mark.parametrize("vid", ["v_svg", "v_xhtml", "v_pdf"])
+def test_operator_links_may_still_share_svg_xhtml_and_pdf(aenv, vid):
+    env = aenv()
+    _plan(env.server, AID, vid, None, OPERATOR)
+    env.approve(env.create(OPERATOR, version_id=vid), OPERATOR)
+
+
+def test_member_html_over_the_cap_is_refused_at_plan_and_approve(aenv):
+    env = aenv()
+    with pytest.raises(ShareHTTPError) as exc:
+        _plan(env.server, AID, "v_big", None, "member:alice")
+    assert exc.value.message.startswith("html_too_large")
+    row = env.create("member:alice", version_id="v_big")
+    with pytest.raises(ShareHTTPError) as exc:
+        env.approve(row, "member:alice")
+    assert exc.value.message.startswith("html_too_large") and not (env.root / row["share_id"]).exists()
+    env.approve(env.create(OPERATOR, version_id="v_big"), OPERATOR)       # the operator is not capped
+
+
+@pytest.mark.parametrize("vid", ["v_utf16", "v_utf32", "v_hidden"])
+def test_member_html_that_cannot_carry_the_label_is_refused_at_approve(aenv, vid):
+    env = aenv()
+    row = env.create("member:alice", version_id=vid)
+    with pytest.raises(ShareHTTPError) as exc:
+        env.approve(row, "member:alice")
+    assert exc.value.status == 400 and exc.value.message.startswith("unsupported_html")
+    assert env.adapter("get", row["share_id"])["state"] == "pending"
+    assert not (env.root / row["share_id"]).exists() and list(env.root.glob("by-token/*")) == []
+    env.approve(env.create(OPERATOR, version_id=vid), OPERATOR)
+
+
+def test_uppercase_markup_is_labelable(aenv):
+    env = aenv()
+    row = env.create("member:alice", version_id="v_upper")
+    env.approve(row, "member:alice")
+    assert env.adapter("get", row["share_id"])["state"] == "live"

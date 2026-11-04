@@ -89,6 +89,21 @@ class Registry:
         self.versions["v_pdf"] = {"version_id": "v_pdf", "artifact_id": AID, "state": "ready",
                                   "output_manifest": [output("paper.pdf", b"%PDF-1.4 fake",
                                                              media_type="application/pdf")]}
+        page = b"<!DOCTYPE HTML><HTML><BODY CLASS=x><P>upper</P></BODY></HTML>"
+        svg = b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
+        xhtml = b"<html xmlns='http://www.w3.org/1999/xhtml'><body>x</body></html>"
+        big = b"<html><body>" + b"x" * (2 * 1024 * 1024) + b"</body></html>"
+        utf16 = "<html><body>hi</body></html>".encode("utf-16")
+        utf32 = "<html><body>hi</body></html>".encode("utf-32")
+        hidden = b"<template><body></template><p>nothing visible"
+        for data in (page, svg, xhtml, big, utf16, utf32, hidden):
+            blobs.add(data)
+        for vid, files in {"v_upper": [("index.html", page)], "v_svg": [("index.html", page), ("pic.svg", svg)],
+                           "v_xhtml": [("index.html", page), ("doc.xhtml", xhtml)], "v_big": [("index.html", big)],
+                           "v_utf16": [("index.html", utf16)], "v_utf32": [("index.html", utf32)],
+                           "v_hidden": [("index.html", hidden)]}.items():
+            self.versions[vid] = {"version_id": vid, "artifact_id": AID, "state": "ready",
+                                  "output_manifest": [output(n, d) for n, d in files]}
         self.versions["v_building"] = {**copy.deepcopy(self.versions["v_pdf"]), "version_id": "v_building",
                                        "state": "building"}
         self.versions["v_csv"] = {"version_id": "v_csv", "artifact_id": AID, "state": "ready",

@@ -38,7 +38,13 @@ from .share_bundle import (
     remove_state,
     write_state,
 )
-from .share_public import SHARED_BY_MAX
+from .share_public import (
+    MODE_SWITCH_MAX_BYTES,
+    SHARED_BY_MAX,
+    content_type_for,
+    labelled_html,
+    shared_by_bar,
+)
 
 DEFAULTS = {"max_share_bytes": 512 * 1024 * 1024, "max_files": 20000, "max_total_bytes": 2 * 1024 * 1024 * 1024,
             "default_public_days": 30}
@@ -228,6 +234,8 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None,
         raise ShareHTTPError(400, str(exc)) from None
     if not any(n.lower().endswith((".html", ".pdf")) for n in names):
         raise ShareHTTPError(400, "version has no HTML or PDF output to share")
+    if is_member_principal(created_by):
+        _member_plan_check(files, names)
     if len(files) > settings["max_files"]:
         raise ShareHTTPError(400, f"share has {len(files)} files, more than the {settings['max_files']} files allowed")
     declared = sum(f["size_bytes"] or 0 for f in files)
@@ -267,6 +275,38 @@ def _shared_by(creator: str, name: str | None) -> str:
     text = name if isinstance(name, str) else ""
     text = "".join(ch for ch in text if ch.isprintable()).strip()
     return (text or creator[len("member:"):])[:SHARED_BY_MAX] or "a member"
+
+
+UNLABELABLE_SUFFIXES = (".svg", ".xhtml", ".xht", ".xml", ".pdf")   # served as active documents the label cannot be shown on
+
+
+def _member_plan_check(files: list[dict], names: list[str]) -> None:
+    """A member-created link labels every page it serves, so it may hold no active document the label cannot be put on."""
+    for name in names:
+        if name.lower().endswith(UNLABELABLE_SUFFIXES):
+            raise ShareHTTPError(400, f"unsupported_type: {name} cannot be shared by a member (SVG, XML and PDF files "
+                                 "cannot carry the 'shared by' label); share the HTML or a raster image instead")
+    if not any(n.lower().endswith(".html") for n in names):
+        raise ShareHTTPError(400, "unsupported_type: a member share needs an HTML output")
+    for item in files:
+        if item["name"].lower().endswith(".html") and (item["size_bytes"] or 0) > MODE_SWITCH_MAX_BYTES:
+            raise ShareHTTPError(400, f"html_too_large: {item['name']} is over {MODE_SWITCH_MAX_BYTES} bytes, the most a "
+                                 "member-created link can label")
+
+
+def _check_labelable(dest: Path, index, shared_by: str) -> None:
+    """Dry run of what the share server will do: every HTML page of the built bundle must take the bar."""
+    bar = shared_by_bar(shared_by)
+    for entry in index.files:
+        if not entry.name.lower().endswith(".html"):
+            continue
+        if entry.size > MODE_SWITCH_MAX_BYTES:
+            raise ShareHTTPError(400, f"html_too_large: {entry.name} is over {MODE_SWITCH_MAX_BYTES} bytes, the most a "
+                                 "member-created link can label")
+        data = (dest / "files" / entry.name).read_bytes()
+        if labelled_html(data, content_type_for(entry.name), bar) is None:
+            raise ShareHTTPError(400, f"unsupported_html: {entry.name} cannot carry the 'shared by' label (unsupported "
+                                 "encoding such as UTF-16, or markup that hides it); save it as plain UTF-8 HTML")
 
 
 def approve_share(server, share: dict, *, approved_by: str | None = None,
@@ -318,8 +358,10 @@ def approve_share(server, share: dict, *, approved_by: str | None = None,
                                  entry=entry, limits=BundleLimits(cap, settings["max_files"]))
             built = True
             over_total(index.total_bytes)
-            token, token_hash = new_token()
             extra = {"shared_by": _shared_by(creator, shared_by_name)} if member else {}
+            if member:
+                _check_labelable(dest, index, extra["shared_by"])
+            token, token_hash = new_token()
             write_state(root, token_hash, {
                 **extra, "share_id": share_id, "audience": share["audience"], "state": "live",
                 "expires_at": _jsonable(expires_at), "allow_emails": list(share.get("allow_emails") or []),

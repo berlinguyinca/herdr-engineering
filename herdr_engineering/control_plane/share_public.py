@@ -88,6 +88,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote_to_bytes, urlsplit
@@ -783,10 +784,9 @@ def _ascii_compatible(content_type: str, data: bytes) -> bool:
     return not data.startswith(_WIDE_BOMS) and b"\x00" not in data[:1024]
 
 
-def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
-    """``data`` with ``link`` inserted right after the first real ``<body ...>`` start tag (outside comments, script,
-    style, textarea and title), else after the first ``<html ...>`` tag, else after the doctype; None when the data has
-    none of them (the caller then serves the file untouched). Never inserts inside a script string or a comment."""
+def _anchor_index(data: bytes) -> int | None:
+    """The offset right after the first real ``<body ...>`` start tag (outside comments, script, style, textarea and
+    title), else after the first ``<html ...>`` tag, else after the doctype; None when the data has none of them."""
     html_end = doctype_end = None
     for match in _SCAN.finditer(data):
         tag = match.group("tag")
@@ -797,13 +797,86 @@ def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
             if end is None:
                 return None                      # an unterminated start tag: nothing safe to anchor on
             if tag.lower() == b"body":
-                return data[:end.end()] + link + data[end.end():]
+                return end.end()
             if html_end is None:
                 html_end = end.end()
         elif match.group("doctype") is not None and doctype_end is None and data[match.end() - 1 : match.end()] == b">":
             doctype_end = match.end()  # unterminated: it ran to the end of the data, nothing to anchor on
-    cut = html_end if html_end is not None else doctype_end
+    return html_end if html_end is not None else doctype_end
+
+
+def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
+    """``data`` with ``link`` inserted at ``_anchor_index``; None when there is no anchor (the caller then serves the
+    file untouched). Never inserts inside a script string or a comment (but see ``labelled_html`` for the strict check)."""
+    cut = _anchor_index(data)
     return None if cut is None else data[:cut] + link + data[cut:]
+
+
+_VOID = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track",
+                   "wbr", "basefont", "bgsound", "frame", "keygen"})
+_BAR_ANCESTORS = frozenset({"html", "head", "body"})
+
+
+class _BarProbe(HTMLParser):
+    """Tokenises the page up to the end of the bar and records how deep in the element tree the bar's start tag sits."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.stack: list[str] = []
+        self.bars = 0
+        self.bar_stack: list[str] = []
+        self.escaped_script = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "div" and any(name == "data-herdr-shared-by" for name, _ in attrs):
+            self.bars += 1
+            self.bar_stack = list(self.stack)
+        if tag not in _VOID:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == "div" and any(name == "data-herdr-shared-by" for name, _ in attrs):
+            self.bars += 1
+            self.bar_stack = list(self.stack)
+
+    def handle_endtag(self, tag):
+        if tag in self.stack:
+            while self.stack.pop() != tag:
+                pass
+
+    def handle_data(self, data):
+        if self.stack and self.stack[-1] in ("script", "style") and "<!--" in data.lower():
+            self.escaped_script = True      # "<!--<script>" double-escapes: browsers and this tokenizer may disagree
+
+
+def bar_is_effective(prefix: str) -> bool:
+    """True when the one ``data-herdr-shared-by`` start tag in ``prefix`` (the page up to the end of the bar) is a normal
+    element whose only open ancestors are html / head / body: not inside an attribute value, a comment, CDATA, a script,
+    a template, noscript, xmp, iframe, select, svg ... (every element still open at that point other than html, head
+    and body fails the check). Fail closed on any parser trouble."""
+    probe = _BarProbe()
+    try:
+        probe.feed(prefix)
+        probe.close()
+    except Exception:
+        return False
+    return probe.bars == 1 and not probe.escaped_script and set(probe.bar_stack) <= _BAR_ANCESTORS
+
+
+def labelled_html(data: bytes, content_type: str, bar: bytes, link: bytes = b"") -> bytes | None:
+    """``data`` with ``bar`` (and then ``link``) inserted where a browser will render the bar as a top-level element, or
+    None when that cannot be shown: non-ASCII-compatible bytes, or a page whose markup puts the anchor in an inert
+    context. A page with no html, head or body anchor at all gets the bar first. Never returns an unlabelled page."""
+    if not _ascii_compatible(content_type, data):
+        return None
+    cut = _anchor_index(data)
+    cut = 0 if cut is None else cut
+    out = data[:cut] + bar + link + data[cut:]
+    try:
+        prefix = out[:cut + len(bar)].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return out if bar_is_effective(prefix) else None
 
 
 def shared_by_bar(name: str) -> bytes:
@@ -881,14 +954,14 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
                 if data is None:
                     deny(handler, state, "size_mismatch", actor)
                     return False
-                if _ascii_compatible(content_type_for(name), data):
-                    insert = bar + (mode_switch.encode("ascii") if mode_switch is not None else b"")
-                    injected = inject_mode_switch(data, insert)
-                    if injected is None and bar:      # no anchor tag at all: the bar goes first, before any content
-                        injected = insert + data
-                elif bar:
-                    deny(handler, state, "banner_unavailable", actor)
-                    return False
+                link = mode_switch.encode("ascii") if mode_switch is not None else b""
+                if bar:
+                    injected = labelled_html(data, content_type_for(name), bar, link)
+                    if injected is None:      # fail closed: a labelled page is never served unlabelled or with a hidden bar
+                        deny(handler, state, "banner_unavailable", actor)
+                        return False
+                elif _ascii_compatible(content_type_for(name), data):
+                    injected = inject_mode_switch(data, link)
                 if injected is not None:
                     suffix = (SHARED_BY_ETAG_SUFFIX if bar else "") + (MODE_SWITCH_ETAG_SUFFIX if mode_switch is not None else "")
                     return _serve_with_link(handler, state, name, item, injected, csp, cors=cors, actor=actor,
