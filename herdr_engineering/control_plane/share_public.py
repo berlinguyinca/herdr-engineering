@@ -805,6 +805,53 @@ def _anchor_index(data: bytes) -> int | None:
     return html_end if html_end is not None else doctype_end
 
 
+# ---- the strict gate: member-link HTML is labelled only when its markup is unambiguous for every HTML5 tokenizer.
+# The scanner above and Python's HTMLParser read comments and CDATA differently from a browser, so they cannot be
+# trusted to say where the bar lands. Instead of reconciling them, pages containing any construct whose tokenization is
+# a browser-specific corner are refused (a uniform 404 at serve time, ``unsupported_html`` at approve).
+_AMBIGUOUS = re.compile(rb"<!\[|<!-->|<!--->|--!>|<\?|\x00|</(?![A-Za-z])")        # CDATA, abrupt comments, PI, bogus end tags
+_BANG = re.compile(rb"<!")
+_BANG_OK = re.compile(rb"<!(?:--(?:[^-]|-(?!-))*-->|doctype(?=[\s>]))", re.I)     # a clean comment (no "--" inside) or a doctype
+_COMMENT = re.compile(rb"<!--(?:[^-]|-(?!-))*-->")
+_RAW_TEXT = frozenset({b"script", b"style", b"title", b"textarea", b"xmp", b"iframe", b"noembed", b"noframes", b"noscript"})
+_NESTING = frozenset({b"template", b"select", b"svg", b"math"})
+_INERT_TAG = re.compile(rb"<(/?)(script|style|title|textarea|xmp|iframe|noembed|noframes|noscript|plaintext|template|select"
+                        rb"|svg|math)(?=[\s/>])", re.I)
+
+
+def _well_formed_markup(data: bytes) -> bool:
+    """True when ``data`` has none of: ``<![``, ``<!-->``, ``<!--->``, ``--!>``, ``<?``, NUL, ``</`` + a non-letter, a
+    ``<!`` that is not ``<!doctype`` or a comment without ``--`` inside it (and ending in ``-->``)."""
+    if _AMBIGUOUS.search(data):
+        return False
+    return all(_BANG_OK.match(data, m.start()) for m in _BANG.finditer(data))
+
+
+def _inert_context_closed(prefix: bytes) -> bool:
+    """True when every raw-text / inert element opened in ``prefix`` (the bytes before the anchor) is closed again in it
+    by a plain closer; ``plaintext`` never closes. A comment is dropped first when its own inert tags balance (a commented-out
+    ``<script src=...></script>``); otherwise it stays (it could hide a closer or an opener) and the ``<!--`` check below
+    refuses the page."""
+    prefix = _COMMENT.sub(lambda m: b"" if _inert_context_closed(m.group()[4:-3]) else m.group(), prefix)
+    if b"<!--" in prefix:
+        return False
+    inside: bytes | None = None
+    depth = {name: 0 for name in _NESTING}
+    for match in _INERT_TAG.finditer(prefix):
+        closing, name = bool(match.group(1)), match.group(2).lower()
+        if inside is not None:
+            inside = None if closing and name == inside else inside
+        elif name == b"plaintext":
+            return False
+        elif name in _RAW_TEXT:
+            inside = None if closing else name
+        elif closing:
+            depth[name] = max(0, depth[name] - 1)
+        else:
+            depth[name] += 1
+    return inside is None and not any(depth.values())
+
+
 def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
     """``data`` with ``link`` inserted at ``_anchor_index``; None when there is no anchor (the caller then serves the
     file untouched). Never inserts inside a script string or a comment (but see ``labelled_html`` for the strict check)."""
@@ -865,12 +912,15 @@ def bar_is_effective(prefix: str) -> bool:
 
 def labelled_html(data: bytes, content_type: str, bar: bytes, link: bytes = b"") -> bytes | None:
     """``data`` with ``bar`` (and then ``link``) inserted where a browser will render the bar as a top-level element, or
-    None when that cannot be shown: non-ASCII-compatible bytes, or a page whose markup puts the anchor in an inert
-    context. A page with no html, head or body anchor at all gets the bar first. Never returns an unlabelled page."""
+    None when that cannot be shown: non-ASCII-compatible bytes, markup the strict gate calls ambiguous
+    (``_well_formed_markup``, ``_inert_context_closed``), or a page whose markup puts the anchor in an inert context
+    (the HTMLParser check, a secondary assertion). A page with no html, head or body anchor at all gets the bar first. Never returns an unlabelled page."""
     if not _ascii_compatible(content_type, data):
         return None
     cut = _anchor_index(data)
     cut = 0 if cut is None else cut
+    if not _well_formed_markup(data) or not _inert_context_closed(data[:cut]):
+        return None
     out = data[:cut] + bar + link + data[cut:]
     try:
         prefix = out[:cut + len(bar)].decode("utf-8")

@@ -865,6 +865,14 @@ DECOYS = {
     "frameset": b"<html><frameset><body></frameset>",
     "svg-open": b"<svg><body></svg><p>real</p>",
     "math-open": b"<math><body></math><p>real</p>",
+    # round 2: tokenizer disagreements the scanner and Python's HTMLParser share (html5ever hides the bar in a template)
+    "abrupt-comment-dash": b"<!doctype html><!---><template><!--><body></template><h1>visible page</h1>",
+    "abrupt-comment": b"<!doctype html><!--><template><!--><body></template><h1>visible page</h1>",
+    "abrupt-comment-textarea": b"<!doctype html><!---><textarea><!--><body></textarea><h1>visible page</h1>",
+    "cdata-html": b"<!doctype html><html><![CDATA[ x><template><body\n]]></template><h1>visible page</h1>",
+    "bogus-end-tag": b"<!doctype html></ x><template><body></template><h1>visible page</h1>",
+    "bang-comment-close": b"<!doctype html><!-- x --!><template><body></template><h1>visible page</h1>",
+    "dashdash-in-comment": b"<!doctype html><!-- a -- b --><template><body></template><h1>visible page</h1>",
 }
 
 
@@ -879,8 +887,7 @@ def test_decoys_never_give_a_200_without_an_effective_bar(tmp_path, decoy):
     e = Env(tmp_path, files={"index.html": DECOYS[decoy]}, state_extra={"shared_by": "Al"})
     try:
         status = _effective_or_404(e, "index.html")
-        # a bogus comment (<?...>) ends at its first ">", so the bar after that "<body>" is outside it and effective
-        assert status == (200 if decoy == "pi" else 404)
+        assert status == 404
     finally:
         e.close()
 
@@ -940,3 +947,128 @@ def test_fuzz_corpus_accepted_pages_have_exactly_one_effective_bar():
                             attributes={"div": {"data-herdr-shared-by"}}, strip_comments=True)
         assert cleaned.count("data-herdr-shared-by") == 1, out
     assert accepted > 200 and rejected > 200
+
+
+# ---------------------------------------------------------------------------- the strict gate, class by class
+
+GATE_REFUSED = {
+    "cdata": b"<html><![CDATA[ x ]]><body><p>x</p>",
+    "abrupt-1": b"<!--><body><p>x</p>",
+    "abrupt-2": b"<!---><body><p>x</p>",
+    "bang-close": b"<!-- x --!><body><p>x</p>",
+    "pi": b"<?php x ?><body><p>x</p>",
+    "bogus-comment": b"<!x><body><p>x</p>",
+    "bad-end-tag": b"</ x><body><p>x</p>",
+    "end-tag-digit": b"</1><body><p>x</p>",
+    "double-dash-comment": b"<!-- a -- b --><body><p>x</p>",
+    "triple-dash-close": b"<!-- a ---><body><p>x</p>",
+    "unterminated-comment": b"<body><p>x</p><!-- never closed",
+    "nul": b"<body><p>" + b"x" * 2000 + b"\x00</p>",             # past the first 1 KiB the encoding check does not look
+    "comment-hides-tag": b"<template><!-- </template> --><body><p>x</p>",
+    "script-comment": b"<script><!-- </script><body><p>x</p>",
+    "commented-opener": b"<!-- <template> --><body><p>x</p>",
+    "commented-closer": b"<script><!-- </script> --><body><p>x</p>",
+    "unclosed-template": b"<template><body><p>x</p>",
+    "unclosed-xmp": b"<xmp><body><p>x</p>",
+    "unclosed-iframe": b"<iframe><body><p>x</p>",
+    "unclosed-noembed": b"<noembed><body><p>x</p>",
+    "unclosed-noframes": b"<noframes><body><p>x</p>",
+    "unclosed-noscript": b"<noscript><body><p>x</p>",
+    "plaintext": b"<plaintext></plaintext><body><p>x</p>",
+    "unclosed-select": b"<select><body><p>x</p>",
+    "unclosed-svg": b"<svg><body><p>x</p>",
+    "unclosed-math": b"<math><body><p>x</p>",
+    "attr-tag": b'<a title="<template>"><body><p>x</p>',
+}
+GATE_ACCEPTED = {
+    "plain": b"<!doctype html><html><head><title>t</title></head><body><p>x</p></body></html>",
+    "comment": b"<!doctype html><!-- fine --><html><body><!-- also fine --><p>x</p>",
+    "style-script": b"<head><style>p{}</style><script>var a = 1 < 2;</script></head><body>",
+    "commented-pair": b"<head><!-- <script src=a.js></script> --></head><body><p>x</p>",
+    "closed-template": b"<template><p>t</p></template><body><p>x</p>",
+    "closed-noscript": b"<head><noscript><style>p{}</style></noscript></head><body>",
+    "raw-after-anchor": b"<body><template><body><textarea>",
+    # an unclosed raw-text element swallows the would-be anchor, so the bar goes first (offset 0) and is top-level
+    "unclosed-script-no-anchor": b"<script><body><p>x</p>",
+    "unclosed-textarea-no-anchor": b"<textarea><body><p>x</p>",
+    "no-anchor": b"<p>just a fragment</p>",
+    "empty": b"",
+}
+
+
+@pytest.mark.parametrize("name", sorted(GATE_REFUSED))
+def test_the_gate_refuses_every_ambiguous_construct(name):
+    data = GATE_REFUSED[name]
+    cut = share_public._anchor_index(data) or 0
+    # the gate alone, not the HTMLParser check behind it: each refusal class is pinned by its own page
+    assert not (share_public._well_formed_markup(data) and share_public._inert_context_closed(data[:cut]))
+    assert share_public.labelled_html(data, "text/html", share_public.shared_by_bar("Al")) is None
+
+
+@pytest.mark.parametrize("name", sorted(GATE_ACCEPTED))
+def test_the_gate_still_labels_ordinary_pages(name):
+    out = share_public.labelled_html(GATE_ACCEPTED[name], "text/html", share_public.shared_by_bar("Al"))
+    assert out is not None and out.count(b"data-herdr-shared-by") == 1
+
+
+GRAMMAR = [b"<!doctype html>", b"<html>", b"<head>", b"</head>", b"<body>", b"<body class=a>", b"</body>", b"</html>",
+           b"<p>", b"</p>", b"text", b"<h1>x</h1>", b"<title>t</title>", b"<style>p{}</style>", b"<script>1</script>",
+           b"<!-- ok -->", b"<!--", b"-->", b"<!-->", b"<!--->", b"--!>", b"<!-- a -- b -->", b"<![CDATA[", b"]]>",
+           b"<?pi ", b"?>", b"<!x>", b"</ x>", b"</>", b"<template>", b"</template>", b"<textarea>", b"</textarea>",
+           b"<title>", b"</title>", b"<xmp>", b"</xmp>", b"<iframe>", b"</iframe>", b"<noembed>", b"<noframes>",
+           b"<noscript>", b"</noscript>", b"<plaintext>", b"<select>", b"</select>", b"<svg>", b"</svg>", b"<math>",
+           b"</math>", b"<script>", b"</script>", b"<style>", b"</style>", b'<a title="', b'">', b"'", b'"', b"<",
+           b">", b"\n", b"<frameset>", b"<object>", b"<!doctype html", b"&lt;"]
+BYPASSES = [b"<!doctype html><!---><template><!--><body></template><h1>visible page</h1>",
+            b"<!doctype html><!--><template><!--><body></template><h1>visible page</h1>",
+            b"<!doctype html><html><![CDATA[ x><template><body\n]]></template><h1>visible page</h1>"]
+_OUT_TAG = __import__("re").compile(r"<(/?)([a-z0-9]+)([^>]*)>")
+
+
+def _oracle_bar_is_top_level(page: str) -> bool:
+    """html5ever (nh3) view: exactly one bar element, and no element is open around it."""
+    import nh3
+    tags = {"html", "head", "body", "div", "p", "span", "title", "template", "b", "i", "a", "h1", "table", "tr", "td",
+            "ul", "li", "svg", "math", "section", "form", "select", "option", "textarea", "style", "script", "pre"}
+    cleaned = nh3.clean(page, tags=tags, attributes={"div": {"data-herdr-shared-by"}}, strip_comments=True,
+                        clean_content_tags=set())
+    if cleaned.count("data-herdr-shared-by") != 1:
+        return False
+    stack: list[str] = []
+    pos = 0
+    while (m := _OUT_TAG.search(cleaned, pos)) is not None:
+        pos = m.end()
+        closing, name, attrs = m.groups()
+        if not closing and name in ("script", "style", "title", "textarea"):
+            stack.append(name)                       # raw text / RCDATA: whatever looks like a tag up to the closer is text
+            pos = cleaned.find("</" + name, pos)
+            if pos < 0:
+                return False
+            continue
+        if "data-herdr-shared-by" in attrs:
+            return not stack
+        if closing:
+            if name in stack:
+                while stack.pop() != name:
+                    pass
+        else:
+            stack.append(name)
+    return False
+
+
+def test_differential_a_served_bar_is_a_real_top_level_element_for_html5ever():
+    import random
+    bar = share_public.shared_by_bar("Al")
+    rng = random.Random(20261104)
+    pages = list(BYPASSES) + [b"".join(rng.choice(GRAMMAR) for _ in range(rng.randint(0, 10))) for _ in range(6000)]
+    accepted = rejected = 0
+    for data in pages:
+        out = share_public.labelled_html(data, "text/html; charset=utf-8", bar)
+        if out is None:
+            rejected += 1
+            continue
+        accepted += 1
+        assert _oracle_bar_is_top_level(out.decode()), (data, out)
+    assert accepted > 300 and rejected > 3000, (accepted, rejected)
+    for data in BYPASSES:
+        assert share_public.labelled_html(data, "text/html", bar) is None

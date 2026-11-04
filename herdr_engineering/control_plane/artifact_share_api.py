@@ -306,7 +306,8 @@ def _check_labelable(dest: Path, index, shared_by: str) -> None:
         data = (dest / "files" / entry.name).read_bytes()
         if labelled_html(data, content_type_for(entry.name), bar) is None:
             raise ShareHTTPError(400, f"unsupported_html: {entry.name} cannot carry the 'shared by' label (unsupported "
-                                 "encoding such as UTF-16, or markup that hides it); save it as plain UTF-8 HTML")
+                                 "encoding such as UTF-16, or ambiguous markup: CDATA, <?...>, odd comments, or an unclosed "
+                                 "template/textarea/svg/script before <body>); save it as plain UTF-8 HTML")
 
 
 def approve_share(server, share: dict, *, approved_by: str | None = None,
