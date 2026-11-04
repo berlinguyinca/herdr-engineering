@@ -18,11 +18,12 @@ from typing import TYPE_CHECKING, Any
 from ..assistant import AssistantError
 from .canonical import RawAction
 from .events import EVENTS_PER_WORKER_PER_MINUTE, RateLimiter, record_event
-from .policy import decide
+from .policy import current_judge_version, decide
 from .workers import Worker, WorkerAuthError
 
 if TYPE_CHECKING:
     from ..assistant import AssistantService, AssistantStore
+    from .judge import JudgeRuntime
     from .workers import WorkerRegistry
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class Hub:
     # Per-worker cap on event-writing paths (MCP ask/report and hook-events); each event persists a full snapshot.
     event_limiter: RateLimiter = field(default_factory=RateLimiter)
     event_rate_limit: int = EVENTS_PER_WORKER_PER_MINUTE
+    judge: JudgeRuntime | None = None      # None: no judge, so an otherwise-authorized action is left to the owner
 
 
 class _ToolError(Exception):
@@ -190,7 +192,8 @@ def _action_request(hub: Hub, worker: Worker, args: dict) -> dict:
     session_id, task_id = _bounded_id(args, "session_id"), _bounded_id(args, "task_id")
     if not hub.event_limiter.allow(worker.worker_id, hub.event_rate_limit):      # one slot per call, taken here
         raise _ToolError("rate limited")
-    d = decide(hub.store, hub.service.config["grants"], worker, raw, session_id, task_id, hub.service.now())
+    d = decide(hub.store, hub.service.config["grants"], worker, raw, session_id, task_id, hub.service.now(),
+               judge=hub.judge)
     try:
         record_event(hub.store, worker, kind="action_request", provenance="worker_reported", session_id=session_id,
                      payload={"outcome": d.outcome, "source": d.source,
@@ -205,8 +208,9 @@ def _action_grants_list(hub: Hub, worker: Worker, args: dict) -> dict:
     _check_args(args, {"limit"})
     limit = _limit(args)
     policy, now = int(hub.service.config["grants"]["policy_version"]), hub.service.now()
+    version = current_judge_version(hub.judge)
     rows = [{"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb, "resource_scope": g.resource_scope,
-             "key_id": g.key_id, "state": g.effective_state(now, policy).value, "expires_at": g.expires_at,
+             "key_id": g.key_id, "state": g.effective_state(now, policy, version).value, "expires_at": g.expires_at,
              "proposed_at": g.proposed_at, "activated_at": g.activated_at, "revoked_at": g.revoked_at}
             for g in hub.store.list_action_grants(worker.tenant_id, worker.user_id)]
     return _rows_result("action_grants", rows, limit)

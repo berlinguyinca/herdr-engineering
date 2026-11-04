@@ -4249,6 +4249,26 @@ def _cmd_bridge_hash_password(args):
     return 0
 
 
+def _build_judge_runtime(service):
+    """The one ``JudgeRuntime`` of this process: live ``judge`` config, a client built per call (so key rotation and
+    config edits apply), and the single-thread shadow recorder. A disabled judge yields no client and records nothing."""
+    from .control_plane.assistant_hub.jev import JevClient
+    from .control_plane.assistant_hub.judge import JudgeRuntime
+    from .control_plane.assistant_hub.shadow import ShadowRecorder
+
+    def cfg_getter():
+        return service.config.get("judge") or {}
+
+    def client_factory():
+        cfg = cfg_getter()
+        if cfg.get("enabled") is not True:
+            return None
+        return JevClient(cfg["endpoint"], cfg["api_key_file"], cfg["model"], float(cfg["timeout_seconds"]))
+
+    recorder = ShadowRecorder(service.store, cfg_getter, client_factory, service.now)
+    return JudgeRuntime(cfg_getter=cfg_getter, client_factory=client_factory, recorder=recorder, now=service.now)
+
+
 def _start_assistant_hub(service):
     """Start the tailnet-only assistant hub when both the assistant and ``personal_assistant.hub`` are enabled.
 
@@ -4266,7 +4286,8 @@ def _start_assistant_hub(service):
     registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
                               worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
     try:
-        server = HubServer(Hub(registry=registry, service=service, store=service.store), host=hub_cfg["host"],
+        server = HubServer(Hub(registry=registry, service=service, store=service.store, judge=_build_judge_runtime(service)),
+                           host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
     except (ValueError, OSError) as exc:
@@ -4282,6 +4303,7 @@ def _wire_assistant_hub(svr):
         return None
     hub_server, registry = _start_assistant_hub(service)
     svr.assistant_workers = registry
+    svr.assistant_judge = hub_server.hub.judge if hub_server is not None else None   # same runtime as the hub
     return hub_server
 
 

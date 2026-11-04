@@ -17,11 +17,44 @@ from herdr_engineering.control_plane.assistant_hub.policy import (
     revoke_action_grant,
 )
 from herdr_engineering.control_plane.assistant_hub.workers import Worker
+from tests.control_plane.judge_support import (
+    SAFE,
+    WireListener,
+    force_active_grant_for_tests,
+    judge_cfg,
+    make_runtime,
+    satisfy_gate,
+    success_body,
+    write_key,
+)
 
 T0 = datetime(2026, 10, 1, tzinfo=UTC)
 NOW = T0 + timedelta(days=20)                      # shadow (14 days) is over
 T, U, W = "acme", "owner", "w1"
 SECRET = "sk-ant-supersecret-0123456789abcdef"
+
+
+_RT = None          # the live JudgeRuntime of the running test (a real client against a documented-shape listener)
+
+
+@pytest.fixture(autouse=True)
+def _judge_runtime(tmp_path):
+    """Phase 3 made the judge part of every authorization, so the Phase 2 tests run against the real wire path."""
+    global _RT
+    li = WireListener(success_body(SAFE))
+    _RT = make_runtime(AssistantStore(), judge_cfg(f"http://127.0.0.1:{li.port}", write_key(tmp_path)), lambda: NOW)
+    yield
+    _RT.recorder.stop()
+    li.close()
+    _RT = None
+
+
+def _activate(store, cfg, now, tenant, user, gid, who):
+    """activate_grant through the REAL gate, with a store populated by real labeled records."""
+    g = store.get_action_grant(gid, tenant_id=tenant, user_id=user)
+    if g is not None and g.key_canonical:
+        satisfy_gate(store, _RT, derive(_push()).key.risk_class.value, tenant, user)
+    return activate_grant(store, cfg, now, tenant, user, gid, who, _RT)
 
 
 def _cfg(**over):
@@ -48,12 +81,11 @@ def _active_grant(store, cfg, raw: RawAction, worker_id: str = W, tenant: str = 
         resource_scope=key.resource_scope, key_id=key.key_id(), verb=key.verb.value, key_canonical=key.canonical(),
         state=GrantState.PROPOSED, created_at=now, proposed_at=now, expires_at=now + timedelta(days=30),
         policy_version=cfg["policy_version"]))
-    return activate_grant(store, cfg, now, tenant, user, f"ag_{worker_id}_{key.key_id()[:8]}",
-                          confirmed_by="owner", judge_gate_satisfied=True)
+    return force_active_grant_for_tests(store, cfg, f"ag_{worker_id}_{key.key_id()[:8]}", now, _RT.cfg_getter())
 
 
 def _decide(store, cfg, raw, worker=None, session="s1", task="t1", now=NOW) -> Decision:
-    return decide(store, cfg, worker or _worker(), raw, session, task, now)
+    return decide(store, cfg, worker or _worker(), raw, session, task, now, judge=_RT)
 
 
 # ------------------------------------------------------------------ vetoes
@@ -359,8 +391,8 @@ def test_activate_refused_without_judge_gate():
     store, cfg = AssistantStore(), _cfg()
     g = _proposed(store, cfg)
     with pytest.raises(ActivationRefused) as exc:
-        activate_grant(store, cfg, NOW, T, U, g.grant_id, "owner", False)
-    assert exc.value.code == "judge_gate_not_satisfied" and isinstance(exc.value, ValueError)
+        activate_grant(store, cfg, NOW, T, U, g.grant_id, "owner", None)
+    assert exc.value.code == "judge_disabled" and isinstance(exc.value, ValueError)
     assert store.list_action_grants(T, U)[0].state is GrantState.PROPOSED
 
 
@@ -369,7 +401,7 @@ def test_activate_requires_first_grant_confirmation():
     g = _proposed(store, cfg)
     for who in ("", "   "):
         with pytest.raises(ActivationRefused) as exc:
-            activate_grant(store, cfg, NOW, T, U, g.grant_id, who, True)
+            _activate(store, cfg, NOW, T, U, g.grant_id, who)
         assert exc.value.code == "confirmation_missing"
 
 
@@ -377,18 +409,18 @@ def test_activate_refusals_for_state_shadow_and_ownership():
     store, cfg = AssistantStore(), _cfg()
     g = _proposed(store, cfg)
     with pytest.raises(ActivationRefused) as exc:
-        activate_grant(store, cfg, T0 + timedelta(days=2), T, U, g.grant_id, "owner", True)
+        _activate(store, cfg, T0 + timedelta(days=2), T, U, g.grant_id, "owner")
     assert exc.value.code == "still_in_shadow"
     for tenant, user, gid in (("other", U, g.grant_id), (T, "x", g.grant_id), (T, U, "nope")):
         with pytest.raises(ActivationRefused) as exc:
-            activate_grant(store, cfg, NOW, tenant, user, gid, "owner", True)
+            _activate(store, cfg, NOW, tenant, user, gid, "owner")
         assert exc.value.code == "not_found"
     with pytest.raises(ActivationRefused) as exc:                       # policy bump sends it back to shadow
-        activate_grant(store, _cfg(policy_version=2), NOW, T, U, g.grant_id, "owner", True)
+        _activate(store, _cfg(policy_version=2), NOW, T, U, g.grant_id, "owner")
     assert exc.value.code == "not_proposed"
-    done = activate_grant(store, cfg, NOW, T, U, g.grant_id, "owner", True)
+    done = _activate(store, cfg, NOW, T, U, g.grant_id, "owner")
     with pytest.raises(ActivationRefused) as exc:
-        activate_grant(store, cfg, NOW, T, U, g.grant_id, "owner", True)
+        _activate(store, cfg, NOW, T, U, g.grant_id, "owner")
     assert exc.value.code == "not_proposed"
     assert done.state is GrantState.ACTIVE
 
@@ -396,7 +428,7 @@ def test_activate_refusals_for_state_shadow_and_ownership():
 def test_activation_sets_state_expiry_and_audit_then_grant_is_honored():
     store, cfg = AssistantStore(), _cfg()
     g = _proposed(store, cfg)
-    done = activate_grant(store, cfg, NOW, T, U, g.grant_id, "owner", True)
+    done = _activate(store, cfg, NOW, T, U, g.grant_id, "owner")
     assert (done.state, done.activated_at, done.confirmed_by) == (GrantState.ACTIVE, NOW, "owner")
     assert done.expires_at == NOW + timedelta(days=cfg["grant_ttl_days"])
     assert store.get_action_grant(g.grant_id, tenant_id=T, user_id=U).state is GrantState.ACTIVE
@@ -410,7 +442,7 @@ def test_audit_chain_verifies_after_a_full_cycle():
     store, cfg = AssistantStore(), _cfg()
     _decide(store, cfg, _push("git push --force origin main"))
     g = _proposed(store, cfg)
-    activate_grant(store, cfg, NOW, T, U, g.grant_id, "owner", True)
+    _activate(store, cfg, NOW, T, U, g.grant_id, "owner")
     assert _decide(store, cfg, _push()).outcome == "authorized"
     revoke_action_grant(store, NOW, T, U, g.grant_id, "owner")
     assert _decide(store, cfg, _push()).outcome == "pending"

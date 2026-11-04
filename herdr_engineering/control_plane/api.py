@@ -303,7 +303,7 @@ class ControlPlaneServer:
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None,
-                 assistant_workers=None):
+                 assistant_workers=None, assistant_judge=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -483,6 +483,7 @@ class ControlPlaneServer:
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
         # The owner routes /api/v1/assistant-workers read it at request time, so it may be attached after startup.
         self.assistant_workers = assistant_workers
+        self.assistant_judge = assistant_judge       # JudgeRuntime | None; None: the activation gate refuses
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
         from .rakazo_artifacts import RegistryBackend
@@ -4486,6 +4487,7 @@ def _make_handler(server, public=False, operator=False):
             from .assistant_hub.policy import (
                 ActivationRefused,
                 activate_grant,
+                current_judge_version,
                 record_owner_decision,
                 revoke_action_grant,
             )
@@ -4499,6 +4501,7 @@ def _make_handler(server, public=False, operator=False):
                 tenant_id, user_id = self._assistant_scope()
                 svc, store = server.assistant, server.assistant.store
                 cfg = svc.config["grants"]
+                version = current_judge_version(server.assistant_judge)
 
                 def request_view(r):
                     return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
@@ -4509,8 +4512,8 @@ def _make_handler(server, public=False, operator=False):
                 def grant_view(g):
                     return {"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb,
                             "resource_scope": g.resource_scope, "key_id": g.key_id,
-                            "state": g.effective_state(svc.now(), int(cfg["policy_version"])).value,
-                            "policy_version": g.policy_version, "created_at": iso(g.created_at),
+                            "state": g.effective_state(svc.now(), int(cfg["policy_version"]), version).value,
+                            "policy_version": g.policy_version, "judge_version": g.judge_version, "created_at": iso(g.created_at),
                             "proposed_at": iso(g.proposed_at), "activated_at": iso(g.activated_at),
                             "expires_at": iso(g.expires_at), "revoked_at": iso(g.revoked_at),
                             "confirmed_by": g.confirmed_by}
@@ -4544,9 +4547,9 @@ def _make_handler(server, public=False, operator=False):
                         if not exact({"confirm"}) or body["confirm"] is not True:
                             return self._json({"error": 'body must be exactly {"confirm": true}'}, 400)
                         try:
-                            # The judge gate is hard-coded unsatisfied this phase: Phase 3 wires the real judge gate.
+                            # The real gate: calibration report from the store, owner flag, false-negative bound.
                             grant = activate_grant(store, cfg, svc.now(), tenant_id, user_id, parts[4],
-                                                   confirmed_by=user_id, judge_gate_satisfied=False)
+                                                   confirmed_by=user_id, judge=server.assistant_judge)
                         except ActivationRefused as exc:
                             if exc.code == "not_found":
                                 return self._json({"error": "not found"}, 404)

@@ -16,16 +16,21 @@ from typing import Literal
 
 from ..assistant import AssistantStore
 from .actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, GrantState, as_utc, revoke
+from .calibration import build_report, gate_satisfied
 from .canonical import Derived, RawAction, derive
 from .events import scrub_payload
 from .evidence import _shadow_elapsed, propose_if_ready
+from .jev import JudgeUnavailable
+from .judge import SEVERITY_LEVELS, JudgeRuntime, Verdict, consult
+from .judge_version import judge_version as _judge_version
+from .shadow import ShadowJob, label_decision, mark_regret
 from .verbs import ActionKey, Verb
 from .vetoes import Veto, VetoRule, check_vetoes
 from .workers import Worker
 
 POLICY_ACTOR = "hub:policy"
 Outcome = Literal["authorized", "denied", "pending"]
-Source = Literal["veto", "grant", "owner", "shadow", "unknown"]
+Source = Literal["veto", "grant", "owner", "shadow", "unknown", "judge", "judge_unavailable"]
 
 
 @dataclass(frozen=True)
@@ -144,52 +149,128 @@ def _deny(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derive
     return Decision("denied", f"Denied by the {veto.code} rule: {veto.reason}.", row.request_id, None, veto.code, "veto")
 
 
-def _live_grant(store: AssistantStore, cfg: dict, worker: Worker, key: ActionKey, now: datetime) -> ActionGrant | None:
+def _live_grant(store: AssistantStore, cfg: dict, worker: Worker, key: ActionKey, now: datetime,
+                judge_version: str = "") -> ActionGrant | None:
     key_id, policy = key.key_id(), int(cfg["policy_version"])
     for g in store.list_action_grants(worker.tenant_id, worker.user_id):
         if (g.worker_id == worker.worker_id and g.key_id == key_id and g.tenant_id == worker.tenant_id
-                and g.user_id == worker.user_id and g.effective_state(now, policy) is GrantState.ACTIVE):
+                and g.user_id == worker.user_id
+                and g.effective_state(now, policy, judge_version) is GrantState.ACTIVE):
             return g
     return None
 
 
+def current_judge_version(judge: JudgeRuntime | None) -> str:
+    """The version stamp of the live judge config, or ``""`` (no version check) when there is no usable judge."""
+    if judge is None:
+        return ""
+    try:
+        return _judge_version(judge.cfg_getter())
+    except Exception:
+        return ""
+
+
+def _submit_to_recorder(judge: JudgeRuntime | None, worker: Worker, derived: Derived, request_id: str,
+                        session_id: str, task_id: str) -> None:
+    """A NEW pending row is recorded once.  Unclassifiable actions have no key facts to judge, so nothing is sent."""
+    key = derived.key
+    if judge is None or key is None or derived.owner_decides or key.verb is Verb.UNKNOWN:
+        return
+    try:
+        judge.recorder.submit(ShadowJob(worker.tenant_id, worker.user_id, worker.worker_id, session_id, task_id,
+                                        request_id, key))
+    except Exception:       # recording is best effort and must never change or break a decision
+        pass
+
+
 def _pending(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
-             task_id: str, now: datetime, source: Source, reason: str) -> Decision:
+             task_id: str, now: datetime, source: Source, reason: str, judge: JudgeRuntime | None = None,
+             extra: str = "") -> Decision:
     row = _new_row(worker, raw, derived, session_id, task_id, "pending", reason, now)
     row, created = _find_or_put(store, worker, row)
     if created:
         _audit(store, worker, POLICY_ACTOR, "assistant.action.requested", row.request_id,
-               f"source={source} key_id={row.key_id}")
+               f"source={source} key_id={row.key_id}{extra}")
+        _submit_to_recorder(judge, worker, derived, row.request_id, session_id, task_id)
     return Decision("pending", reason, row.request_id, None, None, source)
 
 
+_JUDGE_REASON = "The judge flagged this action, so the owner decides."
+_JUDGE_UNAVAILABLE_REASON = "The judge is unavailable, so the owner decides."
+
+
+def _apply_verdict(verdict: Verdict) -> tuple[Outcome, Source]:
+    """Pure: the judge can only ADD friction.  An escalation sends an otherwise-authorized request to the owner."""
+    if verdict.escalate:
+        return "pending", "judge"
+    return "authorized", "grant"
+
+
+def _pct(value: float) -> str:
+    return f"{value * 100:.2f}%"
+
+
+def _verdict_detail(v: Verdict) -> str:
+    """Version and the four answers as two-decimal percentages (severity as a share of the top level); no key, endpoint or text."""
+    top = float(len(SEVERITY_LEVELS) - 1)
+    return (f" judge_version={v.judge_version} destructive={_pct(v.destructive)} irreversible={_pct(v.irreversible)}"
+            f" severity={_pct(v.severity / top)} covers={_pct(v.covers)}")
+
+
+def _consult(judge: JudgeRuntime | None, key: ActionKey) -> Verdict | str:
+    """The verdict, or a short reason code when the judge cannot answer (fail closed)."""
+    if judge is None:
+        return "no_judge"
+    try:
+        cfg = judge.cfg_getter()
+        if cfg.get("enabled") is not True:
+            return "disabled"
+        client = judge.client_factory()
+        if client is None:
+            return "no_client"
+        return consult(client, key, cfg, timeout=float(cfg["timeout_seconds"]))
+    except JudgeUnavailable as exc:
+        return exc.code
+    except Exception:
+        return "internal"
+
+
 def decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, session_id: str, task_id: str,
-           now: datetime) -> Decision:
+           now: datetime, *, judge: JudgeRuntime | None = None) -> Decision:
     derived = derive(raw)
     key = derived.key
-    return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now),
+    return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now, judge),
                    verb=key.verb.value if key else Verb.UNKNOWN.value, key_id=key.key_id() if key else "")
 
 
 def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
-            task_id: str, now: datetime) -> Decision:
+            task_id: str, now: datetime, judge: JudgeRuntime | None) -> Decision:
     veto = check_vetoes(derived, _extra_rules(cfg))
     if veto is not None:
         return _deny(store, worker, raw, derived, veto, session_id, task_id, now)
     if derived.owner_decides or derived.key is None:
         return _pending(store, worker, raw, derived, session_id, task_id, now, "unknown",
-                        "The action could not be classified with certainty, so the owner decides.")
-    grant = _live_grant(store, cfg, worker, derived.key, now)
+                        "The action could not be classified with certainty, so the owner decides.", judge)
+    grant = _live_grant(store, cfg, worker, derived.key, now, current_judge_version(judge))
     if grant is not None and in_shadow(store, cfg, now):
         return _pending(store, worker, raw, derived, session_id, task_id, now, "shadow",
-                        "The shadow period is still running, so the owner decides.")
+                        "The shadow period is still running, so the owner decides.", judge)
     if grant is not None:
+        # The only path that would authorize: the judge is consulted here and nowhere else (no lock is held).
+        result = _consult(judge, derived.key)
+        if isinstance(result, str):
+            return _pending(store, worker, raw, derived, session_id, task_id, now, "judge_unavailable",
+                            _JUDGE_UNAVAILABLE_REASON, judge, extra=f" code={result}")
+        outcome, source = _apply_verdict(result)
+        if outcome == "pending":
+            return _pending(store, worker, raw, derived, session_id, task_id, now, source, _JUDGE_REASON, judge,
+                            extra=_verdict_detail(result))
         _audit(store, worker, POLICY_ACTOR, "assistant.action.authorized", grant.grant_id,
-               f"grant={grant.grant_id} key_id={grant.key_id} worker={worker.worker_id}")
+               f"grant={grant.grant_id} key_id={grant.key_id} worker={worker.worker_id}{_verdict_detail(result)}")
         return Decision("authorized", "Authorized by the owner's active grant for this exact action.", None,
-                        grant.grant_id, None, "grant")
+                        grant.grant_id, None, source)
     return _pending(store, worker, raw, derived, session_id, task_id, now, "owner",
-                    "No active grant covers this exact action, so the owner decides.")
+                    "No active grant covers this exact action, so the owner decides.", judge)
 
 
 def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str,
@@ -214,6 +295,7 @@ def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenan
             key = ActionKey.from_canonical(row.key_canonical)
             if key.key_id() == row.key_id:
                 propose_if_ready(store, cfg, now, tenant_id, user_id, row.worker_id, key, vetoed=False)
+    label_decision(store, lambda: {}, tenant_id, user_id, request_id, approve, as_utc(now))   # first label wins
     store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=decided_by, action="assistant.action.decided",
                        subject_id=request_id, detail=f"{'approve' if approve else 'deny'} request={request_id}")
     return row
@@ -224,9 +306,9 @@ def _refuse(code: str, message: str) -> ActivationRefused:
 
 
 def activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str, grant_id: str,
-                   confirmed_by: str, judge_gate_satisfied: bool) -> ActionGrant:
+                   confirmed_by: str, judge: JudgeRuntime | None) -> ActionGrant:
     try:
-        return _activate_grant(store, cfg, now, tenant_id, user_id, grant_id, confirmed_by, judge_gate_satisfied)
+        return _activate_grant(store, cfg, now, tenant_id, user_id, grant_id, confirmed_by, judge)
     except ActivationRefused as exc:
         if exc.code != "not_found":                     # an unknown id has no grant to attach the entry to
             store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=confirmed_by.strip() or "unknown",
@@ -235,8 +317,36 @@ def activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: s
         raise
 
 
+_GATE_MESSAGES = {
+    "judge_disabled": "the judge is not enabled",
+    "backend_unconfirmed": "the owner has not confirmed a real model is serving the judge",
+    "stale_report": "the calibration report does not match the current judge version",
+    "insufficient_labels": "not enough labeled decisions for this risk class",
+    "insufficient_diversity": "labels come from too few different actions",
+    "no_discrimination": "too few denied or regretted decisions to show the judge can tell them apart",
+    "fn_bound_exceeded": "the judge's false-negative bound is too high",
+}
+
+
+def _check_judge_gate(store: AssistantStore, now: datetime, tenant_id: str, user_id: str, grant: ActionGrant,
+                      judge: JudgeRuntime | None) -> str:
+    """Builds the calibration report from the store and returns the judge version, or refuses with the gate's code."""
+    if judge is None:
+        raise _refuse("judge_disabled", _GATE_MESSAGES["judge_disabled"])
+    jcfg = judge.cfg_getter()
+    try:
+        risk = ActionKey.from_canonical(grant.key_canonical).risk_class.value
+    except Exception:
+        raise _refuse("insufficient_labels", "the grant has no readable action key") from None
+    report = build_report(store.list_judge_records(tenant_id, user_id), jcfg, now, tenant_id, user_id)
+    ok, code = gate_satisfied(report, jcfg, risk)
+    if not ok:
+        raise _refuse(code, _GATE_MESSAGES.get(code, "judge gate not satisfied"))
+    return _judge_version(jcfg)
+
+
 def _activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str, grant_id: str,
-                    confirmed_by: str, judge_gate_satisfied: bool) -> ActionGrant:
+                    confirmed_by: str, judge: JudgeRuntime | None) -> ActionGrant:
     with store._lock:
         grant = store.get_action_grant(grant_id, tenant_id=tenant_id, user_id=user_id)
         if grant is None:
@@ -247,9 +357,9 @@ def _activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: 
             raise _refuse("still_in_shadow", "the shadow period has not elapsed")
         if not confirmed_by.strip():
             raise _refuse("confirmation_missing", "the owner's confirmation is required")
-        if judge_gate_satisfied is not True:
-            raise _refuse("judge_gate_not_satisfied", "judge gate not satisfied")
+        version = _check_judge_gate(store, now, tenant_id, user_id, grant, judge)
         active = replace(grant, state=GrantState.ACTIVE, activated_at=as_utc(now), confirmed_by=confirmed_by,
+                         judge_version=version,
                          expires_at=as_utc(now) + timedelta(days=int(cfg["grant_ttl_days"])))
         store.put_action_grant(active)
     store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=confirmed_by, action="assistant.grant.activated",
@@ -265,6 +375,7 @@ def revoke_action_grant(store: AssistantStore, now: datetime, tenant_id: str, us
             raise KeyError(grant_id)
         revoked = revoke(grant, as_utc(now))
         store.put_action_grant(revoked)
+    mark_regret(store, tenant_id, user_id, revoked.key_id, revoked.worker_id)    # approvals the owner now regrets
     store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=revoked_by, action="assistant.grant.revoked",
                        subject_id=grant_id, detail=f"key_id={revoked.key_id}")
     return revoked

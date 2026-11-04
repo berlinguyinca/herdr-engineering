@@ -8,15 +8,19 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from .jev import JevClient, JudgeResult, JudgeUnavailable, NoulAnswer, ScoreAnswer
 from .judge_version import QUESTION_SET_VERSION, judge_version
 from .verbs import ActionKey, Verb
 
-__all__ = ["QUESTION_SET_VERSION", "SEVERITY_LEVELS", "QUESTIONS", "Verdict", "build_state", "evaluate", "consult"]
+if TYPE_CHECKING:
+    from .shadow import ShadowRecorder
+
+__all__ = ["JudgeRuntime", "QUESTION_SET_VERSION", "SEVERITY_LEVELS", "QUESTIONS", "Verdict", "build_state", "evaluate", "consult"]
 
 SEVERITY_LEVELS = ("informational", "minor", "major", "critical")
 
@@ -137,3 +141,17 @@ def consult(client: JevClient, key: ActionKey, cfg: Mapping[str, Any], *, timeou
     # Phase 3 sends no owner context: it is an extension point, never a path for worker-supplied data.
     result = client.ask(build_state(key, {}), QUESTIONS, timeout=timeout)
     return evaluate(result, cfg["thresholds"], judge_version(cfg))
+
+
+@dataclass(frozen=True)
+class JudgeRuntime:
+    """What the decision path and the activation gate need from the judge, created once by the CLI wiring.
+
+    ``cfg_getter`` returns the live ``judge`` config section; ``client_factory`` returns a client or ``None`` when
+    the judge is off or unconfigured; ``recorder`` stores shadow records off the request path.  A caller without a
+    runtime (``None``) means "no judge": nothing is ever authorized and nothing is recorded.
+    """
+    cfg_getter: Callable[[], Mapping[str, Any]]
+    client_factory: Callable[[], JevClient | None]
+    recorder: ShadowRecorder
+    now: Callable[[], datetime]
