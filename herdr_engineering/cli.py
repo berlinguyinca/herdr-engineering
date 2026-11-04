@@ -64,7 +64,7 @@ def _build_parser() -> argparse.ArgumentParser:
                             "(prevents CPU build-storms from concurrent agents)")
     p.add_argument("--slots", type=int, default=None,
                    help="max concurrent builds host-wide (default: auto = "
-                        "max(2, cpu_cores-4); e.g. 20 on 24 cores)")
+                        "min(4, cpu_cores-4), floor 2)")
     p.add_argument("--max-load", type=float, default=1.5,
                    help="back off while 1-min load per core exceeds this (0=off)")
     p.add_argument("--wait", type=float, default=0.0,
@@ -72,8 +72,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bypass-on-timeout", action="store_true",
                    help="if no slot frees within --wait, run the command ungated "
                         "instead of failing (best-effort coordination)")
+    p.add_argument("--record", action="store_true",
+                   help="opt-in: run the child (instead of exec) and append timing/CPU/IO/"
+                        "sccache events to <state>/build-gates/builds.jsonl")
     p.add_argument("--status", action="store_true",
-                   help="print current build-gate occupancy and exit")
+                   help="print current build-gate occupancy (and recorded-build summary) and exit")
     p.add_argument("--json", action="store_true",
                    help="machine-readable output")
     p.add_argument("command", nargs=argparse.REMAINDER,
@@ -2741,12 +2744,14 @@ def _cmd_build_coordinate(args) -> int:
     build at once and CPU-starve the machine (the "build storm").
     """
     from .build_coord import BuildGate, _default_slots, run_gated
+    from .build_metrics import summarize
 
     slots = args.slots if args.slots is not None else _default_slots()
     if getattr(args, "status", False):
         gate = BuildGate(slots=slots)
         if args.json:
-            _print_json({"slots": slots, "occupancy": gate.status()})
+            _print_json({"slots": slots, "occupancy": gate.status(),
+                         "builds": summarize(gate.dir / "builds.jsonl")})
         else:
             for entry in gate.status():
                 if entry["held"]:
@@ -2756,6 +2761,9 @@ def _cmd_build_coordinate(args) -> int:
                           f"cmd={h.get('cmd')}")
                 else:
                     print(f"  slot {entry['slot']}: free")
+            n = summarize(gate.dir / "builds.jsonl")["builds"]
+            if n:
+                print(f"  recorded builds: {n} (see builds.jsonl)")
         return 0
 
     cmd = args.command
@@ -2763,7 +2771,8 @@ def _cmd_build_coordinate(args) -> int:
         cmd = cmd[1:]
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
-                     bypass_on_timeout=args.bypass_on_timeout)
+                     bypass_on_timeout=args.bypass_on_timeout,
+                     record=getattr(args, "record", False))
 
 
 def _cmd_build_cleanup(args) -> int:
