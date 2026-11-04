@@ -13,6 +13,10 @@ Environment: ``RESTORE_CONFLICT=1`` makes every version commit fail with a stale
 The collaborator routes themselves are the production ``artifact_collab_api.route_collab``; ``CollabFixture`` is the
 in-memory grant store behind them, and ``FakeCollabOperator`` stands in for the collab service the dashboard proxies
 ``/api/v1/collab/*`` to (agents, rooms, one-time invite creation).
+``ANNOT_FAIL_FIRST=<n>`` makes the first n annotation reads fail the way the real route does when its store is down (a fixed
+503); ``DISMISS_DELAY=<seconds>`` holds a dismiss in flight so a second click lands while it runs.
+The annotation routes are the production ``artifact_annotation_api.route_annotations``; ``AnnotationFixture`` is the
+in-memory store behind them (the ``list_for_artifact`` / ``dismiss`` rows have the ``AnnotationStore`` owner shape).
 Stdout carries ``PORT=n`` and one ``MARK_LIVE <share_id>`` line per share made live (never a token or URL).
 """
 import asyncio
@@ -39,6 +43,7 @@ from herdr_engineering.control_plane.api import ControlPlaneServer  # noqa: E402
 from herdr_engineering.control_plane.artifact_shares import ShareError  # noqa: E402
 from herdr_engineering.control_plane.artifact_bundle import ArtifactBundle  # noqa: E402
 from herdr_engineering.control_plane.artifact_collab_store import InviteGrantConflict  # noqa: E402
+from herdr_engineering.control_plane.artifact_annotations import AnnotationError  # noqa: E402
 from herdr_engineering.control_plane.artifacts import ArtifactConflict  # noqa: E402
 from herdr_engineering.control_plane.collab_mirror import REPORT_READ_ONLY  # noqa: E402
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
@@ -399,6 +404,62 @@ class ShareFixture:
             return copy.deepcopy([e for e in self.log if e["share_id"] == share_id][:limit])
 
 
+class AnnotationFixture:
+    """In-memory ``AnnotationStore`` (owner reads): the same rows, status filter, newest-first order and dismiss rules."""
+
+    def __init__(self):
+        self.fail_reads = int(os.environ.get("ANNOT_FAIL_FIRST") or 0)
+        self.dismiss_posts = 0
+
+        def row(n, version, body, status="open", **over):
+            base = {"annotation_id": "ann_" + f"{n:02d}".ljust(22, "x"), "artifact_id": "web_1",
+                    "version_id": f"version_{version}", "share_id": "share_seed", "file": "index.html",
+                    "anchor": {"kind": "text_quote", "file": "index.html", "exact": "Revision", "prefix": "", "suffix": " 1"},
+                    "body": body, "author_identity": "alice", "author_email": "alice@lab.example", "author_role": "viewer",
+                    "status": status, "addressed_in_version_id": None, "resolved_by": None, "resolved_at": None,
+                    "edited_at": None, "withdrawn_at": None, "created_at": datetime(2026, 10, 30, 12, n, tzinfo=UTC),
+                    "updated_at": datetime(2026, 10, 30, 12, n, tzinfo=UTC), "version_number": version,
+                    "addressed_in_version_number": None}
+            base.update(over)
+            return base
+
+        self.rows = [
+            row(3, 1, f"hostile {HOSTILE} {HOSTILE_TAG}", author_email=f"{HOSTILE_TAG}@lab.example",
+                anchor={"kind": "text_quote", "file": f"{HOSTILE_TAG}.html", "exact": HOSTILE_TAG, "prefix": "", "suffix": ""}),
+            row(2, 1, "fixed in the third revision", "addressed", addressed_in_version_id="version_3",
+                addressed_in_version_number=3),
+            row(1, 2, "typo in the heading", edited_at=datetime(2026, 10, 30, 12, 30, tzinfo=UTC)),
+        ]
+
+    def sync_call(self, method, *args, **kwargs):
+        return asyncio.run(getattr(self, method)(*args, **kwargs))
+
+    async def list_for_artifact(self, artifact_id, *, status="open", limit=200, before=None):
+        with _LOCK:
+            if self.fail_reads > 0:
+                self.fail_reads -= 1
+                raise ConnectionResetError("password authentication failed for user secret_db_user")
+            rows = [copy.deepcopy(r) for r in self.rows if r["artifact_id"] == artifact_id
+                    and status in ("all", r["status"])]
+        return sorted(rows, key=lambda r: (-r["created_at"].timestamp(), r["annotation_id"]))[:limit], None
+
+    async def dismiss(self, artifact_id, annotation_id, *, actor):
+        delay = float(os.environ.get("DISMISS_DELAY") or 0)
+        with _LOCK:
+            self.dismiss_posts += 1
+        if delay:
+            time.sleep(delay)
+        with _LOCK:
+            row = next((r for r in self.rows if r["artifact_id"] == artifact_id and r["annotation_id"] == annotation_id), None)
+            if row is None:
+                raise AnnotationError("not_found")
+            if row["status"] == "open":
+                row.update(status="dismissed", resolved_by=actor, resolved_at=_now(), updated_at=_now())
+            elif row["status"] != "dismissed":
+                raise AnnotationError("not_open")
+            return copy.deepcopy(row)
+
+
 class CollabFixture:
     """In-memory ``CollabGrantStore`` behind the adapter call path: ``store("grant", artifact_id, ...)``."""
 
@@ -514,7 +575,7 @@ if __name__ == "__main__":
     server = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, web_root=ROOT / "packages",
                                 artifact_store=artifacts, rustfs=artifacts,
                                 share_store=ShareFixture(artifacts), shares_root=shares_root,
-                                collab_grant_store=CollabFixture(),
+                                collab_grant_store=CollabFixture(), annotation_store=AnnotationFixture(),
                                 collab_artifacts_enabled=not os.environ.get("COLLAB_DISABLED"),
                                 collab_operator_url=operator.url)
     threading.Thread(target=server.serve, daemon=True).start()

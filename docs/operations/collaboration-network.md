@@ -160,3 +160,41 @@ TLS, rate and connection limits and a 64 KB body cap.
   Room content is returned wrapped as UNTRUSTED. No tool executes anything.
 - Collaboration events written before this split live in the dashboard's Postgres and are not migrated.
 - Moving hosts: change `control_plane.collab.public_url`, the app client callback/logout URLs and the router rule.
+
+## Artifact annotations: operator deployment
+
+Annotations move the share links to their own host, `artifacts.metabolomics.us`. These are operator steps; none of
+them is run by the build. Do them in this order, and do not deploy a partial set (the branch is deployable whole).
+
+1. **DNS:** point `artifacts.metabolomics.us` at the public edge.
+2. **SNI front:** add the hostname to the cubert SNI stream edge in `networking/cubert-ansible`, routed to the collab
+   edge exactly like `localdev.mcp.metabolomics.us`.
+3. **Certificate:** expand the existing collab lineage into one SAN certificate that covers
+   `localdev.mcp.metabolomics.us` and `artifacts.metabolomics.us` (`certbot certonly --cert-name
+   localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d artifacts.metabolomics.us`, repeating any
+   other name the lineage already has). The existing `HERDR_COLLAB_CERT_DIR` mount and renewal timer serve both hosts:
+   no new compose key and no second timer.
+4. **Cognito:** in app client `cognito_web_client`, set the callback URL `https://artifacts.metabolomics.us/s/callback`
+   and the sign-out URL `https://artifacts.metabolomics.us/`. Remove the MCP host's `/s/callback` entry.
+   (`update-user-pool-client` replaces the whole client: read it first and send every field back.)
+5. **YAML:** set `control_plane.share.public_url: https://artifacts.metabolomics.us`. Optional: `owner_emails` and an
+   `annotations` mapping (`enabled`, `max_comment_chars`, `per_user_per_minute`, `per_share_per_minute`,
+   `global_per_minute`, `per_user_per_day`, `max_per_share`).
+6. **Build and roll out:** rebuild the image (new `nh3` dependency and the vendored pdf.js), redeploy collab-edge,
+   share-public and the control plane, then apply migration 0046.
+7. **Smoke checks:**
+   - An MCP-host `/s/...` path no longer reaches share-public.
+   - A lab link to an HTML artifact signs in and lands directly on the running page, with the Annotate link. Clicking
+     it opens the annotation view, and Live returns to the page.
+   - Annotate, then a test annotation: it reaches the Feedback panel.
+   - The dashboard shows HTML and PDF previews with no frame.
+
+### Known limitations
+
+- **Owner dashboard preview can beacon.** An artifact's own HTML may carry an inline `<style>` with `url()` or
+  `@import`. The dashboard preview shows that HTML sanitised but the dashboard has no CSP, so such a rule can make the
+  owner's browser request an external URL (owner IP and referrer reach the artifact's author). The sandboxed `live`
+  view and every share-host view are not affected (their CSP blocks it). Follow-up: a dashboard-wide CSP, or dropping
+  `<style>` from the dashboard render.
+- A hostile upload can occupy the single sanitiser lane for its 3 s deadline; there is no per-share or per-IP budget
+  yet. Callers answer a busy lane with a fixed 503.

@@ -1133,7 +1133,9 @@ class ShareHandler(BaseHTTPRequestHandler):
     # -- lab: live view of non-HTML files
 
     def _send_json(self, status: int, payload: object) -> None:
-        body = json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("ascii")
+        # "<" is escaped so that a viewer's text never appears as markup in any body this host sends (the no-frames guard
+        # checks the annotations JSON); the escape is plain JSON, so every client parses the same value.
+        body = json.dumps(payload, sort_keys=True, ensure_ascii=True).replace("<", "\\u003c").encode("ascii")
         _send_headers(self, status, [*JSON_HEADERS, ("Content-Length", str(len(body)))], cors=False)
         if self.command != "HEAD":
             self.wfile.write(body)
