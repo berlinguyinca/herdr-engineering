@@ -96,6 +96,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(func=_cmd_build_cache_inventory)
 
+    p = sub.add_parser("build-cache-rustfs-provision",
+                       help="operator: create the herdr-build-cache rustfs bucket, a bucket-limited "
+                            "read-write and read-only user and 0600 credential files (additive, "
+                            "idempotent; dry-run unless --apply)")
+    p.add_argument("--apply", action="store_true", help="really create (dry-run otherwise)")
+    p.add_argument("--quota-gib", type=float, default=50.0, help="hard bucket quota (default 50)")
+    p.add_argument("--rotate", action="store_true",
+                   help="issue new secrets for the two dedicated build-cache users")
+    p.add_argument("--fleet-config", default=None, metavar="PATH",
+                   help="central fleet config holding the rustfs admin credential "
+                        "(default ~/.config/herdr-engineering/fleet/fleet-config.yaml)")
+    p.add_argument("--container", default="herdr-cp-rustfs", help="rustfs container name")
+    p.add_argument("--registry-host", default="127.0.0.1:9000",
+                   help="host[:port] written to the non-secret registry file (tailnet address "
+                        "for other hosts; prefix https:// for TLS)")
+    p.set_defaults(func=_cmd_build_cache_rustfs_provision)
+
     p = sub.add_parser("build-cache-slurm-plan",
                        help="preview a whole-build Slurm submission as data; NEVER submits "
                             "(spec 11: no runner is verified)")
@@ -1094,7 +1111,13 @@ def _cmd_host_terminal_relay(args) -> int:
     the control plane could not be reached for the first configuration), 2 only when restarting cannot help (host.json
     missing or incomplete, token revoked). argparse usage errors also exit 2, but never under a unit file."""
     from .herdr_pane_client import HerdrPaneClient
-    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config, host_token
+    from .host_config import (
+        ConfigRefresher,
+        HostConfigUnavailable,
+        exit_unavailable,
+        host_config,
+        host_token,
+    )
     from .terminal_relay import (
         ControlPlaneHttp,
         RelayLocked,
@@ -2867,6 +2890,13 @@ def _cmd_build_cache_inventory(args) -> int:
         view["slot_suggestion"] = observed_slot_suggestion(cfg, _default_state_dir())
     _print_json(view)
     return 0
+
+
+def _cmd_build_cache_rustfs_provision(args) -> int:
+    from .build_cache_rustfs import run_cli
+    return run_cli(apply=args.apply, quota_gib=args.quota_gib, rotate=args.rotate,
+                   central=args.fleet_config, container=args.container,
+                   registry_host=args.registry_host)
 
 
 def _cmd_build_cache_slurm_plan(args) -> int:
