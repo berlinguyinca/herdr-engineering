@@ -327,8 +327,14 @@ def test_doctor_warns_when_a_successful_update_goes_stale(home, tmp_path, monkey
     assert check["status"] == "warn" and "ago" in check["detail"]
 
 
-def _client_install(home, *, version="0.1.3", commit="89a8529" + "0" * 33, vcs=True):
-    """A `uv tool`-shaped install: <prefix>/bin/herdr-memory + its own site-packages."""
+def _client_install(home, *, version=None, commit=None, vcs=True):
+    """A `uv tool`-shaped install: <prefix>/bin/herdr-memory + its own site-packages.
+
+    Defaults follow the pins, so bumping `PINNED_REVISION`/`PINNED_CLIENT_VERSION` never
+    leaves a fixture claiming a build the pin does not name.
+    """
+    version = version or mi.PINNED_CLIENT_VERSION
+    commit = commit or mi.PINNED_REVISION + "0" * (40 - len(mi.PINNED_REVISION))
     prefix = home / "tool"
     exe = prefix / "bin" / "herdr-memory"
     exe.parent.mkdir(parents=True, exist_ok=True)
@@ -348,8 +354,8 @@ def test_provenance_is_read_from_the_install_that_owns_the_cli(home):
     exe = _client_install(home)
     i = mi.MemoryInstaller(home, command=CMD, which=lambda n: exe if n == "herdr-memory" else None,
                            run=fake_run)
-    assert i.installed_version() == "0.1.3"
-    assert i.installed_revision() == "89a8529" + "0" * 33
+    assert i.installed_version() == mi.PINNED_CLIENT_VERSION
+    assert i.installed_revision() == mi.PINNED_REVISION + "0" * (40 - len(mi.PINNED_REVISION))
     d = i.doctor(["claude"])
     assert _check(d, "package_revision")["status"] == "ok"
 
@@ -365,22 +371,25 @@ def test_wheel_install_without_provenance_is_reported_unknown_with_its_version(h
 
 def test_doctor_reports_the_client_version_the_cli_advertises(home):
     exe = _client_install(home)
+    pinned = mi.PINNED_CLIENT_VERSION           # the fake must follow the pin, not hardcode it
+    stale_version = "0.0.1" if pinned != "0.0.1" else "9.9.9"
     def run(argv, timeout=5.0):
-        payload = {"client": "0.1.3", "contract": 1, "harness": "codex"} if argv[-1] == "--version" \
+        payload = {"client": pinned, "contract": 1, "harness": "codex"} if argv[-1] == "--version" \
             else '{"healthy": true}'
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
     i = mi.MemoryInstaller(home, command=CMD, which=lambda n: exe if n == "herdr-memory" else None, run=run)
     assert _check(i.doctor(["claude"]), "client_version") == {
-        "name": "client_version", "status": "ok", "detail": "client 0.1.3",
+        "name": "client_version", "status": "ok", "detail": f"client {pinned}",
         "data": {"contract": 1}}
 
     def stale_run(argv, timeout=5.0):
-        payload = {"client": "0.1.2", "contract": 1} if argv[-1] == "--version" else '{"healthy": true}'
+        payload = {"client": stale_version, "contract": 1} if argv[-1] == "--version" else '{"healthy": true}'
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
     stale = mi.MemoryInstaller(home, command=CMD, which=lambda n: exe if n == "herdr-memory" else None,
                                run=stale_run)
     check = _check(stale.doctor(["claude"]), "client_version")
-    assert check["status"] == "warn" and "0.1.2" in check["detail"] and "pinned" in check["detail"]
+    assert check["status"] == "warn" and stale_version in check["detail"]
+    assert mi.PINNED_CLIENT_VERSION in check["detail"] and "pinned" in check["detail"]
 
 
 # ---- server probe needs a project (herdr-engineering#571) ------------------
@@ -458,6 +467,46 @@ def test_probe_project_never_invents_an_unconfigured_project(home):
     assert project is None and "default_project" in reason
     missing = home / ".config" / "herdr-memory" / "absent.json"
     assert mi.MemoryInstaller.probe_project(missing) == (None, "client config unreadable")
+
+
+# ---- server probe needs a credential too (follow-up to #579) ---------------
+
+def test_server_probe_sends_a_credential_the_project_has(home):
+    """The client defaults to codex; a project without a codex key read as a dead server."""
+    write_client_config(home, _project_config())          # credentials: pi only
+    seen: list = []
+    i = mi.MemoryInstaller(home, command=CMD, which=which_all, run=healthy_run(seen))
+    check = _check(i.doctor(["pi", "claude"]), "server")
+    assert check["status"] == "ok"
+    assert check["data"]["harness"] == "pi"
+    assert check["data"]["harness_source"] == "managed harness"
+    argv = seen[-1]
+    assert argv[argv.index("--harness") + 1] == "pi"
+    assert argv[argv.index("--project") + 1] == "canary"
+
+
+def test_a_project_without_credentials_is_not_reported_as_a_failed_server(home):
+    cfg_dir = home / ".config" / "herdr-memory"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(json.dumps({"url": "https://memory.example",
+        "projects": {"canary": {"paths": [str(home / "repo")]}}}))
+
+    def run(argv, timeout=5.0):
+        return subprocess.CompletedProcess(argv, 0, stdout='{"healthy": false, "reason": "unreachable"}',
+                                           stderr="")
+    i = mi.MemoryInstaller(home, command=CMD, which=which_all, run=run)
+    check = _check(i.doctor(["claude"]), "server")
+    assert check["status"] == "unknown"
+    assert "cannot probe without a credential" in check["detail"]
+    assert check["data"]["harness"] is None
+
+
+def test_probe_harness_falls_back_to_any_configured_credential(home):
+    cfg = write_client_config(home, _project_config())
+    assert mi.MemoryInstaller.probe_harness(cfg, "canary", prefer=("opencode",)) == (
+        "pi", "first configured credential")
+    assert mi.MemoryInstaller.probe_harness(cfg, "canary", prefer=("pi",)) == ("pi", "managed harness")
+    assert mi.MemoryInstaller.probe_harness(cfg, None)[1] == "no project to select a credential for"
 
 
 # ---- CLI -------------------------------------------------------------------

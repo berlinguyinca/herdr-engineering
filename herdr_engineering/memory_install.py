@@ -35,9 +35,9 @@ from typing import Any
 MARKER = "herdr-memory:managed"
 ADAPTER_VERSION = 1
 # Pinned herdr-memory revision; must match lock/upstreams.yaml (tested).
-PINNED_REVISION = "89a8529"
+PINNED_REVISION = "685cf07"
 #: Client release the fleet is expected to run (`herdr-memory --version`).
-PINNED_CLIENT_VERSION = "0.1.3"
+PINNED_CLIENT_VERSION = "0.1.4"
 #: An unattended controller update older than this looks like a timer that stopped landing.
 FRESH_UPDATE_HOURS = 26
 SERVER_NAME = "herdr-memory"
@@ -895,7 +895,7 @@ class MemoryInstaller:
         cfg = config_path or Path(os.environ.get("HERDR_MEMORY_CONFIG") or
                                   self.home / ".config" / "herdr-memory" / "config.json")
         checks.extend(check_credentials(Path(cfg), self.home))
-        checks.append(self.server_health(Path(cfg)))
+        checks.append(self.server_health(Path(cfg), prefer=[r.harness for r in verified.reports]))
         statuses = {c["status"] for c in checks}
         overall = "fail" if "fail" in statuses else "warn" if "warn" in statuses else \
             "unknown" if "unknown" in statuses else "ok"
@@ -926,35 +926,70 @@ class MemoryInstaller:
                       f"{len(projects)} projects configured; run inside a mapped directory "
                       "or set default_project")
 
-    def server_health(self, cfg: Path) -> dict:
+    @staticmethod
+    def probe_harness(cfg: Path, project: str | None, prefer=()) -> tuple[str | None, str]:
+        """Which harness to probe as, so the client has a credential to send (#579 follow-up).
+
+        The client defaults to `codex` when no `--harness` is given, and a project with no
+        codex credential reports `unreachable`/`missing_credential` - so probing with the
+        default turned a credential-layout fact into a false server FAIL (the same defect
+        class as D19). Prefer a harness doctor is actually managing, else any configured
+        credential; when the project has none, report that instead of blaming the server.
+        """
+        try:
+            config = json.loads(cfg.read_text())
+        except (OSError, ValueError):
+            return None, "client config unreadable"
+        if not isinstance(config, dict) or not project:
+            return None, "no project to select a credential for"
+        credentials = (config.get("projects", {}).get(project, {}) or {}).get("credentials", {})
+        available = sorted(name for name, path in (credentials or {}).items()
+                           if isinstance(path, str) and path.strip())
+        if not available:
+            return None, f"project {project} has no configured credentials"
+        for harness in prefer:
+            if harness in available:
+                return harness, "managed harness"
+        return available[0], "first configured credential"
+
+    def server_health(self, cfg: Path, prefer=()) -> dict:
         exe = self.which("herdr-memory")
         if not exe:
             return {"name": "server", "status": "unknown", "detail": "herdr-memory CLI not on PATH", "data": {}}
         project, source = self.probe_project(cfg)
+        harness, harness_source = self.probe_harness(cfg, project, prefer)
         argv = [exe, "--config", str(cfg)]
         if project:
             argv += ["--project", project]
+        if harness:
+            argv += ["--harness", harness]
         argv.append("status")
+        seen = {"project": project, "project_source": source,
+                "harness": harness, "harness_source": harness_source}
         try:
             out = self.run(argv)
             data = json.loads(out.stdout)
         except (OSError, subprocess.TimeoutExpired, ValueError):
             return {"name": "server", "status": "unknown", "detail": "herdr-memory status unreachable",
-                    "data": {"project": project, "project_source": source}}
+                    "data": seen}
         if not isinstance(data, dict) or "healthy" not in data:
             detail = "status did not report health (older client or error)"
             if project is None:
                 detail = f"status has no project to report on: {source}"
             return {"name": "server", "status": "unknown", "detail": detail,
-                    "data": {"project": project, "project_source": source,
-                             "error": data.get("error") if isinstance(data, dict) else None}}
-        seen = {"project": project, "project_source": source}
+                    "data": {**seen, "error": data.get("error") if isinstance(data, dict) else None}}
         if data["healthy"] is True:
             return {"name": "server", "status": "ok", "detail": "healthy",
                     "data": {**seen, **{k: data.get(k) for k in
                                         ("outbox_pending", "dead_letter", "server_version")}}}
+        reason = data.get("reason")
+        if harness is None and reason in ("missing_credential", "unreachable"):
+            # Nothing was sent to authenticate with; health is unknown, not failed.
+            return {"name": "server", "status": "unknown",
+                    "detail": f"cannot probe without a credential: {harness_source}",
+                    "data": {**seen, **{k: data.get(k) for k in ("outbox_pending", "dead_letter", "reason")}}}
         return {"name": "server", "status": "fail",
-                "detail": f"server reports unhealthy{': ' + str(data.get('reason')) if data.get('reason') else ''}",
+                "detail": f"server reports unhealthy{': ' + str(reason) if reason else ''}",
                 "data": {**seen, **{k: data.get(k) for k in ("outbox_pending", "dead_letter", "reason")}}}
 
 

@@ -13,11 +13,11 @@ dependencies:
     note: "Required cross-harness artifact skill, installed into the same four harnesses as herdr-handoff."
   herdr-memory:
     source: "berlinguyinca/herdr-memory"
-    revision: "89a8529"
+    revision: "685cf07"
     decision: ADOPT
     license: "private"
-    maintenance: "active; private Hindsight-backed memory client (contract v1)"
-    note: "Optional (opt-in `scripts/install.sh --with-memory`); managed harness config via `herdr-eng memory install`. Pin must match herdr_engineering.memory_install.PINNED_REVISION."
+    maintenance: "active; private Hindsight-backed memory client (contract v1, client 0.1.4)"
+    note: "Optional (opt-in `scripts/install.sh --with-memory`); managed harness config via `herdr-eng memory install`. Pin must match herdr_engineering.memory_install.PINNED_REVISION (and PINNED_CLIENT_VERSION, 0.1.4)."
   herdr-memory-deploy:
     source: "berlinguyinca/herdr-memory"
     revision: "c4e0c64"
