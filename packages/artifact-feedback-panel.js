@@ -82,7 +82,7 @@ export function mountFeedbackPanel(container, client, artifactId, { signal } = {
 
   const dismiss = async id => {
     if (disposed || !id || state.busy.has(id)) return;
-    if (typeof globalThis.confirm === 'function' && !globalThis.confirm('Dismiss this annotation? It will no longer appear as open.')) return;
+    if (typeof globalThis.confirm !== 'function' || !globalThis.confirm('Dismiss this annotation? It will no longer appear as open.')) return;
     state.busy.add(id); render();
     try {
       await client.dismissArtifactAnnotation(artifactId, id, { signal: aborter.signal });
@@ -92,8 +92,9 @@ export function mountFeedbackPanel(container, client, artifactId, { signal } = {
     } catch (error) {
       if (disposed) return;
       state.busy.delete(id);
-      state.note = error?.status === 409 ? 'That annotation is no longer open.' : 'The annotation could not be dismissed.';
-      render();
+      const note = error?.status === 409 ? 'That annotation is no longer open.' : 'The annotation could not be dismissed.';
+      await load();
+      if (!disposed && !state.error) { state.note = note; render(); }
     }
   };
 

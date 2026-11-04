@@ -36,3 +36,9 @@ test('dismissArtifactAnnotation POSTs an empty object to the encoded dismiss pat
   assert.deepEqual(calls[0].body, {});
   assert.equal(calls[0].signal, controller.signal);
 });
+
+test('listArtifactAnnotations passes limit through', async () => {
+  const { client, calls } = recorder();
+  await client.listArtifactAnnotations('a1', { limit: 50 });
+  assert.equal(calls[0].url, 'http://h/api/v1/artifacts/a1/annotations?status=open&limit=50');
+});

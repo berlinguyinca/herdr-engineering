@@ -276,8 +276,9 @@ export class HerdrClient {
   }
 
   /** Annotations on an artifact's shares (owner view): one page, newest first; pass the returned `next` as `before`. */
-  listArtifactAnnotations(id, { status = 'open', before, signal } = {}) {
+  listArtifactAnnotations(id, { status = 'open', limit, before, signal } = {}) {
     const query = new URLSearchParams({ status });
+    if (limit !== undefined && limit !== null) query.set('limit', String(limit));
     if (before !== undefined && before !== null) query.set('before', before);
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/annotations?${query}`, { signal });
   }

@@ -133,3 +133,49 @@ test('dispose removes listeners and aborts', async () => {
   assert.equal(sig.aborted, true);
   assert.equal([...Object.values(c.listeners)].reduce((n, s) => n + s.size, 0), 0);
 });
+
+test('every viewer-controlled field is escaped, including attribute breakouts', () => {
+  const evil = '"><img src=x onerror=alert(1)>';
+  const hostile = {
+    annotation_id: evil, author_email: evil, author_role: evil, version_number: evil, status: evil, body: evil,
+    created_at: evil, edited_at: evil, addressed_in_version_id: evil, addressed_in_version_number: evil,
+    anchor: { kind: 'pdf_page', file: evil, page: evil, exact: evil, region: { x: evil, y: 0, w: 0, h: 0 } },
+  };
+  for (const row of [{ ...hostile, status: 'open' }, hostile, { ...hostile, anchor: { kind: 'text_quote', file: evil, prefix: evil, exact: evil, suffix: evil } },
+    { ...hostile, anchor: { kind: 'image_region', file: evil, x: evil, y: evil, w: evil, h: evil } }, { ...hostile, anchor: { kind: evil, file: evil } }]) {
+    assertInert(renderAnnotationRow(row, { artifactId: evil }));
+  }
+  const open = renderAnnotationRow({ ...hostile, status: 'open' }, { artifactId: evil });
+  assert.match(open, /data-annotation-id="&quot;&gt;&lt;img/);
+  assert.doesNotMatch(open, /"><img/);
+  assert.doesNotMatch(renderAnnotationRow(hostile, { artifactId: evil }), /"><img|<img/);
+  assertInert(renderEvents([{ kind: evil, at: evil, actor: evil, detail: evil }]));
+});
+
+test('a failed dismiss (409, 404, 503) reloads so the row has no live Dismiss', async () => {
+  for (const status of [409, 404, 503]) {
+    let gone = false;
+    const client = {
+      listArtifactAnnotations: async () => ok(gone ? [{ ...base, status: 'dismissed' }] : [base]),
+      dismissArtifactAnnotation: async () => { gone = true; throw Object.assign(new Error('x'), { status }); },
+    };
+    const c = fake(); const h = mountFeedbackPanel(c, client, 'art1', {});
+    await tick();
+    const real = globalThis.confirm; globalThis.confirm = () => true;
+    try { c.fire('click', { disabled: false, dataset: { feedbackAction: 'dismiss', annotationId: 'a1' } }); await tick(); await tick(); } finally { globalThis.confirm = real; }
+    assert.doesNotMatch(c.html, /data-feedback-action="dismiss"/, String(status));
+    assert.match(c.html, status === 409 ? /no longer open/ : /could not be dismissed/);
+    h.dispose();
+  }
+});
+
+test('without confirm() nothing is dismissed', async () => {
+  let calls = 0;
+  const client = { listArtifactAnnotations: async () => ok([base]), dismissArtifactAnnotation: async () => { calls++; return {}; } };
+  const c = fake(); const h = mountFeedbackPanel(c, client, 'art1', {});
+  await tick();
+  const real = globalThis.confirm; delete globalThis.confirm;
+  try { c.fire('click', { disabled: false, dataset: { feedbackAction: 'dismiss', annotationId: 'a1' } }); await tick(); } finally { if (real) globalThis.confirm = real; }
+  assert.equal(calls, 0);
+  h.dispose();
+});
