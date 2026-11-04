@@ -423,3 +423,20 @@ def test_the_one_shared_upload_validator(mime):
     from herdr_engineering.media_type import canonical_upload_media_type
     assert canonical_upload_media_type(mime) is None
     assert canonical_upload_media_type(None) is None and canonical_upload_media_type("a/" + "b" * 300) is None
+
+
+@pytest.mark.parametrize("unit", ["<style>", "<style ", "<style></style", "<style x='>", "</style "])
+def test_drop_style_elements_is_linear_on_raw_text(unit):
+    import time
+    from herdr_engineering.control_plane.artifact_render_api import drop_style_elements
+    text = unit * (400_000 // len(unit))
+    started = time.monotonic()
+    out = drop_style_elements(text)
+    assert time.monotonic() - started < 3.0
+    assert "<style" not in out.lower().replace("&lt;style", "")
+
+
+def test_drop_style_elements_still_cuts_balanced_elements_and_defangs_leftovers():
+    from herdr_engineering.control_plane.artifact_render_api import drop_style_elements
+    assert drop_style_elements("a<style>b{}</style>c<STYLE x>d</style >e") == "ace"
+    assert drop_style_elements("a<style>b") == "a&lt;style>b"

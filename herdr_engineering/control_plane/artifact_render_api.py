@@ -128,13 +128,28 @@ def _send_json(handler, body: dict, status: int = 200) -> None:
 # The dashboard has no CSP, so a style element (url(), @import, CSS escapes) would make the owner's browser fetch
 # whatever URL the author names, LAN and loopback included. The sanitiser's output is canonical markup, so the
 # elements are cut out after the fact; a leftover opener (unclosed element) is defanged rather than trusted.
-_STYLE_ELEMENT = re.compile(r"<style\b[^>]*>.*?</style\s*>", re.I | re.S)
+_STYLE_OPENER = re.compile(r"<style\b", re.I)
+_STYLE_CLOSER = re.compile(r"</style\s*>", re.I)
 _STYLE_TOKEN = re.compile(r"<(/?)style", re.I)
 
 
 def drop_style_elements(html: str) -> str:
-    """``html`` without any style element (the share ``a/`` view keeps them: it has its own CSP)."""
-    return _STYLE_TOKEN.sub(lambda m: "&lt;" + m.group(1) + "style", _STYLE_ELEMENT.sub("", html))
+    """``html`` without any style element (the share ``a/`` view keeps them: it has its own CSP).
+
+    One forward pass: every step moves past the text it looked at, so raw text such as ``"<style>" * N`` is linear."""
+    kept, pos = [], 0
+    while True:
+        opener = _STYLE_OPENER.search(html, pos)
+        if opener is None:
+            break
+        tag_end = html.find(">", opener.end())
+        closer = _STYLE_CLOSER.search(html, tag_end + 1) if tag_end >= 0 else None
+        if closer is None:
+            break                       # nothing later can close it either: the leftover is defanged below
+        kept.append(html[pos:opener.start()])
+        pos = closer.end()
+    kept.append(html[pos:])
+    return _STYLE_TOKEN.sub(lambda m: "&lt;" + m.group(1) + "style", "".join(kept))
 
 
 def _envelope(kind: str, data: bytes, resolve: Resolver, cache_key) -> dict:

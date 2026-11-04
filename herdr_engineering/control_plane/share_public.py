@@ -767,6 +767,8 @@ def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
     for match in _SCAN.finditer(data):
         tag = match.group("tag")
         if tag is not None:
+            if tag.lower() == b"html" and html_end is not None:
+                continue         # only the first <html> tag can be the anchor; matching its end again would rescan
             end = _TAG_END.match(data, match.end())
             if end is None:
                 return None                      # an unterminated start tag: nothing safe to anchor on
