@@ -10,6 +10,7 @@ import { defineComponents } from './herdr-web-components/index.js';
 import { missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { mountInspector } from './inspector-view.js';
 import { mountSessionWorkspace } from './session-workspace.js';
+import { mountSessionContext } from './session-context.js';
 import { mountTerminalAttach } from './terminal-attach.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
@@ -895,6 +896,7 @@ async function viewSession(parts, revision) {
        ${terminal ? `<p class="sd-meta">${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.</p>` : ''}
        ${TABS_STYLE}${tabsHtml(activeTab)}
       <div id="agent-panel-overview" role="tabpanel" tabindex="0" aria-labelledby="agent-tab-overview"${activeTab === 'overview' ? '' : ' hidden'}>
+       <div id="session-context"></div>
        <div id="session-story"></div>
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       <div id="related-panel"></div>
@@ -939,7 +941,9 @@ async function viewSession(parts, revision) {
       },
     });
     if (activeTab === 'evolution') startEvolution();
-    const disposeSession = combineDisposers(relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.(), () => evolution?.dispose());
+    // Work Context: read-only parent mission, measured progress and sibling agents; distinct from the terminal attach panel below.
+    const disposeContext = mountSessionContext(document.getElementById('session-context'), client, s, {signal: controller.signal, onLinked: () => document.getElementById('session-mission')?.setAttribute('hidden', '')});
+    const disposeSession = combineDisposers(disposeContext, relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.(), () => evolution?.dispose());
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();
