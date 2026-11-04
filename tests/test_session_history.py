@@ -260,3 +260,109 @@ def test_history_reports_every_recorded_cwd_latest_last(tmp_path):
     out = sh.read_history(sh.resolve(agent="claude", session="multi", home=tmp_path), home=tmp_path)
     assert out["cwd"] == "/work/wt-b"                       # where the session ended up
     assert out["cwds"] == ["/work/wt-a", "/work", "/work/wt-b"]    # ordered by last use, no duplicates
+
+
+# --- real user prompts, untrimmed and harness-neutral (session drift graph) ---
+
+import pytest
+
+
+@pytest.mark.parametrize("text", ["", "<task-notification>x", "<system-reminder>x", "<environment_context>x",
+                                  "<command-name>/x", "<local-command-stdout>", "<pasted_content id='a'>x"])
+def test_is_human_prompt_rejects_injected_wrappers(text):
+    assert sh.is_human_prompt(text) is False
+
+
+@pytest.mark.parametrize("text", ["fix the usb stick script", "why does a < b fail in x<y?"])
+def test_is_human_prompt_accepts_real_text(text):
+    assert sh.is_human_prompt(text) is True
+
+
+@pytest.mark.parametrize("value", ["2026-01-01T00:00:00Z", "2026-01-01T00:00:00+00:00", "2026-01-01T01:00:00+01:00",
+                                   1767225600000, 1767225600, 1767225600.0])
+def test_normalize_ts_gives_utc_seconds(value):
+    assert sh.normalize_ts(value) == "2026-01-01T00:00:00Z"
+
+
+@pytest.mark.parametrize("value", [None, "", "garbage", "t1", [], True])
+def test_normalize_ts_gives_none_for_the_unusable(value):
+    assert sh.normalize_ts(value) is None
+
+
+def _user(i, text=None):
+    return {"kind": "user", "ts": f"2026-01-01T00:{i % 60:02d}:00Z", "text": text or f"prompt {i}"}
+
+
+def test_prompts_numbered_among_real_prompts_only():
+    events = [_user(1), {"kind": "assistant", "ts": None, "text": "ok"}, _user(2, "<task-notification>n"),
+              _user(3, "<system-reminder>r"), _user(4)]
+    prompts, total = sh.build_prompts(events)
+    assert total == 2 and [p["n"] for p in prompts] == [1, 2] and prompts[1]["text"] == "prompt 4"
+    assert prompts[0]["ts"] == "2026-01-01T00:01:00Z"
+
+
+def test_prompt_text_is_clipped_to_120():
+    prompts, _ = sh.build_prompts([_user(1, "x" * 500)])
+    assert len(prompts[0]["text"]) <= 120
+
+
+def test_prompts_text_sampling_keeps_every_n_and_ts():
+    prompts, total = sh.build_prompts([_user(i) for i in range(500)], text_limit=400)
+    assert total == 500 and [p["n"] for p in prompts] == list(range(1, 501))
+    assert all(p["ts"] for p in prompts)
+    with_text = [p["n"] for p in prompts if "text" in p]
+    assert len(with_text) == 400 and with_text[:50] == list(range(1, 51)) and with_text[-50:] == list(range(451, 501))
+
+
+def test_prompts_survive_the_event_trim(tmp_path):
+    rows = [{"type": "user", "timestamp": f"2026-01-01T00:{i % 60:02d}:00Z", "message": {"content": f"m{i}"}} for i in range(200)]
+    _jl(tmp_path / ".claude/projects/-w/long.jsonl", rows)
+    out = sh.read_history(sh.resolve(agent="claude", session="long", home=tmp_path), home=tmp_path, max_events=100)
+    assert out["events_omitted_from_middle"] == 100 and len(out["events"]) == 100
+    assert out["prompts_total"] == 200 and [p["n"] for p in out["prompts"]] == list(range(1, 201))
+
+
+def _prompt_session(agent, home):
+    inj = "<system-reminder>injected"
+    if agent == "claude":
+        _jl(home / ".claude/projects/-w/p1.jsonl", [
+            {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "first"}},
+            {"type": "user", "timestamp": "2026-01-01T00:01:00Z", "message": {"content": inj}},
+            {"type": "user", "timestamp": "2026-01-01T00:02:00Z", "message": {"content": "second"}}])
+    elif agent == "pi":
+        mk = lambda ts, t: {"type": "message", "timestamp": ts, "message": {"role": "user", "content": [{"type": "text", "text": t}]}}  # noqa: E731
+        _jl(home / ".pi/agent/sessions/--w--/2026_p1.jsonl", [
+            {"type": "session", "id": "p1", "cwd": "/w"}, mk("2026-01-01T00:00:00Z", "first"),
+            mk("2026-01-01T00:01:00Z", inj), mk("2026-01-01T00:02:00Z", "second")])
+    elif agent == "codex":
+        mk = lambda ts, t: {"type": "response_item", "timestamp": ts, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": t}]}}  # noqa: E731
+        _jl(home / ".codex/sessions/2026/01/01/rollout-x-p1.jsonl", [
+            mk("2026-01-01T00:00:00Z", "first"), mk("2026-01-01T00:01:00Z", inj), mk("2026-01-01T00:02:00Z", "second")])
+    else:
+        db = home / ".local/share/opencode/opencode.db"
+        db.parent.mkdir(parents=True)
+        con = sqlite3.connect(db)
+        con.executescript("""create table session(id text primary key, parent_id text, time_updated integer);
+            create table message(id text primary key, session_id text, time_created integer, data text);
+            create table part(id text primary key, message_id text, session_id text, time_created integer, data text);""")
+        con.execute("insert into session values('p1',null,9)")
+        for i, (mid, text) in enumerate((("m1", "first"), ("m2", inj), ("m3", "second"))):
+            ms = 1767225600000 + i * 60000
+            con.execute("insert into message values(?,?,?,?)", (mid, "p1", ms, json.dumps({"role": "user"})))
+            con.execute("insert into part values(?,?,?,?,?)", ("p" + mid, mid, "p1", ms, json.dumps({"type": "text", "text": text})))
+        con.commit(); con.close()
+
+
+@pytest.mark.parametrize("agent", ["claude", "pi", "codex", "opencode"])
+def test_prompts_per_harness(tmp_path, agent):
+    _prompt_session(agent, tmp_path)
+    out = sh.read_history(sh.resolve(agent=agent, session="p1", home=tmp_path), home=tmp_path)
+    assert [(p["n"], p["text"]) for p in out["prompts"]] == [(1, "first"), (2, "second")]
+    assert out["prompts_total"] == 2
+    assert [p["ts"] for p in out["prompts"]] == ["2026-01-01T00:00:00Z", "2026-01-01T00:02:00Z"]
+
+
+def test_dispatch_timestamps_are_reported(tmp_path):
+    claude_fixture(tmp_path)
+    out = sh.read_history(sh.resolve(agent="claude", session="c1", home=tmp_path), home=tmp_path)
+    assert out["dispatch_ts"] == [None]          # one child dispatch whose fixture timestamp is not a real time
