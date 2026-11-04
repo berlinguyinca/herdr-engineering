@@ -370,7 +370,11 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
         raise
     pid = proc.pid
 
+    exited = threading.Event()  # set once the child is a zombie: never signal its pid then
+
     def forward(signum: int, _frame: Any) -> None:
+        if exited.is_set():
+            return
         if run is not None:
             run.note_forwarded_signal()
         try:
@@ -401,6 +405,18 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
     th = threading.Thread(target=sampler, daemon=True)
     th.start()
     try:
+        # Wait WITHOUT reaping: while the child is a zombie its pid cannot be
+        # recycled, so signal forwarding and the heartbeat/cancel thread are
+        # shut down first and only then is the pid released with wait4.
+        while True:
+            try:
+                os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+                break
+            except InterruptedError:
+                continue
+        exited.set()
+        if run is not None:
+            run.halt()
         while True:
             try:
                 _, status, ru = os.wait4(pid, 0)
@@ -408,6 +424,7 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
             except InterruptedError:
                 continue
     finally:
+        exited.set()
         stop.set()
         th.join(timeout=1)
         for s, h in old.items():

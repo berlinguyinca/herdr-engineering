@@ -521,3 +521,56 @@ def test_non_recorded_path_creates_no_registry(tmp_path):
         f"sys.exit(run_gated(['true'], slots=2, max_load=0, state_dir={str(tmp_path)!r}))")
     assert subprocess.run([sys.executable, "-c", script]).returncode == 0
     assert not (tmp_path / br.DB_NAME).exists()
+
+
+# --- review fixes: M1 child pid, M2 lease required, M3 pid-reuse safe signals ----------
+
+def test_build_run_records_child_pid_so_reconcile_spares_live_build(tmp_path):
+    state = tmp_path / "state"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        run = br.BuildRun.open(state, cwd=str(tmp_path), cmd_kind="cargo build", host="h",
+                               cmd=["cargo", "build"], ttl_s=0.2)
+        run.on_spawn(child.pid)
+        row = run.registry.get_attempt(run.reg.attempt_id)
+        assert row["pid"] == child.pid
+        assert row["pid_starttime"] == br.proc_starttime(child.pid)
+        run._stop.set()  # the wrapper "dies": heartbeats stop, lease expires
+        time.sleep(0.5)
+        assert run.registry.reconcile() == []  # child alive => not owner_vanished
+        assert run.registry.get_attempt(run.reg.attempt_id)["state"] == "running"
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_finish_without_lease_after_takeover_is_fenced(reg, clock):
+    a, b = new(reg, input_digest=None), new(reg, input_digest=None)
+    drive(reg, a.attempt_id, "classified", "admitted")
+    drive(reg, b.attempt_id, "classified", "admitted")
+    la = reg.acquire_lease("/tmp/ws-fence", a.attempt_id, 5)
+    reg.transition(a.attempt_id, "running", "go", lease=la)
+    clock.t += 6
+    reg.acquire_lease("/tmp/ws-fence", b.attempt_id, 5)  # takeover, epoch 2
+    with pytest.raises(br.FencedError):
+        reg.finish(a.attempt_id, "completed", "exit_0", exit_code=0)
+    with pytest.raises(br.FencedError):
+        reg.transition(a.attempt_id, "publishing", "x")
+    assert reg.get_attempt(a.attempt_id)["state"] == "running"
+
+
+def test_halt_stops_heartbeat_and_cancel_signals(tmp_path):
+    state = tmp_path / "state"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        run = br.BuildRun.open(state, cwd=str(tmp_path), cmd_kind="cargo build", host="h",
+                               cmd=["cargo", "build"], ttl_s=0.2)
+        run.on_spawn(child.pid)
+        run.halt()  # called before the child is reaped
+        run.registry.request_cancel(run.build_id, "late")
+        time.sleep(0.5)
+        assert child.poll() is None  # no signal after halt
+        assert run._thread is None or not run._thread.is_alive()
+    finally:
+        child.kill()
+        child.wait()

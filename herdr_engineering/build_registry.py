@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS leases (
   ttl_s REAL NOT NULL, heartbeat_ts REAL NOT NULL, acquired_ts REAL NOT NULL,
   released_ts REAL);
 CREATE TABLE IF NOT EXISTS scope_epochs (scope TEXT PRIMARY KEY, last_epoch INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS attempt_leases (
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts (attempt_id) ON DELETE CASCADE,
+  scope TEXT NOT NULL, epoch INTEGER NOT NULL);
 """
 
 
@@ -371,6 +374,11 @@ class Registry:
                 "epoch=excluded.epoch, ttl_s=excluded.ttl_s, heartbeat_ts=excluded.heartbeat_ts, "
                 "acquired_ts=excluded.acquired_ts, released_ts=NULL",
                 (norm, attempt_id, epoch, float(ttl_s), now, now))
+            # Remember that this attempt was ever leased: a stale writer that
+            # omits its lease must still be fenced after a takeover.
+            conn.execute("INSERT INTO attempt_leases (attempt_id, scope, epoch) VALUES (?,?,?) "
+                         "ON CONFLICT(attempt_id) DO UPDATE SET scope=excluded.scope, "
+                         "epoch=excluded.epoch", (attempt_id, norm, epoch))
             return Lease(norm, attempt_id, epoch, float(ttl_s))
 
         return self._tx(work)
@@ -402,8 +410,28 @@ class Registry:
 
     # -- transitions
     def _holds_active_lease(self, conn: sqlite3.Connection, attempt_id: str) -> bool:
-        return conn.execute("SELECT 1 FROM leases WHERE owner_attempt_id=? AND "
-                            "released_ts IS NULL", (attempt_id,)).fetchone() is not None
+        """True when the attempt ever acquired a lease (still held, released or taken over).
+
+        A later mutation without the lease is a stale-writer bypass. Reconcile
+        and ``record_pid`` are the only lease-less mutators and do not use this.
+        """
+        return conn.execute("SELECT 1 FROM attempt_leases WHERE attempt_id=?",
+                            (attempt_id,)).fetchone() is not None
+
+    def record_pid(self, attempt_id: str, pid: int, *, lease: Lease | None = None) -> None:
+        """Store the pid (and start time) of the process that really owns the build."""
+        starttime = proc_starttime(pid)
+
+        def work(conn: sqlite3.Connection) -> None:
+            if lease is not None:
+                if lease.attempt_id != attempt_id:
+                    raise FencedError("lease belongs to a different attempt")
+                self._check_fence(conn, lease)
+            elif self._holds_active_lease(conn, attempt_id):
+                raise FencedError("attempt holds a lease; present it to mutate state")
+            conn.execute("UPDATE attempts SET pid=?, pid_starttime=? WHERE attempt_id=?",
+                         (pid, starttime, attempt_id))
+        self._tx(work)
 
     def _apply(self, conn: sqlite3.Connection, attempt_id: str, to_state: str,
                reason: str, exit_code: int | None) -> None:
@@ -639,6 +667,9 @@ class BuildRun:
         if self.unavailable or self.reg is None or self.registry is None:
             return
         try:
+            # The wrapper's pid was recorded at registration; the BUILD is the
+            # child (it can outlive a SIGKILLed wrapper), so liveness must follow it.
+            self.registry.record_pid(self.reg.attempt_id, child_pid, lease=self.lease)
             self.registry.transition(self.reg.attempt_id, "running", "child_started",
                                      lease=self.lease)
         except Exception:  # noqa: BLE001
@@ -646,6 +677,13 @@ class BuildRun:
             return
         self._thread = threading.Thread(target=self._beat, args=(child_pid,), daemon=True)
         self._thread.start()
+
+    def halt(self) -> None:
+        """Stop the heartbeat/cancel thread. Call BEFORE the child is reaped so no
+        signal can reach a recycled pid."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=7)
 
     def note_forwarded_signal(self) -> None:
         self._forwarded = True
@@ -657,7 +695,7 @@ class BuildRun:
                 if self.lease is not None and self.registry is not None:
                     self.registry.heartbeat(self.lease)
                 if (self.registry is not None and self.reg is not None
-                        and not self._cancel_sent
+                        and not self._cancel_sent and not self._stop.is_set()
                         and self.registry.cancel_requested(self.reg.build_id)):
                     self._cancel_sent = True
                     os.kill(child_pid, signal.SIGTERM)  # our own child only
@@ -668,9 +706,7 @@ class BuildRun:
 
     def on_exit(self, exit_code: int | None, *, signaled: bool = False,
                 spawn_failed: bool = False) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2)
+        self.halt()
         if self.reg is None or self.registry is None:
             return
         if spawn_failed or exit_code is None:
