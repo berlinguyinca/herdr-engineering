@@ -16,8 +16,10 @@ Security rules (see the plan's Global Constraints and Review Focus):
   once as strict UTF-8 (a decoded ``/``, ``\\`` or NUL is refused), normalised by ``normalise_name`` and looked up in
   the state's file index. Request paths are never joined onto the filesystem; files are opened by walking the
   index name component by component with ``openat`` and ``O_NOFOLLOW`` and must be regular files of the indexed size.
-* Tokens, sessions and Authorization values are never written to events or logs (the stdlib request log is disabled).
-* No request body is ever read; a request that announces one gets its response and the connection closed.
+* Tokens, sessions, CSRF tokens, nonces and Authorization values are never written to events or logs (the stdlib request
+  log is disabled).
+* No request body is ever read, EXCEPT the three annotation POSTs (below); any other request that announces a body gets
+  its response and the connection closed.
 
 Lab shares (``audience: lab``) add, only when the lab settings are complete (else every lab route is the 404):
 
@@ -29,15 +31,56 @@ Lab shares (``audience: lab``) add, only when the lab settings are complete (els
   ``session_seconds``, the share's expiry and the access token's ``exp``. Rate-limited per share and globally. OPTIONS
   on it is the 404, so a cross-origin page cannot get a preflight for the ``Authorization`` header.
 * ``GET/HEAD/OPTIONS /s/<token>/k/<session>/f/<path>`` -> the session is checked against the share's CURRENT state on
-  every request (a revoke or expiry kills it at once), then the file is served exactly like a public one.
+  every request (a revoke or expiry kills it at once), then the file is served exactly like a public one. For a
+  document navigation of an HTML file of a lab share with annotations enabled, one fixed mode-switch link is injected
+  (``mode_switch_link``); every other response is byte-for-byte the raw file.
+
+The lab route table (``_ROUTES``; everything else, every other method and every OPTIONS on the ``v/``, ``a/``,
+annotation and ``session`` routes is the uniform 404; POST is accepted ONLY for ``session`` and the two annotation POST
+routes). Path parts are ``['', 's', token, 'k', session, ...]``:
+
+====================================================  =============  ================================================
+path after ``/s/<token>/``                            methods        match
+====================================================  =============  ================================================
+``session``                                           POST           ``len == 4``
+``k/<session>/f/<path>``                              GET, HEAD      ``len >= 7``, ``parts[5] == 'f'``
+``k/<session>/v/<path>``, ``k/<session>/a/<path>``    GET, HEAD      ``len >= 7``, ``parts[5] in ('v', 'a')``
+``k/<session>/annotations``                           GET, POST      ``len == 6``, ``parts[5] == 'annotations'``
+``k/<session>/annotations/<aid>/edit|delete``         POST           ``len == 8``, ``parts[5] == 'annotations'``,
+                                                                     ``parts[7] in ('edit', 'delete')``
+====================================================  =============  ================================================
+
+* ``v/<path>`` is the live view of a non-HTML file, built from our own template (``share_static/view.html``) under a
+  nonce CSP; it is sent without CORS. ``a/<path>`` is the annotation view of ANY kind (``ANNOTATE_CSP``: per-response
+  nonce + ``strict-dynamic``, same-origin fetches only, no frames). HTML is sanitised in the isolated render child and
+  mounted in a declarative shadow root inside ``#herdr-viewport`` (``contain: paint``, ``overflow: clip``), so neither
+  its markup, ids nor styles reach our mode bar, panel, data node or the CSRF meta, which is delivered ONLY in this
+  page. It needs annotations enabled; otherwise the uniform 404.
+* The annotations GET needs the same write cookie (a stolen session URL alone reads nothing). The ``a/`` page, ``f/`` and
+  ``v/`` do not: a navigation out of the opaque-origin ``f/`` page is cross-site and arrives without it.
+* The annotation POSTs are the only routes that read a body. A POST is refused (uniform 404, reason ``annotate_refused``)
+  unless the session is valid and the share's allow-list still admits its email (``share_lab.still_admitted``: an email
+  removed from ``allow_emails`` stops writing at once when the session's MAC'd admission basis is ``e``; a session
+  admitted by a group claim (basis ``g``) needs the share to still have ``allow_groups``, but a removed group MEMBER
+  keeps writing until the session expires), ``Origin`` equals the share origin exactly, the CSRF
+  header passes a constant-time check, the write cookie (set by the ``session`` POST: HttpOnly, Secure, SameSite=Strict,
+  ``Path=/s/<token>/``, a MAC over the session under its own domain label) is present and valid, ``Content-Type`` is exactly ``application/json`` and there is exactly one ``Content-Length`` of 1 to
+  32768 bytes and no ``Transfer-Encoding``. Accepted requests append one line to ``annotations.jsonl`` for the worker;
+  author identity and email come from the session only. Edits and deletes are decided against the viewer's own
+  read-back projection, so an annotation is editable only after the worker has ingested it.
+  A 201 or 202 means the request passed EDGE validation and its line was appended -- nothing more: the worker may still
+  deny it at ingest (caps, an unpublished version, a withdrawn share), and the viewer sees the outcome only through
+  the read-back projection. The lines are ASCII and refused (503) above ``ANNOTATION_LINE_MAX``.
 """
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import os
 import re
+import secrets
 import stat
 import threading
 import time
@@ -49,11 +92,43 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote_to_bytes, urlsplit
 
+from ..https_origin import HOST_PORT as _HOST
+from ..https_origin import https_origin as _https_origin
+from .annotation_anchor import (
+    ANNOTATION_ID_RE,
+    MAX_BODY_BYTES,
+    AnnotationInputError,
+    annotation_settings,
+    parse_annotation_request,
+    parse_delete_request,
+    parse_edit_request,
+)
 from .collab_bridge_files import _open_beneath
 from .collab_cognito import CognitoAuthenticator, SyncedDirectory
-from .share_bundle import ShareBundleError, content_type_for, normalise_name
-from .share_lab import authorise
-from .share_session import MIN_SECRET_BYTES, check_session, mint_session
+from .share_bundle import MAX_PROJECTION_BYTES, ShareBundleError, content_type_for, normalise_name
+from .share_lab import authorise, still_admitted
+from .share_render import (
+    MAX_RENDER_INPUT,
+    RESOLVER_VERSION,
+    RenderBusy,
+    RenderCache,
+    RenderFailed,
+    RenderTooLarge,
+    render_kind,
+    render_text,
+    sanitize_html,
+    share_resolver,
+    wrap_content,
+)
+from .share_session import (
+    MIN_SECRET_BYTES,
+    check_csrf,
+    check_session,
+    check_write_cookie,
+    csrf_token,
+    mint_session,
+    write_cookie_header,
+)
 
 log = logging.getLogger("herdr.share_public")
 
@@ -70,9 +145,23 @@ STATE_CACHE_SIZE = 256
 SESSION_PER_SHARE_PER_MINUTE = 30   # session attempts per share per minute (blunts token guessing)
 SESSION_GLOBAL_PER_MINUTE = 600     # verified session attempts across all lab shares per minute (bounds JWT work)
 STATIC_MAX_BYTES = 1024 * 1024
+VENDOR_MAX_BYTES = 4 * 1024 * 1024   # the vendored pdf.js worker is ~1.4 MB
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parent / "share_static"
 VIEWER_FILE = "viewer.html"
-STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8"}
+STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8",
+                "annotate.js": "text/javascript; charset=utf-8", "anchor.js": "text/javascript; charset=utf-8",
+                "annotate.css": "text/css; charset=utf-8"}
+VIEW_FILE = "view.html"
+ANNOTATIONS_MAX_BYTES = 32 * 1024 * 1024     # the annotations file cap (the worker rotates it long before)
+ANNOTATION_LINE_MAX = 65536                  # the worker's max_line_bytes: a longer line would be dropped at ingest
+MODE_SWITCH_MAX_BYTES = 2 * 1024 * 1024      # larger HTML files are served untouched (streamed), without the link
+MODE_SWITCH_ETAG_SUFFIX = "-m1"
+NONCE_BYTES = 18                             # token_urlsafe(18) is 24 characters
+# One level below static/vendor/pdfjs/: exactly the two vendored pdf.js modules (the licence and SHA256SUMS stay unserved).
+VENDOR_FILES = {"pdf.min.mjs": "text/javascript; charset=utf-8", "pdf.worker.min.mjs": "text/javascript; charset=utf-8"}
+# The URL carries no version, so a bump keeps the path: browsers revalidate every time (no-cache) against a strong
+# ETag that is the file's sha256 (the SHA256SUMS value), and get a 304 while it is unchanged.
+VENDOR_CACHE = "no-cache"
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 _SHARE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -80,9 +169,10 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _RAW_PATH_OK = re.compile(r"[\x21-\x5b\x5d-\x7e]*")   # printable ASCII without space and backslash
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _RANGE_SPEC = re.compile(r"(\d{0,19})-(\d{0,19})")
-_SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,512}")
-_HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::[0-9]{1,5})?")
+_SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,768}")
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_CONTENT_LENGTH = re.compile(r"[0-9]{1,6}")
+_VIEW_PLACEHOLDER = re.compile(r"\{\{(NONCE|MODE|CSRF_META|SWITCH|DATA_JSON|PANEL|CONTENT)\}\}")
 
 _CSP_TEMPLATE = ("sandbox allow-scripts allow-downloads; default-src {self}; script-src {self} 'unsafe-inline' "
                  "'wasm-unsafe-eval'; style-src {self} 'unsafe-inline'; img-src {self} data: blob:; font-src {self} data:; "
@@ -92,6 +182,32 @@ CSP = _CSP_TEMPLATE.format(self="'self'")   # without a configured public origin
 PDF_CSP = "frame-ancestors 'none'"
 VIEWER_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' {origin}; img-src 'self' data:; "
               "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+VIEW_CSP = ("default-src 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; style-src-elem {origin}/s/static/ "
+            "{origin}/s/{token}/ 'unsafe-inline'; style-src-attr 'unsafe-inline'; img-src {origin}/s/{token}/ data: blob:; "
+            "font-src {origin}/s/{token}/ {origin}/s/static/ data:; connect-src {origin}/s/{token}/; "
+            "worker-src {origin}/s/static/vendor/pdfjs/; frame-src 'none'; child-src 'none'; object-src 'none'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+# The annotation view: the plan's view policy (``VIEW_CSP``), path-scoped to this share, with these deviations.
+#   * img-src has NO ``blob:`` (the plan's ``data: blob:``): sanitised content images are same-share ``f/`` URLs or
+#     ``data:`` images, and pdf.js draws on canvases, so nothing needs a blob URL.
+#   * ``style-src-elem`` and ``style-src-attr`` keep ``'unsafe-inline'`` (as the plan does): the sanitiser keeps content
+#     <style> elements and style attributes inside the shadow root and they cannot carry our nonce. A style cannot run
+#     code, and no remote origin is allowed in either directive (an @import of a remote sheet cannot load).
+#   * font-src keeps ``data:`` (plan); there is no ``style-src`` (the two split directives cover every style use).
+# Verified in a real browser by tests/playwright/annotate-view.test.mjs.
+ANNOTATE_CSP = VIEW_CSP.replace("img-src {origin}/s/{token}/ data: blob:;", "img-src {origin}/s/{token}/ data:;")
+PDFJS_CONFIG = {"module": "/s/static/vendor/pdfjs/pdf.min.mjs", "worker": "/s/static/vendor/pdfjs/pdf.worker.min.mjs",
+                "options": {"isEvalSupported": False, "enableXfa": False}}
+MODE_SWITCH_TEMPLATE = (
+    '<a data-herdr-mode-switch href="{href}" rel="noopener" style="position:fixed;right:12px;bottom:12px;'
+    'z-index:2147483647;display:block;margin:0;padding:6px 12px;font:600 14px/1.4 system-ui,sans-serif;color:#fff;'
+    'background:#1f4fd1;border-radius:6px;text-decoration:none;box-shadow:0 1px 4px rgba(0,0,0,.4)">Annotate</a>')
+UNAVAILABLE_BODY = b"Unavailable\n"
+JSON_HEADERS = (("Content-Type", "application/json"), ("X-Content-Type-Options", "nosniff"),
+                ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),
+                ("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox"))
+TOO_LARGE_NOTE = ("This page is too large to show as a static copy \u2014 open the live page, or comment on the "
+                  "whole file")
 CORS_HEADERS = (("Access-Control-Allow-Origin", "*"),
                 ("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, ETag"))
 PREFLIGHT_HEADERS = (("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"),
@@ -121,6 +237,12 @@ class ShareConfig:
     signing_secret: bytes = field(default=b"", repr=False)
     session_seconds: int = 14400
     static_dir: Path | None = None
+    annotations: dict = field(default_factory=lambda: annotation_settings(None))   # control_plane.share.annotations
+    annotations_path: Path | None = None        # default: ``annotations.jsonl`` beside the events file
+
+    def __post_init__(self) -> None:
+        if self.annotations_path is None:
+            self.annotations_path = Path(self.events_path).with_name("annotations.jsonl")
 
 
 @dataclass(frozen=True)
@@ -133,17 +255,6 @@ class LabSettings:
     static_dir: Path
     viewer_csp: str
     config_json: bytes
-
-
-def _https_origin(value) -> str | None:
-    """``https://host[:port]`` for a bare https origin (a trailing ``/`` allowed), else None."""
-    if not isinstance(value, str) or not value.isascii():
-        return None
-    parts = urlsplit(value.strip())
-    if (parts.scheme != "https" or parts.username or parts.password or parts.query or parts.fragment
-            or parts.path not in ("", "/") or not _HOST.fullmatch(parts.netloc.lower())):
-        return None
-    return "https://" + parts.netloc.lower()
 
 
 def sandbox_csp(public_origin: str | None, token: str | None) -> str:
@@ -287,6 +398,49 @@ class EventLog:
     def _drop(self, why: str) -> None:
         self.dropped += 1
         _log(why, "dropped=%d" % self.dropped)
+
+
+class AnnotationLog:
+    """Append-only ``annotations.jsonl`` for the worker's ingest: one ``os.write`` per ASCII line under ``O_APPEND``.
+
+    Same rotation story as ``EventLog`` (the path is opened per line, so the worker's rename starts a fresh file).
+    ``append`` returns False -- and writes nothing -- when the line is over ``ANNOTATION_LINE_MAX`` (the worker would
+    drop it), the file is over ``ANNOTATIONS_MAX_BYTES``, or the file cannot be opened or written; the caller answers
+    503 and the viewer keeps their text. Never logs a record."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.dropped = 0
+        self._lock = threading.Lock()
+
+    def append(self, record: dict) -> bool:
+        try:
+            line = (json.dumps(record, sort_keys=True, ensure_ascii=True) + "\n").encode("ascii")
+        except (TypeError, ValueError):
+            return self._drop("annotation not serialisable")
+        if len(line) > ANNOTATION_LINE_MAX:
+            return self._drop("annotation line is over the line cap")
+        with self._lock:
+            try:
+                fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644)
+            except OSError:
+                return self._drop("annotations file unavailable")
+            try:
+                EventLog._readable(fd)
+                if os.fstat(fd).st_size + len(line) > ANNOTATIONS_MAX_BYTES:
+                    return self._drop("annotations file is full")
+                if os.write(fd, line) != len(line):
+                    return self._drop("short write to annotations file")
+                return True
+            except OSError:
+                return self._drop("annotations file write failed")
+            finally:
+                os.close(fd)
+
+    def _drop(self, why: str) -> bool:
+        self.dropped += 1
+        _log(why, f"dropped={self.dropped}")
+        return False
 
 
 _log_limiter = RateLimiter(LOG_PER_MINUTE, time.monotonic)
@@ -471,6 +625,19 @@ def _weak(tag: str) -> str:
     return tag[2:] if tag.startswith("W/") else tag
 
 
+def vendor_etag(body: bytes) -> str:
+    """Strong validator for a vendored file: its sha256, the same digest SHA256SUMS records."""
+    return f'"{hashlib.sha256(body).hexdigest()}"'
+
+
+def etag_matches(if_none_match: str | None, etag: str) -> bool:
+    """If-None-Match (weak comparison, ``*`` matches) against one ETag."""
+    if if_none_match is None:
+        return False
+    tags = [_weak(t) for t in _parse_etags(if_none_match)]
+    return "*" in tags or etag in tags
+
+
 def parse_range(value: str, size: int):
     """None to ignore the header (serve 200), "unsatisfiable" for 416, or an inclusive (start, end) for 206.
 
@@ -546,11 +713,13 @@ def deny(handler, state: dict | None, reason: str, actor: str = "public") -> Non
     send_not_found(handler)
 
 
-def _content_headers(name: str, etag: str, csp: str = CSP) -> list[tuple[str, str]]:
+def _content_headers(name: str, etag: str, csp: str = CSP, *, sandbox_pdf: bool = False) -> list[tuple[str, str]]:
     content_type = content_type_for(name)
     if content_type == "application/pdf":
+        # A lab PDF (its URL holds a session) gets the sandbox policy too: a viewer with PDF scripting must not be
+        # able to reach the session URL. Public shares keep the plain frame-ancestors policy.
         headers = [("Content-Type", "application/pdf"), ("Content-Disposition", "inline"),
-                   ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", PDF_CSP)]
+                   ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", csp if sandbox_pdf else PDF_CSP)]
     else:
         headers = [("Content-Type", content_type), ("Content-Security-Policy", csp),
                    ("X-Content-Type-Options", "nosniff")]
@@ -574,13 +743,80 @@ def _announces_body(handler) -> bool:
     return bool(lengths) and lengths != ["0"]
 
 
+def mode_switch_link(depth: int, path: str) -> str:
+    """The fixed mode-switch link for the HTML file at the raw request path ``path`` (still percent-encoded).
+
+    ``depth`` is the number of ``../`` steps from the page to the session base: one for the mode segment (``f/``) plus
+    one per directory of ``path``. The only bytes we add to bundle content; script-free, built from a constant."""
+    return MODE_SWITCH_TEMPLATE.format(href=html.escape("../" * depth + "a/" + path))
+
+
+# One pass over the bytes (no lower-cased copy). Tokens that can hide a tag: comments and the raw-text / RCDATA
+# elements (their bodies run to the matching closer); the three markers we may insert after are `<body`, `<html` and
+# the doctype. Anything unterminated (a doctype too, so repeats cannot rescan) runs to the end of the data, so nothing after it is ever a candidate.
+_SCAN = re.compile(
+    rb"<!--.*?(?:-->|\Z)"
+    rb"|<(?P<raw>script|style|textarea|title)(?=[\s/>])(?:[^>]*>)?.*?(?:</(?P=raw)(?=[\s/>])|\Z)"
+    rb"|<(?P<tag>body|html)(?=[\s/>])|<(?P<doctype>!doctype)(?:[^>]*>|.*\Z)", re.I | re.S)
+_TAG_END = re.compile(rb"""(?:[^>"']|"[^"]*"|'[^']*')*>""")
+_WIDE_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff", b"\xef\xbb\xbf\x00")
+
+
+def _ascii_compatible(content_type: str, data: bytes) -> bool:
+    """False for a response whose bytes are not an ASCII-compatible text (a UTF-16/32 BOM, NUL bytes at the start, or a
+    declared charset other than utf-8 / us-ascii): inserting ASCII bytes there would corrupt it."""
+    for part in content_type.split(";")[1:]:
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "charset" and value.strip().strip('"').lower() not in ("utf-8", "utf8", "us-ascii"):
+            return False
+    return not data.startswith(_WIDE_BOMS) and b"\x00" not in data[:1024]
+
+
+def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
+    """``data`` with ``link`` inserted right after the first real ``<body ...>`` start tag (outside comments, script,
+    style, textarea and title), else after the first ``<html ...>`` tag, else after the doctype; None when the data has
+    none of them (the caller then serves the file untouched). Never inserts inside a script string or a comment."""
+    html_end = doctype_end = None
+    for match in _SCAN.finditer(data):
+        tag = match.group("tag")
+        if tag is not None:
+            if tag.lower() == b"html" and html_end is not None:
+                continue         # only the first <html> tag can be the anchor; matching its end again would rescan
+            end = _TAG_END.match(data, match.end())
+            if end is None:
+                return None                      # an unterminated start tag: nothing safe to anchor on
+            if tag.lower() == b"body":
+                return data[:end.end()] + link + data[end.end():]
+            if html_end is None:
+                html_end = end.end()
+        elif match.group("doctype") is not None and doctype_end is None and data[match.end() - 1 : match.end()] == b">":
+            doctype_end = match.end()  # unterminated: it ran to the end of the data, nothing to anchor on
+    cut = html_end if html_end is not None else doctype_end
+    return None if cut is None else data[:cut] + link + data[cut:]
+
+
+def _read_all(fd: int, size: int) -> bytes | None:
+    """Exactly ``size`` bytes of ``fd`` (``pread``), or None when the file is shorter than promised."""
+    chunks, offset = [], 0
+    while offset < size:
+        chunk = os.pread(fd, min(CHUNK_BYTES, size - offset), offset)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
+
+
 def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True, actor: str = "public",
-                      token: str | None = None) -> bool:
+                      token: str | None = None, mode_switch: str | None = None, sandbox_pdf: bool = False) -> bool:
     """Serve ``rel_path`` (raw, still percent-encoded) from ``state``'s bundle; True when served, False after a 404.
 
     ``state`` is what ``load_state`` returned. Handles HEAD, If-Match (412), If-None-Match (304), If-Range and a single
     Range (206/416); a multi-range request gets the full 200. Streams in ``CHUNK_BYTES`` chunks with ``os.pread``.
     ``token`` (the share's link token) scopes the sandbox CSP's explicit source; see ``sandbox_csp``.
+    ``mode_switch`` (computed by the router, only for a lab document navigation of an HTML file) is the link to inject:
+    the response is then the full 200 of the modified bytes under the ``-m1`` ETag, ``Vary: Sec-Fetch-Dest``, no
+    ``Accept-Ranges`` and any ``Range`` ignored. HTML over ``MODE_SWITCH_MAX_BYTES`` is served unmodified.
     """
     index = getattr(state, "index", None)
     if index is None:
@@ -613,7 +849,19 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
             deny(handler, state, "size_mismatch", actor)
             return False
         etag = '"%s"' % item["sha256"]
-        headers = _content_headers(name, etag, sandbox_csp(getattr(handler.server, "public_origin", None), token))
+        csp = sandbox_csp(getattr(handler.server, "public_origin", None), token)
+        injected = None
+        if (mode_switch is not None and content_type_for(name).split(";")[0].strip() == "text/html"
+                and size <= MODE_SWITCH_MAX_BYTES):
+            data = _read_all(fd, size)
+            if data is None:
+                deny(handler, state, "size_mismatch", actor)
+                return False
+            if _ascii_compatible(content_type_for(name), data):
+                injected = inject_mode_switch(data, mode_switch.encode("ascii"))
+            if injected is not None:
+                return _serve_with_link(handler, state, name, item, injected, csp, cors=cors, actor=actor)
+        headers = _content_headers(name, etag, csp, sandbox_pdf=sandbox_pdf)
         if _announces_body(handler):
             handler.close_connection = True
         if_match = handler.headers.get("If-Match")
@@ -672,7 +920,71 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         os.close(fd)
 
 
+def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, csp: str, *, cors: bool,
+                     actor: str) -> bool:
+    """The full 200 of ``body`` (an HTML file with the mode-switch link injected; see ``serve_bundle_file``). The ETag is
+    the index sha256 plus ``-m1``, as for the raw file (the same size-only integrity check as the raw route)."""
+    etag = f'"{item["sha256"]}{MODE_SWITCH_ETAG_SUFFIX}"'
+    headers = [h for h in _content_headers(name, etag, csp) if h[0] != "Accept-Ranges"] + [("Vary", "Sec-Fetch-Dest")]
+    if _announces_body(handler):
+        handler.close_connection = True
+    if_match = handler.headers.get("If-Match")
+    if if_match is not None:
+        tags = _parse_etags(if_match)
+        if "*" not in tags and etag not in tags:
+            _send_headers(handler, 412, [("Content-Length", "0"), ("X-Content-Type-Options", "nosniff"),
+                                         ("Cache-Control", "no-store")], cors=cors)
+            return True
+    if_none_match = handler.headers.get("If-None-Match")
+    if if_none_match is not None:
+        tags = [_weak(t) for t in _parse_etags(if_none_match)]
+        if "*" in tags or etag in tags:
+            _send_headers(handler, 304, [h for h in headers if h[0] != "Content-Type"], cors=cors)
+            return True
+    _send_headers(handler, 200, headers + [("Content-Length", str(len(body)))], cors=cors)
+    if handler.command == "GET" and name == state.get("entry"):
+        try:
+            handler.server.events.opened(state["share_id"], actor, {"file": name[:200]})
+        except Exception:
+            _log("event append failed")
+    if handler.command != "HEAD":
+        try:
+            view = memoryview(body)
+            for at in range(0, len(view), WRITE_SLICE_BYTES):
+                handler.wfile.write(view[at:at + WRITE_SLICE_BYTES])
+        except (OSError, ValueError):
+            handler.close_connection = True
+    return True
+
+
 # ----------------------------------------------------------------------------- handler and server
+
+_ROUTE_METHODS: dict[str, tuple[str, ...]] = {
+    "link": ("GET", "HEAD"), "file": ("GET", "HEAD"), "session": ("POST",), "lab_file": ("GET", "HEAD"),
+    "lab_view": ("GET", "HEAD"), "annotations": ("GET", "POST"), "annotation_item": ("POST",)}
+_NO_PREFLIGHT = frozenset({"session", "lab_view", "annotations", "annotation_item"})   # OPTIONS is the uniform 404
+
+
+def _classify(parts: list[str]) -> str | None:
+    """The route name of the request path parts (``['', 's', token, ...]``), or None (see the module docstring)."""
+    n = len(parts)
+    if n == 4 and parts[3] == "":
+        return "link"
+    if n == 4 and parts[3] == "session":
+        return "session"
+    if n >= 5 and parts[3] == "f":
+        return "file"
+    if n >= 6 and parts[3] == "k":
+        if n >= 7 and parts[5] == "f":
+            return "lab_file"
+        if n >= 7 and parts[5] in ("v", "a"):
+            return "lab_view"
+        if n == 6 and parts[5] == "annotations":
+            return "annotations"
+        if n == 8 and parts[5] == "annotations" and parts[7] in ("edit", "delete"):
+            return "annotation_item"
+    return None
+
 
 class ShareHandler(BaseHTTPRequestHandler):
     server_version = "herdr-share"
@@ -756,10 +1068,10 @@ class ShareHandler(BaseHTTPRequestHandler):
         parts = raw_path.split("/")
         if parts[2] in ("static", "callback"):
             return self._viewer_asset(parts)
-        is_session = len(parts) == 4 and parts[3] == "session"
+        route = _classify(parts)
         if self.command == "OPTIONS":
-            if is_session:
-                return deny(self, None, "method")    # no preflight: a foreign origin cannot send Authorization here
+            if route in _NO_PREFLIGHT:
+                return deny(self, None, "method")    # no preflight: a foreign origin cannot send Authorization or the CSRF header
             _send_headers(self, 204, PREFLIGHT_HEADERS)
             return None
         if len(parts) == 3 and self.command in ("GET", "HEAD") and TOKEN_RE.fullmatch(parts[2]):
@@ -771,12 +1083,9 @@ class ShareHandler(BaseHTTPRequestHandler):
             return None
         if len(parts) < 4 or not TOKEN_RE.fullmatch(parts[2]):
             return deny(self, None, "bad_token")
-        is_link = len(parts) == 4 and parts[3] == ""
-        is_file = len(parts) >= 5 and parts[3] == "f"
-        is_lab_file = len(parts) >= 7 and parts[3] == "k" and parts[5] == "f"
-        if not (is_link or is_file or is_session or is_lab_file):
+        if route is None:
             return deny(self, None, "unknown_route")
-        if (self.command == "POST") != is_session:
+        if self.command not in _ROUTE_METHODS[route]:
             return deny(self, None, "method")
         prepared = _read_state(self.server.config.shares_root, parts[2])
         if prepared is None:
@@ -785,8 +1094,8 @@ class ShareHandler(BaseHTTPRequestHandler):
         if state is None:
             return deny(self, prepared.raw, reason)
         audience = state.get("audience")
-        if audience == "public" and (is_link or is_file):
-            if is_link:
+        if audience == "public" and route in ("link", "file"):
+            if route == "link":
                 location = "f/" + quote(state["entry"], safe="/")
                 _send_headers(self, 302, [("Location", location), ("Content-Length", "0"),
                                           ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"),
@@ -794,21 +1103,300 @@ class ShareHandler(BaseHTTPRequestHandler):
                 return None
             serve_bundle_file(self, state, "/".join(parts[4:]), token=parts[2])
             return None
-        if audience != "lab" or is_file:
+        if audience != "lab" or route == "file":
             return deny(self, state, "audience")    # lab files only under a session; sessions only for lab shares
         lab = self.server.lab
         if lab is None:
             return deny(self, state, "lab_unconfigured")
-        if is_link:
+        if route == "link":
             return self._send_static(lab, VIEWER_FILE, "text/html; charset=utf-8")
-        if is_session:
+        if route == "session":
             return self._session(state, parts[2], lab)
         session = parts[4]
         got = check_session(lab.secret, state["share_id"], session, self.server.now()) \
             if _SESSION_SEGMENT.fullmatch(session) else None
         if got is None:
             return deny(self, state, "bad_session")
-        serve_bundle_file(self, state, "/".join(parts[6:]), actor=got["identity"], token=parts[2])
+        enabled = self.server.annotations_enabled
+        if route == "lab_file":
+            link = self._mode_switch(parts) if enabled else None
+            serve_bundle_file(self, state, "/".join(parts[6:]), actor=got["identity"], token=parts[2],
+                              mode_switch=link, sandbox_pdf=True)
+            return None
+        if route == "lab_view":
+            if parts[5] == "v":
+                return self._view(state, parts, got, "live", lab)
+            if not enabled:
+                return deny(self, state, "annotations_disabled", got["identity"])
+            return self._view(state, parts, got, "annotate", lab)
+        if not enabled:
+            return deny(self, state, "annotations_disabled", got["identity"])
+        if route == "annotations" and self.command == "GET":
+            if not self._has_write_cookie(state, session, lab):
+                return deny(self, state, "no_write_cookie", got["identity"])   # the URL alone is not a credential
+            return self._annotations_get(state, got)
+        return self._annotation_post(state, parts, got, lab)
+
+    def _mode_switch(self, parts) -> str | None:
+        """The link to inject into this lab ``f/`` response, or None: only HTML, only a document navigation."""
+        if self.headers.get_all("Sec-Fetch-Dest") != ["document"]:
+            return None
+        rel = "/".join(parts[6:])
+        name = decode_rel_path(rel)
+        if name is None or content_type_for(name).split(";")[0].strip() != "text/html":
+            return None
+        return mode_switch_link(rel.count("/") + 1, rel)
+
+    # -- lab: live view of non-HTML files
+
+    def _send_json(self, status: int, payload: object) -> None:
+        # "<" is escaped so that a viewer's text never appears as markup in any body this host sends (the no-frames guard
+        # checks the annotations JSON); the escape is plain JSON, so every client parses the same value.
+        body = json.dumps(payload, sort_keys=True, ensure_ascii=True).replace("<", "\\u003c").encode("ascii")
+        _send_headers(self, status, [*JSON_HEADERS, ("Content-Length", str(len(body)))], cors=False)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _unavailable(self) -> None:
+        """The uniform 503 (a render is busy or the annotations file is unavailable): fixed body, no detail."""
+        _send_headers(self, 503, [("Content-Type", "text/plain; charset=utf-8"),
+                                  ("Content-Length", str(len(UNAVAILABLE_BODY))), ("Retry-After", "5"),
+                                  ("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store"),
+                                  ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex")], cors=False)
+        if self.command != "HEAD":
+            self.wfile.write(UNAVAILABLE_BODY)
+
+    def _view(self, state: ShareState, parts, got: dict, mode: str, lab: LabSettings):
+        """``v/<path>`` (live) and ``a/<path>`` (annotate): one template, our own markup around the static render.
+
+        ``v/`` of an HTML file is the 404 (its live view is ``f/``). ``a/`` serves every kind: HTML is sanitised in the
+        isolated render child, text is escaped, image / PDF / other kinds are built by ``annotate.js`` from the data."""
+        server = self.server
+        token = parts[2]
+        origin = server.public_origin
+        name = decode_rel_path("/".join(parts[6:]))
+        index = state.index
+        item = index.get(name) if name is not None else None
+        actor = got["identity"]
+        if origin is None or name is None or item is None:
+            return deny(self, state, "not_in_bundle" if origin is not None else "invalid_state", actor)
+        kind = render_kind(name)
+        if kind == "html" and mode == "live":
+            return deny(self, state, "not_in_mode", actor)
+        share_id = state["share_id"]
+        opened = _open_beneath(Path(server.config.shares_root), [share_id, "files", *name.split("/")])
+        if opened is None:
+            return deny(self, state, "missing_file", actor)
+        fd, st = opened
+        try:
+            if st.st_size != item["size"]:
+                return deny(self, state, "size_mismatch", actor)
+            content, shown = "", kind
+            if kind in ("text", "html"):
+                if item["size"] > MAX_RENDER_INPUT:
+                    content, shown = self._too_large(), "document"
+                else:
+                    data = _read_all(fd, item["size"])
+                    if data is None or hashlib.sha256(data).hexdigest() != item["sha256"]:
+                        return deny(self, state, "size_mismatch", actor)
+                    try:
+                        content = self._static_copy(kind, share_id, name, item["sha256"], data, index)
+                    except RenderTooLarge:
+                        content, shown = self._too_large(), "document"
+                    except RenderBusy:
+                        return self._unavailable()
+                    except RenderFailed:
+                        return deny(self, state, "render_failed", actor)
+        finally:
+            os.close(fd)
+        nonce, body = self._render_view(state, parts, got, name, shown, content, mode, lab)
+        csp = (ANNOTATE_CSP.format(origin=origin, token=token, nonce=nonce) if mode == "annotate"
+               else VIEW_CSP.format(origin=origin, token=token, nonce=nonce))
+        headers = [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
+                   ("Content-Security-Policy", csp),
+                   ("X-Frame-Options", "DENY"), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
+                   ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex")]
+        if mode == "annotate":
+            headers += [("Cross-Origin-Opener-Policy", "same-origin"), ("Cross-Origin-Resource-Policy", "same-origin")]
+        _send_headers(self, 200, headers, cors=False)
+        if self.command == "GET" and name == state.get("entry"):
+            try:
+                server.events.opened(share_id, actor, {"file": name[:200], "mode": mode})
+            except Exception:
+                _log("event append failed")
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        return None
+
+    @staticmethod
+    def _too_large() -> str:
+        return f'<p class="herdr-static-note">{html.escape(TOO_LARGE_NOTE)}</p>'
+
+    def _static_copy(self, kind: str, share_id: str, name: str, sha256: str, data: bytes, index: dict) -> str:
+        """The wrapped static render of ``data`` (raises ``RenderTooLarge`` / ``RenderBusy`` / ``RenderFailed``).
+
+        HTML: the sanitised output depends on the bytes, the file name and WHICH names the bundle holds (the resolver
+        drops links to absent files), so the cache key names all of them plus the share and the resolver version."""
+        if kind == "html":
+            fingerprint = hashlib.sha256("\0".join(sorted(index)).encode("utf-8")).hexdigest()
+            key = (share_id, name, sha256, RESOLVER_VERSION, fingerprint)
+            return wrap_content("html", sanitize_html(data, resolve=share_resolver(name, index), cache_key=key))
+        cache = self.server.render_cache
+        cached = cache.get(sha256, "text\0" + name)
+        if cached is None:
+            cached = wrap_content("text", render_text(data))
+            cache.put(sha256, "text\0" + name, cached)
+        return cached
+
+    def _render_view(self, state: ShareState, parts, got: dict, name: str, kind: str, content: str, mode: str,
+                     lab: LabSettings) -> tuple[str, bytes]:
+        """``(nonce, page)``: ``view.html`` with each placeholder replaced once, in one pass (so no substituted value is
+        ever re-scanned). Every value of ours is escaped or JSON-encoded; ``content`` is the only untrusted markup and
+        it is already sanitised and sits inside a shadow root."""
+        server = self.server
+        up = "../" * (name.count("/") + 1)
+        quoted = quote(name, safe="/")
+        nonce = secrets.token_urlsafe(NONCE_BYTES)
+        annotate = mode == "annotate"
+        live_href = up + ("f/" if render_kind(name) == "html" else "v/") + quoted
+        links = [f'<a data-mode="live" href="{html.escape(live_href)}"' + ("" if annotate else ' aria-current="page"')
+                 + ">Live</a>"]
+        if server.annotations_enabled:
+            links.append(f'<a data-mode="annotate" href="{html.escape(up + "a/" + quoted)}"'
+                         + (' aria-current="page"' if annotate else "") + ">Annotate</a>")
+        data = {"file": name, "kind": kind, "mode": mode, "entry": state["entry"], "expires_at": int(got["exp"]),
+                "max_comment_chars": server.config.annotations["max_comment_chars"], "raw_href": up + "f/" + quoted}
+        if annotate and kind == "pdf":
+            data["pdfjs"] = PDFJS_CONFIG
+        data_json = json.dumps(data, sort_keys=True, ensure_ascii=True)
+        for ch, esc in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026")):
+            data_json = data_json.replace(ch, esc)
+        csrf = ""
+        panel = ""
+        if annotate:
+            token = csrf_token(lab.secret, state["share_id"], parts[4])
+            csrf = f'<meta name="herdr-annotate-csrf" content="{html.escape(token)}">'
+            panel = '<aside data-annotate-panel aria-label="Annotations"></aside>'
+        values = {
+            "NONCE": nonce, "MODE": mode, "CSRF_META": csrf, "PANEL": panel,
+            "SWITCH": '<nav data-mode-switch aria-label="View mode">' + "".join(links) + "</nav>",
+            "DATA_JSON": f'<script type="application/json" id="herdr-view-data" nonce="{nonce}">{data_json}</script>',
+            "CONTENT": content}
+        page = _VIEW_PLACEHOLDER.sub(lambda m: values[m.group(1)], server.view_template)
+        return nonce, page.encode("utf-8")
+
+    # -- lab: annotations API
+
+    def _annotations_get(self, state: ShareState, got: dict):
+        """The caller's OWN annotations from the worker's per-viewer projection; never another viewer's."""
+        name = hashlib.sha256(got["identity"].encode("utf-8")).hexdigest() + ".json"
+        rows = self._own_rows(state["share_id"], name)
+        if rows is None:
+            return self._annotate_error(state, got, 503, "unavailable")
+        self._send_json(200, {"annotations": rows})
+        return None
+
+    def _own_rows(self, share_id: str, name: str) -> list | None:
+        opened = _open_beneath(Path(self.server.config.shares_root), [share_id, "annotations", name],
+                               max_size=MAX_PROJECTION_BYTES)
+        if opened is None:
+            return []                                    # no projection yet: nothing of theirs has been ingested
+        fd, st = opened
+        try:
+            data = _read_all(fd, st.st_size)
+            doc = json.loads(data) if data is not None else None
+        except (OSError, ValueError):
+            return None
+        finally:
+            os.close(fd)
+        rows = doc.get("annotations") if isinstance(doc, dict) else None
+        return rows if isinstance(rows, list) and all(isinstance(r, dict) for r in rows) else None
+
+    def _annotate_error(self, state: ShareState, got: dict, status: int, code: str):
+        """A JSON refusal (400/409/429/503) that also leaves a ``denied`` event with a fixed reason code."""
+        try:
+            self.server.events.denied(state["share_id"], got["identity"], "annotate_" + code)
+        except Exception:
+            _log("event append failed")
+        self._send_json(status, {"error": code})
+        return None
+
+    def _has_write_cookie(self, state: ShareState, session: str, lab: LabSettings) -> bool:
+        return check_write_cookie(lab.secret, state["share_id"], session, self.headers.get_all("Cookie"))
+
+    def _gate_ok(self, state: ShareState, session: str, got: dict, lab: LabSettings) -> bool:
+        """Every POST precondition except the body: share allow-list, Origin, CSRF, content type and framing."""
+        headers = self.headers
+        if getattr(headers, "defects", None) or headers.get_all("Transfer-Encoding"):
+            return False
+        origin, csrf, ctype = (self._single_header(n) for n in ("Origin", "X-Herdr-Annotate", "Content-Type"))
+        lengths = headers.get_all("Content-Length") or []
+        expected = self.server.annotate_origin
+        if (expected is None or origin is None or origin != expected or csrf is None or ctype is None
+                or len(lengths) != 1 or not _CONTENT_LENGTH.fullmatch(lengths[0])
+                or not 1 <= int(lengths[0]) <= MAX_BODY_BYTES):
+            return False
+        if ctype != "application/json":              # exactly, case-sensitive, no parameters
+            return False
+        return check_csrf(lab.secret, state["share_id"], session, csrf) and self._has_write_cookie(state, session, lab)
+
+    def _annotation_post(self, state: ShareState, parts, got: dict, lab: LabSettings):
+        server, share_id = self.server, state["share_id"]
+        self.close_connection = True                      # the body is read once; the connection never carries a second request
+        if not self._gate_ok(state, parts[4], got, lab):
+            return deny(self, state, "annotate_refused", got["identity"])
+        if not still_admitted(state, got["email"], got["basis"]):
+            return deny(self, state, "not_on_list", got["identity"])      # removed from the allow-list since the session
+        route_edit = len(parts) == 8
+        annotation_id = parts[6] if route_edit else None
+        if route_edit and not ANNOTATION_ID_RE.fullmatch(annotation_id):
+            return deny(self, state, "annotate_refused", got["identity"])
+        identity = got["identity"]
+        if not (server.annotate_user.allow(f"{share_id}\x00{identity}") and server.annotate_share.allow(share_id)
+                and server.annotate_global.allow("*")):
+            return self._annotate_error(state, got, 429, "rate_limited")
+        length = int(self.headers.get("Content-Length"))
+        try:
+            raw = self.rfile.read(length)
+        except OSError:
+            raw = b""
+        if len(raw) != length:
+            return deny(self, state, "annotate_refused", identity)
+        max_chars = server.config.annotations["max_comment_chars"]
+        at = datetime.fromtimestamp(server.now(), UTC).isoformat()
+        try:
+            if not route_edit:
+                anchor, comment = parse_annotation_request(raw, max_chars=max_chars)
+                if anchor["file"] not in state.index:
+                    return self._annotate_error(state, got, 400, "bad_file")
+                annotation_id = "ann_" + secrets.token_urlsafe(16)
+                record = {"v": 1, "op": "create", "annotation_id": annotation_id, "share_id": share_id,
+                          "author_identity": identity, "author_email": got["email"], "at": at, "anchor": anchor,
+                          "body": comment}
+            else:
+                verb = parts[7]
+                record = {"v": 1, "op": verb, "annotation_id": annotation_id, "share_id": share_id,
+                          "author_identity": identity, "at": at}
+                if verb == "edit":
+                    record["body"] = parse_edit_request(raw, max_chars=max_chars)
+                else:
+                    parse_delete_request(raw)
+        except AnnotationInputError as exc:
+            return self._annotate_error(state, got, 400, exc.code)
+        if route_edit:
+            name = hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".json"
+            rows = self._own_rows(share_id, name)
+            if rows is None:
+                return self._annotate_error(state, got, 503, "unavailable")
+            if not any(r.get("annotation_id") == annotation_id and r.get("status") == "open" for r in rows):
+                return self._annotate_error(state, got, 409, "not_editable")
+        if not server.annotation_log.append(record):
+            return self._annotate_error(state, got, 503, "unavailable")
+        if route_edit:
+            self._send_json(202, {"annotation_id": annotation_id, "status": "pending"})
+        else:
+            self._send_json(201, {"annotation": {"annotation_id": annotation_id, "anchor": record["anchor"],
+                                                 "body": record["body"], "status": "submitted", "created_at": at}})
         return None
 
     # -- lab: viewer page, static assets, session exchange
@@ -827,11 +1415,14 @@ class ShareHandler(BaseHTTPRequestHandler):
                 return self._send_viewer_bytes(lab, lab.config_json, "application/json")
             if name in STATIC_FILES:
                 return self._send_static(lab, name, STATIC_FILES[name])
+        if len(parts) == 6 and parts[2:5] == ["static", "vendor", "pdfjs"] and parts[5] in VENDOR_FILES:
+            return self._send_static(lab, parts[5], VENDOR_FILES[parts[5]], subdir=("vendor", "pdfjs"))
         return deny(self, None, "unknown_route")
 
-    def _send_static(self, lab: LabSettings, name: str, content_type: str):
-        """One allow-listed file straight from ``static_dir`` (no directory walk, no symlink), or the 404."""
-        opened = _open_beneath(lab.static_dir, [name], max_size=STATIC_MAX_BYTES)
+    def _send_static(self, lab: LabSettings, name: str, content_type: str, subdir: tuple[str, ...] = ()):
+        """One allow-listed file straight from ``static_dir`` (no directory walk, no symlink), or the 404.
+        ``subdir`` is the fixed vendored-library directory: bigger cap, immutable cache (the path pins the release)."""
+        opened = _open_beneath(lab.static_dir, [*subdir, name], max_size=VENDOR_MAX_BYTES if subdir else STATIC_MAX_BYTES)
         if opened is None:
             return deny(self, None, "static_missing")
         fd, st = opened
@@ -845,14 +1436,26 @@ class ShareHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
         finally:
             os.close(fd)
-        return self._send_viewer_bytes(lab, b"".join(chunks), content_type)
+        body = b"".join(chunks)
+        if not subdir:
+            return self._send_viewer_bytes(lab, body, content_type)
+        etag = vendor_etag(body)
+        if etag_matches(self.headers.get("If-None-Match"), etag):
+            return self._send_viewer_bytes(lab, body, content_type, VENDOR_CACHE, etag=etag, status=304)
+        return self._send_viewer_bytes(lab, body, content_type, VENDOR_CACHE, etag=etag)
 
-    def _send_viewer_bytes(self, lab: LabSettings, body: bytes, content_type: str):
-        _send_headers(self, 200, [("Content-Type", content_type), ("Content-Length", str(len(body))),
-                                  ("Content-Security-Policy", lab.viewer_csp), ("X-Content-Type-Options", "nosniff"),
-                                  ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"),
-                                  ("X-Robots-Tag", "noindex"), ("X-Frame-Options", "DENY")], cors=False)
-        if self.command != "HEAD":
+    def _send_viewer_bytes(self, lab: LabSettings, body: bytes, content_type: str, cache: str = "no-store",
+                           *, etag: str | None = None, status: int = 200):
+        headers = [("Content-Type", content_type), ("Content-Length", str(len(body))),
+                   ("Content-Security-Policy", lab.viewer_csp), ("X-Content-Type-Options", "nosniff"),
+                   ("Cache-Control", cache), ("Referrer-Policy", "no-referrer"),
+                   ("X-Robots-Tag", "noindex"), ("X-Frame-Options", "DENY")]
+        if etag:
+            headers.append(("ETag", etag))
+        if status == 304:
+            headers = [h for h in headers if h[0] not in ("Content-Type", "Content-Length")]
+        _send_headers(self, status, headers, cors=False)
+        if self.command != "HEAD" and status == 200:
             self.wfile.write(body)
 
     def _single_header(self, name: str) -> str | None:
@@ -889,12 +1492,17 @@ class ShareHandler(BaseHTTPRequestHandler):
         if exp_int <= now:
             return deny(self, state, "token_expired", grant["identity"])
         try:
-            session = mint_session(lab.secret, share_id, grant["identity"], exp_int)
+            session = mint_session(lab.secret, share_id, grant["identity"], exp_int, email=grant["email"], basis=grant["basis"])
         except ValueError:
             return deny(self, state, "bad_identity", grant["identity"])
-        body = json.dumps({"base": f"/s/{token}/k/{session}/f/", "entry": state["entry"],
-                           "expires_at": exp_int}, sort_keys=True, ensure_ascii=True).encode("ascii")
+        entry = state["entry"]
+        kind = "f" if content_type_for(entry).split(";")[0].strip() == "text/html" else "v"
+        landing = f"/s/{token}/k/{session}/{kind}/{quote(entry, safe='/')}"
+        body = json.dumps({"landing": landing, "expires_at": exp_int},
+                          sort_keys=True, ensure_ascii=True).encode("ascii")
+        cookie = write_cookie_header(lab.secret, share_id, token, session, exp_int - now)
         _send_headers(self, 200, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
+                                  ("Set-Cookie", cookie),
                                   ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
                                   ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),
                                   ("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")],
@@ -916,8 +1524,27 @@ class ShareServer(ThreadingHTTPServer):
         self.public_origin = _https_origin(config.public_url)    # None: the sandbox CSP keeps 'self' only
         self.session_per_share = RateLimiter(SESSION_PER_SHARE_PER_MINUTE, now)
         self.session_global = RateLimiter(SESSION_GLOBAL_PER_MINUTE, now, max_keys=1)
+        limits = config.annotations
+        self.annotations_enabled = bool(self.lab is not None and limits["enabled"])
+        self.annotate_origin = self.public_origin          # the exact Origin an annotation POST must carry
+        self.annotate_user = RateLimiter(limits["per_user_per_minute"], now)
+        self.annotate_share = RateLimiter(limits["per_share_per_minute"], now)
+        self.annotate_global = RateLimiter(limits["global_per_minute"], now, max_keys=1)
+        self.annotation_log = AnnotationLog(config.annotations_path)
+        self.render_cache = RenderCache()
+        self.view_template = self._load_view_template()
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         super().__init__(address, ShareHandler)
+
+    def _load_view_template(self) -> str:
+        """``view.html`` once at start-up; every placeholder must occur exactly once (else the server does not start)."""
+        static = Path(self.config.static_dir) if self.config.static_dir else DEFAULT_STATIC_DIR
+        text = (static / VIEW_FILE).read_text(encoding="utf-8") if (static / VIEW_FILE).is_file() else ""
+        found = [m.group(1) for m in _VIEW_PLACEHOLDER.finditer(text)]
+        if self.lab is not None and sorted(found) != sorted(["NONCE", "MODE", "CSRF_META", "SWITCH", "DATA_JSON",
+                                                              "PANEL", "CONTENT"]):
+            raise RuntimeError("share_static/view.html must hold each placeholder exactly once")
+        return text
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):

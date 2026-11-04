@@ -145,6 +145,12 @@ TLS, rate and connection limits and a 64 KB body cap.
 - **Certificate:** certbot lineage `localdev.mcp.metabolomics.us` (DNS-01, Route53) in the host's acme dir
   (`control_plane.compose.HERDR_COLLAB_CERT_DIR` in the central file); the renewal hook also reloads the edge.
 - **Router:** a hostname rule on the router sends `localdev.mcp.metabolomics.us` to the edge's published port.
+- **Share host (only with `control_plane.share.enabled`):** artifact share links live on their own host
+  (`control_plane.share.public_url`), a second `server` in the same edge; the MCP host serves no `/s/`. It uses the
+  same certificate, so the existing lineage must name both hosts (`certbot certonly --cert-name
+  localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d <share host>`, repeating every name the
+  lineage already has), and the router / SNI front must send the share host to the same edge port. Details in
+  `deploy/control-plane/COLLAB.md`.
 - **Sign-in:** Cognito Hosted UI (app client `herdr-collab-web`); access requires the `local.dev` group.
   Removing someone takes effect at token expiry (at most 1 hour).
 - **Connect Claude Code:** sign in, press *Connect Claude Code* under "Your AI agents", run the shown
@@ -154,3 +160,97 @@ TLS, rate and connection limits and a 64 KB body cap.
   Room content is returned wrapped as UNTRUSTED. No tool executes anything.
 - Collaboration events written before this split live in the dashboard's Postgres and are not migrated.
 - Moving hosts: change `control_plane.collab.public_url`, the app client callback/logout URLs and the router rule.
+
+## Artifact annotations: operator deployment
+
+Annotations move the share links to their own host, `artifacts.metabolomics.us`. These are operator steps; none of
+them is run by the build. Do them in this order, and do not deploy a partial set (the branch is deployable whole).
+
+1. **DNS:** point `artifacts.metabolomics.us` at the public edge.
+2. **SNI front:** add the hostname to the cubert SNI stream edge in `networking/cubert-ansible`, routed to the collab
+   edge exactly like `localdev.mcp.metabolomics.us`.
+3. **Certificate:** expand the existing collab lineage into one SAN certificate that covers
+   `localdev.mcp.metabolomics.us` and `artifacts.metabolomics.us` (`certbot certonly --cert-name
+   localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d artifacts.metabolomics.us`, repeating any
+   other name the lineage already has). The existing `HERDR_COLLAB_CERT_DIR` mount and renewal timer serve both hosts:
+   no new compose key and no second timer.
+4. **Cognito:** in app client `cognito_web_client`, ADD `https://artifacts.metabolomics.us/s/callback` to BOTH
+   CallbackURLs and LogoutURLs (the one rule, as in `deploy/control-plane/COLLAB.md`; no separate sign-out page).
+   Keep the MCP host's old `/s/callback` entry until step 8: a rollback to the previous release signs in there.
+   (`update-user-pool-client` replaces the whole client: read it first and send every field back.)
+5. **YAML:** set `control_plane.share.public_url: https://artifacts.metabolomics.us`. Optional: `owner_emails` and an
+   `annotations` mapping (`enabled`, `max_comment_chars`, `per_user_per_minute`, `per_share_per_minute`,
+   `global_per_minute`, `per_user_per_day`, `max_per_share`).
+6. **Build and roll out:** rebuild the image (new `nh3` dependency and the vendored pdf.js), then run
+   `deploy/control-plane/deploy.sh`. It refuses to continue (and rolls back) when the staged edge certificate does not
+   name the share host (step 3 not done or the renewal dropped it) and probes
+   `https://artifacts.metabolomics.us/s/probe/` afterwards (a warning unless it answers 404). Migration 0046 needs no
+   manual step: the worker applies migrations when it starts, and the owner annotation API answers 503 until it has.
+   The web container starts at the same time, so expect that 503 for a few seconds.
+7. **Smoke checks:**
+   - An MCP-host `/s/...` path no longer reaches share-public.
+   - A lab link to an HTML artifact signs in and lands directly on the running page, with the Annotate link. Clicking
+     it opens the annotation view, and Live returns to the page.
+   - Annotate, then a test annotation: it reaches the Feedback panel.
+   - The dashboard shows HTML and PDF previews with no frame.
+   - By hand: `curl -sS --resolve artifacts.metabolomics.us:443:<edge ip> -o /dev/null -w '%{http_code}\n'
+     https://artifacts.metabolomics.us/s/x/` prints 404 (DNS, SNI route and certificate line up).
+8. **Only after the smoke checks pass:** remove the MCP host's `/s/callback` entry from the Cognito client. Before this
+   point the previous release can still be rolled back to.
+
+### Before you deploy: what changes for existing links
+
+- **Every outstanding share link stops working.** Links issued so far point at the MCP host
+  (`localdev.mcp.metabolomics.us/s/<token>/`); that host no longer serves `/s/` and a temporary redirect was
+  deliberately not added. Tokens are shown once and cannot be re-derived: list the live shares first
+  (`artifacts share list`) and re-issue each one after the cutover.
+- **Rollback** restores the previous edge conf and share-public. The new tables and the widened
+  `artifact_share_events` CHECK stay (they are harmless to the old code); the MCP-host Cognito callback must still be
+  registered for the old release to sign in (hence step 8).
+- A refused or over-quota annotation is consumed with only a `denied` event; the author's browser already received
+  202, so the comment drops out of their own panel at the next projection.
+
+### Known limitations
+
+- **Owner dashboard preview residual.** The dashboard render routes now drop every `<style>` element, so inline CSS
+  can no longer make the owner's browser fetch URLs (`url()`, `@import`, CSS escapes). `style=""` attributes are
+  rewritten or dropped by the sanitiser, and linked sibling stylesheets are never mapped. The dashboard still has no
+  CSP of its own: what remains is an `<a>` the owner clicks and the images the resolver allows (`data:` rasters only).
+- A hostile upload can occupy the single sanitiser lane for its 3 s deadline; there is no per-share or per-IP budget
+  yet. Callers answer a busy lane with a fixed 503.
+- The sanitiser child runs under the same uid as share-public, which holds the session signing secret.
+- The MCP tool `artifact_annotation_resolve` holds its request thread for up to 10 s per call.
+- The edge's per-IP rate limits (`share_req` 100 r/s, burst 300) are generous for the expensive `a/` renders; the
+  single sanitiser lane is the real bound.
+- **A scripted `f/` page sees its own session URL (mitigated by a write cookie).** Author JavaScript in a raw HTML
+  file (sandboxed, opaque origin) can read `location.href`, which carries the viewer's session, and an author
+  `<meta name="referrer" content="unsafe-url">` overrides our `Referrer-Policy: no-referrer` header, so a click or a
+  meta refresh can send the session URL to another site in the `Referer` (Firefox and WebKit, even without script).
+  That URL alone no longer reads or writes annotations: the session exchange also sets
+  `hw_<hash>=<MAC>; Path=/s/<token>/; HttpOnly; Secure; SameSite=Strict`, a MAC under its own domain label
+  (`herdr-annotate-write-v1`), and both annotation routes (GET and POST) require it in addition to the CSRF token,
+  `Origin` and the allow-list checks. The opaque-origin `f/` page cannot read it (HttpOnly) and its requests are
+  cross-site, so Strict never sends it; the `a/` page and the `f/` and `v/` views do not need it (a click-through
+  from `f/` to `a/` still works, and the `a/` page's own requests carry the cookie). Verified in Chromium, Firefox
+  and WebKit (`tests/playwright/share-annotations.test.mjs`). What remains: the stolen URL still opens the share's
+  files (`f/`, `v/`, `a/` page including its CSRF meta) until the session expires, because the author already holds
+  those files; the viewer's email is part of the session segment and therefore of the URL (removing it would mean
+  changing the session format; deferred); and a cookie is bound to the session, not to a device, so it protects
+  against URL leaks, not against malware in the viewer's browser. Lab PDFs on `f/` are now served under the sandbox
+  policy as well; where a browser refuses to show a sandboxed PDF inline, use the `v/` view.
+- **Stored media types.** Responses never carry a stored media type's parameters: `/live`, `/download`, report asset
+  downloads and the public gateways send the bare `type/subtype` (or `application/octet-stream`); uploads refuse `,`,
+  `"` and `\` and store the bare lowercase type. Artifacts uploaded before this check are safe because the send-time
+  reader does not depend on it.
+- **A single failing ingest line can stall the worker.** A deterministic non-poison error (not a data or integrity
+  error) on one `annotations.jsonl` line aborts every ingest pass at that offset; the batch rolls back and the marker
+  does not move. The worker logs a warning with a consecutive-failure counter so an operator sees it; clearing it
+  means fixing or removing that line. Only a compromised edge can write such lines.
+- The worker does not re-check an annotation author against the share's allow-list when it ingests a line (the edge
+  does); a compromised edge could mint unlisted or owner-role authors.
+- Comments and anchor text may contain bidirectional and zero-width format characters (they render as text, but can
+  spoof layout in the owner's panel).
+- PDF annotation is pointer-only: keyboard users can comment on the whole PDF but cannot choose a page or region.
+- Purged or tombstoned artifacts keep their annotation rows and author emails; there is no retention rule yet.
+- Test-suite gaps, tracked separately: a few unit tests use fakes (fake DOM, a scripted render child, `FakeBlobs`),
+  and the PostgreSQL-backed tests skip when the host has no `initdb`.

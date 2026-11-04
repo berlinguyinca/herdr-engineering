@@ -226,6 +226,31 @@ export class HerdrClient {
     return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/download`;
   }
 
+  // Static (sanitised) copy of the current file: { kind, html, too_large }.
+  artifactRender(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/render`, { signal });
+  }
+
+  // Static copy of one legacy report output of a version.
+  artifactOutputRender(id, versionId, index, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/outputs/${encodeURIComponent(index)}/render`, { signal });
+  }
+
+  // Static copy of a report version's lightweight preview.
+  artifactReportPreviewRender(id, versionId, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/preview/render`, { signal });
+  }
+
+  // The sandboxed raw view, opened in a new tab (never framed).
+  artifactLiveUrl(id) {
+    return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/live`;
+  }
+
+  // The current file's bytes (the /download route, with this client's headers).
+  artifactBytes(id, { signal } = {}) {
+    return this.artifactReportContent(`/api/v1/artifacts/${encodeURIComponent(id)}/download`, 'buffer', signal);
+  }
+
   artifactVersions(id, { signal, summary = false } = {}) {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions${summary ? '?summary=true' : ''}`, { signal });
   }
@@ -261,6 +286,19 @@ export class HerdrClient {
 
   artifactShareEvents(id, shareId, { signal } = {}) {
     return this.request(`${this.artifactSharesPath(id, shareId)}/events`, { signal });
+  }
+
+  /** Annotations on an artifact's shares (owner view): one page, newest first; pass the returned `next` as `before`. */
+  listArtifactAnnotations(id, { status = 'open', limit, before, signal } = {}) {
+    const query = new URLSearchParams({ status });
+    if (limit !== undefined && limit !== null) query.set('limit', String(limit));
+    if (before !== undefined && before !== null) query.set('before', before);
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/annotations?${query}`, { signal });
+  }
+
+  dismissArtifactAnnotation(id, annotationId, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/annotations/${encodeURIComponent(annotationId)}/dismiss`,
+      { method: 'POST', body: {}, signal });
   }
 
   // Artifact collaborators (owner view): grants for agents, one-time invite grants, activity, version diffs.
@@ -384,7 +422,7 @@ export class HerdrClient {
       error.requestId = response.headers?.get?.('X-Request-ID') || '';
       throw error;
     }
-    return kind === 'text' ? response.text() : response.blob();
+    return kind === 'text' ? response.text() : kind === 'buffer' ? response.arrayBuffer() : response.blob();
   }
 
   listPublications({ signal } = {}) {
@@ -500,6 +538,19 @@ export class HerdrClient {
   // -- services / hosts ---------------------------------------------------
   listServices({ signal } = {}) {
     return this.request('/api/v1/services', { signal });
+  }
+
+  listServiceCatalog({scope='herdr', status='current', includeArchived=false,
+    search='', hostId='', groupBy='project', limit=100, cursor, signal} = {}) {
+    const query = new URLSearchParams({view:'catalog', scope:scope==='local'?'unassigned':scope,
+      status, include_archived:String(includeArchived), search, host_id:hostId,
+      group_by:groupBy, limit:String(limit)});
+    if(cursor != null)query.set('cursor',cursor);
+    return this.request(`/api/v1/services?${query}`, {signal});
+  }
+
+  getService(serviceId, {signal} = {}) {
+    return this.request(`/api/v1/services/${encodeURIComponent(serviceId)}`, {signal});
   }
 
   /** Canonical fabric URLs for URLs in agent output (read-only; originals are never changed). */

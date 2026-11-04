@@ -166,24 +166,52 @@ count, and a Revoke button.
 Only a signed-in lab viewer who passes the share's lab check (verified Cognito token, on the allow-list) and the
 artifact owner can annotate. Public/anonymous visitors cannot (the endpoint refuses them).
 
-* **Anchor.** HTML: W3C-style text-quote selector (exact text + short prefix/suffix) plus the file path within the
-  bundle; PDF: page number and optional quoted text; other types: whole-document comment. Parquet data views are not
-  annotatable in v1.
-* **Capture.** The lab viewer shell already hosts the content; for HTML the share server injects a small
-  selection script into served HTML (the sandboxed content cannot be touched from outside) that reports selections to
-  the viewer shell by `postMessage`. The shell shows an "Annotate" button and a comment box and posts to
-  `POST /s/<token>/k/<session>/annotations` (session-authenticated, body size-capped, rate-limited per user and per
-  share). The text is stored as plain text, never rendered as HTML.
+**Constraint: no frames anywhere, the dashboard included (operator 2026-10-30).** No page, script or style sheet this
+project ships creates or contains a frame, frame set, `object`, `embed`, `portal`, fenced frame or `srcdoc`, and nothing
+uses `postMessage` between documents (the vendored pdf.js posts to its own worker, which is allowed). A repo-wide test
+(`tests/control_plane/test_no_frames.py`) scans the sources, checks every rendered response and runs the sanitiser on
+frame markup. The raw `f/` route and the owner `live` route serve an artifact's own bytes and are the only exceptions.
+
+* **Share host.** Share links live on their own host, `control_plane.share.public_url` (for example
+  `https://artifacts.metabolomics.us`), served by `share-public`. The collaboration (MCP) host serves no `/s/`.
+  Sessions, the CSRF token and the Cognito callback (`/s/callback`) belong to the share host.
+* **Two views of a lab share.** A lab link lands directly on the **live** view (`f/` for HTML, `v/` for the other
+  types), and a mode switch moves between **Live** and **Annotate**: on HTML an injected, script-free link on `f/`; on
+  `v/` and `a/` a mode bar. The annotation view `a/<path>` is a **static render**, never the running page: HTML goes
+  through `nh3` (an allow-list sanitiser run in a killable child process with a deadline), text becomes an escaped
+  `pre`, images are an `img`, PDFs are drawn to canvases by the vendored pdf.js. Scripts, forms, frames and every
+  external URL are removed or rewritten to the bundle's own files. The live page stays sandboxed as before.
+* **Capture.** The annotation view has a per-response nonce CSP (`default-src 'none'`; script, style, image, font and
+  connect sources limited to the share host and the nonce; no `frame-src`). The sanitised content is mounted in an
+  open shadow root on an inner element of a wrapper that has `contain: paint` and `overflow: clip`, below the mode bar
+  and the annotation panel, so content styles cannot reach the page and cannot cover the panel. The selection is read
+  in the page itself (`anchor.js`), with no script injected into the content and no `postMessage`. The panel posts to
+  `POST /s/<token>/k/<session>/annotations` with a CSRF token that is delivered in our markup only
+  (session-authenticated, body size-capped, rate-limited per user and per share). The text is stored as plain text,
+  never rendered as HTML.
+* **Anchor.** HTML and text: W3C-style text-quote selector (exact text + short prefix/suffix) plus the file path within
+  the bundle; PDF (`pdf_page`): page number, optional quoted text and an optional normalised region; images: a
+  normalised region; other types: whole-document comment. Parquet data views are not annotatable in v1.
+* **Edit and delete.** The author may edit or delete their own annotation while it is **open**; an edit records
+  `edited_at`, a delete sets the status `withdrawn`. A resolved (addressed or dismissed) annotation is final for the
+  author. Withdrawn annotations are kept for the owner's audit under the status filter and are not offered to agents.
+* **Limits.** `enabled`, `max_comment_chars` (4000), `per_user_per_minute` (60), `per_share_per_minute` (600),
+  `global_per_minute` (3000), `per_user_per_day` (2000) and `max_per_share` (20000) are YAML settings under
+  `control_plane.share.annotations`; the defaults are higher than in the first draft (`ANNOTATION_DEFAULTS`).
 * **Write path.** `share-public` stays database-free: it appends the annotation (share id, version id, author email
-  and sub from the verified session, anchor, comment, time) to an append-only annotations file; the worker ingests it
-  into `artifact_annotations` (status `open` | `addressed` | `dismissed`, `addressed_in_version_id`). The usual
+  and sub from the verified session, anchor, comment, time) to an append-only annotations file (`op` `create` | `edit`
+  | `delete`); the worker ingests it into `artifact_annotations` (status `open` | `addressed` | `dismissed` |
+  `withdrawn`, `addressed_in_version_id`) and writes each author's own projection back for their read-back. The usual
   size/rotation rules of the audit events file apply.
 * **Owner view.** A **Feedback** tab in the Share panel lists annotations per artifact (author, version, anchor, comment,
-  status), with a Dismiss action and a link to the version that addressed it. Annotators see their own annotations
-  and the "addressed in version N" status when they reopen the link.
-* **Agent integration.** New MCP tools for granted agents: `artifact_annotations` (open annotations, wrapped
-  `untrusted=True`) and `artifact_annotation_resolve` (marks annotations addressed by a given version id the agent
-  just committed). The agent integrates them with the normal `artifact_commit` (section B). Annotation text is
+  status, "edited"), with a status filter, a Dismiss action and a link to the version that addressed it. A failed read
+  shows a fixed message and Retry, never the server's text. Annotators see their own annotations and the "addressed in
+  version N" status when they reopen the link. The dashboard previews of HTML, text, PDF and images use the same static
+  render (shadow root, no frame).
+* **Agent integration.** MCP tools for granted agents, registered through the intent registry: `artifact_annotations`
+  (open annotations, wrapped `untrusted=True`) and `artifact_annotation_resolve` (marks annotations addressed by a
+  given version id the agent just committed; a read-only grant is refused). The agent integrates them with the normal
+  `artifact_commit` (section B). Annotation text is
   untrusted input to the agent (prompt-injection risk): it is delivered as data with the `UNTRUSTED` notice, the
   resulting revision is an ordinary attributed, revertible version, and nothing goes live automatically — a live
   share link stays frozen on the version people saw until the owner shares the new one ("share latest" convenience is

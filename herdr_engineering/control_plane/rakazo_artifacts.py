@@ -15,6 +15,7 @@ import hashlib
 import secrets
 from typing import Any
 
+from ..media_type import canonical_upload_media_type
 from . import rakazo_events as ev
 
 META_KIND = "artifact_meta"
@@ -167,8 +168,9 @@ class Artifacts:
         name, mime, body = inp.get("name"), inp.get("mimeType"), inp.get("contentBase64")
         if not isinstance(name, str) or not name.strip() or len(name) > 255 or "/" in name or "\\" in name:
             raise self.Error(400, "BAD_REQUEST", "A file needs a name of up to 255 characters, without slashes.")
-        if not isinstance(mime, str) or not mime or len(mime) > 200:
-            raise self.Error(400, "BAD_REQUEST", "mimeType is required.")
+        mime = canonical_upload_media_type(mime) if isinstance(mime, str) and len(mime) <= 200 else None
+        if mime is None:
+            raise self.Error(400, "BAD_REQUEST", "mimeType is required and must be a plain type/subtype.")
         description = inp.get("description") or ""
         if not isinstance(description, str) or len(description) > 280:
             raise self.Error(400, "BAD_REQUEST", "The description is too long.")

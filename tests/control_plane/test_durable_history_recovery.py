@@ -97,13 +97,17 @@ def test_database_failure_is_explicit_unavailable_not_incomplete_memory(db):
     _, source, server, worker, loop, conn = start(db, 'host', True)
 
     class Unavailable:
+        calls = 0
+
         def __getattr__(self, name):
             return getattr(conn, name)
 
         async def fetch(self, *args, **kwargs):
+            self.calls += 1
             raise RuntimeError('injected database failure with private details')
 
         async def fetchrow(self, *args, **kwargs):
+            self.calls += 1
             raise RuntimeError('injected database failure with private details')
 
     source._conn = Unavailable()
@@ -111,8 +115,11 @@ def test_database_failure_is_explicit_unavailable_not_incomplete_memory(db):
         for extra in ({}, {'limit': 3}):
             status, body = get(server, entity_type='host', entity_id='entity', **extra)
             assert status == 503 and body == {'error': 'Integration service is unavailable.'}
+        public_calls = source._conn.calls
+        assert public_calls >= 2
         status, body = get(server, entity_type='agent_identity', entity_id='entity', limit=3)
-        assert status == 200 and body['events'] == []
+        assert status == 404 and body == {'error': 'not found'}
+        assert source._conn.calls == public_calls
     finally:
         close(server, worker, loop, conn)
 
