@@ -465,7 +465,10 @@ herdr-eng rooms direct-cancel ROOM TASK_ID
 - **The flag is the whole rollback and it is safe.** `direct_enabled: false` (or `team_rooms.enabled: false` / `kill_switch: true`): the
   level goes back to acting as Suggest, new guest tasks are 403, open guest tasks are no longer served at once and the next sweep cancels
   them (they stay cancelled when the flag comes back; nothing is revived). Nothing is deleted from the log. To end one guest or all of them
-  without touching the flag: `direct-guests --deny USER`, or `guest-level ROOM suggest`. Both are safety writes and still work when the log is full.
+  without touching the flag: `direct-guests --deny USER`, or `guest-level ROOM suggest`. Leaving Direct and withdrawing a guest's
+  right are safety writes (setting Direct paid for the first one) and still work when the log is full. Narrowing the allow-list
+  while staying at Direct is an ordinary write, as is toggling between `suggest` and `read_only`; with a full log, lower the room to
+  `suggest` instead.
 - **Image rollback: remove the key first.** An older image rejects the unknown `direct_enabled` key, so the hot path turns ALL team rooms
   off and the startup path refuses to start. With the key removed, the older image replays a log that holds `guest_direct_set`, guest tasks
   and cancellations without trouble and serves none of the guest tasks (a guest has no `task` right there, so the "requester still has

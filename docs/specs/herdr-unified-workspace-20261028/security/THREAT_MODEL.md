@@ -329,10 +329,15 @@ Residual risks:
   within its own authority; the allow-list and caps bound who and how often, not what the words say (R-TR2 applies, with no operator
   approval in between). Allow only agents whose own grants you are content to have a guest steer. This is why the flag is off by default.
 - **R-DG2 (Low-Medium).** Caps and the cancel sweep are one-process and replay-derived (like R-TR6 / R-TC2). Between an expiry or an
-  identity-provider group drop and the next sweep, the task is already unservable but is not yet marked cancelled.
+  identity-provider group drop and the next sweep, the task is already unservable but is not yet marked cancelled. Withdrawing a guest's
+  right (`guest_direct_set` with `allowed: false`) is a safety write that is not pre-paid; it is bounded only because each guest can be
+  withdrawn once until the right is restored, and restoring it is an ordinary write that a full log refuses. Leaving Direct is the
+  one pre-paid safety write (`revokes_direct`); toggling among the other levels is ordinary, so it cannot fill the log.
 - **R-DG3 (Low).** Assistants and coordinators are excluded by derivation from the log (designated coordinators, claimed assistant
   runtimes), not by any label the client sends. An assistant that is not yet claimed or designated is not recognised; operators must not
-  list one in `direct_limits`.
+  list one in `direct_limits`. The Direct tests exercise the designated-coordinator branch through the real routes; the
+  runtime-claimed branch is the same `_tc_assistants()` call slice 3 tests, and has no Direct-specific test (the assistant-runtime path
+  needs a package and a host attestation).
 - **R-DG4 (Low).** A review request goes by role only and the server picks the holder. Read/post-only reviewer agents cannot take tasks
   (R-TR12), so it routes to a person holder of the reviewer role or fails closed with 409; a person reviewer sees the fixed command text,
   not the guest's words, and must open the work task to review it.
