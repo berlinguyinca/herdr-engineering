@@ -271,7 +271,8 @@ def test_non_safety_writes_stop_before_safety_writes_and_the_tiers_are_ordered()
                              "helpers_paused", "helper_cancelled", "egress_removed",
                              "federation_share_revoked", "federation_peer_disabled",      # ADR-0008 P2
                              "team_detached",                                              # team rooms slice 1
-                             "team_role_cleared"}                                          # team roles slice 2
+                             "team_role_cleared",                                           # team roles slice 2
+                                 "team_coordinator_cleared"}                                   # coordinators slice 3
     svc._log.extend([{}] * (ordinary - len(svc._log)))        # exactly at the ordinary limit
     with pytest.raises(CollabError):
         svc._commit("room_created", {})
