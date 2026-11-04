@@ -259,7 +259,8 @@ def _open_side_pane(file, pane_id, env, run, herdr="herdr"):
         return {"ok": False, "error": "herdr_unavailable"}
 
 
-def view_report(file, *, close_pane=None, run=subprocess.run, out=None, width=None, herdr="herdr"):
+def view_report(file, *, close_pane=None, run=subprocess.run, out=None, width=None, herdr="herdr",
+                which=shutil.which, ask=input):
     """Render the Markdown report ``file`` and page it; then close ``close_pane`` (the pane showing it).
 
     Closing happens in ``finally`` so Ctrl-C or a pager failure still leaves no empty pane behind. When stdout is
@@ -274,15 +275,15 @@ def view_report(file, *, close_pane=None, run=subprocess.run, out=None, width=No
         if not out.isatty():
             out.write(rendered + "\n")
             return 0
-        pager = shutil.which("less")
+        pager = which("less")
         if pager:
             prompt = " session summary \u00b7 q closes this pane \u00b7 space/arrows scroll \u00b7 / searches"
             run([pager, "-R", "-Pm" + prompt, "-PM" + prompt], input=rendered + "\n", text=True)
         else:
             out.write(rendered + "\n")
-            input("\nPress Enter to close ")
+            ask("\nPress Enter to close ")
         return 0
-    except (OSError, KeyboardInterrupt):
+    except (OSError, EOFError, KeyboardInterrupt):
         return 1
     finally:
         if close_pane:

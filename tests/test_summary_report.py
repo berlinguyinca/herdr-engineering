@@ -300,9 +300,9 @@ def test_view_pages_the_rendered_report_then_closes_its_pane(tmp_path):
     def run(argv, **kw):
         calls.append((argv, kw))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-    assert sr.view_report(f, close_pane="w1:p9", run=run, out=_Tty(True), width=60) == 0
+    assert sr.view_report(f, close_pane="w1:p9", run=run, out=_Tty(True), width=60, which=lambda _: "/usr/bin/less") == 0
     pager, closer = calls
-    assert pager[0][0].endswith("less") and "-R" in pager[0]
+    assert pager[0][0] == "/usr/bin/less" and "-R" in pager[0]
     assert "**" not in pager[1]["input"] and "# " not in pager[1]["input"] and "\x1b[" in pager[1]["input"]
     assert closer[0] == ["herdr", "pane", "close", "w1:p9"]
 
@@ -314,11 +314,28 @@ def test_view_still_closes_its_pane_when_the_pager_is_interrupted(tmp_path):
 
     def run(argv, **kw):
         calls.append(argv)
-        if argv[0].endswith("less"):
+        if argv[0] == "/usr/bin/less":
             raise KeyboardInterrupt
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-    assert sr.view_report(f, close_pane="w1:p9", run=run, out=_Tty(True)) == 1
+    assert sr.view_report(f, close_pane="w1:p9", run=run, out=_Tty(True), which=lambda _: "/usr/bin/less") == 1
     assert calls[-1] == ["herdr", "pane", "close", "w1:p9"]
+
+
+def test_view_without_less_prints_waits_for_enter_then_closes_its_pane(tmp_path):
+    f = tmp_path / "r.md"
+    f.write_text("# Title\n")
+    out, calls, asked = _Tty(True), [], []
+    run = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0)       # noqa: E731
+    assert sr.view_report(f, close_pane="w1:p9", run=run, out=out, which=lambda _: None,
+                          ask=lambda prompt: asked.append(prompt) or "") == 0
+    assert "Title" in out.text and len(asked) == 1 and calls == [["herdr", "pane", "close", "w1:p9"]]
+    # a closed stdin must not leave the pane open either
+    calls.clear()
+
+    def eof(prompt):
+        raise EOFError
+    assert sr.view_report(f, close_pane="w1:p9", run=run, out=out, which=lambda _: None, ask=eof) == 1
+    assert calls == [["herdr", "pane", "close", "w1:p9"]]
 
 
 def test_view_without_a_terminal_prints_and_leaves_no_pane_to_close(tmp_path):
