@@ -35,7 +35,7 @@ from herdr_engineering.control_plane.db import Migrator  # noqa: E402
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
 from tests.control_plane.registry_pg import FakeBlobs  # noqa: E402
 
-NAMES = ["alpha.md", "beta.md", "gamma.md", f"hostile \"><img src=x onerror=window.__x=1>.md", "delta.md"]
+NAMES = ["alpha.md", "beta.md", "gamma.md", "hostile \"><img src=x onerror=window.__x=1>.md", "delta.md"]
 
 
 def start_postgres(area: Path) -> tuple[str, callable]:
