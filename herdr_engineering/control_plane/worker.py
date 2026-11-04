@@ -484,7 +484,7 @@ async def _close_quietly(conn) -> None:
 
 
 class CollabBridgeLoop:
-    """The fast side of the collaborator bridge: three independent tasks beside the 30 s worker pass.
+    """The fast side of the collaborator bridge: up to four independent tasks beside the 30 s worker pass.
 
     * **grants** (own connection, every ``interval``): refreshes the shared retraction gate every
       ``retractions_every``, resolves invite grants from the fresh ``agents.json`` and publishes ``grants.json``
@@ -500,8 +500,10 @@ class CollabBridgeLoop:
 
     def __init__(self, dsn_connect, mirror, applier, *, interval: float = 1.0, mirror_every: float = 30.0,
                  retractions_every: float = 30.0, heartbeat: float = 30.0, sweep_every: float | None = None,
-                 reconnect_delay: float = BRIDGE_RECONNECT, close_timeout: float = 10.0):
+                 reconnect_delay: float = BRIDGE_RECONNECT, close_timeout: float = 10.0,
+                 members_publisher=None, members_every: float = 60.0):
         self.dsn_connect, self.mirror, self.applier = dsn_connect, mirror, applier
+        self.members_publisher, self.members_every = members_publisher, members_every
         self.interval, self.mirror_every, self.retractions_every = interval, mirror_every, retractions_every
         self.heartbeat = heartbeat
         self.sweep_every = mirror_every if sweep_every is None else sweep_every
@@ -514,7 +516,8 @@ class CollabBridgeLoop:
     async def run(self, stop: asyncio.Event) -> None:
         pool = _ConnPool(self.dsn_connect, self.mirror.limits.apply_concurrency + 1)
         tasks = [asyncio.create_task(self._supervise(name, body, stop, pool), name=name) for name, body in (
-            ("collab-grants", self._grants), ("collab-mirror", self._mirror), ("collab-applier", self._applier))]
+            ("collab-grants", self._grants), ("collab-mirror", self._mirror), ("collab-applier", self._applier),
+            *((("collab-members", self._members),) if self.members_publisher is not None else ()))]
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -550,6 +553,13 @@ class CollabBridgeLoop:
             await asyncio.wait_for(stop.wait(), timeout=seconds)
         except TimeoutError:
             pass
+
+    # -- members ------------------------------------------------------------------------------------------------
+    async def _members(self, conn, stop: asyncio.Event, _pool) -> None:
+        """Every ``members_every``: rewrite the member views and revoke the shares of members no longer admitted."""
+        while not stop.is_set():
+            await self.members_publisher(conn)
+            await self._wait(stop, self.members_every)
 
     # -- grants -------------------------------------------------------------------------------------------------
     async def _grants(self, conn, stop: asyncio.Event, _pool) -> None:

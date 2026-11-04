@@ -82,6 +82,7 @@ _SHA = re.compile(SHA_RE)
 _PART = re.compile(r"[0-9]{7}\Z")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")  # owner keys, actor / artifact / version ids
 _KIND = re.compile(r"[a-z][a-z0-9_.]{0,47}\Z")
+_USER_ACTOR_ID = re.compile(r"[A-Za-z0-9_.:@+-]{1,128}\Z")   # a Cognito username (collab_cognito._USER_RE)
 _IDEMPOTENCY = re.compile(r"[\x21-\x7e]{1,128}\Z")
 _TEXT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _MAX_B64 = 4 * math.ceil(CHUNK_BYTES / 3)
@@ -1267,7 +1268,12 @@ def _validate_actor(raw) -> Actor:
     if not isinstance(raw, dict) or set(raw) != {"kind", "id"} or raw["kind"] not in _ACTOR_KINDS:
         raise IntentError("invalid actor")
     try:
-        actor_id = agent_owner_key(raw["id"]) if raw["kind"] == "agent" else _check_id(raw["id"], "actor id")
+        if raw["kind"] == "agent":
+            actor_id = agent_owner_key(raw["id"])
+        elif isinstance(raw["id"], str) and _USER_ACTOR_ID.match(raw["id"]):
+            actor_id = raw["id"]
+        else:
+            raise BridgeError("invalid actor id")
     except BridgeError:
         raise IntentError("invalid actor") from None
     return Actor(raw["kind"], actor_id)

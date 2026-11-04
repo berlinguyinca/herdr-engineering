@@ -81,7 +81,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import annotation_intents, collab_waiters
+from . import annotation_intents, artifact_member_intents, collab_waiters  # noqa: F401 - registers the member kinds
 from .collab import CollabError, Principal
 from .collab_bridge_files import (
     AUDITED_MARKER,

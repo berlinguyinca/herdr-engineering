@@ -452,7 +452,8 @@ def test_importing_collab_artifacts_registers_the_kind():
             "print(sorted(c._INTENT_KINDS))")
     proc = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == "['annotation_resolve', 'commit']"
+    assert proc.stdout.strip() == ("['annotation_resolve', 'commit', 'member.artifact_create', 'member.artifact_delete', "
+                                   "'member.publish']")
 
 
 def test_the_module_registers_its_kind_once():

@@ -4874,14 +4874,16 @@ def _build_collab_mirror(settings: CollabArtifactsSettings, *, rustfs):
     return CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=time.time)
 
 
-def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rustfs, connect, lineage):
+def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rustfs, connect, lineage, members=None):
     """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
     applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
-    and staging owner here). ``mirror`` comes from ``_build_collab_mirror``."""
+    and staging owner here). ``mirror`` comes from ``_build_collab_mirror``. ``members`` is a ``MemberRuntime`` (config
+    wiring is plan 5 task 5); None leaves the member kinds answering ``members_disabled``."""
     from .control_plane import worker as cp_worker
     from .control_plane.annotation_intents import (
         register_annotation_resolve,  # registers the kind at import
     )
+    from .control_plane.artifact_member_intents import publish_member_views, register_member_intents
     from .control_plane.artifact_scope import ArtifactGraphGate
     from .control_plane.collab_intents import CollabIntentApplier
     clock = mirror.clock
@@ -4894,11 +4896,13 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rust
                 return {"skipped": "retracted"}
             return post(version)
     applier = CollabIntentApplier(settings.outbox_dir, mirror, rustfs=rustfs, limits=settings.limits,
-                                  spool_dir=settings.spool_dir, lineage=lineage, context_extras={}, clock=clock,
-                                  gate=gate)
+                                  spool_dir=settings.spool_dir, lineage=lineage, context_extras={} if members is None else {"members": members},
+                                  clock=clock, gate=gate)
     applier.register_commit()
     register_annotation_resolve(applier)
-    return cp_worker.CollabBridgeLoop(connect, mirror, applier)
+    register_member_intents(applier)
+    publisher = None if members is None else (lambda conn: publish_member_views(conn, members))
+    return cp_worker.CollabBridgeLoop(connect, mirror, applier, members_publisher=publisher)
 
 
 def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):

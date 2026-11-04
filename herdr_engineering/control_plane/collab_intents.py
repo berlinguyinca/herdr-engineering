@@ -231,9 +231,9 @@ GATE_RELOAD = 30.0                  # the worker-local retraction gate is reload
 LINEAGE_QUEUE_MAX = 1000            # versions waiting for lineage emission; the oldest is dropped beyond this
 
 _RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason", "resolved",
-                "skipped")
+                "skipped", "artifact_id")
 MAX_RESOLVED = 50                       # annotation_resolve: ids resolved / skipped in one outcome
-_STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id")
+_STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id", "artifact_id")
 _OUTCOME = re.compile(r"[a-z_]{1,32}\Z")
 _INTENT_FILE = re.compile(TICKET_RE[:-2] + r"\.json\Z")
 _KIND_NAME = re.compile(r"[a-z][a-z0-9_.]{0,47}\Z")
@@ -1407,11 +1407,12 @@ class CollabIntentApplier:
             except ValueError:
                 continue
             payload = raw.get("payload") if isinstance(raw, dict) else None
-            changes = payload.get("changes") if isinstance(payload, dict) else None
-            for change in changes if isinstance(changes, list) else ():
-                upload_id = change.get("upload_id") if isinstance(change, dict) else None
-                if isinstance(upload_id, str):
-                    out.add(upload_id)
+            for field in ("changes", "files"):           # commit changes; member.publish files
+                listed = payload.get(field) if isinstance(payload, dict) else None
+                for item in listed if isinstance(listed, list) else ():
+                    upload_id = item.get("upload_id") if isinstance(item, dict) else None
+                    if isinstance(upload_id, str):
+                        out.add(upload_id)
         return out
 
     def _remove_upload(self, owner: str, upload_id: str) -> bool:
