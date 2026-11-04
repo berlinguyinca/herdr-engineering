@@ -148,7 +148,9 @@ Operator step, once, before sending lab links (not done by `deploy.sh`): add
 `<control_plane.share.public_url>/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
 `herdr-collab-web` app client (`aws cognito-idp update-user-pool-client` replaces the whole client: read it
 first with `describe-user-pool-client` and send every existing attribute back with the new URL added). Public
-links need no Cognito change.
+links need no Cognito change. Keep the previous host's `/s/callback` registered until the deploy is verified: a
+rollback to the previous release signs in there. Existing links on the old host stop working at the cutover
+(re-issue them); see docs/operations/collaboration-network.md.
 
 ## Artifact collaborator bridge (`control_plane.collab_artifacts`)
 

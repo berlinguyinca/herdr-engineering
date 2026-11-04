@@ -174,27 +174,63 @@ them is run by the build. Do them in this order, and do not deploy a partial set
    localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d artifacts.metabolomics.us`, repeating any
    other name the lineage already has). The existing `HERDR_COLLAB_CERT_DIR` mount and renewal timer serve both hosts:
    no new compose key and no second timer.
-4. **Cognito:** in app client `cognito_web_client`, set the callback URL `https://artifacts.metabolomics.us/s/callback`
-   and the sign-out URL `https://artifacts.metabolomics.us/`. Remove the MCP host's `/s/callback` entry.
+4. **Cognito:** in app client `cognito_web_client`, ADD `https://artifacts.metabolomics.us/s/callback` to BOTH
+   CallbackURLs and LogoutURLs (the one rule, as in `deploy/control-plane/COLLAB.md`; no separate sign-out page).
+   Keep the MCP host's old `/s/callback` entry until step 8: a rollback to the previous release signs in there.
    (`update-user-pool-client` replaces the whole client: read it first and send every field back.)
 5. **YAML:** set `control_plane.share.public_url: https://artifacts.metabolomics.us`. Optional: `owner_emails` and an
    `annotations` mapping (`enabled`, `max_comment_chars`, `per_user_per_minute`, `per_share_per_minute`,
    `global_per_minute`, `per_user_per_day`, `max_per_share`).
-6. **Build and roll out:** rebuild the image (new `nh3` dependency and the vendored pdf.js), redeploy collab-edge,
-   share-public and the control plane, then apply migration 0046.
+6. **Build and roll out:** rebuild the image (new `nh3` dependency and the vendored pdf.js), then run
+   `deploy/control-plane/deploy.sh`. It refuses to continue (and rolls back) when the staged edge certificate does not
+   name the share host (step 3 not done or the renewal dropped it) and probes
+   `https://artifacts.metabolomics.us/s/probe/` afterwards (a warning unless it answers 404). Migration 0046 needs no
+   manual step: the worker applies migrations when it starts, and the owner annotation API answers 503 until it has.
+   The web container starts at the same time, so expect that 503 for a few seconds.
 7. **Smoke checks:**
    - An MCP-host `/s/...` path no longer reaches share-public.
    - A lab link to an HTML artifact signs in and lands directly on the running page, with the Annotate link. Clicking
      it opens the annotation view, and Live returns to the page.
    - Annotate, then a test annotation: it reaches the Feedback panel.
    - The dashboard shows HTML and PDF previews with no frame.
+   - By hand: `curl -sS --resolve artifacts.metabolomics.us:443:<edge ip> -o /dev/null -w '%{http_code}\n'
+     https://artifacts.metabolomics.us/s/x/` prints 404 (DNS, SNI route and certificate line up).
+8. **Only after the smoke checks pass:** remove the MCP host's `/s/callback` entry from the Cognito client. Before this
+   point the previous release can still be rolled back to.
+
+### Before you deploy: what changes for existing links
+
+- **Every outstanding share link stops working.** Links issued so far point at the MCP host
+  (`localdev.mcp.metabolomics.us/s/<token>/`); that host no longer serves `/s/` and a temporary redirect was
+  deliberately not added. Tokens are shown once and cannot be re-derived: list the live shares first
+  (`artifacts share list`) and re-issue each one after the cutover.
+- **Rollback** restores the previous edge conf and share-public. The new tables and the widened
+  `artifact_share_events` CHECK stay (they are harmless to the old code); the MCP-host Cognito callback must still be
+  registered for the old release to sign in (hence step 8).
+- A refused or over-quota annotation is consumed with only a `denied` event; the author's browser already received
+  202, so the comment drops out of their own panel at the next projection.
 
 ### Known limitations
 
-- **Owner dashboard preview can beacon.** An artifact's own HTML may carry an inline `<style>` with `url()` or
-  `@import`. The dashboard preview shows that HTML sanitised but the dashboard has no CSP, so such a rule can make the
-  owner's browser request an external URL (owner IP and referrer reach the artifact's author). The sandboxed `live`
-  view and every share-host view are not affected (their CSP blocks it). Follow-up: a dashboard-wide CSP, or dropping
-  `<style>` from the dashboard render.
+- **Owner dashboard preview residual.** The dashboard render routes now drop every `<style>` element, so inline CSS
+  can no longer make the owner's browser fetch URLs (`url()`, `@import`, CSS escapes). `style=""` attributes are
+  rewritten or dropped by the sanitiser, and linked sibling stylesheets are never mapped. The dashboard still has no
+  CSP of its own: what remains is an `<a>` the owner clicks and the images the resolver allows (`data:` rasters only).
 - A hostile upload can occupy the single sanitiser lane for its 3 s deadline; there is no per-share or per-IP budget
   yet. Callers answer a busy lane with a fixed 503.
+- The sanitiser child runs under the same uid as share-public, which holds the session signing secret.
+- The MCP tool `artifact_annotation_resolve` holds its request thread for up to 10 s per call.
+- The edge's per-IP rate limits (`share_req` 100 r/s, burst 300) are generous for the expensive `a/` renders; the
+  single sanitiser lane is the real bound.
+- **A scripted `f/` page sees its own session URL.** Author JavaScript in a raw HTML file (sandboxed, opaque origin)
+  can read `location.href`, which carries the viewer's session; it could navigate away with it. With annotations the
+  session also has write power for that viewer's own annotations. Operator decision pending: a read-only derived
+  credential for `f/`, or an opaque id in the path.
+- The worker does not re-check an annotation author against the share's allow-list when it ingests a line (the edge
+  does); a compromised edge could mint unlisted or owner-role authors.
+- Comments and anchor text may contain bidirectional and zero-width format characters (they render as text, but can
+  spoof layout in the owner's panel).
+- PDF annotation is pointer-only: keyboard users can comment on the whole PDF but cannot choose a page or region.
+- Purged or tombstoned artifacts keep their annotation rows and author emails; there is no retention rule yet.
+- Test-suite gaps, tracked separately: a few unit tests use fakes (fake DOM, a scripted render child, `FakeBlobs`),
+  and the PostgreSQL-backed tests skip when the host has no `initdb`.

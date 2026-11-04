@@ -136,6 +136,15 @@ sections:
       #   max_share_bytes: 536870912       # one bundle
       #   max_total_bytes: 2147483648      # all live bundles
       #   max_files: 20000                 # files per bundle
+      #   owner_emails: ["owner@example.test"]   # lowercase; their annotations carry the owner role
+      #   annotations:                     # all optional; the defaults apply when omitted
+      #     enabled: true
+      #     max_comment_chars: 4000
+      #     per_user_per_minute: 60
+      #     per_share_per_minute: 600
+      #     global_per_minute: 3000
+      #     per_user_per_day: 2000
+      #     max_per_share: 20000
       #   # container paths; keep the defaults with deploy.sh (its mounts are fixed):
       #   # shares_dir: /shares   events_dir: /share-events   marker_dir: /var/lib/herdr/share-markers
       # OPTIONAL: the collaborator bridge (external agents read and commit artifacts through collab-public's MCP tools).

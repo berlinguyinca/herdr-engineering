@@ -29,7 +29,9 @@
 #      Share links: control_plane.share is always validated (render-share; `enabled: true` without a
 #      signing_secret is refused before anything runs, the secret never printed). Only when it is enabled
 #      (which needs the collaboration marker) is its slice installed at a stable 0600 path, the edge
-#      nginx.conf rendered with the /s/ location, and share-public force-recreated once, before the edge;
+#      nginx.conf rendered with the share host's own server block (control_plane.share.public_url; the edge
+#      certificate must name that host, or the deploy is refused), and share-public force-recreated once,
+#      before the edge;
 #      disabled, a running share-public is stopped and the edge conf is the repo file unchanged. A rollback
 #      recreates share-public from the previous commit when the restored edge conf routes /s/, else stops it
 #   5. waits for /api/v1/health to report the new commit AND for every recreated
@@ -485,7 +487,7 @@ if [ "$DRY" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; after the build would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
   fi
   if [ "$SHARE" = 1 ]; then
-    echo "[dry-run] share links enabled: rendered the share slice to a temp dir (would install it at ~/.config/herdr-engineering/share/), the edge conf gains /s/, share-public would be force-recreated before the edge"
+    echo "[dry-run] share links enabled: rendered the share slice to a temp dir (would install it at ~/.config/herdr-engineering/share/), the edge conf gains the share host's server block, the edge certificate must name that host, share-public would be force-recreated before the edge"
   fi
   echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}}"
   exit 0
@@ -850,7 +852,7 @@ forward() {
   # The edge resolves collab-public once, at (re)load: a recreated collab-public has a
   # new address, so reload the edge after every collab up, not only on a new conf.
   if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi
-  # Shares disabled: the edge no longer routes /s/; stop a share-public a previous deploy started (its
+  # Shares disabled: the edge no longer serves the share host; stop a share-public a previous deploy started (its
   # bundles stay on disk). Never fatal.
   if [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ]; then stop_share_public; fi
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
