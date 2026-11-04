@@ -102,7 +102,7 @@ def registry_pg():
             subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), *args], check=True, capture_output=True)
 
         def start():
-            pg_ctl("-l", str(area / "server.log"), "-o", f"-c listen_addresses='' -k {area}", "-w", "start")
+            pg_ctl("-l", str(area / "server.log"), "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap", "-w", "start")
 
         def stop():
             pg_ctl("-m", "fast", "-w", "stop")
