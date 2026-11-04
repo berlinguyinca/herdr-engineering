@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### CI: the ui-gates focus-audit floor is back at 480
+- Commit 643d2b5f lowered the owner `focused` floor in `ui-gates-states.test.mjs` from 480 to 470, blaming the Usage page's new tabs. The Usage page is not audited by that test (every state's scope is a workbench panel, `#hcn-p-*`); the real drift was the phone's closed Filters disclosure, which 8cbeff9b fixed by opening it in every lineage state (498 focused before the drift, 479 during). The floor is 480 again and the stale comment is replaced. `ui-gates-floor.test.mjs` reads the floors from source and fails if any drops below its recorded minimum (runs without a browser). Not verified locally: Playwright is not installed here, so only a green ui-gates run proves the owner total reaches 480; do not merge before it.
+
 ### CI: the fabric agent watchdog tests always stop their watchdog thread
 - Run 550 of an unrelated PR lost its whole unit-gates step at 87%: a `fabric_agent._watchdog` thread dumped every thread's stack and called the real `os._exit(1)`, which ended the pytest process (the log shows `FF`, no summary). Both watchdog tests stub `os._exit` with `monkeypatch`, which restores the real one when the test ends; `test_watchdog_exits_on_wedged_scan` also asserted `exited == [1]` although the stub returns, so the watchdog calls it again on every poll, and a failed assertion skipped `stop.set()`, leaving the thread to outlive the stub. Both tests now stop the thread in a `finally`, and the first asserts the exit code, not the count. This was not reproduced (6 of 6 runs of the old test passed with every core busy), so it is hardening that removes the way a watchdog can outlive its stub, not a proven fix of that one run.
 ### CI: every private test Postgres keeps dynamic shared memory out of /dev/shm
