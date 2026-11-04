@@ -82,18 +82,21 @@ test('? opens the shortcut sheet, traps focus, and Escape closes it back to wher
   assert.equal(await page.evaluate(() => document.activeElement.dataset.config !== undefined), true);
 }));
 
+// The assistant picker became a tablist of groups (e8b2a3a2); the selected assistant is the one tab with aria-selected=true there.
+const selectedAssistant = (page) => page.locator('[data-atab][aria-selected=true]').getAttribute('data-atab');
+
 test('digits and arrows move between Configure tabs, which are a real tablist', () => withPage(async (page) => {
   await page.keyboard.press('2');
-  assert.equal(await page.locator('[role=tab][aria-selected=true]').innerText(), 'Permissions');
+  assert.equal(await page.locator('.pa-tabs [role=tab][aria-selected=true]').innerText(), 'Permissions');
   assert.equal(await page.evaluate(() => document.activeElement.dataset.tab), 'Permissions');
   await page.keyboard.press('ArrowRight');
-  assert.equal(await page.locator('[role=tab][aria-selected=true]').innerText(), 'Memory');
+  assert.equal(await page.locator('.pa-tabs [role=tab][aria-selected=true]').innerText(), 'Memory');
   assert.equal(await page.evaluate(() => document.activeElement.dataset.tab), 'Memory');
   await page.keyboard.press('End');
-  assert.equal(await page.locator('[role=tab][aria-selected=true]').innerText(), 'Diagnostics');
+  assert.equal(await page.locator('.pa-tabs [role=tab][aria-selected=true]').innerText(), 'Diagnostics');
   await page.keyboard.press('ArrowRight');                                   // wraps
-  assert.equal(await page.locator('[role=tab][aria-selected=true]').innerText(), 'General');
-  assert.equal(await page.locator('[role=tab][tabindex="0"]').count(), 1);   // roving tabindex: one tab stop
+  assert.equal(await page.locator('.pa-tabs [role=tab][aria-selected=true]').innerText(), 'General');
+  assert.equal(await page.locator('.pa-tabs [role=tab][tabindex="0"]').count(), 1);   // roving tabindex: one tab stop
 }));
 
 test('Ctrl+K filters commands by words and Enter runs the first match', () => withPage(async (page) => {
@@ -104,9 +107,9 @@ test('Ctrl+K filters commands by words and Enter runs the first match', () => wi
   assert.equal(await palette.getByRole('option').count(), 1);
   await page.keyboard.press('Enter');
   assert.equal(await palette.count(), 0);
-  assert.equal(await page.locator('[role=tab][aria-selected=true]').innerText(), 'Diagnostics');
+  assert.equal(await page.locator('.pa-tabs [role=tab][aria-selected=true]').innerText(), 'Diagnostics');
   await page.keyboard.press('Control+k'); await page.keyboard.type('switch ci'); await page.keyboard.press('Enter');
-  assert.equal(await page.locator('[data-select]').inputValue(), 'asst_2');
+  assert.equal(await selectedAssistant(page), 'asst_2');
 }));
 
 test('/ focuses the message box, Enter sends, bare keys do nothing while typing, Escape leaves the box', () => withPage(async (page) => {
@@ -135,9 +138,9 @@ test('a focuses the Approve button but never approves; Enter on the button does'
 
 test('[ and ] switch assistant, j and k step through threads, n starts a new one', () => withPage(async (page) => {
   await page.keyboard.press(']');
-  assert.equal(await page.locator('[data-select]').inputValue(), 'asst_2');
+  assert.equal(await selectedAssistant(page), 'asst_2');
   await page.keyboard.press('[');
-  assert.equal(await page.locator('[data-select]').inputValue(), 'asst_1');
+  assert.equal(await selectedAssistant(page), 'asst_1');
   await page.locator('#pa-threads [data-t]').first().waitFor();
   await page.keyboard.press('j');
   assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Planning');
@@ -148,12 +151,15 @@ test('[ and ] switch assistant, j and k step through threads, n starts a new one
   await page.waitForFunction(() => window.__calls.some((c) => c.method === 'POST' && c.path.endsWith('/threads')));
 }));
 
-test('typing in the assistant picker does not trigger shortcuts', () => withPage(async (page) => {
-  await page.locator('[data-select]').focus();
+test('typing in a Configure form field does not trigger shortcuts', () => withPage(async (page) => {
+  // The assistant picker (a <select>) became tabs, which are buttons and keep shortcuts live; the form fields are the typing targets now.
+  await page.keyboard.press('1');
+  await page.locator('[data-f=name]').focus();
   await page.keyboard.press('n'); await page.keyboard.press('?');
   assert.equal(await page.getByRole('dialog').count(), 0);
   assert.equal((await mutations(page)).length, 0);
 }));
+
 
 test('Enter during a slow redraw still sends (the handler no longer waits for the network)', () => withPage(async (page) => {
   await page.evaluate(() => { window.__delay = 700; });
@@ -167,5 +173,5 @@ test('Enter during a slow redraw still sends (the handler no longer waits for th
 
 test('AltGr-produced brackets still switch assistant (AltGr reports ctrl+alt)', () => withPage(async (page) => {
   await page.evaluate(() => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: ']', ctrlKey: true, altKey: true, modifierAltGraph: true, bubbles: true })));
-  assert.equal(await page.locator('[data-select]').inputValue(), 'asst_2');
+  assert.equal(await selectedAssistant(page), 'asst_2');
 }));
