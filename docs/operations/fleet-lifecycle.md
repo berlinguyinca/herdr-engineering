@@ -230,6 +230,26 @@ a lock prevents overlapping scheduled runs. SSH authentication must remain valid
 for unattended access. Hosts requiring an interactive Tailscale SSH check will
 fail that deployment and be retried by a later scheduled run.
 
+**A refused update is a skip, not a failure.** If the configured checkout holds local
+work or is not on `main`, the run preserves that work, prints
+`{"ok": true, "skipped": true, "reason": ..., "detail": {dirty_paths, tracked_changes,
+examples, hint}}` and exits 0. Refusing to touch an operator's work is correct, but a
+unit that exited 1 every night for it meant the daily status was permanently red, so a
+real deployment failure looked exactly like a busy checkout
+([herdr-engineering#572](https://github.com/berlinguyinca/herdr-engineering/issues/572)).
+The reason names the checkout and previews up to eight dirty paths, so the operator sees
+what to move; the hint points at the supported fix — point `HERDR_ENGINEERING_REPO` at a
+dedicated clean checkout for unattended updates, which is the only way a controller whose
+`main` checkout is a busy multi-agent workspace (and whose private inventory is gitignored
+and therefore not in any clone) gets unattended updates at all.
+
+Every run records its outcome (`updated` | `skipped` | `failed`, reason, revision,
+timestamp) in `$XDG_STATE_HOME/herdr-engineering/fleet-auto-update.json`, and
+`herdr-eng memory doctor` reports it as the `fleet_update` check: `ok` when a successful
+run landed within the last 26h, `warn` for a skip or a stale record, `fail` for a failed
+update. Before that, `doctor` reported `overall: ok` for a fleet that had not updated in
+weeks.
+
 Fleet sync refreshes the fabric agent and Pi build gate. On Linux, it also
 installs/restarts the Rust cleanup companion according to each machine's existing
 `~/.config/herdr-engineering/config.yaml`. Cleanup remains disabled without both
@@ -242,12 +262,22 @@ Inspect update results and installed revisions:
 ```bash
 journalctl --user -u herdr-eng-fleet-update.service
 herdr-eng fleet status
+herdr-eng memory doctor
 herdr-eng build-cleanup status
 ```
 
 The update service emits a JSON report with step failures and revision mismatches.
 `fleet status` now includes source revision and cleanup service state. The legacy
 `scripts/fleet-self-update.sh` delegates to the same guarded updater.
+
+`memory doctor` also reports client provenance without needing to import the client: the
+`package_revision` check reads `direct_url.json` from the install that owns the
+`herdr-memory` CLI (`<prefix>/lib/python*/site-packages/herdr_memory-*.dist-info`), and
+`client_version` compares `herdr-memory --version` against
+`memory_install.PINNED_CLIENT_VERSION`. A wheel install with no VCS provenance reports
+`UNKNOWN package_revision ... (wheel install 0.1.3: no VCS provenance recorded)` instead
+of the old bare `not determinable`, which is what made an unpinned build invisible to
+health reporting (D11, D17).
 
 Disable unattended updates with:
 

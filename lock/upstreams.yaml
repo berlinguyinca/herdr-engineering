@@ -13,7 +13,7 @@ dependencies:
     note: "Required cross-harness artifact skill, installed into the same four harnesses as herdr-handoff."
   herdr-memory:
     source: "berlinguyinca/herdr-memory"
-    revision: "b3c5074"
+    revision: "89a8529"
     decision: ADOPT
     license: "private"
     maintenance: "active; private Hindsight-backed memory client (contract v1)"

@@ -265,6 +265,124 @@ def test_pin_matches_lock():
     assert m and m.group(1) == mi.PINNED_REVISION
 
 
+# ---- unattended update + client provenance (herdr-engineering#572) --------
+
+def _state_env(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    return state
+
+
+def _check(doctor, name):
+    return next(c for c in doctor["checks"] if c["name"] == name)
+
+
+def test_doctor_does_not_invent_an_unattended_update(home, tmp_path, monkeypatch):
+    _state_env(tmp_path, monkeypatch)
+    d = inst(home).doctor(["claude"])
+    assert _check(d, "fleet_update")["status"] == "unknown"
+    assert "no unattended fleet update" in _check(d, "fleet_update")["detail"]
+
+
+def test_doctor_surfaces_a_refused_update_as_a_warning(home, tmp_path, monkeypatch):
+    """A skipped update is drift worth reporting, but never a failed unit."""
+    from herdr_engineering import fleet_autoupdate
+
+    _state_env(tmp_path, monkeypatch)
+    fleet_autoupdate.record_run("skipped",
+                                reason="controller checkout is dirty; local work is preserved",
+                                detail={"dirty_paths": 42})
+    d = inst(home).doctor(["claude"])
+    check = _check(d, "fleet_update")
+    assert check["status"] == "warn"
+    assert "skipped" in check["detail"] and "dirty" in check["detail"]
+    assert check["data"]["reason"].startswith("controller checkout is dirty")
+    assert d["overall"] != "fail"
+
+
+def test_doctor_fails_for_a_failed_update(home, tmp_path, monkeypatch):
+    from herdr_engineering import fleet_autoupdate
+
+    _state_env(tmp_path, monkeypatch)
+    fleet_autoupdate.record_run("failed", reason="ansible-playbook fleet-sync failed")
+    d = inst(home).doctor(["claude"])
+    assert _check(d, "fleet_update")["status"] == "fail"
+    assert d["overall"] == "fail"
+
+
+def test_doctor_warns_when_a_successful_update_goes_stale(home, tmp_path, monkeypatch):
+    import datetime as dt
+
+    from herdr_engineering import fleet_autoupdate
+
+    state = _state_env(tmp_path, monkeypatch)
+    fleet_autoupdate.record_run("updated", revision="89a8529")
+    assert _check(inst(home).doctor(["claude"]), "fleet_update")["status"] == "ok"
+
+    record = fleet_autoupdate.read_state()
+    record["last_run"] = (dt.datetime.now(dt.UTC)
+                          - dt.timedelta(hours=mi.FRESH_UPDATE_HOURS + 14)).isoformat()
+    (state / "herdr-engineering" / fleet_autoupdate.STATE_NAME).write_text(json.dumps(record))
+    check = _check(inst(home).doctor(["claude"]), "fleet_update")
+    assert check["status"] == "warn" and "ago" in check["detail"]
+
+
+def _client_install(home, *, version="0.1.3", commit="89a8529" + "0" * 33, vcs=True):
+    """A `uv tool`-shaped install: <prefix>/bin/herdr-memory + its own site-packages."""
+    prefix = home / "tool"
+    exe = prefix / "bin" / "herdr-memory"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_text("#!/bin/sh\necho '{}'\n")
+    exe.chmod(0o755)
+    dist = prefix / "lib" / "python3.12" / "site-packages" / f"herdr_memory-{version}.dist-info"
+    dist.mkdir(parents=True)
+    payload = {"url": "https://github.com/berlinguyinca/herdr-memory.git"}
+    if vcs:
+        payload["vcs_info"] = {"commit_id": commit, "vcs": "git"}
+    (dist / "direct_url.json").write_text(json.dumps(payload))
+    return str(exe)
+
+
+def test_provenance_is_read_from_the_install_that_owns_the_cli(home):
+    """The wrapper's interpreter cannot import the client; provenance still resolves."""
+    exe = _client_install(home)
+    i = mi.MemoryInstaller(home, command=CMD, which=lambda n: exe if n == "herdr-memory" else None,
+                           run=fake_run)
+    assert i.installed_version() == "0.1.3"
+    assert i.installed_revision() == "89a8529" + "0" * 33
+    d = i.doctor(["claude"])
+    assert _check(d, "package_revision")["status"] == "ok"
+
+
+def test_wheel_install_without_provenance_is_reported_unknown_with_its_version(home):
+    exe = _client_install(home, version="0.1.3", vcs=False)
+    i = mi.MemoryInstaller(home, command=CMD, which=lambda n: exe if n == "herdr-memory" else None,
+                           run=fake_run)
+    assert i.installed_revision() is None and i.installed_version() == "0.1.3"
+    check = _check(i.doctor(["claude"]), "package_revision")
+    assert check["status"] == "unknown" and "0.1.3" in check["detail"]
+
+
+def test_doctor_reports_the_client_version_the_cli_advertises(home):
+    exe = _client_install(home)
+    def run(argv, timeout=5.0):
+        payload = {"client": "0.1.3", "contract": 1, "harness": "codex"} if argv[-1] == "--version" \
+            else '{"healthy": true}'
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+    i = mi.MemoryInstaller(home, command=CMD, which=lambda n: exe if n == "herdr-memory" else None, run=run)
+    assert _check(i.doctor(["claude"]), "client_version") == {
+        "name": "client_version", "status": "ok", "detail": "client 0.1.3",
+        "data": {"contract": 1}}
+
+    def stale_run(argv, timeout=5.0):
+        payload = {"client": "0.1.2", "contract": 1} if argv[-1] == "--version" else '{"healthy": true}'
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+    stale = mi.MemoryInstaller(home, command=CMD, which=lambda n: exe if n == "herdr-memory" else None,
+                               run=stale_run)
+    check = _check(stale.doctor(["claude"]), "client_version")
+    assert check["status"] == "warn" and "0.1.2" in check["detail"] and "pinned" in check["detail"]
+
+
 # ---- CLI -------------------------------------------------------------------
 def test_cli_install_dry_run_and_json(home, monkeypatch, capsys):
     monkeypatch.setattr("shutil.which", which_only("claude"))
