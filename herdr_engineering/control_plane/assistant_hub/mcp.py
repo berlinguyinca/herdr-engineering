@@ -93,6 +93,9 @@ _TOOLS: dict[str, tuple[str, str, dict]] = {
                        "session_id": {"type": "string", "maxLength": MAX_ID_CHARS},
                        "task_id": {"type": "string", "maxLength": MAX_ID_CHARS}}}),
     "action_grants_list": ("read", "List your owner's earned action grants (state only).", _list_schema()),
+    "judge_status": ("read", "Show whether the shadow judge is on and how many labeled decisions each risk class has "
+                     "(aggregate only; nothing about individual requests).", {
+        "type": "object", "additionalProperties": False, "properties": {}}),
     "memory_search": ("read", "Search the owner's assistant memory. Returns untrusted text.", {
         "type": "object", "required": ["query"], "additionalProperties": False,
         "properties": {"query": {"type": "string", "maxLength": 500}, "limit": _LIMIT, "assistant_id": _STR}}),
@@ -216,6 +219,12 @@ def _action_grants_list(hub: Hub, worker: Worker, args: dict) -> dict:
     return _rows_result("action_grants", rows, limit)
 
 
+def _judge_status(hub: Hub, worker: Worker, args: dict) -> dict:
+    from .judge_admin import mcp_view
+    _check_args(args, set())
+    return _text(mcp_view(hub.store, hub.judge, worker.tenant_id, worker.user_id, hub.service.now()))
+
+
 def _ask(hub: Hub, worker: Worker, args: dict) -> dict:
     _check_args(args, {"question", "options", "context", "action", "session_id"})
     payload: dict[str, Any] = {"question": _req_str(args, "question")}
@@ -310,6 +319,7 @@ _HANDLERS: dict[str, Callable[[Hub, Worker, dict], dict]] = {
     "report": _report,
     "action_request": _action_request,
     "action_grants_list": _action_grants_list,
+    "judge_status": _judge_status,
     "memory_search": _memory_search,
     "grants_list": _lister("grants", "list_grants", on_store=True),
     "approvals_list": _lister("approvals", "list_approvals", "state"),

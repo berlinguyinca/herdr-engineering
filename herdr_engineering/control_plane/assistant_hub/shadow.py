@@ -113,6 +113,10 @@ class ShadowRecorder:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
 
+    def queued(self) -> int:
+        with self._cond:
+            return len(self._queue)
+
     def is_running(self) -> bool:
         thread = self._thread
         return thread is not None and thread.is_alive()

@@ -57,9 +57,12 @@ def closed_port() -> int:
 class WireListener:
     """Raw listener serving one fixed documented-shape body to every request; counts requests and keeps the bytes."""
 
-    def __init__(self, body: bytes, delay: float = 0.0) -> None:
+    def __init__(self, body: bytes, delay: float = 0.0, *, models: list[str] | None = None,
+                 require_key: str | None = None) -> None:
         self.body = body
         self.delay = delay
+        self.models = models              # when set, ``GET /v1/models`` answers with this OpenAI-shaped id list
+        self.require_key = require_key    # when set, any other bearer key gets a documented-shape 401
         self.hits = 0
         self.seen: list[bytes] = []
         self._lock = threading.Lock()
@@ -111,8 +114,13 @@ class WireListener:
                     self.seen.append(data)
                 if self.delay:
                     time.sleep(self.delay)
-                head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(self.body)
-                conn.sendall(head + self.body)
+                status, body = b"200 OK", self.body
+                if self.require_key is not None and f"Bearer {self.require_key}".encode() not in data.split(b"\r\n\r\n")[0]:
+                    status, body = b"401 Unauthorized", b'{"error":{"code":"unauthorized","message":"nope"}}'
+                elif self.models is not None and data.startswith(b"GET /v1/models"):
+                    body = json.dumps({"object": "list", "data": [{"id": m, "object": "model"} for m in self.models]}).encode()
+                head = b"HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % (status, len(body))
+                conn.sendall(head + body)
             except OSError:
                 pass
 

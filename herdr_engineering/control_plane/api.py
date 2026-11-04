@@ -2350,7 +2350,7 @@ def _make_handler(server, public=False, operator=False):
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
-                                    "assistant-action-requests", "assistant-grants"}
+                                    "assistant-action-requests", "assistant-grants", "assistant-judges"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
                     or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
@@ -2457,7 +2457,7 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
                                         "assistant-reminders", "assistant-workers",
-                                        "assistant-action-requests", "assistant-grants"}
+                                        "assistant-action-requests", "assistant-grants", "assistant-judges"}
 
         def _mutate_verb(self):
             if operator:
@@ -2488,7 +2488,7 @@ def _make_handler(server, public=False, operator=False):
             if err:
                 return err
             if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
-                            "assistant-action-requests", "assistant-grants"):
+                            "assistant-action-requests", "assistant-grants", "assistant-judges"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3736,6 +3736,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts)
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource)
+            if resource == "assistant-judges":
+                return self._assistant_judges(parts)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -4204,6 +4206,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts, body)     # body was read above; never read it twice
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource, body)
+            if resource == "assistant-judges":
+                return self._assistant_judges(parts, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4562,6 +4566,31 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "not found"}, 404)
             except ValueError as exc:
                 return self._json({"error": str(exc)}, 400)
+
+        def _assistant_judges(self, parts, body=None):
+            """Owner-only judge status and a one-shot connectivity check. Same tenant/user scope as the grants routes;
+            the endpoint is shown as a host only and no key material or key path ever leaves here."""
+            from .assistant import AssistantNotFound, AssistantUnavailable
+            from .assistant_hub.judge_admin import check_view, status_view
+            if self._require("operator"):
+                return None
+            try:
+                server.assistant._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                judge = server.assistant_judge
+                fallback = svc.config.get("judge") or {}
+                if len(parts) == 4 and self.command == "GET":
+                    return self._json(status_view(svc.store, judge, fallback, tenant_id, user_id, svc.now()))
+                if len(parts) == 5 and parts[4] == "check" and self.command == "POST":
+                    if body not in (None, {}):
+                        return self._json({"error": "body must be empty"}, 400)
+                    return self._json(check_view(judge, fallback))
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited

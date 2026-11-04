@@ -287,27 +287,7 @@ class JevClient:
     # -- internals
 
     def _read_key(self) -> str:
-        path = self._key_file
-        try:
-            st = os.lstat(path)
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
-                raise JudgeUnavailable("config")
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                fst = os.fstat(fd)
-                if not stat.S_ISREG(fst.st_mode) or fst.st_uid != os.geteuid() or fst.st_mode & 0o077:
-                    raise JudgeUnavailable("config")
-                raw = os.read(fd, 8192)
-            finally:
-                os.close(fd)
-            key = raw.decode("ascii").strip()
-        except JudgeUnavailable:
-            raise
-        except (OSError, ValueError) as exc:
-            raise JudgeUnavailable("config") from exc
-        if not key or not key.isprintable() or " " in key:
-            raise JudgeUnavailable("config")
-        return key
+        return read_key_file(self._key_file)
 
     def _connect(self, conn: http.client.HTTPConnection, deadline: _Deadline) -> None:
         """Resolve, then try each address against the shared deadline (never a per-address timeout)."""
@@ -397,6 +377,30 @@ class JevClient:
         finally:
             watchdog.cancel()
             conn.close()
+
+
+def read_key_file(path: str) -> str:
+    """The API key in ``path``: a regular file we own with no group/other access, else ``JudgeUnavailable('config')``."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            raise JudgeUnavailable("config")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode) or fst.st_uid != os.geteuid() or fst.st_mode & 0o077:
+                raise JudgeUnavailable("config")
+            raw = os.read(fd, 8192)
+        finally:
+            os.close(fd)
+        key = raw.decode("ascii").strip()
+    except JudgeUnavailable:
+        raise
+    except (OSError, ValueError) as exc:
+        raise JudgeUnavailable("config") from exc
+    if not key or not key.isprintable() or " " in key:
+        raise JudgeUnavailable("config")
+    return key
 
 
 def _arm(conn: http.client.HTTPConnection, deadline: _Deadline) -> None:
