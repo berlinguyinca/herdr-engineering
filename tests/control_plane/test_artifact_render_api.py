@@ -317,3 +317,25 @@ def test_dashboard_render_drops_every_style_element(world, payload):
         assert "keep" in html
         for bad in ("<style", "</style", "@import", "url(", "\\72", "\\69", "127.0.0.1", "192.168", "evil.example"):
             assert bad not in html, (bad, html)
+
+
+@pytest.mark.parametrize("mime", ["text/html\r\nX-Evil: 1\r\nContent-Security-Policy: none", "text/plain\nx", "a/b\x00"])
+def test_stored_media_type_with_control_characters_never_reaches_a_header(world, mime):
+    """Response splitting through a stored mime (``?mime=`` upload): /live and /download fall back to octet-stream."""
+    base, store = world
+    store.add("m1", "evil.html", mime, b"<p>x</p>")
+    store.acl.grant("m1", f"api-key:{OWNER}:operator", {"read"})
+    for path in ("/api/v1/artifacts/m1/live", "/api/v1/artifacts/m1/download"):
+        status, _, headers = get(base, path)
+        assert status == 200 and headers["Content-Type"].startswith("application/octet-stream"), path
+        assert headers.get("X-Evil") is None
+        assert headers.get("Content-Security-Policy", "none") != "none"
+
+
+def test_mime_upload_query_with_control_characters_is_refused(world):
+    base, _ = world
+    req = urllib.request.Request(base + "/api/v1/artifacts?filename=a.txt&mime=text%2Fhtml%0D%0AX-Evil%3A1", data=b"x",
+                                 method="POST", headers={"X-API-Key": "owner-key"})
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(req)
+    assert caught.value.code == 400

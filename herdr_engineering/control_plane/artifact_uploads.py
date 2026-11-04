@@ -69,6 +69,7 @@ class ArtifactUploadMixin:
         if not isinstance(sha256, str) or not _SHA256.match(sha256):
             raise ArtifactError("sha256 must be 64 lowercase hex characters")
         if (not isinstance(media_type, str) or not media_type or len(media_type) > 255
+                or any(ord(c) < 32 or ord(c) == 127 for c in media_type)
                 or not isinstance(filename, str) or not filename or len(filename) > 512
                 or any(ord(c) < 32 for c in filename)):
             raise ArtifactError("filename and media_type are required and bounded")

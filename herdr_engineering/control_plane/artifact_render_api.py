@@ -157,6 +157,16 @@ def _send_render(handler, kind: str, data: bytes, resolve: Resolver, cache_key) 
         _send_json(handler, body)
 
 
+def safe_mime(mime: object) -> str:
+    """The stored media type when it is safe to put in a header line, else ``application/octet-stream``.
+
+    ``send_header`` does not strip CR/LF, so a media type that arrived through a query string could split the
+    response and drop the sandbox CSP. Any control character (or a non-string) is refused."""
+    if isinstance(mime, str) and mime and len(mime) <= 255 and not any(ord(c) < 32 or ord(c) == 127 for c in mime):
+        return mime
+    return "application/octet-stream"
+
+
 def _live_headers(mime: str) -> list[tuple[str, str]]:
     base = mime.split(";")[0].strip().lower()
     csp = PDF_LIVE_CSP if base == "application/pdf" else LIVE_CSP
@@ -236,7 +246,7 @@ def route_render(handler, server, parts, resource) -> bool:
                     data is None and wanted(record)):
                 handler._deny(404, "not found")
                 return True
-            mime = record.get("mime_type") or "application/octet-stream"
+            mime = safe_mime(record.get("mime_type") or "application/octet-stream")
             if route == "live":
                 _send_live(handler, data, mime)
                 return True

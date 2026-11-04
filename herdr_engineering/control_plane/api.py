@@ -3647,7 +3647,8 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"error": "not found"}, 404)
                 # No artifact byte may execute on the dashboard origin: download as an attachment under a sandbox.
                 name = PurePosixPath(a.get("original_filename") or "artifact").name or "artifact"
-                return self._bytes(data, a.get("mime_type", "application/octet-stream"), headers=[
+                from .artifact_render_api import safe_mime
+                return self._bytes(data, safe_mime(a.get("mime_type", "application/octet-stream")), headers=[
                     ("Content-Disposition", "attachment; filename*=UTF-8''" + quote(name, safe="")),
                     ("Content-Security-Policy", "default-src 'none'; sandbox")])
             if resource == "artifacts" and len(parts) == 4:
@@ -5470,6 +5471,8 @@ def _make_handler(server, public=False, operator=False):
             filename = _q(self.path, "filename") or "upload"
             mime = _q(self.path, "mime") or \
                 self.headers.get("Content-Type", "application/octet-stream")
+            if any(ord(c) < 32 or ord(c) == 127 for c in mime):
+                return self._json({"error": "invalid mime"}, 400)
             session_id = _q(self.path, "session_id")
             mission_id = _q(self.path, "mission_id")
             owner = self._resource_principal()
