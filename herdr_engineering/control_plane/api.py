@@ -3850,6 +3850,12 @@ def _make_handler(server, public=False, operator=False):
                 if len(parts) > 4:
                     record = reviews.get(parts[4])
                     return self._json(record) if record else self._json({"error": "not found"}, 404)
+                hidden = {"plan", "feedback", "receipt", "instance_id"}
+                if _q(self.path, "needs_decision") == "1":
+                    page = reviews.list_waiting(limit=min(200, max(1, _qint(self.path, "limit", 200))))
+                    return self._json({"available": True, "needs_decision": True, "total": page["total"], "has_more": page["has_more"],
+                                       "reviews": [{k: v for k, v in row.items() if k not in hidden} for row in page["reviews"]],
+                                       "checked_at": r._stamp()})
                 rows = reviews.list_reviews()
                 offset = max(0, _qint(self.path, "offset", 0))
                 limit = min(500, max(1, _qint(self.path, "limit", 500)))
