@@ -10,7 +10,6 @@ import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from .jev import JevClient, JudgeResult, JudgeUnavailable, NoulAnswer, ScoreAnswer
@@ -26,7 +25,7 @@ SEVERITY_LEVELS = ("informational", "minor", "major", "critical")
 
 OWNER_CONTEXT_KEYS = ("note",)
 MAX_CONTEXT_VALUE = 500
-COVERS_MIN = 0.5
+COVERS_MIN = 0.5   # NOTE: changing this, or any question text above, must bump QUESTION_SET_VERSION (judge_version.py)
 
 QUESTIONS: dict[str, dict[str, Any]] = {
     "destructive": {
@@ -154,4 +153,3 @@ class JudgeRuntime:
     cfg_getter: Callable[[], Mapping[str, Any]]
     client_factory: Callable[[], JevClient | None]
     recorder: ShadowRecorder
-    now: Callable[[], datetime]

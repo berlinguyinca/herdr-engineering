@@ -90,7 +90,10 @@ def mcp_view(store: Any, judge: JudgeRuntime | None, tenant_id: str, user_id: st
     if judge is None:
         return {"enabled": False, "mode": "shadow", "judge_version": "",
                 "labeled_by_class": {rc.value: 0 for rc in RiskClass}, "gate": {rc.value: False for rc in RiskClass}}
-    cfg = judge.cfg_getter()
+    cfg = _cfg(judge, {})
+    if not cfg:
+        return {"enabled": False, "mode": "shadow", "judge_version": "",
+                "labeled_by_class": {rc.value: 0 for rc in RiskClass}, "gate": {rc.value: False for rc in RiskClass}}
     report = build_report(store.list_judge_records(tenant_id, user_id), cfg, now, tenant_id, user_id)
     labeled = {rc.value: (report.classes[rc.value].labeled if rc.value in report.classes else 0) for rc in RiskClass}
     return {"enabled": cfg.get("enabled") is True, "mode": "shadow", "judge_version": judge_version(cfg),

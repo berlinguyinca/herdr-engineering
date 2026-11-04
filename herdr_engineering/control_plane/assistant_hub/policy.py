@@ -225,6 +225,8 @@ def _consult(judge: JudgeRuntime | None, key: ActionKey) -> Verdict | str:
         cfg = judge.cfg_getter()
         if cfg.get("enabled") is not True:
             return "disabled"
+        if cfg.get("backend_confirmed") is not True:
+            return "judge_unconfirmed"       # the owner withdrew (or never gave) the attestation: no autonomy
         client = judge.client_factory()
         if client is None:
             return "no_client"
@@ -301,14 +303,10 @@ def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenan
             key = ActionKey.from_canonical(row.key_canonical)
             if key.key_id() == row.key_id:
                 propose_if_ready(store, cfg, now, tenant_id, user_id, row.worker_id, key, vetoed=False)
-    label_decision(store, lambda: {}, tenant_id, user_id, request_id, approve, as_utc(now))   # first label wins
+    label_decision(store, tenant_id, user_id, request_id, approve, as_utc(now))   # first label wins
     store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=decided_by, action="assistant.action.decided",
                        subject_id=request_id, detail=f"{'approve' if approve else 'deny'} request={request_id}")
     return row
-
-
-def _refuse(code: str, message: str) -> ActivationRefused:
-    return ActivationRefused(code, message)
 
 
 def activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str, grant_id: str,
@@ -338,20 +336,20 @@ def _check_judge_gate(store: AssistantStore, now: datetime, tenant_id: str, user
                       judge: JudgeRuntime | None) -> str:
     """Builds the calibration report from the store and returns the judge version, or refuses with the gate's code."""
     if judge is None:
-        raise _refuse("judge_disabled", _GATE_MESSAGES["judge_disabled"])
+        raise ActivationRefused("judge_disabled", _GATE_MESSAGES["judge_disabled"])
     try:
         risk = ActionKey.from_canonical(grant.key_canonical).risk_class.value
     except Exception:
-        raise _refuse("insufficient_labels", "the grant has no readable action key") from None
+        raise ActivationRefused("insufficient_labels", "the grant has no readable action key") from None
     try:
         jcfg = judge.cfg_getter()
         report = build_report(store.list_judge_records(tenant_id, user_id), jcfg, now, tenant_id, user_id)
         ok, code = gate_satisfied(report, jcfg, risk)
         version = _judge_version(jcfg)
     except Exception:
-        raise _refuse("judge_error", "the judge gate could not be evaluated") from None
+        raise ActivationRefused("judge_error", "the judge gate could not be evaluated") from None
     if not ok:
-        raise _refuse(code, _GATE_MESSAGES.get(code, "judge gate not satisfied"))
+        raise ActivationRefused(code, _GATE_MESSAGES.get(code, "judge gate not satisfied"))
     return version
 
 
@@ -360,13 +358,13 @@ def _activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: 
     with store._lock:
         grant = store.get_action_grant(grant_id, tenant_id=tenant_id, user_id=user_id)
         if grant is None:
-            raise _refuse("not_found", "grant not found")
+            raise ActivationRefused("not_found", "grant not found")
         if grant.effective_state(now, int(cfg["policy_version"])) is not GrantState.PROPOSED:
-            raise _refuse("not_proposed", "only a proposed grant can be activated")
+            raise ActivationRefused("not_proposed", "only a proposed grant can be activated")
         if in_shadow(store, cfg, now):
-            raise _refuse("still_in_shadow", "the shadow period has not elapsed")
+            raise ActivationRefused("still_in_shadow", "the shadow period has not elapsed")
         if not confirmed_by.strip():
-            raise _refuse("confirmation_missing", "the owner's confirmation is required")
+            raise ActivationRefused("confirmation_missing", "the owner's confirmation is required")
         version = _check_judge_gate(store, now, tenant_id, user_id, grant, judge)
         active = replace(grant, state=GrantState.ACTIVE, activated_at=as_utc(now), confirmed_by=confirmed_by,
                          judge_version=version,

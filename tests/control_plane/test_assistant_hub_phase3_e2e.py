@@ -303,3 +303,24 @@ def test_integration_active_grant_consults_the_real_system_one(acknowledged_sink
         assert (res["outcome"], res["source"]) in {("authorized", "grant"), ("pending", "judge"),
                                                    ("pending", "judge_unavailable")}
         assert w.svc.store.verify_audit(TENANT) is True
+
+
+def test_unsetting_backend_confirmed_stops_autonomy_for_an_active_grant(acknowledged_sink, tmp_path):
+    li = WireListener(success_body(SAFE))
+    try:
+        with running(acknowledged_sink, tmp_path, endpoint=f"http://127.0.0.1:{li.port}", backend_confirmed=True) as w:
+            wk = enroll(w, "laptop", "dev1")
+            key = derive(RawAction(tool="Bash", command=PUSH, repo="acme/repo")).key
+            now = w.svc.now()
+            w.svc.store.put_action_grant(ActionGrant(
+                grant_id="ag_bc", tenant_id=TENANT, user_id=OWNER, worker_id=wk.wid,
+                resource_scope=key.resource_scope, key_id=key.key_id(), verb=key.verb.value,
+                key_canonical=key.canonical(), state=GrantState.PROPOSED, created_at=now, proposed_at=now,
+                expires_at=now + timedelta(days=30), policy_version=w.svc.config["grants"]["policy_version"]))
+            force_active_grant_for_tests(w.svc.store, w.svc.config["grants"], "ag_bc", now, w.cfg)
+            assert ask_action(w, wk, PUSH, "s1", "t1")["outcome"] == "authorized"
+            w.cfg["backend_confirmed"] = False
+            res = ask_action(w, wk, PUSH, "s2", "t2")
+            assert (res["outcome"], res["source"], res["grant_id"]) == ("pending", "judge_unavailable", None)
+    finally:
+        li.close()

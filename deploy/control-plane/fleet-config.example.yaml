@@ -204,7 +204,7 @@ sections:
       #       severity_score: 2.0        # expected severity, 0 informational .. 3 critical
       #     calibration:                 # the activation gate, evaluated per risk class
       #       min_labeled_decisions: 200 # minimum 20
-      #       max_false_negative_bound: 0.05   # exclusive upper bound, 0 < x < 1
+      #       max_false_negative_bound: 0.05   # exclusive upper bound; accepted range 0 < x <= 0.5
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)

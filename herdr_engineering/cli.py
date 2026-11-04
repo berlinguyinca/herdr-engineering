@@ -3931,9 +3931,11 @@ def _cmd_cp_web(args) -> int:
         pass
     finally:
         if hub_server is not None:
-            hub_server.shutdown()
-            if hub_server.hub.judge is not None:
-                hub_server.hub.judge.recorder.stop()
+            try:
+                hub_server.shutdown()
+            finally:
+                if hub_server.hub.judge is not None:
+                    hub_server.hub.judge.recorder.stop()
         svr.shutdown()
         if artifact_adapter is not None:
             artifact_adapter.close()
@@ -4370,7 +4372,7 @@ def _build_judge_runtime(service):
         return JevClient(cfg["endpoint"], cfg["api_key_file"], cfg["model"], float(cfg["timeout_seconds"]))
 
     recorder = ShadowRecorder(service.store, cfg_getter, client_factory, service.now)
-    return JudgeRuntime(cfg_getter=cfg_getter, client_factory=client_factory, recorder=recorder, now=service.now)
+    return JudgeRuntime(cfg_getter=cfg_getter, client_factory=client_factory, recorder=recorder)
 
 
 def _start_assistant_hub(service):

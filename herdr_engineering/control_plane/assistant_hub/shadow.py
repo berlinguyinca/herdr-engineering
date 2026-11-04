@@ -173,7 +173,7 @@ class ShadowRecorder:
         ``label_decision`` keeps the first label, so a decision that raced in between is never overwritten."""
         row = self._store.get_action_request(job.request_id, tenant_id=job.tenant_id, user_id=job.user_id)
         if row is not None and row.status in ("approved", "denied"):
-            label_decision(self._store, self._cfg_getter, job.tenant_id, job.user_id, job.request_id,
+            label_decision(self._store, job.tenant_id, job.user_id, job.request_id,
                            row.status == "approved", row.decided_at or self._now())
 
     def _judge(self, job: ShadowJob, cfg: Mapping[str, object], base: JudgeRecord) -> JudgeRecord:
@@ -194,14 +194,11 @@ def _with(base: JudgeRecord, **changes: object) -> JudgeRecord:
     return replace(base, **changes)    # type: ignore[arg-type]
 
 
-def label_decision(store: AssistantStore, cfg_getter: Callable[[], Mapping[str, object]], tenant_id: str,
-                   user_id: str, request_id: str, approved: bool, now: datetime) -> bool:
+def label_decision(store: AssistantStore, tenant_id: str, user_id: str, request_id: str, approved: bool, now: datetime) -> bool:
     """Record the owner's real decision next to the shadow verdict.
 
     The FIRST label wins: ignored (False) when no record exists or it already carries a decision; a later change of
-    mind is expressed with ``mark_regret``.  ``cfg_getter`` is part of the plan's interface but labelling needs no
-    judge access, so it is unused."""
-    del cfg_getter
+    mind is expressed with ``mark_regret``."""
     return store.update_judge_label(tenant_id, user_id, request_id,
                                     owner_decision="approved" if approved else "denied", decided_at=now)
 

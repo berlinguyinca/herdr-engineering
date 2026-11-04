@@ -197,9 +197,14 @@ state computed now.
 
 ### Why nothing is autonomous yet
 
+- **BREAKING from Phase 2:** an `authorized` answer now also needs a judge that is enabled, `backend_confirmed` and
+  reachable; otherwise `pending` (source `judge_unavailable`). Phase 2 activation was hard-blocked, so no `active`
+  grants should exist. Unsetting `backend_confirmed` or disabling the judge immediately stops autonomy for existing
+  `active` grants.
 - **Phase 3** (below) adds the Jev judge and its calibration gate. `POST /api/v1/assistant-grants/<id>/activate` checks, in
   order: 404 `not_found`, 409 `not_proposed`, `still_in_shadow`, `confirmation_missing`, then the judge gate codes
-  listed in Phase 3. Every refusal writes `assistant.grant.activate_refused`. With no judge configured the answer is
+  listed in Phase 3. Every refusal except `not_found` (an unknown id has no grant to attach it to) writes
+  `assistant.grant.activate_refused`. With no judge configured the answer is
   `judge_disabled`, so a default install can never reach an active grant.
 - **Phase 4** adds hook-attested evidence (so tool outcomes the harness saw can count) and the in-session first-grant
   confirmation. The Phase 1 known limit above (a model with shell access can post `harness_attested` events) must be
@@ -271,6 +276,12 @@ anything by itself. An action is `authorized` only when an `active` grant covers
 AND does not escalate. Before that, the judge runs in **shadow**: it is asked about every new `pending` request, the
 answer is stored next to the owner's real decision, and those pairs are the evidence for the gate.
 
+> **Upgrading from Phase 2 (breaking change).** Any request that Phase 2 would have answered `authorized` now comes
+> back `pending` with source `judge_unavailable` unless a judge is **enabled, `backend_confirmed: true` and reachable**.
+> Phase 2 activation was hard-blocked, so no `active` grants should exist on an upgraded install. Conversely, unsetting
+> `backend_confirmed` or disabling the judge takes effect on the very next request and immediately stops autonomy for
+> every existing `active` grant.
+
 ### Registering the key (CLI only)
 
 There is deliberately no HTTP route that accepts a key: secrets never travel in request bodies.
@@ -287,7 +298,8 @@ printf '%s' "$KEY" | herdr-eng control-plane assistant-judge register \
   untouched. **Rotation** is the same command: the old key stays in place until the new one has proved itself.
 - The parent directory must not be group- or world-writable (`unsafe_dir`), `PATH` must be absolute and not a symlink,
   the endpoint must be `https` (`http` only for loopback, so a bearer key never crosses a network in clear text).
-- Failures print `assistant-judge register failed: <code>` (for example `model_not_listed`, which also prints the first
+- Failures print `assistant-judge register failed: <code>` (for example `unsafe_dir`, `tmp_exists` when a stale
+  `PATH.new` is left over, `bad_path`, `symlink`, `bad_key`, `config`, or `model_not_listed`, which also prints the first
   ten model ids the server offered). Exit codes: 0 ok, 1 refused, 2 usage.
 - The command does **not** edit the YAML. Add the block below yourself.
 
@@ -307,7 +319,12 @@ printf '%s' "$KEY" | herdr-eng control-plane assistant-judge register \
 | `fail_mode` | `closed` | The only value: judge unavailable means the owner decides. |
 | `backend_confirmed` | `false` | Owner attestation, see below. |
 | `thresholds` | `destructive 0.30`, `irreversible 0.30`, `severity_score 2.0` | The judge escalates when any answer reaches its threshold (or when "would the owner's approval cover this" is below 0.5). |
-| `calibration` | `min_labeled_decisions 200`, `max_false_negative_bound 0.05` | The gate; the minimum cannot be set below 20. |
+| `calibration` | `min_labeled_decisions 200`, `max_false_negative_bound 0.05` | The gate; the minimum cannot be set below 20; the bound must satisfy 0 < x <= 0.5. |
+
+Validator rules (a bad value refuses to load the config): `endpoint` is `https`, or `http` for loopback hosts only, with no
+userinfo, query, fragment, whitespace or control characters; `thresholds.destructive` and `.irreversible` satisfy
+0 < x <= 1, `severity_score` 0 <= x <= 3; `timeout_seconds` is an integer 1..60; `api_key_file` is absolute; unknown
+keys are rejected.
 
 ### `backend_confirmed`: why the response cannot prove a real model
 
@@ -338,12 +355,22 @@ recorded on the shadow record and is not an error.
 |---|---|
 | No active grant, or the judge version changed | `pending`, source `owner` (a stale or empty judge version on an active grant shows as grant state `shadow`) |
 | Active grant, global shadow period still running | `pending`, source `shadow` |
+| Active grant, `backend_confirmed` not `true` (even if the judge would answer) | `pending`, source `judge_unavailable` |
 | Active grant, judge answers and does not escalate | `authorized`, source `grant` |
 | Active grant, judge escalates | `pending`, source `judge` |
 | Active grant, judge unreachable, timed out, malformed, 401/429/5xx, disabled or no runtime | `pending`, source `judge_unavailable` |
 | Grant revoked, expired or re-versioned **while the judge was being consulted** | re-checked after the consult: `pending`, source `owner` |
 
 ### Shadow records and ground-truth rules
+
+Operational limits to know about:
+
+- The recorder consults with a **fixed 30 s timeout** (not `timeout_seconds`).
+- The recorder queue lives in memory and is **lost on restart**: a request that is pending across a restart gets no
+  `JudgeRecord`, and its later owner label is dropped (there is no record to label). Jobs dropped from a full queue
+  are not resubmitted.
+- A slow consult on the authorize path occupies one hub handler thread for up to `timeout_seconds` (max 60) per
+  authorize attempt.
 
 For every **new** `pending` request with a known key, the hub queues a job on a single background recorder. The
 recorder is **async** (never on the request path), **bounded** (100 jobs) and **drop-oldest** (`recorder.dropped` in

@@ -604,7 +604,7 @@ def test_owner_decision_before_the_record_exists_is_copied_by_the_recorder(key_f
     rt.recorder._process(ShadowJob(T, U, W, "s1", "t1", d.request_id, key))
     rec = store.list_judge_records(T, U)[0]
     assert rec.owner_decision == "denied" and rec.status == "ok"
-    assert label_decision(store, lambda: {}, T, U, d.request_id, True, NOW) is False     # first label still wins
+    assert label_decision(store, T, U, d.request_id, True, NOW) is False     # first label still wins
     assert store.list_judge_records(T, U)[0].owner_decision == "denied"
     _stop(rt)
 
@@ -618,7 +618,7 @@ def test_gate_errors_become_judge_error(key_file: Path, break_it: str) -> None:
     def boom() -> dict[str, Any]:
         raise RuntimeError("config exploded")
     getter = boom if break_it == "cfg_getter_raises" else (lambda: {})
-    bad = JudgeRuntime(cfg_getter=getter, client_factory=good.client_factory, recorder=good.recorder, now=good.now)
+    bad = JudgeRuntime(cfg_getter=getter, client_factory=good.client_factory, recorder=good.recorder)
     with pytest.raises(ActivationRefused) as err:
         _activate(store, cfg, g, bad)
     assert err.value.code == "judge_error" and "exploded" not in str(err.value)
@@ -635,7 +635,7 @@ def test_route_judge_error_is_409(acknowledged_sink: Any, key_file: Path) -> Non
         def boom() -> dict[str, Any]:
             raise RuntimeError("x")
         w.svr.assistant_judge = JudgeRuntime(cfg_getter=boom, client_factory=w.rt.client_factory,
-                                             recorder=w.rt.recorder, now=w.rt.now)
+                                             recorder=w.rt.recorder)
         status, body = _call(w.base, "POST", f"/api/v1/assistant-grants/{g.grant_id}/activate", {"confirm": True})
         assert (status, body["code"]) == (409, "judge_error")
     finally:

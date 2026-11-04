@@ -175,13 +175,13 @@ def test_label_decision_and_mark_regret() -> None:
     s = AssistantStore()
     s.add_judge_record(_rec(1))
     s.add_judge_record(_rec(2, key_id="other"))
-    assert label_decision(s, lambda: {}, "t", "u", "req1", True, T0) is True
+    assert label_decision(s, "t", "u", "req1", True, T0) is True
     r = s.get_judge_record_by_request("t", "u", "req1")
     assert r is not None and r.owner_decision == "approved" and r.decided_at == T0
-    assert label_decision(s, lambda: {}, "t", "u", "req1", False, T0 + timedelta(1)) is False   # first label wins
+    assert label_decision(s, "t", "u", "req1", False, T0 + timedelta(1)) is False   # first label wins
     r = s.get_judge_record_by_request("t", "u", "req1")
     assert r is not None and r.owner_decision == "approved" and r.decided_at == T0
-    assert label_decision(s, lambda: {}, "t", "u", "nope", True, T0) is False       # absent: ignored
+    assert label_decision(s, "t", "u", "nope", True, T0) is False       # absent: ignored
     assert mark_regret(s, "t", "u", "k", "w") == 1
     assert mark_regret(s, "t", "u", "k", "other-worker") == 0
     assert s.get_judge_record_by_request("t", "u", "req1").regret is True       # type: ignore[union-attr]
