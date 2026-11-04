@@ -31,6 +31,9 @@ MAX_INGEST_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_LINE_BYTES = 16 * 1024
 FINGERPRINT_BYTES = 64
 INGEST_ROUNDS = 64
+# What marks ONE line as unusable. Transient server errors are deliberately absent: swallowing them would lose a
+# user's accepted comment for good.
+_POISON = (asyncpg.DataError, asyncpg.IntegrityConstraintViolationError, UnicodeError, ValueError)
 
 ParseLine = Callable[[bytes], Any | None]
 StoreLine = Callable[[Any, Any, str], Awaitable[bool]]
@@ -199,8 +202,10 @@ class JsonlIngestor:
                                 async with transaction(conn):
                                     if await self._store(conn, parsed, key):
                                         inserted += 1
-                            except (asyncpg.PostgresError, UnicodeError, ValueError):
-                                pass  # poison line: skipped, but consumed below
+                            except _POISON:
+                                pass  # poison line (bad data, violated constraint): skipped, but consumed below
+                            # anything else (lock or statement timeout, deadlock, serialization, shutdown, lost
+                            # connection) propagates: the pass aborts, the marker stays and the next tick retries
                         position += len(raw)
                 consumed = end
             elif end == 0 and start == 0 and full:  # one huge line with no newline: skip it

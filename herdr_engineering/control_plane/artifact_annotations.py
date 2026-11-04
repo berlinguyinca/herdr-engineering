@@ -16,7 +16,7 @@ the owner and agents read and resolve them through the other methods.
   records its own success event.
 * ``touched_since`` filters on ``updated_at = now()``, which is the START of the writing transaction: a caller must
   read with an overlap margin (e.g. ``since`` minus a minute) and treat the result as a superset.
-* ``parse_line`` and ``ingest`` raise only ``ValueError`` / ``asyncpg.PostgresError`` (what ``JsonlIngestor`` swallows).
+* ``parse_line`` and ``ingest`` raise only ``ValueError`` / data or integrity errors (what ``JsonlIngestor`` swallows; transient errors abort the pass).
 """
 from __future__ import annotations
 

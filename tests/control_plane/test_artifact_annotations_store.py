@@ -432,3 +432,36 @@ def test_concurrent_change_waits_for_the_row_lock(registry_pg):
             await a.close()
             await b.close()
     asyncio.run(go())
+
+
+def test_transient_database_error_aborts_the_pass_and_the_line_is_retried(registry_pg, tmp_path):
+    """A lock timeout (a real Postgres provocation) is not a poison line: the marker must not move, the next pass
+    ingests the edit. Data and integrity errors are still swallowed (see the sibling tests)."""
+    async def body(store, conn):
+        _, _, sid = await seed(conn)
+        assert await store.ingest(conn, create(sid, 1), "c1", **KW) == "inserted"
+        path, marker = tmp_path / "annotations.jsonl", tmp_path / "m"
+        edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "body": "later",
+                "at": datetime.now(UTC).isoformat()}
+        path.write_text(json.dumps(edit) + "\n")
+
+        async def put(c, record, key):
+            return await store.ingest(c, record, key, **KW) == "edited"
+        ingestor = JsonlIngestor(conn, parse_line=AnnotationStore.parse_line, store=put)
+        holder = await asyncpg.connect(registry_pg["dsn"])
+        tx = holder.transaction()
+        await tx.start()
+        await holder.fetchrow("SELECT 1 FROM artifact_annotations WHERE annotation_id=$1 FOR UPDATE", ann_id(1))
+        await conn.execute("SET lock_timeout = '150ms'")
+        try:
+            with pytest.raises(asyncpg.PostgresError):
+                await ingestor.ingest_file(path, marker)
+        finally:
+            await tx.rollback()
+            await holder.close()
+        assert not marker.exists()                      # nothing was consumed
+        assert await conn.fetchval("SELECT body FROM artifact_annotations") == "note"
+        await conn.execute("SET lock_timeout = 0")
+        assert await ingestor.ingest_file(path, marker) == 1
+        assert await conn.fetchval("SELECT body FROM artifact_annotations") == "later"
+    run(registry_pg, body)
