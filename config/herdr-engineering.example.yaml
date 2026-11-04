@@ -105,6 +105,14 @@ fabric_build_cache:
     gpu_for_cpu_builds: false # default false: true only warns, never recommended
     remote_fallback: local    # local | fail
     max_build_slots: 2        # 1..16
+  slurm:                      # spec 11 opt-in, NOT executable today: no runner is verified
+    enabled: false            # default false; true also needs account + allowed_partitions
+    account: null             # Slurm account NAME only, never a credential
+    allowed_partitions: []    # explicit CPU partitions; anything else falls back locally
+    cpus: 8                   # 1..128
+    mem_gb: 16                # 1..2048
+    time_limit_minutes: 60    # 1..1440
+    queue_wait_timeout_s: 900 # queue wait before local fallback
   cleanup:
     dry_run: true             # default true: report only, delete nothing
     min_idle_hours: 24

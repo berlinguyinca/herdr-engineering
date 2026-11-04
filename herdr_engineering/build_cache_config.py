@@ -20,6 +20,7 @@ from .errors import InvalidError
 _ENDPOINT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 _SECRET_WORDS = ("secret", "password", "token", "access_key", "api_key")
 LOCAL_TEST_SUFFIX = ".local-test"
+_SLURM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class Mode(StrEnum):
@@ -65,6 +66,18 @@ class Execution:
 
 
 @dataclass(frozen=True)
+class SlurmSection:
+    """Spec 11 opt-in for whole-build CPU jobs. Default off; a name, never a credential."""
+    enabled: bool = False
+    account: str | None = None
+    allowed_partitions: tuple[str, ...] = ()
+    cpus: int = 8
+    mem_gb: int = 16
+    time_limit_minutes: int = 60
+    queue_wait_timeout_s: int = 900
+
+
+@dataclass(frozen=True)
 class Cleanup:
     dry_run: bool
     min_idle_hours: float
@@ -104,6 +117,7 @@ class BuildCacheConfig:
     warnings: tuple[str, ...] = field(default_factory=tuple)
     eviction: Eviction = Eviction(False, 40, 5000)
     adaptive_slots: AdaptiveSlots = AdaptiveSlots(False, 1, 4)
+    slurm: SlurmSection = SlurmSection()
 
     @property
     def effective_mode(self) -> Mode:
@@ -116,6 +130,11 @@ class BuildCacheConfig:
     @property
     def slurm_effective(self) -> bool:
         return self.enabled and self.execution.slurm_enabled
+
+    @property
+    def slurm_runner_requested(self) -> bool:
+        """Operator opted in (master switch AND slurm.enabled). Says nothing about a runner."""
+        return self.enabled and self.slurm.enabled
 
     def public_view(self) -> dict[str, Any]:
         """API/status-safe view: no credentials path, endpoint reference only."""
@@ -145,6 +164,13 @@ class BuildCacheConfig:
                 "gpu_for_cpu_builds": ex.gpu_for_cpu_builds,
                 "remote_fallback": ex.remote_fallback.value,
                 "max_build_slots": ex.max_build_slots,
+            },
+            "slurm": {
+                "enabled": self.slurm_runner_requested, "account": self.slurm.account,
+                "allowed_partitions": list(self.slurm.allowed_partitions),
+                "cpus": self.slurm.cpus, "mem_gb": self.slurm.mem_gb,
+                "time_limit_minutes": self.slurm.time_limit_minutes,
+                "queue_wait_timeout_s": self.slurm.queue_wait_timeout_s,
             },
             "cleanup": {
                 "dry_run": cl.dry_run, "min_idle_hours": cl.min_idle_hours,
@@ -228,6 +254,30 @@ def _defaults() -> dict[str, Any]:
     return DEFAULTS["fabric_build_cache"]
 
 
+def _slurm_section(raw: Any, defaults: dict, path: str) -> SlurmSection:
+    d = _filled(raw, defaults, path)
+    on = _bool(d, "enabled", path)
+    acct = d["account"]
+    if acct is not None and (not isinstance(acct, str) or not _SLURM_NAME_RE.match(acct)):
+        raise _bad(f"{path}.account", "must be an account NAME like 'buildgrp' "
+                   "(^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$), never a credential")
+    parts = _strlist(d, "allowed_partitions", path)
+    for x in parts:
+        if not _SLURM_NAME_RE.match(x):
+            raise _bad(f"{path}.allowed_partitions", f"entry {x!r} is not a plain partition name")
+    cpus = int(_num(d, "cpus", path, lo=1, lo_incl=True, hi=128, hi_incl=True, integer=True))
+    mem = int(_num(d, "mem_gb", path, lo=1, lo_incl=True, hi=2048, hi_incl=True, integer=True))
+    tl = int(_num(d, "time_limit_minutes", path, lo=1, lo_incl=True, hi=1440, hi_incl=True,
+                  integer=True))
+    qw = int(_num(d, "queue_wait_timeout_s", path, lo=1, lo_incl=True, hi=86400, hi_incl=True,
+                  integer=True))
+    if on and acct is None:
+        raise _bad(f"{path}.account", "is required when slurm.enabled")
+    if on and not parts:
+        raise _bad(f"{path}.allowed_partitions", "must be non-empty when slurm.enabled")
+    return SlurmSection(on, acct, parts, cpus, mem, tl, qw)
+
+
 def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     """Validate a ``fabric_build_cache`` mapping; raise ``InvalidError`` on any fault."""
     base = _defaults()
@@ -295,6 +345,8 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     if gpu:
         warnings.append(f"{xp}.gpu_for_cpu_builds is true: CPU builds may occupy GPU nodes")
 
+    sl = _slurm_section(top["slurm"], base["slurm"], f"{p}.slurm")
+
     cp = f"{p}.cleanup"
     cl = _filled(top["cleanup"], base["cleanup"], cp)
     dry = _bool(cl, "dry_run", cp)
@@ -348,6 +400,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
         warnings=tuple(warnings),
         eviction=Eviction(destructive, hard_cap, max_entries),
         adaptive_slots=AdaptiveSlots(ad_on, min_s, max_s),
+        slurm=sl,
     )
 
 

@@ -52,6 +52,10 @@ DEFAULTS: dict[str, Any] = {
             "slurm_enabled": False, "allowed_clusters": [], "allowed_partitions": [],
             "gpu_for_cpu_builds": False, "remote_fallback": "local", "max_build_slots": 2,
         },
+        "slurm": {
+            "enabled": False, "account": None, "allowed_partitions": [], "cpus": 8,
+            "mem_gb": 16, "time_limit_minutes": 60, "queue_wait_timeout_s": 900,
+        },
         "cleanup": {"dry_run": True, "min_idle_hours": 24, "max_evict_per_pass_gib": 10},
         "eviction": {"destructive_enabled": False, "hard_cap_gib": 40,
                      "max_entries_per_run": 5000},

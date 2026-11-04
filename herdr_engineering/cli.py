@@ -96,6 +96,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(func=_cmd_build_cache_inventory)
 
+    p = sub.add_parser("build-cache-slurm-plan",
+                       help="preview a whole-build Slurm submission as data; NEVER submits "
+                            "(spec 11: no runner is verified)")
+    p.add_argument("--source-dir", default=".", help="source tree to digest (default: cwd)")
+    p.add_argument("--partition", default=None, help="partition to preview")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=_cmd_build_cache_slurm_plan)
+
     p = sub.add_parser("build-cache-evict",
                        help="local sccache quota preview; --apply deletes only with "
                             "eviction.destructive_enabled (spec 07; nothing when disabled)")
@@ -2858,6 +2866,28 @@ def _cmd_build_cache_inventory(args) -> int:
         from .build_coord import _default_state_dir
         view["slot_suggestion"] = observed_slot_suggestion(cfg, _default_state_dir())
     _print_json(view)
+    return 0
+
+
+def _cmd_build_cache_slurm_plan(args) -> int:
+    from .build_cache_config import validate
+    from .build_slurm_adapter import preview
+    from .config import load_config
+    try:
+        cfg = validate(load_config(strict_build_cache=True).get("fabric_build_cache"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"build-cache-slurm-plan: invalid config: {exc}", file=sys.stderr)
+        return 1
+    import platform
+    out = preview(cfg, args.source_dir, args.partition, f"python-{platform.python_version()}")
+    if args.json:
+        _print_json(out)
+    else:
+        print(out["message"])
+        print(f"decision: {out['decision']}")
+        if out.get("sbatch_argv"):
+            print(" ".join(out["sbatch_argv"]))
+            print(out["script"])
     return 0
 
 
