@@ -138,3 +138,50 @@ def test_concurrent_first_requests_grant_each_tool_once():
     [t.join() for t in threads]
     ids = [g.tool_id for g in grants(b, ctx, bot.assistant_id)]
     assert sorted(ids) == sorted(rb.DEFAULT_TOOLS)
+
+
+def _expire(b, ctx, bot, tool):
+    from datetime import timedelta
+    for g in grants(b, ctx, bot):
+        if g.tool_id == tool:
+            g.expires_at = b.svc.now() - timedelta(days=1)
+
+
+def _active(b, ctx, bot):
+    now = b.svc.now()
+    return {g.tool_id for g in grants(b, ctx, bot) if g.active(now)}
+
+
+def test_expired_default_grant_is_renewed_after_the_recheck_interval():
+    _, b = build()
+    clock = [1000.0]
+    b._monotonic = lambda: clock[0]
+    ctx = ctx_for(b, "op")
+    bot_id = b._bots_create(ctx, {"name": "Phone"})["id"]
+    _expire(b, ctx, bot_id, "search_email")
+    assert "search_email" not in _active(b, ctx, bot_id)
+    b._assistant(ctx, bot_id)                       # inside the hour: cheap, no work
+    assert "search_email" not in _active(b, ctx, bot_id)
+    clock[0] += 3601
+    b._assistant(ctx, bot_id)
+    assert _active(b, ctx, bot_id) == set(rb.DEFAULT_TOOLS)
+    n = len(grants(b, ctx, bot_id))
+    clock[0] += 3601
+    b._assistant(ctx, bot_id)                       # nothing expired: no new records
+    assert len(grants(b, ctx, bot_id)) == n
+
+
+def test_revoked_tool_stays_revoked_even_when_expired_too():
+    _, b = build()
+    clock = [1000.0]
+    b._monotonic = lambda: clock[0]
+    ctx = ctx_for(b, "op")
+    bot_id = b._bots_create(ctx, {"name": "Phone"})["id"]
+    victim = next(g for g in grants(b, ctx, bot_id) if g.tool_id == "search_email")
+    b.svc.revoke_grant(victim.grant_id, tenant_id=ctx.tenant, user_id=ctx.user)
+    _expire(b, ctx, bot_id, "search_email")
+    _expire(b, ctx, bot_id, "read_email")
+    clock[0] += 3601
+    b._assistant(ctx, bot_id)
+    assert "search_email" not in _active(b, ctx, bot_id)
+    assert "read_email" in _active(b, ctx, bot_id)

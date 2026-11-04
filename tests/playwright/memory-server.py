@@ -22,7 +22,7 @@ class MockAdapter:
     def recall(self, query, *, scope=None, project=None, max_results=200):
         return {"results": RECORDS[:max_results], "degraded": False, "offline": False}
 
-    def get(self, memory_id):
+    def get(self, memory_id, *, scope="project", project=None):
         for r in RECORDS:
             if r["memory_id"] == memory_id:
                 return r

@@ -34,6 +34,7 @@ class AppsService:
                  on_change: Callable[[str, str], None] | None = None):
         self._store, self._clock = store, clock
         self.on_change = on_change      # (tenant, user): a person's connection was replaced or removed
+        self.on_client_change: Callable[[], None] | None = None     # the OAuth client was replaced: every cached token is stale
         self._open = opener or google_oauth.default_opener
         self._redirect = redirect_base.rstrip("/") + CALLBACK_PATH
         self._github = github_status_fn
@@ -87,6 +88,11 @@ class AppsService:
         if not isinstance(client_id, str) or not isinstance(client_secret, str) or not client_id.strip() or not client_secret.strip():
             raise AppsError("bad_client")
         self._store.put_client(provider, client_id.strip(), client_secret.strip())
+        if self.on_client_change is not None:
+            try:
+                self.on_client_change()
+            except Exception:  # noqa: BLE001 - a cache hook must never fail a save
+                log.warning("assistant apps: on_client_change hook failed")
 
     def blocked_calendars(self, tenant: str, user: str) -> list[str]:
         return self._store.get_blocked(tenant, user, GOOGLE)

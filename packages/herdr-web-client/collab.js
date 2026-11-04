@@ -223,6 +223,34 @@ export class CollabApi {
   removeMember(id, user) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/members/${encodeURIComponent(user)}/remove`, {});
   }
+  // Team rooms (slices 1-3). Every route answers 404 while its server flag is off or when the caller is not allowed; the screens read that as "not turned on".
+  roomTeams(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/teams`); }
+  attachTeam(room, team, roles) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/attach`, { roles }); }
+  detachTeam(room, team) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/detach`, {}); }
+  guestLevel(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/guest-level`); }
+  setGuestLevel(room, level, directLimits) {
+    return this.call('POST', `/rooms/${encodeURIComponent(room)}/guest-level`, { level, ...(directLimits ? { direct_limits: directLimits } : {}) });
+  }
+  suggestions(room, state) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/suggestions${state ? `?state=${encodeURIComponent(state)}` : ''}`); }
+  suggest(room, text, key) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/suggestions`, { text, ...(key ? { idempotency_key: key } : {}) }); }
+  decideSuggestion(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/suggestions/${encodeURIComponent(id)}/decide`, body); }
+  withdrawSuggestion(room, id) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/suggestions/${encodeURIComponent(id)}/withdraw`, {}); }
+  teamRoles(room, team) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/roles`); }
+  assignRole(room, team, role, holder) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/roles`, { role, holder }); }
+  clearRole(room, team, role, holder) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/roles/clear`, { role, holder }); }
+  setRolePolicy(room, team, policy) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/policy`, { no_response_policy: policy }); }
+  memberVisibility(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/member-visibility`); }
+  setMemberVisibility(room, enabled) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/member-visibility`, { enabled: Boolean(enabled) }); }
+  myTasks(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/my-tasks`); }
+  respondTask(room, task, status, result) {
+    return this.call('POST', `/rooms/${encodeURIComponent(room)}/tasks/${encodeURIComponent(task)}/respond`, { status, ...(result ? { result } : {}) });
+  }
+  teamCoordinator(room, team) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/coordinator`); }
+  setTeamCoordinator(room, team, holder) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/coordinator`, { holder }); }
+  clearTeamCoordinator(room, team) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/coordinator/clear`, {}); }
+  setExternalCoordination(room, team, enabled, limits) {
+    return this.call('POST', `/rooms/${encodeURIComponent(room)}/teams/${encodeURIComponent(team)}/external-coordination`, { enabled: Boolean(enabled), ...(enabled && limits ? { limits } : {}) });
+  }
   // agent helpers: the room profile (names only, never secret values), host-access requests, the panic switch
   roomProfile(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/profile`); }
   setRoomProfile(id, profile) { return this.call('POST', `/rooms/${encodeURIComponent(id)}/profile`, profile); }

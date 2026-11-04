@@ -413,6 +413,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--no-pane", action="store_true")
     p2.add_argument("--no-dashboard", action="store_true")
     p2.set_defaults(func=_cmd_summary_publish)
+    p2 = smsub.add_parser("view", help="render a published /summary report and page it (what the side pane runs)")
+    p2.add_argument("file", help="the report's Markdown file")
+    p2.add_argument("--close-pane", default=None, metavar="PANE_ID",
+                    help="close this Herdr pane when the reader quits")
+    p2.set_defaults(func=_cmd_summary_view)
 
     # memory ---------------------------------------------------------------
     p = sub.add_parser("memory", help="herdr-memory harness adapters: plan/install/status/doctor/repair/upgrade/uninstall")
@@ -1312,6 +1317,11 @@ def _cmd_summary_publish(args) -> int:
         return 1
     _print_json(out)
     return 0 if out["ok"] else 1
+
+
+def _cmd_summary_view(args) -> int:
+    from . import summary_report as sr
+    return sr.view_report(args.file, close_pane=args.close_pane)
 
 
 def _cmd_agent_mine(args) -> int:

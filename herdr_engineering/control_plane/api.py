@@ -711,6 +711,7 @@ class ControlPlaneServer:
                 from .google_workspace import GoogleWorkspace
                 _gw = GoogleWorkspace(apps=self.apps)
                 self.apps.on_change = _gw.invalidate
+                self.apps.on_client_change = _gw.invalidate_all
                 # Single-operator rule: map the data key (never the approval actor) through the bridge when there is one.
                 self.assistant.google_read = lambda t, u, tool, payload: _gw.run(*self._canonical_person(t, u), tool, payload)
                 self.assistant.google_write = lambda t, u, tool, payload: _gw.write(*self._canonical_person(t, u), tool, payload)
@@ -722,6 +723,14 @@ class ControlPlaneServer:
             self.assistant.lineage_emit = ActionLineageEmitter(self.ingest, principal_resolver(self._keys)).emit
             self.assistant.review_rereview = rereview_hook(self)
             self.assistant.comment_poster = comment_hook(self)
+            if self.assistant.config["team_briefs"]["enabled"]:
+                # team collaboration slice 4: wired ONLY when the flag is on, so a deployment that never sets it has no hook at all
+                from .assistant_adapters import brief_hook
+                self.assistant.brief_submitter = brief_hook(self)
+                if self.collab is not None:
+                    self.collab.assistant_briefs_source = lambda: self.assistant.config["team_briefs"]
+                if getattr(self, "google", None) is not None and self.assistant.mail_source is None:
+                    self.assistant.mail_source = lambda t, u, mid: self.google.get_raw_message(*self._canonical_person(t, u), mid)
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
             self.assistant.ci_rerun_request = self.intelligence.assistant_ci_rerun
@@ -1574,6 +1583,8 @@ class ControlPlaneServer:
             caps.append("collab_v1")
         if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
             caps.append("assistant_v1")
+            if self.assistant.team_briefs.enabled():
+                caps.append("assistant_team_briefs")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             caps.append("project_intelligence_v1")
         if getattr(self, "memory", None) is not None and self.memory.enabled():
@@ -1927,6 +1938,7 @@ _PUBLIC_STATIC = {
     "/collab-context.js": ("collab-context.js", "text/javascript"),
     "/collab-helpers.js": ("collab-helpers.js", "text/javascript"),
     "/collab-workbench.js": ("collab-workbench.js", "text/javascript"),
+    "/collab-team-rooms.js": ("collab-team-rooms.js", "text/javascript"),
     "/motion.js": ("motion.js", "text/javascript"),
     "/patch.js": ("patch.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
@@ -2453,7 +2465,7 @@ def _make_handler(server, public=False, operator=False):
             dpath = "/".join(seg.replace("/", "\x00") for seg in segs)
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
-                                    "assistant-action-requests", "assistant-grants"}
+                                    "assistant-action-requests", "assistant-grants", "assistant-team-briefs"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
@@ -3849,6 +3861,12 @@ def _make_handler(server, public=False, operator=False):
                 if len(parts) > 4:
                     record = reviews.get(parts[4])
                     return self._json(record) if record else self._json({"error": "not found"}, 404)
+                hidden = {"plan", "feedback", "receipt", "instance_id"}
+                if _q(self.path, "needs_decision") == "1":
+                    page = reviews.list_waiting(limit=min(200, max(1, _qint(self.path, "limit", 200))))
+                    return self._json({"available": True, "needs_decision": True, "total": page["total"], "has_more": page["has_more"],
+                                       "reviews": [{k: v for k, v in row.items() if k not in hidden} for row in page["reviews"]],
+                                       "checked_at": r._stamp()})
                 rows = reviews.list_reviews()
                 offset = max(0, _qint(self.path, "offset", 0))
                 limit = min(500, max(1, _qint(self.path, "limit", 500)))
@@ -3868,6 +3886,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts)
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource)
+            if resource in ("assistant-team-briefs", "assistant-references"):
+                return self._assistant_briefs(parts, resource, None)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -4340,6 +4360,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts, body)     # body was read above; never read it twice
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource, body)
+            if resource == "assistant-team-briefs":
+                return self._assistant_briefs(parts, resource, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4695,6 +4717,66 @@ def _make_handler(server, public=False, operator=False):
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
             except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+
+        def _assistant_briefs(self, parts, resource, body):
+            """Team collaboration slice 4 (assistant_briefs.py): the operator's assistant offers a team a derived brief.
+
+            POST /api/v1/assistant-team-briefs  {room_id, team_id, message_ref[, assistant_id, target_agent_id]}
+            GET  /api/v1/assistant-team-briefs  the caller's own briefs (no mail pointers)
+            GET  /api/v1/assistant-references/<id>  the caller's own reference, resolved. Anyone else, or a wrong id, is one 404.
+
+            The scope is the authenticated API-key principal's own ``(tenant, user)``; collaboration credentials do not
+            authenticate here. Off (the flag, or the assistant) answers like a route that does not exist."""
+            from .assistant import (
+                AssistantError,
+                AssistantForbidden,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
+            from .assistant_briefs import TeamBriefError
+            try:
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                svc._require_enabled()
+                briefs = svc.team_briefs
+                briefs._require_enabled()
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                if resource == "assistant-references" and len(parts) == 5 and self.command == "GET":
+                    return self._json(briefs.reference(parts[4], tenant_id=tenant_id, user_id=user_id))
+                if resource == "assistant-team-briefs" and len(parts) == 4 and self.command == "GET":
+                    return self._json({"briefs": briefs.list(tenant_id=tenant_id, user_id=user_id)})
+                if resource == "assistant-team-briefs" and len(parts) == 4 and self.command == "POST":
+                    body = body if isinstance(body, dict) else {}
+                    if set(body) - {"room_id", "team_id", "message_ref", "assistant_id", "target_agent_id"}:
+                        return self._json({"error": "unknown field"}, 400)
+                    for key in ("room_id", "team_id", "message_ref"):
+                        if not isinstance(body.get(key), str) or not body[key]:
+                            return self._json({"error": f"{key} is required"}, 400)
+                    for key in ("assistant_id", "target_agent_id"):
+                        if body.get(key) is not None and not isinstance(body[key], str):
+                            return self._json({"error": f"{key} must be a string"}, 400)
+                    assistant_id = body.get("assistant_id") or next(
+                        (a.assistant_id for a in svc.store.list_assistants(tenant_id=tenant_id, user_id=user_id) if a.enabled), "")
+                    brief = briefs.process_message(
+                        tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id, message_ref=body["message_ref"],
+                        room_id=body["room_id"], team_id=body["team_id"], target_agent_id=body.get("target_agent_id"))
+                    if brief is None:
+                        return self._json({"brief": None, "result": "no_topic"})
+                    return self._json({"brief": brief}, 200 if brief["replayed"] else 201)
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except AssistantForbidden:
+                return self._json({"error": "forbidden"}, 403)
+            except TeamBriefError as exc:
+                return self._json({"error": str(exc)}, exc.status)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except (AssistantError, ValueError) as exc:
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):

@@ -14,6 +14,7 @@ import {
 import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
 import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
 import { commentBody, freshDraft, proposalBody, renderWorkbench } from './collab-workbench.js';
+import { mountTeamRoom } from './collab-team-rooms.js';
 import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
@@ -631,7 +632,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const SUB_USE = { chat: 'Talk with the people and agents in this room', tasks: 'Assign work to an agent and follow it', agents: 'Who is in the room and what they may do',
       lineage: 'How work started and moved between agents', flow: 'Who is handing work to whom, as a graph', tabs: 'Agents by terminal tab, and remote-agent invites',
       attention: 'Items in this room that need a person', progress: 'How far assigned work has come', links: 'Workspaces linked to this room',
-      proposals: 'Changes agents propose, held until reviewed', people: 'Members and invitations' };
+      proposals: 'Changes agents propose, held until reviewed', people: 'Members, invitations and team-room controls' };
     const order = (list) => [...list.filter(([k]) => MAJOR_SUBS.includes(k)), ...list.filter(([k]) => !MAJOR_SUBS.includes(k))];
     const tabs = order([['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])]);
     let sub = subTab.get(roomId);
@@ -648,7 +649,9 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span><button type="button" id="hcn-flow-still" class="hd-btn hd-btn--ghost hd-btn--sm" aria-pressed="false">Pause motion</button></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
       <section class="cx-panel cx-cols" id="hcn-p-tasks" hidden>
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Give a task</div><form id="hcn-task" class="cx-stack"><label class="cx-field">To<select name="target" id="hcn-task-target"></select></label><label class="cx-field">What should it do?<textarea class="cx-input" name="text" required maxlength="4000" rows="4"></textarea></label><button class="hd-btn" type="submit">Send task</button><span id="hcn-task-msg" class="cx-msg" role="alert"></span></form></div>' : ''}
-        <div class="hd-card cx-stack"><div class="hd-card__title">Tasks</div><div id="hcn-tasks"></div></div></section>
+        <div class="hd-card cx-stack"><div class="hd-card__title">Tasks</div><div id="hcn-tasks"></div></div>
+        <div class="hd-card cx-stack"><details id="hcn-tr-mine-d"><summary>Tasks assigned to you</summary><div id="hcn-tr-mine"></div></details>
+          ${guest ? '<details id="hcn-tr-req-d"><summary>Your requests to the room owner</summary><div id="hcn-tr-req"></div></details>' : ''}</div></section>
       ${guest ? '' : `<section class="cx-panel cx-cols" id="hcn-p-agents" hidden>
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
@@ -696,7 +699,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
-          <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div></section>` : ''}`, strip);
+          <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div>
+        <div class="hd-card cx-stack"><details id="hcn-tr-owner-d"><summary>Team room: teams, guests, requests, roles and coordinators</summary><div id="hcn-tr-owner"></div></details></div></section>` : ''}`, strip);
 
     const stillBtn = $('hcn-flow-still');      // WCAG 2.2.2: moving lines run for longer than 5 s, so they can be paused
     if (stillBtn) {
@@ -723,7 +727,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const stale = new Set();               // panels whose redraw was held back because you were typing in them
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
-    teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    let teamRoom = null;
+    teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); teamRoom?.dispose(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
@@ -747,6 +752,12 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       return true;
     };
     root.addEventListener('focusout', () => setTimeout(() => { if (stale.size && alive) paint(); }, 0));
+    // Team rooms (slices 1-3): three collapsed sections that ask the server nothing until someone opens them, so a server with the
+    // flags off never sees a request from a room nobody opened this in.
+    teamRoom = mountTeamRoom({ root, api, roomId, put, sections: {
+      mine: { details: 'hcn-tr-mine-d', body: 'hcn-tr-mine' },
+      ...(guest ? { requests: { details: 'hcn-tr-req-d', body: 'hcn-tr-req' } } : {}),
+      ...(canInvite ? { owner: { details: 'hcn-tr-owner-d', body: 'hcn-tr-owner' } } : {}) } });
     // after an inline edit the panel's markup no longer matches what `put` remembers: forget it and refetch
     const redraw = (id) => () => { const el = $(id); if (el) delete el.dataset.h; stale.delete(id); kick(); };
 

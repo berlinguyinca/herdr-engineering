@@ -67,6 +67,8 @@ class GoogleError(Exception):
         self.detail = detail      # "http_403:accessNotConfigured": status plus Google's short error code, for the log only
 
 
+_JOINERS = frozenset("\u200c\u200d")      # ZWNJ/ZWJ: needed by emoji sequences and several scripts, harmless in a header
+_SCOPE_REASONS = frozenset({"insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"})
 _CODE = re.compile(r"[A-Za-z0-9_.-]{1,60}")
 
 
@@ -130,6 +132,8 @@ def _urlopen(req, timeout):
 
 
 class GoogleWorkspace:
+    MAX_TRACKED = 2048      # people tracked in _key_locks/_gen before idle entries are dropped
+
     def __init__(self, store: Any = None, apps: Any = None, *, blocked_fn: Callable[[str, str], list[str]] | None = None,
                  opener: Callable | None = None, clock: Callable[[], float] = time.time):
         store = store if store is not None else apps.credentials
@@ -138,6 +142,7 @@ class GoogleWorkspace:
         self._lock = threading.Lock()
         self._key_locks: dict[tuple[str, str], threading.Lock] = {}
         self._gen: dict[tuple[str, str], int] = {}
+        self._epoch = 0         # every invalidation gets a never-reused number, so an evicted entry cannot match a live refresh
         self._access: dict[tuple[str, str], tuple[str, float]] = {}
         self._policies: dict[tuple[str, str], Any] = {}
 
@@ -161,14 +166,40 @@ class GoogleWorkspace:
         """Forget this person's cached access token, policy and resolved primary id (reconnect, disconnect, revoke)."""
         with self._lock:
             key = (tenant, user)
-            self._gen[key] = self._gen.get(key, 0) + 1
+            self._epoch += 1
+            self._gen[key] = self._epoch
             self._access.pop(key, None)
             self._policies.pop(key, None)
+            self._trim()
+
+    def invalidate_all(self) -> None:
+        """Forget every cached access token and policy (the OAuth client changed, so tokens minted for the old one are stale)."""
+        with self._lock:
+            self._epoch += 1
+            for key in set(self._gen) | set(self._access) | set(self._key_locks):
+                self._gen[key] = self._epoch
+            self._access.clear()
+            self._policies.clear()
+            self._trim()
+
+    def _trim(self) -> None:
+        """Caller holds ``_lock``. Drop tracking for people with no refresh in flight (their key lock is free) once the tables
+        outgrow ``MAX_TRACKED``; a held lock means a refresh is using its generation, so that entry stays."""
+        if len(self._gen) <= self.MAX_TRACKED and len(self._key_locks) <= self.MAX_TRACKED:
+            return
+        for key in list(set(self._gen) | set(self._key_locks)):
+            lock = self._key_locks.get(key)
+            if lock is None or not lock.locked():
+                self._key_locks.pop(key, None)
+                self._gen.pop(key, None)
+                if len(self._gen) <= self.MAX_TRACKED // 2 and len(self._key_locks) <= self.MAX_TRACKED // 2:
+                    break
 
     def _access_token(self, tenant: str, user: str) -> str:
         key = (tenant, user)
         with self._lock:
             key_lock = self._key_locks.setdefault(key, threading.Lock())
+            self._trim()
         with key_lock:                      # serialises refreshes for ONE person; others and the cache stay free
             self._connection(tenant, user)
             with self._lock:
@@ -239,11 +270,13 @@ class GoogleWorkspace:
                 raw = resp.read(MAX_RESPONSE + 1)
         except urllib.error.HTTPError as exc:
             code = exc.code
+            detail = error_detail(exc) if code == 403 else ""
             exc.close()
             if code == 401:
                 with self._lock:
                     self._access.pop((tenant, user), None)
-            raise GoogleError({401: "unauthorized", 403: "forbidden", 404: "not_found", 429: "rate_limited"}.get(code, "unavailable")) from None
+            raise GoogleError({401: "unauthorized", 403: "forbidden", 404: "not_found", 429: "rate_limited"}.get(code, "unavailable"),
+                              detail) from None
         except (urllib.error.URLError, OSError):
             raise GoogleError("unavailable") from None
         if len(raw) > MAX_RESPONSE:
@@ -340,6 +373,19 @@ class GoogleWorkspace:
         body = self._text(msg.get("payload") or {}) or str(msg.get("snippet", ""))
         return {"id": message_id, "from": h.get("from", ""), "to": h.get("to", ""), "subject": h.get("subject", ""),
                 "date": h.get("date", ""), "body": body[:MAX_BODY], "truncated": len(body) > MAX_BODY}
+
+    def get_raw_message(self, tenant: str, user: str, message_id: str) -> dict:
+        """The Gmail ``users.messages.get`` document (format full), for the team-brief builder. Its output never leaves the
+        assistant: only a derived brief and an opaque reference do (``assistant_briefs.py``). Missing -> ``LookupError``."""
+        self._require_gmail(tenant, user)
+        if not isinstance(message_id, str) or not _ID.fullmatch(message_id):
+            raise LookupError("not found")
+        try:
+            return self._get(tenant, user, f"{GMAIL}/messages/{message_id}", {"format": "full"})
+        except GoogleError as exc:
+            if exc.reason in ("not_found", "bad_request"):
+                raise LookupError("not found") from None
+            raise
 
     @classmethod
     def _text(cls, part: dict, depth: int = 0) -> str:
@@ -487,13 +533,13 @@ class GoogleWorkspace:
 
     # ---- writes: only after a person approved the exact content ---------------------------------------------
     @staticmethod
-    def _plain(value: Any, limit: int, name: str, *, required: bool = True) -> str:
+    def _plain(value: Any, limit: int, name: str, *, required: bool = True, joiners: bool = False) -> str:
         """Text with no control characters at all (so no header or line injection through a single-line field)."""
         if value is None or value == "":
             if required:
                 raise GoogleError("bad_request")
             return ""
-        if not isinstance(value, str) or len(value) > limit or any(unicodedata.category(c) in _BAD_CATEGORIES for c in value):
+        if not isinstance(value, str) or len(value) > limit or any(unicodedata.category(c) in _BAD_CATEGORIES and not (joiners and c in _JOINERS) for c in value):
             raise GoogleError("bad_request")
         return value.strip()
 
@@ -502,9 +548,13 @@ class GoogleWorkspace:
         addrs = [a.strip() for a in cls._plain(to, MAX_TO, "to").split(",")]
         if not 1 <= len(addrs) <= MAX_ADDRESSES or not all(_ADDRESS.match(a) for a in addrs):
             raise GoogleError("bad_request")
-        subj = cls._plain(subject, MAX_SUBJECT, "subject")
+        subj = cls._plain(subject, MAX_SUBJECT, "subject", joiners=True)
         if not isinstance(body, str) or not body.strip() or len(body) > MAX_DRAFT_BODY or "\x00" in body:
             raise GoogleError("bad_request")
+        try:
+            body.encode("utf-8")        # a lone surrogate cannot be encoded, so it would crash the draft at run time
+        except UnicodeEncodeError:
+            raise GoogleError("bad_request") from None
         return addrs, subj, body
 
     @classmethod
@@ -554,7 +604,7 @@ class GoogleWorkspace:
         try:
             return self._request(tenant, user, req, allow_empty=method == "DELETE")
         except GoogleError as exc:
-            if exc.reason == "forbidden":       # a connection made before the write scopes were requested
+            if exc.reason == "forbidden" and exc.detail.rpartition(":")[2] in _SCOPE_REASONS:     # made before the write scopes were requested
                 raise GoogleError("reconnect_needed") from None
             raise
 

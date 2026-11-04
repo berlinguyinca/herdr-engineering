@@ -65,6 +65,27 @@ def comment_hook(server):
     return hook
 
 
+def brief_hook(server):
+    """(collab_user, room_id, brief) -> dict: the collab service's in-process ``submit_brief``, as the room OWNER's user.
+
+    There is no collab HTTP route or MCP tool for this. The user is the one the operator's YAML maps the assistant to
+    (``actions.collab_users``); it is built exactly like an authenticated person, never an agent, and the room's own owner check
+    decides (anyone who does not own the room gets the same 404 as a missing room)."""
+    def hook(collab_user: str, room_id: str, brief: dict):
+        from .collab import CollabError, Principal
+        service = server.collab
+        if service is None:
+            raise CollabError(404, "not found")
+        if getattr(service, "degraded", False):
+            raise CollabError(503, "collaboration is disabled; ask the operator")
+        if not service.auth.exists(collab_user):
+            raise CollabError(404, "not found")
+        if service.approval is not None and service._users.get(collab_user, {}).get("status") != "approved":
+            raise CollabError(404, "not found")
+        return service.submit_brief(Principal("user", collab_user, collab_user), room_id, brief)
+    return hook
+
+
 def draft_writer_hook(server):
     """(user, draft, idempotency key) -> committed version: a versioned artifact via the existing registry."""
     def hook(user_id: str, draft: dict, idem: str) -> dict:
