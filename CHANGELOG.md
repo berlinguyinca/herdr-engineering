@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: the macOS fleet updater reads an existing agent's Label without `plutil`
+- `scripts/fleet-auto-update-macos.sh install` decides whether an existing launchd plist is its own by reading `Label` with `plutil`, which exists only on macOS. On the Linux CI hosts the read failed, so `test_install_without_load_writes_the_agent_and_keeps_the_previous_copy` failed on a clean main and turned unit-gates red for every PR. The script now falls back to Python's `plistlib` when `plutil` is unavailable. A foreign label is still refused. All 12 tests in the file pass.
+
 ### Hindsight shared memory as an optional fabric service (unified memory P06; off by default)
 - New compose profile `memory` in `deploy/control-plane/compose.yaml`: `hindsight-db` (pgvector pinned by digest, internal network only, named volume) and `hindsight-api` (loopback-only publish, pinned model directory mounted read-only, same hardening and limits as the herdr-memory deployment candidate). Nothing starts without `deploy.sh --with-memory`.
 - New `control_plane.memory` block in the central fleet file (enabled flag, image tag, model dir, port, https endpoint, database password and four separately generated tenant keys: project, global, infra, personal). `herdr-eng fleet config memory init|status|endpoint|export-key` generates secrets on the host (0600, backup first, never printed); `render-compose` renders them only when enabled and refuses an incomplete block by key name. The non-secret endpoint is served to every host as `memory.url`.
