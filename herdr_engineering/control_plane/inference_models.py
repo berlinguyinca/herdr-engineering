@@ -53,6 +53,9 @@ class ModelResolver:
         except Exception:  # noqa: BLE001 - an unreachable or odd gateway is an empty catalog, never an error
             ids = []
         with self._lock:
+            if not ids and self._cache and self._cache[1]:     # a blip keeps what was last seen, and is retried soon
+                self._cache = (self._clock(), self._cache[1], FAILED_TTL)
+                return list(self._cache[1])
             self._cache = (self._clock(), ids, TTL if ids else FAILED_TTL)
         return ids
 

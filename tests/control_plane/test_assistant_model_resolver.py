@@ -174,3 +174,38 @@ class _Run:
     assistant_id = "asst_x"
     tenant_id = "t"
     user_id = "u"
+
+
+class Rejected(Exception):
+    def __init__(self, code, body):
+        self.code, self._body = code, body
+
+    def read(self, n=-1):
+        return self._body
+
+
+def test_a_context_window_rejection_moves_on_to_a_model_with_room():
+    r, seen = runner("auto", [Rejected(400, b"proxy: request exceeds available context windows\n"), OK],
+                     preferred=["laya", "qwen3.8-text"])
+    assert r._post({"model": "auto", "messages": []}) == OK
+    assert seen == ["laya", "qwen3.8-text"]
+
+
+def test_any_other_bad_request_fails_fast():
+    r, seen = runner("auto", [Rejected(400, b"invalid tool schema"), OK], preferred=["laya", "qwen3.8-text"])
+    with pytest.raises(Rejected):
+        r._post({"model": "auto", "messages": []})
+    assert len(seen) == 1
+
+
+def test_a_catalog_blip_keeps_the_last_known_models():
+    now, up = [0.0], [True]
+
+    def fetch(url, key, timeout):
+        if not up[0]:
+            raise OSError("down")
+        return json.dumps({"data": [{"id": m} for m in SERVED]}).encode()
+    r = ModelResolver(URL, "k", ["laya"], fetch=fetch, clock=lambda: now[0])
+    assert r.candidates("auto")[0] == "laya"
+    up[0], now[0] = False, 61.0                                  # the cache expired and the gateway blipped
+    assert r.candidates("auto")[0] == "laya"                    # still served from what was last seen
