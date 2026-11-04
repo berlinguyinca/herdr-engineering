@@ -50,7 +50,11 @@
       XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active \
         herdr-eng-fabric-agent.service 2>/dev/null && echo active || echo inactive
     else
-      launchctl print gui/$(id -u)/herdr-eng-fabric-agent 2>/dev/null | \
+      # Not the systemd unit name. scripts/fabric-agent-macos.sh registers the LaunchAgent as
+      # com.herdr-engineering.fabric-agent, and launchctl only knows that label — asking it for
+      # herdr-eng-fabric-agent finds nothing and answers `inactive` for a running agent, which
+      # _parity() then reports as an invalid host on every fleet update.
+      launchctl print gui/$(id -u)/com.herdr-engineering.fabric-agent 2>/dev/null | \
         grep -q 'state = running' && echo active || echo inactive
     fi
   args:

@@ -50,3 +50,25 @@ def test_fleet_join_gateway_flag_is_loudly_ignored(capsys):
     assert warn_gateway_ignored("http://x:1") is True
     err = capsys.readouterr().err
     assert "IGNORED" in err and "fabric.url" in err and "fleet-config.yaml" in err
+
+
+def test_fleet_fingerprint_probes_the_service_names_the_installers_actually_use():
+    """`agent=inactive` on a Mac whose agent was running, forever.
+
+    The fleet fingerprint asks launchd for `herdr-eng-fabric-agent` - the *systemd* unit name -
+    while scripts/fabric-agent-macos.sh registers the LaunchAgent as
+    `com.herdr-engineering.fabric-agent`. `launchctl print` finds nothing, the probe answers
+    `inactive`, `_parity()` counts the host invalid, and every `herdr-eng fleet update` - including
+    the unattended nightly one - reports the fleet not at parity because of a host that is fine.
+    The probe has carried the wrong name since 57615222, so no mac has ever passed it.
+    """
+    probe = (ROOT / "ansible/tasks/fleet-fingerprint.yml").read_text()
+    installer = (ROOT / "scripts/fabric-agent-macos.sh").read_text()
+    linux_unit = (ROOT / "scripts/herdr-eng-fabric-agent.service").name
+
+    label = next(line.split('="', 1)[1].rstrip('"')
+                 for line in installer.splitlines() if line.startswith("LABEL="))
+    assert label != linux_unit, "the two platforms do not share a service name"
+    assert f"gui/$(id -u)/{label}" in probe, (
+        f"the launchctl probe must ask for the label the macOS installer writes ({label})")
+    assert linux_unit in probe, "the systemd probe must ask for the unit the Linux installer writes"
