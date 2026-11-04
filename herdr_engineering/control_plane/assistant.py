@@ -2178,6 +2178,7 @@ class AssistantStore:
             hit = [self.judge_records[rid] for rid in self._judge_index.get(tenant_id, {})
                    if rid in self.judge_records and self.judge_records[rid].key_id == key_id
                    and self.judge_records[rid].worker_id == worker_id
+                   and self.judge_records[rid].owner_decision == "approved"
                    and (user_id is None or self.judge_records[rid].user_id == user_id)]
             for r in hit:
                 r.regret = True

@@ -110,11 +110,11 @@ def test_judge_endpoint_scheme_lowercased_and_zero_normalised() -> None:
     assert str(t) == "0.0"
 
 
-def test_judge_version_ignores_endpoint_and_calibration_and_int_float() -> None:
+def test_judge_version_ignores_calibration_and_int_float_but_not_the_endpoint() -> None:
     v = jv.judge_version(_judge())
     other = _judge({"calibration": {"min_labeled_decisions": 50}, "backend_confirmed": True})
     assert jv.judge_version(other) == v
-    assert jv.judge_version(_judge(_on(endpoint="https://other.example.org"))) == v
+    assert jv.judge_version(_judge(_on(endpoint="https://other.example.org"))) != v     # a different backend resets trust
     assert jv.judge_version({"model": "laya-auto", "thresholds": {"destructive": 0.3, "irreversible": 0.3,
                                                                   "severity_score": 2}}) == v
 

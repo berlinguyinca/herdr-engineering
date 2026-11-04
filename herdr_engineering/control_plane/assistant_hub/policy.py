@@ -160,6 +160,14 @@ def _live_grant(store: AssistantStore, cfg: dict, worker: Worker, key: ActionKey
     return None
 
 
+def _fresh_now(judge: JudgeRuntime | None, fallback: datetime) -> datetime:
+    """The clock after a slow consult (never earlier than the caller's ``now``)."""
+    try:
+        return max(as_utc(judge.now()), as_utc(fallback)) if judge is not None else fallback
+    except Exception:
+        return fallback
+
+
 def current_judge_version(judge: JudgeRuntime | None) -> str:
     """The version stamp of the live judge config, or ``""`` (no version check) when there is no usable judge."""
     if judge is None:
@@ -266,7 +274,7 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
         outcome, source = _apply_verdict(result)
         if outcome == "authorized":
             # The consult can be slow: re-check that the grant is still live (revoked/expired/judge changed meanwhile).
-            grant = _live_grant(store, cfg, worker, derived.key, now, current_judge_version(judge))
+            grant = _live_grant(store, cfg, worker, derived.key, _fresh_now(judge, now), current_judge_version(judge))
             if grant is None:
                 return _pending(store, worker, raw, derived, session_id, task_id, now, "owner",
                                 "No active grant covers this exact action, so the owner decides.", judge)
@@ -282,7 +290,7 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
 
 
 def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str,
-                          request_id: str, approve: bool, decided_by: str) -> ActionRequestRow:
+                          request_id: str, approve: bool, decided_by: str, *, judge_version: str = "") -> ActionRequestRow:
     if not decided_by.strip():
         raise ValueError("decided_by must not be empty")
     with store._lock:
@@ -302,7 +310,8 @@ def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenan
         if approve and row.verb != Verb.UNKNOWN.value and row.key_canonical:
             key = ActionKey.from_canonical(row.key_canonical)
             if key.key_id() == row.key_id:
-                propose_if_ready(store, cfg, now, tenant_id, user_id, row.worker_id, key, vetoed=False)
+                propose_if_ready(store, cfg, now, tenant_id, user_id, row.worker_id, key, vetoed=False,
+                                 judge_version=judge_version)
     label_decision(store, tenant_id, user_id, request_id, approve, as_utc(now))   # first label wins
     store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=decided_by, action="assistant.action.decided",
                        subject_id=request_id, detail=f"{'approve' if approve else 'deny'} request={request_id}")
@@ -376,14 +385,17 @@ def _activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: 
 
 
 def revoke_action_grant(store: AssistantStore, now: datetime, tenant_id: str, user_id: str, grant_id: str,
-                        revoked_by: str) -> ActionGrant:
+                        revoked_by: str, *, policy_version: int | None = None, judge_version: str = "") -> ActionGrant:
     with store._lock:
         grant = store.get_action_grant(grant_id, tenant_id=tenant_id, user_id=user_id)
         if grant is None:
             raise KeyError(grant_id)
+        was_active = grant.effective_state(
+            now, grant.policy_version if policy_version is None else policy_version, judge_version) is GrantState.ACTIVE
         revoked = revoke(grant, as_utc(now))
         store.put_action_grant(revoked)
-    mark_regret(store, tenant_id, user_id, revoked.key_id, revoked.worker_id)    # approvals the owner now regrets
+    if was_active:      # only approvals that actually rode a live grant are regretted; a proposal never authorized anything
+        mark_regret(store, tenant_id, user_id, revoked.key_id, revoked.worker_id)
     store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=revoked_by, action="assistant.grant.revoked",
                        subject_id=grant_id, detail=f"key_id={revoked.key_id}")
     return revoked

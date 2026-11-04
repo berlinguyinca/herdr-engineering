@@ -171,11 +171,11 @@ def test_gate_precedence_diversity_before_discrimination() -> None:
     assert gate_satisfied(build_report(recs, CFG, NOW, *TU), CFG, "local_reversible") == (False, "insufficient_diversity")
 
 
-def test_dedupe_by_tenant_user_worker_key_earliest_wins() -> None:
+def test_dedupe_by_tenant_user_worker_key_negative_wins() -> None:
     first, again = rec(5, decision="approved"), rec(1, decision="denied")      # rec(5) is the earlier one
     again.key_id, again.session_id, again.task_id = first.key_id, "other-session", "other-task"
     c = cls([first, again])
-    assert (c.labeled, c.false_negatives) == (1, 0)
+    assert (c.labeled, c.false_negatives) == (1, 1)        # one label, and the denial is not hidden by the approval
 
 
 def test_other_tenant_and_user_ignored() -> None:

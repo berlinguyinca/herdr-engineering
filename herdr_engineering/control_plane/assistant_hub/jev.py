@@ -11,6 +11,7 @@ deadline so a slow-drip response cannot outlive ``timeout``.  Redirects are neve
 """
 from __future__ import annotations
 
+import functools
 import http.client
 import json
 import math
@@ -20,7 +21,7 @@ import ssl
 import stat
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -231,6 +232,34 @@ def _parse_answer(kind: str, raw: dict[str, Any], crit: Any) -> Answer:
 # ---------------------------------------------------------------- transport
 
 
+@functools.lru_cache(maxsize=1)
+def _tls_context() -> ssl.SSLContext:
+    """One default TLS context for the process (loading the CA bundle per request is slow)."""
+    return ssl.create_default_context()
+
+
+def _resolve(host: str, port: int, deadline: _Deadline, resolver: Callable[..., Any] = socket.getaddrinfo) -> list[Any]:
+    """Name resolution under the deadline: ``getaddrinfo`` cannot be interrupted, so it runs in a daemon thread and
+    we stop waiting when the deadline passes (the thread ends by itself)."""
+    box: list[Any] = []
+
+    def work() -> None:
+        try:
+            box.append(("ok", resolver(host, port, type=socket.SOCK_STREAM)))
+        except BaseException as exc:                     # noqa: BLE001 - relayed to the caller
+            box.append(("err", exc))
+
+    thread = threading.Thread(target=work, name="jev-resolve", daemon=True)
+    thread.start()
+    thread.join(deadline.remaining())
+    if not box:
+        raise JudgeUnavailable("timeout")
+    kind, value = box[0]
+    if kind == "err":
+        raise value
+    return value
+
+
 class _Deadline:
     def __init__(self, seconds: float) -> None:
         self.end = time.monotonic() + seconds
@@ -291,7 +320,7 @@ class JevClient:
 
     def _connect(self, conn: http.client.HTTPConnection, deadline: _Deadline) -> None:
         """Resolve, then try each address against the shared deadline (never a per-address timeout)."""
-        infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
+        infos = _resolve(self._host, self._port, deadline)
         last: OSError = OSError("no address")
         for family, stype, proto, _, addr in infos:
             if deadline.expired():
@@ -301,7 +330,7 @@ class JevClient:
                 sock.settimeout(max(deadline.remaining(), 0.001))
                 sock.connect(addr)
                 if self._scheme == "https":
-                    sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self._host)
+                    sock = _tls_context().wrap_socket(sock, server_hostname=self._host)
                 conn.sock = sock
                 return
             except TimeoutError:

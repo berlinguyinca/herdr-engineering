@@ -379,9 +379,13 @@ numbers; status `ok` or `unavailable` (with a short reason code). It never holds
 
 Labels come from the owner's decision on the request:
 
-- The **first** owner label wins. A later change of mind is not a new label: revoking the grant marks the records for
-  that key and worker as **regret**, which counts like a denial.
-- Records are de-duplicated per (tenant, user, worker, key id) when reports are built: the earliest label counts.
+- The **first** owner label wins. A later change of mind is not a new label: revoking an **active** grant marks the
+  *approved* records for that key and worker as **regret**, which counts like a denial. Revoking a proposed, shadow or
+  expired grant marks nothing (it never authorized anything).
+- Records are grouped per (tenant, user, worker, key id) when reports are built, and a group is **one** label, so
+  `min_labeled_decisions` counts distinct (worker, action) pairs, not requests. Negative wins inside a group: if any
+  record in it was denied or regretted, the group counts as a negative label (and as a false negative when the judge
+  called that record safe), so a later denial is never hidden by an earlier approval.
 - Only records with status `ok` made under the **current judge version** count. Unavailable records never do.
 - A false negative is a judge "safe" verdict (no escalation) on an action the owner denied or regretted. An approval is
   not proof of safety, so the bound is an estimate: owners misclick and approve things they later regret.
@@ -407,9 +411,11 @@ Activation stamps the grant with the judge version.
 
 ### Judge version resets
 
-`judge_version` is a hash of the `model`, the `thresholds` and the question-set version. Changing any of them makes
+`judge_version` is a hash of the `model`, the normalized `endpoint` (scheme, host, port and path; spelling and a default port
+do not matter), the `thresholds` and the question-set version. Repointing the endpoint means a different backend, so it resets trust like the rest. Changing any of them makes
 every report and every grant stale: active grants show as `shadow` and nothing is authorized until a fresh set of
-labels exists under the new version and the owner activates again. Endpoint, key file and timeout do not change it.
+labels exists under the new version and the owner activates again. Key file and timeout do not change it. Once evidence is ready again, a **new proposal** replaces a grant that became
+`shadow` because of a judge-version change; activate it (gate permitting) to re-earn autonomy.
 
 ### Owner status and checks
 

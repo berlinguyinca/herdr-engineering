@@ -165,7 +165,7 @@ def make_runtime(store: AssistantStore, cfg: dict[str, Any], now: Callable[[], d
             return None
         return JevClient(str(cfg["endpoint"]), str(cfg["api_key_file"]), str(cfg["model"]), float(cfg["timeout_seconds"]))
     recorder = CountingRecorder(store, lambda: cfg, factory, now)
-    return JudgeRuntime(cfg_getter=lambda: cfg, client_factory=factory, recorder=recorder)
+    return JudgeRuntime(cfg_getter=lambda: cfg, client_factory=factory, recorder=recorder, now=now)
 
 
 def force_active_grant_for_tests(store: AssistantStore, grants_cfg: dict[str, Any], grant_id: str, now: datetime,

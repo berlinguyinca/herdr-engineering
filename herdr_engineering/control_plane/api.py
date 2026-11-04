@@ -4537,7 +4537,8 @@ def _make_handler(server, public=False, operator=False):
                             return self._json({"error": 'body must be exactly {"approve": true|false}'}, 400)
                         try:
                             row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
-                                                        body["approve"], decided_by=user_id)
+                                                        body["approve"], decided_by=user_id,
+                                                        judge_version=version)
                         except ValueError as exc:       # already decided, or vetoed (a veto is final)
                             return self._json({"error": str(exc), "code": "conflict"}, 409)
                         return self._json(request_view(row))
@@ -4546,7 +4547,9 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"grants": [grant_view(g) for g in store.list_action_grants(tenant_id, user_id)]})
                     if len(parts) == 5 and self.command == "DELETE":
                         return self._json(grant_view(revoke_action_grant(store, svc.now(), tenant_id, user_id,
-                                                                          parts[4], revoked_by=user_id)))
+                                                                          parts[4], revoked_by=user_id,
+                                                                          policy_version=int(cfg["policy_version"]),
+                                                                          judge_version=version)))
                     if len(parts) == 6 and parts[5] == "activate" and self.command == "POST":
                         if not exact({"confirm"}) or body["confirm"] is not True:
                             return self._json({"error": 'body must be exactly {"confirm": true}'}, 400)

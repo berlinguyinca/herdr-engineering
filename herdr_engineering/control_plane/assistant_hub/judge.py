@@ -10,6 +10,7 @@ import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from .jev import JevClient, JudgeResult, JudgeUnavailable, NoulAnswer, ScoreAnswer
@@ -153,3 +154,4 @@ class JudgeRuntime:
     cfg_getter: Callable[[], Mapping[str, Any]]
     client_factory: Callable[[], JevClient | None]
     recorder: ShadowRecorder
+    now: Callable[[], datetime]

@@ -263,7 +263,7 @@ def test_owner_decision_labels_record_and_revoke_marks_regret(key_file: Path, li
     record_owner_decision(store, cfg, NOW, T, U, d.request_id, True, "owner")
     rec = store.list_judge_records(T, U)[0]
     assert rec.owner_decision == "approved" and not rec.regret
-    g = _proposed(store, cfg, _push())
+    g = _active(store, cfg, rt)
     revoke_action_grant(store, NOW, T, U, g.grant_id, "owner")
     assert store.list_judge_records(T, U)[0].regret is True
     _stop(rt)
@@ -377,6 +377,8 @@ def test_judge_version_change_after_activation_makes_grant_shadow_and_next_decid
     store, cfg, rt, g = _gate_world(key_file)
     # rebuild the runtime against the live listener so the pre-change decide is authorized end to end
     live = make_runtime(store, judge_cfg(f"http://127.0.0.1:{listener_safe.port}", key_file), lambda: NOW)
+    for r in _labeled_records(live.cfg_getter(), derive(_push()).key.risk_class.value):    # the endpoint is in the version
+        store.add_judge_record(r)
     active = _activate(store, cfg, g, live)
     assert decide(store, cfg, _worker(), _push(), "s1", "t1", NOW, judge=live).outcome == "authorized"
     changed = make_runtime(store, judge_cfg(f"http://127.0.0.1:{listener_safe.port}", key_file, model="other-model"),
@@ -618,7 +620,7 @@ def test_gate_errors_become_judge_error(key_file: Path, break_it: str) -> None:
     def boom() -> dict[str, Any]:
         raise RuntimeError("config exploded")
     getter = boom if break_it == "cfg_getter_raises" else (lambda: {})
-    bad = JudgeRuntime(cfg_getter=getter, client_factory=good.client_factory, recorder=good.recorder)
+    bad = JudgeRuntime(cfg_getter=getter, client_factory=good.client_factory, recorder=good.recorder, now=good.now)
     with pytest.raises(ActivationRefused) as err:
         _activate(store, cfg, g, bad)
     assert err.value.code == "judge_error" and "exploded" not in str(err.value)
@@ -635,7 +637,7 @@ def test_route_judge_error_is_409(acknowledged_sink: Any, key_file: Path) -> Non
         def boom() -> dict[str, Any]:
             raise RuntimeError("x")
         w.svr.assistant_judge = JudgeRuntime(cfg_getter=boom, client_factory=w.rt.client_factory,
-                                             recorder=w.rt.recorder)
+                                             recorder=w.rt.recorder, now=w.rt.now)
         status, body = _call(w.base, "POST", f"/api/v1/assistant-grants/{g.grant_id}/activate", {"confirm": True})
         assert (status, body["code"]) == (409, "judge_error")
     finally:

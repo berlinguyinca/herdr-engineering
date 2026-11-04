@@ -152,7 +152,7 @@ def audit_actions(w):
 
 
 def test_phase3_flow_shadow_labels_gate_judge_on_the_authorize_path(acknowledged_sink, tmp_path):
-    safe, risky = WireListener(success_body(SAFE)), WireListener(success_body(RISKY))
+    live = WireListener(success_body(SAFE))      # one listener; its body is switched between the safe and the risky answer
     try:
         with running(acknowledged_sink, tmp_path, endpoint=f"http://127.0.0.1:{closed_port()}") as w:
             wk = enroll(w, "laptop", "dev1")
@@ -187,43 +187,47 @@ def test_phase3_flow_shadow_labels_gate_judge_on_the_authorize_path(acknowledged
             status, refused = owner(w, "POST", f"/api/v1/assistant-grants/{gid}/activate", {"confirm": True})
             assert status == 409 and refused["code"] == "insufficient_labels"
 
-            # 4. hand-built records stand in for a real judge: enough labels, keys and denied decisions
+            # 4. the endpoint is part of the judge version: point at the live judge BEFORE the labels and the activation
+            w.cfg["endpoint"] = f"http://127.0.0.1:{live.port}"
+            # hand-built records stand in for a real judge: enough labels, keys and denied decisions
             satisfy_gate(w.svc.store, w.rt, RISK, TENANT, OWNER)
             assert owner(w, "GET", "/api/v1/assistant-judges")[1]["gate"][RISK] == {"satisfied": True, "code": ""}
             status, activated = owner(w, "POST", f"/api/v1/assistant-grants/{gid}/activate", {"confirm": True})
             assert status == 200 and activated["state"] == "active", activated
 
-            # 5. an ACTIVE grant still needs the judge to answer: down => pending/judge_unavailable
-            down = ask_action(w, wk, PUSH, "s10", "t10")
-            assert (down["outcome"], down["source"], down["grant_id"]) == ("pending", "judge_unavailable", None)
-            w.cfg["enabled"] = False                                # disabled judge is the same fail-closed answer
+            # 5. an ACTIVE grant still needs the judge: a disabled judge is the same fail-closed answer
+            w.cfg["enabled"] = False
             off = ask_action(w, wk, PUSH, "s11", "t11")
             assert (off["outcome"], off["source"]) == ("pending", "judge_unavailable")
             w.cfg["enabled"] = True
 
             # 6. non-escalating answer => authorized; escalating answer => pending/judge
-            w.cfg["endpoint"] = f"http://127.0.0.1:{safe.port}"
             ok = ask_action(w, wk, PUSH, "s12", "t12")
             assert (ok["outcome"], ok["source"], ok["grant_id"]) == ("authorized", "grant", gid)
-            assert safe.hits >= 1
-            w.cfg["endpoint"] = f"http://127.0.0.1:{risky.port}"
+            assert live.hits >= 1
+            live.body = success_body(RISKY)
             flagged = ask_action(w, wk, PUSH, "s13", "t13")
             assert (flagged["outcome"], flagged["source"], flagged["grant_id"]) == ("pending", "judge", None)
+            live.body = success_body(SAFE)
 
             # 7. a different exact key never rides the grant, whatever the judge says
             other = ask_action(w, wk, "git push -u origin feature", "s14", "t14")
             assert other["outcome"] == "pending" and other["grant_id"] is None
-            w.cfg["endpoint"] = f"http://127.0.0.1:{safe.port}"
             assert ask_action(w, wk, PUSH, "s15", "t15")["outcome"] == "authorized"
+
+            # judge unreachable at authorize time (same endpoint, so the grant stays ACTIVE): pending/judge_unavailable
+            live.close()
+            down = ask_action(w, wk, PUSH, "s10", "t10")
+            assert (down["outcome"], down["source"], down["grant_id"]) == ("pending", "judge_unavailable", None)
 
             # 8. changing the model changes the judge version: the grant shows SHADOW and authorizes nothing
             w.cfg["model"] = "some-other-model"
             shown = owner(w, "GET", "/api/v1/assistant-grants")[1]["grants"]
             assert [g["state"] for g in shown if g["grant_id"] == gid] == ["shadow"]
-            hits = safe.hits
+            hits = live.hits
             moved = ask_action(w, wk, PUSH, "s16", "t16")
             assert moved["outcome"] == "pending" and moved["grant_id"] is None
-            assert safe.hits >= hits        # the recorder may still record it; it just must not authorize
+            assert live.hits >= hits        # the recorder may still record it; it just must not authorize
 
             # 9. a pending unknown command carrying a canary secret
             unknown = ask_action(w, wk, SECRET_URL_CMD, "s17", "t17")
@@ -241,7 +245,7 @@ def test_phase3_flow_shadow_labels_gate_judge_on_the_authorize_path(acknowledged
                      "snapshot": json.dumps(store.snapshot(), default=str),
                      "outputs": "\n".join(w.outputs),
                      "to_judge": "\n".join(m.decode("utf-8", "replace").split("\r\n\r\n", 1)[-1]
-                                           for m in safe.seen + risky.seen)}
+                                           for m in live.seen)}
             for secret in (w.key_text, w.key_path, CANARY, "frobnicate"):
                 for name, blob in blobs.items():
                     if name == "snapshot" and secret == "frobnicate":
@@ -252,8 +256,7 @@ def test_phase3_flow_shadow_labels_gate_judge_on_the_authorize_path(acknowledged
             assert CANARY not in owner_rows
             assert "git push" not in blobs["to_judge"]          # command text never reaches the judge
     finally:
-        safe.close()
-        risky.close()
+        live.close()
 
 
 def test_active_grant_with_a_stale_judge_version_is_shadow_not_authorized(acknowledged_sink, tmp_path):

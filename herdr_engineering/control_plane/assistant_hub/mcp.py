@@ -222,6 +222,8 @@ def _action_grants_list(hub: Hub, worker: Worker, args: dict) -> dict:
 def _judge_status(hub: Hub, worker: Worker, args: dict) -> dict:
     from .judge_admin import mcp_view
     _check_args(args, set())
+    if not hub.event_limiter.allow(worker.worker_id, hub.event_rate_limit):      # same slot accounting as the writers
+        raise _ToolError("rate limited")
     return _text(mcp_view(hub.store, hub.judge, worker.tenant_id, worker.user_id, hub.service.now()))
 
 

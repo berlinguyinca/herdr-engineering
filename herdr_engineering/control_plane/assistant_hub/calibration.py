@@ -81,18 +81,30 @@ class CalibrationReport:
     labels_note: str
 
 
+def _rank(r: JudgeRecord) -> int:
+    """2 = a judge-safe record the owner denied or regretted (false negative), 1 = any other negative, 0 = clean."""
+    if r.owner_decision == "denied" or r.regret:
+        return 1 if r.escalate else 2
+    return 0
+
+
 def _labeled(records: Iterable[JudgeRecord], version: str, tenant_id: str, user_id: str) -> list[JudgeRecord]:
     seen: set[tuple[str, str, str, str]] = set()
+    index: dict[tuple[str, str, str, str], int] = {}
     out: list[JudgeRecord] = []
     for r in sorted(records, key=lambda x: (x.created_at, x.record_id)):
         if r.tenant_id != tenant_id or r.user_id != user_id:
             continue
         if r.status != "ok" or not r.owner_decision or r.judge_version != version:
             continue
-        ident = (r.tenant_id, r.user_id, r.worker_id, r.key_id)       # earliest label per key wins
+        ident = (r.tenant_id, r.user_id, r.worker_id, r.key_id)
         if ident in seen:
+            i = index[ident]
+            if _rank(r) > _rank(out[i]):                     # negative wins: a later denial/regret is never hidden
+                out[i] = r
             continue
         seen.add(ident)
+        index[ident] = len(out)
         out.append(r)
     return out
 

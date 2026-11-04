@@ -192,7 +192,7 @@ sections:
       #   judge:
       #     enabled: false
       #     provider: jev                # only "jev" (System One) exists
-      #     endpoint: ""                 # https URL of System One; http only for loopback. Required when enabled
+      #     endpoint: ""                 # https URL of System One; http only for loopback. Required when enabled; changing it resets grants
       #     model: laya-auto             # must appear in GET <endpoint>/v1/models; changing it resets every grant to shadow
       #     api_key_file: ""             # absolute PATH only, never the key itself; 0600, owned by the service user
       #     timeout_seconds: 5           # integer 1..60; budget on the authorize path (real Laya may need more; see docs)
