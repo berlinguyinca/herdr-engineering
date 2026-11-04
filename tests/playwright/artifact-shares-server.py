@@ -40,10 +40,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from herdr_engineering.control_plane.api import ControlPlaneServer  # noqa: E402
-from herdr_engineering.control_plane.artifact_shares import ShareError  # noqa: E402
+from herdr_engineering.control_plane.artifact_annotations import AnnotationError  # noqa: E402
 from herdr_engineering.control_plane.artifact_bundle import ArtifactBundle  # noqa: E402
 from herdr_engineering.control_plane.artifact_collab_store import InviteGrantConflict  # noqa: E402
-from herdr_engineering.control_plane.artifact_annotations import AnnotationError  # noqa: E402
+from herdr_engineering.control_plane.artifact_shares import ShareError  # noqa: E402
 from herdr_engineering.control_plane.artifacts import ArtifactConflict  # noqa: E402
 from herdr_engineering.control_plane.collab_mirror import REPORT_READ_ONLY  # noqa: E402
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402

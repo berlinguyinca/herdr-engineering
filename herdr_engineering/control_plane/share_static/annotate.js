@@ -491,7 +491,11 @@ async function drawPdf(native, data, onAnchor) {
   status.textContent = '';
   const total = Math.min(doc.numPages, MAX_PDF_PAGES);
   if (doc.numPages > total) status.textContent = `Showing the first ${total} of ${doc.numPages} pages`;
-  const first = await doc.getPage(1);
+  let first;
+  try { first = await doc.getPage(1); } catch {   // a zero-page or damaged document
+    fail();
+    return { setRegions() {}, regionMode() {} };
+  }
   const width = Math.max(200, Math.min(native.clientWidth || 800, 1000) - 4);
   const base = first.getViewport({ scale: 1 });
   const scale = Math.max(0.2, Math.min(1.6, width / base.width));

@@ -1,4 +1,5 @@
 """Migration 0046 and ``AnnotationStore`` on an isolated PostgreSQL with every migration applied (no mocks)."""
+# ruff: noqa: F811 - pytest fixtures are imported by name
 import asyncio
 import json
 import re

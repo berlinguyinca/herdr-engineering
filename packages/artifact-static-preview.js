@@ -59,11 +59,14 @@ export async function mountPdf(container, bytes, { signal, document: doc = globa
   pages.setAttribute('data-pdf-pages', '');
   container.replaceChildren(status, pages);
   let loading;
+  let observer = null;
+  const destroy = () => { observer?.disconnect(); loading?.destroy?.(); };
   const fail = () => { status.textContent = PDF_FAILED; return { pages: 0, destroy() {} }; };
   try {
     const pdfjs = await import(PDFJS_MODULE);
     pdfjs.GlobalWorkerOptions.workerSrc = new URL(PDFJS_WORKER, globalThis.location?.href ?? 'http://localhost/').href;
     loading = pdfjs.getDocument({ data: bytes, isEvalSupported: false, enableXfa: false, verbosity: 0 });
+    signal?.addEventListener('abort', destroy, { once: true });   // before any await: an abort mid-load must tear down
     const pdf = await loading.promise;
     if (signal?.aborted) { await loading.destroy(); return { pages: 0, destroy() {} }; }
     const total = Math.min(pdf.numPages, MAX_PDF_PAGES);
@@ -119,12 +122,10 @@ export async function mountPdf(container, bytes, { signal, document: doc = globa
       queue = queue.then(() => draw(n)).catch(() => { status.textContent = PDF_FAILED; });
     };
     const Observer = globalThis.IntersectionObserver;
-    const observer = Observer ? new Observer(entries => {
+    observer = Observer ? new Observer(entries => {
       for (const entry of entries) if (entry.isIntersecting) { observer.unobserve(entry.target); schedule(Number(entry.target.getAttribute('data-page'))); }
     }, { rootMargin: '300px' }) : null;
     if (observer) holders.forEach(holder => observer.observe(holder)); else schedule(1);
-    const destroy = () => { observer?.disconnect(); loading.destroy(); };
-    signal?.addEventListener('abort', destroy, { once: true });
     return { pages: total, destroy };
   } catch {
     loading?.destroy?.();

@@ -25,8 +25,8 @@ from pathlib import Path
 import pytest
 
 from herdr_engineering.control_plane import api as api_module
-from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.control_plane import share_public, share_render
+from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane import test_artifact_render_api as owner
 from tests.control_plane import test_share_annotate as sa
 from tests.control_plane.test_share_lab import STATIC_DIR
