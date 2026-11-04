@@ -731,6 +731,13 @@ class ControlPlaneServer:
                     self.collab.assistant_briefs_source = lambda: self.assistant.config["team_briefs"]
                 if getattr(self, "google", None) is not None and self.assistant.mail_source is None:
                     self.assistant.mail_source = lambda t, u, mid: self.google.get_raw_message(*self._canonical_person(t, u), mid)
+            if self.assistant.config["external_actions"]["enabled"]:
+                # team collaboration slice 5: the same rule, wired ONLY when the flag is on
+                from .assistant_adapters import ExternalActionsBridge, wire_external_providers
+                if self.collab is not None:
+                    self.collab.external_actions_hook = ExternalActionsBridge(self)
+                    self.collab.external_actions_source = lambda: self.assistant.config["external_actions"]
+                wire_external_providers(self)
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
             self.assistant.ci_rerun_request = self.intelligence.assistant_ci_rerun
@@ -1585,6 +1592,8 @@ class ControlPlaneServer:
             caps.append("assistant_v1")
             if self.assistant.team_briefs.enabled():
                 caps.append("assistant_team_briefs")
+            if self.assistant.external_actions.enabled():
+                caps.append("assistant_external_actions")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             caps.append("project_intelligence_v1")
         if getattr(self, "memory", None) is not None and self.memory.enabled():
@@ -2465,7 +2474,8 @@ def _make_handler(server, public=False, operator=False):
             dpath = "/".join(seg.replace("/", "\x00") for seg in segs)
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
-                                    "assistant-action-requests", "assistant-grants", "assistant-team-briefs"}
+                                    "assistant-action-requests", "assistant-grants", "assistant-team-briefs",
+                                    "assistant-external-actions"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
@@ -3888,6 +3898,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource)
             if resource in ("assistant-team-briefs", "assistant-references"):
                 return self._assistant_briefs(parts, resource, None)
+            if resource == "assistant-external-actions":
+                return self._assistant_external(parts, None)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -4362,6 +4374,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource, body)
             if resource == "assistant-team-briefs":
                 return self._assistant_briefs(parts, resource, body)
+            if resource == "assistant-external-actions":
+                return self._assistant_external(parts, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4778,6 +4792,64 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "not found"}, 404)
             except (AssistantError, ValueError) as exc:
                 return self._json({"error": str(exc)}, 400)
+
+        def _assistant_external(self, parts, body):
+            """Team collaboration slice 5 (external_actions.py): the operator's own door onto approval-gated external actions.
+
+            GET  /api/v1/assistant-external-actions[?state=]           the caller's actions, with the full card
+            GET  /api/v1/assistant-external-actions/<id>                one action
+            POST /api/v1/assistant-external-actions                     {kind, room_id, reference[, title, labels, body]}
+            POST /api/v1/assistant-external-actions/<id>/decision       {decision, expected_sha256}
+            POST /api/v1/assistant-external-actions/<id>/retry          {expected_sha256}
+
+            The scope is the authenticated API-key principal's own ``(tenant, user)``; collaboration credentials do not
+            authenticate here. Filing, deciding and retrying go through the collaboration service (the same authorisation and
+            audit as the collab door); that mapping needs ``actions.collab_users``. Off answers like a route that does not exist."""
+            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant_adapters import ExternalActionsBridge
+            from .collab import CollabError, Principal
+            try:
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                svc._require_enabled()
+                ext = svc.external_actions
+                ext._require_enabled()
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                collab, n = server.collab, len(parts)
+                collab_user = svc.config["actions"]["collab_users"].get(user_id)
+                if n == 4 and self.command == "GET":
+                    return self._json({"actions": ext.list(tenant_id=tenant_id, user_id=user_id, state=_q(self.path, "state"))})
+                if n == 5 and self.command == "GET":
+                    return self._json(ext.get(parts[4], tenant_id=tenant_id, user_id=user_id))
+                if collab is None or not collab_user or not collab.auth.exists(collab_user):
+                    raise AssistantNotFound("not found")
+                owner = Principal("user", collab_user, collab_user)
+                body = body if isinstance(body, dict) else {}
+                if n == 4 and self.command == "POST":
+                    room_id = body.get("room_id")
+                    if not isinstance(room_id, str) or not room_id:
+                        return self._json({"error": "room_id is required"}, 400)
+                    status, out = collab.file_external_action(owner, room_id, {k: v for k, v in body.items() if k != "room_id"},
+                                                              via="assistant")
+                    return self._json({**out, "card": ext.get(out["action_id"], tenant_id=tenant_id, user_id=user_id)["card"]}, status)
+                if n == 6 and self.command == "POST" and parts[5] in ("decision", "retry"):
+                    row = ext.get(parts[4], tenant_id=tenant_id, user_id=user_id)
+                    return self._json(collab.decide_external_action(owner, row["room_id"], parts[4], body, parts[5]))
+                return self._json({"error": "not found"}, 404)
+            except CollabError as exc:
+                return self._json({"error": exc.message}, exc.status)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except (AssistantError, ValueError) as exc:
+                try:
+                    mapped = ExternalActionsBridge.error(exc)
+                except Exception:                                  # noqa: BLE001
+                    return self._json({"error": str(exc)}, 400)
+                return self._json({"error": mapped.message}, mapped.status)
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
