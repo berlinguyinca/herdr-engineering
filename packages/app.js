@@ -18,6 +18,7 @@ import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountGithubProjects } from './github-projects-view.js';
+import { refsFromMissionOutcomes } from './board-links.js';
 import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArchitecture } from './architecture-view.js';
@@ -501,7 +502,17 @@ async function viewGithub() {
 async function viewGithubProjects() {
   // Read-only Projects v2 boards; keeps its own 5 s poll, live events refresh it too.
   const query = route().query;
-  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board' });
+  // WC-005b: one read on mount of the mission PR refs (no polling); a failed read marks the Herdr data partial.
+  let herdrRefs = [];
+  let herdrRefsFailed = false;
+  try {
+    const mapped = refsFromMissionOutcomes(await client.missionOutcomes());
+    herdrRefs = mapped.refs;
+    herdrRefsFailed = mapped.failed;
+  } catch {
+    herdrRefsFailed = true;
+  }
+  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board', herdrRefs, herdrRefsFailed });
 }
 
 async function viewReviewGate() {
