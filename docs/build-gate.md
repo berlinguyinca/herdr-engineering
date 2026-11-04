@@ -20,9 +20,9 @@ dev-fabric gateway and the machine became unresponsive.
    **ungated** (never fails/hangs the agent) if no slot frees within `--wait`,
    making the gate best-effort coordination.
 
-   Defaults: `slots` = **auto** (`max(2, cpu_cores-4)`), `max-load=3.0`,
+   Defaults: `slots` = **auto** (`min(4, cpu_cores-4)`, floor 2), `max-load=3.0`,
    `wait=900s`, `bypass-on-timeout`. The auto slot count scales with the
-   host: 2 on small hosts, more on high-performance hosts (e.g. **20 on 24
+   host: 2 on small hosts, capped at 4 on large hosts (e.g. **4 on 24
    cores**). Override with `--slots` / `HERDR_BUILD_GATE_SLOTS`.
 
 2. **Pi build-gate extension** (`deploy/pi-build-gate/build-gate.ts`) — hooks
@@ -91,13 +91,37 @@ fleet scale of 14+ concurrent full-workspace cargo builds, starve the CPU.
 - frequent contention **but** idle host → gate too conservative; raise slots.
 - Contention counts: `grep -c '"event": *"contention"' state/build-gates/telemetry.jsonl`
 
-> **Note on adaptive slots vs the load guard.** The auto default (`cores-4`)
-> is permissive on big hosts (20 on 24 cores). If every build is a full-
-> workspace `cargo check` using `-j nproc`, 20 concurrent builds will still
+> **Note on slots vs the load guard.** The auto default is
+> `min(4, cores-4)`, floor 2 (4 on 24 cores). If every build is a full-
+> workspace `cargo check` using `-j nproc`, even 4 concurrent builds can
 > saturate the CPU — the `--max-load` guard only stops *new* builds from
 > starting once load/core is high; it does not stop already-running ones. If
 > you see contention + sustained high load after deployment, pin
 > `HERDR_BUILD_GATE_SLOTS` to a lower value and/or lower `HERDR_BUILD_GATE_MAX_LOAD`.
+
+## Recording build metrics (opt-in)
+
+`herdr-eng build-coordinate --record -- <cmd...>` forks the child instead of
+`exec`ing it, so the wrapper stays alive holding the slot and the maintenance
+`LOCK_SH` until the child is reaped (cleanup still cannot run mid-build). It
+forwards SIGINT/SIGTERM to the child only and returns the child's exit code
+(signal death = 128+sig). Without `--record` behavior is unchanged (`exec`).
+
+Two JSON lines per build are appended (0600, rotated to `builds.jsonl.1` above
+5 MiB) to `<state>/build-gates/builds.jsonl`: `build_started` and
+`build_finished` with `build_id`, `host`, `slot`, `cmd_kind` (allowlist only:
+`cargo build|test|check|clippy`, `tsc`, `other`; argv and env are never
+recorded), `exit_code`, `elapsed_s`, `user_cpu_s`, `sys_cpu_s`, `max_rss_kb`,
+`rusage_oublock`, `proc_io_write_bytes` (logical, sampled from `/proc/<pid>/io`
+over the child tree; a lower bound), `host_disk_write_bytes_delta` with
+`host_disk_scope` (`device:<name>` or `host_wide_physical_ish`; includes other
+activity on the host), `sccache_stats` (delta of numeric counters from
+`sccache --show-stats --stats-format json`, 2 s timeout), and `unavailable`
+listing every field that could not be measured (those fields are `null`, never
+zero). Measurement errors never change the build result. Note `sccache
+--show-stats` may start the sccache server if it is not running.
+`build-coordinate --status` includes a summary (counts, p50/p95 by `cmd_kind`,
+total writes). `scripts/build_bench.py` runs a cold/warm benchmark outside the gate.
 
 Rust cache maintenance uses the same per-host state directory and a shared build
 lock. See [automatic Rust build-cache cleanup](build-cleanup.md) for configuration,
