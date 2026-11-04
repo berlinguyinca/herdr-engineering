@@ -4161,6 +4161,7 @@ def _cmd_cp_web(args) -> int:
                              scheduler_admission=cp.get("scheduler_admission") is True,
                              scheduler_limits=cp.get("scheduler_limits") or {},
                              skill_registry=cp.get("skill_registry"),
+                             build_cache=cp.get("build_cache"),
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
