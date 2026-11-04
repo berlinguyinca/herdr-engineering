@@ -93,6 +93,7 @@ MAX_SENDS = 4
 MAX_NONCES = 512
 # Tools a phone operator's bots get on first use (preauthorized=False: every sensitive one still needs an approval card).
 # send_email is deliberately absent. Override with control_plane.rakazo_bridge.default_tools; [] disables.
+GRANT_RECHECK_SECONDS = 3600.0      # how often a bot's lapsed default grants are looked at again
 DEFAULT_TOOLS = ("set_reminder", "list_reminders", "cancel_reminder", "search_email", "read_email", "list_calendar_events",
                  "find_free_time", "create_email_draft", "create_calendar_event")
 # default_tools may only name these: tools that stay behind an approval card or touch only the person's own data.
@@ -713,6 +714,7 @@ class RakazoBridge:
         self._nonces: OrderedDict[tuple, dict[str, Any]] = OrderedDict()      # recent sends, by clientNonce
         self._create_lock = threading.Lock()
         self._grant_lock = threading.Lock()
+        self._grant_checked: dict[str, float] = {}      # bot id -> monotonic time of its last default-grant pass
         self._closed = threading.Event()
         self._monotonic = monotonic
         self.thread_factory = threading.Thread      # tests swap it to make a thread start fail
@@ -1088,24 +1090,44 @@ class RakazoBridge:
         return assistant
 
     def _ensure_default_grants(self, ctx: _Ctx, assistant) -> None:
-        """Once per bot, give a real operator phone's assistant the default tools (never preauthorized, so sensitive tools
-        still need an approval card). The meta flag makes a later revoke stick; a tool that already has any grant record is
-        skipped. Never raises: chat must not break over this."""
+        """Give a real operator phone's assistant the default tools (never preauthorized, so sensitive tools still need an
+        approval card). First use grants every tool that has no record; the meta flag makes a later revoke (or delete) stick.
+        Grants lapse after ``grant_max_ttl_seconds``, so at most once per ``GRANT_RECHECK_SECONDS`` per bot a default tool
+        whose records are all expired (none revoked) gets a fresh grant. Never raises: chat must not break over this."""
         try:
             if not self.default_tools or ctx.account.role != "operator":
                 return
             if self.canonical_person(ctx.tenant, ctx.user) != (ctx.tenant, OPEN_LISTENER_USER):
                 return
             bot_id = assistant.assistant_id
+            now = self._monotonic()
+            last = self._grant_checked.get(bot_id)
+            if last is not None and now - last < GRANT_RECHECK_SECONDS:
+                return
             with self._grant_lock:      # concurrent first requests must not each grant every tool
-                if self.bots.meta(ctx, bot_id).get("default_tools_applied"):
+                last = self._grant_checked.get(bot_id)
+                if last is not None and now - last < GRANT_RECHECK_SECONDS:
                     return
-                have = {g.tool_id for g in self.svc.store.list_grants(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id)}
+                applied = bool(self.bots.meta(ctx, bot_id).get("default_tools_applied"))
+                by_tool: dict[str, list] = {}
+                for g in self.svc.store.list_grants(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id):
+                    by_tool.setdefault(g.tool_id, []).append(g)
+                wall = self.svc.now()
                 for tool in self.default_tools:
-                    if tool in ALLOWED_DEFAULT_TOOLS and tool not in have:
-                        self.svc.grant_tool(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id, tool_id=tool,
-                                            scope="*", preauthorized=False)
-                self.bots._put_meta(ctx, bot_id, {"default_tools_applied": True})
+                    if tool not in ALLOWED_DEFAULT_TOOLS:
+                        continue
+                    records = by_tool.get(tool, [])
+                    if records:
+                        # renew only a lapsed tool: any revoked or still-active record means "leave it alone"
+                        if applied is False or any(g.revoked_at is not None or g.active(wall) for g in records):
+                            continue
+                    elif applied:
+                        continue
+                    self.svc.grant_tool(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=bot_id, tool_id=tool,
+                                        scope="*", preauthorized=False)
+                if not applied:
+                    self.bots._put_meta(ctx, bot_id, {"default_tools_applied": True})
+                self._grant_checked[bot_id] = now
         except Exception as exc:  # noqa: BLE001 - a grant failure must never break chat
             log.warning("rakazo bridge: default tool grants failed (%s)", type(exc).__name__)
 
