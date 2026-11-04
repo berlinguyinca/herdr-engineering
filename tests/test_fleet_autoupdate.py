@@ -155,3 +155,49 @@ def test_installer_renders_explicit_checkout_and_interpreter_without_enabling(tm
         if "Failed to initialize manager" in stderr or "Failed to lookup RuntimeDirectory" in stderr:
             pytest.skip("user systemd manager unavailable for systemd-analyze verify")
         assert validation.returncode == 0, stderr
+
+
+def test_service_working_directory_stays_outside_the_checkout():
+    """Issue #584: `python -m` puts the working directory first on sys.path.
+
+    The repository is flat-layout, so `WorkingDirectory=<checkout>` makes the timer import the
+    checkout instead of the installed build - and then the updater a host needs is the code the
+    checkout is too far behind (or too dirty) to receive.
+    """
+    source = Path(__file__).resolve().parents[1]
+    text = (source / "scripts/herdr-eng-fleet-update.service").read_text()
+    assert "WorkingDirectory=%h" in text
+    # Nothing may re-inject the checkout as the working directory.
+    assert "__REPO__" not in text
+    assert "WorkingDirectory=__" not in text
+
+
+def test_shadowing_is_only_cwd_shadowing():
+    from herdr_engineering.fleet_autoupdate import shadowed
+
+    target = Path("/srv/controller")
+    assert shadowed(target, "/srv/controller", target) is True
+    # An editable install of the same checkout reached through the console script keeps its own
+    # interpreter directory first on sys.path; that is the operator's choice, not shadowing.
+    assert shadowed(target, "/home/operator/.local/bin", target) is False
+    # Running the installed build from inside the checkout is also fine.
+    assert shadowed(Path("/opt/herdr-engineering"), "/srv/controller", target) is False
+    # A relative or missing sys.path[0] cannot be resolved, so it cannot be blamed.
+    assert shadowed(target, "", target) is False
+
+
+def test_run_update_refuses_to_update_the_checkout_it_imported(checkout, monkeypatch, tmp_path,
+                                                               capsys):
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    monkeypatch.setattr(fleet_autoupdate, "package_root", lambda: checkout)
+    monkeypatch.setattr(sys, "path", [str(checkout), *sys.path[1:]])
+    with patch.object(fleet_autoupdate, "fleet_update") as update:
+        assert fleet_autoupdate.main() == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "checkout it would update" in error
+    assert "herdr-eng fleet update" in error
+    update.assert_not_called()
+    # Refused before any work: no lock file, no state recorded as a fleet change.
+    assert not (tmp_path / "state" / "herdr-engineering" / "fleet-auto-update.lock").exists()

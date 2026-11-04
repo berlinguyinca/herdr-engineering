@@ -21,6 +21,7 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from .fleet import fleet_update
@@ -110,12 +111,47 @@ def _divergence(root: Path) -> dict:
     return detail
 
 
+def package_root() -> Path:
+    """The directory holding the `herdr_engineering` package this process imported."""
+    return Path(__file__).resolve().parent.parent
+
+
+def shadowed(module_root: Path, entry: str, target: Path) -> bool:
+    """Whether the code running this update came from the checkout it is about to update.
+
+    For `python -m`, `sys.path[0]` is the working directory. This project is flat-layout
+    (`herdr_engineering/` at the repository root), so a unit with `WorkingDirectory=<checkout>`
+    imports the checkout rather than the installed build, and the updater that is meant to
+    fast-forward a checkout becomes whatever revision that checkout happens to hold. A checkout
+    behind then runs an outdated updater, and a fix shipped inside the updater can only arrive by
+    fast-forwarding the very checkout it exists to unblock - observed on bender (exit 1 reporting
+    the pre-#572 message while the installed build already reported a skip) and on the Mac before
+    #583 gave the launchd counterpart a neutral working directory (#584).
+
+    Only cwd shadowing is refused: an editable install reached through the `herdr-eng` console
+    script (or `python -m` from a neutral directory) is the operator's own checkout by choice.
+    """
+    if not entry:
+        return False
+    try:
+        # Not strict: the working directory can be a path that no longer exists, and a checkout
+        # that has vanished cannot be updated by anyone.
+        return Path(entry).resolve() == target and module_root.resolve() == target
+    except OSError:
+        return False
+
+
 def run_update() -> dict:
     """Run the normal updater only for an explicitly configured clean main checkout."""
     configured_root = os.environ.get("HERDR_ENGINEERING_REPO")
     if not configured_root:
         raise RuntimeError("HERDR_ENGINEERING_REPO must name the controller checkout")
     root = Path(configured_root).resolve(strict=True)
+    if shadowed(package_root(), sys.path[0] if sys.path else "", root):
+        raise RuntimeError(
+            f"the fleet updater is running from {package_root()}, the checkout it would update; "
+            "run the installed `herdr-eng fleet update`, or give the unit a working directory "
+            "outside the checkout (see scripts/herdr-eng-fleet-update.service)")
     state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
     lock_path = state / "herdr-engineering" / "fleet-auto-update.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

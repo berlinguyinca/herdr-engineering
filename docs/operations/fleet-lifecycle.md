@@ -248,6 +248,23 @@ Automatic updates require a clean `main` checkout, fetch `origin/main`, reject
 unpublished/divergent commits, and fast-forward before reinstalling. Ignored
 private inventory is retained. A lock prevents overlapping scheduled runs.
 
+**The updater must not run from the checkout it updates.** Both installers give it a neutral working
+directory (`WorkingDirectory=%h` on systemd, `WorkingDirectory=$HOME` in the LaunchAgent), because
+for `python -m` the working directory is `sys.path[0]` and this repository is flat-layout: with the
+checkout as working directory, `import herdr_engineering` resolves to the checkout and the nightly
+job runs whatever revision that checkout holds - so an updater fix could only arrive on a host after
+that host had already been updated, which is the condition it exists to survive
+([herdr-engineering#584](https://github.com/berlinguyinca/herdr-engineering/issues/584)). The updater
+checks this itself and refuses, rather than running stale code silently:
+
+```
+the fleet updater is running from <checkout>, the checkout it would update; run the installed
+`herdr-eng fleet update`, or give the unit a working directory outside the checkout
+```
+
+An editable install reached through the `herdr-eng` console script is not shadowing and is not
+refused - that checkout is the operator's own, by choice.
+
 Failures divide in two, and the difference is what makes the job safe to leave switched on:
 
 * **reported skip, exit 0** — the checkout is dirty, or not on `main`, or holds unpublished
@@ -272,7 +289,10 @@ scripts/fleet-auto-update-macos.sh uninstall                                    
 
 Re-enable with the installer above. Check with `systemctl --user is-enabled
 herdr-eng-fleet-update.timer`, `scripts/fleet-auto-update-macos.sh status`, and
-`herdr-eng memory doctor` (`fleet_update`). SSH authentication must remain valid
+`herdr-eng memory doctor` (`fleet_update`). Re-enabling does not update the checkout, so the host's
+`herdr-eng` stays at whatever the pinned install provides until the checkout is cleaned and
+fast-forwarded once by hand - bender is in exactly that state (units `disabled`, `herdr-eng 0.1.0`,
+checkout `06e3d501` with 42 modified tracked files) and its tooling is owned by `~/.venvs/herdr-engineering`. SSH authentication must remain valid
 for unattended access. Hosts requiring an interactive Tailscale SSH check will
 fail that deployment and be retried by a later scheduled run.
 

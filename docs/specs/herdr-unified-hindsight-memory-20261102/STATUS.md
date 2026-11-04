@@ -258,6 +258,20 @@ code that fired there. The operator action taken 2026-11-04 was to **unpin** ben
 (`systemctl --user disable --now` on the timer and service, unit files kept on disk): it no longer
 fails nightly and no longer takes unattended updates, so the pinned install path owns its tooling
 until the checkout is cleaned. macOS gained the counterpart installer that never existed
-(`scripts/fleet-auto-update-macos.sh`), and D23 records why two drafts of §14.4 described the unit
-wrongly - the schedule now comes from the systemd template, with a test holding the two installers
-together.
+(`scripts/fleet-auto-update-macos.sh`, merged), and D23 records why two drafts of §14.4 described
+the unit wrongly - the schedule now comes from the systemd template, with a test holding the two
+installers together.
+
+**Second promotion the same day: client `0.1.5` (`e483bda`).** Three of the §13/§14 findings were
+defects in what the client *claims*, not in what the service stores: the outbox recorded intent as
+fact (`queued` rows were written as `verified` and never updated, so a write stranded under another
+identity read as remembered - herdr-memory#5/D25); recall results could name nothing, because
+`normalize_record()` collapsed the client's `document_id` and the service's `mem-...` `memory_id`
+into one fallback chain and dropped the second (herdr-memory#8/D26, closed with
+`document_id`/`server_memory_id`/`address` and the `documents` command); and inert configuration keys
+were read as active (herdr-memory#9/D27, closed by `validate_config()` failing closed). `0.1.5` is
+pinned (`PINNED_REVISION = e483bda`, `PINNED_CLIENT_VERSION = 0.1.5`), the adapter is version 2 so it
+tells agents to address records by `address`, and the unit's cwd-shadowing defect (#584/D24) is fixed
+with `WorkingDirectory=%h` plus a guard that refuses a shadowed run. 100 client tests and the full
+controller suite pass; what remains open is operator work - bender's 42-file checkout (§14.4) and
+`#568` (HTTPS before the bearer token leaves loopback).
