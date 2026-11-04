@@ -901,22 +901,61 @@ class MemoryInstaller:
             "unknown" if "unknown" in statuses else "ok"
         return {"ok": overall != "fail", "overall": overall, "checks": checks}
 
+    @staticmethod
+    def probe_project(cfg: Path) -> tuple[str | None, str]:
+        """Which project to probe `status` as, and why (herdr-engineering#571).
+
+        `herdr-memory status` resolves its project from the current directory, so run from
+        anywhere that is not a mapped path it answers an error object and `doctor` could
+        only report UNKNOWN - it looked like a broken server when the probe simply had no
+        project to ask with.
+        """
+        try:
+            config = json.loads(cfg.read_text())
+        except (OSError, ValueError):
+            return None, "client config unreadable"
+        if not isinstance(config, dict):
+            return None, "client config malformed"
+        projects = config.get("projects") or {}
+        default = config.get("default_project")
+        if isinstance(default, str) and default.strip() and default.strip() in projects:
+            return default.strip(), "default_project"
+        if len(projects) == 1:
+            return next(iter(projects)), "only configured project"
+        return None, ("no default_project and "
+                      f"{len(projects)} projects configured; run inside a mapped directory "
+                      "or set default_project")
+
     def server_health(self, cfg: Path) -> dict:
         exe = self.which("herdr-memory")
         if not exe:
             return {"name": "server", "status": "unknown", "detail": "herdr-memory CLI not on PATH", "data": {}}
+        project, source = self.probe_project(cfg)
+        argv = [exe, "--config", str(cfg)]
+        if project:
+            argv += ["--project", project]
+        argv.append("status")
         try:
-            out = self.run([exe, "--config", str(cfg), "status"])
+            out = self.run(argv)
             data = json.loads(out.stdout)
         except (OSError, subprocess.TimeoutExpired, ValueError):
-            return {"name": "server", "status": "unknown", "detail": "herdr-memory status unreachable", "data": {}}
+            return {"name": "server", "status": "unknown", "detail": "herdr-memory status unreachable",
+                    "data": {"project": project, "project_source": source}}
         if not isinstance(data, dict) or "healthy" not in data:
-            return {"name": "server", "status": "unknown",
-                    "detail": "status did not report health (older client or error)", "data": {}}
+            detail = "status did not report health (older client or error)"
+            if project is None:
+                detail = f"status has no project to report on: {source}"
+            return {"name": "server", "status": "unknown", "detail": detail,
+                    "data": {"project": project, "project_source": source,
+                             "error": data.get("error") if isinstance(data, dict) else None}}
+        seen = {"project": project, "project_source": source}
         if data["healthy"] is True:
             return {"name": "server", "status": "ok", "detail": "healthy",
-                    "data": {k: data.get(k) for k in ("outbox_pending", "dead_letter", "server_version")}}
-        return {"name": "server", "status": "fail", "detail": "server reports unhealthy", "data": {}}
+                    "data": {**seen, **{k: data.get(k) for k in
+                                        ("outbox_pending", "dead_letter", "server_version")}}}
+        return {"name": "server", "status": "fail",
+                "detail": f"server reports unhealthy{': ' + str(data.get('reason')) if data.get('reason') else ''}",
+                "data": {**seen, **{k: data.get(k) for k in ("outbox_pending", "dead_letter", "reason")}}}
 
 
 def _hours_since(iso: object) -> float | None:
