@@ -762,3 +762,84 @@ def test_malformed_header_lines_close_the_connection(env, defect):
     out = env.raw(first + SMUGGLE_SECOND)
     assert out.count(b"HTTP/1.1 ") == 1, out[:300]
     assert b"\r\nConnection: close\r\n" in out.split(b"\r\n\r\n", 1)[0] + b"\r\n"
+
+
+# ---------------------------------------------------------------------------- "Shared by" bar on HTML pages (plan 5, Task 8)
+
+BAR_MARK = b"data-herdr-shared-by"
+HOSTILE_NAME = "<img src=x onerror=alert(1)>&\"'"
+SCRIPTY = (b"<!doctype html><html><head><!-- <body> --><script>var s='<body>';</script><title><body></title></head>"
+           b"<BODY class=x onload=1><p>hello</p></body></html>")
+NO_ANCHOR = b"<p>no html, head or body at all</p>"
+BANNER_FILES = {"index.html": SCRIPTY, "bare.html": NO_ANCHOR, "n.txt": b"plain <b>text</b>",
+                "pic.svg": b"<svg xmlns='http://www.w3.org/2000/svg'/>"}
+
+
+def banner_env(tmp_path, name=HOSTILE_NAME, **over):
+    return Env(tmp_path, files=BANNER_FILES, state_extra={"shared_by": name} if name is not None else {}, **over)
+
+
+def test_public_member_html_page_has_one_escaped_bar_before_content(tmp_path):
+    e = banner_env(tmp_path)
+    try:
+        status, h, body = e.request("GET", f("index.html"))
+        assert status == 200 and body.count(BAR_MARK) == 1
+        assert b"<img" not in body and b"Shared by &lt;img src=x onerror=alert(1)&gt;&amp;&quot;&#x27;" in body
+        assert "content was not reviewed by the operator" in body.decode()
+        assert body.index(BAR_MARK) < body.index(b"<p>hello</p>")
+        assert body.index(b"<BODY class=x onload=1>") < body.index(BAR_MARK)      # the real body tag, not the decoys
+        assert int(h["content-length"]) == len(body) and "accept-ranges" not in h
+        assert h["etag"].endswith('-b1"')
+    finally:
+        e.close()
+
+
+def test_page_without_any_anchor_tag_gets_the_bar_first(tmp_path):
+    e = banner_env(tmp_path, "Al")
+    try:
+        body = e.request("GET", f("bare.html"))[2]
+        assert body.startswith(b"<div data-herdr-shared-by") and body.count(BAR_MARK) == 1 and body.endswith(NO_ANCHOR)
+    finally:
+        e.close()
+
+
+def test_operator_html_is_byte_identical_and_non_html_stays_raw(tmp_path):
+    op = banner_env(tmp_path, None)
+    try:
+        status, h, body = op.request("GET", f("index.html"))
+        assert body == SCRIPTY and h["etag"] == '"%s"' % hashlib.sha256(SCRIPTY).hexdigest() and "accept-ranges" in h
+    finally:
+        op.close()
+    (tmp_path / "m").mkdir()
+    e = banner_env(tmp_path / "m")
+    try:
+        assert e.request("GET", f("n.txt"))[2] == BANNER_FILES["n.txt"]
+        assert e.request("GET", f("pic.svg"))[2] == BANNER_FILES["pic.svg"]
+    finally:
+        e.close()
+
+
+def test_bar_head_etag_range_and_conditional_requests(tmp_path):
+    e = banner_env(tmp_path, "Al")
+    try:
+        status, h, body = e.request("GET", f("index.html"))
+        hs, hh, hb = e.request("HEAD", f("index.html"))
+        assert hs == 200 and hb == b"" and hh["content-length"] == str(len(body)) and hh["etag"] == h["etag"]
+        rs, rh, rb = e.request("GET", f("index.html"), {"Range": "bytes=0-9"})
+        assert rs == 200 and rb == body                                  # a range is ignored for an injected page
+        assert e.request("GET", f("index.html"), {"If-None-Match": h["etag"]})[0] == 304
+    finally:
+        e.close()
+
+
+def test_lab_member_html_first_page_shows_the_bar(tmp_path):
+    from tests.control_plane.test_share_annotate import base, make_env
+    env = make_env(tmp_path, files=BANNER_FILES, state_extra={"shared_by": "Alice"})
+    try:
+        for headers in ({}, {"Sec-Fetch-Dest": "document"}):
+            status, _, body = env.request("GET", base(kind="f") + "index.html", headers)
+            assert status == 200 and body.count(BAR_MARK) == 1 and b"Shared by Alice" in body
+        assert b"data-herdr-mode-switch" in body and body.index(BAR_MARK) < body.index(b"data-herdr-mode-switch")
+        assert BAR_MARK not in env.request("GET", base(kind="f") + "n.txt")[2]
+    finally:
+        env.close()

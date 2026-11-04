@@ -203,6 +203,13 @@ MODE_SWITCH_TEMPLATE = (
     '<a data-herdr-mode-switch href="{href}" rel="noopener" style="position:fixed;right:12px;bottom:12px;'
     'z-index:2147483647;display:block;margin:0;padding:6px 12px;font:600 14px/1.4 system-ui,sans-serif;color:#fff;'
     'background:#1f4fd1;border-radius:6px;text-decoration:none;box-shadow:0 1px 4px rgba(0,0,0,.4)">Annotate</a>')
+SHARED_BY_BAR = (
+    '<div data-herdr-shared-by role="note" style="position:fixed!important;top:0!important;left:0!important;'
+    'right:0!important;z-index:2147483647!important;display:block!important;visibility:visible!important;'
+    'opacity:1!important;margin:0!important;padding:8px 12px!important;font:600 14px/1.4 system-ui,sans-serif!important;'
+    'color:#4a3b00!important;background:#fff3cd!important;border-bottom:1px solid #b8a04a!important;'
+    'text-align:center!important;transform:none!important;clip:auto!important;height:auto!important">{text}</div>')
+SHARED_BY_ETAG_SUFFIX = "-b1"
 UNAVAILABLE_BODY = b"Unavailable\n"
 JSON_HEADERS = (("Content-Type", "application/json"), ("X-Content-Type-Options", "nosniff"),
                 ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),
@@ -799,6 +806,12 @@ def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
     return None if cut is None else data[:cut] + link + data[cut:]
 
 
+def shared_by_bar(name: str) -> bytes:
+    """The fixed, non-dismissable top bar for a member-created link; ``name`` is HTML-escaped."""
+    text = f"Shared by {html.escape(name)} \u2014 content was not reviewed by the operator"
+    return SHARED_BY_BAR.format(text=text).encode("utf-8")
+
+
 def _read_all(fd: int, size: int) -> bytes | None:
     """Exactly ``size`` bytes of ``fd`` (``pread``), or None when the file is shorter than promised."""
     chunks, offset = [], 0
@@ -855,16 +868,31 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         etag = '"%s"' % item["sha256"]
         csp = sandbox_csp(getattr(handler.server, "public_origin", None), token)
         injected = None
-        if (mode_switch is not None and content_type_for(name).split(";")[0].strip() == "text/html"
-                and size <= MODE_SWITCH_MAX_BYTES):
-            data = _read_all(fd, size)
-            if data is None:
-                deny(handler, state, "size_mismatch", actor)
-                return False
-            if _ascii_compatible(content_type_for(name), data):
-                injected = inject_mode_switch(data, mode_switch.encode("ascii"))
-            if injected is not None:
-                return _serve_with_link(handler, state, name, item, injected, csp, cors=cors, actor=actor)
+        is_html = content_type_for(name).split(";")[0].strip() == "text/html"
+        shared_by = state.get("shared_by") if is_html else None
+        bar = shared_by_bar(shared_by) if isinstance(shared_by, str) else b""
+        if is_html and (bar or mode_switch is not None):
+            if size > MODE_SWITCH_MAX_BYTES:
+                if bar:      # a labelled page is never served unlabelled
+                    deny(handler, state, "banner_unavailable", actor)
+                    return False
+            else:
+                data = _read_all(fd, size)
+                if data is None:
+                    deny(handler, state, "size_mismatch", actor)
+                    return False
+                if _ascii_compatible(content_type_for(name), data):
+                    insert = bar + (mode_switch.encode("ascii") if mode_switch is not None else b"")
+                    injected = inject_mode_switch(data, insert)
+                    if injected is None and bar:      # no anchor tag at all: the bar goes first, before any content
+                        injected = insert + data
+                elif bar:
+                    deny(handler, state, "banner_unavailable", actor)
+                    return False
+                if injected is not None:
+                    suffix = (SHARED_BY_ETAG_SUFFIX if bar else "") + (MODE_SWITCH_ETAG_SUFFIX if mode_switch is not None else "")
+                    return _serve_with_link(handler, state, name, item, injected, csp, cors=cors, actor=actor,
+                                            etag_suffix=suffix)
         headers = _content_headers(name, etag, csp, sandbox_pdf=sandbox_pdf)
         if _announces_body(handler):
             handler.close_connection = True
@@ -925,10 +953,10 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
 
 
 def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, csp: str, *, cors: bool,
-                     actor: str) -> bool:
+                     actor: str, etag_suffix: str = MODE_SWITCH_ETAG_SUFFIX) -> bool:
     """The full 200 of ``body`` (an HTML file with the mode-switch link injected; see ``serve_bundle_file``). The ETag is
     the index sha256 plus ``-m1``, as for the raw file (the same size-only integrity check as the raw route)."""
-    etag = f'"{item["sha256"]}{MODE_SWITCH_ETAG_SUFFIX}"'
+    etag = f'"{item["sha256"]}{etag_suffix}"'
     headers = [h for h in _content_headers(name, etag, csp) if h[0] != "Accept-Ranges"] + [("Vary", "Sec-Fetch-Dest")]
     if _announces_body(handler):
         handler.close_connection = True

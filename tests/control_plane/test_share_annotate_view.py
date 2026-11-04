@@ -349,10 +349,10 @@ def test_operator_links_have_no_banner(lab, kind):
     assert "herdr-shared-by" not in page and "Shared by" not in page
 
 
-def test_banner_is_not_injected_into_raw_files(tmp_path):
+def test_banner_is_not_injected_into_non_html_raw_files(tmp_path):
     env = banner_env(tmp_path, "Alice Example")
     try:
-        for name in ("index.html", "notes.txt", "pic.png"):
+        for name in ("notes.txt", "pic.png"):
             status, _, body = env.request("GET", base(kind="f") + name)
             assert status == 200 and b"herdr-shared-by" not in body and b"Shared by" not in body
     finally:
@@ -377,12 +377,12 @@ def test_a_120_char_name_is_accepted(tmp_path):
         env.close()
 
 
-def test_public_member_link_serves_raw_files_with_no_banner_and_no_annotation_ui(tmp_path):
+def test_public_member_link_has_the_bar_on_html_but_no_annotation_ui(tmp_path):
     env = Env(tmp_path, audience="public", files=FILES, config_extra=lab_config(tmp_path),
               state_extra={"shared_by": "Alice Example"})
     try:
         status, h, body = env.request("GET", f"/s/{TOKEN}/f/index.html")
-        assert status == 200 and b"herdr-shared-by" not in body and b"data-annotate-panel" not in body
+        assert status == 200 and body.count(b"data-herdr-shared-by") == 1 and b"data-annotate-panel" not in body
         assert env.request("GET", base(kind="a") + "notes.txt")[0] == 404
         assert env.request("GET", base(kind="v") + "notes.txt")[0] == 404
     finally:
