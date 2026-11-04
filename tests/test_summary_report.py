@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from herdr_engineering import summary_report as sr
+from herdr_engineering.md_render import visible_width
 
 REPORT = "# Session summary\n**Overall status:** completed\n\nEvidence coverage: complete\n"
 
@@ -318,7 +319,7 @@ def test_view_renders_through_the_viewer_loop_then_closes_its_pane_and_its_peer(
     assert drawn["kw"]["scroll"] is True
     text = "\n".join(drawn["lines"])
     assert "**" not in text and "# " not in text and "\x1b[" in text
-    assert all(sr.visible_width(line) <= 50 for line in drawn["lines"])
+    assert all(visible_width(line) <= 50 for line in drawn["lines"])
     assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pA"]          # itself first, then its peer
 
 
@@ -406,7 +407,7 @@ def test_graph_viewer_follows_the_pane_width_and_output_encoding(tmp_path):
     ascii_out.encoding = "ascii"
     sr.view_graph(f, run=_recorder([]), out=ascii_out, viewer=lambda render, **kw: drawn.update(wide=render(120, 20), narrow=render(32, 40)) or 0)
     assert all(line.isascii() for line in drawn["wide"] + drawn["narrow"])
-    assert all(sr.visible_width(line) <= 32 for line in drawn["narrow"])
+    assert all(visible_width(line) <= 32 for line in drawn["narrow"])
 
 
 @pytest.mark.parametrize("content", [None, "not json", "[]"])

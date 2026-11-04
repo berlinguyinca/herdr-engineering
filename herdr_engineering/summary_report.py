@@ -22,7 +22,6 @@ from pathlib import Path
 
 from . import session_history as sh
 from .control_plane.redact import redact_text
-from .md_render import visible_width  # noqa: F401  (re-exported for callers measuring rendered lines)
 from .session_history import AGENTS
 
 HARNESSES = ("claude", "codex")
