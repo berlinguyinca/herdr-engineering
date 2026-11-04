@@ -38,7 +38,7 @@ def sha(b: bytes) -> str:
 class World(Net):
     def __init__(self, s, tmp_path, **cfg):
         super().__init__(s, tmp_path)
-        self.cfg = MembersConfig(result_wait_seconds=0, **cfg)
+        self.cfg = MembersConfig(**{"result_wait_seconds": 0, **cfg})
         self.ms = MemberService(s, self.bridge, self.cfg)
         s.member_service = self.ms
         self.person("op")
@@ -160,10 +160,13 @@ def test_a_view_that_names_someone_else_is_treated_as_absent(world):
 
 
 def test_refusals_are_audited(world):
-    before = world.s.stats["policy_denied"]
+    def denied():
+        return [(e["payload"]["action"], e["payload"]["reason"]) for e in world.s._log if e["event_type"] == "audit_denied"]
+    before = len(denied())
     refuse(world.ms.upload_chunk, world.user("op"), world.chunk(DATA, 0, artifact=OTHER))
     refuse(world.ms.mine, member_actor(world.people["mal"]))
-    assert world.s.stats["policy_denied"] == before + 2
+    got = denied()[before:]
+    assert ("artifact.upload_chunk", "not_owner") in got and ("artifact.mine", "not_in_group") in got
 
 
 def test_per_member_staging_cap_is_429(approval_svc, tmp_path):
@@ -346,3 +349,95 @@ def test_a_deleted_artifact_takes_no_uploads_or_publishes(world):
     f = [{"name": "a.txt", "upload_id": "upl_" + "0" * 24}]
     assert refuse(world.ms.publish, world.user("op"), ART, files=f, message="m").status == 404
     assert world.staged("op") == []
+
+
+def ticket_of_newest_intent(world):
+    paths = sorted((world.outbox / "intents").glob("*.json"), key=lambda p: p.stat().st_mtime_ns)
+    return paths[-1].stem
+
+
+def worker_answers(world, actor_id="op"):
+    """The worker's side of a result: written the first time the service sleeps in its 5 s wait."""
+    def sleep(_seconds):
+        t = ticket_of_newest_intent(world)
+        atomic_write_json(world.bridge.mirror / "results", f"{t}.json",
+                          {"ticket": t, "kind": "member.artifact_create", "actor": {"kind": "user", "id": actor_id},
+                           "artifact_id": ART, "result": "ok"})
+    world.bridge.sleep = sleep
+
+
+def test_a_result_ready_within_the_wait_comes_back_done(approval_svc, tmp_path):
+    w = World(approval_svc, tmp_path, result_wait_seconds=5.0)
+    w.view("op", [ART])
+    try:
+        worker_answers(w)
+        out = w.ms.create(w.user("op"), "T", "a.html", "web")
+        assert out["status"] == "done" and out["result"] == "ok" and out["artifact_id"] == ART
+    finally:
+        w.bridge.stop()
+
+
+def test_a_result_that_never_comes_returns_the_ticket_after_the_wait(approval_svc, tmp_path):
+    w = World(approval_svc, tmp_path, result_wait_seconds=5.0)
+    w.view("op", [ART])
+    try:
+        clock = iter(range(0, 1000, 2))
+        w.bridge.monotonic = lambda: next(clock)
+        w.bridge.sleep = lambda _s: None
+        out = w.ms.delete(w.user("op"), ART, True)
+        assert out["status"] == "pending" and out["ticket"] == ticket_of_newest_intent(w)
+    finally:
+        w.bridge.stop()
+
+
+def test_a_full_waiter_slot_never_loses_the_ticket(approval_svc, tmp_path):
+    from herdr_engineering.control_plane import collab_waiters
+    w = World(approval_svc, tmp_path, result_wait_seconds=5.0)
+    w.view("op", [ART])
+    try:
+        with collab_waiters.waiter_slot("artifact_result:user:op") as a, \
+                collab_waiters.waiter_slot("artifact_result:user:op") as b:
+            assert a and b
+            out = w.ms.create(w.user("op"), "T", "a.html", "web")      # the wait is refused (429) ...
+        assert out["status"] == "pending" and out["ticket"] == ticket_of_newest_intent(w)   # ... the ticket is not
+    finally:
+        w.bridge.stop()
+
+
+def test_operator_limits_can_only_be_tightened_by_the_member_defaults(world):
+    world.write_grants(max_file_bytes=CHUNK_BYTES)                 # operator: 512 KiB per file; member default: 1 TiB
+    assert refuse(world.ms.upload_chunk, world.user("op"), world.chunk(DATA, 0)).status == 400
+    q = ("f.bin", len(DATA), sha(DATA))
+    assert refuse(world.ms.upload_status, world.user("op"), ART, *q).status == 400
+    assert world.staged("op") == []
+    world.s._now.t += 61                                           # the refused attempts above also count as hits
+    world.write_grants(chunks_per_minute=2)
+    for _ in range(2):
+        world.ms.upload_chunk(world.user("op"), world.chunk(DATA, 0))
+    assert refuse(world.ms.upload_chunk, world.user("op"), world.chunk(DATA, 0)).status == 429
+    world.write_grants(staging_bytes_per_agent=len(DATA) - 1)
+    assert refuse(world.ms.upload_chunk, world.user("lab"),
+                  world.chunk(DATA, 0, artifact=OTHER)).status == 429
+
+
+def test_publish_is_capped_at_the_validators_file_limit_with_a_clear_400(world):
+    files = [{"name": f"f{i}", "upload_id": "upl_" + "0" * 24} for i in range(101)]
+    e = refuse(world.ms.publish, world.user("op"), ART, files=files, message="m")
+    assert e.status == 400 and "1 to 100" in e.message
+    assert world.ms.publish(world.user("op"), ART, files=files[:100], message="m")["status"] == "pending"
+
+
+def intent_keys(world):
+    return [json.loads(p.read_text()).get("idempotency_key") for p in sorted((world.outbox / "intents").glob("*.json"))]
+
+
+def test_idempotency_keys_reach_the_intent_and_bad_ones_are_400(world):
+    key = "retry-key-0001"
+    world.ms.create(world.user("op"), "T", "a.html", "web", idempotency_key=key)
+    world.ms.create(world.user("op"), "T", "a.html", "web", idempotency_key=key)      # the retry: same key, new ticket
+    f = [{"name": "a.txt", "upload_id": "upl_" + "0" * 24}]
+    world.ms.publish(world.user("op"), ART, files=f, message="m", idempotency_key="pub-key-0001")
+    assert sorted(k for k in intent_keys(world)) == ["pub-key-0001", key, key]
+    for bad in ("short", "x" * 129, "has space in it", 12345678):
+        assert refuse(world.ms.create, world.user("op"), "T", "a.html", "web", idempotency_key=bad).status == 400
+    assert len(intent_keys(world)) == 3

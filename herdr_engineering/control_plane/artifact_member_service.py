@@ -52,6 +52,7 @@ NOT_FOUND: Final = "not found"
 VIEW_MAX_BYTES: Final = 16 * 1024 * 1024
 MAX_RANGES: Final = 1000          # missing ranges reported by upload_status
 _SHA = re.compile(SHA_RE)
+_IDEMPOTENCY = re.compile(r"[\x21-\x7e]{8,128}\Z")
 _UPLOAD = re.compile(UPLOAD_RE)
 _TIB: Final = 1 << 40
 _CODES: Final = {400: "bad_request", 403: "forbidden", 404: "not_found", 409: "conflict", 413: "too_large",
@@ -155,7 +156,14 @@ class MemberService:
             base = self.bridge.limits()
         except CollabError as exc:
             raise MemberServiceError(exc.status, _CODES.get(exc.status, "error"), exc.message) from None
-        return dataclasses.replace(base, max_file_bytes=self.config.max_upload_bytes)
+        # the member default may only tighten what the operator configured, never raise it
+        return dataclasses.replace(base, max_file_bytes=min(base.max_file_bytes, self.config.max_upload_bytes))
+
+    def _chunk_rate(self, limits: BridgeLimits) -> int:
+        return min(self.config.chunks_per_minute, limits.chunks_per_minute)
+
+    def _staging_cap(self, limits: BridgeLimits) -> int:
+        return min(self.config.staging_bytes_per_member, limits.staging_bytes_per_agent)
 
     # ------------------------------------------------------------------------------------------ the member view
     def _view(self, who: _Caller) -> dict[str, Any]:
@@ -212,14 +220,24 @@ class MemberService:
             svc._hits[key] = hits
 
     # ------------------------------------------------------------------------------------------ intents
-    def _submit(self, who: _Caller, kind: str, payload: dict, artifact_id: str | None, tool: str) -> dict[str, Any]:
-        self._throttle(who, "write", self.config.writes_per_minute)
+    def _submit(self, who: _Caller, kind: str, payload: dict, artifact_id: str | None, tool: str,
+                idempotency_key: Any = None) -> dict[str, Any]:
+        if idempotency_key is not None and (not isinstance(idempotency_key, str)
+                                            or not _IDEMPOTENCY.match(idempotency_key)):
+            raise MemberServiceError(400, "bad_request", "idempotency_key must be 8 to 128 printable characters")
+        limits = self._limits()
+        self._throttle(who, "write", min(self.config.writes_per_minute, limits.commits_per_minute))
         try:
             ticket = self.bridge.append_intent(who.actor, kind, payload, artifact_id=artifact_id,
-                                               idempotency_key=None)
+                                               idempotency_key=idempotency_key)
         except CollabError as exc:
             raise MemberServiceError(exc.status, _CODES.get(exc.status, "error"), exc.message) from None
-        return self._wait(who, ticket, self.config.result_wait_seconds)
+        try:
+            return self._wait(who, ticket, self.config.result_wait_seconds)
+        except CollabError:
+            # the intent is written: whatever stops the wait (no free waiter slot, a bad feed), the caller must get
+            # its ticket, or it retries and duplicates the write
+            return {"ticket": ticket, "status": "pending"}
 
     def _wait(self, who: _Caller, ticket: str, seconds: float) -> dict[str, Any]:
         try:
@@ -229,23 +247,25 @@ class MemberService:
             raise MemberServiceError(exc.status, _CODES.get(exc.status, "error"), exc.message) from None
         return _present(ticket, doc)
 
-    def create(self, actor: Mapping[str, Any], title: Any, filename: Any, profile: Any) -> dict[str, Any]:
+    def create(self, actor: Mapping[str, Any], title: Any, filename: Any, profile: Any,
+               idempotency_key: Any = None) -> dict[str, Any]:
         who = self._caller(actor, "create")
         return self._submit(who, KIND_CREATE, {"title": title, "filename": filename, "profile": profile}, None,
-                            "create")
+                            "create", idempotency_key)
 
     def publish(self, actor: Mapping[str, Any], artifact_id: Any, *, base_version_id: Any = None, files: Any,
-                message: Any, entry: Any = None) -> dict[str, Any]:
+                message: Any, entry: Any = None, idempotency_key: Any = None) -> dict[str, Any]:
         who = self._caller(actor, "publish")
         self._own(who, "publish", artifact_id)
-        if not isinstance(files, list) or not 1 <= len(files) <= self.config.max_publish_files:
-            raise MemberServiceError(400, "bad_request", f"files must list 1 to {self.config.max_publish_files} files")
+        cap = min(self.config.max_publish_files, self._limits().max_changes_per_commit)
+        if not isinstance(files, list) or not 1 <= len(files) <= cap:
+            raise MemberServiceError(400, "bad_request", f"files must list 1 to {cap} files")
         if not isinstance(message, str) or len(message) > self.config.max_message_chars:
             raise MemberServiceError(400, "bad_request", "message is invalid")
         payload: dict[str, Any] = {"base_version_id": base_version_id, "files": files, "message": message}
         if entry is not None:
             payload["entry"] = entry
-        return self._submit(who, KIND_PUBLISH, payload, artifact_id, "publish")
+        return self._submit(who, KIND_PUBLISH, payload, artifact_id, "publish", idempotency_key)
 
     def delete(self, actor: Mapping[str, Any], artifact_id: Any, confirm: Any) -> dict[str, Any]:
         who = self._caller(actor, "delete")
@@ -312,7 +332,7 @@ class MemberService:
     def _stage_validated(self, who: _Caller, chunk: Any, limits: BridgeLimits) -> dict[str, Any]:
         try:
             got = self.bridge.stage_chunk_for(who.owner_key, chunk, limits=limits,
-                                              staging_cap=self.config.staging_bytes_per_member)
+                                              staging_cap=self._staging_cap(limits))
         except CollabError as exc:
             raise MemberServiceError(exc.status, _CODES.get(exc.status, "error"), exc.message) from None
         out = {"upload_id": got["upload_id"], "received": got.get("received"), "total": chunk.total,
@@ -326,8 +346,9 @@ class MemberService:
         if not isinstance(args, dict):
             raise MemberServiceError(400, "bad_request", "chunk arguments are missing or unknown")
         self._own(who, "upload_chunk", args.get("artifact_id"))
-        self._throttle(who, "chunk", self.config.chunks_per_minute)
-        return self._stage(who, args, self._limits())
+        limits = self._limits()
+        self._throttle(who, "chunk", self._chunk_rate(limits))
+        return self._stage(who, args, limits)
 
     def upload_run(self, actor: Mapping[str, Any], artifact_id: Any, name: Any, size_bytes: Any, file_sha256: Any,
                    first_index: Any, data: Any, run_sha256: Any) -> dict[str, Any]:
@@ -341,14 +362,14 @@ class MemberService:
         pieces = [bytes(data[i:i + CHUNK_BYTES]) for i in range(0, len(data), CHUNK_BYTES)]
         if len(pieces) > self.config.http_chunks_per_request:
             raise MemberServiceError(400, "bad_request", "too many chunks in one request")
-        self._throttle(who, "chunk", self.config.chunks_per_minute, len(pieces))
+        limits = self._limits()
+        self._throttle(who, "chunk", self._chunk_rate(limits), len(pieces))
         if not isinstance(run_sha256, str) or not _SHA.match(run_sha256) \
                 or hashlib.sha256(data).hexdigest() != run_sha256:
             raise MemberServiceError(400, "bad_request", "run sha256 does not match its data")
         if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 1:
             raise MemberServiceError(400, "bad_request", "size_bytes is out of range")
         total = -(-size_bytes // CHUNK_BYTES)
-        limits = self._limits()
         chunks = []
         for offset, piece in enumerate(pieces):
             args = {"artifact_id": artifact_id, "name": name, "size_bytes": size_bytes, "file_sha256": file_sha256,
@@ -365,9 +386,10 @@ class MemberService:
             replayed = replayed and last["replayed"]
         return {**last, "replayed": replayed, "chunks": len(chunks)}
 
-    def _upload_key(self, artifact_id: Any, name: Any, size_bytes: Any, file_sha256: Any, who: _Caller) -> str:
+    def _upload_key(self, artifact_id: Any, name: Any, size_bytes: Any, file_sha256: Any, who: _Caller,
+                    limits: BridgeLimits) -> str:
         if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) \
-                or not 1 <= size_bytes <= self.config.max_upload_bytes or not isinstance(file_sha256, str) \
+                or not 1 <= size_bytes <= limits.max_file_bytes or not isinstance(file_sha256, str) \
                 or not _SHA.match(file_sha256):
             raise MemberServiceError(400, "bad_request", "size_bytes or file_sha256 is invalid")
         try:
@@ -379,9 +401,9 @@ class MemberService:
                       file_sha256: Any) -> dict[str, Any]:
         who = self._caller(actor, "upload_status")
         self._own(who, "upload_status", artifact_id)
-        upload_id = self._upload_key(artifact_id, name, size_bytes, file_sha256, who)
-        total = -(-size_bytes // CHUNK_BYTES)
         limits = self._limits()
+        upload_id = self._upload_key(artifact_id, name, size_bytes, file_sha256, who, limits)
+        total = -(-size_bytes // CHUNK_BYTES)
         outbox = self.bridge.outbox
         meta = read_staged_meta(outbox, who.owner_key, upload_id, limits)
         parts = staging_parts(who.owner_key, upload_id)
@@ -420,6 +442,5 @@ class MemberService:
             raise self._fail(who.pr, "upload_abort", "not_owner", 404, "not_found", NOT_FOUND, artifact_id)
         removed = remove_tree_beneath(self.bridge.outbox, staging_parts(who.owner_key, upload_id),
                                       max_entries=tree_entry_cap(limits))
-        with self.bridge._staging_lock:
-            self.bridge._owner_usage.pop(who.owner_key, None)      # the freed reservation counts at once
+        self.bridge.release_owner_usage(who.owner_key)             # the freed reservation counts at once
         return {"upload_id": upload_id, "aborted": bool(removed)}

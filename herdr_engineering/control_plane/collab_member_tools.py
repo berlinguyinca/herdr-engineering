@@ -13,6 +13,8 @@ from .collab import CollabError, CollabService, Principal
 _ID = {"type": "string", "minLength": 1, "maxLength": 200}
 _STR = {"type": "string"}
 _NAME = {"type": "string", "minLength": 1}
+_KEY = {"type": "string", "minLength": 8, "maxLength": 128,
+        "description": "optional; reuse it when retrying so the write happens once"}
 
 
 def _tool(name: str, description: str, properties: dict, required: list[str]) -> dict:
@@ -24,7 +26,7 @@ def _tool(name: str, description: str, properties: dict, required: list[str]) ->
 MEMBER_TOOLS: list[dict] = [
     _tool("artifact_create", "Create an artifact you own (profile web or document). Returns a ticket; poll "
           "artifact_result if it is still pending.",
-          {"title": _STR, "filename": _NAME, "profile": {"enum": ["web", "document"]}},
+          {"title": _STR, "filename": _NAME, "profile": {"enum": ["web", "document"]}, "idempotency_key": _KEY},
           ["title", "filename", "profile"]),
     _tool("artifact_upload_chunk", "Stage one chunk (512 KiB raw, base64) of a file of an artifact you own. Resend "
           "the same file to resume.",
@@ -42,7 +44,7 @@ MEMBER_TOOLS: list[dict] = [
            "files": {"type": "array", "minItems": 1,
                      "items": {"type": "object", "additionalProperties": False, "required": ["name", "upload_id"],
                                "properties": {"name": _NAME, "upload_id": _STR}}},
-           "message": _STR, "entry": _STR},
+           "message": _STR, "entry": _STR, "idempotency_key": _KEY},
           ["artifact_id", "files", "message"]),
     _tool("artifact_delete", "Delete an artifact you own. Requires confirm: true.",
           {"artifact_id": _ID, "confirm": {"type": "boolean"}}, ["artifact_id", "confirm"]),
@@ -80,7 +82,11 @@ def view_access(service: CollabService, pr: Principal, artifact_id: Any) -> bool
 
 def call(service: CollabService, pr: Principal, name: str, args: Any) -> dict[str, Any]:
     ms: MemberService | None = service.member_service
-    if ms is None or not member_pr(service, pr):
+    check = service.member_check(pr)
+    if ms is None or not (check.ok and pr.is_agent):
+        service._audit_denied(pr, f"artifact.{name}", check.reason or "not_member",
+                              agent_id=pr.id if pr.is_agent else None)
+        service.stats["policy_denied"] += 1
         raise CollabError(403, NOT_A_MEMBER)
     schema = _SCHEMAS.get(name)
     if schema is not None:
@@ -89,7 +95,7 @@ def call(service: CollabService, pr: Principal, name: str, args: Any) -> dict[st
         args = _check_args(name, args, _VIEW_TOOLS[name], {"artifact_id"})
     actor = member_actor(pr)
     if name == "artifact_create":
-        return ms.create(actor, args["title"], args["filename"], args["profile"])
+        return ms.create(actor, args["title"], args["filename"], args["profile"], args.get("idempotency_key"))
     if name == "artifact_upload_chunk":
         body = {k: v for k, v in args.items() if k != "data_b64"}
         body["data"] = args["data_b64"]
@@ -100,7 +106,8 @@ def call(service: CollabService, pr: Principal, name: str, args: Any) -> dict[st
         return ms.upload_abort(actor, args["artifact_id"], args["upload_id"])
     if name == "artifact_publish":
         return ms.publish(actor, args["artifact_id"], base_version_id=args.get("base_version_id"),
-                          files=args["files"], message=args["message"], entry=args.get("entry"))
+                          files=args["files"], message=args["message"], entry=args.get("entry"),
+                          idempotency_key=args.get("idempotency_key"))
     if name == "artifact_delete":
         return ms.delete(actor, args["artifact_id"], args["confirm"])
     if name == "artifact_result":

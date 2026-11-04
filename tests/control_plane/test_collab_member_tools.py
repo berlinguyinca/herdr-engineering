@@ -131,3 +131,24 @@ def test_head_and_history_answer_for_the_callers_own_view(world):
     assert hist["versions"][0]["message"] == "first"
     assert json.dumps(ok_json(tool(world, world.info, "artifact_history", artifact_id="art_sh1")[1]))
     assert err(world, world.info, "artifact_history", artifact_id=ART, limit=0)["status"] == 400
+
+
+def test_tool_denials_of_non_members_are_audited(world):
+    mal = world.agent("mal")[1]
+    before = len([e for e in world.s._log if e["event_type"] == "audit_denied"])
+    assert err(world, mal, "artifacts_mine")["status"] == 403
+    got = [(e["payload"]["action"], e["payload"]["reason"]) for e in world.s._log if e["event_type"] == "audit_denied"][before:]
+    assert got == [("artifact.artifacts_mine", "not_in_group")]
+
+
+def test_idempotency_key_is_in_the_create_and_publish_schemas_and_reaches_the_intent(world):
+    schemas = {t["name"]: t["inputSchema"] for t in world_tools(world, world.info)}
+    for name in ("artifact_create", "artifact_publish"):
+        assert schemas[name]["properties"]["idempotency_key"]["minLength"] == 8
+    for _ in range(2):
+        tool(world, world.info, "artifact_create", title="T", filename="a.html", profile="web",
+             idempotency_key="retry-key-0001")
+    keys = [json.loads(p.read_text())["idempotency_key"] for p in (world.outbox / "intents").glob("*.json")]
+    assert keys == ["retry-key-0001"] * 2
+    assert err(world, world.info, "artifact_create", title="T", filename="a.html", profile="web",
+               idempotency_key="short")["status"] == 400

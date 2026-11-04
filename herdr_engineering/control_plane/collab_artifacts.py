@@ -765,6 +765,12 @@ class CollabArtifactBridge:
                 self._tickets.popitem(last=False)
                 self.stats["tickets_evicted"] += 1
 
+    def release_owner_usage(self, owner_key: str) -> None:
+        """Forget the cached staging usage of ``owner_key`` (after its upload dir was removed), so the freed
+        reservation counts at once instead of after the cache ages out."""
+        with self._staging_lock:
+            self._owner_usage.pop(owner_key, None)
+
     def append_intent(self, actor: Actor, kind: str, payload: dict, *, artifact_id: str | None,
                       idempotency_key: str | None, ticket: str | None = None) -> str:
         """Write one intent for ``actor`` and return its ticket. The CALLER authorizes (``commit`` does for agents).
