@@ -141,12 +141,35 @@ def shadowed(module_root: Path, entry: str, target: Path) -> bool:
         return False
 
 
-def run_update() -> dict:
-    """Run the normal updater only for an explicitly configured clean main checkout."""
+def runner_identity(root: Path) -> dict:
+    """Which code is performing this update, and whether it is the checkout being updated.
+
+    Two independent routes make the nightly job run a checkout's own code. One is `python -m` with
+    the checkout as the process working directory: `sys.path[0]` then wins over every install, and
+    that is what the unit used to do (fixed by `WorkingDirectory=%h`, and refused by `shadowed()`).
+    The other is an **editable install of the controller checkout** - bender's controller `.venv`
+    carries `__editable__.herdr_engineering-0.1.0.pth` - so its runner is the checkout whatever the
+    working directory is. That route is not refused: for a clean checkout the fast-forward simply
+    updates the code the next run uses. But it is why a dirty checkout is permanently self-blocking
+    (the runner cannot be refreshed from a checkout the updater will not touch), so every run records
+    it instead of leaving the condition invisible - the mistake D23 warns against is asserting a
+    mechanism from how installs *should* be laid out rather than from what actually ran.
+    """
+    module = package_root().resolve()
+    return {"runner_module": str(module), "runner_is_checkout": module == root.resolve()}
+
+
+def controller_root() -> Path:
+    """The controller checkout the unattended updater is configured to update."""
     configured_root = os.environ.get("HERDR_ENGINEERING_REPO")
     if not configured_root:
         raise RuntimeError("HERDR_ENGINEERING_REPO must name the controller checkout")
-    root = Path(configured_root).resolve(strict=True)
+    return Path(configured_root).resolve(strict=True)
+
+
+def run_update() -> dict:
+    """Run the normal updater only for an explicitly configured clean main checkout."""
+    root = controller_root()
     if shadowed(package_root(), sys.path[0] if sys.path else "", root):
         raise RuntimeError(
             f"the fleet updater is running from {package_root()}, the checkout it would update; "
@@ -189,19 +212,26 @@ def run_update() -> dict:
 
 
 def main() -> int:
+    runner: dict = {}
+    try:
+        runner = runner_identity(controller_root())
+    except (OSError, RuntimeError):
+        pass  # no controller configured (or unreachable): nothing to attribute this run to
     try:
         report = run_update()
     except SkipUpdate as exc:
         report = {"ok": True, "skipped": True, "reason": str(exc)}
-        if exc.detail:
-            report["detail"] = exc.detail
-        record_run("skipped", reason=str(exc), detail=exc.detail or None)
+        detail = {**runner, **(exc.detail or {})}
+        if detail:
+            report["detail"] = detail
+        record_run("skipped", reason=str(exc), detail=detail or None)
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         report = {"ok": False, "error": str(exc)}
-        record_run("failed", reason=str(exc))
+        record_run("failed", reason=str(exc), detail=runner or None)
     else:
         record_run("updated" if report.get("ok") else "failed",
-                   reason=report.get("error"), revision=report.get("revision"))
+                   reason=report.get("error"), revision=report.get("revision"),
+                   detail=runner or None)
     print(json.dumps(report, sort_keys=True))
     return 0 if report.get("ok") else 1
 

@@ -118,6 +118,56 @@ def test_missing_repository_setting_fails_closed(monkeypatch, capsys):
     update.assert_not_called()
 
 
+def test_every_run_records_which_code_executed_it(checkout, capsys, monkeypatch):
+    """The state file says which code performed the update, and whether that was the checkout."""
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True}):
+        assert fleet_autoupdate.main() == 0
+    capsys.readouterr()
+
+    runner = fleet_autoupdate.read_state()["detail"]
+    assert runner["runner_module"] == str(fleet_autoupdate.package_root())
+    assert runner["runner_is_checkout"] is False
+
+
+def test_a_skip_records_the_runner_too(checkout, capsys, monkeypatch):
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    subprocess.run(["git", "-C", str(checkout), "checkout", "-b", "feature"],
+                   check=True, capture_output=True)
+    with patch.object(fleet_autoupdate, "fleet_update") as update:
+        assert fleet_autoupdate.main() == 0
+    capsys.readouterr()
+    update.assert_not_called()
+
+    detail = fleet_autoupdate.read_state()["detail"]
+    assert detail["branch"] == "feature"
+    assert detail["runner_is_checkout"] is False
+
+
+def test_editable_controller_runs_and_says_so(checkout, capsys, monkeypatch):
+    """An editable install of the checkout is the other route to running its own code (bender).
+
+    Not refused - for a clean checkout the fast-forward updates the code the next run uses - but it
+    must be visible in the record, because it is why a dirty checkout stays permanently self-blocking.
+    """
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    monkeypatch.setattr(fleet_autoupdate, "package_root", lambda: checkout)
+    with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True}) as update:
+        assert fleet_autoupdate.main() == 0
+    capsys.readouterr()
+    update.assert_called_once_with()
+
+    runner = fleet_autoupdate.read_state()["detail"]
+    assert runner["runner_is_checkout"] is True
+    assert runner["runner_module"] == str(checkout)
+
+
 def test_installer_renders_explicit_checkout_and_interpreter_without_enabling(tmp_path):
     source = Path(__file__).resolve().parents[1]
     root = tmp_path / 'checkout space %n $here "quote"'

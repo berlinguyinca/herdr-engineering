@@ -267,8 +267,15 @@ the fleet updater is running from <checkout>, the checkout it would update; run 
 `herdr-eng fleet update`, or give the unit a working directory outside the checkout
 ```
 
-An editable install reached through the `herdr-eng` console script is not shadowing and is not
-refused - that checkout is the operator's own, by choice.
+That is only one of two routes. The other is an **editable install of the controller checkout**:
+bender's `.venv` carries `__editable__.herdr_engineering-0.1.0.pth`, so its nightly runner *is* the
+checkout whatever the working directory says. That route is not refused - for a clean checkout the
+fast-forward updates the code the next run uses, and refusing it would break the ordinary
+controller-on-a-checkout flow - but it is recorded: every run writes `runner_module` and
+`runner_is_checkout` to `fleet-auto-update.json`, so a runner that updates its own source is visible
+to `herdr-eng memory doctor` rather than assumed. A host whose checkout is *dirty* still needs one
+manual act - clean it, or point `HERDR_ENGINEERING_REPO` at a dedicated clean checkout - and the
+rendered unit on disk is replaced only when the installer runs again.
 
 Failures divide in two, and the difference is what makes the job safe to leave switched on:
 
