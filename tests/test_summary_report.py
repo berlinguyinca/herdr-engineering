@@ -459,3 +459,122 @@ def test_publish_refuses_a_non_report_and_bad_ids(tmp_path):
     with pytest.raises(sr.ReportError):
         sr.publish_report("claude", "../x", REPORT, home=tmp_path)
     assert not (tmp_path / ".cache").exists() or not list((tmp_path / ".cache").rglob("*.md"))
+
+
+# -- publishing the drift graph ------------------------------------------------------------------
+BLOCK = json.dumps({"segments": [{"label": "USB stick", "from_prompt": 1, "to_prompt": 3},
+                                  {"label": "web page", "from_prompt": 4, "to_prompt": 6}],
+                    "drift_at": 4, "drift_note": "a new task"})
+WITH_BLOCK = REPORT + "\n```drift-graph\n" + BLOCK + "\n```\n"
+
+
+def _history(n=6, boom=None):
+    def history(agent, session_id):
+        if boom:
+            raise boom
+        return {"prompts": [{"n": i, "ts": f"2026-01-01T09:0{i}:00Z"} for i in range(1, n + 1)],
+                "prompts_total": n, "dispatch_ts": []}
+    return history
+
+
+def _graph_fake(calls, alive=True):
+    """Like ``_fake_herdr`` but hands out a new pane id per split, so the summary and graph panes differ."""
+    ids = iter(["w1:p9", "w1:pA", "w1:pB", "w1:pC"])
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if argv[1:3] == ["pane", "split"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"result": {"pane": {"pane_id": next(ids)}}}), stderr="")
+        if argv[1:3] == ["pane", "get"]:
+            return subprocess.CompletedProcess(argv, 0 if alive else 1, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+    return run
+
+
+def _publish(tmp_path, calls, text=WITH_BLOCK, history=None, posted=None, **kw):
+    posted = posted if posted is not None else []
+    return sr.publish_report("claude", "abc-123", text, home=tmp_path, environ={"HERDR_PANE_ID": "w1:p1"},
+                             run=_graph_fake(calls, kw.pop("alive", True)), load_config=lambda: _Cfg,
+                             post=lambda cfg, body: posted.append(body) or (200, {}),
+                             history=history or _history(), **kw)
+
+
+def _runs(calls):
+    return [c for c in calls if c[1:3] == ["pane", "run"]]
+
+
+def test_publish_strips_the_block_before_storing_posting_and_rendering(tmp_path):
+    calls, posted = [], []
+    out = _publish(tmp_path, calls, posted=posted)
+    assert "drift-graph" not in Path(out["file"]).read_text() and "drift-graph" not in posted[0]["report"]
+    assert posted[0]["report"].startswith("# Session summary") and "Evidence coverage" in posted[0]["report"]
+    assert out["message"] == "Session summary published to the dashboard Summary view and a side pane; it is not repeated here."
+
+
+def test_publish_writes_sidecar_and_opens_graph_pane_below(tmp_path):
+    calls = []
+    out = _publish(tmp_path, calls)
+    side = Path(out["file"] + ".graph.json")
+    graph = json.loads(side.read_text())
+    assert [s["label"] for s in graph["segments"]] == ["USB stick", "web page"] and graph["drift"]["at"] == 4
+    assert (side.stat().st_mode & 0o777) == 0o600
+    assert out["graph"] == {"ok": True, "pane_id": "w1:pA"}
+    splits = [c for c in calls if c[1:3] == ["pane", "split"]]
+    assert splits[0][splits[0].index("--direction") + 1] == "right"
+    down = splits[1]
+    assert down[down.index("--pane") + 1] == "w1:p9" and down[down.index("--direction") + 1] == "down" and "--no-focus" in down
+    summary_run, graph_run = _runs(calls)
+    assert summary_run[3] == "w1:p9" and "view" in summary_run and out["file"] in summary_run
+    assert summary_run[-4:] == ["--close-pane", "w1:p9", "--peer", "w1:pA"]
+    assert graph_run[3] == "w1:pA" and graph_run[-4:] == ["--close-pane", "w1:pA", "--peer", "w1:p9"]
+    assert "graph" in graph_run and out["file"] in graph_run
+
+
+@pytest.mark.parametrize("block", ["not json", json.dumps({"segments": [{"label": "x", "from_prompt": 1, "to_prompt": 2}]})])
+def test_invalid_block_still_publishes_without_graph_pane(tmp_path, block):
+    calls = []
+    out = _publish(tmp_path, calls, text=REPORT + "\n```drift-graph\n" + block + "\n```\n")
+    assert out["ok"] and out["pane"]["ok"] and out["graph"]["ok"] is False
+    assert sum(1 for c in calls if c[1:3] == ["pane", "split"]) == 1
+    assert len(_runs(calls)) == 1 and "--peer" not in _runs(calls)[0]
+    assert not Path(out["file"] + ".graph.json").exists()
+
+
+def test_history_failure_is_soft(tmp_path):
+    calls = []
+    out = _publish(tmp_path, calls, history=_history(boom=RuntimeError("boom")))
+    assert out["ok"] and out["pane"]["ok"] and out["graph"]["ok"] is False and out["graph"]["error"] == "RuntimeError"
+    assert len(_runs(calls)) == 1 and not Path(out["file"] + ".graph.json").exists()
+
+
+def test_republish_closes_both_old_panes_first(tmp_path):
+    calls = []
+    _publish(tmp_path, calls)
+    assert not any(c[1:3] == ["pane", "close"] for c in calls)
+    _publish(tmp_path, calls)
+    assert sorted(c[3] for c in calls if c[1:3] == ["pane", "close"]) == ["w1:p9", "w1:pA"]
+    closes = [i for i, c in enumerate(calls) if c[1:3] == ["pane", "close"]]
+    second_split = [i for i, c in enumerate(calls) if c[1:3] == ["pane", "split"]][2]
+    assert max(closes) < second_split                                    # old pair gone before the new one opens
+
+
+def test_no_pane_flag_skips_the_graph_pane(tmp_path):
+    calls = []
+    out = _publish(tmp_path, calls, pane=False)
+    assert calls == [] and out["graph"] == {"ok": False, "skipped": True}
+    assert not Path(out["file"] + ".graph.json").exists()
+
+
+def test_fewer_than_five_prompts_opens_no_graph_pane(tmp_path):
+    calls = []
+    out = _publish(tmp_path, calls, history=_history(n=4))
+    assert out["graph"]["ok"] is False and sum(1 for c in calls if c[1:3] == ["pane", "split"]) == 1
+    assert not Path(out["file"] + ".graph.json").exists()
+
+
+def test_sidecar_removed_when_a_later_publish_has_no_graph(tmp_path):
+    calls = []
+    first = _publish(tmp_path, calls)
+    assert Path(first["file"] + ".graph.json").exists()
+    second = _publish(tmp_path, calls, text=REPORT)
+    assert second["graph"]["ok"] is False and not Path(second["file"] + ".graph.json").exists()
