@@ -515,8 +515,20 @@ def test_share_list_returns_the_view_links_without_urls(world):
     key = member_owner_key("member:op")
     doc = json.loads((world.bridge.mirror / "member-views" / f"{key}.json").read_text())
     doc["links"] = [{"share_id": "share_" + "a" * 24, "artifact_id": ART, "audience": "public", "state": "live"},
-                    {"share_id": "share_" + "b" * 24, "artifact_id": OTHER, "audience": "lab", "state": "live"}]
+                    {"share_id": "share_" + "b" * 24, "artifact_id": OTHER, "audience": "lab", "state": "live",
+                     "mine": True}]
     atomic_write_json(world.bridge.mirror / "member-views", f"{key}.json", doc)
     assert len(world.ms.share_list(world.user("op"))["links"]) == 2
     assert [r["artifact_id"] for r in world.ms.share_list(world.user("op"), ART)["links"]] == [ART]
     assert refuse(world.ms.share_list, member_actor(world.people["mal"])).status == 403
+
+
+def test_share_list_drops_links_the_caller_neither_created_nor_owns(world):
+    key = member_owner_key("member:op")
+    doc = json.loads((world.bridge.mirror / "member-views" / f"{key}.json").read_text())
+    doc["links"] = [{"share_id": "share_" + "a" * 24, "artifact_id": ART, "mine": False},       # on an owned artifact
+                    {"share_id": "share_" + "b" * 24, "artifact_id": OTHER, "mine": True},       # created by the caller
+                    {"share_id": "share_" + "c" * 24, "artifact_id": OTHER, "mine": False}]      # neither
+    atomic_write_json(world.bridge.mirror / "member-views", f"{key}.json", doc)
+    got = [r["share_id"][6] for r in world.ms.share_list(world.user("op"))["links"]]
+    assert got == ["a", "b"]

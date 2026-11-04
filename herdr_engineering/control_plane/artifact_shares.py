@@ -27,6 +27,7 @@ Conventions:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -187,8 +188,10 @@ class ShareStore:
         try:
             try:
                 await tx.commit()
-            except Exception:
-                await tx.rollback()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await tx.rollback()
+                raise           # a commit that failed means nothing was approved: never report success
         finally:
             if conn is not self._conn:
                 await conn.close()

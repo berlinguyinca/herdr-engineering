@@ -276,34 +276,35 @@ def approve_share(server, share: dict, *, approved_by: str | None = None) -> tup
     expires_at = share.get("expires_at")
     if expires_at is not None and expires_at <= datetime.now(UTC):
         raise ShareHTTPError(410, "share expired before approval; create a new share")
-    with _APPROVE_LOCK, _spending(server):
-        creator = share.get("created_by")
-        files, entry, warnings = _plan(server, share["artifact_id"], share["version_id"], share.get("entry"), creator)
-        _call(server.artifact_store, "verify_share_outputs", share["artifact_id"], share["version_id"])
-        member = is_member_principal(creator)
-        live = int(_call(server.share_store, "live_total_bytes", member=member))    # member / operator totals are separate
-        cap, total_cap = _caps(server, creator)
+    token_hash, built = None, False
+    try:
+        with _APPROVE_LOCK, _spending(server):
+            creator = share.get("created_by")
+            files, entry, warnings = _plan(server, share["artifact_id"], share["version_id"], share.get("entry"), creator)
+            _call(server.artifact_store, "verify_share_outputs", share["artifact_id"], share["version_id"])
+            member = is_member_principal(creator)
+            live = int(_call(server.share_store, "live_total_bytes", member=member))    # member / operator totals are separate
+            cap, total_cap = _caps(server, creator)
 
-        def over_total(size):
-            if total_cap is not None and live + size > total_cap:
-                raise ShareHTTPError(400, f"approving would put {live + size} bytes live, over the {total_cap} byte total cap "
-                                     f"({live} already live)")
+            def over_total(size):
+                if total_cap is not None and live + size > total_cap:
+                    raise ShareHTTPError(400, f"approving would put {live + size} bytes live, over the {total_cap} byte total cap "
+                                         f"({live} already live)")
 
-        over_total(sum(f["size_bytes"] or 0 for f in files))
-        budget = cap - sum(f["size_bytes"] or 0 for f in files)
-        for item in files:
-            if item["size_bytes"] is None:
-                item["size_bytes"] = _measure(server, item, budget)
-                budget -= item["size_bytes"]
-        over_total(sum(f["size_bytes"] for f in files))        # measured sizes, before anything is written
-        dest = root / share_id
-        if dest.exists() or dest.is_symlink():
-            raise ShareHTTPError(409, "a bundle directory already exists for this share; revoke it and create a new share")
-        index = build_bundle(dest, ((f["name"], f["sha256"], f["size_bytes"],
-                                     [f["data"]] if "data" in f else _chunks(server, f)) for f in files),
-                             entry=entry, limits=BundleLimits(cap, settings["max_files"]))
-        token_hash = None
-        try:
+            over_total(sum(f["size_bytes"] or 0 for f in files))
+            budget = cap - sum(f["size_bytes"] or 0 for f in files)
+            for item in files:
+                if item["size_bytes"] is None:
+                    item["size_bytes"] = _measure(server, item, budget)
+                    budget -= item["size_bytes"]
+            over_total(sum(f["size_bytes"] for f in files))        # measured sizes, before anything is written
+            dest = root / share_id
+            if dest.exists() or dest.is_symlink():
+                raise ShareHTTPError(409, "a bundle directory already exists for this share; revoke it and create a new share")
+            index = build_bundle(dest, ((f["name"], f["sha256"], f["size_bytes"],
+                                         [f["data"]] if "data" in f else _chunks(server, f)) for f in files),
+                                 entry=entry, limits=BundleLimits(cap, settings["max_files"]))
+            built = True
             over_total(index.total_bytes)
             token, token_hash = new_token()
             write_state(root, token_hash, {
@@ -317,11 +318,12 @@ def approve_share(server, share: dict, *, approved_by: str | None = None) -> tup
                       approved_by=approved_by or "unknown")
             except ShareError as exc:
                 raise ShareHTTPError({"expired": 410, "not_found": 404}.get(exc.code, 409), str(exc)) from None
-        except BaseException:
-            if token_hash is not None:
-                remove_state(root, token_hash)
+    except BaseException:       # includes a release (COMMIT) that failed: no live link without a committed row
+        if token_hash is not None:
+            remove_state(root, token_hash)
+        if built:
             remove_bundle(root, share_id)
-            raise
+        raise
     url = settings["public_url"].rstrip("/") + "/s/" + token + "/"
     summary = {"entry": index.entry, "file_count": len(index.files), "total_bytes": index.total_bytes,
                "expires_at": _jsonable(expires_at), "audience": share["audience"],

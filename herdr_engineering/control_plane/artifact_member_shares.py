@@ -127,10 +127,12 @@ def _capped(summary: dict) -> dict:
 # ----------------------------------------------------------------------------- create
 
 def _audience_pool(directory: dict[str, dict[str, Any]], user_id: str, rt: MemberRuntime) -> tuple[frozenset, frozenset]:
-    """``(groups, emails)`` this member may put on a lab share: the groups it belongs to, and the lower-cased emails of
-    the approved members of the directory."""
+    """``(groups, emails)`` this member may put on a lab share: ONLY the lab group (the member's other sign-in groups
+    include automatic federated ones such as ``<pool>_Google``, which would open the link to every user of the pool),
+    and the lower-cased emails of the approved members of the directory."""
     mine = directory.get(user_id) or {}
-    groups = frozenset(g for g in (mine.get("groups") or [rt.group]) if isinstance(g, str))
+    held = [g for g in (mine.get("groups") or [rt.group]) if isinstance(g, str)]
+    groups = frozenset({rt.group}) if rt.group in held else frozenset()
     emails = frozenset(e["email"].strip().lower() for e in directory.values()
                        if e.get("status") == "approved" and isinstance(e.get("email"), str) and e["email"].strip())
     return groups, emails
@@ -140,6 +142,7 @@ async def handle_share_create(ctx: IntentContext, intent: Intent) -> dict:
     from .artifact_share_api import ShareHTTPError, _jsonable, _plan, _summary
     from .artifact_shares import ShareError, ShareStore
     from .collab_intents import REASON_MAX
+    from .share_bundle import ShareBundleError
     who, refusal = await _gate(ctx, intent, "share_create", spends=True)
     if refusal is not None:
         return refusal
@@ -153,15 +156,22 @@ async def handle_share_create(ctx: IntentContext, intent: Intent) -> dict:
     groups, emails = _audience_pool(directory, who.principal[len("member:"):], rt)
     if p.audience == "lab" and not set(p.allow_groups or ()) <= groups:    # exactly a group of the member: no trimming
         return await _refuse(ctx, who, "share_create", "member_audience_refused", intent, audience=p.audience)
+    from .artifact_shares import PUBLIC_MAX_DAYS
     days = p.expires_in_days
-    if days is None and p.audience == "public":
+    if days is None:       # no member link is permanent: lab and public alike get the default
         days = rt.share_settings["default_public_days"]
-    expires_at = datetime.now(UTC) + timedelta(days=days) if days is not None else None
+    if days > PUBLIC_MAX_DAYS:
+        return await _refuse(ctx, who, "share_create", f"expires_in_days must be at most {PUBLIC_MAX_DAYS}", intent,
+                             audience=p.audience)
+    expires_at = datetime.now(UTC) + timedelta(days=days)
     server = _Server(ctx, rt)
     try:
         files, chosen, warnings = await asyncio.to_thread(_plan, server, aid, p.version_id, p.entry, who.principal)
     except ShareHTTPError as exc:
         return await _refuse(ctx, who, "share_create", _http_reason(exc), intent, audience=p.audience)
+    except ShareBundleError as exc:
+        return await _refuse(ctx, who, "share_create", str(exc)[:REASON_MAX] or "bundle_invalid", intent,
+                             audience=p.audience)
     try:
         row = await ShareStore(ctx.conn).create(
             artifact_id=aid, version_id=p.version_id, audience=p.audience,
@@ -180,7 +190,9 @@ async def handle_share_create(ctx: IntentContext, intent: Intent) -> dict:
 
 async def handle_share_approve(ctx: IntentContext, intent: Intent) -> dict:
     from .artifact_share_api import ShareHTTPError, approve_share
-    from .artifact_shares import ShareStore
+    from .artifact_shares import ShareError, ShareStore
+    from .collab_intents import REASON_MAX
+    from .share_bundle import ShareBundleError
     who, refusal = await _gate(ctx, intent, "share_approve", spends=True)
     if refusal is not None:
         return refusal
@@ -203,11 +215,20 @@ async def handle_share_approve(ctx: IntentContext, intent: Intent) -> dict:
         # mark_live's own refusals (404, 410) are audited by the store; the rest are ours to record
         return await _refuse(ctx, who, "share_approve", _http_reason(exc) if exc.status != 410 else "expired", intent,
                              share_id=share_id, audience=share["audience"], audit=exc.status not in (404, 410))
+    except (ShareBundleError, ShareError) as exc:
+        return await _refuse(ctx, who, "share_approve", str(exc)[:REASON_MAX] or "bundle_invalid", intent,
+                             share_id=share_id, audience=share["audience"])
+    except Exception as exc:      # e.g. the transaction could not commit: no link was issued, the share stays pending
+        log.error("member share %s: approval failed (%s)", share_id, type(exc).__name__)
+        return await _refuse(ctx, who, "share_approve", "approval_failed", intent, share_id=share_id,
+                             audience=share["audience"])
     secret = json.dumps({"ticket": intent.ticket, "principal": who.principal, "url": url,
                          "at": rt.clock()}).encode("utf-8")
     try:
-        await asyncio.to_thread(link_new_beneath, rt.outbox, [SECRETS_DIR], intent.ticket + ".json", secret,
-                                mode=rt.secret_mode, create_dirs=True, dir_mode=SECRET_DIR_MODE)
+        written = await asyncio.to_thread(link_new_beneath, rt.outbox, [SECRETS_DIR], intent.ticket + ".json", secret,
+                                          mode=rt.secret_mode, create_dirs=True, dir_mode=SECRET_DIR_MODE)
+        if not written:
+            raise OSError("the secret result already exists")
     except (BridgeError, OSError):      # a live link nobody can receive is worse than none
         log.error("member share %s: the secret result could not be written; revoking", share_id)
         await revoke_share(ctx.conn, rt, share_id, actor="secret-unavailable")

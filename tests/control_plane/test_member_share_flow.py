@@ -48,6 +48,8 @@ DIRECTORY = {
     "carol": {"status": "approved", "email": "carol@lab.example.org", "groups": ["other-group"]},
     "dave": {"status": "disabled", "email": "dave@lab.example.org"},
     "erin": {"status": "approved", "email": "erin@lab.example.org"},
+    "frank": {"status": "approved", "email": "frank@lab.example.org",
+              "groups": ["lab", "us-east-1_POOL_Google", "admins"]},      # a federated sign-in adds automatic groups
 }
 
 
@@ -334,7 +336,7 @@ def test_sharing_that_is_not_wired_answers_sharing_unavailable(registry_pg, tmp_
     srun(registry_pg, tmp_path, body, shares=False)
 
 
-def test_collab_principals_and_foreign_actors_never_create_shares(registry_pg, tmp_path):
+def test_a_user_outside_the_lab_group_cannot_create_shares(registry_pg, tmp_path):
     async def body(env, rt):
         aid, vid = await published(env)
         out = await share(env, user("carol"), aid, vid)
@@ -485,3 +487,103 @@ def test_a_failed_secret_write_revokes_the_link_it_could_not_hand_over(registry_
 def test_the_validators_are_registered_by_the_light_module():
     for kind in ("member.share_create", "member.share_approve", "member.share_revoke", "member.share_events"):
         assert kind in cbf._INTENT_KINDS
+
+
+# ----------------------------------------------------------------------------- review round 1
+FRANK = "member:frank"
+
+
+def test_a_lab_share_may_name_only_the_lab_group_never_the_members_other_groups(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, vid = await published(env, user("frank"), owner=FRANK)
+        for groups in (["us-east-1_POOL_Google"], ["admins"], ["lab", "admins"]):
+            out = await share(env, user("frank"), aid, vid, "lab", allow_groups=groups)
+            assert out["result"] == "rejected", (groups, out)
+        assert not await sql(env, "SELECT 1 FROM artifact_shares")
+        ok = await share(env, user("frank"), aid, vid, "lab", allow_groups=["lab"])
+        assert ok["result"] == "created"
+        (row,) = await sql(env, "SELECT allow_groups FROM artifact_shares")
+        assert list(row["allow_groups"]) == ["lab"]
+    srun(registry_pg, tmp_path, body)
+
+
+def test_lab_shares_always_expire_and_never_beyond_ninety_days(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, vid = await published(env)
+        default = await share(env, user("alice"), aid, vid, "lab", allow_groups=["lab"])
+        assert default["result"] == "created"
+        (row,) = await sql(env, "SELECT expires_at FROM artifact_shares WHERE share_id=$1", default["share_id"])
+        left = row["expires_at"] - datetime.now(UTC)
+        assert timedelta(days=29) < left <= timedelta(days=30, minutes=1)
+        too_long = await share(env, user("alice"), aid, vid, "lab", allow_groups=["lab"], expires_in_days=91)
+        assert too_long["result"] == "rejected"
+        assert (await share(env, user("alice"), aid, vid, "lab", allow_groups=["lab"],
+                            expires_in_days=90))["result"] == "created"
+        assert all(r["expires_at"] is not None for r in await sql(env, "SELECT expires_at FROM artifact_shares"))
+    srun(registry_pg, tmp_path, body)
+
+
+def test_a_failed_commit_of_the_approval_issues_no_link_and_leaves_nothing_behind(registry_pg, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+
+    async def body(env, rt):
+        aid, vid = await published(env)
+        sid = (await share(env, user("alice"), aid, vid))["share_id"]
+        async with env.pool.acquire() as conn:     # a real deferred constraint: the UPDATE succeeds, the COMMIT fails
+            await conn.execute("""
+                CREATE OR REPLACE FUNCTION induced_commit_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN IF NEW.state = 'live' THEN RAISE EXCEPTION 'induced commit failure'; END IF; RETURN NULL; END $$;
+                CREATE CONSTRAINT TRIGGER induced_commit_failure AFTER UPDATE ON artifact_shares
+                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION induced_commit_failure();""")
+        try:
+            ticket, done = await approve(env, user("alice"), aid, sid)
+        finally:
+            async with env.pool.acquire() as conn:
+                await conn.execute("DROP TRIGGER induced_commit_failure ON artifact_shares;"
+                                   "DROP FUNCTION induced_commit_failure()")
+        assert done["result"] == "rejected" and done["reason"] == "approval_failed", done
+        assert secret_of(env, ticket) is None and "secret_result" not in done
+        (row,) = await sql(env, "SELECT state, token_hash FROM artifact_shares")
+        assert (row["state"], row["token_hash"]) == ("pending", None)
+        left = [p for p in (tmp_path / "shares").rglob("*") if not p.is_dir()] if (tmp_path / "shares").exists() else []
+        assert not (tmp_path / "shares" / sid).exists()
+        assert left == [], left                      # no bundle, no state.json for a link that does not exist
+        assert PUBLIC_URL + "/s/" not in caplog.text
+        # the share is still approvable afterwards (nothing was spent)
+        t2, again = await approve(env, user("alice"), aid, sid)
+        assert again["result"] == "live" and take_secret(env.outbox, t2, ALICE)
+    srun(registry_pg, tmp_path, body)
+
+
+def test_a_corrupt_blob_at_approval_is_a_refusal_with_an_event_not_internal(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, vid = await published(env)
+        sid = (await share(env, user("alice"), aid, vid))["share_id"]
+        for key in list(env.applier.rustfs.objects):
+            env.applier.rustfs.objects[key] = b"tampered" + env.applier.rustfs.objects[key]
+        ticket, done = await approve(env, user("alice"), aid, sid)
+        assert done["result"] == "rejected" and done["reason"] != "internal", done
+        events = await sql(env, "SELECT outcome, code FROM artifact_member_events WHERE action='share_approve'")
+        assert [(e["outcome"], e["code"]) for e in events] == [("refused", done["reason"])]
+        assert (await sql(env, "SELECT state FROM artifact_shares"))[0]["state"] == "pending"
+        assert not (tmp_path / "shares" / sid).exists()
+    srun(registry_pg, tmp_path, body)
+
+
+def test_a_repeated_approve_with_the_same_idempotency_key_is_already_approved(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, vid = await published(env)
+        sid = (await share(env, user("alice"), aid, vid))["share_id"]
+        payload = {"share_id": sid, "confirm": True}
+        r1 = await send(env, user("alice"), "member.share_approve", payload, aid=aid, key="approve-key-0001")
+        r2 = await send(env, user("alice"), "member.share_approve", payload, aid=aid, key="approve-key-0001")
+        assert r1["result"] == "live" and r2["result"] == "already_approved" and "secret_result" not in r2
+        events = await sql(env, "SELECT kind FROM artifact_share_events WHERE share_id=$1 AND kind='approved'", sid)
+        assert len(events) == 1                                       # approve_share ran once
+        assert sorted(p.name for p in (env.outbox / SECRETS_DIR).iterdir()) == [r1_ticket_name(env)]
+    srun(registry_pg, tmp_path, body)
+
+
+def r1_ticket_name(env):
+    (only,) = [p.name for p in (env.outbox / SECRETS_DIR).iterdir()]
+    return only

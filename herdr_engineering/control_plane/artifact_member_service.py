@@ -338,7 +338,11 @@ class MemberService:
     def share_list(self, actor: Mapping[str, Any], artifact_id: Any = None) -> dict[str, Any]:
         """The caller's share links from its own view (never the URL: it is shown once, at approval)."""
         who = self._caller(actor, "share_list")
-        links = [row for row in (self._view(who).get("links") or []) if isinstance(row, dict)]
+        view = self._view(who)
+        owned = {row.get("artifact_id") for row in (view.get("artifacts") or []) if isinstance(row, dict)}
+        # only links the caller created, or that sit on an artifact it owns (it may revoke those)
+        links = [row for row in (view.get("links") or []) if isinstance(row, dict)
+                 and (row.get("mine") is True or row.get("artifact_id") in owned)]
         if artifact_id is not None:
             links = [row for row in links if row.get("artifact_id") == artifact_id]
         return {"links": links}
