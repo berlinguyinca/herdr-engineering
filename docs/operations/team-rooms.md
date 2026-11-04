@@ -258,3 +258,122 @@ Web UI (no role, my-tasks or overdue screen), a way for the owner to re-issue a 
 re-routing on a decline, `task_assigned` for guests in the attention inbox (a guest reads `my-tasks`; the attention inbox stays 404 for
 guests), email or push notification of a reminder (the reminder is an event and the queue entry), the fleet-wide `attention_inbox.py`,
 coordinators (slice 3), assistant briefs (slice 4), approval-gated external actions (slice 5), Direct behaviour.
+
+# Slice 3: coordinators with limits
+
+Slice 3 of the same design (`TEAM_COLLABORATION.md` section 10, 10.2, 16 and the T-TC threat rows). A coordinator decomposes an
+operator-approved root task into tasks for a team's role holders and tracks them. Two flags, both under
+`control_plane.collab.coordinators`, both off by default:
+
+- `enabled` (also needs `team_rooms` and `team_roles`): operator-owned coordinators, an agent the operator owns.
+- `external.enabled` (also needs `enabled`): an external person, opted in per team by the operator.
+
+With either off, `create_task` behaves exactly as before (a test pins that), every new route answers 404, the sweep does nothing
+and a coordinator's authority is gone. The OFF direction of every revocation stays reachable.
+
+## What it does
+
+- **Operator-owned coordinator.** The room owner designates one of their own active agents (not a foreign agent, not a helper, not
+  one that already holds access in the room) as the coordinator of a team in a room. It gets `read`, `post`, `instruct` and `execute`
+  on the room (`execute` because it must accept the root task; design table 7 lists read/post/instruct). It can create tasks only
+  by `target_role`, only for roles the team has, only for that team, and only under a root task the operator made and the coordinator
+  accepted (an agent cannot create a root task). Cap: `tasks_per_hour` (default 20) and `max_open` (default 20), counted from the
+  replayed log so a restart does not reset them.
+- **External coordinator.** The owner turns on `external-coordination` for a team (with the roles the person may assign to and
+  optional lower limits), then designates a current guest of the room. They act as themselves (events carry their user id and
+  `origin: coordinator`), with a new per-team `coordinate` right, not the contributor or guest right. Caps default to 5 per hour,
+  are always strictly lower than the operator-owned cap and can be lowered further per team, never raised past the service-wide
+  ceiling. They see status only: no results, no task list, no task by id, no assistants, no brief references.
+- **Cannot, for either kind.** Approve any external action, grant a role or permission (to anyone, itself included), change the
+  guest level, change the coordinator designation or the opt-in, attach or detach a team. Each attempt is 403 with an audit event
+  under the coordinator's own identity (a designated external person gets 403 where a plain guest gets the old 404, so the refusal is
+  recorded).
+- **No assistant loop.** A task created by an agent is refused (400 `coordination_loop`) when its target is anywhere in the chain
+  of creators above it, or when it targets an assistant after an assistant already appears in the chain. This covers the
+  third-agent case (A to B to C to A). An assistant is derived from the log (designated coordinator agents, and agents claimed as an
+  assistant runtime), never from `harness_type`.
+- **Independent review.** A coordinator is never the independent reviewer of work it decomposed, and neither is anyone above it in
+  the chain. This holds after a revocation, because the requeue keeps who the work came from.
+- **Revocation.** Clearing the designation, turning the opt-in off, removing the person from the room, detaching the team, revoking
+  the agent, or the identity provider dropping the person's group (the sweep notices it by itself, within the 60 second recheck
+  window): an operator-owned coordinator's open tasks are cancelled; an external person's open tasks go back to the role queue under
+  the operator with `attempt` raised by one, so the old run's update is a 409 `stale attempt`. If nobody is eligible to take a
+  requeued task it is cancelled. Repeating a revocation changes nothing.
+
+## Turn it on
+
+```yaml
+control_plane:
+  collab:
+    team_rooms: {enabled: true}
+    team_roles: {enabled: true}
+    coordinators:
+      enabled: true                  # absent = off
+      kill_switch: false
+      tasks_per_hour: 20             # 2 .. 200
+      max_open: 20                   # 1 .. 100
+      external:
+        enabled: false               # second flag; absent = off
+        tasks_per_hour: 5            # 1 .. coordinators.tasks_per_hour - 1
+        max_open: 5                  # <= coordinators.max_open
+        max_depth: 2                 # 1 .. 3
+        max_items_per_request: 10    # 1 .. 50
+```
+
+Read per request (a missing, unreadable or invalid file turns it OFF). No migration, no table, no environment variable.
+
+## Operate it
+
+```bash
+herdr-eng rooms coordinator ROOM TEAM [agent:ID|user:ID]      # show, or designate (owner only)
+herdr-eng rooms coordinator-clear ROOM TEAM
+herdr-eng rooms external-coordination ROOM TEAM [on --roles implementer,tester --per-hour 3 | off]
+herdr-eng rooms coordination ROOM                              # a coordinator's own tracking
+```
+
+| Route (`/api/v1/collab`) | Who |
+|---|---|
+| `GET` / `POST /rooms/{room}/teams/{team}/coordinator` `{"holder": "agent:ID" \| "user:ID"}`, `.../coordinator/clear` | owner |
+| `POST /rooms/{room}/teams/{team}/external-coordination` `{"enabled", "limits": {"roles", ...}}` | owner |
+| `GET /rooms/{room}/coordination` | the coordinator (status only for an external person) |
+| `POST /rooms/{room}/tasks` with `target_role`, `parent_task_id` | the coordinator, within its limits |
+
+## Roll back
+
+- **Fast and safe: the flag.** `external-coordination off` (per team) revokes one external coordinator at once and requeues their
+  work. `coordinators.external.enabled: false` or `coordinators.enabled: false` (or `kill_switch: true`) withdraws the authority
+  everywhere: new tasks are 403, the routes are 404, tasks a coordinator made stop being served, and the next sweep with the flag
+  back on requeues or cancels them. Turn the opt-ins off per team first if you want the requeue to happen while you are flagged off.
+  Nothing is deleted from the log.
+- **Rolling the image back is safe for reading, not for state, and I would still do the flag first.** Checked by replaying a log that
+  holds a designation, an opt-in, coordinator child tasks, a revoked external person and a `task_requeued` event into the code of
+  `origin/main` (the slice 2 code is the same on these paths): the log replays cleanly (not degraded), and `room_state`, `room_flow`
+  and `list_tasks` answer for owner, contributor and viewer (a guest gets the usual 403 on `room_flow`). The old code ignores the
+  new events: it grants the coordinator agent nothing, so tasks a coordinator created fail the "requester still has authority" test
+  and no agent inbox serves them (checked: 0 tasks served). It also ignores `task_requeued`, so a requeued task shows the old
+  `attempt` and the old requester, and the stale-run 409 fence does not exist on the old image. Nothing runs wrongly; revoked work
+  just stays stuck until you cancel it. The slice 2 warning still applies if the log holds a task for a person: the root task of an
+  external coordinator is one (R-TR14). So: turn the opt-ins off first, then the flags, and cancel what you do not want, before any
+  image rollback.
+- No migration, no table, no environment variable.
+
+## Choices made where the design left room
+
+- A coordinator is per (room, team), not per team, and the routes are room-scoped like slice 2 (`POST`, not `PUT`).
+- The coordinator agent gets `execute` as well as `instruct` so that it can accept its root task.
+- Coordinators assign by `target_role` only; they cannot name an agent or a person.
+- An external coordinator must be a current guest of the room. A contributor already holds `grant_agent`, so the design's
+  "no new right" rule excludes them, and the owner cannot be one.
+- The external coordinator's root is a person task made by the operator for them (`target_user_id`); the Suggest queue only targets agents.
+- Turning the opt-in off also clears the designation, so a later opt-in starts without a coordinator.
+- On a requeue the operator adopts the task: it is attributed to the operator, the coordinator key is kept for review disqualification.
+- A designated external coordinator gets 403 plus an audit event on owner-only routes where everyone else gets the old 404.
+- Loop guard: chain-based, applied to every agent-created task while the flag is on.
+- An external coordinator reading a task by id gets 404 while the flag is on (guests are blinded to tasks).
+
+## Not built in this slice
+
+Web UI of any kind (no coordinator or coordination screen), assistant briefs and the brief-reference check (slice 4: the refusal
+"an external coordinator cannot read a brief reference" holds because no such route exists yet, and the only assistant API an
+external credential reaches is rejected with 401, tested), approval-gated external actions (slice 5), and `direct` guest behaviour.
+Coordinators cannot yet be handed work by Suggest requests.
