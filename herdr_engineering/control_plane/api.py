@@ -28,9 +28,9 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from ..version import __version__
 from .artifact_acl import is_agent_collaborator
@@ -42,6 +42,7 @@ from .graph import read_graph
 from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_delivery, redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
+from .share_public import etag_matches, vendor_etag
 from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
@@ -137,6 +138,10 @@ def _is_loopback(host: str) -> bool:
         return False
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
+# pdf.js is vendored once, under share_static (the share-public viewer serves the same files); the dashboard maps the
+# two modules into its web root's /vendor/pdfjs/. Nothing else of that directory (LICENSE, SHA256SUMS) is served.
+_PDFJS_VENDOR_DIR = Path(__file__).resolve().parent / "share_static" / "vendor" / "pdfjs"
+_VENDORED_PDFJS = frozenset({"vendor/pdfjs/pdf.min.mjs", "vendor/pdfjs/pdf.worker.min.mjs"})
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
 _MAX_ATTACHMENT_JSON = 36 * 1024 * 1024        # a 25 MiB attachment is ~33.4 MiB of base64 plus its mail envelope
@@ -306,7 +311,7 @@ class ControlPlaneServer:
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None):
         """
@@ -445,6 +450,8 @@ class ControlPlaneServer:
         self.share_store = share_store
         self.shares_root = shares_root
         self.share_settings = share_settings
+        # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
+        self.annotation_store = annotation_store
         # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
         self.collab_grant_store = collab_grant_store
         self.collab_artifacts_enabled = collab_artifacts_enabled
@@ -3063,11 +3070,18 @@ def _make_handler(server, public=False, operator=False):
                 from .artifact_collab_api import route_collab
                 if route_collab(self, server, parts, resource):
                     return None
+                # route_render FIRST: route_report claims every versioned preview/outputs path of any depth.
+                from .artifact_render_api import route_render
+                if route_render(self, server, parts, resource):
+                    return None
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
                     return None
                 from .artifact_share_api import route_share
                 if route_share(self, server, parts, resource):
+                    return None
+                from .artifact_annotation_api import route_annotations
+                if route_annotations(self, server, parts, resource):
                     return None
                 from .artifact_registry_api import route_registry
                 if route_registry(self, server, parts, resource):
@@ -3640,20 +3654,15 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({**page, "events": [_redact_event(event) for event in page["events"]]})
                     return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
-                data = r.get_artifact_data(parts[4])
-                a = r.get_artifact(parts[4])
-                if a is None and server.artifact_store is not None:
-                    a = self._artifact_call('get_record', parts[4], principal_id=self._resource_principal())
-                # payload lives in the object store, not the in-memory blob
-                if data is None and a is not None and server.rustfs is not None \
-                        and a.get("storage_key") and a.get("sha256"):
-                    try:
-                        data = server.rustfs.get(a["storage_key"], a["sha256"])
-                    except Exception:
-                        data = None
+                a, data = self._artifact_current_file(parts[4])
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
-                return self._bytes(data, a.get("mime_type", "application/octet-stream"))
+                # No artifact byte may execute on the dashboard origin: download as an attachment under a sandbox.
+                name = PurePosixPath(a.get("original_filename") or "artifact").name or "artifact"
+                from .artifact_render_api import safe_mime
+                return self._bytes(data, safe_mime(a.get("mime_type", "application/octet-stream")), headers=[
+                    ("Content-Disposition", "attachment; filename*=UTF-8''" + quote(name, safe="")),
+                    ("Content-Security-Policy", "default-src 'none'; sandbox")])
             if resource == "artifacts" and len(parts) == 4:
                 if server.artifact_store is not None:
                     artifacts = self._artifact_call(
@@ -5544,6 +5553,10 @@ def _make_handler(server, public=False, operator=False):
             filename = _q(self.path, "filename") or "upload"
             mime = _q(self.path, "mime") or \
                 self.headers.get("Content-Type", "application/octet-stream")
+            from ..media_type import canonical_upload_media_type
+            mime = canonical_upload_media_type(mime)
+            if mime is None:
+                return self._json({"error": "invalid mime"}, 400)
             session_id = _q(self.path, "session_id")
             mission_id = _q(self.path, "mission_id")
             owner = self._resource_principal()
@@ -5643,18 +5656,30 @@ def _make_handler(server, public=False, operator=False):
             rel = self.path.lstrip("/") or _INDEX
             if ".." in rel:
                 return self._send_json(403, {"error": "forbidden"})
-            target = (server.web_root / rel).resolve()
-            if not target.is_relative_to(server.web_root.resolve()) or \
+            vendored = rel in _VENDORED_PDFJS
+            target = ((_PDFJS_VENDOR_DIR / rel.rsplit("/", 1)[1]) if vendored else server.web_root / rel).resolve()
+            if not vendored and not target.is_relative_to(server.web_root.resolve()) or \
                     not target.exists() or target.is_dir():
                 return self._send_json(404, {"error": "not found"})
             ctype = {
-                ".html": "text/html", ".css": "text/css",
+                ".html": "text/html", ".css": "text/css", ".mjs": "text/javascript",
                 ".js": "text/javascript", ".svg": "image/svg+xml",
             }.get(target.suffix, "application/octet-stream")
             data = target.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Cache-Control", "no-store")
+            etag = vendor_etag(data) if vendored else None
+            not_modified = vendored and etag_matches(self.headers.get("If-None-Match"), etag)
+            self.send_response(304 if not_modified else 200)
+            if not not_modified:
+                self.send_header("Content-Type", ctype)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # The vendored path carries no version: revalidate (no-cache) against a sha256 ETag; the rest is the
+            # dashboard's own, edited code.
+            self.send_header("Cache-Control", "no-cache" if vendored else "no-store")
+            if etag:
+                self.send_header("ETag", etag)
+            if not_modified:
+                self.end_headers()
+                return None
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -6013,12 +6038,32 @@ def _make_handler(server, public=False, operator=False):
                 return self._etag_json(body)
             return self._json(body, etag=etag)
 
-        def _bytes(self, data, mime):
+        def _artifact_current_file(self, artifact_id, want=None):
+            """``(record, bytes)`` of the artifact's current file (either may be None), as ``/download`` serves it.
+
+            ``want(record) -> bool`` may veto reading the bytes (they are then None) for callers that need only the record."""
+            r = server.repo
+            data = r.get_artifact_data(artifact_id)
+            a = r.get_artifact(artifact_id)
+            if a is None and server.artifact_store is not None:
+                a = self._artifact_call('get_record', artifact_id, principal_id=self._resource_principal())
+            # payload lives in the object store, not the in-memory blob
+            if data is None and a is not None and (want is None or want(a)) and server.rustfs is not None \
+                    and a.get("storage_key") and a.get("sha256"):
+                try:
+                    data = server.rustfs.get(a["storage_key"], a["sha256"])
+                except Exception:
+                    data = None
+            return a, data
+
+        def _bytes(self, data, mime, headers=()):
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
+            for name, value in headers:
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
             return None

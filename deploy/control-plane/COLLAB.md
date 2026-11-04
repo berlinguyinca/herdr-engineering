@@ -64,23 +64,27 @@ These were applied by hand on bender; reapply them on a new host.
 ## Share links (`/s/`)
 
 Artifact share links are served by `herdr-share-public` behind the same edge, under
-`control_plane.collab.public_url` (`https://localdev.mcp.metabolomics.us/s/<token>/`). Off unless
+`control_plane.share.public_url`, a host of its own (`https://<share host>/s/<token>/`); MCP stays on
+`control_plane.collab.public_url`. Off unless
 `control_plane.share.enabled: true` in the central fleet config; enabling them needs the collab marker.
 
 ```
-edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, internal; no DB, RustFS,
+edge (nginx, the share host's own server: /s/ only) -> herdr-share-public:8083 (network `share`, internal; no DB, RustFS,
                                        control plane or outbound route)
 ```
 
 - Config: `deploy.sh` renders `herdr-eng fleet config render-share` to
   `~/.config/herdr-engineering/share/share-config.json` (0600): only `control_plane.share`'s serving keys
-  and collab's `cognito_pool`, `cognito_clients`, `cognito_web_client`, `cognito_domain`, `public_url`.
+  and collab's `cognito_pool`, `cognito_clients`, `cognito_web_client`, `cognito_domain`, `public_url`
+  (the collab URL is carried but share links no longer use it).
   share-public refuses any file carrying more.
 - Signing secret: `enabled: true` without `control_plane.share.signing_secret` (at least 32 bytes) is refused
   before anything is built. Generate it on the control-plane host and paste it into the fleet YAML yourself:
   `openssl rand -hex 32`. Never commit it, print it, or pass it as a flag or environment variable. Rotating it
   ends every open lab session.
-- `public_url` must be a bare origin (empty path or `/`): the viewer's sign-in redirect is fixed at `/s/callback`.
+- `control_plane.share.public_url` must be a bare lowercase https origin (empty path or `/`; no userinfo, query,
+  fragment, non-ASCII or trailing-dot host) on a host other than `control_plane.collab.public_url`'s: the viewer's
+  sign-in redirect is fixed at `/s/callback` at its root. `deploy.sh` refuses anything else.
 - Lab session lifetime: `control_plane.share.session_seconds` (default 14400 = 4 h) is only a cap. A session
   also ends at the share's expiry and at the Cognito access token's `exp` (about 1 h with the pool's default
   token validity), so recipients sign in again after ~1 h unless the app client's access-token validity is raised.
@@ -107,17 +111,28 @@ edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, 
 - Edge resilience: share-public is resolved at run time (`resolver 127.0.0.11`, `server ... resolve` in a
   zoned upstream, `max_conns=100` under share-public's 128-connection cap), so the edge starts and reloads
   (certificate renewals included) while share-public is down; `/s/` then answers 502.
-- Edge: with shares enabled the edge's `nginx.conf` gains exactly one location, `^~ /s/` (snippets
-  `collab-edge/share-http.conf` and `share-location.conf`): GET/HEAD/OPTIONS, plus POST only on
-  `/s/<token>/session` (the body-less lab sign-in exchange); any request with a body is refused; its own
-  `limit_req`/`limit_conn` zones; `proxy_buffering off`; `proxy_read_timeout 600s`; no access log (tokens and
-  session HMACs are in the path). Disabled, the edge conf is the repo file unchanged and a running
-  share-public is stopped (its bundles stay on disk).
+- Edge: with shares enabled the edge's `nginx.conf` gains the zones, upstream and a `server` for the share host
+  (snippet `collab-edge/share-http.conf`; `@share_host@` is the host of `control_plane.share.public_url`, rendered by
+  `herdr-eng fleet config render-edge`). The MCP host serves no `/s/` at all (404). The share server proxies only
+  `/s/`; everything else is a 404. `location /s/`: GET/HEAD/OPTIONS, plus POST only on `/s/<token>/session` (the
+  body-less lab sign-in exchange); any request with a body is refused. The annotation endpoints
+  (`/s/<token>/k/<session>/annotations[/ann_<id>/edit|delete]`) are a separate location: GET and POST only, a 32k
+  body cap, their own `share_annotate` zone (5 r/s, burst 30). Both have `limit_conn share_conn 16`,
+  `proxy_buffering off`, and no access log (tokens and session HMACs are in the path). The edge adds no caching and
+  no response headers beyond HSTS, so share-public's CSP and `Cache-Control: no-store` reach the browser unchanged;
+  `Origin`, `Sec-Fetch-Dest`, `Range` and `Content-Length` are passed on, `X-Forwarded-Host` is dropped. Disabled, the
+  edge conf is the repo file unchanged and a running share-public is stopped (its bundles stay on disk).
+- Certificate: the edge presents ONE certificate for both hosts (`/etc/acme`); `collab-sync.sh` is unchanged and
+  still manages one lineage. Before enabling shares, add the share host to the existing lineage once, on the
+  certbot host, with the same DNS-01 plugin and flags the lineage was created with:
+  `certbot certonly --cert-name localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d <share host>`
+  (every name the lineage already has must be repeated). Renewals then cover both names. The router and SNI front
+  must also send the share host's name to the edge's port.
 - Edge limits (trade-off): `/s/` allows 100 requests/s per client address with a burst of 300 (parquet range
   reads come in bursts, and campus NAT puts many people behind one address) and 16 concurrent connections per
   address. The total is capped only by the upstream's `max_conns=100` (share-public refuses past 128): a
   handful of heavy clients can take most of it and other viewers then wait or get 502, without a log line
-  per refusal. Lower the rate in `collab-edge/share-http.conf` / `share-location.conf` if abuse shows up.
+  per refusal. Lower the rate in `collab-edge/share-http.conf` if abuse shows up.
 - Edge logging: `/s/` has no access log, but a request nginx refuses before it reaches the `/s/` location
   (malformed request line, oversized headers, TLS or PROXY-protocol errors) can appear in the edge's access or
   error log with its request line, which may contain a token.
@@ -130,10 +145,12 @@ real share server over the bundles in `tests/share-fixtures/` (see its README) a
 reads, the sandbox, CSP blocking, PDF display, revoke and lab sign-in against a fake Cognito.
 
 Operator step, once, before sending lab links (not done by `deploy.sh`): add
-`https://localdev.mcp.metabolomics.us/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
+`<control_plane.share.public_url>/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
 `herdr-collab-web` app client (`aws cognito-idp update-user-pool-client` replaces the whole client: read it
 first with `describe-user-pool-client` and send every existing attribute back with the new URL added). Public
-links need no Cognito change.
+links need no Cognito change. Keep the previous host's `/s/callback` registered until the deploy is verified: a
+rollback to the previous release signs in there. Existing links on the old host stop working at the cutover
+(re-issue them); see docs/operations/collaboration-network.md.
 
 ## Artifact collaborator bridge (`control_plane.collab_artifacts`)
 
@@ -296,5 +313,5 @@ curl -s https://localdev.mcp.metabolomics.us/api/v1/collab/config        # 200
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/collab/rooms   # 401
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/hosts          # 404
 curl -s http://<tailnet-ip>:9482/api/v1/collab/config                    # operator block present
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (shares on or off)
+curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (the MCP host serves no /s/)
 ```

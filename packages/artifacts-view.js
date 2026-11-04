@@ -4,6 +4,7 @@ import { morph } from './patch.js';
 import { pollWhileVisible } from './refresh-bus.js';
 import { mountSharePanel } from './artifact-share-panel.js';
 import { mountHistory } from './artifact-history.js';
+import { liveLink, mountPdf, mountStaticHtml } from './artifact-static-preview.js';
 
 const humanSize = value => {
   const size = Number(value || 0);
@@ -149,21 +150,13 @@ async function renderReportReader(container, client, id, artifact, versions, { v
   const alive = ticket => !disposed && ticket === generation && container.contains(shell);
   const revokeBlobs = () => { for (const url of blobs) URL.revokeObjectURL(url); blobs.clear(); };
 
-  function showPreview(output, content) {
-    const template = document.createElement('template');
-    template.innerHTML = content;
-    // Even fragment links in srcdoc can resolve against the parent SPA URL.
-    // The surrounding reader owns navigation and authenticated downloads.
-    template.content.querySelectorAll('a').forEach(link => link.replaceWith(...link.childNodes));
-    const frame = document.createElement('iframe');
-    frame.title = 'Report preview';
-    frame.setAttribute('sandbox', '');
-    frame.referrerPolicy = 'no-referrer';
-    frame.style.cssText = 'width:100%;min-height:560px;border:1px solid currentColor';
-    frame.srcdoc = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'">${template.innerHTML}`;
-    const note = document.createElement('p');
-    note.textContent = 'Use the surrounding reader controls to navigate findings and download files.';
-    output.replaceChildren(note, frame);
+  // `render` is a render-route response: { kind, html, too_large }. The sanitised copy goes into a contained shadow root.
+  function showPreview(output, render) {
+    if (!render || render.too_large || typeof render.html !== 'string') {
+      output.innerHTML = `<p role="alert">${render?.too_large ? 'This output exceeds the preview limit. Download it instead.' : 'This output type has no static preview. Download it instead.'}</p>`;
+      return;
+    }
+    mountStaticHtml(output, render.html, { label: 'Report preview' });
   }
 
   function showLegacyVersion(version, selected, ticket, signal) {
@@ -177,22 +170,21 @@ async function renderReportReader(container, client, id, artifact, versions, { v
       button.disabled = true;
       output.textContent = preview ? 'Loading preview…' : 'Downloading…';
       try {
+        if (preview) {
+          const render = await client.artifactOutputRender(id, selected, index, { signal });
+          if (alive(ticket)) showPreview(output, render);
+          return;
+        }
         const path = `${client.artifactReportPath(id, selected)}/outputs/${index}`;
         const data = await client.artifactReportContent(path, 'blob', signal);
         if (!alive(ticket)) return;
-        if (preview) {
-          if (data.size > 256 * 1024) throw new Error('This output exceeds the preview limit. Download it instead.');
-          const content = await data.text();
-          if (alive(ticket)) showPreview(output, content);
-        } else {
-          const url = URL.createObjectURL(data);
-          blobs.add(url);
-          const link = document.createElement('a');
-          link.href = url;
-          link.download = (asset.name || `output-${index + 1}`).split(/[\\/]/).pop();
-          link.click();
-          output.textContent = 'Download ready.';
-        }
+        const url = URL.createObjectURL(data);
+        blobs.add(url);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = (asset.name || `output-${index + 1}`).split(/[\\/]/).pop();
+        link.click();
+        output.textContent = 'Download ready.';
       } catch (error) { if (alive(ticket)) output.textContent = `Output unavailable: ${error.message || 'Request failed'}`; }
       finally { if (alive(ticket)) button.disabled = false; }
     }));
@@ -321,9 +313,8 @@ async function renderReportReader(container, client, id, artifact, versions, { v
         const output = body.querySelector('[data-report-preview-result]');
         output.textContent = 'Loading bounded preview…';
         try {
-          const preview = await client.artifactReportPreview(id, selected, { signal });
+          const preview = await client.artifactReportPreviewRender(id, selected, { signal });
           if (!alive(ticket)) return;
-          if (typeof preview !== 'string' || new TextEncoder().encode(preview).length > 1024 * 1024) throw new Error('The preview exceeds its display size limit. Use the individual downloads.');
           showPreview(output, preview);
         } catch (error) {
           if (alive(ticket)) { output.innerHTML = `<p role="alert">Preview unavailable: ${failure(error)}</p>`; body.querySelector('[data-report-preview]').disabled = false; }
@@ -390,6 +381,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
   }
   versionsRead.catch(() => {});
   const mime = artifact.mime_type || 'application/octet-stream';
+  const mediaType = mime.split(';')[0].trim().toLowerCase();
   const url = client.artifactDownloadUrl(id);
   container.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><div class="hd-card"><h2>Preview</h2><div data-artifact-preview>${skeleton('preview', { rows: 1 })}</div></div><div class="hd-card"><dl><dt>Artifact ID</dt><dd><code>${esc(id)}</code></dd><dt>Type</dt><dd>${esc(artifact.artifact_type || 'other')}</dd><dt>MIME</dt><dd>${esc(mime)}</dd><dt>Status</dt><dd>${esc(artifact.status || 'unknown')}</dd><dt>SHA-256</dt><dd><code>${esc(artifact.sha256 || 'versioned blob')}</code></dd></dl></div><div class="hd-card"><h2>Versions</h2><div data-artifact-versions>${skeleton('versions', { rows: 1 })}</div></div><div class="hd-card" data-artifact-share-card><h2>Share</h2><div data-artifact-share></div></div><div class="hd-card"><h2>Review</h2><div data-artifact-reviews>${skeleton('reviews', { rows: 1 })}</div></div><div class="hd-card"><h2>Linked to</h2><div data-artifact-links>${skeleton('links', { rows: 1 })}</div></div>`;
   client.artifactLinks(id, { signal: bounded() }).then(({ links }) => {
@@ -416,7 +408,29 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
     headVersionId: artifact.current_version_id, signal,
   });
   // Only a non-report artifact may fetch the download for its preview.
-  container.querySelector('[data-artifact-preview]').innerHTML = mime === 'application/pdf' ? `<iframe title="PDF preview" src="${esc(url)}" style="width:100%;min-height:640px;border:0"></iframe>` : mime.startsWith('image/') ? `<img src="${esc(url)}" alt="${esc(artifact.original_filename || id)}" style="max-width:100%;max-height:640px;object-fit:contain">` : mime === 'text/html' ? `<iframe title="HTML preview" sandbox src="${esc(url)}" style="width:100%;min-height:640px;border:0"></iframe>` : mime.startsWith('text/') || mime === 'application/json' ? `<a class="hd-btn" href="${esc(url)}" target="_blank" rel="noopener">Open text artifact</a>` : `<a class="hd-btn" href="${esc(url)}" download>Download artifact</a>`;
+  const previewSlot = container.querySelector('[data-artifact-preview]');
+  const imageHtml = `<img src="${esc(url)}" alt="${esc(artifact.original_filename || id)}" style="max-width:100%;max-height:640px;object-fit:contain">`;
+  const textHtml = liveLink(client.artifactLiveUrl(id));
+  const otherHtml = `<a class="hd-btn" href="${esc(url)}" download>Download artifact</a>`;
+  if (mediaType === 'application/pdf' || mediaType === 'text/html') {
+    // No frames: a PDF is drawn on canvases, HTML is the server's sanitised copy; the raw file opens sandboxed in a new tab.
+    previewSlot.innerHTML = `<div data-preview-body>${skeleton('preview', { rows: 1 })}</div><p>${liveLink(client.artifactLiveUrl(id))}</p>`;
+    const body = previewSlot.querySelector('[data-preview-body]');
+    const alive = () => !signal?.aborted && container.isConnected && body.isConnected;
+    const unavailable = message => { if (alive()) body.innerHTML = `<p role="alert">${esc(message)}</p>`; };
+    if (mediaType === 'application/pdf') {
+      client.artifactBytes(id, { signal }).then(bytes => { if (alive()) return mountPdf(body, bytes, { signal }); })
+        .catch(error => unavailable(`Preview unavailable: ${error?.message || 'request failed'}`));
+    } else {
+      client.artifactRender(id, { signal }).then(render => {
+        if (!alive()) return;
+        if (render?.too_large || typeof render?.html !== 'string') unavailable('This file is too large for a static preview. Open the live view or download it.');
+        else mountStaticHtml(body, render.html, { label: 'HTML preview' });
+      }).catch(error => unavailable(`Preview unavailable: ${error?.message || 'request failed'}`));
+    }
+  } else {
+    previewSlot.innerHTML = mediaType.startsWith('image/') ? imageHtml : mediaType.startsWith('text/') || mediaType === 'application/json' ? textHtml : otherHtml;
+  }
   results.push((await Promise.allSettled([reviewsRead]))[0]);
   if (signal?.aborted || !container.isConnected) return;
   const errors = [];
