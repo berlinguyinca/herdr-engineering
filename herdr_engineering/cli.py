@@ -4035,6 +4035,8 @@ def _cmd_cp_web(args) -> int:
         collab.team_roles = normalize_team_roles(getattr(args, "collab_team_roles", None))
         from .control_plane.collab_coordinators import normalize_coordinators
         collab.coordinators = normalize_coordinators(getattr(args, "collab_coordinators", None))
+        from .control_plane.collab_fabric_trust import normalize_fabric_trust
+        collab.fabric_trust = normalize_fabric_trust(getattr(args, "collab_fabric_trust", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
     from .control_plane.rakazo_bridge import rakazo_bridge_config
     try:
@@ -4267,6 +4269,8 @@ COLLAB_CONFIG_KEYS = {
     "team_roles": ("collab_team_roles", dict),
     # team collaboration slice 3: the coordinator role with limits; external people only behind a second flag; YAML only, off
     "coordinators": ("collab_coordinators", dict),
+    # fabric trust slice 1: which tailnet machines may be recognised as fabric peers; YAML only, off by default
+    "fabric_trust": ("collab_fabric_trust", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
@@ -4303,12 +4307,13 @@ def _apply_collab_config(args, cp) -> None:
             from .control_plane.collab_attention import normalize_insights
             from .control_plane.collab_context import normalize_contextual
             from .control_plane.collab_coordinators import normalize_coordinators
+            from .control_plane.collab_fabric_trust import normalize_fabric_trust
             from .control_plane.collab_team_roles import normalize_team_roles
             from .control_plane.collab_team_rooms import normalize_team_rooms
             from .control_plane.collab_workbench import normalize_steering
             try:
                 {"contextual": normalize_contextual, "insights": normalize_insights, "coordinators": normalize_coordinators,
-                 "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}.get(key, normalize_steering)(value)
+                 "fabric_trust": normalize_fabric_trust, "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
@@ -4336,6 +4341,7 @@ HOT_COLLAB_SWITCHES = {
     "team_rooms": ("team_rooms_source", "dict"),
     "team_roles": ("team_roles_source", "dict"),
     "coordinators": ("coordinators_source", "dict"),
+    "fabric_trust": ("fabric_trust_source", "dict"),
     "delegation_enabled": ("delegation_source", "bool"),
     "replay_history": ("replay_history_source", "str"),
 }
@@ -4362,12 +4368,13 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
     from .control_plane.collab_attention import normalize_insights
     from .control_plane.collab_context import normalize_contextual
     from .control_plane.collab_coordinators import normalize_coordinators
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
     from .control_plane.collab_team_roles import normalize_team_roles
     from .control_plane.collab_team_rooms import normalize_team_rooms
     from .control_plane.collab_workbench import normalize_steering
     normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights,
                    "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles,
-                   "coordinators": normalize_coordinators}
+                   "coordinators": normalize_coordinators, "fabric_trust": normalize_fabric_trust}
 
     def check(key, value):
         return normalizers[key](value) if key in normalizers else value
