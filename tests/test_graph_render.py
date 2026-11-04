@@ -103,3 +103,12 @@ def test_below_the_floor_it_is_a_numbered_list():
     lines = render(graph(3), 25)
     assert lines[0].startswith("1.") and any(line.startswith("3.") for line in lines)
     assert not any("┌" in line for line in lines)
+
+
+@pytest.mark.parametrize("width", [30, 31, 40, 60, 120])
+def test_ascii_fallback_is_ascii_for_a_long_cjk_note_in_every_layout(width):
+    g = {"total_prompts": 9, "drift": {"at": 5, "note": "日本語のメモ " * 30 + "…"}, "segments": [
+        {"label": "日本語", "from_prompt": 1, "to_prompt": 4, "count": 4, "start": None, "agents": None},
+        {"label": "second topic with a long label", "from_prompt": 5, "to_prompt": 9, "count": 5, "start": None, "agents": None}]}
+    lines = render_graph(g, width, unicode=False, color=False)
+    assert all(line.isascii() for line in lines), [x for x in lines if not x.isascii()]

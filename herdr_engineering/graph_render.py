@@ -124,7 +124,7 @@ def render_graph(graph: dict, width: int, *, unicode: bool = True, color: bool =
             if sum(visible_width(b[0]) for b in boxes) + _ARROW * (len(boxes) - 1) <= width:
                 row = boxes
                 break
-        out = _row(row, segments, drift_at, g) if row else _column(segments, drift_at, g, width, seg_lines, graph)
+        out = _row(row, segments, drift_at, g) if row else _column(segments, drift_at, g, width, seg_lines, graph, fix)
         if row:
             out += [fix(line) for line in _drift_text(graph, g, width)]
     if not graph.get("drift"):
@@ -159,13 +159,13 @@ def _row(boxes, segments, drift_at, g):
     return rows
 
 
-def _column(segments, drift_at, g, width, seg_lines, graph):
+def _column(segments, drift_at, g, width, seg_lines, graph, fix):
     out = []
     for i, seg in enumerate(segments):
         if i:
             out += ["  " + g["v"], "  " + g["down"]]
             if seg["from_prompt"] == drift_at:
-                out += _drift_text(graph, g, width)
+                out += [fix(line) for line in _drift_text(graph, g, width)]
         out += _box(seg_lines(seg, width - 4), g)
     return out
 

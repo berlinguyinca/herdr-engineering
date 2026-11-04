@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 
 from .control_plane.redact import redact_text
 
@@ -21,17 +22,28 @@ _FENCE = re.compile(r"^```drift-graph[ \t]*\n(.*?)^```[ \t]*$\n?", re.DOTALL | r
 
 
 def extract_block(report: str) -> tuple[str, str | None]:
-    """The report without any ``drift-graph`` fence, and the raw JSON of the first one (None when there is none)."""
-    found = _FENCE.findall(report)
-    if not found:
+    """The report without any ``drift-graph`` fence, and the raw JSON of the block (None unless there is exactly one).
+
+    Two blocks, or one that never closes, give no graph: which one the model meant is a guess. Every trace of a
+    block is removed either way, so nobody sees raw JSON.
+    """
+    if "```drift-graph" not in report:
         return report, None
-    clean = _FENCE.sub("", report)
+    text = report.replace("\r\n", "\n")
+    found = _FENCE.findall(text)
+    clean = _FENCE.sub("", text)
+    open_fence = re.search(r"^```drift-graph", clean, re.MULTILINE)
+    if open_fence:                                   # never closed (or cut off by the report size limit)
+        clean = clean[: open_fence.start()].rstrip("\n") + "\n"
+        found = []
     clean = re.sub(r"\n{3,}", "\n\n", clean)
-    return clean, found[0]
+    return clean, found[0] if len(found) == 1 else None
 
 
 def _clip(text: str, limit: int) -> str:
-    text = " ".join(redact_text(str(text)).split())
+    text = redact_text(str(text))
+    text = "".join(" " if c.isspace() else c for c in text if unicodedata.category(c) not in ("Cc", "Cf") or c.isspace())
+    text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
@@ -53,7 +65,9 @@ def build_graph(raw: str | None, prompts: list[dict], total: int,
         out, expect = [], 1
         for seg in segments:
             first, last = seg.get("from_prompt"), seg.get("to_prompt")
-            label = _clip(seg.get("label") or "", MAX_LABEL)
+            if not isinstance(seg.get("label"), str):
+                return None
+            label = _clip(seg["label"], MAX_LABEL)
             if not (_is_int(first) and _is_int(last) and label):
                 return None
             if first != expect or last < first or last > total or first not in by_n:
@@ -69,11 +83,15 @@ def build_graph(raw: str | None, prompts: list[dict], total: int,
     if dispatch_ts:
         starts = [s["start"] for s in out]
         for i, seg in enumerate(out):
-            lo, hi = starts[i], (starts[i + 1] if i + 1 < len(out) else None)
-            seg["agents"] = sum(1 for t in dispatch_ts if t and lo and t >= lo and (hi is None or t < hi))
+            last = i + 1 == len(out)
+            lo, hi = starts[i], (None if last else starts[i + 1])
+            if not lo or (not last and not hi):          # a boundary with no recorded time: count nothing rather than guess
+                continue
+            seg["agents"] = sum(1 for t in dispatch_ts if t and t >= lo and (hi is None or t < hi))
 
     drift = None
     at = data.get("drift_at")
     if _is_int(at) and at in {s["from_prompt"] for s in out[1:]}:
-        drift = {"at": at, "note": _clip(data.get("drift_note") or "", MAX_NOTE)}
+        note = data.get("drift_note")
+        drift = {"at": at, "note": _clip(note, MAX_NOTE) if isinstance(note, str) else ""}
     return {"total_prompts": total, "segments": out, "drift": drift}

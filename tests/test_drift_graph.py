@@ -20,11 +20,11 @@ GOOD = [{"label": "USB stick", "from_prompt": 1, "to_prompt": 5},
 REPORT = "# Session summary\n\nbody\n\n```drift-graph\n{\"segments\": []}\n```\n\nEvidence coverage: complete\n"
 
 
-def test_extract_block_strips_all_blocks_and_returns_first():
+def test_extract_block_strips_all_blocks_and_gives_no_graph_when_there_are_two():
     text = "# S\n\n```drift-graph\n{\"a\": 1}\n```\n\nmiddle\n\n```drift-graph\n{\"b\": 2}\n```\n\nend\n"
     clean, raw = dg.extract_block(text)
     assert "drift-graph" not in clean and "{" not in clean and "middle" in clean and clean.rstrip().endswith("end")
-    assert json.loads(raw) == {"a": 1}
+    assert raw is None                                       # two blocks: which one the model meant is a guess
     assert "\n\n\n" not in clean
 
 
@@ -119,3 +119,51 @@ def test_agents_counts_dispatches_inside_each_segment_and_is_none_without_dispat
     assert [s["agents"] for s in g["segments"]] == [0, 2]
     assert [s["agents"] for s in dg.build_graph(block(GOOD), ps, 12, dispatch_ts=[])["segments"]] == [None, None]
     assert [s["agents"] for s in dg.build_graph(block(GOOD), ps, 12)["segments"]] == [None, None]
+
+
+def _raw(**over):
+    d = {"segments": [{"label": "A", "from_prompt": 1, "to_prompt": 3}, {"label": "B", "from_prompt": 4, "to_prompt": 6}]}
+    d.update(over)
+    return json.dumps(d)
+
+
+PROMPTS = [{"n": i, "ts": f"2026-01-01T0{i}:00:00Z"} for i in range(1, 7)]
+
+
+def test_control_characters_never_reach_a_label_or_note():
+    raw = _raw(segments=[{"label": "a\x1b[2Jb\x07c", "from_prompt": 1, "to_prompt": 3},
+                         {"label": "B", "from_prompt": 4, "to_prompt": 6}], drift_at=4, drift_note="n\x1b]0;x\x07\u200bm")
+    g = dg.build_graph(raw, PROMPTS, 6)
+    text = g["segments"][0]["label"] + g["drift"]["note"]
+    assert not any(ord(c) < 32 or ord(c) == 127 or c == "\u200b" for c in text)
+    assert g["segments"][0]["label"].startswith("a") and "c" in g["segments"][0]["label"]
+
+
+def test_a_label_or_note_that_is_not_a_string_drops_the_graph():
+    bad = [{"label": ["x"], "from_prompt": 1, "to_prompt": 3}, {"label": "B", "from_prompt": 4, "to_prompt": 6}]
+    assert dg.build_graph(_raw(segments=bad), PROMPTS, 6) is None
+    assert dg.build_graph(_raw(drift_at=4, drift_note=["x"]), PROMPTS, 6)["drift"]["note"] == ""
+
+
+def test_agent_counts_need_both_segment_boundaries_known():
+    prompts = [dict(p) for p in PROMPTS]
+    prompts[3]["ts"] = None                                   # segment 2 starts at an unknown time
+    g = dg.build_graph(_raw(), prompts, 6, ["2026-01-01T06:30:00Z"])
+    assert [s["agents"] for s in g["segments"]] == [None, None]  # segment 1 has no end time, segment 2 no start time
+
+
+def test_two_blocks_drop_the_graph_but_both_are_stripped():
+    block = "```drift-graph\n" + _raw() + "\n```\n"
+    clean, raw = dg.extract_block("# R\n\n" + block + "\n" + block)
+    assert "drift-graph" not in clean and raw is None
+
+
+def test_crlf_blocks_are_found_and_stripped():
+    text = "# R\r\n\r\n```drift-graph\r\n" + _raw() + "\r\n```\r\n"
+    clean, raw = dg.extract_block(text)
+    assert "drift-graph" not in clean and "\r" not in clean and dg.build_graph(raw, PROMPTS, 6) is not None
+
+
+def test_an_unterminated_block_is_stripped_and_gives_no_graph():
+    clean, raw = dg.extract_block("# R\n\nbody\n\n```drift-graph\n" + _raw()[:40])
+    assert "drift-graph" not in clean and "body" in clean and raw is None

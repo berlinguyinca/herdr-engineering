@@ -320,7 +320,7 @@ def test_view_renders_through_the_viewer_loop_then_closes_its_pane_and_its_peer(
     text = "\n".join(drawn["lines"])
     assert "**" not in text and "# " not in text and "\x1b[" in text
     assert all(visible_width(line) <= 50 for line in drawn["lines"])
-    assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pA"]          # itself first, then its peer
+    assert [c[3] for c in _closes(calls)] == ["w1:pA", "w1:p9"]          # the peer first: closing our own pane may end this process
 
 
 def test_view_honours_no_color(tmp_path, monkeypatch):
@@ -341,7 +341,7 @@ def test_view_still_closes_both_panes_when_the_viewer_fails_or_is_interrupted(tm
         def viewer(render, **kw):
             raise exc
         assert sr.view_report(f, close_pane="w1:p9", peer_pane="w1:pA", run=_recorder(calls), out=_Tty(True), viewer=viewer) == 1
-        assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pA"]
+        assert [c[3] for c in _closes(calls)] == ["w1:pA", "w1:p9"]
 
 
 def test_a_peer_pane_that_is_already_gone_is_not_an_error(tmp_path):
@@ -350,7 +350,7 @@ def test_a_peer_pane_that_is_already_gone_is_not_an_error(tmp_path):
     calls = []
     assert sr.view_report(f, close_pane="w1:p9", peer_pane="w1:pA", run=_recorder(calls, fail_on="w1:pA"),
                           out=_Tty(True), viewer=lambda render, **kw: 0) == 0
-    assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pA"]
+    assert [c[3] for c in _closes(calls)] == ["w1:pA", "w1:p9"]
 
     def exploding(argv, **kw):
         raise FileNotFoundError("herdr")
@@ -373,7 +373,7 @@ def test_view_closes_its_panes_even_if_the_report_is_missing(tmp_path):
     calls = []
     assert sr.view_report(tmp_path / "gone.md", close_pane="w1:p9", peer_pane="w1:pA", run=_recorder(calls),
                           out=_Tty(True), viewer=lambda render, **kw: 0) == 1
-    assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pA"]
+    assert [c[3] for c in _closes(calls)] == ["w1:pA", "w1:p9"]
 
 
 GRAPH = {"total_prompts": 12, "drift": {"at": 6, "note": "web page task"}, "segments": [
@@ -398,7 +398,7 @@ def test_graph_viewer_draws_the_sidecar_and_closes_itself_then_its_peer(tmp_path
     text = "\n".join(drawn["lines"])
     assert "USB stick" in text and "web page" in text and "Looks like a new task" in text
     assert drawn["kw"]["scroll"] is True                                   # a column graph can be taller than its pane
-    assert [c[3] for c in _closes(calls)] == ["w1:pB", "w1:p9"]
+    assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pB"]
 
 
 def test_graph_viewer_follows_the_pane_width_and_output_encoding(tmp_path):
@@ -419,7 +419,7 @@ def test_graph_viewer_without_a_usable_sidecar_closes_and_returns_1(tmp_path, co
     calls = []
     assert sr.view_graph(f, close_pane="w1:pB", peer_pane="w1:p9", run=_recorder(calls), out=_Tty(True),
                          viewer=lambda render, **kw: 0) == 1
-    assert [c[3] for c in _closes(calls)] == ["w1:pB", "w1:p9"]
+    assert [c[3] for c in _closes(calls)] == ["w1:p9", "w1:pB"]
 
 
 def test_graph_viewer_without_a_terminal_prints_the_graph(tmp_path):

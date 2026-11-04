@@ -316,7 +316,7 @@ def _open_panes(file, pane_id, env, run, herdr, build):
 
 
 def _close_panes(run, herdr, *panes):
-    """Close each pane in turn; one that is already gone, or a herdr that cannot be run, is not an error."""
+    """Close each pane in turn (the caller passes its own pane last: closing it may end this process); one that is already gone, or a herdr that cannot be run, is not an error."""
     for pane in panes:
         if pane:
             try:
@@ -335,7 +335,7 @@ def _view(draw, out, viewer, title, scroll, run, herdr, close_pane, peer_pane):
     except (Exception, KeyboardInterrupt):
         return 1
     finally:
-        _close_panes(run, herdr, close_pane, peer_pane)
+        _close_panes(run, herdr, peer_pane, close_pane)
 
 
 def view_report(file, *, close_pane=None, peer_pane=None, run=subprocess.run, out=None, herdr="herdr",
@@ -352,7 +352,7 @@ def view_report(file, *, close_pane=None, peer_pane=None, run=subprocess.run, ou
     try:
         text = Path(file).read_text()
     except OSError:
-        _close_panes(run, herdr, close_pane, peer_pane)
+        _close_panes(run, herdr, peer_pane, close_pane)
         return 1
 
     def draw(width, _height):
@@ -375,7 +375,7 @@ def view_graph(file, *, close_pane=None, peer_pane=None, run=subprocess.run, out
         if not isinstance(graph, dict) or not graph.get("segments"):
             raise ValueError("unusable graph")
     except (OSError, ValueError):
-        _close_panes(run, herdr, close_pane, peer_pane)
+        _close_panes(run, herdr, peer_pane, close_pane)
         return 1
     color = os.environ.get("NO_COLOR") is None
     unicode = "utf" in (getattr(out, "encoding", None) or "utf-8").lower()
