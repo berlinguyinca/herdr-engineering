@@ -46,6 +46,16 @@ tests pass, including a deliberately stale wrapper distribution.
 
 ## Remaining boundaries
 
+Real Claude and Pi sessions retrieved synthetic private validation tokens using
+the installed MCP surface and documented CLI fallback respectively. Their
+synthetic memories were deleted afterward. A real Codex session exposed a
+different issue: the unconfigured MCP tool approval policy refused recall when
+approvals were unavailable. Adapter 3 adds a tool-specific recall approval and
+keeps retention approval-gated. A subsequent actual Codex session with the
+candidate policy completed the MCP call, retrieved the unknown reply token,
+and its synthetic memory was deleted afterward. Merely listing an MCP tool did
+not establish that it could execute.
+
 The older automatic summary adapters are not installed by this reconciliation.
 The current installer explicitly advertises automatic retention as unsupported.
 If completion summaries are added, integrate them into the existing installer

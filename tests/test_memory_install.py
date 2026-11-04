@@ -202,6 +202,21 @@ def test_codex_hooks_trust_never_written(home):
     assert "hooks.state" not in (home / ".codex/config.toml").read_text()
 
 
+def test_codex_approves_only_memory_recall_and_preserves_other_tool_policies(home):
+    path = home / '.codex/config.toml'
+    path.parent.mkdir()
+    path.write_text('[mcp_servers.other]\ncommand = "other"\ndefault_tools_approval_mode = "prompt"\n')
+    result = inst(home, which_only('codex')).install()
+    assert result.ok
+    config = tomllib.loads(path.read_text())
+    memory = config['mcp_servers']['herdr-memory']
+    assert memory['tools']['memory_recall']['approval_mode'] == 'approve'
+    assert memory['tools']['memory_retain']['approval_mode'] == 'prompt'
+    assert 'default_tools_approval_mode' not in memory
+    assert config['mcp_servers']['other']['default_tools_approval_mode'] == 'prompt'
+    assert 'approval_policy' not in config and 'hooks' not in config
+
+
 # ---- credentials / doctor -------------------------------------------------
 def write_cfg(home, cred, extra=None):
     cfg = home / ".config/herdr-memory/config.json"
