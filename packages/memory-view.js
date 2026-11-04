@@ -123,7 +123,7 @@ export function renderDrawer(d) {
 
 export function renderStatus(s) {
   const wrap = (inner) => `<section class="mem-status" aria-labelledby="mem-status-h"><h2 id="mem-status-h">Integration status</h2>${inner}</section>`;
-  if (s.phase === 'loading') return wrap(skeleton('integration status', { rows: 1, height: 64 }));
+  if (s.phase === 'loading') return wrap(skeleton('integration status', { rows: 3, height: 54 }));
   if (s.phase === 'forbidden') return wrap('<p class="mem-note">You do not have access to memory status.</p>');
   if (s.phase === 'disabled') return wrap('<p class="mem-note">Memory is not enabled on this control plane.</p>');
   if (s.phase === 'unavailable') return wrap('<p class="mem-note" role="alert"><strong>Memory service unavailable.</strong> Service health, queue depth and versions are UNKNOWN.</p>');

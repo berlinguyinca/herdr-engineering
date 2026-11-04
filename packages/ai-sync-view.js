@@ -68,11 +68,14 @@ export function renderAiSync(data, now = Date.now()) {
 
 export const AI_SYNC_POLL_MS = 30000;
 
-export function mountAiSync(root, client, data) {
+export function mountAiSync(root, client, data, { freshness } = {}) {
   root.innerHTML = `${AI_SYNC_STYLE}<section class="ai-sync-page"><div class="hd-live-head"><h1>AI sync</h1><herdr-freshness interval="30000"></herdr-freshness></div>
     <p>Config sync (ai-sync) on every machine. Warns after 1 hour without a sync, stale after 24 hours. Reports counts and file paths only, never contents.</p><div data-ais-list></div></section>`;
   const list = root.querySelector('[data-ais-list]');
   const paint = () => { list.innerHTML = renderAiSync(data); };
   paint();
-  return pollWhileVisible(async () => { try { data = await client.listAiSync(); paint(); } catch { /* keep the last list */ } }, AI_SYNC_POLL_MS);
+  return pollWhileVisible(async () => {
+    try { data = await client.listAiSync(); paint(); freshness?.(true); }
+    catch (err) { freshness?.(false, err?.message || 'request failed'); }     // keep the last list, but say the page is no longer current
+  }, AI_SYNC_POLL_MS);
 }
