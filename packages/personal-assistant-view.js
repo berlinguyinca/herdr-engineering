@@ -58,12 +58,15 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   let state = { assistants: [], selectedId: null, tab: 'General' };
   let graphState = { phase: 'loading' };
 
+  let loaded = false;
   const render = async () => {
-    container.innerHTML = skeleton('Personal Assistant');
+    // Only the first load shows the placeholder: a refresh after unlink/archive/create keeps the page on screen until the new list lands.
+    if (!loaded) container.innerHTML = skeleton('Personal Assistant', { rows: 5, height: 64 });   // sized to the page that replaces it
     try {
       const { assistants = [] } = await client.listAssistants();
       if (disposed) return;
       state.assistants = assistants;
+      loaded = true;
       if (!state.selectedId && assistants.length) state.selectedId = assistants[0].assistant_id;
       draw();
       onFreshness(true);
