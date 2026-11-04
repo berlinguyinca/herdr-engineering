@@ -252,5 +252,8 @@ With that, durable write/read works from anywhere: five evidenced records (`herd
 `/tmp` on bender, including a record written on one host and read on the other. The retention
 gate earned its keep - `retain` rejected every write until `--explicit`/`--evidence` were given.
 Full evidence: [`audit/DRILLS_20261104.md`](audit/DRILLS_20261104.md) §14, including the one
-operator action still open (bender's controller checkout is 41 tracked files dirty at
-`06e3d501`, so unattended updates will skip it, not fail it, until it is cleaned).
+operator action still open - and it is self-blocking: bender's controller checkout is 41 tracked
+files dirty at `06e3d501`, and that checkout *is* the nightly runner, so #572's `skip` behaviour
+is not in the code that runs there yet. bender keeps failing nightly until the operator cleans
+and fast-forwards it, or removes it from `controller_updates` and lets the pinned install path own
+the tooling.
