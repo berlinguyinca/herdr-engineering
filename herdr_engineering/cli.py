@@ -75,6 +75,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--record", action="store_true",
                    help="opt-in: run the child (instead of exec) and append timing/CPU/IO/"
                         "sccache events to <state>/build-gates/builds.jsonl")
+    p.add_argument("--require-cache-enabled", action="store_true",
+                   help="only coordinate when fabric_build_cache is enabled; otherwise "
+                        "run the command directly, ungated and unrecorded (spec 08)")
+    p.add_argument("--trace-session", default=None, metavar="ID",
+                   help="agent session id to record with --record (validated, non-secret ids only)")
+    p.add_argument("--trace-mission", default=None, metavar="ID",
+                   help="agent mission/task id to record with --record (validated)")
     p.add_argument("--status", action="store_true",
                    help="print current build-gate occupancy (and recorded-build summary) and exit")
     p.add_argument("--json", action="store_true",
@@ -2789,11 +2796,34 @@ def _cmd_build_coordinate(args) -> int:
     cmd = args.command
     if cmd and cmd[0] == "--":  # argparse REMAINDER keeps a leading `--`
         cmd = cmd[1:]
+    if cmd and (_is_gate_command(cmd) or (
+            getattr(args, "require_cache_enabled", False) and cache_cfg is None)):
+        # Already coordinated (never nest a gate), or the cache is not enabled
+        # and the caller only wanted coordination for it: run the original.
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError as exc:
+            print(f"build-coordinate: could not exec {cmd[0]}: {exc}", file=sys.stderr)
+            return 127
+    from .build_metrics import make_trace
+    trace = make_trace(getattr(args, "trace_session", None),
+                       getattr(args, "trace_mission", None))
+    if getattr(args, "trace_session", None) and trace is None:
+        print("build-coordinate: --trace-session ignored (not a plain non-secret id)",
+              file=sys.stderr)
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
                      record=getattr(args, "record", False),
-                     cache_config=cache_cfg)
+                     cache_config=cache_cfg, trace=trace)
+
+
+def _is_gate_command(cmd: list[str]) -> bool:
+    """True when ``cmd`` is itself a build-coordinate call or a sccache run."""
+    names = [os.path.basename(t) for t in cmd[:2]]
+    return names[0] == "sccache" or (
+        names[0] in ("herdr-eng", "herdr-engineering") and len(cmd) > 1
+        and cmd[1] == "build-coordinate")
 
 
 def _build_cache_config():

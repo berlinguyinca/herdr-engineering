@@ -224,7 +224,8 @@ class BuildGate:
 
 def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
             slot_fd: int | None = None, env: dict[str, str] | None = None,
-            cache: dict | None = None) -> int:
+            cache: dict | None = None,
+            trace: dict[str, str] | None = None) -> int:
     """exec ``cmd`` (default) or, with ``record``, run it measured and return its code."""
     if not record:
         os.execvp(cmd[0], cmd)
@@ -232,7 +233,7 @@ def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
     from .build_metrics import run_measured
     try:
         return run_measured(cmd, state_dir=state_dir, slot=slot, env=env,
-                            cache=cache, registry=True).exit_code
+                            cache=cache, registry=True, trace=trace).exit_code
     finally:
         # Held until the child is reaped above; only now may the slot be freed.
         if slot_fd is not None:
@@ -247,7 +248,8 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
               state_dir: Path | None = None,
               bypass_on_timeout: bool = False, record: bool = False,
               child_env: dict[str, str] | None = None,
-              cache: dict | None = None) -> int:
+              cache: dict | None = None,
+              trace: dict[str, str] | None = None) -> int:
     """Run ``cmd`` under the per-host build gate.
 
     This is the entry point for ``herdr-eng build-coordinate``. It acquires a
@@ -294,7 +296,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
             print(f"build-coordinate: {exc}; running ungated (bypass-on-timeout)",
                   file=sys.stderr)
             try:
-                return _launch(cmd, record, None, gate.dir, None, child_env, cache)
+                return _launch(cmd, record, None, gate.dir, None, child_env, cache, trace)
             except OSError as e:
                 if json_out:
                     print(json.dumps({"error": f"could not exec {cmd[0]}: {e}"},
@@ -313,7 +315,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
     try:
         # Default: replaces this process; flock held by fd. With ``record`` the
         # parent stays alive holding every lock fd until the child exits.
-        return _launch(cmd, record, _slot, gate.dir, fd, child_env, cache)
+        return _launch(cmd, record, _slot, gate.dir, fd, child_env, cache, trace)
     except OSError as exc:
         if fd is not None and not record:  # record mode already closed it
             try:
@@ -360,7 +362,8 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
               wait_seconds: float = 0.0, json_out: bool = False,
               state_dir: Path | None = None,
               bypass_on_timeout: bool = False, record: bool = False,
-              cache_config: BuildCacheConfig | None = None) -> int:
+              cache_config: BuildCacheConfig | None = None,
+              trace: dict[str, str] | None = None) -> int:
     """Hold a maintenance read lock for the entire build, even on slot bypass.
 
     Cleanup takes the exclusive side of this lock. The inheritable descriptor
@@ -386,7 +389,7 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
         return _run_gated(cmd, slots=slots, max_load=max_load,
                           wait_seconds=wait_seconds, json_out=json_out,
                           state_dir=state_dir, bypass_on_timeout=bypass_on_timeout,
-                          record=record, child_env=child_env, cache=cache)
+                          record=record, child_env=child_env, cache=cache, trace=trace)
     finally:
         if maintenance_fd is not None:
             os.close(maintenance_fd)

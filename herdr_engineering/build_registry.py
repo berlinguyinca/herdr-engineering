@@ -669,7 +669,8 @@ class BuildRun:
     @classmethod
     def open(cls, state_dir: str | os.PathLike[str], *, cwd: str, cmd_kind: str,
              host: str, cmd: list[str], toolchain_digest: str | None = None,
-             build_id: str | None = None, ttl_s: float | None = None) -> BuildRun:
+             build_id: str | None = None, ttl_s: float | None = None,
+             owner_session: str | None = None, mission_id: str | None = None) -> BuildRun:
         run = cls()
         run._ttl = DEFAULT_LEASE_TTL_S if ttl_s is None else ttl_s
         try:
@@ -679,7 +680,8 @@ class BuildRun:
             run.reg = run.registry.register(
                 repo_id=repo_id, source_rev=rev, input_digest=digest,
                 toolchain_digest=toolchain_digest, profile=profile, cmd_kind=cmd_kind,
-                trust_domain=f"uid:{os.getuid()}", host=host, build_id=build_id)
+                trust_domain=f"uid:{os.getuid()}", host=host, build_id=build_id,
+                owner_session=owner_session, mission_id=mission_id)
             aid = run.reg.attempt_id
             run.registry.transition(aid, "classified", "classified")
             run.registry.transition(aid, "admitted", "gate_slot_held")

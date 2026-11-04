@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import socket
@@ -33,14 +34,19 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 SCCACHE_TIMEOUT_S = 2.0
 MAX_LOG_BYTES = 5 * 1024 * 1024
 MAX_EVENT_BYTES = 4000
 SAMPLE_INTERVAL_S = 0.1
 _SECTOR = 512
-_CMD_KINDS = ("cargo build", "cargo test", "cargo check", "cargo clippy", "tsc")
+_CMD_KINDS = ("cargo build", "cargo test", "cargo check", "cargo clippy", "cargo nextest",
+              "tsc", "rustc")
+TRACE_ID_MAX = 64
+_TRACE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
+_SECRETISH = ("token", "secret", "passw", "key", "cred", "auth", "bearer")
+_SECRET_PREFIXES = ("sk-", "ghp_", "gho_", "ghs_", "github_pat", "xox", "akia", "asia", "eyj")
 
 FINISHED_FIELDS = (
     "event", "ts", "build_id", "host", "slot", "cmd_kind", "exit_code",
@@ -58,6 +64,7 @@ class BuildStarted(TypedDict):
     slot: int | None
     cmd_kind: str
     cache: dict[str, Any] | None
+    trace: NotRequired[dict[str, str]]
 
 
 class BuildFinished(TypedDict):
@@ -79,6 +86,7 @@ class BuildFinished(TypedDict):
     sccache_stats: dict[str, float] | None
     unavailable: list[str]
     cache: dict[str, Any] | None  # spec 03 plan outcome; never paths/env values
+    trace: NotRequired[dict[str, str]]  # spec 08 agent trace; ids only
 
 
 _warned = False
@@ -100,6 +108,41 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
+def sanitize_trace_id(value: object) -> str | None:
+    """Return ``value`` if it is a short, plainly non-secret identifier, else None.
+
+    Charset ``[A-Za-z0-9._:-]``, 1..64 chars, first char alphanumeric; anything
+    that looks like a credential (known prefixes, secret-ish words, or a long
+    separator-free alphanumeric blob) is refused rather than recorded.
+    """
+    if not isinstance(value, str) or not 1 <= len(value) <= TRACE_ID_MAX:
+        return None
+    if _TRACE_ID_RE.fullmatch(value) is None:
+        return None
+    low = value.lower()
+    if low.startswith(_SECRET_PREFIXES) or any(w in low for w in _SECRETISH):
+        return None
+    if len(value) >= 40 and value.isalnum():
+        return None
+    return value
+
+
+def make_trace(session: object, mission: object = None) -> dict[str, str] | None:
+    """Agent trace fields for build events: ids only, never argv/env/secrets.
+
+    A session id is required (without one there is nothing to correlate);
+    an invalid mission id is dropped on its own.
+    """
+    sid = sanitize_trace_id(session)
+    if sid is None:
+        return None
+    trace = {"session": sid, "source": "pi"}
+    mid = sanitize_trace_id(mission)
+    if mid is not None:
+        trace["mission"] = mid
+    return trace
+
+
 def classify_cmd(cmd: list[str]) -> str:
     """Map a command to a small allowlisted kind; never returns argv values."""
     try:
@@ -108,6 +151,8 @@ def classify_cmd(cmd: list[str]) -> str:
             toks = toks[1:]
         if toks[0] == "tsc":
             return "tsc"
+        if toks[0] == "rustc":
+            return "rustc"
         if toks[0] == "cargo":
             rest = [t for t in toks[1:] if not t.startswith("+")]
             if rest:
@@ -327,7 +372,8 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
                  slot: int | None = None, cwd: str | None = None,
                  emit: bool = True, env: dict[str, str] | None = None,
                  cache: dict[str, Any] | None = None,
-                 registry: bool = False) -> Measured:
+                 registry: bool = False,
+                 trace: dict[str, str] | None = None) -> Measured:
     """Fork+exec ``cmd``, wait with wait4, return its exit code and metrics.
 
     The caller keeps any lock fds open for the duration of this call (inheritable
@@ -352,10 +398,14 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
         run = BuildRun.open(
             state_dir, cwd=os.path.realpath(cwd or os.getcwd()), cmd_kind=kind, host=host,
             cmd=cmd, build_id=build_id,
-            toolchain_digest=(cache or {}).get("fingerprint"))
+            toolchain_digest=(cache or {}).get("fingerprint"),
+            owner_session=(trace or {}).get("session"),
+            mission_id=(trace or {}).get("mission"))
         if run.build_id:
             build_id = run.build_id
             extra = run.ids()
+    if trace:
+        extra = {**extra, "trace": dict(trace)}
     if emit and state_dir is not None:
         append_event(state_dir, {**BuildStarted(
             event="build_started", ts=_now_iso(), build_id=build_id, host=host,
