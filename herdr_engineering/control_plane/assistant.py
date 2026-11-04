@@ -47,6 +47,7 @@ from typing import Any, Protocol
 from . import placement, slurm_placement
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.events import WorkerEvent, event_size
+from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
 from .assistant_hub.verbs import Verb
 from .assistant_hub.vetoes import FIXED_VETOES
 from .assistant_hub.workers import Enrollment, Worker
@@ -360,6 +361,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "ci_watch": ci_watch_config(section.get("ci_watch")),
         # Scheduled inbox watch (inbox_watch.py): new mail goes to the assistant as one triage turn; off unless enabled.
         "inbox_watch": inbox_watch_config(section.get("inbox_watch")),
+        # Team collaboration slice 4 (assistant_briefs.py): derived briefs to a team; off unless enabled; no key skips approval.
+        "team_briefs": team_briefs_config(section.get("team_briefs")),
         # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
         "apps": apps_config(section.get("apps")),
         # Tailnet-only MCP hub: off unless enabled; the tenant defaults to the section's default tenant.
@@ -1947,6 +1950,7 @@ class AssistantStore:
         self.connectors: dict[str, Connector] = {}
         self.delegations: dict[str, DelegationRequest] = {}
         self.proposals: dict[str, AssistantProposal] = {}
+        self.team_briefs: dict[str, TeamBriefRecord] = {}          # reference -> the private record of one offered brief
         self.notifications: dict[str, AssistantNotification] = {}
         self.workers: dict[str, Worker] = {}
         self.enrollments: dict[str, Enrollment] = {}
@@ -2022,6 +2026,7 @@ class AssistantStore:
                 "connectors": [self._e_to_dict(c) for c in self.connectors.values()],
                 "delegations": [self._e_to_dict(d) for d in self.delegations.values()],
                 "proposals": [self._e_to_dict(x) for x in self.proposals.values()],
+                "team_briefs": [self._e_to_dict(x) for x in self.team_briefs.values()],
                 "notifications": [self._e_to_dict(x) for x in self.notifications.values()],
                 "workers": [self._e_to_dict(x) for x in self.workers.values()],
                 "enrollments": [self._e_to_dict(x) for x in self.enrollments.values()],
@@ -2060,6 +2065,8 @@ class AssistantStore:
                                 (self._e_from_dict(DelegationRequest, d) for d in snap.get("delegations", []))}
             self.proposals = {x.proposal_id: x for x in
                               (self._e_from_dict(AssistantProposal, d) for d in snap.get("proposals", []))}
+            self.team_briefs = {x.reference: x for x in
+                                (self._e_from_dict(TeamBriefRecord, d) for d in snap.get("team_briefs", []))}
             self.notifications = {x.notification_id: x for x in
                                   (self._e_from_dict(AssistantNotification, d)
                                    for d in snap.get("notifications", []))}
@@ -2550,6 +2557,21 @@ class AssistantStore:
             key=lambda c: c.created_at)
 
     # -- delegations ---------------------------------------------------------------
+    def put_team_brief_required(self, rec: TeamBriefRecord) -> None:
+        """Store one brief record and acknowledge durable persistence, or raise (and leave the store as it was). The collab log
+        is only written after this returns, so a crash can lose the log entry but never the reference."""
+        with self._lock:
+            previous = self.team_briefs.get(rec.reference)
+            self.team_briefs[rec.reference] = rec
+            try:
+                self._persist_required()
+            except Exception:
+                if previous is None:
+                    self.team_briefs.pop(rec.reference, None)
+                else:
+                    self.team_briefs[rec.reference] = previous
+                raise
+
     def put_delegation(self, d: DelegationRequest) -> None:
         with self._lock:
             d.updated_at = _now()
@@ -2758,6 +2780,13 @@ class AssistantService:
         self.ci_rerun_request = None   # same signature; queues a ci_rerun (restart that CI run) proposal beside the repair
         self.ci_repo_scope = None      # (tenant, user, "owner/name") -> bool: is the repo in this user's board scope (pre-filter)
         self.ci_snapshot = None        # callable -> CI monitor snapshot (cache read); a second source of failed runs for watch_ci
+        # Team collaboration slice 4 (assistant_briefs.py). Both hooks are wired by the control plane and absent means "not available".
+        self.mail_source = None        # (tenant, user, message id) -> a Gmail users.messages.get dict (raises LookupError when absent)
+        self.brief_submitter = None    # (collab_user, room_id, brief dict) -> dict: the collab service's in-process submit_brief
+        self.team_briefs = TeamBriefService(self)
+        if self.config["team_briefs"]["enabled"] and not self.store.supports_required_persistence:
+            raise ValueError("control_plane.personal_assistant.team_briefs requires acknowledged assistant persistence "
+                             "(personal_assistant.persistence.dsn): the brief reference must survive a restart")
         if runner is not None:
             self.runner = runner
         else:
