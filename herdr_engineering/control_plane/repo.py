@@ -26,7 +26,7 @@ from uuid import uuid4
 
 from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from ..llm_session_id import dashboard_form
-from . import llm_stats, usage_spend
+from . import llm_stats, review_refs, usage_spend
 from .agent_identity import (
     AgentIdentityConflict,
     AgentIdentityRegistry,
@@ -54,7 +54,6 @@ from .ids import new_id, validate_mission_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
-from . import review_refs
 from .service_catalog import (
     INACTIVE,
     capture_service_origin,
@@ -1152,7 +1151,7 @@ class ControlPlaneRepo:
             ),
         )
 
-    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=(), deny_tags=(), reason=None):
+    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=None, deny_tags=None, reason=None):
         """Update scheduler policy with optimistic concurrency and an audit event."""
         with self.scheduler_admission():
             return self._set_host_policy(host_id, mode=mode, expected_revision=expected_revision,
@@ -1169,8 +1168,10 @@ class ControlPlaneRepo:
         next_policy = {
             "mode": mode.value,
             "revision": int(current.get("revision", 0)) + 1,
-            "allow_tags": sorted({str(v).strip().lower() for v in allow_tags if str(v).strip()}),
-            "deny_tags": sorted({str(v).strip().lower() for v in deny_tags if str(v).strip()}),
+            "allow_tags": sorted({str(v).strip().lower() for v in (
+                current.get("allow_tags", ()) if allow_tags is None else allow_tags) if str(v).strip()}),
+            "deny_tags": sorted({str(v).strip().lower() for v in (
+                current.get("deny_tags", ()) if deny_tags is None else deny_tags) if str(v).strip()}),
             "reason": str(reason)[:300] if reason else None,
         }
         self.record_event("host", host_id, "HostPolicyChanged", next_policy, require_durable=True)

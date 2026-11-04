@@ -3417,7 +3417,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:
-                    return self._json(server.scheduler.overview())
+                    return self._json({**server.scheduler.overview(), "admission_enabled": server.scheduler_admission})
                 if parts[4:] == ["queue"]:
                     return self._json({"queue": server.scheduler.overview()["queue"]})
                 return self._json({"error": "not found"}, 404)
@@ -4106,8 +4106,8 @@ def _make_handler(server, public=False, operator=False):
                             return self._json({"error": "host not found"}, 404)
                         updated = r.set_host_policy(host["host_id"], mode=body.get("mode"),
                                                     expected_revision=body.get("expected_revision"),
-                                                    allow_tags=body.get("allow_tags", ()),
-                                                    deny_tags=body.get("deny_tags", ()),
+                                                    allow_tags=body.get("allow_tags"),
+                                                    deny_tags=body.get("deny_tags"),
                                                     reason=body.get("reason"))
                         return self._json(updated)
                 except KeyError:
@@ -4780,7 +4780,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):
-            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant import (
+                AssistantError,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant
