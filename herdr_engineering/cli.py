@@ -365,6 +365,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_share_subparser(asub)
     from .artifact_collab_client import add_collab_subparser
     add_collab_subparser(asub)
+    from .artifact_delete_client import add_delete_subparsers
+    add_delete_subparsers(asub)
     from .artifact_browse_client import add_browse_subparsers
     add_browse_subparsers(asub)
     from .teams_client import add_teams_subparser
