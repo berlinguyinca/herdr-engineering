@@ -801,6 +801,31 @@ def test_team_roles_settings_are_yaml_only_validated_and_off_by_default(tmp_path
             fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, team_roles=bad))))
 
 
+def test_coordinators_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+
+    import pytest as _pytest
+
+    from herdr_engineering.control_plane.collab_coordinators import normalize_coordinators
+    assert "coordinators" in fcc.COLLAB_KEYS and "coordinators" in cli.COLLAB_CONFIG_KEYS
+    assert "coordinators" in cli.HOT_COLLAB_SWITCHES                                # read per request, fail closed
+    cfg = normalize_coordinators(None)
+    assert cfg["enabled"] is False and cfg["external"]["enabled"] is False
+    assert cfg["tasks_per_hour"] == 20 and cfg["external"]["tasks_per_hour"] == 5
+    good = {"enabled": True, "tasks_per_hour": 10, "external": {"enabled": True, "tasks_per_hour": 3}}
+    central = make_file(tmp_path, collab=dict(COLLAB, coordinators=good))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["coordinators"]["external"]["tasks_per_hour"] == 3
+    args = argparse.Namespace(collab_coordinators=None)
+    cli._apply_collab_config(args, {"collab": {"coordinators": good}})
+    assert args.collab_coordinators == good
+    for bad in ({"kill_switch": "no"}, {"unknown": 1}, {"tasks_per_hour": 0}, {"external": {"enabled": "yes"}},
+                {"external": {"tasks_per_hour": 20}}, {"external": {"nope": 1}}, {"tasks_per_hour": 4, "external": {"tasks_per_hour": 4}}):
+        with _pytest.raises(SystemExit):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"coordinators": bad}})
+        with _pytest.raises(fcc.FleetConfigError):
+            fcc.collab_values(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, coordinators=bad))))
+
+
 def test_collab_skills_slice_is_accepted_and_forwarded(tmp_path):
     central = make_file(tmp_path, collab=dict(COLLAB, skills={"enabled": True}))
     values = fcc.collab_values(fcc.load_fleet_config(central))

@@ -38,6 +38,7 @@ from . import collab_models, ids, logfile_lock, placement
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_federation import FederationMixin
+from .collab_coordinators import CoordinatorsMixin
 from .collab_team_roles import ROLE_FIELDS, TeamRolesMixin
 from .collab_team_rooms import TeamRoomsMixin
 from .collab_workbench import WorkbenchMixin
@@ -387,7 +388,8 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin):
+class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin,
+                    CoordinatorsMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -535,6 +537,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._init_federation()
         self._init_team_rooms()
         self._init_team_roles()
+        self._init_coordinators()
 
     # ------------------------------------------------------------ plumbing
     @property
