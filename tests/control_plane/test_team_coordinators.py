@@ -25,6 +25,7 @@ from herdr_engineering.control_plane.collab_team_rooms import normalize_team_roo
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane.test_collab import BASE, Api, Clock, _digest
 from tests.control_plane.test_team_rooms import USERS
+from tests.control_plane.wg_pg import wg, wg_pg  # noqa: F401
 
 TEAM = "team-" + "c" * 20
 TEAM2 = "team-" + "d" * 20
@@ -463,3 +464,132 @@ def test_a_to_b_to_c_to_a_is_refused_with_the_flag_and_allowed_without_it(cp):
     assert out["code"] == "coordination_loop"
     p.svc.coordinators = normalize_coordinators(None)           # flag off: slice 2 behaviour, the chain is allowed
     chain(201)
+
+
+# ============================================================== revoking an operator-owned coordinator
+def reborn(p, tmp_path):
+    svc = _service(tmp_path, p.clock, name="reborn")
+    svc.hydrate(p.svc._log)
+    return svc
+
+
+def owner_pr(svc):
+    return svc.authenticate(f"Bearer {USERS['alice']}", None)
+
+
+def test_clearing_the_coordinator_cancels_its_open_work_stops_new_work_and_survives_a_restart(cp, tmp_path):
+    p = cp
+    held, rev, coord = crew(p)
+    root = root_for(p, coord)
+    c1 = p.make(coord, target_role="implementer", parent_task_id=root, text="one")[1]
+    c2 = p.make(coord, target_role="implementer", parent_task_id=root, text="two")[1]
+    holder = next(a for a in held if a["agent_id"] == c1["routed_to"][6:])
+    p.accept(holder, c1["task_id"])
+    s, out = p.clear_coord()
+    assert s == 200 and sorted(out["cancelled"]) == sorted([c1["task_id"], c2["task_id"]]) and out["requeued"] == []
+    for a in held:
+        assert p.inbox(a) == []
+    assert p.make(coord, target_role="implementer", parent_task_id=root)[0] == 404         # its access went with the designation
+    assert p.view_coord()[1]["holder"] is None
+    n = len(p.svc._log)
+    assert p.clear_coord()[1]["replayed"] is True and len(p.svc._log) == n                 # repeating changes nothing
+    again = reborn(p, tmp_path)
+    assert again.view_team_coordinator(owner_pr(again), p.room, TEAM)["holder"] is None
+    assert [t["status"] for t in again._tasks.values() if t.get("coord")] == ["cancelled", "cancelled"]
+    # a later designation starts clean
+    assert p.set_coord("agent:" + coord["agent_id"])[0] == 200
+
+
+def test_the_designation_and_the_cap_survive_a_restart(cp, tmp_path):
+    p = cp
+    held, rev, coord = crew(p)
+    root = root_for(p, coord)
+    again = reborn(p, tmp_path)
+    row = again.view_team_coordinator(owner_pr(again), p.room, TEAM)
+    assert row["holder"] == "agent:" + coord["agent_id"] and row["active"] is True
+    assert row["limits"]["tasks_per_hour"] == 4 and row["usage"] == {"created_last_hour": 0, "open": 0}
+    pr = again.authenticate(f"Agent {coord['credential']}", coord["device_id"])
+    assert again.create_task(pr, p.room, {"target_role": "implementer", "parent_task_id": root, "text": "x"})["status"] == "pending"
+
+
+def test_detaching_the_team_ends_the_coordinator_and_its_open_work_and_the_flags_off_still_allow_it(cp):
+    p = cp
+    held, rev, coord = crew(p)
+    root = root_for(p, coord)
+    child = p.make(coord, target_role="implementer", parent_task_id=root)[1]["task_id"]
+    p.svc.coordinators = normalize_coordinators(None)                  # a kill switch never blocks a revocation
+    s, out = p.detach()
+    assert s == 200 and coord["agent_id"] in out["removed"]
+    pr = p.svc.authenticate(f"Agent {coord['credential']}", coord["device_id"])
+    assert p.svc.agent_rooms(pr)["rooms"] == []
+    p.svc.coordinators = normalize_coordinators(COORD)
+    p.svc.sweep_coordinators()
+    assert p.svc._tasks[child]["status"] == "cancelled"
+    assert p.view_coord()[0] == 404
+
+
+def test_a_revoked_coordinator_agent_loses_its_open_work_at_the_next_sweep(cp):
+    p = cp
+    held, rev, coord = crew(p)
+    root = root_for(p, coord)
+    child = p.make(coord, target_role="implementer", parent_task_id=root)[1]["task_id"]
+    assert p.c("alice", "POST", f"{BASE}/agents/{coord['agent_id']}/revoke", {})[0] == 200
+    assert p.svc.sweep_coordinators()["cancelled"] == 1
+    assert p.svc._tasks[child]["status"] == "cancelled"
+    assert p.svc.sweep_coordinators()["cancelled"] == 0                # idempotent
+
+
+# ============================================================== independent review reaches the coordinator chain
+def test_the_coordinator_is_never_the_independent_reviewer_of_work_it_decomposed(cp):
+    p = cp
+    held, rev, coord = crew(p)
+    root = root_for(p, coord)
+    child = p.make(coord, target_role="implementer", parent_task_id=root)[1]
+    holder = next(a for a in held if a["agent_id"] == child["routed_to"][6:])
+    p.accept(holder, child["task_id"])
+    p.update(holder, child["task_id"], "done", result="ok")
+    s, out = p.make("alice", target_agent_id=coord["agent_id"], reviews_task_id=child["task_id"], text="review it")
+    assert s == 400 and "reviewer" in out["error"], out                       # the coordinator that decomposed it
+    s, out = p.make("alice", target_agent_id=holder["agent_id"], reviews_task_id=child["task_id"], text="review it")
+    assert s == 400, out                                                       # the implementer (slice 2 rule, still true)
+    assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/teams/{TEAM}/roles", {"role": "reviewer", "holder": "user:bob"})[0] == 200
+    s, out = p.make("alice", target_role="reviewer", reviews_task_id=child["task_id"], text="review it")
+    assert s == 201 and out["routed_to"] == "user:bob", out                  # a different principal is accepted
+
+
+# ============================================================== the Work Graph shows the coordinator, it never grants
+def test_the_work_graph_shows_the_coordinator_as_a_team_role_fact(tmp_path, wg, wg_pg):
+    from herdr_engineering.control_plane import workspace_contracts as wc
+    from herdr_engineering.control_plane.work_graph_store import WorkGraphStore
+    from tests.control_plane.test_team_rooms import Plane
+    wg.run(wg.pool.execute("DELETE FROM fabric_events"))
+    clock = Clock()
+    svc = _service(tmp_path, clock)
+    srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, api_keys={"op-key": "operator"}, collab=svc,
+                             unified_workspace_config={"enabled": True}, github_pg_dsn=wg_pg["dsn"])
+    threading.Thread(target=srv.serve, daemon=True).start()
+    srv.wait_until_ready()
+    for _ in range(100):
+        if srv.work_graph.available():
+            break
+        threading.Event().wait(0.1)
+    try:
+        p = Plane(svc, srv, wg, clock)
+        team = p.team()
+        impl, coord = p.agent(name="impl"), p.agent(name="coordy")
+        assert p.attach(team, {"implementer": [impl["agent_id"]]})[0] == 200
+        assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/teams/{team}/coordinator", {"holder": "agent:" + coord["agent_id"]})[0] == 200
+        p.sync_graph()
+        dump = p.wg.run(WorkGraphStore(p.wg.pool).dump())
+        urn = wc.urn_for("team", team)
+        held = {f["subject_ref"] for f in dump["facts"].values()
+                if f["fact_kind"] == "team_role" and f["object_id"] == urn and f["open"]}
+        assert held == {f"agent:{coord['agent_id']}", f"agent:{impl['agent_id']}"}
+        assert p.c("alice", "POST", f"{BASE}/rooms/{p.room}/teams/{team}/coordinator/clear", {})[0] == 200
+        p.sync_graph()
+        dump = p.wg.run(WorkGraphStore(p.wg.pool).dump())
+        held = {f["subject_ref"] for f in dump["facts"].values()
+                if f["fact_kind"] == "team_role" and f["object_id"] == urn and f["open"]}
+        assert held == {f"agent:{impl['agent_id']}"}
+    finally:
+        srv.shutdown()

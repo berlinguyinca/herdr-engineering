@@ -633,18 +633,15 @@ class CoordinatorsMixin:
                         if t is not None and self._task_status(t) in ("pending", "accepted"):
                             self._tc_requeue(tid, t, room, out)
                 else:
-                    self._tc_cancel_chain(room, tids, out)
+                    self._tc_cancel_own(room, tids, out)
         except CollabError:
             pass                                          # log full or unavailable: authority is already off; the sweep retries
         return out
 
-    def _tc_cancel_chain(self, room: dict, own: list, out: dict) -> None:
-        """An operator-owned coordinator was revoked: cancel its open tasks and everything delegated beneath them."""
-        gone = set(own)
-        for tid, t in sorted(self._tasks.items(), key=lambda kv: kv[1]["seq"]):
-            if t["room_id"] == room["id"] and t.get("parent") in gone:
-                gone.add(tid)
-        for tid in sorted(gone, key=lambda i: self._tasks[i]["seq"]):
+    def _tc_cancel_own(self, room: dict, own: list, out: dict) -> None:
+        """An operator-owned coordinator was revoked: cancel its open tasks. Nothing is delegated beneath them: a team role's
+        fixed actions carry no ``instruct``, so a holder cannot hand the work on."""
+        for tid in sorted(own, key=lambda i: self._tasks[i]["seq"]):
             t = self._tasks.get(tid)
             if t is not None and self._task_status(t) in ("pending", "accepted", "blocked"):
                 self._tc_cancel(tid, t, room, "coordinator_revoked", out)
