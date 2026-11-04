@@ -37,6 +37,7 @@ from . import rakazo_terminal
 from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_cognito as cognito
+from . import rakazo_connections as connections
 from . import rakazo_events as ev
 from . import rakazo_hindsight as hs
 from . import rakazo_mcp as mcp
@@ -753,6 +754,8 @@ class RakazoBridge:
         self.routines = routines.Routines(self, BridgeError)
         self.artifacts = artifacts.Artifacts(self, BridgeError, artifacts_fn)
         self.models = models.Models(self, BridgeError)
+        self.apps_fn: Callable[[], Any] = lambda: None      # set by api.py: the AppsService, or None when Google is not set up
+        self.connections = connections.Connections(self, BridgeError)
         self.skills = skills.Skills(self, BridgeError)
         self.mcp = mcp.Mcp(self, BridgeError)
         self.tickets = tickets.Tickets(self, BridgeError)
@@ -767,7 +770,7 @@ class RakazoBridge:
         for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs(),
                          **self.artifacts.procs(), **self.models.procs(), **self.skills.procs(),
                          **self.vault.procs(), **self.mcp.procs(), **self.tickets.procs(),
-                         **self.rules.procs()}.items():
+                         **self.rules.procs(), **self.connections.procs()}.items():
             self._procs[name] = fn
         self.rest = rest.Rest(self, BridgeError, set(self._procs))
         self._procs.update(self.rest.procs())

@@ -696,6 +696,7 @@ class ControlPlaneServer:
         self.intelligence.single_operator_fn = lambda: self.single_operator
         if self.rakazo is not None:
             self.rakazo.agents.repo = self.repo
+            self.rakazo.apps_fn = lambda: self.apps
             self.rakazo.terminal.repo = self.repo
             self.rakazo.desk.routes = self.intelligence      # board proposals as phone cards (scope: assistant_viewers)
             self.intelligence.board.on_new = self.rakazo.notify_proposal      # and as push notifications
