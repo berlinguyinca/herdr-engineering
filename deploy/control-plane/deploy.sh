@@ -388,7 +388,7 @@ if [ "$COLLAB" = 1 ]; then
     exit 1
   fi
   export HERDR_COLLAB_CONFIG_DIR="$COLLAB_DIR"
-  # The edge conf for this config: the repo file, plus the /s/ location only when share is enabled.
+  # The edge conf for this config: the repo file, plus the share host server only when share is enabled.
   NEW_EDGE="$ENV_DIR/new/collab-edge/nginx.conf"
   EDGE_TEMPLATE="$WORK/deploy/control-plane/collab-edge/nginx.conf"
   if [ -n "$NEW_SHARE" ]; then
@@ -838,7 +838,7 @@ echo "rolling back to $PREVIOUS_IMAGE with the compose files and code of commit 
 rollback_share() {
   local conf="${HERDR_COLLAB_EDGE_CONF:-}"
   SHARE_SERVICE=()
-  if [ "$COLLAB" = 1 ] && [ -f "$conf" ] && grep -q 'location ^~ /s/' "$conf" \
+  if [ "$COLLAB" = 1 ] && [ -f "$conf" ] && grep -Eq 'location (\^~ )?/s/ ' "$conf" \
       && grep -q '^  share-public:' "$PREV_WORK/deploy/control-plane/compose.collab.yaml" 2>/dev/null; then
     SHARE_SERVICE=(share-public)
     compose_up_retry "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" \
