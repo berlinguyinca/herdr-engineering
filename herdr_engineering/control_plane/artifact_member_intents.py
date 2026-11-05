@@ -590,7 +590,8 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
         " a.current_version_id, v.version_number AS head_number,"
         " COALESCE((SELECT sum(b.size_bytes) FROM artifact_blobs b WHERE b.scope=a.artifact_id), 0)::bigint AS bytes"
         " FROM artifacts a LEFT JOIN artifact_versions v ON v.version_id=a.current_version_id"
-        f" WHERE a.created_by=$1 AND {_NOT_PURGED} ORDER BY a.created_at DESC, a.artifact_id LIMIT $2",
+        f" WHERE a.created_by=$1 AND a.lifecycle <> 'tombstoned' AND {_NOT_PURGED}"      # a tombstone is not a reader's
+        " ORDER BY a.created_at DESC, a.artifact_id LIMIT $2",
         principal, VIEW_MAX_ARTIFACTS)
     versions: dict[str, list[dict]] = {}
     for v in await conn.fetch(
@@ -615,7 +616,9 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
     links = await conn.fetch(      # the member's own links, and every link on an artifact it owns (it may revoke those)
         "SELECT s.share_id, s.artifact_id, s.version_id, s.audience, s.state, s.expires_at, s.allow_emails,"
         " s.allow_groups, s.created_at, (s.created_by = $1) AS mine FROM artifact_shares s"
-        " WHERE s.created_by=$1 OR s.artifact_id = ANY($3::text[]) ORDER BY s.created_at DESC, s.share_id LIMIT $2",
+        " WHERE (s.created_by=$1 OR s.artifact_id = ANY($3::text[]))"
+        " AND NOT EXISTS (SELECT 1 FROM artifacts t WHERE t.artifact_id=s.artifact_id AND t.lifecycle='tombstoned')"
+        " ORDER BY s.created_at DESC, s.share_id LIMIT $2",
         principal, VIEW_MAX_LINKS, [a["artifact_id"] for a in artifacts])
     doc = {
         "principal": principal, "updated": __import__("time").time(),
