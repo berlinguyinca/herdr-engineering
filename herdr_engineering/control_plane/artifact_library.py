@@ -325,14 +325,16 @@ class LibraryStore:
         until: datetime | None = None,
         limit: int = 50,
         offset: int = 0,
+        principal: str | None = None,
     ) -> FeedPage:
         """Everything the member can see, one row per artifact (badge priority mine > assigned > opened),
-        newest first.  Visibility, search and filters apply before LIMIT; ``total`` counts the filtered set."""
+        newest first.  Visibility, search and filters apply before LIMIT; ``total`` counts the filtered set.
+        ``principal`` overrides ``member:<member_id>`` for a viewer that is not a member (the dashboard's API key)."""
         limit = max(1, min(int(limit), MAX_PAGE))
         offset = max(0, int(offset))
         wanted = sorted(DEFAULT_SOURCES if sources is None else sources)
         args: list[object] = [
-            f"member:{member_id}",
+            principal or f"member:{member_id}",
             member_id,
             (member_email or "").lower(),
             sorted(member_groups),

@@ -3959,6 +3959,19 @@ def _member_admin_wiring(cp: dict, dsn: str | None):
     return artifact_adapter.SyncArtifactAdapter(create)
 
 
+def _library_wiring(dsn: str | None):
+    """The dashboard artifact library (adapter over ``LibraryStore`` on its own small pool) when a DSN exists, else None."""
+    if not dsn:
+        return None
+    from .control_plane.artifact_library_api import make_library_adapter
+
+    async def pool():
+        import asyncpg
+        return await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+
+    return make_library_adapter(pool)
+
+
 def _collab_grant_wiring(cp: dict, dsn: str | None):
     """(grant store adapter, enabled) when control_plane.collab_artifacts.enabled is exactly true and a DSN exists, else
     (None, False). The owner routes for collaborators, activity and diffs use the adapter's call path."""
@@ -4154,6 +4167,7 @@ def _cmd_cp_web(args) -> int:
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
     member_admin = _member_admin_wiring(cp, dsn)
+    library = _library_wiring(dsn)
     try:
         from .control_plane.artifact_delete_api import owner_digests_config
         artifact_delete = owner_digests_config(cp.get("artifact_delete"))
@@ -4291,7 +4305,7 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
-                             annotation_store=annotation_store, member_admin=member_admin,
+                             annotation_store=annotation_store, member_admin=member_admin, library=library,
                              artifact_delete_owners=artifact_delete.digests,
                              artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
@@ -4335,6 +4349,8 @@ def _cmd_cp_web(args) -> int:
             artifact_adapter.close()
         if member_admin is not None:
             member_admin.close()
+        if library is not None:
+            library.close()
         if share_store is not None:
             share_store.close()
         if annotation_store is not None:

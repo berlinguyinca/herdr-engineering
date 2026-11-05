@@ -299,7 +299,8 @@ export function rejectionText(out) {
   return out.reason ? `Refused: ${out.reason}` : 'Refused.';
 }
 
-export function renderFeedRow(row, { folders = [], activeFolder = null } = {}) {
+/** `href(row)` (optional) makes the title a plain link instead of an open button: the dashboard opens its own detail page. */
+export function renderFeedRow(row, { folders = [], activeFolder = null, href = null } = {}) {
   const [badgeKey, badgeText] = SOURCE_BADGE[row.source] || ['opened', row.source || 'Unknown'];
   const gone = GONE[row.status];
   const when = formatDate(row.shared_at);
@@ -313,7 +314,10 @@ export function renderFeedRow(row, { folders = [], activeFolder = null } = {}) {
   }
   const entry = chooseEntry(row);
   const title = esc(row.title || row.artifact_id);
-  const open = entry
+  const target = href ? href(row) : null;
+  const open = target
+    ? `<a class="row-title row-open" data-action="open" data-artifact="${esc(row.artifact_id)}" href="${esc(target)}">${title}</a>`
+    : entry
     ? `<button type="button" class="row-title row-open" data-action="open" data-artifact="${esc(row.artifact_id)}" data-path="${esc(entry.path)}">${title}</button>`
     : `<span class="row-title">${title}</span>`;
   const expiry = row.source === 'opened' && row.expires_at ? ` <span data-expiry>Expires ${esc(formatDate(row.expires_at))}</span>` : '';
@@ -351,12 +355,13 @@ export function renderChips(counts = {}, active = 'all') {
   }).join('')}</div>`;
 }
 
-export function renderFolderSidebar(folders, activeId = null) {
+/** `allHref` / `folderHref(id)` (optional) point the folder links at another router (the dashboard's `#/library`). */
+export function renderFolderSidebar(folders, activeId = null, { allHref = '#/', folderHref = (id) => `#/f/${encodeURIComponent(id)}` } = {}) {
   const rows = list(folders);
   const active = rows.find((f) => f.folder_id === activeId);
   return `<aside class="folders" aria-label="Folders">
 <h3>Folders</h3>
-<ul class="folder-list"><li><a class="tab" href="#/"${activeId ? '' : ' aria-current="page"'}>All items</a></li>${rows.map((f) => `<li><a class="tab" href="#/f/${esc(encodeURIComponent(f.folder_id))}"${f.folder_id === activeId ? ' aria-current="page"' : ''}>${esc(f.name)}${f.item_count === undefined ? '' : ` <span class="row-meta">${esc(f.item_count)}</span>`}</a></li>`).join('')}</ul>
+<ul class="folder-list"><li><a class="tab" href="${esc(allHref)}"${activeId ? '' : ' aria-current="page"'}>All items</a></li>${rows.map((f) => `<li><a class="tab" href="${esc(folderHref(f.folder_id))}"${f.folder_id === activeId ? ' aria-current="page"' : ''}>${esc(f.name)}${f.item_count === undefined ? '' : ` <span class="row-meta">${esc(f.item_count)}</span>`}</a></li>`).join('')}</ul>
 <form data-folder-form><label>New folder <input name="name" required maxlength="80" autocomplete="off"></label><button type="submit" class="btn">Create folder</button></form>
 ${active ? `<div class="folder-manage"><button type="button" class="btn" data-action="rename-folder" data-folder="${esc(active.folder_id)}">Rename</button>
 <button type="button" class="btn btn-danger" data-action="delete-folder" data-folder="${esc(active.folder_id)}">Delete folder</button></div>` : ''}

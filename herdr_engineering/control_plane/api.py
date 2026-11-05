@@ -311,7 +311,7 @@ class ControlPlaneServer:
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None, assistant_judge=None, member_web=None):
@@ -453,6 +453,8 @@ class ControlPlaneServer:
         self.share_settings = share_settings
         # Operator controls for member-owned artifacts (a SyncArtifactAdapter over MemberAdmin): absent -> 503.
         self.member_admin = member_admin
+        # Dashboard artifact library (a SyncArtifactAdapter over LibraryStore): absent -> the routes answer 503.
+        self.library = library
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
         # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
@@ -2627,7 +2629,7 @@ def _make_handler(server, public=False, operator=False):
             # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
             if public and server.member_web is not None and self.path.startswith("/api/member/"):
                 return self._timed_request(self._public)      # the member run upload (only on the member host)
-            if operator or public or not self.path.startswith("/api/v1/assistant-apps/"):
+            if operator or public or not self.path.startswith(("/api/v1/assistant-apps/", "/api/v1/library/")):
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
 
@@ -2660,8 +2662,8 @@ def _make_handler(server, public=False, operator=False):
             segs = path.split("/")
             resource = unquote(segs[3]) if (len(segs) > 3 and segs[:3] == ["", "api", "v1"]
                                             and path.startswith("/api/v1/")) else ""
-            if resource not in self._ASSISTANT_MUTABLE_RESOURCES or (
-                    self.command == "PUT" and resource != "assistant-apps"):
+            if resource not in self._ASSISTANT_MUTABLE_RESOURCES | {"library"} or (
+                    self.command == "PUT" and resource not in {"assistant-apps", "library"}):
                 # preserve the pre-existing 501 for PATCH/DELETE elsewhere
                 return self._send_json(501, {"error": "not implemented"})
             err = self._require("operator")
@@ -3125,6 +3127,9 @@ def _make_handler(server, public=False, operator=False):
             try:
                 from .artifact_members_api import route_members
                 if route_members(self, server, parts, resource):
+                    return None
+                from .artifact_library_api import route_library
+                if route_library(self, server, parts, resource):
                     return None
                 from .artifact_delete_api import route_delete
                 if route_delete(self, server, parts, resource):

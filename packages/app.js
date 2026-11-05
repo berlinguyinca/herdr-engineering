@@ -48,6 +48,7 @@ import { mountRelated } from './related-panel.js';
 import { mountMissionStory } from './mission-story-view.js';
 import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
+import { mountLibrary } from './library-view.js';
 import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
 import { mountMemory } from './memory-view.js';
@@ -96,7 +97,7 @@ const NAV = [
   { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
   { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects', '/pr'] },
   { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
-  { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
+  { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/library', '/publications'] },
   { group: 'Code', path: '/memory', label: 'Memory', capability: 'memory_v1' },
   { group: 'Code', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
 ];
@@ -110,7 +111,7 @@ const SECTION_TABS = [
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
   [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
   [['/github', 'Issues'], ['/github/projects', 'Boards']],
-  [['/artifacts', 'Artifacts'], ['/publications', 'Publications']],
+  [['/artifacts', 'Artifacts'], ['/library', 'Library'], ['/publications', 'Publications']],
 ];
 
 const SHELL = document.getElementById('shell');
@@ -252,6 +253,7 @@ const ROUTES = {
   '/llm/session/:id': viewLlmSession,
   '/artifacts': viewArtifacts,
   '/artifacts/:id': viewArtifact,
+  '/library': viewLibrary,
   '/publications': viewPublications,
   '/scheduling': viewScheduling,
   '/handoffs': viewHandoffs,
@@ -411,6 +413,11 @@ async function viewArtifact(parts, revision) {
     .then(result => { if (!controller.signal.aborted && revision === renderRevision) chip.touch(!result?.errors?.length, result?.errors?.join('; ')); })
     .catch(error => { if (!controller.signal.aborted && revision === renderRevision) { container.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error><button type="button" data-route-retry>Retry</button>`; chip.touch(false, error.message); } });
   return { refresh() {}, dispose: () => controller.abort() };
+}
+
+async function viewLibrary() {
+  root.innerHTML = `${liveHead('<h1>Library</h1>')}<div id="artifact-library"></div>`;
+  return mountLibrary(root.querySelector('#artifact-library'), client, { freshness: chipIn(root), folderId: route().query.get('folder') || null });
 }
 
 async function viewPublications() {
