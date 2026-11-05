@@ -205,8 +205,10 @@ class MemberWeb:
         ms: MemberService | None = self.service.member_service
         if ms is None or self.service.member_group is None:
             raise _Reply(404, "not_found", "not found")
-        if self.require_https and h.headers.get("X-Forwarded-Proto", "").lower() != "https":
-            raise _bad("https is required")
+        if self.require_https:        # exactly one value: a second one is never resolved in the client's favour
+            protos = h.headers.get_all("X-Forwarded-Proto") or []
+            if len(protos) != 1 or protos[0].strip().lower() != "https":
+                raise _bad("https is required")
         raw = h.path
         path, _, query = raw.partition("?")
         if len(raw) > 1024 or not _PATH.fullmatch(path):

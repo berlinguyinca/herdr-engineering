@@ -19,6 +19,7 @@ the same ``not_found``, whether or not it exists.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -152,6 +153,17 @@ async def handle_share_create(ctx: IntentContext, intent: Intent) -> dict:
     p, aid, rt = intent.payload, intent.artifact_id, who.rt
     if not await _may_share_active(ctx.conn, aid, who.principal):
         return await _refuse(ctx, who, "share_create", "not_found", intent, audience=p.audience)
+    key = f"share:{intent.idempotency_key}" if intent.idempotency_key else None
+    digest = hashlib.sha256(json.dumps([aid, p.version_id, p.audience, p.allow_groups, p.allow_emails,
+                                        p.expires_in_days, p.entry, p.title], default=list).encode()).hexdigest()
+    if key is not None:           # keyed by (member, key) like artifact_create, after the admission and permission checks
+        prior = await ctx.conn.fetchrow("SELECT request_sha256, artifact_id FROM artifact_member_creates"
+                                        " WHERE member_principal=$1 AND idempotency_key=$2", who.principal, key)
+        if prior is not None:
+            if prior["request_sha256"] != digest:
+                return {**_rejected("idempotency_conflict"), "_principal": who.principal}
+            return {"result": "created", "share_id": prior["artifact_id"], "audience": p.audience, "summary": {},
+                    "_principal": who.principal}
     directory = await asyncio.to_thread(load_directory, rt)
     if directory is None:
         return _rejected("directory_stale")
@@ -182,6 +194,10 @@ async def handle_share_create(ctx: IntentContext, intent: Intent) -> dict:
             entry=p.entry, title=p.title, created_by=who.principal, member_groups=groups, member_emails=emails)
     except ShareError as exc:           # the store audited the refusal itself
         return {**_rejected(exc.code or str(exc)[:REASON_MAX] or "refused"), "_principal": who.principal}
+    if key is not None:           # the ledger row reuses artifact_member_creates: its "artifact_id" column holds the share id
+        await ctx.conn.execute("INSERT INTO artifact_member_creates (member_principal, idempotency_key, request_sha256,"
+                               " artifact_id) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                               who.principal, key, digest, row["share_id"])
     await _touch(ctx, who)
     summary = _capped(_summary(files, chosen, warnings, p.audience, row.get("expires_at")))
     return {"result": "created", "share_id": row["share_id"], "audience": p.audience, "summary": _jsonable(summary),
@@ -256,6 +272,8 @@ async def _creator_or_owner(ctx: IntentContext, intent: Intent, who: _Who) -> di
     share = await ShareStore(ctx.conn).get(intent.payload.share_id)
     if share is None or share["artifact_id"] != intent.artifact_id:
         return None
+    if await ctx.conn.fetchval("SELECT lifecycle='tombstoned' FROM artifacts WHERE artifact_id=$1", intent.artifact_id):
+        return None                        # a purged artifact is gone for events and revoke alike (purge revoked its links)
     if share["created_by"] == who.principal or await _own(ctx.conn, intent.artifact_id, who.principal) is not None:
         return share
     return None

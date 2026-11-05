@@ -377,7 +377,8 @@ async def _own(conn: Any, artifact_id: str | None, principal: str) -> Mapping[st
         return None
     return await conn.fetchrow(
         "SELECT a.artifact_id, a.lifecycle, a.current_version_id FROM artifacts a "
-        f"WHERE a.artifact_id=$1 AND a.created_by=$2 AND {_NOT_PURGED}", artifact_id, principal)
+        f"WHERE a.artifact_id=$1 AND a.created_by=$2 AND a.lifecycle <> 'tombstoned' AND {_NOT_PURGED}",
+        artifact_id, principal)
 
 
 async def _conclude(ctx: IntentContext, who: _Who, action: str, out: dict, *, artifact_id: str | None) -> dict:
@@ -700,19 +701,31 @@ async def sweep_disabled_members(conn: Any, rt: MemberRuntime) -> int:
     The directory-based reasons need a fresh directory: a stale or missing file, a member who is absent from it and
     one marked ``unknown`` prove nothing, so nothing is revoked for them."""
     from .artifact_members import positively_out
+    from .artifact_shares import _may_share
     directory = await asyncio.to_thread(load_directory, rt)
     rows = await conn.fetch(
-        "SELECT s.share_id, s.created_by, COALESCE(u.sharing_disabled, false) AS off FROM artifact_shares s"
+        "SELECT s.share_id, s.artifact_id, s.created_by, a.created_by AS owner,"
+        " COALESCE(u.sharing_disabled, false) AS off FROM artifact_shares s"
         " LEFT JOIN artifact_member_usage u ON u.member_principal=s.created_by"
+        " LEFT JOIN artifacts a ON a.artifact_id=s.artifact_id"
         " WHERE s.state IN ('pending','live') AND s.created_by LIKE 'member:%'")
+
+    def out(principal: str | None) -> bool:                       # absent or "unknown" proves nothing
+        if directory is None or not isinstance(principal, str) or not principal.startswith("member:"):
+            return False
+        return positively_out(directory.get(principal[len("member:"):]), rt.group, now=rt.clock(),
+                              grace=rt.removed_grace)
+
     revoked = 0
     for r in rows:
-        if not r["off"]:
-            if directory is None:
-                continue
-            entry = directory.get(r["created_by"][len("member:"):])
-            if not positively_out(entry, rt.group, now=rt.clock(), grace=rt.removed_grace):    # absent or "unknown" proves nothing
-                continue
+        creator, owner = r["created_by"], r["owner"]
+        # the creator's own standing, the artifact owner's (a collaborator's link must not outlive its owner), and
+        # the creator's grant (a link authorised by a share grant must not outlive the grant): all positive evidence
+        gone = r["off"] or out(creator) or (owner != creator and out(owner))
+        if not gone and owner != creator:
+            gone = not await _may_share(conn, r["artifact_id"], creator)
+        if not gone:
+            continue
         try:
             await revoke_share(conn, rt, r["share_id"], actor="member-disabled")
             revoked += 1

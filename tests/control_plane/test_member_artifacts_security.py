@@ -10,15 +10,18 @@ D limits and switches, E parked risk items."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 
 import pytest
 
 from herdr_engineering.control_plane import collab_member_tools
 from herdr_engineering.control_plane.artifact_member_service import MemberServiceError, member_actor
+from herdr_engineering.control_plane.artifact_members import member_owner_key
 from herdr_engineering.control_plane.artifact_shares import ShareError, ShareStore
 from herdr_engineering.control_plane.artifacts import ArtifactStore  # noqa: F401
 from herdr_engineering.control_plane.collab import CollabError
+from herdr_engineering.control_plane.collab_bridge_files import upload_id_for
 from herdr_engineering.control_plane.members_config import parse_members
 from herdr_engineering.control_plane.share_session import mint_session as mint_share_session
 from tests.control_plane import test_artifact_members_api as opapi
@@ -339,7 +342,15 @@ def test_no_mcp_tool_or_web_route_tells_a_foreign_artifact_from_a_missing_one(st
                                       audience="public"),
         "share_approve": lambda a: mcp(stack, "artifact_share_approve", artifact_id=a,
                                        share_id="share_" + "1" * 24, confirm=True),
+        "upload_abort": lambda a: mcp(stack, "artifact_upload_abort", artifact_id=a, upload_id="upl_" + "2" * 24),
     }
+    queued = {   # no front-door precheck: the worker decides, and decides alike (section A); both are queued the same
+        "share_revoke": lambda a: mcp(stack, "artifact_share_revoke", artifact_id=a, share_id="share_" + "1" * 24),
+        "share_events": lambda a: mcp(stack, "artifact_share_events", artifact_id=a, share_id="share_" + "1" * 24),
+    }
+    for name, fn in queued.items():
+        a, b = fn(OTHER), fn(GHOST)
+        assert {k: v for k, v in a.items() if k != "ticket"}.keys() == {k: v for k, v in b.items() if k != "ticket"}.keys(), name
     for name, fn in calls.items():
         assert failure(fn, OTHER) == failure(fn, GHOST) == (404, "not_found", "not found"), name
     # the web, same artifacts, same answers
@@ -347,10 +358,24 @@ def test_no_mcp_tool_or_web_route_tells_a_foreign_artifact_from_a_missing_one(st
            ("POST", "/api/member/artifacts/{}/delete", {"confirm": True}),
            ("POST", "/api/member/artifacts/{}/publish", pub),
            ("POST", "/api/member/artifacts/{}/shares", {"version_id": "v_1", "audience": "public"}),
-           ("POST", "/api/member/artifacts/{}/shares/share_" + "1" * 24 + "/approve", {"confirm": True})]
+           ("POST", "/api/member/artifacts/{}/shares/share_" + "1" * 24 + "/approve", {"confirm": True}),
+           ("POST", "/api/member/artifacts/{}/uploads/upl_" + "2" * 24 + "/abort", {}),
+           ("POST", "/api/member/artifacts/{}/uploads/status", {"name": "f.bin", "size_bytes": 3, "file_sha256": "0" * 64})]
     for method, path, body in web:
         a, b = (req(stack, method, path.format(x), body=body) for x in (OTHER, GHOST))
         assert (a.status, a.raw) == (b.status, b.raw) and a.status == 404, path
+    # revoke and events are queued for the worker on the web too; the run PUT is refused before any body byte is read
+    for path in ("/api/member/artifacts/{}/shares/share_" + "1" * 24 + "/revoke",
+                 "/api/member/artifacts/{}/shares/share_" + "1" * 24 + "/events"):
+        a, b = (req(stack, "POST", path.format(x), body={}) for x in (OTHER, GHOST))
+        assert a.status == b.status and a.json.keys() == b.json.keys(), path
+    sha = hashlib.sha256(DATA).hexdigest()
+    for x in (OTHER, GHOST):
+        owner = member_owner_key(stack.s.member_check(stack.w.people["op"]).principal)
+        up = upload_id_for(owner, x, "f.bin", sha, len(DATA))
+        got = req(stack, "PUT", f"/api/member/artifacts/{x}/uploads/{up}/runs/0", raw=DATA,
+                  extra=("X-Name: f.bin", f"X-Size-Bytes: {len(DATA)}", f"X-File-SHA256: {sha}", f"X-Run-SHA256: {sha}"))
+        assert got.status == 404, (x, got.status)
     # links: a link of lab's on OTHER is not op's to list
     stack.w.view("lab", [OTHER])
     assert mcp(stack, "artifact_share_list", artifact_id=OTHER) == mcp(stack, "artifact_share_list", artifact_id=GHOST)
@@ -410,7 +435,7 @@ def test_members_switched_off_means_no_tools_no_web_and_no_artifact_api(stack):
     assert exchange(stack).status == 404
 
 
-def test_a_share_session_cannot_call_the_member_api_nor_a_member_session_the_share_routes(stack):
+def test_a_share_session_cannot_call_the_member_api(stack):
     shr = mint_share_session(SECRET, "shr-1", "op", 1_800_000_600.0, email="op@example.org", basis="e")
     for method, path, body in (("GET", "/api/member/me", None), ("GET", "/api/member/links", None),
                                ("POST", "/api/member/artifacts", {"title": "t", "filename": "a.html", "profile": "web"}),
@@ -488,10 +513,8 @@ def test_a_limit_of_zero_is_refused_at_load_and_null_is_accepted():
             zero_ok.append(key)
         except ValueError:
             pass
-        try:
-            parse_members({**base, key: None}, public_host="artifacts.example.org")
-        except ValueError:
-            pass
+        if key.startswith("max_"):          # the three size/count limits may be unlimited: null is accepted, asserted
+            assert parse_members({**base, key: None}, public_host="artifacts.example.org") is not None, key
     assert zero_ok == []
     for section in ("rate_limits", "request_limits", "staging"):
         keys = {"rate_limits": ("chunks_per_minute", "writes_per_minute"),
@@ -591,3 +614,133 @@ def test_a_member_cannot_reach_the_others_share_by_guessing_or_replaying_its_id(
     cross = env.req(f"{BASE_BODY}/bob/shares/{s['share_id']}/revoke", body={})
     assert ghost == cross
     assert opapi._call(env.shares, "get", s["share_id"])["state"] == "live"
+
+
+def test_a_member_session_is_nothing_on_the_share_routes(tmp_path):
+    """The reverse direction: a signed-in member's token in the ``/s/<token>/k/<session>/`` slot opens nothing."""
+    from tests.control_plane.test_share_annotate import make_env
+    env = make_env(tmp_path)
+    try:
+        junk = env.request("GET", f"/s/{TOKEN}/k/{'x' * 40}/f/index.html", {"Sec-Fetch-Dest": "document"})
+        for tok in (session("op"), session("lab")):
+            for kind in ("f", "v"):
+                got = env.request("GET", f"/s/{TOKEN}/k/{tok}/{kind}/index.html", {"Sec-Fetch-Dest": "document"})
+                assert got[0] in (401, 403, 404) and got[0] == junk[0], (kind, got[0])
+                assert b"hello" not in got[2]
+            assert env.request("POST", api(tok), good_headers(body=b"{}"), b"{}")[0] in (401, 403, 404)
+        assert not env.config.annotations_path.exists()
+    finally:
+        env.close()
+
+
+def test_exactly_one_forwarded_proto_is_required_on_the_member_web(stack):
+    """A second ``X-Forwarded-Proto`` is refused, whichever value comes first, and nothing is queued."""
+    before = len(intents_in(stack.w.outbox))
+    for helper_adds_https in (True, False):
+        for extra in ("X-Forwarded-Proto: http", "X-Forwarded-Proto: https"):
+            got = req(stack, "POST", f"/api/member/artifacts/{ART}/delete", body={"confirm": True}, extra=(extra,),
+                      proto=helper_adds_https)
+            single_https = not helper_adds_https and extra.endswith("https")      # the only valid combination
+            assert got.status == (200 if single_https else 400), (helper_adds_https, extra, got.status)
+    assert len(intents_in(stack.w.outbox)) == before + 1                          # exactly the one valid delete
+    assert req(stack, "GET", "/api/member/me", proto=False).status == 400       # none at all
+
+
+# ============================================================================ fix round 1: shares and ownership
+
+from herdr_engineering.control_plane.artifact_member_intents import sweep_disabled_members  # noqa: E402
+
+
+def test_a_member_share_create_honours_its_idempotency_key_per_member(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, vid = await published(env, user("alice"))
+        payload = {"version_id": vid, "audience": "public"}
+        first = await send(env, user("alice"), "member.share_create", payload, aid=aid, key="share-key-0001")
+        again = await send(env, agent_actor("ag1"), "member.share_create", payload, aid=aid, key="share-key-0001")
+        assert first["result"] == again["result"] == "created" and first["share_id"] == again["share_id"]
+        assert len(await sql(env, "SELECT 1 FROM artifact_shares")) == 1
+        other = await send(env, user("alice"), "member.share_create", {**payload, "audience": "lab",
+                           "allow_groups": ["lab"]}, aid=aid, key="share-key-0001")
+        assert verdict(other) == {"result": "rejected", "reason": "idempotency_conflict"}
+        assert len(await sql(env, "SELECT 1 FROM artifact_shares")) == 1
+        # bob using alice's key on his own artifact gets his own share, and alice's id never reaches him
+        baid, bvid = await published(env, user("bob"), owner=BOB)
+        mine = await send(env, user("bob"), "member.share_create", {"version_id": bvid, "audience": "public"},
+                          aid=baid, key="share-key-0001")
+        assert mine["result"] == "created" and mine["share_id"] != first["share_id"]
+        # and on alice's artifact he is refused exactly as for a missing one, key or no key
+        steal = await send(env, user("bob"), "member.share_create", payload, aid=aid, key="share-key-0001")
+        assert verdict(steal) == {"result": "rejected", "reason": "not_found"} and first["share_id"] not in str(steal)
+        # no key: two creates are two shares
+        await send(env, user("alice"), "member.share_create", payload, aid=aid)
+        await send(env, user("alice"), "member.share_create", payload, aid=aid)
+        assert len(await sql(env, "SELECT 1 FROM artifact_shares WHERE created_by=$1", ALICE)) == 3
+    srun(registry_pg, tmp_path, body)
+
+
+async def _grantee_link(env, rt):
+    """Bob owns an artifact, alice holds ``share`` on it and has made a live public link."""
+    aid, vid = await published(env, user("bob"), owner=BOB)
+    await grant(env, aid, ALICE, ["read", "share"])
+    out = await share(env, user("alice"), aid, vid)
+    assert out["result"] == "created", out
+    ticket, got = await approve(env, user("alice"), aid, out["share_id"])
+    assert got["result"] == "live", got
+    return aid, out["share_id"]
+
+
+async def _state(env, sid):
+    return (await sql(env, "SELECT state FROM artifact_shares WHERE share_id=$1", sid))[0]["state"]
+
+
+def test_a_grantees_link_does_not_outlive_the_grant(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, sid = await _grantee_link(env, rt)
+        write_feeds(env, users=DIRECTORY)
+        async with env.pool.acquire() as conn:
+            assert await sweep_disabled_members(conn, rt) == 0 and await _state(env, sid) == "live"
+            await sql(env, "DELETE FROM artifact_acl WHERE artifact_id=$1 AND principal_id=$2", aid, ALICE)
+            assert await sweep_disabled_members(conn, rt) == 1
+        assert await _state(env, sid) == "revoked"
+    srun(registry_pg, tmp_path, body)
+
+
+def test_a_grants_expiry_and_a_downgrade_withdraw_the_link_too(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, sid = await _grantee_link(env, rt)
+        write_feeds(env, users=DIRECTORY)
+        await sql(env, "UPDATE artifact_acl SET permissions='[\"read\"]'::jsonb WHERE artifact_id=$1", aid)
+        async with env.pool.acquire() as conn:
+            assert await sweep_disabled_members(conn, rt) == 1
+        assert await _state(env, sid) == "revoked"
+    srun(registry_pg, tmp_path, body)
+
+
+def test_a_grantees_link_does_not_outlive_a_disabled_owner(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, sid = await _grantee_link(env, rt)
+        write_feeds(env, users={**DIRECTORY, "bob": {"status": "disabled", "email": "bob@lab.example.org"}})
+        async with env.pool.acquire() as conn:
+            assert await sweep_disabled_members(conn, rt) == 1
+        assert await _state(env, sid) == "revoked"
+        # an unknown owner (a restarted directory) proves nothing: a fresh link stays
+        write_feeds(env, users=DIRECTORY)
+        aid2, sid2 = await _grantee_link(env, rt)
+        write_feeds(env, users={"alice": DIRECTORY["alice"], "bob": {"status": "unknown"}})
+        async with env.pool.acquire() as conn:
+            assert await sweep_disabled_members(conn, rt) == 0
+        assert await _state(env, sid2) == "live"
+    srun(registry_pg, tmp_path, body)
+
+
+def test_the_worker_treats_a_purged_artifact_as_missing_for_revoke_events_and_delete(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, vid = await published(env, user("alice"))
+        out = await share(env, user("alice"), aid, vid)
+        await sql(env, "UPDATE artifacts SET lifecycle='tombstoned' WHERE artifact_id=$1", aid)
+        for kind, payload in (("member.share_events", {"share_id": out["share_id"]}),
+                              ("member.share_revoke", {"share_id": out["share_id"]}),
+                              ("member.artifact_delete", {"confirm": True})):
+            got = await send(env, user("alice"), kind, payload, aid=aid)
+            assert verdict(got) == {"result": "rejected", "reason": "not_found"}, kind
+    srun(registry_pg, tmp_path, body)
