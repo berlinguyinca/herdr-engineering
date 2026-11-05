@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class SlackListener:
-    def __init__(self, bot_token: str, app_token: str, *, team: str = "Acme", bot_user_id: str = "U0BOT0001") -> None:
+    def __init__(self, bot_token: str, app_token: str, *, team: str = "Acme", bot_user_id: str = "U0BOT0001",
+                 on_request: Callable[[str], None] | None = None) -> None:
+        self.on_request = on_request          # runs while a call is in flight (lets tests race the filesystem)
         self.bot_token = bot_token
         self.app_token = app_token
         self.team = team
@@ -33,6 +36,8 @@ class SlackListener:
                 method = self.path.rsplit("/", 1)[-1]
                 with outer._lock:
                     outer.requests.append({"path": self.path, "authorization": auth})
+                if outer.on_request is not None:
+                    outer.on_request(method)
                 doc: dict[str, object] = {"ok": False, "error": "invalid_auth"}
                 if method == "auth.test" and auth == f"Bearer {outer.bot_token}":
                     doc = {"ok": True, "url": "https://acme.slack.com/", "team": outer.team, "user": "herdr",

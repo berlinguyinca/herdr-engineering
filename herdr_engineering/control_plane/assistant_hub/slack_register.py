@@ -65,7 +65,7 @@ def _check_token(token: str, prefix: str) -> str:
 def _call(base_url: str, method: str, token: str, timeout: float) -> dict[str, Any]:
     req = urllib.request.Request(base_url.rstrip("/") + "/" + method, method="POST", data=b"", headers={
         "Authorization": f"Bearer {token}", "Content-Type": "application/x-www-form-urlencoded"})
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)    # never via a proxy
     try:
         with opener.open(req, timeout=timeout) as response:
             body = response.read(_MAX_REPLY)
@@ -107,6 +107,27 @@ def _install(tmp: Path, path: Path, rotating: bool) -> None:
         raise SlackRegisterError("io") from None
 
 
+def _backup(path: Path, bak: Path, created: list[Path]) -> None:
+    """Hard-link the current file to ``bak`` (same inode, so same 0600 mode); never overwrites an existing ``bak``."""
+    try:
+        os.link(path, bak)
+    except FileExistsError:
+        raise SlackRegisterError("tmp_exists") from None
+    except OSError:
+        raise SlackRegisterError("io") from None
+    created.append(bak)
+
+
+def _rollback(path: Path, bak: Path, rotating: bool) -> None:
+    try:
+        if rotating:
+            os.replace(bak, path)
+        else:
+            os.unlink(path)
+    except OSError:
+        pass
+
+
 def register_tokens(base_url: str, bot_file: str, app_file: str, bot_token: str, app_token: str,
                     timeout: float = 10.0) -> SlackRegistered:
     bot_token = _check_token(bot_token, BOT_PREFIX)
@@ -121,17 +142,33 @@ def register_tokens(base_url: str, bot_file: str, app_file: str, bot_token: str,
     bot_rot, app_rot = _target(bot_path), _target(app_path)
     bot_tmp = bot_path.with_name(bot_path.name + ".new")
     app_tmp = app_path.with_name(app_path.name + ".new")
+    bot_bak = bot_path.with_name(bot_path.name + ".bak")
+    app_bak = app_path.with_name(app_path.name + ".bak")
+    created: list[Path] = []                  # only files THIS call made are ever removed
     try:
         _stage(bot_tmp, bot_token)
+        created.append(bot_tmp)
         _stage(app_tmp, app_token)
+        created.append(app_tmp)
         who = _call(base_url, "auth.test", bot_token, timeout)
         _call(base_url, "apps.connections.open", app_token, timeout)
+        if bot_rot:
+            _backup(bot_path, bot_bak, created)
+        if app_rot:
+            _backup(app_path, app_bak, created)
         _install(bot_tmp, bot_path, bot_rot)
-        _install(app_tmp, app_path, app_rot)
+        try:
+            _install(app_tmp, app_path, app_rot)
+        except BaseException:
+            _rollback(bot_path, bot_bak, bot_rot)      # never leave a new bot token beside the old app token
+            raise
     except BaseException:
-        _unlink(bot_tmp)
-        _unlink(app_tmp)
+        for leftover in created:
+            _unlink(leftover)
         raise
+    for leftover in (bot_bak, app_bak):
+        if leftover in created:
+            _unlink(leftover)
     team = who.get("team") if isinstance(who.get("team"), str) else ""
     user_id = who.get("user_id") if isinstance(who.get("user_id"), str) else ""
     return SlackRegistered(fingerprint(bot_token), fingerprint(app_token), team, user_id)

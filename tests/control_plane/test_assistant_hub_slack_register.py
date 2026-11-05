@@ -168,14 +168,69 @@ def test_symlink_target_refused(slack, keydir, tmp_path):
     assert victim.read_text() == "keep\n"
 
 
-def test_leftover_new_file_is_refused(slack, keydir):
+@pytest.mark.parametrize("stale", ["bot.tok.new", "app.tok.new"])
+def test_leftover_new_file_is_refused_and_kept(slack, keydir, stale):
     bot, app = bot_tok(), app_tok()
     li = slack(bot, app)
-    (keydir / "app.tok.new").write_text("stale\n")
+    (keydir / stale).write_text("stale\n")
     with pytest.raises(SlackRegisterError) as exc:
         register_tokens(li.base_url, str(keydir / "bot.tok"), str(keydir / "app.tok"), bot, app)
     assert exc.value.code == "tmp_exists"
-    assert not (keydir / "bot.tok").exists() and not (keydir / "bot.tok.new").exists()
+    assert (keydir / stale).read_text() == "stale\n"            # not ours: never deleted
+    assert sorted(x.name for x in keydir.iterdir()) == [stale]
+
+
+def _break_app_install(keydir: Path):
+    def hook(method: str) -> None:
+        if method == "apps.connections.open":
+            (keydir / "app.tok.new").unlink()           # the second install now fails (staged file vanished)
+    return hook
+
+
+def test_second_install_failure_restores_old_pair(keydir):
+    old_bot, old_app = bot_tok(), app_tok()
+    li = SlackListener(old_bot, old_app)
+    try:
+        register_tokens(li.base_url, str(keydir / "bot.tok"), str(keydir / "app.tok"), old_bot, old_app)
+    finally:
+        li.close()
+    bot, app = bot_tok(), app_tok()
+    li = SlackListener(bot, app, on_request=_break_app_install(keydir))
+    try:
+        with pytest.raises(SlackRegisterError) as exc:
+            register_tokens(li.base_url, str(keydir / "bot.tok"), str(keydir / "app.tok"), bot, app)
+    finally:
+        li.close()
+    assert exc.value.code == "io"
+    assert (keydir / "bot.tok").read_text() == old_bot + "\n" and (keydir / "app.tok").read_text() == old_app + "\n"
+    assert sorted(x.name for x in keydir.iterdir()) == ["app.tok", "bot.tok"]
+    assert stat.S_IMODE((keydir / "bot.tok").stat().st_mode) == 0o600
+
+
+def test_second_install_failure_first_time_leaves_nothing(keydir):
+    bot, app = bot_tok(), app_tok()
+    li = SlackListener(bot, app, on_request=_break_app_install(keydir))
+    try:
+        with pytest.raises(SlackRegisterError):
+            register_tokens(li.base_url, str(keydir / "bot.tok"), str(keydir / "app.tok"), bot, app)
+    finally:
+        li.close()
+    assert list(keydir.iterdir()) == []
+
+
+def test_proxy_environment_is_ignored(slack, keydir, monkeypatch):
+    bot, app = bot_tok(), app_tok()
+    li = slack(bot, app)
+    proxy = SlackListener("x", "y")
+    try:
+        for var in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+            monkeypatch.setenv(var, f"http://127.0.0.1:{proxy.port}")
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        register_tokens(li.base_url, str(keydir / "bot.tok"), str(keydir / "app.tok"), bot, app)
+        assert proxy.requests == [] and len(li.requests) == 2
+    finally:
+        proxy.close()
 
 
 # ------------------------------------------------------------------------------------------------- CLI
