@@ -261,11 +261,11 @@ def collab_values(cfg: FleetConfig) -> dict:
         summary_fix_config(collab.get("summary_fix"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
-    _check_members(collab, _share_mapping(cfg)[0])
+    _check_members(collab, _share_mapping(cfg)[0], cfg)
     return dict(collab)
 
 
-def _check_members(collab: dict, share: dict) -> None:
+def _check_members(collab: dict, share: dict, cfg: FleetConfig | None = None) -> None:
     """Validate ``control_plane.collab.members`` (the member web host comes from ``control_plane.share.public_host``).
 
     Messages name keys, never values: the section carries ``session_secret``."""
@@ -285,6 +285,27 @@ def _check_members(collab: dict, share: dict) -> None:
         parse_members(members, public_host=host, session_seconds=share.get("session_seconds"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    if members.get("enabled") is True and cfg is not None:
+        _check_members_prerequisites(cfg, share)
+
+
+def _check_members_prerequisites(cfg: FleetConfig, share: dict) -> None:
+    """Members that cannot work are refused here instead of failing silently at runtime (404 everywhere, no routes)."""
+    try:
+        values = cfg.section(CONTROL_PLANE_SECTION)
+    except FleetConfigError:
+        return
+    if share.get("enabled") is not True:
+        raise FleetConfigError("control_plane.collab.members.enabled needs control_plane.share.enabled: true "
+                               "(the member host is routed by the share edge)")
+    bridge = values.get("collab_artifacts")
+    if not (isinstance(bridge, dict) and bridge.get("enabled") is True):
+        raise FleetConfigError("control_plane.collab.members.enabled needs control_plane.collab_artifacts.enabled: "
+                               "true (members publish through the collab artifact bridge)")
+    keys = values.get("api_keys")
+    if not keys:
+        raise FleetConfigError("control_plane.collab.members.enabled needs control_plane.api_keys: without keys the "
+                               "API treats every caller as the operator, who may read and share member artifacts")
 
 
 def _members_with_host(values: dict, share: dict) -> dict:

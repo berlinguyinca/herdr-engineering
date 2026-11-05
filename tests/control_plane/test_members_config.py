@@ -61,6 +61,16 @@ def test_null_share_limits_accepted():
     assert got["share_limits"] == {"max_share_bytes": None, "max_total_bytes": None}
 
 
+def test_null_upload_and_staging_limits_are_accepted_but_other_limits_still_refuse_null():
+    got = parse_members(section(request_limits={"max_upload_bytes": None}, staging={"staging_bytes_per_member": None}),
+                        public_host=HOST)
+    assert got["limits"].max_upload_bytes is None and got["limits"].staging_bytes_per_member is None
+    for bad in ({"request_limits": {"max_publish_files": None}}, {"rate_limits": {"writes_per_minute": None}},
+                {"request_limits": {"max_upload_bytes": (1 << 40) + 1}}):
+        with pytest.raises(ValueError):
+            parse_members(section(**bad), public_host=HOST)
+
+
 @pytest.mark.parametrize("bad", [
     {"session_secret": None}, {"session_secret": "short"}, {"session_secret": 5}, {"session_secret": "é" * 40},
     {"nope": 1}, {"group": ""}, {"enabled": "yes"},

@@ -14,7 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("_members_share_deploy", ROOT / "tests" / "test_share_deploy_config.py")
 _sd = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_sd)
-_central, COLLAB, SECRET = _sd._central, _sd.COLLAB, _sd.SECRET
+COLLAB, SECRET = _sd.COLLAB, _sd.SECRET
+BRIDGE = {"collab_artifacts": {"enabled": True}}
+
+
+def _central(tmp_path, share=None, collab=COLLAB, extra=BRIDGE):
+    return _sd._central(tmp_path, share=share, collab=collab, extra=extra)
 
 HOST = "artifacts.example.test"
 MEMBER_SECRET = "m-" + secrets.token_hex(32)
@@ -382,3 +387,19 @@ def test_run_upload_raw_path_shapes_on_a_real_nginx(tmp_path, path, status):
         assert got.startswith(f"HTTP/1.1 {status} "), got
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+# ----------------------------------------------------- members.enabled prerequisites (final review A2, security F5)
+def test_enabled_members_need_the_share_the_bridge_and_api_keys_with_the_keys_named(tmp_path):
+    def load(sub, **kw):
+        return load_fleet_config(_central(tmp_path / sub, collab={**COLLAB, "members": members()}, **kw))
+
+    with pytest.raises(FleetConfigError, match=r"control_plane\.share\.enabled"):
+        fcc.collab_values(load("a", share={**share(), "enabled": False}))
+    with pytest.raises(FleetConfigError, match=r"control_plane\.collab_artifacts\.enabled"):
+        fcc.collab_values(load("b", share=share(), extra={}))
+    with pytest.raises(FleetConfigError, match=r"control_plane\.collab_artifacts\.enabled"):
+        fcc.collab_values(load("c", share=share(), extra={"collab_artifacts": {"enabled": "true"}}))
+    with pytest.raises(FleetConfigError, match=r"control_plane\.api_keys"):
+        fcc.collab_values(load("d", share=share(), extra={**BRIDGE, "api_keys": {}}))
+    assert fcc.collab_values(load("ok", share=share()))["members"]["enabled"] is True

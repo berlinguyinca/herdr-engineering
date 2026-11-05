@@ -56,6 +56,9 @@ _BOUNDS: Final = {"http_chunks_per_request": MAX_HTTP_CHUNKS, "max_publish_files
 MAX_SESSION_SECONDS: Final = 7 * 86400
 
 
+_NULLABLE: Final = frozenset({"max_upload_bytes", "staging_bytes_per_member"})
+
+
 def _positive(name: str, value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
@@ -67,14 +70,14 @@ class MembersConfig:
     """The sanity, rate and staging limits of the member channel (plan 5, Global Constraints).  ``max_upload_bytes`` is the
     per-file limit handed to ``validate_chunk``; ``staging_bytes_per_member`` is the member's staging cap (reserved by
     declared size), on top of the whole-volume ``staging_bytes_total`` of the bridge limits."""
-    max_upload_bytes: int = _TIB
+    max_upload_bytes: int | None = _TIB          # None: no member cap, only the bridge limits and the chunk index bound
     http_chunks_per_request: int = 32
     max_publish_files: int = 200
     max_message_chars: int = 500
     chunks_per_minute: int = 1200
     writes_per_minute: int = 30
     share_creates_per_hour: int = 20
-    staging_bytes_per_member: int = _TIB
+    staging_bytes_per_member: int | None = _TIB   # None: only the bridge's staging_bytes_per_agent applies
     result_wait_seconds: float = 5.0
     session_exchanges_per_minute: int = 20
 
@@ -84,6 +87,8 @@ class MembersConfig:
                 v = self.result_wait_seconds
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 20:
                     raise ValueError("result_wait_seconds must be 0 to 20")
+            elif f.name in _NULLABLE and getattr(self, f.name) is None:
+                continue
             else:
                 value = _positive(f.name, getattr(self, f.name))
                 if value > _BOUNDS[f.name]:

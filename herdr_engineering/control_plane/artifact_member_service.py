@@ -130,13 +130,15 @@ class MemberService:
         except CollabError as exc:
             raise MemberServiceError(exc.status, _CODES.get(exc.status, "error"), exc.message) from None
         # the member default may only tighten what the operator configured, never raise it
-        return dataclasses.replace(base, max_file_bytes=min(base.max_file_bytes, self.config.max_upload_bytes))
+        cap = self.config.max_upload_bytes                           # None: the bridge limit alone applies
+        return base if cap is None else dataclasses.replace(base, max_file_bytes=min(base.max_file_bytes, cap))
 
     def _chunk_rate(self, limits: BridgeLimits) -> int:
         return min(self.config.chunks_per_minute, limits.chunks_per_minute)
 
     def _staging_cap(self, limits: BridgeLimits) -> int:
-        return min(self.config.staging_bytes_per_member, limits.staging_bytes_per_agent)
+        cap = self.config.staging_bytes_per_member
+        return limits.staging_bytes_per_agent if cap is None else min(cap, limits.staging_bytes_per_agent)
 
     # ------------------------------------------------------------------------------------------ the member view
     def _view(self, who: _Caller) -> dict[str, Any]:

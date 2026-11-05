@@ -169,6 +169,27 @@ def test_refusals_are_audited(world):
     assert ("artifact.upload_chunk", "not_owner") in got and ("artifact.mine", "not_in_group") in got
 
 
+def test_null_member_limits_leave_the_bridge_limits_in_charge(approval_svc, tmp_path):
+    """Effective limits are min(member config, bridge limits); a null member value drops its side of the min."""
+    w = World(approval_svc, tmp_path, max_upload_bytes=None, staging_bytes_per_member=None)
+    w.write_grants(max_file_bytes=CHUNK_BYTES, staging_bytes_per_agent=2 * CHUNK_BYTES)
+    w.view("op", [ART])
+    try:
+        limits = w.ms._limits()
+        assert limits.max_file_bytes == CHUNK_BYTES                       # the bridge value, not a member cap
+        assert w.ms._staging_cap(limits) == 2 * CHUNK_BYTES
+        assert refuse(w.ms.upload_chunk, w.user("op"), w.chunk(DATA, 0)).status == 400      # bridge cap still bites
+        (tmp_path / "t").mkdir()
+        tight = World(approval_svc, tmp_path / "t", max_upload_bytes=5, staging_bytes_per_member=7)
+        try:
+            tight.write_grants(max_file_bytes=CHUNK_BYTES, staging_bytes_per_agent=2 * CHUNK_BYTES)
+            assert tight.ms._limits().max_file_bytes == 5 and tight.ms._staging_cap(tight.ms._limits()) == 7
+        finally:
+            tight.bridge.stop()
+    finally:
+        w.bridge.stop()
+
+
 def test_per_member_staging_cap_is_429(approval_svc, tmp_path):
     w = World(approval_svc, tmp_path, staging_bytes_per_member=len(DATA))
     w.view("op", [ART])
