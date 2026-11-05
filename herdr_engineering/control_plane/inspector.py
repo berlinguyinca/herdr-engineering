@@ -24,6 +24,7 @@ from collections import OrderedDict, deque
 from datetime import UTC, datetime
 from typing import Any
 
+from .admission import AdmissionContext
 from .envelope import (
     _checkpoint_header,
     _checkpoint_int,
@@ -36,7 +37,16 @@ from .envelope import (
 from .redact import redact_payload, redact_text, rules_fingerprint
 
 #: Bump when the replayed projection changes shape or meaning, so older snapshots are replayed from events instead.
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
+
+
+def _replayed_admission(payload, session_id):
+    private = payload.get("_inspector_context")
+    if (type(private) is not dict or set(private) != {"version", "admission"}
+            or type(private["version"]) is not int or private["version"] != 2):
+        return None
+    context = AdmissionContext.from_private(private["admission"])
+    return context if context is not None and context.entity_id == session_id else None
 
 
 class SnapshotStale(Exception):
@@ -323,13 +333,16 @@ class InspectorStore:
                     "tools": {key: entry["seq"] for key, entry in sess.tools.items()},
                     "tests": {key: entry["seq"] for key, entry in sess.tests.items()},
                 })
-            return _checkpoint_json({"version": 1, "domain": "inspector", "sessions": sessions,
+            return _checkpoint_json({"version": 1, "domain": "inspector", "inspector_private_schema": 2, "sessions": sessions,
                                      "global_prefs": self._global_prefs, "stats": self.stats,
                                      "replay": {"key": list(self._replay_key) if self._replay_key is not None else None,
                                                 "watermark": self._replay_watermark,
                                                 "count": self._replay_count}})
 
     def restore_checkpoint(self, state) -> None:
+        state = _checkpoint_json(state)
+        private_schema = state.pop("inspector_private_schema", 1)
+        _checkpoint_require(type(private_schema) is int and private_schema in (1, 2))
         state = _checkpoint_header(state, "inspector", ("sessions", "global_prefs", "stats", "replay"))
         replay = state['replay']
         _checkpoint_object(replay, ('key', 'watermark', 'count'))
@@ -355,7 +368,7 @@ class InspectorStore:
                           "seen", "capabilities", "assoc", "models", "usage_totals", "usage_latest",
                           "last_event", "last_ingest", "ended", "prefs", "evicted_to", "tools", "tests")
         entry_fields = ("seq", "rev", "kind", "agent_id", "parent_agent_id", "event_id", "ts",
-                        "recv", "sensitive", "redacted", "truncated", "data", "size")
+                        "recv", "sensitive", "redacted", "truncated", "data", "size", "admission")
         usage_keys = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens")
         for row in state["sessions"]:
             _checkpoint_object(row, session_fields)
@@ -397,7 +410,13 @@ class InspectorStore:
             _checkpoint_require(type(row["events"]) is list)
             previous = -1
             for entry in row["events"]:
+                if private_schema == 1:
+                    entry.pop("admission", None)
+                    entry["admission"] = None
                 _checkpoint_object(entry, entry_fields, ("t0",))
+                context = AdmissionContext.from_private(entry["admission"])
+                _checkpoint_require(entry["admission"] is None or (
+                    context is not None and context.entity_id == sid))
                 _checkpoint_int(entry["seq"])
                 _checkpoint_int(entry["rev"])
                 _checkpoint_int(entry["size"])
@@ -514,11 +533,17 @@ class InspectorStore:
             return self.get_prefs(session_id)
 
     # --------------------------------------------------------------- ingest
-    def ingest(self, session_id: str, payload: dict, *, persist: bool = True) -> dict:
+    def ingest(self, session_id: str, payload: dict, *, persist: bool = True,
+               admission: AdmissionContext | None = None) -> dict:
         """Ingest one envelope payload (``{"events": [...]}`` or a single event)."""
         if (not isinstance(session_id, str) or len(session_id) > 128 or
                 not (_SESSION_ID.fullmatch(session_id) or _CANONICAL_SESSION_ID.fullmatch(session_id))):
             raise ValueError("entity_id must be a valid session id (1-128 chars; canonical pane %3A escapes allowed)")
+        if admission is not None:
+            if type(admission) is not AdmissionContext:
+                raise TypeError("admission must be a private AdmissionContext")
+            if admission.entity_id != session_id:
+                raise ValueError("admission session mismatch")
         events = payload.get("events") if isinstance(payload, dict) else None
         if events is None:
             events = [payload]
@@ -531,7 +556,8 @@ class InspectorStore:
             sess = self._session(session_id)
             for i, ev in enumerate(events):
                 try:
-                    status = self._ingest_one(sess, ev, persist)
+                    status = self._ingest_one(sess, ev, persist,
+                        admission.for_child(i) if admission is not None and persist else admission)
                 except RuntimeError:
                     # A partially persisted batch is retried by the emitter. Keep
                     # successful entries bounded while leaving the failed id unseen.
@@ -552,7 +578,7 @@ class InspectorStore:
             self._enforce_global(keep=session_id)
         return result
 
-    def _ingest_one(self, sess: _Session, ev: Any, persist: bool) -> str:
+    def _ingest_one(self, sess: _Session, ev: Any, persist: bool, admission: AdmissionContext | None) -> str:
         if not isinstance(ev, dict):
             raise ValueError("event must be an object")
         kind = ev.get("kind")
@@ -562,7 +588,7 @@ class InspectorStore:
         if eid and eid in sess.seen:
             return "dup"
         try:
-            status = self._apply(sess, kind, ev, persist)
+            status = self._apply(sess, kind, ev, persist, admission)
         except ValueError:
             raise
         except (TypeError, AttributeError, KeyError, OverflowError, IndexError) as exc:
@@ -573,9 +599,10 @@ class InspectorStore:
                 sess.seen.popitem(last=False)
         return status
 
-    def _apply(self, sess: _Session, kind: str, ev: dict, persist: bool) -> str:
+    def _apply(self, sess: _Session, kind: str, ev: dict, persist: bool, admission: AdmissionContext | None) -> str:
         data = self._sanitize(kind, ev)
         base = {
+            "admission": admission.to_private() if admission is not None else None,
             "agent_id": _s(ev.get("agent_id"), 128) or "main",
             "parent_agent_id": _s(ev.get("parent_agent_id"), 128),
             "event_id": _s(ev.get("event_id"), 128),
@@ -628,6 +655,7 @@ class InspectorStore:
                     if t["data"].get("status") == "running":
                         t["data"]["status"] = "interrupted"
                         t["data"]["incomplete"] = True
+                        t["admission"] = base["admission"]
                         self._touch(sess, t)
                 sess.tools = {k: t for k, t in sess.tools.items() if t["data"]["status"] == "running"}
             if phase == "ended":
@@ -832,7 +860,8 @@ class InspectorStore:
             "entity_type": "inspector", "entity_id": sess.session_id,
             "event_type": f"inspector.{kind}", "session_id": sess.session_id,
             "source_timestamp": base["ts"],
-            "payload": {**{k: v for k, v in data.items() if k not in ("failures", "_flags")},
+            "payload": {"_inspector_context": {"version": 2, "admission": base["admission"]},
+                        **{k: v for k, v in data.items() if k not in ("failures", "_flags")},
                         "agent_id": base["agent_id"], "parent_agent_id": base["parent_agent_id"],
                         "event_id": base["event_id"], "kind": kind, "sensitive": flagged,
                         **flags, "_received_at": self._clock(), "_sequence": sess.rev},
@@ -869,6 +898,7 @@ class InspectorStore:
                 flagged or self._cmd_sensitive(data), False)
             sess.tools[cid] = live
             live["t0"] = self._clock()
+        live["admission"] = base["admission"]
         d = live["data"]
         if data.get("tool") and d.get("tool") in (None, "unknown"):
             d["tool"] = data["tool"]
@@ -905,6 +935,7 @@ class InspectorStore:
                 "run_id": rid, "command": data.get("command"), "status": "running",
                 "_flags": {"redacted": False, "truncated": False}}, flagged, False)
             sess.tests[rid] = live
+        live["admission"] = base["admission"]
         d = live["data"]
         for k in ("command", "passed", "failed", "skipped", "duration_ms", "failures"):
             if k in data:
@@ -921,7 +952,8 @@ class InspectorStore:
                     "entity_type": "inspector", "entity_id": sess.session_id,
                     "event_type": "inspector.test", "session_id": sess.session_id,
                     "source_timestamp": base["ts"],
-                    "payload": {"kind": "test", **{k: v for k, v in d.items() if k != "failures"},
+                    "payload": {"_inspector_context": {"version": 2, "admission": base["admission"]},
+                                "kind": "test", **{k: v for k, v in d.items() if k != "failures"},
                                 # Sensitive runs persist counts/status only, never bodies.
                                 "failures": [] if live["sensitive"] else (d.get("failures") or [])[:20],
                                 "sensitive": live["sensitive"],
@@ -1320,6 +1352,11 @@ class InspectorStore:
             for row in state["sessions"]:
                 sess = _Session(row["session_id"])
                 sess.events = deque(row["events"])
+                for entry in sess.events:
+                    context = AdmissionContext.from_private(entry.get("admission"))
+                    if "admission" not in entry or (entry["admission"] is not None and (
+                            context is None or context.entity_id != sess.session_id)):
+                        raise SnapshotStale("invalid private admission context")
                 sess.by_seq = {e["seq"]: e for e in sess.events}
                 sess.bytes, sess.next_seq, sess.rev = int(row["bytes"]), int(row["next_seq"]), int(row["rev"])
                 sess.dropped_ring, sess.client_dropped = int(row["dropped_ring"]), int(row["client_dropped"])
@@ -1390,7 +1427,8 @@ class InspectorStore:
                                       if isinstance(sid, str) and sid in self._sessions else 0)
                         result = self.ingest(sid, {**p, "ts": _iso_of(ev.get("source_timestamp")),
                                                   **({"phase": "end"} if p["kind"] == "test" else {})},
-                                             persist=False)
+                                             persist=False,
+                                             admission=_replayed_admission(p, sid))
                         if not result["accepted"]:
                             continue
                         sess = self._sessions[sid]
