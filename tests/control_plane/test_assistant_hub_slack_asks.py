@@ -399,6 +399,7 @@ def test_sweep_skips_vetoed_requests_and_ones_already_asked_or_queued(aw):
     fresh = aw.new_runtime()
     aw.runtime.start()
     assert aw.listener.wait_for(lambda: len(aw.posts()) == 1)
+    assert aw.runtime.stop()                    # quiesce the drain thread: it must not race `fresh.sweep()` below
     queued = aw.decide()                                                 # already queued in `fresh` below
     fresh.notify_pending(aw.store.get_action_request(queued.request_id, tenant_id=T, user_id=U), "x", "y")
     assert fresh.sweep() == 0 and fresh.queued() == 1
