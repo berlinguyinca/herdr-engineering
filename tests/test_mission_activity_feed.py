@@ -528,3 +528,54 @@ def test_model_use_crosses_the_allowlist_and_unknown_fields_do_not():
     assert use['agents'][0]['role'] == 'reviewer' and use['agents'][0]['onPin'] is False
     assert use['agents'][0]['why'] == 'separation of duties'
     assert 'rawPrompt' not in use['agents'][0] and 'hiddenReasoning' not in clean
+
+
+def test_next_action_crosses_feed_and_store_summaries_unchanged_and_bounded():
+    """G8-A: the allowlist already carries nextAction/nextActionAt; the literal fallback is NOT filtered server-side
+    (the client treats it as no next action, so the server stays a pure passthrough)."""
+    from herdr_engineering.control_plane.mission_activity import MissionActivityStore
+    from herdr_engineering.mission_activity_feed import _sanitize
+
+    clean = _sanitize({'nextAction': 'Run the suite ' + 'x' * 2000, 'nextActionAt': STAMP, 'prompt': 'no', 'reasoning': 'no'})
+    assert clean['nextActionAt'] == STAMP and clean['nextAction'].startswith('Run the suite')
+    assert len(clean['nextAction']) <= 1024 and 'prompt' not in clean and 'reasoning' not in clean
+    now = 1_800_000_000
+    store = MissionActivityStore(now=lambda: now)
+    def iso(epoch):
+        return __import__('datetime').datetime.fromtimestamp(epoch, __import__('datetime').UTC).isoformat()
+    payload = {'contract_version': 1, 'host_id': 'h', 'instance_id': 'i', 'session_id': 's', 'observed_at': iso(now),
+               'snapshot_at': iso(now), 'mission_revision': 1, 'connection': 'connected',
+               'mission': {'id': 'MSN-1', 'title': 't', 'status': 'RUNNING'},
+               'activity': {'nextAction': 'No further action is scheduled', 'nextActionAt': STAMP}}
+    store.ingest('pi:MSN-1', payload, source='pi')
+    summary = store.list_summaries()[0]['activity']
+    assert summary['nextAction'] == 'No further action is scheduled' and summary['nextActionAt'] == STAMP
+
+
+def _rewrite_snapshot(project, snapshot, **top):
+    path = project / '.pi-eng/orchestration-snapshot.json'
+    path.write_text(json.dumps(dict(snapshot, **top)))
+    path.chmod(0o600)
+
+
+def test_contract_v4_fields_cross_the_feed_and_v3_still_works(tmp_path):
+    with native_session(tmp_path) as (root, project, _, snapshot, _), api() as (url, posts):
+        snapshot['missions'][0].update(created_at='2026-11-01T10:00:00Z', completed_at='nope', secret='x',
+                                       links=[dict(kind='issue', repository='acme/app', number=3, title='no'), 'junk'])
+        _rewrite_snapshot(project, snapshot, contractVersion=4)
+        assert feed.MissionActivityFeed(url, host_id='host', control_dir=root).run_once()['posted'] == 1
+        mission = posts[0]['payload']['mission']
+        assert mission['created_at'] == '2026-11-01T10:00:00Z' and mission['completed_at'] == 'nope'
+        assert mission['links'] == [dict(kind='issue', repository='acme/app', number=3)]
+        assert 'secret' not in mission
+    (tmp_path / 'v3').mkdir()
+    with native_session(tmp_path / 'v3') as (root, _, _, _, _), api() as (url, posts):
+        feed.MissionActivityFeed(url, host_id='host', control_dir=root).run_once()
+        assert not {'created_at', 'completed_at', 'links'} & set(posts[0]['payload']['mission'])
+
+
+def test_unknown_contract_version_is_not_published(tmp_path):
+    with native_session(tmp_path) as (root, project, _, snapshot, _), api() as (url, posts):
+        _rewrite_snapshot(project, snapshot, contractVersion=5)
+        feed.MissionActivityFeed(url, host_id='host', control_dir=root).run_once()
+        assert all(p['payload']['connection'] != 'connected' for p in posts)

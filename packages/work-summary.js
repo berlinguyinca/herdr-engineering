@@ -12,6 +12,26 @@ const stamp = v => text(v) || undefined;
 const compact = o => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null));
 const link = (kind, id) => { const href = entityHref(kind, id); return href ? {kind, entity_id: String(id), href} : null; };
 
+// G8: Pi's own "nothing scheduled" marker (MissionObservability.ts) is an absence, never a next action.
+const NO_NEXT_ACTION = 'no further action is scheduled';
+const NEXT_ACTION_MAX = 500;
+/** @returns {{text:string, at?:string}|undefined} only when Pi supplied non-empty text that is not its absence marker; never inferred. */
+export function piNextAction(activity) {
+  const t = text(activity?.nextAction);
+  if (!t || t.toLowerCase() === NO_NEXT_ACTION) return undefined;
+  const at = text(activity.nextActionAt);
+  return {text: t.slice(0, NEXT_ACTION_MAX), ...(at && Number.isFinite(Date.parse(at)) ? {at} : {})};
+}
+
+const PI_TIMES = [['created_at', 'pi_reported_created'], ['completed_at', 'pi_reported_completed']];
+function piTimes(projection) {
+  const m = projection?.mission;
+  return PI_TIMES.map(([field, kind]) => {
+    const at = text(m?.[field]);
+    return at && Number.isFinite(Date.parse(at)) ? {kind, ref: text(m.id) || 'mission', timestamp: at} : null;
+  }).filter(Boolean);
+}
+
 function missionLifecycle(entry) {
   if (entry.outcome === 'failed' || entry.outcome === 'finished') return entry.outcome;
   if (entry.tab !== 'current') return 'unconfirmed'; // stale / disconnected / recorded-only is not live
@@ -41,10 +61,14 @@ export function workSummaries({projections = [], recorded = [], sessions = [], r
       work_id: `mission:${e.key}`, title: e.title, source: 'mission', source_ref: e.key, mission_key: e.key, session_ids: [], sessionHosts: [],
       pane_refs: [], links: [link('mission', e.key)].filter(Boolean), lifecycle: missionLifecycle(e),
       evidence: [e.projection && {kind: 'mission_projection', ref: e.key, timestamp: stamp(e.projection.activity_snapshot_at ?? e.projection.snapshot_at)},
+        // G8: contract-v4 times are Pi's own claim. They are evidence only: never started_at/completed_at, never used to
+        // assert history coverage (a mission Pi no longer reports still has no row here), so the G1 coverage rules are unchanged.
+        ...piTimes(e.projection),
         e.recorded && {kind: 'mission_record', ref: e.key, timestamp: stamp(e.recorded.updated_at)},
         missionLifecycle(e) === 'paused_quota' && {kind: 'quota_status', ref: e.key, timestamp: stamp(e.projection?.activity_snapshot_at ?? e.projection?.snapshot_at ?? e.recorded?.updated_at)}].filter(Boolean),
       ...(progress ? {progress: {percent: progress.percent, label: progress.label, basis: 'measuredProgress', measured_at: stamp(e.projection?.activity_snapshot_at ?? e.projection?.snapshot_at)}} : {}),
       ...compact({started_at: stamp(e.recorded?.created_at), completed_at: e.outcome === 'finished' ? stamp(e.recorded?.completed_at) : undefined, updated_at: stamp(e.recorded?.updated_at)}),
+      ...(e.projection && piNextAction(a) ? {nextAction: piNextAction(a)} : {}),
       coverage: e.projection && e.tab === 'current' ? 'complete' : 'unconfirmed',
     }];
   }));

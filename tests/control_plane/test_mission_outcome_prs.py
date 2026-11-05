@@ -136,6 +136,7 @@ def test_g3_failing_read_yields_empty_and_the_list_still_answers():
 
 def test_g3_http_envelope_adds_pr_refs_and_keeps_outcomes(served):
     status, body = _get(served, "v1")
-    assert status == 200 and set(body) == {"outcomes", "pr_refs"}
+    assert status == 200 and set(body) == {"outcomes", "pr_refs", "issue_refs"}
     assert body["pr_refs"]["pi:MSN-1"] == [{"repository": "org/app", "number": 10}, {"repository": "org/app", "number": 20}]
+    assert body["issue_refs"] == {}   # G8: nothing Pi-linked here, so nothing is inferred
     assert _get(served, None)[0] == 401

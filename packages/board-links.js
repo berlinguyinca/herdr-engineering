@@ -52,12 +52,12 @@ export function refsFromMissionOutcomes(body) {
   const outcomes = body && typeof body === 'object' ? body.outcomes : null;
   if (!outcomes || typeof outcomes !== 'object' || Array.isArray(outcomes)) return { refs: [], failed: true };
   const refs = [], seen = new Set();
-  const add = (id, pr) => {
+  const add = (id, pr, type = 'pr') => {
     if (!pr || typeof pr.repository !== 'string' || !Number.isInteger(pr.number)) return;
-    const k = `${id}\u0000${pr.repository}\u0000${pr.number}`;
+    const k = `${type}\u0000${id}\u0000${pr.repository}\u0000${pr.number}`;
     if (seen.has(k)) return;
     seen.add(k);
-    refs.push({ kind: 'mission', id, type: 'pr', repository: pr.repository, number: pr.number });
+    refs.push({ kind: 'mission', id, type, repository: pr.repository, number: pr.number });
   };
   for (const [id, summary] of Object.entries(outcomes)) {
     if (summary && Array.isArray(summary.prs)) for (const pr of summary.prs) add(id, pr);
@@ -65,6 +65,12 @@ export function refsFromMissionOutcomes(body) {
   const prRefs = body.pr_refs;
   if (prRefs && typeof prRefs === 'object' && !Array.isArray(prRefs)) {
     for (const [id, list] of Object.entries(prRefs)) if (Array.isArray(list)) for (const pr of list) add(id, pr);
+  }
+  // G8: top-level `issue_refs` are issues Pi explicitly linked to a mission (absent on older servers). Same rules as PRs:
+  // an issue verifies only when exactly one distinct mission carries that exact repository+number.
+  const issueRefs = body.issue_refs;
+  if (issueRefs && typeof issueRefs === 'object' && !Array.isArray(issueRefs)) {
+    for (const [id, list] of Object.entries(issueRefs)) if (Array.isArray(list)) for (const issue of list) add(id, issue, 'issue');
   }
   return { refs, failed: false };
 }

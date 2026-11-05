@@ -31,6 +31,7 @@ export function sessionContextModel({session, projections = [], recorded = [], s
     ...base, state: 'linked',
     mission: {title: parent.title, href: entityHref('mission', parent.mission_key), lifecycle: parent.lifecycle, coverage: parent.coverage},
     ...(parent.progress && Number.isFinite(parent.progress.percent) ? {progress: parent.progress} : {}),
+    ...(parent.nextAction ? {nextAction: parent.nextAction} : {}),
     siblings: siblingIds.slice(0, SIBLING_LIMIT).map(sid => ({id: sid, label: label(byId.get(sid)), href: entityHref('session', sid)})),
     moreSiblings: Math.max(0, siblingIds.length - SIBLING_LIMIT),
   };
@@ -62,6 +63,7 @@ export function renderSessionContext(model) {
   const rows = [
     `<dt>Mission</dt><dd>${m.href ? `<a href="${esc(m.href)}" data-mission-link>${esc(m.title)}</a>` : esc(m.title)} <span class="wcx-note">${esc(LIFECYCLE[m.lifecycle] || m.lifecycle)}${m.coverage !== 'complete' ? ' · not fully confirmed' : ''}</span></dd>`,
     percent === null ? '' : `<dt>Progress</dt><dd><progress class="wcx-progress" max="100" value="${percent}" aria-label="${esc(`Measured progress for ${m.title}: ${p.label || `${percent}%`}`)}">${percent}%</progress><span class="wcx-note">${esc(p.label || `${percent}%`)}</span></dd>`,
+    model.nextAction ? `<dt>Pi-reported next action</dt><dd data-next-action>${esc(model.nextAction.text)}${model.nextAction.at ? ` <span class="wcx-note">at <time datetime="${esc(model.nextAction.at)}">${esc(model.nextAction.at)}</time></span>` : ''}</dd>` : '',
     model.siblings.length ? `<dt>Other agents</dt><dd><ul>${model.siblings.map(s => `<li>${s.href ? `<a href="${esc(s.href)}" data-sibling-link>${esc(s.label)}</a>` : esc(s.label)}</li>`).join('')}</ul>${model.moreSiblings ? `<span class="wcx-note">+${model.moreSiblings} more</span>` : ''}</dd>` : '',
   ].join('');
   return wrap('linked', `<dl>${rows}</dl>${failedNote(model.failed || [])}`);

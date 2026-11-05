@@ -3444,12 +3444,13 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
             if resource == "mission-outcomes" and len(parts) == 4:
-                from .mission_outcome import outcome_summaries, pr_refs_by_mission
+                from .mission_outcome import issue_refs_by_mission, outcome_summaries, pr_refs_by_mission
                 try:
                     server.mission_outcomes.sweep()
                 except Exception:  # noqa: BLE001
                     pass
-                return self._json({"outcomes": outcome_summaries(r), "pr_refs": pr_refs_by_mission(r)})
+                return self._json({"outcomes": outcome_summaries(r), "pr_refs": pr_refs_by_mission(r),
+                                   "issue_refs": issue_refs_by_mission(r)})
             if resource == "missions":
                 try:
                     server.mission_outcomes.sweep()   # throttled; closes missions that went silent
