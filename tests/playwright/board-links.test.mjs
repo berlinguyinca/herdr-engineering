@@ -29,6 +29,8 @@ const OUTCOMES={outcomes:{
  'MSN-9':{result:'succeeded',prs:[{repository:'acme/app',number:9}]},
  'pi:MSN-9':{result:'succeeded',prs:[{repository:'acme/app',number:9}]},
  'pi:MSN-10':{result:'failed',prs:[]},
+ // G2: free-text/unrecorded issue hints must never link an issue card (acme/app#1 is I-verified, #2 is I-none)
+ 'pi:MSN-11':{result:'succeeded',prs:[],title:'Closes #1',last_event:'Fixes acme/app#2',objective:'resolves acme/app#1',issue_number:1,issue:{repository:'acme/app',number:2}},
 }};
 const REFS=[
  {kind:'mission',id:'pi:MSN-1',type:'issue',repository:'acme/app',number:1},

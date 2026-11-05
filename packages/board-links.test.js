@@ -92,3 +92,14 @@ test('refsFromMissionOutcomes flags malformed payloads as failed', () => {
   for (const bad of [null, undefined, {}, {outcomes: null}, {outcomes: []}, 'x'])
     assert.deepEqual(refsFromMissionOutcomes(bad), {refs: [], failed: true});
 });
+
+test('G2: issue cards stay unlinked; free text and unrecorded issue fields are never relationship sources', () => {
+  const body = {outcomes: {
+    'pi:MSN-1': {prs: [{repository: 'acme/app', number: 7}], title: 'Closes #7', last_event: 'Fixes acme/app#7', issue_number: 7, issue: {repository: 'acme/app', number: 7}},
+    'pi:MSN-2': {prs: [], issues: [{repository: 'acme/app', number: 7}]},
+  }};
+  const {refs, failed} = refsFromMissionOutcomes(body);
+  assert.equal(failed, false);
+  assert.ok(refs.every(r => r.type === 'pr'), 'only recorded PRs become refs');
+  assert.equal(resolveBoardLink(issue(), {refs}).state, 'none');
+});
