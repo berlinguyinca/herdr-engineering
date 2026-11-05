@@ -3463,23 +3463,34 @@ class ControlPlaneRepo:
         return [{k: v for k, v in key.items() if k != "key_hash"}
                 for key in self._llm_keys()]
 
-    def upsert_custom_model(self, name, base_url, upstream_model=None, project=None, *,
-                            fabric_model=None, context_window=8192):
-        if not name or not base_url:
-            raise ValueError("name and base_url are required")
-        if not str(base_url).startswith(("http://", "https://")):
+    def upsert_custom_model(self, name, base_url=None, upstream_model=None, project=None, *,
+                            fabric_model=None, context_window=8192, fallback_models=None):
+        """``base_url`` is the optional private service; ``fallback_models`` are fnmatch patterns of gateway models used
+        instead when the advertised ``fabric_model`` is not ready. One of the two must exist."""
+        if fallback_models is not None:
+            if (not isinstance(fallback_models, list) or not 1 <= len(fallback_models) <= 8
+                    or any(not isinstance(p, str) or not p or len(p) > 128 or not p.isprintable()
+                           or any(c.isspace() for c in p) for p in fallback_models)):
+                raise ValueError("fallback_models must be one to eight gateway model patterns without whitespace")
+        if not name or not (base_url or fallback_models):
+            raise ValueError("name and a base_url or fallback_models are required")
+        if base_url and not str(base_url).startswith(("http://", "https://")):
             raise ValueError("base_url must be http(s)")
-        payload = {"name": name, "base_url": base_url.rstrip("/"),
-                   "upstream_model": upstream_model or name, "project": project,
-                   "deleted": False}
+        payload = {"name": name, "upstream_model": upstream_model or name, "project": project, "deleted": False}
+        if base_url:
+            payload["base_url"] = base_url.rstrip("/")
         if fabric_model is not None:
             if (not isinstance(fabric_model, str) or not fabric_model
                     or len(fabric_model) > 256 or not fabric_model.isprintable()
                     or any(c.isspace() for c in fabric_model)):
                 raise ValueError("fabric_model must be a bounded model identity without whitespace")
+            payload["fabric_model"] = fabric_model
+        if fabric_model is not None or fallback_models:
             if type(context_window) is not int or not 1 <= context_window <= 1048576:
                 raise ValueError("context_window must be an integer between 1 and 1048576")
-            payload.update(fabric_model=fabric_model, context_window=context_window)
+            payload["context_window"] = context_window
+        if fallback_models:
+            payload["fallback_models"] = list(fallback_models)
         return self.record_event("custom_model", name, "custom_model.upserted", payload)
 
     def delete_custom_model(self, name):
