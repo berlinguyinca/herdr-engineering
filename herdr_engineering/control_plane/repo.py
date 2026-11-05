@@ -72,6 +72,9 @@ from .service_catalog import (
 #: Hard bound on one durable deployment write made under a store lock (seconds).
 DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S = 10
 
+# build_cache events arrive per build on every host; keep a bounded recent window
+# per host stream (older ones stay in the durable sink). Trimmed at 2x to amortise.
+BUILD_CACHE_STREAM_MAX = 500
 _CI_EVENT_KINDS = frozenset({"ci_report", "ci_observation", "ci_telemetry", "ci_logtests"})
 
 _STAGES = {
@@ -2885,6 +2888,11 @@ class ControlPlaneRepo:
                     self._event_order.append((entity_type, entity_id, seq))
             if self._durable_history is not None and entity_type in {'service','session'}:
                 stream[:] = stream[-1:]
+            if entity_type == "build_cache" and len(stream) > 2 * BUILD_CACHE_STREAM_MAX:
+                cutoff = stream[-BUILD_CACHE_STREAM_MAX]["sequence"]
+                del stream[:-BUILD_CACHE_STREAM_MAX]
+                self._event_order = [t for t in self._event_order
+                                     if not (t[0] == entity_type and t[1] == entity_id and t[2] < cutoff)]
             if self._sink is not None and not require_durable:
                 try:
                     self._sink.record(ev)

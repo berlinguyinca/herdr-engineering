@@ -47,6 +47,10 @@ from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
 
+
+class TombstoneUnavailable(Exception):
+    """The tombstone cache could not be refreshed within its staleness window: the request answers the fixed 503."""
+
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
@@ -309,7 +313,7 @@ class ControlPlaneServer:
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
-                 scheduler_admission=False, scheduler_limits=None, skill_registry=None,
+                 scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
@@ -490,6 +494,9 @@ class ControlPlaneServer:
         self.skills, self.skill_transfer = build_skill_registry(
             skill_registry, artifact_store=artifact_store, rustfs=rustfs, acl=artifact_acl,
             record_event=repo.record_event)
+        # control_plane.build_cache (flag off by default: nothing is constructed and the routes answer 404).
+        from .build_cache_routes import build_build_cache
+        self.build_cache = build_build_cache(build_cache, record_event=repo.record_event)
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
@@ -1612,6 +1619,8 @@ class ControlPlaneServer:
             caps.append("unified_workspace_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
+        if getattr(self, "build_cache", None) is not None:
+            caps.append("build_cache_v1")
         try:
             if self.deployment_definitions.status()["configured"]:
                 caps.append("deployments_v1")     # the read-only Deployments page
@@ -2094,8 +2103,12 @@ def _make_handler(server, public=False, operator=False):
             if server.artifact_store is None or not artifact_id:
                 return False
             if permission == "read":
-                return server.tombstone_cache.contains(
-                    artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                try:
+                    return server.tombstone_cache.contains(
+                        artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                except Exception as exc:        # noqa: BLE001 - fail closed: no fresh answer, nothing is served
+                    log.exception("tombstone cache unavailable")
+                    raise TombstoneUnavailable() from exc
             return self._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
 
         def _artifact_allowed(self, artifact_id, permission, *, operator_member=True):
@@ -2414,6 +2427,9 @@ def _make_handler(server, public=False, operator=False):
             self._request_cause = None
             try:
                 return dispatch()
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._json({"error": "artifact store unavailable"}, 503)
             except Exception as exc:
                 # A client closing while we write a dependency error must not
                 # replace the already-recorded reason that the request failed.
@@ -3151,6 +3167,9 @@ def _make_handler(server, public=False, operator=False):
                 from .skill_routes import route_skills
                 if route_skills(self, server, parts, resource):
                     return None
+                from .build_cache_routes import route_build_cache
+                if route_build_cache(self, server, parts, resource):
+                    return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
                 return self._api_post(parts, resource)
@@ -3182,6 +3201,9 @@ def _make_handler(server, public=False, operator=False):
             except ArtifactError as exc:
                 return self._send_json(404 if str(exc).startswith("no artifact") else 400,
                                        {"error": str(exc)})
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._send_json(503, {"error": "artifact store unavailable"})
             except RuntimeError as exc:
                 self._request_cause = type(exc).__name__
                 if resource == 'events':
@@ -3815,6 +3837,12 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(version) if version else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_review_manager is not None:
                 if len(parts) == 6 and parts[5] == "reviews":
+                    # without an ACL the registry decides (like the versions routes); with one, the blanket guard above already did
+                    # (legacy uploads have no registry row). No answer reveals that the artifact exists
+                    if (server.artifact_store is not None and server.artifact_acl is None
+                            and not self._artifact_call(
+                            "report_permission", parts[4], self._resource_principal(), "read")):
+                        return self._json({"error": "not found"}, 404)
                     return self._json({"artifact_id": parts[4],
                                        "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})
             if resource == 'artifacts' and len(parts) == 6 and r.get_artifact(parts[4]):
