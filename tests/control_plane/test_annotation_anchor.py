@@ -232,7 +232,7 @@ def test_ordinary_bidi_text_and_marks_are_still_accepted():
 
 INVISIBLE = [chr(c) for c in (0x80, 0x85, 0x9F, 0xAD, 0x2028, 0x2029, 0x2060, 0x2064, 0x206A, 0x206F, 0xFEFF, 0xFFF9, 0xFFFB,
                               0xE0001, 0xE0041, 0xE007F, 0xE000, 0x0378,
-                              0xE0100, 0xE01EF, 0x034F, 0x115F, 0x1160, 0x17B4, 0x3164, 0xFFA0, 0x2800)]
+                              0x034F, 0x115F, 0x1160, 0x17B4, 0x3164, 0xFFA0)]
 
 
 @pytest.mark.parametrize("ch", INVISIBLE, ids=lambda c: f"U+{ord(c):04X}")
@@ -252,3 +252,19 @@ def test_joiners_and_directional_marks_are_still_accepted():
 
 def test_emoji_variation_selector_is_still_accepted():
     assert clean_comment("\u2764\ufe0f ok") == "\u2764\ufe0f ok"
+
+
+def test_ideographic_variation_selectors_and_braille_blank_are_accepted():
+    text = "\u845b\U000e0100 \u2800\u2801"
+    assert clean_comment(text) == text
+    assert clean_anchor({"kind": "text_quote", "file": "a", "exact": text})["exact"] == text
+
+
+def test_the_worker_does_not_judge_unassigned_code_points_but_the_edge_does():
+    unassigned = "ok \u0378 ok"            # unassigned in every Unicode version so far; a newer table may assign others
+    assert code(clean_comment, unassigned) == "bad_chars"
+    assert clean_comment(unassigned, unassigned=False) == unassigned
+    anchor = {"kind": "text_quote", "file": "a", "exact": unassigned}
+    assert code(clean_anchor, anchor) == "bad_chars"
+    assert clean_anchor(anchor, unassigned=False)["exact"] == unassigned
+    assert code(lambda v: clean_comment(v, unassigned=False), "x\u202ey") == "bad_chars"       # real format chars still refused

@@ -340,5 +340,21 @@ def test_the_owner_list_cleans_invisible_characters_from_rows_stored_before_the_
         perms.owned.add(aid)
         _, body = request(base, listing(aid))
         row = body["annotations"][0]
-        assert row["body"] == "fix it" and row["anchor"]["exact"] == "hello" and row["anchor"]["kind"] == "text_quote"
-        assert not any(0xE0000 <= ord(c) <= 0xE007F or c in dirty for c in json.dumps(body, ensure_ascii=False))
+        assert row["body"] == "fix it" and row["anchor"]["kind"] == "text_quote"
+        assert not any(0xE0000 <= ord(c) <= 0xE007F or c in dirty for c in row["body"])
+
+
+def test_the_owner_list_returns_anchor_quotes_as_stored(registry_pg):
+    """The UI matches quotes against the document text: a ZWJ emoji and a double space must come back unchanged."""
+    quote = "family \U0001f468\u200d\U0001f469\u200d\U0001f467  and  more"
+
+    async def build(conn, store, aid, share_id):
+        ids = await ingest_rows(1)(conn, store, aid, share_id)
+        await conn.execute("UPDATE artifact_annotations SET anchor=$2::jsonb WHERE annotation_id=$1", ids[0],
+                           json.dumps({"kind": "text_quote", "file": "index.html", "exact": quote, "prefix": " a  ", "suffix": "b "}))
+        return ids
+    aid, _share, _ids = with_rows(registry_pg, build)
+    with api(registry_pg) as (base, perms):
+        perms.owned.add(aid)
+        anchor = request(base, listing(aid))[1]["annotations"][0]["anchor"]
+        assert anchor == {"kind": "text_quote", "file": "index.html", "exact": quote, "prefix": " a  ", "suffix": "b "}

@@ -119,8 +119,9 @@ def sse_text(env, key):
     conn.request("GET", "/api/v1/events/stream", headers={"X-API-Key": key})
     resp = conn.getresponse()
     out = b""
+    deadline = __import__("time").monotonic() + 3.5       # a live stream never ends: read for a bounded time
     try:
-        while True:
+        while __import__("time").monotonic() < deadline:
             chunk = resp.fp.readline()
             if not chunk:
                 break
@@ -138,3 +139,33 @@ def test_the_global_event_stream_drops_artifact_events_the_subscriber_may_not_re
         assert "StreamConnected" in theirs and "StreamConnected" in mine
         assert aid in mine and "ArtifactRegistered" in mine
         assert aid not in theirs
+
+
+def test_the_activity_feed_drops_artifact_events_the_caller_may_not_read(registry_pg):
+    with acl_env(registry_pg) as env:
+        aid = upload(env)
+        mine = status_of(env, "/api/v1/activity?limit=100")
+        theirs = status_of(env, "/api/v1/activity?limit=100", key="member-key")
+        assert mine[0] == theirs[0] == 200
+        assert aid in mine[1].decode() and "ArtifactRegistered" in mine[1].decode()
+        assert aid not in theirs[1].decode() and "p.html" not in theirs[1].decode()
+
+
+def test_sse_keepalives_run_from_the_last_write_even_while_hidden_events_arrive(registry_pg, monkeypatch):
+    from herdr_engineering.control_plane import api as api_module
+    monkeypatch.setattr(api_module, "_SSE_IDLE_SECONDS", 1)
+    with acl_env(registry_pg) as env:
+        import threading
+        stop = threading.Event()
+
+        def noise():                      # artifact events the stranger may not read, faster than the idle window
+            while not stop.wait(0.3):
+                env.server.repo.record_event("artifact", "hidden-artifact", "ArtifactRegistered", {"x": 1})
+        thread = threading.Thread(target=noise, daemon=True)
+        thread.start()
+        try:
+            theirs = sse_text(env, "member-key")        # reads for ~2 s
+        finally:
+            stop.set()
+            thread.join(2)
+        assert theirs.count("StreamKeepalive") >= 1 and "hidden-artifact" not in theirs

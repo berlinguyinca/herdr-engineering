@@ -1658,6 +1658,9 @@ class ShareHandler(BaseHTTPRequestHandler):
             session = mint_session(lab.secret, share_id, grant["identity"], exp_int, email=grant["email"], basis=grant["basis"])
         except ValueError:
             return deny(self, state, "bad_identity", grant["identity"])
+        except RuntimeError:
+            log.error("cryptography missing for lab sessions: no session can be minted")    # no secrets in the message
+            return deny(self, state, "session_unavailable", grant["identity"])
         entry = state["entry"]
         kind = "f" if content_type_for(entry).split(";")[0].strip() == "text/html" else "v"
         landing = f"/s/{token}/k/{session}/{kind}/{quote(entry, safe='/')}"

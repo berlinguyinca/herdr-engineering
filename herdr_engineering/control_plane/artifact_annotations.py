@@ -158,8 +158,8 @@ class AnnotationStore:
                 or not isinstance(annotation_id, str) or not ANNOTATION_ID_RE.fullmatch(annotation_id)):
             return "invalid"
         try:
-            anchor = clean_anchor(record.get("anchor"))
-            body = clean_comment(record.get("body"), max_chars=max_comment_chars)
+            anchor = clean_anchor(record.get("anchor"), unassigned=False)
+            body = clean_comment(record.get("body"), max_chars=max_comment_chars, unassigned=False)
         except AnnotationInputError:
             return "invalid"
         file = anchor["file"]
@@ -209,7 +209,7 @@ class AnnotationStore:
         body = None
         if op == "edit":
             try:
-                body = clean_comment(record.get("body"), max_chars=max_comment_chars)
+                body = clean_comment(record.get("body"), max_chars=max_comment_chars, unassigned=False)
             except AnnotationInputError:
                 return "invalid"
         row = await conn.fetchrow("SELECT author_identity, author_email, status, file_name FROM artifact_annotations "

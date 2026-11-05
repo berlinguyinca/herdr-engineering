@@ -157,17 +157,13 @@ def route_annotations(handler, server, parts, resource) -> bool:
 
 
 def _display_safe(row):
-    """Rows stored before the input check may carry invisible or direction-changing characters: the owner's list gets the
-    same display-safe text external agents do (``clean_text``)."""
+    """Rows stored before the input check may carry invisible or direction-changing characters in the free-text body: the
+    owner's list gets the same display-safe text external agents do (``clean_text``). The anchor fields the UI matches
+    quotes against (exact, prefix, suffix, file) are returned as stored: they were validated at input."""
     from .collab_external import clean_text
     out = dict(row)
-    for key in ("body", "file"):
-        if isinstance(out.get(key), str):
-            out[key] = clean_text(out[key], 8000, multiline=True)
-    anchor = out.get("anchor")
-    if isinstance(anchor, dict):
-        out["anchor"] = {k: clean_text(v, 8000, multiline=True) if isinstance(v, str) and k != "kind" else v
-                         for k, v in anchor.items()}
+    if isinstance(out.get("body"), str):
+        out["body"] = clean_text(out["body"], 8000, multiline=True)
     return out
 
 

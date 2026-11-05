@@ -204,9 +204,8 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   deletes); the worker now refuses such lines as `invalid`. Lines spooled but not yet ingested at the cutover would be
   lost: wait until the worker has ingested the spool, or stop share-public before deploying and start it after the
   worker runs the new code. Existing lab sessions are invalidated (the session format changed), so viewers sign in again.
-- **Version skew.** The edge and the worker should run the same Python version: the character check refuses
-  unassigned code points (category Cn), and two runtimes with different Unicode tables disagree about a very new
-  character (the edge accepts, the worker drops the line).
+- **Version skew.** The edge refuses unassigned code points (category Cn) using its Python's Unicode tables; keep the
+  edge's Python current so brand-new characters are not refused (the worker does not check Cn).
 
 - **Every outstanding share link stops working.** Links issued so far point at the MCP host
   (`localdev.mcp.metabolomics.us/s/<token>/`); that host no longer serves `/s/` and a temporary redirect was
@@ -269,11 +268,15 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   refused (`invalid`). A member removed from the list can neither create, edit nor withdraw: the edge refuses their POST,
   and a line the edge accepted just before the removal is acknowledged (202 "pending") and then dropped by the worker.
   A compromised edge, which holds the signing secret, can still claim any listed email.
-- Comments and anchor text are refused (`bad_chars`) when they contain a character of Unicode category Cc, Cf, Cs, Co or Cn
-  (C0/C1 controls, bidi embeddings/overrides/isolates, tag characters, invisible operators, BOM, private use, unassigned)
-  or U+2028/2029, except ZWJ, ZWNJ and the directional marks U+200E/200F/061C and `\n`, `\t`. Rows stored earlier are
-  cleaned again in the MCP `artifact_annotations` view (`clean_text`), and viewer text is rendered with `dir="auto"` / `<bdi>`.
-  Unassigned means "unassigned in this Python's Unicode tables", so a brand-new emoji can be refused until the runtime updates.
+- Emails longer than 200 characters are refused by ingest (`invalid`) although a session allows 254.
+- Comments and anchor text are refused (`bad_chars`) at the edge when they contain a character of Unicode category Cc, Cf,
+  Cs, Co or Cn (C0/C1 controls, bidi embeddings/overrides/isolates, tag characters, invisible operators, BOM, private use,
+  unassigned) or U+2028/2029, or one of U+034F, U+115F, U+1160, U+17B4/17B5, U+3164, U+FFA0, except ZWJ, ZWNJ, the directional
+  marks U+200E/200F/061C, `\n` and `\t`. Ideographic variation selectors (U+E0100-E01EF) and braille blank U+2800 are accepted
+  because real text uses them. The worker applies the same checks except the unassigned (Cn) one, so Python-version skew
+  between edge and worker cannot drop an acknowledged line. Rows stored earlier are cleaned in the MCP
+  `artifact_annotations` view and the owner list's `body` (`clean_text`); anchor quotes are returned as stored. Viewer
+  text is rendered with `dir="auto"` / `<bdi>`.
 - PDF pages are keyboard-operable (Tab to a page, Enter or Space for the whole page; after "Mark region" the arrows move
   a region, Shift+arrows resize it, Enter uses it, Escape drops it), like the image view.
 - Purged or tombstoned artifacts keep their annotation rows and author emails; there is no retention rule yet.

@@ -3726,8 +3726,8 @@ def _make_handler(server, public=False, operator=False):
                         {"error": "not found"}, 404)
                 return self._etag_json({"hosts": r.list_hosts()})
             if resource == "activity":
-                evs = [_redact_event(e) for e in r.recent_events(
-                    limit=_qint(self.path, "limit", 50))]
+                evs = [_redact_event(e) for e in r.recent_events(limit=_qint(self.path, "limit", 50))
+                       if self._sse_readable(e)]        # artifact events only for callers who may read that artifact
                 return self._json({"events": evs})
             if resource == "analytics":
                 kind = parts[4]
@@ -5825,28 +5825,38 @@ def _make_handler(server, public=False, operator=False):
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
                 started = time.monotonic()
+                last_write = started       # keepalives run on the wall clock from the last WRITE: a skipped event is no write
                 # Bounded lifetime frees threads held by half-open clients;
                 # EventSource reconnects and replays.
                 while time.monotonic() - started < _MAX_SSE_SECONDS:
-                    try:
-                        ev = q.get(timeout=_SSE_IDLE_SECONDS)
-                    except queue.Empty:
-                        if q not in server._subscribers:
-                            break  # dropped as a slow subscriber: close so the client reconnects
-                        # A data frame (not an SSE comment, which EventSource never surfaces)
-                        # keeps proxies from timing out AND tells the UI the stream is alive on
-                        # a quiet fleet; the client filters it out like StreamConnected.
-                        self.wfile.write(_sse_frame({
-                            "event_type": "StreamKeepalive",
-                            "entity_type": "stream", "entity_id": "control-plane",
-                            "sequence": 0, "payload": {},
-                        }))
+                    wait = _SSE_IDLE_SECONDS - (time.monotonic() - last_write)
+                    ev = None
+                    if wait > 0:
+                        try:
+                            ev = q.get(timeout=wait)
+                        except queue.Empty:
+                            ev = None
+                    if ev is not None:
+                        if not self._sse_readable(ev):
+                            continue
+                        self.wfile.write(_sse_frame(ev))
                         self.wfile.flush()
+                        last_write = time.monotonic()
                         continue
-                    if not self._sse_readable(ev):
+                    if time.monotonic() - last_write < _SSE_IDLE_SECONDS:
                         continue
-                    self.wfile.write(_sse_frame(ev))
+                    if q not in server._subscribers:
+                        break  # dropped as a slow subscriber: close so the client reconnects
+                    # A data frame (not an SSE comment, which EventSource never surfaces)
+                    # keeps proxies from timing out AND tells the UI the stream is alive on
+                    # a quiet fleet; the client filters it out like StreamConnected.
+                    self.wfile.write(_sse_frame({
+                        "event_type": "StreamKeepalive",
+                        "entity_type": "stream", "entity_id": "control-plane",
+                        "sequence": 0, "payload": {},
+                    }))
                     self.wfile.flush()
+                    last_write = time.monotonic()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:
