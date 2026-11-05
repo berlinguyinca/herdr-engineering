@@ -1,6 +1,8 @@
 -- Owner delete hardening: a durable legal-hold flag, a queue of object keys whose purge is committed but whose bytes
 -- are not yet deleted (the record is committed first, bytes after, so a failure never leaves bytes gone with a 'ready'
 -- version), and a 'refused' audit action. Additive and idempotent. Safe to re-run.
+-- The backfill below is idempotent; the application also treats a tombstone without a purge date as a hold, and the
+-- worker re-normalises such rows, so a rolling deploy cannot lose a hold written by older code.
 --
 -- DOWN:
 --   DROP TABLE IF EXISTS artifact_pending_deletes;
