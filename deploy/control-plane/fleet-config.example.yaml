@@ -263,6 +263,18 @@ sections:
       #     calibration:                 # the activation gate, evaluated per risk class
       #       min_labeled_decisions: 200 # minimum 20
       #       max_false_negative_bound: 0.05   # exclusive upper bound; accepted range 0 < x <= 0.5
+      #   # OPTIONAL: Slack front door (Phase 4). Register tokens with
+      #   # `herdr-eng control-plane assistant-slack register --base-url URL --bot-token-file PATH --app-token-file PATH`
+      #   # (bot token, then app token, one per line on stdin). Inline tokens are rejected.
+      #   slack:
+      #     enabled: false
+      #     base_url: https://slack.com/api  # https; http only for loopback (tests)
+      #     bot_token_file: ""           # absolute PATH to the xoxb- token file (0600)
+      #     app_token_file: ""           # absolute PATH to the xapp- token file (0600), Socket Mode
+      #     owner_user_id: ""            # Slack user id of the owner, like U01ABC23DEF; required when enabled
+      #     channel: ""                  # channel id; empty = the owner's DM
+      #     ask_ttl_minutes: 15          # integer 1..120
+      #     max_asks_per_task_per_hour: 6
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)

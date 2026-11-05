@@ -380,6 +380,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "grants": _grants_config(section.get("grants")),
         # Action judge (jev): off unless enabled; the API key is read from api_key_file, never inline.
         "judge": _judge_config(section.get("judge")),
+        # Slack front door: off unless enabled; tokens are read from files, never inline.
+        "slack": _slack_config(section.get("slack")),
     }
 
 
@@ -627,6 +629,63 @@ def _judge_config(raw: Any) -> dict[str, Any]:
                                                                   f"{where}.calibration.max_false_negative_bound",
                                                                   0.0, 0.5, low_open=True)},
     }
+
+
+_SLACK_KEYS = {"enabled", "base_url", "bot_token_file", "app_token_file", "owner_user_id", "channel", "ask_ttl_minutes",
+               "max_asks_per_task_per_hour"}
+_SLACK_INLINE_SECRETS = {"bot_token", "app_token", "token", "secret"}
+
+
+def _slack_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.slack``. Off by default; secrets only via ``bot_token_file`` / ``app_token_file``."""
+    where = "control_plane.personal_assistant.slack"
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    inline = sorted(set(raw) & _SLACK_INLINE_SECRETS)
+    if inline:
+        raise ValueError(f"{where} must not hold secrets inline ({inline}); put each token in a file and set "
+                         "bot_token_file / app_token_file")
+    unknown = set(raw) - _SLACK_KEYS
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{where}.enabled must be true or false (not a string)")
+    base_url = _judge_endpoint(raw.get("base_url", "https://slack.com/api"), f"{where}.base_url")
+    if not base_url:
+        raise ValueError(f"{where}.base_url must not be empty")
+    files: dict[str, str] = {}
+    for name in ("bot_token_file", "app_token_file"):
+        value = raw.get(name, "")
+        if not isinstance(value, str):
+            raise ValueError(f"{where}.{name} must be a path string")
+        value = value.strip()
+        if value and not value.startswith("/"):
+            raise ValueError(f"{where}.{name} must be an absolute path")
+        if enabled and not value:
+            raise ValueError(f"{where}.{name} is required when Slack is enabled")
+        files[name] = value
+    if files["bot_token_file"] and files["bot_token_file"] == files["app_token_file"]:
+        raise ValueError(f"{where}.bot_token_file and app_token_file must be different files")
+    owner = raw.get("owner_user_id", "")
+    if not isinstance(owner, str) or (owner and not re.fullmatch(r"U[A-Z0-9]+", owner.strip())):
+        raise ValueError(f"{where}.owner_user_id must be a Slack user id like U01ABC23DEF")
+    owner = owner.strip()
+    if enabled and not owner:
+        raise ValueError(f"{where}.owner_user_id is required when Slack is enabled")
+    channel = raw.get("channel", "")
+    if not isinstance(channel, str) or not re.fullmatch(r"([CGD][A-Z0-9]+)?", channel.strip()):
+        raise ValueError(f"{where}.channel must be a Slack channel id like C01ABC23DEF (empty = the owner's DM)")
+    ttl = raw.get("ask_ttl_minutes", 15)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 1 <= ttl <= 120:
+        raise ValueError(f"{where}.ask_ttl_minutes must be an integer between 1 and 120")
+    cap = raw.get("max_asks_per_task_per_hour", 6)
+    if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 1000:
+        raise ValueError(f"{where}.max_asks_per_task_per_hour must be an integer between 1 and 1000")
+    return {"enabled": enabled, "base_url": base_url, "bot_token_file": files["bot_token_file"],
+            "app_token_file": files["app_token_file"], "owner_user_id": owner, "channel": channel.strip(),
+            "ask_ttl_minutes": ttl, "max_asks_per_task_per_hour": cap}
 
 
 def apps_config(raw: Any) -> dict[str, Any]:
