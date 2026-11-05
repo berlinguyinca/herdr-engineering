@@ -17,6 +17,7 @@ import os
 import shlex
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 from .shellparse import XARGS_MARKER, SimpleCommand, Unparseable, parse
 from .verbs import STRICTER, VERB_RISK, ActionKey, FlagClass, Verb
@@ -67,6 +68,7 @@ class Derived:
     unparsed: bool = False
     hint_cwd: str = ""
     one_shot_safe: bool = False   # True only when key.target digests the WHOLE action (see policy one-shot approvals)
+    deploy: Any = None            # a deploy.DeployMatch when the hub matched a configured deploy scope (else None)
 
 
 @dataclass(frozen=True)
@@ -1040,7 +1042,18 @@ _TOOLS: dict[str, Callable[[RawAction, dict[str, str], list[str]], Derived]] = {
 }
 
 
-def derive(raw: RawAction) -> Derived:
+def _with_deploy(raw: RawAction, derived: Derived, deploy_cfg: Any) -> Derived:
+    """Pre-step for configured deploy scopes: an exact ``<command> --ref <sha>`` becomes a sha-bound deploy.prod key.
+    Everything the shell analysis found (details for the vetoes, facts, text) is kept; only the key and flags change."""
+    from .deploy import match_deploy, request_key
+    match = match_deploy(raw, deploy_cfg)
+    if match is None:
+        return derived
+    key = request_key(match)
+    return replace(derived, key=key, elements=(key,), owner_decides=False, reason="", one_shot_safe=True, deploy=match)
+
+
+def derive(raw: RawAction, deploy_cfg: Any = None) -> Derived:
     tool = raw.tool.strip().lower()
     hint = _hint(raw)
     facts: list[str] = []
@@ -1048,7 +1061,8 @@ def derive(raw: RawAction) -> Derived:
         return _TOOLS[tool](raw, hint, facts)
     if tool in SHELL_TOOLS:
         try:
-            return _shell(raw, hint, facts)
+            derived = _shell(raw, hint, facts)
         except RecursionError:
             return _unknown_derived(raw, "too complex", facts)
+        return _with_deploy(raw, derived, deploy_cfg) if deploy_cfg else derived
     return _unknown_derived(raw, f"unknown tool {tool!r}", facts)
