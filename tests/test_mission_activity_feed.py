@@ -528,3 +528,24 @@ def test_model_use_crosses_the_allowlist_and_unknown_fields_do_not():
     assert use['agents'][0]['role'] == 'reviewer' and use['agents'][0]['onPin'] is False
     assert use['agents'][0]['why'] == 'separation of duties'
     assert 'rawPrompt' not in use['agents'][0] and 'hiddenReasoning' not in clean
+
+
+def test_next_action_crosses_feed_and_store_summaries_unchanged_and_bounded():
+    """G8-A: the allowlist already carries nextAction/nextActionAt; the literal fallback is NOT filtered server-side
+    (the client treats it as no next action, so the server stays a pure passthrough)."""
+    from herdr_engineering.control_plane.mission_activity import MissionActivityStore
+    from herdr_engineering.mission_activity_feed import _sanitize
+
+    clean = _sanitize({'nextAction': 'Run the suite ' + 'x' * 2000, 'nextActionAt': STAMP, 'prompt': 'no', 'reasoning': 'no'})
+    assert clean['nextActionAt'] == STAMP and clean['nextAction'].startswith('Run the suite')
+    assert len(clean['nextAction']) <= 1024 and 'prompt' not in clean and 'reasoning' not in clean
+    now = 1_800_000_000
+    store = MissionActivityStore(now=lambda: now)
+    iso = lambda epoch: __import__('datetime').datetime.fromtimestamp(epoch, __import__('datetime').UTC).isoformat()
+    payload = {'contract_version': 1, 'host_id': 'h', 'instance_id': 'i', 'session_id': 's', 'observed_at': iso(now),
+               'snapshot_at': iso(now), 'mission_revision': 1, 'connection': 'connected',
+               'mission': {'id': 'MSN-1', 'title': 't', 'status': 'RUNNING'},
+               'activity': {'nextAction': 'No further action is scheduled', 'nextActionAt': STAMP}}
+    store.ingest('pi:MSN-1', payload, source='pi')
+    summary = store.list_summaries()[0]['activity']
+    assert summary['nextAction'] == 'No further action is scheduled' and summary['nextActionAt'] == STAMP

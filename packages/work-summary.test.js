@@ -88,3 +88,27 @@ test('updated_at is never used as a completion time', () => {
   const real = run({recorded: [{...finished, completed_at: iso(now - 9000)}]});
   assert.equal(real[0].completed_at, iso(now - 9000));
 });
+
+// G8-A: Pi-reported next action passthrough. Present only when Pi supplied real text; never inferred.
+const withNext = (activity) => run({projections: [projection('pi:MSN-1', {activity: {health: 'active', ...activity}})]})[0];
+test('G8 nextAction is exposed only when Pi supplied non-empty text', () => {
+  const item = withNext({nextAction: '  Run the integration suite  ', nextActionAt: '2026-11-04T13:00:00Z'});
+  assert.deepEqual(item.nextAction, {text: 'Run the integration suite', at: '2026-11-04T13:00:00Z'});
+  assert.deepEqual(withNext({nextAction: 'Wait for review'}).nextAction, {text: 'Wait for review'});
+});
+test('G8 the literal fallback, empty and absent next action are no next action', () => {
+  for (const value of ['No further action is scheduled', '  no further ACTION is scheduled ', '', '   ', null, 7, {}, undefined]) {
+    assert.equal(withNext({nextAction: value, nextActionAt: '2026-11-04T13:00:00Z'}).nextAction, undefined, JSON.stringify(value));
+  }
+  assert.equal(withNext({}).nextAction, undefined);
+});
+test('G8 a malformed nextActionAt is dropped, not guessed', () => {
+  assert.deepEqual(withNext({nextAction: 'Go', nextActionAt: 'tomorrow-ish'}).nextAction, {text: 'Go'});
+});
+test('G8 sessions without a mission never get a next action', () => {
+  const out = run({sessions: [agent('x1', {mission_key: undefined, nextAction: 'Do thing', next_action: 'Do thing'})]});
+  assert.equal(out.length, 1);
+  assert.equal(out[0].nextAction, undefined);
+  const recordedOnly = run({recorded: [{mission_id: 'M9', title: 'Plain', next_action: 'Not from Pi'}]});
+  assert.equal(recordedOnly[0].nextAction, undefined);
+});

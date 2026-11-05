@@ -252,3 +252,16 @@ test('G5: the no-match message also shows when only Unconfirmed rows remain', ()
   assert.match(html, /No listed work matches this filter/);
   assert.match(html, /Old report/);
 });
+
+// G8-A: Pi-reported next action in row Details.
+const detailsOf = (activity, id = 'pi:N') => render({projections: [projection(id, 'Repair parser', {activity: {health: 'active', ...activity}})], weekDetails: [`mission:${id}`]}).match(/<dl class="wk-details".*?<\/dl>/s)?.[0] || '';
+test('G8: details show the Pi-reported next action, escaped, with its time in the chosen zone', () => {
+  const d = detailsOf({nextAction: '<script>alert(1)</script> merge', nextActionAt: '2026-11-04T15:00:00Z'});
+  assert.match(d, /Pi-reported next action<\/dt><dd><span data-next-action>&lt;script&gt;alert\(1\)&lt;\/script&gt; merge<\/span> \(<time datetime="2026-11-04T15:00:00Z">2026-11-04, 15:00 UTC<\/time>\)/);
+  assert.doesNotMatch(d, /<script/);
+});
+test('G8: details omit the row for the literal fallback, empty text and sessions without a mission', () => {
+  for (const nextAction of ['No further action is scheduled', '', undefined]) assert.doesNotMatch(detailsOf({nextAction}), /next action/i);
+  const lone = render({sessions: [{session_id: 'solo', host_id: 'beast', status: 'running', updated_at: iso(now - 1000), nextAction: 'x'}], weekDetails: ['session:beast/solo']});
+  assert.doesNotMatch(lone, /next action/i);
+});
