@@ -1209,3 +1209,24 @@ def test_record_event_swallows_an_append_failure():
         raise OSError("disk full")
 
     sp._record_event(boom, "share_x", "who", "why")               # must not raise
+
+
+def test_every_share_host_response_forces_referrer_policy_no_referrer(env):
+    """Plan 4 C1: the header is on every response the host sends, whatever the status, so a share URL that carries a
+    session never leaves in a Referer unless the (author-controlled) document itself loosens it with a meta tag."""
+    etag = '"%s"' % _sha(FILES["index.html"])
+    requests = [
+        ("GET", f("index.html"), {}), ("HEAD", f("index.html"), {}),
+        ("GET", f("data/table.parquet"), {"Range": "bytes=0-9"}),               # 206
+        ("GET", f("data/table.parquet"), {"Range": "bytes=999999-"}),           # 416
+        ("GET", f("index.html"), {"If-None-Match": etag}),                      # 304
+        ("GET", f("index.html"), {"If-Match": '"other"'}),                      # 412
+        ("OPTIONS", f("index.html"), {"Origin": "https://x.example", "Access-Control-Request-Method": "GET"}),  # 204
+        ("GET", f("missing.html"), {}), ("GET", "/nothing-here", {}),           # 404
+    ]
+    seen = set()
+    for method, path, headers in requests:
+        status, got, _ = env.request(method, path, headers)
+        seen.add(status)
+        assert got.get("referrer-policy") == "no-referrer", (method, path, status)
+    assert {200, 204, 206, 304, 404, 412, 416} <= seen

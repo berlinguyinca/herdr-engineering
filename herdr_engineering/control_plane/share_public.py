@@ -712,6 +712,8 @@ def _send_headers(handler, status: int, headers, *, cors: bool = True, close: bo
     handler.send_header("Date", handler.date_time_string())
     for name, value in headers:
         handler.send_header(name, value)
+    if not any(name.lower() == "referrer-policy" for name, _ in headers):
+        handler.send_header("Referrer-Policy", "no-referrer")     # every response: the URL path may carry a session
     if cors:
         for name, value in CORS_HEADERS:
             handler.send_header(name, value)
