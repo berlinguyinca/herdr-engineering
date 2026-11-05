@@ -103,6 +103,7 @@ def test_each_intent_updates_db_and_view_file(registry_pg, tmp_path):
             (fid, "Papers", 0)
         ]
         assert {i["artifact_id"] for i in lib["items"]} == {mine, pushed}
+        assert {i["artifact_id"]: i["filename"] for i in lib["items"]}[pushed] == "a.html"   # searchable by the agent tool
 
         out = await send(env, user("alice"), FOLDER_RENAME, {"folder_id": fid, "name": "Reads"})
         assert out["result"] == "renamed"

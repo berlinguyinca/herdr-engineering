@@ -331,9 +331,13 @@ class MemberService:
         view = self._view(who)
         return {k: view.get(k) for k in ("available", "updated", "usage", "artifacts", "shared_with_me", "links")}
 
-    def library(self, actor: Mapping[str, Any]) -> dict[str, Any]:
-        """The caller's library (feed items and folders) from their view file; empty when there is none yet."""
-        library = self._view(self._caller(actor, "library")).get("library")
+    def library(self, actor: Mapping[str, Any], *, available_only: bool = False) -> dict[str, Any]:
+        """The caller's library (feed items and folders) from their view file; empty when there is none yet, or, with
+        ``available_only``, a 503 ``unavailable`` (the agent tool must not mistake a missing view for an empty library)."""
+        view = self._view(self._caller(actor, "library"))
+        if available_only and not (view.get("available") and isinstance(view.get("library"), dict)):
+            raise MemberServiceError(503, "unavailable", "your library is not available right now; try again shortly")
+        library = view.get("library")
         if not isinstance(library, dict):
             return {"items": [], "folders": []}
         return {"items": library.get("items") if isinstance(library.get("items"), list) else [],

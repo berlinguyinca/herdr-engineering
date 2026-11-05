@@ -990,6 +990,12 @@ async def _library_view(conn: Any, principal: str, rt: MemberRuntime | None, rus
         items.extend(_item_json(i) for i in page.items)
         if page.next_offset is None or not page.items:
             break
+    # the original filename (searchable by the agent tool), only while the item is readable: same rule as the SQL search
+    names = {r["artifact_id"]: r["original_filename"] or "" for r in await conn.fetch(
+        "SELECT artifact_id, original_filename FROM artifacts WHERE artifact_id = ANY($1::text[])",
+        [i["artifact_id"] for i in items])}
+    for item in items:
+        item["filename"] = names.get(item["artifact_id"], "") if item["status"] in ("active", "pending") else ""
     pooled = await _attach_files(conn, items, rustfs, root, rt, budget) if root is not None else set()
     return {"items": items, "folders": [_folder_json(f) for f in await store.list_folders(principal)]}, pooled
 

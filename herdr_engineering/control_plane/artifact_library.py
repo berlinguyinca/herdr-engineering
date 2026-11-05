@@ -7,7 +7,7 @@ see (someone else's folder, an unreadable or missing artifact) is the same ``Lib
 from __future__ import annotations
 
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -105,6 +105,28 @@ class FeedPage:
 
 
 MAX_QUERY = 200
+
+
+def library_matches(
+    q: str,
+    *,
+    title: str,
+    sharer: str,
+    artifact_type: str,
+    filename: str,
+    status: str,
+    folder_names: Iterable[str],
+) -> bool:
+    """The python twin of the SQL ``q`` rule in ``LibraryStore.feed`` (case-insensitive substring, literal ``%`` and
+    ``_``) for readers of the member view file: title, sharer, type, the filename only while the item is still readable
+    (active or pending), and the member's own folder names.  An empty ``q`` matches everything."""
+    if not q:
+        return True
+    needle = q.lower()
+    fields = [title, sharer, artifact_type, *folder_names]
+    if status in ("active", "pending"):
+        fields.append(filename)
+    return any(needle in (f or "").lower() for f in fields)
 
 
 def _like(text: str) -> str:
