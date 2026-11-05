@@ -190,6 +190,8 @@ class _BootPhases:
         self._last = now
 
 
+_CONTAINER_ID = re.compile(r"[0-9a-f]{12}|[0-9a-f]{64}")
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -1135,8 +1137,14 @@ class ControlPlaneRepo:
                 base["inventory"] = _copy(rec["inventory"])
         return merged
 
+    @staticmethod
+    def _is_container_id(host):
+        """A docker container id (12 or 64 hex digits) that never reported a tailnet address: a container, not a machine."""
+        return bool(_CONTAINER_ID.fullmatch(str(host.get("host_name") or host.get("host_id") or ""))) and not host.get("tailnet_ip")
+
     def list_hosts(self):
-        hosts = [self._with_problems(h) for h in self._merged_hosts().values()]
+        """Machines only: container ids with no tailnet address are kept in the store but never listed."""
+        hosts = [self._with_problems(h) for h in self._merged_hosts().values() if not self._is_container_id(h)]
         return _sort_by(hosts, "host_name")
 
     def host_snapshot(self, host_id):
