@@ -39,6 +39,7 @@ from . import collab_models, ids, logfile_lock, placement
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_coordinators import CoordinatorsMixin
+from .collab_direct import DirectMixin
 from .collab_federation import FederationMixin
 from .collab_team_briefs import BRIEF_NOTE as _TR_BRIEF_NOTE
 from .collab_team_briefs import TeamBriefsMixin
@@ -95,7 +96,8 @@ REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_e
                     "egress_decided": "egress", "egress_promoted": "egress", "room_profile_set": "egress",
                     "federation_share_granted": "fedshare", "federation_peer_enabled": "fedpeer",
                     "team_attached": "teamattach", "team_role_assigned": "teamrole",
-                    "team_coordinator_set": "teamcoord", "team_external_coordination_set": "teamext"}
+                    "team_coordinator_set": "teamcoord", "team_external_coordination_set": "teamext",
+                    "room_guest_level_set": "dglevel"}
 # every event that can change what _recount() returns (the cache is cleared when one is committed)
 COUNT_EVENTS = frozenset(REVOCABLE_CREATE) | {
     "member_removed", "agent_grant_revoked", "agent_grant_expired", "agent_revoked", "join_token_revoked",
@@ -406,7 +408,7 @@ class _GroupClaim(NamedTuple):
 
 
 class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin,
-                    CoordinatorsMixin, TeamBriefsMixin):
+                    CoordinatorsMixin, TeamBriefsMixin, DirectMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -670,6 +672,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             return payload.get("paused") is True          # resuming helpers is an ordinary write
         if event_type == "team_external_coordination_set" and payload is not None:
             return payload.get("enabled") is False        # turning the opt-in OFF is a revocation; ON is an ordinary write
+        if event_type == "room_guest_level_set" and payload is not None:
+            return payload.get("revokes_direct") is True  # leaving Direct is a revocation (pre-paid by setting it); other toggles are ordinary
+        if event_type == "guest_direct_set" and payload is not None:
+            return payload.get("allowed") is False        # withdrawing one guest's Direct right is a revocation
         return event_type in SAFETY_EVENTS
 
     def _creation_cost(self, event_type: str, payload: dict | None) -> int:
@@ -682,6 +688,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             return 1 if payload.get("state") == "approved" else 0
         if event_type == "team_external_coordination_set":
             return 1 if payload.get("enabled") else 0
+        if event_type == "room_guest_level_set":
+            return 1 if payload.get("level") == "direct" else 0       # only Direct has something to take back
         if event_type == "room_profile_set":
             room = self._rooms.get(payload.get("room_id")) or {}
             have = set((room.get("profile") or {}).get("permanent_hosts") or ())
@@ -826,7 +834,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
         if (self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev)
                 or self._apply_federation(ev) or self._apply_team_rooms(ev) or self._apply_team_roles(ev)
-                or self._apply_coordinators(ev)):
+                or self._apply_coordinators(ev) or self._apply_direct(ev)):
             return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
@@ -968,6 +976,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "updated_at": p["created_at"], "seq": seq}
             self._tr2_fold_created(p["task_id"], p)
             self._tc_fold_created(p["task_id"], p)
+            self._dg_fold_created(p["task_id"], p)
             if p.get("reviews_task_id"):
                 self._tasks[p["task_id"]]["reviews"] = p["reviews_task_id"]
             if p.get("origin"):          # team rooms: written only by the server (a suggestion's approval), never by a request body
@@ -1886,6 +1895,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 resource_id=room_id))
             self._expire_helpers()                   # their helpers in this room end now and free their slots
             self._tc_reconcile_room(room_id)         # slice 3: a removed coordinator's open assignments are requeued now
+            self._dg_reconcile_room(room_id)         # Direct: a removed guest's open tasks are cancelled now
         self._xlink_sweep(room_id)          # T14: links this person made no longer stand
         return {"ok": True}
 
@@ -4753,6 +4763,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         gives work to ONE agent that the owner approved with "execute"."""
         with self._lock:
             room, first = self._tc_authorize_create(pr, room_id)
+            if self._dg_applies(pr, room_id):              # the Direct guest level: its own path, its own limits
+                return self._dg_create(pr, room, room_id, body)
             roles_on = self.team_roles_active()
             bad = [k for k in body if k not in ("target_agent_id", "text", "parent_task_id", "idempotency_key",
                                                 "reviews_task_id") and not (roles_on and k in ROLE_FIELDS)]
@@ -4786,6 +4798,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         or pt["seq"] < first or self._task_status(pt) != "accepted"
                         or not self._creator_valid(pt, room)):
                     raise CollabError(400, "agents delegate: parent_task_id must be a task you accepted in this room")
+                self._dg_refuse_child(pr, room, pt)                  # T-TC5: a guest's task is not handed on
                 if pt["by_kind"] == "agent" and pt["by_id"] == tid_:
                     raise CollabError(400, "cannot hand a task straight back to the agent that gave it")
                 self._tc_loop_check(pr, pt, "agent:" + tid_)         # slice 3: no loop through a third agent, no assistant chain
@@ -5672,6 +5685,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def _creator_valid(self, t: dict, room: dict) -> bool:
         """A task is only as good as its requester's CURRENT authority."""
+        if t.get("origin") == "guest-direct":
+            return self._dg_creator_valid(t, room)           # a guest's authority is the room's Direct level, not a member right
         c = t.get("coord")
         if c is not None and t["by_kind"] == "user" and c["key"] == "user:" + t["by_id"]:
             return self._tc_holder_active(room, c["team"], c["key"])    # an external coordinator: authority is `coordinate`
@@ -6820,6 +6835,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.get_member_visibility(pr, rid)
                     if parts[2:] == ["guest-level"]:
                         return 200, self.get_guest_level(pr, rid)
+                    if parts[2:] == ["direct-tasks"]:
+                        return 200, self.direct_tasks(pr, rid)
+                    if parts[2:] == ["direct-guests"]:
+                        return 200, self.direct_guests(pr, rid)
                     if parts[2:] == ["suggestions"]:
                         return 200, self.list_suggestions(pr, rid, query)
                     if n == 4 and parts[2] == "suggestions":
@@ -7030,6 +7049,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.attach_team(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "teams" and parts[4] == "detach":
                         return 200, self.detach_team(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "direct-tasks" and parts[4] == "cancel":
+                        return 200, self.cancel_direct_task(pr, rid, parts[3])
+                    if parts[2:] == ["direct-guests"]:
+                        return 200, self.set_direct_guest(pr, rid, body)
                     if parts[2:] == ["suggestions"]:
                         out = self.submit_suggestion(pr, rid, body)
                         return (200 if out["replayed"] else 201), out
