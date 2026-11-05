@@ -47,6 +47,10 @@ from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
 
+
+class TombstoneUnavailable(Exception):
+    """The tombstone cache could not be refreshed within its staleness window: the request answers the fixed 503."""
+
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
@@ -2094,8 +2098,12 @@ def _make_handler(server, public=False, operator=False):
             if server.artifact_store is None or not artifact_id:
                 return False
             if permission == "read":
-                return server.tombstone_cache.contains(
-                    artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                try:
+                    return server.tombstone_cache.contains(
+                        artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                except Exception as exc:        # noqa: BLE001 - fail closed: no fresh answer, nothing is served
+                    log.exception("tombstone cache unavailable")
+                    raise TombstoneUnavailable() from exc
             return self._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
 
         def _artifact_allowed(self, artifact_id, permission, *, operator_member=True):
@@ -2414,6 +2422,9 @@ def _make_handler(server, public=False, operator=False):
             self._request_cause = None
             try:
                 return dispatch()
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._json({"error": "artifact store unavailable"}, 503)
             except Exception as exc:
                 # A client closing while we write a dependency error must not
                 # replace the already-recorded reason that the request failed.
@@ -3182,6 +3193,9 @@ def _make_handler(server, public=False, operator=False):
             except ArtifactError as exc:
                 return self._send_json(404 if str(exc).startswith("no artifact") else 400,
                                        {"error": str(exc)})
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._send_json(503, {"error": "artifact store unavailable"})
             except RuntimeError as exc:
                 self._request_cause = type(exc).__name__
                 if resource == 'events':
@@ -3815,6 +3829,12 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(version) if version else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_review_manager is not None:
                 if len(parts) == 6 and parts[5] == "reviews":
+                    # without an ACL the registry decides (like the versions routes); with one, the blanket guard above already did
+                    # (legacy uploads have no registry row). No answer reveals that the artifact exists
+                    if (server.artifact_store is not None and server.artifact_acl is None
+                            and not self._artifact_call(
+                            "report_permission", parts[4], self._resource_principal(), "read")):
+                        return self._json({"error": "not found"}, 404)
                     return self._json({"artifact_id": parts[4],
                                        "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})
             if resource == 'artifacts' and len(parts) == 6 and r.get_artifact(parts[4]):
