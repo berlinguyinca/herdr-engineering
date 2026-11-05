@@ -596,6 +596,11 @@ class ControlPlaneServer:
         self.fleet_config = fleet_config
         from .memory_explorer import MemoryExplorer
         self.memory = MemoryExplorer(repo, lambda: memory_config if memory_config is not None else self._control_plane_value(fleet_config, "memory"), memory_adapter)
+        from .memory_cognito import MemoryCognito
+        memory_policy = memory_config if memory_config is not None else self._control_plane_value(fleet_config, "memory") or {}
+        self.memory_cognito = (MemoryCognito(memory_policy["cognito"], self._control_plane_value(fleet_config, "collab"))
+                               if memory_policy.get("cognito") is not None else None)
+
         # callable(urls, source_machine) -> {'resolutions': [...]}; None when no fabric gateway is configured
         self.fabric_resolver = fabric_resolver
         self.fabric_services = fabric_services      # callable() -> {'leases': [...]} | None
@@ -2473,6 +2478,8 @@ def _make_handler(server, public=False, operator=False):
             if self._path_only() == "/api/v1/assistant-apps/google/callback":
                 # Google redirects the person's browser here with no API key: the one-time state is the credential.
                 return self._assistant_apps_callback()
+            if self._decoded_parts()[:4] == ["", "api", "v1", "memory"]:
+                return self._memory_get()
             err = self._require("viewer")
             if err:
                 return err
@@ -3211,6 +3218,48 @@ def _make_handler(server, public=False, operator=False):
                 message = "GitHub service is unavailable." if resource == "github" else str(exc)
                 return self._send_json(500, {"error": message})
 
+        def _memory_get(self):
+            # A Memory request always has its own identity gate, including encoded route aliases.
+            # In particular the legacy open listener must never mint a Memory viewer.
+            for name in ("Host", "Origin", "Authorization", "Content-Type", "X-API-Key", "Sec-Fetch-Site"):
+                if len(self.headers.get_all(name) or []) > 1:
+                    return self._deny(400, "ambiguous memory headers")
+            lengths = self.headers.get_all("Content-Length") or []
+            if ("Transfer-Encoding" in self.headers or len(lengths) > 1
+                    or lengths and lengths[0] != "0"):
+                return self._deny(400, "ambiguous memory request framing")
+            if self._rate_limit():
+                return None
+            path = self._path_only()
+            human = server.memory_cognito
+            if path == "/api/v1/memory/auth/config":
+                if human is None or not server.memory.enabled():
+                    return self._deny(404, "not found")
+                if not human.browser_allowed(self):
+                    return self._deny(403, "memory needs its configured HTTPS origin")
+                return self._json(human.public_config)
+            authorization = self.headers.get("Authorization")
+            key = self.headers.get("X-API-Key")
+            if authorization is not None and key is not None:
+                return self._deny(401, "ambiguous memory credentials")
+            if key is not None:
+                # _role alone is insufficient: in open mode it returns operator for any key.
+                principal, role = self._principal(), self._role()
+                if principal.get("authenticated_by") != "api_key" or role is None:
+                    return self._deny(401, "unauthorized")
+            else:
+                if human is None or authorization is None:
+                    return self._deny(401, "unauthorized")
+                if not human.browser_allowed(self):
+                    return self._deny(403, "memory needs its configured HTTPS origin")
+                principal, role = human.principal(authorization), "viewer"
+                if principal is None:
+                    return self._deny(401, "unauthorized")
+            status, body = server.memory.get(
+                self._decoded_parts()[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},
+                principal, role)
+            return self._json(body, status)
+
         def _review_gate_get(self, parts):
             if parts[-1] == "" and len(parts) > 5:
                 parts = parts[:-1]  # one trailing slash is the same route
@@ -3506,10 +3555,7 @@ def _make_handler(server, public=False, operator=False):
             if resource == "architecture":
                 return self._architecture_get(parts)
             if resource == "memory":
-                status, body = server.memory.get(
-                    parts[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},
-                    self._principal(), self._role())
-                return self._json(body, status)
+                return self._memory_get()
             if resource == "intelligence":
                 status, body = server.intelligence.get(
                     parts[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},

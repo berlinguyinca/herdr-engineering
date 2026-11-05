@@ -2,6 +2,7 @@
 
 Every record below is test data defined in this file; no herdr-memory CLI or Hindsight is contacted."""
 import sys
+import hashlib
 import threading
 import time
 from pathlib import Path
@@ -33,8 +34,8 @@ class MockAdapter:
 
 
 if __name__ == "__main__":
-    server = ControlPlaneServer(ControlPlaneRepo(), web_root=ROOT / "packages", memory_adapter=MockAdapter(), allow_open=True,
-                                memory_config={"enabled": True, "viewers": {"open-listener": {"projects": ["herdr-engineering"], "scopes": []}}})
+    server = ControlPlaneServer(ControlPlaneRepo(), web_root=ROOT / "packages", memory_adapter=MockAdapter(), api_keys={"memory-ui-fixture": "viewer"},
+                                memory_config={"enabled": True, "viewers": {"key:" + hashlib.sha256(b"memory-ui-fixture").hexdigest()[:12]: {"projects": ["herdr-engineering"], "scopes": []}}})
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
     print(f"PORT={server.port}", flush=True)

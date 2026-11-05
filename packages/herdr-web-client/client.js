@@ -16,9 +16,10 @@ export class ApiError extends Error {
 const CONDITIONAL_ENTRIES = 64;
 
 export class HerdrClient {
-  constructor(baseUrl = '', { fetchImpl = fetch, user = 'operator', tenant = 'default', headers = {} } = {}) {
+  constructor(baseUrl = '', { fetchImpl = fetch, user = 'operator', tenant = 'default', headers = {}, memoryAuth = null } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.fetch = fetchImpl;
+    this.memoryAuth = memoryAuth;
     this.user = user;
     this.tenant = tenant;
     this.headers = { ...headers };  // extra headers (e.g. API key) sent on every request
@@ -66,7 +67,10 @@ export class HerdrClient {
   async request(path, { method = 'GET', body, signal = AbortSignal.timeout(15000) } = {}) {
     const startedAt = Date.now();
     const url = `${this.base}${path}`;
-    const headers = { ...this.headers, Accept: 'application/json', 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant };
+    // An explicitly configured native key selects that scoped identity, even after browser sign-in.
+    const nativeKey = Object.keys(this.headers).some(name => name.toLowerCase() === 'x-api-key');
+    const memoryOptions = nativeKey ? {} : this.memoryAuth?.requestOptions(this.base, path, method) || {};
+    const headers = { ...this.headers, Accept: 'application/json', 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant, ...memoryOptions.headers };
     let payload;
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -76,7 +80,7 @@ export class HerdrClient {
     // invocation" if it is invoked as a method (receiver = this client),
     // so extract it to a local first (this === undefined).
     const doFetch = this.fetch;
-    const res = await doFetch(url, { method, headers, body: payload, signal });
+    const res = await doFetch(url, { ...memoryOptions, method, headers, body: payload, signal });
     const text = await res.text();
     let json;
     try {

@@ -40,7 +40,7 @@ PUBLIC_SECTION = "memory"           # roles [all]; only {url}
 DEFAULT_PORT = 8888
 # The default is the revision the herdr-memory deployment candidate pins for its image.
 DEFAULT_IMAGE_TAG = "5a672f0cdb89f4a3b841770cce2036a5b28b799d"
-MEMORY_KEYS = frozenset({"enabled", "image_tag", "model_dir", "port", "endpoint", "db_password", "tenants"})
+MEMORY_KEYS = frozenset({"enabled", "image_tag", "model_dir", "port", "endpoint", "db_password", "tenants", "cognito"})
 MEMORY_COMPOSE_VARS = ("HERDR_MEMORY_DB_PASSWORD", "HERDR_MEMORY_TENANT_USERS", "HERDR_MEMORY_IMAGE_TAG",
                        "HERDR_MEMORY_MODEL_DIR", "HERDR_MEMORY_PORT")
 _SECRET = re.compile(r"^[A-Za-z0-9_-]{32,128}$")      # URL/CSV safe: no ':' ',' '@' '/' '$' or quotes
@@ -89,6 +89,12 @@ def parse_memory_section(raw: Any) -> dict[str, Any]:
     if not isinstance(enabled, bool):
         raise _err("enabled must be true or false")
     out: dict[str, Any] = {"enabled": enabled}
+    if "cognito" in raw:
+        from .control_plane.memory_cognito import parse_cognito
+        try:
+            out["cognito"] = parse_cognito(raw["cognito"])
+        except ValueError as exc:
+            raise _err(str(exc)) from None
     if "image_tag" in raw:
         if not isinstance(raw["image_tag"], str) or not _TAG.match(raw["image_tag"]):
             raise _err("image_tag must be an image tag ([A-Za-z0-9_.-], at most 128 characters)")

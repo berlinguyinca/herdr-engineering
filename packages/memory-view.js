@@ -136,12 +136,12 @@ export function renderStatus(s) {
     <h3>Per harness and host</h3>${(integ.rows || []).length ? `<table class="mem-table"><thead><tr><th scope="col">Host</th><th scope="col">Harness</th><th scope="col">State</th></tr></thead><tbody>${integ.rows.map((r) => `<tr><td>${esc(r.host)}</td><td>${esc(r.harness)}</td><td>${esc(r.state)}</td></tr>`).join('')}</tbody></table>` : `<p class="mem-note">State: UNKNOWN. ${esc(integ.reason || 'Not reported by the control plane.')}</p>`}`);
 }
 
-export function mountMemory(root, client, { query, setQuery = () => {}, freshness } = {}) {
+export function mountMemory(root, client, { query, setQuery = () => {}, freshness, auth } = {}) {
   const form = {};
   for (const k of FIELDS) form[k] = query?.get ? query.get(k) || '' : '';
   const st = { phase: 'idle', results: [], offset: Number(query?.get?.('offset')) || 0, has_more: false };
-  let drawer = null, status = { phase: 'loading' }, lastFocus = null, token = 0, disposed = false;
-  root.innerHTML = `<div class="mem"><div data-mem-filters></div><div class="mem-grid"><div data-mem-results aria-live="polite"></div><div data-mem-side></div></div>
+  let drawer = null, status = { phase: 'loading' }, lastFocus = null, token = 0, authEpoch = 0, disposed = false;
+  root.innerHTML = `<div class="mem"><div data-mem-auth aria-live="polite"></div><div data-mem-filters></div><div class="mem-grid"><div data-mem-results aria-live="polite"></div><div data-mem-side></div></div>
     <aside class="mem-drawer" data-mem-drawer role="dialog" aria-modal="false" aria-labelledby="mem-drawer-title" hidden></aside><div data-mem-status></div></div>`;
   const $ = (sel) => root.querySelector(sel);
   const paint = () => { $('[data-mem-results]').innerHTML = renderResults(st); };
@@ -153,8 +153,17 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
   $('[data-mem-filters]').innerHTML = renderFilters(form);
   paint(); paintStatus();
 
+  let authAvailable = false;
+  const paintAuth = () => {
+    if (!auth || disposed) return;
+    $('[data-mem-auth]').innerHTML = `<p>${esc(auth.message || (auth.signedIn ? 'Signed in to Memory.' : 'Sign in to access Memory with your account.'))}</p>${authAvailable ? `<button class="hd-btn" type="button" ${auth.signedIn ? 'data-mem-sign-out' : 'data-mem-sign-in'}>${auth.signedIn ? 'Sign out' : 'Sign in'}</button>` : ''}`;
+  };
+  const authReady = auth ? auth.config().then(cfg => { authAvailable = !!cfg; paintAuth(); }).catch(() => { paintAuth(); }) : Promise.resolve();
+
   async function search(offset = 0) {
     const mine = ++token;
+    await authReady;
+    if (disposed || mine !== token) return;
     st.phase = 'loading'; st.offset = offset; paint();
     const params = searchParams(form, offset);
     setQuery(Object.fromEntries(params));
@@ -171,11 +180,12 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
     paint();
   }
   async function open(id) {
+    const epoch = authEpoch;
     drawer = { phase: 'loading' }; paintDrawer();
     $('#mem-drawer-title')?.focus();
-    try { const body = await client.getMemoryRecord(id); if (!disposed) drawer = { phase: 'ok', ...body }; }
-    catch (err) { drawer = err?.status === 404 ? { phase: 'notfound' } : classify(err); }
-    if (disposed) return;
+    try { const body = await client.getMemoryRecord(id); if (!disposed && epoch === authEpoch) drawer = { phase: 'ok', ...body }; }
+    catch (err) { if (epoch !== authEpoch || disposed) return; drawer = err?.status === 404 ? { phase: 'notfound' } : classify(err); }
+    if (disposed || epoch !== authEpoch) return;
     paintDrawer(); $('#mem-drawer-title')?.focus();
   }
   function close() { drawer = null; paintDrawer(); lastFocus?.focus?.(); }
@@ -183,9 +193,14 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
   function reportFailure(err) { classify(err).phase === 'error' ? freshness?.(false, err?.message) : freshness?.(true); }
   async function loadStatus() {
     // The service status is the one request the page makes before anyone searches, so it is what the chip reports until then.
+    const epoch = authEpoch;
+    await authReady;
+    if (disposed || epoch !== authEpoch) return;
     let failure = null;
-    try { status = { phase: 'ok', data: await client.getMemoryServiceStatus() }; } catch (err) { status = classify(err); failure = err; }
-    if (disposed) return;
+    let nextStatus;
+    try { nextStatus = { phase: 'ok', data: await client.getMemoryServiceStatus() }; } catch (err) { nextStatus = classify(err); failure = err; }
+    if (disposed || epoch !== authEpoch) return;
+    status = nextStatus;
     paintStatus();
     if (st.phase === 'idle') failure ? reportFailure(failure) : freshness?.(true);
   }
@@ -197,6 +212,13 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
     search(0);
   });
   root.addEventListener('click', (e) => {
+    if (auth && e.target.closest?.('[data-mem-sign-in]')) {
+      auth.beginSignIn().catch(() => { auth.message = 'Memory sign-in failed. Please try again.'; paintAuth(); }); return;
+    }
+    if (auth && e.target.closest?.('[data-mem-sign-out]')) {
+      auth.signOut(); token++; authEpoch++; st.phase = 'idle'; st.results = []; drawer = null;
+      paint(); paintDrawer(); paintAuth(); loadStatus(); return;
+    }
     const row = e.target.closest?.('[data-memory]');
     if (row) { lastFocus = row; open(row.dataset.memory); return; }
     if (e.target.closest?.('[data-mem-close]')) { close(); return; }

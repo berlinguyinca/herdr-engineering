@@ -131,3 +131,32 @@ for (const [status, red] of [[403, false], [404, false], [503, false], [500, tru
     assert.deepEqual(reports, [!red]);
   });
 }
+
+test('Memory auth controls sign in and out, show failures safely, and keep optional auth usable', async () => {
+  const {root,nodes,handlers}=fakeRoot();let signed=false,signIns=0,signOuts=0;
+  const auth={message:'', async config(){return {enabled:true};},get signedIn(){return signed;},async beginSignIn(){signIns++;throw new Error('private config secret');},signOut(){signed=false;signOuts++;}};
+  const client={async getMemoryServiceStatus(){return {};}};
+  const view=mountMemory(root,client,{auth});await tick();
+  assert.match(nodes['[data-mem-auth]'].innerHTML,/Sign in/);
+  handlers.click({target:{closest:sel=>sel==='[data-mem-sign-in]'?{}:null}});await tick();
+  assert.equal(signIns,1);assert.doesNotMatch(nodes['[data-mem-auth]'].innerHTML,/private config secret/);
+  signed=true;view.dispose();const f=fakeRoot();mountMemory(f.root,client,{auth});await tick();
+  assert.match(f.nodes['[data-mem-auth]'].innerHTML,/Sign out/);
+  f.handlers.click({target:{closest:sel=>sel==='[data-mem-sign-out]'?{}:null}});await tick();assert.equal(signOuts,1);
+  const g=fakeRoot();mountMemory(g.root,client,{auth:{async config(){return null;},message:'Use private HTTPS for Memory sign-in.'}});await tick();
+  assert.match(g.nodes['[data-mem-auth]'].innerHTML,/private HTTPS/);
+  assert.doesNotMatch(g.nodes['[data-mem-auth]'].innerHTML,/data-mem-sign-in/);
+});
+
+test('sign-out prevents pending search and drawer responses from restoring Memory content', async()=>{
+  const f=fakeRoot();let resolveSearch,resolveRecord;
+  const client={async getMemoryServiceStatus(){return {};},exploreMemory(){return new Promise(r=>{resolveSearch=r;});},getMemoryRecord(){return new Promise(r=>{resolveRecord=r;});}};
+  const auth={async config(){return {};},signedIn:true,signOut(){this.signedIn=false;}};
+  mountMemory(f.root,client,{auth});await tick();
+  f.handlers.submit({target:{matches:()=>true,elements:{q:{value:'queue'}}},preventDefault(){}});await tick();
+  f.handlers.click({target:{closest:sel=>sel==='[data-memory]'?{dataset:{memory:'m1'}}:null}});
+  f.handlers.click({target:{closest:sel=>sel==='[data-mem-sign-out]'?{}:null}});
+  resolveSearch({results:[mem()],offset:0});resolveRecord({memory:mem(),retrieval_history:{}});await tick();
+  assert.doesNotMatch(f.nodes['[data-mem-results]'].innerHTML,/Use the staging queue/);
+  assert.equal(f.nodes['[data-mem-drawer]'].hidden,true);
+});

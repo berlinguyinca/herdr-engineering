@@ -13,7 +13,7 @@ test('Memory Explorer: search, page, open the detail drawer with keyboard, mobil
  try {
   const port=await new Promise((resolve,reject)=>{let out='';const t=setTimeout(()=>reject(new Error(stderr||'timeout')),25000);server.stdout.on('data',d=>{out+=d;const m=out.match(/PORT=(\d+)/);if(m){clearTimeout(t);resolve(m[1]);}});server.once('exit',c=>{clearTimeout(t);reject(new Error(`exit ${c}: ${stderr}`));});});
   browser=await chromium.launch({headless:true});
-  const page=await browser.newPage({viewport:{width:1280,height:900}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  const page=await browser.newPage({viewport:{width:1280,height:900},extraHTTPHeaders:{'X-API-Key':'memory-ui-fixture'}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(`http://127.0.0.1:${port}/#/memory`);
   await page.getByText('Nothing is listed until you search').waitFor({timeout:15000});
   await page.getByText('healthy').first().waitFor();

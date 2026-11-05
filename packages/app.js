@@ -1,6 +1,7 @@
 // HerdR Dev Fabric control-plane web app (spec 0190 §5, §20-34, §42-47).
 // Hash-routed SPA. The UI is a *client* of the structured /api/v1 JSON + SSE
 // stream. Views render loading / empty / error / data states (Spec §91).
+import { MemoryAuth, dispatchAuthCallback } from './herdr-web-client/memory-auth.js';
 import { HerdrClient } from './herdr-web-client/client.js';
 import { connectEvents } from './herdr-web-client/events.js';
 import { createRefreshBus } from './refresh-bus.js';
@@ -76,7 +77,8 @@ function missionKey(m) { return m.mission_key || m.mission_id; }
 
 defineComponents();
 
-const client = new HerdrClient('');
+const memoryAuth = new MemoryAuth();
+const client = new HerdrClient('', { memoryAuth });
 const root = document.getElementById('view');
 
 // Sidebar sections. A `tabs` entry owns a section whose other pages show as a tab strip above the page (SECTION_TABS), so
@@ -454,7 +456,7 @@ async function viewHandoffs() {
 async function viewMemory() {
   root.innerHTML = `${liveHead('<h1>Memory</h1>')}<div id="memory"></div>`;
   const chip = root.querySelector('herdr-freshness');
-  const view = mountMemory(root.querySelector('#memory'), client, { query: route().query,
+  const view = mountMemory(root.querySelector('#memory'), client, { auth: memoryAuth, query: route().query,
     freshness: (ok, message) => chip.touch(ok, message),
     setQuery: (o) => history.replaceState(null, '', `#/memory${Object.keys(o).length ? `?${new URLSearchParams(o)}` : ''}`) });
   return ownPolling(view);   // a live event must not wipe the person's query or the open drawer
@@ -1176,4 +1178,4 @@ if (document.hidden) bus.pause();
 
 window.addEventListener('hashchange', () => render());
 root.addEventListener('click', event => { if (event.target.closest?.('[data-route-retry]')) render(); });
-completeSignInIfRedirected().finally(() => render());
+dispatchAuthCallback(memoryAuth, completeSignInIfRedirected).finally(() => render());
