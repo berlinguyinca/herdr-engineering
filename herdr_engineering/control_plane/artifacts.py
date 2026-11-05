@@ -491,6 +491,11 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                 try:
                     # one savepoint: a failed check leaves neither scoped blob rows nor a version behind
                     async with _transaction(self._conn):
+                        # every digest this transaction will lock, in ONE sorted pass: the registrations and
+                        # commit_version each lock on their own, and a purge locks the same digests in sorted order
+                        await self._lock_digests_shared(
+                            [e["storage_key"] for e in registrations]
+                            + [e.get("storage_key") or e.get("blob_sha256") for e in merge.files])
                         for entry in registrations:
                             await self.register_report_blob(
                                 artifact_id, storage_key=entry["storage_key"], sha256=entry["sha256"],

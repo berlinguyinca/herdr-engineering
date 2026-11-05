@@ -4,13 +4,16 @@
 Real Postgres (the isolated server of ``registry_pg``), real temp dirs for the outbox and the mirror, and the same
 ``FakeBlobs`` object store the plan-3 applier tests use. No mocks.
 """
+import asyncio
 import hashlib
 import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
+import asyncpg
 import pytest
 
 from herdr_engineering.control_plane import collab_bridge_files as cbf
@@ -846,4 +849,68 @@ def test_the_results_never_echo_payload_text(registry_pg, tmp_path):
                          {"title": "SECRET-TITLE", "filename": "a.html", "profile": "web"})
         assert "SECRET-TITLE" not in json.dumps(out)
         assert Path(env.mirror_root / "results").is_dir()
+    mrun(registry_pg, tmp_path, body)
+
+
+# ----------------------------------------------------------------------------- lock order: usage row, then artifact row
+
+_PROBE_SQL = (
+    """CREATE OR REPLACE FUNCTION lock_order_probe_fn() RETURNS trigger AS $$
+    BEGIN
+      -- sleep only when this transaction already holds an artifact row lock (xmax = our xid): the publish's stage 3
+      -- in the wrong order. Usage-first code reaches this trigger before it holds any artifact row.
+      IF EXISTS (SELECT 1 FROM artifacts WHERE xmax::text = (txid_current() % 4294967296)::text) THEN
+        PERFORM pg_sleep(0.6);
+      END IF;
+      RETURN NEW;
+    END $$ LANGUAGE plpgsql""",
+    "DROP TRIGGER IF EXISTS lock_order_probe_trg ON artifact_member_usage",
+    """CREATE TRIGGER lock_order_probe_trg BEFORE INSERT ON artifact_member_usage
+      FOR EACH ROW EXECUTE FUNCTION lock_order_probe_fn()""",
+)
+
+
+def test_member_publish_and_purge_take_the_usage_row_before_the_artifact_row(registry_pg, tmp_path):
+    """The trigger stretches the window between the publish's stage-3 locks (real Postgres sleep); the purge starts
+    inside it. With the artifact row taken first a deadlock follows; usage -> row on both sides queues them."""
+    from herdr_engineering.control_plane.artifacts import ArtifactStore
+    from tests.control_plane.registry_pg import FakeBlobs
+
+    async def body(env, rt):
+        try:
+            for round_no in range(3):
+                aid = await create(env, title=f"T{round_no}")
+                for statement in _PROBE_SQL:
+                    await sql(env, statement)
+                box = {}
+
+                async def purge():
+                    conn = await asyncpg.connect(registry_pg["dsn"])
+                    try:
+                        for _ in range(200):                  # wait until a publish backend sleeps in the trigger
+                            if await conn.fetchval("SELECT count(*) FROM pg_stat_activity WHERE wait_event='PgSleep'"):
+                                break
+                            await asyncio.sleep(0.02)
+                        return await ArtifactStore(conn, FakeBlobs()).purge_now(aid, actor="op", reason="x")
+                    finally:
+                        await conn.close()
+
+                def target():
+                    try:
+                        box["purge"] = asyncio.run(purge())
+                    except BaseException as exc:             # noqa: BLE001
+                        box["purge"] = exc
+                thread = threading.Thread(target=target, daemon=True)
+                thread.start()
+                try:
+                    out = await publish(env, aid, {"index.html": HTML + str(round_no).encode()})
+                except BaseException as exc:                  # noqa: BLE001
+                    out = exc
+                await asyncio.get_running_loop().run_in_executor(None, thread.join, 30)
+                assert not isinstance(box["purge"], BaseException), box["purge"]     # no DeadlockDetectedError
+                assert isinstance(out, dict) and out["result"] in ("created", "rejected", "failed"), out
+                assert box["purge"]["result"] in ("deleted", "already_purged")
+        finally:
+            await sql(env, "DROP TRIGGER IF EXISTS lock_order_probe_trg ON artifact_member_usage")
+            await sql(env, "DROP FUNCTION IF EXISTS lock_order_probe_fn()")
     mrun(registry_pg, tmp_path, body)
