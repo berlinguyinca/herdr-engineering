@@ -129,3 +129,40 @@ test('noncanonical configured default and padded ports fail before PKCE navigati
     assert.equal(f.storage.getItem('herdr.memory.pkce'), null);
   }
 });
+function deferred() { let resolve, reject; const promise = new Promise((yes,no) => { resolve=yes; reject=no; }); return {promise,resolve,reject}; }
+test('sign-out while OAuth exchange is pending cannot resurrect tokens or overwrite its message', async () => {
+  for (const fail of [false, true]) {
+    const f=fixture(); await f.auth.beginSignIn();
+    const state=new URL(f.location.assigned).searchParams.get('state');
+    f.location.search=`?code=old&state=${state}`;
+    const gate=deferred(), entered=deferred(); const original=f.auth.fetch;
+    f.auth.fetch=(url,options)=>{if(url.endsWith('/oauth2/token')){entered.resolve();return gate.promise;}return original(url,options);};
+    const completing=f.auth.completeCallback(); await entered.promise;
+    f.auth.signOut(); const message=f.auth.message;
+    if(fail)gate.reject(new Error('old exchange failed'));else gate.resolve(new Response(JSON.stringify({access_token:jwt,id_token:jwt})));
+    assert.equal(await completing,true);
+    assert.equal(f.auth.tokens.get(),null); assert.equal(f.auth.message,message);
+    assert.equal(f.auth.requestOptions('', '/api/v1/memory/status', 'GET').headers?.Authorization, undefined);
+    assert.equal(f.storage.getItem('herdr.memory.pkce'),null);
+  }
+});
+test('sign-out cancels a pending sign-in before PKCE storage or redirect', async () => {
+  const f=fixture(), gate=deferred(), entered=deferred();
+  f.auth.fetch=()=>{entered.resolve();return gate.promise;};
+  const signing=f.auth.beginSignIn(); await entered.promise;
+  f.auth.signOut(); const message=f.auth.message;
+  gate.resolve(new Response(JSON.stringify(cfg)));await signing;
+  assert.equal(f.location.assigned,undefined); assert.equal(f.storage.getItem('herdr.memory.pkce'),null);
+  assert.equal(f.auth.tokens.get(),null); assert.equal(f.auth.message,message);
+});
+test('an older callback failure preserves a newer sign-in and identity', async () => {
+  const f=fixture(); await f.auth.beginSignIn();
+  const first=new URL(f.location.assigned).searchParams.get('state');f.location.search=`?code=old&state=${first}`;
+  const gate=deferred(), entered=deferred();const original=f.auth.fetch;
+  f.auth.fetch=(url,options)=>{if(url.endsWith('/oauth2/token')&&options.body.get('code')==='old'){entered.resolve();return gate.promise;}return original(url,options);};
+  const old=f.auth.completeCallback();await entered.promise;
+  await f.auth.beginSignIn();const second=new URL(f.location.assigned).searchParams.get('state');
+  f.location.search=`?code=new&state=${second}`;await f.auth.completeCallback();
+  const message=f.auth.message;assert.ok(f.auth.tokens.get());gate.reject(new Error('old failure'));await old;
+  assert.equal(f.auth.tokens.get().access,jwt);assert.equal(f.auth.message,message);
+});

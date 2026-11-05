@@ -213,7 +213,7 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
   });
   root.addEventListener('click', (e) => {
     if (auth && e.target.closest?.('[data-mem-sign-in]')) {
-      auth.beginSignIn().catch(() => { auth.message = 'Memory sign-in failed. Please try again.'; paintAuth(); }); return;
+      auth.beginSignIn().catch(() => { paintAuth(); }); return;
     }
     if (auth && e.target.closest?.('[data-mem-sign-out]')) {
       auth.signOut(); token++; authEpoch++; st.phase = 'idle'; st.results = []; drawer = null;

@@ -21,3 +21,9 @@ Review focus: scheme/authority parsing, proxy peer identity, duplicate headers, 
 - Summary policy document cherry-picked from parent commit 62633d7a; runtime activation remains dependent on #620.
 
 Final checks: 47 Memory Cognito cases passed, 229 focused API/auth compatibility cases passed, 1,239 client/component cases passed, and the real Chromium Memory UI test passed. Public listener denial and explicit native-key identity selection are exercised against real HTTP listeners. Ruff on new Python modules/tests and git diff --check passed. Live Cognito login and production activation are intentionally not performed in this slice.
+
+## Deferred by latest operator policy
+
+The operator explicitly requires no dashboard or Memory sign-in at the trusted private location. Do not merge or activate this authentication slice: it unconditionally refuses open-listener Memory reads. Preserve it only as optional/deferred draft WIP. The separate #620 runtime/egress path can explicitly authorize the existing open-listener principal for engineering projects/scopes, excluding personal data. No Cognito activation candidate was applied.
+
+The in-progress logout fix is retained: action generation invalidates pending configuration, PKCE and token exchanges on sign-out or superseding flows; stale successes cannot restore credentials, and stale failures cannot clear a newer identity/message. Three deferred-action regressions were observed RED and pass GREEN.
