@@ -3,7 +3,9 @@ import { skeleton } from './motion.js';
 import { morph } from './patch.js';
 import { pollWhileVisible } from './refresh-bus.js';
 import { mountSharePanel } from './artifact-share-panel.js';
+import { mountMembersPanel } from './artifact-members-panel.js';
 import { mountHistory } from './artifact-history.js';
+import { liveLink, mountPdf, mountStaticHtml } from './artifact-static-preview.js';
 
 const humanSize = value => {
   const size = Number(value || 0);
@@ -14,10 +16,47 @@ const humanSize = value => {
 
 export function mountArtifacts(container, client, { freshness = () => null } = {}) {
   let disposed = false, timer, controller, generation = 0, loaded = false;
-  container.innerHTML = '<div class="hd-card" data-artifact-registry><div class="hd-card__title">Artifact registry</div><div class="hd-inline"><input class="hd-input" data-artifact-query placeholder="Search artifacts" aria-label="Search artifacts"><select class="hd-input" data-artifact-type aria-label="Filter artifact type"><option value="">All types</option><option value="other">Other</option><option value="web">Web</option><option value="report">Report</option><option value="document">Document</option></select><select class="hd-input" data-artifact-status aria-label="Filter artifact status"><option value="">All statuses</option><option value="available">Available</option><option value="draft">Draft</option></select><select class="hd-input" data-artifact-context-kind aria-label="Linked to"><option value="">Any work</option><option value="project">Project</option><option value="issue">Issue</option><option value="task">Task</option><option value="room">Room</option></select><input class="hd-input" data-artifact-context-ref placeholder="Project, issue, task or room id" aria-label="Linked work id"></div><p data-artifact-state role="status"></p><div data-artifact-results></div><button type="button" data-artifact-retry hidden>Retry</button></div>';
+  container.innerHTML = '<div class="hd-card" data-artifact-registry><div class="hd-card__title">Artifact registry</div><div class="hd-inline"><input class="hd-input" data-artifact-query placeholder="Search artifacts" aria-label="Search artifacts"><select class="hd-input" data-artifact-type aria-label="Filter artifact type"><option value="">All types</option><option value="other">Other</option><option value="web">Web</option><option value="report">Report</option><option value="document">Document</option></select><select class="hd-input" data-artifact-status aria-label="Filter artifact status"><option value="">All statuses</option><option value="available">Available</option><option value="draft">Draft</option></select><select class="hd-input" data-artifact-context-kind aria-label="Linked to"><option value="">Any work</option><option value="project">Project</option><option value="issue">Issue</option><option value="task">Task</option><option value="room">Room</option></select><input class="hd-input" data-artifact-context-ref placeholder="Project, issue, task or room id" aria-label="Linked work id"></div><div class="hd-inline" data-artifact-owner hidden><select class="hd-input" data-artifact-view aria-label="Show artifacts"><option value="active">Active artifacts</option><option value="deleted">Deleted artifacts</option></select><button type="button" class="hd-btn" data-artifact-delete disabled>Delete</button><button type="button" class="hd-btn" data-artifact-purge disabled>Delete permanently</button><button type="button" class="hd-btn" data-artifact-restore hidden disabled>Restore</button></div><form class="hd-inline" data-artifact-purge-form hidden><label>Type <strong data-artifact-purge-count></strong> to delete permanently <input class="hd-input" data-artifact-purge-confirm autocomplete="off" inputmode="numeric" style="max-width:8ch"></label><button type="submit" class="hd-btn" data-artifact-purge-go disabled>Delete permanently</button><button type="button" class="hd-btn" data-artifact-purge-cancel>Cancel</button></form><p data-artifact-action-state role="status"></p><p data-artifact-state role="status"></p><div data-artifact-results></div><button type="button" data-artifact-retry hidden>Retry</button></div><div data-artifact-members hidden></div>';
   const results = container.querySelector('[data-artifact-results]');
   const state = container.querySelector('[data-artifact-state]');
   const retry = container.querySelector('[data-artifact-retry]');
+  const q = selector => container.querySelector(selector);
+  const ownerBar = q('[data-artifact-owner]'), actionState = q('[data-artifact-action-state]'), purgeForm = q('[data-artifact-purge-form]');
+  const selected = new Set();
+  let owner = false, view = 'active';
+  const SUMMARY = { not_found: 'not found', refused: 'refused', already_purged: 'already purged', error: 'failed' };
+  const syncOwner = () => {
+    const count = selected.size, deleted = view === 'deleted';
+    ownerBar.hidden = !owner;
+    q('[data-artifact-delete]').hidden = q('[data-artifact-purge]').hidden = deleted;
+    q('[data-artifact-restore]').hidden = !deleted;
+    q('[data-artifact-delete]').disabled = q('[data-artifact-purge]').disabled = q('[data-artifact-restore]').disabled = !count;
+    q('[data-artifact-purge-count]').textContent = String(count);
+    q('[data-artifact-purge-go]').disabled = q('[data-artifact-purge-confirm]').value !== String(count) || !count;
+    if (!count) purgeForm.hidden = true;
+  };
+  const announce = (results, verb) => {
+    const counts = {};
+    for (const row of Array.isArray(results) ? results : []) counts[row.result] = (counts[row.result] || 0) + 1;
+    const parts = Object.entries(counts).map(([key, n]) => `${n} ${['tombstoned', 'deleted', 'restored'].includes(key) ? verb : SUMMARY[key] || 'not changed'}`);
+    actionState.textContent = parts.length ? `${parts.join(', ')}.` : 'Nothing changed.';
+  };
+  // One fixed message for every failure: the server's text is never shown.
+  const act = async (run, verb) => {
+    actionState.textContent = 'Working…';
+    for (const button of [...ownerBar.querySelectorAll('button'), ...purgeForm.querySelectorAll('button')]) button.disabled = true;
+    try {
+      const out = await run();
+      selected.clear();
+      q('[data-artifact-purge-confirm]').value = '';
+      purgeForm.hidden = true;
+      syncOwner();
+      await render({ replace: true });
+      announce(out?.results, verb);
+      return;
+    } catch { actionState.textContent = 'That did not work. Some changes may have been applied; reload to see the current state.'; }
+    syncOwner();
+  };
   const render = async ({ replace = false } = {}) => {
     if (disposed || (controller && !replace)) return;
     controller?.abort();
@@ -32,6 +71,16 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
       const contextRef = container.querySelector('[data-artifact-context-ref]').value.trim();
       const q = container.querySelector('[data-artifact-query]').value;
       // A named piece of work asks the registry for what is linked to it; type and status do not apply there.
+      if (view === 'deleted' && owner) {
+        const { artifacts: gone } = await client.listTombstonedArtifacts({ signal });
+        if (disposed || current !== generation) return;
+        if (!Array.isArray(gone)) throw new Error('Invalid response');
+        const live = new Set(gone.filter(a => !a.purged).map(a => a.artifact_id));
+        for (const id of [...selected]) if (!live.has(id)) selected.delete(id);
+        morph(results, gone.length ? `<div class="hd-table-wrap"><table class="hd-table"><thead><tr><th><span class="visually-hidden">Select</span></th><th>Name</th><th>Deleted</th><th>Purge after</th></tr></thead><tbody>${gone.map(a => `<tr><td><input type="checkbox" data-artifact-select value="${esc(a.artifact_id)}" aria-label="Select ${esc(a.original_filename || a.artifact_id)}"${selected.has(a.artifact_id) ? ' checked' : ''}${a.purged ? ' disabled' : ''}></td><td>${esc(a.original_filename || a.artifact_id)}${a.purged ? ' (purged)' : ''}</td><td>${esc(a.tombstoned_at || 'unknown')}</td><td>${esc(a.purge_after || 'held')}</td></tr>`).join('')}</tbody></table></div>` : '<herdr-empty message="No deleted artifacts"></herdr-empty>');
+        loaded = true; state.textContent = ''; syncOwner(); freshness()?.touch(true);
+        return;
+      }
       const { artifacts } = contextKind && contextRef
         ? await client.artifactsForContext(contextKind, contextRef, { q, limit: 100, signal })
         : await client.listArtifacts({
@@ -41,8 +90,9 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
         });
       if (disposed || current !== generation) return;
       if (!Array.isArray(artifacts)) throw new Error('Invalid artifact registry response');
-      morph(results, artifacts.length ? `<div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Status</th><th>Created</th></tr></thead><tbody>${artifacts.map(artifact => `<tr><td><a href="#/artifacts/${encodeURIComponent(artifact.artifact_id)}">${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}</a></td><td>${esc(artifact.artifact_type || 'other')}</td><td>${artifact.size_bytes == null ? '—' : humanSize(artifact.size_bytes)}</td><td>${esc(artifact.status || '—')}</td><td>${esc(artifact.created_at || 'unknown')}</td></tr>`).join('')}</tbody></table></div>` : '<herdr-empty message="No artifacts match the current filters"></herdr-empty>');
-      loaded = true;
+      { const visible = new Set(artifacts.map(a => a.artifact_id)); for (const id of [...selected]) if (!visible.has(id)) selected.delete(id); }
+      morph(results, artifacts.length ? `<div class="hd-table-wrap"><table class="hd-table"><thead><tr>${owner ? '<th><span class="visually-hidden">Select</span></th>' : ''}<th>Name</th><th>Type</th><th>Size</th><th>Status</th><th>Created</th></tr></thead><tbody>${artifacts.map(artifact => `<tr>${owner ? `<td><input type="checkbox" data-artifact-select value="${esc(artifact.artifact_id)}" aria-label="Select ${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}"${selected.has(artifact.artifact_id) ? ' checked' : ''}></td>` : ''}<td><a href="#/artifacts/${encodeURIComponent(artifact.artifact_id)}">${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}</a></td><td>${esc(artifact.artifact_type || 'other')}</td><td>${artifact.size_bytes == null ? '—' : humanSize(artifact.size_bytes)}</td><td>${esc(artifact.status || '—')}</td><td>${esc(artifact.created_at || 'unknown')}</td></tr>`).join('')}</tbody></table></div>` : '<herdr-empty message="No artifacts match the current filters"></herdr-empty>');
+      loaded = true; syncOwner();
       state.textContent = artifacts.length === 100 ? 'Showing the first 100 artifacts. Refine the search to narrow results.' : '';
       freshness()?.touch(true);
     } catch (error) {
@@ -56,9 +106,34 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
   const schedule = () => { clearTimeout(timer); timer = setTimeout(() => render({ replace: true }), 200); };
   container.querySelectorAll('[data-artifact-query],[data-artifact-type],[data-artifact-status],[data-artifact-context-kind],[data-artifact-context-ref]').forEach(control => control.addEventListener('input', schedule));
   retry.addEventListener('click', render);
+  const key = () => (globalThis.crypto?.randomUUID?.() || String(Date.now())).replace(/[^A-Za-z0-9-]/g, '');
+  results.addEventListener('change', event => {
+    const box = event.target.closest?.('[data-artifact-select]');
+    if (!box) return;
+    if (box.checked && selected.size >= 200) { box.checked = false; actionState.textContent = 'Select at most 200 artifacts at a time.'; return; }
+    if (box.checked) selected.add(box.value); else selected.delete(box.value);
+    syncOwner();
+  });
+  q('[data-artifact-view]').addEventListener('change', event => { view = event.target.value; selected.clear(); purgeForm.hidden = true; syncOwner(); render({ replace: true }); });
+  q('[data-artifact-delete]').addEventListener('click', () => act(() => client.deleteArtifacts([...selected], { reason: 'Deleted from the dashboard', requestKey: key() }), 'deleted'));
+  q('[data-artifact-restore]').addEventListener('click', () => act(() => client.restoreArtifacts([...selected], { requestKey: key() }), 'restored'));
+  q('[data-artifact-purge]').addEventListener('click', () => { purgeForm.hidden = false; q('[data-artifact-purge-confirm]').value = ''; syncOwner(); q('[data-artifact-purge-confirm]').focus(); });
+  q('[data-artifact-purge-cancel]').addEventListener('click', () => { purgeForm.hidden = true; q('[data-artifact-purge-confirm]').value = ''; });
+  q('[data-artifact-purge-confirm]').addEventListener('input', syncOwner);
+  purgeForm.addEventListener('submit', event => {
+    event.preventDefault();
+    const typed = q('[data-artifact-purge-confirm]').value;
+    if (typed !== String(selected.size) || !selected.size) return;
+    act(() => client.deleteArtifacts([...selected], { mode: 'purge_now', confirm: typed, reason: 'Permanently deleted from the dashboard', requestKey: key() }), 'permanently deleted');
+  });
+  // Only an owner sees the controls; a failed probe leaves them hidden. The server enforces this on every call.
+  client.artifactDeleteAccess?.().then(access => { if (!disposed && access?.owner === true) { owner = true; syncOwner(); render({ replace: true }); } }, () => {});
   const stop = pollWhileVisible(render, 30000);
   void render();
-  return { refresh: render, dispose() { disposed = true; clearTimeout(timer); stop(); controller?.abort(); } };
+  // The operator Members section shows itself only when the members list loads; a 403 leaves it hidden.
+  const membersAbort = new AbortController();
+  const members = mountMembersPanel(container.querySelector('[data-artifact-members]'), client, { signal: membersAbort.signal });
+  return { refresh: render, dispose() { disposed = true; clearTimeout(timer); stop(); controller?.abort(); membersAbort.abort(); members.dispose(); } };
 }
 
 const STAGES = { rendered: 'Rendered', evidence_checked: 'Evidence checked', reviewed: 'Reviewed' };
@@ -149,21 +224,13 @@ async function renderReportReader(container, client, id, artifact, versions, { v
   const alive = ticket => !disposed && ticket === generation && container.contains(shell);
   const revokeBlobs = () => { for (const url of blobs) URL.revokeObjectURL(url); blobs.clear(); };
 
-  function showPreview(output, content) {
-    const template = document.createElement('template');
-    template.innerHTML = content;
-    // Even fragment links in srcdoc can resolve against the parent SPA URL.
-    // The surrounding reader owns navigation and authenticated downloads.
-    template.content.querySelectorAll('a').forEach(link => link.replaceWith(...link.childNodes));
-    const frame = document.createElement('iframe');
-    frame.title = 'Report preview';
-    frame.setAttribute('sandbox', '');
-    frame.referrerPolicy = 'no-referrer';
-    frame.style.cssText = 'width:100%;min-height:560px;border:1px solid currentColor';
-    frame.srcdoc = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'">${template.innerHTML}`;
-    const note = document.createElement('p');
-    note.textContent = 'Use the surrounding reader controls to navigate findings and download files.';
-    output.replaceChildren(note, frame);
+  // `render` is a render-route response: { kind, html, too_large }. The sanitised copy goes into a contained shadow root.
+  function showPreview(output, render) {
+    if (!render || render.too_large || typeof render.html !== 'string') {
+      output.innerHTML = `<p role="alert">${render?.too_large ? 'This output exceeds the preview limit. Download it instead.' : 'This output type has no static preview. Download it instead.'}</p>`;
+      return;
+    }
+    mountStaticHtml(output, render.html, { label: 'Report preview' });
   }
 
   function showLegacyVersion(version, selected, ticket, signal) {
@@ -177,22 +244,21 @@ async function renderReportReader(container, client, id, artifact, versions, { v
       button.disabled = true;
       output.textContent = preview ? 'Loading preview…' : 'Downloading…';
       try {
+        if (preview) {
+          const render = await client.artifactOutputRender(id, selected, index, { signal });
+          if (alive(ticket)) showPreview(output, render);
+          return;
+        }
         const path = `${client.artifactReportPath(id, selected)}/outputs/${index}`;
         const data = await client.artifactReportContent(path, 'blob', signal);
         if (!alive(ticket)) return;
-        if (preview) {
-          if (data.size > 256 * 1024) throw new Error('This output exceeds the preview limit. Download it instead.');
-          const content = await data.text();
-          if (alive(ticket)) showPreview(output, content);
-        } else {
-          const url = URL.createObjectURL(data);
-          blobs.add(url);
-          const link = document.createElement('a');
-          link.href = url;
-          link.download = (asset.name || `output-${index + 1}`).split(/[\\/]/).pop();
-          link.click();
-          output.textContent = 'Download ready.';
-        }
+        const url = URL.createObjectURL(data);
+        blobs.add(url);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = (asset.name || `output-${index + 1}`).split(/[\\/]/).pop();
+        link.click();
+        output.textContent = 'Download ready.';
       } catch (error) { if (alive(ticket)) output.textContent = `Output unavailable: ${error.message || 'Request failed'}`; }
       finally { if (alive(ticket)) button.disabled = false; }
     }));
@@ -321,9 +387,8 @@ async function renderReportReader(container, client, id, artifact, versions, { v
         const output = body.querySelector('[data-report-preview-result]');
         output.textContent = 'Loading bounded preview…';
         try {
-          const preview = await client.artifactReportPreview(id, selected, { signal });
+          const preview = await client.artifactReportPreviewRender(id, selected, { signal });
           if (!alive(ticket)) return;
-          if (typeof preview !== 'string' || new TextEncoder().encode(preview).length > 1024 * 1024) throw new Error('The preview exceeds its display size limit. Use the individual downloads.');
           showPreview(output, preview);
         } catch (error) {
           if (alive(ticket)) { output.innerHTML = `<p role="alert">Preview unavailable: ${failure(error)}</p>`; body.querySelector('[data-report-preview]').disabled = false; }
@@ -390,6 +455,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
   }
   versionsRead.catch(() => {});
   const mime = artifact.mime_type || 'application/octet-stream';
+  const mediaType = mime.split(';')[0].trim().toLowerCase();
   const url = client.artifactDownloadUrl(id);
   container.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><div class="hd-card"><h2>Preview</h2><div data-artifact-preview>${skeleton('preview', { rows: 1 })}</div></div><div class="hd-card"><dl><dt>Artifact ID</dt><dd><code>${esc(id)}</code></dd><dt>Type</dt><dd>${esc(artifact.artifact_type || 'other')}</dd><dt>MIME</dt><dd>${esc(mime)}</dd><dt>Status</dt><dd>${esc(artifact.status || 'unknown')}</dd><dt>SHA-256</dt><dd><code>${esc(artifact.sha256 || 'versioned blob')}</code></dd></dl></div><div class="hd-card"><h2>Versions</h2><div data-artifact-versions>${skeleton('versions', { rows: 1 })}</div></div><div class="hd-card" data-artifact-share-card><h2>Share</h2><div data-artifact-share></div></div><div class="hd-card"><h2>Review</h2><div data-artifact-reviews>${skeleton('reviews', { rows: 1 })}</div></div><div class="hd-card"><h2>Linked to</h2><div data-artifact-links>${skeleton('links', { rows: 1 })}</div></div>`;
   client.artifactLinks(id, { signal: bounded() }).then(({ links }) => {
@@ -416,7 +482,29 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
     headVersionId: artifact.current_version_id, signal,
   });
   // Only a non-report artifact may fetch the download for its preview.
-  container.querySelector('[data-artifact-preview]').innerHTML = mime === 'application/pdf' ? `<iframe title="PDF preview" src="${esc(url)}" style="width:100%;min-height:640px;border:0"></iframe>` : mime.startsWith('image/') ? `<img src="${esc(url)}" alt="${esc(artifact.original_filename || id)}" style="max-width:100%;max-height:640px;object-fit:contain">` : mime === 'text/html' ? `<iframe title="HTML preview" sandbox src="${esc(url)}" style="width:100%;min-height:640px;border:0"></iframe>` : mime.startsWith('text/') || mime === 'application/json' ? `<a class="hd-btn" href="${esc(url)}" target="_blank" rel="noopener">Open text artifact</a>` : `<a class="hd-btn" href="${esc(url)}" download>Download artifact</a>`;
+  const previewSlot = container.querySelector('[data-artifact-preview]');
+  const imageHtml = `<img src="${esc(url)}" alt="${esc(artifact.original_filename || id)}" style="max-width:100%;max-height:640px;object-fit:contain">`;
+  const textHtml = liveLink(client.artifactLiveUrl(id));
+  const otherHtml = `<a class="hd-btn" href="${esc(url)}" download>Download artifact</a>`;
+  if (mediaType === 'application/pdf' || mediaType === 'text/html') {
+    // No frames: a PDF is drawn on canvases, HTML is the server's sanitised copy; the raw file opens sandboxed in a new tab.
+    previewSlot.innerHTML = `<div data-preview-body>${skeleton('preview', { rows: 1 })}</div><p>${liveLink(client.artifactLiveUrl(id))}</p>`;
+    const body = previewSlot.querySelector('[data-preview-body]');
+    const alive = () => !signal?.aborted && container.isConnected && body.isConnected;
+    const unavailable = message => { if (alive()) body.innerHTML = `<p role="alert">${esc(message)}</p>`; };
+    if (mediaType === 'application/pdf') {
+      client.artifactBytes(id, { signal }).then(bytes => { if (alive()) return mountPdf(body, bytes, { signal }); })
+        .catch(error => unavailable(`Preview unavailable: ${error?.message || 'request failed'}`));
+    } else {
+      client.artifactRender(id, { signal }).then(render => {
+        if (!alive()) return;
+        if (render?.too_large || typeof render?.html !== 'string') unavailable('This file is too large for a static preview. Open the live view or download it.');
+        else mountStaticHtml(body, render.html, { label: 'HTML preview' });
+      }).catch(error => unavailable(`Preview unavailable: ${error?.message || 'request failed'}`));
+    }
+  } else {
+    previewSlot.innerHTML = mediaType.startsWith('image/') ? imageHtml : mediaType.startsWith('text/') || mediaType === 'application/json' ? textHtml : otherHtml;
+  }
   results.push((await Promise.allSettled([reviewsRead]))[0]);
   if (signal?.aborted || !container.isConnected) return;
   const errors = [];

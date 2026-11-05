@@ -374,6 +374,19 @@ class GoogleWorkspace:
         return {"id": message_id, "from": h.get("from", ""), "to": h.get("to", ""), "subject": h.get("subject", ""),
                 "date": h.get("date", ""), "body": body[:MAX_BODY], "truncated": len(body) > MAX_BODY}
 
+    def get_raw_message(self, tenant: str, user: str, message_id: str) -> dict:
+        """The Gmail ``users.messages.get`` document (format full), for the team-brief builder. Its output never leaves the
+        assistant: only a derived brief and an opaque reference do (``assistant_briefs.py``). Missing -> ``LookupError``."""
+        self._require_gmail(tenant, user)
+        if not isinstance(message_id, str) or not _ID.fullmatch(message_id):
+            raise LookupError("not found")
+        try:
+            return self._get(tenant, user, f"{GMAIL}/messages/{message_id}", {"format": "full"})
+        except GoogleError as exc:
+            if exc.reason in ("not_found", "bad_request"):
+                raise LookupError("not found") from None
+            raise
+
     @classmethod
     def _text(cls, part: dict, depth: int = 0) -> str:
         if depth > 6:

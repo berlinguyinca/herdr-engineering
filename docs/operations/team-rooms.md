@@ -376,6 +376,90 @@ herdr-eng rooms coordination ROOM                              # a coordinator's
 Web UI (built afterwards, see "The screens"), assistant briefs and the brief-reference check (slice 4: the refusal
 "an external coordinator cannot read a brief reference" holds because no such route exists yet, and the only assistant API an
 external credential reaches is rejected with 401, tested), approval-gated external actions (slice 5), and `direct` guest behaviour.
+Coordinators can be handed an approved Suggest request or brief by the owner (slice 4 tested this: the coordinator accepts it as the root and decomposes it by role); a `direct` guest still cannot target one.
+
+
+# Slice 4: the assistant hands a team a derived brief
+
+Slice 4 of the same design (`TEAM_COLLABORATION.md` sections 6.1, 6.3, 11, 13, 14 and the T-TC1/T-TC6/T-TC9/T-TC13 rows). The
+operator's personal assistant, which can read the operator's email, offers a team a DERIVED brief plus an opaque reference only the
+operator can follow. A brief is a Suggest request with extra fields: it waits in the operator's queue and nothing runs until the
+operator approves.
+
+## What it does
+
+- The assistant reads one message through a single seam (`assistant.mail_source`, in production `GoogleWorkspace.get_raw_message`)
+  and builds the brief from named fields: a topic from the operator's list, a capped and redacted summary (secrets masked, addresses
+  become `[address]`, links `[link]`, quoted reply lines dropped), a sender class (`known` or `unknown`), an attachment count and an
+  injection flag. The raw body, headers and addresses never leave the assistant.
+- The private record (message id, thread id, sender, subject, Message-ID header) is stored in the assistant's own store
+  (`pa_store_snapshot`, per tenant and user) behind a `bref-` reference. Nothing in collab, the room log, the Work Graph, events or
+  audit payloads holds it. Team agents, guests and external coordinators cannot resolve it: the reference route answers the same 404
+  as a nonexistent one.
+- The brief is filed in process as `suggestion_submitted` (`source: assistant_brief`) with the taint `external-source:email`, set by
+  collab itself. It is ALWAYS pending. No configuration key approves, trusts or skips; an unknown key stops startup.
+- The approval card (`herdr-eng rooms queue`) shows the exact text the team will see, whether the injection flag fired, and every
+  reader: the team's agents, the people on the team, and the external coordinator if opted in. The owner can trim the text when
+  approving. Approval makes a NEW operator-origin task whose command is a fixed sentence and whose quoted data is the brief; the
+  taint stays.
+- Idempotency: the key is a SHA-256 of user, provider and message id, indexed from the replayed log. The same email is one request
+  across ticks, restarts and a crash between the two durable steps (the retry reuses the reference). The same email offered to
+  another room or team is 409.
+- The assistant cannot address team agents and team agents cannot address the assistant except through this route; a brief to an
+  assistant-kind target is refused, as is an agent off the named team.
+
+## Turn it on
+
+Three flags, all YAML, all off by default, read hot on the collab side and at start on the assistant side:
+
+```yaml
+control_plane:
+  collab:
+    team_rooms: {enabled: true}
+  personal_assistant:
+    enabled: true
+    persistence: {dsn: ...}           # required: references must be durable
+    collab_users: {"key:<id>": "<collab user that owns the room>"}
+    team_briefs:
+      enabled: true
+      topics: [invoice, grant]       # keywords, 3 to 60 characters; required when enabled
+      known_senders: [alice@example.org]
+      briefs_per_hour: 6
+      briefs_per_topic_per_hour: 3
+      summary_max_chars: 400
+```
+
+Then restart the control plane. Flag off: both routes 404, the capability `assistant_team_briefs` is not advertised, and collab
+behaves exactly as before (pinned by a test).
+
+## Operate it
+
+- `herdr-eng assistant brief-offer ROOM TEAM MESSAGE [--target AGENT]`, `brief-list`, `brief-reference REF` (the operator only).
+- Routes: `POST/GET /api/v1/assistant-team-briefs` (201 new, 200 replay; a message matching no topic is 200 with `brief: null`) and
+  `GET /api/v1/assistant-references/<id>`. They authenticate with the assistant API key, not a collab token.
+- Decide with `herdr-eng rooms queue|approve|reject` as for any request.
+
+## Roll back
+
+- Safe and normal: set `team_briefs.enabled: false` and restart. Routes 404, the door closes. Briefs already filed stay in the queue
+  as ordinary tainted requests: decide or reject them.
+- Rolling the IMAGE back is safe for collab (a log with briefs replays cleanly into the previous code; they show as ordinary tainted
+  pending or materialized requests; checked) but NOT for references: the previous assistant code rewrites the snapshot without
+  `team_briefs`, so every reference is lost. Roll back the flag, not the image.
+
+## Choices made where the design left room
+
+- Routes follow the existing `/api/v1/assistant-*` convention rather than `/api/v1/assistant/team-briefs`.
+- A brief names a team (`team_id` required); the approving target must be that team's own agent or coordinator.
+- The summary is a capped, redacted excerpt, not a model summary; `topic-trusted` sender class is never produced.
+- Collaboration credentials get 401 or 403 on the reference route (they cannot authenticate on the assistant door at all).
+
+## Not built in this slice
+
+Web UI, automatic scanning of the inbox (`process_message` is the single entry point and the inbox watch does not call it),
+approval-gated external actions (slice 5), the `direct` guest level, the attention inbox. The live Gmail fetch is wired but was not
+exercised against Gmail. Taint is not propagated into tasks a coordinator authors from an approved brief.
+
 Coordinators cannot yet be handed work by Suggest requests.
 
 ---

@@ -1024,9 +1024,13 @@ async function copyText(text, btn) {
 }
 
 async function viewServices(_parts, revision) {
-  const { services } = await client.listServices();
+  const scope=({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr';
+  const showAll=route().query.get('all')==='1';
+  const requested=route().query.get('status');
+  const status=['current','unavailable','unknown','all','archived'].includes(requested)?requested:showAll?'all':'current';
+  const body=await client.listServiceCatalog({scope,status,includeArchived:status==='archived',groupBy:scope==='herdr'?'project':'type'});
   if (revision !== renderRevision) return;
-  return mountServices(root, client, services, { scope: ({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
+  return mountServices(root, client, body.page ? body : body.services, {scope,showAll,status});
 }
 
 async function viewFabricServices(_parts, revision) {

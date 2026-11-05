@@ -1,0 +1,8 @@
+/* Dashboard PDF previews. The .textLayer rules follow the layout pdf.js documents for its text layer
+   (pdf.js, Copyright Mozilla Foundation, Apache License 2.0; the licence ships with the vendored build). */
+.hd-pdf-page { position: relative; margin: 0 auto 12px; background: #fff; box-shadow: 0 1px 4px #0005; }
+.hd-pdf-page canvas { display: block; }
+.hd-pdf-page .textLayer { position: absolute; inset: 0; overflow: clip; line-height: 1; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; z-index: 1; }
+.hd-pdf-page .textLayer :is(span, br) { position: absolute; color: transparent; white-space: pre; cursor: text; transform-origin: 0 0; }
+.hd-pdf-page .textLayer ::selection { background: rgba(0, 80, 255, .3); }
+[data-static-preview] { border: 1px solid var(--border, currentColor); border-radius: 6px; padding: 8px; background: #fff; color: #111; }

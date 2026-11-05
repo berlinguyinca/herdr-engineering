@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -223,31 +224,171 @@ def _post_publish(cfg, body, *, timeout=15):
             return exc.code, {}
 
 
-def _open_side_pane(file, pane_id, env, run, herdr="herdr"):
-    """Show the report in a pane to the right of the caller's own pane, reusing the one a previous run made."""
-    sidecar = Path(str(file) + ".pane")
+GRAPH_RATIO = 0.3     # share of the summary pane's height that the graph pane takes
+
+
+def _viewer_argv(file, pane_id, peer=None, kind="view"):
+    """The command a pane runs to read ``file`` (``kind`` is the ``summary`` subcommand: view or graph).
+
+    It uses this interpreter rather than whatever ``herdr-eng`` PATH finds, so the viewer always matches the
+    code that published the report. ``peer`` is the other pane of the pair, closed with this one.
+    """
+    argv = [sys.executable, "-m", "herdr_engineering.cli", "summary", kind, str(file), "--close-pane", pane_id]
+    return argv + ["--peer", peer] if peer else argv
+
+
+def _default_history(agent, session_id):
+    res = sh.resolve(agent=agent, session=session_id)
+    return sh.read_history(res)
+
+
+def _close_if_alive(sidecar, run, env, herdr):
+    """Close the pane whose id ``sidecar`` holds if it is still open: a live viewer is being read, not typed into."""
+    previous = sidecar.read_text().strip() if sidecar.is_file() else ""
+    if previous:
+        alive = run([herdr, "pane", "get", previous], capture_output=True, text=True, timeout=10, env=env)
+        if alive.returncode == 0:
+            run([herdr, "pane", "close", previous], capture_output=True, text=True, timeout=10, env=env)
+
+
+def _split(run, env, herdr, parent, direction, cwd, *extra):
+    if env.get("PYTHONPATH"):                  # a pane's shell starts from Herdr's environment, not ours
+        extra = (*extra, "--env", f"PYTHONPATH={env['PYTHONPATH']}")
+    done = run([herdr, "pane", "split", "--pane", parent, "--direction", direction, *extra, "--no-focus",
+                "--cwd", str(cwd)], capture_output=True, text=True, timeout=10, env=env)
+    return json.loads(done.stdout)["result"]["pane"]["pane_id"] if done.returncode == 0 else None
+
+
+def _build_graph(file, raw, agent, session_id, history):
+    """Write (or remove) the ``<file>.graph.json`` sidecar; returns the graph or None. Raises if history fails."""
+    from .drift_graph import build_graph
+    side = Path(str(file) + ".graph.json")
+    graph = None
     try:
-        previous = sidecar.read_text().strip() if sidecar.is_file() else ""
-        target = None
-        if previous:
-            alive = run([herdr, "pane", "get", previous], capture_output=True, text=True, timeout=10, env=env)
-            target = previous if alive.returncode == 0 else None
-        if target is None:
-            split = run([herdr, "pane", "split", "--pane", pane_id, "--direction", "right", "--no-focus",
-                         "--cwd", str(Path(file).parent)], capture_output=True, text=True, timeout=10, env=env)
-            if split.returncode != 0:
-                return {"ok": False, "error": "split_failed"}
-            target = json.loads(split.stdout)["result"]["pane"]["pane_id"]
-            sidecar.write_text(target)
-        shown = run([herdr, "pane", "run", target, "less", "-R", str(file)], capture_output=True, text=True,
-                    timeout=10, env=env)
-        return {"ok": shown.returncode == 0, "pane_id": target} if shown.returncode == 0 else {"ok": False, "error": "run_failed"}
+        if raw:
+            data = history(agent, session_id)
+            graph = build_graph(raw, data.get("prompts") or [], data.get("prompts_total") or 0, data.get("dispatch_ts"),
+                                activity_ts=data.get("activity_ts"), usage=data.get("usage"),
+                                main_only=bool(data.get("child_records")))
+    finally:
+        if graph:
+            side.write_text(json.dumps(graph))
+            os.chmod(side, 0o600)
+        else:
+            side.unlink(missing_ok=True)
+    return graph
+
+
+def _open_panes(file, pane_id, env, run, herdr, build):
+    """Show the report in a pane to the right of the caller's own and, if ``build()`` gives a graph, the graph under it.
+
+    The summary pane is split first so it exists at once; its viewer starts after the graph is known, because
+    it must be told its peer's id. A pair that is still alive is replaced whole.
+    """
+    try:
+        _close_if_alive(Path(str(file) + ".pane"), run, env, herdr)
+        _close_if_alive(Path(str(file) + ".graph.pane"), run, env, herdr)
+        target = _split(run, env, herdr, pane_id, "right", Path(file).parent)
+        if not target:
+            return {"ok": False, "error": "split_failed"}, {"ok": False, "skipped": True}
+        Path(str(file) + ".pane").write_text(target)
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
-        return {"ok": False, "error": "herdr_unavailable"}
+        return {"ok": False, "error": "herdr_unavailable"}, {"ok": False, "skipped": True}
+
+    graph_pane, info = None, {"ok": False, "skipped": True}
+    try:
+        graph = build()
+        if graph:
+            graph_pane = _split(run, env, herdr, target, "down", Path(file).parent, "--ratio", str(1 - GRAPH_RATIO))
+            info = {"ok": True, "pane_id": graph_pane} if graph_pane else {"ok": False, "error": "split_failed"}
+            if graph_pane:
+                Path(str(file) + ".graph.pane").write_text(graph_pane)
+    except Exception as exc:                           # history unreadable, disk full, herdr gone: the summary still shows
+        info = {"ok": False, "error": exc.__class__.__name__}
+    try:
+        shown = run([herdr, "pane", "run", target, *_viewer_argv(file, target, graph_pane)], capture_output=True,
+                    text=True, timeout=10, env=env)
+        if graph_pane:
+            run([herdr, "pane", "run", graph_pane, *_viewer_argv(file, graph_pane, target, "graph")],
+                capture_output=True, text=True, timeout=10, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"ok": False, "error": "herdr_unavailable"}, info
+    ok = shown.returncode == 0
+    return ({"ok": True, "pane_id": target} if ok else {"ok": False, "error": "run_failed"}), info
+
+
+def _close_panes(run, herdr, *panes):
+    """Close each pane in turn (the caller passes its own pane last: closing it may end this process); one that is already gone, or a herdr that cannot be run, is not an error."""
+    for pane in panes:
+        if pane:
+            try:
+                run([herdr, "pane", "close", pane], capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+
+def _view(draw, out, viewer, title, scroll, run, herdr, close_pane, peer_pane):
+    """Run ``draw(width, height) -> lines`` in the viewer loop, or print it without a terminal; then close the panes."""
+    try:
+        if not out.isatty():
+            out.write("\n".join(draw(100, 24)) + "\n")
+            return 0
+        return viewer(draw, scroll=scroll, title=title, out=out)
+    except (Exception, KeyboardInterrupt):
+        return 1
+    finally:
+        _close_panes(run, herdr, peer_pane, close_pane)
+
+
+def view_report(file, *, close_pane=None, peer_pane=None, run=subprocess.run, out=None, herdr="herdr",
+                viewer=None):
+    """Show the Markdown report ``file`` full screen, re-wrapped whenever the pane is resized.
+
+    When the reader quits, ``close_pane`` (the pane showing it) closes and then ``peer_pane`` (the graph under
+    it), in ``finally`` so Ctrl-C or a failure still leaves no orphan. Without a terminal the text is printed.
+    """
+    from .md_render import render_markdown
+    from .pane_viewer import run_viewer
+    out = out or sys.stdout
+    color = os.environ.get("NO_COLOR") is None
+    try:
+        text = Path(file).read_text()
+    except OSError:
+        _close_panes(run, herdr, peer_pane, close_pane)
+        return 1
+
+    def draw(width, _height):
+        return render_markdown(text, width=min(max(width - 2, 40), 110), color=color).split("\n")
+    return _view(draw, out, viewer or run_viewer, "session summary", True, run, herdr, close_pane, peer_pane)
+
+
+def view_graph(file, *, close_pane=None, peer_pane=None, run=subprocess.run, out=None, herdr="herdr",
+               viewer=None):
+    """Draw the drift graph saved beside the report ``file``, fitted to the pane, until the reader quits.
+
+    It reads only the ``<file>.graph.json`` sidecar that ``publish`` wrote, never the session history. Closing
+    behaves as in ``view_report``; a missing or unusable sidecar closes the panes and returns 1.
+    """
+    from .graph_render import render_graph
+    from .pane_viewer import run_viewer
+    out = out or sys.stdout
+    try:
+        graph = json.loads(Path(str(file) + ".graph.json").read_text())
+        if not isinstance(graph, dict) or not graph.get("segments"):
+            raise ValueError("unusable graph")
+    except (OSError, ValueError):
+        _close_panes(run, herdr, peer_pane, close_pane)
+        return 1
+    color = os.environ.get("NO_COLOR") is None
+    unicode = "utf" in (getattr(out, "encoding", None) or "utf-8").lower()
+
+    def draw(width, _height):
+        return render_graph(graph, width, unicode=unicode, color=color)
+    return _view(draw, out, viewer or run_viewer, "drift graph", True, run, herdr, close_pane, peer_pane)
 
 
 def publish_report(agent, session_id, text, *, home=None, environ=None, run=subprocess.run,
-                   load_config=None, post=_post_publish, pane=True, dashboard=True):
+                   load_config=None, post=_post_publish, pane=True, dashboard=True, history=None):
     """Put a terminal-made report where it can be read without scrolling the terminal.
 
     It goes to the dashboard (the session's Summary view) and into a Herdr pane beside the caller's own.
@@ -256,14 +397,17 @@ def publish_report(agent, session_id, text, *, home=None, environ=None, run=subp
     """
     if agent not in AGENTS or not isinstance(session_id, str) or not _SESSION_ID.match(session_id):
         raise ReportError("invalid_session_id", "agent or session id has unsupported characters")
+    from .drift_graph import extract_block
     report = validate_report(text)
+    report, raw_graph = extract_block(report)
+    report = validate_report(report)
     home = Path(home) if home else Path.home()
     env = dict(os.environ if environ is None else environ)
     file = _cache_dir(home) / f"{agent}-{session_id}.md"
     file.write_text(report + "\n")
     os.chmod(file, 0o600)
     out = {"ok": False, "file": str(file), "dashboard": {"ok": False, "skipped": True},
-           "pane": {"ok": False, "skipped": True}}
+           "pane": {"ok": False, "skipped": True}, "graph": {"ok": False, "skipped": True}}
     if dashboard:
         try:
             if load_config is None:
@@ -274,9 +418,13 @@ def publish_report(agent, session_id, text, *, home=None, environ=None, run=subp
             out["dashboard"] = {"ok": False, "error": exc.__class__.__name__}
     pane_id = env.get("HERDR_PANE_ID")
     if pane and pane_id:
-        out["pane"] = _open_side_pane(file, pane_id, env, run)
+        out["pane"], out["graph"] = _open_panes(
+            file, pane_id, env, run, "herdr",
+            lambda: _build_graph(file, raw_graph, agent, session_id, history or _default_history))
     elif pane:
         out["pane"] = {"ok": False, "error": "not_in_a_herdr_pane"}
+    if not (pane and pane_id):
+        Path(str(file) + ".graph.json").unlink(missing_ok=True)      # a stale graph must not outlive its report
     places = [name for name, key in (("the dashboard Summary view", "dashboard"), ("a side pane", "pane"))
               if out[key]["ok"]]
     out["ok"] = bool(places)

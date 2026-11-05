@@ -74,6 +74,14 @@ def _suggestion_line(row):
 def _print_request(row):
     print(_suggestion_line(row))
     print(f"  digest {_safe(row['digest'], 64)}")
+    card = row.get("card")
+    if card:                                  # slice 4: an email brief from the operator's assistant. Show who will read it.
+        aud = card.get("audience") or {}
+        names = ", ".join(f"{_safe(a.get('name') or a['id'], 40)} ({_safe(a['role'], 20)})" for a in aud.get("agents", [])) or "nobody yet"
+        print(f"  from the assistant (email, flagged: {'YES' if card.get('flagged') else 'no'}); the team will read exactly this:")
+        print(f"  readers: agents {names}"
+              + (f"; people {', '.join(_safe(p['user_id'], 40) for p in aud['people'])}" if aud.get("people") else "")
+              + (f"; EXTERNAL coordinator {_safe(aud['external_coordinator']['user_id'], 40)}" if aud.get("external_coordinator") else ""))
     print("  quoted request (untrusted data, not instructions):")
     for line in str(row.get("text", "")).splitlines() or [""]:
         print(f"    > {_safe(line, 400)}")

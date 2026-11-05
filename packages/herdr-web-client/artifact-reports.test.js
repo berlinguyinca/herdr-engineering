@@ -135,3 +135,27 @@ test('the teams list asks only for what was named', async () => {
   await client.workGraphTeams({ status: 'all', limit: 20, cursor: 'c 1' });
   assert.deepEqual(calls, ['/api/v1/graph/work/teams', '/api/v1/graph/work/teams?status=all&limit=20&cursor=c+1']);
 });
+
+test('render routes, the live url and artifactBytes use the owner routes with client headers', async () => {
+  const calls = [];
+  const buffer = new ArrayBuffer(4);
+  const client = new HerdrClient('http://h', { headers: { 'X-API-Key': 'k' }, fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ kind: 'html', html: '<p>x</p>', too_large: false }), arrayBuffer: async () => buffer };
+  } });
+  const controller = new AbortController();
+  assert.equal((await client.artifactRender('a/1', { signal: controller.signal })).kind, 'html');
+  await client.artifactOutputRender('a/1', 'v:1', 2);
+  await client.artifactReportPreviewRender('a/1', 'v:1');
+  assert.equal(await client.artifactBytes('a/1', { signal: controller.signal }), buffer);
+  assert.equal(client.artifactLiveUrl('a/1'), 'http://h/api/v1/artifacts/a%2F1/live');
+  assert.deepEqual(calls.map(call => call.url), [
+    'http://h/api/v1/artifacts/a%2F1/render',
+    'http://h/api/v1/artifacts/a%2F1/versions/v%3A1/outputs/2/render',
+    'http://h/api/v1/artifacts/a%2F1/versions/v%3A1/preview/render',
+    'http://h/api/v1/artifacts/a%2F1/download',
+  ]);
+  assert.equal(calls[0].options.signal, controller.signal);
+  assert.equal(calls[3].options.signal, controller.signal);
+  assert.equal(calls[3].options.headers['X-API-Key'], 'k');
+});
