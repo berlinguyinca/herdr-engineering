@@ -3679,6 +3679,14 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"error": "not configured"}, 404)
             if resource == "ai-sync" and len(parts) == 4:
                 return self._etag_json({"hosts": r.list_ai_sync(_q(self.path, "host_id"))})
+            if resource == "fleet-rollouts" and len(parts) in (4, 5):
+                if len(parts) == 4:
+                    return self._etag_json({"rollouts": r.list_fleet_rollouts(
+                        min(max(_qint(self.path, "limit", 50), 1), 200), _q(self.path, "repo"))})
+                if parts[4] == "versions":
+                    return self._etag_json(r.fleet_rollout_versions())
+                found = r.get_fleet_rollout(parts[4])
+                return self._etag_json(found) if found else self._json({"error": "not found"}, 404)
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
                     rng = _q(self.path, "range")
