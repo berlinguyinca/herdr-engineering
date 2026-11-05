@@ -171,6 +171,12 @@ def _sanitize(value: Any, *, depth=0, budget=None) -> Any:
     return None
 
 
+def _only_valid_v4(mission: dict, now: float) -> bool:
+    """A saved mission may carry the contract-v4 fields only in the exact shape clean_pi_fields would have stored."""
+    saved = {name: mission[name] for name in PI_V4_FIELDS if name in mission}
+    return clean_pi_fields(saved, now=now) == saved
+
+
 class MissionActivityStore:
     """Latest read-only projection per namespaced mission, under a fixed memory cap."""
 
@@ -230,7 +236,8 @@ class MissionActivityStore:
                 _checkpoint_stamp(value["activity_snapshot_at"])
             _checkpoint_require(type(value["mission"]) is dict and type(value["activity"]) is dict
                                 and value["mission"].get("id") == key[3:]
-                                and value["mission"].keys() <= MISSION_FIELDS
+                                and value["mission"].keys() <= MISSION_FIELDS | set(PI_V4_FIELDS)
+                                and _only_valid_v4(value["mission"], self._now())
                                 and value["activity"].keys() <= ACTIVITY_FIELDS)
             # The saved value has already crossed the sanitizing boundary; do not
             # ingest it again or manufacture a new receive timestamp.
