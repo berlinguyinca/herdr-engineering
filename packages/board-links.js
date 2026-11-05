@@ -41,3 +41,21 @@ export function resolveBoardLink(item, {refs = null, refsFailed = false} = {}) {
   const [target] = found.values(), href = entityHref(target.kind, target.id);
   return href ? {state: 'verified', target: {...target, href}} : {state: 'none'};
 }
+
+/**
+ * WC-005b: map `/api/v1/mission-outcomes` summaries ({[missionKey]: {prs:[{repository,number}]}}) to resolver refs.
+ * The key is kept exactly as served (namespace included). Entries without a usable prs list contribute nothing.
+ * @returns {{refs: object[], failed: boolean}} failed is true when the payload is not the expected shape
+ */
+export function refsFromMissionOutcomes(body) {
+  const outcomes = body && typeof body === 'object' ? body.outcomes : null;
+  if (!outcomes || typeof outcomes !== 'object' || Array.isArray(outcomes)) return { refs: [], failed: true };
+  const refs = [];
+  for (const [id, summary] of Object.entries(outcomes)) {
+    if (!summary || !Array.isArray(summary.prs)) continue;
+    for (const pr of summary.prs) {
+      if (pr && typeof pr.repository === 'string' && Number.isInteger(pr.number)) refs.push({ kind: 'mission', id, type: 'pr', repository: pr.repository, number: pr.number });
+    }
+  }
+  return { refs, failed: false };
+}

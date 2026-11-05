@@ -18,13 +18,24 @@ const ITEMS=[
  item('I-ambiguous',2),                                  // acme/app#3 -> two missions
  item('I-other-repo',3,{number:1,repository:'acme/other',url:'https://github.com/acme/other/issues/1'}), // same number, other repo
  item('I-hostile',4,{title:evil,url:'javascript:alert(1)'}),
+ item('P-verified',5,{type:'PULL_REQUEST',number:7,url:'https://github.com/acme/app/pull/7'}),        // acme/app PR 7 -> exactly one mission
+ item('P-none',6,{type:'PULL_REQUEST',number:8,url:'https://github.com/acme/app/pull/8'}),            // no mission records it
+ item('P-ambiguous',7,{type:'PULL_REQUEST',number:9,url:'https://github.com/acme/app/pull/9'}),      // two missions record it
+ item('P-other-repo',8,{type:'PULL_REQUEST',number:7,repository:'acme/other',url:'https://github.com/acme/other/pull/7'}), // same number, other repo
 ];
+const OUTCOMES={outcomes:{
+ 'pi:MSN-7':{result:'succeeded',prs:[{repository:'acme/app',number:7}]},
+ 'MSN-9':{result:'succeeded',prs:[{repository:'acme/app',number:9}]},
+ 'pi:MSN-9':{result:'succeeded',prs:[{repository:'acme/app',number:9}]},
+ 'pi:MSN-10':{result:'failed',prs:[]},
+}};
 const REFS=[
  {kind:'mission',id:'pi:MSN-1',type:'issue',repository:'acme/app',number:1},
  {kind:'mission',id:'pi:MSN-2',type:'issue',repository:'acme/app',number:3},
  {kind:'mission',id:'pi:MSN-3',type:'issue',repository:'acme/app',number:3},
 ];
 const handler=(p,url)=>{
+ if(p==='/api/v1/mission-outcomes')return OUTCOMES;
  if(p==='/api/v1/github/projects')return url.searchParams.get('project')?{...sync,project:board,items:ITEMS}:{...sync,projects:[board]};
  return {services:[],hosts:[],activities:[],events:[],items:[],reviews:[],available:true,components:[],summary:{},status:'ok',repositories:[],pipelines:[],missions:[]};
 };
@@ -40,14 +51,27 @@ const mountWithRefs=(page,refs)=>page.evaluate(async refs=>{
  window.__board=mountGithubProjects(host,{getGithubProjects:get},{project:'PVT_1',herdrRefs:refs});
 },refs);
 
-test('real app: with no relationship source wired, no card offers Open in Herdr and GitHub links are untouched',async()=>withPage(async(page,base)=>{
+test('real app: a PR card recorded by exactly one mission offers Open in Herdr; none, ambiguous, other-repo and issue cards do not; all requests are reads',async()=>withPage(async(page,base)=>{
  const net=await withProjects(page);
- await boot(page,base,'/github/projects?project=PVT_1',handler);
- await page.locator('[data-ghp-item="I-verified"]').waitFor({timeout:8000});
- assert.equal(await page.locator('[data-herdr-link]').count(),0);
+ const reads=await boot(page,base,'/github/projects?project=PVT_1',handler);
+ await page.locator('[data-ghp-item="P-verified"]').waitFor({timeout:8000});
+ assert.equal(await page.locator('[data-ghp-item="P-verified"] [data-herdr-link]').count(),1);
+ assert.equal(await page.locator('[data-ghp-item="P-verified"] [data-herdr-link]').getAttribute('href'),'#/missions/pi%3AMSN-7');
+ assert.equal(await page.locator('[data-ghp-item="P-verified"] a:not([data-herdr-link])').getAttribute('href'),'https://github.com/acme/app/pull/7');
+ for(const id of ['P-none','P-ambiguous','P-other-repo','I-verified','I-none','I-hostile'])assert.equal(await page.locator(`[data-ghp-item="${id}"] [data-herdr-link]`).count(),0,id);
  assert.equal(await page.locator('[data-herdr-partial]').count(),0);
- assert.equal(await page.locator('[data-ghp-item="I-verified"] a').getAttribute('href'),'https://github.com/acme/app/issues/1');
+ assert.equal(reads['/api/v1/mission-outcomes'],1,'one read on mount, no polling of the refs');
  assert.deepEqual(net.writes,[]);
+ await page.locator('[data-ghp-item="P-verified"] [data-herdr-link]').click();
+ await until(async()=>(await page.evaluate(()=>location.hash)).startsWith('#/missions/pi%3AMSN-7'),'mission route');
+}));
+
+test('real app: a failed mission-outcomes read shows the partial note and no link',async()=>withPage(async(page,base)=>{
+ await withProjects(page);
+ await boot(page,base,'/github/projects?project=PVT_1',(p,url)=>p==='/api/v1/mission-outcomes'?{__status:500,json:{error:'boom'}}:handler(p,url));
+ await page.locator('[data-ghp-item="P-verified"]').waitFor({timeout:8000});
+ assert.equal(await page.locator('[data-herdr-link]').count(),0);
+ assert.match(await page.locator('[data-ghp-item="P-verified"]').innerText(),/Herdr data partial/);
 }));
 
 test('verified card links to its mission; none, ambiguous and other-repo cards show no link; hostile item stays inert; GitHub requests are read-only',async()=>withPage(async(page,base)=>{

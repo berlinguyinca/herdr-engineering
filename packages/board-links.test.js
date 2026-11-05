@@ -1,7 +1,7 @@
 // WC-005: board item -> Herdr target resolver and card render. Real code, no mocks.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveBoardLink } from './board-links.js';
+import { resolveBoardLink, refsFromMissionOutcomes } from './board-links.js';
 import { renderProjectCard, renderProjectRow } from './github-projects-view.js';
 
 const issue = (o = {}) => ({item_id: 'I1', type: 'ISSUE', repository: 'acme/app', number: 7, title: 'Fix parser', url: 'https://github.com/acme/app/issues/7', ...o});
@@ -75,4 +75,20 @@ test('card and row keep the external GitHub link; Open in Herdr only when verifi
     assert.ok(!p.includes('Open in Herdr'));
     assert.match(p, /data-herdr-partial[^>]*>Herdr data partial</);
   }
+});
+
+test('refsFromMissionOutcomes keeps the served mission key and verifies a PR card end to end', () => {
+  const {refs, failed} = refsFromMissionOutcomes({outcomes: {
+    'pi:MSN-1': {prs: [{repository: 'acme/app', number: 7}]},
+    'MSN-2': {prs: []}, 'MSN-3': {}, 'MSN-4': {prs: [{repository: 5, number: 1}, {repository: 'a/b', number: '2'}, null]},
+  }});
+  assert.equal(failed, false);
+  assert.deepEqual(refs, [{kind: 'mission', id: 'pi:MSN-1', type: 'pr', repository: 'acme/app', number: 7}]);
+  assert.equal(resolveBoardLink(pr(), {refs}).state, 'verified');
+  assert.equal(resolveBoardLink(issue(), {refs}).state, 'none', 'a PR ref never verifies an issue');
+});
+
+test('refsFromMissionOutcomes flags malformed payloads as failed', () => {
+  for (const bad of [null, undefined, {}, {outcomes: null}, {outcomes: []}, 'x'])
+    assert.deepEqual(refsFromMissionOutcomes(bad), {refs: [], failed: true});
 });
