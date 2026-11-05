@@ -232,12 +232,24 @@ class ArtifactLifecycleMixin:
         # Personal data collected through the artifact's links: comment text and author identity, the viewers recorded
         # on opened/denied events (the rows stay, so the audit trail of what happened does), staged upload names, and
         # the artifact's own title and filename.
+        # The anchor keeps its structural keys (file, offsets) but loses the text quoted from the report.
         await self._conn.execute(
             "UPDATE artifact_annotations SET body='[removed]', author_identity='[removed]', author_email='[removed]',"
-            " file_name='[removed]', resolved_by=NULL WHERE artifact_id=$1", artifact_id)
+            " file_name='[removed]', resolved_by=NULL, anchor=(anchor - 'exact' - 'prefix' - 'suffix')"
+            " WHERE artifact_id=$1", artifact_id)
+        # Every share event whose actor is not one of our own principals (a member or an api key, i.e. the owner or an
+        # operator) names a viewer: opened, denied and the annotation kinds alike. Cleared by actor, not by kind.
         await self._conn.execute(
-            "UPDATE artifact_share_events SET actor='[removed]', detail='{}'::jsonb WHERE kind IN ('opened','denied')"
+            "UPDATE artifact_share_events SET actor='[removed]', detail='{}'::jsonb"
+            " WHERE actor NOT LIKE 'member:%' AND actor NOT LIKE 'api-key:%' AND actor <> '[removed]'"
             " AND share_id IN (SELECT share_id FROM artifact_shares WHERE artifact_id=$1)", artifact_id)
+        # Third-party feedback on the report: text and author go, the rows (that feedback was given) stay; the
+        # owner's own feedback is kept. artifact_annotation_ops holds only ingest keys and ids, nothing personal.
+        await self._conn.execute("SET LOCAL herdr.purge_redaction = 'on'")
+        await self._conn.execute(
+            "UPDATE artifact_report_feedback SET body='[removed]', actor='[removed]' WHERE artifact_id=$1"
+            " AND actor IS DISTINCT FROM (SELECT created_by FROM artifacts WHERE artifact_id=$1)", artifact_id)
+        await self._conn.execute("SET LOCAL herdr.purge_redaction = 'off'")
         await self._conn.execute("UPDATE artifact_collab_uploads SET name='[removed]' WHERE artifact_id=$1", artifact_id)
         await self._conn.execute(
             "UPDATE artifacts SET display_name=NULL, original_filename='[removed]' WHERE artifact_id=$1", artifact_id)

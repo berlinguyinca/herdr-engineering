@@ -423,6 +423,35 @@ def test_purge_anonymises_annotations_viewer_events_uploads_and_the_filename(env
     assert "smith" not in json.dumps(dict(row)).lower()
 
 
+def test_purge_clears_every_viewer_identity_quoted_anchor_text_and_feedback(env):
+    from herdr_engineering.control_plane.artifact_shares import EVENT_KINDS
+    aid, vid = env.artifact()
+    sid = env.share(aid, vid)["share_id"]
+    env.sql("INSERT INTO artifact_annotations (annotation_id, artifact_id, version_id, share_id, file_name, anchor,"
+            " body, author_identity, author_email, author_role, created_at) VALUES"
+            " ('ann_' || repeat('b', 22), $1, $2, $3, 'index.html',"
+            " '{\"file\": \"index.html\", \"exact\": \"quoted sentence\", \"prefix\": \"before text\","
+            " \"suffix\": \"after text\"}'::jsonb, 'c', 'ident-x', 'viewer@lab.example.org', 'member', now())",
+            aid, vid, sid)
+    for kind in [k for k in EVENT_KINDS if k != "created"]:
+        _call(env.shares, "add_event", sid, kind, "viewer@lab.example.org", {"file": "private.html"})
+    env.sql("INSERT INTO artifact_report_feedback (feedback_id, artifact_id, version_id, target_kind, body, actor)"
+            " VALUES ('fb_1', $1, $2, 'report', 'reviewer remark', 'carol@lab.example.org')", aid, vid)
+    env.sql("INSERT INTO artifact_annotation_ops (ingest_key, annotation_id, op, at)"
+            " VALUES ('k1', 'ann_' || repeat('b', 22), 'edit', now())")
+    retract(env, aid)
+    assert env.req(purge_path(aid), body={"confirm": aid})[0] == 200
+    events = [dict(r) for r in env.sql("SELECT kind, actor, detail FROM artifact_share_events WHERE share_id=$1", sid)]
+    blob = json.dumps(events, default=str)
+    assert "viewer@" not in blob and "private.html" not in blob
+    assert {e["kind"] for e in events} >= set(EVENT_KINDS) - {"created"}, "audit rows must remain"
+    assert [e["actor"] for e in events if e["kind"] == "created"] != ["[removed]"]
+    anchor = json.dumps(env.sql("SELECT anchor::text FROM artifact_annotations")[0][0])
+    assert not any(t in anchor for t in ("quoted sentence", "before text", "after text"))
+    fb = json.dumps(dict(env.sql("SELECT body, actor FROM artifact_report_feedback")[0]))
+    assert "remark" not in fb and "carol@" not in fb
+
+
 def test_operator_can_share_only_active_member_artifacts_and_not_via_publications(env):
     aid, vid = env.artifact()
     pub = {"resource_id": aid, "version_id": vid, "audience": "unlisted_link", "expires_at": time.time() + 3600}
