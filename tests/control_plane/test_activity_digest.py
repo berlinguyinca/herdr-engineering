@@ -325,3 +325,41 @@ def test_conflicting_same_record_is_order_independent_without_revision_guess(con
 def test_malformed_enrollment_project_is_invalid_not_typeerror(context, project):
     context["enrollment"] = replace(context["enrollment"], project_id=project)
     assert preview_activity(metadata(), **context).state == "invalid_context"
+
+
+@pytest.mark.parametrize("flag", ["sensitive", "withheld"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_revision_confidentiality_conflict_same_provenance_fails_closed(context, flag, reverse):
+    session = context["session"]
+    public = RevisionObservation(
+        "a" * 40,
+        "repo:engineering",
+        "scm:shared",
+        session.canonical_session_id,
+        "epoch-one",
+        "collector",
+        observed=True,
+    )
+    denied = replace(public, **{flag: True})
+    observations = (denied, public) if reverse else (public, denied)
+    result = preview_activity((), revision_observations=observations, **context)
+    assert result.state == "empty" and result.digest is None
+    assert result.omitted.confidential == 1
+
+
+@pytest.mark.parametrize("run_id", ["\ud800", "x" * 1025])
+def test_invalid_matched_run_id_is_safely_omitted_before_hashing(context, run_id):
+    context["event_bindings"] = (
+        replace(context["event_bindings"][1], completed_test_run_id=run_id),
+    )
+    result = preview_activity((replace(metadata()[1], run_id=run_id),), **context)
+    assert result.state == "empty" and result.digest is None
+    assert result.omitted.invalid_metadata == 1
+
+
+@pytest.mark.parametrize("suffix", ["?", "#", "?#"])
+def test_empty_origin_delimiters_are_invalid(context, suffix):
+    context["enrollment"] = replace(
+        context["enrollment"], configured_private_origin="https://private.example.test" + suffix
+    )
+    assert preview_activity(metadata(), **context).state == "invalid_context"

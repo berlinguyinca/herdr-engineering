@@ -29,12 +29,14 @@ floats. Missing counts remain absent. Reported terminal status and counts are
 not independent proof of success. An observed revision is not session authorship.
 
 The canonical digest includes at most eight paths, four completed receipts and
-three observed revisions. Source and run references are hashed. No commands,
+three observed revisions. Source and run references are hashed. Run IDs must be valid UTF-8 and at most
+1,024 bytes before hashing. Revision observations sharing stable provenance are
+withheld as a group when any duplicate carries a confidentiality denial. No commands,
 output, diffs, names, messages, reasoning or arbitrary payload URLs are copied.
 The exact canonical JSON is at most 3,072 UTF-8 bytes. Overflow drops whole items,
 removes unreferenced source hashes and records fixed numeric omission reasons.
 A link alone cannot create activity. An explicitly operator-approved HTTP(S)
-origin generates `/#/herd/session/<encoded-id>`; no hostname suffix implies
+origin generates `/#/herd/session/<encoded-id>`; literal query/fragment delimiters are rejected, no hostname suffix implies
 privacy, and no DNS lookup, request or sign-on occurs.
 
 Raw Inspector revision is available for future cursoring but excluded from

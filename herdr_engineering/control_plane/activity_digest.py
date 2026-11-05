@@ -172,6 +172,15 @@ def _identity(value):
     )
 
 
+def _run_id(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 1024
+    except UnicodeError:
+        return False
+
+
 def _path(value):
     if not isinstance(value, str) or not value or any(c in value for c in ("\\", ":", "%")):
         return False
@@ -191,6 +200,8 @@ def _private_origin(origin):
     if (
         not isinstance(origin, str)
         or len(origin) > 512
+        or "?" in origin
+        or "#" in origin
         or any(ord(c) < 33 or ord(c) == 127 for c in origin)
     ):
         raise ValueError("invalid private origin")
@@ -363,8 +374,10 @@ def preview_activity(
                 or binding.completed_test_run_id != row.run_id
             ):
                 omitted["unsupported_source"] += 1
-            elif row.status not in ("passed", "failed") or not all(
-                value is None or _integer(value) for value in counts
+            elif (
+                not _run_id(row.run_id)
+                or row.status not in ("passed", "failed")
+                or not all(value is None or _integer(value) for value in counts)
             ):
                 omitted["invalid_metadata"] += 1
             else:
@@ -380,7 +393,30 @@ def preview_activity(
                 tests[run_hash] = CompletedTest(
                     run_hash, row.status, ReportedCounts(*counts), source_hash
                 )
+    # Confidentiality is resolved for a stable provenance group before any SHA
+    # is selected. A permissive duplicate cannot bypass an explicit denial.
+    observation_groups = {}
     for observation in revision_observations:
+        if not isinstance(observation, RevisionObservation):
+            continue
+        provenance = (
+            observation.canonical_repository_id,
+            observation.canonical_session_id,
+            observation.native_context_epoch,
+            observation.producer_binding_id,
+            observation.stable_source_identity,
+        )
+        if not all(_identity(value) for value in provenance):
+            omitted["unsupported_source"] += 1
+            continue
+        observation_groups.setdefault(provenance, []).append(observation)
+    eligible_observations = []
+    for group in observation_groups.values():
+        if any(item.sensitive is not False or item.withheld is not False for item in group):
+            omitted["confidential"] += 1
+        else:
+            eligible_observations.extend(group)
+    for observation in eligible_observations:
         if not isinstance(observation, RevisionObservation):
             continue
         if observation.sensitive is not False or observation.withheld is not False:
