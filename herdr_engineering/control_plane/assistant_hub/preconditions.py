@@ -29,6 +29,7 @@ MAX_HEALTH_BYTES = 64 * 1024
 _SHA = re.compile(r"[0-9a-f]{40}")
 _GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 _COMPARE_STATUSES = frozenset({"ahead", "behind", "identical", "diverged"})
+_CI_EVENTS = frozenset({"push", "manual"})       # only these can gate a deploy (not pull_request, cron, tag, ...)
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
@@ -143,7 +144,7 @@ def _woodpecker_ci(ctx: _Ctx) -> None:
     pipelines = ctx.call(ctx.ci.public_pipelines, ctx.match.repo)
     if pipelines is None:
         raise _Unchecked                               # the configured CI address is not safe to read from
-    mine = [p for p in pipelines if p.revision == ctx.match.sha and p.branch == branch and p.event != "pull_request"]
+    mine = [p for p in pipelines if p.revision == ctx.match.sha and p.branch == branch and p.event in _CI_EVENTS]
     if not mine:
         raise _Failed
     latest = max(mine, key=lambda p: p.run_number if isinstance(p.run_number, int) else -1)
@@ -274,7 +275,11 @@ def default_clients(timeout: float = 8.0) -> PreconditionClients:
         gh = None
     try:
         from herdr_engineering.ci import WoodpeckerProvider
-        ci = WoodpeckerProvider()
+        from herdr_engineering.host_config import host_value
+        url = host_value("ci.url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("no ci.url configured")     # never fall back to the provider's built-in public host
+        ci = WoodpeckerProvider(base_url=url.strip())
         ci.public_timeout = timeout
     except Exception:                                   # noqa: BLE001
         ci = None

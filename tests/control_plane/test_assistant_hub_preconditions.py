@@ -99,6 +99,7 @@ class Remote:
         self.wp: list[dict] = [{"id": 5, "number": 11, "commit": TIP, "branch": "main", "status": "success",
                                 "event": "push"}]
         self.compare = "ahead"
+        self.runs_total: Any = "auto"                          # "auto": len(runs); else the claimed total_count
         self.fail: dict[str, tuple[int, Any, float]] = {}      # path-fragment -> forced (status, body, delay)
         self.on_hit = None
 
@@ -125,7 +126,14 @@ class Remote:
             return 200, {"state": self.status_state, "total_count": self.status_count,
                          "statuses": [{"state": self.status_state}] * min(self.status_count, 30)}, 0
         if p == f"{SLUG}/commits/{TIP}/check-runs":
-            return 200, {"total_count": len(self.runs), "check_runs": self.runs}, 0
+            q = dict(kv.split("=", 1) for kv in path.split("?", 1)[1].split("&")) if "?" in path else {}
+            page, per = int(q.get("page", 1)), min(int(q.get("per_page", 30)), 100)
+            doc: dict[str, Any] = {"check_runs": self.runs[(page - 1) * per: page * per]}
+            if self.runs_total == "auto":
+                doc["total_count"] = len(self.runs)
+            elif self.runs_total is not None:
+                doc["total_count"] = self.runs_total
+            return 200, doc, 0
         if "/compare/" in p:
             commits = [{"sha": "b" * 40, "commit": {"message": "one"}}, {"sha": TIP, "commit": {"message": "two"}}]
             shapes = {"ahead": ("ahead", 2, 0, commits), "behind": ("behind", 0, 3, []),
@@ -359,6 +367,8 @@ def _force(stack: Stack, where: str, kind: str, answer) -> GitHubAppClient | Non
 ])
 @pytest.mark.parametrize("kind,answer", FORCED, ids=[k for k, _ in FORCED])
 def test_a_broken_endpoint_is_unchecked_never_ok(tmp_path, where, names, kind, answer):
+    if answer is None and where.startswith("gh"):
+        pytest.skip("one GitHub path cannot be 'down' alone; test_github_down_makes_every_github_name_unchecked")
     stack = Stack(tmp_path)
     try:
         if kind == "slow":
@@ -367,8 +377,6 @@ def test_a_broken_endpoint_is_unchecked_never_ok(tmp_path, where, names, kind, a
             stack.ci.public_timeout = 1
             stack.health = HealthClient(timeout=1)
         _force(stack, where, kind, answer)
-        if answer is None and where.startswith("gh"):
-            return          # whole GitHub down is covered below; per-path "down" only applies to wp and health
         res = check(stack)
         assert not res.ok
         assert set(res.unchecked) == names and res.failed == ()
@@ -432,6 +440,83 @@ def test_health_commit_is_only_read_from_the_commit_key(stack):
         assert h.hits[0][1] == "/api/v1/health?probe=1"
     finally:
         h.close()
+
+
+# ------------------------------------------------------------------------------------------------ check-run paging
+def _runs(n: int, bad_at: int | None = None) -> list[dict]:
+    return [{"name": f"r{i}", "status": "completed", "conclusion": "failure" if i == bad_at else "success"}
+            for i in range(n)]
+
+
+def test_a_failing_run_on_page_two_is_seen(stack):
+    stack.r.runs = _runs(150, bad_at=120)
+    res = check(stack)
+    assert not res.ok and res.failed == ("ci_green",) and res.unchecked == ()
+    pages = [p for _, p, _ in stack.gh_l.hits if "check-runs" in p]
+    assert any("page=2" in p for p in pages)
+
+
+@pytest.mark.parametrize("n", [100, 101, 250, 500])
+def test_all_green_runs_up_to_the_five_page_cap_pass(stack, n):
+    stack.r.runs = _runs(n)
+    assert check(stack) == PreconditionResult(True, (), ())
+
+
+@pytest.mark.parametrize("total", [501, 600, 10_000])
+def test_more_runs_than_the_cap_can_read_is_unchecked(stack, total):
+    stack.r.runs = _runs(500)
+    stack.r.runs_total = total
+    res = check(stack)
+    assert not res.ok and res.unchecked == ("ci_green",) and res.failed == ()
+
+
+def test_total_above_what_was_served_is_unchecked(stack):
+    stack.r.runs = _runs(3)
+    stack.r.runs_total = 7                          # the listener serves 3 and claims 7: an incomplete list
+    res = check(stack)
+    assert not res.ok and res.unchecked == ("ci_green",)
+
+
+@pytest.mark.parametrize("total", [None, "many", -1, 1.5, True])
+def test_malformed_check_run_page_is_unchecked(stack, total):
+    stack.r.runs_total = total
+    res = check(stack)
+    assert not res.ok and res.unchecked == ("ci_green",) and res.failed == ()
+
+
+# ------------------------------------------------------------------------------------------------ woodpecker events
+def _pipe(number, status, event, branch="main", commit=TIP):
+    return {"number": number, "commit": commit, "branch": branch, "status": status, "event": event}
+
+
+def test_a_later_cron_or_tag_success_cannot_mask_a_failed_push(stack):
+    for event in ("cron", "tag", "release", "deployment", "weird"):
+        stack.r.wp = [_pipe(1, "failure", "push"), _pipe(2, "success", event)]
+        res = check(stack)
+        assert not res.ok and res.failed == ("ci_green",), event
+
+
+def test_a_later_manual_success_counts_as_the_latest(stack):
+    stack.r.wp = [_pipe(1, "failure", "push"), _pipe(2, "success", "manual")]
+    assert check(stack) == PreconditionResult(True, (), ())
+    stack.r.wp = [_pipe(1, "success", "push"), _pipe(2, "failure", "manual")]
+    assert check(stack).failed == ("ci_green",)
+
+
+def test_only_cron_or_tag_pipelines_is_not_green(stack):
+    stack.r.wp = [_pipe(1, "success", "cron"), _pipe(2, "success", "tag")]
+    assert check(stack).failed == ("ci_green",)
+
+
+# ------------------------------------------------------------------------------------------------ default clients
+def test_default_clients_without_a_configured_ci_url_has_no_ci(fake_host_config):
+    from herdr_engineering.control_plane.assistant_hub.preconditions import default_clients
+    for values in ({}, {"ci": {}}, {"ci": {"url": ""}}, {"ci": {"url": "  "}}):
+        fake_host_config(values)
+        assert default_clients().ci is None
+    fake_host_config({"ci": {"url": "https://ci.example.test"}})
+    ci = default_clients().ci
+    assert ci is not None and ci.base_url == "https://ci.example.test"
 
 
 # ------------------------------------------------------------------------------------------------ decide
@@ -574,3 +659,52 @@ def test_vetoes_still_win_over_green_preconditions(dwrld, stack):
         RawAction(tool="Bash", command=f"{CMD} --ref {SHA}", repo=REPO), "s1", "t1", dwrld.clock.now,
         judge=dwrld.judge, deploy_cfg=cfg, preconditions=stack.clients())
     assert d.outcome == "denied"
+
+
+@pytest.mark.parametrize("frag,name", [("/branches/", "on_main"), ("/status", "ci_green"),
+                                       ("/check-runs", "ci_green"), ("/compare/", "descends_from_deployed")])
+@pytest.mark.parametrize("answer", [(500, {}, 0), (200, b"{nope", 0), (200, [1], 0)], ids=["500", "garbage", "type"])
+def test_each_github_endpoint_broken_is_exactly_pending_preconditions(dwrld, stack, frag, name, answer):
+    stack.r.fail[frag] = answer
+    d = dwrld.go(stack, deploy_cfg(stack))
+    assert (d.outcome, d.source) == ("pending", "deploy_preconditions")
+    assert f"unchecked {name}" in d.reason
+    assert not dwrld.audits("assistant.deploy.authorized")
+
+
+def test_callable_deploy_cfg_flipped_to_ask_mid_check_is_deploy_mode(dwrld, stack):
+    cfg = deploy_cfg(stack)
+
+    def flip(path: str) -> None:
+        if "/status" in path:
+            scope_of(cfg)["mode"] = "ask"
+
+    stack.r.on_hit = flip
+    d = decide(dwrld.store, dwrld.cfg, dwrld.worker, RawAction(tool="Bash", command=f"{CMD} --ref {SHA}", repo=REPO),
+               "s1", "t1", dwrld.clock.now, judge=dwrld.judge, deploy_cfg=lambda: cfg,
+               preconditions=stack.clients())
+    assert (d.outcome, d.source) == ("pending", "deploy_mode")
+
+
+def test_callable_deploy_cfg_replaced_with_a_new_dict_mid_check_is_deploy_mode(dwrld, stack):
+    holder = {"cfg": deploy_cfg(stack)}
+    ask = deploy_cfg(stack, mode="ask")
+
+    def swap(path: str) -> None:
+        if "/status" in path:
+            holder["cfg"] = ask                       # a config reload replaces the whole object
+
+    stack.r.on_hit = swap
+    d = decide(dwrld.store, dwrld.cfg, dwrld.worker, RawAction(tool="Bash", command=f"{CMD} --ref {SHA}", repo=REPO),
+               "s1", "t1", dwrld.clock.now, judge=dwrld.judge, deploy_cfg=lambda: holder["cfg"],
+               preconditions=stack.clients())
+    assert (d.outcome, d.source) == ("pending", "deploy_mode")
+
+
+def test_default_require_scope_without_health_url_is_pending_never_authorized(dwrld, stack):
+    cfg = deploy_cfg(stack, health_url=None)
+    assert "require" in scope_of(cfg) and "health_url" not in scope_of(cfg)
+    d = dwrld.go(stack, cfg)
+    assert (d.outcome, d.source) == ("pending", "deploy_preconditions")
+    assert "unchecked descends_from_deployed" in d.reason
+    assert not dwrld.audits("assistant.deploy.authorized")
