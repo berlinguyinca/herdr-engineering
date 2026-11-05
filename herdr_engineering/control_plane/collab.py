@@ -5619,8 +5619,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 result=None, target_agent_id=pr.id, visibility_scope="room", action="task.requeue",
                 outcome="allowed", project_ids=[room["project_id"]], resource_id=tid))
 
-    def task_inbox(self, pr: Principal, limit: int = 20) -> dict:
-        """Open tasks addressed to this agent, only where it STILL holds "execute"."""
+    def task_inbox(self, pr: Principal, limit: int = 20, room_id: str | None = None) -> dict:
+        """Open tasks addressed to this agent, only where it STILL holds "execute". ``room_id`` narrows it to one room."""
         if not pr.is_agent or pr.external:
             raise CollabError(403, "forbidden")
         with self._lock:
@@ -5630,6 +5630,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 t = self._tasks[tid]
                 if self._task_status(t) not in ("pending", "accepted") or "bounds" in t:
                     continue                            # a bounded delegation is never an instruction to execute
+                if room_id is not None and t["room_id"] != room_id:
+                    continue
                 room = self._rooms.get(t["room_id"])
                 eff = self._effective(pr, room) if room else None
                 # a task made before this agent's current grant never revives; and its requester
@@ -5678,6 +5680,21 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 action="task.update", outcome="allowed", project_ids=[room["project_id"]],
                 resource_id=task_id))
         return {"task_id": task_id, "status": status, "attempt": t.get("attempt", 1)}
+
+    # -- fabric trust slice 3: the agent's own task routes, scoped to one room. They serve a credential agent and a fabric
+    # agent alike (both are the same Principal) and add no authority: they are task_inbox / update_task with a room check.
+    def agent_room_tasks(self, pr: Principal, room_id: str) -> dict:
+        out = self.task_inbox(pr, room_id=room_id)
+        return {"tasks": [dict(t, untrusted=True) for t in out["tasks"]]}
+
+    def agent_respond_task(self, pr: Principal, room_id: str, task_id: str, body: dict) -> dict:
+        if not pr.is_agent or pr.external:
+            raise CollabError(403, "forbidden")
+        with self._lock:
+            t = self._tasks.get(task_id) if isinstance(task_id, str) else None
+            if not t or t["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            return self.update_task(pr, task_id, body)
 
     # -- bounded delegation and artifact proposals (T11)
     # A delegation is a task in the SAME store with a ``bounds`` block, addressed to an external coworker agent
@@ -6647,6 +6664,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.list_room_externals(pr, rid)
                     if parts[2:] == ["agent-requests"]:
                         return 200, self.list_agent_requests(pr, rid)
+                    if parts[2:] == ["agent", "tasks"]:
+                        return 200, self.agent_room_tasks(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
                     if parts[2:] == ["artifacts"]:
@@ -6934,6 +6953,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.set_external_coordination(pr, rid, parts[3], body)
                     if parts[2:] == ["member-visibility"]:
                         return 200, self.set_member_visibility(pr, rid, body)
+                    if n == 6 and parts[2] == "agent" and parts[3] == "tasks" and parts[5] == "respond":
+                        return 200, self.agent_respond_task(pr, rid, parts[4], body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "respond":
                         return 200, self.respond_task(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":

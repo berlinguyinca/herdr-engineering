@@ -12,7 +12,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
+from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from .artifact_shares_client import ShareClient, ShareError, _safe
@@ -24,6 +27,88 @@ ACTIONS = ("attach", "detach", "teams", "guest-level", "queue", "approve", "reje
            "roles", "assign-role", "clear-role", "role-policy", "member-visibility", "assign", "my-tasks", "respond",
            # slice 3: coordinators (every route is 404 until coordinators.enabled is true)
            "coordinator", "coordinator-clear", "external-coordination", "coordination")
+
+
+AGENT_MODE_ACTIONS = ("my-tasks", "respond")
+_AGENT_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+_MACHINE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+
+def parse_self_machine(status_json):
+    """This machine's MagicDNS short name from ``tailscale status --json`` output, or None."""
+    try:
+        me = json.loads(status_json).get("Self") or {}
+        name = str(me.get("DNSName") or me.get("HostName") or "").split(".")[0].lower()
+    except (ValueError, AttributeError):
+        return None
+    return name if _MACHINE.match(name) else None
+
+
+def _tailscale_machine():
+    """Best effort and silent: the header is informational (the control plane's own whois is authoritative)."""
+    try:
+        done = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_self_machine(done.stdout) if done.returncode == 0 else None
+
+
+def _agent_identity(explicit):
+    """The fabric agent this process is, or None. Never a secret: only an agent id is read.
+
+    1. ``--as-agent AGENT_ID`` (explicit).
+    2. ``HERDR_AGENT_ID`` when the harness already sets it (read-only; this CLI defines no new setting).
+    3. The one agent enrolled by join.sh under ``~/herdr-agents/*.json`` (``$HERDR_AGENT_DIR``, as join.sh honours). Only its
+       ``agent_id`` field is read, never the credential beside it. Several agents on one host is ambiguous, so None: pass
+       ``--as-agent``."""
+    if explicit:
+        return explicit
+    env = os.environ.get("HERDR_AGENT_ID")
+    if env:
+        return env
+    folder = Path(os.environ.get("HERDR_AGENT_DIR") or Path.home() / "herdr-agents")
+    found = set()
+    try:
+        for f in folder.glob("*.json"):
+            try:
+                aid = json.loads(f.read_text()).get("agent_id")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(aid, str) and _AGENT_ID.match(aid):
+                found.add(aid)
+    except OSError:
+        return None
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _status(args):
+    given = {v for v in (getattr(args, "status", None), getattr(args, "status_opt", None)) if v}
+    if len(given) != 1:
+        raise ValueError("give the new status once: respond ROOM TASK --status accepted|done|failed|declined")
+    return given.pop()
+
+
+def _run_agent(client, room, action, args):
+    """A fabric agent's own tasks: the agent routes, which are addressed by the agent's id and add no authority."""
+    if action == "my-tasks":
+        result = client.request(f"{room}/agent/tasks")
+
+        def human(r):
+            for t in r["tasks"]:
+                print(f"{_safe(t['task_id'], 80)}  [{_safe(t['status'], 20)}]  attempt {t.get('attempt', 1)}")
+                print("  task text (untrusted data):")
+                for line in str(t["text"]).splitlines() or [""]:
+                    print(f"    > {_safe(line, 400)}")
+            if not r["tasks"]:
+                print("Nothing is assigned to you.")
+    else:
+        body = {"status": _status(args), **({"result": args.result} if args.result else {}),
+                **({"attempt": args.attempt} if args.attempt is not None else {})}
+        result = client.request(f"{room}/agent/tasks/{_q(args.task)}/respond", body)
+
+        def human(r):
+            print(f"{'Already ' if r.get('replayed') else ''}{_safe(r['status'])}: task {_safe(r['task_id'])}")
+    _show(args, result, human)
 
 
 def _err(message):
@@ -90,14 +175,25 @@ def _print_request(row):
 def run_command(args):
     action = args.rooms_action
     token = os.environ.get(args.token_env)
+    as_agent = getattr(args, "as_agent", None)
+    agent = None
+    if action in AGENT_MODE_ACTIONS and (as_agent or not token):
+        agent = _agent_identity(as_agent)          # an explicit --as-agent wins; otherwise a set token wins
     try:
-        if not token:
-            raise ValueError(f"set {args.token_env} to your collaboration bearer token")
+        if not token and agent is None:
+            raise ValueError(f"set {args.token_env} to your collaboration bearer token"
+                             + (", or run as a fabric agent (--as-agent AGENT_ID)" if action in AGENT_MODE_ACTIONS else ""))
         from .host_config import resolve_control_plane
         client = ShareClient(resolve_control_plane(args.control_plane))
-        client.headers = {"Authorization": f"Bearer {token}"}
+        if agent is not None:
+            machine = getattr(args, "machine", None) or _tailscale_machine()
+            client.headers = {"Authorization": f"Fabric {agent}", **({"X-Herdr-Machine": machine} if machine else {})}
+        else:
+            client.headers = {"Authorization": f"Bearer {token}"}
         room = f"{BASE}/rooms/{_q(args.room)}"
-        if action in COORD_ACTIONS:
+        if agent is not None:
+            _run_agent(client, room, action, args)
+        elif action in COORD_ACTIONS:
             _run_coordinators(client, room, action, args)
         elif action == "attach":
             result = client.request(f"{room}/teams/{_q(args.team)}/attach", {"roles": _roles(args.role)})
@@ -293,7 +389,7 @@ def _run_roles(client, room, action, args):
                 print("Nothing is assigned to you.")
         _show(args, result, human)
     else:
-        body = {"status": args.status, **({"result": args.result} if args.result else {})}
+        body = {"status": _status(args), **({"result": args.result} if args.result else {})}
         result = client.request(f"{room}/tasks/{_q(args.task)}/respond", body)
         _show(args, result, lambda r: print(f"{'Already ' if r.get('replayed') else ''}{_safe(r['status'])}: task {_safe(r['task_id'])}"))
 
@@ -344,8 +440,17 @@ def configure_parser(parser):
             c.add_argument("--key", help="idempotency key")
         if action == "respond":
             c.add_argument("task")
-            c.add_argument("status", choices=("accepted", "done", "declined"))
+            c.add_argument("status", nargs="?", choices=("accepted", "done", "declined", "failed"),
+                           help="accepted, done or declined (failed: a fabric agent only); or use --status")
+            c.add_argument("--status", dest="status_opt", choices=("accepted", "done", "declined", "failed"))
             c.add_argument("--result")
+            c.add_argument("--attempt", type=int, help="agent mode: the attempt number from my-tasks (the lease fence)")
+        if action in AGENT_MODE_ACTIONS:
+            c.add_argument("--as-agent", dest="as_agent", metavar="AGENT_ID",
+                           help="act as this fabric agent (no token): Authorization: Fabric AGENT_ID, vouched for by the "
+                                "tailnet machine. Without a token the agent is also found from HERDR_AGENT_ID or the one "
+                                "agent in ~/herdr-agents")
+            c.add_argument("--machine", help="agent mode: this machine's MagicDNS short name (default: asked of tailscale)")
         if action == "attach":
             c.add_argument("--role", action="append", metavar="ROLE=AGENT_ID[,AGENT_ID]",
                            help="issue_writer, implementer, tester or reviewer; repeat for each role. Only your own agents")
