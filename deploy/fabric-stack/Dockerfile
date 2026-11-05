@@ -12,7 +12,8 @@
 #
 # Build context = repository root:
 #   docker build -f deploy/fabric-stack/Dockerfile .
-FROM python:3.12-slim
+ARG RUNTIME_BASE=python:3.12-slim
+FROM ${RUNTIME_BASE}
 
 # Optional build stamp surfaced by /api/v1/health (commit=). Passed via
 # `docker compose build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`;

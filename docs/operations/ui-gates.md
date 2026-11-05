@@ -45,6 +45,14 @@ scripts glob `tests/playwright/!(ui-gates-)*.test.mjs` (the glob is quoted, so N
 start real Python servers, launch Chromium and push 10,000-node graphs with 600 s timeouts. Only `npm run test:ui-gates` (and
 `bash scripts/ci/ui-gates.sh`, which calls it) runs `tests/playwright/ui-gates-*.test.mjs` and `tests/visual/`.
 
+The artifact-annotation browser suites (`annotate-view`, `artifact-feedback`, `artifact-reports`, `share-annotations`) are NOT
+wired into `ui-gates.sh`: they are security checks (containment CSS, CSP, hostile content), but they were only run on a workstation,
+not under the Woodpecker harness, and `share-annotations` also drives Firefox and WebKit, which crash intermittently on a loaded host
+(Chromium alone passed 3 of 3 runs; the full three-engine run was green once in three under load 17). Run them with
+`npm run test:annotations` (set `PYTHON` to the interpreter with the repo installed) before changing `share_static/`,
+`share_render*.py` or the feedback panel. Wire them into the CI ui path once they have run reliably there. The pure anchor tests
+(`packages/share-anchor.test.js`) already run in `unit-gates`.
+
 ## What is gated, by surface
 
 | Surface | Gate |

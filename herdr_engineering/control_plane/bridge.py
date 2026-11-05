@@ -12,6 +12,7 @@ CI. ``PostgresSource`` is the real asyncpg-backed implementation.
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as _dt
 import json
 import threading
@@ -173,9 +174,12 @@ class PostgresSource(DurableSource):
 
     def __init__(self, conn: Any = None, *, run: Callable | None = None,
                  events_table: str = "fabric_events", dsn: str | None = None,
+                 use_checkpoints: bool = True, checkpoint_publish: bool = False,
                  inspector_snapshots: bool = False):
+        self._owned_runner = None
         if run is None:
-            run = _LoopRunner().run
+            self._owned_runner = _LoopRunner()
+            run = self._owned_runner.run
         self._conn = conn
         self._dsn = dsn
         self._run = run
@@ -184,6 +188,38 @@ class PostgresSource(DurableSource):
         self._cache: dict | None = None
         self.recovery_metrics: dict = {}
         self._query_lock = threading.RLock()
+        self.checkpoint_enabled = bool(use_checkpoints and dsn and events_table == 'fabric_events')
+        self.checkpoint_publish = checkpoint_publish
+        self.recovery_info = None
+        self._history_provider = None
+
+    def recover_projection(self, repo):
+        if not self.checkpoint_enabled:
+            return None
+        from .projection_recovery import recover_repository
+        try:
+            return recover_repository(repo, self)
+        except Exception as exc:
+            if self.checkpoint_publish:
+                raise
+            import logging
+            logging.getLogger(__name__).warning('checkpoint recovery unavailable (%s); replaying complete retained history',type(exc).__name__)
+            from .projection_recovery import _reset_private
+            _reset_private(repo)
+            self.recovery_info={'mode':'full_replay','reason':type(exc).__name__}
+            if self._conn is not None and self._conn.is_closed():
+                self._conn=None
+            self._cache=None
+            return None
+
+    def close(self):
+        if self._history_provider is not None:
+            self._history_provider.close()
+        if self._conn is not None and not self._conn.is_closed():
+            self._run(self._conn.close())
+        if self._owned_runner is not None:
+            self._owned_runner._loop.call_soon_threadsafe(self._owned_runner._loop.stop)
+            self._owned_runner._thread.join(timeout=3)
 
     def _load(self) -> dict:
         with self._query_lock:
@@ -406,7 +442,8 @@ def _ev_payload(event: dict) -> dict:
     return p
 
 
-def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dict]:
+def _reconstruct_from_events(streams: dict, *, initial_core=None,
+                             initial_operator_policies=None) -> tuple[dict, dict, dict, dict, dict]:
     """Replay the event log to rebuild hosts/missions/sessions/services/artifacts.
 
     ``streams`` is the ``{stream: [events]}`` dict from ``_rebuild_events``.
@@ -415,16 +452,20 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
     restart even though only ``fabric_events`` is written to. Returns
     ``(missions, sessions, hosts, services, artifacts)`` dicts keyed by id.
     """
-    missions: dict = {}
-    sessions: dict = {}
-    hosts: dict = {}
-    services: dict = {}
-    artifacts: dict = {}
+    import copy
+    seed = initial_core or {}
+    missions: dict = copy.deepcopy(seed.get('missions', {}))
+    sessions: dict = copy.deepcopy(seed.get('sessions', {}))
+    hosts: dict = copy.deepcopy(seed.get('hosts', {}))
+    services: dict = copy.deepcopy(seed.get('services', {}))
+    artifacts: dict = copy.deepcopy(seed.get('artifacts', {}))
+    operator_policies: dict = copy.deepcopy(initial_operator_policies or {})
     flat: list[dict] = []
     for stream in streams.values():
         flat.extend(stream)
     flat.sort(key=lambda e: (e.get("ingest_timestamp") or "",
-                             e.get("sequence") or 0))
+                             e.get("sequence") or 0, e.get('event_id') or '',
+                             str((e.get('actor') or {}).get('id') or '')))
     for ev in flat:
         et, eid = ev.get("entity_type"), ev.get("entity_id")
         if not et or not eid:
@@ -438,6 +479,9 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
             if etype == "HostPolicyChanged":
                 if "_envelope" in p:
                     continue
+                previous = operator_policies.get(eid) or {}
+                if p.get('revision', -1) >= previous.get('revision', -1):
+                    operator_policies[eid] = p
                 # Policy edits are not evidence that the host is alive.
                 host = hosts.get(eid)
                 if host is not None:
@@ -603,6 +647,10 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 else svc["status"]
             svc["url"] = None if svc.get("endpoint_scope") == "local_only" else (svc["route"] or f"http://{svc['host_id']}:{svc['port']}")
             svc["updated_at"] = ts
+    for hid, policy in operator_policies.items():
+        host = hosts.setdefault(hid, {'host_id': hid, 'host_name': hid})
+        if policy.get('revision', -1) >= (host.get('scheduler_policy') or {}).get('revision', -1):
+            host['scheduler_policy'] = policy
     for sid, s in sessions.items():
         mid = s.get("mission_key", s.get("mission_id"))
         if mid and mid in missions and sid not in missions[mid]["sessions"]:
@@ -611,6 +659,16 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
 
 
 def load_into(repo, source: DurableSource) -> dict:
+    recover = getattr(source, 'recover_projection', None)
+    if callable(recover):
+        result = recover(repo)
+        if result is not None:
+            return result
+    return _load_full_into(repo, source)
+
+
+def _load_full_into(repo, source: DurableSource, *, core_override=None,
+                    projection_state=None, capture_event_core=False) -> dict:
     """Hydrate ``repo`` from ``source``. Idempotent; returns counts.
 
     Designed for a fresh repo at server startup: replaces all structured state
@@ -687,10 +745,8 @@ def load_into(repo, source: DurableSource) -> dict:
             "updated_at": _iso(row.get("updated_at") or row.get("created_at")),
         }
 
-    if isinstance(source, PostgresSource):
-        rows = source.take_events()
-        events, event_order = _rebuild_events(rows, reuse=True)
-        del rows
+    if callable(getattr(source, 'take_events', None)):
+        events, event_order = _rebuild_events(source.take_events(), reuse=True)
     else:
         events, event_order = _rebuild_events(source.events())
     phase("group rows into streams")
@@ -711,8 +767,16 @@ def load_into(repo, source: DurableSource) -> dict:
             elif base.get(k) in (None, "", []):
                 base[k] = v
 
-    rmissions, rsessions, rhosts, rservices, rartifacts = \
-        _reconstruct_from_events(events)
+    if core_override is None:
+        rmissions, rsessions, rhosts, rservices, rartifacts = _reconstruct_from_events(events)
+    else:
+        rmissions, rsessions, rhosts, rservices, rartifacts = (
+            copy.deepcopy(core_override[name])
+            for name in ('missions', 'sessions', 'hosts', 'services', 'artifacts'))
+    if capture_event_core:
+        repo._checkpoint_event_core = copy.deepcopy(dict(zip(
+            ('missions','sessions','hosts','services','artifacts'),
+            (rmissions,rsessions,rhosts,rservices,rartifacts))))
     phase("reconstruct entities from events")
     for mid, m in rmissions.items():
         _overlay(missions.setdefault(mid, m), m)
@@ -773,14 +837,40 @@ def load_into(repo, source: DurableSource) -> dict:
         if mid in missions and sid not in missions[mid]["sessions"]:
             missions[mid]["sessions"].append(sid)
 
-    repo.import_state({
+    restored_state = {
+        **(projection_state or {}),
         "version": 1,
         "missions": missions, "sessions": sessions, "services": services,
         "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
-        "telemetry": {}, "events": events, "event_order": event_order,
+        "telemetry": (projection_state or {}).get('telemetry', {}),
+        "events": events, "event_order": event_order,
         "inspector_snapshot": source.inspector_snapshot() if isinstance(source, PostgresSource) else None,
         "inspector_backfill": source.inspector_backfill if isinstance(source, PostgresSource) else None,
-    })
+    }
+    for key in ('leases', 'scheduler_reservations', 'scheduler_leases'):
+        if key in (projection_state or {}):
+            restored_state[key] = projection_state[key]
+    if getattr(source, 'source_ledger', None) is not None:
+        restored_state['source_ledger'] = source.source_ledger
+    if capture_event_core:
+        from .projection_checkpoint import (
+            COMPACT_TYPES,
+            PRIVATE_REPLAY_TYPES,
+            event_time,
+            operator_policies,
+        )
+        repo._checkpoint_core_cursors = {key: max(event_time(row) for row in stream)
+            for key, stream in events.items() if key.split('|', 1)[0] in COMPACT_TYPES and stream}
+        repo._checkpoint_operator_policies = operator_policies(
+            [row for key, stream in events.items() if key.startswith('host|') for row in stream])
+        repo._checkpoint_inspector_preferences = [copy.deepcopy(row)
+            for stream in events.values() for row in stream
+            if row.get('entity_type') == 'inspector' and row.get('event_type') == 'inspector.preferences'
+            and (row.get('payload') or {}).get('scope') == 'global']
+        repo._checkpoint_private_streams = {
+            key: copy.deepcopy(rows) for key, rows in events.items()
+            if key.split('|', 1)[0] in PRIVATE_REPLAY_TYPES}
+    repo.import_state(restored_state)
     # Compact projection recovery must not truncate the raw history API.
     repo._durable_history = source if isinstance(source, PostgresSource) else None
     return {"missions": len(missions), "sessions": len(sessions),

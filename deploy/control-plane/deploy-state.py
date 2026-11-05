@@ -193,13 +193,57 @@ def prepare(state, central, commit, previous_commit, previous_image, collab):
     print(attempt)
 
 
+# These fields are deliberately bounded/allowlisted: never print arbitrary owner
+# files, process command lines, refs, config paths, or environment values.
+LOCK_PHASES = {"prepare", "build", "checkpoint-prewarm", "forward", "verify", "rollback", "cleanup"}
+
+
+def lock_metadata(action, args):
+    state = Path(args[0])
+    path = state / "rollout-owner.json"
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    if action == "lock-report":
+        owner = data.get("owner")
+        owner = owner if isinstance(owner, str) and re.fullmatch(r"[0-9a-f]{32}", owner) else "unknown"
+        phase = data.get("phase")
+        phase = phase if isinstance(phase, str) and phase in LOCK_PHASES else "unknown"
+        pid = data.get("pid")
+        pid = pid if type(pid) is int and 0 < pid < 2**31 else "unknown"
+        print(f"deployment busy: owner={owner} pid={pid} phase={phase} (exit 75)")
+        return
+    owner = args[1]
+    if not re.fullmatch(r"[0-9a-f]{32}", owner):
+        raise ValueError("invalid owner")
+    if action == "lock-start":
+        write_json(path, {"owner": owner, "pid": int(args[2]), "phase": "prepare"})
+    elif data.get("owner") == owner:
+        if action == "lock-clear":
+            path.unlink()
+            sync_directory(state)
+        elif action == "lock-phase":
+            if args[2] not in LOCK_PHASES:
+                raise ValueError("invalid phase")
+            data["phase"] = args[2]
+            write_json(path, data)
+
+
 def main():
     action, *args = sys.argv[1:]
-    if action == "prepare":
+    if action in ("lock-start", "lock-phase", "lock-clear", "lock-report"):
+        lock_metadata(action, args)
+    elif action == "prepare":
         prepare(*args)
-    elif action == "resolve-previous":
-        tag, _ = previous_receipt(*args)
-        print(tag)
+    elif action in ("resolve-previous", "verified-previous"):
+        tag, receipt = previous_receipt(*args)
+        if action == "verified-previous":
+            print(tag, receipt.get("commit", ""))
+        else:
+            print(tag)
     elif action == "outcome":
         attempt, outcome = args
         path = Path(attempt) / "metadata.json"

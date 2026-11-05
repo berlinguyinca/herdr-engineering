@@ -16,6 +16,15 @@ from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import Any
 
+from .envelope import (
+    _checkpoint_header,
+    _checkpoint_int,
+    _checkpoint_json,
+    _checkpoint_object,
+    _checkpoint_require,
+    _checkpoint_stamp,
+    _checkpoint_time,
+)
 from .redact import redact_text
 
 MAX_PAYLOAD_BYTES = 512 * 1024
@@ -172,6 +181,71 @@ class MissionActivityStore:
         self._max_missions = max(1, min(MAX_MISSIONS, max_missions))
         self._entries: OrderedDict[str, dict] = OrderedDict()
         self._lock = threading.RLock()
+
+    def export_checkpoint(self) -> dict:
+        """Capture the transient read model, not a new durable mission payload."""
+        with self._lock:
+            return _checkpoint_json({"version": 1, "domain": "mission_activity",
+                                     "transient": True,
+                                     "entries": [[key, entry] for key, entry in self._entries.items()]})
+
+    def restore_checkpoint(self, state) -> None:
+        state = _checkpoint_header(state, "mission_activity", ("transient", "entries"))
+        _checkpoint_require(state["transient"] is True and type(state["entries"]) is list
+                            and len(state["entries"]) <= MAX_MISSIONS)
+        entries = OrderedDict()
+        fields = ("contract_version", "mission_key", "source", "host_id", "instance_id", "session_id",
+                  "observed_at", "snapshot_at", "received_at", "mission_revision", "connection",
+                  "activity_revision", "activity_snapshot_at", "mission", "activity")
+        for row in state["entries"]:
+            _checkpoint_require(type(row) is list and len(row) == 2)
+            key, entry = row
+            _checkpoint_require(type(key) is str and _MISSION_KEY.fullmatch(key) is not None
+                                and key not in entries)
+            _checkpoint_object(entry, ("value", "received_epoch", "observed_epoch", "snapshot_epoch"))
+            _checkpoint_time(entry["received_epoch"])
+            _checkpoint_time(entry["observed_epoch"])
+            if entry["snapshot_epoch"] is not None:
+                _checkpoint_time(entry["snapshot_epoch"])
+            value = entry["value"]
+            _checkpoint_object(value, fields)
+            _checkpoint_require(type(value["contract_version"]) is int and value["contract_version"] == 1
+                                and value["mission_key"] == key and value["source"] == "pi"
+                                and value["connection"] in ("connected", "disconnected", "updating"))
+            for field in ("host_id", "instance_id", "session_id"):
+                _identifier(value[field], field)
+            _checkpoint_int(value["mission_revision"])
+            _checkpoint_require(value["mission_revision"] <= 2 ** 53)
+            if value["activity_revision"] is not None:
+                _checkpoint_int(value["activity_revision"])
+                _checkpoint_require(value["activity_revision"] <= value["mission_revision"])
+            for field, epoch in (("received_at", "received_epoch"), ("observed_at", "observed_epoch"),
+                                 ("snapshot_at", "snapshot_epoch")):
+                if value[field] is None:
+                    _checkpoint_require(entry[epoch] is None)
+                else:
+                    _checkpoint_stamp(value[field])
+                    _checkpoint_require(abs(datetime.fromisoformat(value[field]).timestamp() - entry[epoch]) <= 1e-6)
+            if value["activity_snapshot_at"] is not None:
+                _checkpoint_stamp(value["activity_snapshot_at"])
+            _checkpoint_require(type(value["mission"]) is dict and type(value["activity"]) is dict
+                                and value["mission"].get("id") == key[3:]
+                                and value["mission"].keys() <= MISSION_FIELDS
+                                and value["activity"].keys() <= ACTIVITY_FIELDS)
+            # The saved value has already crossed the sanitizing boundary; do not
+            # ingest it again or manufacture a new receive timestamp.
+            _checkpoint_require(_sanitize(value["mission"]) == value["mission"]
+                                and _sanitize(value["activity"]) == value["activity"]
+                                and len(json.dumps(value).encode()) <= MAX_PROJECTION_BYTES)
+            entries[key] = entry
+        now = self._now()
+        entries = OrderedDict((key, value) for key, value in entries.items()
+                              if now - value["received_epoch"] <= RETENTION_SECONDS)
+        while len(entries) > self._max_missions:
+            entries.popitem(last=False)
+        with self._lock:
+            self._entries = entries
+            self._lock = threading.RLock()
 
     def _prune(self, now):
         for key in list(self._entries):

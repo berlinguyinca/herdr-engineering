@@ -583,6 +583,20 @@ test('getGithubProjects reads the projects list or one project, conditionally', 
   assert.equal(server.calls[2].url, '/api/v1/github/projects?project=PVT_1&since=2');
 });
 
+test('catalog paging is opt in, encoded and abortable; detail reads only one service', async()=>{
+  const calls=[]; const controller=new AbortController();
+  const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{calls.push({url,signal:opts.signal});return {ok:true,status:200,text:async()=>'{}'};}});
+  await client.listServices();
+  await client.listServiceCatalog({scope:'unassigned',status:'all',includeArchived:true,search:'a & b',hostId:'h/x',groupBy:'type',limit:2,cursor:'opaque',signal:controller.signal});
+  await client.getService('a/b?#',{signal:controller.signal});
+  assert.equal(calls[0].url,'/api/v1/services');
+  const params=new URL(calls[1].url,'http://x').searchParams;
+  assert.deepEqual(Object.fromEntries(params),{view:'catalog',scope:'unassigned',status:'all',include_archived:'true',search:'a & b',host_id:'h/x',group_by:'type',limit:'2',cursor:'opaque'});
+  assert.equal(calls[1].signal,controller.signal);
+  assert.equal(calls[2].url,'/api/v1/services/a%2Fb%3F%23');
+  assert.equal(calls[2].signal,controller.signal);
+});
+
 test('the log slice request names the step, the line range and the test it expects there',async()=>{
  const calls=[];
  const client=new HerdrClient('',{fetchImpl:async url=>{calls.push(url);return {ok:true,status:200,text:async()=>'{}'};}});

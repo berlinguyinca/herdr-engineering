@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import os
 import re
@@ -65,8 +66,11 @@ from .collab_bridge_files import (
 log = logging.getLogger(__name__)
 
 GRANTS_NAME = "grants.json"
+ANNOTATIONS_NAME = "annotations.json"
+ANNOTATIONS_MAX_BYTES = 1024 * 1024
 HEAD_NAME = "head.json"
 ARTIFACTS_DIR = "artifacts"
+HIDDEN_LIFECYCLES = frozenset({"retracted", "tombstoned"})   # a mirror never carries these artifacts
 BLOBS_DIR = "blobs"
 REPORT_READ_ONLY = "report artifacts are read-only for collaborators"
 RENDERED_READ_ONLY = "renderer-built artifacts are read-only for collaborators"
@@ -152,6 +156,7 @@ class CollabMirror:
         self._binary: set[str] = set()                 # content-addressed, so "not UTF-8" never expires
         self._bad: dict[str, float] = {}               # sha -> retry-after (epoch) for failed fetches
         self._cache_lock = threading.Lock()            # _bad/_binary are touched from worker threads
+        self._new_heads: set[str] = set()              # artifacts whose head.json appeared (annotations follow them)
         self._grants_lock = asyncio.Lock()             # one publish at a time: a stale snapshot never lands last
         self._grants_body: dict | None = None
         self._grants_written_at: float | None = None
@@ -192,9 +197,11 @@ class CollabMirror:
         else:
             def is_retracted(_artifact_id: str) -> bool:
                 return False
+        deleted = frozenset(await store.tombstoned_ids()) if store is not None and hasattr(
+            store, "tombstoned_ids") else frozenset()
         agents: dict[str, dict] = {}
         for row in rows:
-            if is_retracted(row["artifact_id"]):
+            if is_retracted(row["artifact_id"]) or row["artifact_id"] in deleted:
                 continue
             agents.setdefault(row["agent_id"], {})[row["artifact_id"]] = {
                 "permission": row["permission"], "expires_at": _epoch(row["expires_at"])}
@@ -293,7 +300,7 @@ class CollabMirror:
         if artifact is None:
             return None, []
         artifact_id = artifact["artifact_id"]
-        if artifact["lifecycle"] == "retracted" or gate.artifact_retracted(artifact_id):
+        if artifact["lifecycle"] in HIDDEN_LIFECYCLES or gate.artifact_retracted(artifact_id):
             return None, []
         live = self._live(artifact_id, versions, gate)
         head_id = artifact["current_version_id"]
@@ -362,7 +369,11 @@ class CollabMirror:
     def _publish_head(self, artifact_id: str, doc: dict) -> None:
         """Swap ``head.json``, then collect every blob it does not mark mirrored (stale ``.tmp-*`` included)."""
         parts = [ARTIFACTS_DIR, artifact_id, BLOBS_DIR]
+        first = not file_exists_beneath(self.root, [ARTIFACTS_DIR, artifact_id], HEAD_NAME)
         atomic_write_json(self.root / ARTIFACTS_DIR / artifact_id, HEAD_NAME, doc)
+        if first:
+            with self._cache_lock:
+                self._new_heads.add(artifact_id)
         keep = {f["sha256"] for v in doc["versions"] for f in v["files"] if f["mirrored"]}
         try:
             entries = list_beneath(self.root, parts, max_entries=len(keep) + MIRROR_MAX_ENTRIES)
@@ -473,6 +484,39 @@ class CollabMirror:
         return (artifact["current_version_id"], artifact["lifecycle"], artifact["artifact_type"],
                 tuple(sorted(v["version_id"] for v in self._live(artifact_id, versions, gate))))
 
+    def take_new_heads(self) -> set[str]:
+        """Artifact ids whose ``head.json`` was written for the first time (or again after ``remove``) since the last
+        call. An agent granted after people annotated needs ``annotations.json`` next to that new head."""
+        with self._cache_lock:
+            taken, self._new_heads = self._new_heads, set()
+        return taken
+
+    async def publish_annotations(self, artifact_id: str, rows: list[dict]) -> bool:
+        """Write ``artifacts/<id>/annotations.json`` (open annotations, newest first, at most 1 MiB; ``truncated`` when cut).
+
+        Runs under the artifact's lock (the one ``remove`` and ``sync`` take) and writes only while the artifact's
+        ``head.json`` exists: ``atomic_write_json`` creates missing parent directories, so without this check a publish
+        racing ``remove()`` would resurrect ``artifacts/<id>/`` holding only this file.  ``grants.json`` liveness is
+        not the test.  True when the file was written, False for a no-op (nothing mirrored for that artifact)."""
+        if not _ARTIFACT_ID.match(artifact_id or ""):
+            raise BridgeError("invalid artifact id")
+        async with self._lock(artifact_id):
+            def go() -> bool:
+                if not file_exists_beneath(self.root, [ARTIFACTS_DIR, artifact_id], HEAD_NAME):
+                    return False
+                doc = {"artifact_id": artifact_id, "generated_at": self.clock(), "annotations": []}
+                size = len(json.dumps(doc, ensure_ascii=False, allow_nan=False).encode("utf-8")) + 32
+                for raw in rows:
+                    row = {k: v.isoformat() if isinstance(v, datetime) else v for k, v in raw.items()}
+                    size += len(json.dumps(row, ensure_ascii=False, allow_nan=False).encode("utf-8")) + 1
+                    if size > ANNOTATIONS_MAX_BYTES:
+                        doc["truncated"] = True
+                        break
+                    doc["annotations"].append(row)
+                atomic_write_json(self.root / ARTIFACTS_DIR / artifact_id, ANNOTATIONS_NAME, doc)
+                return True
+            return await asyncio.to_thread(go)
+
     async def remove(self, artifact_id: str) -> bool:
         """Delete ``artifacts/<artifact_id>`` entirely (annotations included), under the artifact's lock."""
         if not _ARTIFACT_ID.match(artifact_id or ""):
@@ -515,7 +559,8 @@ class CollabMirror:
         for artifact_id in granted:
             try:
                 artifact = await store.get(artifact_id)
-                if artifact is None or artifact["lifecycle"] == "retracted" or gate.artifact_retracted(artifact_id):
+                if artifact is None or artifact["lifecycle"] in HIDDEN_LIFECYCLES \
+                        or gate.artifact_retracted(artifact_id):
                     if await self._known(artifact_id):
                         await self._remove_into(artifact_id, out)
                     continue

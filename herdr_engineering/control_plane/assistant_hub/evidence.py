@@ -67,9 +67,9 @@ def _scope_is_new_for_confirmed_verb(grants: Sequence[ActionGrant], worker_id: s
 _NO_FLOOR = datetime.min.replace(tzinfo=UTC)               # sentinel: stale but no usable timestamp
 
 
-def _stale_floor(g: ActionGrant, now: datetime, policy: int) -> datetime | None:
+def _stale_floor(g: ActionGrant, now: datetime, policy: int, judge_version: str = "") -> datetime | None:
     """None when ``g`` is live; otherwise the time before which evidence no longer counts (or ``_NO_FLOOR``)."""
-    effective = g.effective_state(now, policy)
+    effective = g.effective_state(now, policy, judge_version)
     if g.state in (GrantState.PROPOSED, GrantState.ACTIVE) and effective in (GrantState.PROPOSED, GrantState.ACTIVE):
         if g.state is GrantState.ACTIVE or g.expires_at is None or as_utc(g.expires_at) > now:
             return None
@@ -89,7 +89,7 @@ def _shadow_elapsed(store: AssistantStore, cfg: Mapping, now: datetime) -> bool:
 
 
 def propose_if_ready(store: AssistantStore, cfg: Mapping, now: datetime, tenant_id: str, user_id: str,
-                     worker_id: str, key: ActionKey, *, vetoed: bool) -> ActionGrant | None:
+                     worker_id: str, key: ActionKey, *, vetoed: bool, judge_version: str = "") -> ActionGrant | None:
     """The existing live grant for (worker, key), or a new PROPOSED one when the evidence suffices, else None.
 
     Known limit: a worker can enumerate session/task ids, but each counted approval is an owner decision, so
@@ -105,7 +105,7 @@ def propose_if_ready(store: AssistantStore, cfg: Mapping, now: datetime, tenant_
         policy = int(cfg["policy_version"])
         floors: list[datetime] = []
         for g in mine:
-            floor = _stale_floor(g, now, policy)
+            floor = _stale_floor(g, now, policy, judge_version)
             if floor is None:
                 return g                                    # a live grant wins, whatever the store order
             floors.append(floor)

@@ -64,7 +64,7 @@ def _build_parser() -> argparse.ArgumentParser:
                             "(prevents CPU build-storms from concurrent agents)")
     p.add_argument("--slots", type=int, default=None,
                    help="max concurrent builds host-wide (default: auto = "
-                        "max(2, cpu_cores-4); e.g. 20 on 24 cores)")
+                        "min(4, cpu_cores-4), floor 2)")
     p.add_argument("--max-load", type=float, default=1.5,
                    help="back off while 1-min load per core exceeds this (0=off)")
     p.add_argument("--wait", type=float, default=0.0,
@@ -72,13 +72,62 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bypass-on-timeout", action="store_true",
                    help="if no slot frees within --wait, run the command ungated "
                         "instead of failing (best-effort coordination)")
+    p.add_argument("--record", action="store_true",
+                   help="opt-in: run the child (instead of exec) and append timing/CPU/IO/"
+                        "sccache events to <state>/build-gates/builds.jsonl")
+    p.add_argument("--require-cache-enabled", action="store_true",
+                   help="only coordinate when fabric_build_cache is enabled; otherwise "
+                        "run the command directly, ungated and unrecorded (spec 08)")
+    p.add_argument("--trace-session", default=None, metavar="ID",
+                   help="agent session id to record with --record (validated, non-secret ids only)")
+    p.add_argument("--trace-mission", default=None, metavar="ID",
+                   help="agent mission/task id to record with --record (validated)")
     p.add_argument("--status", action="store_true",
-                   help="print current build-gate occupancy and exit")
+                   help="print current build-gate occupancy (and recorded-build summary) and exit")
     p.add_argument("--json", action="store_true",
                    help="machine-readable output")
     p.add_argument("command", nargs=argparse.REMAINDER,
                    help="the build command to run, e.g. `-- cargo check -j 4 --workspace --tests`")
     p.set_defaults(func=_cmd_build_coordinate)
+
+    p = sub.add_parser("build-cache-inventory",
+                       help="read-only: this host's build-cache capability record "
+                            "(spec 06; nothing when fabric_build_cache is disabled)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=_cmd_build_cache_inventory)
+
+    p = sub.add_parser("build-cache-rustfs-provision",
+                       help="operator: create the herdr-build-cache rustfs bucket, a bucket-limited "
+                            "read-write and read-only user and 0600 credential files (additive, "
+                            "idempotent; dry-run unless --apply)")
+    p.add_argument("--apply", action="store_true", help="really create (dry-run otherwise)")
+    p.add_argument("--quota-gib", type=float, default=50.0, help="hard bucket quota (default 50)")
+    p.add_argument("--rotate", action="store_true",
+                   help="issue new secrets for the two dedicated build-cache users")
+    p.add_argument("--fleet-config", default=None, metavar="PATH",
+                   help="central fleet config holding the rustfs admin credential "
+                        "(default ~/.config/herdr-engineering/fleet/fleet-config.yaml)")
+    p.add_argument("--container", default="herdr-cp-rustfs", help="rustfs container name")
+    p.add_argument("--registry-host", default="127.0.0.1:9000",
+                   help="host[:port] written to the non-secret registry file (tailnet address "
+                        "for other hosts; prefix https:// for TLS)")
+    p.set_defaults(func=_cmd_build_cache_rustfs_provision)
+
+    p = sub.add_parser("build-cache-slurm-plan",
+                       help="preview a whole-build Slurm submission as data; NEVER submits "
+                            "(spec 11: no runner is verified)")
+    p.add_argument("--source-dir", default=".", help="source tree to digest (default: cwd)")
+    p.add_argument("--partition", default=None, help="partition to preview")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=_cmd_build_cache_slurm_plan)
+
+    p = sub.add_parser("build-cache-evict",
+                       help="local sccache quota preview; --apply deletes only with "
+                            "eviction.destructive_enabled (spec 07; nothing when disabled)")
+    p.add_argument("--apply", action="store_true",
+                   help="really delete planned entries (dry-run otherwise)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=_cmd_build_cache_evict)
 
     # doctor ---------------------------------------------------------------
     p = sub.add_parser("doctor", help="capability/health checks (spec 0050/0170)")
@@ -195,6 +244,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # google ---------------------------------------------------------------
     from .google_setup_cli import register as _register_google
     _register_google(sub)
+    from .fleet_watch.cli import register as _register_fleet_watch
+    _register_fleet_watch(sub)
 
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
@@ -365,6 +416,10 @@ def _build_parser() -> argparse.ArgumentParser:
     add_share_subparser(asub)
     from .artifact_collab_client import add_collab_subparser
     add_collab_subparser(asub)
+    from .artifact_members_client import add_members_subparser
+    add_members_subparser(asub)
+    from .artifact_delete_client import add_delete_subparsers
+    add_delete_subparsers(asub)
     from .artifact_browse_client import add_browse_subparsers
     add_browse_subparsers(asub)
     from .teams_client import add_teams_subparser
@@ -417,7 +472,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("file", help="the report's Markdown file")
     p2.add_argument("--close-pane", default=None, metavar="PANE_ID",
                     help="close this Herdr pane when the reader quits")
+    p2.add_argument("--peer", default=None, metavar="PANE_ID", help="also close this pane (the graph) afterwards")
     p2.set_defaults(func=_cmd_summary_view)
+    p2 = smsub.add_parser("graph", help="draw a published report's drift graph (what the graph pane runs)")
+    p2.add_argument("file", help="the report's Markdown file; the graph is read from its .graph.json sidecar")
+    p2.add_argument("--close-pane", default=None, metavar="PANE_ID",
+                    help="close this Herdr pane when the reader quits")
+    p2.add_argument("--peer", default=None, metavar="PANE_ID", help="also close this pane (the summary) afterwards")
+    p2.set_defaults(func=_cmd_summary_graph)
 
     # memory ---------------------------------------------------------------
     p = sub.add_parser("memory", help="herdr-memory harness adapters: plan/install/status/doctor/repair/upgrade/uninstall")
@@ -737,6 +799,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
+    p2 = csub.add_parser("checkpoint", help="prewarm durable projection checkpoints")
+    p2.add_argument("--fleet-config", required=True)
+    p2.add_argument("--migrations", default=None)
+    p2.set_defaults(func=_cmd_cp_checkpoint)
     p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
                          "never deletes: rows move to a quarantine file/table)")
     p2.add_argument("--log-file", default=None, help="a collab-only JSON-lines log; without it the Postgres "
@@ -795,6 +861,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
     p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
     p2.set_defaults(func=_cmd_cp_assistant_hub_owner, command_group_kind="grant")
+    p2 = csub.add_parser("assistant-judge", help="register the judge API key, show judge status, or check connectivity")
+    p2.add_argument("action", choices=["register", "status", "check"])
+    p2.add_argument("--endpoint", default=None, help="register: the judge base URL (https; http only for loopback)")
+    p2.add_argument("--key-file", default=None, help="register: absolute PATH the 0600 key file is written to (rotated via PATH.new)")
+    p2.add_argument("--key-stdin", action="store_true", help="register: read the key from stdin (the only way; never argv)")
+    p2.add_argument("--model", default="laya-auto", help="register: the model id that must appear in GET /v1/models")
+    p2.add_argument("--control-plane", default=None, help="status|check: control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None, help="status|check: PATH to a file holding an operator API key")
+    p2.set_defaults(func=_cmd_cp_assistant_judge)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -1067,7 +1142,13 @@ def _cmd_host_terminal_relay(args) -> int:
     the control plane could not be reached for the first configuration), 2 only when restarting cannot help (host.json
     missing or incomplete, token revoked). argparse usage errors also exit 2, but never under a unit file."""
     from .herdr_pane_client import HerdrPaneClient
-    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config, host_token
+    from .host_config import (
+        ConfigRefresher,
+        HostConfigUnavailable,
+        exit_unavailable,
+        host_config,
+        host_token,
+    )
     from .terminal_relay import (
         ControlPlaneHttp,
         RelayLocked,
@@ -1321,7 +1402,12 @@ def _cmd_summary_publish(args) -> int:
 
 def _cmd_summary_view(args) -> int:
     from . import summary_report as sr
-    return sr.view_report(args.file, close_pane=args.close_pane)
+    return sr.view_report(args.file, close_pane=args.close_pane, peer_pane=args.peer)
+
+
+def _cmd_summary_graph(args) -> int:
+    from . import summary_report as sr
+    return sr.view_graph(args.file, close_pane=args.close_pane, peer_pane=args.peer)
 
 
 def _cmd_agent_mine(args) -> int:
@@ -2750,13 +2836,21 @@ def _cmd_build_coordinate(args) -> int:
     autonomous agents on a host, so N agents can't each launch a full-workspace
     build at once and CPU-starve the machine (the "build storm").
     """
-    from .build_coord import BuildGate, _default_slots, run_gated
+    from .build_cache_policy import effective_slots, observed_slot_suggestion
+    from .build_coord import BuildGate, _default_slots, _default_state_dir, run_gated
+    from .build_metrics import summarize
 
-    slots = args.slots if args.slots is not None else _default_slots()
+    cache_cfg = _build_cache_config()
+    slots = args.slots if args.slots is not None else effective_slots(
+        cache_cfg, _default_slots(), _default_state_dir())
     if getattr(args, "status", False):
         gate = BuildGate(slots=slots)
         if args.json:
-            _print_json({"slots": slots, "occupancy": gate.status()})
+            view = {"slots": slots, "occupancy": gate.status(),
+                    "builds": summarize(gate.dir / "builds.jsonl")}
+            if cache_cfg is not None:
+                view["slot_suggestion"] = observed_slot_suggestion(cache_cfg, gate.dir)
+            _print_json(view)
         else:
             for entry in gate.status():
                 if entry["held"]:
@@ -2766,14 +2860,121 @@ def _cmd_build_coordinate(args) -> int:
                           f"cmd={h.get('cmd')}")
                 else:
                     print(f"  slot {entry['slot']}: free")
+            n = summarize(gate.dir / "builds.jsonl")["builds"]
+            if n:
+                print(f"  recorded builds: {n} (see builds.jsonl)")
         return 0
 
     cmd = args.command
     if cmd and cmd[0] == "--":  # argparse REMAINDER keeps a leading `--`
         cmd = cmd[1:]
+    if cmd and (_is_gate_command(cmd) or (
+            getattr(args, "require_cache_enabled", False) and cache_cfg is None)):
+        # Already coordinated (never nest a gate), or the cache is not enabled
+        # and the caller only wanted coordination for it: run the original.
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError as exc:
+            print(f"build-coordinate: could not exec {cmd[0]}: {exc}", file=sys.stderr)
+            return 127
+    from .build_metrics import make_trace
+    trace = make_trace(getattr(args, "trace_session", None),
+                       getattr(args, "trace_mission", None))
+    if getattr(args, "trace_session", None) and trace is None:
+        print("build-coordinate: --trace-session ignored (not a plain non-secret id)",
+              file=sys.stderr)
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
-                     bypass_on_timeout=args.bypass_on_timeout)
+                     bypass_on_timeout=args.bypass_on_timeout,
+                     record=getattr(args, "record", False),
+                     cache_config=cache_cfg, trace=trace)
+
+
+def _is_gate_command(cmd: list[str]) -> bool:
+    """True when ``cmd`` is itself a build-coordinate call or a sccache run."""
+    names = [os.path.basename(t) for t in cmd[:2]]
+    return names[0] == "sccache" or (
+        names[0] in ("herdr-eng", "herdr-engineering") and len(cmd) > 1
+        and cmd[1] == "build-coordinate")
+
+
+def _build_cache_config():
+    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid.
+
+    A config problem must never block a build: it just runs uncached.
+    """
+    from .build_cache_config import validate
+    from .config import load_config
+    try:
+        section = load_config(strict_build_cache=True).get("fabric_build_cache")
+        cfg = validate(section) if section else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"build-coordinate: build cache config ignored: {exc}", file=sys.stderr)
+        return None
+    return cfg if cfg is not None and cfg.enabled else None
+
+
+def _cmd_build_cache_inventory(args) -> int:
+    from .build_cache_config import validate
+    from .build_cache_inventory import collect, inventory_view
+    from .config import load_config
+    try:
+        cfg = validate(load_config(strict_build_cache=True).get("fabric_build_cache"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"build-cache-inventory: invalid config: {exc}", file=sys.stderr)
+        return 1
+    cap = collect(cfg)
+    view = inventory_view(cfg, [cap] if cap else [])
+    if cap:
+        from .build_cache_policy import observed_slot_suggestion
+        from .build_coord import _default_state_dir
+        view["slot_suggestion"] = observed_slot_suggestion(cfg, _default_state_dir())
+    _print_json(view)
+    return 0
+
+
+def _cmd_build_cache_rustfs_provision(args) -> int:
+    from .build_cache_rustfs import run_cli
+    return run_cli(apply=args.apply, quota_gib=args.quota_gib, rotate=args.rotate,
+                   central=args.fleet_config, container=args.container,
+                   registry_host=args.registry_host)
+
+
+def _cmd_build_cache_slurm_plan(args) -> int:
+    from .build_cache_config import validate
+    from .build_slurm_adapter import preview
+    from .config import load_config
+    try:
+        cfg = validate(load_config(strict_build_cache=True).get("fabric_build_cache"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"build-cache-slurm-plan: invalid config: {exc}", file=sys.stderr)
+        return 1
+    import platform
+    out = preview(cfg, args.source_dir, args.partition, f"python-{platform.python_version()}")
+    if args.json:
+        _print_json(out)
+    else:
+        print(out["message"])
+        print(f"decision: {out['decision']}")
+        if out.get("sbatch_argv"):
+            print(" ".join(out["sbatch_argv"]))
+            print(out["script"])
+    return 0
+
+
+def _cmd_build_cache_evict(args) -> int:
+    from .build_cache_config import validate
+    from .build_cache_policy import run_eviction
+    from .build_coord import _default_state_dir
+    from .config import load_config
+    try:
+        cfg = validate(load_config(strict_build_cache=True).get("fabric_build_cache"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"build-cache-evict: invalid config: {exc}", file=sys.stderr)
+        return 1
+    result = run_eviction(cfg, _default_state_dir(), apply=args.apply)
+    _print_json(result)
+    return 0 if result.get("status") in (None, "preview", "applied") else 1
 
 
 def _cmd_build_cleanup(args) -> int:
@@ -3431,6 +3632,99 @@ def _tty_safe(value) -> str:
     return "".join(c for c in str(value) if c == " " or not (ord(c) < 32 or 0x7F <= ord(c) <= 0x9F))
 
 
+def _assistant_judge_register(args) -> int:
+    """``assistant-judge register``: the key comes from stdin only and is never printed. 0 ok, 1 refused, 2 usage."""
+    from .control_plane.assistant_hub.judge_register import (
+        MAX_KEY_CHARS,
+        RegisterError,
+        register_key,
+    )
+
+    if not (args.endpoint and args.key_file and args.key_stdin):
+        print("assistant-judge register needs --endpoint, --key-file and --key-stdin (the key is never taken from argv)",
+              file=sys.stderr)
+        return 2
+    if sys.stdin.isatty():
+        import getpass
+        raw = getpass.getpass("judge API key: ")
+    else:
+        raw = sys.stdin.read(MAX_KEY_CHARS + 2)
+    key = raw.strip()
+    if not key or any(c.isspace() for c in key):
+        print("assistant-judge register failed: empty or malformed key on stdin", file=sys.stderr)
+        return 2
+    try:
+        done = register_key(args.endpoint, args.key_file, key, args.model)
+    except RegisterError as exc:
+        print(f"assistant-judge register failed: {exc.code}", file=sys.stderr)
+        if exc.seen:
+            print("models seen (first 10): " + ", ".join(_tty_safe(m) for m in exc.seen), file=sys.stderr)
+        return 1
+    print(f"registered: fingerprint={done.fingerprint} model={_tty_safe(done.model)} models_seen={done.models_seen}")
+    print("next: add api_key_file, endpoint and model to control_plane.personal_assistant.judge in your fleet YAML (this "
+          "command does not edit it); set backend_confirmed: true only after verifying a real model is serving.")
+    return 0
+
+
+def _cmd_cp_assistant_judge(args) -> int:
+    """``control-plane assistant-judge register|status|check``: 0 ok, 1 failure (one stderr line), 2 usage."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    if args.action == "register":
+        return _assistant_judge_register(args)
+    if not args.api_key_file:
+        print(f"assistant-judge {args.action} needs --api-key-file", file=sys.stderr)
+        return 2
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+    except ValueError:
+        print("cannot read --api-key-file: not a text file", file=sys.stderr)
+        return 2
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(f"{base}{path}", method=method, headers={
+            "X-API-Key": key, "Content-Type": "application/json"},
+            data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=90) as response:
+            return json.loads(response.read(1024 * 1024))
+    try:
+        if args.action == "check":
+            out = call("POST", "/api/v1/assistant-judges/check", {})
+            if out["ok"]:
+                print(_tty_safe(f"ok latency_ms={out['latency_ms']} model={out['model']}"))
+                return 0
+            print(_tty_safe(f"check failed: {out['code']}"))
+            return 1
+        out = call("GET", "/api/v1/assistant-judges")
+        print(_tty_safe(f"enabled={out['enabled']} model={out['model']} judge_version={out['judge_version']} "
+                        f"backend_confirmed={out['backend_confirmed']}"))
+        print(_tty_safe(f"endpoint_host={out['endpoint_host'] or '-'} key_fingerprint={out['key_fingerprint'] or '-'} "
+                        f"recorder_queue={out['recorder']['queue']} recorder_dropped={out['recorder']['dropped']}"))
+        print(f"{'RISK_CLASS':<18} {'LABELED':>7} {'FN':>4} {'FN_BOUND':>9}  GATE")
+        classes = out["calibration"]["classes"]
+        for name, gate in out["gate"].items():
+            row = classes.get(name)
+            labeled, fn, bound = (row["labeled"], row["false_negatives"], f"{row['fn_upper_bound']:.3f}") if row else (0, 0, "-")
+            verdict = "satisfied" if gate["satisfied"] else f"closed ({gate['code']})"
+            print(_tty_safe(f"{name:<18} {labeled:>7} {fn:>4} {bound:>9}  {verdict}"))
+        return 0
+    except urllib.error.HTTPError as exc:
+        print(f"assistant-judge {args.action} failed: HTTP {exc.code}", file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"assistant-judge {args.action} failed: {type(exc).__name__}", file=sys.stderr)
+    return 1
+
+
 def _cmd_cp_assistant_hub_owner(args) -> int:
     """``control-plane assistant-action list|approve|deny`` and ``assistant-grant list|revoke|activate``.
 
@@ -3635,6 +3929,49 @@ def _assistant_worker_install_hooks(args) -> int:
     return 0
 
 
+def _cmd_cp_checkpoint(args) -> int:
+    import asyncio
+
+    from .control_plane.db import Migrator
+    from .control_plane.projection_refresh import refresh_checkpoint
+    from .control_plane.projection_store import CheckpointInvalid, ProjectionStore
+
+    stage = 'configuration'
+    try:
+        _, cp = _load_cp_fleet_config(args.fleet_config)
+        dsn = cp.get("pg_dsn")
+        if not dsn:
+            _print_json({"ok": False, "error": "checkpoint requires control_plane.pg_dsn"})
+            return 1
+
+        async def migrate():
+            nonlocal stage
+            stage = 'database_connection'
+            conn = await _cp_connect(dsn)
+            try:
+                stage = 'migration'
+                await Migrator(conn).apply(args.migrations or _cp_migrations_dir())
+                # Migrator has committed: concurrent indexes must run outside its transaction.
+                stage = 'index_preparation'
+                await ProjectionStore(conn).ensure_indexes()
+            finally:
+                await conn.close()
+
+        asyncio.run(migrate())
+        stage = 'materialization'
+        result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
+                                    inspector_limits=cp.get("inspector_limits") or {})
+    except (Exception, SystemExit) as exc:
+        error = {"ok": False, "error": type(exc).__name__, "stage": stage}
+        if isinstance(exc, CheckpointInvalid):
+            # Only our own static validation messages are safe to surface.
+            error['reason'] = str(exc)
+        _print_json(error)
+        return 1
+    _print_json({"ok": True, **result})
+    return 0
+
+
 def _cmd_cp_collab_repair(args) -> int:
     import asyncio
 
@@ -3734,19 +4071,30 @@ def _require_durable_review_gate(cp: dict, dsn) -> None:
                          "control_plane.pg_dsn, or disable the review gate")
 
 
+def _annotation_wiring(cp: dict, dsn: str | None):
+    """The owner annotation store adapter when control_plane.share.enabled is true (it needs the registry database)."""
+    share = cp.get("share") or {}
+    if not isinstance(share, dict) or share.get("enabled") is not True or not dsn:
+        return None
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_annotation_api import ReconnectingAnnotationStore
+
+    return artifact_adapter.SyncArtifactAdapter(lambda: ReconnectingAnnotationStore(dsn))
+
+
 def _share_wiring(cp: dict, dsn: str | None):
     """(share store adapter, shares root, settings) when control_plane.share.enabled is true, else three Nones.
 
-    Needs the registry database (shares live beside artifacts). Links are issued under control_plane.collab.public_url;
+    Needs the registry database (shares live beside artifacts). Links are issued under control_plane.share.public_url;
     the bundle volume is control_plane.share.shares_dir (default /shares, the container mount). Caps come from the YAML.
     """
     share = cp.get("share") or {}
     if not isinstance(share, dict) or share.get("enabled") is not True or not dsn:
         return None, None, None
     from .control_plane.artifact_share_api import share_settings_config
-    collab = cp.get("collab") if isinstance(cp.get("collab"), dict) else {}
     try:
-        settings = share_settings_config(share, public_url=collab.get("public_url"))
+        settings = share_settings_config(share, public_url=share.get("public_url"),
+                                          public_host=share.get("public_host"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     from .control_plane import artifact_adapter
@@ -3754,9 +4102,25 @@ def _share_wiring(cp: dict, dsn: str | None):
 
     async def create_share_store():
         import asyncpg
-        return ShareStore(await asyncpg.connect(dsn))
+        return ShareStore(await asyncpg.connect(dsn), lock_connect=lambda: asyncpg.connect(dsn))
 
     return artifact_adapter.SyncArtifactAdapter(create_share_store), Path(share.get("shares_dir") or "/shares"), settings
+
+
+def _member_admin_wiring(cp: dict, dsn: str | None):
+    """The operator member controls (adapter over ``MemberAdmin``) when ``control_plane.collab.members`` is enabled and a
+    DSN exists, else None (the routes answer 503). The configured limit defaults feed the effective limits shown."""
+    got = _members_settings(cp)
+    if got is None or not dsn:
+        return None
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_members_api import MemberAdmin
+
+    async def create():
+        import asyncpg
+        return MemberAdmin(await asyncpg.connect(dsn), defaults=got["defaults"])
+
+    return artifact_adapter.SyncArtifactAdapter(create)
 
 
 def _collab_grant_wiring(cp: dict, dsn: str | None):
@@ -3819,6 +4183,7 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
+        _refuse_keyless_members(cp, api_keys)
         from .control_plane.federation import PEER_KINDS, FederationConfigError, parse_federation
         if any(str(v).strip() in PEER_KINDS for v in (api_keys or {}).values()):
             raise SystemExit("api_keys: role 'peer'/'peer-user' is not an API key role; a federated peer is configured "
@@ -3951,6 +4316,13 @@ def _cmd_cp_web(args) -> int:
         artifact_reviews.load(artifact_adapter("load_reviews"))
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
+    annotation_store = _annotation_wiring(cp, dsn)
+    member_admin = _member_admin_wiring(cp, dsn)
+    try:
+        from .control_plane.artifact_delete_api import owner_digests_config
+        artifact_delete = owner_digests_config(cp.get("artifact_delete"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     collab_grant_store, collab_artifacts_enabled = _collab_grant_wiring(cp, dsn)
     collab = None
     artifact_bridge = None
@@ -3996,7 +4368,10 @@ def _cmd_cp_web(args) -> int:
                                       approver_groups=args.collab_approver_group)
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
                                delegation_enabled=_delegation_switch(args, cp),
-                               summary_fix=getattr(args, "collab_summary_fix", None))
+                               summary_fix=getattr(args, "collab_summary_fix", None),
+                               **_collab_member_kwargs(cp, state_dir=(
+                                   os.path.dirname(os.path.abspath(args.collab_log_file))
+                                   if args.collab_only and args.collab_log_file else None)))
         collab.task_lease_seconds = _task_lease(args, cp)
         if args.collab_only:
             collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
@@ -4041,6 +4416,7 @@ def _cmd_cp_web(args) -> int:
         rakazo_bridge_config(cp.get("rakazo_bridge"))      # an enabled but malformed bridge stops startup here, clearly
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    member_web = _member_web(cp, collab, args)
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              rakazo_bridge=cp.get("rakazo_bridge"), rakazo_bridge_dsn=dsn, assistant_apps_dsn=dsn,
                              federation_source=federation_source,
@@ -4061,6 +4437,7 @@ def _cmd_cp_web(args) -> int:
                              scheduler_admission=cp.get("scheduler_admission") is True,
                              scheduler_limits=cp.get("scheduler_limits") or {},
                              skill_registry=cp.get("skill_registry"),
+                             build_cache=cp.get("build_cache"),
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
@@ -4080,7 +4457,11 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
-                             collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
+                             annotation_store=annotation_store, member_admin=member_admin,
+                             artifact_delete_owners=artifact_delete.digests,
+                             artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
+                             collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
+                             member_web=member_web)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -4108,14 +4489,22 @@ def _cmd_cp_web(args) -> int:
         pass
     finally:
         if hub_server is not None:
-            hub_server.shutdown()
+            try:
+                hub_server.shutdown()
+            finally:
+                if hub_server.hub.judge is not None:
+                    hub_server.hub.judge.recorder.stop()
         svr.shutdown()
         if artifact_bridge is not None:
             artifact_bridge.stop()
         if artifact_adapter is not None:
             artifact_adapter.close()
+        if member_admin is not None:
+            member_admin.close()
         if share_store is not None:
             share_store.close()
+        if annotation_store is not None:
+            annotation_store.close()
         if collab_grant_store is not None:
             collab_grant_store.close()
     return 0
@@ -4165,14 +4554,18 @@ def _share_lab_problems(collab: dict, share: dict) -> list[str]:
     secret = share.get("signing_secret")
     if not isinstance(secret, str) or len(secret.encode("utf-8")) < MIN_SECRET_BYTES:
         problems.append(f"control_plane.share.signing_secret (at least {MIN_SECRET_BYTES} bytes)")
-    for key in ("cognito_web_client", "cognito_domain", "cognito_pool", "public_url"):
+    for key in ("cognito_web_client", "cognito_domain", "cognito_pool"):
         if not isinstance(collab.get(key), str) or not collab.get(key):
             problems.append(f"control_plane.collab.{key}")
+    from .https_origin import https_origin
+    if https_origin(share.get("public_url")) is None:
+        problems.append("control_plane.share.public_url (a bare https origin)")
     return problems
 
 
 def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host, port):
     """Build (not start) the share server from the render-share slice; logs once when lab links are off."""
+    from .control_plane.annotation_anchor import annotation_settings
     from .control_plane.share_public import ShareConfig, make_share_server
     from .fleet_config import FleetConfigError, load_fleet_config
     from .fleet_config_cli import check_share_slice
@@ -4193,16 +4586,17 @@ def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host
         pool_id=collab.get("cognito_pool"),
         client_ids=tuple(c for c in clients if isinstance(c, str)) if isinstance(clients, list) else (),
         web_client_id=collab.get("cognito_web_client"), cognito_domain=collab.get("cognito_domain"),
-        public_url=collab.get("public_url"),
+        public_url=share.get("public_url"), public_host=share.get("public_host"),
         signing_secret=secret.encode("utf-8") if isinstance(secret, str) else b"",
-        session_seconds=share.get("session_seconds", 14400))
+        session_seconds=share.get("session_seconds", 14400), annotations=annotation_settings(share.get("annotations")),
+        annotations_path=Path(events_dir) / "annotations.jsonl")
     server = make_share_server(config, host=host, port=port)
     if server.lab is None:
         problems = _share_lab_problems(collab, share)
         log.warning("share-public: lab links are OFF (every lab link answers 404) because these settings are "
                     "missing or invalid: %s; public links are served",
                     ", ".join(problems) or "control_plane.collab Cognito identifiers (pool, web client, https "
-                                           "domain, https public_url)")
+                                           "domain; https control_plane.share.public_url)")
     return server
 
 
@@ -4269,6 +4663,7 @@ COLLAB_CONFIG_KEYS = {
     # team collaboration slice 3: the coordinator role with limits; external people only behind a second flag; YAML only, off
     "coordinators": ("collab_coordinators", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
+    "members": ("collab_members", dict),                  # plan 5 member-owned artifacts; YAML only, off by default
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
 }
@@ -4286,6 +4681,10 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
+        if key == "members":
+            _members_settings({"collab": {"members": value}, "share": cp.get("share")})   # validated here, read again where used
+            setattr(args, dest, dict(value))
+            continue
         if kind is dict and key == "summary_fix":
             from .control_plane.collab import summary_fix_config
             try:
@@ -4406,6 +4805,94 @@ def _task_lease_value(value) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 60 <= value <= 7 * 86400:
         raise SystemExit("fleet config control_plane.collab.task_lease_seconds must be a number of seconds, 60 to 604800")
     return float(value)
+
+
+def _members_settings(cp) -> dict | None:
+    """``control_plane.collab.members`` (YAML only): None unless ``enabled`` is exactly true. An enabled section needs
+    a ``group``, a ``session_secret`` and ``control_plane.share.public_host``; see ``members_config``. A bad section
+    stops the start."""
+    from .control_plane.members_config import parse_members
+    collab = cp.get("collab") if isinstance(cp, dict) else None
+    raw = collab.get("members") if isinstance(collab, dict) else None
+    share = cp.get("share") if isinstance(cp, dict) else None
+    host = share.get("public_host") if isinstance(share, dict) else None
+    seconds = share.get("session_seconds") if isinstance(share, dict) else None
+    try:
+        return parse_members(raw, public_host=host, session_seconds=seconds)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+
+
+def _refuse_keyless_members(cp, api_keys) -> None:
+    """Members need API keys (from the fleet config, --api-key or --api-keys, already merged): with none, every caller on
+    the listener is the operator and could read and share member artifacts (D4). Stops the start."""
+    if _members_settings(cp) is not None and not api_keys:
+        raise SystemExit("fleet config control_plane.collab.members.enabled needs at least one API key "
+                         "(control_plane.api_keys, --api-key or --api-keys): without keys every caller is the operator")
+
+
+def _member_web(cp, collab, args):
+    """The member web API for collab-public (None unless members are enabled on a collab-only server)."""
+    got = _members_settings(cp)
+    if got is None or collab is None or not getattr(args, "collab_only", False):
+        return None
+    from .control_plane.member_web import MemberWeb
+    return MemberWeb(collab, public_host=got["public_host"], session_secret=got["session_secret"].encode("utf-8"),
+                     session_seconds=got["session_seconds"],
+                     web_root=getattr(args, "web_root", None), public_config=collab.public_config,
+                     require_https=bool(getattr(args, "collab_require_https", False)))
+
+
+def _collab_member_kwargs(cp, *, state_dir=None) -> dict:
+    """``CollabService`` keyword arguments for the member group (empty when members are off). ``state_dir`` (the
+    collab log's directory) holds ``member-groups.json``, the last-seen group claims, so a restart is not amnesia."""
+    got = _members_settings(cp)
+    if got is None:
+        return {}
+    out = {"member_group": got["group"], "member_groups_ttl": got["groups_ttl"]}
+    if state_dir is not None:
+        out["member_groups_path"] = Path(state_dir) / "member-groups.json"
+    return out
+
+
+def _secrets_gid(got) -> int | None:
+    """The group that may read and delete member share secrets: ``members.secrets_gid``, else the group of the
+    collab-public container (compose runs it as ``HERDR_COLLAB_CERT_UID:HERDR_COLLAB_CERT_UID``); None = root-private."""
+    if got["secrets_gid"] is not None:
+        return got["secrets_gid"]
+    raw = os.environ.get("HERDR_COLLAB_CERT_UID", "").strip()
+    return int(raw) if re.fullmatch(r"[0-9]+", raw) else None
+
+
+def _members_runtime(cp, settings: CollabArtifactsSettings):
+    """The worker's ``MemberRuntime`` (None when members are off). ``shares_root`` is the share bundle directory only
+    when ``control_plane.share`` is enabled; without it only share rows are revoked."""
+    import time
+
+    from .control_plane.artifact_member_intents import MemberRuntime
+    got = _members_settings(cp)
+    if got is None:
+        return None
+    secret_gid = _secrets_gid(got)
+    if secret_gid is None:      # fail closed: an approve would go live with a URL collab-public can never read
+        raise SystemExit("fleet config control_plane.collab.members.secrets_gid is not set and HERDR_COLLAB_CERT_UID is "
+                         "not in the worker's environment: members cannot start (the share URL could not reach "
+                         "collab-public)")
+    share = _share_worker_settings(cp)
+    share_settings = None
+    if share["enabled"]:
+        from .control_plane.artifact_share_api import share_settings_config
+        raw = (cp or {}).get("share") or {}
+        try:
+            share_settings = {**share_settings_config(raw, public_url=raw.get("public_url"),
+                                                     public_host=raw.get("public_host")),
+                              "member_share_limits": got["share_limits"]}
+        except ValueError as exc:
+            raise SystemExit(f"fleet config {exc}") from None
+    return MemberRuntime(outbox=settings.outbox_dir, mirror_root=settings.mirror_dir, group=got["group"], enabled=True,
+                         defaults=got["defaults"], removed_grace=got["removed_grace"],
+                         shares_root=Path(share["shares_dir"]) if share["enabled"] else None,
+                         share_settings=share_settings, clock=time.time, secret_gid=secret_gid)
 
 
 def _task_lease(args, cp):
@@ -4550,6 +5037,26 @@ def _cmd_bridge_hash_password(args):
     return 0
 
 
+def _build_judge_runtime(service):
+    """The one ``JudgeRuntime`` of this process: live ``judge`` config, a client built per call (so key rotation and
+    config edits apply), and the single-thread shadow recorder. A disabled judge yields no client and records nothing."""
+    from .control_plane.assistant_hub.jev import JevClient
+    from .control_plane.assistant_hub.judge import JudgeRuntime
+    from .control_plane.assistant_hub.shadow import ShadowRecorder
+
+    def cfg_getter():
+        return service.config.get("judge") or {}
+
+    def client_factory():
+        cfg = cfg_getter()
+        if cfg.get("enabled") is not True:
+            return None
+        return JevClient(cfg["endpoint"], cfg["api_key_file"], cfg["model"], float(cfg["timeout_seconds"]))
+
+    recorder = ShadowRecorder(service.store, cfg_getter, client_factory, service.now)
+    return JudgeRuntime(cfg_getter=cfg_getter, client_factory=client_factory, recorder=recorder, now=service.now)
+
+
 def _start_assistant_hub(service):
     """Start the tailnet-only assistant hub when both the assistant and ``personal_assistant.hub`` are enabled.
 
@@ -4567,12 +5074,14 @@ def _start_assistant_hub(service):
     registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
                               worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
     try:
-        server = HubServer(Hub(registry=registry, service=service, store=service.store), host=hub_cfg["host"],
+        server = HubServer(Hub(registry=registry, service=service, store=service.store, judge=_build_judge_runtime(service)),
+                           host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
     except (ValueError, OSError) as exc:
         raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
     server.start()
+    server.hub.judge.recorder.start()          # a thread exists only when the judge is enabled
     return server, registry
 
 
@@ -4583,6 +5092,7 @@ def _wire_assistant_hub(svr):
         return None
     hub_server, registry = _start_assistant_hub(service)
     svr.assistant_workers = registry
+    svr.assistant_judge = hub_server.hub.judge if hub_server is not None else None   # same runtime as the hub
     return hub_server
 
 
@@ -4656,6 +5166,32 @@ def _worker_share_housekeeper(fleet_config_path):
     if not settings["enabled"]:
         return None
     return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"])
+
+
+def _worker_annotation_housekeeper(fleet_config_path, mirror=None):
+    """The annotation housekeeper when the fleet file enables shares, else None. ``mirror`` is the worker's one shared
+    ``CollabMirror`` (None: the mirror step is skipped)."""
+    from pathlib import Path
+
+    from .control_plane.annotation_anchor import annotation_settings, clean_owner_emails
+    from .control_plane.worker import AnnotationHousekeeper
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    settings = _share_worker_settings(cp)
+    if not settings["enabled"]:
+        return None
+    share = cp.get("share") or {}
+    try:
+        annotations, owners = annotation_settings(share.get("annotations")), clean_owner_emails(share.get("owner_emails"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    return AnnotationHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"], annotations,
+                                 owner_emails=owners, mirror=mirror)
 
 
 def _worker_fabric_compactor(fleet_config_path):
@@ -4831,19 +5367,28 @@ def _collab_lineage_hook(worker_cfg):
         raise SystemExit(f"control_plane.artifact_worker.lineage: {exc}") from None
 
 
-def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, rustfs, connect, lineage):
-    """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
-    applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
-    and staging owner here)."""
+def _build_collab_mirror(settings: CollabArtifactsSettings, *, rustfs):
+    """The worker's ONE ``CollabMirror``: the bridge loop and the annotation housekeeper share it (a second instance
+    would have its own per-artifact locks and could race ``remove``/``sync``)."""
     import time
 
+    from .control_plane.collab_mirror import CollabMirror
+    return CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=time.time)
+
+
+def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rustfs, connect, lineage, members=None):
+    """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
+    applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
+    and staging owner here). ``mirror`` comes from ``_build_collab_mirror``. ``members`` is a ``MemberRuntime`` (``_members_runtime``); None leaves the member kinds answering ``members_disabled``."""
     from .control_plane import worker as cp_worker
+    from .control_plane.annotation_intents import (
+        register_annotation_resolve,  # registers the kind at import
+    )
+    from .control_plane.artifact_member_intents import publish_member_views, register_member_intents
     from .control_plane.artifact_scope import ArtifactGraphGate
     from .control_plane.collab_intents import CollabIntentApplier
-    from .control_plane.collab_mirror import CollabMirror
-    clock = time.time
+    clock = mirror.clock
     gate = ArtifactGraphGate(None)
-    mirror = CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=clock)
     if lineage is not None:
         post = lineage
 
@@ -4852,10 +5397,13 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, rustfs, conn
                 return {"skipped": "retracted"}
             return post(version)
     applier = CollabIntentApplier(settings.outbox_dir, mirror, rustfs=rustfs, limits=settings.limits,
-                                  spool_dir=settings.spool_dir, lineage=lineage, context_extras={}, clock=clock,
-                                  gate=gate)
+                                  spool_dir=settings.spool_dir, lineage=lineage, context_extras={} if members is None else {"members": members},
+                                  clock=clock, gate=gate)
     applier.register_commit()
-    return cp_worker.CollabBridgeLoop(connect, mirror, applier)
+    register_annotation_resolve(applier)
+    register_member_intents(applier)
+    publisher = None if members is None else (lambda conn: publish_member_views(conn, members))
+    return cp_worker.CollabBridgeLoop(connect, mirror, applier, members_publisher=publisher)
 
 
 def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):
@@ -4868,10 +5416,15 @@ def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):
     from .control_plane.collab_artifacts import CollabArtifactBridge
     bridge = CollabArtifactBridge(service, Path(mirror_dir), Path(outbox_dir))
     service.artifact_bridge = bridge
+    if getattr(service, "member_group", None):
+        from .control_plane.artifact_member_service import MemberService
+        got = _members_settings(cp)
+        service.member_service = MemberService(service, bridge, got["limits"] if got else None)
     try:
         bridge.start()
     except BaseException:
         service.artifact_bridge = None
+        service.member_service = None
         bridge.stop()
         raise
     return bridge
@@ -4900,7 +5453,9 @@ def _cmd_cp_worker(args) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # validated before anything connects: an invalid collab_artifacts section refuses the start (also with --once)
-    collab_settings = _collab_artifacts_settings(_worker_control_plane_section(getattr(args, "fleet_config", None)))
+    worker_cp = _worker_control_plane_section(getattr(args, "fleet_config", None))
+    collab_settings = _collab_artifacts_settings(worker_cp)
+    member_runtime = _members_runtime(worker_cp, collab_settings) if collab_settings.enabled else None
 
     async def _run():
         cp = _cp_config(getattr(args, "fleet_config", None))
@@ -4929,24 +5484,51 @@ def _cmd_cp_worker(args) -> int:
                 return await run_one_pass(conn, worker_id=worker_id,
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                           fabric_compactor=compactor, share_housekeeper=share_hk,
+                                          annotation_housekeeper=_worker_annotation_housekeeper(
+                                              getattr(args, "fleet_config", None)),
                                           artifact_reconciler=reconciler)
             stop = asyncio.Event()
             bridge_task = None
+            mirror = None
             if collab_settings.enabled:     # a long-running loop on its own connections; --once never starts it
                 if rustfs is None:
                     raise SystemExit("control_plane.collab_artifacts needs RustFS (control_plane.rustfs_endpoint)")
                 dsn = cp["postgres_dsn"]
-                bridge_loop = _build_collab_bridge_loop(
-                    collab_settings, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
-                    lineage=_collab_lineage_hook(worker_cfg))
+                mirror = _build_collab_mirror(collab_settings, rustfs=rustfs)
+            try:       # everything is validated and built before any task starts
+                annotation_hk = _worker_annotation_housekeeper(getattr(args, "fleet_config", None), mirror)
+                bridge_loop = None
+                if mirror is not None:
+                    bridge_loop = _build_collab_bridge_loop(
+                        collab_settings, mirror=mirror, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
+                        lineage=_collab_lineage_hook(worker_cfg), members=member_runtime)
+            except BaseException:
+                if mirror is not None:
+                    mirror.close()
+                raise
+            if bridge_loop is not None:
                 bridge_task = asyncio.create_task(bridge_loop.run(stop), name="collab-bridge-loop")
+            from .control_plane.projection_refresh import ProjectionRefresh
+
+            # --once stays bounded. A dedicated thread/source leaves lease and
+            # artifact work on its existing connection and event loop.
+            fleet_cp = _worker_control_plane_section(getattr(args, "fleet_config", None))
+            refresh = None
             try:
+                if fleet_cp.get("pg_dsn"):
+                    refresh = ProjectionRefresh(
+                        fleet_cp["pg_dsn"], host_aliases=_host_aliases_from(fleet_cp),
+                        inspector_limits=fleet_cp.get("inspector_limits") or {})
+                    refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                  fabric_compactor=compactor, share_housekeeper=share_hk,
+                                 annotation_housekeeper=annotation_hk,
                                  artifact_reconciler=reconciler)
             finally:
                 stop.set()
+                if refresh is not None:
+                    await asyncio.to_thread(refresh.stop)
                 if bridge_task is not None:
                     try:
                         await asyncio.wait_for(bridge_task, 60)    # applier.aclose / mirror.close run in its teardown

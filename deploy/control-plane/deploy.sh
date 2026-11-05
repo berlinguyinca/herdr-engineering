@@ -5,6 +5,11 @@
 #                                  [--fleet-config PATH] [--collab-lock-wait SECONDS]
 #                                  [--deploy-lock-wait SECONDS]
 #                                  [--with-memory [--memory-checkout PATH]]
+#                                  [--memory-client-config PATH]
+#                                  [--allow-divergent]
+#   HEAD expressions use the caller worktree only after common-repository proof.
+#   Normal rollouts must descend from the verified deployed commit; intentional
+#   manual rollback requires --allow-divergent (automatic rollback is unchanged).
 #
 # What it does, in order:
 #   1. checks the central fleet config (default
@@ -29,7 +34,9 @@
 #      Share links: control_plane.share is always validated (render-share; `enabled: true` without a
 #      signing_secret is refused before anything runs, the secret never printed). Only when it is enabled
 #      (which needs the collaboration marker) is its slice installed at a stable 0600 path, the edge
-#      nginx.conf rendered with the /s/ location, and share-public force-recreated once, before the edge;
+#      nginx.conf rendered with the share host's own server block (control_plane.share.public_url; the edge
+#      certificate must name that host, or the deploy is refused), and share-public force-recreated once,
+#      before the edge;
 #      disabled, a running share-public is stopped and the edge conf is the repo file unchanged. A rollback
 #      recreates share-public from the previous commit when the restored edge conf routes /s/, else stops it
 #   5. waits for /api/v1/health to report the new commit AND for every recreated
@@ -100,31 +107,54 @@
 # kept. Nothing from it is printed by this script or written to a receipt.
 set -euo pipefail
 
-REF="origin/main"; DRY=0; FETCH=1; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
+REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
 MEMORY=0; MEMORY_CHECKOUT="${HERDR_MEMORY_CHECKOUT:-}"
+MEMORY_CLIENT_CONFIG="${HERDR_CP_MEMORY_CLIENT_CONFIG:-}"
 CENTRAL="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?--ref needs a value}"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --no-fetch) FETCH=0; shift ;;
+    --allow-divergent) ALLOW_DIVERGENT=1; shift ;;
     --fleet-config) CENTRAL="${2:?--fleet-config needs a value}"; shift 2 ;;
     --collab-lock-wait) COLLAB_LOCK_WAIT="${2:?--collab-lock-wait needs a value}"; shift 2 ;;
     --deploy-lock-wait) DEPLOY_LOCK_WAIT="${2:?--deploy-lock-wait needs a value}"; shift 2 ;;
     --with-memory) MEMORY=1; shift ;;
     --memory-checkout) MEMORY_CHECKOUT="${2:?--memory-checkout needs a value}"; shift 2 ;;
+    --memory-client-config) MEMORY_CLIENT_CONFIG="${2:?--memory-client-config needs a path}"; shift 2 ;;
     -h|--help) sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [[ "$COLLAB_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--collab-lock-wait needs a whole number of seconds" >&2; exit 2; }
 [[ "$DEPLOY_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--deploy-lock-wait needs a whole number of seconds" >&2; exit 2; }
+if [ -n "$MEMORY_CLIENT_CONFIG" ]; then
+  MEMORY_CLIENT_CONFIG="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().absolute())' "$MEMORY_CLIENT_CONFIG")"
+fi
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO="$(git -C "$HERE" rev-parse --show-toplevel)"
+REF_REPO="$REPO"
+case "$REF" in
+  HEAD|HEAD[~^:@]*|@|@[~^:]*|'@{'*)
+    # A canonical tool worktree has its own HEAD. Never substitute that for the
+    # caller's revision, and never trust an unrelated clone merely sharing SHAs.
+    CALLER_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    TOOL_COMMON="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)"
+    if [ -z "$CALLER_COMMON" ] || ! [ "$CALLER_COMMON" -ef "$TOOL_COMMON" ]; then
+      echo "cannot resolve caller-local HEAD without a shared Git repository; use --ref <published ref> or --ref <full commit SHA>" >&2
+      exit 2
+    fi
+    REF_REPO="$(pwd -P)"
+    ;;
+esac
 PROJECT="${HERDR_CP_PROJECT:-herdr-control-plane}"
 HEALTH_URL="${HERDR_CP_HEALTH_URL:-}"
 STATE_DIR="$HOME/.local/state/herdr-engineering/deploys"
+STATE_HELPER="$HERE/deploy-state.py"
+# shellcheck source=deploy-lock.sh
+source "$HERE/deploy-lock.sh"
 MOUNT_TARGET="/etc/herdr/fleet/fleet-config.yaml"
 # Collaboration network (HCN) is opt-in per host: it is layered on only when this
 # marker file exists, so an ordinary deploy never switches it on elsewhere.
@@ -249,34 +279,59 @@ check_pipelines_dir() {   # names only, never content
 check_pipelines_dir || exit 1
 
 WORK=""; ENV_DIR=""; PREV_WORK=""
+HOST_MUTATED=0
+DEPLOY_FINISHED=0
+# Called by the EXIT trap via finish().
+# shellcheck disable=SC2317
 cleanup() {
   if [ -n "$PREV_WORK" ]; then git -C "$REPO" worktree remove --force "$PREV_WORK" >/dev/null 2>&1 || true; fi
   [ -z "$ENV_DIR" ] || rm -rf "$ENV_DIR"
-  if [ -n "$WORK" ]; then git -C "$REPO" worktree remove --force "$WORK" >/dev/null 2>&1 || rm -rf "$WORK"; fi
+  if [ -n "$WORK" ]; then
+    if [ "$DRY" = 1 ]; then rm -rf "$WORK"
+    else git -C "$REPO" worktree remove --force "$WORK" >/dev/null 2>&1 || rm -rf "$WORK"; fi
+  fi
+  deploy_lock_cleanup
 }
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM HUP
+# shellcheck disable=SC2317
+finish() {
+  local status=$? rollback_status=0
+  # Repeated interrupts must not cut short recovery or release ownership early.
+  trap '' INT TERM HUP
+  trap - EXIT
+  if [ "$HOST_MUTATED" = 1 ] && [ "$DEPLOY_FINISHED" = 0 ]; then
+    rollback || rollback_status=$?
+    [ "$rollback_status" != 3 ] || status=3
+  fi
+  deploy_lock_phase cleanup || true
+  cleanup
+  exit "$status"
+}
+trap finish EXIT
+trap 'trap "" INT TERM HUP; exit 130' INT
+trap 'trap "" INT TERM HUP; exit 143' TERM HUP
 
-# One deploy at a time (fd 7, released by the kernel on any exit). A dry run changes
+# One deploy at a time (both locks released by the kernel on any exit). A dry run changes
 # nothing, so it neither takes nor waits for the lock.
 if [ "$DRY" = 0 ]; then
-  mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+  deploy_lock_acquire || exit $?
   DEPLOY_LOCK="$STATE_DIR/deploy.lock"
-  exec 7>"$DEPLOY_LOCK"
-  if ! flock -w "$DEPLOY_LOCK_WAIT" 7; then
+  if ! deploy_compat_lock_acquire; then
     echo "another deploy.sh is still running after ${DEPLOY_LOCK_WAIT}s (lock $DEPLOY_LOCK); nothing was changed. Retry, or raise --deploy-lock-wait" >&2
     exit 1
   fi
 fi
 
-[ "$FETCH" = 1 ] && git -C "$REPO" fetch -q origin
-FULL="$(git -C "$REPO" rev-parse --verify "$REF^{commit}")"
+if [ "$DRY" = 0 ] && [ "$FETCH" = 1 ]; then git -C "$REPO" fetch -q origin; fi
+FULL="$(git -C "$REF_REPO" rev-parse --verify "$REF^{commit}")"
 SHA="${FULL:0:12}"
 TAG="$SHA"
 
 WORK="$(mktemp -d)"
-git -C "$REPO" worktree add -q --detach "$WORK" "$FULL"
+if [ "$DRY" = 1 ]; then
+  git -C "$REPO" archive "$FULL" | tar -x -C "$WORK"
+else
+  git -C "$REPO" worktree add -q --detach "$WORK" "$FULL"
+fi
 # herdr-eng from exactly the commit being deployed, so the rendered variables match
 # the compose files that ship with it.
 # Run from inside $WORK: `python3 -m` puts the cwd first on sys.path, so a caller
@@ -319,6 +374,13 @@ if [ "$MEMORY" = 1 ]; then
   . "$MEM_LIB"
 fi
 if [ "$MEMORY" = 1 ]; then memory_preflight || exit 1; fi
+
+# The read-only explorer's CLI/profile use the app's existing rollout, lock
+# and rollback, independently of the optional backend memory step.
+MEMORY_CLIENT_LIB="$WORK/deploy/control-plane/memory-client-deploy.sh"
+[ -f "$MEMORY_CLIENT_LIB" ] || MEMORY_CLIENT_LIB="$HERE/memory-client-deploy.sh"
+. "$MEMORY_CLIENT_LIB"
+memory_client_preflight || exit 1
 
 # only_file <dir> <name>: the directory (mounted whole into a container) holds nothing else
 only_file() {
@@ -417,7 +479,7 @@ if [ "$COLLAB" = 1 ]; then
     exit 1
   fi
   export HERDR_COLLAB_CONFIG_DIR="$COLLAB_DIR"
-  # The edge conf for this config: the repo file, plus the /s/ location only when share is enabled.
+  # The edge conf for this config: the repo file, plus the share host server only when share is enabled.
   NEW_EDGE="$ENV_DIR/new/collab-edge/nginx.conf"
   EDGE_TEMPLATE="$WORK/deploy/control-plane/collab-edge/nginx.conf"
   if [ -n "$NEW_SHARE" ]; then
@@ -485,26 +547,26 @@ if [ "$DRY" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; after the build would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
   fi
   if [ "$SHARE" = 1 ]; then
-    echo "[dry-run] share links enabled: rendered the share slice to a temp dir (would install it at ~/.config/herdr-engineering/share/), the edge conf gains /s/, share-public would be force-recreated before the edge"
+    echo "[dry-run] share links enabled: rendered the share slice to a temp dir (would install it at ~/.config/herdr-engineering/share/), the edge conf gains the share host's server block, the edge certificate must name that host, share-public would be force-recreated before the edge"
   fi
+  echo "[dry-run] would prewarm the target image checkpoint on an existing deployment when its CLI supports it, before host or service changes"
   echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}}"
   exit 0
 fi
 
 PREVIOUS_IMAGE="$(docker inspect -f '{{.Config.Image}}' herdr-cp-web 2>/dev/null || true)"
 echo "currently running: ${PREVIOUS_IMAGE:-nothing}"
-STATE_HELPER="$HERE/deploy-state.py"
-
 # What to roll back to: the commit recorded in the running image's receipt, deployed
 # again with THAT commit's compose files. Only a commit whose compose.yaml carries
 # `x-herdr-deploy-layout: 2` can run on this script's variables; anything older (or no
 # receipt at all) gets no automatic rollback and a manual recipe instead.
 PREV_COMMIT=""; PREV_SHA=""; PREV_TAG=""; PREV_COLLAB_HASH=""; ROLLBACK_NOTE=""
-PREV_RECEIPT_TAG=""
+PREV_RECEIPT_TAG=""; VERIFIED_PREV_COMMIT=""
 if [ -n "$PREVIOUS_IMAGE" ]; then
   # Protected rollback uses image IDs as Config.Image. Recover its logical tag
   # from the actual image buildstamp, cross-checked against the existing receipt.
-  PREV_RECEIPT_TAG="$(python3 "$STATE_HELPER" resolve-previous "$STATE_DIR" "$PREVIOUS_IMAGE")" || exit 1
+  PREVIOUS_IDENTITY="$(python3 "$STATE_HELPER" verified-previous "$STATE_DIR" "$PREVIOUS_IMAGE")" || exit 1
+  read -r PREV_RECEIPT_TAG VERIFIED_PREV_COMMIT <<< "$PREVIOUS_IDENTITY"
 fi
 if [ -z "$PREVIOUS_IMAGE" ]; then
   ROLLBACK_NOTE="nothing was running (first deploy)"
@@ -516,6 +578,10 @@ else
       "$STATE_DIR/$PREV_RECEIPT_TAG.json" "$1" 2>/dev/null || true
   }
   CANDIDATE="$(receipt_field commit)"
+  if [ "$CANDIDATE" != "$VERIFIED_PREV_COMMIT" ]; then
+    echo "previous deployment receipt changed after image verification; refusing deployment" >&2
+    exit 1
+  fi
   PREV_COLLAB_HASH="$(receipt_field collab_slice_sha256)"
   # (no `git show | grep -q` under pipefail: grep's early exit would SIGPIPE git)
   PREV_COMPOSE=""
@@ -540,6 +606,15 @@ else
     echo "cannot validate a rollback target for the pinned running image; refusing deployment" >&2
     exit 1
   fi
+fi
+
+# Apply the ancestry guard to every verified previous commit, even old layouts
+# lacking automatic rollback. Missing history cannot prove a safe forward roll.
+# This guards only forward entry; rollback() always uses its protected snapshot.
+if [ -n "$VERIFIED_PREV_COMMIT" ] && [ "$ALLOW_DIVERGENT" = 0 ] \
+    && ! git -C "$REPO" merge-base --is-ancestor "$VERIFIED_PREV_COMMIT" "$FULL"; then
+  echo "candidate $SHA does not descend from verified deployed commit $VERIFIED_PREV_COMMIT; refusing stale/divergent rollout before build or host changes. Use --allow-divergent only for an intentional manual rollback." >&2
+  exit 1
 fi
 
 if [ -z "$HEALTH_URL" ]; then
@@ -576,9 +651,12 @@ if [ "$COLLAB" = 1 ]; then
   fi
 fi
 
-# A failed build exits here: nothing on the host has been touched yet.
+deploy_lock_phase build
+
+# A failed build exits here: no running service or installed profile changed.
+memory_client_build || exit 1
 docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
-  -t "herdr-engineering:$TAG" "$WORK" >/dev/null
+  "${MEMORY_CLIENT_BUILD_ARGS[@]}" -t "herdr-engineering:$TAG" "$WORK" >/dev/null
 
 # Use this checkout's helper, not the target commit's possibly older deploy tooling.
 # The selected canonical source stays the forward mount. Snapshots live outside
@@ -597,14 +675,40 @@ if [ -n "$ABSENT" ]; then
   echo "missing service containers (will be created by this deploy): $ABSENT"
 fi
 
+# Prewarm with the TARGET image while the previous release still serves. Only the
+# protected config snapshot is mounted: compose run would create the web service's
+# missing host bind directories before prewarm succeeded. Share the live web's
+# network namespace so its database names/routes work without starting any service.
+# A first deploy has no live database/network; legacy targets lack this CLI.
+if [ -n "$PREVIOUS_IMAGE" ] && grep -q '^def _cmd_cp_checkpoint(' "$WORK/herdr_engineering/cli.py"; then
+  CANDIDATE_IMAGE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate"]["image_id"])' "$ATTEMPT/metadata.json")"
+  PREWARM_LOG="$ATTEMPT/checkpoint-prewarm.log"
+  (umask 077; : > "$PREWARM_LOG")
+  chmod 600 "$PREWARM_LOG"
+  deploy_lock_phase checkpoint-prewarm
+  echo "prewarming target projection checkpoint before host or service changes"
+  if ! docker run --rm --network container:herdr-cp-web \
+      --mount "type=bind,src=$ATTEMPT/candidate,dst=/etc/herdr/fleet,readonly" \
+      --entrypoint herdr-eng "$CANDIDATE_IMAGE_ID" \
+      control-plane checkpoint --fleet-config "$MOUNT_TARGET" \
+      --migrations /app/control-plane/migrations >"$PREWARM_LOG" 2>&1; then
+    python3 "$STATE_HELPER" outcome "$ATTEMPT" prewarm_failed
+    echo "target projection checkpoint prewarm failed; no host files or services changed. Reason and output saved in private log: $PREWARM_LOG" >&2
+    exit 1
+  fi
+  echo "projection checkpoint prewarm succeeded; metrics saved in private log: $PREWARM_LOG"
+else
+  echo "projection checkpoint prewarm skipped (first deploy or target predates checkpoint CLI)"
+fi
+
 # Keep the timer-driven collab-sync out of this deploy: take the SAME lock its once()
-# takes and hold it (fd 8, released by the kernel on any exit) across every host and
+# takes and hold it (released by the kernel on any exit) across every host and
 # container change below, rollback included.
 if [ "$COLLAB" = 1 ]; then
   COLLAB_LOCK="${HERDR_COLLAB_SYNC_DIR}.lock"
   mkdir -p "$(dirname "$COLLAB_LOCK")"
-  exec 8>"$COLLAB_LOCK"
-  if ! flock -w "$COLLAB_LOCK_WAIT" 8; then
+  exec {COLLAB_LOCK_FD}>>"$COLLAB_LOCK"
+  if ! flock -w "$COLLAB_LOCK_WAIT" "$COLLAB_LOCK_FD"; then
     python3 "$STATE_HELPER" outcome "$ATTEMPT" collab_sync_busy
     echo "collab-sync is still running after ${COLLAB_LOCK_WAIT}s (lock $COLLAB_LOCK); nothing was changed. Retry, or raise --collab-lock-wait" >&2
     exit 1
@@ -674,6 +778,8 @@ install_private() {   # <src> <dest>: 0600 file in a 0700 dir, atomic
   mkdir -p "$(dirname "$2")" && chmod 700 "$(dirname "$2")" \
     && install -m 0600 "$1" "$2.install.tmp" && mv -f "$2.install.tmp" "$2"
 }
+
+memory_client_snapshot || exit 1
 
 # compose_run <worktree> <env file> <image tag> <commit> <compose args...>: that
 # worktree's compose files with the given env file and this deploy's paths. Rollback
@@ -789,6 +895,8 @@ stop_share_public() {   # never fatal; plain docker, so it works whichever compo
 }
 
 forward() {
+  deploy_lock_phase forward || return 1
+  HOST_MUTATED=1
   install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
   # mount sources of web/worker (and share-public): created here, after the build, never before
   mkdir -p "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" && chmod 755 "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" \
@@ -815,8 +923,21 @@ forward() {
     local held=()
     if grep -q -- '--lock-held' "$WORK/deploy/control-plane/collab-sync.sh"; then held=(--lock-held)
     else echo "WARNING: this commit's collab-sync.sh cannot run under the deploy's lock; its refresh is left to the timer" >&2; fi
+    # Shares enabled: the edge serves the share host with this same certificate, so refuse one that does not
+    # name it (checked by collab-sync before it copies, and once more on the staged copy).
+    local share_host=()
+    if [ "$SHARE" = 1 ]; then
+      SHARE_HOST_NAME="$(python3 -c 'import json,sys; from urllib.parse import urlsplit; print(urlsplit(json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["share"]["public_url"]).hostname or "")' "$SHARE_CONFIG")" \
+        && [ -n "$SHARE_HOST_NAME" ] || { echo "cannot read the share host from $SHARE_CONFIG" >&2; return 1; }
+      share_host=(--share-host "$SHARE_HOST_NAME")
+    fi
     "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
-      --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" "${held[@]}" || return 1
+      --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" \
+      "${share_host[@]}" "${held[@]}" || return 1
+    if [ "$SHARE" = 1 ]; then
+      "$WORK/deploy/control-plane/collab-sync.sh" cert-host --config "$COLLAB_CONFIG" --cert-dir "$CERT_DIR_VALUE" \
+        "${share_host[@]}" || return 1
+    fi
     mkdir -p "$(dirname "$HERDR_COLLAB_EDGE_CONF")" || return 1
     write_edge_conf "$NEW_EDGE" || return 1
   fi
@@ -834,56 +955,23 @@ forward() {
   else
     compose_up "$WORK" "$ENV_FILE" "$TAG" "$SHA" >/dev/null || return 1
   fi
+  memory_client_apply forward "$WORK" || return 1
   # The edge resolves collab-public once, at (re)load: a recreated collab-public has a
   # new address, so reload the edge after every collab up, not only on a new conf.
   if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi
-  # Shares disabled: the edge no longer routes /s/; stop a share-public a previous deploy started (its
+  # Shares disabled: the edge no longer serves the share host; stop a share-public a previous deploy started (its
   # bundles stay on disk). Never fatal.
   if [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ]; then stop_share_public; fi
+  deploy_lock_phase verify || return 1
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
-  verify "$SHA"
+  verify "$SHA" || return 1
+  memory_client_promote
 }
 
-if forward; then
-  # The receipt names the ref, commits and images (and only a hash of the collab
-  # slice) - never configuration. json.dumps: a ref may contain quotes.
-  python3 "$STATE_HELPER" receipt "$ATTEMPT" "$STATE_DIR/$SHA.json" "$REF" \
-    "herdr-engineering:$TAG" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)"
-  python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
-  echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
-  if [ "$MEMORY" = 1 ]; then memory_phase || exit 4; fi
-  exit 0
-fi
-
-echo "deploy of $SHA failed (an install step or compose up failed, the health check did not report $SHA, or a recreated service is not running)" >&2
-# Host files go back first (slices rendered by the previous deploy, its nginx.conf and
-# collab-sync units), so a rollback - or the old containers left running - read them.
-RESTORED=1
-if ! restore_host_state; then
-  RESTORED=0
-  echo "WARNING: could not restore every host file this deploy changed" >&2
-fi
-if [ -z "$PREV_COMMIT" ]; then
-  python3 "$STATE_HELPER" outcome "$ATTEMPT" failed_no_rollback
-  echo "NOT rolled back: $ROLLBACK_NOTE." >&2
-  if [ -n "${PREV_COMMIT_OLD:-}" ]; then
-    echo "manual rollback (that commit's own deploy.sh reads ~/.config/herdr-engineering/control-plane.env):" >&2
-    echo "  git -C $REPO worktree add /tmp/herdr-rollback $PREV_COMMIT_OLD && /tmp/herdr-rollback/deploy/control-plane/deploy.sh --ref $PREV_COMMIT_OLD --no-fetch" >&2
-  elif [ -n "$PREVIOUS_IMAGE" ]; then
-    echo "manual rollback: redeploy the commit $PREVIOUS_IMAGE was built from with that commit's deploy/control-plane/deploy.sh" >&2
-  fi
-  [ "$RESTORED" = 1 ] || exit 3
-  exit 1
-fi
-
-echo "rolling back to $PREVIOUS_IMAGE with the compose files and code of commit $PREV_SHA" >&2
-# share-public follows the RESTORED edge conf: when it routes /s/ and the previous commit defines the service,
-# share-public is recreated from that commit with the restored slice (and verified with the rest); otherwise a
-# running one is stopped, so a rollback never reports healthy while /s/ points at the failed release.
 rollback_share() {
   local conf="${HERDR_COLLAB_EDGE_CONF:-}"
   SHARE_SERVICE=()
-  if [ "$COLLAB" = 1 ] && [ -f "$conf" ] && grep -q 'location ^~ /s/' "$conf" \
+  if [ "$COLLAB" = 1 ] && [ -f "$conf" ] && grep -Eq 'location (\^~ )?/s/ ' "$conf" \
       && grep -q '^  share-public:' "$PREV_WORK/deploy/control-plane/compose.collab.yaml" 2>/dev/null; then
     SHARE_SERVICE=(share-public)
     compose_up_retry "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" \
@@ -892,32 +980,85 @@ rollback_share() {
     stop_share_public
   fi
 }
-PREV_CONFIG="$ATTEMPT/previous/fleet-config.yaml"
-FLEET_DIR="$(dirname "$PREV_CONFIG")"
-ROLLBACK_IMAGES="$ATTEMPT/rollback-images.json"
-printf -v MANUAL '%q --ref %q --no-fetch --fleet-config %q' \
-  "$REPO/deploy/control-plane/deploy.sh" "$PREV_COMMIT" "$PREV_CONFIG"
-PREV_WORK="$ENV_DIR/rollback-worktree"
-PREV_ENV="$ENV_DIR/rollback-compose.env"
-# the compose env as the PREVIOUS commit's own code renders it
-prev_render() {
-  (cd "$PREV_WORK" && PYTHONPATH="$PREV_WORK" python3 -m herdr_engineering.cli \
-    fleet config render-compose --path "$PREV_CONFIG" --out "$PREV_ENV") >/dev/null 2>&1
+
+rollback() {
+  trap '' INT TERM HUP
+  DEPLOY_FINISHED=1
+  deploy_lock_phase rollback || true
+
+  echo "deploy of $SHA failed (an install step or compose up failed, the health check did not report $SHA, or a recreated service is not running)" >&2
+  # Host files go back first (slices rendered by the previous deploy, its nginx.conf and
+  # collab-sync units), so a rollback - or the old containers left running - read them.
+  RESTORED=1
+  if ! restore_host_state; then
+    RESTORED=0
+    echo "WARNING: could not restore every host file this deploy changed" >&2
+  fi
+  if [ -z "$PREV_COMMIT" ]; then
+    python3 "$STATE_HELPER" outcome "$ATTEMPT" failed_no_rollback || return 3
+    echo "NOT rolled back: $ROLLBACK_NOTE." >&2
+    if [ -n "${PREV_COMMIT_OLD:-}" ]; then
+      echo "manual rollback (that commit's own deploy.sh reads ~/.config/herdr-engineering/control-plane.env):" >&2
+      echo "  git -C $REPO worktree add /tmp/herdr-rollback $PREV_COMMIT_OLD && /tmp/herdr-rollback/deploy/control-plane/deploy.sh --ref $PREV_COMMIT_OLD --no-fetch" >&2
+    elif [ -n "$PREVIOUS_IMAGE" ]; then
+      echo "manual rollback: redeploy the commit $PREVIOUS_IMAGE was built from with that commit's deploy/control-plane/deploy.sh" >&2
+    fi
+    [ "$RESTORED" = 1 ] || return 3
+    return 1
+  fi
+
+  echo "rolling back to $PREVIOUS_IMAGE with the compose files and code of commit $PREV_SHA" >&2
+  PREV_CONFIG="$ATTEMPT/previous/fleet-config.yaml"
+  FLEET_DIR="$(dirname "$PREV_CONFIG")"
+  ROLLBACK_IMAGES="$ATTEMPT/rollback-images.json"
+  printf -v MANUAL '%q --ref %q --no-fetch --allow-divergent --fleet-config %q' \
+    "$REPO/deploy/control-plane/deploy.sh" "$PREV_COMMIT" "$PREV_CONFIG"
+  PREV_WORK="$ENV_DIR/rollback-worktree"
+  PREV_ENV="$ENV_DIR/rollback-compose.env"
+  # the compose env as the PREVIOUS commit's own code renders it
+  prev_render() {
+    (cd "$PREV_WORK" && PYTHONPATH="$PREV_WORK" python3 -m herdr_engineering.cli \
+      fleet config render-compose --path "$PREV_CONFIG" --out "$PREV_ENV") >/dev/null 2>&1
+  }
+  if [ "$RESTORED" = 1 ] \
+      && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
+      && prev_render \
+      && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+      && memory_client_apply rollback "$PREV_WORK" \
+      && rollback_share \
+      && { [ "$COLLAB" = 0 ] || { EDGE_CONF_CHANGED=1; reload_edge_if_changed || true; }; } \
+      && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
+      && verify "$PREV_SHA"; then
+    python3 "$STATE_HELPER" outcome "$ATTEMPT" rolled_back || return 3
+    echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy (all of: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}); the deploy of $SHA FAILED" >&2
+    return 1
+  fi
+  python3 "$STATE_HELPER" outcome "$ATTEMPT" rollback_failed || return 3
+  echo "FAILED TO ROLL BACK to $PREVIOUS_IMAGE (commit $PREV_SHA): the control plane may be down or mixed." >&2
+  echo "manual rollback: $MANUAL" >&2
+  echo "pinned rollback images and recovery metadata: $ATTEMPT" >&2
+  return 3
 }
-if [ "$RESTORED" = 1 ] \
-    && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
-    && prev_render \
-    && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
-    && rollback_share \
-    && { [ "$COLLAB" = 0 ] || { EDGE_CONF_CHANGED=1; reload_edge_if_changed || true; }; } \
-    && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
-    && verify "$PREV_SHA"; then
-  python3 "$STATE_HELPER" outcome "$ATTEMPT" rolled_back
-  echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy (all of: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}); the deploy of $SHA FAILED" >&2
-  exit 1
+
+if forward; then
+  # The receipt names the ref, commits and images (and only a hash of the collab
+  # slice) - never configuration. json.dumps: a ref may contain quotes.
+  python3 "$STATE_HELPER" receipt "$ATTEMPT" "$STATE_DIR/$SHA.json" "$REF" \
+    "herdr-engineering:$TAG" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)"
+  python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
+  DEPLOY_FINISHED=1
+  echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
+  if [ "$SHARE" = 1 ] && [ -n "${SHARE_HOST_NAME:-}" ]; then
+    # Smoke line, never fatal: an unknown token on the share host's own TLS name answers a bare 404 when the DNS
+    # record, the SNI route, the certificate and the share server all line up.
+    probe="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$SHARE_HOST_NAME/s/probe/" 2>/dev/null || true)"
+    [ "$probe" = 404 ] || echo "WARNING: probe of https://$SHARE_HOST_NAME/s/probe/ answered '${probe:-no response}', expected 404:" \
+      "check DNS, the SNI route to the edge and the certificate for the share host" >&2
+  fi
+  if [ "$MEMORY" = 1 ]; then memory_phase || exit 4; fi
+  exit 0
 fi
-python3 "$STATE_HELPER" outcome "$ATTEMPT" rollback_failed
-echo "FAILED TO ROLL BACK to $PREVIOUS_IMAGE (commit $PREV_SHA): the control plane may be down or mixed." >&2
-echo "manual rollback: $MANUAL" >&2
-echo "pinned rollback images and recovery metadata: $ATTEMPT" >&2
-exit 3
+
+rollback_status=0
+rollback || rollback_status=$?
+exit "$rollback_status"
