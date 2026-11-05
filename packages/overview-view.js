@@ -193,6 +193,16 @@ export function saveWeekPreferences(storage, prefs) {
   try { storage.setItem(WEEK_PREFS_KEY, JSON.stringify(sanitizeWeekPreferences(prefs))); } catch { /* The choice then lasts for this page only. */ }
 }
 export const userWeekStart = (data = {}) => sanitizeWeekPreferences({weekStart: data.weekStart}).weekStart;
+const OPEN_LIFECYCLES = new Set(['running', 'blocked', 'review', 'paused_quota']);
+// Row predicates mirror the headline metric rules in work-week.js; they only choose which rows to list.
+const WEEK_FILTERS = {
+  started: inWindow => item => inWindow(item.started_at),
+  finished: inWindow => item => item.lifecycle === 'finished' && inWindow(item.completed_at),
+  open: () => item => OPEN_LIFECYCLES.has(item.lifecycle),
+  paused: () => item => item.lifecycle === 'paused_quota',
+  attention: inWindow => item => item.lifecycle === 'blocked' || item.lifecycle === 'review' || (item.lifecycle === 'failed' && inWindow(item.updated_at)),
+};
+const FILTER_LABEL = {started: 'Started', finished: 'Finished', open: 'Open', paused: 'Paused', attention: 'Needs attention'};
 const weekGroup = item => item.lifecycle === 'paused_quota' ? 'paused' : item.lifecycle === 'finished' || item.lifecycle === 'failed' ? 'completed' : item.lifecycle === 'unconfirmed' ? 'unconfirmed' : 'active';
 export function weekCardModel(data = {}, states = {}, received = Date.now(), now = Date.now()) {
   const timeZone = userTimeZone(data), weekStart = userWeekStart(data);
@@ -208,9 +218,20 @@ export function weekCardModel(data = {}, states = {}, received = Date.now(), now
   });
   const rank = item => NEEDS_ATTENTION.has(item.lifecycle) ? 0 : 1;
   const sorted = [...visible].sort((a, b) => rank(a) - rank(b) || (Date.parse(b.updated_at || '') || 0) - (Date.parse(a.updated_at || '') || 0));
-  const groups = ['active', 'paused', 'completed', 'unconfirmed'].map(key => ({key, items: sorted.filter(item => weekGroup(item) === key)})).filter(group => group.items.length);
+  // G5: a filter narrows the listed rows only. Headline counts come from `week` (untouched); the Unconfirmed group is never filtered,
+  // because its state is unknown and a metric cannot rule it out.
+  const filter = typeof data.weekFilter === 'string' && Object.hasOwn(WEEK_FILTERS, data.weekFilter) ? data.weekFilter : null;
+  const keep = filter ? WEEK_FILTERS[filter](inWindow) : () => true;
+  const expandedKeys = new Set(Array.isArray(data.weekExpanded) ? data.weekExpanded : data.weekExpanded instanceof Set ? [...data.weekExpanded] : []);
+  const detailIds = new Set(Array.isArray(data.weekDetails) ? data.weekDetails : data.weekDetails instanceof Set ? [...data.weekDetails] : []);
+  const groups = ['active', 'paused', 'completed', 'unconfirmed'].map(key => {
+    const all = sorted.filter(item => weekGroup(item) === key);
+    const items = key === 'unconfirmed' ? all : all.filter(keep);
+    const expanded = expandedKeys.has(key) && items.length > WEEK_ROW_LIMIT;
+    return {key, items, total: all.length, expanded, shown: expanded ? items : items.slice(0, WEEK_ROW_LIMIT)};
+  }).filter(group => group.total);
   const partial = missing.length > 0 || ['started', 'finished', 'open', 'paused_quota', 'attention_needed'].some(key => week[key].coverage !== 'complete');
-  return {week, groups, timeZone, weekStart, loaded, missing, partial, total: items.length, history: Boolean(data.weeklyHistory), historyFailed: Boolean(states.weekly?.error)};
+  return {week, groups, filter, detailIds, timeZone, weekStart, loaded, missing, partial, total: items.length, history: Boolean(data.weeklyHistory), historyFailed: Boolean(states.weekly?.error)};
 }
 const dayIn = (iso, timeZone) => { try { return new Intl.DateTimeFormat('en-CA', {timeZone, year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date(iso)); } catch { return String(iso).slice(0, 10); } };
 function weekMetric(label, m, timeZone = 'UTC') {
@@ -221,7 +242,7 @@ function weekMetric(label, m, timeZone = 'UTC') {
   const full = `${label}: ${unknown ? 'unknown' : partial ? `at least ${m.count}, partial data` : m.count}${m.basis === 'snapshot' ? ', current snapshot' : ''}`;
   return `<div class="ov-metric wk-metric" role="group" aria-label="${esc(full)}"><strong>${esc(value)}</strong><span>${esc(label)}</span><small class="wk-badge" data-coverage="${esc(m.coverage)}">${esc(badge)}${m.basis === 'snapshot' ? ' · snapshot' : ''}</small></div>`;
 }
-function weekRow(item) {
+function weekRow(item, m) {
   const href = item.links?.[0]?.href;
   const title = short(text(item.title) || text(item.source_ref) || 'Untitled work', 90);
   const sessions = item.session_ids?.length || 0;
@@ -230,8 +251,21 @@ function weekRow(item) {
   return `<li class="ov-row wk-row" data-work-id="${esc(item.work_id)}"><div>${href ? `<a href="${esc(href)}">${esc(title)}</a>` : `<span class="wk-title">${esc(title)}</span>`}
     <p>${esc(item.source === 'session' ? 'Agent without a mission' : 'Mission')} · ${sessions} ${sessions === 1 ? 'session' : 'sessions'}</p>
     ${progress === null ? '' : `<progress class="wk-progress" max="100" value="${progress}" aria-label="${esc(`Measured progress for ${title}: ${item.progress.label || `${progress}%`}`)}">${progress}%</progress><p>${esc(short(text(item.progress.label), 80))}</p>`}</div>
-    <span class="ov-tag ${attention ? 'ov-alert' : ''}">${esc(LIFECYCLE_LABEL[item.lifecycle] || item.lifecycle)}</span></li>`;
+    <span class="ov-tag ${attention ? 'ov-alert' : ''}">${esc(LIFECYCLE_LABEL[item.lifecycle] || item.lifecycle)}<br>${detailToggle(item, m.detailIds.has(item.work_id))}</span>${m.detailIds.has(item.work_id) ? weekDetails(item, m.timeZone) : ''}</li>`;
 }
+const detailToggle = (item, open) => `<button type="button" class="hd-btn hd-btn--quiet hd-btn--sm wk-detail-toggle" data-week-detail="${esc(item.work_id)}" aria-expanded="${open}" aria-controls="wk-d-${esc(domId(item.work_id))}">${open ? 'Hide details' : 'Details'}</button>`;
+const domId = value => String(value).replace(/[^A-Za-z0-9_-]/g, '_');
+const stampIn = (iso, timeZone) => { try { return new Intl.DateTimeFormat('en-CA', {timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false}).format(new Date(iso)); } catch { return String(iso); } };
+// Only fields that exist on the WorkSummary: lifecycle, coverage, timestamps, evidence entries, links, session ids.
+function weekDetails(item, timeZone) {
+  const row = (label, value) => value ? `<dt>${esc(label)}</dt><dd>${value}</dd>` : '';
+  const when = value => text(value) ? `<time datetime="${esc(value)}">${esc(stampIn(value, timeZone))} ${esc(timeZone)}</time>` : '';
+  const links = (item.links || []).filter(l => l && l.href).map(l => `<a href="${esc(l.href)}">${esc(l.kind === 'mission' ? 'Mission detail' : l.kind === 'session' ? `Session ${short(String(l.entity_id), 40)}` : cap(String(l.kind)))}</a>`).join(' · ');
+  const evidence = (item.evidence || []).map(e => `${esc(human(e.kind) || e.kind)}${e.timestamp ? ` (${when(e.timestamp)})` : ''}`).join('; ');
+  const terminal = item.pane_refs?.length ? 'A verified pane is recorded; open the session page for the copyable attach command.' : '';
+  return `<dl class="wk-details" id="wk-d-${esc(domId(item.work_id))}">${row('Status', esc(LIFECYCLE_LABEL[item.lifecycle] || item.lifecycle))}${row('Coverage', esc(item.coverage || 'unknown'))}${row('Started', when(item.started_at))}${row('Finished', when(item.completed_at))}${row('Updated', when(item.updated_at))}${row('Evidence', evidence)}${row('Links', links)}${row('Terminal', esc(terminal))}</dl>`;
+}
+const chipBar = (active) => `<div class="wk-filters" role="group" aria-label="Filter listed work by metric">${Object.entries(FILTER_LABEL).map(([key, label]) => `<button type="button" class="hd-btn hd-btn--secondary hd-btn--sm wk-chip" data-week-filter="${key}" aria-pressed="${active === key}">${esc(label)}</button>`).join('')}</div>`;
 const cap = word => word[0].toUpperCase() + word.slice(1);
 function weekControls(zone, weekStart) {
   let zones = [];
@@ -253,10 +287,12 @@ export function renderWeekCard(data = {}, states = {}, received = Date.now(), no
     : m.history ? `History is read from stored start and finish events since ${w.started.horizon ? esc(dayIn(w.started.horizon, m.timeZone)) : 'the first stored event'}; work before that, or work the control plane never saw start or finish, is not counted, so Started and Finished are lower bounds. `
     : `${m.historyFailed ? 'The weekly history could not be read, so ' : ''}Started and Finished only count work with recorded timestamps in the current snapshot, so they are lower bounds. `;
   const banner = m.partial ? `<p class="ov-warning wk-banner" role="status">Partial data: ${m.missing.length ? `still waiting for ${esc(m.missing.map(key => SOURCE_LABELS[key].toLowerCase()).join(', '))}. ` : ''}${historyNote}Open, Paused and Needs attention are snapshots of right now.</p>` : '';
-  const rows = m.groups.map(group => `<h3 class="ov-sub">${GROUP_LABEL[group.key]} <span class="wk-count">(${group.items.length})</span></h3><ul class="ov-list" aria-label="${esc(GROUP_LABEL[group.key])} work">${group.items.slice(0, WEEK_ROW_LIMIT).map(weekRow).join('')}</ul>${group.items.length > WEEK_ROW_LIMIT ? empty(`Showing ${WEEK_ROW_LIMIT} of ${group.items.length}.`) : ''}`).join('');
+  const count = group => group.items.length === group.total ? `${group.total}` : `${group.items.length} of ${group.total}`;
+  const rows = m.groups.filter(group => group.items.length).map(group => `<h3 class="ov-sub">${GROUP_LABEL[group.key]} <span class="wk-count">(${count(group)})</span></h3><ul class="ov-list" aria-label="${esc(GROUP_LABEL[group.key])} work">${group.shown.map(item => weekRow(item, m)).join('')}</ul>${group.items.length > WEEK_ROW_LIMIT ? `<p class="ov-note wk-more">Showing ${group.shown.length} of ${group.items.length}. <button type="button" class="hd-btn hd-btn--quiet hd-btn--sm" data-week-more="${group.key}" aria-expanded="${group.expanded}">${group.expanded ? 'Show fewer' : `Show all ${group.items.length}`}</button></p>` : ''}`).join('');
+  const filterNote = m.filter ? `<p class="ov-note wk-filter-note" role="status">Filter: ${esc(FILTER_LABEL[m.filter])}. It only narrows the rows below; the counts above are unchanged.${m.groups.some(group => group.key === 'unconfirmed') ? ' Unconfirmed work is always listed, because its state is not known.' : ''}</p>${m.groups.some(group => group.key !== 'unconfirmed' && group.items.length) ? '' : empty('No listed work matches this filter.')}` : '';
   return `${heading}${errors}
     <div class="ov-metrics wk-metrics">${weekMetric('Started', w.started, m.timeZone)}${weekMetric('Finished', w.finished, m.timeZone)}${weekMetric('Open', w.open)}${weekMetric('Quota-paused', w.paused_quota)}${weekMetric('Needs attention', w.attention_needed)}</div>
-    ${banner}${rows || empty('No work items are reported yet.')}
+    ${banner}${chipBar(m.filter)}${filterNote}${rows || (m.filter ? '' : empty('No work items are reported yet.'))}
     ${weekControls(m.timeZone, m.weekStart)}
     <p class="ov-note">Week of ${esc(dayIn(w.window.start, m.timeZone))} (${esc(m.timeZone)}), week starts ${esc(cap(m.weekStart))}, counted from recorded timestamps. Progress is shown only where a mission reports measured evidence.</p>`;
 }
@@ -351,7 +387,8 @@ const styles = `<style>
 @media(max-width:960px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel[data-overview=sessions]{grid-column:auto}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
 .ov-attention{margin-bottom:16px}.ov-attention-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:0 24px}.ov-attention-list.is-expanded{max-height:min(60vh,560px);overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.ov-attention-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}.ov-attention-controls button:focus-visible,.ov-attention-list:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-panel[hidden]{display:none}.ov-customize{margin:0 0 16px;font-size:13px}.ov-customize>summary{cursor:pointer;width:fit-content;padding:8px 0}.ov-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}.ov-control-row strong{min-width:145px}.ov-customize button:focus-visible,.ov-customize summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-layout:has(>[hidden]){grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr))}.ov-layout:has(>[hidden])>.ov-panel{grid-column:auto}
 @media(max-width:960px){.ov-layout:has(>[hidden]){grid-template-columns:minmax(0,1fr)}.ov-control-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding-bottom:8px;border-bottom:1px solid var(--border)}.ov-control-row strong{grid-column:1/-1}}
-.wk-metrics{align-items:stretch}.wk-badge{font-size:11px;color:var(--text-secondary);line-height:1.3}.wk-badge[data-coverage=partial],.wk-badge[data-coverage=unknown]{color:var(--status-attention)}.wk-count{color:var(--text-muted);font-weight:400}.wk-progress{display:block;width:100%;max-width:260px;height:8px;margin-top:6px;accent-color:var(--accent)}.wk-row a:focus-visible,.wk-row .wk-title{outline-offset:2px}.ov-panel[data-overview=week]{grid-column:1/-1}
+.wk-metrics{align-items:stretch}.wk-badge{font-size:11px;color:var(--text-secondary);line-height:1.3}.wk-badge[data-coverage=partial],.wk-badge[data-coverage=unknown]{color:var(--status-attention)}.wk-count{color:var(--text-muted);font-weight:400}.wk-progress{display:block;width:100%;max-width:260px;height:8px;margin-top:6px;accent-color:var(--accent)}.wk-filters{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}.wk-chip[aria-pressed=true]{background:var(--accent);color:var(--bg,#fff);border-color:var(--accent)}.wk-more{margin:4px 0 8px}.wk-row{flex-wrap:wrap}.wk-details{flex:1 0 100%;display:grid;grid-template-columns:max-content minmax(0,1fr);gap:2px 12px;margin:8px 0 0;font-size:13px;overflow-wrap:anywhere}.wk-details dt{color:var(--text-secondary)}.wk-details dd{margin:0}
+.wk-row a:focus-visible,.wk-row .wk-title{outline-offset:2px}.ov-panel[data-overview=week]{grid-column:1/-1}
 @media(max-width:960px){.wk-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.wk-progress{max-width:none}}
 @media(prefers-reduced-motion:reduce){.wk-progress{transition:none}}
 </style>`;
@@ -369,6 +406,7 @@ function saveSnoozed(map) {
   try { localStorage.setItem(SNOOZE_KEY, JSON.stringify(Object.fromEntries(map))); } catch { /* ignore */ }
 }
 
+const toggled=(list,key)=>{const set=new Set(Array.isArray(list)?list:[]);if(!set.delete(key))set.add(key);return [...set];};
 export function mountOverview(container, client, { freshness = () => null, workCenter = false } = {}) {
   const CARDS=overviewCards(workCenter);
   let disposed=false, clock=null, received=Date.now();
@@ -477,6 +515,7 @@ export function mountOverview(container, client, { freshness = () => null, workC
       const snooze=hadFocus ? focused.dataset?.snooze : null;
       const attentionToggle=hadFocus && focused.hasAttribute('data-attention-toggle');
       const attentionList=hadFocus && focused.id==='ov-attention-items';
+      const weekControl=hadFocus ? ['weekFilter','weekMore','weekDetail'].map(k=>[k,focused.dataset?.[k]]).find(([,v])=>v!==undefined) : null;
       const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
       const metrics=live?snapshotText(element,'.ov-metric strong',metricKey):null;
       // Morphed in place: unchanged rows and metric tiles keep their nodes (and any focus/scroll),
@@ -491,7 +530,7 @@ export function mountOverview(container, client, { freshness = () => null, workC
       const expandedList=element.querySelector('.ov-attention-list.is-expanded');
       if(expandedList)expandedList.scrollTop=attentionScroll;
       if(hadFocus) {
-        const target=attentionToggle ? element.querySelector('[data-attention-toggle]') : attentionList ? expandedList : href ? [...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href) : snooze ? [...element.querySelectorAll('[data-snooze]')].find(button=>button.dataset.snooze===snooze) : null;
+        const target=attentionToggle ? element.querySelector('[data-attention-toggle]') : attentionList ? expandedList : weekControl ? [...element.querySelectorAll('button')].find(b=>b.dataset[weekControl[0]]===weekControl[1]) : href ? [...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href) : snooze ? [...element.querySelectorAll('[data-snooze]')].find(button=>button.dataset.snooze===snooze) : null;
         const fallback=element.querySelector('h2');
         if(fallback)fallback.tabIndex=-1;
         (target || fallback)?.focus({preventScroll:true});
@@ -536,6 +575,11 @@ export function mountOverview(container, client, { freshness = () => null, workC
     delete data.weeklyHistory;loadWeekly();draw();
   });
   container.addEventListener('click',event=>{
+    // G5: in-memory only (per page); keys come from our own markup and are validated by weekCardModel.
+    const wkFilter=event.target.closest?.('[data-week-filter]'), wkMore=event.target.closest?.('[data-week-more]'), wkDetail=event.target.closest?.('[data-week-detail]');
+    if(wkFilter){data.weekFilter=data.weekFilter===wkFilter.dataset.weekFilter?undefined:wkFilter.dataset.weekFilter;draw();return;}
+    if(wkMore){data.weekExpanded=toggled(data.weekExpanded,wkMore.dataset.weekMore);draw();return;}
+    if(wkDetail){data.weekDetails=toggled(data.weekDetails,wkDetail.dataset.weekDetail);draw();return;}
     if(event.target.closest?.('[data-attention-toggle]')){data.attentionExpanded=!data.attentionExpanded;draw();return;}
     const control=event.target.closest?.('[data-overview-action], [data-overview-reset]');
     if(control) {

@@ -139,3 +139,116 @@ test('G4: storage round trip validates, and throwing storage still works', () =>
   assert.deepEqual(loadWeekPreferences(undefined), {timeZone: null, weekStart: 'monday'});
   assert.match(render({}), /This week/);
 });
+
+// ---- G5: per-group expansion, metric filter chips, row details ----
+const many = (n, o = () => ({})) => Array.from({length: n}, (_, i) => projection(`pi:M${i}`, `Mission ${i}`, o(i)));
+const recorded = (id, created, updated, o = {}) => ({mission_id: id, title: `Done ${id}`, created_at: created, updated_at: updated, ...o});
+const group = (m, key) => m.groups.find(g => g.key === key);
+test('G5: a group over the cap lists 5 rows, with a Show all N button that lists them all and a Show fewer that restores the cap', () => {
+  const data = {projections: many(8)};
+  const m = weekCardModel({timeZone: 'UTC', ...data}, loaded, now, now);
+  assert.equal(group(m, 'active').total, 8);
+  assert.equal(group(m, 'active').shown.length, 5);
+  const html = render(data);
+  assert.equal((html.match(/class="ov-row wk-row"/g) || []).length, 5);
+  assert.match(html, /<button type="button"[^>]*data-week-more="active"[^>]*aria-expanded="false"[^>]*>Show all 8<\/button>/);
+  const open = render({...data, weekExpanded: ['active']});
+  assert.equal((open.match(/class="ov-row wk-row"/g) || []).length, 8);
+  assert.match(open, /data-week-more="active"[^>]*aria-expanded="true"[^>]*>Show fewer<\/button>/);
+  assert.equal(group(weekCardModel({timeZone: 'UTC', ...data, weekExpanded: ['active']}, loaded, now, now), 'active').shown.length, 8);
+});
+test('G5: a group within the cap has no expand button', () => {
+  assert.doesNotMatch(render({projections: many(5)}), /data-week-more/);
+});
+test('G5: expansion is per group', () => {
+  const data = {projections: many(7), weekExpanded: ['paused']};
+  assert.equal(group(weekCardModel({timeZone: 'UTC', ...data}, loaded, now, now), 'active').shown.length, 5);
+});
+const blocked = {activity: {health: 'blocked'}};
+test('G5: the filter chips narrow rows by metric, are aria-pressed buttons, and a second press is a clear', () => {
+  const data = {projections: [projection('pi:A', 'Calm'), projection('pi:B', 'Stuck', blocked)]};
+  const html = render({...data, weekFilter: 'attention'});
+  assert.match(html, /<button type="button"[^>]*data-week-filter="attention"[^>]*aria-pressed="true"/);
+  assert.match(html, /data-week-filter="started"[^>]*aria-pressed="false"/);
+  for (const k of ['started', 'finished', 'open', 'paused', 'attention']) assert.match(html, new RegExp(`data-week-filter="${k}"`));
+  assert.match(html, /Stuck/);
+  assert.doesNotMatch(html, /Calm/);
+  assert.match(html, /Filter: Needs attention/);
+  assert.match(render(data), /Calm/);
+});
+test('G5: a filter never changes the headline counts', () => {
+  const data = {projections: [projection('pi:A', 'Calm'), projection('pi:B', 'Stuck', blocked)], missions: [recorded('MSN-9', '2026-11-03T10:00:00Z', '2026-11-03T11:00:00Z')]};
+  const base = weekCardModel({timeZone: 'UTC', ...data}, loaded, now, now).week;
+  for (const f of ['started', 'finished', 'open', 'paused', 'attention']) {
+    const m = weekCardModel({timeZone: 'UTC', ...data, weekFilter: f}, loaded, now, now);
+    assert.deepEqual(m.week, base, f);
+    assert.equal(m.total, 3, f);
+    assert.equal(m.partial, true, f);
+  }
+  const strip = h => h.match(/<div class="ov-metrics wk-metrics">.*?<\/div>\s*<p/s)?.[0];
+  assert.equal(strip(render({...data, weekFilter: 'attention'})), strip(render(data)));
+});
+test('G5: the Unconfirmed group is never hidden by a filter, and the filter says so', () => {
+  const stale = projection('pi:S', 'Old report', {freshness: {state: 'stale', age_seconds: 9000}, activity_snapshot_at: iso(now - 9000e3)});
+  const data = {projections: [projection('pi:A', 'Calm'), stale]};
+  const m = weekCardModel({timeZone: 'UTC', ...data, weekFilter: 'attention'}, loaded, now, now);
+  assert.equal(group(m, 'unconfirmed')?.shown.length, 1, 'unconfirmed row is kept');
+  assert.equal(group(m, 'active').items.length, 0, 'calm active row filtered out');
+  assert.equal(group(m, 'active').total, 1, 'its total is still known');
+  const html = render({...data, weekFilter: 'attention'});
+  assert.match(html, /Old report/);
+  assert.match(html, /Unconfirmed work is always listed/);
+});
+test('G5: a filter that matches nothing says so and keeps the counts and chips', () => {
+  const html = render({projections: [projection('pi:A', 'Calm')], weekFilter: 'paused'});
+  assert.match(html, /No listed work matches this filter/);
+  assert.match(html, /data-week-filter="paused"[^>]*aria-pressed="true"/);
+});
+test('G5: filter and expansion combine: the cap applies to the filtered rows', () => {
+  const data = {projections: many(9, i => i < 7 ? blocked : {}), weekFilter: 'attention'};
+  const g = group(weekCardModel({timeZone: 'UTC', ...data}, loaded, now, now), 'active');
+  assert.equal(g.total, 9);
+  assert.equal(g.items.length, 7);
+  assert.equal(g.shown.length, 5);
+  assert.match(render(data), /data-week-more="active"[^>]*>Show all 7</);
+});
+test('G5: an unknown filter or expansion value is ignored', () => {
+  const data = {projections: many(2), weekFilter: '__proto__', weekExpanded: 'nope'};
+  const m = weekCardModel({timeZone: 'UTC', ...data}, loaded, now, now);
+  assert.equal(m.filter, null);
+  assert.equal(group(m, 'active').shown.length, 2);
+});
+test('G5: there is no repository filter because work summaries carry no repository', () => {
+  assert.doesNotMatch(render({projections: many(2)}), /data-week-repo|Repository/i);
+});
+test('G5: row details show only fields that exist, with links from the work summary', () => {
+  const data = {projections: [projection('pi:A', 'Repair parser')], sessions: [{session_id: 's-1', host_id: 'beast', status: 'running', updated_at: iso(now - 1000), mission_key: 'pi:A'}], missions: [recorded('A', '2026-11-03T10:00:00Z', '2026-11-03T11:00:00Z')]};
+  const closed = render(data);
+  assert.match(closed, /<button type="button"[^>]*data-week-detail="mission:pi:A"[^>]*aria-expanded="false"/);
+  assert.doesNotMatch(closed, /wk-details/);
+  const html = render({...data, weekDetails: ['mission:pi:A']});
+  assert.match(html, /data-week-detail="mission:pi:A"[^>]*aria-expanded="true"/);
+  const d = html.match(/<dl class="wk-details".*?<\/dl>/s)?.[0] || '';
+  assert.match(d, /Status<\/dt><dd>running/);
+  assert.match(d, /Coverage<\/dt><dd>complete/);
+  assert.match(d, /href="#\/missions\/pi%3AA"/);
+  assert.match(d, /href="#\/herd\/session\/s-1"/);
+  assert.match(d, /Evidence<\/dt>/);
+  assert.doesNotMatch(d, /Next action|Last event|Repository|Owner/i);
+});
+test('G5: details of an unconfirmed row say unconfirmed and omit fields the summary lacks', () => {
+  const stale = projection('pi:S', 'Old report', {freshness: {state: 'stale', age_seconds: 9000}, activity_snapshot_at: iso(now - 9000e3)});
+  const d = render({projections: [stale], weekDetails: ['mission:pi:S']}).match(/<dl class="wk-details".*?<\/dl>/s)?.[0] || '';
+  assert.match(d, /Coverage<\/dt><dd>unconfirmed/);
+  assert.doesNotMatch(d, /Started<\/dt>|Finished<\/dt>/);
+});
+test('G5: hostile ids and titles stay escaped in details', () => {
+  const html = render({projections: [projection('pi:X', '<b onmouseover=1>t</b>')], weekDetails: ['mission:pi:X']});
+  assert.doesNotMatch(html, /<b onmouseover/);
+});
+test('G5: the no-match message also shows when only Unconfirmed rows remain', () => {
+  const stale = projection('pi:S', 'Old report', {freshness: {state: 'stale', age_seconds: 9000}, activity_snapshot_at: iso(now - 9000e3)});
+  const html = render({projections: [projection('pi:A', 'Calm'), stale], weekFilter: 'paused'});
+  assert.match(html, /No listed work matches this filter/);
+  assert.match(html, /Old report/);
+});
