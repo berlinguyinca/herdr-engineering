@@ -311,7 +311,7 @@ class ControlPlaneServer:
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None, annotation_store=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None):
         """
@@ -450,6 +450,8 @@ class ControlPlaneServer:
         self.share_store = share_store
         self.shares_root = shares_root
         self.share_settings = share_settings
+        # Operator controls for member-owned artifacts (a SyncArtifactAdapter over MemberAdmin): absent -> 503.
+        self.member_admin = member_admin
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
         # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
@@ -2063,6 +2065,13 @@ def _make_handler(server, public=False, operator=False):
                 return True
             if self._artifact_acl_allows(artifact_id, permission):
                 return True
+            # Plan 5 D4: an operator key reads and shares (never edits) member-owned artifacts. Gated on the operator
+            # principal first, so any other unauthorized read still never reaches the store.
+            if (permission in ("read", "share") and server.artifact_store is not None and artifact_id
+                    and self._resource_principal().endswith(":operator")
+                    and self._artifact_call("operator_member_access", artifact_id, self._resource_principal(),
+                                            permission)):
+                return True
             # Versioned-registry artifacts (native reports) are also private to their
             # durable owner and grants, which the registry itself records. Reads stay
             # ACL-only: an unauthorized read must never reach the store.
@@ -3055,6 +3064,9 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_members_api import route_members
+                if route_members(self, server, parts, resource):
+                    return None
                 from .artifact_collab_api import route_collab
                 if route_collab(self, server, parts, resource):
                     return None
@@ -4707,7 +4719,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):
-            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant import (
+                AssistantError,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant

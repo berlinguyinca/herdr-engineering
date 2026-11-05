@@ -6,6 +6,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import tempfile
 import uuid
 from collections.abc import Sequence
@@ -17,10 +18,14 @@ from typing import Any
 from . import ids
 from .artifact_context import ArtifactContextMixin
 from .artifact_lifecycle import ArtifactLifecycleMixin
+from .artifact_members import is_member_principal
 from .artifact_merge import FileConflict, merge_manifests
 from .artifact_provenance import ProvenanceError, context_links, normalize_origin
 from .artifact_uploads import ArtifactUploadMixin
 from .rustfs import IntegrityError, RustFSClient
+
+OPERATOR_MEMBER_PERMISSIONS = frozenset({"read", "share"})
+_OPERATOR_PRINCIPAL = re.compile(r"^api-key:[0-9a-f]{16}:operator$")
 
 __all__ = ["ArtifactStore", "ArtifactError", "ArtifactConflict", "ArtifactMergeConflict", "IntegrityError"]
 
@@ -626,6 +631,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             return False
         if artifact.get("created_by") == principal_id:
             return True
+        if await self.operator_member_access(artifact_id, principal_id, permission):
+            return True
         grant = await self._conn.fetchrow(
             "SELECT permissions FROM artifact_acl WHERE artifact_id=$1 AND principal_id=$2 "
             "AND (expires_at IS NULL OR expires_at > now())", artifact_id, principal_id)
@@ -635,6 +642,16 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         if isinstance(permissions, str):
             permissions = json.loads(permissions)
         return permission in permissions or "admin" in permissions
+
+    async def operator_member_access(self, artifact_id: str, principal_id: str, permission: str) -> bool:
+        """Plan 5 D4: an operator API key may ``read`` and ``share`` (never edit or commit) a member-owned artifact
+        that is not tombstoned, so the generic share routes work on member content. ``principal_id`` is the
+        server-derived ``api-key:<hash>:operator``; a member, collab or open-listener principal never matches."""
+        if permission not in OPERATOR_MEMBER_PERMISSIONS or not _OPERATOR_PRINCIPAL.fullmatch(principal_id or ""):
+            return False
+        row = await self._conn.fetchrow(
+            "SELECT created_by, lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id)
+        return bool(row and is_member_principal(row["created_by"]) and row["lifecycle"] != "tombstoned")
 
     async def _validate_existing_blob_scope(self, artifact_id, reference, **metadata):
         # Inspect the actual reference, never the caller's optional SHA metadata:
@@ -977,8 +994,9 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             "(a.created_by=$2 OR EXISTS (SELECT 1 FROM artifact_acl acl "
             "WHERE acl.artifact_id=a.artifact_id AND acl.principal_id=$2 "
             "AND (acl.expires_at IS NULL OR acl.expires_at > now()) "
-            "AND (acl.permissions ? 'read' OR acl.permissions ? 'admin'))) ",
-            artifact_id, principal_id)
+            "AND (acl.permissions ? 'read' OR acl.permissions ? 'admin')) "
+            "OR (a.created_by LIKE 'member:%' AND a.lifecycle <> 'tombstoned' AND $2 ~ $3)) ",
+            artifact_id, principal_id, _OPERATOR_PRINCIPAL.pattern)
         return self._row(row)
 
     async def materialize_version(self, version_id: str, *, host_id: str,

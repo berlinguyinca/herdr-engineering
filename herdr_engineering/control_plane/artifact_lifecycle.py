@@ -16,6 +16,8 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+from .artifact_members import is_member_principal
+
 DEFAULT_HOLD_DAYS = 30.0
 _TRANSITIONS = {
     "archive": ({"active"}, "archived"),
@@ -151,46 +153,116 @@ class ArtifactLifecycleMixin:
         for row in rows:
             artifact_id = row["artifact_id"]
             async with _transaction(self._conn):
+                await self._lock_owner_usage(artifact_id)
                 locked = await self._conn.fetchrow(
                     "SELECT lifecycle FROM artifacts WHERE artifact_id=$1 FOR UPDATE", artifact_id)
                 if locked is None or locked["lifecycle"] != "tombstoned":
                     continue
-                versions = [self._row(v) for v in await self._conn.fetch(
-                    "SELECT * FROM artifact_versions WHERE artifact_id=$1 AND purged_at IS NULL", artifact_id)]
-                keys: set[str] = set()
-                for version in versions:
-                    keys |= self._version_keys(version)
-                for blob in await self._conn.fetch(
-                        "SELECT storage_key FROM artifact_blobs WHERE scope=$1", artifact_id):
-                    keys.add(blob["storage_key"])
-                legacy = await self._conn.fetchrow("SELECT storage_key FROM artifacts WHERE artifact_id=$1", artifact_id)
-                if legacy and legacy["storage_key"]:
-                    keys.add(legacy["storage_key"])
-                deleted, retained = [], []
-                for key in sorted(keys):
-                    if not key.startswith("sha256/"):
-                        digest = self._digest_of(key)
-                        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}" if len(digest) == 64 else key
-                    if not key.startswith("sha256/"):
-                        continue
-                    if await self._key_shared(artifact_id, key):
-                        retained.append(key)
-                        continue
-                    try:
-                        self._rf.delete(key)
-                        deleted.append(key)
-                    except Exception:                       # noqa: BLE001 - recorded, retried next sweep
-                        retained.append(key)
-                await self._conn.execute(
-                    "UPDATE artifact_versions SET state='purged', purged_at=now() "
-                    "WHERE artifact_id=$1 AND purged_at IS NULL", artifact_id)
-                await self._conn.execute("DELETE FROM artifact_blobs WHERE scope=$1", artifact_id)
-                await self._conn.execute(
-                    "INSERT INTO artifact_lifecycle_events (artifact_id, action, from_state, to_state, actor, reason, "
-                    "detail) VALUES ($1,'purge','tombstoned','tombstoned','system','hold window elapsed',$2::jsonb)",
-                    artifact_id, json.dumps({"deleted": deleted, "retained_shared": retained}))
-            results.append({"artifact_id": artifact_id, "deleted": deleted, "retained_shared": retained})
+                outcome = await self._purge_locked(artifact_id, actor="system", reason="hold window elapsed")
+            results.append({"artifact_id": artifact_id, **outcome})
         return results
+
+    async def _lock_owner_usage(self, artifact_id: str) -> None:
+        """A member owner's usage row is locked BEFORE the artifact row (publish takes them in that order), so the
+        ``settle`` at the end of a purge cannot deadlock against a publish."""
+        owner = await self._conn.fetchval("SELECT created_by FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if is_member_principal(owner):
+            from .artifact_member_quota import _lock_usage
+            await _lock_usage(self._conn, owner)
+
+    async def _purge_locked(self, artifact_id: str, *, actor: str, reason: str, strict: bool = False) -> dict:
+        """Delete the unshared bytes of a tombstoned artifact and mark its versions purged. The caller holds the
+        artifact row lock inside a transaction. ``strict`` (operator purge) refuses to mark anything purged when an
+        object delete failed, so a failure is never recorded as a purge. A member-owned artifact also has its
+        recipient data anonymised and its owner's usage settled in the same transaction."""
+        from .artifacts import ArtifactError
+        versions = [self._row(v) for v in await self._conn.fetch(
+            "SELECT * FROM artifact_versions WHERE artifact_id=$1 AND purged_at IS NULL", artifact_id)]
+        keys: set[str] = set()
+        for version in versions:
+            keys |= self._version_keys(version)
+        for blob in await self._conn.fetch("SELECT storage_key FROM artifact_blobs WHERE scope=$1", artifact_id):
+            keys.add(blob["storage_key"])
+        legacy = await self._conn.fetchrow("SELECT storage_key FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if legacy and legacy["storage_key"]:
+            keys.add(legacy["storage_key"])
+        deleted, retained, failed = [], [], []
+        for key in sorted(keys):
+            if not key.startswith("sha256/"):
+                digest = self._digest_of(key)
+                key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}" if len(digest) == 64 else key
+            if not key.startswith("sha256/"):
+                continue
+            if await self._key_shared(artifact_id, key):
+                retained.append(key)
+                continue
+            try:
+                self._rf.delete(key)
+                deleted.append(key)
+            except Exception:                       # noqa: BLE001 - recorded, retried next sweep
+                retained.append(key)
+                failed.append(key)
+        if failed and strict:
+            raise ArtifactError(f"{len(failed)} object(s) could not be deleted; nothing was marked purged")
+        await self._conn.execute(
+            "UPDATE artifact_versions SET state='purged', purged_at=now() "
+            "WHERE artifact_id=$1 AND purged_at IS NULL", artifact_id)
+        await self._conn.execute("DELETE FROM artifact_blobs WHERE scope=$1", artifact_id)
+        await self._conn.execute(
+            "INSERT INTO artifact_lifecycle_events (artifact_id, action, from_state, to_state, actor, reason, "
+            "detail) VALUES ($1,'purge','tombstoned','tombstoned',$2,$3,$4::jsonb)",
+            artifact_id, actor, reason, json.dumps({"deleted": deleted, "retained_shared": retained}))
+        owner = await self._conn.fetchval("SELECT created_by FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if is_member_principal(owner):
+            await self._anonymise_member_data(artifact_id)
+            from .artifact_member_quota import settle
+            await settle(self._conn, owner)
+        return {"deleted": deleted, "retained_shared": retained}
+
+    async def _anonymise_member_data(self, artifact_id: str) -> None:
+        """Per-member data tied to a purged artifact: the recipients and titles of its links, the free-text detail of
+        its member audit rows and its access grants. The rows (who did what, when) remain; nothing identifying does."""
+        await self._conn.execute(
+            "UPDATE artifact_shares SET allow_emails='{}', allow_groups='{}', title=NULL WHERE artifact_id=$1",
+            artifact_id)
+        await self._conn.execute(
+            "UPDATE artifact_member_events SET detail='{}'::jsonb WHERE artifact_id=$1", artifact_id)
+        await self._conn.execute("DELETE FROM artifact_acl WHERE artifact_id=$1", artifact_id)
+
+    async def purge_artifact(self, artifact_id: str, *, actor: str, reason: str = "operator purge") -> dict:
+        """Operator purge, now: tombstone a retracted artifact (no hold window) and purge its bytes at once, ignoring
+        the hold. The state afterwards is the one ``purge_due`` leaves: lifecycle stays ``tombstoned``, versions are
+        ``purged``, blobs are deleted. Only a ``retracted`` artifact, or a ``tombstoned`` one with bytes left, can be
+        purged; every share must already be revoked. Returns ``{"artifact_id", "deleted", "retained_shared"}``."""
+        from .artifacts import ArtifactError, _transaction
+        if not actor:
+            raise ArtifactError("actor is required")
+        async with _transaction(self._conn):
+            await self._lock_owner_usage(artifact_id)
+            row = await self._conn.fetchrow(
+                "SELECT lifecycle FROM artifacts WHERE artifact_id=$1 FOR UPDATE", artifact_id)
+            if row is None:
+                raise ArtifactError(f"no artifact {artifact_id}")
+            lifecycle = row["lifecycle"]
+            if lifecycle not in ("retracted", "tombstoned"):
+                raise ArtifactError(f"cannot purge an artifact that is {lifecycle}; retract it first")
+            if lifecycle == "tombstoned" and not await self._conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM artifact_versions WHERE artifact_id=$1 AND purged_at IS NULL)"
+                    " OR EXISTS (SELECT 1 FROM artifact_blobs WHERE scope=$1)", artifact_id):
+                raise ArtifactError("artifact bytes were already purged")
+            if await self._conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM artifact_shares WHERE artifact_id=$1 AND state<>'revoked')",
+                    artifact_id):
+                raise ArtifactError("revoke the artifact's share links before purging")
+            if lifecycle == "retracted":
+                await self._conn.execute(
+                    "UPDATE artifacts SET lifecycle='tombstoned', tombstoned_at=now(), purge_after=now() "
+                    "WHERE artifact_id=$1", artifact_id)
+                await self._conn.execute(
+                    "INSERT INTO artifact_lifecycle_events (artifact_id, action, from_state, to_state, actor, reason) "
+                    "VALUES ($1,'tombstone','retracted','tombstoned',$2,$3)", artifact_id, actor, reason)
+            outcome = await self._purge_locked(artifact_id, actor=actor, reason=reason, strict=True)
+        return {"artifact_id": artifact_id, **outcome}
 
     # -------------------------------------------------------------- reconcile
     async def mark_linked(self, version_id: str, *, error: str | None = None) -> None:

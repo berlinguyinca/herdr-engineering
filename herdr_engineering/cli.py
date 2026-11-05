@@ -365,6 +365,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_share_subparser(asub)
     from .artifact_collab_client import add_collab_subparser
     add_collab_subparser(asub)
+    from .artifact_members_client import add_members_subparser
+    add_members_subparser(asub)
     from .artifact_browse_client import add_browse_subparsers
     add_browse_subparsers(asub)
     from .teams_client import add_teams_subparser
@@ -3765,6 +3767,22 @@ def _share_wiring(cp: dict, dsn: str | None):
     return artifact_adapter.SyncArtifactAdapter(create_share_store), Path(share.get("shares_dir") or "/shares"), settings
 
 
+def _member_admin_wiring(cp: dict, dsn: str | None):
+    """The operator member controls (adapter over ``MemberAdmin``) when ``control_plane.collab.members`` is enabled and a
+    DSN exists, else None (the routes answer 503). The configured limit defaults feed the effective limits shown."""
+    got = _members_settings(cp)
+    if got is None or not dsn:
+        return None
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_members_api import MemberAdmin
+
+    async def create():
+        import asyncpg
+        return MemberAdmin(await asyncpg.connect(dsn), defaults=got["defaults"])
+
+    return artifact_adapter.SyncArtifactAdapter(create)
+
+
 def _collab_grant_wiring(cp: dict, dsn: str | None):
     """(grant store adapter, enabled) when control_plane.collab_artifacts.enabled is exactly true and a DSN exists, else
     (None, False). The owner routes for collaborators, activity and diffs use the adapter's call path."""
@@ -3958,6 +3976,7 @@ def _cmd_cp_web(args) -> int:
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
+    member_admin = _member_admin_wiring(cp, dsn)
     collab_grant_store, collab_artifacts_enabled = _collab_grant_wiring(cp, dsn)
     collab = None
     artifact_bridge = None
@@ -4089,7 +4108,7 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
-                             annotation_store=annotation_store,
+                             annotation_store=annotation_store, member_admin=member_admin,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
@@ -4124,6 +4143,8 @@ def _cmd_cp_web(args) -> int:
             artifact_bridge.stop()
         if artifact_adapter is not None:
             artifact_adapter.close()
+        if member_admin is not None:
+            member_admin.close()
         if share_store is not None:
             share_store.close()
         if annotation_store is not None:

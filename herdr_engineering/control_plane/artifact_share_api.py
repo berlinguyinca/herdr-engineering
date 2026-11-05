@@ -452,18 +452,25 @@ def _show(handler, server, share):
     handler._json(out)
 
 
-def _revoke(handler, server, share):
+def revoke_share(server, share, actor):
+    """Revoke one share: its served state first, then the row, then the bundle; returns the revoked row.
+
+    Shared by the owner route, the operator member controls and purge, so no path leaves a bundle behind."""
     root = Path(server.shares_root)
     if share.get("token_hash"):
         remove_state(root, share["token_hash"])
-    row = _call(server.share_store, "mark_revoked", share["share_id"], actor=handler._resource_principal())
+    row = _call(server.share_store, "mark_revoked", share["share_id"], actor=actor)
     # An approve that raced this revoke (pending when read above, live just before mark_revoked) set a token hash
     # this call has not seen: read it back so its state.json cannot outlive the revoked row.
     latest = _call(server.share_store, "get", share["share_id"]) or {}
     if latest.get("token_hash") and latest["token_hash"] != share.get("token_hash"):
         remove_state(root, latest["token_hash"])
     remove_bundle(root, share["share_id"])
-    handler._json({"share": _jsonable(row)})
+    return row
+
+
+def _revoke(handler, server, share):
+    handler._json({"share": _jsonable(revoke_share(server, share, handler._resource_principal()))})
 
 
 def route_share(handler, server, parts, resource) -> bool:
