@@ -83,18 +83,17 @@ def _when(value: object, now: datetime) -> datetime | None:
     return min(at, now + MAX_FUTURE)
 
 
-def _admitted(share: Any, email: str, basis: object, owner_emails: frozenset[str]) -> bool:
-    """Whether ``email`` may still annotate ``share`` by its CURRENT allow-list (the ingest-time twin of the POST check).
+def _admitted(share: Any, email: str, basis: object) -> bool:
+    """Whether ``email`` may still annotate ``share`` by its CURRENT allow-list, by the basis the session was admitted on.
 
-    ``basis`` is how the session was admitted (``e`` email / ``g`` group claim); a line without one (spooled before the
-    field existed) passes when either basis still holds. The share owner's emails stay admitted, as at POST time."""
+    The ingest-time twin of the edge's POST check (``share_lab.still_admitted``): same function, same rules, no owner
+    exception. ``basis`` must be ``e`` or ``g``; anything else (missing, bogus) is refused, and only that basis is checked."""
     from .share_lab import still_admitted
+    if basis not in ("e", "g"):
+        return False
     state = {"audience": share["audience"], "allow_emails": list(share["allow_emails"] or []),
              "allow_groups": list(share["allow_groups"] or [])}
-    if email.lower() in owner_emails:
-        return True
-    bases = (basis,) if basis in ("e", "g") else ("e", "g")
-    return any(still_admitted(state, email, b) for b in bases)
+    return still_admitted(state, email, basis)
 
 
 def _live_at(share: Any, at: datetime) -> bool:
@@ -168,7 +167,9 @@ class AnnotationStore:
             return "invalid"
         if not _live_at(share, at):
             return "not_live"
-        if not _admitted(share, email, record.get("basis"), owner_emails):
+        if record.get("basis") not in ("e", "g"):
+            return "invalid"                # every line names how its author was admitted
+        if not _admitted(share, email, record.get("basis")):
             return "not_on_list"            # removed from the allow-list between the POST and this ingest
         version = {"output_manifest": json.loads(share["output_manifest"]),
                    "report_descriptor": json.loads(share["report_descriptor"]) if share["report_descriptor"] else None}
@@ -222,8 +223,10 @@ class AnnotationStore:
             return "not_open"
         if not _live_at(share, at):
             return "not_live"
-        if op == "edit" and not _admitted(share, row["author_email"], None, owner_emails):
-            return "not_on_list"            # a removed member can still withdraw their note, never rewrite it
+        if record.get("basis") not in ("e", "g"):
+            return "invalid"
+        if not _admitted(share, row["author_email"], record.get("basis")):
+            return "not_on_list"            # removed since the POST: neither an edit nor a withdrawal is applied
         if op == "edit":
             await conn.execute("UPDATE artifact_annotations SET body = $2, edited_at = $3, updated_at = now() "
                                "WHERE annotation_id = $1", annotation_id, body, at)

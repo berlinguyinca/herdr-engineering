@@ -1539,7 +1539,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             else:
                 verb = parts[7]
                 record = {"v": 1, "op": verb, "annotation_id": annotation_id, "share_id": share_id,
-                          "author_identity": identity, "at": at}
+                          "author_identity": identity, "basis": got["basis"], "at": at}
                 if verb == "edit":
                     record["body"] = parse_edit_request(raw, max_chars=max_chars)
                 else:
