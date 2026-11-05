@@ -2499,7 +2499,7 @@ def _make_handler(server, public=False, operator=False):
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
                                     "assistant-action-requests", "assistant-grants", "assistant-judges",
-                                    "assistant-slack", "assistant-team-briefs"}
+                                    "assistant-slack", "assistant-deploys", "assistant-team-briefs"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
@@ -2609,7 +2609,7 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-notifications", "assistant-apps",
                                         "assistant-reminders", "assistant-workers",
                                         "assistant-action-requests", "assistant-grants", "assistant-judges",
-                                        "assistant-slack"}
+                                        "assistant-slack", "assistant-deploys"}
 
         def _mutate_verb(self):
             if operator:
@@ -2641,7 +2641,7 @@ def _make_handler(server, public=False, operator=False):
                 return err
             if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
                             "assistant-action-requests", "assistant-grants", "assistant-judges",
-                            "assistant-slack"):
+                            "assistant-slack", "assistant-deploys"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3967,6 +3967,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_judges(parts)
             if resource == "assistant-slack":
                 return self._assistant_slack(parts)
+            if resource == "assistant-deploys":
+                return self._assistant_deploys(parts)
             if resource in ("assistant-team-briefs", "assistant-references"):
                 return self._assistant_briefs(parts, resource, None)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
@@ -4443,6 +4445,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource, body)
             if resource == "assistant-judges":
                 return self._assistant_judges(parts, body)
+            if resource == "assistant-deploys":
+                return self._assistant_deploys(parts, body)
             if resource == "assistant-team-briefs":
                 return self._assistant_briefs(parts, resource, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
@@ -4828,6 +4832,99 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"error": "body must be empty"}, 400)
                     return self._json(check_view(judge, fallback))
                 return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+
+        def _assistant_deploys(self, parts, body=None):
+            """Owner-only deploy permission per project and scope.
+
+            GET    /api/v1/assistant-deploys                              configured projects/scopes, live standing grants
+            POST   /api/v1/assistant-deploys/<project>/<scope>/auto       {"worker_id", "confirm": true}: ASKS in Slack
+            DELETE /api/v1/assistant-deploys/<project>/<scope>/auto?worker_id=...   revokes the standing grant
+
+            The POST only posts a confirmation to the owner's Slack; the standing grant is created by the owner's
+            verified Confirm tap and by nothing else.  No token, token path or secret is ever returned."""
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant_hub.actiongrants import GrantState
+            from .assistant_hub.deploy import DeployMatch, scope_key
+            from .assistant_hub.policy import STANDING, current_judge_version, revoke_action_grant
+            from .assistant_hub.slack import SlackError
+            if self._require("operator"):
+                return None
+            try:
+                svc = server.assistant
+                svc._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                projects = (svc.config.get("deploy") or {}).get("projects") or {}
+                policy, now = int(svc.config["grants"]["policy_version"]), svc.now()
+                version = current_judge_version(server.assistant_judge)
+
+                def standing(match):
+                    key_id = scope_key(match).key_id()
+                    return [g for g in svc.store.list_action_grants(tenant_id, user_id)
+                            if g.key_id == key_id and g.source == STANDING
+                            and g.effective_state(now, policy, version) is GrantState.ACTIVE]
+
+                if len(parts) == 4 and self.command == "GET":
+                    out = []
+                    for pid, proj in projects.items():
+                        scopes = []
+                        for sid, scope in proj["scopes"].items():
+                            workers = sorted({g.worker_id for g in standing(DeployMatch(pid, sid, proj["repo"], "", ""))})
+                            scopes.append({"scope": sid, "mode": scope["mode"], "command": scope["command"],
+                                           "require": list(scope["require"]), "standing_grant": bool(workers),
+                                           "workers": workers})
+                        out.append({"project": pid, "repo": proj["repo"], "scopes": scopes})
+                    return self._json({"projects": out})
+                if len(parts) != 7 or parts[6] != "auto" or self.command not in ("POST", "DELETE"):
+                    return self._json({"error": "not found"}, 404)
+                proj = projects.get(parts[4])
+                if proj is None or parts[5] not in proj["scopes"]:
+                    return self._json({"error": "not found"}, 404)
+                project, scope = parts[4], parts[5]
+
+                def active_worker(worker_id):
+                    w = svc.store.workers.get(worker_id) if isinstance(worker_id, str) else None
+                    return (w is not None and w.status == "active"
+                            and (w.tenant_id, w.user_id) == (tenant_id, user_id))
+
+                runtime = server.assistant_slack
+                if self.command == "POST":
+                    if (not isinstance(body, dict) or set(body) != {"worker_id", "confirm"} or body["confirm"] is not True
+                            or not isinstance(body["worker_id"], str)
+                            or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", body["worker_id"])):
+                        return self._json({"error": 'body must be exactly {"worker_id": "...", "confirm": true}'}, 400)
+                    if not active_worker(body["worker_id"]):
+                        return self._json({"error": "not found"}, 404)
+                    if runtime is None or not runtime.is_enabled():
+                        return self._json({"error": "Slack is not enabled, so the confirmation cannot be asked",
+                                           "code": "unavailable"}, 503)
+                    try:
+                        ask = runtime.ask_deploy_auto(tenant_id, user_id, project, scope, body["worker_id"])
+                    except SlackError as exc:
+                        return self._json({"error": "the confirmation could not be posted to Slack",
+                                           "code": exc.code}, 502)
+                    return self._json({"status": "awaiting_confirmation", "ask_id": ask.ask_id,
+                                       "expires_at": self._iso(ask.expires_at)}, 202)
+                from urllib.parse import parse_qs, urlsplit
+                worker_id = _q(self.path, "worker_id")
+                if (set(parse_qs(urlsplit(self.path).query)) != {"worker_id"} or not worker_id
+                        or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", worker_id)):
+                    return self._json({"error": "exactly one query parameter, worker_id, is required"}, 400)
+                if runtime is not None:
+                    runtime.retire_deploy_asks(tenant_id, user_id, project, scope, worker_id)
+                live = [g for g in standing(DeployMatch(project, scope, proj["repo"], "", "")) if g.worker_id == worker_id]
+                if not live:
+                    return self._json({"error": "no standing grant"}, 404)
+                for g in live:
+                    revoke_action_grant(svc.store, now, tenant_id, user_id, g.grant_id, revoked_by=user_id,
+                                        policy_version=policy, judge_version=version)
+                return self._json({"revoked": len(live)})
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)
             except RateLimited as exc:

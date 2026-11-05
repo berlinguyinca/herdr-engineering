@@ -26,10 +26,12 @@ from typing import Any
 
 from ..assistant import AssistantStore
 from .actiongrants import ActionRequestRow, GrantState, as_utc
+from .deploy import DeployMatch, scope_key
 from .evidence import propose_if_ready
 from .policy import (
     ActivationRefused,
     activate_grant,
+    create_standing_grant,
     current_judge_version,
     in_shadow,
     record_owner_decision,
@@ -37,7 +39,7 @@ from .policy import (
 from .slack_asks import SlackAsk, button_value, new_ask_id, new_nonce
 from .verbs import ActionKey, Verb
 
-__all__ = ["SlackClient", "SlackError", "SlackRuntime", "ASK_ACTIONS", "slack_text", "slack_api_call", "PERMANENT_ERRORS",
+__all__ = ["SlackClient", "SlackError", "SlackRuntime", "ASK_ACTIONS", "DEPLOY_ACTIONS", "slack_text", "slack_api_call", "PERMANENT_ERRORS",
            "refusal_sentence"]
 
 _log = logging.getLogger("herdr_engineering.assistant_hub.slack")
@@ -46,6 +48,7 @@ _MAX_REPLY = 1024 * 1024
 PERMANENT_ERRORS = frozenset({"channel_not_found", "invalid_auth", "not_in_channel", "account_inactive",
                               "token_revoked", "is_archived", "token_expired", "missing_scope", "disabled", "token"})
 ASK_ACTIONS = {"ask_approve": (True, False), "ask_deny": (False, False), "ask_remember": (True, True)}
+DEPLOY_ACTIONS = {"deploy_confirm": True, "deploy_cancel": False}       # kind "deploy" asks only
 _ID = re.compile(r"[A-Za-z0-9_.\-]{1,64}")
 SLACK_ACTOR = "hub:slack"
 
@@ -185,6 +188,9 @@ _SENTENCES = {
     "confirmation_missing": "your confirmation was missing",
     "not_enough_approvals": "this action has not been approved enough times yet, across enough sessions and tasks",
     "not_rememberable": "this kind of action can never be remembered, so it will always ask you",
+    "grant_cap": "this account already holds the maximum number of permissions",
+    "not_configured": "that deploy scope is no longer configured the way you were asked about, so nothing was turned on",
+    "no_worker": "that worker is no longer active, so nothing was turned on",
 }
 
 
@@ -256,6 +262,7 @@ class SlackRuntime:
         self._summary_interval = summary_interval    # how often the idle timer looks at unfinished task trackers
         self._next_summary = 0.0
         self._summ = threading.Lock()                # one tracker row per (worker, task): creation is serialized
+        self._deploy_lock = threading.Lock()         # one deploy confirmation posted at a time (it retires the older)
         self._failed_at: dict[str, float] = {}
         self._batched: dict[str, None] = {}          # request ids folded into a batched line: the sweep skips them
         self._current: str = ""                      # request id being posted right now
@@ -861,10 +868,11 @@ class SlackRuntime:
         action = actions[0] if isinstance(actions, list) and len(actions) == 1 and isinstance(actions[0], dict) else {}
         value, action_id = action.get("value"), action.get("action_id")
         parts = value.split(":") if isinstance(value, str) else []
-        if payload.get("type") != "block_actions" or len(parts) != 2 or action_id not in ASK_ACTIONS:
+        deploy_tap = action_id in DEPLOY_ACTIONS
+        if payload.get("type") != "block_actions" or len(parts) != 2 or not (action_id in ASK_ACTIONS or deploy_tap):
             return self._refuse("bad_payload", None, uid)
         ask = self.store.find_slack_ask(parts[0])
-        if ask is None or ask.kind != "action":
+        if ask is None or ask.kind != ("deploy" if deploy_tap else "action"):      # a button only acts on its own kind
             return self._refuse("no_ask", None, uid)
         if not ask.nonce or not hmac.compare_digest(parts[1].encode(), ask.nonce.encode()):
             return self._refuse("bad_nonce", ask, uid)
@@ -878,6 +886,8 @@ class SlackRuntime:
         if (not ask.channel or not ask.ts or channel.get("id") != ask.channel or message.get("ts") != ask.ts
                 or "edited" in message):
             return self._refuse("wrong_message", ask, uid)
+        if deploy_tap:
+            return self._deploy_tap(ask, DEPLOY_ACTIONS[action_id], uid, now)
         row = self.store.get_action_request(ask.request_id, tenant_id=ask.tenant_id, user_id=ask.user_id)
         if row is None:
             return self._refuse("no_request", ask, uid)
@@ -906,6 +916,127 @@ class SlackRuntime:
         self._show_outcome(ask, row.display, approve, uid)
         if approve:
             self._remember(ask, row, uid, now)
+
+    # -- standing deploy permission ----------------------------------------------------------------
+    def _deploy_scope(self, project: str, scope: str) -> tuple[str, str] | None:
+        """(repo, command) of a configured deploy scope, or None."""
+        proj = ((self.service.config.get("deploy") or {}).get("projects") or {}).get(project)
+        found = ((proj or {}).get("scopes") or {}).get(scope)
+        if not isinstance(proj, dict) or not isinstance(found, dict):
+            return None
+        return str(proj["repo"]), str(found["command"])
+
+    def ask_deploy_auto(self, tenant_id: str, user_id: str, project: str, scope: str, worker_id: str) -> SlackAsk:
+        """Post the owner's confirmation for turning on auto-deploy and return its ask.  NOTHING is granted here: the
+        standing grant exists only after the owner's verified Confirm tap.  Older open asks for the same worker and scope
+        are retired.  Raises ``SlackError`` (no usable ask is left behind) when it cannot be posted."""
+        cfg = self._cfg()
+        if not cfg.get("enabled"):
+            raise SlackError("disabled")
+        found = self._deploy_scope(project, scope)
+        if found is None:
+            raise SlackError("not_configured")
+        repo, command = found
+        now = as_utc(self._now())
+        ttl = timedelta(minutes=int(cfg.get("ask_ttl_minutes") or 15))
+        with self._deploy_lock:
+            for old in self.store.list_slack_asks(tenant_id, user_id, "open"):
+                if (old.kind, old.project, old.scope, old.worker_id) == ("deploy", project, scope, worker_id):
+                    old.status = "expired"
+                    self.store.put_slack_ask(old)
+            channel = self._target(cfg)
+            ask = SlackAsk(ask_id=new_ask_id(), tenant_id=tenant_id, user_id=user_id, kind="deploy", nonce=new_nonce(),
+                           channel=channel, created_at=now, expires_at=now + ttl, worker_id=worker_id,
+                           project=project, scope=scope, repo=repo, command=command)
+            self.store.put_slack_ask(ask)
+            try:
+                ts = self.client.post_message(channel, self._deploy_blocks(ask, repo, command),
+                                              f"Turn on auto-deploy for {slack_text(project)} / {slack_text(scope)}?")
+            except SlackError:
+                ask.status = "expired"
+                self.store.put_slack_ask(ask)
+                raise
+            ask.ts = ts
+            self.store.put_slack_ask(ask)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=SLACK_ACTOR,
+                                action="assistant.slack.ask_posted", subject_id=ask.ask_id,
+                                detail=f"ask={ask.ask_id} kind=deploy project={_short_id(project)} "
+                                       f"scope={_short_id(scope)} worker={_short_id(worker_id)}")
+        return ask
+
+    @staticmethod
+    def _deploy_blocks(ask: SlackAsk, repo: str, command: str) -> list[dict[str, Any]]:
+        lines = ["*Turn on auto-deploy?*",
+                 f"Project: `{slack_text(ask.project)}`  Scope: `{slack_text(ask.scope)}`",
+                 f"Repo: `{slack_text(repo)}`  Command: `{slack_text(command)}`",
+                 f"Worker: `{slack_text(ask.worker_id)}`",
+                 "If you confirm, this worker may deploy this scope without asking you each time, for any commit "
+                 "that passes the hub's own checks, until the permission expires or you revoke it. "
+                 "The safety judge, the shadow period and every veto still apply. Cancel does nothing."]
+        value = button_value(ask)
+
+        def button(label: str, action_id: str, style: str) -> dict[str, Any]:
+            return {"type": "button", "text": {"type": "plain_text", "text": label}, "action_id": action_id,
+                    "value": value, "style": style}
+
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
+                {"type": "actions", "elements": [button("Confirm", "deploy_confirm", "primary"),
+                                                 button("Cancel", "deploy_cancel", "danger")]}]
+
+    def retire_deploy_asks(self, tenant_id: str, user_id: str, project: str, scope: str, worker_id: str) -> int:
+        """Close every open confirmation for this worker and scope (the owner revoked it): a later tap is refused."""
+        closed = 0
+        with self._tap:
+            for old in self.store.list_slack_asks(tenant_id, user_id, "open"):
+                if (old.kind, old.project, old.scope, old.worker_id) == ("deploy", project, scope, worker_id):
+                    old.status = "expired"
+                    self.store.put_slack_ask(old)
+                    closed += 1
+        return closed
+
+    def _deploy_tap(self, ask: SlackAsk, confirm: bool, uid: str, now: datetime) -> None:
+        """A verified tap on a deploy confirmation (owner, nonce, open, unexpired, the very message).  The ask is spent
+        first, so a second tap can never create a second grant; Confirm creates the standing grant through the real
+        gates and Cancel creates nothing."""
+        if ask.status != "open":
+            return self._refuse("not_open", ask, uid)
+        ask.status = "decided"
+        self.store.put_slack_ask(ask)
+        outcome = "deploy_confirm" if confirm else "deploy_cancel"
+        self.store.audit_record(tenant_id=ask.tenant_id, user_id=ask.user_id, actor=f"slack:{uid}",
+                                action="assistant.slack.decision", subject_id=ask.ask_id,
+                                detail=f"{outcome} ask={ask.ask_id} project={_short_id(ask.project)} "
+                                       f"scope={_short_id(ask.scope)} worker={_short_id(ask.worker_id)}")
+        label = f"{slack_text(ask.project)} / {slack_text(ask.scope)}"
+        if not confirm:
+            return self._edit_message(ask, f"Auto-deploy for {label}", f"Cancelled by <@{uid}>; nothing was turned on")
+        refusal = self._confirm_deploy(ask, uid, now)
+        if refusal is None:
+            self._edit_message(ask, f"Auto-deploy for {label}", f"Confirmed by <@{uid}>")
+        else:
+            self._edit_message(ask, f"Auto-deploy for {label}", f"Not turned on (confirmed by <@{uid}>)")
+            self._say(ask, f"Auto-deploy was not turned on: {_SENTENCES.get(refusal, _SENTENCES['judge_error'])}.")
+
+    def _confirm_deploy(self, ask: SlackAsk, uid: str, now: datetime) -> str | None:
+        """None when the standing grant exists (now or already), otherwise the refusal code.  Re-checks everything the
+        ask said against the CURRENT config and worker: a changed scope or a revoked worker creates nothing."""
+        found = self._deploy_scope(ask.project, ask.scope)
+        worker = self.store.workers.get(ask.worker_id)
+        if found is None or found != (ask.repo, ask.command):
+            return "not_configured"
+        if worker is None or worker.status != "active" or (worker.tenant_id, worker.user_id) != (ask.tenant_id,
+                                                                                               ask.user_id):
+            return "no_worker"
+        key = scope_key(DeployMatch(ask.project, ask.scope, found[0], "", ""))
+        try:
+            create_standing_grant(self.store, self.service.config["grants"], now, ask.tenant_id, ask.user_id,
+                                  ask.worker_id, key, f"slack:{uid}", current_judge_version(self.judge), self.judge)
+        except ActivationRefused as exc:
+            return exc.code
+        except Exception as exc:              # nothing was created; the owner is told the check could not run
+            _log.warning("slack deploy confirm failed: %s", type(exc).__name__)
+            return "judge_error"
+        return None
 
     # -- approve and remember ----------------------------------------------------------------------
     def _remember(self, ask: SlackAsk, row: ActionRequestRow, uid: str, now: datetime) -> None:

@@ -47,6 +47,10 @@ class SlackAsk:
     context: str = ""
     last_activity: datetime = _EPOCH  # summary rows: when the worker's task last did anything (the idle timer's clock)
     final: bool = False               # summary rows: the worker said the task is finished (post at once)
+    project: str = ""                 # deploy asks: the configured project and scope the owner is asked to turn on
+    scope: str = ""
+    repo: str = ""                    # deploy asks: the repo and command the owner was shown (the tap re-checks them)
+    command: str = ""
 
 
 def button_value(ask: SlackAsk) -> str:
