@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import re
 import threading
@@ -48,6 +49,11 @@ MISSION_FIELDS = frozenset((
 PI_V4_FIELDS = ('created_at', 'completed_at', 'links')
 SUMMARY_MISSION_FIELDS = ('id', 'title', 'status', 'goal', 'canonicalState', 'created_at', 'completed_at')
 MAX_LINKS = 20
+# G8-C durable mirror: a private stream, one bounded row per accepted snapshot (throttled per mission).
+ENTITY_TYPE = 'mission_activity_store'
+STORED_EVENT = 'MissionActivityStored'
+PERSIST_INTERVAL_SECONDS = 30
+log = logging.getLogger(__name__)
 LINK_KINDS = frozenset(('issue', 'pull_request'))
 _REPOSITORY = re.compile(r'^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$')
 MAX_LINK_NUMBER = 2 ** 31 - 1
@@ -159,8 +165,10 @@ def _sanitize(value: Any, *, depth=0, budget=None) -> Any:
 class MissionActivityStore:
     """Latest read-only projection per namespaced mission, under a fixed memory cap."""
 
-    def __init__(self, *, now=None, max_missions=MAX_MISSIONS):
+    def __init__(self, *, now=None, max_missions=MAX_MISSIONS, persist=None):
         self._now = now or time.time
+        self._persist = persist           # callable(event dict) or None; best-effort, never breaks ingest
+        self._persisted: dict[str, tuple[float, str]] = {}   # key -> (epoch, connection) of the last mirrored row
         self._max_missions = max(1, min(MAX_MISSIONS, max_missions))
         self._entries: OrderedDict[str, dict] = OrderedDict()
         self._lock = threading.RLock()
@@ -247,7 +255,86 @@ class MissionActivityStore:
             self._entries.move_to_end(mission_key)
             while len(self._entries) > self._max_missions:
                 self._entries.popitem(last=False)
+            row = self._storable(mission_key, self._entries[mission_key], now)
+        if row is not None:
+            try:
+                self._persist(row)
+            except Exception:  # noqa: BLE001 - the mirror is best-effort; the in-memory projection already holds the snapshot
+                log.warning('mission activity persistence failed for %s', mission_key, exc_info=True)
         return {'accepted': True, 'mission_key': mission_key}
+
+    def _storable(self, key, entry, now):
+        """The event to mirror for this accepted snapshot, or None (no sink, or throttled). Caller holds the lock."""
+        if self._persist is None:
+            return None
+        connection = entry['value']['connection']
+        last = self._persisted.get(key)
+        if last is not None and last[1] == connection and now - last[0] < PERSIST_INTERVAL_SECONDS:
+            return None
+        self._persisted[key] = (now, connection)
+        while len(self._persisted) > 4 * self._max_missions:
+            self._persisted.pop(next(iter(self._persisted)))
+        return {'entity_type': ENTITY_TYPE, 'entity_id': key, 'event_type': STORED_EVENT,
+                'payload': {'value': copy.deepcopy(entry['value']), 'received_epoch': entry['received_epoch'],
+                            'observed_epoch': entry['observed_epoch'], 'snapshot_epoch': entry['snapshot_epoch']}}
+
+    def hydrate(self, rows) -> dict:
+        """Rebuild the projection from mirrored rows after a restart. Newest row per mission wins; rows that are expired,
+        corrupt, of another kind or not shaped like what this store writes are skipped, never fatal. Returns counts."""
+        now = self._now()
+        best: dict[str, tuple[float, dict]] = {}
+        skipped = 0
+        for row in rows:
+            entry = self._restore(row, now)
+            if entry is None:
+                skipped += 1
+                continue
+            key = row['entity_id']
+            if key not in best or entry['received_epoch'] >= best[key][0]:
+                best[key] = (entry['received_epoch'], entry)
+        with self._lock:
+            self._entries.clear()
+            self._persisted.clear()
+            for key, (_, entry) in sorted(best.items(), key=lambda item: item[1][0])[-self._max_missions:]:
+                self._entries[key] = entry
+                self._persisted[key] = (entry['received_epoch'], entry['value']['connection'])
+        return {'loaded': len(self._entries), 'skipped': skipped}
+
+    @staticmethod
+    def _restore(row, now):
+        try:
+            if row.get('entity_type') != ENTITY_TYPE or row.get('event_type') != STORED_EVENT:
+                return None
+            key, payload = row.get('entity_id'), row.get('payload')
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(key, str) or not _MISSION_KEY.fullmatch(key) or not isinstance(payload, dict):
+                return None
+            value = payload['value']
+            if (not isinstance(value, dict) or value.get('mission_key') != key or value.get('source') != 'pi'
+                    or value.get('contract_version') != 1
+                    or value.get('connection') not in ('connected', 'disconnected', 'updating')
+                    or not isinstance(value.get('mission'), dict) or value['mission'].get('id') != key[3:]
+                    or not isinstance(value.get('activity'), dict)
+                    or type(value.get('mission_revision')) is not int
+                    or len(json.dumps(value, allow_nan=False).encode()) > MAX_PROJECTION_BYTES):
+                return None
+            epochs = {}
+            for name in ('received_epoch', 'observed_epoch', 'snapshot_epoch'):
+                number = payload.get(name)
+                if number is None and name == 'snapshot_epoch':
+                    epochs[name] = None
+                    continue
+                if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+                    return None
+                epochs[name] = float(number)
+            if now - epochs['received_epoch'] > RETENTION_SECONDS or epochs['received_epoch'] > now + 60:
+                return None
+            value['mission'] = {**{k: v for k, v in value['mission'].items() if k not in PI_V4_FIELDS},
+                                **clean_pi_fields(value['mission'], now=now)}
+            return {'value': value, **epochs}
+        except (KeyError, TypeError, ValueError, RecursionError, AttributeError):
+            return None
 
     def _view(self, entry, now, *, summary=False):
         value = copy.deepcopy(entry['value'])

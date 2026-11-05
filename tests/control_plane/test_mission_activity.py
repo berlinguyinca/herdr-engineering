@@ -50,7 +50,9 @@ def test_activity_ingestion_never_changes_missions_or_emits_events():
     assert result['accepted'] is True
     assert repo.list_missions() == before
     assert repo._event_order == before_events
-    assert written == notified == []
+    assert notified == []   # nothing reaches subscribers or the shared streams
+    # G8-C: the only durable write is the private mirror row, never a mission/session/global-stream event
+    assert [(w['entity_type'], w['event_type']) for w in written] == [('mission_activity_store', 'MissionActivityStored')]
     view = repo.mission_activity.get(KEY)
     assert view['mission']['title'] == 'Fix login'
     assert repo.mission_activity.get('MSN-one') is None
