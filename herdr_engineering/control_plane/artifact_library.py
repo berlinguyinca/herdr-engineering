@@ -7,6 +7,7 @@ see (someone else's folder, an unreadable or missing artifact) is the same ``Lib
 from __future__ import annotations
 
 import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -39,10 +40,23 @@ _FOLDER_SELECT = (
 
 
 class LibraryError(Exception):
-    def __init__(self, status: int, code: str):
-        super().__init__(code)
+    def __init__(self, status: int, code: str, message: str | None = None):
+        super().__init__(message or code)
         self.status = status
         self.code = code
+        self.message = message or code
+
+
+PENDING_CAP = 25
+
+
+class PendingCapExceeded(LibraryError):
+    def __init__(self) -> None:
+        super().__init__(
+            429,
+            "pending_cap",
+            f"at most {PENDING_CAP} agent-pushed artifacts may await review; accept or discard some",
+        )
 
 
 NOT_FOUND = (404, "not_found")
@@ -139,9 +153,53 @@ SELECT a.artifact_id, coalesce(nullif(c.title,''), nullif(s.title,''), {_TITLE})
 """
 
 
+# A pending artifact still counts until it is deleted (member delete retracts it) or tombstoned.
+_PENDING_LIVE = "created_by=$1 AND intake='pending' AND lifecycle NOT IN ('retracted','tombstoned')"
+
+
+async def count_pending_on(conn: asyncpg.Connection | asyncpg.Pool, owner: str) -> int:
+    return int(await conn.fetchval(f"SELECT count(*) FROM artifacts WHERE {_PENDING_LIVE}", owner))
+
+
+async def require_pending_on(
+    conn: asyncpg.Connection | asyncpg.Pool, owner: str, artifact_id: str
+) -> None:
+    """Raise not_found unless ``artifact_id`` is ``owner``'s own pending artifact."""
+    found = await conn.fetchval(
+        f"SELECT 1 FROM artifacts WHERE artifact_id=$2 AND {_PENDING_LIVE}", owner, artifact_id
+    )
+    if found is None:
+        raise LibraryError(*NOT_FOUND)
+
+
+async def accept_pending_on(
+    conn: asyncpg.Connection | asyncpg.Pool, owner: str, artifact_id: str
+) -> None:
+    done = await conn.execute(
+        f"UPDATE artifacts SET intake='accepted' WHERE artifact_id=$2 AND {_PENDING_LIVE}",
+        owner,
+        artifact_id,
+    )
+    if done != "UPDATE 1":
+        raise LibraryError(*NOT_FOUND)
+
+
 class LibraryStore:
     def __init__(self, pool: asyncpg.Pool):
         self._pool = pool
+
+    async def count_pending(self, owner: str) -> int:
+        return await count_pending_on(self._pool, owner)
+
+    async def accept_pending(self, owner: str, artifact_id: str) -> None:
+        await accept_pending_on(self._pool, owner, artifact_id)
+
+    async def discard_pending(
+        self, owner: str, artifact_id: str, delete: Callable[[str], Awaitable[object]]
+    ) -> None:
+        """Delete ``owner``'s own pending artifact through ``delete`` (the member delete path)."""
+        await require_pending_on(self._pool, owner, artifact_id)
+        await delete(artifact_id)
 
     async def create_folder(self, owner: str, name: str) -> Folder:
         cleaned = _clean_name(name)

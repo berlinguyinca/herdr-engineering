@@ -67,6 +67,8 @@ log = logging.getLogger(__name__)
 KIND_CREATE = "member.artifact_create"
 KIND_PUBLISH = "member.publish"
 KIND_DELETE = "member.artifact_delete"
+KIND_LIBRARY_ACCEPT = "library_accept"
+KIND_LIBRARY_DISCARD = "library_discard"
 KIND_SHARE_CREATE = "member.share_create"
 KIND_SHARE_APPROVE = "member.share_approve"
 KIND_SHARE_REVOKE = "member.share_revoke"
@@ -277,6 +279,21 @@ register_intent_kind(KIND_PUBLISH, validate_publish_payload, actors=_BOTH, requi
 register_intent_kind(KIND_DELETE, validate_delete_payload, actors=_BOTH, requires_artifact=True)
 
 
+def _validate_empty(kind: str):
+    def validate(raw: dict, limits: BridgeLimits) -> dict:
+        if raw != {}:
+            raise _bad(kind)
+        return {}
+    return validate
+
+
+# Reviewing agent pushes is a human decision: users only, and never on the agent tool menu.
+register_intent_kind(KIND_LIBRARY_ACCEPT, _validate_empty(KIND_LIBRARY_ACCEPT), actors=frozenset({"user"}),
+                     requires_artifact=True)
+register_intent_kind(KIND_LIBRARY_DISCARD, _validate_empty(KIND_LIBRARY_DISCARD), actors=frozenset({"user"}),
+                     requires_artifact=True)
+
+
 # ----------------------------------------------------------------------------- the member directory
 
 def _finite(value: object) -> bool:
@@ -384,7 +401,7 @@ async def _own(conn: Any, artifact_id: str | None, principal: str) -> Mapping[st
 async def _conclude(ctx: IntentContext, who: _Who, action: str, out: dict, *, artifact_id: str | None) -> dict:
     """Audit the outcome, stamp ``last_used_at`` and hand the principal to the after-hook."""
     from .artifact_members import MemberStore
-    ok = out.get("result") in ("created", "deleted")
+    ok = out.get("result") in ("created", "deleted", "accepted")
     await MemberStore(ctx.conn).record(
         who.principal, action, actor=_actor_json(who.actor), artifact_id=artifact_id,
         outcome="ok" if ok else "refused", code=None if ok else str(out.get("reason") or out.get("result")))
@@ -396,6 +413,7 @@ async def _conclude(ctx: IntentContext, who: _Who, action: str, out: dict, *, ar
 # ----------------------------------------------------------------------------- create
 
 async def handle_create(ctx: IntentContext, intent: Intent) -> dict:
+    from .artifact_library import PENDING_CAP, PendingCapExceeded, count_pending_on
     from .artifact_member_quota import QuotaExceeded, check_new_artifact
     who, refusal = await _member(ctx, "artifact_create")
     if refusal is not None:
@@ -416,9 +434,17 @@ async def handle_create(ctx: IntentContext, intent: Intent) -> dict:
         except QuotaExceeded as exc:
             out = _rejected(exc.code)
         else:
+            agent_push = who.actor.kind == "agent"
+            if agent_push:             # the usage row is already locked by the quota check: counting here is race-free
+                if await count_pending_on(ctx.conn, who.principal) >= PENDING_CAP:
+                    # the applier keeps only the stable ``reason`` code; PendingCapExceeded carries the clear text
+                    out = _rejected(PendingCapExceeded().code)
+                    return await _conclude(ctx, who, "artifact_create", out, artifact_id=None)
             made = await ctx.store.register_logical(original_filename=payload.filename, artifact_type="other",
                                                     created_by=who.principal)
             aid = made["artifact_id"]
+            if agent_push:
+                await ctx.conn.execute("UPDATE artifacts SET intake='pending' WHERE artifact_id=$1", aid)
             await ctx.conn.execute(
                 "UPDATE artifacts SET display_name=$2, payload=$3::jsonb WHERE artifact_id=$1", aid, payload.title,
                 json.dumps({"profile": payload.profile}))
@@ -551,16 +577,19 @@ def _remove_member_staging(rt: MemberRuntime, owner_key: str, artifact_id: str, 
 
 
 async def handle_delete(ctx: IntentContext, intent: Intent) -> dict:
-    from .artifact_member_quota import settle
-    from .artifact_shares import ShareStore
     who, refusal = await _member(ctx, "artifact_delete")
     if refusal is not None:
         return refusal
-    aid = intent.artifact_id
+    return await _delete_own(ctx, who, intent.artifact_id, "artifact_delete")
+
+
+async def _delete_own(ctx: IntentContext, who: _Who, aid: str | None, action: str) -> dict:
+    from .artifact_member_quota import settle
+    from .artifact_shares import ShareStore
     async with ctx.conn.transaction():
         row = await _own(ctx.conn, aid, who.principal)
         if row is None:
-            return await _conclude(ctx, who, "artifact_delete", _rejected("not_found"), artifact_id=aid)
+            return await _conclude(ctx, who, action, _rejected("not_found"), artifact_id=aid)
         if row["lifecycle"] == "active":
             await ctx.store.record_retraction(aid, reason="member delete")
         for share in await ShareStore(ctx.conn).list_for_artifact(aid):     # any creator, any audience
@@ -568,7 +597,37 @@ async def handle_delete(ctx: IntentContext, intent: Intent) -> dict:
                 await revoke_share(ctx.conn, who.rt, share["share_id"], actor=f"member-delete:{who.principal}")
         await settle(ctx.conn, who.principal)
     await asyncio.to_thread(_remove_member_staging, who.rt, who.owner_key, aid, ctx.limits)
-    return await _conclude(ctx, who, "artifact_delete", {"result": "deleted"}, artifact_id=aid)
+    return await _conclude(ctx, who, action, {"result": "deleted"}, artifact_id=aid)
+
+
+# ----------------------------------------------------------------------------- library: accept or discard a push
+
+async def handle_library_accept(ctx: IntentContext, intent: Intent) -> dict:
+    from .artifact_library import LibraryError, accept_pending_on
+    who, refusal = await _member(ctx, "library_accept")
+    if refusal is not None:
+        return refusal
+    try:
+        async with ctx.conn.transaction():
+            await accept_pending_on(ctx.conn, who.principal, intent.artifact_id)
+    except LibraryError:
+        out = _rejected("not_found")
+    else:
+        out = {"result": "accepted"}
+    return await _conclude(ctx, who, "library_accept", out, artifact_id=intent.artifact_id)
+
+
+async def handle_library_discard(ctx: IntentContext, intent: Intent) -> dict:
+    from .artifact_library import LibraryError, require_pending_on
+    who, refusal = await _member(ctx, "library_discard")
+    if refusal is not None:
+        return refusal
+    try:
+        await require_pending_on(ctx.conn, who.principal, intent.artifact_id)
+    except LibraryError:
+        out = _rejected("not_found")
+        return await _conclude(ctx, who, "library_discard", out, artifact_id=intent.artifact_id)
+    return await _delete_own(ctx, who, intent.artifact_id, "library_discard")
 
 
 # ----------------------------------------------------------------------------- the member view
@@ -800,7 +859,9 @@ def _lane(intent: Intent, agent: Mapping[str, Any] | None) -> str:
 def register_member_intents(applier: CollabIntentApplier) -> None:
     """Attach the handlers and the ``m_`` staging rule; the runtime comes from the applier's ``context_extras``."""
     for kind, handler, outcomes in ((KIND_CREATE, handle_create, "created"), (KIND_PUBLISH, handle_publish, "created"),
-                                    (KIND_DELETE, handle_delete, "deleted")):
+                                    (KIND_DELETE, handle_delete, "deleted"),
+                                    (KIND_LIBRARY_ACCEPT, handle_library_accept, "accepted"),
+                                    (KIND_LIBRARY_DISCARD, handle_library_discard, "deleted")):
         # No ``replay_outcomes``: the applier would replay a stored result before the handler runs, i.e. before the
         # directory/admission check. The handlers are idempotent themselves, behind ``_member``.
         applier.register(kind, handler, lane_key=_lane, after=_after)
