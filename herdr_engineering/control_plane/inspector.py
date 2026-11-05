@@ -1075,6 +1075,43 @@ class InspectorStore:
                 "prefs": self.get_prefs(session_id),
             }
 
+    def activity_metadata(self, session_id: str, role: str = "viewer", *, limit: int = 200):
+        """Private metadata-only projection for explicit digest preview, never bodies.
+
+        No producer identity is inferred here: callers supply independent bindings
+        to the pure extractor. Raw revisions are freshness data, not digest input.
+        """
+        from .activity_digest import ActivityMetadata
+
+        if role != "operator":
+            raise PermissionError("private operator metadata access required")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("metadata limit must be an integer in 1..1000")
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                raise KeyError(session_id)
+            rows = []
+            for entry in reversed(sess.events):
+                kind = entry["kind"]
+                if kind not in ("file", "test"):
+                    continue
+                data = entry["data"]
+                rows.append(ActivityMetadata(
+                    entry["seq"], entry["rev"], kind,
+                    path=data.get("path") if kind == "file" else None,
+                    operation=data.get("op") if kind == "file" else None,
+                    run_id=data.get("run_id") if kind == "test" else None,
+                    status=data.get("status") if kind == "test" else None,
+                    passed=data.get("passed") if kind == "test" else None,
+                    failed=data.get("failed") if kind == "test" else None,
+                    skipped=data.get("skipped") if kind == "test" else None,
+                    sensitive=entry.get("sensitive") is not False,
+                    withheld=entry.get("withheld", False) is not False or data.get("withheld", False) is not False))
+                if len(rows) == limit:
+                    break
+            return tuple(reversed(rows))
+
     def events_after(self, session_id: str, after_rev: int, role: str = "viewer",
                      limit: int = 200) -> list[dict]:
         """Events whose revision is newer than ``after_rev``, ascending by revision, rendered for ``role``.
