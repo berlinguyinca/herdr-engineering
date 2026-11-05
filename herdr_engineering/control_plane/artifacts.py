@@ -658,7 +658,9 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
     async def operator_member_access(self, artifact_id: str, principal_id: str, permission: str) -> bool:
         """Plan 5 D4: an operator API key may ``read`` and ``share`` (never edit or commit) a member-owned artifact
         that is not tombstoned (``share`` only while it is active), so the generic share routes work on member content. ``principal_id`` is the
-        server-derived ``api-key:<hash>:operator``; a member, collab or open-listener principal never matches."""
+        server-derived ``api-key:<hash>:operator``; a member or collab principal never matches. The open
+        listener's ``open-listener`` principal does not match either, but a deployment with NO api keys makes every
+        caller an operator by role, so members must not be enabled without api keys (``fleet-config check`` refuses it)."""
         if permission not in OPERATOR_MEMBER_PERMISSIONS or not _OPERATOR_PRINCIPAL.fullmatch(principal_id or ""):
             return False
         row = await self._conn.fetchrow(

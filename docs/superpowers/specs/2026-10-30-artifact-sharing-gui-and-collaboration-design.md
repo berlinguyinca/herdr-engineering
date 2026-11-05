@@ -283,7 +283,7 @@ Today's control plane was single-operator. This section makes it multi-user for 
   and version counts per member, soft-deleted artifacts reported separately until purged) and shown to the member and
   the operator. Limits exist only as optional YAML values (`collab.members.limits`, default `null` = unlimited) with
   per-member overrides set by the operator. Anti-abuse rate limits and per-request sanity limits stay, all
-  configurable (default per-file limit 1 TiB, `request_limits.max_upload_bytes`). File bytes use plan 3's chunk protocol
+  configurable (default per-file limit 1 TiB, `request_limits.max_upload_bytes`, `null` = only the structural bound; the effective limit is the smaller of it and the collab_artifacts bridge limits). File bytes use plan 3's chunk protocol
   unchanged (fixed 512 KiB chunks, base64 on MCP, sha256 and size verified at assembly, idempotent resumable), staged
   under a per-member owner key so an upload resumes across MCP and web, bounded by a staging cap and swept by TTL;
   the worker assembles at publish, so multi-GB uploads do not ride the 60 s intent clock. Content types follow the

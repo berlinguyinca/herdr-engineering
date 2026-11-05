@@ -217,9 +217,23 @@ edge (nginx, server_name <public_host>): /s/ -> share-public:8083
   - The operator-API approve path shows the user id, not the display name; the member web path shows the name.
   - Removing a member from the group takes effect after the claim TTL (`members.groups_ttl`, 24 h) and then a grace
     (`members.removed_grace`, default 3600 s of continuous removed observation) before their shares are revoked.
+    Group REMOVAL is only observed at a sign-in: a member who never signs in again keeps the last seen groups. A
+    DISABLED account is different: it reports `disabled` at any claim age (the TTL only ages group membership), and
+    the sweep revokes their links.
+  - Effective upload limits are the smaller of the member setting and the collab_artifacts bridge limit
+    (`max_upload_bytes` vs `max_file_bytes`; `staging_bytes_per_member` vs the bridge staging caps). `null` for
+    `max_upload_bytes` or `staging_bytes_per_member` means "only the 1 TiB structural bound".
+  - `members.enabled` needs `share.enabled`, `collab_artifacts.enabled: true` and at least one `api_keys` entry;
+    `herdr-eng fleet-config check` names the missing key. With no API keys the open listener makes every caller an
+    operator, so the member routes would be reachable by anyone on that listener.
   - Orphan blobs left by conflicting publishes stay counted against the member's quota until an operator purge.
   - Purge refuses held tombstones and tombstones without a purge date; it anonymises annotations, share events and
-    feedback of third parties (migrations 0048 and 0049; renumber at merge if another branch took the number).
+    feedback of third parties, and blanks file names in `output_manifest`, `provenance.message`/`entry` and
+    `artifact_shares.entry` (migrations 0048, 0049 and 0050; renumber at merge if another branch took the number).
+    Storage keys and hashes are kept. The append-only jsonl event files on disk are written by a separate process and
+    are NOT rewritten by purge; they keep the old names until the retention window of that log removes them.
+  - A shared blob survives the deletion of one owner while another artifact (including a held or restorable
+    tombstone) still references it.
   - `share_creates_per_hour` (default 20) is counted per process in memory.
 - Verifying the rendered edge: `docker run --rm --add-host collab-public:127.0.0.1 --add-host share-public:127.0.0.1
   -v <conf>:/etc/nginx/nginx.conf:ro -v <certdir>:/etc/acme:ro nginx:1.29-alpine nginx -t` (a test does this when

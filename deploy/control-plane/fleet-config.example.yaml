@@ -129,14 +129,16 @@ sections:
         #     http_chunks_per_request: 32        # at most 32 (the edge accepts 17 MiB per upload request)
         #     max_publish_files: 200
         #     max_message_chars: 500
-        #     max_upload_bytes: 1099511627776    # one file, 1 TiB
+        #     max_upload_bytes: 1099511627776    # one file, 1 TiB; null = only the structural bound. The effective limit is
+        #                                        # the smaller of this and collab_artifacts max_file_bytes
         #     result_wait_seconds: 5.0           # 0-20
         #   rate_limits:
         #     chunks_per_minute: 1200
         #     writes_per_minute: 30
         #     session_exchanges_per_minute: 20   # sign-ins, per client address
         #   staging:
-        #     staging_bytes_per_member: 1099511627776   # reserved by declared size, 1 TiB
+        #     staging_bytes_per_member: 1099511627776   # reserved by declared size, 1 TiB; null = only the 1 TiB bound.
+        #                                               # Effective cap = min(this, collab_artifacts staging caps)
         #   # secrets_gid: 1000    # numeric gid shared by the worker and collab-public so the worker can hand over the
         #                          # read-once share URL; needed only when collab-public does not run as the default uid
         #                          # (members refuse to start without a usable gid). Prefer a dedicated group.
