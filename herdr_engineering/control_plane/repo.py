@@ -72,6 +72,9 @@ from .service_catalog import (
 #: Hard bound on one durable deployment write made under a store lock (seconds).
 DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S = 10
 
+# build_cache events arrive per build on every host; keep a bounded recent window
+# per host stream (older ones stay in the durable sink). Trimmed at 2x to amortise.
+BUILD_CACHE_STREAM_MAX = 500
 _CI_EVENT_KINDS = frozenset({"ci_report", "ci_observation", "ci_telemetry", "ci_logtests"})
 
 _STAGES = {
@@ -2885,6 +2888,11 @@ class ControlPlaneRepo:
                     self._event_order.append((entity_type, entity_id, seq))
             if self._durable_history is not None and entity_type in {'service','session'}:
                 stream[:] = stream[-1:]
+            if entity_type == "build_cache" and len(stream) > 2 * BUILD_CACHE_STREAM_MAX:
+                cutoff = stream[-BUILD_CACHE_STREAM_MAX]["sequence"]
+                del stream[:-BUILD_CACHE_STREAM_MAX]
+                self._event_order = [t for t in self._event_order
+                                     if not (t[0] == entity_type and t[1] == entity_id and t[2] < cutoff)]
             if self._sink is not None and not require_durable:
                 try:
                     self._sink.record(ev)
@@ -3024,6 +3032,21 @@ class ControlPlaneRepo:
             if stream:
                 latest.append({k: v for k, v in stream[-1]["payload"].items() if not k.startswith("_")})
         return latest
+
+    def list_fleet_rollouts(self, limit=50, repo_name=None):
+        """Rollout summaries (newest first) derived from the ``fleet_rollout`` event streams."""
+        from . import fleet_rollout
+        return fleet_rollout.list_rollouts(self, limit, repo_name)
+
+    def get_fleet_rollout(self, rollout_id):
+        """One rollout: summary, per-host rows and the ordered events; None when unknown."""
+        from . import fleet_rollout
+        return fleet_rollout.rollout_detail(self, rollout_id)
+
+    def fleet_rollout_versions(self):
+        """What each host runs, the newest observed heads, the last lock pin and the watched sources' state."""
+        from . import fleet_rollout
+        return fleet_rollout.versions(self)
 
     def entity_ids(self, entity_type):
         """Ids of every entity of ``entity_type`` that has at least one event."""
