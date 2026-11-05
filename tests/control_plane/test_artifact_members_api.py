@@ -30,6 +30,10 @@ from herdr_engineering.control_plane.artifact_share_api import (
 )
 from herdr_engineering.control_plane.artifact_shares import ShareStore
 from herdr_engineering.control_plane.artifacts import ArtifactStore
+from herdr_engineering.control_plane.publication import (
+    PrivateOnlyExposureProvider,
+    PublicationController,
+)
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane.registry_pg import FakeBlobs, registry_pg  # noqa: F401 - imported fixture
 
@@ -127,7 +131,8 @@ def members_server(pg, blobs, root):
     reg, sh, adm = SyncArtifactAdapter(registry), SyncArtifactAdapter(shares), SyncArtifactAdapter(admin)
     server = ControlPlaneServer(ControlPlaneRepo(), api_keys={"owner-key": "operator", "viewer-key": "viewer"},
                                 artifact_store=reg, artifact_acl=ArtifactAcl(), rustfs=blobs, share_store=sh,
-                                shares_root=root, share_settings=settings, member_admin=adm)
+                                shares_root=root, share_settings=settings, member_admin=adm,
+                                publication_controller=PublicationController(provider=PrivateOnlyExposureProvider()))
     thread = threading.Thread(target=server.serve, daemon=True)
     thread.start()
     server.wait_until_ready()
@@ -356,8 +361,7 @@ def test_purge_removes_the_bytes_keeps_the_tombstone_and_revokes_links(env):
     assert life[-1]["action"] == "purge" and life[-1]["actor"].endswith(":operator")
     member = env.sql("SELECT actor FROM artifact_member_events WHERE action='artifact_purge'")
     assert len(member) == 1 and ":operator" in json.dumps(member[0]["actor"])
-    # purging again is refused, and the artifact is gone from the readers
-    assert env.req(purge_path(aid), body={"confirm": aid})[0] == 409
+    # the artifact is gone from the readers
     assert env.req(f"/api/v1/artifacts/{aid}")[0] == 404
     assert aid not in [a["artifact_id"] for a in env.req(BASE_BODY + "/alice")[1]["artifacts"]]
     assert env.req(BASE_BODY + "/links")[1]["links"] == []
@@ -369,3 +373,97 @@ def test_a_tombstoned_member_artifact_is_excluded_from_the_operator_reader(env):
     assert env.req(f"/api/v1/artifacts/{aid}")[0] == 200       # retracted is still readable by the operator
     env.sql("UPDATE artifacts SET lifecycle='tombstoned' WHERE artifact_id=$1", aid)
     assert env.req(f"/api/v1/artifacts/{aid}")[0] == 404
+
+
+# ------------------------------------------------------------------------------------------------ fix round 1
+
+def tombstone_held(env, aid):
+    """A tombstoned artifact with bytes left and no purge date: held, as artifact-delete's legal hold leaves it."""
+    retract(env, aid)
+    env.sql("UPDATE artifacts SET lifecycle='tombstoned', tombstoned_at=now(), purge_after=NULL WHERE artifact_id=$1", aid)
+
+
+def test_purge_refuses_an_artifact_under_legal_hold(env):
+    aid, _ = env.artifact()
+    tombstone_held(env, aid)
+    status, body = env.req(purge_path(aid), body={"confirm": aid})
+    assert status == 409 and "legal hold" in body["error"]
+    assert env.blobs.deleted == []
+    assert env.sql("SELECT count(*) FROM artifact_blobs WHERE scope=$1", aid)[0][0] == 1
+    env.sql("UPDATE artifacts SET purge_after=now() WHERE artifact_id=$1", aid)              # hold lifted
+    assert env.req(purge_path(aid), body={"confirm": aid})[0] == 200
+
+
+def test_purge_anonymises_annotations_viewer_events_uploads_and_the_filename(env):
+    aid, vid = env.artifact()
+    share = env.share(aid, vid)
+    sid = share["share_id"]
+    env.sql("INSERT INTO artifact_annotations (annotation_id, artifact_id, version_id, share_id, file_name, anchor,"
+            " body, author_identity, author_email, author_role, created_at) VALUES"
+            " ('ann_' || repeat('a', 22), $1, $2, $3, 'index.html', '{}'::jsonb, 'secret comment', 'ident-x',"
+            " 'viewer@lab.example.org', 'member', now())", aid, vid, sid)
+    for kind in ("opened", "denied"):
+        _call(env.shares, "add_event", sid, kind, "viewer@lab.example.org", {"ip": "10.0.0.9"})
+    env.sql("INSERT INTO artifact_collab_uploads (owner_key, upload_id, artifact_id, name, sha256, size_bytes,"
+            " storage_key, media_type, charged) VALUES ('m_k', 'upl_1', $1, 'private-notes.html', 'x', 1, 'k',"
+            " 'text/html', false)", aid)
+    env.sql("UPDATE artifacts SET display_name='Dr Smith report', original_filename='smith-report.html'"
+            " WHERE artifact_id=$1", aid)
+    retract(env, aid)
+    assert env.req(purge_path(aid), body={"confirm": aid})[0] == 200
+    note = env.sql("SELECT body, author_identity, author_email, file_name FROM artifact_annotations")[0]
+    assert "secret" not in json.dumps(dict(note)) and "viewer@" not in json.dumps(dict(note))
+    assert "viewer@" not in json.dumps([dict(r) for r in env.sql(
+        "SELECT actor, detail FROM artifact_share_events WHERE share_id=$1", sid)], default=str)
+    assert "10.0.0.9" not in json.dumps([dict(r) for r in env.sql(
+        "SELECT detail FROM artifact_share_events WHERE share_id=$1", sid)], default=str)
+    assert env.sql("SELECT count(*) FROM artifact_share_events WHERE share_id=$1 AND kind='created'", sid)[0][0] == 1
+    assert "private-notes" not in env.sql("SELECT name FROM artifact_collab_uploads")[0][0]
+    row = env.sql("SELECT display_name, original_filename FROM artifacts WHERE artifact_id=$1", aid)[0]
+    assert "smith" not in json.dumps(dict(row)).lower()
+
+
+def test_operator_can_share_only_active_member_artifacts_and_not_via_publications(env):
+    aid, vid = env.artifact()
+    pub = {"resource_id": aid, "version_id": vid, "audience": "unlisted_link", "expires_at": time.time() + 3600}
+    status, _ = env.req("/api/v1/publications/requests", body=pub)
+    assert status in {403, 404}
+    assert env.server.publication_controller.list() == []
+    retract(env, aid)
+    assert env.req(f"/api/v1/artifacts/{aid}")[0] == 200                  # read stays for inspection
+    status, _ = env.req(f"/api/v1/artifacts/{aid}/shares", body={"version_id": vid, "audience": "public"})
+    assert status == 404
+    env.sql("UPDATE artifacts SET lifecycle='archived' WHERE artifact_id=$1", aid)
+    assert env.req(f"/api/v1/artifacts/{aid}/shares", body={"version_id": vid, "audience": "public"})[0] == 404
+    assert env.sql("SELECT count(*) FROM artifact_shares")[0][0] == 0
+
+
+def test_a_link_cannot_be_created_once_sharing_is_disabled_even_past_the_gate(env):
+    from herdr_engineering.control_plane.artifact_shares import ShareError
+    aid, vid = env.artifact()
+    assert env.req(BASE_BODY + "/alice/sharing", body={"enabled": False})[0] == 200
+    with pytest.raises(ShareError) as caught:
+        env.share(aid, vid, approve=False)
+    assert caught.value.code == "sharing_disabled"
+    assert env.sql("SELECT count(*) FROM artifact_shares")[0][0] == 0
+
+
+def test_sweep_revokes_for_disabled_sharing_without_a_fresh_directory(env, tmp_path):
+    aid, vid = env.artifact()
+    share = env.share(aid, vid)
+    env.sql("UPDATE artifact_member_usage SET sharing_disabled=true WHERE member_principal=$1", ALICE)
+    rt = MemberRuntime(outbox=tmp_path / "no-outbox", mirror_root=tmp_path / "mirror", group="lab", enabled=True,
+                       defaults={}, shares_root=env.root, clock=time.time)
+
+    async def sweep(store, conn):
+        return await sweep_disabled_members(conn, rt)
+    assert env.run(sweep) == 1
+    assert _call(env.shares, "get", share["share_id"])["state"] == "revoked"
+
+
+def test_a_repeated_purge_replays_as_success(env):
+    aid, _ = env.artifact()
+    retract(env, aid)
+    assert env.req(purge_path(aid), body={"confirm": aid})[0] == 200
+    status, body = env.req(purge_path(aid), body={"confirm": aid})
+    assert status == 200 and body["already_purged"] is True

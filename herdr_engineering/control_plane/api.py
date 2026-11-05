@@ -2046,9 +2046,10 @@ def _make_handler(server, public=False, operator=False):
             digest = hashlib.sha256(supplied.encode()).hexdigest()[:16]
             return f"api-key:{digest}:{self._role() or 'local'}"
 
-        def _artifact_version_allowed(self, artifact_id, version_id, permission):
-            """Permission on the artifact AND the version must belong to it (registry-backed only)."""
-            if not self._artifact_allowed(artifact_id, permission):
+        def _artifact_version_allowed(self, artifact_id, version_id, permission, *, operator_member=True):
+            """Permission on the artifact AND the version must belong to it (registry-backed only).
+            ``operator_member=False`` withholds the plan 5 D4 operator grant (publications never reach member content)."""
+            if not self._artifact_allowed(artifact_id, permission, operator_member=operator_member):
                 return False
             if server.artifact_store is None:
                 return True
@@ -2060,14 +2061,14 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             return self._deny(403, "forbidden")
 
-        def _artifact_allowed(self, artifact_id, permission):
+        def _artifact_allowed(self, artifact_id, permission, *, operator_member=True):
             if server.artifact_acl is None:
                 return True
             if self._artifact_acl_allows(artifact_id, permission):
                 return True
             # Plan 5 D4: an operator key reads and shares (never edits) member-owned artifacts. Gated on the operator
             # principal first, so any other unauthorized read still never reaches the store.
-            if (permission in ("read", "share") and server.artifact_store is not None and artifact_id
+            if (operator_member and permission in ("read", "share") and server.artifact_store is not None and artifact_id
                     and self._resource_principal().endswith(":operator")
                     and self._artifact_call("operator_member_access", artifact_id, self._resource_principal(),
                                             permission)):
@@ -2075,9 +2076,10 @@ def _make_handler(server, public=False, operator=False):
             # Versioned-registry artifacts (native reports) are also private to their
             # durable owner and grants, which the registry itself records. Reads stay
             # ACL-only: an unauthorized read must never reach the store.
+            extra = {} if operator_member else {"operator_member": False}
             return bool(permission != "read" and server.artifact_store is not None
                         and artifact_id and self._artifact_call(
-                "report_permission", artifact_id, self._resource_principal(), permission))
+                "report_permission", artifact_id, self._resource_principal(), permission, **extra))
 
         def _artifact_acl_allows(self, artifact_id, permission):
             principal = self._resource_principal()
@@ -4055,7 +4057,8 @@ def _make_handler(server, public=False, operator=False):
             if resource == "publications" and server.publication_controller is not None:
                 if len(parts) == 5 and parts[4] == "requests":
                     body = self._read_json() or {}
-                    if not self._artifact_version_allowed(body.get('resource_id', ''), body.get('version_id'), 'share'):
+                    if not self._artifact_version_allowed(body.get('resource_id', ''), body.get('version_id'), 'share',
+                                                       operator_member=False):
                         return self._artifact_forbidden()
                     return self._json(server.publication_controller.request(
                         resource_id=body.get("resource_id"), version_id=body.get("version_id"),
@@ -4067,7 +4070,8 @@ def _make_handler(server, public=False, operator=False):
                     if publication is None:
                         return self._json({'error': 'not found'}, 404)
                     if not self._artifact_version_allowed(
-                            publication['resource_id'], publication['pinned_version_id'], 'share'):
+                            publication['resource_id'], publication['pinned_version_id'], 'share',
+                            operator_member=parts[5] == "revoke"):
                         return self._artifact_forbidden()
                     if parts[5] == "approve":
                         result = server.publication_controller.approve(parts[4], approver=self._resource_principal())

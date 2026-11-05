@@ -621,7 +621,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         return {**entry, "name": name, "media_type": media_type, "storage_key": key, "sha256": digest,
                 "size_bytes": len(data)}
 
-    async def report_permission(self, artifact_id: str, principal_id: str, permission: str) -> bool:
+    async def report_permission(self, artifact_id: str, principal_id: str, permission: str, *,
+                                operator_member: bool = True) -> bool:
         """Private report operations use durable owner/grant authority, not a guessed context."""
         if not principal_id or permission not in {"read", "edit", "review", "share", "admin"}:
             return False
@@ -631,7 +632,7 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             return False
         if artifact.get("created_by") == principal_id:
             return True
-        if await self.operator_member_access(artifact_id, principal_id, permission):
+        if operator_member and await self.operator_member_access(artifact_id, principal_id, permission):
             return True
         grant = await self._conn.fetchrow(
             "SELECT permissions FROM artifact_acl WHERE artifact_id=$1 AND principal_id=$2 "
@@ -645,13 +646,16 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
 
     async def operator_member_access(self, artifact_id: str, principal_id: str, permission: str) -> bool:
         """Plan 5 D4: an operator API key may ``read`` and ``share`` (never edit or commit) a member-owned artifact
-        that is not tombstoned, so the generic share routes work on member content. ``principal_id`` is the
+        that is not tombstoned (``share`` only while it is active), so the generic share routes work on member content. ``principal_id`` is the
         server-derived ``api-key:<hash>:operator``; a member, collab or open-listener principal never matches."""
         if permission not in OPERATOR_MEMBER_PERMISSIONS or not _OPERATOR_PRINCIPAL.fullmatch(principal_id or ""):
             return False
         row = await self._conn.fetchrow(
             "SELECT created_by, lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id)
-        return bool(row and is_member_principal(row["created_by"]) and row["lifecycle"] != "tombstoned")
+        if not row or not is_member_principal(row["created_by"]):
+            return False
+        # share needs live content (no fresh links on what the member deleted or archived); read stays for inspection
+        return row["lifecycle"] == "active" if permission == "share" else row["lifecycle"] != "tombstoned"
 
     async def _validate_existing_blob_scope(self, artifact_id, reference, **metadata):
         # Inspect the actual reference, never the caller's optional SHA metadata:

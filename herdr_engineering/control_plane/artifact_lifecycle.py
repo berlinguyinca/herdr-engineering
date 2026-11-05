@@ -173,7 +173,8 @@ class ArtifactLifecycleMixin:
     async def _purge_locked(self, artifact_id: str, *, actor: str, reason: str, strict: bool = False) -> dict:
         """Delete the unshared bytes of a tombstoned artifact and mark its versions purged. The caller holds the
         artifact row lock inside a transaction. ``strict`` (operator purge) refuses to mark anything purged when an
-        object delete failed, so a failure is never recorded as a purge. A member-owned artifact also has its
+        object delete failed, so a failure is never recorded as a purge. The non-strict (scheduled) path records a failed
+        delete in ``retained_shared`` and still marks the versions purged: those keys are not retried (known gap). A member-owned artifact also has its
         recipient data anonymised and its owner's usage settled in the same transaction."""
         from .artifacts import ArtifactError
         versions = [self._row(v) for v in await self._conn.fetch(
@@ -199,7 +200,7 @@ class ArtifactLifecycleMixin:
             try:
                 self._rf.delete(key)
                 deleted.append(key)
-            except Exception:                       # noqa: BLE001 - recorded, retried next sweep
+            except Exception:                       # noqa: BLE001 - recorded in the outcome; not retried
                 retained.append(key)
                 failed.append(key)
         if failed and strict:
@@ -228,6 +229,18 @@ class ArtifactLifecycleMixin:
         await self._conn.execute(
             "UPDATE artifact_member_events SET detail='{}'::jsonb WHERE artifact_id=$1", artifact_id)
         await self._conn.execute("DELETE FROM artifact_acl WHERE artifact_id=$1", artifact_id)
+        # Personal data collected through the artifact's links: comment text and author identity, the viewers recorded
+        # on opened/denied events (the rows stay, so the audit trail of what happened does), staged upload names, and
+        # the artifact's own title and filename.
+        await self._conn.execute(
+            "UPDATE artifact_annotations SET body='[removed]', author_identity='[removed]', author_email='[removed]',"
+            " file_name='[removed]', resolved_by=NULL WHERE artifact_id=$1", artifact_id)
+        await self._conn.execute(
+            "UPDATE artifact_share_events SET actor='[removed]', detail='{}'::jsonb WHERE kind IN ('opened','denied')"
+            " AND share_id IN (SELECT share_id FROM artifact_shares WHERE artifact_id=$1)", artifact_id)
+        await self._conn.execute("UPDATE artifact_collab_uploads SET name='[removed]' WHERE artifact_id=$1", artifact_id)
+        await self._conn.execute(
+            "UPDATE artifacts SET display_name=NULL, original_filename='[removed]' WHERE artifact_id=$1", artifact_id)
 
     async def purge_artifact(self, artifact_id: str, *, actor: str, reason: str = "operator purge") -> dict:
         """Operator purge, now: tombstone a retracted artifact (no hold window) and purge its bytes at once, ignoring
@@ -250,6 +263,11 @@ class ArtifactLifecycleMixin:
                     "SELECT EXISTS (SELECT 1 FROM artifact_versions WHERE artifact_id=$1 AND purged_at IS NULL)"
                     " OR EXISTS (SELECT 1 FROM artifact_blobs WHERE scope=$1)", artifact_id):
                 raise ArtifactError("artifact bytes were already purged")
+            # No purge date on a tombstone is a legal hold. TODO(artifact-delete merge): use
+            # ``legal_hold OR purge_after IS NULL`` once that branch's column exists here.
+            if lifecycle == "tombstoned" and await self._conn.fetchval(
+                    "SELECT purge_after IS NULL FROM artifacts WHERE artifact_id=$1", artifact_id):
+                raise ArtifactError("cannot purge an artifact under legal hold; lift the hold first")
             if await self._conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM artifact_shares WHERE artifact_id=$1 AND state<>'revoked')",
                     artifact_id):

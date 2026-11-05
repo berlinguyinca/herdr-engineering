@@ -265,6 +265,13 @@ class ShareStore:
         share_id = "share_" + secrets.token_hex(12)
         async with _transaction(self._conn) as conn:
             if member:
+                # The usage row lock serialises this insert with the operator's disable-sharing (which updates that
+                # row, then lists open shares): a link is either refused here or visible to that revocation.
+                from .artifact_member_quota import _lock_usage
+                await _lock_usage(conn, created_by)
+                if await conn.fetchval("SELECT sharing_disabled FROM artifact_member_usage WHERE member_principal=$1",
+                                       created_by):
+                    raise ShareError("sharing is disabled for this member", code="sharing_disabled")
                 if not await _may_share(conn, artifact_id, created_by):
                     raise ShareError("not found", code="not_found")
                 if audience == "lab":

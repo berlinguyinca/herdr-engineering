@@ -87,7 +87,7 @@ class MemberAdmin:
     async def purgeable(self, principal: str, artifact_id: str) -> dict | None:
         """The member's artifact for purge: any lifecycle (the caller decides), tombstoned included."""
         row = await self.conn.fetchrow(
-            "SELECT artifact_id, lifecycle FROM artifacts WHERE artifact_id=$1 AND created_by=$2",
+            "SELECT artifact_id, lifecycle, purge_after FROM artifacts WHERE artifact_id=$1 AND created_by=$2",
             artifact_id, principal)
         return dict(row) if row else None
 
@@ -155,6 +155,9 @@ def route_members(handler, server, parts, resource) -> bool:
         message = str(exc)
         if message.startswith("no artifact"):
             handler._json({"error": "not found"}, 404)
+        elif message.startswith("artifact bytes were already") and kind == "purge":
+            handler._json({"artifact_id": parts[6], "purged": True, "already_purged": True, "deleted": 0,
+                           "retained_shared": 0, "revoked_shares": []})
         elif message.startswith(("cannot purge", "artifact bytes were already", "revoke the artifact")):
             handler._json({"error": message}, 409)
         else:
@@ -240,6 +243,8 @@ def _purge(handler, server, admin, principal: str, artifact_id: str, body: dict,
         raise ShareHTTPError(404, "not found")
     if artifact["lifecycle"] not in ("retracted", "tombstoned"):
         raise ShareHTTPError(409, f"cannot purge an artifact that is {artifact['lifecycle']}; it must be deleted first")
+    if artifact["lifecycle"] == "tombstoned" and artifact["purge_after"] is None:    # a hold: refuse before revoking
+        raise ShareHTTPError(409, "cannot purge an artifact under legal hold; lift the hold first")
     revoked = _revoke_all(server, _call(admin, "open_shares", artifact_id=artifact_id), actor)
     result = _call(server.artifact_store, "purge_artifact", artifact_id, actor=actor)
     try:

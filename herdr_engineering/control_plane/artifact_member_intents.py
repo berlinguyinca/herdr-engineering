@@ -692,21 +692,23 @@ def sweep_secrets(rt: MemberRuntime) -> int:
 async def sweep_disabled_members(conn: Any, rt: MemberRuntime) -> int:
     """Revoke the pending and live shares of members that are disabled, removed from the group, or have sharing off.
 
-    Only on positive evidence from a fresh directory: a stale or missing file, a member who is absent from it and
+    Sharing switched off by the operator is positive evidence by itself and is acted on even without a directory.
+    The directory-based reasons need a fresh directory: a stale or missing file, a member who is absent from it and
     one marked ``unknown`` prove nothing, so nothing is revoked for them."""
     from .artifact_members import positively_out
     directory = await asyncio.to_thread(load_directory, rt)
-    if directory is None:
-        return 0
     rows = await conn.fetch(
         "SELECT s.share_id, s.created_by, COALESCE(u.sharing_disabled, false) AS off FROM artifact_shares s"
         " LEFT JOIN artifact_member_usage u ON u.member_principal=s.created_by"
         " WHERE s.state IN ('pending','live') AND s.created_by LIKE 'member:%'")
     revoked = 0
     for r in rows:
-        entry = directory.get(r["created_by"][len("member:"):])
-        if not r["off"] and not positively_out(entry, rt.group, now=rt.clock(), grace=rt.removed_grace):    # absent or "unknown" proves nothing
-            continue
+        if not r["off"]:
+            if directory is None:
+                continue
+            entry = directory.get(r["created_by"][len("member:"):])
+            if not positively_out(entry, rt.group, now=rt.clock(), grace=rt.removed_grace):    # absent or "unknown" proves nothing
+                continue
         try:
             await revoke_share(conn, rt, r["share_id"], actor="member-disabled")
             revoked += 1
