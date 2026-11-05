@@ -87,7 +87,12 @@ browser sign-in, so only that key is sent and its project/scope bounds apply.
 A request combining API-key and bearer credentials is
 refused. `single_operator`/`open-listener`, an operator proxy, an email header,
 and a posted user ID grant no Memory access. Origin restrictions do not turn a
-Cognito identity into a global dashboard operator.
+Cognito identity into a global dashboard operator. This is a route-level gate,
+not isolation from the existing dashboard's broader operator powers: in open
+single-operator mode, other dashboard capabilities (including agent messaging
+or terminal access) may still offer indirect access. Requiring authentication
+for the entire dashboard is a separate scope decision; this change does not
+establish that boundary.
 
 Cognito settings and collaboration identifiers are captured at server startup;
 restart the web process after changing them. Viewer mappings retain the existing

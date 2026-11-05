@@ -263,3 +263,58 @@ def test_cli_missing_key_refusal_does_not_print_values(central):
     assert not (central.parent / "x.env").exists()
     mem = yaml.safe_load(central.read_text())["sections"]["control_plane"]["values"]["memory"]
     assert not any(v in r.stdout + r.stderr for v in [mem["db_password"], *mem["tenants"].values()])
+
+
+def test_combined_cognito_viewer_and_runtime_profile_policy(central, tmp_path):
+    """The real fleet parser and runtime exporter accept the same complete activation policy."""
+    import io
+    import tarfile
+    from types import SimpleNamespace
+
+    from herdr_engineering.memory_client_profile import prepare_profile
+    from herdr_engineering.memory_install import PINNED_CLIENT_VERSION
+
+    enable(central)
+    private = tmp_path / 'client'
+    private.mkdir(mode=0o700)
+    credential = private / 'codex.key'
+    credential.write_text('synthetic-test-credential-only')
+    credential.chmod(0o600)
+    source = private / 'config.json'
+    source.write_text(json.dumps({'url': 'https://memory.example.test', 'default_project': 'canary',
+                                 'projects': {'canary': {'credentials': {'codex': str(credential)}}}}))
+    source.chmod(0o600)
+    policy = {'viewers': {'verified-existing-human': {'projects': ['canary'], 'scopes': []}},
+              'command': ['herdr-memory'], 'client_config_source': str(source),
+              'cognito': {'origin': 'https://dashboard.example.test:9447',
+                          'trusted_proxy_ips': ['127.0.0.1'], 'sync_dir': '/etc/herdr/collab-sync'}}
+    edit(central, lambda cp: cp['memory'].update(policy))
+    cfg = load_fleet_config(central)
+    memory = fm.memory_values(cfg.section('control_plane'))
+    assert all(memory[k] == v for k, v in policy.items())
+    archive = private / 'runtime' / 'profile.tar'
+    def canonical_validation(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            'contract': 1, 'client': PINNED_CLIENT_VERSION, 'valid': True}))
+    receipt = prepare_profile(source, memory, archive, runner=canonical_validation)
+    assert receipt['prepared'] is True
+    assert receipt['viewer_projects'] == ['canary']
+    assert receipt['scopes'] == []
+    with tarfile.open(fileobj=io.BytesIO(archive.read_bytes())) as packed:
+        rendered = json.loads(packed.extractfile('config.json').read())
+    assert set(rendered['projects']) == {'canary'}
+    assert 'cognito' not in rendered and 'viewers' not in rendered
+    assert rendered['cache_dir'] == '/state/herdr-memory-explorer'
+
+
+@pytest.mark.parametrize('change', [
+    {'cognito': {'origin': 'https://dashboard.example.test:443'}},
+    {'viewers': {'human': {'projects': ['canary'], 'scopes': ['personal']}}},
+    {'command': ['herdr-memory', 5]},
+    {'client_config_source': 'relative/profile.json'},
+])
+def test_combined_memory_schema_keeps_each_validator(central, change):
+    enable(central)
+    edit(central, lambda cp: cp['memory'].update(change))
+    with pytest.raises(FleetConfigError):
+        load_fleet_config(central)
