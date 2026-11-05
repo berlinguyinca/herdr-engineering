@@ -211,3 +211,20 @@ def test_anchor_text_control_chars_refused(field, value):
     assert code(clean_anchor, anchor) == "bad_chars"
     pdf = {"kind": "pdf_page", "file": "a", "page": 1, "exact": "\x00"}
     assert code(clean_anchor, pdf) == "bad_chars"
+
+
+BIDI = [chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))]
+
+
+@pytest.mark.parametrize("ch", BIDI)
+def test_bidi_controls_are_refused_in_comments_and_anchors(ch):
+    """Plan 4 C4: an explicit directional embedding / override / isolate can reorder what the owner reads (Trojan Source)."""
+    assert code(clean_comment, f"safe {ch} text") == "bad_chars"
+    for field in ("exact", "prefix", "suffix"):
+        anchor = {"kind": "text_quote", "file": "a", "exact": "x", field: f"a{ch}b"}
+        assert code(clean_anchor, anchor) == "bad_chars", field
+    assert code(clean_anchor, {"kind": "pdf_page", "file": "a", "page": 1, "exact": f"a{ch}"}) == "bad_chars"
+
+
+def test_ordinary_bidi_text_and_marks_are_still_accepted():
+    assert clean_comment("שלום עולם مرحبا ‏‎ ok") == "שלום עולם مرحبا ‏‎ ok"

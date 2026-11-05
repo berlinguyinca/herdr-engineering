@@ -98,9 +98,16 @@ def annotation_settings(raw: dict[str, object] | None) -> dict[str, bool | int]:
     return out
 
 
+_BIDI_CONTROLS: Final = frozenset(chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)))
+
+
 def _bad_chars(text: str, *, allow_whitespace: bool) -> bool:
+    """Control characters, surrogates, NUL and the explicit bidi embedding/override/isolate controls (U+202A-202E,
+    U+2066-2069), which can make the owner read a note or quote in a different order than it was typed."""
     for ch in text:
         o = ord(ch)
+        if ch in _BIDI_CONTROLS:
+            return True
         if 0xD800 <= o <= 0xDFFF or o == 0 or o == 0x7F:
             return True
         if o < 0x20 and not (allow_whitespace and ch in "\n\t"):
