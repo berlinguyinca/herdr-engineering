@@ -383,6 +383,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "judge": _judge_config(section.get("judge")),
         # Slack front door: off unless enabled; tokens are read from files, never inline.
         "slack": _slack_config(section.get("slack")),
+        # Per-project, per-scope deploy permission (Phase 4): ``mode: auto`` is only a candidate until the owner confirms.
+        "deploy": _deploy_config(section.get("deploy")),
     }
 
 
@@ -697,6 +699,101 @@ def _slack_config(raw: Any) -> dict[str, Any]:
     return {"enabled": enabled, "base_url": base_url, "bot_token_file": files["bot_token_file"],
             "app_token_file": files["app_token_file"], "owner_user_id": owner, "channel": channel.strip(),
             "ask_ttl_minutes": ttl, "max_asks_per_task_per_hour": cap, "summary_idle_minutes": idle}
+
+
+DEPLOY_REQUIRE = ("on_main", "ci_green", "descends_from_deployed")
+_DEPLOY_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_DEPLOY_REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
+_DEPLOY_COMMAND = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+/-]*")
+_DEPLOY_SECRET_WORDS = ("token", "secret", "password", "passwd", "api_key", "apikey", "key", "credential", "webhook")
+
+
+def _deploy_command(value: Any, where: str) -> str:
+    if (not isinstance(value, str) or not 0 < len(value) <= 200 or not value.isascii()
+            or not _DEPLOY_COMMAND.fullmatch(value)):
+        raise ValueError(f"{where}.command must be a relative path like deploy/app/deploy.sh (letters, digits and "
+                         "_ . + - /; no leading / or ./, no .., no spaces or shell characters)")
+    parts = value.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise ValueError(f"{where}.command must be a clean relative path (no empty, . or .. parts)")
+    return value
+
+
+def _deploy_scope(raw: Any, where: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    inline = sorted(k for k in raw if isinstance(k, str) and any(w in k.lower() for w in _DEPLOY_SECRET_WORDS))
+    if inline:
+        raise ValueError(f"{where} must not hold secrets inline ({inline}); a deploy scope has no secret settings")
+    unknown = set(raw) - {"mode", "command", "require"}
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(map(str, unknown))}")
+    mode = raw.get("mode", "ask")
+    if not isinstance(mode, str) or mode not in ("ask", "auto"):
+        raise ValueError(f"{where}.mode must be 'ask' or 'auto' (auto is only a candidate until you confirm it in Slack)")
+    if "command" not in raw:
+        raise ValueError(f"{where}.command is required")
+    command = _deploy_command(raw["command"], where)
+    require = raw.get("require", list(DEPLOY_REQUIRE))
+    if not isinstance(require, list) or not require or not all(isinstance(r, str) for r in require):
+        raise ValueError(f"{where}.require must be a non-empty list drawn from {list(DEPLOY_REQUIRE)}")
+    if len(set(require)) != len(require):
+        raise ValueError(f"{where}.require has a duplicate entry")
+    if not set(require) <= set(DEPLOY_REQUIRE):
+        raise ValueError(f"{where}.require may only hold {list(DEPLOY_REQUIRE)}")
+    return {"mode": mode, "command": command, "require": [r for r in DEPLOY_REQUIRE if r in require]}
+
+
+def _deploy_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.deploy``: ``{projects: {<id>: {repo, scopes: {<id>: {mode, command, require}}}}}``.
+
+    Strict and fail closed.  ``mode: auto`` is a candidate only: nothing here authorizes a deploy; the owner's Slack
+    confirmation stores the standing grant that does."""
+    where = "control_plane.personal_assistant.deploy"
+    if raw is None:
+        return {"projects": {}}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - {"projects"}
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(map(str, unknown))}")
+    projects = raw.get("projects", {})
+    if not isinstance(projects, dict):
+        raise ValueError(f"{where}.projects must be a mapping")
+    if len(projects) > 50:
+        raise ValueError(f"{where}.projects has too many entries (at most 50)")
+    out: dict[str, Any] = {}
+    seen: set[tuple[str, str]] = set()
+    for pid, proj in projects.items():
+        if not isinstance(pid, str) or not _DEPLOY_ID.fullmatch(pid):
+            raise ValueError(f"{where}: project id {pid!r} must match [a-z0-9][a-z0-9_-]{{0,63}}")
+        pwhere = f"{where}.projects.{pid}"
+        if not isinstance(proj, dict):
+            raise ValueError(f"{pwhere} must be a mapping")
+        inline = sorted(k for k in proj if isinstance(k, str) and any(w in k.lower() for w in _DEPLOY_SECRET_WORDS))
+        if inline:
+            raise ValueError(f"{pwhere} must not hold secrets inline ({inline})")
+        unknown = set(proj) - {"repo", "scopes"}
+        if unknown:
+            raise ValueError(f"{pwhere} has unknown keys: {sorted(map(str, unknown))}")
+        repo = proj.get("repo")
+        if (not isinstance(repo, str) or not _DEPLOY_REPO.fullmatch(repo) or repo.endswith(".git")
+                or any(part in (".", "..") for part in repo.split("/"))):
+            raise ValueError(f"{pwhere}.repo must be owner/name")
+        scopes = proj.get("scopes")
+        if not isinstance(scopes, dict) or not scopes or len(scopes) > 20:
+            raise ValueError(f"{pwhere}.scopes must be a mapping of 1 to 20 scopes")
+        norm: dict[str, Any] = {}
+        for sid, scope in scopes.items():
+            if not isinstance(sid, str) or not _DEPLOY_ID.fullmatch(sid):
+                raise ValueError(f"{pwhere}: scope id {sid!r} must match [a-z0-9][a-z0-9_-]{{0,63}}")
+            norm[sid] = _deploy_scope(scope, f"{pwhere}.scopes.{sid}")
+            ident = (repo.casefold(), norm[sid]["command"])
+            if ident in seen:
+                raise ValueError(f"{pwhere}.scopes.{sid}: duplicate repo and command (another scope already runs it)")
+            seen.add(ident)
+        out[pid] = {"repo": repo, "scopes": norm}
+    return {"projects": out}
 
 
 def apps_config(raw: Any) -> dict[str, Any]:

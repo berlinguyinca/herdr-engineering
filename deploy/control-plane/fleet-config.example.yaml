@@ -275,6 +275,19 @@ sections:
       #     channel: ""                  # channel id; empty = the owner's DM
       #     ask_ttl_minutes: 15          # integer 1..120
       #     max_asks_per_task_per_hour: 6
+      #   # OPTIONAL: per-project, per-scope deploy permission (Phase 4). A worker's command maps to a project and scope
+      #   # ONLY when it is exactly `<command> --ref <40 lowercase hex chars>` and its repo agrees. `mode: auto` is only a
+      #   # candidate: it takes effect after YOU confirm it with a Slack tap (POST /api/v1/assistant-deploys/<project>/<scope>/auto)
+      #   # and is revocable (DELETE the same path). Every `require` entry is checked by the hub, never claimed by the worker.
+      #   deploy:
+      #     projects:
+      #       herdr-engineering:           # project id: [a-z0-9][a-z0-9_-]{0,63}
+      #         repo: berlinguyinca/herdr-engineering
+      #         scopes:
+      #           control-plane:           # scope id, same pattern
+      #             mode: ask              # ask (default) | auto (candidate only)
+      #             command: deploy/control-plane/deploy.sh   # relative path: no leading / or ./, no .., no spaces
+      #             require: [on_main, ci_green, descends_from_deployed]   # a non-empty subset; default all three
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)
