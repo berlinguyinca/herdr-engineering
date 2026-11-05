@@ -5,6 +5,7 @@
 #                                  [--fleet-config PATH] [--collab-lock-wait SECONDS]
 #                                  [--deploy-lock-wait SECONDS]
 #                                  [--with-memory [--memory-checkout PATH]]
+#                                  [--memory-client-config PATH]
 #                                  [--allow-divergent]
 #   HEAD expressions use the caller worktree only after common-repository proof.
 #   Normal rollouts must descend from the verified deployed commit; intentional
@@ -108,6 +109,7 @@ set -euo pipefail
 
 REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
 MEMORY=0; MEMORY_CHECKOUT="${HERDR_MEMORY_CHECKOUT:-}"
+MEMORY_CLIENT_CONFIG="${HERDR_CP_MEMORY_CLIENT_CONFIG:-}"
 CENTRAL="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -120,12 +122,16 @@ while [ $# -gt 0 ]; do
     --deploy-lock-wait) DEPLOY_LOCK_WAIT="${2:?--deploy-lock-wait needs a value}"; shift 2 ;;
     --with-memory) MEMORY=1; shift ;;
     --memory-checkout) MEMORY_CHECKOUT="${2:?--memory-checkout needs a value}"; shift 2 ;;
+    --memory-client-config) MEMORY_CLIENT_CONFIG="${2:?--memory-client-config needs a path}"; shift 2 ;;
     -h|--help) sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [[ "$COLLAB_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--collab-lock-wait needs a whole number of seconds" >&2; exit 2; }
 [[ "$DEPLOY_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--deploy-lock-wait needs a whole number of seconds" >&2; exit 2; }
+if [ -n "$MEMORY_CLIENT_CONFIG" ]; then
+  MEMORY_CLIENT_CONFIG="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().absolute())' "$MEMORY_CLIENT_CONFIG")"
+fi
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO="$(git -C "$HERE" rev-parse --show-toplevel)"
@@ -368,6 +374,13 @@ if [ "$MEMORY" = 1 ]; then
   . "$MEM_LIB"
 fi
 if [ "$MEMORY" = 1 ]; then memory_preflight || exit 1; fi
+
+# The read-only explorer's CLI/profile use the app's existing rollout, lock
+# and rollback, independently of the optional backend memory step.
+MEMORY_CLIENT_LIB="$WORK/deploy/control-plane/memory-client-deploy.sh"
+[ -f "$MEMORY_CLIENT_LIB" ] || MEMORY_CLIENT_LIB="$HERE/memory-client-deploy.sh"
+. "$MEMORY_CLIENT_LIB"
+memory_client_preflight || exit 1
 
 # only_file <dir> <name>: the directory (mounted whole into a container) holds nothing else
 only_file() {
@@ -640,9 +653,10 @@ fi
 
 deploy_lock_phase build
 
-# A failed build exits here: nothing on the host has been touched yet.
+# A failed build exits here: no running service or installed profile changed.
+memory_client_build || exit 1
 docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
-  -t "herdr-engineering:$TAG" "$WORK" >/dev/null
+  "${MEMORY_CLIENT_BUILD_ARGS[@]}" -t "herdr-engineering:$TAG" "$WORK" >/dev/null
 
 # Use this checkout's helper, not the target commit's possibly older deploy tooling.
 # The selected canonical source stays the forward mount. Snapshots live outside
@@ -764,6 +778,8 @@ install_private() {   # <src> <dest>: 0600 file in a 0700 dir, atomic
   mkdir -p "$(dirname "$2")" && chmod 700 "$(dirname "$2")" \
     && install -m 0600 "$1" "$2.install.tmp" && mv -f "$2.install.tmp" "$2"
 }
+
+memory_client_snapshot || exit 1
 
 # compose_run <worktree> <env file> <image tag> <commit> <compose args...>: that
 # worktree's compose files with the given env file and this deploy's paths. Rollback
@@ -939,6 +955,7 @@ forward() {
   else
     compose_up "$WORK" "$ENV_FILE" "$TAG" "$SHA" >/dev/null || return 1
   fi
+  memory_client_apply forward "$WORK" || return 1
   # The edge resolves collab-public once, at (re)load: a recreated collab-public has a
   # new address, so reload the edge after every collab up, not only on a new conf.
   if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi
@@ -947,7 +964,8 @@ forward() {
   if [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ]; then stop_share_public; fi
   deploy_lock_phase verify || return 1
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
-  verify "$SHA"
+  verify "$SHA" || return 1
+  memory_client_promote
 }
 
 rollback_share() {
@@ -1006,6 +1024,7 @@ rollback() {
       && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
       && prev_render \
       && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+      && memory_client_apply rollback "$PREV_WORK" \
       && rollback_share \
       && { [ "$COLLAB" = 0 ] || { EDGE_CONF_CHANGED=1; reload_edge_if_changed || true; }; } \
       && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \

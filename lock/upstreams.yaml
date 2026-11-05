@@ -13,11 +13,11 @@ dependencies:
     note: "Required cross-harness artifact skill, installed into the same four harnesses as herdr-handoff."
   herdr-memory:
     source: "berlinguyinca/herdr-memory"
-    revision: "cc20ad4d46845b8257e54596e152846e3ce4a3c2"
+    revision: "7d8499af11d3ef825ecf7fd3bba3189b0f56e5f7"
     decision: ADOPT
     license: "private"
-    maintenance: "active; private Hindsight-backed memory client (contract v1, client 0.1.6)"
-    note: "Optional (opt-in `scripts/install.sh --with-memory`); managed harness config via `herdr-eng memory install`. Pin must match herdr_engineering.memory_install.PINNED_REVISION (and PINNED_CLIENT_VERSION, 0.1.6). 0.1.6 verifies Git worktree registration before inheriting a project and preserves the explicit default_project fallback (herdr-memory#13)."
+    maintenance: "active; private Hindsight-backed memory client (contract v1, client 0.1.7)"
+    note: "Optional managed harness config via herdr-eng memory install; also the canonical dashboard CLI when authorized viewers are configured. Pin must match herdr_engineering.memory_install.PINNED_REVISION and PINNED_CLIENT_VERSION (0.1.7). Offline validate-config checks schema/URL without credentials, network or cache state (herdr-memory#15)."
   herdr-memory-deploy:
     source: "berlinguyinca/herdr-memory"
     revision: "c4e0c64"
