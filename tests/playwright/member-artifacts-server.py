@@ -201,6 +201,95 @@ class FakeMemberService:
                                         "head_version_number": 2, "permissions": ["read", "share"]}]}
             return self.users[uid]
 
+    # ------------------------------------------------------------------ the library (feed items, folders, pending pushes)
+    def _lib(self, actor) -> dict:
+        u = self._u(actor)
+        with _LOCK:
+            if "lib" not in u:
+                def item(aid, title, sharer, day, source, status="active", expires=None, body=b"", ctype="text/html"):
+                    path = "index.html" if ctype == "text/html" else "data.bin"
+                    return {"artifact_id": aid, "title": title, "sharer": sharer, "shared_at": f"2026-10-{day:02d}T10:00:00+00:00",
+                            "source": source, "status": status, "expires_at": expires, "share_id": None if source != "opened" else "shr_hidden",
+                            "folder_ids": [], "artifact_type": "html" if ctype == "text/html" else "bin", "size_bytes": len(body),
+                            "files": [{"path": path, "sha256": hashlib.sha256(body).hexdigest(), "size": len(body), "content_type": ctype}]
+                            if status in ("active", "pending") else [], "_body": body}
+                u["lib"] = {"folders": [], "items": [
+                    item("lib_mine", "Plate map", "alice@lab.example", 1, "mine", body=b"<h1>mine content</h1>"),
+                    item("lib_assigned", f"QC report {HOSTILE}", "bob@lab.example", 5, "assigned", body=b"<h1>assigned content</h1>"),
+                    item("lib_opened", "Opened by link", "cy@lab.example", 3, "opened", expires="2026-12-01T00:00:00+00:00", body=b"<h1>opened content</h1>"),
+                    item("lib_expired", "Old link", "dee@lab.example", 2, "opened", status="expired", expires="2026-09-30T00:00:00+00:00"),
+                    item("lib_pending", "Agent push", "agent", 7, "pending", status="pending", body=b"<h1>pending content</h1>"),
+                    item("lib_pending2", "Second push", "agent", 8, "pending", status="pending", body=b"x", ctype="application/octet-stream"),
+                ]}
+            return u["lib"]
+
+    def library(self, actor):
+        lib = self._lib(actor)
+        with _LOCK:
+            items = [{k: v for k, v in i.items() if not k.startswith("_")} for i in lib["items"]]
+            folders = [{**f, "item_count": sum(1 for i in lib["items"] if f["folder_id"] in i["folder_ids"])} for f in lib["folders"]]
+        return {"items": items, "folders": folders}
+
+    def library_content(self, actor, artifact_id, path):
+        lib = self._lib(actor)
+        with _LOCK:
+            row = next((i for i in lib["items"] if i["artifact_id"] == artifact_id and i["status"] in ("active", "pending")), None)
+            entry = next((f for f in (row or {}).get("files", []) if f["path"] == path), None)
+            if row is None or entry is None:
+                raise MemberServiceError(404, "not_found", "not found")
+            return entry, row["_body"]
+
+    def _folder_write(self, actor, change, doc):
+        lib, u = self._lib(actor), self._u(actor)
+        with _LOCK:
+            change(lib)
+        return self._submit(u, doc)
+
+    def library_folder_create(self, actor, name):
+        fid = "fld_" + secrets.token_hex(12)
+        return self._folder_write(actor, lambda lib: lib["folders"].append({"folder_id": fid, "name": name}),
+                                  {"result": "created", "folder_id": fid})
+
+    def library_folder_rename(self, actor, folder_id, name):
+        def change(lib):
+            for f in lib["folders"]:
+                if f["folder_id"] == folder_id:
+                    f["name"] = name
+        return self._folder_write(actor, change, {"result": "renamed"})
+
+    def library_folder_delete(self, actor, folder_id):
+        def change(lib):
+            lib["folders"] = [f for f in lib["folders"] if f["folder_id"] != folder_id]
+            for i in lib["items"]:
+                i["folder_ids"] = [x for x in i["folder_ids"] if x != folder_id]
+        return self._folder_write(actor, change, {"result": "deleted"})
+
+    def library_file(self, actor, folder_id, artifact_id):
+        def change(lib):
+            for i in lib["items"]:
+                if i["artifact_id"] == artifact_id and folder_id not in i["folder_ids"]:
+                    i["folder_ids"].append(folder_id)
+        return self._folder_write(actor, change, {"result": "filed"})
+
+    def library_unfile(self, actor, folder_id, artifact_id):
+        def change(lib):
+            for i in lib["items"]:
+                if i["artifact_id"] == artifact_id:
+                    i["folder_ids"] = [x for x in i["folder_ids"] if x != folder_id]
+        return self._folder_write(actor, change, {"result": "unfiled"})
+
+    def library_accept(self, actor, artifact_id):
+        def change(lib):
+            for i in lib["items"]:
+                if i["artifact_id"] == artifact_id and i["source"] == "pending":
+                    i["source"], i["status"] = "mine", "active"
+        return self._folder_write(actor, change, {"result": "accepted"})
+
+    def library_discard(self, actor, artifact_id):
+        def change(lib):
+            lib["items"] = [i for i in lib["items"] if not (i["artifact_id"] == artifact_id and i["source"] == "pending")]
+        return self._folder_write(actor, change, {"result": "discarded"})
+
     def _stage_bytes(self, u) -> int:
         return sum(len(p) for up in u["uploads"].values() for p in up["parts"].values())
 

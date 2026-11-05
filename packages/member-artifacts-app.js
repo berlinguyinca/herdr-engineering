@@ -25,7 +25,10 @@ let approving = false;             // an approve call is in flight: Approve and 
 let uploads = new Map();           // artifact id -> Map(name -> row)
 let files = new Map();             // artifact id -> Map(name -> File)
 let draft = null;                  // a share awaiting approval {artifactId, created, key}
-let current = { route: 'mine', id: null };
+let current = { route: 'library', id: null };
+let lib = { items: [], folders: [], chip: 'all', q: '' };      // the library feed; filtering is client-side over the fetched list
+let searchTimer = null;
+const SEARCH_DEBOUNCE_MS = 150;
 let busyDelete = null;
 
 function say(message, kind = 'info') {
@@ -169,12 +172,80 @@ const stagedBytes = () => Object.values(readRecord()).flat().reduce((n, r) => n 
 
 // ------------------------------------------------------------------------------------------------ views
 function paintNav() {
-  nav.innerHTML = V.renderNav(current.route, true);
+  nav.innerHTML = V.renderNav(current.route === 'folder' ? 'library' : current.route, true);
   $('#signout').hidden = false;
+  const who = $('#who');
+  if (who) { who.textContent = memberName(); who.hidden = !who.textContent; }
 }
 
 function paint(html) {
   app.innerHTML = html;
+}
+
+// ------------------------------------------------------------------------------------------------ library
+async function reloadLibrary() {
+  const [me, got] = await Promise.all([api.me(), api.library()]);
+  data.me = { display_name: me.display_name, user_id: me.user_id };
+  lib.items = Array.isArray(got.items) ? got.items : [];
+  lib.folders = Array.isArray(got.folders) ? got.folders : [];
+}
+
+const CHIP_SOURCES = { all: undefined, assigned: ['assigned'], opened: ['opened'], mine: ['mine'], pending: ['pending'] };
+
+function paintFeed() {
+  const folderId = current.route === 'folder' ? current.id : null;
+  const scope = V.filterFeed(lib.items, { folderId, sources: ['mine', 'assigned', 'opened', 'pending'] });
+  const count = (src) => scope.filter((r) => r.source === src).length;
+  const counts = { all: count('mine') + count('assigned') + count('opened'), assigned: count('assigned'), opened: count('opened'), mine: count('mine'), pending: count('pending') };
+  if (!counts.pending && lib.chip === 'pending') lib.chip = 'all';
+  const rows = V.filterFeed(lib.items, { q: lib.q, sources: CHIP_SOURCES[lib.chip], folderId, folders: lib.folders });
+  $('[data-chips-region]').innerHTML = V.renderChips(counts, lib.chip);
+  $('[data-feed-region]').innerHTML = V.renderFeedList(rows, { folders: lib.folders, activeFolder: folderId });
+}
+
+function viewLibrary() {
+  const folder = current.route === 'folder' ? lib.folders.find((f) => f.folder_id === current.id) : null;
+  if (current.route === 'folder' && !folder) { paint('<p class="empty" data-empty>This folder is not available.</p>'); return; }
+  paint(`<div class="library">${V.renderFolderSidebar(lib.folders, folder ? folder.folder_id : null)}
+<section class="library-main"><h2>${folder ? V.esc(folder.name) : 'Library'}</h2>
+<label class="search">Search <input type="search" data-search maxlength="200" autocomplete="off" placeholder="Title, sharer, folder" value="${V.esc(lib.q)}"></label>
+<div data-chips-region></div><div data-feed-region></div></section></div>`);
+  paintFeed();
+}
+
+const wait = async (work, done) => { await work(); await route(); if (done) say(done); };
+
+async function folderCreate(form) {
+  const name = String(new FormData(form).get('name') || '').trim();
+  if (!name) return;
+  await wait(() => api.createFolder(name), 'Folder created.');
+}
+async function folderRename(el) {
+  const folder = lib.folders.find((f) => f.folder_id === el.dataset.folder);
+  const name = (window.prompt('Folder name', folder?.name || '') || '').trim();
+  if (name && folder && name !== folder.name) await wait(() => api.renameFolder(folder.folder_id, name), 'Folder renamed.');
+}
+async function folderDelete(el) {
+  const folder = lib.folders.find((f) => f.folder_id === el.dataset.folder);
+  if (!folder || !window.confirm(`Delete the folder "${folder.name}"? Its items stay in your library.`)) return;
+  await api.deleteFolder(folder.folder_id);
+  say('Folder deleted.');
+  if (location.hash === '#/') await route(); else location.hash = '#/';
+}
+
+const VIEWABLE = /^(text\/|application\/pdf$|image\/(png|jpe?g|gif|webp)$)/;
+/** Fetch with the member session, then show the blob in its own window (the strict page CSP carries over to it) or save it. */
+async function openContent(el) {
+  const { artifact, path } = el.dataset;
+  const { blob, type } = await api.fetchContent(artifact, path);
+  const url = URL.createObjectURL(blob);
+  if (VIEWABLE.test(type)) window.open(url, '_blank', 'noopener');
+  else {
+    const a = document.createElement('a');
+    a.href = url; a.download = path.split('/').pop(); a.hidden = true;
+    document.body.append(a); a.click(); a.remove();
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 function viewMine() {
@@ -255,10 +326,17 @@ async function route() {
   else if (hash === '#/links') current = { route: 'links', id: null };
   else if (hash === '#/usage') current = { route: 'usage', id: null };
   else if (hash === '#/new') current = { route: 'new', id: null };
-  else current = { route: 'mine', id: null };
+  else if (hash === '#/mine') current = { route: 'mine', id: null };
+  else {
+    const f = /^#\/f\/(.+)$/.exec(hash);
+    let fid = null;
+    try { fid = f ? decodeURIComponent(f[1]) : null; } catch { /* malformed: the folder is not found below */ }
+    current = f ? { route: 'folder', id: fid } : { route: 'library', id: null };
+  }
   paintNav();
   try {
     if (current.route === 'artifact' && current.id === null) { paint('<p class="empty" data-empty>This artifact is not available.</p>'); return; }
+    if (current.route === 'library' || current.route === 'folder') { await reloadLibrary(); viewLibrary(); return; }
     if (current.route !== 'new') await reload();
     ({ mine: viewMine, shared: viewShared, links: viewLinks, usage: viewUsage, new: viewNew,
       artifact: () => viewArtifact(current.id) })[current.route]();
@@ -481,7 +559,7 @@ async function confirmDelete() {
     forgetRecord(row.artifact_id);
     uploads.delete(row.artifact_id);
     say('Deleted. Its links stopped working.');
-    if (location.hash === '#/') await route(); else location.hash = '#/';
+    if (location.hash === '#/mine') await route(); else location.hash = '#/mine';
   } catch (e) { say(describe(e), 'error'); }
 }
 
@@ -496,6 +574,12 @@ async function revoke(button) {
 }
 
 const actions = {
+  open: (el) => openContent(el),
+  accept: (el) => wait(() => api.acceptPending(el.dataset.artifact), 'Added to your library.'),
+  discard: (el) => wait(() => api.discardPending(el.dataset.artifact), 'Discarded.'),
+  unfile: (el) => wait(() => api.unfileItem(el.dataset.folder, el.dataset.artifact), 'Removed from the folder.'),
+  'rename-folder': (el) => folderRename(el),
+  'delete-folder': (el) => folderDelete(el),
   signin: () => startSignIn(),
   signout: () => signOut(),
   approve: () => approve(),
@@ -515,6 +599,8 @@ const actions = {
 };
 
 document.addEventListener('click', (ev) => {
+  const chip = ev.target instanceof Element ? ev.target.closest('[data-chip]') : null;
+  if (chip && chip.dataset.chip in CHIP_SOURCES) { lib.chip = chip.dataset.chip; paintFeed(); return; }
   const el = ev.target instanceof Element ? ev.target.closest('[data-action]') : null;
   const run = el && actions[el.dataset.action];
   if (run) { ev.preventDefault(); Promise.resolve(run(el)).catch((e) => say(describe(e), 'error')); }
@@ -532,6 +618,9 @@ document.addEventListener('change', (ev) => {
     if (dup) say(`Two files are named "${dup}". Rename one and choose them again.`, 'error');
     else if (busy) say(`"${busy.name}" is already uploading.`, 'error');
     else startUploads(current.id, chosen);
+  } else if (t.matches('select[data-action="file"]')) {
+    const folder = t.value;
+    if (folder) wait(() => api.fileItem(folder, t.dataset.artifact), 'Filed.').catch((e) => say(describe(e), 'error'));
   } else if (t.matches('input[name="audience"]')) {
     const form = t.closest('form');
     const pub = form.elements.audience.value === 'public';
@@ -540,9 +629,17 @@ document.addEventListener('change', (ev) => {
   }
 });
 
+document.addEventListener('input', (ev) => {
+  const t = ev.target;
+  if (!(t instanceof Element) || !t.matches('[data-search]')) return;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { lib.q = t.value; paintFeed(); }, SEARCH_DEBOUNCE_MS);
+});
+
 document.addEventListener('submit', (ev) => {
   const form = ev.target;
   if (!(form instanceof HTMLFormElement)) return;
+  if (form.matches('[data-folder-form]')) { ev.preventDefault(); folderCreate(form).catch((e) => say(describe(e), 'error')); return; }
   if (form.matches('[data-share-form]')) { ev.preventDefault(); onShareSubmit(form); }
   else if (form.matches('[data-new-form]')) { ev.preventDefault(); createArtifact(form); }
 });

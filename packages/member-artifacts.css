@@ -47,6 +47,20 @@ input[type="radio"] { padding: 0; }
 .chip { font: inherit; font-size: .85rem; padding: 3px 12px; min-height: 28px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text); cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; box-sizing: border-box; }
 .chip:hover { background: var(--surface-hover); }
 .chip[aria-pressed="true"], .chip[aria-current="true"], .chip.is-active { background: var(--btn-accent); border-color: var(--btn-accent); color: var(--text-on-accent); }
+/* library layout, muted rows, folder sidebar */
+.library { display: grid; grid-template-columns: 220px 1fr; gap: 16px; align-items: start; }
+.library-main { min-width: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.chip-count { opacity: .85; }
+.search { max-width: 420px; }
+.folders { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.folder-list { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 2px; }
+.folder-list .tab { display: block; overflow-wrap: anywhere; }
+.folder-manage { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.row-muted { background: #f0f0f3; color: #5a5a6c; }
+.row-muted .row-title { color: #5a5a6c; font-weight: 400; }
+#who { max-width: 24ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* library badges: small, 4px radius; every pair is >= 4.5:1 */
 .badge-mine, .badge-assigned, .badge-opened, .badge-pending, .badge-expired { border-radius: 4px; border-color: transparent; font-size: .75rem; padding: 2px 8px; }
 .badge-mine { background: var(--accent-weak); color: #0b5d48; }
@@ -69,6 +83,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .45); }
 code { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); overflow-wrap: anywhere; }
 @media (max-width: 640px) {
   main { padding: 12px; }
+  .library { grid-template-columns: 1fr; }
   .btn, .tab, input, select { min-height: 44px; }
   .toolbar .btn { width: 100%; justify-content: center; }
 }
