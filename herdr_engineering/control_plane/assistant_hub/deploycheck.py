@@ -14,7 +14,7 @@ import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .deploy import DeployMatch, scope_config
 
@@ -22,11 +22,13 @@ if TYPE_CHECKING:
     from ..assistant import AssistantStore
     from .workers import Worker
 
-__all__ = ["DeployCheck", "STATUSES", "FINAL", "DEFAULT_CHECK_MINUTES", "DEFAULT_WINDOW_MINUTES", "open_check",
+__all__ = ["DeployCheck", "Status", "STATUSES", "FINAL", "sanitize_check", "short_label", "NOT_OPENED", "DEFAULT_CHECK_MINUTES", "DEFAULT_WINDOW_MINUTES", "open_check",
            "verify_deploy", "record_exit", "check_minutes", "describe_status"]
 
-STATUSES = ("awaiting", "healthy", "rolled_back", "failed_rollback", "unconfirmed")
+Status = Literal["awaiting", "healthy", "rolled_back", "failed_rollback", "unconfirmed"]
+STATUSES: tuple[Status, ...] = ("awaiting", "healthy", "rolled_back", "failed_rollback", "unconfirmed")
 FINAL = frozenset(STATUSES) - {"awaiting"}
+NOT_OPENED = "not_opened"           # last_error of an unconfirmed row written because the real check could not be opened
 DEFAULT_CHECK_MINUTES = 20
 DEFAULT_WINDOW_MINUTES = 10
 MIN_PREFIX = 12                     # a shorter commit prefix is never accepted as "the target commit"
@@ -44,7 +46,7 @@ class DeployCheck:
     scope: str = ""
     sha: str = ""
     request_id: str = ""            # the owner-approved request, "" when a standing grant authorized it
-    status: str = "awaiting"        # awaiting | healthy | rolled_back | failed_rollback | unconfirmed
+    status: Status = "awaiting"
     started_at: datetime = _EPOCH
     deadline: datetime = _EPOCH
     last_error: str = ""            # a short code, never remote text
@@ -55,9 +57,42 @@ class DeployCheck:
     window_ends: datetime = _EPOCH  # before this a different commit only means the deploy has not happened yet
     exit_code: int | None = None    # what the worker reported deploy.sh exited with (data, never trusted for "healthy")
     notified: bool = False          # the Slack outcome message was posted
-    reverified: str = ""            # after a healthy result: on_main | off_main | unverified | ""
+    reverified: str = ""            # after a healthy result: on_main | off_main | unverified | newer | ""
     finished_at: datetime = _EPOCH
     seen_commit: str = ""           # the last commit health reported (12 chars)
+
+
+_DATES = ("started_at", "deadline", "window_ends", "finished_at")
+
+
+def sanitize_check(row: DeployCheck) -> DeployCheck | None:
+    """Fail closed on a row read back from stored state: None when it cannot be trusted at all (no ids, malformed
+    sha), otherwise a row whose status is one the hub knows.  Anything odd becomes ``unconfirmed``, never ``healthy``."""
+    if not all(isinstance(v, str) and v for v in (row.check_id, row.tenant_id, row.user_id)):
+        return None
+    if not isinstance(row.sha, str) or not _SHA.fullmatch(row.sha):
+        return None
+    for name in ("project", "scope", "request_id", "worker_id", "task_id", "repo", "health_url", "last_error",
+                 "reverified", "seen_commit"):
+        if not isinstance(getattr(row, name), str):
+            setattr(row, name, "")
+    if row.exit_code is not None and type(row.exit_code) is not int:
+        row.exit_code = None
+    if type(row.notified) is not bool:
+        row.notified = False
+    bad = row.status not in STATUSES
+    for name in _DATES:
+        value = getattr(row, name)
+        if not isinstance(value, datetime):
+            setattr(row, name, _EPOCH)
+            bad = True
+        elif value.tzinfo is None:
+            setattr(row, name, value.replace(tzinfo=UTC))
+    if bad:
+        row.status = "unconfirmed"
+        row.last_error = "bad_state"
+        row.notified = False
+    return row
 
 
 def _utc(value: datetime) -> datetime:
@@ -80,6 +115,8 @@ def open_check(store: AssistantStore, deploy_cfg: Any, worker: Worker, match: De
     """Record that this exact deploy was authorized and must be verified.  One awaiting check per (worker, scope, sha):
     asking again returns the open one.  The health address comes from the live config, never from the request."""
     now = _utc(now)
+    if not _SHA.fullmatch(match.sha):
+        raise ValueError("a deploy check needs a full commit sha")
     with store._lock:
         for old in store.list_deploy_checks(worker.tenant_id, worker.user_id, worker_id=worker.worker_id):
             if old.status == "awaiting" and (old.project, old.scope, old.sha) == (match.project, match.scope, match.sha):
@@ -93,12 +130,34 @@ def open_check(store: AssistantStore, deploy_cfg: Any, worker: Worker, match: De
             health_url=health_url if isinstance(health_url, str) else "",
             window_ends=now + timedelta(minutes=_window_minutes(deploy_cfg, total)),
             last_error="" if isinstance(health_url, str) and health_url else "no_health_url")
-        store.put_deploy_check(check)
+        # audit first: if the durable audit fails nothing is stored, and the caller records "not verified"
         store.audit_record(tenant_id=check.tenant_id, user_id=check.user_id, actor="hub:deploycheck",
                            action="assistant.deploy.check_opened", subject_id=check.check_id,
                            detail=f"check={check.check_id} project={check.project} scope={check.scope} "
                                   f"sha12={check.sha[:12]} worker={check.worker_id}")
+        store.put_deploy_check(check)
     return check
+
+
+def record_not_opened(store: AssistantStore, worker: Worker, match: DeployMatch, task_id: str, request_id: str,
+                      now: datetime) -> None:
+    """The check for an authorized deploy could not be opened.  Say so in the audit (ids only) and leave a final
+    ``unconfirmed`` row so the task summary and the Slack sweep report "NOT verified by the hub".  Best effort."""
+    now = _utc(now)
+    row = DeployCheck(
+        check_id="dc_" + secrets.token_urlsafe(12), tenant_id=worker.tenant_id, user_id=worker.user_id,
+        project=match.project, scope=match.scope, sha=match.sha, request_id=request_id, status="unconfirmed",
+        started_at=now, deadline=now, window_ends=now, finished_at=now, worker_id=worker.worker_id, task_id=task_id,
+        repo=match.repo, last_error=NOT_OPENED)
+    for step in (lambda: store.put_deploy_check(row),
+                 lambda: store.audit_record(tenant_id=row.tenant_id, user_id=row.user_id, actor="hub:deploycheck",
+                                            action="assistant.deploy.check_failed", subject_id=row.check_id,
+                                            detail=f"check={row.check_id} project={row.project} scope={row.scope} "
+                                                   f"sha12={row.sha[:12]} worker={row.worker_id}")):
+        try:
+            step()
+        except Exception:                                  # noqa: BLE001 - each step on its own
+            pass
 
 
 def _matches(commit: str, sha: str) -> bool:
@@ -123,11 +182,21 @@ def _finish(store: AssistantStore, check_id: str, tenant: str, user: str, status
         return new
 
 
+def _live_health_url(deploy_cfg: Any, check: DeployCheck) -> str:
+    """The health address the LIVE config has for this check's project and scope ("" when the scope is gone)."""
+    url = scope_config(deploy_cfg, DeployMatch(check.project, check.scope, check.repo, check.sha, "")).get("health_url")
+    return url if isinstance(url, str) else ""
+
+
 def verify_deploy(store: AssistantStore, check: DeployCheck, health: Any, now: datetime, *,
-                  reverify: Callable[[DeployCheck], str] | None = None) -> DeployCheck:
+                  reverify: Callable[[DeployCheck], str] | None = None,
+                  lineage: Callable[[DeployCheck, str], str] | None = None,
+                  deploy_cfg: Any = None) -> DeployCheck:
     """One polling step.  Healthy when the health endpoint reports the target commit; rolled back when it reports a
-    different commit once the deploy window has passed; unconfirmed at the deadline.  An unreachable or odd answer
-    only records a short code.  Never raises."""
+    different commit once the deploy window has passed (unless ``lineage`` says that commit CONTAINS the target: then
+    healthy, ``reverified="newer"``); unconfirmed at the deadline.  An unreachable or odd answer only records a short
+    code.  When ``deploy_cfg`` is given, a stored health address that differs from the live config's is never polled.
+    Never raises."""
     now = _utc(now)
     try:
         cur = store.get_deploy_check(check.check_id, tenant_id=check.tenant_id, user_id=check.user_id)
@@ -136,7 +205,13 @@ def verify_deploy(store: AssistantStore, check: DeployCheck, health: Any, now: d
         commit: Any = None
         error = ""
         if not cur.health_url:
-            error = "no_health_url"
+            done = _finish(store, cur.check_id, cur.tenant_id, cur.user_id, "unconfirmed", now, ("awaiting",),
+                           last_error="no_health_url")
+            return done or cur
+        if deploy_cfg is not None and _live_health_url(deploy_cfg, cur) != cur.health_url:
+            done = _finish(store, cur.check_id, cur.tenant_id, cur.user_id, "unconfirmed", now, ("awaiting",),
+                           last_error="health_url_changed")
+            return done or cur
         else:
             try:
                 commit = health.deployed_commit(cur.health_url)
@@ -157,6 +232,15 @@ def verify_deploy(store: AssistantStore, check: DeployCheck, health: Any, now: d
             return done or cur
         if (isinstance(commit, str) and _HEX.fullmatch(commit) and len(commit) >= MIN_PREFIX
                 and now >= _utc(cur.window_ends)):
+            if lineage is not None:
+                try:
+                    relation = lineage(cur, commit)
+                except Exception:                  # noqa: BLE001
+                    relation = "unverified"
+                if relation == "descendant":       # what is serving contains the target commit
+                    done = _finish(store, cur.check_id, cur.tenant_id, cur.user_id, "healthy", now, ("awaiting",),
+                                   last_error="", seen_commit=seen, reverified="newer")
+                    return done or cur
             done = _finish(store, cur.check_id, cur.tenant_id, cur.user_id, "rolled_back", now, ("awaiting",),
                            last_error="", seen_commit=seen)
             return done or cur
@@ -204,11 +288,19 @@ def record_exit(store: AssistantStore, worker: Worker, task_id: str | None, exit
 _WORDS = {
     "awaiting": "still being checked",
     "healthy": "healthy",
-    "rolled_back": "rolled back (the previous version is serving again)",
+    "rolled_back": "NOT live: a different version is serving (cause unknown)",
     "failed_rollback": "FAILED TO ROLL BACK (needs you now)",
     "unconfirmed": "unconfirmed (the hub could not confirm the new version; do not assume it worked)",
 }
+_LABELS = {"awaiting": "still being checked", "healthy": "healthy", "rolled_back": "not live",
+           "failed_rollback": "failed to roll back", "unconfirmed": "unconfirmed"}
 
 
 def describe_status(check: DeployCheck) -> str:
-    return _WORDS.get(check.status, "unconfirmed")
+    if check.status == "unconfirmed" and check.last_error == NOT_OPENED:
+        return "NOT verified by the hub (its check could not be opened); do not assume it worked"
+    return _WORDS.get(check.status, _WORDS["unconfirmed"])
+
+
+def short_label(check: DeployCheck) -> str:
+    return _LABELS.get(check.status, "unconfirmed")

@@ -27,7 +27,7 @@ from typing import Any
 from ..assistant import AssistantStore
 from .actiongrants import ActionRequestRow, GrantState, as_utc
 from .deploy import DeployMatch, scope_key, scope_mode
-from .deploycheck import FINAL, DeployCheck, describe_status, verify_deploy
+from .deploycheck import FINAL, NOT_OPENED, DeployCheck, describe_status, short_label, verify_deploy
 from .evidence import propose_if_ready
 from .policy import (
     ActivationRefused,
@@ -219,6 +219,7 @@ class _Queued:
     project: str
     queued_at: datetime
     ask: SlackAsk | None = None
+    urgent: bool = False             # goes to the head of the queue and is never the one dropped on overflow
     kind: str = "action"             # action | question | summary (their asks are created up front) | outcome (a deploy
                                      # check id in ``request_id``)
 
@@ -423,9 +424,15 @@ class SlackRuntime:
     def _enqueue(self, item: _Queued) -> None:
         with self._qcond:
             if len(self._queue) >= self._qsize:
-                self._queue.popleft()
-                self.dropped += 1
-            self._queue.append(item)
+                for i, old in enumerate(self._queue):      # the oldest item that is not urgent goes; urgent never
+                    if not old.urgent:
+                        del self._queue[i]
+                        self.dropped += 1
+                        break
+            if item.urgent:
+                self._queue.appendleft(item)
+            else:
+                self._queue.append(item)
             self._qcond.notify()
 
     def is_enabled(self) -> bool:
@@ -505,8 +512,10 @@ class SlackRuntime:
             if done:
                 delay = self._min_backoff
                 with self._qcond:
-                    if self._queue and self._queue[0] is item:
-                        self._queue.popleft()
+                    for i, queued in enumerate(self._queue):     # by identity: an urgent item may have moved the head
+                        if queued is item:
+                            del self._queue[i]
+                            break
             elif wait:
                 self._stop.wait(wait)
 
@@ -727,7 +736,8 @@ class SlackRuntime:
         for check in self.store.list_deploy_checks_any(status="awaiting"):
             if self._stop.is_set():
                 break
-            done = verify_deploy(self.store, check, self.health, now, reverify=self._reverify)
+            done = verify_deploy(self.store, check, self.health, now, reverify=self._reverify,
+                                 lineage=self._lineage, deploy_cfg=self.service.config.get("deploy") or {})
             if done.status in FINAL:
                 finished += 1
                 self.notify_deploy_outcome(done)
@@ -750,13 +760,24 @@ class SlackRuntime:
             return "on_main"
         return "off_main" if span.status in ("behind", "diverged") else "unverified"
 
+    def _lineage(self, check: DeployCheck, served: str) -> str:
+        """Is the commit now serving a descendant of the target?  ``descendant`` | ``other`` | ``unverified``."""
+        clients = self.preconditions
+        if clients is None or clients.gh is None or not check.repo:
+            return "unverified"
+        span = clients.gh.commits_between(f"github.com/{check.repo}", check.sha, served)
+        if span.status in ("ahead", "identical"):
+            return "descendant"
+        return "other" if span.status in ("behind", "diverged") else "unverified"
+
     def notify_deploy_outcome(self, check: DeployCheck) -> None:
         """Queue the Slack message for a finished check.  Never blocks and never raises."""
         try:
             if not self._cfg().get("enabled") or check.status not in FINAL or check.notified:
                 return
             self._enqueue(_Queued(check.tenant_id, check.user_id, check.check_id, check.worker_id, check.task_id, "",
-                                  "", check.project, as_utc(self._now()), kind="outcome"))
+                                  "", check.project, as_utc(self._now()), kind="outcome",
+                                  urgent=check.status == "failed_rollback"))
         except Exception as exc:
             _log.warning("slack outcome notify failed: %s", type(exc).__name__)
 
@@ -766,15 +787,15 @@ class SlackRuntime:
         for check in self.store.list_deploy_checks_any(unnotified=True):
             if mono - self._failed_at.get(check.check_id, -1e9) < self._reoffer_backoff:
                 continue
+            urgent = check.status == "failed_rollback"
             with self._qcond:
-                if len(self._queue) >= self._qsize:
-                    break
                 if check.check_id == self._current or any(i.kind == "outcome" and i.request_id == check.check_id
                                                           for i in self._queue):
                     continue
-                self._queue.append(_Queued(check.tenant_id, check.user_id, check.check_id, check.worker_id,
-                                           check.task_id, "", "", check.project, now, kind="outcome"))
-                self._qcond.notify()
+                if len(self._queue) >= self._qsize and not urgent:
+                    break
+            self._enqueue(_Queued(check.tenant_id, check.user_id, check.check_id, check.worker_id,
+                                  check.task_id, "", "", check.project, now, kind="outcome", urgent=urgent))
             queued += 1
         return queued
 
@@ -786,7 +807,7 @@ class SlackRuntime:
             return True
         urgent = check.status == "failed_rollback"
         text = ("URGENT: a deploy failed to roll back" if urgent else
-                f"Deploy {describe_status(check).split(' (')[0]}")
+                f"Deploy {short_label(check)}")
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": self._outcome_text(check)}}]
         channel = self._target(cfg)
         self.client.post_message(channel, blocks, text)
@@ -811,14 +832,19 @@ class SlackRuntime:
                     "This needs you now.")
         if check.status == "healthy":
             line = f"*Deploy healthy:* {head} is serving."
-            if check.reverified == "off_main":
+            if check.reverified == "newer":
+                line = f"*Deploy healthy:* a newer version that contains {head} is serving."
+            elif check.reverified == "off_main":
                 line += " Warning: that commit is no longer on main's history."
             elif check.reverified != "on_main":
                 line += " Main could not be re-checked after the deploy."
             return line
         if check.status == "rolled_back":
-            return (f"*Deploy rolled back:* {head} is not serving; the previous version is back "
-                    f"(health reports `{slack_text(check.seen_commit, 12)}`).")
+            return (f"*Deploy not live:* {head} is not serving. A different version is serving "
+                    f"(`{slack_text(check.seen_commit, 12)}`); the new version is not live; cause unknown.")
+        if check.last_error == NOT_OPENED:
+            return (f"*Deploy NOT verified by the hub:* {head} was authorized but the hub could not open its outcome "
+                    "check. Do not assume it worked.")
         return (f"*Deploy unconfirmed:* the hub could not confirm {head} within the check window"
                 f"{' (health ' + 'reported ' + slack_text(check.seen_commit, 12) + ')' if check.seen_commit else ''}."
                 " Do not assume it worked.")

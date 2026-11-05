@@ -21,7 +21,7 @@ from .actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, GrantSt
 from .calibration import build_report, gate_satisfied
 from .canonical import Derived, RawAction, derive
 from .deploy import DeployMatch, scope_config, scope_key, scope_mode
-from .deploycheck import open_check
+from .deploycheck import open_check, record_not_opened
 from .events import scrub_payload
 from .evidence import OWNER_PROVENANCE, _shadow_elapsed, propose_if_ready
 from .jev import JudgeUnavailable
@@ -377,6 +377,7 @@ def _open_deploy_check(store: AssistantStore, deploy_cfg: dict | Callable[[], di
     except Exception as exc:                                    # noqa: BLE001
         logging.getLogger("herdr_engineering.assistant_hub.policy").warning(
             "deploy check not opened: %s", type(exc).__name__)
+        record_not_opened(store, worker, match, task_id, request_id, now)   # audited; the summary says "NOT verified"
 
 
 def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, derived: Derived, session_id: str,

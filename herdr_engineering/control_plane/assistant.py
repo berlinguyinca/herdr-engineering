@@ -48,7 +48,8 @@ from urllib.parse import urlsplit
 from . import placement, slurm_placement
 from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
-from .assistant_hub.deploycheck import DeployCheck
+from .assistant_hub.deploycheck import FINAL as DEPLOY_FINAL
+from .assistant_hub.deploycheck import DeployCheck, sanitize_check
 from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_hub.shadow import JudgeRecord
 from .assistant_hub.slack_asks import SlackAsk
@@ -2328,6 +2329,27 @@ class AssistantStore:
             kwargs[f.name] = v
         return cls(**kwargs)
 
+    @classmethod
+    def _restore_deploy_check(cls, d: Any) -> DeployCheck | None:
+        """A stored deploy check, read back fail closed: unreadable parts make it ``unconfirmed``, an untrustworthy
+        row (no ids, malformed sha) is dropped.  Never raises."""
+        if not isinstance(d, dict):
+            return None
+        try:
+            row = cls._e_from_dict(DeployCheck, d)
+        except Exception:                               # noqa: BLE001 - e.g. a corrupt datetime
+            try:
+                row = cls._e_from_dict(DeployCheck, {k: v for k, v in d.items()
+                                                     if not (isinstance(v, dict) and "$dt" in v)})
+            except Exception:                           # noqa: BLE001
+                return None
+            row.status = "unconfirmed"
+            row.last_error = "bad_state"
+        try:
+            return sanitize_check(row)
+        except Exception:                               # noqa: BLE001
+            return None
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -2415,7 +2437,7 @@ class AssistantStore:
             self.slack_asks = {x.ask_id: x for x in
                                (self._e_from_dict(SlackAsk, d) for d in snap.get("slack_asks", []))}
             self.deploy_checks = {x.check_id: x for x in
-                                  (self._e_from_dict(DeployCheck, d) for d in snap.get("deploy_checks", []))}
+                                  (self._restore_deploy_check(d) for d in snap.get("deploy_checks", [])) if x}
             self._request_index, self._evidence_index, self._judge_index = {}, {}, {}
             self._slack_index = {}
             self._deploy_index = {}
@@ -2625,7 +2647,7 @@ class AssistantStore:
         the checker's and the Slack sweep's one cross-tenant read."""
         with self._lock:
             rows = [c for c in self.deploy_checks.values()
-                    if (status is None or c.status == status) and (not unnotified or (c.status != "awaiting"
+                    if (status is None or c.status == status) and (not unnotified or (c.status in DEPLOY_FINAL
                                                                                        and not c.notified))]
             return [replace(c) for c in sorted(rows, key=lambda c: c.started_at)]
 
