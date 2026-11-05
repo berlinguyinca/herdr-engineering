@@ -231,6 +231,8 @@ class ArtifactLifecycleMixin:
     async def _lock_digests(self, keys: list[str]) -> None:
         """Exclusive digest locks for several keys, always in sorted digest order (the order every shared taker uses):
         two transactions over overlapping digest sets then queue instead of deadlocking."""
+        # sorted by digest text, not by the lock's hash key: every taker uses this order, and two digests whose hashes
+        # collide in a way that inverts it are a theoretical concern only
         for digest in sorted({self._digest_of(k) for k in keys if k}):
             await self._conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", digest)
 
@@ -238,6 +240,7 @@ class ArtifactLifecycleMixin:
         """Writers of a reference to content-addressed bytes call this inside their committing transaction, then
         re-check the object exists. It excludes a concurrent purge sweep (exclusive lock on the same digest) until the
         reference commits, after which the sweep sees the reference and keeps the bytes."""
+        # sorted by digest text, not by the lock's hash key (see _lock_digests)
         for digest in sorted({self._digest_of(k) for k in keys if k}):
             await self._conn.execute("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))", digest)
 

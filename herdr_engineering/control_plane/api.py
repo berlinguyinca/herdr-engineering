@@ -3820,9 +3820,11 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(version) if version else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_review_manager is not None:
                 if len(parts) == 6 and parts[5] == "reviews":
-                    # the same read permission as the sibling versions routes; no answer reveals that the artifact exists
-                    if server.artifact_store is not None and not self._artifact_call(
-                            "report_permission", parts[4], self._resource_principal(), "read"):
+                    # without an ACL the registry decides (like the versions routes); with one, the blanket guard above already did
+                    # (legacy uploads have no registry row). No answer reveals that the artifact exists
+                    if (server.artifact_store is not None and server.artifact_acl is None
+                            and not self._artifact_call(
+                            "report_permission", parts[4], self._resource_principal(), "read")):
                         return self._json({"error": "not found"}, 404)
                     return self._json({"artifact_id": parts[4],
                                        "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})

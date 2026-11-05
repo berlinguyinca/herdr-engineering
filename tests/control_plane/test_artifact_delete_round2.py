@@ -544,3 +544,15 @@ def test_n3_register_report_blob_and_commit_version_wait_for_the_sweep_and_reche
                 await task
 
     run(with_store(registry_pg["dsn"], blobs, body))
+
+
+def test_the_reviews_list_of_a_legacy_upload_follows_the_acl_when_a_store_exists(registry_pg):
+    """A legacy event-projection upload has no registry row: the ACL alone decides, as for artifact-reviews/{id}."""
+    from herdr_engineering.control_plane.artifact_reviews import ArtifactReviewManager
+    reviews = ArtifactReviewManager()
+    with api(registry_pg, extra={"artifact_acl": ArtifactAcl(), "artifact_review_manager": reviews}) as env:
+        aid, _ = legacy_upload(env)
+        reviews.request(artifact_id=aid, version_id="v1", requested_by="x")
+        got, body = request(env.base, f"{ROOT}/{aid}/reviews", key="creator-key")
+        assert got == 200 and len(body["reviews"]) == 1
+        assert request(env.base, f"{ROOT}/{aid}/reviews", key="member-key")[0] == 404

@@ -95,6 +95,9 @@ Digest locks (purge, merge, publish) are always taken in sorted digest order, so
 overlapping digests queue instead of deadlocking. The reviews list of an artifact needs the same read permission as
 its versions (otherwise the plain 404).
 
+Known limitation: with a store but no in-memory ACL (embedded/test setups only; the production CLI always builds an
+`ArtifactAcl`) the sibling routes `artifact-reviews/{id}`, `artifact-jobs` and publications lack a principal check.
+
 Parked (not done): route names `tombstoned` and `delete-access` shadow artifacts with those literal ids; the tombstone
 listing is capped at 200 and has no pagination; bulk purges run synchronously and `_key_shared` scans have no GIN index
 (a 200-artifact purge is slow and holds the store connection); the CLI redacts the key itself but not URL-encoded forms.
