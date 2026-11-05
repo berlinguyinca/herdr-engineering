@@ -1991,3 +1991,61 @@ def test_a_bad_apps_dir_is_refused_before_anything_runs(env, fault, needle):
     r = deploy(env, "--dry-run")
     assert r.returncode != 0 and needle in r.stderr
     assert not env["log"].exists()
+
+
+def _dashboard_memory_policy(e):
+    from herdr_engineering.fleet_memory import init_memory
+    init_memory(e["central"], enable=True, endpoint="https://memory.example.test",
+                model_dir=str(e["tmp"] / "model"))
+    data = yaml.safe_load(e["central"].read_text())
+    data["sections"]["control_plane"]["values"]["memory"]["viewers"] = {
+        "open-listener": {"projects": ["canary"], "scopes": []}}
+    e["central"].write_text(yaml.safe_dump(data))
+    e["central"].chmod(0o600)
+
+
+def _dashboard_memory_client(e):
+    from herdr_engineering.memory_install import PINNED_CLIENT_VERSION
+    directory = e["tmp"] / "operator-profile"
+    directory.mkdir(mode=0o700)
+    key = directory / "project.key"
+    key.write_text("private-client-fixture-value")
+    key.chmod(0o600)
+    profile = directory / "config.json"
+    profile.write_text(json.dumps({
+        "url": "https://memory.example.test", "default_project": "canary",
+        "cache_dir": str(e["tmp"] / "operator-cache"),
+        "projects": {"canary": {"credentials": {"codex": str(key)}}}}))
+    profile.chmod(0o600)
+    executable = Path(e["env"]["PATH"].split(os.pathsep)[0]) / "herdr-memory"
+    executable.write_text("#!/usr/bin/env python3\nimport json,sys\n"
+                          f"print(json.dumps({{'valid':True,'contract':1,'client':{PINNED_CLIENT_VERSION!r}}}))\n")
+    executable.chmod(0o755)
+    return profile
+
+
+def test_memory_dashboard_viewers_require_explicit_profile_before_build(env):
+    _dashboard_memory_policy(env)
+    result = deploy(env, "--dry-run")
+    assert result.returncode != 0
+    assert "explicit client profile" in result.stderr
+    assert "docker build" not in (env["log"].read_text() if env["log"].exists() else "")
+
+
+def test_memory_client_profile_dry_run_is_secret_safe_and_preserves_user_state(env):
+    _dashboard_memory_policy(env)
+    profile = _dashboard_memory_client(env)
+    before = profile.read_bytes()
+    result = deploy(env, "--dry-run", "--memory-client-config", str(profile))
+    assert result.returncode == 0, result.stderr
+    assert "private-client-fixture-value" not in result.stdout + result.stderr + env["log"].read_text()
+    assert profile.read_bytes() == before
+    assert not (env["tmp"] / "operator-cache").exists()
+    assert not list(env["home"].rglob("profile.tar"))
+    assert "docker build" not in env["log"].read_text()
+
+
+def test_memory_client_flag_does_not_read_source_with_no_viewer_grants(env):
+    result = deploy(env, "--dry-run", "--memory-client-config", str(env["tmp"] / "missing.json"))
+    assert result.returncode == 0, result.stderr
+    assert "docker build" not in env["log"].read_text()
