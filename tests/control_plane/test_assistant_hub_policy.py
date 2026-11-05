@@ -205,7 +205,7 @@ def test_expired_and_revoked_grants_do_not_authorize_on_next_call():
     assert _decide(store, cfg, _push()).outcome == "authorized"
     assert _decide(store, cfg, _push(), now=NOW + timedelta(days=31)).outcome == "pending"
     revoke_action_grant(store, NOW, T, U, g.grant_id, "owner")
-    assert _decide(store, cfg, _push()).outcome == "pending"
+    assert _decide(store, cfg, _push(), now=NOW + timedelta(hours=1)).outcome == "pending"
     kinds = [e["action"] for e in store._audit]
     assert "assistant.grant.revoked" in kinds
 
@@ -371,19 +371,19 @@ def test_unknown_verb_approval_records_evidence_but_proposes_nothing():
 
 def test_ready_evidence_creates_proposed_not_active():
     store, cfg = AssistantStore(), _cfg()
-    for i in range(2):
-        d = _decide(store, cfg, _push(), session=f"s{i}", task=f"t{i}")
+    asked = [_decide(store, cfg, _push(), session=f"s{i}", task=f"t{i}") for i in range(2)]   # ask first: a re-ask would spend an approval
+    for d in asked:
         record_owner_decision(store, cfg, NOW, T, U, d.request_id, True, "owner")
     grants = store.list_action_grants(T, U)
     assert len(grants) == 1 and grants[0].state is GrantState.PROPOSED and grants[0].worker_id == W
-    assert _decide(store, cfg, _push(), session="s3", task="t3").outcome == "pending"       # still not trusted
+    assert _decide(store, cfg, _push(), session="s3", task="t3", now=NOW + timedelta(hours=1)).outcome == "pending"       # still not trusted (one-shot approvals have expired)
 
 
 # ------------------------------------------------------------------ activation
 
 def _proposed(store, cfg, now=NOW) -> ActionGrant:
-    for i in range(2):
-        d = _decide(store, cfg, _push(), session=f"s{i}", task=f"t{i}", now=now)
+    asked = [_decide(store, cfg, _push(), session=f"s{i}", task=f"t{i}", now=now) for i in range(2)]
+    for d in asked:
         record_owner_decision(store, cfg, now, T, U, d.request_id, True, "owner")
     return store.list_action_grants(T, U)[0]
 
@@ -446,7 +446,7 @@ def test_audit_chain_verifies_after_a_full_cycle():
     _activate(store, cfg, NOW, T, U, g.grant_id, "owner")
     assert _decide(store, cfg, _push()).outcome == "authorized"
     revoke_action_grant(store, NOW, T, U, g.grant_id, "owner")
-    assert _decide(store, cfg, _push()).outcome == "pending"
+    assert _decide(store, cfg, _push(), now=NOW + timedelta(hours=1)).outcome == "pending"   # one-shot approvals expired
     assert store.verify_audit(T) is True
     actions = {e["action"] for e in store._audit}
     assert {"assistant.action.vetoed", "assistant.action.requested", "assistant.action.decided",

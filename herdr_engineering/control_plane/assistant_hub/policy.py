@@ -19,7 +19,7 @@ from .actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, GrantSt
 from .calibration import build_report, gate_satisfied
 from .canonical import Derived, RawAction, derive
 from .events import scrub_payload
-from .evidence import _shadow_elapsed, propose_if_ready
+from .evidence import OWNER_PROVENANCE, _shadow_elapsed, propose_if_ready
 from .jev import JudgeUnavailable
 from .judge import SEVERITY_LEVELS, JudgeRuntime, Verdict, consult
 from .judge_version import judge_version as _judge_version
@@ -253,11 +253,35 @@ def decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, ses
                    verb=key.verb.value if key else Verb.UNKNOWN.value, key_id=key.key_id() if key else "")
 
 
+def _consume_approval(store: AssistantStore, cfg: dict, worker: Worker, key_id: str,
+                      now: datetime) -> ActionRequestRow | None:
+    """Atomically spend one fresh owner approval for exactly this tenant, user, worker and key (oldest first)."""
+    ttl = timedelta(minutes=int(cfg.get("approval_ttl_minutes", 15)))
+    with store._lock:
+        for r in store.list_action_requests(worker.tenant_id, worker.user_id, "approved"):
+            if (r.worker_id, r.key_id) != (worker.worker_id, key_id) or r.consumed_at is not None:
+                continue
+            if r.decided_at is None or as_utc(now) - as_utc(r.decided_at) > ttl or as_utc(now) < as_utc(r.decided_at):
+                continue
+            spent = replace(r, consumed_at=as_utc(now))
+            store.put_action_request(spent)
+            _audit(store, worker, POLICY_ACTOR, "assistant.action.authorized", spent.request_id,
+                   f"source=owner request={spent.request_id} key_id={key_id} worker={worker.worker_id}")
+            return spent
+    return None
+
+
 def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
             task_id: str, now: datetime, judge: JudgeRuntime | None) -> Decision:
     veto = check_vetoes(derived, _extra_rules(cfg))
     if veto is not None:
         return _deny(store, worker, raw, derived, veto, session_id, task_id, now)
+    if derived.key is not None and not derived.owner_decides and derived.key.verb is not Verb.UNKNOWN:
+        # unclassifiable actions share no meaningful key id, so one approval must never cover another command
+        consumed = _consume_approval(store, cfg, worker, derived.key.key_id(), now)
+        if consumed is not None:
+            return Decision("authorized", "Authorized once by the owner's approval of this exact action.",
+                            consumed.request_id, None, None, "owner")
     if derived.owner_decides or derived.key is None:
         return _pending(store, worker, raw, derived, session_id, task_id, now, "unknown",
                         "The action could not be classified with certainty, so the owner decides.", judge)
@@ -290,7 +314,10 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
 
 
 def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str,
-                          request_id: str, approve: bool, decided_by: str, *, judge_version: str = "") -> ActionRequestRow:
+                          request_id: str, approve: bool, decided_by: str, *, judge_version: str = "",
+                          provenance: str = "owner_api") -> ActionRequestRow:
+    if provenance not in OWNER_PROVENANCE:
+        raise ValueError(f"unknown provenance {provenance!r}")
     if not decided_by.strip():
         raise ValueError("decided_by must not be empty")
     with store._lock:
@@ -306,7 +333,7 @@ def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenan
         store.add_action_evidence(ActionEvidence(
             evidence_id="ev_" + secrets.token_urlsafe(12), tenant_id=tenant_id, user_id=user_id,
             worker_id=row.worker_id, session_id=row.session_id, task_id=row.task_id, key_id=row.key_id,
-            outcome=row.status, provenance="owner_api", created_at=as_utc(now)))
+            outcome=row.status, provenance=provenance, created_at=as_utc(now)))
         if approve and row.verb != Verb.UNKNOWN.value and row.key_canonical:
             key = ActionKey.from_canonical(row.key_canonical)
             if key.key_id() == row.key_id:

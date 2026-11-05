@@ -90,6 +90,7 @@ class ActionRequestRow:
     decided_at: datetime | None = None
     decided_by: str = ""
     display: str = ""                # scrubbed, truncated command for the owner API only; never audit/grants/events
+    consumed_at: datetime | None = None   # set once when an approved row authorized one re-ask (older snapshots: None)
 
 
 @dataclass
@@ -102,5 +103,5 @@ class ActionEvidence:
     task_id: str = ""
     key_id: str = ""
     outcome: str = ""                # approved | denied
-    provenance: str = ""             # owner_api | worker_reported
+    provenance: str = ""             # owner_api | owner_slack | worker_reported
     created_at: datetime = _EPOCH

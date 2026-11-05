@@ -439,7 +439,7 @@ def _hub_config(raw: Any, default_tenant: str) -> dict[str, Any]:
 
 
 _GRANTS_KEYS = {"shadow_days", "shadow_started_at", "required_approvals", "min_sessions", "min_tasks",
-                "grant_ttl_days", "extra_vetoes", "policy_version"}
+                "grant_ttl_days", "extra_vetoes", "policy_version", "approval_ttl_minutes"}
 _GRANTS_RISKS = ("local_reversible", "remote_reversible", "outward")
 _GRANTS_APPROVALS = {"local_reversible": 5, "remote_reversible": 10, "outward": 30}
 
@@ -478,6 +478,12 @@ def _grants_extra_vetoes(value: Any, where: str) -> list[dict[str, str]]:
     return out
 
 
+def _approval_ttl(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 120:
+        raise ValueError(f"{where} must be an integer from 1 to 120")
+    return value
+
+
 def _grants_config(raw: Any) -> dict[str, Any]:
     """``personal_assistant.grants``. ``shadow_started_at`` null means the hub stamps it on first start."""
     where = "control_plane.personal_assistant.grants"
@@ -513,6 +519,7 @@ def _grants_config(raw: Any) -> dict[str, Any]:
         "grant_ttl_days": _hub_pos_int(raw.get("grant_ttl_days", 30), f"{where}.grant_ttl_days"),
         "extra_vetoes": _grants_extra_vetoes(raw.get("extra_vetoes", []), f"{where}.extra_vetoes"),
         "policy_version": _hub_pos_int(raw.get("policy_version", 1), f"{where}.policy_version"),
+        "approval_ttl_minutes": _approval_ttl(raw.get("approval_ttl_minutes", 15), f"{where}.approval_ttl_minutes"),
     }
 
 
