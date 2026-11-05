@@ -313,7 +313,7 @@ class ControlPlaneServer:
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
-                 scheduler_admission=False, scheduler_limits=None, skill_registry=None,
+                 scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
@@ -494,6 +494,9 @@ class ControlPlaneServer:
         self.skills, self.skill_transfer = build_skill_registry(
             skill_registry, artifact_store=artifact_store, rustfs=rustfs, acl=artifact_acl,
             record_event=repo.record_event)
+        # control_plane.build_cache (flag off by default: nothing is constructed and the routes answer 404).
+        from .build_cache_routes import build_build_cache
+        self.build_cache = build_build_cache(build_cache, record_event=repo.record_event)
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
@@ -1616,6 +1619,8 @@ class ControlPlaneServer:
             caps.append("unified_workspace_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
+        if getattr(self, "build_cache", None) is not None:
+            caps.append("build_cache_v1")
         try:
             if self.deployment_definitions.status()["configured"]:
                 caps.append("deployments_v1")     # the read-only Deployments page
@@ -3161,6 +3166,9 @@ def _make_handler(server, public=False, operator=False):
                     return None
                 from .skill_routes import route_skills
                 if route_skills(self, server, parts, resource):
+                    return None
+                from .build_cache_routes import route_build_cache
+                if route_build_cache(self, server, parts, resource):
                     return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
