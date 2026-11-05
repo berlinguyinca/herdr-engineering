@@ -3025,6 +3025,21 @@ class ControlPlaneRepo:
                 latest.append({k: v for k, v in stream[-1]["payload"].items() if not k.startswith("_")})
         return latest
 
+    def list_fleet_rollouts(self, limit=50, repo_name=None):
+        """Rollout summaries (newest first) derived from the ``fleet_rollout`` event streams."""
+        from . import fleet_rollout
+        return fleet_rollout.list_rollouts(self, limit, repo_name)
+
+    def get_fleet_rollout(self, rollout_id):
+        """One rollout: summary, per-host rows and the ordered events; None when unknown."""
+        from . import fleet_rollout
+        return fleet_rollout.rollout_detail(self, rollout_id)
+
+    def fleet_rollout_versions(self):
+        """What each host runs, the newest observed heads, the last lock pin and the watched sources' state."""
+        from . import fleet_rollout
+        return fleet_rollout.versions(self)
+
     def entity_ids(self, entity_type):
         """Ids of every entity of ``entity_type`` that has at least one event."""
         if callable(getattr(self._durable_history, 'entity_ids', None)):
