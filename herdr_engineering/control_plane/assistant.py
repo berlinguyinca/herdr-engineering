@@ -50,6 +50,7 @@ from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionReque
 from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
 from .assistant_hub.shadow import JudgeRecord
+from .assistant_hub.slack_asks import SlackAsk
 from .assistant_hub.verbs import Verb
 from .assistant_hub.vetoes import FIXED_VETOES
 from .assistant_hub.workers import Enrollment, Worker
@@ -2147,6 +2148,9 @@ class AssistantStore:
         self._judge_index: dict[str, dict[str, None]] = {}
         self.max_action_rows_per_tenant = 5000
         self.max_action_grants_per_tenant = 2000
+        self.slack_asks: dict[str, SlackAsk] = {}                   # insertion order == oldest first
+        self.max_slack_asks_per_tenant = 2000
+        self._slack_index: dict[str, dict[str, None]] = {}
         self._request_index: dict[str, dict[str, None]] = {}        # tenant -> request ids, oldest first
         self._evidence_index: dict[str, dict[str, None]] = {}
         self.policy_state: dict[str, Any] = {}                      # small durable policy facts (shadow start)
@@ -2222,6 +2226,7 @@ class AssistantStore:
                 "action_requests": [self._e_to_dict(x) for x in self.action_requests.values()],
                 "action_evidence": [self._e_to_dict(x) for x in self.action_evidence.values()],
                 "judge_records": [self._e_to_dict(x) for x in self.judge_records.values()],
+                "slack_asks": [self._e_to_dict(x) for x in self.slack_asks.values()],
                 "policy_state": dict(self.policy_state),
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
@@ -2280,7 +2285,12 @@ class AssistantStore:
                                     (self._e_from_dict(ActionEvidence, d) for d in snap.get("action_evidence", []))}
             self.judge_records = {x.record_id: x for x in
                                   (self._e_from_dict(JudgeRecord, d) for d in snap.get("judge_records", []))}
+            self.slack_asks = {x.ask_id: x for x in
+                               (self._e_from_dict(SlackAsk, d) for d in snap.get("slack_asks", []))}
             self._request_index, self._evidence_index, self._judge_index = {}, {}, {}
+            self._slack_index = {}
+            for sa in self.slack_asks.values():
+                self._slack_index.setdefault(sa.tenant_id, {})[sa.ask_id] = None
             for j in self.judge_records.values():
                 self._judge_index.setdefault(j.tenant_id, {})[j.record_id] = None
             for r in self.action_requests.values():
@@ -2288,11 +2298,12 @@ class AssistantStore:
             for ev in self.action_evidence.values():
                 self._evidence_index.setdefault(ev.tenant_id, {})[ev.evidence_id] = None
             self.policy_state = dict(snap.get("policy_state", {}))
-            for rows, index in ((self.action_requests, self._request_index),
-                                (self.action_evidence, self._evidence_index),
-                                (self.judge_records, self._judge_index)):
+            for rows, index, cap in ((self.action_requests, self._request_index, self.max_action_rows_per_tenant),
+                                     (self.action_evidence, self._evidence_index, self.max_action_rows_per_tenant),
+                                     (self.judge_records, self._judge_index, self.max_action_rows_per_tenant),
+                                     (self.slack_asks, self._slack_index, self.max_slack_asks_per_tenant)):
                 for idx in index.values():           # an oversized snapshot must not stay over the cap
-                    while len(idx) > self.max_action_rows_per_tenant:
+                    while len(idx) > cap:
                         rows.pop(next(iter(idx)), None)
                         del idx[next(iter(idx))]
             self._routine_fired = set(snap.get("routine_fired", []))
@@ -2322,16 +2333,18 @@ class AssistantStore:
 
     # -- action grants, requests and evidence (assistant hub) -------------------
     def _bounded_put(self, rows: dict[str, Any], index: dict[str, dict[str, None]], tenant_id: str, row_id: str,
-                     row: Any) -> None:
+                     row: Any, cap: int | None = None) -> None:
         existing = rows.get(row_id)
         if existing is not None and existing.tenant_id != tenant_id:
             raise ValueError(f"id {row_id!r} already belongs to another tenant")     # ids are immutable per tenant
         rows[row_id] = row
         idx = index.setdefault(tenant_id, {})
         idx[row_id] = None                  # re-putting an id keeps its original position
-        while len(idx) > self.max_action_rows_per_tenant:
+        limit = self.max_action_rows_per_tenant if cap is None else cap
+        while len(idx) > limit:
             # decided rows go first, so a flood of vetoed or decided requests never pushes out a pending one
-            old = next((k for k in idx if getattr(rows.get(k), "status", "") in ("vetoed", "denied", "approved")),
+            old = next((k for k in idx if getattr(rows.get(k), "status", "") in
+                        ("vetoed", "denied", "approved", "decided", "expired")),
                        None) or next(iter(idx))
             del idx[old]
             rows.pop(old, None)
@@ -2375,6 +2388,31 @@ class AssistantStore:
             return self._sorted_copies([r for r in self.action_requests.values()
                                         if r.tenant_id == tenant_id and r.user_id == user_id
                                         and (status is None or r.status == status)])
+
+    # -- Slack asks (assistant hub) ---------------------------------------------
+    def put_slack_ask(self, ask: SlackAsk) -> None:
+        with self._lock:
+            self._bounded_put(self.slack_asks, self._slack_index, ask.tenant_id, ask.ask_id, replace(ask),
+                              cap=self.max_slack_asks_per_tenant)
+            self._after_mutation()
+
+    def get_slack_ask(self, ask_id: str, *, tenant_id: str, user_id: str) -> SlackAsk | None:
+        with self._lock:
+            a = self.slack_asks.get(ask_id)
+            return replace(a) if a and a.tenant_id == tenant_id and a.user_id == user_id else None
+
+    def find_slack_ask(self, ask_id: str) -> SlackAsk | None:
+        """Look an ask up by id alone. Only for the Slack runtime, which has just a button's id and needs the ask's own
+        tenant and user to scope everything else (audit included); every other caller uses ``get_slack_ask``."""
+        with self._lock:
+            a = self.slack_asks.get(ask_id)
+            return replace(a) if a else None
+
+    def list_slack_asks(self, tenant_id: str, user_id: str, status: str | None = None) -> list[SlackAsk]:
+        with self._lock:
+            return self._sorted_copies([a for a in self.slack_asks.values()
+                                        if a.tenant_id == tenant_id and a.user_id == user_id
+                                        and (status is None or a.status == status)])
 
     def add_action_evidence(self, evidence: ActionEvidence) -> None:
         with self._lock:
