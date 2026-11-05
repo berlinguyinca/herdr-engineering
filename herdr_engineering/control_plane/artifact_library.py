@@ -10,7 +10,7 @@ import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 import asyncpg
 
@@ -201,6 +201,21 @@ class LibraryStore:
         """Delete ``owner``'s own pending artifact through ``delete`` (the member delete path)."""
         await require_pending_on(self._pool, owner, artifact_id)
         await delete(artifact_id)
+
+    async def close(self) -> None:
+        """Close the connection pool (server shutdown)."""
+        await self._pool.close()
+
+    async def discard_member_pending(self, owner: str, artifact_id: str, *, shares_root: Any = None,
+                                     rustfs: Any = None) -> None:
+        """Discard a member's own pending push through the member delete (``delete_member_rows``): retract, revoke
+        every share inside the transaction, settle the quota.  ``not_found`` unless ``owner`` has it pending."""
+        from .artifact_member_intents import delete_member_rows
+        from .artifacts import ArtifactStore
+        async with self._pool.acquire() as conn:
+            await require_pending_on(conn, owner, artifact_id)
+            if not await delete_member_rows(conn, ArtifactStore(conn, rustfs), shares_root, owner, artifact_id):
+                raise LibraryError(*NOT_FOUND)
 
     async def create_folder(self, owner: str, name: str) -> Folder:
         cleaned = _clean_name(name)

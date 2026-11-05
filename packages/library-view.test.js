@@ -36,6 +36,8 @@ test('active and pending rows link to the artifact page, expired and revoked row
   assert.equal(rowHref(items[2]), null);
   assert.equal(rowHref(items[3]), null);
   assert.equal(rowHref(items[1]), '#/artifacts/a2');
+  assert.equal(rowHref({ artifact_id: 'a9', status: 'active', readable: false }), null);
+  assert.equal(rowHref({ artifact_id: 'a9', status: 'active', readable: true }), '#/artifacts/a9');
   assert.doesNotMatch(rowsOf(html).find((l) => l.includes('"a3"')), /href=/);
   assert.equal(rowHref({ artifact_id: 'x/y z', status: 'active' }), '#/artifacts/x%2Fy%20z');
 });

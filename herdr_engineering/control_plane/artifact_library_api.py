@@ -2,7 +2,9 @@
 
 The feed, folders, filing and pending accept/discard call the same ``LibraryStore`` as the member intents, so the two
 surfaces cannot disagree.  The viewer is the dashboard's API-key principal (``api-key:<digest>:<role>``): it is not a
-Cognito member, so that principal is the library owner everywhere (feed, folders, filing, pending).  Another viewer's
+Cognito member, so that principal is the library owner everywhere (feed, folders, filing, pending) -- unless the
+authenticated key is listed in ``control_plane.artifact_library.viewers``, which makes it that member's library (the
+member principal, with email and groups from the member directory; fail closed when that is stale).  Another viewer's
 folder, or an artifact the viewer may not read, is the same ``404 not_found``.  There is no claim route: claims come
 only from the public share flow.  ``GET`` needs any authenticated role; every write needs ``operator``.
 """
@@ -10,6 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
 from urllib.parse import parse_qs, urlsplit
@@ -26,6 +31,73 @@ log = logging.getLogger("herdr.control_plane.artifact_library_api")
 SOURCES: Final = frozenset({*DEFAULT_SOURCES, "pending"})
 _ITEM_FIELDS: Final = frozenset({"folder_id", "artifact_id"})
 _NAME_FIELDS: Final = frozenset({"name"})
+
+
+@dataclass(frozen=True)
+class Viewer:
+    """Whose library a request reads: its owner principal, and for a mapped member the identity the feed needs."""
+    principal: str
+    member_id: str = ""
+    email: str = ""
+    groups: frozenset[str] = frozenset()
+    member: bool = False
+
+
+def parse_library_viewers(raw: Any) -> dict[str, str]:
+    """``{"key:<digest>": "<member id>"}`` validated; ``ValueError`` names the bad entry."""
+    import re
+
+    from .artifact_members import member_principal
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("artifact_library.viewers must be a mapping of key:<digest> to a member id")
+    out: dict[str, str] = {}
+    for key, member in raw.items():
+        if not isinstance(key, str) or not re.fullmatch(r"key:[0-9a-f]{12}", key):
+            raise ValueError(f"artifact_library.viewers key {key!r} must look like key:<12 hex digits>")
+        try:
+            member_principal(member)
+        except ValueError:
+            raise ValueError(f"artifact_library.viewers[{key}] is not a valid member id") from None
+        out[key] = member
+    return out
+
+
+def _directory_body(server) -> dict | None:
+    source = getattr(server, "member_directory", None)
+    if source is None and getattr(server, "collab", None) is not None:
+        source = getattr(server.collab, "member_directory", None)
+    return source() if source is not None else None
+
+
+def resolve_viewer(handler, server) -> Viewer:
+    """The library owner of this request.  Only the authenticated key digest (``key:<digest>``) is looked up in
+    ``library_viewers``; the client-supplied ``X-Herdr-User`` header is never read.  An unmapped key keeps its own key
+    principal.  A mapped key needs a fresh directory that lists its member as approved, else it fails closed with
+    ``503 directory_stale`` (``403 not_a_member`` for a disabled or removed member): never a guess."""
+    from .artifact_members import member_principal
+    from .collab_bridge_files import FEED_MAX_AGE
+    key_principal = handler._resource_principal()
+    member_id = server.library_viewers.get(handler._principal().get("id"))
+    if member_id is None:
+        return Viewer(key_principal)
+    stale = LibraryError(503, "directory_stale", "the member directory is unavailable; try again shortly")
+    body = _directory_body(server)
+    if not isinstance(body, dict) or not isinstance(body.get("users"), dict):
+        raise stale
+    updated = body.get("updated")
+    if updated is not None and (isinstance(updated, bool) or not isinstance(updated, (int, float))
+                                or not math.isfinite(updated) or abs(time.time() - updated) > FEED_MAX_AGE):
+        raise stale
+    entry = body["users"].get(member_id)
+    if not isinstance(entry, dict):
+        raise stale
+    if entry.get("status") != "approved":
+        raise LibraryError(403, "not_a_member", "this member is not active")
+    email, groups = entry.get("email"), entry.get("groups")
+    return Viewer(member_principal(member_id), member_id, email if isinstance(email, str) else "",
+                  frozenset(g for g in groups or [] if isinstance(g, str)), True)
 
 
 def error_body(exc: LibraryError) -> tuple[int, dict]:
@@ -128,7 +200,9 @@ def _retract_pending(handler, server, principal: str):
     def retract(artifact_id: str) -> None:
         handler._artifact_call("record_retraction", artifact_id, reason="dashboard discard")
         from .artifact_delete_api import revoke_shares
-        revoke_shares(handler, server, artifact_id, principal)
+        if revoke_shares(handler, server, artifact_id, principal) is None:    # the retraction stands; a repeat retries
+            raise LibraryError(500, "share_revoke_failed",
+                               "the artifact was retracted but its shares could not all be revoked; discard it again")
 
     async def delete(artifact_id: str) -> None:
         await asyncio.to_thread(retract, artifact_id)
@@ -154,9 +228,8 @@ def route_library(handler, server, parts, resource) -> bool:
                                         or urlsplit(origin).scheme not in {"http", "https"}):
         handler._deny(403, "cross-origin library mutation refused")
         return True
-    principal = handler._resource_principal()
     try:
-        _dispatch(handler, server, action, parts, principal)
+        _dispatch(handler, server, action, parts, resolve_viewer(handler, server))
     except LibraryError as exc:
         status, body = error_body(exc)
         handler._json(body, status)
@@ -165,14 +238,20 @@ def route_library(handler, server, parts, resource) -> bool:
     return True
 
 
-def _dispatch(handler, server, action: str, parts: list[str], principal: str) -> None:
+def _dispatch(handler, server, action: str, parts: list[str], viewer: Viewer) -> None:
     from .artifact_member_intents import _folder_json, _item_json
+    principal = viewer.principal
     call = lambda method, *a, **k: _library_call(server, method, *a, **k)  # noqa: E731
     if action == "feed":
         kwargs = parse_feed_query(parse_qs(urlsplit(handler.path).query))
-        page = call("feed", principal, "", frozenset(), principal=principal, **kwargs)
+        page = call("feed", viewer.member_id or principal, viewer.email, viewer.groups, principal=principal, **kwargs)
         folders = call("list_folders", principal)
-        handler._json({"items": [_item_json(i) for i in page.items], "total": page.total,
+        items = [_item_json(i) for i in page.items]
+        if viewer.member:       # a member's rows can be ones the dashboard's ACL will not open: say so, the page unlinks them
+            for item in items:
+                item["readable"] = item["status"] in {"active", "pending"} and bool(
+                    handler._artifact_allowed(item["artifact_id"], "read"))
+        handler._json({"items": items, "total": page.total,
                        "next_offset": page.next_offset, "folders": [_folder_json(f) for f in folders]})
     elif action == "folder_create":
         folder = call("create_folder", principal, _text(_body(handler, _NAME_FIELDS), "name"))
@@ -193,6 +272,10 @@ def _dispatch(handler, server, action: str, parts: list[str], principal: str) ->
     elif action == "accept":
         call("accept_pending", principal, parts[5])
         handler._json({"result": "accepted", "artifact_id": parts[5]})
+    elif viewer.member:         # the member delete itself: shares revoked inside the transaction, quota settled
+        call("discard_member_pending", principal, parts[5], shares_root=getattr(server, "shares_root", None),
+             rustfs=getattr(server, "rustfs", None))
+        handler._json({"result": "deleted", "artifact_id": parts[5]})
     else:
         call("discard_pending", principal, parts[5], _retract_pending(handler, server, principal))
         handler._json({"result": "deleted", "artifact_id": parts[5]})

@@ -737,6 +737,28 @@ proposals (as on the dashboard). Only the first bot's thread carries cards. Appr
 attachments, memory, routines, skills, connections, bot editing/archiving, spaces other than "Herdr", and ActionBoard
 proposals (those stay on the dashboard). `threads/send` does not deduplicate a retried `clientNonce`.
 
+## Dashboard artifact library (`control_plane.artifact_library`)
+
+The dashboard's `/library` page and `/api/v1/library...` routes use the same store as the member site. A dashboard key is
+not a Cognito member, so by default a key sees its **own** library: the artifacts it created, ACL grants to it and its own
+pending pushes. Rows for a person (lab shares to their email or group, claimed links, agent-pushed pending) appear only
+when that key is mapped to the person:
+
+```yaml
+control_plane:
+  artifact_library:
+    viewers:
+      "key:0123456789ab": "<cognito user id>"     # key:<first 12 hex of sha256(api key)>, the id logged for the key
+```
+
+The key is the same `key:<digest>` identity that `project_intelligence.viewers` uses, taken from the authenticated
+`X-API-Key`; the client-sent `X-Herdr-User` header is never consulted. A mapped key uses `member:<id>` as the owner of
+folders, filing and pending, with email and groups from the member directory (the collab service's, in process). A missing
+or stale directory, or an unlisted member, answers `503 directory_stale` and shows nothing; a disabled or removed member
+answers `403 not_a_member`. Discarding a pending push as a mapped member runs the member delete (shares revoked in the same
+transaction, quota settled). A mapped member's row that the dashboard's own artifact ACL will not open is shown without a
+link. A malformed entry stops the start. Without a DSN the library routes answer 503.
+
 ## Scheduled CI watch (assistant)
 
 `watch_ci` used to run only when the assistant model called it, so a failed CI run went unnoticed unless someone asked.

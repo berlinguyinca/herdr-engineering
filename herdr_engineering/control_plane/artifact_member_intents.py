@@ -586,10 +586,14 @@ async def _publish(ctx: IntentContext, intent: Intent, who: _Who) -> dict:
 
 async def revoke_share(conn: Any, rt: MemberRuntime, share_id: str, *, actor: str) -> None:
     """Revoke one share: its served state first (the next lookup finds nothing), then the row, then the bundle."""
+    await revoke_share_at(conn, rt.shares_root, share_id, actor=actor)
+
+
+async def revoke_share_at(conn: Any, root: Path | None, share_id: str, *, actor: str) -> None:
+    """``revoke_share`` for a caller that has the share bundle directory but no ``MemberRuntime`` (the dashboard)."""
     from .artifact_shares import ShareStore
     from .share_bundle import remove_bundle, remove_state
     store = ShareStore(conn)
-    root = rt.shares_root
     seen = await store.get(share_id)
     if seen is None:
         return
@@ -628,19 +632,28 @@ async def handle_delete(ctx: IntentContext, intent: Intent) -> dict:
     return await _delete_own(ctx, who, intent.artifact_id, "artifact_delete")
 
 
-async def _delete_own(ctx: IntentContext, who: _Who, aid: str | None, action: str) -> dict:
+async def delete_member_rows(conn: Any, store: Any, shares_root: Path | None, principal: str, aid: str | None) -> bool:
+    """The member delete, in one transaction: retract the artifact, revoke every share of it and settle the quota.
+    False when ``principal`` does not own a live ``aid`` (nothing is changed).  The one implementation behind a
+    member's delete/discard intents and the dashboard's discard for a key mapped to that member."""
     from .artifact_member_quota import settle
     from .artifact_shares import ShareStore
-    async with ctx.conn.transaction():
-        row = await _own(ctx.conn, aid, who.principal)
+    async with conn.transaction():
+        row = await _own(conn, aid, principal)
         if row is None:
-            return await _conclude(ctx, who, action, _rejected("not_found"), artifact_id=aid)
+            return False
         if row["lifecycle"] == "active":
-            await ctx.store.record_retraction(aid, reason="member delete")
-        for share in await ShareStore(ctx.conn).list_for_artifact(aid):     # any creator, any audience
+            await store.record_retraction(aid, reason="member delete")
+        for share in await ShareStore(conn).list_for_artifact(aid):     # any creator, any audience
             if share["state"] != "revoked":
-                await revoke_share(ctx.conn, who.rt, share["share_id"], actor=f"member-delete:{who.principal}")
-        await settle(ctx.conn, who.principal)
+                await revoke_share_at(conn, shares_root, share["share_id"], actor=f"member-delete:{principal}")
+        await settle(conn, principal)
+    return True
+
+
+async def _delete_own(ctx: IntentContext, who: _Who, aid: str | None, action: str) -> dict:
+    if not await delete_member_rows(ctx.conn, ctx.store, who.rt.shares_root, who.principal, aid):
+        return await _conclude(ctx, who, action, _rejected("not_found"), artifact_id=aid)
     await asyncio.to_thread(_remove_member_staging, who.rt, who.owner_key, aid, ctx.limits)
     return await _conclude(ctx, who, action, {"result": "deleted"}, artifact_id=aid)
 

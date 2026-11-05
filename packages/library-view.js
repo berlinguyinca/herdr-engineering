@@ -10,8 +10,9 @@ const PAGE = 200;
 const ALL_SOURCES = ['mine', 'assigned', 'opened', 'pending'];
 const CHIP_SOURCES = { all: ['mine', 'assigned', 'opened'], assigned: ['assigned'], opened: ['opened'], mine: ['mine'], pending: ['pending'] };
 
-/** Expired and revoked rows have no link; everything else opens the dashboard's artifact page. */
-export const rowHref = (row) => (row.status === 'expired' || row.status === 'revoked' ? null : `#/artifacts/${encodeURIComponent(row.artifact_id)}`);
+/** Expired and revoked rows have no link, nor has a row the server says this key cannot read (`readable: false`, sent
+ * for a key mapped to a member); everything else opens the dashboard's artifact page. */
+export const rowHref = (row) => (row.status === 'expired' || row.status === 'revoked' || row.readable === false ? null : `#/artifacts/${encodeURIComponent(row.artifact_id)}`);
 export const folderHref = (id) => `#/library?folder=${encodeURIComponent(id)}`;
 
 /** The server's refusal text when it sent one (e.g. the pending cap), else the error message. */
