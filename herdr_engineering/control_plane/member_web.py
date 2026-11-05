@@ -103,6 +103,10 @@ def _bad(message: str = "bad request") -> _Reply:
     return _Reply(400, "bad_request", message)
 
 
+CONTENT_READS = 8       # concurrent content reads (each holds a whole file, up to 25 MB, in memory)
+_content_gate = threading.BoundedSemaphore(CONTENT_READS)     # the server is threaded, so a thread semaphore
+
+
 class _Window:
     """A small per-key sliding-window counter (best effort, in memory)."""
 
@@ -548,7 +552,12 @@ class MemberWeb:
         self._query(query, set())
         if not _ARTIFACT.match(rest[1]) or h.path.partition("?")[0].endswith("/"):
             raise _Reply(404, "not_found", "not found")
-        entry, data = ms.library_content(actor, rest[1], "/".join(rest[3:]))
+        if not _content_gate.acquire(timeout=5):
+            raise _Reply(503, "busy", "too many downloads, retry shortly", {"Retry-After": "2"})
+        try:
+            entry, data = ms.library_content(actor, rest[1], "/".join(rest[3:]))
+        finally:
+            _content_gate.release()
         ctype = entry.get("content_type") if isinstance(entry.get("content_type"), str) else "application/octet-stream"
         base = ctype.split(";", 1)[0].strip().lower()
         inline = base in _INLINE_TYPES

@@ -803,6 +803,9 @@ LIB_MAX_FILES = 200
 LIB_MAX_FILE_BYTES = 25 * 1024 * 1024
 LIB_MAX_ITEM_BYTES = 100 * 1024 * 1024
 POOL_GC_MIN_AGE = 600.0
+POOL_TICK_FILL_BYTES = 200 * 1024 * 1024          # new pool bytes fetched per publish tick; the rest waits for the next
+POOL_FILE_MODE, POOL_DIR_MODE = 0o640, 0o750      # with the collab-public group (``MemberRuntime.secret_gid``)
+POOL_FILE_MODE_OPEN, POOL_DIR_MODE_OPEN = 0o644, 0o755   # no group known: world-readable, the mirror's own modes
 _SHA_HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -812,21 +815,84 @@ def safe_content_path(path: object) -> bool:
             and all(part not in ("", ".", "..") for part in path.split("/")))
 
 
-def _fetch_into_pool(rustfs: Any, root: Path, entry: dict) -> bool:
-    """Blocking: put one blob into the pool unless it is there (digest verified while streaming; never replaced)."""
+def _touch_pooled(root: Path, sha: str, perms: tuple[int, int, int | None] | None = None) -> bool:
+    """Blocking: refresh the mtime of a pooled blob (no-follow) so the GC age guard protects it, and bring its mode and
+    group (and the directory's) to ``perms``; False when absent."""
+    try:
+        dfd = os.open(root / LIBRARY_CONTENT_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fd = os.open(sha, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError:
+        os.close(dfd)
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        os.utime(fd)
+        if perms is not None and perms[2] is not None:
+            try:
+                os.fchown(fd, -1, perms[2])
+                os.fchmod(fd, perms[0])
+                os.fchown(dfd, -1, perms[2])
+                os.fchmod(dfd, perms[1])
+            except OSError as exc:
+                log.warning("library content pool: mode/group not repaired (%s)", type(exc).__name__)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+        os.close(dfd)
+
+
+def _pool_perms(rt: MemberRuntime | None) -> tuple[int, int, int | None]:
+    """(file mode, dir mode, gid): 0640/0750 in the collab-public group, else 0644/0755 with a warning."""
+    gid = getattr(rt, "secret_gid", None)
+    if gid is None:
+        log.warning("library content pool: no collab-public group (members.secrets_gid / HERDR_COLLAB_CERT_UID) is "
+                    "known; pool files are world-readable (0644)")
+        return POOL_FILE_MODE_OPEN, POOL_DIR_MODE_OPEN, None
+    return POOL_FILE_MODE, POOL_DIR_MODE, gid
+
+
+def _fetch_into_pool(rustfs: Any, root: Path, entry: dict, perms: tuple[int, int, int | None] | None = None,
+                     budget: list[int] | None = None) -> bool:
+    """Blocking: put one blob into the pool unless it is there (digest verified while streaming; never replaced).
+
+    A blob already pooled is touched (the GC age guard then protects it) and costs nothing; a new one is refused,
+    to be fetched next tick, once ``budget[0]`` (bytes left this tick) cannot cover it."""
     sha, size = entry["sha256"], entry["size"]
+    if _touch_pooled(root, sha, perms):
+        return True
+    if budget is not None and budget[0] < size:
+        return False
     key = entry["storage_key"]
     if isinstance(key, str) and _SHA_HEX.match(key):
         key = f"sha256/{key[:2]}/{key[2:4]}/{key}"
+    fmode, dmode, gid = perms or (POOL_FILE_MODE_OPEN, POOL_DIR_MODE_OPEN, None)
     try:
-        return stream_new_beneath(root, [LIBRARY_CONTENT_DIR], sha, rustfs.iter_get(key, sha), max_bytes=size)
+        try:
+            ok = stream_new_beneath(root, [LIBRARY_CONTENT_DIR], sha, rustfs.iter_get(key, sha), max_bytes=size,
+                                    mode=fmode, dir_mode=dmode, gid=gid)
+        except PermissionError:      # the group cannot be set (not root, not a member of it): readable, but say so
+            log.warning("library content pool: cannot set the collab-public group; storing world-readable")
+            ok = stream_new_beneath(root, [LIBRARY_CONTENT_DIR], sha, rustfs.iter_get(key, sha), max_bytes=size,
+                                    mode=POOL_FILE_MODE_OPEN, dir_mode=POOL_DIR_MODE_OPEN)
+        if ok and budget is not None:
+            budget[0] -= size
+        return ok
     except Exception as exc:                                   # noqa: BLE001 - one blob never stops the view
         log.warning("library content blob not pooled (%s)", type(exc).__name__)
         return False
 
 
-async def _attach_files(conn: Any, items: list[dict], rustfs: Any, root: Path) -> set[str]:
-    """Give every active or pending item the files of its head version and pool their bytes; the pooled shas.
+async def _attach_files(conn: Any, items: list[dict], rustfs: Any, root: Path, rt: MemberRuntime | None = None,
+                        budget: list[int] | None = None) -> set[str]:
+    """Give every active or pending item its files and pool their bytes; the pooled shas.
+
+    Owned, assigned and pending items list the head version; an opened (claimed) one the version its share pinned.
 
     Anything else (revoked, expired, no head, over a cap, bytes unavailable) gets ``files: []``; an item over a cap is
     also marked ``too_large`` (the owner is told, nobody else).  Access ends when the view is rewritten."""
@@ -840,9 +906,20 @@ async def _attach_files(conn: Any, items: list[dict], rustfs: Any, root: Path) -
         " ON v.version_id=a.current_version_id WHERE a.artifact_id = ANY($1::text[])"
         " AND a.lifecycle NOT IN ('retracted','tombstoned') AND v.state <> 'retracted'", wanted)
     heads = {r["artifact_id"]: _json(r["output_manifest"]) for r in rows}
+    claimed = [i["share_id"] for i in items if i["status"] in ("active", "pending") and i["source"] == "opened"
+               and i.get("share_id")]
+    pinned: dict[str, Any] = {}
+    if claimed:
+        for r in await conn.fetch(
+                "SELECT s.share_id, v.output_manifest FROM artifact_shares s"
+                " JOIN artifact_versions v ON v.version_id=s.version_id AND v.artifact_id=s.artifact_id"
+                " JOIN artifacts a ON a.artifact_id=s.artifact_id WHERE s.share_id = ANY($1::text[])"
+                " AND a.lifecycle NOT IN ('retracted','tombstoned') AND v.state <> 'retracted'", claimed):
+            pinned[r["share_id"]] = _json(r["output_manifest"])
+    perms = _pool_perms(rt)
     pooled: set[str] = set()
     for item in items:
-        manifest = heads.get(item["artifact_id"])
+        manifest = pinned.get(item.get("share_id")) if item["source"] == "opened" else heads.get(item["artifact_id"])
         if item["status"] not in ("active", "pending") or not isinstance(manifest, list):
             continue
         entries: list[dict] = []
@@ -862,7 +939,7 @@ async def _attach_files(conn: Any, items: list[dict], rustfs: Any, root: Path) -
             continue
         ok = True
         for e in entries:
-            ok = ok and await asyncio.to_thread(_fetch_into_pool, rustfs, root, e)
+            ok = ok and await asyncio.to_thread(_fetch_into_pool, rustfs, root, e, perms, budget)
         if not ok:
             continue
         item["files"] = [{"path": e["path"], "sha256": e["sha256"], "size": e["size"],
@@ -886,7 +963,7 @@ def sweep_pool(root: Path, referenced: set[str], now: float) -> int:
 
 
 async def _library_view(conn: Any, principal: str, rt: MemberRuntime | None, rustfs: Any = None,
-                        root: Path | None = None) -> tuple[dict, set[str]]:
+                        root: Path | None = None, budget: list[int] | None = None) -> tuple[dict, set[str]]:
     """``({items, folders}, pooled shas)``: the feed (own pending included) newest first, at most ``LIBRARY_VIEW_MAX``."""
     from .artifact_library import DEFAULT_SOURCES, MAX_PAGE, LibraryStore
     store = LibraryStore(_OneConn(conn))
@@ -900,12 +977,13 @@ async def _library_view(conn: Any, principal: str, rt: MemberRuntime | None, rus
         items.extend(_item_json(i) for i in page.items)
         if page.next_offset is None or not page.items:
             break
-    pooled = await _attach_files(conn, items, rustfs, root) if root is not None else set()
+    pooled = await _attach_files(conn, items, rustfs, root, rt, budget) if root is not None else set()
     return {"items": items, "folders": [_folder_json(f) for f in await store.list_folders(principal)]}, pooled
 
 
 async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: Mapping[str, Any] | None = None,
-                            rt: MemberRuntime | None = None, rustfs: Any = None) -> set[str]:
+                            rt: MemberRuntime | None = None, rustfs: Any = None,
+                            budget: list[int] | None = None) -> set[str]:
     """Write ``<root>/member-views/<member_owner_key>.json``: the member's usage, artifacts, shared-with-me and links."""
     from .artifact_member_quota import _NOT_PURGED
     from .artifact_members import MemberStore, member_owner_key
@@ -948,7 +1026,7 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
     root = Path(root)
     from .collab_bridge_files import DIR_MODE
     ensure_dir(root, mode=DIR_MODE, public_mode=True)
-    library, pooled = await _library_view(conn, principal, rt, rustfs if rustfs is not None else getattr(rt, "rustfs", None), root)
+    library, pooled = await _library_view(conn, principal, rt, rustfs if rustfs is not None else getattr(rt, "rustfs", None), root, budget)
     doc = {
         "principal": principal, "updated": __import__("time").time(),
         "usage": {"bytes_used": usage["bytes_used"], "bytes_retracted": usage["bytes_retracted"],
@@ -1070,14 +1148,18 @@ async def publish_member_views(conn: Any, rt: MemberRuntime) -> int:
         " UNION SELECT principal_id FROM artifact_acl WHERE principal_id LIKE 'member:%'")
     written, failed = 0, False
     referenced: set[str] = set()
+    budget = [POOL_TICK_FILL_BYTES]
     for r in rows:
         try:
-            referenced |= await write_member_view(conn, r["p"], rt.mirror_root, defaults=rt.defaults, rt=rt)
+            referenced |= await write_member_view(conn, r["p"], rt.mirror_root, defaults=rt.defaults, rt=rt,
+                                                   budget=budget)
             written += 1
         except Exception as exc:
             failed = True
             log.error("member view not written (%s)", type(exc).__name__)
-    if not failed and rt.rustfs is not None:        # a view that failed still lists its blobs: collect nothing then
+    if rt.rustfs is not None and failed:      # a view that failed still lists its blobs: collect nothing then
+        log.warning("library content pool: garbage collection skipped, a member view was not written this tick")
+    elif rt.rustfs is not None:
         await asyncio.to_thread(sweep_pool, rt.mirror_root, referenced, time.time())
     await sweep_disabled_members(conn, rt)
     await asyncio.to_thread(sweep_secrets, rt)

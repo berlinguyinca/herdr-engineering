@@ -366,3 +366,103 @@ def test_pool_gc_removes_unreferenced_old_blobs_only(registry_pg, tmp_path):
         assert old not in names and young in names and kept <= names
 
     lrun(registry_pg, tmp_path, body)
+
+
+def test_claimed_item_lists_the_share_pinned_version_not_the_head(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, title="Doc")
+        await publish(env, aid, {"index.html": HTML})
+        v1 = (await sql(env, "SELECT current_version_id FROM artifacts WHERE artifact_id=$1", aid))[
+            0
+        ][0]
+        sid = await live_share(env, aid, groups=("nobody",))
+        assert (await send(env, user("bob"), CLAIM, {"share_id": sid}))["result"] == "claimed"
+        await publish(env, aid, {"index.html": HTML, "v2-only.css": b"b{}"}, base=v1)
+        await tick(env, rt)
+        assert {f["path"] for f in files_of(env, BOB, aid)} == {"index.html"}  # v1 only
+        assert {f["path"] for f in files_of(env, ALICE, aid)} == {
+            "index.html",
+            "v2-only.css",
+        }  # owner: head
+        # assigned beats opened: with a grant the head decides
+        await sql(
+            env,
+            "INSERT INTO artifact_acl (artifact_id,principal_id,permissions,granted_by) "
+            "VALUES ($1,$2,'[\"read\"]'::jsonb,$3)",
+            aid,
+            BOB,
+            ALICE,
+        )
+        await tick(env, rt)
+        assert {f["path"] for f in files_of(env, BOB, aid)} == {"index.html", "v2-only.css"}
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_pool_files_use_the_collab_group_modes_and_a_hit_is_touched(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, title="Doc")
+        await publish(env, aid)
+        rt = dataclasses.replace(rt, secret_gid=os.getgid())
+        await tick(env, rt)
+        pool = env.mirror_root / POOL
+        sha = files_of(env, ALICE, aid)[0]["sha256"]
+        assert (pool.stat().st_mode & 0o777, (pool / sha).stat().st_mode & 0o777) == (0o750, 0o640)
+        assert (pool / sha).stat().st_gid == os.getgid()
+        os.utime(pool / sha, (1, 1))
+        await tick(env, rt)  # a hit refreshes the mtime, so the GC age guard protects it
+        assert (pool / sha).stat().st_mtime > 1000
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_pool_without_a_group_falls_back_to_0644_with_a_warning(registry_pg, tmp_path, caplog):
+    async def body(env, rt):
+        aid = await create(env, title="Doc")
+        await publish(env, aid)
+        await tick(env, dataclasses.replace(rt, secret_gid=None))
+        sha = files_of(env, ALICE, aid)[0]["sha256"]
+        assert (env.mirror_root / POOL / sha).stat().st_mode & 0o777 == 0o644
+        assert "world-readable" in caplog.text
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_pool_fill_is_capped_per_tick_and_finished_next_tick(registry_pg, tmp_path, monkeypatch):
+    from herdr_engineering.control_plane import artifact_member_intents as ami
+
+    async def body(env, rt):
+        aid = await create(env, title="Doc")
+        await publish(env, aid, {"index.html": HTML, "style.css": b"a{}"})
+        for blob in (
+            env.mirror_root / POOL
+        ).iterdir():  # the publish's own view write pooled them: start empty
+            blob.unlink()
+        monkeypatch.setattr(ami, "POOL_TICK_FILL_BYTES", 1)
+        await tick(env, rt)
+        assert files_of(env, ALICE, aid) == [] and not pool_files(
+            env
+        )  # over the tick budget: nothing yet
+        monkeypatch.setattr(ami, "POOL_TICK_FILL_BYTES", 10**9)
+        await tick(env, rt)
+        assert len(files_of(env, ALICE, aid)) == 2
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_gc_skip_after_a_failed_view_write_is_logged(registry_pg, tmp_path, caplog):
+    async def body(env, rt):
+        aid = await create(env, title="Doc")
+        await publish(env, aid)
+        await tick(env, rt)
+        blocker = env.mirror_root / "member-views"
+        saved = blocker.rename(env.mirror_root / "mv-saved")
+        blocker.write_text("not a directory")  # every view write now fails
+        try:
+            await tick(env, rt)
+        finally:
+            blocker.unlink()
+            saved.rename(blocker)
+        assert "garbage collection skipped" in caplog.text
+
+    lrun(registry_pg, tmp_path, body)
