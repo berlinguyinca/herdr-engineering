@@ -190,6 +190,8 @@ def test_limit_truncates_and_pages(world):
     "since=2026-01-01T00:00:00Z&until=2026-12-31T00:00:00Z",          # span > 31 days
     WEEK + "&limit=0", WEEK + "&limit=501", WEEK + "&limit=abc", WEEK + "&limit=1&limit=2",
     WEEK + "&after=!!", WEEK + "&since=2026-11-01T00:00:00Z",
+    "since=0001-01-01T00:00:00%2B05:00&until=2026-11-09T00:00:00Z",   # astimezone(UTC) underflows
+    "since=2026-11-02T00:00:00Z&until=9999-12-31T23:59:59-05:00",     # astimezone(UTC) overflows
 ])
 def test_bad_parameters_are_400(world, query):
     status, body = world[2](query)

@@ -48,14 +48,14 @@ def restart(sink, clock):
     for row in sink.rows:
         streams.setdefault(f"{row['entity_type']}|{row['entity_id']}", []).append(row)
         order.append([row['entity_type'], row['entity_id'], row['sequence']])
-    repo = ControlPlaneRepo(now=lambda: clock[0], sink=ListSink())
+    repo = ControlPlaneRepo(now=lambda: clock[0], sink=ListSink(), mission_activity_mirror=True)
     repo.import_state({'events': streams, 'event_order': order})
     return repo
 
 
 def test_projection_survives_restart_and_stays_out_of_the_shared_streams():
     clock, sink = [NOW], ListSink()
-    repo = ControlPlaneRepo(now=lambda: clock[0], sink=sink)
+    repo = ControlPlaneRepo(now=lambda: clock[0], sink=sink, mission_activity_mirror=True)
     IngestService(repo).ingest(snapshot('MSN-1', NOW, created_at=stamp(NOW - 60),
                                         links=[{'kind': 'issue', 'repository': 'acme/app', 'number': 3}]))
     before = repo.mission_activity.get('pi:MSN-1')
@@ -72,20 +72,20 @@ def test_projection_survives_restart_and_stays_out_of_the_shared_streams():
 
 def test_restored_store_keeps_ordering_rules_and_keeps_persisting():
     clock, sink = [NOW], ListSink()
-    repo = ControlPlaneRepo(now=lambda: clock[0], sink=sink)
+    repo = ControlPlaneRepo(now=lambda: clock[0], sink=sink, mission_activity_mirror=True)
     IngestService(repo).ingest(snapshot('MSN-1', NOW))
     again = restart(sink, clock)
     old = IngestService(again).ingest(snapshot('MSN-1', NOW - 5))
     assert again.mission_activity.get('pi:MSN-1')['observed_at'] == stamp(NOW)
     assert old['accepted'] is False    # out-of-order rules survive the restart
     clock[0] += PERSIST_INTERVAL_SECONDS + 1
-    IngestService(again).ingest(snapshot('MSN-1', clock[0]))
+    IngestService(again).ingest(snapshot('MSN-1', clock[0], title='Changed'))
     assert [r['entity_type'] for r in again._sink.rows] == [ENTITY_TYPE]
 
 
 def test_writes_are_throttled_per_mission_but_a_connection_change_is_written():
     clock, sink = [NOW], ListSink()
-    repo = ControlPlaneRepo(now=lambda: clock[0], sink=sink)
+    repo = ControlPlaneRepo(now=lambda: clock[0], sink=sink, mission_activity_mirror=True)
     service = IngestService(repo)
     service.ingest(snapshot('MSN-1', NOW))
     clock[0] += 5
@@ -97,7 +97,7 @@ def test_writes_are_throttled_per_mission_but_a_connection_change_is_written():
     service.ingest(changed)
     assert len(sink.rows) == 2
     clock[0] += PERSIST_INTERVAL_SECONDS
-    service.ingest(snapshot('MSN-1', clock[0]))
+    service.ingest(snapshot('MSN-1', clock[0], title='Changed again'))
     assert len(sink.rows) == 3
     service.ingest(snapshot('MSN-2', clock[0]))
     assert len(sink.rows) == 4
@@ -107,7 +107,7 @@ def test_a_failing_sink_never_breaks_ingest():
     class Broken(ListSink):
         def record(self, event):
             raise RuntimeError('db down')
-    repo = ControlPlaneRepo(now=lambda: NOW, sink=Broken())
+    repo = ControlPlaneRepo(now=lambda: NOW, sink=Broken(), mission_activity_mirror=True)
     assert IngestService(repo).ingest(snapshot('MSN-1', NOW))['accepted'] is True
     assert repo.mission_activity.get('pi:MSN-1') is not None
 
@@ -212,7 +212,7 @@ def test_json_text_payload_from_the_database_is_accepted_and_bad_links_are_dropp
 
 def test_durable_prune_runs_hourly_with_the_retention_cutoff():
     clock, sink = [NOW], ListSink()
-    repo = ControlPlaneRepo(now=lambda: clock[0], sink=sink)
+    repo = ControlPlaneRepo(now=lambda: clock[0], sink=sink, mission_activity_mirror=True)
     service = IngestService(repo)
     service.ingest(snapshot('MSN-1', NOW))
     assert [(t, c.timestamp()) for t, c in sink.pruned] == [(ENTITY_TYPE, NOW - RETENTION_SECONDS)]
@@ -225,6 +225,6 @@ def test_durable_prune_runs_hourly_with_the_retention_cutoff():
 
 
 def test_no_sink_means_no_persistence_and_unchanged_behaviour():
-    repo = ControlPlaneRepo(now=lambda: NOW)
+    repo = ControlPlaneRepo(now=lambda: NOW, mission_activity_mirror=True)
     assert IngestService(repo).ingest(snapshot('MSN-1', NOW))['accepted'] is True
     assert repo.mission_activity.get('pi:MSN-1') is not None

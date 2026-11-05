@@ -40,7 +40,7 @@ def test_activity_ingestion_never_changes_missions_or_emits_events():
     class Sink:
         def record(self, event):
             written.append(event)
-    repo = ControlPlaneRepo(now=lambda: NOW, sink=Sink())
+    repo = ControlPlaneRepo(now=lambda: NOW, sink=Sink(), mission_activity_mirror=True)
     repo.upsert_mission('MSN-one', title='Separate existing mission', source='herdr')
     before = copy.deepcopy(repo.list_missions())
     written.clear()

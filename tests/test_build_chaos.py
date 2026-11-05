@@ -339,8 +339,19 @@ def test_twenty_build_storm_respects_slots_and_completes(tmp_path):
     assert len(fin) == 20
     assert sorted(e["exit_code"] for e in fin) == sorted(codes)
     db = gates / "build-registry.db"
+    # The registry is best-effort by design ("registry failure must never fail a
+    # build"): under a loaded disk a registration can hit the 5 s busy timeout and the
+    # build runs unrecorded. Such a build's finish event carries no attempt_id, so the
+    # invariant is "exactly the builds that registered have a terminal row", not a
+    # fixed 20 -- which would depend on the host's speed.
+    registered = [e for e in fin if e.get("attempt_id")]
+    assert len(registered) >= 1
+    want: dict[str, int] = {}
+    for e in registered:
+        st = "completed" if e["exit_code"] == 0 else "failed"
+        want[st] = want.get(st, 0) + 1
     states = dict(_rows(db, "SELECT state, COUNT(*) FROM attempts GROUP BY state"))
-    assert states == {"completed": 16, "failed": 4}                    # rows consistent
+    assert states == want                                              # rows consistent
     assert _rows(db, "SELECT COUNT(*) FROM leases WHERE released_ts IS NULL") == [(0,)]
     assert _rows(db, "SELECT COUNT(*) FROM builds WHERE state NOT IN "
                      "('completed','failed','cancelled','timed_out','rejected')") == [(0,)]

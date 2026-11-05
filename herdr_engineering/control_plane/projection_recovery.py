@@ -21,7 +21,7 @@ from .projection_store import CheckpointInvalid, ProjectionStore, SnapshotChange
 
 log = logging.getLogger(__name__)
 RETENTION_TYPES = frozenset({'inspector','host_metrics','token_usage','resource_usage',
-                             'ci_report','ci_observation','ci_telemetry','ci_pipeline'})
+                             'ci_report','ci_observation','ci_telemetry','ci_pipeline','mission_activity_store'})
 MAX_TAIL_ROWS = 100_000
 MAX_DIRTY_ROWS = 250_000
 
