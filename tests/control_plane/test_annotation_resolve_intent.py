@@ -405,7 +405,7 @@ def test_the_mirror_drops_resolved_and_deleted_annotations_after_a_tick(registry
             resolve_raw(env, a, aid, mine, [resolved])
             await settle(env)
             await AnnotationStore(conn).ingest(conn, {"op": "delete", "share_id": sid, "annotation_id": deleted,
-                                                      "author_identity": "u1", "at": datetime.now(UTC).isoformat()},
+                                                      "author_identity": "u1", "basis": "e", "at": datetime.now(UTC).isoformat()},
                                                "del" + deleted, **KW)
             await hk.tick(conn)
             assert [r["annotation_id"] for r in mirrored(mirror, aid)["annotations"]] == [keep], (
