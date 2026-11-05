@@ -7,7 +7,7 @@ import urllib.request
 import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
-from herdr_engineering.control_plane.mission_outcome import outcome_summaries
+from herdr_engineering.control_plane.mission_outcome import outcome_summaries, pr_refs_by_mission
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 
@@ -90,7 +90,6 @@ def test_g2_summaries_carry_no_issue_relationship_and_text_is_never_parsed():
 
 
 # ---- G3: top-level `pr_refs` covers running missions too; `outcomes` membership/meaning is unchanged ----
-from herdr_engineering.control_plane.mission_outcome import pr_refs_by_mission
 
 
 def _running(repo, key):
