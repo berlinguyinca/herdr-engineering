@@ -211,3 +211,30 @@ def test_other_command_is_not_covered_by_an_approval():
                    "s1", "t1", NOW + timedelta(minutes=1))
     assert other.outcome == "pending"
     assert store.get_action_request(d.request_id, tenant_id=T, user_id=U).consumed_at is None
+
+
+# ---- round 2: the dynamic-word / xargs guard also applies to unknown (unparsed) commands
+
+@pytest.mark.parametrize("raw", [
+    RawAction(tool="Bash", command="frob $X 'unterminated", repo="acme/repo-a"),
+    RawAction(tool="Bash", command="$X", repo="acme/repo-a"),
+    RawAction(tool="Bash", command="[ -f x ]", repo="acme/repo-a"),
+    RawAction(tool="mystery", command="run $X", repo="acme/repo-a"),
+    RawAction(tool="Bash", command="frob *.txt 'x", repo="acme/repo-a"),
+    RawAction(tool="Bash", command="frob 'unterminated | xargs rm", repo="acme/repo-a"),
+])
+def test_dynamic_unknown_commands_stay_pending_after_approval(raw):
+    first, second, third = _once(raw)
+    assert second.outcome == "pending" and third.outcome == "pending"
+
+
+def test_plain_unparseable_command_is_still_authorized_once():
+    first, second, third = _once(RawAction(tool="Bash", command="frob 'unterminated", repo="acme/repo-a"))
+    assert (second.outcome, third.outcome) == ("authorized", "pending")
+
+
+def test_email_send_with_valid_recipients_is_one_shot_safe():
+    from herdr_engineering.control_plane.assistant_hub.canonical import derive
+    assert derive(RawAction(tool="email", operation="send", recipients=["a@b.co"])).one_shot_safe is True
+    first, second, third = _once(RawAction(tool="email", operation="send", recipients=["a@b.co"]))
+    assert (second.outcome, third.outcome) == ("authorized", "pending")

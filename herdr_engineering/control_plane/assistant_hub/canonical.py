@@ -847,7 +847,7 @@ def _unknown_derived(raw: RawAction, reason: str, facts: list[str], details: tup
                      hint_host: str = "") -> Derived:
     key = mk_key(raw.tool.strip().lower() or "unknown", Verb.UNKNOWN, raw.repo or "", raw_digest(raw.command or ""))
     return Derived(key, (), True, reason, tuple(facts), details, raw.command or "", hint_host,
-                   one_shot_safe=bool((raw.command or "").strip()))
+                   one_shot_safe=_text_is_stable(raw.command or ""))
 
 
 def split_recipients(values: Iterable[str]) -> tuple[set[str], bool]:
@@ -990,9 +990,19 @@ def _shell(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
 _DYNAMIC_CHARS = frozenset("$`*?[]{}~")
 
 
+def _static_text(text: str) -> bool:
+    """Non-blank and free of expansion characters ($ ` globs ~ braces)."""
+    return bool(text.strip()) and not any(c in _DYNAMIC_CHARS for c in text)
+
+
+def _text_is_stable(text: str) -> bool:
+    """Fail closed on unparsed text: static, and no ``xargs`` word anywhere (it cannot be detected structurally)."""
+    return _static_text(text) and "xargs" not in text
+
+
 def _digests_whole_action(text: str, cmds: list, out: list[Element]) -> bool:
     """Fail closed: the same text must mean the same thing at run time (no expansion, no xargs)."""
-    if not text.strip() or any(c in _DYNAMIC_CHARS for c in text):
+    if not _static_text(text):
         return False
     return not (any(XARGS_MARKER in c.argv for c in cmds) or any(el.xargs for el in out))
 
