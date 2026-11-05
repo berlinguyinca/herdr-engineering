@@ -19,7 +19,7 @@ def _on(**extra: Any) -> dict[str, Any]:
 def test_defaults() -> None:
     assert _slack() == {"enabled": False, "base_url": "https://slack.com/api", "bot_token_file": "",
                         "app_token_file": "", "owner_user_id": "", "channel": "", "ask_ttl_minutes": 15,
-                        "max_asks_per_task_per_hour": 6}
+                        "max_asks_per_task_per_hour": 6, "summary_idle_minutes": 30}
     assert assistant_config({})["slack"] == _slack()
 
 

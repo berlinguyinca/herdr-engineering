@@ -45,6 +45,8 @@ class SlackAsk:
     question: str = ""               # question asks: what the worker asked (kept so a restart can still post it)
     options: list[str] = field(default_factory=list)
     context: str = ""
+    last_activity: datetime = _EPOCH  # summary rows: when the worker's task last did anything (the idle timer's clock)
+    final: bool = False               # summary rows: the worker said the task is finished (post at once)
 
 
 def button_value(ask: SlackAsk) -> str:

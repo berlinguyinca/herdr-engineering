@@ -46,9 +46,9 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from . import placement, slurm_placement
+from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.events import WorkerEvent, event_size
-from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
 from .assistant_hub.shadow import JudgeRecord
 from .assistant_hub.slack_asks import SlackAsk
 from .assistant_hub.verbs import Verb
@@ -640,7 +640,7 @@ def _judge_config(raw: Any) -> dict[str, Any]:
 
 
 _SLACK_KEYS = {"enabled", "base_url", "bot_token_file", "app_token_file", "owner_user_id", "channel", "ask_ttl_minutes",
-               "max_asks_per_task_per_hour"}
+               "max_asks_per_task_per_hour", "summary_idle_minutes"}
 _SLACK_INLINE_SECRETS = {"bot_token", "app_token", "token", "secret"}
 
 
@@ -691,9 +691,12 @@ def _slack_config(raw: Any) -> dict[str, Any]:
     cap = raw.get("max_asks_per_task_per_hour", 6)
     if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 1000:
         raise ValueError(f"{where}.max_asks_per_task_per_hour must be an integer between 1 and 1000")
+    idle = raw.get("summary_idle_minutes", 30)
+    if isinstance(idle, bool) or not isinstance(idle, int) or not 1 <= idle <= 1440:
+        raise ValueError(f"{where}.summary_idle_minutes must be an integer between 1 and 1440")
     return {"enabled": enabled, "base_url": base_url, "bot_token_file": files["bot_token_file"],
             "app_token_file": files["app_token_file"], "owner_user_id": owner, "channel": channel.strip(),
-            "ask_ttl_minutes": ttl, "max_asks_per_task_per_hour": cap}
+            "ask_ttl_minutes": ttl, "max_asks_per_task_per_hour": cap, "summary_idle_minutes": idle}
 
 
 def apps_config(raw: Any) -> dict[str, Any]:
@@ -2432,6 +2435,40 @@ class AssistantStore:
         with self._lock:
             return [replace(a) for a in self.slack_asks.values()
                     if a.kind == "question" and a.status == "open" and not a.ts]
+
+    def find_summary_ask(self, tenant_id: str, user_id: str, worker_id: str, task_id: str) -> SlackAsk | None:
+        """The one summary row (tracker, then record) of this worker's task, scoped to tenant and user."""
+        with self._lock:
+            for a in self.slack_asks.values():
+                if (a.kind == "summary" and a.tenant_id == tenant_id and a.user_id == user_id
+                        and a.worker_id == worker_id and a.task_id == task_id):
+                    return replace(a)
+            return None
+
+    def list_open_summaries(self, tenant_id: str | None = None, user_id: str | None = None,
+                            worker_id: str | None = None) -> list[SlackAsk]:
+        """Summary rows still waiting to be posted (no message yet), oldest first.  No filter: every tenant's."""
+        with self._lock:
+            return [replace(a) for a in self.slack_asks.values()
+                    if a.kind == "summary" and a.status == "open" and not a.ts
+                    and (tenant_id is None or a.tenant_id == tenant_id) and (user_id is None or a.user_id == user_id)
+                    and (worker_id is None or a.worker_id == worker_id)]
+
+    def task_activity(self, tenant_id: str, user_id: str, worker_id: str, task_id: str) -> dict[str, int]:
+        """Counts for one worker's task: grant and one-shot authorizations (from the action_request events), plus
+        owner-denied and vetoed requests (from the request rows).  Every row is scoped by tenant, user and worker."""
+        with self._lock:
+            events = [e for e in self.worker_events.values()
+                      if e.kind == "action_request" and e.tenant_id == tenant_id and e.user_id == user_id
+                      and e.worker_id == worker_id and e.payload.get("task_id") == task_id
+                      and e.payload.get("outcome") == "authorized"]
+            rows = [r for r in self.action_requests.values()
+                    if r.tenant_id == tenant_id and r.user_id == user_id and r.worker_id == worker_id
+                    and r.task_id == task_id]
+        return {"grant": sum(1 for e in events if e.payload.get("source") == "grant"),
+                "one_shot": sum(1 for e in events if e.payload.get("source") == "owner"),
+                "denied": sum(1 for r in rows if r.status == "denied"),
+                "vetoed": sum(1 for r in rows if r.status == "vetoed")}
 
     def list_slack_asks(self, tenant_id: str, user_id: str, status: str | None = None) -> list[SlackAsk]:
         with self._lock:

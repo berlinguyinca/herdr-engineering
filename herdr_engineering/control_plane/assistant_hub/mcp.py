@@ -82,10 +82,12 @@ _TOOLS: dict[str, tuple[str, str, dict]] = {
                        "context": {"type": "string", "maxLength": 2000}, "action": {"type": "object"},
                        "session_id": _STR}}),
     "report": ("report", "Report a decision, correction, stated rule or outcome from your session. It is recorded as "
-               "worker-reported; it never grants anything.", {
+               "worker-reported; it never grants anything. With task_id and final=true it says the task is finished "
+               "and the owner gets one summary of it.", {
         "type": "object", "required": ["kind", "session_id"], "additionalProperties": False,
         "properties": {"kind": {"enum": list(REPORT_KINDS)}, "text": {"type": "string", "maxLength": 2000},
-                       "payload": {"type": "object"}, "session_id": _STR}}),
+                       "payload": {"type": "object"}, "session_id": _STR,
+                       "task_id": {"type": "string", "maxLength": MAX_ID_CHARS}, "final": {"type": "boolean"}}}),
     "action_request": ("act", "Ask the owner's assistant whether an action is authorized before you run it. The answer "
                        "is a decision with a reason (authorized, denied or pending), never an instruction.", {
         "type": "object", "required": ["tool", "session_id", "task_id"], "additionalProperties": False,
@@ -193,6 +195,12 @@ def _raw_action(args: dict) -> RawAction:
                      environment=_opt_str(args, "environment"), hint=dict(hint))
 
 
+def _note_task(hub: Hub, worker: Worker, task_id: str, *, final: bool = False, text: str | None = None) -> None:
+    """Tell the Slack runtime the task did something (for its summary).  Never raises and never blocks."""
+    if hub.slack is not None:
+        hub.slack.note_task(worker.tenant_id, worker.user_id, worker.worker_id, task_id, final=final, text=text)
+
+
 def _action_request(hub: Hub, worker: Worker, args: dict) -> dict:
     _check_args(args, {"tool", "command", "operation", "recipients", "repo", "environment", "hint", "session_id",
                        "task_id"})
@@ -205,9 +213,10 @@ def _action_request(hub: Hub, worker: Worker, args: dict) -> dict:
     try:
         record_event(hub.store, worker, kind="action_request", provenance="worker_reported", session_id=session_id,
                      payload={"outcome": d.outcome, "source": d.source,
-                              "verb": d.verb, "key_id": d.key_id})
+                              "verb": d.verb, "key_id": d.key_id, "task_id": task_id})
     except ValueError as exc:
         raise _ToolError(str(exc)) from exc
+    _note_task(hub, worker, task_id)
     return _text({"outcome": d.outcome, "reason": d.reason, "request_id": d.request_id, "grant_id": d.grant_id,
                   "veto_code": d.veto_code, "source": d.source})
 
@@ -270,7 +279,7 @@ def _ask(hub: Hub, worker: Worker, args: dict) -> dict:
 
 
 def _report(hub: Hub, worker: Worker, args: dict) -> dict:
-    _check_args(args, {"kind", "text", "payload", "session_id"})
+    _check_args(args, {"kind", "text", "payload", "session_id", "task_id", "final"})
     kind = args.get("kind")
     if kind not in REPORT_KINDS:
         raise _ToolError(f"kind must be one of {', '.join(REPORT_KINDS)}")
@@ -282,9 +291,21 @@ def _report(hub: Hub, worker: Worker, args: dict) -> dict:
         if not isinstance(extra, dict):
             raise _ToolError("payload must be an object")
         payload["payload"] = extra
+    task_id = _bounded_id(args, "task_id") if "task_id" in args else None
+    final = args.get("final")
+    if final is not None and not isinstance(final, bool):
+        raise _ToolError("final must be true or false")
+    if final is not None and task_id is None:
+        raise _ToolError("final needs a task_id")
+    if task_id is not None:
+        payload["task_id"] = task_id
+    if final is not None:
+        payload["final"] = final
     # Provenance is fixed here and is not part of the tool schema: whatever the caller claims is only stored data.
     event = _record(hub, worker, kind="report", provenance="worker_reported",
                          session_id=_req_str(args, "session_id"), payload=payload)
+    if task_id is not None:         # the recorded (scrubbed) text, never the raw argument
+        _note_task(hub, worker, task_id, final=final is True, text=event.payload.get("text"))
     return _text({"status": "recorded", "event_id": event.event_id})
 
 

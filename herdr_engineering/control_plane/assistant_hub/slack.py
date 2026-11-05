@@ -210,7 +210,7 @@ class _Queued:
     project: str
     queued_at: datetime
     ask: SlackAsk | None = None
-    kind: str = "action"             # action | question (a question's ask is created up front)
+    kind: str = "action"             # action | question | summary (their asks are created up front)
 
 
 @dataclass
@@ -222,6 +222,10 @@ class _Batch:
 
 
 _HOUR = timedelta(hours=1)
+_MAX_OPEN_SUMMARIES = 50           # unfinished task trackers one worker may hold (task ids are worker-controlled)
+_SUMMARY_GIVE_UP = timedelta(hours=24)       # a summary that could not be posted for this long is dropped
+_SUMMARY_REPORT_KEEP = 1000        # report text kept on the row for the summary
+_SUMMARY_REPORT_SHOWN = 600
 
 
 class SlackRuntime:
@@ -231,7 +235,8 @@ class SlackRuntime:
                  now_fn: Callable[[], datetime], *, min_backoff: float = 0.5, max_backoff: float = 30.0,
                  ping_interval: float = 2.0, stop_timeout: float = 15.0,
                  queue_size: int = 200, sweep_interval: float = 300.0, reoffer_backoff: float = 300.0,
-                 max_task_keys: int = 1000, judge: Any = None) -> None:
+                 max_task_keys: int = 1000, judge: Any = None,
+                 summary_interval: float = 5.0) -> None:
         self.store = store
         self.service = service
         self.judge = judge                 # the policy's judge runtime: activating a remembered grant uses its gate
@@ -248,6 +253,9 @@ class SlackRuntime:
         self._sweep_interval = sweep_interval
         self._reoffer_backoff = reoffer_backoff      # a request that failed is not offered again sooner (monotonic s)
         self._max_keys = max(1, int(max_task_keys))
+        self._summary_interval = summary_interval    # how often the idle timer looks at unfinished task trackers
+        self._next_summary = 0.0
+        self._summ = threading.Lock()                # one tracker row per (worker, task): creation is serialized
         self._failed_at: dict[str, float] = {}
         self._batched: dict[str, None] = {}          # request ids folded into a batched line: the sweep skips them
         self._current: str = ""                      # request id being posted right now
@@ -436,6 +444,7 @@ class SlackRuntime:
         delay = self._min_backoff
         while not self._stop.is_set():
             self._maybe_sweep()
+            self._maybe_summaries()
             self._prune()
             with self._qcond:
                 if not self._queue and not self._stop.is_set() and not self._sweep_due:
@@ -474,6 +483,9 @@ class SlackRuntime:
         self._audit_failed(item, code)
         if item.kind == "action":
             self._failed_at[item.request_id] = time.monotonic()
+            self._cap(self._failed_at)
+        elif item.kind == "summary" and item.ask is not None:      # stays open: the timer offers it again later
+            self._failed_at[item.ask.ask_id] = time.monotonic()
             self._cap(self._failed_at)
 
     def _cap(self, mapping: dict[Any, Any]) -> None:
@@ -539,6 +551,130 @@ class SlackRuntime:
             queued += 1
         return queued + self._sweep_questions(now)
 
+    # -- task summaries ----------------------------------------------------------------------------
+    def note_task(self, tenant_id: str, user_id: str, worker_id: str, task_id: str, *, final: bool = False,
+                  text: str | None = None) -> None:
+        """A worker's task did something (a report or an action request).  Keeps the task's one summary row up to date;
+        a final report queues the summary.  A task with a summary already (posted or given up) is left alone, so it
+        never gets a second.  Never blocks and never raises: the caller is a request thread."""
+        try:
+            if not self._cfg().get("enabled"):
+                return
+            now = as_utc(self._now())
+            with self._summ:
+                ask = self.store.find_summary_ask(tenant_id, user_id, worker_id, task_id)
+                if ask is None:
+                    if not final and len(self.store.list_open_summaries(tenant_id, user_id, worker_id)) \
+                            >= _MAX_OPEN_SUMMARIES:
+                        return           # a flood of task ids must not push the owner's asks out of the store
+                    ask = SlackAsk(ask_id=new_ask_id(), tenant_id=tenant_id, user_id=user_id, kind="summary",
+                                   task_id=task_id, nonce=new_nonce(), created_at=now, worker_id=worker_id)
+                elif ask.status != "open" or ask.ts:
+                    return
+                was_final = ask.final
+                ask.last_activity, ask.final = now, ask.final or final
+                if text:
+                    ask.context = text[:_SUMMARY_REPORT_KEEP]
+                self.store.put_slack_ask(ask)
+            if ask.final and not was_final:
+                self._enqueue(self._summary_item(ask, now))
+        except Exception as exc:
+            _log.warning("slack note_task failed: %s", type(exc).__name__)
+
+    @staticmethod
+    def _summary_item(ask: SlackAsk, now: datetime) -> _Queued:
+        return _Queued(ask.tenant_id, ask.user_id, "", ask.worker_id, ask.task_id, "", "", "", now, ask=ask,
+                       kind="summary")
+
+    def _maybe_summaries(self) -> None:
+        mono = time.monotonic()
+        if mono < self._next_summary:
+            return
+        self._next_summary = mono + self._summary_interval
+        try:
+            self.sweep_summaries()
+        except Exception as exc:
+            _log.warning("slack summary sweep failed: %s", type(exc).__name__)
+
+    def sweep_summaries(self) -> int:
+        """Queue every task summary that is due and unposted: finished tasks (a restart or an outage lost the queue
+        entry) and tasks quiet for ``summary_idle_minutes``.  Returns how many were queued."""
+        cfg = self._cfg()
+        if not cfg.get("enabled"):
+            return 0
+        now = as_utc(self._now())
+        idle = timedelta(minutes=int(cfg.get("summary_idle_minutes") or 30))
+        mono = time.monotonic()
+        queued = 0
+        for ask in self.store.list_open_summaries():
+            quiet = now - as_utc(ask.last_activity)
+            if not ask.final and quiet < idle:
+                continue
+            if quiet >= idle + _SUMMARY_GIVE_UP:
+                ask.status = "expired"           # could not be posted for a day: give up (still never a second one)
+                self.store.put_slack_ask(ask)
+                continue
+            if mono - self._failed_at.get(ask.ask_id, -1e9) < self._reoffer_backoff:
+                continue
+            with self._qcond:
+                if len(self._queue) >= self._qsize:
+                    break
+                if ask.ask_id == self._current or any(i.ask is not None and i.ask.ask_id == ask.ask_id
+                                                      for i in self._queue):
+                    continue
+                self._queue.append(self._summary_item(ask, now))
+                self._qcond.notify()
+            queued += 1
+        return queued
+
+    def _post_summary(self, item: _Queued, cfg: dict[str, Any], now: datetime) -> bool:
+        current = self.store.get_slack_ask(item.ask.ask_id, tenant_id=item.tenant_id,
+                                           user_id=item.user_id) if item.ask is not None else None
+        if current is None or current.status != "open" or current.ts:
+            return True                      # already posted (a duplicate entry), given up, or gone: never a second
+        key = (item.tenant_id, item.user_id, item.worker_id, item.task_id, "summary")   # its own counter
+        stamps = self._posted.pop(key, None) or deque()
+        self._posted[key] = stamps
+        while stamps and now - stamps[0] >= _HOUR:
+            stamps.popleft()
+        if len(stamps) >= int(cfg.get("max_asks_per_task_per_hour") or 6):
+            self._failed_at[current.ask_id] = time.monotonic()      # over the limit: the timer offers it later
+            return True
+        counts = self.store.task_activity(item.tenant_id, item.user_id, item.worker_id, item.task_id)
+        idle = int(cfg.get("summary_idle_minutes") or 30)
+        text = f"Task summary from worker {slack_text(item.worker_id)}"
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": self._summary_text(current, counts, idle)}}]
+        channel = self._target(cfg)
+        ts = self.client.post_message(channel, blocks, text)
+        current.ts, current.channel, current.status = ts, channel, "decided"
+        self.store.put_slack_ask(current)
+        stamps.append(now)
+        self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
+                                action="assistant.slack.summary_posted", subject_id=current.ask_id,
+                                detail=f"ask={current.ask_id} worker={_short_id(item.worker_id)}"
+                                       f" final={'yes' if current.final else 'no'}")
+        return True
+
+    @classmethod
+    def _summary_text(cls, ask: SlackAsk, counts: dict[str, int], idle_minutes: int) -> str:
+        """Counts and the worker's inert report text only: never a command, a display string, a secret or a token."""
+        lines = [f"*Task summary* from worker `{slack_text(ask.worker_id)}`, task `{slack_text(ask.task_id, 128)}`"]
+        if not ask.final:
+            lines.append(f"_No final report; the task has been quiet for {idle_minutes} minutes._")
+        lines += [f"Authorized under grants: {counts['grant']}",
+                  f"One-shot approvals used: {counts['one_shot']}",
+                  f"Denied by you: {counts['denied']}",
+                  f"Vetoed: {counts['vetoed']}"]
+        lines += cls._summary_deploy_lines(ask)
+        if ask.context:
+            lines.append("Worker's report: " + slack_text(ask.context, _SUMMARY_REPORT_SHOWN))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _summary_deploy_lines(ask: SlackAsk) -> list[str]:
+        """Deploy outcomes of this task.  Empty until deploys exist (Task 9 fills it in)."""
+        return []
+
     def _sweep_questions(self, now: datetime) -> int:
         """Questions stored but never posted (a restart, or the queue dropped them) are queued again until they expire."""
         queued = 0
@@ -563,7 +699,7 @@ class SlackRuntime:
         return as_utc(self._now()) - item.queued_at >= ttl
 
     def _audit_failed(self, item: _Queued, code: str) -> None:
-        if item.ask is not None:
+        if item.ask is not None and item.kind != "summary":
             item.ask.status = "expired"
             self.store.put_slack_ask(item.ask)
         subject = item.request_id or (item.ask.ask_id if item.ask is not None else "-")
@@ -585,6 +721,8 @@ class SlackRuntime:
         if not cfg.get("enabled"):
             return True
         now = as_utc(self._now())
+        if item.kind == "summary":
+            return self._post_summary(item, cfg, now)
         question = item.kind == "question"
         if question:
             current = self.store.get_slack_ask(item.ask.ask_id, tenant_id=item.tenant_id,
