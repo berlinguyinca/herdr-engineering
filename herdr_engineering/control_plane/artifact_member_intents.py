@@ -1164,7 +1164,9 @@ async def publish_member_views(conn: Any, rt: MemberRuntime) -> int:
     rows = await conn.fetch(
         "SELECT created_by AS p FROM artifacts WHERE created_by LIKE 'member:%'"
         " UNION SELECT member_principal FROM artifact_member_usage"
-        " UNION SELECT principal_id FROM artifact_acl WHERE principal_id LIKE 'member:%'")
+        " UNION SELECT principal_id FROM artifact_acl WHERE principal_id LIKE 'member:%'"
+        " UNION SELECT 'member:' || member_id FROM artifact_share_claims"      # a member who only opens links
+        " UNION SELECT owner FROM artifact_library_folders WHERE owner LIKE 'member:%'")
     written, failed = 0, False
     referenced: set[str] = set()
     budget = [POOL_TICK_FILL_BYTES]
