@@ -313,7 +313,7 @@ class ControlPlaneServer:
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None):
+                 assistant_workers=None, assistant_judge=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -506,6 +506,7 @@ class ControlPlaneServer:
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
         # The owner routes /api/v1/assistant-workers read it at request time, so it may be attached after startup.
         self.assistant_workers = assistant_workers
+        self.assistant_judge = assistant_judge       # JudgeRuntime | None; None: the activation gate refuses
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
         from .rakazo_artifacts import RegistryBackend
@@ -2477,7 +2478,8 @@ def _make_handler(server, public=False, operator=False):
             dpath = "/".join(seg.replace("/", "\x00") for seg in segs)
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
-                                    "assistant-action-requests", "assistant-grants", "assistant-team-briefs"}
+                                    "assistant-action-requests", "assistant-grants", "assistant-judges",
+                                    "assistant-team-briefs"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
@@ -2586,7 +2588,7 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
                                         "assistant-reminders", "assistant-workers",
-                                        "assistant-action-requests", "assistant-grants"}
+                                        "assistant-action-requests", "assistant-grants", "assistant-judges"}
 
         def _mutate_verb(self):
             if operator:
@@ -2617,7 +2619,7 @@ def _make_handler(server, public=False, operator=False):
             if err:
                 return err
             if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
-                            "assistant-action-requests", "assistant-grants"):
+                            "assistant-action-requests", "assistant-grants", "assistant-judges"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3933,6 +3935,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts)
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource)
+            if resource == "assistant-judges":
+                return self._assistant_judges(parts)
             if resource in ("assistant-team-briefs", "assistant-references"):
                 return self._assistant_briefs(parts, resource, None)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
@@ -4407,6 +4411,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts, body)     # body was read above; never read it twice
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource, body)
+            if resource == "assistant-judges":
+                return self._assistant_judges(parts, body)
             if resource == "assistant-team-briefs":
                 return self._assistant_briefs(parts, resource, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
@@ -4692,6 +4698,7 @@ def _make_handler(server, public=False, operator=False):
             from .assistant_hub.policy import (
                 ActivationRefused,
                 activate_grant,
+                current_judge_version,
                 record_owner_decision,
                 revoke_action_grant,
             )
@@ -4705,6 +4712,7 @@ def _make_handler(server, public=False, operator=False):
                 tenant_id, user_id = self._assistant_scope()
                 svc, store = server.assistant, server.assistant.store
                 cfg = svc.config["grants"]
+                version = current_judge_version(server.assistant_judge)
 
                 def request_view(r):
                     return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
@@ -4715,8 +4723,8 @@ def _make_handler(server, public=False, operator=False):
                 def grant_view(g):
                     return {"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb,
                             "resource_scope": g.resource_scope, "key_id": g.key_id,
-                            "state": g.effective_state(svc.now(), int(cfg["policy_version"])).value,
-                            "policy_version": g.policy_version, "created_at": iso(g.created_at),
+                            "state": g.effective_state(svc.now(), int(cfg["policy_version"]), version).value,
+                            "policy_version": g.policy_version, "judge_version": g.judge_version, "created_at": iso(g.created_at),
                             "proposed_at": iso(g.proposed_at), "activated_at": iso(g.activated_at),
                             "expires_at": iso(g.expires_at), "revoked_at": iso(g.revoked_at),
                             "confirmed_by": g.confirmed_by}
@@ -4736,7 +4744,8 @@ def _make_handler(server, public=False, operator=False):
                             return self._json({"error": 'body must be exactly {"approve": true|false}'}, 400)
                         try:
                             row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
-                                                        body["approve"], decided_by=user_id)
+                                                        body["approve"], decided_by=user_id,
+                                                        judge_version=version)
                         except ValueError as exc:       # already decided, or vetoed (a veto is final)
                             return self._json({"error": str(exc), "code": "conflict"}, 409)
                         return self._json(request_view(row))
@@ -4745,14 +4754,16 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"grants": [grant_view(g) for g in store.list_action_grants(tenant_id, user_id)]})
                     if len(parts) == 5 and self.command == "DELETE":
                         return self._json(grant_view(revoke_action_grant(store, svc.now(), tenant_id, user_id,
-                                                                          parts[4], revoked_by=user_id)))
+                                                                          parts[4], revoked_by=user_id,
+                                                                          policy_version=int(cfg["policy_version"]),
+                                                                          judge_version=version)))
                     if len(parts) == 6 and parts[5] == "activate" and self.command == "POST":
                         if not exact({"confirm"}) or body["confirm"] is not True:
                             return self._json({"error": 'body must be exactly {"confirm": true}'}, 400)
                         try:
-                            # The judge gate is hard-coded unsatisfied this phase: Phase 3 wires the real judge gate.
+                            # The real gate: calibration report from the store, owner flag, false-negative bound.
                             grant = activate_grant(store, cfg, svc.now(), tenant_id, user_id, parts[4],
-                                                   confirmed_by=user_id, judge_gate_satisfied=False)
+                                                   confirmed_by=user_id, judge=server.assistant_judge)
                         except ActivationRefused as exc:
                             if exc.code == "not_found":
                                 return self._json({"error": "not found"}, 404)
@@ -4765,6 +4776,34 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "not found"}, 404)
             except ValueError as exc:
                 return self._json({"error": str(exc)}, 400)
+
+        def _assistant_judges(self, parts, body=None):
+            """Owner-only judge status and a one-shot connectivity check. Same tenant/user scope as the grants routes;
+            the endpoint is shown as a host only and no key material or key path ever leaves here."""
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant_hub.judge_admin import check_view, status_view
+            if self._require("operator"):
+                return None
+            try:
+                server.assistant._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                judge = server.assistant_judge
+                fallback = svc.config.get("judge") or {}
+                if len(parts) == 4 and self.command == "GET":
+                    return self._json(status_view(svc.store, judge, fallback, tenant_id, user_id, svc.now()))
+                if len(parts) == 5 and parts[4] == "check" and self.command == "POST":
+                    if body not in (None, {}):
+                        return self._json({"error": "body must be empty"}, 400)
+                    return self._json(check_view(judge, fallback))
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
 
         def _assistant_briefs(self, parts, resource, body):
             """Team collaboration slice 4 (assistant_briefs.py): the operator's assistant offers a team a derived brief.

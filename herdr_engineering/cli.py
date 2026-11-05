@@ -799,6 +799,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
     p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
     p2.set_defaults(func=_cmd_cp_assistant_hub_owner, command_group_kind="grant")
+    p2 = csub.add_parser("assistant-judge", help="register the judge API key, show judge status, or check connectivity")
+    p2.add_argument("action", choices=["register", "status", "check"])
+    p2.add_argument("--endpoint", default=None, help="register: the judge base URL (https; http only for loopback)")
+    p2.add_argument("--key-file", default=None, help="register: absolute PATH the 0600 key file is written to (rotated via PATH.new)")
+    p2.add_argument("--key-stdin", action="store_true", help="register: read the key from stdin (the only way; never argv)")
+    p2.add_argument("--model", default="laya-auto", help="register: the model id that must appear in GET /v1/models")
+    p2.add_argument("--control-plane", default=None, help="status|check: control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None, help="status|check: PATH to a file holding an operator API key")
+    p2.set_defaults(func=_cmd_cp_assistant_judge)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -3441,6 +3450,99 @@ def _tty_safe(value) -> str:
     return "".join(c for c in str(value) if c == " " or not (ord(c) < 32 or 0x7F <= ord(c) <= 0x9F))
 
 
+def _assistant_judge_register(args) -> int:
+    """``assistant-judge register``: the key comes from stdin only and is never printed. 0 ok, 1 refused, 2 usage."""
+    from .control_plane.assistant_hub.judge_register import (
+        MAX_KEY_CHARS,
+        RegisterError,
+        register_key,
+    )
+
+    if not (args.endpoint and args.key_file and args.key_stdin):
+        print("assistant-judge register needs --endpoint, --key-file and --key-stdin (the key is never taken from argv)",
+              file=sys.stderr)
+        return 2
+    if sys.stdin.isatty():
+        import getpass
+        raw = getpass.getpass("judge API key: ")
+    else:
+        raw = sys.stdin.read(MAX_KEY_CHARS + 2)
+    key = raw.strip()
+    if not key or any(c.isspace() for c in key):
+        print("assistant-judge register failed: empty or malformed key on stdin", file=sys.stderr)
+        return 2
+    try:
+        done = register_key(args.endpoint, args.key_file, key, args.model)
+    except RegisterError as exc:
+        print(f"assistant-judge register failed: {exc.code}", file=sys.stderr)
+        if exc.seen:
+            print("models seen (first 10): " + ", ".join(_tty_safe(m) for m in exc.seen), file=sys.stderr)
+        return 1
+    print(f"registered: fingerprint={done.fingerprint} model={_tty_safe(done.model)} models_seen={done.models_seen}")
+    print("next: add api_key_file, endpoint and model to control_plane.personal_assistant.judge in your fleet YAML (this "
+          "command does not edit it); set backend_confirmed: true only after verifying a real model is serving.")
+    return 0
+
+
+def _cmd_cp_assistant_judge(args) -> int:
+    """``control-plane assistant-judge register|status|check``: 0 ok, 1 failure (one stderr line), 2 usage."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    if args.action == "register":
+        return _assistant_judge_register(args)
+    if not args.api_key_file:
+        print(f"assistant-judge {args.action} needs --api-key-file", file=sys.stderr)
+        return 2
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+    except ValueError:
+        print("cannot read --api-key-file: not a text file", file=sys.stderr)
+        return 2
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(f"{base}{path}", method=method, headers={
+            "X-API-Key": key, "Content-Type": "application/json"},
+            data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=90) as response:
+            return json.loads(response.read(1024 * 1024))
+    try:
+        if args.action == "check":
+            out = call("POST", "/api/v1/assistant-judges/check", {})
+            if out["ok"]:
+                print(_tty_safe(f"ok latency_ms={out['latency_ms']} model={out['model']}"))
+                return 0
+            print(_tty_safe(f"check failed: {out['code']}"))
+            return 1
+        out = call("GET", "/api/v1/assistant-judges")
+        print(_tty_safe(f"enabled={out['enabled']} model={out['model']} judge_version={out['judge_version']} "
+                        f"backend_confirmed={out['backend_confirmed']}"))
+        print(_tty_safe(f"endpoint_host={out['endpoint_host'] or '-'} key_fingerprint={out['key_fingerprint'] or '-'} "
+                        f"recorder_queue={out['recorder']['queue']} recorder_dropped={out['recorder']['dropped']}"))
+        print(f"{'RISK_CLASS':<18} {'LABELED':>7} {'FN':>4} {'FN_BOUND':>9}  GATE")
+        classes = out["calibration"]["classes"]
+        for name, gate in out["gate"].items():
+            row = classes.get(name)
+            labeled, fn, bound = (row["labeled"], row["false_negatives"], f"{row['fn_upper_bound']:.3f}") if row else (0, 0, "-")
+            verdict = "satisfied" if gate["satisfied"] else f"closed ({gate['code']})"
+            print(_tty_safe(f"{name:<18} {labeled:>7} {fn:>4} {bound:>9}  {verdict}"))
+        return 0
+    except urllib.error.HTTPError as exc:
+        print(f"assistant-judge {args.action} failed: HTTP {exc.code}", file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"assistant-judge {args.action} failed: {type(exc).__name__}", file=sys.stderr)
+    return 1
+
+
 def _cmd_cp_assistant_hub_owner(args) -> int:
     """``control-plane assistant-action list|approve|deny`` and ``assistant-grant list|revoke|activate``.
 
@@ -4172,7 +4274,11 @@ def _cmd_cp_web(args) -> int:
         pass
     finally:
         if hub_server is not None:
-            hub_server.shutdown()
+            try:
+                hub_server.shutdown()
+            finally:
+                if hub_server.hub.judge is not None:
+                    hub_server.hub.judge.recorder.stop()
         svr.shutdown()
         if artifact_bridge is not None:
             artifact_bridge.stop()
@@ -4621,6 +4727,26 @@ def _cmd_bridge_hash_password(args):
     return 0
 
 
+def _build_judge_runtime(service):
+    """The one ``JudgeRuntime`` of this process: live ``judge`` config, a client built per call (so key rotation and
+    config edits apply), and the single-thread shadow recorder. A disabled judge yields no client and records nothing."""
+    from .control_plane.assistant_hub.jev import JevClient
+    from .control_plane.assistant_hub.judge import JudgeRuntime
+    from .control_plane.assistant_hub.shadow import ShadowRecorder
+
+    def cfg_getter():
+        return service.config.get("judge") or {}
+
+    def client_factory():
+        cfg = cfg_getter()
+        if cfg.get("enabled") is not True:
+            return None
+        return JevClient(cfg["endpoint"], cfg["api_key_file"], cfg["model"], float(cfg["timeout_seconds"]))
+
+    recorder = ShadowRecorder(service.store, cfg_getter, client_factory, service.now)
+    return JudgeRuntime(cfg_getter=cfg_getter, client_factory=client_factory, recorder=recorder, now=service.now)
+
+
 def _start_assistant_hub(service):
     """Start the tailnet-only assistant hub when both the assistant and ``personal_assistant.hub`` are enabled.
 
@@ -4638,12 +4764,14 @@ def _start_assistant_hub(service):
     registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
                               worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
     try:
-        server = HubServer(Hub(registry=registry, service=service, store=service.store), host=hub_cfg["host"],
+        server = HubServer(Hub(registry=registry, service=service, store=service.store, judge=_build_judge_runtime(service)),
+                           host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
     except (ValueError, OSError) as exc:
         raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
     server.start()
+    server.hub.judge.recorder.start()          # a thread exists only when the judge is enabled
     return server, registry
 
 
@@ -4654,6 +4782,7 @@ def _wire_assistant_hub(svr):
         return None
     hub_server, registry = _start_assistant_hub(service)
     svr.assistant_workers = registry
+    svr.assistant_judge = hub_server.hub.judge if hub_server is not None else None   # same runtime as the hub
     return hub_server
 
 
