@@ -94,3 +94,49 @@ def test_missing_secret_is_refused_when_enabled():
 
 def test_slice_form_carries_public_host_inside_the_section():
     assert parse_members(section(public_host=HOST))["public_host"] == HOST
+
+
+# --- the shipped example (Task 14) -------------------------------------------------------------------------------
+
+def _uncommented_example(tmp_path):
+    """The example fleet config with its commented member blocks switched on (real YAML, real loader)."""
+    import yaml
+
+    from herdr_engineering.fleet_config import load_fleet_config
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[2] / "deploy" / "control-plane" / "fleet-config.example.yaml"
+    lines, out, mode = src.read_text().splitlines(), [], None
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("# @members-begin"):
+            mode = "members"
+            continue
+        if stripped.startswith("# @members-end"):
+            mode = None
+            continue
+        if mode == "members":
+            indent = line[: len(line) - len(stripped)]
+            out.append(indent + stripped[2:] if stripped.startswith("# ") else line)
+            continue
+        out.append(line)
+    text = "\n".join(out) + "\n"
+    data = yaml.safe_load(text)
+    path = tmp_path / "fleet.yaml"
+    path.write_text(yaml.safe_dump({**data, "hosts": {}}))      # the example's placeholder hosts are not loadable
+    path.chmod(0o600)
+    return data["sections"]["control_plane"]["values"], load_fleet_config(path)
+
+
+def test_example_members_block_loads_through_members_config_and_share_values(tmp_path):
+    from herdr_engineering import fleet_config_cli as fcc
+    values, cfg = _uncommented_example(tmp_path)
+    raw = values["collab"]["members"]
+    assert raw["enabled"] is False
+    assert raw["max_artifact_bytes"] is None and raw["max_member_bytes"] is None and raw["max_artifacts"] is None
+    assert raw["share_limits"] == {"max_share_bytes": None, "max_total_bytes": None}
+    assert parse_members(raw, public_host=values["share"]["public_host"]) is None           # disabled: validated, off
+    on = parse_members({**raw, "enabled": True, "session_secret": SECRET}, public_host=values["share"]["public_host"])
+    assert on is not None and on["limits"] == MembersConfig()                    # the example states the parsed defaults
+    assert on["groups_ttl"] == 86400.0 and on["removed_grace"] == 3600.0 and on["share_creates_per_hour"] == 20
+    assert "session_secret" not in raw                                      # the example never carries a secret value
+    fcc.share_values(cfg)                                                                   # the deploy parser accepts it

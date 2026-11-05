@@ -103,6 +103,44 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+        # OPTIONAL: member-owned artifacts (members of one Cognito group upload, publish and share their own
+        # artifacts in the browser at share.public_host). OFF unless `enabled: true` (exactly true); when false the
+        # member API answers 404 and the worker refuses every member intent. A disabled block is still validated, so
+        # a typo shows now and not on the day you switch it on. Enabling also needs control_plane.share.public_host.
+        # There are NO default size or count caps: leave the three limits and share_limits null and usage stays
+        # visible to the operator (Members panel); set a positive integer (bytes, or a count) to cap.
+        # @members-begin
+        # members:
+        #   enabled: false
+        #   group: "staff"                       # Cognito group whose members may use it (required when enabled)
+        #   # session_secret: <paste `openssl rand -hex 32` here, at least 32 bytes, when enabling>
+        #   # Generate it locally; never commit it, print it or pass it as a flag. The line above is a comment on
+        #   # purpose: an empty or short value is refused, and no placeholder is ever a usable secret.
+        #   groups_ttl: 86400                    # seconds a signed-in user's group claim is trusted
+        #   removed_grace: 3600                  # seconds of continuous "not in the group" before shares are revoked (0-2592000)
+        #   max_artifact_bytes: null             # per artifact; null = no cap
+        #   max_member_bytes: null               # per member, all artifacts; null = no cap
+        #   max_artifacts: null                  # per member; null = no cap
+        #   share_limits:
+        #     max_share_bytes: null              # one member share bundle; null = the share defaults above
+        #     max_total_bytes: null              # all live member bundles
+        #   share_creates_per_hour: 20           # per member (counted per process, in memory)
+        #   request_limits:
+        #     http_chunks_per_request: 32        # at most 32 (the edge accepts 17 MiB per upload request)
+        #     max_publish_files: 200
+        #     max_message_chars: 500
+        #     max_upload_bytes: 1099511627776    # one file, 1 TiB
+        #     result_wait_seconds: 5.0           # 0-20
+        #   rate_limits:
+        #     chunks_per_minute: 1200
+        #     writes_per_minute: 30
+        #     session_exchanges_per_minute: 20   # sign-ins, per client address
+        #   staging:
+        #     staging_bytes_per_member: 1099511627776   # reserved by declared size, 1 TiB
+        #   # secrets_gid: 1000    # numeric gid shared by the worker and collab-public so the worker can hand over the
+        #                          # read-once share URL; needed only when collab-public does not run as the default uid
+        #                          # (members refuse to start without a usable gid). Prefer a dedicated group.
+        # @members-end
       # OPTIONAL: Hindsight shared memory (compose profile `memory`; docs/operations/memory-hindsight.md). OFF unless
       # `enabled: true` AND `deploy.sh --with-memory`. Do NOT write the secrets by hand: run
       #   herdr-eng fleet config memory init --enable --endpoint https://memory.dev.lan --model-dir /abs/path/to/e5-model
@@ -120,6 +158,15 @@ sections:
       #     global: "REDACTED"
       #     infra: "REDACTED"
       #     personal: "REDACTED"                                  # the personal-assistant tenant: never shared
+      # OPTIONAL: member-owned artifacts host (COLLAB.md, "Member artifacts"). One DNS name serves share links (/s/),
+      # the member API and the member page. A bare lowercase host: no scheme, port or path. It replaces
+      # share.public_url (set only one of the two; a disagreeing public_url is refused) and must differ from the host
+      # of collab.public_url. Both `https://<host>/s/callback` and `https://<host>/my/callback` must be callback and
+      # logout URLs of the web app client (operator step, see COLLAB.md). Needs collab.members below to turn on.
+      # @members-begin
+      # share:
+      #   public_host: "artifacts.example.test"
+      # @members-end
       # OPTIONAL: artifact share links (/s/ on share.public_url). OFF unless `enabled: true`, which needs the
       # collab marker and a signing_secret: deploy.sh refuses otherwise. share-public gets only the serving keys
       # below plus collab's cognito_pool/cognito_clients/cognito_web_client/cognito_domain (render-share).
