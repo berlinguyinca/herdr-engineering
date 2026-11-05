@@ -19,10 +19,10 @@ RECORDS = [{"memory_id": f"mock-{i:02}", "bank_id": "herdr-engineering-facts", "
 
 
 class MockAdapter:
-    def recall(self, query, *, scope=None, project=None, max_results=200):
+    def recall(self, query, *, scope=None, project=None, max_results=200, kind="fact"):
         return {"results": RECORDS[:max_results], "degraded": False, "offline": False}
 
-    def get(self, memory_id, *, scope="project", project=None):
+    def get(self, memory_id, *, scope="project", project=None, kind="fact"):
         for r in RECORDS:
             if r["memory_id"] == memory_id:
                 return r
