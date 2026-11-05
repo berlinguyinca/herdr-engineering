@@ -276,8 +276,7 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
     veto = check_vetoes(derived, _extra_rules(cfg))
     if veto is not None:
         return _deny(store, worker, raw, derived, veto, session_id, task_id, now)
-    if derived.key is not None and not derived.owner_decides and derived.key.verb is not Verb.UNKNOWN:
-        # unclassifiable actions share no meaningful key id, so one approval must never cover another command
+    if derived.key is not None and derived.one_shot_safe:     # fail closed: only keys that digest the whole action
         consumed = _consume_approval(store, cfg, worker, derived.key.key_id(), now)
         if consumed is not None:
             return Decision("authorized", "Authorized once by the owner's approval of this exact action.",

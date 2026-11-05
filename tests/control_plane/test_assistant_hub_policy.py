@@ -363,8 +363,9 @@ def test_vetoed_requests_cannot_be_decided():
 
 def test_unknown_verb_approval_records_evidence_but_proposes_nothing():
     store, cfg = AssistantStore(), _cfg()
-    for i in range(4):
-        d = _decide(store, cfg, RawAction(tool="Bash", command="frobnicate --x"), session=f"s{i}", task=f"t{i}")
+    asked = [_decide(store, cfg, RawAction(tool="Bash", command="frobnicate --x"), session=f"s{i}", task=f"t{i}")
+             for i in range(4)]
+    for d in asked:
         record_owner_decision(store, cfg, NOW, T, U, d.request_id, True, "owner")
     assert store.list_action_grants(T, U) == []
 

@@ -66,6 +66,7 @@ class Derived:
     hint_host: str = ""
     unparsed: bool = False
     hint_cwd: str = ""
+    one_shot_safe: bool = False   # True only when key.target digests the WHOLE action (see policy one-shot approvals)
 
 
 @dataclass(frozen=True)
@@ -845,7 +846,8 @@ def _hint(raw: RawAction) -> dict[str, str]:
 def _unknown_derived(raw: RawAction, reason: str, facts: list[str], details: tuple[Element, ...] = (),
                      hint_host: str = "") -> Derived:
     key = mk_key(raw.tool.strip().lower() or "unknown", Verb.UNKNOWN, raw.repo or "", raw_digest(raw.command or ""))
-    return Derived(key, (), True, reason, tuple(facts), details, raw.command or "", hint_host)
+    return Derived(key, (), True, reason, tuple(facts), details, raw.command or "", hint_host,
+                   one_shot_safe=bool((raw.command or "").strip()))
 
 
 def split_recipients(values: Iterable[str]) -> tuple[set[str], bool]:
@@ -874,6 +876,8 @@ def _email(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
     if "recipient" in hint:
         attested, bad = split_recipients([hint["recipient"]])
         facts.append(f"recipient={hint['recipient'].lower()}")
+        if bad:
+            invalid = True
         if bad or (recipients and not attested <= recipients):
             owner = True
             notes.append("hint recipient disagrees with the request")
@@ -886,7 +890,7 @@ def _email(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
         notes.append("send without recipients")
     flag = FlagClass.MULTIPLE if len(recipients) > 1 else FlagClass.NONE
     key = mk_key("email", Verb.EMAIL_SEND if op == "send" else Verb.EMAIL_DRAFT, scope, "", flag)
-    return Derived(key, (key,), owner, "; ".join(notes), tuple(facts))
+    return Derived(key, (key,), owner, "; ".join(notes), tuple(facts), one_shot_safe=not invalid)
 
 
 def _deploy(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
@@ -899,14 +903,15 @@ def _deploy(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
             verb = {"canary": Verb.DEPLOY_CANARY, "prod": Verb.DEPLOY_PROD,
                     "production": Verb.DEPLOY_PROD}.get(env, Verb.UNKNOWN)
             key = mk_key("deploy", verb, repo)
-            return Derived(key, (key,), True, "hint repo disagrees with the request", tuple(facts))
+            return Derived(key, (key,), True, "hint repo disagrees with the request", tuple(facts))   # unsafe: no target
         repo = repo or hint["repo"]
     verb = {"canary": Verb.DEPLOY_CANARY, "prod": Verb.DEPLOY_PROD, "production": Verb.DEPLOY_PROD}.get(env)
     if verb is None:
         key = mk_key("deploy", Verb.UNKNOWN, repo, raw_digest(env))
-        return Derived(key, (key,), True, f"unknown deploy environment {env!r}", tuple(facts))
+        return Derived(key, (key,), True, f"unknown deploy environment {env!r}", tuple(facts),
+                       one_shot_safe=bool(env))
     key = mk_key("deploy", verb, repo)
-    return Derived(key, (key,), False, "", tuple(facts))
+    return Derived(key, (key,), False, "", tuple(facts), one_shot_safe=True)
 
 
 def _bare_env_records(text: str, cwd: str | None) -> list[Element]:
@@ -976,7 +981,20 @@ def _shell(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
         owner = True
         reasons.append("too complex")
         best = replace(best, target=raw_digest(_normalized_text(text)))
-    return Derived(best, keys, owner, "; ".join(reasons), tuple(facts), details, text, host, False, hint_cwd)
+    safe = best.verb is not Verb.UNKNOWN and not owner          # already classified: unchanged behaviour
+    if not safe:
+        safe = _digests_whole_action(text, cmds, st.out)
+    return Derived(best, keys, owner, "; ".join(reasons), tuple(facts), details, text, host, False, hint_cwd, safe)
+
+
+_DYNAMIC_CHARS = frozenset("$`*?[]{}~")
+
+
+def _digests_whole_action(text: str, cmds: list, out: list[Element]) -> bool:
+    """Fail closed: the same text must mean the same thing at run time (no expansion, no xargs)."""
+    if not text.strip() or any(c in _DYNAMIC_CHARS for c in text):
+        return False
+    return not (any(XARGS_MARKER in c.argv for c in cmds) or any(el.xargs for el in out))
 
 
 def _single_simple(text: str, cmds: list, out: list[Element]) -> bool:
