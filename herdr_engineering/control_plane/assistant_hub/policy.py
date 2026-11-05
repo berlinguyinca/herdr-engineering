@@ -19,12 +19,19 @@ from ..assistant import AssistantStore
 from .actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, GrantState, as_utc, revoke
 from .calibration import build_report, gate_satisfied
 from .canonical import Derived, RawAction, derive
-from .deploy import DeployMatch, scope_key, scope_mode
+from .deploy import DeployMatch, scope_config, scope_key, scope_mode
 from .events import scrub_payload
 from .evidence import OWNER_PROVENANCE, _shadow_elapsed, propose_if_ready
 from .jev import JudgeUnavailable
 from .judge import SEVERITY_LEVELS, JudgeRuntime, Verdict, consult
 from .judge_version import judge_version as _judge_version
+from .preconditions import (
+    DEFAULT_TIMEOUT_SECONDS,
+    PreconditionClients,
+    PreconditionResult,
+    describe,
+    run_preconditions,
+)
 from .shadow import ShadowJob, label_decision, mark_regret
 from .verbs import ActionKey, Verb
 from .vetoes import Veto, VetoRule, check_vetoes
@@ -274,30 +281,71 @@ def _consult(judge: JudgeRuntime | None, key: ActionKey) -> Verdict | str:
         return "internal"
 
 
-_PRECONDITIONS_REASON = "The deploy preconditions could not be verified, so the owner decides."
+def _precondition_reason(result: PreconditionResult) -> str:
+    return f"The deploy preconditions are not all verified ({describe(result)}), so the owner decides."
 
 
-@dataclass(frozen=True)
-class PreconditionResult:
-    """Outcome of the hub's own deploy checks.  Only ``passed`` lets a standing-grant deploy through."""
-    status: Literal["passed", "failed", "not_checked"]
-    detail: str = ""
+def _live_deploy_cfg(deploy_cfg: dict | Callable[[], dict | None] | None) -> dict | None:
+    """The deploy config as of NOW (a callable is read each time, so a reload or a mode flip during a slow window is
+    seen); a failing getter reads as no config, which matches nothing."""
+    if not callable(deploy_cfg):
+        return deploy_cfg
+    try:
+        return deploy_cfg()
+    except Exception:
+        return None
 
 
-def _deploy_preconditions(store: AssistantStore, match: DeployMatch, grant: ActionGrant, worker: Worker,
-                          now: datetime) -> PreconditionResult:
-    """The hub-verified checks (on main, CI green, descends from the deployed commit) belong to Task 8.
+def _scope_is_auto(deploy_cfg: dict | Callable[[], dict | None] | None, m: DeployMatch) -> bool:
+    return scope_mode(_live_deploy_cfg(deploy_cfg), m.project, m.scope, m.repo) == "auto"
 
-    Until they exist this FAILS CLOSED: nothing is checked, so a standing-grant deploy is never authorized."""
-    return PreconditionResult("not_checked")
+
+def _precondition_timeout(deploy_cfg: dict | Callable[[], dict | None] | None) -> float:
+    value = (_live_deploy_cfg(deploy_cfg) or {}).get("precondition_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    return float(value) if type(value) is int and 1 <= value <= 60 else float(DEFAULT_TIMEOUT_SECONDS)
+
+
+def _deploy_gate(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, derived: Derived,
+                 session_id: str, task_id: str, now: datetime, judge: JudgeRuntime | None, notify: Notify | None,
+                 deploy_cfg: dict | Callable[[], dict | None] | None, clients: PreconditionClients | None,
+                 grant: ActionGrant) -> Decision | None:
+    """Everything a matched deploy must still pass AFTER the judge said yes: the owner's mode switch, the hub's own
+    verified preconditions, then the switch and the grant once more (the remote checks are slow).  None means go.
+    No lock is held here: the checks do network I/O."""
+    match = derived.deploy
+    assert match is not None
+    key = derived.key
+    assert key is not None
+
+    def mode_off() -> Decision:
+        return _pending(store, worker, raw, derived, session_id, task_id, now, "deploy_mode",
+                        "Auto-deploy is not switched on for this scope, so the owner decides.", judge, notify=notify)
+
+    if not _scope_is_auto(deploy_cfg, match):
+        return mode_off()
+    result = run_preconditions(clients, match, scope_config(_live_deploy_cfg(deploy_cfg), match),
+                               _precondition_timeout(deploy_cfg))
+    if not result.ok:
+        return _pending(store, worker, raw, derived, session_id, task_id, now, "deploy_preconditions",
+                        _precondition_reason(result), judge,
+                        extra=f" failed={','.join(result.failed)} unchecked={','.join(result.unchecked)}",
+                        notify=notify)
+    if _live_grant(store, cfg, worker, key, _fresh_now(judge, now), current_judge_version(judge), match) is None:
+        return _pending(store, worker, raw, derived, session_id, task_id, now, "owner",
+                        "No active grant covers this exact action, so the owner decides.", judge, notify=notify)
+    if not _scope_is_auto(deploy_cfg, match):                  # the last look before authorizing
+        return mode_off()
+    return None
 
 
 def decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, session_id: str, task_id: str,
            now: datetime, *, judge: JudgeRuntime | None = None, notify: Notify | None = None,
-           deploy_cfg: dict | None = None) -> Decision:
-    derived = derive(raw, deploy_cfg)
+           deploy_cfg: dict | Callable[[], dict | None] | None = None,
+           preconditions: PreconditionClients | None = None) -> Decision:
+    derived = derive(raw, _live_deploy_cfg(deploy_cfg))
     key = derived.key
-    return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now, judge, notify, deploy_cfg),
+    return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now, judge, notify, deploy_cfg,
+                           preconditions),
                    verb=key.verb.value if key else Verb.UNKNOWN.value, key_id=key.key_id() if key else "")
 
 
@@ -321,7 +369,8 @@ def _consume_approval(store: AssistantStore, cfg: dict, worker: Worker, key_id: 
 
 def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
             task_id: str, now: datetime, judge: JudgeRuntime | None, notify: Notify | None = None,
-            deploy_cfg: dict | None = None) -> Decision:
+            deploy_cfg: dict | Callable[[], dict | None] | None = None,
+            preconditions: PreconditionClients | None = None) -> Decision:
     veto = check_vetoes(derived, _extra_rules(cfg))
     if veto is not None:
         return _deny(store, worker, raw, derived, veto, session_id, task_id, now)
@@ -334,8 +383,7 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
         return _pending(store, worker, raw, derived, session_id, task_id, now, "unknown",
                         "The action could not be classified with certainty, so the owner decides.", judge, notify=notify)
     grant = _live_grant(store, cfg, worker, derived.key, now, current_judge_version(judge), derived.deploy)
-    if grant is not None and derived.deploy is not None and scope_mode(
-            deploy_cfg, derived.deploy.project, derived.deploy.scope, derived.deploy.repo) != "auto":
+    if grant is not None and derived.deploy is not None and not _scope_is_auto(deploy_cfg, derived.deploy):
         # mode is the owner's kill switch: the standing grant stays stored but is ignored until mode is auto again
         return _pending(store, worker, raw, derived, session_id, task_id, now, "deploy_mode",
                         "Auto-deploy is not switched on for this scope, so the owner decides.", judge, notify=notify)
@@ -357,14 +405,18 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
                 return _pending(store, worker, raw, derived, session_id, task_id, now, "owner",
                                 "No active grant covers this exact action, so the owner decides.", judge, notify=notify)
             if derived.deploy is not None:
-                checked = _deploy_preconditions(store, derived.deploy, grant, worker, _fresh_now(judge, now))
-                if checked.status != "passed":
-                    return _pending(store, worker, raw, derived, session_id, task_id, now, "deploy_preconditions",
-                                    _PRECONDITIONS_REASON, judge, extra=f" preconditions={checked.status}",
-                                    notify=notify)
+                blocked = _deploy_gate(store, cfg, worker, raw, derived, session_id, task_id, now, judge, notify,
+                                       deploy_cfg, preconditions, grant)
+                if blocked is not None:
+                    return blocked
         if outcome == "pending":
             return _pending(store, worker, raw, derived, session_id, task_id, now, source, _JUDGE_REASON, judge,
                             extra=_verdict_detail(result), notify=notify)
+        if derived.deploy is not None:
+            m = derived.deploy
+            _audit(store, worker, POLICY_ACTOR, "assistant.deploy.authorized", grant.grant_id,
+                   f"project={m.project} scope={m.scope} sha12={m.sha[:12]} grant={grant.grant_id} "
+                   f"worker={worker.worker_id}")
         _audit(store, worker, POLICY_ACTOR, "assistant.action.authorized", grant.grant_id,
                f"grant={grant.grant_id} key_id={grant.key_id} worker={worker.worker_id}{_verdict_detail(result)}")
         return Decision("authorized", "Authorized by the owner's active grant for this exact action.", None,

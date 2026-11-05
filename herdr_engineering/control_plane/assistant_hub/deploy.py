@@ -107,3 +107,13 @@ def scope_mode(deploy_cfg: Any, project: str, scope: str, repo: str) -> str:
             mode = deploy_cfg["projects"][pid]["scopes"][sid].get("mode")
             return mode if isinstance(mode, str) else ""
     return ""
+
+
+def scope_config(deploy_cfg: Any, match: DeployMatch) -> dict[str, Any]:
+    """The CURRENT config dict of the matched scope ({} when it is gone): what the hub verifies is the live config's
+    ``require`` and ``health_url``, never anything the request carried."""
+    for pid, sid, rrepo, _command in _scopes(deploy_cfg):
+        if (pid, sid) == (match.project, match.scope) and rrepo.casefold() == match.repo.casefold():
+            scope = deploy_cfg["projects"][pid]["scopes"][sid]
+            return scope if isinstance(scope, dict) else {}
+    return {}

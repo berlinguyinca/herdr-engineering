@@ -4874,8 +4874,9 @@ def _start_assistant_hub(service):
     judge = _build_judge_runtime(service)
     slack = SlackRuntime(service.store, service, lambda: service.config.get("slack") or {}, service.now, judge=judge)
     try:
+        from .control_plane.assistant_hub.preconditions import default_clients
         server = HubServer(Hub(registry=registry, service=service, store=service.store,
-                               judge=judge, slack=slack),
+                               judge=judge, slack=slack, preconditions=default_clients()),
                            host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
