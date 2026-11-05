@@ -80,3 +80,11 @@ test('identical titles never correlate', () => {
   assert.equal(out.length, 2);
   assert.deepEqual(out[0].session_ids, []);
 });
+test('updated_at is never used as a completion time', () => {
+  const finished = {mission_id: 'M9', title: 'Done', status: 'COMPLETED', outcome: 'finished', updated_at: iso(now - 5000)};
+  const none = run({recorded: [finished]});
+  assert.equal(none[0].lifecycle, 'finished');
+  assert.equal(none[0].completed_at, undefined);
+  const real = run({recorded: [{...finished, completed_at: iso(now - 9000)}]});
+  assert.equal(real[0].completed_at, iso(now - 9000));
+});
