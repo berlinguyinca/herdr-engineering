@@ -41,7 +41,7 @@ def parse_instant(value: object, name: str) -> datetime:
         raise ValueError(f"{name} must be an ISO-8601 instant with a time zone offset")
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00").replace("z", "+00:00")).astimezone(UTC)
-    except ValueError:
+    except (ValueError, OverflowError):   # an offset can push year 1 / 9999 out of range on conversion to UTC
         raise ValueError(f"{name} must be an ISO-8601 instant with a time zone offset") from None
 
 
