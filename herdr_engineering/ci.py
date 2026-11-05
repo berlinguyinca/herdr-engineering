@@ -237,13 +237,16 @@ class WoodpeckerProvider:
     repos_are_snapshot = True
 
     def __init__(self, base_url: str | None = None, token: str | None = None,
-                 client=None) -> None:
+                 client=None, *, allow_loopback_http: bool = False) -> None:
         from .host_config import host_value
         self.base_url = (base_url or host_value("ci.url")
                          or "https://ci.metabolomics.us").rstrip("/")
         self.token = token or host_value("ci.token") or None
         self._client = client or urllib.request.build_opener(_NoRedirect())
         self._repo_id_cache: dict[str, str] = {}
+        # Tokenless public reads (used by the assistant hub): https only, plain http to loopback only when a test says so.
+        self._allow_loopback_http = allow_loopback_http
+        self.public_timeout = 8.0
 
     @property
     def available(self) -> bool:
@@ -311,6 +314,68 @@ class WoodpeckerProvider:
 
     def _get(self, path: str, raw: bool = False):
         return self._request(path, raw=raw)
+
+    # -- tokenless public reads ---------------------------------------------------------------------------------
+    def _public_base(self) -> str | None:
+        url = urllib.parse.urlsplit(self.base_url)
+        try:
+            url.port  # noqa: B018 - raises ValueError on a malformed port
+        except ValueError:
+            return None
+        loopback = url.hostname in ("127.0.0.1", "::1", "localhost")
+        scheme_ok = url.scheme == "https" or (url.scheme == "http" and loopback and self._allow_loopback_http)
+        if (not scheme_ok or not url.hostname or url.username or url.password or url.query or url.fragment
+                or url.path not in ("", "/")):
+            return None
+        return self.base_url.rstrip("/")
+
+    def _public_get(self, base: str, path: str):
+        """One unauthenticated GET: no token, no environment proxy, no redirect, bounded time and size."""
+        req = urllib.request.Request(base + path, headers={"Accept": "application/json"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        try:
+            with opener.open(req, timeout=self.public_timeout) as resp:
+                body = resp.read(_MAX_RESPONSE_BYTES + 1)
+            if len(body) > _MAX_RESPONSE_BYTES:
+                raise CIProviderError("response_too_large")
+            return json.loads(body)
+        except CIProviderError:
+            raise
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+            exc.close()
+            raise CIProviderError("redirect" if 300 <= code < 400 else "unavailable", code) from None
+        except TimeoutError:
+            raise CIProviderError("timeout") from None
+        except urllib.error.URLError as exc:
+            raise CIProviderError("timeout" if isinstance(exc.reason, (TimeoutError, socket.timeout))
+                                  else "unavailable") from None
+        except (ValueError, UnicodeError):
+            raise CIProviderError("invalid_response") from None
+        except OSError:
+            raise CIProviderError("unavailable") from None
+
+    def public_pipelines(self, repository: str) -> list[PipelineView] | None:
+        """The recent pipelines of a PUBLIC repository read without any credential, or None when the configured CI
+        address is not a safe place to read from (so the caller treats CI as unverified).  Raises CIProviderError on
+        any failure; never returns data it could not parse."""
+        base = self._public_base()
+        if base is None:
+            return None
+        parts = repository.split("/") if isinstance(repository, str) else []
+        if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) and p not in (".", "..") for p in parts):
+            raise InvalidError("CI repository must be owner/name")
+        info = self._public_get(base, f"/api/repos/lookup/{parts[0]}/{parts[1]}")
+        rid = _positive_id(info.get("id")) if isinstance(info, dict) else None
+        if rid is None:
+            raise CIProviderError("invalid_response")
+        rows = _items(self._public_get(base, f"/api/repos/{rid}/pipelines"))
+        return [PipelineView(
+            pipeline_id=str(item.get("id", "")), run_number=item.get("number", 0),
+            repository=repository, revision=item.get("commit", ""), branch=item.get("branch"),
+            state=item.get("status", "unknown"), event=item.get("event", "pipeline"),
+            created_at=_timestamp(item.get("created")), started_at=_timestamp(item.get("started")),
+            finished_at=_timestamp(item.get("finished")), ref=item.get("ref")) for item in rows[:50]]
 
     @staticmethod
     def _page_path(path: str, page: int, per_page: int) -> str:
