@@ -22,7 +22,7 @@ MiB, TiB = 1 << 20, 1 << 40
 
 @pytest.fixture
 def migrated(_migrated):  # noqa: F811
-    """0047 plus 0031 (purged_at column and the lifecycle CHECK), as production has them."""
+    """0048 plus 0031 (purged_at column and the lifecycle CHECK), as production has them."""
     async def go():
         conn = await asyncpg.connect(_migrated)
         try:

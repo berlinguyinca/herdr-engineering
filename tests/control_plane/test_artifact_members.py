@@ -82,7 +82,7 @@ def migrated(share_postgres):  # noqa: F811
         conn = await asyncpg.connect(share_postgres)
         try:
             for _ in range(2):  # applying twice is a no-op
-                await conn.execute((MIGRATIONS / "0047_member_artifacts.sql").read_text())
+                await conn.execute((MIGRATIONS / "0048_member_artifacts.sql").read_text())
         finally:
             await conn.close()
     asyncio.run(go())

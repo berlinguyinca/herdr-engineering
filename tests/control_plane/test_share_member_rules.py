@@ -27,7 +27,7 @@ def migrated(share_postgres):  # noqa: F811
     async def go():
         conn = await asyncpg.connect(share_postgres)
         try:
-            await conn.execute((MIGRATIONS / "0047_member_artifacts.sql").read_text())
+            await conn.execute((MIGRATIONS / "0048_member_artifacts.sql").read_text())
         finally:
             await conn.close()
     asyncio.run(go())
