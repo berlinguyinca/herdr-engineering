@@ -1121,3 +1121,95 @@ def test_connections_beyond_the_cap_are_dropped():
     finally:
         fwd.stop()
         srv.close()
+
+
+# --- SigV4: the signed Host must reach the backend untouched ----------------
+
+_SIGV4_AUTH = (b"Authorization: AWS4-HMAC-SHA256 Credential=AKID/20261104/us-east-1/s3/"
+               b"aws4_request, SignedHeaders=host;x-amz-date, Signature=abcd\r\n")
+
+
+def test_a_sigv4_authorization_header_keeps_its_signed_host():
+    got, _reply, _port = _through_forwarder(
+        {"100.104.39.6"}, b"GET /b?list-type=2 HTTP/1.1\r\nHost: 100.104.39.6:9000\r\n"
+                          + _SIGV4_AUTH + b"X-Amz-Date: 20261104T000000Z\r\n\r\n")
+    assert b"Host: 100.104.39.6:9000\r\n" in got
+    assert b"127.0.0.1" not in got
+
+
+def test_a_sigv4_query_string_keeps_its_signed_host():
+    for q in (b"X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=1", b"a=1&X-Amz-Signature=ff"):
+        got, _reply, _port = _through_forwarder(
+            {"100.104.39.6"}, b"GET /b/k?" + q + b" HTTP/1.1\r\n"
+                              b"Host: 100.104.39.6:9000\r\n\r\n")
+        assert b"Host: 100.104.39.6:9000\r\n" in got
+        assert b"Connection: close" not in got
+
+
+def test_an_unsigned_request_is_still_rewritten_byte_for_byte():
+    got, _reply, port = _through_forwarder(
+        {"100.104.39.6"}, b"GET /?x=1 HTTP/1.1\r\nHost: 100.104.39.6:9000\r\n"
+                          b"Accept: */*\r\n\r\n")
+    assert got == (b"GET /?x=1 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nAccept: */*\r\n"
+                   b"Connection: close\r\n\r\n" % port)
+
+
+def test_a_non_sigv4_authorization_is_still_rewritten():
+    got, _reply, port = _through_forwarder(
+        {"dev.lan"}, b"GET / HTTP/1.1\r\nHost: dev.lan\r\n"
+                     b"Authorization: Bearer abc\r\n\r\n")
+    assert f"Host: 127.0.0.1:{port}".encode() in got
+
+
+def test_a_signed_request_with_two_hosts_is_forwarded_as_received():
+    req = (b"GET / HTTP/1.1\r\nHost: 100.104.39.6\r\nHost: evil\r\n" + _SIGV4_AUTH + b"\r\n")
+    got, _reply, _port = _through_forwarder({"100.104.39.6"}, req)
+    assert got == req
+
+
+def test_signed_chunked_put_and_keepalive_framing_survive():
+    import socket as _s
+    import threading as _t
+    srv = _s.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    seen: list[bytes] = []
+
+    def _serve():
+        c, _ = srv.accept()
+        data = b""
+        # Two requests on one connection: a chunked PUT, then a GET.
+        while not data.endswith(b"\r\n\r\n") or b"GET /two" not in data:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"0\r\n\r\n" in data and b"PUT" in data and b"GET /two" not in data:
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen.append(data)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        c.close()
+
+    _t.Thread(target=_serve, daemon=True).start()
+    fwd = AgentForwarder("127.0.0.1", srv.getsockname()[1],
+                         fabric_names=frozenset({"100.104.39.6"})).start()
+    try:
+        c = _s.create_connection(("127.0.0.1", fwd.port), timeout=5)
+        put = (b"PUT /b/k HTTP/1.1\r\nHost: 100.104.39.6:9000\r\n" + _SIGV4_AUTH +
+               b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+        get = b"GET /two HTTP/1.1\r\nHost: 100.104.39.6:9000\r\n" + _SIGV4_AUTH + b"\r\n"
+        c.sendall(put)
+        assert c.recv(4096).startswith(b"HTTP/1.1 200")  # connection still open
+        c.sendall(get)
+        reply = b""
+        while True:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+        c.close()
+        assert seen[0] == put + get
+        assert reply.endswith(b"ok")
+    finally:
+        fwd.stop()
+        srv.close()

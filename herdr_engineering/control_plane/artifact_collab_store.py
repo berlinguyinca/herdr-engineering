@@ -150,7 +150,8 @@ class CollabGrantStore:
         rows = await self.conn.fetch(
             "SELECT artifact_id, principal_id, permissions, expires_at FROM artifact_acl "
             "WHERE left(principal_id, $1) = $2 AND principal_id NOT LIKE 'collab:user:%' AND expires_at > now() "
-            "ORDER BY artifact_id, principal_id",
+            "AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.artifact_id = artifact_acl.artifact_id "
+            "AND a.lifecycle = 'tombstoned') ORDER BY artifact_id, principal_id",
             len(PREFIX), PREFIX)
         return [_grant_row(r) for r in rows]
 
@@ -159,7 +160,9 @@ class CollabGrantStore:
             return None
         row = await self.conn.fetchrow(
             "SELECT artifact_id, principal_id, permissions, expires_at FROM artifact_acl "
-            "WHERE artifact_id=$1 AND principal_id=$2", artifact_id, PREFIX + agent_id)
+            "WHERE artifact_id=$1 AND principal_id=$2 AND NOT EXISTS (SELECT 1 FROM artifacts a "
+            "WHERE a.artifact_id = artifact_acl.artifact_id AND a.lifecycle = 'tombstoned')",
+            artifact_id, PREFIX + agent_id)
         return _grant_row(row) if row else None
 
     # -- invite grants ----------------------------------------------------------------------------------------
@@ -203,7 +206,7 @@ class CollabGrantStore:
         rows = await self.conn.fetch(
             "SELECT invite_id, artifact_id, permission, expires_at, granted_by FROM artifact_collab_invite_grants "
             "WHERE resolved_at IS NULL AND invite_id = ANY($1::text[]) AND NOT EXISTS (SELECT 1 FROM artifacts a "
-            "WHERE a.artifact_id = artifact_collab_invite_grants.artifact_id AND a.lifecycle = 'retracted') "
+            "WHERE a.artifact_id = artifact_collab_invite_grants.artifact_id AND a.lifecycle IN ('retracted', 'tombstoned')) "
             "ORDER BY invite_id", list(join_to_agent))
         resolved = 0
         for row in rows:

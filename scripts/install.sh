@@ -20,6 +20,10 @@
 #      otherwise it prints the command and continues)
 #   7. puts `herdr-eng` and `herdr-handoff` on PATH (~/.local/bin) when writable
 #   8. runs `herdr-eng doctor` and prints a summary
+#   2b. build-cache toolchain: checksum-pinned sccache 0.19.0 into ~/.local/bin
+#      (per-user, no root; non-fatal). --no-build-cache-tools skips it;
+#      --build-cache-tools-only runs just this step. Installing sccache does NOT
+#      enable the feature (fabric_build_cache.enabled stays off by default).
 #   (opt-in) --with-memory / HERDR_INSTALL_MEMORY=1: after step 7, plans and
 #      installs the managed herdr-memory harness adapters (pi, claude, codex,
 #      opencode) via `herdr-eng memory install`; harnesses that are not
@@ -31,10 +35,14 @@ set -euo pipefail
 
 # Opt-in herdr-memory step: `--with-memory` or HERDR_INSTALL_MEMORY=1.
 WITH_MEMORY="${HERDR_INSTALL_MEMORY:-0}"
+BUILD_CACHE_TOOLS=1
+BUILD_CACHE_TOOLS_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --with-memory) WITH_MEMORY=1 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
+    --build-cache-tools-only) BUILD_CACHE_TOOLS_ONLY=1 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) printf 'unknown option: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -63,6 +71,23 @@ step() { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m  x %s\033[0m\n' "$*" >&2; exit 1; }
 
+install_build_cache_tools() {
+  # Non-fatal by design: a failure warns loudly and the rest of the install continues.
+  if "$REPO_ROOT/scripts/install-sccache.sh"; then
+    return 0
+  fi
+  warn "BUILD-CACHE TOOLCHAIN NOT INSTALLED: sccache 0.19.0 is missing or too old."
+  warn "  The build cache stays off/unavailable; builds are unaffected."
+  warn "  Fix: $REPO_ROOT/scripts/install.sh --build-cache-tools-only"
+  return 1
+}
+
+if [ "$BUILD_CACHE_TOOLS_ONLY" = "1" ]; then
+  step "build-cache toolchain only (sccache 0.19.0, per-user)"
+  install_build_cache_tools
+  exit $?
+fi
+
 # --- 1. assume herdr exists ------------------------------------------------
 step "1/7 verifying Herdr is present (assumption; will not install/upgrade it)"
 if ! command -v "$HERDR_BIN" >/dev/null 2>&1; then
@@ -81,6 +106,14 @@ fi
 "$PY" -m pip install --quiet --upgrade pip
 "$PY" -m pip install --quiet -e "$REPO_ROOT[dev]"
 printf '  installed herdr-engineering into %s\n' "$VENV"
+
+# --- 2b. build-cache toolchain (sccache; per-user, non-fatal) ---------------
+if [ "$BUILD_CACHE_TOOLS" = "1" ]; then
+  step "2b/8 build-cache toolchain (sccache 0.19.0 -> ~/.local/bin; does not enable the feature)"
+  install_build_cache_tools || true
+else
+  printf '\n  (build-cache tools skipped: --no-build-cache-tools)\n'
+fi
 
 # --- 3. required cross-harness handoff ------------------------------------
 step "3/8 installing required herdr-handoff integration"

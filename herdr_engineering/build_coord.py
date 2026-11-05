@@ -9,7 +9,8 @@ fixed number of flock-based slots that bound the number of concurrently running
 builds across ALL agents, plus load-aware backoff so new builds wait when the
 machine is already oversubscribed.
 
-Usage (any agent, any shell)::
+Only the Pi agent is wrapped automatically (``deploy/pi-build-gate``); any other
+agent or shell can opt in by invoking the command below::
 
     herdr-eng build-coordinate [--slots 2] [--max-load 1.5] [--wait 0] -- <cmd...>
 
@@ -19,7 +20,8 @@ lifetime of the child command. A slot is released automatically when the child
 currently holds it, for ``--status`` diagnostics.
 
 The lock lives in a shared per-host directory (default
-``~/.cache/herdr-engineering/build-gates/``), so every agent on the machine
+``$HERDR_ENGINEERING_STATE/build-gates`` or
+``~/.local/share/herdr-engineering/state/build-gates``), so every agent on the machine
 contends for the same slots regardless of which repo/worktree it is building.
 """
 from __future__ import annotations
@@ -27,9 +29,12 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+from .build_cache_config import BuildCacheConfig
 
 try:
     import fcntl  # POSIX only (Linux/macOS); the gate is a no-op elsewhere
@@ -218,16 +223,65 @@ class BuildGate:
         return out
 
 
+def _prestart_sccache_server(env: dict[str, str] | None) -> None:
+    """Start the per-policy sccache server WITHOUT the gate's lock fds.
+
+    The first cargo/rustc compile would otherwise spawn the long-lived server as
+    a grandchild that inherits the slot flock and the maintenance LOCK_SH, pinning
+    both for as long as it lives (review H2). Started here with ``close_fds=True``
+    (stdio detached) it holds neither. Best effort: a failure just means the
+    compile starts the server itself.
+    """
+    if not env or os.path.basename(env.get("RUSTC_WRAPPER", "")) != "sccache":
+        return
+    try:
+        subprocess.run([env["RUSTC_WRAPPER"], "--start-server"], env=env,
+                       close_fds=True, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
+            slot_fd: int | None = None, env: dict[str, str] | None = None,
+            cache: dict | None = None,
+            trace: dict[str, str] | None = None) -> int:
+    """exec ``cmd`` (default) or, with ``record``, run it measured and return its code."""
+    if not record:
+        os.execvp(cmd[0], cmd)
+        raise AssertionError("unreachable")  # pragma: no cover
+    from .build_metrics import run_measured
+    _prestart_sccache_server(env)
+    try:
+        return run_measured(cmd, state_dir=state_dir, slot=slot, env=env,
+                            cache=cache, registry=True, trace=trace).exit_code
+    finally:
+        # Held until the child is reaped above; only now may the slot be freed.
+        if slot_fd is not None:
+            try:
+                os.close(slot_fd)
+            except OSError:
+                pass
+
+
 def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
               wait_seconds: float = 0.0, json_out: bool = False,
               state_dir: Path | None = None,
-              bypass_on_timeout: bool = False) -> int:
+              bypass_on_timeout: bool = False, record: bool = False,
+              child_env: dict[str, str] | None = None,
+              cache: dict | None = None,
+              trace: dict[str, str] | None = None) -> int:
     """Run ``cmd`` under the per-host build gate.
 
     This is the entry point for ``herdr-eng build-coordinate``. It acquires a
     slot, then ``exec``s the child (replacing this process) so the flock is
     held for the child's full lifetime and released automatically on exit.
     Returns the child's exit code (or a structured error for --json).
+
+    With ``record`` (opt-in) the child is forked instead of exec'd so metrics
+    can be taken; this process then holds the slot and maintenance fds until the
+    child exits, preserving the lock lifetime contract.
 
     When ``bypass_on_timeout`` is set and no slot frees up within
     ``wait_seconds``, the command is run **ungated** instead of failing. This
@@ -264,7 +318,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
             print(f"build-coordinate: {exc}; running ungated (bypass-on-timeout)",
                   file=sys.stderr)
             try:
-                os.execvp(cmd[0], cmd)
+                return _launch(cmd, record, None, gate.dir, None, child_env, cache, trace)
             except OSError as e:
                 if json_out:
                     print(json.dumps({"error": f"could not exec {cmd[0]}: {e}"},
@@ -279,11 +333,15 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
         else:
             print(f"build-coordinate: {exc}", file=sys.stderr)
         return 1
+    except OSError as exc:  # slot file unusable (TimeoutError handled above)
+        return _run_ungated(cmd, "state_dir_unwritable", exc)
 
     try:
-        os.execvp(cmd[0], cmd)  # replaces this process; flock held by fd
+        # Default: replaces this process; flock held by fd. With ``record`` the
+        # parent stays alive holding every lock fd until the child exits.
+        return _launch(cmd, record, _slot, gate.dir, fd, child_env, cache, trace)
     except OSError as exc:
-        if fd is not None:
+        if fd is not None and not record:  # record mode already closed it
             try:
                 os.close(fd)
             except OSError:
@@ -297,21 +355,76 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
         return 127
 
 
+def _cache_env(cfg: BuildCacheConfig, cmd: list[str], state_dir: Path | None):
+    """Plan the spec-03 cache env. Returns (child_env | None, event summary).
+
+    The child env is a COPY of os.environ plus overrides (None => inherit as
+    today). Planning failure never blocks a build: it just runs uncached.
+    """
+    from .build_cache_env import NOT_REQUESTED, activate_shared, detect_tools, plan
+    from .build_cache_storage import check_shared
+    directory = Path(state_dir) if state_dir is not None else _default_state_dir()
+    try:
+        env = dict(os.environ)
+        reachable = check_shared(cfg, directory)  # bounded probe, negative-cached
+        tools = detect_tools(env.get("PATH"))
+        p = plan(cfg, cmd, env, tools, Path.cwd(), directory, reachable)
+        if p.shared_setup is not None:
+            p = activate_shared(p, tools, env)  # credentials: server env only
+    except Exception as exc:  # noqa: BLE001 - never break a build
+        print(f"build-coordinate: cache planning failed ({type(exc).__name__}); uncached",
+              file=sys.stderr)
+        return None, {"applied": False, "reasons": ["plan_error"], "fingerprint": None,
+                      "shared": NOT_REQUESTED.as_event()}
+    for w in p.warnings:
+        print(f"build-coordinate: cache: {w}", file=sys.stderr)
+    summary = {"applied": p.applied, "reasons": p.reasons,
+               "fingerprint": p.fingerprint.digest if p.fingerprint else None,
+               "shared": p.shared.as_event()}
+    return ({**env, **p.env_overrides} if p.applied else None), summary
+
+
+def _run_ungated(cmd: list[str], reason: str, exc: OSError) -> int:
+    """Gate state is unusable (read-only/full state dir): run the plain command.
+
+    A coordination aid must never be the reason a build fails. The command runs
+    exactly as it would without the gate (no cache env, no recording).
+    """
+    print(f"build-coordinate: gate unavailable ({reason}: {exc}); running ungated",
+          file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execvp(cmd[0], cmd)  # same signal/exit semantics as the ungated command
+    except OSError as e:
+        print(f"build-coordinate: could not exec {cmd[0]}: {e}", file=sys.stderr)
+        return 127
+
+
 def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
               wait_seconds: float = 0.0, json_out: bool = False,
               state_dir: Path | None = None,
-              bypass_on_timeout: bool = False) -> int:
+              bypass_on_timeout: bool = False, record: bool = False,
+              cache_config: BuildCacheConfig | None = None,
+              trace: dict[str, str] | None = None) -> int:
     """Hold a maintenance read lock for the entire build, even on slot bypass.
 
     Cleanup takes the exclusive side of this lock. The inheritable descriptor
     survives exec just like the build slot; kernel teardown releases both.
     """
+    child_env, cache = None, None
+    if cache_config is not None and cmd:
+        child_env, cache = _cache_env(cache_config, cmd, state_dir)
+        record = record or child_env is not None
     maintenance_fd = None
     if cmd and _HAS_FCNTL:
         directory = Path(state_dir) if state_dir is not None else _default_state_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        maintenance_fd = os.open(directory / "build-maintenance.lock",
-                                 os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            maintenance_fd = os.open(directory / "build-maintenance.lock",
+                                     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except OSError as exc:
+            return _run_ungated(cmd, "state_dir_unwritable", exc)
         try:
             fcntl.flock(maintenance_fd, fcntl.LOCK_SH)
             os.set_inheritable(maintenance_fd, True)
@@ -321,7 +434,8 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
     try:
         return _run_gated(cmd, slots=slots, max_load=max_load,
                           wait_seconds=wait_seconds, json_out=json_out,
-                          state_dir=state_dir, bypass_on_timeout=bypass_on_timeout)
+                          state_dir=state_dir, bypass_on_timeout=bypass_on_timeout,
+                          record=record, child_env=child_env, cache=cache, trace=trace)
     finally:
         if maintenance_fd is not None:
             os.close(maintenance_fd)

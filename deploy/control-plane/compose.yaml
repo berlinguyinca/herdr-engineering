@@ -197,6 +197,9 @@ services:
       - ${HERDR_COLLAB_SPOOL_DIR:?run deploy.sh}:/collab-spool
     environment:
       HERDR_ENGINEERING_CONFIG: /app/control-plane/config.yaml
+      # The group of collab-public (compose.collab.yaml runs it as this uid:uid): the worker hands member share URLs to
+      # it through group-readable files. Same default as collab-public; members refuse to start without a group.
+      HERDR_COLLAB_CERT_UID: ${HERDR_COLLAB_CERT_UID:-1000}
     command:
       - "control-plane"
       - "worker"

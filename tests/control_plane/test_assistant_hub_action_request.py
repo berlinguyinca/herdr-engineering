@@ -1,6 +1,8 @@
 """MCP action_request / action_grants_list over a real hub, store and policy (no doubles)."""
 import json
+import tempfile
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from herdr_engineering.control_plane.assistant import (
     AssistantService,
@@ -12,8 +14,16 @@ from herdr_engineering.control_plane.assistant_hub.actiongrants import ActionGra
 from herdr_engineering.control_plane.assistant_hub.canonical import RawAction, derive
 from herdr_engineering.control_plane.assistant_hub.events import list_events
 from herdr_engineering.control_plane.assistant_hub.mcp import Hub
-from herdr_engineering.control_plane.assistant_hub.policy import activate_grant
 from herdr_engineering.control_plane.assistant_hub.workers import WorkerRegistry
+from tests.control_plane.judge_support import (
+    SAFE,
+    WireListener,
+    force_active_grant_for_tests,
+    judge_cfg,
+    make_runtime,
+    success_body,
+    write_key,
+)
 from tests.control_plane.test_assistant_hub_mcp import body_of, call, enrol, rpc
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
@@ -23,13 +33,26 @@ CANARY = "hunter2-CANARY-9f3a"
 PUSH = "git push origin main"
 
 
+_WIRE: dict[str, WireListener | Path] = {}
+
+
+def _wire():
+    """One documented-shape listener and key file for the module: the judge that finds nothing to flag."""
+    if not _WIRE:
+        _WIRE["li"] = WireListener(success_body(SAFE))
+        _WIRE["key"] = write_key(Path(tempfile.mkdtemp(prefix="herdr-judge-test-")))
+    return _WIRE["li"], _WIRE["key"]
+
+
 def make_hub(shadow_started_at=T0, enabled=True):
     cfg = assistant_config({"personal_assistant": {"enabled": enabled, "actions": {"allow_self_approval": True},
                                                    "grants": {"shadow_started_at": shadow_started_at.isoformat()}}})
     svc = AssistantService(config=cfg, now=lambda: NOW)
     reg = WorkerRegistry(svc.store, enrollment_ttl=timedelta(minutes=10), worker_ttl=timedelta(days=30),
                          now=lambda: NOW)
-    return Hub(registry=reg, service=svc, store=svc.store)
+    li, key = _wire()
+    return Hub(registry=reg, service=svc, store=svc.store,
+               judge=make_runtime(svc.store, judge_cfg(f"http://127.0.0.1:{li.port}", key), svc.now))
 
 
 def act(hub, auth, **over):
@@ -47,8 +70,7 @@ def grant_for(hub, worker, cmd=PUSH, state=GrantState.PROPOSED, activate=True):
         state=state, created_at=NOW, proposed_at=NOW, expires_at=NOW + timedelta(days=30),
         policy_version=cfg["policy_version"]))
     if activate:
-        activate_grant(hub.store, cfg, NOW, worker.tenant_id, worker.user_id, gid, confirmed_by="owner",
-                       judge_gate_satisfied=True)
+        force_active_grant_for_tests(hub.store, cfg, gid, NOW, hub.judge.cfg_getter())
     return gid
 
 

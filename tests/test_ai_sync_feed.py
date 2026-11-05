@@ -239,6 +239,28 @@ def test_dry_run_posts_nothing(tmp_path, cp):
     assert agent.run_once(dry_run=True)["posted"] == 0 and Capture.posts == []
 
 
+def test_feed_passes_custom_timeout_to_collect_status(tmp_path, cp, monkeypatch):
+    home, *_ = make_repo(tmp_path)
+    seen = {}
+    real = feed.collect_status
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(feed, "collect_status", spy)
+    agent = AiSyncFeed(feed.MetadataClient(cp, "k"), host_id="h1", binary=str(tmp_path / "missing"),
+                       home=home, timeout=120, clock=lambda: 0.0)
+    agent.run_once()
+    assert seen.get("timeout") == 120.0
+
+
+@pytest.mark.parametrize("bad", [1, 4.5, 3601, "120", None])
+def test_feed_timeout_out_of_range_is_refused(tmp_path, bad):
+    with pytest.raises(ValueError):
+        AiSyncFeed(None, host_id="h1", timeout=bad)
+
+
 def test_allowed_commands_are_read_only():
     assert feed.ALLOWED_COMMANDS == frozenset({("--version",), ("status",), ("env", "list"), ("verify", "--json")})
 

@@ -40,7 +40,8 @@ PUBLIC_SECTION = "memory"           # roles [all]; only {url}
 DEFAULT_PORT = 8888
 # The default is the revision the herdr-memory deployment candidate pins for its image.
 DEFAULT_IMAGE_TAG = "5a672f0cdb89f4a3b841770cce2036a5b28b799d"
-MEMORY_KEYS = frozenset({"enabled", "image_tag", "model_dir", "port", "endpoint", "db_password", "tenants"})
+MEMORY_KEYS = frozenset({"enabled", "image_tag", "model_dir", "port", "endpoint", "db_password", "tenants",
+                         "viewers", "command", "client_config_source"})
 MEMORY_COMPOSE_VARS = ("HERDR_MEMORY_DB_PASSWORD", "HERDR_MEMORY_TENANT_USERS", "HERDR_MEMORY_IMAGE_TAG",
                        "HERDR_MEMORY_MODEL_DIR", "HERDR_MEMORY_PORT")
 _SECRET = re.compile(r"^[A-Za-z0-9_-]{32,128}$")      # URL/CSV safe: no ':' ',' '@' '/' '$' or quotes
@@ -89,6 +90,29 @@ def parse_memory_section(raw: Any) -> dict[str, Any]:
     if not isinstance(enabled, bool):
         raise _err("enabled must be true or false")
     out: dict[str, Any] = {"enabled": enabled}
+    if "viewers" in raw:
+        from .control_plane.memory_explorer import Viewer
+        viewers = raw["viewers"]
+        if (not isinstance(viewers, dict) or any(
+                not isinstance(principal, str) or not principal or len(principal) > 256
+                or Viewer.from_entry(entry) is None
+                or any(scope not in ("global", "infra") for scope in entry.get("scopes", []))
+                for principal, entry in viewers.items())):
+            raise _err("viewers must map principals to valid engineering project/scope grants")
+        out["viewers"] = dict(viewers)
+    if "command" in raw:
+        command = raw["command"]
+        if (not isinstance(command, list) or not command or not command[0]
+                or any(not isinstance(arg, str) for arg in command)):
+            raise _err("command must be a nonempty argument list")
+        out["command"] = list(command)
+    if "client_config_source" in raw:
+        source = raw["client_config_source"]
+        if (not isinstance(source, str) or not source
+                or not (os.path.isabs(source) or source.startswith("~/"))
+                or any(ord(char) < 32 for char in source)):
+            raise _err("client_config_source must be an explicit absolute or home-relative file path")
+        out["client_config_source"] = source
     if "image_tag" in raw:
         if not isinstance(raw["image_tag"], str) or not _TAG.match(raw["image_tag"]):
             raise _err("image_tag must be an image tag ([A-Za-z0-9_.-], at most 128 characters)")

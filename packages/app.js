@@ -53,6 +53,7 @@ import { mountHandoffs } from './handoffs-view.js';
 import { mountMemory } from './memory-view.js';
 import { mountScheduling } from './scheduler-view.js';
 import { mountDeployments } from './deployments-view.js';
+import { mountBuildCache, mountBuildDetail } from './build-cache-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 import { mountEventHistory } from './event-history.js';
 
@@ -89,7 +90,7 @@ const NAV = [
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
-  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync'] },
+  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
   { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
@@ -105,7 +106,7 @@ const NAV = [
 const SECTION_TABS = [
   [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
   [['/attention', 'Attention'], ['/activity', 'Activity']],
-  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync']],
+  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
   [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
@@ -136,7 +137,8 @@ function renderSubnav() {
   // The longest matching path wins, so /github/projects is not also an active "Issues" tab.
   const current = tabs.map(([p]) => p).filter((p) => path === p || path.startsWith(p + '/')).sort((x, y) => y.length - x.length)[0];
   SUBNAV.hidden = false;
-  const listed = tabs.filter(([p]) => showUnavailable || p === current || !unavailable.has(p));
+  // A tab with a third element is an optional feature: it is listed only while /api/v1/health advertises that capability.
+  const listed = tabs.filter(([p, , cap]) => (!cap || capabilities.includes(cap)) && (showUnavailable || p === current || !unavailable.has(p)));
   SUBNAV.hidden = listed.length < 2;
   SUBNAV.innerHTML = listed.map(([p, label]) => `<a href="#${p}"${p === current ? ' aria-current="page"' : ''}>${label}</a>`).join('');
 }
@@ -217,6 +219,8 @@ const ROUTES = {
   '/collab': viewCollab,
   '/ci': viewIntegrations,
   '/deployments': viewDeployments,
+  '/build-cache': viewBuildCache,
+  '/build-cache/:id': viewBuildDetail,
   '/reviews': viewIntegrations,
   '/review-gate': viewReviewGate,
   '/topology': viewTopology,
@@ -426,6 +430,18 @@ async function viewScheduling() {
 async function viewDeployments() {
   root.innerHTML = `${liveHead('<h1>Deployments</h1>')}<div id="deployments"></div>`;
   return mountDeployments(root.querySelector('#deployments'), client, { freshness: chipIn(root) });
+}
+
+async function viewBuildCache() {
+  root.innerHTML = `${liveHead('<h1>Build cache</h1>')}<div id="build-cache"></div>`;
+  return mountBuildCache(root.querySelector('#build-cache'), client, { freshness: chipIn(root) });
+}
+
+async function viewBuildDetail(parts) {
+  const id = safeDecode(parts[1]);
+  if (!id) { statusPage('<herdr-error message="Build not found"></herdr-error>', true); return; }
+  root.innerHTML = `${liveHead('<h1>Build</h1>')}<div id="build-cache"></div>`;
+  return mountBuildDetail(root.querySelector('#build-cache'), client, id, { freshness: chipIn(root) });
 }
 
 async function viewPrTrail(parts) {

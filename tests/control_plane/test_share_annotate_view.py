@@ -20,7 +20,8 @@ from tests.control_plane.test_share_annotate import (
     make_env,
     session,
 )
-from tests.control_plane.test_share_lab import NOW0
+from tests.control_plane.test_share_lab import NOW0, lab_config
+from tests.control_plane.test_share_public import Env
 
 CLOSE_TEMPLATE = "</" + "template>"
 CLOSE_STYLE = "</" + "style>"
@@ -304,3 +305,85 @@ def test_sanitised_output_is_cached_per_share_file_hash_and_resolver(lab, monkey
     assert (share_id, name, version) == ("shr-1", "page2.html", share_render.RESOLVER_VERSION)
     assert re.fullmatch(r"[0-9a-f]{64}", sha) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
     assert first
+
+
+# ---------------------------------------------------------------------------- "Shared by" banner (plan 5, Task 8)
+
+BANNER_RE = re.compile(r'<aside class="herdr-shared-by" role="note">(.*?)</aside>', re.S)
+
+
+def banner_env(tmp_path, name, **over):
+    return make_env(tmp_path, files=FILES, state_extra={"shared_by": name}, **over)
+
+
+@pytest.mark.parametrize("kind", ["v", "a"])
+def test_member_link_views_show_the_banner(tmp_path, kind):
+    env = banner_env(tmp_path, "Alice Example")
+    try:
+        status, h, body = env.request("GET", base(kind=kind) + "notes.txt")
+        page = body.decode()
+        assert status == 200 and "{{" not in page
+        assert BANNER_RE.search(page).group(1) == "Shared by Alice Example — content was not reviewed by the operator"
+        assert page.index("herdr-shared-by") < page.index('<nav data-mode-switch')
+        assert "<script" not in BANNER_RE.search(page).group(0)
+        assert "'unsafe-inline'" not in h["content-security-policy"].split("script-src")[1].split(";")[0]
+    finally:
+        env.close()
+
+
+def test_hostile_name_renders_as_text(tmp_path):
+    hostile = "<img src=x onerror=alert(1)>&\"'"
+    env = banner_env(tmp_path, hostile)
+    try:
+        page = env.request("GET", base(kind="v") + "notes.txt")[2].decode()
+        shown = BANNER_RE.search(page).group(1)
+        assert "<img" not in page and "onerror=alert(1)>" not in page
+        assert "&lt;img src=x onerror=alert(1)&gt;" in shown
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("kind", ["v", "a"])
+def test_operator_links_have_no_banner(lab, kind):
+    page = lab.request("GET", base(kind=kind) + "notes.txt")[2].decode()
+    assert "herdr-shared-by" not in page and "Shared by" not in page
+
+
+def test_banner_is_not_injected_into_non_html_raw_files(tmp_path):
+    env = banner_env(tmp_path, "Alice Example")
+    try:
+        for name in ("notes.txt", "pic.png"):
+            status, _, body = env.request("GET", base(kind="f") + name)
+            assert status == 200 and b"herdr-shared-by" not in body and b"Shared by" not in body
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("bad", ["x" * 121, "", 5, ["a"], None])
+def test_invalid_shared_by_is_the_uniform_404(tmp_path, bad):
+    env = banner_env(tmp_path, bad)
+    try:
+        assert env.request("GET", base(kind="v") + "notes.txt")[0] == 404
+        assert env.request("GET", base(kind="a") + "notes.txt")[0] == 404
+    finally:
+        env.close()
+
+
+def test_a_120_char_name_is_accepted(tmp_path):
+    env = banner_env(tmp_path, "n" * 120)
+    try:
+        assert "n" * 120 in env.request("GET", base(kind="v") + "notes.txt")[2].decode()
+    finally:
+        env.close()
+
+
+def test_public_member_link_has_the_bar_on_html_but_no_annotation_ui(tmp_path):
+    env = Env(tmp_path, audience="public", files=FILES, config_extra=lab_config(tmp_path),
+              state_extra={"shared_by": "Alice Example"})
+    try:
+        status, h, body = env.request("GET", f"/s/{TOKEN}/f/index.html")
+        assert status == 200 and body.count(b"data-herdr-shared-by") == 1 and b"data-annotate-panel" not in body
+        assert env.request("GET", base(kind="a") + "notes.txt")[0] == 404
+        assert env.request("GET", base(kind="v") + "notes.txt")[0] == 404
+    finally:
+        env.close()

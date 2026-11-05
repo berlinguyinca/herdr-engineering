@@ -34,6 +34,34 @@ DEFAULTS: dict[str, Any] = {
         "low_water_percent": 80,
         "min_age_hours": 24,
     },
+    # Spec 02: default-off; validated by build_cache_config.validate (fails closed).
+    "fabric_build_cache": {
+        "enabled": False,
+        "mode": "local_only",
+        "allowed_hosts": [],
+        "shared_cache": {
+            "enabled": False, "endpoint_ref": None, "namespace": "trusted-dev",
+            "writes_enabled": False, "max_total_gib": 250, "tls_required": True,
+            "credentials_file": None, "registry_file": None,
+        },
+        "local": {
+            "capacity_gib": 20, "ram_scratch_gib": 0, "min_free_disk_percent": 20,
+            "incremental_disabled_for_cacheable_builds": True,
+        },
+        "execution": {
+            "slurm_enabled": False, "allowed_clusters": [], "allowed_partitions": [],
+            "gpu_for_cpu_builds": False, "remote_fallback": "local", "max_build_slots": 2,
+        },
+        "slurm": {
+            "enabled": False, "account": None, "allowed_partitions": [], "cpus": 8,
+            "mem_gb": 16, "time_limit_minutes": 60, "queue_wait_timeout_s": 900,
+        },
+        "cleanup": {"dry_run": True, "min_idle_hours": 24, "max_evict_per_pass_gib": 10},
+        "eviction": {"destructive_enabled": False, "hard_cap_gib": 40,
+                     "max_entries_per_run": 5000},
+        "adaptive_slots": {"enabled": False, "min_slots": 1, "max_slots": 4},
+        "observability": {"enabled": False, "export_existing_metrics_pipeline": False},
+    },
     "herdr": {"capability_cache_ttl_seconds": 30},
     "web": {"private_only": True, "host": "127.0.0.1", "port": 8787},
     "artifacts": {
@@ -213,7 +241,14 @@ def _discover_config_paths() -> list[Path]:
     return [c for c in candidates if c.exists()]
 
 
-def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
+def _repo_local_paths() -> set[Path]:
+    """Config files taken from the current directory (untrusted: the repo being built)."""
+    cwd = Path.cwd()
+    return {cwd / "config" / "herdr-engineering.yaml", cwd / "herdr-engineering.yaml"}
+
+
+def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = False
+                ) -> dict[str, Any]:
     """Load config by precedence. Each path may be missing (skipped).
 
     When ``paths`` is omitted, a sensible default set is discovered (machine-
@@ -221,6 +256,8 @@ def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
     file written by the installer is actually used.
     """
     cfg = copy.deepcopy(DEFAULTS)
+    discovered = paths is None
+    repo_local = _repo_local_paths() if discovered else set()
     for path in (paths if paths is not None else _discover_config_paths()):
         if not path.exists():
             continue
@@ -241,9 +278,25 @@ def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
                 "%s: github.* is validated but not read from this file; control-plane-web reads "
                 "github.organizations and github.sync from the central fleet config (control_plane "
                 "fleet file), so this section has no effect", path)
+        if path in repo_local:
+            # A checkout being built must never choose build-cache policy
+            # (writes, namespace, credentials): machine-local config only.
+            data.pop("fabric_build_cache", None)
         cfg = _deep_merge(cfg, data)
     validate_github(cfg.get("github"))
-    return _expand_env(cfg)
+    cfg = _expand_env(cfg)
+    from .build_cache_config import validate as validate_build_cache
+    try:
+        validate_build_cache(cfg.get("fabric_build_cache"))
+    except InvalidError as exc:
+        if strict_build_cache:
+            raise
+        # Fail closed: an invalid build-cache section disables the feature
+        # instead of breaking every unrelated command.
+        logging.getLogger(__name__).warning(
+            "fabric_build_cache config invalid, feature disabled: %s", exc)
+        cfg["fabric_build_cache"] = copy.deepcopy(DEFAULTS["fabric_build_cache"])
+    return cfg
 
 
 def _read_simple_yaml(path: Path) -> dict[str, Any]:

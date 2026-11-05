@@ -4,7 +4,13 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
-const SOURCE = fs.readFileSync(new URL('../herdr_engineering/control_plane/share_static/share.js', import.meta.url), 'utf8');
+// share.js is now an ES module importing lab-signin.js; vm runs classic scripts, so the two real sources are joined with the
+// import line and the `export` keywords removed (nothing else is changed).
+const STATIC = new URL('../herdr_engineering/control_plane/share_static/', import.meta.url);
+const SOURCE = [
+  fs.readFileSync(new URL('lab-signin.js', STATIC), 'utf8').replace(/^export /gm, ''),
+  fs.readFileSync(new URL('share.js', STATIC), 'utf8').replace(/^import .*lab-signin\.js";\s*$/m, ''),
+].join('\n');
 const TOKEN = 'A'.repeat(43);
 const OTHER = 'B'.repeat(43);
 const SHARE = `/s/${TOKEN}/`;

@@ -14,11 +14,21 @@ from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.assistant import AssistantService, assistant_config
 from herdr_engineering.control_plane.assistant_hub.actiongrants import ActionGrant, GrantState
 from herdr_engineering.control_plane.assistant_hub.canonical import RawAction, derive
+from herdr_engineering.control_plane.assistant_hub.judge_version import judge_version
 from herdr_engineering.control_plane.assistant_hub.mcp import UNTRUSTED, Hub
-from herdr_engineering.control_plane.assistant_hub.policy import activate_grant
 from herdr_engineering.control_plane.assistant_hub.server import HubServer
 from herdr_engineering.control_plane.assistant_hub.workers import WorkerRegistry
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
+from tests.control_plane.judge_support import (
+    SAFE,
+    WireListener,
+    force_active_grant_for_tests,
+    judge_cfg,
+    make_runtime,
+    satisfy_gate,
+    success_body,
+    write_key,
+)
 
 OWNER_KEY = "p2-e2e-owner-key-0001"
 OWNER = "key:" + hashlib.sha256(OWNER_KEY.encode()).hexdigest()[:12]
@@ -48,17 +58,20 @@ def http(method, url, body=None, headers=None):
 
 
 @contextlib.contextmanager
-def running(sink, grants):
+def running(sink, grants, tmp):
     section = {"enabled": True, "tenancy": {"principals": {OWNER: TENANT}}, "grants": grants,
                "hub": {"enabled": True, "host": "127.0.0.1", "port": 9483, "allowed_networks": ["127.0.0.0/8"]}}
     svc = AssistantService(config=assistant_config({"personal_assistant": section}))
     registry = WorkerRegistry(svc.store, enrollment_ttl=timedelta(minutes=10), worker_ttl=timedelta(days=30))
-    hub = HubServer(Hub(registry=registry, service=svc, store=svc.store), host="127.0.0.1", port=0,
+    li = WireListener(success_body(SAFE))
+    rt = make_runtime(svc.store, judge_cfg(f"http://127.0.0.1:{li.port}", write_key(tmp), backend_confirmed=True), svc.now)
+    svc._test_judge = rt
+    hub = HubServer(Hub(registry=registry, service=svc, store=svc.store, judge=rt), host="127.0.0.1", port=0,
                     allowed_networks=["127.0.0.0/8"], allowed_hosts=[])
     hub.start()
     hub.wait_until_ready()
     svr = ControlPlaneServer(ControlPlaneRepo(sink=sink), assistant_service=svc, api_keys={OWNER_KEY: "operator"},
-                             assistant_workers=registry)
+                             assistant_workers=registry, assistant_judge=rt)
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     try:
@@ -68,6 +81,8 @@ def running(sink, grants):
             svr.shutdown()
         finally:
             hub.shutdown()
+            rt.recorder.stop()
+            li.close()
 
 
 def owner(w, method, path, body=None):
@@ -111,8 +126,7 @@ def audit_actions(w):
 
 
 def put_grant(w, worker_id, state):
-    """Hand-insert a grant for PUSH. ACTIVE goes through policy.activate_grant exactly as Phase 3 will, except that
-    the judge gate is declared satisfied here: Phase 3 supplies the real gate, the owner route hard-codes False."""
+    """Hand-insert a grant for PUSH. ACTIVE is forced by the tests-only helper (the real gate has its own tests)."""
     key = derive(RawAction(tool="Bash", command=PUSH, repo="acme/repo")).key
     cfg, now = w.svc.config["grants"], w.svc.now()
     gid = "ag_e2e_" + worker_id[-6:]
@@ -121,13 +135,13 @@ def put_grant(w, worker_id, state):
         key_id=key.key_id(), verb=key.verb.value, key_canonical=key.canonical(), state=GrantState.PROPOSED,
         created_at=now, proposed_at=now, expires_at=now + timedelta(days=30), policy_version=cfg["policy_version"]))
     if state is GrantState.ACTIVE:
-        activate_grant(w.svc.store, cfg, now, TENANT, OWNER, gid, confirmed_by="owner", judge_gate_satisfied=True)
+        force_active_grant_for_tests(w.svc.store, cfg, gid, now, w.svc._test_judge.cfg_getter())
     return gid
 
 
-def test_phase2_flow_vetoes_evidence_proposal_gate_grant_revoke(acknowledged_sink):
+def test_phase2_flow_vetoes_evidence_proposal_gate_grant_revoke(acknowledged_sink, tmp_path):
     long_ago = (datetime.now(UTC) - timedelta(days=60)).isoformat()
-    with running(acknowledged_sink, {"shadow_started_at": long_ago, **TINY}) as w:
+    with running(acknowledged_sink, {"shadow_started_at": long_ago, **TINY}, tmp_path) as w:
         wk = enroll(w, "laptop", "dev1", ACT)
         other = enroll(w, "desktop", "dev2", ACT)
         status, listed = owner(w, "GET", "/api/v1/assistant-workers")
@@ -196,14 +210,16 @@ def test_phase2_flow_vetoes_evidence_proposal_gate_grant_revoke(acknowledged_sin
         # activation through the owner route answers 409 (judge gate), audited
         status, refused = owner(w, "POST", f"/api/v1/assistant-grants/{proposed['grant_id']}/activate",
                                 {"confirm": True})
-        assert status == 409 and refused["code"] == "judge_gate_not_satisfied"
+        assert status == 409 and refused["code"] == "insufficient_labels"
         assert "assistant.grant.activate_refused" in audit_actions(w)
         assert owner(w, "GET", "/api/v1/assistant-grants")[1]["grants"][0]["state"] == "proposed"
 
-        # Phase 3 supplies the real judge gate; here an ACTIVE grant is created through policy.activate_grant
+        # the real judge gate passes once the store holds enough real labeled records
         gid = proposed["grant_id"]
-        activate_grant(w.svc.store, w.svc.config["grants"], w.svc.now(), TENANT, OWNER, gid, confirmed_by="owner",
-                       judge_gate_satisfied=True)
+        satisfy_gate(w.svc.store, w.svc._test_judge, derive(RawAction(tool="Bash", command=PUSH, repo="acme/repo")).key.risk_class.value,
+                     TENANT, OWNER)
+        status, activated = owner(w, "POST", f"/api/v1/assistant-grants/{gid}/activate", {"confirm": True})
+        assert status == 200 and activated["state"] == "active", activated      # the REAL gate, over populated records
         ok, _ = ask_action(w, wk, PUSH, session="s9", task="t9")
         assert (ok["outcome"], ok["grant_id"], ok["source"]) == ("authorized", gid, "grant")
         for variant in ("git push -u origin feature", "git push origin main && echo done"):
@@ -236,8 +252,8 @@ def test_phase2_flow_vetoes_evidence_proposal_gate_grant_revoke(acknowledged_sin
         assert CANARY not in requests_json and "frobnicate" in requests_json
 
 
-def test_active_grant_is_not_honoured_during_the_global_shadow_period(acknowledged_sink):
-    with running(acknowledged_sink, {"shadow_started_at": datetime.now(UTC).isoformat(), **TINY}) as w:
+def test_active_grant_is_not_honoured_during_the_global_shadow_period(acknowledged_sink, tmp_path):
+    with running(acknowledged_sink, {"shadow_started_at": datetime.now(UTC).isoformat(), **TINY}, tmp_path) as w:
         wk = enroll(w, "laptop", "dev1", ACT)
         # In shadow, activation itself is refused; insert the ACTIVE state directly to prove decide() still holds.
         key = derive(RawAction(tool="Bash", command=PUSH, repo="acme/repo")).key
@@ -246,7 +262,8 @@ def test_active_grant_is_not_honoured_during_the_global_shadow_period(acknowledg
             grant_id="ag_shadow", tenant_id=TENANT, user_id=OWNER, worker_id=wk.wid, resource_scope=key.resource_scope,
             key_id=key.key_id(), verb=key.verb.value, key_canonical=key.canonical(), state=GrantState.ACTIVE,
             created_at=now, proposed_at=now, activated_at=now, expires_at=now + timedelta(days=30),
-            policy_version=w.svc.config["grants"]["policy_version"], confirmed_by="owner"))
+            policy_version=w.svc.config["grants"]["policy_version"], confirmed_by="owner",
+            judge_version=judge_version(w.svc._test_judge.cfg_getter())))
         res, _ = ask_action(w, wk, PUSH)
         assert res["outcome"] == "pending" and res["source"] == "shadow" and res["grant_id"] is None
         assert w.svc.store.verify_audit(TENANT) is True

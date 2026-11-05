@@ -195,12 +195,51 @@ def run_doctor(config: dict[str, Any] | None = None,
     except Exception as exc:  # doctor must never crash on an optional section
         report.add("memory_hindsight", "warn", f"memory backend checks failed: {type(exc).__name__}")
 
+    _add_build_cache_toolchain(report)
+
     # external providers
     ci_offline = not (config or {}).get("ci", {}).get("provider")
     report.add("ci_provider", "warn" if ci_offline else "ok",
                "no CI provider configured (offline-safe)" if ci_offline
                else "CI provider configured")
     return report
+
+
+_SCCACHE_FIX = "scripts/install.sh --build-cache-tools-only"
+
+
+def _add_build_cache_toolchain(report: DoctorReport) -> None:
+    """Read-only build-cache toolchain check: sccache >= 0.19.0, rustc/cargo, python deps."""
+    import importlib.util
+
+    from .build_cache_env import detect_tools
+    from .build_cache_storage import _VERSION_RE, MIN_SCCACHE_VERSION
+
+    try:
+        tools = detect_tools(os.environ.get("PATH", ""))
+    except Exception as exc:  # doctor must never crash on an optional section
+        report.add("build_cache_toolchain", "warn", f"toolchain detection failed: {type(exc).__name__}")
+        return
+    want = ".".join(map(str, MIN_SCCACHE_VERSION))
+    m = _VERSION_RE.search(tools.sccache_version or "")
+    have = tuple(int(x) for x in m.groups()) if m else None
+    if tools.sccache is None:
+        report.add("build_cache_sccache", "warn",
+                   f"sccache not installed (need >= {want}); fix: {_SCCACHE_FIX}",
+                   {"fix": _SCCACHE_FIX})
+    elif have is None or have < MIN_SCCACHE_VERSION:
+        report.add("build_cache_sccache", "warn",
+                   f"sccache {tools.sccache_version or 'version unknown'} is older than {want}; "
+                   f"fix: {_SCCACHE_FIX}", {"fix": _SCCACHE_FIX})
+    else:
+        report.add("build_cache_sccache", "ok", f"{tools.sccache_version} at {tools.sccache}")
+    missing = [n for n, p in (("rustc", tools.rustc), ("cargo", tools.cargo)) if p is None]
+    report.add("build_cache_rust", "warn" if missing else "ok",
+               f"missing on PATH: {', '.join(missing)}" if missing else "rustc and cargo present")
+    absent = [m for m in ("yaml",) if importlib.util.find_spec(m) is None]
+    report.add("build_cache_python_deps", "warn" if absent else "ok",
+               f"missing python modules: {', '.join(absent)}; fix: pip install -e ." if absent
+               else "python deps import (PyYAML)")
 
 
 def _adopted_plugins(lock_path: str) -> list[str]:

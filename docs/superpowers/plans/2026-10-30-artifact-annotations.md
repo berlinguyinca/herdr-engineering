@@ -258,7 +258,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - `control_plane.share.annotations`: `enabled` (bool, default `true`) plus the Decision 6 limits. Added to `SHARE_KEYS` and `SHARE_SLICE_KEYS`.
   - `control_plane.share.owner_emails`: a list, default `[]`. Added to `SHARE_KEYS` only, NOT `SHARE_SLICE_KEYS`.
   - There is no new certificate key. The share host is a second SAN on the existing collab certificate (`HERDR_COLLAB_CERT_DIR`, `collab-sync.sh`'s single lineage and renewal timer).
-- **Migration.** Number `0046`, verified free on main and every branch (0043 x2, 0044 and 0045 are on main; 0047 is plan 5's). Re-check before committing and take the next free number if that changed. The migration must be additive and idempotent, with a `DOWN:` comment like 0043.
+- **Migration.** Number `0046`, verified free on main and every branch (0043 x2, 0044 and 0045 are on main; 0048 is plan 5's (renumbered; 0047 is feat/artifact-delete's)). Re-check before committing and take the next free number if that changed. The migration must be additive and idempotent, with a `DOWN:` comment like 0043.
 - **Never logged, and never stored outside the response that needs them:** tokens, sessions, CSRF tokens, nonces, `Authorization` and `X-Id-Token` values. Author emails reach only the owner API and the author's own projection, never the MCP mirror or an agent.
 - **Code style.**
   - Python: `from __future__ import annotations`, type hints, and the surrounding module's style.
