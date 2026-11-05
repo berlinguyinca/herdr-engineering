@@ -224,8 +224,12 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   single sanitiser lane is the real bound.
 - **A scripted `f/` page sees its own session URL (mitigated by a write cookie).** Author JavaScript in a raw HTML
   file (sandboxed, opaque origin) can read `location.href`, which carries the viewer's session, and an author
-  `<meta name="referrer" content="unsafe-url">` overrides our `Referrer-Policy: no-referrer` header, so a click or a
-  meta refresh can send the session URL to another site in the `Referer` (Firefox and WebKit, even without script).
+  `<meta name="referrer" content="unsafe-url">` overrides our `Referrer-Policy: no-referrer` header (which the share host
+  now sends on every response, including 206/304/412/416/204/404), so a click or a meta refresh can send the session
+  URL to another site in the `Referer` (Firefox and WebKit, even without script). The raw `f/` bytes are deliberately
+  served as authored (stripping the meta would not close this: `referrerpolicy` attributes on `a`/`img`/`iframe`,
+  script-created metas and `location.href` itself all remain); the `a/` render drops `<meta>` and `referrerpolicy`
+  (`test_sanitiser_output_never_carries_an_author_referrer_policy`), and the write cookie below is the mitigation.
   That URL alone no longer reads or writes annotations: the session exchange also sets
   `hw_<hash>=<MAC>; Path=/s/<token>/; HttpOnly; Secure; SameSite=Strict`, a MAC under its own domain label
   (`herdr-annotate-write-v1`), and both annotation routes (GET and POST) require it in addition to the CSRF token,
@@ -234,8 +238,8 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   from `f/` to `a/` still works, and the `a/` page's own requests carry the cookie). Verified in Chromium, Firefox
   and WebKit (`tests/playwright/share-annotations.test.mjs`). What remains: the stolen URL still opens the share's
   files (`f/`, `v/`, `a/` page including its CSRF meta) until the session expires, because the author already holds
-  those files; the viewer's email is part of the session segment and therefore of the URL (removing it would mean
-  changing the session format; deferred); and a cookie is bound to the session, not to a device, so it protects
+  those files; the viewer's email is no longer readable from the URL (the session segment carries it encrypted under a key derived
+  from the signing secret; sessions minted before this change stop working and the viewer signs in again); and a cookie is bound to the session, not to a device, so it protects
   against URL leaks, not against malware in the viewer's browser. Lab PDFs on `f/` are now served under the sandbox
   policy as well; where a browser refuses to show a sandboxed PDF inline, use the `v/` view.
 - **Stored media types.** Responses never carry a stored media type's parameters: `/live`, `/download`, report asset
@@ -246,11 +250,16 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   error) on one `annotations.jsonl` line aborts every ingest pass at that offset; the batch rolls back and the marker
   does not move. The worker logs a warning with a consecutive-failure counter so an operator sees it; clearing it
   means fixing or removing that line. Only a compromised edge can write such lines.
-- The worker does not re-check an annotation author against the share's allow-list when it ingests a line (the edge
-  does); a compromised edge could mint unlisted or owner-role authors.
-- Comments and anchor text may contain bidirectional and zero-width format characters (they render as text, but can
-  spoof layout in the owner's panel).
-- PDF annotation is pointer-only: keyboard users can comment on the whole PDF but cannot choose a page or region.
+- The worker re-checks the author against the share's CURRENT allow-list when it ingests a line (`not_on_list`, a
+  `denied` event): an email-basis author must still be on `allow_emails`, a group-basis author needs the share to still
+  have `allow_groups` (the worker holds no group names, like the edge), and an edit needs the stored author to be listed
+  (withdrawing one's own note stays allowed). A compromised edge, which holds the signing secret, can still claim any
+  listed email or the owner role.
+- Explicit bidirectional embedding, override and isolate controls (U+202A-202E, U+2066-2069) are refused in comments and
+  anchor text (`bad_chars`). Directional marks (U+200E/F) and zero-width characters are still accepted; they render as
+  text.
+- PDF pages are keyboard-operable (Tab to a page, Enter or Space for the whole page; after "Mark region" the arrows move
+  a region, Shift+arrows resize it, Enter uses it, Escape drops it), like the image view.
 - Purged or tombstoned artifacts keep their annotation rows and author emails; there is no retention rule yet.
 - Test-suite gaps, tracked separately: a few unit tests use fakes (fake DOM, a scripted render child, `FakeBlobs`),
   and the PostgreSQL-backed tests skip when the host has no `initdb`.
