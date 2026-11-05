@@ -38,6 +38,7 @@ class LogStore:
         """Store `text` (its last 1 MB) and return the event reference for exactly the bytes stored."""
         path = self._path(rollout_id, host, path_id)
         data = text.encode("utf-8", "replace")[-MAX_BYTES:]
+        state.private_dir(self.directory)
         state.private_dir(path.parent)
         tmp = path.with_name(path.name + ".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -51,9 +52,10 @@ class LogStore:
         return {"host": host, "path_id": path_id, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
                 "lines": data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)}
 
-    def read(self, rollout_id: str, host: str, path_id: str) -> str:
+    def read_bytes(self, rollout_id: str, host: str, path_id: str) -> bytes:
+        """The stored bytes exactly as hashed into the event's `sha256` (no newline or encoding translation)."""
         try:
-            return self._path(rollout_id, host, path_id).read_text(errors="replace")
+            return self._path(rollout_id, host, path_id).read_bytes()
         except FileNotFoundError:
             raise LogNotFound(f"no {path_id} log for {host} in rollout {rollout_id}") from None
 

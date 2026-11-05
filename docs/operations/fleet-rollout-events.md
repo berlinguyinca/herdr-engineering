@@ -51,7 +51,7 @@ last 1 MB kept, files older than 30 days deleted when a new one is written) and 
 herdr-eng fleet-watch log show <rollout_id> --host bender [--path-id updater|installer|healthcheck]
 ```
 
-The command prints each stored log with its SHA-256, which should equal the `log.sha256` in the event. (The watcher
+The command hashes the stored bytes (no newline or encoding translation, so CRLF and invalid UTF-8 logs hash the same as when written) and prints each log with that SHA-256, which equals the `log.sha256` in the event; the text is then decoded with replacement characters for display. (The watcher
 that drives `ssh` runs on the controller, so for remote hosts the logs it captured are in the controller's store.)
 
 ## Read API (ETag, like ai-sync)

@@ -99,10 +99,10 @@ def cmd_log(args) -> int:
         if not kinds:
             raise logs.LogNotFound(f"no log for {args.host} in rollout {args.rollout_id}")
         for kind in kinds:
-            text = store.read(args.rollout_id, args.host, kind)
-            digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
-            print(f"== {args.host} {kind} sha256={digest}")
-            print(text, end="" if text.endswith("\n") else "\n")
+            raw = store.read_bytes(args.rollout_id, args.host, kind)
+            print(f"== {args.host} {kind} sha256={hashlib.sha256(raw).hexdigest()}")     # hash the bytes, then decode
+            text = raw.decode("utf-8", "replace")
+            sys.stdout.write(text if text.endswith("\n") or not text else text + "\n")
     except logs.LogNotFound as exc:
         print(f"fleet-watch log show: {exc}", file=sys.stderr)
         return 1

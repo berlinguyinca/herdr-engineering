@@ -143,7 +143,7 @@ GitHub (read-only poll, ETag)                      beast (controller)
                                                        │ verifier (fleet_watch/verify.py: D3 reachability)
                                                        │ planner  (fleet_watch/plan.py: coalesce, rollout_id)
                                                        │ runner   (fleet_watch/run.py: state machine, per-host exec)
-                                                       │ emitter  (fleet_watch/events.py: redact, outbox, POST /ingest)
+                                                       │ emitter  (fleet_watch/events.py: outbox, POST /ingest; section 14)
                                                        │ state    ~/.local/state/herdr-engineering/fleet-watch/{state.json,outbox.jsonl,lock}
                                                        ▼ ssh (tailscale, BatchMode, timeouts)
               beast (local) ─► bender ─► macbook-pro:  herdr-eng fleet host-apply --rollout ID --repo R --sha S
@@ -239,7 +239,7 @@ JSON schema (common fields; per-type subsets in the validator):
   "ts": "ISO-8601 UTC",
   "seq": "int >= 0",
   "trigger": {"repo": "autospec|pi-engineering|herdr-engineering|ai-sync|claude-config",
-              "sha": "40 hex", "pr": "int|null", "pr_title": "str<=120|null", "merged_at": "ISO|null"},
+              "sha": "40 hex", "pr": "int|null", "merged_at": "ISO|null"},
   "targets": [{"repo": "str", "sha": "40 hex", "before": "40 hex|null"}],
   "host": "beast|bender|macbook-pro (inventory name, [a-z0-9-]{1,40})",
   "repo": "str (for host events)",
@@ -247,8 +247,8 @@ JSON schema (common fields; per-type subsets in the validator):
   "reason": "enum: dirty_checkout|not_on_main|unpublished_commits|busy|timeout|health_failed|apply_failed|ssh_failed|halted|optional_unreachable|not_published|rate_limited|operator",
   "before_sha": "40 hex|null", "after_sha": "40 hex|null",
   "started_at": "ISO", "finished_at": "ISO", "duration_ms": "int >= 0",
-  "checks": [{"name": "str<=40", "ok": "bool"}],
-  "log_tail": "str<=2048, <=40 lines, redacted",
+  "checks": [{"name": "closed enum", "status": "ok|failed|skipped", "duration_ms": "int >= 0"}],
+  "log": {"host": "inventory host", "path_id": "updater|installer|healthcheck", "sha256": "64 hex", "bytes": "int", "lines": "int"},
   "counts": {"dirty_paths": "int", "unpublished_commits": "int", "behind": "int"},
   "links": {"pi_session_rollout": "str|null"},
   "halted_at_host": "str|null"
@@ -256,13 +256,12 @@ JSON schema (common fields; per-type subsets in the validator):
 ```
 
 Rules: `reason` and `status` are closed enums (the mermaid generator only ever interpolates enums, short
-SHAs, inventory host names and dates, never free text); `log_tail` is stored but never placed in a diagram.
+SHAs, inventory host names and dates, never free text); there is no free text in any event (section 14).
 
-**No secrets.** `log_tail` passes through the existing `redact()` (userinfo URLs, 24+ character token-like
-runs, non-printables, whitespace-collapsed) plus a denylist for `Authorization`, `token=`, `password=`, `-----BEGIN`;
-environment is never logged; the watcher's GitHub credential comes from `gh auth` on beast and never enters
-a payload; the ingest validator re-applies the length caps and rejects strings matching the denylist so a buggy
-emitter cannot leak.
+**No secrets (revised by section 14).** Events contain no free text: only enums, inventory hosts, hex and UTC
+timestamps, and unknown fields are rejected. Log text is never sent; `log` is a reference (host, kind, SHA-256, sizes)
+to a log kept on the host and read with `herdr-eng fleet-watch log show`. Environment is never logged; the watcher's
+GitHub credential comes from `gh auth` on beast and never enters a payload.
 
 ### 8.2 Read API
 
@@ -302,7 +301,7 @@ Layout (top to bottom):
    head node and one node per host labelled `host sha7 (age)`, an edge `head --> host` solid when equal,
    dashed red when behind, plus the lock pin as a note node. Source: `.../versions` projection.
 5. **Event table** (below the diagrams, because diagrams are lossy): time, rollout, host, repo, status,
-   before -> after, duration, expandable redacted log tail. Filters: repo, host, status.
+   before -> after, duration, the log reference (SHA-256 and the host-side `log show` command, no text). Filters: repo, host, status.
 6. **Mermaid source** in a `<details>` per diagram for copy/paste into a PR or issue.
 
 ### 9.1 How Mermaid is rendered (decision and justification)
@@ -345,9 +344,9 @@ dependency"); client-rendered diagrams from untrusted strings.
 - **Unit** (pytest/vitest, pure functions): ETag/`304` header parsing and backoff schedule from recorded
   real `gh api -i` outputs kept as fixtures; coalescing and `rollout_id` determinism; state-machine
   transitions table (every illegal transition rejected); event validator (unknown field, bad enum, oversize,
-  secret denylist, `host_id` bounds); `redact` of tokens/userinfo; lock writer round-trip preserves comments
+  secret-shaped strings in every field, `host_id` bounds); lock writer round-trip preserves comments
   and unrelated keys; mermaid generators produce only enum/short-SHA/host text (property test over
-  adversarial `pr_title`); `fleet-rollout-view.js` row/escape tests like `ai-sync-view.test.js`.
+  adversarial strings in every field); `fleet-rollout-view.js` row/escape tests like `ai-sync-view.test.js`.
 - **Integration** (real git, real SQLite/Postgres event store, real HTTP): bare repos created in a temp dir
   act as "GitHub" through a real local HTTP server that implements the three used REST endpoints with ETag and
   rate-limit headers (a protocol-faithful fixture server, not a mock of our code); a real `git` pair proves
@@ -358,7 +357,7 @@ dependency"); client-rendered diagrams from untrusted strings.
   server; `fleet lock verify` on a sample lock; unit-file lint (`systemd-analyze verify`) for the service.
 - **E2E**: Playwright CLI (`npx playwright test`, never MCP) loads `#/fabric-management` against a control
   plane seeded with a three-host rollout (success, halted-at-bender, superseded) and asserts the three SVG
-  diagrams render, status classes, empty/error/stale states, and that an XSS-style `pr_title` appears
+  diagrams render, status classes, empty/error/stale states, and that an XSS-style string in a field is refused / appears
   escaped. A **real-host canary** (documented runbook, not CI): disposable branch on a fork repo merged, watcher
   rolls beast then a second Linux target, evidence recorded in `STATUS.md`. macOS path is verified live on
   `macbook-pro` only; CI can lint the plist but cannot prove macOS behaviour, and the PR says so.

@@ -547,3 +547,28 @@ def test_per_rollout_counters_are_never_pruned_so_a_resumed_rollout_never_reuses
     for name in ("seq.json", "seq.json.bak"):
         (tmp_path / "other" / name).unlink()
     assert em2.emit(RID, "rollout.resumed")["payload"]["seq"] < 2**31
+
+
+# --------------------------------------------------------------------------- round 4
+
+def test_log_show_digest_equals_the_events_sha256_for_crlf_and_invalid_utf8(tmp_path):
+    state_dir = tmp_path / "state" / "herdr-engineering" / "fleet-watch"
+    em = events.Emitter(state_dir, client=None)
+    ref = em.record_log(RID, "bender", "updater", "one\r\ntwo\r\n")                  # CRLF
+    shown = run_cli(tmp_path, "log", "show", RID, "--host", "bender", "--path-id", "updater")
+    assert shown.returncode == 0 and f"sha256={ref['sha256']}" in shown.stdout
+    raw = b"bad \xff\xfe bytes\n"                                                     # not valid UTF-8
+    (state_dir / "logs" / RID / "bender-installer.log").write_bytes(raw)
+    import hashlib
+    shown = run_cli(tmp_path, "log", "show", RID, "--host", "bender", "--path-id", "installer")
+    assert shown.returncode == 0 and f"sha256={hashlib.sha256(raw).hexdigest()}" in shown.stdout
+
+
+def test_a_preexisting_world_readable_logs_root_is_made_private(tmp_path):
+    from herdr_engineering.fleet_watch import logs
+    root = tmp_path / "logs"
+    root.mkdir(mode=0o755)
+    os.chmod(root, 0o755)
+    logs.LogStore(root).write(RID, "beast", "updater", "x\n")
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE((root / RID).stat().st_mode) == 0o700
