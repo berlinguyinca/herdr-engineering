@@ -10,20 +10,25 @@ const shareStatic = join(here, '..', 'herdr_engineering', 'control_plane', 'shar
 const PLAN_FILES = ['member-artifacts.html', 'member-artifacts-app.js', 'member-artifacts-view.js', 'member-api.js',
   'member-upload.js', 'sha256-stream.js'];
 const TAG = /<\s*(iframe|frame|frameset|object|embed)(?=[\s/>])/i;
-const API = /createElement\(\s*['"`](iframe|frame|object|embed)/i;
+const API = /createElement\(\s*['"`](iframe|frameset|frame|object|embed)/i;
+
+function walk(dir, out) {
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) walk(p, out);
+    else if (/\.(js|mjs|html|css)$/.test(name)) out.push(p);
+  }
+  return out;
+}
 
 function scannable() {
-  const files = PLAN_FILES.map((f) => join(here, f));
-  for (const name of readdirSync(shareStatic)) {
-    const p = join(shareStatic, name);
-    if (statSync(p).isFile() && /\.(js|html|css)$/.test(name)) files.push(p);
-  }
-  return files;
+  return [...PLAN_FILES.map((f) => join(here, f)), ...walk(shareStatic, [])];     // share_static includes vendor/pdfjs
 }
 
 test('the plan files and share_static contain no frame, object or embed markup or creation', () => {
   const files = scannable();
   assert.ok(files.length > 8);
+  assert.ok(files.some((f) => f.includes('vendor')), 'the vendored pdf.js is scanned too');
   for (const file of files) {
     const text = readFileSync(file, 'utf8');
     assert.doesNotMatch(text, TAG, file);

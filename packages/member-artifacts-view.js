@@ -7,6 +7,8 @@ const MIB = KIB * 1024;
 const GIB = MIB * 1024;
 export const NOT_A_MEMBER = 'Your account is not a member of the lab group';
 export const PUBLIC_TEXT = "Anyone with the link can view this version. It shows 'Shared by <you>'.";
+/** The notice with `<you>` replaced by the member's name when it is known (the server banner shows the same name). */
+export const publicText = (name) => (name ? PUBLIC_TEXT.replace('<you>', String(name)) : PUBLIC_TEXT);
 export const DELETE_TEXT = 'Its links stop working. Only the operator can recover or purge it.';
 export const SHOWN_ONCE = 'Shown once. Copy it now; if you lose it, generate a new link.';
 export const DEFAULT_PUBLIC_DAYS = 30;
@@ -117,7 +119,7 @@ ${open ? `<button type="button" class="btn btn-danger" data-action="revoke" data
   }).join('')}</ul>`;
 }
 
-export function renderShareForm({ versions = [], headId = null, groups = [] } = {}) {
+export function renderShareForm({ versions = [], headId = null, groups = [], name = '' } = {}) {
   const options = list(versions).map((v) => `<option value="${esc(v.version_id)}"${v.version_id === headId ? ' selected' : ''}>v${esc(v.version_number)}${v.version_id === headId ? ' (head)' : ''}</option>`).join('');
   return `<form class="card" data-share-form>
 <h3>Share a version</h3>
@@ -131,7 +133,7 @@ export function renderShareForm({ versions = [], headId = null, groups = [] } = 
 <label>Expires in days (1 to ${MAX_PUBLIC_DAYS}, optional) <input name="lab_days" type="number" min="1" max="${MAX_PUBLIC_DAYS}" inputmode="numeric"></label>
 </div>
 <div data-audience-public hidden>
-<p class="notice" data-public-text>${esc(PUBLIC_TEXT)}</p>
+<p class="notice" data-public-text>${esc(publicText(name))}</p>
 <label>Expires in days (1 to ${MAX_PUBLIC_DAYS}) <input name="public_days" type="number" min="1" max="${MAX_PUBLIC_DAYS}" value="${DEFAULT_PUBLIC_DAYS}" inputmode="numeric"></label>
 </div>
 <p class="form-error" role="alert" data-form-error hidden></p>
@@ -139,14 +141,14 @@ export function renderShareForm({ versions = [], headId = null, groups = [] } = 
 </form>`;
 }
 
-export function renderShareSummary(created) {
+export function renderShareSummary(created, { name = '' } = {}) {
   const s = created?.summary || {};
   const files = list(s.files);
   const warnings = Array.isArray(s.warnings) ? s.warnings : [];
   return `<section class="card" data-share-summary>
 <h3>Check before approving</h3>
 <p><span data-summary-audience>${audienceBadge(created?.audience || s.audience)}</span> Expires <strong data-summary-expiry>${esc(formatDate(s.expires_at))}</strong>. Entry file: <code>${esc(s.entry || 'default')}</code>.</p>
-${(created?.audience || s.audience) === 'public' ? `<p class="notice">${esc(PUBLIC_TEXT)}</p>` : ''}
+${(created?.audience || s.audience) === 'public' ? `<p class="notice">${esc(publicText(name))}</p>` : ''}
 <p>${esc(s.file_count ?? files.length)} file${(s.file_count ?? files.length) === 1 ? '' : 's'}, ${esc(humanBytes(s.total_bytes))}.</p>
 <ul class="files" data-summary-files>${files.map((f) => `<li>${esc(f.name)} <span class="row-meta">${esc(humanBytes(f.size_bytes))}</span></li>`).join('')}</ul>
 ${s.files_truncated ? '<p class="row-meta">The list is shortened.</p>' : ''}

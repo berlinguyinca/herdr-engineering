@@ -151,3 +151,28 @@ test('writes poll their ticket until done; share events are a POST; delete confi
     assert.deepEqual(JSON.parse(s.seen.find((r) => r.url.endsWith('/delete')).body.toString()), { confirm: true });
   } finally { await s.close(); }
 });
+
+test('an upload status leaves 429 to the uploader (one retry layer); approve reuses a caller-supplied idempotency key', async () => {
+  let statusCalls = 0;
+  const keys = [];
+  const s = await serve((req, res, seen) => {
+    if (req.url.endsWith('/uploads/status')) { statusCalls += 1; return json(res, 429, { error: 'rate_limited' }, { 'Retry-After': '2' }); }
+    if (req.url.endsWith('/approve')) { keys.push(JSON.parse(seen.at(-1).body.toString()).idempotency_key); return json(res, 200, { status: 'done', result: 'live' }); }
+    return json(res, 404, {});
+  });
+  try {
+    const sessions = createSessionStore(memoryStorage());
+    sessions.set({ session: 's', expires_at: future() });
+    const waits = [];
+    const api = createMemberApi({ base: s.base, sessions, refresh: async () => {}, sleep: async (ms) => { waits.push(ms); } });
+    await assert.rejects(api.status('a1', { name: 'x', size_bytes: 1, file_sha256: 'f'.repeat(64) }), (e) => e.status === 429 && e.retryAfter === 2);
+    assert.equal(statusCalls, 1);
+    assert.deepEqual(waits, []);
+    await api.shareApprove('a1', 'sh1', { idempotencyKey: 'fixed-key' });
+    await api.shareApprove('a1', 'sh1', { idempotencyKey: 'fixed-key' });
+    await api.shareApprove('a1', 'sh1');
+    assert.equal(keys[0], 'fixed-key');
+    assert.equal(keys[1], 'fixed-key');
+    assert.notEqual(keys[2], 'fixed-key');
+  } finally { await s.close(); }
+});

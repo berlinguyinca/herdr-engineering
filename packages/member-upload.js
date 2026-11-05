@@ -12,6 +12,16 @@ const HASH_BLOCK = 4 * 1024 * 1024;
 const MAX_ATTEMPTS = 6;
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 30000;
+const MAX_ROUNDS = 12;                          // status/fill cycles: a status lists at most 1000 holes at a time
+
+// One cap for the whole page: three run bodies in flight however many files are uploading.
+let inFlight = 0;
+const waiting = [];
+async function gate(operation) {
+  while (inFlight >= MAX_RUNS_IN_FLIGHT) await new Promise((resolve) => waiting.push(resolve));
+  inFlight += 1;
+  try { return await operation(); } finally { inFlight -= 1; waiting.shift()?.(); }
+}
 
 export function abortError() {
   return Object.assign(new Error('upload aborted'), { name: 'AbortError' });
@@ -81,35 +91,52 @@ export async function uploadFile(file, { client, artifactId, signal, onProgress 
   checkAbort(signal);
   const fileSha = knownSha256 || await hashFile(file, signal, onProgress);
   const meta = { name: file.name, size_bytes: size, file_sha256: fileSha };
-  const status = await withRetry(() => client.status(artifactId, meta, { signal }), { signal, sleep });
   const total = Math.ceil(size / CHUNK_BYTES);
-  const present = missingToPresent(status.missing_ranges, total);
-  const runs = [];
-  for (let first = 0; first < total; first += perRun) {
-    const indexes = Array.from({ length: Math.min(perRun, total - first) }, (_, i) => first + i);
-    runs.push({ first, bytes: Math.min(size, (first + indexes.length) * CHUNK_BYTES) - first * CHUNK_BYTES, skip: indexes.every((i) => present.has(i)) });
+  let uploaded = 0;
+  let status = null;
+  for (let round = 0; ; round += 1) {
+    if (round >= MAX_ROUNDS) throw new Error('upload incomplete: the server still reports missing chunks');
+    status = await withRetry(() => client.status(artifactId, meta, { signal }), { signal, sleep });
+    if (!status || !Array.isArray(status.missing_ranges) || typeof status.upload_id !== 'string') throw new Error('unexpected status answer from the server');
+    // A truncated list names only the first holes: nothing is assumed about chunks beyond them, only those holes are filled.
+    const present = missingToPresent(status.missing_ranges, total);
+    const runs = [];
+    for (let first = 0; first < total; first += perRun) {
+      const indexes = Array.from({ length: Math.min(perRun, total - first) }, (_, i) => first + i);
+      const listed = indexes.some((i) => !present.has(i));
+      runs.push({ first, bytes: Math.min(size, (first + indexes.length) * CHUNK_BYTES) - first * CHUNK_BYTES, skip: !listed });
+    }
+    const queue = runs.filter((r) => !r.skip);
+    if (round === 0) {
+      uploaded = runs.filter((r) => r.skip).reduce((sum, r) => sum + r.bytes, 0);
+      onProgress({ phase: 'uploading', done: uploaded, total: size });
+    }
+    if (!queue.length) {
+      if (status.truncated || status.complete !== true) throw new Error('upload incomplete: the server does not report every chunk');
+      break;
+    }
+    await sendRuns(queue, status.upload_id);
   }
-  let done = runs.filter((r) => r.skip).reduce((sum, r) => sum + r.bytes, 0);
-  onProgress({ phase: 'uploading', done, total: size });
-  const queue = runs.filter((r) => !r.skip);
-  let failure = null;
-  async function worker() {
-    while (queue.length && failure === null) {
-      const run = queue.shift();
-      try {
-        checkAbort(signal);
-        const body = new Uint8Array(await file.slice(run.first * CHUNK_BYTES, run.first * CHUNK_BYTES + run.bytes).arrayBuffer());
-        const runSha = hex(await crypto.subtle.digest('SHA-256', body));
-        await withRetry(() => client.putRun(artifactId, status.upload_id, run.first, body, { ...meta, run_sha256: runSha, signal }), { signal, sleep });
-        done += run.bytes;
-        onProgress({ phase: 'uploading', done, total: size });
-      } catch (error) {
-        failure ??= error;
+  async function sendRuns(queue, uploadId) {
+    let failure = null;
+    async function worker() {
+      while (queue.length && failure === null) {
+        const run = queue.shift();
+        try {
+          checkAbort(signal);
+          const body = new Uint8Array(await file.slice(run.first * CHUNK_BYTES, run.first * CHUNK_BYTES + run.bytes).arrayBuffer());
+          const runSha = hex(await crypto.subtle.digest('SHA-256', body));
+          await withRetry(() => gate(() => client.putRun(artifactId, uploadId, run.first, body, { ...meta, run_sha256: runSha, signal })), { signal, sleep });
+          uploaded += run.bytes;
+          onProgress({ phase: 'uploading', done: Math.min(size, uploaded), total: size });
+        } catch (error) {
+          failure ??= error;
+        }
       }
     }
+    await Promise.all(Array.from({ length: Math.min(MAX_RUNS_IN_FLIGHT, queue.length) }, worker));
+    if (failure !== null) throw failure;
   }
-  await Promise.all(Array.from({ length: Math.min(MAX_RUNS_IN_FLIGHT, queue.length) }, worker));
-  if (failure !== null) throw failure;
   checkAbort(signal);
   onProgress({ phase: 'done', done: size, total: size });
   return { upload_id: status.upload_id, file_sha256: fileSha };

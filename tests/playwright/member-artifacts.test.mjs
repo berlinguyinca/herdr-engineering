@@ -71,6 +71,8 @@ async function createArtifact(page, title) {
 // Records every phase an upload row passes through so short-lived "Checking file" states are not missed by polling.
 const OBSERVER = () => {
   window.__phases = [];
+  window.__csp = [];
+  document.addEventListener('securitypolicyviolation', (e) => window.__csp.push(`${e.violatedDirective} ${e.blockedURI}`));
   const note = () => document.querySelectorAll('[data-upload]').forEach((el) => {
     const key = `${el.getAttribute('data-upload')}:${el.getAttribute('data-phase')}`;
     const bar = el.querySelector('progress');
@@ -116,7 +118,7 @@ for (const [label, viewport, colorScheme] of COMBOS) {
 
       // public share
       await page.locator('[data-share-form] input[value="public"]').check();
-      assert.equal(await page.locator('[data-public-text]').innerText(), "Anyone with the link can view this version. It shows 'Shared by <you>'.");
+      assert.equal(await page.locator('[data-public-text]').innerText(), "Anyone with the link can view this version. It shows 'Shared by alice'.");
       assert.equal(await page.locator('input[name="public_days"]').inputValue(), '30');
       await page.locator('[data-share-form] button[type="submit"]').click();
       const summary = page.locator('[data-share-summary]');
@@ -166,6 +168,7 @@ for (const [label, viewport, colorScheme] of COMBOS) {
       assert.equal(await page.evaluate(() => window.localStorage.length), 0);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), true, 'no horizontal scroll');
       assert.deepEqual(errors, []);
+      assert.deepEqual(await page.evaluate(() => window.__csp), [], 'no CSP violation anywhere in the flow');
     });
   });
 }
@@ -219,6 +222,90 @@ test('hostile titles are shown as text', async () => {
     assert.ok((await page.locator('[data-shared-list]').innerText()).includes('onerror=window.__x=1'));
     assert.equal(await page.evaluate(() => window.__x), undefined);
     assert.equal(await page.locator('[data-shared-list] img').count(), 0);
+    assert.deepEqual(errors, []);
+  });
+});
+
+// A published artifact with a head version to share.
+async function publishedArtifact(page, srv, title) {
+  await signIn(page, srv);
+  await createArtifact(page, title);
+  await page.locator('[data-file-input]').setInputFiles([{ name: 'index.html', mimeType: 'text/html', buffer: Buffer.from('<p>hi</p>') }]);
+  await page.locator('[data-upload="index.html"][data-phase="done"]').waitFor({ timeout: 15000 });
+  await page.locator('[data-action="publish"]').click();
+  await page.locator('[data-history]').getByText('v1').first().waitFor({ timeout: 15000 });
+}
+
+async function reviewPublicShare(page) {
+  await page.locator('[data-share-form] input[value="public"]').check();
+  await page.locator('[data-share-form] button[type="submit"]').click();
+  await page.locator('[data-share-summary]').waitFor({ timeout: 15000 });
+}
+
+test('a double-clicked Approve sends one approval and the one-time URL stays on screen', async () => {
+  await withApp({}, async ({ page, srv }) => {
+    await publishedArtifact(page, srv, 'Double click');
+    await reviewPublicShare(page);
+    const approve = page.locator('[data-action="approve"]');
+    await approve.dblclick();
+    assert.equal(await page.locator('[data-action="cancel-share"]').isDisabled().catch(() => true), true, 'Cancel is off while approving');
+    const url = await page.locator('[data-secret-url]').inputValue({ timeout: 15000 });
+    await page.waitForTimeout(1200);
+    assert.equal(await page.locator('[data-secret-url]').inputValue(), url, 'the URL was not replaced');
+    const s = await stats(srv);
+    assert.equal(s.approve_calls, 1);
+    assert.equal(s.revokes, 0, 'nothing was revoked');
+  });
+});
+
+for (const [reason, pattern] of [['not_pending', /no longer waiting/], ['expired', /expired/], ['not_found', /no longer exists/], ['secret_unavailable', /revoked/]]) {
+  test(`an approval refused as ${reason} is reported as a failure, never as a live link`, async () => {
+    await withApp({}, async ({ page, srv }) => {
+      await publishedArtifact(page, srv, `Refused ${reason}`);
+      await reviewPublicShare(page);
+      await post(`${srv.ctl}/fault?approve=${reason}`);
+      await page.locator('[data-action="approve"]').click();
+      await page.locator('[data-share-region] [data-error]').waitFor({ timeout: 15000 });
+      const text = await page.locator('[data-share-region]').innerText();
+      assert.match(text, pattern);
+      assert.doesNotMatch(text, /is live/);
+      assert.equal(await page.locator('[data-secret-url]').count(), 0);
+    });
+  });
+}
+
+test('a failed approval that leaves the link pending can be retried and then shows the URL', async () => {
+  await withApp({}, async ({ page, srv }) => {
+    await publishedArtifact(page, srv, 'Retry approval');
+    await reviewPublicShare(page);
+    await post(`${srv.ctl}/fault?approve=approval_failed`);
+    await page.locator('[data-action="approve"]').click();
+    await page.locator('[data-share-summary] [data-form-error]:not([hidden])').waitFor({ timeout: 15000 });
+    assert.equal(await page.locator('[data-action="approve"]').isEnabled(), true, 'Approve is available again');
+    await page.locator('[data-action="approve"]').click();
+    assert.match(await page.locator('[data-secret-url]').inputValue({ timeout: 15000 }), /\/s\//);
+    const s = await stats(srv);
+    assert.equal(s.approve_calls, 2);
+    assert.notEqual(s.approve_keys[0], s.approve_keys[1], 'a new attempt uses a new key');
+  });
+});
+
+test('leaving a share that was never approved revokes it', async () => {
+  await withApp({}, async ({ page, srv }) => {
+    await publishedArtifact(page, srv, 'Abandoned');
+    await reviewPublicShare(page);
+    await page.goto(page.url().replace(/#.*$/, '') + '#/links');
+    await page.getByRole('heading', { name: 'My links' }).waitFor();
+    for (let i = 0; i < 50 && (await stats(srv)).revokes < 1; i += 1) await page.waitForTimeout(100);
+    assert.equal((await stats(srv)).revokes, 1);
+  });
+});
+
+test('a malformed address in the hash shows a not-found view without an error', async () => {
+  await withApp({}, async ({ page, srv, errors }) => {
+    await signIn(page, srv);
+    await page.goto(page.url().replace(/#.*$/, '') + '#/a/%E0');
+    await page.locator('[data-empty]').getByText('not available').waitFor({ timeout: 10000 });
     assert.deepEqual(errors, []);
   });
 });

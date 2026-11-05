@@ -48,3 +48,17 @@ test('update does not retain or modify the caller buffer, and digest is repeatab
   assert.throws(() => h.update(new Uint8Array(1)), /finished/);
   assert.equal(hex(new Uint8Array(0)), '');
 });
+
+const subtle = async (bytes) => Buffer.from(await crypto.webcrypto.subtle.digest('SHA-256', bytes)).toString('hex');
+
+test('agrees with WebCrypto crypto.subtle, including a message longer than 2^29 bytes (bit length above 2^32)', async () => {
+  for (const n of [0, 1, 63, 64, 1000, 1_048_576 + 7]) {
+    const data = crypto.randomBytes(n);
+    assert.equal(feed([new Uint8Array(data)]), await subtle(data), String(n));
+  }
+  const block = crypto.randomBytes(1_048_576);
+  const rounds = 513;
+  const h = createSha256();
+  for (let i = 0; i < rounds; i += 1) h.update(new Uint8Array(block));
+  assert.equal(h.digestHex(), await subtle(Buffer.concat(Array.from({ length: rounds }, () => block))));
+});

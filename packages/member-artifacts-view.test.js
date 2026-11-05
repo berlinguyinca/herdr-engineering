@@ -137,3 +137,12 @@ test('delete dialog names the artifact and says what happens; sign-in and no-acc
   assert.match(renderNav('links', true), /aria-current="page">My links/);
   assert.equal(renderNav('links', false), '');
 });
+
+test('the public notice names the member when the name is known, escaped, and keeps the exact brief text otherwise', async () => {
+  const { publicText, renderShareForm, renderShareSummary } = await import('./member-artifacts-view.js');
+  assert.equal(publicText(''), PUBLIC_TEXT);
+  assert.equal(publicText('Ada'), "Anyone with the link can view this version. It shows 'Shared by Ada'.");
+  const html = renderShareForm({ versions: [], name: '<img src=x onerror=1>' });
+  assert.ok(!html.includes('<img'));
+  assert.ok(renderShareSummary({ audience: 'public', summary: {} }, { name: 'Ada' }).includes('Shared by Ada'));
+});

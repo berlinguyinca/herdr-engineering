@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import { uploadFile, CHUNK_BYTES, MAX_CHUNKS_PER_RUN, MAX_RUNS_IN_FLIGHT, missingToPresent } from './member-upload.js';
 
 const MIB = 1024 * 1024;
+// The server's own derivation (python upload_id_for) for one fixed input; tests/control_plane/test_member_upload_vector.py keeps it honest.
+const VECTOR = JSON.parse(fs.readFileSync(new URL('./member-upload-vector.json', import.meta.url), 'utf8'));
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
 const noSleep = { sleep: async () => {} };
 
@@ -19,8 +22,8 @@ function httpError(status, extra = {}) {
 
 /** A client that behaves like the server: the upload id derives from the whole-file sha256, runs are stored by chunk. */
 class FakeServer {
-  constructor() { this.stored = new Set(); this.events = []; this.puts = []; this.inFlight = 0; this.maxInFlight = 0; this.failures = []; }
-  uploadId(artifactId, name, size, fileSha) { return `u_${sha(`${artifactId}|${name}|${size}|${fileSha}`).slice(0, 32)}`; }
+  constructor() { this.stored = new Set(); this.events = []; this.puts = []; this.inFlight = 0; this.maxInFlight = 0; this.failures = []; this.cap = Infinity; this.statusCalls = 0; }
+  uploadId(artifactId, name, size, fileSha) { if (artifactId === VECTOR.artifact_id && name === VECTOR.name && size === VECTOR.size_bytes && fileSha === VECTOR.file_sha256) return VECTOR.upload_id; return `u_${sha(`${artifactId}|${name}|${size}|${fileSha}`).slice(0, 32)}`; }
   client() {
     return {
       status: async (artifactId, args) => {
@@ -33,7 +36,10 @@ class FakeServer {
           if (absent && start === null) start = i;
           if (!absent && start !== null) { ranges.push([start, i - 1]); start = null; }
         }
-        return { upload_id: this.uploadId(artifactId, args.name, args.size_bytes, args.file_sha256), total, missing_ranges: ranges, complete: ranges.length === 0 };
+        this.statusCalls += 1;
+        const truncated = ranges.length > this.cap;
+        const shown = ranges.slice(0, this.cap);
+        return { upload_id: this.uploadId(artifactId, args.name, args.size_bytes, args.file_sha256), total, missing_ranges: shown, complete: ranges.length === 0, truncated };
       },
       putRun: async (artifactId, uploadId, first, bytes, meta) => {
         this.events.push(['put', first]);
@@ -160,4 +166,47 @@ test('an empty file is refused before anything is sent', async () => {
   const server = new FakeServer();
   await assert.rejects(uploadFile(fileOf(new Uint8Array(0)), { client: server.client(), artifactId: 'a', ...noSleep }), /empty/);
   assert.equal(server.events.length, 0);
+});
+
+test('a truncated status is never read as "the rest is present": the listed holes are filled and status is asked again', async () => {
+  const data = bytesOf(10 * CHUNK_BYTES);
+  const server = new FakeServer();
+  for (const i of [1, 3, 5, 7, 9]) server.stored.add(i);       // holes at 0, 2, 4, 6, 8
+  server.cap = 2;                                               // the server lists two holes at a time
+  const out = await uploadFile(fileOf(data), { client: server.client(), artifactId: 'a', chunksPerRequest: 1, ...noSleep });
+  assert.deepEqual(server.events.filter((e) => e[0] === 'put').map((e) => e[1]).sort((a, b) => a - b), [0, 2, 4, 6, 8]);
+  assert.ok(server.statusCalls >= 4, `status asked again (${server.statusCalls})`);
+  assert.equal(out.file_sha256, sha(data));
+});
+
+test('an upload the server does not call complete is never reported done', async () => {
+  const data = bytesOf(2 * CHUNK_BYTES);
+  const server = new FakeServer();
+  const client = server.client();
+  const lying = { ...client, status: async (...a) => ({ ...(await client.status(...a)), complete: false, missing_ranges: [] }) };
+  const phases = [];
+  await assert.rejects(uploadFile(fileOf(data), { client: lying, artifactId: 'a', onProgress: (p) => phases.push(p.phase), ...noSleep }), /incomplete/);
+  assert.ok(!phases.includes('done'));
+  const bad = { ...client, status: async () => ({ upload_id: 'u', total: 2 }) };
+  await assert.rejects(uploadFile(fileOf(data), { client: bad, artifactId: 'a', ...noSleep }), /status/);
+});
+
+test('at most three runs are in flight across all files uploading at once', async () => {
+  let live = 0;
+  let peak = 0;
+  const wrap = (server) => {
+    const c = server.client();
+    return { status: c.status, putRun: async (...a) => { live += 1; peak = Math.max(peak, live); try { return await c.putRun(...a); } finally { live -= 1; } } };
+  };
+  const servers = [new FakeServer(), new FakeServer(), new FakeServer()];
+  await Promise.all(servers.map((sv, i) => uploadFile(fileOf(bytesOf(12 * CHUNK_BYTES), `f${i}.bin`), { client: wrap(sv), artifactId: 'a', chunksPerRequest: 1, ...noSleep })));
+  assert.ok(peak <= MAX_RUNS_IN_FLIGHT && peak >= 2, `peak ${peak}`);
+});
+
+test('the upload id comes back exactly as the server derives it (vector computed with the python upload_id_for)', async () => {
+  const data = bytesOf(VECTOR.size_bytes);
+  assert.equal(sha(data), VECTOR.file_sha256, 'the fixture file hashes as the server saw it');
+  const server = new FakeServer();
+  const out = await uploadFile(fileOf(data, VECTOR.name), { client: server.client(), artifactId: VECTOR.artifact_id, ...noSleep });
+  assert.equal(out.upload_id, VECTOR.upload_id);
 });

@@ -130,11 +130,11 @@ export function createMemberApi({ sessions, refresh, onSignedOut, base = '', fet
       { files, message, ...(baseVersionId ? { base_version_id: baseVersionId } : {}), idempotency_key: key() }, o),
     remove: (id, o) => write('POST', `${A(id)}/delete`, { confirm: true }, o),
     shareCreate: (id, body, o) => write('POST', `${A(id)}/shares`, { ...body, idempotency_key: key() }, o),
-    shareApprove: (id, sid, o) => write('POST', `${A(id)}/shares/${encodeURIComponent(sid)}/approve`, { confirm: true, idempotency_key: key() }, o),
+    shareApprove: (id, sid, o) => write('POST', `${A(id)}/shares/${encodeURIComponent(sid)}/approve`, { confirm: true, idempotency_key: o?.idempotencyKey || key() }, o),
     shareRevoke: (id, sid, o) => write('POST', `${A(id)}/shares/${encodeURIComponent(sid)}/revoke`, undefined, o),
     shareEvents: (id, sid, o) => write('POST', `${A(id)}/shares/${encodeURIComponent(sid)}/events`, undefined, o),
     // the uploader's client contract (member-upload.js)
-    status: (id, body, o) => request('POST', `${A(id)}/uploads/status`, { body, signal: o?.signal }),
+    status: (id, body, o) => request('POST', `${A(id)}/uploads/status`, { body, signal: o?.signal, retry429: false }),
     putRun: (id, uploadId, firstIndex, bytes, meta) => request('PUT',
       `${A(id)}/uploads/${encodeURIComponent(uploadId)}/runs/${firstIndex}`, {
         rawBody: bytes, signal: meta.signal, retry429: false,

@@ -20,10 +20,11 @@ const sessions = createSessionStore();
 let cfg = null;
 let tokens = null;                 // {access, id}: memory only
 let data = { usage: null, artifacts: [], shared_with_me: [], links: [] };
-let secretUrl = null;              // the one-time share URL: memory only, gone on navigation
+let shownShare = null;             // id of the share whose one-time URL is on screen (the URL itself is only in the DOM)
+let approving = false;             // an approve call is in flight: Approve and Cancel are off
 let uploads = new Map();           // artifact id -> Map(name -> row)
 let files = new Map();             // artifact id -> Map(name -> File)
-let draft = null;                  // a share awaiting approval {artifactId, created}
+let draft = null;                  // a share awaiting approval {artifactId, created, key}
 let current = { route: 'mine', id: null };
 let busyDelete = null;
 
@@ -37,6 +38,18 @@ function showError(root, message) {
   if (el) { el.textContent = message; el.hidden = false; } else say(message, 'error');
 }
 const clearError = (root) => { const el = $('[data-form-error]', root || app); if (el) el.hidden = true; };
+
+/** The name the public banner will show: the display name from /me if the server sends one, else the user id. */
+function memberName() {
+  const me = data.me || {};
+  const named = me.display_name || me.user_id;
+  if (typeof named === 'string' && named) return named;
+  try {
+    const payload = JSON.parse(atob((tokens?.id || '').split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+    const user = payload['cognito:username'] || payload.preferred_username || '';
+    return typeof user === 'string' ? user : '';
+  } catch { return ''; }
+}
 
 function describe(error) {
   if (error instanceof ApiError) {
@@ -121,6 +134,7 @@ function signOut() {
 async function reload() {
   const [me, links] = await Promise.all([api.me(), api.links()]);
   data = {
+    me: { display_name: me.display_name, user_id: me.user_id },
     usage: me.usage || null,
     artifacts: Array.isArray(me.artifacts) ? me.artifacts : [],
     shared_with_me: Array.isArray(me.shared_with_me) ? me.shared_with_me : [],
@@ -215,7 +229,7 @@ async function viewArtifact(id) {
     V.renderArtifactHeader(row, { shared: !own }),
     own ? V.renderUploadPicker() : '',
     '<section class="card"><h3>Version history</h3>', V.renderHistory(history), '</section>',
-    sharable ? V.renderShareForm({ versions, headId: history.head_version_id }) : '',
+    sharable ? V.renderShareForm({ versions, headId: history.head_version_id, name: memberName() }) : '',
     '<div data-share-region></div>',
     '<section class="card"><h3>Links</h3>', V.renderLinks(links, titles()), '</section>',
     own ? V.renderDeleteButton() : '',
@@ -224,12 +238,19 @@ async function viewArtifact(id) {
 }
 
 async function route() {
-  secretUrl = null;
+  shownShare = null;
+  const abandoned = draft;
   draft = null;
+  // A share still waiting for approval is revoked when the member leaves it (Cancel does the same): no stray pending link.
+  if (abandoned && !approving) api.shareRevoke(abandoned.artifactId, abandoned.created.share_id).catch(() => {});
   say('');
   const hash = location.hash || '#/';
   const m = /^#\/(a|s)\/(.+)$/.exec(hash);
-  if (m) current = { route: 'artifact', id: decodeURIComponent(m[2]) };
+  if (m) {
+    let id = null;
+    try { id = decodeURIComponent(m[2]); } catch { /* a malformed escape: shown as not found below */ }
+    current = { route: 'artifact', id };
+  }
   else if (hash === '#/shared') current = { route: 'shared', id: null };
   else if (hash === '#/links') current = { route: 'links', id: null };
   else if (hash === '#/usage') current = { route: 'usage', id: null };
@@ -237,6 +258,7 @@ async function route() {
   else current = { route: 'mine', id: null };
   paintNav();
   try {
+    if (current.route === 'artifact' && current.id === null) { paint('<p class="empty" data-empty>This artifact is not available.</p>'); return; }
     if (current.route !== 'new') await reload();
     ({ mine: viewMine, shared: viewShared, links: viewLinks, usage: viewUsage, new: viewNew,
       artifact: () => viewArtifact(current.id) })[current.route]();
@@ -309,34 +331,75 @@ async function onShareSubmit(form) {
   try {
     const out = await api.shareCreate(id, body);
     if (out.result !== 'created') return showError(form, out.reason ? `The link could not be created: ${out.reason}` : 'The link could not be created.');
-    draft = { artifactId: id, created: out };
-    $('[data-share-region]').innerHTML = V.renderShareSummary(out);
+    draft = { artifactId: id, created: out, key: crypto.randomUUID() };
+    $('[data-share-region]').innerHTML = V.renderShareSummary(out, { name: memberName() });
     form.hidden = true;
   } catch (e) { showError(form, describe(e)); }
   return undefined;
 }
 
+const APPROVE_REFUSALS = {
+  not_found: ['This link no longer exists. Create a new one.', false],
+  not_pending: ['This link is no longer waiting for approval. Check My links.', false],
+  expired: ['This link has expired. Create a new one.', false],
+  secret_unavailable: ['The link could not be delivered to you, so it was revoked. Create a new one.', false],
+  approval_failed: ['Approving failed. Nothing was published; try Approve again.', true],
+};
+
+function setBusy(on) {
+  approving = on;
+  for (const b of document.querySelectorAll('[data-share-summary] button')) b.disabled = on;
+}
+
 async function approve() {
   const region = $('[data-share-region]');
-  if (!draft) return;
-  const { artifactId, created } = draft;
+  if (!draft || approving) return;
+  const pending = draft;
+  const { artifactId, created } = pending;
+  setBusy(true);
   try {
-    const out = await api.shareApprove(artifactId, created.share_id);
+    const out = await api.shareApprove(artifactId, created.share_id, { idempotencyKey: pending.key });
     const url = out.secret?.url;
-    draft = null;
-    await reload();
-    if (typeof url === 'string' && url) {
-      secretUrl = url;
+    if (out.result === 'live' && typeof url === 'string' && url) {
+      draft = null;
+      shownShare = created.share_id;
+      await reload();
       region.innerHTML = V.renderSecretUrl(url);
-    } else {
-      region.innerHTML = V.renderError(out.result === 'already_approved' ? 'This link was already approved; its address is shown only once.' : 'The link is live but its address is no longer available. Create a new link.');
+      const form = $('[data-share-form]');
+      if (form) form.hidden = false;
+      setBusy(false);
+      return;
     }
+    if (out.result === 'already_approved' || out.result === 'live') {
+      // Never replace a URL that is on screen; otherwise the address was already handed out once.
+      draft = null;
+      if (shownShare !== created.share_id) {
+        await reload();
+        region.innerHTML = V.renderError(out.result === 'live'
+          ? 'The link is live but its address could not be shown. Revoke it in My links and create a new one.'
+          : 'This link was already approved; its address is shown only once.');
+      }
+      setBusy(false);
+      return;
+    }
+    const known = out.result === 'rejected' ? APPROVE_REFUSALS[out.reason] : undefined;
+    const [message, again] = known || [out.reason ? `The link could not be approved: ${out.reason}` : 'The link could not be approved.', false];
+    if (again) pending.key = crypto.randomUUID();       // the refusal was recorded under the old key; a retry is a new attempt
+    else draft = null;
+    setBusy(false);
+    if (again) { showError(region, message); return; }
+    await reload();
+    region.innerHTML = V.renderError(message);
     const form = $('[data-share-form]');
     if (form) form.hidden = false;
-  } catch (e) { showError(region, describe(e)); }
+  } catch (e) {
+    setBusy(false);
+    showError(region, describe(e));                     // the draft and its key stay: Approve again replays safely
+  }
 }
 
 async function cancelShare() {
+  if (approving) return;
   const region = $('[data-share-region]');
   if (draft) {
     try { await api.shareRevoke(draft.artifactId, draft.created.share_id); } catch { /* the pending link never goes live */ }
@@ -463,7 +526,12 @@ document.addEventListener('change', (ev) => {
   if (t.matches('[data-file-input]') && current.id) {
     const chosen = [...t.files];
     t.value = '';
-    startUploads(current.id, chosen);
+    const names = chosen.map((f) => f.name);
+    const dup = names.find((n, i) => names.indexOf(n) !== i);
+    const busy = chosen.find((f) => ['hashing', 'uploading', 'queued'].includes(uploads.get(current.id)?.get(f.name)?.phase));
+    if (dup) say(`Two files are named "${dup}". Rename one and choose them again.`, 'error');
+    else if (busy) say(`"${busy.name}" is already uploading.`, 'error');
+    else startUploads(current.id, chosen);
   } else if (t.matches('input[name="audience"]')) {
     const form = t.closest('form');
     const pub = form.elements.audience.value === 'public';

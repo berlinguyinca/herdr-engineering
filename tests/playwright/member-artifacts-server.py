@@ -183,7 +183,9 @@ class FakeMemberService:
         self.result_delay, self.run_delay = result_delay, run_delay
         self.users: dict[str, dict] = {}
         self.tickets: dict[str, dict] = {}
-        self.stats = {"run_puts": 0, "duplicate_runs": 0, "max_in_flight": 0, "status_calls": 0}
+        self.stats = {"run_puts": 0, "duplicate_runs": 0, "max_in_flight": 0, "status_calls": 0, "approve_calls": 0,
+                      "approve_keys": [], "revokes": 0}
+        self.fault_next_approve: str | None = None
         self._in_flight = 0
 
     # ------------------------------------------------------------------ state
@@ -358,6 +360,12 @@ class FakeMemberService:
         link = u["links"].get(share_id)
         if link is None or link["artifact_id"] != artifact_id:
             raise MemberServiceError(404, "not_found", "not found")
+        with _LOCK:
+            self.stats["approve_calls"] += 1
+            self.stats["approve_keys"].append(idempotency_key)
+            fault, self.fault_next_approve = self.fault_next_approve, None
+        if fault:
+            return self._submit(u, {"result": "rejected", "reason": fault})
         if link["state"] != "pending":
             return self._submit(u, {"result": "already_approved", "share_id": share_id, "audience": link["audience"]})
         link["state"] = "live"
@@ -369,6 +377,8 @@ class FakeMemberService:
         link = u["links"].get(share_id)
         if link is None or link["artifact_id"] != artifact_id:
             raise MemberServiceError(404, "not_found", "not found")
+        with _LOCK:
+            self.stats["revokes"] += 1
         link["state"] = "revoked"
         return self._submit(u, {"result": "revoked", "share_id": share_id, "audience": link["audience"]})
 
@@ -464,6 +474,9 @@ def control_handler(cognito: FakeCognito, mw: MemberWeb, fake: FakeMemberService
                     return self._json(400, {})
                 cognito.user = name
                 return self._json(200, {"user": name})
+            if parts.path == "/fault":
+                fake.fault_next_approve = parse_qs(parts.query).get("approve", [""])[0] or None
+                return self._json(200, {"fault": fake.fault_next_approve})
             if parts.path == "/rotate":
                 mw.secret = secrets.token_bytes(48)
                 return self._json(200, {"rotated": True})
