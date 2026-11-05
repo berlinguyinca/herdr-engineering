@@ -373,7 +373,7 @@ class EventLog:
             self.append(share_id, "opened", actor, detail)
 
     def denied(self, share_id: str, actor: str, reason: str) -> None:
-        if self._denied.allow("%s\x00%s" % (share_id, reason)):   # per share: one link cannot silence the others
+        if self._denied.allow(f"{share_id}\x00{reason}"):   # per share: one link cannot silence the others
             self.append(share_id, "denied", actor, {"reason": reason})
 
     def append(self, share_id: str, kind: str, actor: str, detail: dict) -> None:
@@ -410,7 +410,7 @@ class EventLog:
 
     def _drop(self, why: str) -> None:
         self.dropped += 1
-        _log(why, "dropped=%d" % self.dropped)
+        _log(why, f"dropped={self.dropped}")
 
 
 class AnnotationLog:
@@ -463,6 +463,25 @@ def _log(reason: str, extra: str = "") -> None:
     """A rate-limited warning carrying a fixed reason code only (never a path, token or header value)."""
     if _log_limiter.allow(reason):
         log.warning("share-public: %s %s", reason, extra)
+
+
+def _record_event(append, *args) -> None:
+    """Run one event-log append (``events.opened`` / ``events.denied``); a failure is logged and never reaches the
+    reader (the audit trail must not break serving)."""
+    try:
+        append(*args)
+    except Exception:
+        _log("event append failed")
+
+
+def _write_body(handler, body: bytes) -> None:
+    """Write ``body`` in slices; a client that went away closes the connection instead of raising."""
+    try:
+        view = memoryview(body)
+        for at in range(0, len(view), WRITE_SLICE_BYTES):
+            handler.wfile.write(view[at:at + WRITE_SLICE_BYTES])
+    except (OSError, ValueError):
+        handler.close_connection = True
 
 
 # safe filesystem access: ``_open_beneath`` lives in ``collab_bridge_files`` (shared with the collab artifact bridge)
@@ -722,10 +741,7 @@ def deny(handler, state: dict | None, reason: str, actor: str = "public") -> Non
     _log("denied", reason)
     share_id = state.get("share_id") if isinstance(state, dict) else None
     if isinstance(share_id, str) and _SHARE_ID.fullmatch(share_id):
-        try:
-            handler.server.events.denied(share_id, actor, reason)
-        except Exception:
-            _log("event append failed")
+        _record_event(handler.server.events.denied, share_id, actor, reason)
     send_not_found(handler)
 
 
@@ -978,7 +994,7 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         if st.st_size != size:
             deny(handler, state, "size_mismatch", actor)
             return False
-        etag = '"%s"' % item["sha256"]
+        etag = f'"{item["sha256"]}"'
         csp = sandbox_csp(getattr(handler.server, "public_origin", None), token)
         injected = None
         is_html = content_type_for(name).split(";")[0].strip() == "text/html"
@@ -1028,22 +1044,19 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         if range_value is not None and (if_range is None or if_range.strip() == etag):
             parsed = parse_range(range_value, size)
             if parsed == "unsatisfiable":
-                _send_headers(handler, 416, [("Content-Range", "bytes */%d" % size), ("Content-Length", "0"),
+                _send_headers(handler, 416, [("Content-Range", f"bytes */{size}"), ("Content-Length", "0"),
                                              ("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")],
                               cors=cors)
                 return True
             if parsed is not None:
                 start, end = parsed
                 status = 206
-                headers.append(("Content-Range", "bytes %d-%d/%d" % (start, end, size)))
+                headers.append(("Content-Range", f"bytes {start}-{end}/{size}"))
         length = end - start + 1 if size else 0
         headers.append(("Content-Length", str(length)))
         _send_headers(handler, status, headers, cors=cors)
         if handler.command == "GET" and status == 200 and name == state.get("entry"):
-            try:
-                handler.server.events.opened(share_id, actor, {"file": name[:200]})
-            except Exception:
-                _log("event append failed")
+            _record_event(handler.server.events.opened, share_id, actor, {"file": name[:200]})
         if handler.command == "HEAD":
             return True
         offset, remaining = start, length
@@ -1088,17 +1101,9 @@ def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, c
             return True
     _send_headers(handler, 200, headers + [("Content-Length", str(len(body)))], cors=cors)
     if handler.command == "GET" and name == state.get("entry"):
-        try:
-            handler.server.events.opened(state["share_id"], actor, {"file": name[:200]})
-        except Exception:
-            _log("event append failed")
+        _record_event(handler.server.events.opened, state["share_id"], actor, {"file": name[:200]})
     if handler.command != "HEAD":
-        try:
-            view = memoryview(body)
-            for at in range(0, len(view), WRITE_SLICE_BYTES):
-                handler.wfile.write(view[at:at + WRITE_SLICE_BYTES])
-        except (OSError, ValueError):
-            handler.close_connection = True
+        _write_body(handler, body)
     return True
 
 
@@ -1378,12 +1383,9 @@ class ShareHandler(BaseHTTPRequestHandler):
             headers += [("Cross-Origin-Opener-Policy", "same-origin"), ("Cross-Origin-Resource-Policy", "same-origin")]
         _send_headers(self, 200, headers, cors=False)
         if self.command == "GET" and name == state.get("entry"):
-            try:
-                server.events.opened(share_id, actor, {"file": name[:200], "mode": mode})
-            except Exception:
-                _log("event append failed")
+            _record_event(server.events.opened, share_id, actor, {"file": name[:200], "mode": mode})
         if self.command != "HEAD":
-            self.wfile.write(body)
+            _write_body(self, body)
         return None
 
     @staticmethod
@@ -1475,10 +1477,7 @@ class ShareHandler(BaseHTTPRequestHandler):
 
     def _annotate_error(self, state: ShareState, got: dict, status: int, code: str):
         """A JSON refusal (400/409/429/503) that also leaves a ``denied`` event with a fixed reason code."""
-        try:
-            self.server.events.denied(state["share_id"], got["identity"], "annotate_" + code)
-        except Exception:
-            _log("event append failed")
+        _record_event(self.server.events.denied, state["share_id"], got["identity"], "annotate_" + code)
         self._send_json(status, {"error": code})
         return None
 

@@ -1158,3 +1158,54 @@ def test_with_a_public_host_links_are_served_on_that_host_only(tmp_path):
 
 def test_without_a_public_host_any_host_is_served(env):
     assert _get_with_host(env, "/s/%s/" % TOKEN, "whatever.example") == 302
+
+
+# ---------------------------------------------------------------- shared writer and event helpers (final review B)
+def test_write_body_closes_the_connection_when_the_client_is_gone():
+    import socket
+
+    from herdr_engineering.control_plane import share_public as sp
+
+    class Handler:
+        close_connection = False
+
+    server_side, client_side = socket.socketpair()
+    handler = Handler()
+    handler.wfile = server_side.makefile("wb", buffering=0)
+    client_side.close()                                         # the reader went away before the body was written
+    sp._write_body(handler, b"x" * (sp.WRITE_SLICE_BYTES * 8))
+    assert handler.close_connection is True
+    server_side.close()
+
+
+def test_write_body_delivers_every_slice_to_a_live_reader():
+    import socket
+    import threading
+
+    from herdr_engineering.control_plane import share_public as sp
+
+    class Handler:
+        close_connection = False
+
+    a, b = socket.socketpair()
+    handler = Handler()
+    handler.wfile = a.makefile("wb", buffering=0)
+    body = bytes(range(256)) * (sp.WRITE_SLICE_BYTES // 100)
+    got = bytearray()
+    reader = threading.Thread(target=lambda: [got.extend(c) for c in iter(lambda: b.recv(65536), b"")])
+    reader.start()
+    sp._write_body(handler, body)
+    a.shutdown(socket.SHUT_WR)
+    reader.join(5)
+    assert bytes(got) == body and handler.close_connection is False
+    a.close()
+    b.close()
+
+
+def test_record_event_swallows_an_append_failure():
+    from herdr_engineering.control_plane import share_public as sp
+
+    def boom(*_args):
+        raise OSError("disk full")
+
+    sp._record_event(boom, "share_x", "who", "why")               # must not raise
