@@ -56,12 +56,29 @@ Then these numbered sections, in order:
 
 Finish with **Evidence coverage**: `complete / partial / limited`, explain which historical sources were and were not accessible. If little work has occurred, be concise and say so. Never fabricate dates, tests, commit hashes, or completed work.
 
+## Optional drift-graph block
+
+When the history helper's output has a `prompts` list with at least 5 entries, you may end the report, after **Evidence coverage**, with one fenced block that draws where the session's topic changed. The block is optional: leave it out when the session never drifted, when there are fewer than 5 prompts, or when the helper is absent. Never write one for a session you cannot read through the helper.
+
+````
+```drift-graph
+{"segments": [{"label": "USB stick", "from_prompt": 1, "to_prompt": 9},
+              {"label": "Web page design", "from_prompt": 10, "to_prompt": 31}],
+ "drift_at": 10, "drift_note": "A web page is its own project and deserved a new session."}
+```
+````
+
+- Build it from `prompts` (`n` is the prompt number, `text` is present for the sampled ones, and `prompts_total` is the real count). Group consecutive prompts by topic into 2 to 8 segments that start at prompt 1 with no gaps and end at `prompts_total`.
+- A label is a short phrase of at most 40 characters. Give labels only: never times or counts, which the tool computes from the history.
+- Set `drift_at` to a segment's first prompt only where the topic really changed into something that deserved its own session, and say why in `drift_note`. Omit both when you see no such change; the graph then says no drift was found.
+- The tool checks the block against the real prompts and drops it if anything does not add up, so a wrong block costs nothing but also shows nothing. It strips the block from the report before storing or showing it.
+
 ## Delivering the report
 
 - **Target mode or prepared evidence** (a `SUMMARY_EVIDENCE_JSON` block, or a request naming `<agent> <session-id>`): output the report only. Never run `herdr-eng summary publish` there.
 - **Otherwise, when `herdr-eng` is on PATH:** a long report must not flood the terminal. Do not print the report. Publish it once with a single command, taking `agent` and `session_id` from the history helper's JSON and passing the complete report on stdin through a quoted heredoc:
   `herdr-eng summary publish --agent <agent> --session <session_id> <<'SUMMARY_EOF'` … the full report … `SUMMARY_EOF`
-  This is the only write allowed: it saves the report to the user's private cache, posts it to the dashboard's Summary view for this agent, and opens it in a Herdr pane beside the terminal.
+  This is the only write allowed: it saves the report to the user's private cache, posts it to the dashboard's Summary view for this agent, and opens it in a Herdr pane beside the terminal (with the drift graph in a pane under it when the report has a valid `drift-graph` block).
   - If it prints `"ok": true`, reply with **only** its `message` line. No report text, no recap.
   - If it fails, or prints `"ok": false`, print the complete report in the conversation instead, so nothing is lost.
 - **Without `herdr-eng`:** write the report to the current conversation. Do not save a file unless explicitly asked.

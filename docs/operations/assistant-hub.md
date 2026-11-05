@@ -14,7 +14,7 @@ Phase 1 is **record only**.
 - It approves nothing, grants nothing, runs nothing and learns nothing from what it records.
 - Read-only tools: `memory_search`, `grants_list`, `approvals_list`, `routines_list`, `connectors_list`,
   `delegations_list`, `proposals_list`.
-- Learning, grants driven by observed behaviour and the Jev judge are later phases. Nothing recorded now activates them.
+- Learning and grants driven by observed behaviour are Phases 2 and 3 (below); nothing recorded in Phase 1 activates them.
 
 ## Enabling the hub
 
@@ -126,8 +126,8 @@ credential or the enrollment code.
 
 Phase 2 adds one worker tool, `action_request`, and the owner-side machinery behind it. A worker asks "may I run this?"
 before it acts and gets a **decision with a reason** (`authorized`, `denied` or `pending`), never an instruction.
-**Nothing is autonomous yet**: in this phase no request can come back `authorized` through the owner routes, because
-activation is gated (see "Why nothing is autonomous yet").
+**Nothing is autonomous by default**: a request can only come back `authorized` through an `active` grant, and a grant
+can only be activated after the Phase 3 judge gate passes (see "Phase 3" below and "Why nothing is autonomous yet").
 
 ### Verbs and what an ActionKey binds
 
@@ -197,10 +197,15 @@ state computed now.
 
 ### Why nothing is autonomous yet
 
-- **Phase 3** adds the Jev judge and its calibration gate. Until it exists, `POST /api/v1/assistant-grants/<id>/activate`
-  refuses every activation and writes `assistant.grant.activate_refused`. Refusals are checked in this order: 404
-  `not_found`, 409 `not_proposed`, `still_in_shadow`, `confirmation_missing`, `judge_gate_not_satisfied`. Until Phase 3
-  no request can reach success, because the gate is hard-coded to unsatisfied.
+- **BREAKING from Phase 2:** an `authorized` answer now also needs a judge that is enabled, `backend_confirmed` and
+  reachable; otherwise `pending` (source `judge_unavailable`). Phase 2 activation was hard-blocked, so no `active`
+  grants should exist. Unsetting `backend_confirmed` or disabling the judge immediately stops autonomy for existing
+  `active` grants.
+- **Phase 3** (below) adds the Jev judge and its calibration gate. `POST /api/v1/assistant-grants/<id>/activate` checks, in
+  order: 404 `not_found`, 409 `not_proposed`, `still_in_shadow`, `confirmation_missing`, then the judge gate codes
+  listed in Phase 3. Every refusal except `not_found` (an unknown id has no grant to attach it to) writes
+  `assistant.grant.activate_refused`. With no judge configured the answer is
+  `judge_disabled`, so a default install can never reach an active grant.
 - **Phase 4** adds hook-attested evidence (so tool outcomes the harness saw can count) and the in-session first-grant
   confirmation. The Phase 1 known limit above (a model with shell access can post `harness_attested` events) must be
   closed before attested evidence counts.
@@ -230,7 +235,7 @@ A worker credential gets 401/403 on all of these, a viewer key gets 403, and cro
 | `GET /api/v1/assistant-action-requests[?status=pending\|approved\|denied\|vetoed]` | `assistant-action list [--status S]` | Requests, including `display`. |
 | `POST /api/v1/assistant-action-requests/<id>/decision` `{"approve": true\|false}` | `assistant-action approve\|deny ID` | Record the owner decision (counts as evidence). 409 if already decided or vetoed. |
 | `GET /api/v1/assistant-grants` | `assistant-grant list` | Grants with their effective state. |
-| `POST /api/v1/assistant-grants/<id>/activate` `{"confirm": true}` | `assistant-grant activate ID` | Currently always 409 (judge gate). |
+| `POST /api/v1/assistant-grants/<id>/activate` `{"confirm": true}` | `assistant-grant activate ID` | 409 with the gate code until the judge gate passes (Phase 3). |
 | `DELETE /api/v1/assistant-grants/<id>` | `assistant-grant revoke ID` | Revoke; the next request is `pending`. Idempotent. |
 | `POST /api/v1/assistant-workers/<id>/scopes` `{"scopes": [...]}` | `assistant-worker scopes ID --scopes ...` | Change a worker's scopes. |
 
@@ -264,9 +269,190 @@ Protect it with mode 0600 and treat host access as the trust boundary.
 `worker.auth_failed`, `worker.revoked`). Entries carry the key id and ids only: no command text, credentials or enrollment codes. The chain verifies with
 `herdr-eng control-plane assistant-audit verify`.
 
+## Phase 3: the Jev judge, shadow records and the activation gate
+
+Phase 3 connects the hub to a **System One** (Jev) judge. The judge can only **add friction**: it never authorizes
+anything by itself. An action is `authorized` only when an `active` grant covers the exact key AND the judge answers
+AND does not escalate. Before that, the judge runs in **shadow**: it is asked about every new `pending` request, the
+answer is stored next to the owner's real decision, and those pairs are the evidence for the gate.
+
+> **Upgrading from Phase 2 (breaking change).** Any request that Phase 2 would have answered `authorized` now comes
+> back `pending` with source `judge_unavailable` unless a judge is **enabled, `backend_confirmed: true` and reachable**.
+> Phase 2 activation was hard-blocked, so no `active` grants should exist on an upgraded install. Conversely, unsetting
+> `backend_confirmed` or disabling the judge takes effect on the very next request and immediately stops autonomy for
+> every existing `active` grant.
+
+### Registering the key (CLI only)
+
+There is deliberately no HTTP route that accepts a key: secrets never travel in request bodies.
+
+```
+printf '%s' "$KEY" | herdr-eng control-plane assistant-judge register \
+    --endpoint https://llm.example.org --key-file /etc/herdr/jev.key --key-stdin [--model laya-auto]
+```
+
+- The key is read from **stdin only** (never argv; a TTY gets a hidden prompt). It is never printed; the command prints
+  only `registered: fingerprint=<8 hex of sha256> model=<id> models_seen=<n>`.
+- The file is created `0600` with `O_EXCL` at `PATH.new`, health-checked with a real `GET <endpoint>/v1/models`, checked
+  for the configured model id, and only then moved to `PATH`. A failure removes `PATH.new` and leaves an existing `PATH`
+  untouched. **Rotation** is the same command: the old key stays in place until the new one has proved itself.
+- The parent directory must not be group- or world-writable (`unsafe_dir`), `PATH` must be absolute and not a symlink,
+  the endpoint must be `https` (`http` only for loopback, so a bearer key never crosses a network in clear text).
+- Failures print `assistant-judge register failed: <code>` (for example `unsafe_dir`, `tmp_exists` when a stale
+  `PATH.new` is left over, `bad_path`, `symlink`, `bad_key`, `config`, or `model_not_listed`, which also prints the first
+  ten model ids the server offered). Exit codes: 0 ok, 1 refused, 2 usage.
+- The command does **not** edit the YAML. Add the block below yourself.
+
+### The YAML block
+
+`personal_assistant.judge` in the fleet config (a commented copy with the defaults is in
+`deploy/control-plane/fleet-config.example.yaml`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Off = no consults, no shadow records, `judge_disabled` at the gate. |
+| `provider` | `jev` | The only value. |
+| `endpoint` | `""` | `https` URL; `http` only for loopback. Required when enabled. |
+| `model` | `laya-auto` | Must be served by `GET /v1/models`. Part of the judge version. |
+| `api_key_file` | `""` | Absolute **path** of the key file. Inline `api_key`, `key`, `token` are rejected at load. |
+| `timeout_seconds` | `5` | Integer 1..60, applied to each authorize-path consult. |
+| `fail_mode` | `closed` | The only value: judge unavailable means the owner decides. |
+| `backend_confirmed` | `false` | Owner attestation, see below. |
+| `thresholds` | `destructive 0.30`, `irreversible 0.30`, `severity_score 2.0` | The judge escalates when any answer reaches its threshold (or when "would the owner's approval cover this" is below 0.5). |
+| `calibration` | `min_labeled_decisions 200`, `max_false_negative_bound 0.05` | The gate; the minimum cannot be set below 20; the bound must satisfy 0 < x <= 0.5. |
+
+Validator rules (a bad value refuses to load the config): `endpoint` is `https`, or `http` for loopback hosts only, with no
+userinfo, query, fragment, whitespace or control characters; `thresholds.destructive` and `.irreversible` satisfy
+0 < x <= 1, `severity_score` 0 <= x <= 3; `timeout_seconds` is an integer 1..60; `api_key_file` is absolute; unknown
+keys are rejected.
+
+### `backend_confirmed`: why the response cannot prove a real model
+
+The System One mock backend and a real Laya serve the **same documented response shape** and the same model ids, so
+nothing in a reply tells you which one answered. A judge backed by a mock would pass every calibration check
+trivially and then wave things through. So the gate refuses (`backend_unconfirmed`) until you set
+`backend_confirmed: true`, and you set it only after verifying out of band: `GET /v1/systemone/runtimes` on the
+System One host, or ask whoever runs the worker. Treat it as an attestation, not a probe.
+
+### What is sent to the judge, and what never is
+
+Sent: five facts of the ActionKey: `tool`, `verb`, `resource_scope`, `flag_class`, `risk_class`, plus four fixed
+questions (destructive? irreversible or external? severity? would the owner's approvals cover it?). Free text fields
+(`tool`, `resource_scope`) are forwarded only when short (at most 120) and made of identifier characters; otherwise
+they are replaced by `[redacted]`. For email verbs a scope holding addresses is replaced by `[recipients]`.
+Phase 3 sends no owner context at all.
+
+Never sent: the command, the `display` text, argv or its digest, the target, hints, worker or tenant ids, credentials.
+The key file path and key never appear in audit, records, the store snapshot, MCP output or owner routes (the status
+route shows the endpoint **host** and the key **fingerprint** only).
+
+A resolved model id that differs from the configured one (a concrete checkpoint behind `laya-auto`) is expected: it is
+recorded on the shadow record and is not an error.
+
+### Fail-closed table
+
+| Situation | Result |
+|---|---|
+| No active grant, or the judge version changed | `pending`, source `owner` (a stale or empty judge version on an active grant shows as grant state `shadow`) |
+| Active grant, global shadow period still running | `pending`, source `shadow` |
+| Active grant, `backend_confirmed` not `true` (even if the judge would answer) | `pending`, source `judge_unavailable` |
+| Active grant, judge answers and does not escalate | `authorized`, source `grant` |
+| Active grant, judge escalates | `pending`, source `judge` |
+| Active grant, judge unreachable, timed out, malformed, 401/429/5xx, disabled or no runtime | `pending`, source `judge_unavailable` |
+| Grant revoked, expired or re-versioned **while the judge was being consulted** | re-checked after the consult: `pending`, source `owner` |
+
+### Shadow records and ground-truth rules
+
+Operational limits to know about:
+
+- The recorder consults with a **fixed 30 s timeout** (not `timeout_seconds`).
+- The recorder queue lives in memory and is **lost on restart**: a request that is pending across a restart gets no
+  `JudgeRecord`, and its later owner label is dropped (there is no record to label). Jobs dropped from a full queue
+  are not resubmitted.
+- A slow consult on the authorize path occupies one hub handler thread for up to `timeout_seconds` (max 60) per
+  authorize attempt.
+
+For every **new** `pending` request with a known key, the hub queues a job on a single background recorder. The
+recorder is **async** (never on the request path), **bounded** (100 jobs) and **drop-oldest** (`recorder.dropped` in
+the status counts the losses). A `JudgeRecord` holds ids, verb, risk class, judge version, model and the verdict
+numbers; status `ok` or `unavailable` (with a short reason code). It never holds command or display text.
+
+Labels come from the owner's decision on the request:
+
+- The **first** owner label wins. A later change of mind is not a new label: revoking an **active** grant marks the
+  *approved* records for that key and worker as **regret**, which counts like a denial. Revoking a proposed, shadow or
+  expired grant marks nothing (it never authorized anything).
+- Records are grouped per (tenant, user, worker, key id) when reports are built, and a group is **one** label, so
+  `min_labeled_decisions` counts distinct (worker, action) pairs, not requests. Negative wins inside a group: if any
+  record in it was denied or regretted, the group counts as a negative label (and as a false negative when the judge
+  called that record safe), so a later denial is never hidden by an earlier approval.
+- Only records with status `ok` made under the **current judge version** count. Unavailable records never do.
+- A false negative is a judge "safe" verdict (no escalation) on an action the owner denied or regretted. An approval is
+  not proof of safety, so the bound is an estimate: owners misclick and approve things they later regret.
+
+### The gate and its refusal codes
+
+`activate` computes a calibration report per risk class from the owner's labeled records. All of these answer **409**
+with `code`, in this order (as in `policy.activate_grant` and `calibration.gate_satisfied`):
+
+| Code | Meaning |
+|---|---|
+| `judge_disabled` | No judge runtime, or `judge.enabled` is false. |
+| `backend_unconfirmed` | `backend_confirmed` is not `true`. |
+| `stale_report` | The report's judge version differs from the live one. |
+| `insufficient_labels` | Fewer than `min_labeled_decisions` (default 200) labeled decisions in the grant's risk class. |
+| `insufficient_diversity` | Labels come from fewer than 5 distinct action keys. |
+| `no_discrimination` | Fewer than 5 denied or regretted labels, so "always safe" cannot pass. |
+| `fn_bound_exceeded` | The one-sided 95% Clopper-Pearson upper bound on the false-negative rate is not below `max_false_negative_bound`. |
+| `judge_error` | The gate could not be evaluated (treated as a refusal). |
+
+Because the default needs 200 labeled decisions per risk class, no gate can pass soon after a fresh start.
+Activation stamps the grant with the judge version.
+
+### Judge version resets
+
+`judge_version` is a hash of the `model`, the normalized `endpoint` (scheme, host, port and path; spelling and a default port
+do not matter), the `thresholds` and the question-set version. Repointing the endpoint means a different backend, so it resets trust like the rest. Changing any of them makes
+every report and every grant stale: active grants show as `shadow` and nothing is authorized until a fresh set of
+labels exists under the new version and the owner activates again. Key file and timeout do not change it. Once evidence is ready again, a **new proposal** replaces a grant that became
+`shadow` because of a judge-version change; activate it (gate permitting) to re-earn autonomy.
+
+### Owner status and checks
+
+- `GET /api/v1/assistant-judges` / `herdr-eng control-plane assistant-judge status --api-key-file PATH`: enabled, model,
+  version, `backend_confirmed`, endpoint host, key fingerprint, recorder queue and drops, per-class calibration and the
+  gate result (`satisfied`, `code`) per risk class.
+- `POST /api/v1/assistant-judges/check` / `assistant-judge check`: one synthetic consult with a harmless fixed key. It
+  records nothing and touches no grant.
+- Both are operator-only and rate limited (429 `rate_limited`).
+- Workers with the `read` scope get the MCP tool `judge_status`: enabled flag, mode (`shadow`), version, labeled counts
+  and a boolean gate per class. No endpoint, fingerprint or per-request data.
+
+### Not verified yet (read before relying on this)
+
+- **Which backend serves production.** Whether `llm.metabolomics.us` serves real Laya or the mock cannot be told from a
+  response. Use `GET /v1/systemone/runtimes` or ask the operator, then set `backend_confirmed`.
+- **Model ids on the Go gateway** may be canonical checkpoint ids rather than `laya-auto`. `register` then fails with
+  `model_not_listed` and prints the ids it saw; pick one and set `model` to it.
+- **Latency.** Real Laya is measured at about 1.3 states per second per CPU node, which can exceed the 5 s default
+  timeout; every timeout is a fail-closed `pending`. Tune `timeout_seconds` after `assistant-judge check`.
+- **The integration tier has not been run against a real System One.** The documented response shape used in tests is
+  the documented sample, not a recorded real response.
+- **Determinism of real Laya** across calls is unmeasured; calibration assumes it is stable enough.
+- **Deferred:** the canary prompt (a known-bad probe to catch a mock or degraded judge), and **Phase 4**: dynamic
+  activation UX, in-session confirmation, hook-attested evidence, the owner digest, and Codex/OpenCode/Pi adapters.
+
+### Integration-test environment variables
+
+`@pytest.mark.integration` tests that talk to a real System One (a mock backend is fine) are skipped unless both are set:
+`HERDR_JEV_TEST_URL` (base URL) and `HERDR_JEV_TEST_KEY_FILE` (path of a key file); `HERDR_JEV_TEST_MODEL` is optional
+(default `laya-auto`). Run: `python3 -m pytest tests/control_plane/test_assistant_hub_jev.py tests/control_plane/test_assistant_hub_phase3_e2e.py -m integration`.
+New audit action names: none beyond those above; consults and authorizations carry the judge version and the four answers
+as percentages, never text.
+
 ## Testing notes
 
-The end-to-end flows are `tests/control_plane/test_assistant_hub_e2e.py` (Phase 1) and `tests/control_plane/test_assistant_hub_phase2_e2e.py` (Phase 2), each with a real control plane and hub on 127.0.0.1, port 0.
+The end-to-end flows are `tests/control_plane/test_assistant_hub_e2e.py` (Phase 1), `test_assistant_hub_phase2_e2e.py` (Phase 2) and `test_assistant_hub_phase3_e2e.py` (Phase 3, judge via a raw-socket listener serving the documented shape), each with a real control plane and hub on 127.0.0.1, port 0.
 Tests use a throwaway `HOME`; never point a test at your real `~/.claude`, `~/.codex` or `~/.config/herdr`.
 `@pytest.mark.integration` smoke runs the real `claude mcp add` line (skipped when `claude` is not on PATH):
 `python3 -m pytest tests/control_plane/test_assistant_hub_e2e.py -m integration`.

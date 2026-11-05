@@ -638,3 +638,69 @@ def test_hook_labels_untrusted_and_fails_silent():
     assert mcp.run_hook("claude", "SessionStart", io.StringIO("{}"), out, run=boom, which=lambda n: "/x") == 0
     assert out.getvalue() == ""
     assert mcp.run_hook("claude", "SessionStart", io.StringIO("{}"), out, which=lambda n: None) == 0
+
+
+# ---- guarded Claude lifecycle hooks -----------------------------------------
+
+GUARDED = {
+    ev: f'[ -x "/opt/herdr-eng" ] && "/opt/herdr-eng" memory hook claude {ev} || true # {mi.MARKER}'
+    for ev in ("SessionStart", "UserPromptSubmit")
+}
+OLD_UNGUARDED = {ev: f"/opt/herdr-eng memory hook claude {ev} # {mi.MARKER}" for ev in GUARDED}
+
+
+def _hook_cmds(home):
+    s = json.loads((home / ".claude/settings.json").read_text())
+    return {ev: [h["command"] for e in s["hooks"][ev] for h in e["hooks"] if mi.MARKER in h["command"]]
+            for ev in GUARDED}
+
+
+def _write_old_hooks(home):
+    (home / ".claude").mkdir(exist_ok=True)
+    hooks = {ev: [{"hooks": [{"type": "command", "command": "user-" + ev}]},
+                  {"hooks": [{"type": "command", "command": c, "timeout": 3}]}]
+             for ev, c in OLD_UNGUARDED.items()}
+    (home / ".claude/settings.json").write_text(json.dumps({"hooks": hooks}, indent=2) + "\n")
+
+
+def test_install_writes_guarded_hook_form(home):
+    inst(home).install()
+    assert _hook_cmds(home) == {ev: [c] for ev, c in GUARDED.items()}
+
+
+def test_repair_upgrades_old_unguarded_hooks_in_place_without_duplicates(home):
+    _write_old_hooks(home)
+    assert inst(home).verify(["claude"]).ok is False
+    res = inst(home).repair(["claude"])
+    assert res.ok
+    assert _hook_cmds(home) == {ev: [c] for ev, c in GUARDED.items()}
+    s = json.loads((home / ".claude/settings.json").read_text())
+    assert [e["hooks"][0]["command"] for e in s["hooks"]["SessionStart"]][0] == "user-SessionStart"
+
+
+def test_repair_on_guarded_hooks_is_a_noop(home):
+    inst(home).install()
+    before = snapshot(home)
+    res = inst(home).repair(["claude"])
+    assert all(r.action == "noop" for r in res.reports if r.unit == "hooks")
+    assert snapshot(home) == before
+
+
+def test_status_treats_guarded_hooks_as_healthy(home):
+    inst(home).install()
+    res = inst(home).status(["claude"])
+    assert res.ok
+    assert [r.state for r in res.reports if r.unit == "hooks"] == [mi.CURRENT]
+
+
+@pytest.mark.parametrize("with_binary", [False, True])
+def test_guarded_hook_command_runs_under_bin_sh(tmp_path, with_binary):
+    exe = tmp_path / "bin" / "herdr-eng"
+    exe.parent.mkdir()
+    if with_binary:
+        exe.write_text('#!/bin/sh\necho RAN "$@"\n')
+        exe.chmod(0o755)
+    cmd = mi._hook_command([str(exe)], "claude", "SessionStart")
+    out = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+    assert out.returncode == 0
+    assert out.stdout == ("RAN memory hook claude SessionStart\n" if with_binary else "")

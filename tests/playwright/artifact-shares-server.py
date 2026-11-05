@@ -214,6 +214,9 @@ class ArtifactFixture:
             item["diff"] = ArtifactBundle.diff(left, right, media_type=media)
         return {"version_id": version_id, "against": parents[0] if parents else None, "files": out}
 
+    async def lifecycle_of(self, artifact_id):
+        return "active"
+
     async def report_permission(self, artifact_id, principal_id, permission):
         return artifact_id in self.records
 
@@ -395,7 +398,7 @@ class ShareFixture:
                 self._event(share_id, "revoked", actor, {"was": was})
             return self._public(share_id)
 
-    async def live_total_bytes(self):
+    async def live_total_bytes(self, *, member=False):
         with _LOCK:
             return sum(r["total_bytes"] or 0 for r in self.rows.values() if r["state"] == "live")
 

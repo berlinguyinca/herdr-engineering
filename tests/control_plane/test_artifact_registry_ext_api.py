@@ -30,7 +30,8 @@ def running(dsn, blobs):
 
     adapter = SyncArtifactAdapter(factory)
     acl = ArtifactAcl(on_change=lambda action, payload: adapter("record_acl_event", action, payload))
-    server = ControlPlaneServer(ControlPlaneRepo(), artifact_store=adapter, artifact_acl=acl, rustfs=blobs, api_keys=KEYS)
+    server = ControlPlaneServer(ControlPlaneRepo(), artifact_store=adapter, artifact_acl=acl, rustfs=blobs, api_keys=KEYS,
+                                artifact_delete_owners=frozenset({hashlib.sha256(b"owner").hexdigest()[:16]}))
     thread = threading.Thread(target=server.serve, daemon=True)
     thread.start()
     server.wait_until_ready()
@@ -115,6 +116,7 @@ def test_lifecycle_routes_need_admin_and_hide_from_lookup(registry_pg):
         events = call(server, "GET", base + "/lifecycle")[1]["events"]
         assert [e["action"] for e in events] == ["archive", "restore", "tombstone"]
         assert call(server, "GET", base + "/lifecycle", key="other")[0] == 404
+        assert call(server, "POST", base + "/restore", {}, key="other")[0] == 404
         assert call(server, "POST", base + "/tombstone", {"reason": "x"}, key="agent")[0] == 403      # agents never delete
 
 

@@ -147,8 +147,9 @@ SESSION_GLOBAL_PER_MINUTE = 600     # verified session attempts across all lab s
 STATIC_MAX_BYTES = 1024 * 1024
 VENDOR_MAX_BYTES = 4 * 1024 * 1024   # the vendored pdf.js worker is ~1.4 MB
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parent / "share_static"
+SHARED_BY_MAX = 120      # ``state.json`` ``shared_by``: the creator's display name on a member-created link (artifact_share_api)
 VIEWER_FILE = "viewer.html"
-STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8",
+STATIC_FILES = {"lab-signin.js": "text/javascript; charset=utf-8", "share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8",
                 "annotate.js": "text/javascript; charset=utf-8", "anchor.js": "text/javascript; charset=utf-8",
                 "annotate.css": "text/css; charset=utf-8"}
 VIEW_FILE = "view.html"
@@ -172,7 +173,7 @@ _RANGE_SPEC = re.compile(r"(\d{0,19})-(\d{0,19})")
 _SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,768}")
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,6}")
-_VIEW_PLACEHOLDER = re.compile(r"\{\{(NONCE|MODE|CSRF_META|SWITCH|DATA_JSON|PANEL|CONTENT)\}\}")
+_VIEW_PLACEHOLDER = re.compile(r"\{\{(NONCE|MODE|CSRF_META|SWITCH|DATA_JSON|PANEL|CONTENT|BANNER)\}\}")
 
 _CSP_TEMPLATE = ("sandbox allow-scripts allow-downloads; default-src {self}; script-src {self} 'unsafe-inline' "
                  "'wasm-unsafe-eval'; style-src {self} 'unsafe-inline'; img-src {self} data: blob:; font-src {self} data:; "
@@ -202,6 +203,13 @@ MODE_SWITCH_TEMPLATE = (
     '<a data-herdr-mode-switch href="{href}" rel="noopener" style="position:fixed;right:12px;bottom:12px;'
     'z-index:2147483647;display:block;margin:0;padding:6px 12px;font:600 14px/1.4 system-ui,sans-serif;color:#fff;'
     'background:#1f4fd1;border-radius:6px;text-decoration:none;box-shadow:0 1px 4px rgba(0,0,0,.4)">Annotate</a>')
+SHARED_BY_BAR = (
+    '<div data-herdr-shared-by role="note" style="position:fixed!important;top:0!important;left:0!important;'
+    'right:0!important;z-index:2147483647!important;display:block!important;visibility:visible!important;'
+    'opacity:1!important;margin:0!important;padding:8px 12px!important;font:600 14px/1.4 system-ui,sans-serif!important;'
+    'color:#4a3b00!important;background:#fff3cd!important;border-bottom:1px solid #b8a04a!important;'
+    'text-align:center!important;transform:none!important;clip:auto!important;height:auto!important">{text}</div>')
+SHARED_BY_ETAG_SUFFIX = "-b1"
 UNAVAILABLE_BODY = b"Unavailable\n"
 JSON_HEADERS = (("Content-Type", "application/json"), ("X-Content-Type-Options", "nosniff"),
                 ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),
@@ -239,8 +247,13 @@ class ShareConfig:
     static_dir: Path | None = None
     annotations: dict = field(default_factory=lambda: annotation_settings(None))   # control_plane.share.annotations
     annotations_path: Path | None = None        # default: ``annotations.jsonl`` beside the events file
+    public_host: str | None = None              # control_plane.share.public_host: /s/ is served on this Host only (D9)
 
     def __post_init__(self) -> None:
+        if self.public_host is not None:
+            from .members_config import valid_public_host
+            if not valid_public_host(self.public_host):
+                raise ValueError("public_host must be a lowercase DNS name (no scheme, port or path)")
         if self.annotations_path is None:
             self.annotations_path = Path(self.events_path).with_name("annotations.jsonl")
 
@@ -360,7 +373,7 @@ class EventLog:
             self.append(share_id, "opened", actor, detail)
 
     def denied(self, share_id: str, actor: str, reason: str) -> None:
-        if self._denied.allow("%s\x00%s" % (share_id, reason)):   # per share: one link cannot silence the others
+        if self._denied.allow(f"{share_id}\x00{reason}"):   # per share: one link cannot silence the others
             self.append(share_id, "denied", actor, {"reason": reason})
 
     def append(self, share_id: str, kind: str, actor: str, detail: dict) -> None:
@@ -397,7 +410,7 @@ class EventLog:
 
     def _drop(self, why: str) -> None:
         self.dropped += 1
-        _log(why, "dropped=%d" % self.dropped)
+        _log(why, f"dropped={self.dropped}")
 
 
 class AnnotationLog:
@@ -450,6 +463,25 @@ def _log(reason: str, extra: str = "") -> None:
     """A rate-limited warning carrying a fixed reason code only (never a path, token or header value)."""
     if _log_limiter.allow(reason):
         log.warning("share-public: %s %s", reason, extra)
+
+
+def _record_event(append, *args) -> None:
+    """Run one event-log append (``events.opened`` / ``events.denied``); a failure is logged and never reaches the
+    reader (the audit trail must not break serving)."""
+    try:
+        append(*args)
+    except Exception:
+        _log("event append failed")
+
+
+def _write_body(handler, body: bytes) -> None:
+    """Write ``body`` in slices; a client that went away closes the connection instead of raising."""
+    try:
+        view = memoryview(body)
+        for at in range(0, len(view), WRITE_SLICE_BYTES):
+            handler.wfile.write(view[at:at + WRITE_SLICE_BYTES])
+    except (OSError, ValueError):
+        handler.close_connection = True
 
 
 # safe filesystem access: ``_open_beneath`` lives in ``collab_bridge_files`` (shared with the collab artifact bridge)
@@ -567,6 +599,9 @@ def _prepare(raw: dict) -> _Prepared:
         return bad("invalid_state")
     if entry not in index:
         return bad("invalid_state")
+    shared_by = raw.get("shared_by")
+    if "shared_by" in raw and (not isinstance(shared_by, str) or not shared_by or len(shared_by) > SHARED_BY_MAX):
+        return bad("invalid_state")       # the banner name is ours to bound: a bad one fails closed like any bad state
     state = ShareState(raw)
     state["entry"] = entry
     state.index = index
@@ -706,10 +741,7 @@ def deny(handler, state: dict | None, reason: str, actor: str = "public") -> Non
     _log("denied", reason)
     share_id = state.get("share_id") if isinstance(state, dict) else None
     if isinstance(share_id, str) and _SHARE_ID.fullmatch(share_id):
-        try:
-            handler.server.events.denied(share_id, actor, reason)
-        except Exception:
-            _log("event append failed")
+        _record_event(handler.server.events.denied, share_id, actor, reason)
     send_not_found(handler)
 
 
@@ -772,10 +804,9 @@ def _ascii_compatible(content_type: str, data: bytes) -> bool:
     return not data.startswith(_WIDE_BOMS) and b"\x00" not in data[:1024]
 
 
-def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
-    """``data`` with ``link`` inserted right after the first real ``<body ...>`` start tag (outside comments, script,
-    style, textarea and title), else after the first ``<html ...>`` tag, else after the doctype; None when the data has
-    none of them (the caller then serves the file untouched). Never inserts inside a script string or a comment."""
+def _anchor_index(data: bytes) -> int | None:
+    """The offset right after the first real ``<body ...>`` start tag (outside comments, script, style, textarea and
+    title), else after the first ``<html ...>`` tag, else after the doctype; None when the data has none of them."""
     html_end = doctype_end = None
     for match in _SCAN.finditer(data):
         tag = match.group("tag")
@@ -786,13 +817,128 @@ def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
             if end is None:
                 return None                      # an unterminated start tag: nothing safe to anchor on
             if tag.lower() == b"body":
-                return data[:end.end()] + link + data[end.end():]
+                return end.end()
             if html_end is None:
                 html_end = end.end()
         elif match.group("doctype") is not None and doctype_end is None and data[match.end() - 1 : match.end()] == b">":
             doctype_end = match.end()  # unterminated: it ran to the end of the data, nothing to anchor on
-    cut = html_end if html_end is not None else doctype_end
+    return html_end if html_end is not None else doctype_end
+
+
+# ---- the strict gate: member-link HTML is labelled only when its markup is unambiguous for every HTML5 tokenizer.
+# The scanner above reads comments and CDATA differently from a browser, so it cannot be
+# trusted to say where the bar lands. Instead of reconciling them, pages containing any construct whose tokenization is
+# a browser-specific corner are refused (a uniform 404 at serve time, ``unsupported_html`` at approve).
+_AMBIGUOUS = re.compile(rb"<!\[|<!-->|<!--->|--!>|<\?|\x00|</(?![A-Za-z])|<frame(?:set)?(?=[\s/>])", re.I)        # CDATA, abrupt comments, PI, bogus end tags, frames (a frameset page ignores <body>, so it cannot carry the bar)
+_BANG = re.compile(rb"<!")
+_BANG_OK = re.compile(rb"<!(?:--(?:[^-]|-(?!-))*-->|doctype(?=[\s>]))", re.I)     # a clean comment (no "--" inside) or a doctype
+_COMMENT = re.compile(rb"<!--(?:[^-]|-(?!-))*-->")
+_WS = re.compile(rb"[ \t\r\n\f]+")
+_DOCTYPE = re.compile(rb"<!doctype[^>]*>", re.I)
+_ATTRS = (rb"(?:[ \t\r\n\f]+[^\s\"'<>/=`]+(?:[ \t\r\n\f]*=[ \t\r\n\f]*(?:\"[^\"<>]*\"|'[^'<>]*'|[^\s\"'<>=`]+))?)*"
+          rb"[ \t\r\n\f]*")
+_START = re.compile(rb"<([A-Za-z][A-Za-z0-9]*)" + _ATTRS + rb"(/?)>")
+_HEAD_END = re.compile(rb"</head[ \t\r\n\f]*>", re.I)
+_VOID_HEAD = frozenset({b"meta", b"link", b"base"})
+_RAW_HEAD = frozenset({b"title", b"style", b"script", b"noscript"})
+_NOSCRIPT_BODY = re.compile(rb"(?:[ \t\r\n\f]+|<(?:meta|link)" + _ATTRS + rb"/?>|<style" + _ATTRS + rb">[^<]*</style[ \t\r\n\f]*>)*",
+                            re.I)
+
+
+def _well_formed_markup(data: bytes) -> bool:
+    """True when ``data`` has none of: ``<![``, ``<!-->``, ``<!--->``, ``--!>``, ``<?``, NUL, ``</`` + a non-letter, a
+    ``<!`` that is not ``<!doctype`` or a comment without ``--`` inside it (and ending in ``-->``)."""
+    if _AMBIGUOUS.search(data):
+        return False
+    return all(_BANG_OK.match(data, m.start()) for m in _BANG.finditer(data))
+
+
+def _raw_element_end(prefix: bytes, pos: int, name: bytes) -> int | None:
+    """Offset after the plain closer of the raw-text element whose start tag ends at ``pos``, or None when there is no
+    closer, the first ``</name`` is not a plain ``</name>``, or the body holds markup that changes how it ends."""
+    closer = re.compile(rb"</" + name + rb"(?=[\s/>])", re.I).search(prefix, pos)
+    if closer is None:
+        return None
+    plain = re.compile(rb"</" + name + rb"[ \t\r\n\f]*>", re.I).match(prefix, closer.start())
+    body = prefix[pos:closer.start()]
+    if plain is None or (name in (b"script", b"style") and re.search(rb"<!--|<script", body, re.I)):
+        return None
+    if name == b"noscript" and not _NOSCRIPT_BODY.fullmatch(body):
+        return None
+    return plain.end()
+
+
+def _prefix_allowed(prefix: bytes) -> bool:
+    """Structural allowlist for the bytes before the injection anchor (``prefix`` ends with the anchor tag itself). Only
+    these may appear: whitespace, one doctype (first), well-formed comments, the start tags html and head (once, in
+    order) with plain attributes, meta / link / base, and title / style / script / noscript elements with a plain
+    closer (noscript only holding meta, link and style), ``</head>``, and finally ``<body ...>`` as the last token.
+    Any other element, any text, a stray closer, or a ``/>`` on a non-void element refuses the page, so nothing
+    before the anchor can open an element the parser would still have open (or a mode it would stay in) at the bar."""
+    pos, size, stage = 0, len(prefix), 0       # stage: 0 nothing yet, 1 after html, 2 in head, 3 after </head>
+    seen_doctype = False
+    while pos < size:
+        if match := _WS.match(prefix, pos) or _COMMENT.match(prefix, pos):
+            pos = match.end()
+        elif match := _DOCTYPE.match(prefix, pos):
+            if seen_doctype or stage:
+                return False
+            seen_doctype, pos = True, match.end()
+        elif match := _HEAD_END.match(prefix, pos):
+            if stage != 2:
+                return False
+            stage, pos = 3, match.end()
+        elif match := _START.match(prefix, pos):
+            name, slash = match.group(1).lower(), match.group(2)
+            pos = match.end()
+            if name == b"body":
+                return pos == size and not slash
+            if name in _VOID_HEAD and stage < 3:
+                stage = 2 if stage < 2 else stage
+            elif slash:
+                return False
+            elif name == b"html" and stage == 0:
+                stage = 1
+            elif name == b"head" and stage < 2:
+                stage = 2
+            elif name in _RAW_HEAD and stage < 3:
+                stage = 2
+                end = _raw_element_end(prefix, pos, name)
+                if end is None:
+                    return False
+                pos = end
+            else:
+                return False
+        else:
+            return False
+    return True
+
+
+def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
+    """``data`` with ``link`` inserted at ``_anchor_index``; None when there is no anchor (the caller then serves the
+    file untouched). Never inserts inside a script string or a comment (but see ``labelled_html`` for the strict check)."""
+    cut = _anchor_index(data)
     return None if cut is None else data[:cut] + link + data[cut:]
+
+
+def labelled_html(data: bytes, content_type: str, bar: bytes, link: bytes = b"") -> bytes | None:
+    """``data`` with ``bar`` (and then ``link``) inserted where a browser will render the bar as a top-level element, or
+    None when that cannot be shown: non-ASCII-compatible bytes, markup the strict gate calls ambiguous
+    (``_well_formed_markup``) or anything but the allowlisted head constructs before the anchor (``_prefix_allowed``).
+    A page with no html, head or body anchor at all gets the bar first. Never returns an unlabelled page."""
+    if not _ascii_compatible(content_type, data):
+        return None
+    cut = _anchor_index(data)
+    cut = 0 if cut is None else cut
+    if not _well_formed_markup(data) or not _prefix_allowed(data[:cut]):
+        return None
+    return data[:cut] + bar + link + data[cut:]
+
+
+def shared_by_bar(name: str) -> bytes:
+    """The fixed, non-dismissable top bar for a member-created link; ``name`` is HTML-escaped."""
+    text = f"Shared by {html.escape(name)} \u2014 content was not reviewed by the operator"
+    return SHARED_BY_BAR.format(text=text).encode("utf-8")
 
 
 def _read_all(fd: int, size: int) -> bytes | None:
@@ -848,19 +994,34 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         if st.st_size != size:
             deny(handler, state, "size_mismatch", actor)
             return False
-        etag = '"%s"' % item["sha256"]
+        etag = f'"{item["sha256"]}"'
         csp = sandbox_csp(getattr(handler.server, "public_origin", None), token)
         injected = None
-        if (mode_switch is not None and content_type_for(name).split(";")[0].strip() == "text/html"
-                and size <= MODE_SWITCH_MAX_BYTES):
-            data = _read_all(fd, size)
-            if data is None:
-                deny(handler, state, "size_mismatch", actor)
-                return False
-            if _ascii_compatible(content_type_for(name), data):
-                injected = inject_mode_switch(data, mode_switch.encode("ascii"))
-            if injected is not None:
-                return _serve_with_link(handler, state, name, item, injected, csp, cors=cors, actor=actor)
+        is_html = content_type_for(name).split(";")[0].strip() == "text/html"
+        shared_by = state.get("shared_by") if is_html else None
+        bar = shared_by_bar(shared_by) if isinstance(shared_by, str) else b""
+        if is_html and (bar or mode_switch is not None):
+            if size > MODE_SWITCH_MAX_BYTES:
+                if bar:      # a labelled page is never served unlabelled
+                    deny(handler, state, "banner_unavailable", actor)
+                    return False
+            else:
+                data = _read_all(fd, size)
+                if data is None:
+                    deny(handler, state, "size_mismatch", actor)
+                    return False
+                link = mode_switch.encode("ascii") if mode_switch is not None else b""
+                if bar:
+                    injected = labelled_html(data, content_type_for(name), bar, link)
+                    if injected is None:      # fail closed: a labelled page is never served unlabelled or with a hidden bar
+                        deny(handler, state, "banner_unavailable", actor)
+                        return False
+                elif _ascii_compatible(content_type_for(name), data):
+                    injected = inject_mode_switch(data, link)
+                if injected is not None:
+                    suffix = (SHARED_BY_ETAG_SUFFIX if bar else "") + (MODE_SWITCH_ETAG_SUFFIX if mode_switch is not None else "")
+                    return _serve_with_link(handler, state, name, item, injected, csp, cors=cors, actor=actor,
+                                            etag_suffix=suffix)
         headers = _content_headers(name, etag, csp, sandbox_pdf=sandbox_pdf)
         if _announces_body(handler):
             handler.close_connection = True
@@ -883,22 +1044,19 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         if range_value is not None and (if_range is None or if_range.strip() == etag):
             parsed = parse_range(range_value, size)
             if parsed == "unsatisfiable":
-                _send_headers(handler, 416, [("Content-Range", "bytes */%d" % size), ("Content-Length", "0"),
+                _send_headers(handler, 416, [("Content-Range", f"bytes */{size}"), ("Content-Length", "0"),
                                              ("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")],
                               cors=cors)
                 return True
             if parsed is not None:
                 start, end = parsed
                 status = 206
-                headers.append(("Content-Range", "bytes %d-%d/%d" % (start, end, size)))
+                headers.append(("Content-Range", f"bytes {start}-{end}/{size}"))
         length = end - start + 1 if size else 0
         headers.append(("Content-Length", str(length)))
         _send_headers(handler, status, headers, cors=cors)
         if handler.command == "GET" and status == 200 and name == state.get("entry"):
-            try:
-                handler.server.events.opened(share_id, actor, {"file": name[:200]})
-            except Exception:
-                _log("event append failed")
+            _record_event(handler.server.events.opened, share_id, actor, {"file": name[:200]})
         if handler.command == "HEAD":
             return True
         offset, remaining = start, length
@@ -921,10 +1079,10 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
 
 
 def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, csp: str, *, cors: bool,
-                     actor: str) -> bool:
+                     actor: str, etag_suffix: str = MODE_SWITCH_ETAG_SUFFIX) -> bool:
     """The full 200 of ``body`` (an HTML file with the mode-switch link injected; see ``serve_bundle_file``). The ETag is
     the index sha256 plus ``-m1``, as for the raw file (the same size-only integrity check as the raw route)."""
-    etag = f'"{item["sha256"]}{MODE_SWITCH_ETAG_SUFFIX}"'
+    etag = f'"{item["sha256"]}{etag_suffix}"'
     headers = [h for h in _content_headers(name, etag, csp) if h[0] != "Accept-Ranges"] + [("Vary", "Sec-Fetch-Dest")]
     if _announces_body(handler):
         handler.close_connection = True
@@ -943,17 +1101,9 @@ def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, c
             return True
     _send_headers(handler, 200, headers + [("Content-Length", str(len(body)))], cors=cors)
     if handler.command == "GET" and name == state.get("entry"):
-        try:
-            handler.server.events.opened(state["share_id"], actor, {"file": name[:200]})
-        except Exception:
-            _log("event append failed")
+        _record_event(handler.server.events.opened, state["share_id"], actor, {"file": name[:200]})
     if handler.command != "HEAD":
-        try:
-            view = memoryview(body)
-            for at in range(0, len(view), WRITE_SLICE_BYTES):
-                handler.wfile.write(view[at:at + WRITE_SLICE_BYTES])
-        except (OSError, ValueError):
-            handler.close_connection = True
+        _write_body(handler, body)
     return True
 
 
@@ -1058,7 +1208,20 @@ class ShareHandler(BaseHTTPRequestHandler):
             else:
                 self.close_connection = True
 
+    def _host_ok(self) -> bool:
+        """With a configured ``public_host`` the request must carry exactly one Host naming it (D9)."""
+        wanted = self.server.config.public_host
+        if wanted is None:
+            return True
+        hosts = self.headers.get_all("Host") or []
+        if len(hosts) != 1:
+            return False
+        host = hosts[0].strip().lower()
+        return host == wanted or host == wanted + ":443"
+
     def _route(self):
+        if not self._host_ok():
+            return deny(self, None, "wrong_host")
         raw = self.path
         if len(raw) > MAX_RAW_PATH or not raw.startswith("/s/"):
             return deny(self, None, "unknown_route")
@@ -1220,12 +1383,9 @@ class ShareHandler(BaseHTTPRequestHandler):
             headers += [("Cross-Origin-Opener-Policy", "same-origin"), ("Cross-Origin-Resource-Policy", "same-origin")]
         _send_headers(self, 200, headers, cors=False)
         if self.command == "GET" and name == state.get("entry"):
-            try:
-                server.events.opened(share_id, actor, {"file": name[:200], "mode": mode})
-            except Exception:
-                _log("event append failed")
+            _record_event(server.events.opened, share_id, actor, {"file": name[:200], "mode": mode})
         if self.command != "HEAD":
-            self.wfile.write(body)
+            _write_body(self, body)
         return None
 
     @staticmethod
@@ -1277,8 +1437,11 @@ class ShareHandler(BaseHTTPRequestHandler):
             token = csrf_token(lab.secret, state["share_id"], parts[4])
             csrf = f'<meta name="herdr-annotate-csrf" content="{html.escape(token)}">'
             panel = '<aside data-annotate-panel aria-label="Annotations"></aside>'
+        shared_by = state.get("shared_by")
+        banner = (f'<aside class="herdr-shared-by" role="note">Shared by {html.escape(shared_by)} \u2014 content was not '
+                  'reviewed by the operator</aside>') if isinstance(shared_by, str) else ""
         values = {
-            "NONCE": nonce, "MODE": mode, "CSRF_META": csrf, "PANEL": panel,
+            "BANNER": banner, "NONCE": nonce, "MODE": mode, "CSRF_META": csrf, "PANEL": panel,
             "SWITCH": '<nav data-mode-switch aria-label="View mode">' + "".join(links) + "</nav>",
             "DATA_JSON": f'<script type="application/json" id="herdr-view-data" nonce="{nonce}">{data_json}</script>',
             "CONTENT": content}
@@ -1314,10 +1477,7 @@ class ShareHandler(BaseHTTPRequestHandler):
 
     def _annotate_error(self, state: ShareState, got: dict, status: int, code: str):
         """A JSON refusal (400/409/429/503) that also leaves a ``denied`` event with a fixed reason code."""
-        try:
-            self.server.events.denied(state["share_id"], got["identity"], "annotate_" + code)
-        except Exception:
-            _log("event append failed")
+        _record_event(self.server.events.denied, state["share_id"], got["identity"], "annotate_" + code)
         self._send_json(status, {"error": code})
         return None
 
@@ -1542,7 +1702,7 @@ class ShareServer(ThreadingHTTPServer):
         text = (static / VIEW_FILE).read_text(encoding="utf-8") if (static / VIEW_FILE).is_file() else ""
         found = [m.group(1) for m in _VIEW_PLACEHOLDER.finditer(text)]
         if self.lab is not None and sorted(found) != sorted(["NONCE", "MODE", "CSRF_META", "SWITCH", "DATA_JSON",
-                                                              "PANEL", "CONTENT"]):
+                                                              "PANEL", "CONTENT", "BANNER"]):
             raise RuntimeError("share_static/view.html must hold each placeholder exactly once")
         return text
 

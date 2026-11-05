@@ -33,7 +33,9 @@ def test_legacy_name_conflicts_do_not_discard_sessions_or_reassign_aliases():
     assert 'conflict' in sessions['one']['name_error']
     assert sessions['three']['display_name'] == 'Grace'
     assert repo.agent_identities.conflict_count == 2
-    assert repo.export_state()['agent_projections'] == original
+    # export_state() orders projections by key since aa35edb2 ("stabilize identity exports"), not by insertion order
+    by_key = lambda rows: sorted(rows, key=lambda e: (e['entity_type'], e['entity_id']))  # noqa: E731
+    assert by_key(repo.export_state()['agent_projections']) == by_key(original)
     assert not any(e['entity_type'] == 'agent_identity' for e in repo.recent_events())
     new = repo.agent_identities.allocate('four', 'Ada')
     assert new['display_name'] != 'Ada'

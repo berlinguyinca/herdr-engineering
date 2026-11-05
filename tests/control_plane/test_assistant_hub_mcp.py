@@ -60,7 +60,7 @@ def test_initialize_and_tools_list():
     names = {t["name"] for t in body["result"]["tools"]}
     assert names == {"assistant_ask", "report", "memory_search", "grants_list", "approvals_list",
                      "routines_list", "connectors_list", "delegations_list", "proposals_list",
-                     "action_grants_list"}
+                     "action_grants_list", "judge_status"}
     full = enrol(hub, user="u2", scopes=["ask", "report", "read", "act"])
     _, body = rpc(hub, full, "tools/list")
     assert "action_request" in {t["name"] for t in body["result"]["tools"]}
@@ -276,14 +276,14 @@ def test_everything_inert_when_feature_disabled():
     calls = {"assistant_ask": {"question": "q", "session_id": "s"}, "report": {"kind": "outcome", "session_id": "s"},
              "memory_search": {"query": "x"}, "grants_list": {}, "approvals_list": {}, "routines_list": {},
              "connectors_list": {}, "delegations_list": {}, "proposals_list": {},
-             "action_grants_list": {}, "action_request": {"tool": "Bash", "session_id": "s", "task_id": "t"}}
+             "action_grants_list": {}, "judge_status": {}, "action_request": {"tool": "Bash", "session_id": "s", "task_id": "t"}}
     for name, args in calls.items():
         res = call(hub, auth, name, args)
         assert res["isError"] is True and "not enabled" in res["content"][0]["text"], name
     assert list_events(hub.store, tenant_id="t1", user_id="u1") == []
     assert rpc(hub, auth, "initialize")[0] == 200
     assert rpc(hub, auth, "ping")[0] == 200
-    assert len(rpc(hub, auth, "tools/list")[1]["result"]["tools"]) == 11
+    assert len(rpc(hub, auth, "tools/list")[1]["result"]["tools"]) == 12
 
 
 def test_memory_search_target_is_deterministic_and_selectable():

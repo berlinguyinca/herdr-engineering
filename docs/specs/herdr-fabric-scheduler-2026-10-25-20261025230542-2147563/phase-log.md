@@ -1,5 +1,10 @@
 # Phase boundary log
 
+This is a historical implementation log containing both local prototypes and
+subsequently merged components. Its completion statements are not current
+acceptance evidence. Use [the 2026-11-04 reconciliation](reconciliation-2026-11-04.md)
+for the main-branch status, newer deferrals, and remaining gates.
+
 ## P00 — audit
 
 - Changed files: `audit.md`, `launch-path-matrix.md`, implementation plan.
