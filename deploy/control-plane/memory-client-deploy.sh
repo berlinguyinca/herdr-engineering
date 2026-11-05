@@ -110,6 +110,15 @@ memory_client_apply() {  # forward|rollback <the matching source tree>
   fi
 }
 
+memory_client_forward_connectivity() {
+  [ "${MEMORY_PRIVATE_EGRESS:-0}" = 1 ] || return 0
+  [ "${MEMORY_PRIVATE_EGRESS_CHANGED:-0}" = 1 ] || return 0
+  [ "${MEMORY_CLIENT_SUPPORTED:-0}" = 1 ] || return 0
+  [ "${MEMORY_CLIENT_ENABLED:-0}" = 1 ] || return 0
+  [ "${MEMORY_CLIENT_MODE:-unmanaged}" = install ] || return 0
+  memory_client_cmd "$1" connectivity --container "$(container_of control-plane-web)"
+}
+
 memory_client_promote() {
   [ "$MEMORY_CLIENT_SUPPORTED" = 1 ] || return 0
   if [ "$MEMORY_CLIENT_MODE" = install ]; then
