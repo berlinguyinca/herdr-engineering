@@ -143,3 +143,57 @@ test('G1 real server, flag OFF: the weekly endpoint is 404 and the page never as
   assert.deepEqual(calls,[]);
  });
 });
+
+// G9: Pi-reported next action and Pi issue links, from a real Pi-shaped activity snapshot ingested by the real server
+// (tests/playwright/server.py PI_ACTIVITY_SEED=1). Only the GitHub projects feed is stubbed, as above.
+const projectsStub=async(page,items)=>{
+ const board={project_id:'PVT_1',owner:'org',number:1,title:'Roadmap',url:'https://github.com/orgs/org/projects/1',closed:false,updated_at:'2026-10-24T00:00:00Z',item_count:items.length,status_options:[{id:'o1',name:'Todo'}],complete:true,error:null};
+ const sync={available:true,status:'ready',connection_generation:1,projects_sync:{enabled:true,status:'ready',error:null,projects:1,deferred:0},revision:3};
+ await page.route('**/api/v1/github/projects**',route=>{
+  const u=new URL(route.request().url());
+  route.fulfill({json:u.searchParams.get('project')?{...sync,project:board,items}:{...sync,projects:[board]}});
+ });
+};
+const issue=(id,n)=>({item_id:id,project_id:'PVT_1',type:'ISSUE',status_option:'o1',status:'Todo',title:`Issue ${n}`,number:n,url:`https://github.com/org/app/issues/${n}`,repository:'org/app',state:'OPEN',position:n});
+
+test('G9 real server, flag ON: session page shows the Pi-reported next action and an issue card verifies through Pi issue_refs',async()=>{
+ await withServer({WORK_CENTER:'1',PI_ACTIVITY_SEED:'1'},async(page,base)=>{
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  const {sessions}=await json(base,'/api/v1/sessions');
+  const piSession=sessions.find(s=>s.mission_key==='pi:MSN-PI1');
+  assert.ok(piSession,'the seed has an agent in the Pi mission');
+  const refs=await json(base,'/api/v1/mission-outcomes');
+  assert.deepEqual(refs.issue_refs,{'pi:MSN-PI1':[{repository:'org/app',number:321}]});
+  await page.goto(`${base}/index.html#/herd/session/${encodeURIComponent(piSession.session_id)}`);
+  await page.locator('[data-work-context]').waitFor({timeout:15000});
+  await until(async()=>(await page.locator('[data-work-context]').getAttribute('data-state'))!=='loading','work context settled');
+  assert.equal(await page.locator('[data-work-context]').getAttribute('data-state'),'linked');
+  assert.equal(await page.locator('[data-work-context] [data-next-action]').innerText().then(t=>t.includes('Run the integration suite')),true);
+  // Issue card: org/app#321 is Pi-linked to exactly one mission; #322 is not linked.
+  await projectsStub(page,[issue('I-321',321),issue('I-322',322)]);
+  await page.goto(`${base}/index.html#/github/projects?project=PVT_1`);
+  await page.locator('[data-ghp-item="I-321"] [data-herdr-link]').waitFor({timeout:15000});
+  assert.equal(await page.locator('[data-ghp-item="I-321"] [data-herdr-link]').getAttribute('href'),`#/missions/${encodeURIComponent('pi:MSN-PI1')}`);
+  assert.equal(await page.locator('[data-ghp-item="I-322"] [data-herdr-link]').count(),0);
+  await page.locator('[data-ghp-item="I-321"] [data-herdr-link]').click();
+  await until(async()=>(await page.evaluate(()=>location.hash))===`#/missions/${encodeURIComponent('pi:MSN-PI1')}`,'mission route');
+  assert.deepEqual(errors.filter(m=>!/Failed to load resource/.test(m)),[]);
+ });
+});
+
+test('G9 real server, flag OFF with the same Pi data: no next action row and no Open in Herdr on the issue card',async()=>{
+ await withServer({PI_ACTIVITY_SEED:'1'},async(page,base)=>{
+  const {sessions}=await json(base,'/api/v1/sessions');
+  const piSession=sessions.find(s=>s.mission_key==='pi:MSN-PI1');
+  assert.ok(!(await json(base,'/api/v1/health?probe=1')).capabilities.includes('work_center_v1'));
+  await page.goto(`${base}/index.html#/herd/session/${encodeURIComponent(piSession.session_id)}`);
+  await page.locator('#session-terminal').waitFor({timeout:15000});
+  await sleep(500);
+  assert.equal(await page.locator('[data-work-context], [data-next-action]').count(),0);
+  await projectsStub(page,[issue('I-321',321)]);
+  await page.goto(`${base}/index.html#/github/projects?project=PVT_1`);
+  await page.locator('[data-ghp-item="I-321"]').waitFor({timeout:15000});
+  await sleep(500);
+  assert.equal(await page.locator('[data-herdr-link], [data-herdr-partial]').count(),0);
+ });
+});
