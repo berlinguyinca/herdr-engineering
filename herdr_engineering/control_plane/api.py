@@ -2127,6 +2127,17 @@ def _make_handler(server, public=False, operator=False):
                         and artifact_id and self._artifact_call(
                 "report_permission", artifact_id, self._resource_principal(), permission, **extra))
 
+        def _registry_read_ok(self, artifact_id):
+            """Principal check for registry-backed reads when no in-memory ACL exists (embedded/test setups).
+
+            With an ``ArtifactAcl`` the ACL already decided (production: unchanged, True here). Without one but with a
+            registry store, the registry's ``report_permission`` decides; a caller it refuses gets the same plain 404 as a
+            missing id."""
+            if server.artifact_store is None or server.artifact_acl is not None:
+                return True
+            return bool(artifact_id and self._artifact_call(
+                "report_permission", artifact_id, self._resource_principal(), "read"))
+
         def _artifact_acl_allows(self, artifact_id, permission):
             principal = self._resource_principal()
             if server.artifact_acl.can(artifact_id, principal, permission):
@@ -3771,6 +3782,8 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({**page, "events": [_redact_event(event) for event in page["events"]]})
                     return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
+                if not self._registry_read_ok(parts[4]):
+                    return self._json({"error": "not found"}, 404)
                 a, data = self._artifact_current_file(parts[4])
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
@@ -3831,9 +3844,7 @@ def _make_handler(server, public=False, operator=False):
                 if len(parts) == 6 and parts[5] == "reviews":
                     # without an ACL the registry decides (like the versions routes); with one, the blanket guard above already did
                     # (legacy uploads have no registry row). No answer reveals that the artifact exists
-                    if (server.artifact_store is not None and server.artifact_acl is None
-                            and not self._artifact_call(
-                            "report_permission", parts[4], self._resource_principal(), "read")):
+                    if not self._registry_read_ok(parts[4]):
                         return self._json({"error": "not found"}, 404)
                     return self._json({"artifact_id": parts[4],
                                        "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})
@@ -3848,7 +3859,8 @@ def _make_handler(server, public=False, operator=False):
                            else server.artifact_job_manager.get(parts[4]))
                     if job is None:
                         return self._json({'error': 'not found'}, 404)
-                    if not self._artifact_allowed(job['artifact_id'], 'read'):
+                    if (not self._artifact_allowed(job['artifact_id'], 'read')
+                            or not self._registry_read_ok(job['artifact_id'])):
                         return self._json({'error': 'not found'}, 404)
                     server.artifact_job_manager.load([job])
                     if job.get("profile") == "report" and server.artifact_store is not None:
@@ -3859,17 +3871,20 @@ def _make_handler(server, public=False, operator=False):
             if resource == "artifact-reviews" and server.artifact_review_manager is not None:
                 if len(parts) == 5:
                     review = server.artifact_review_manager.get(parts[4])
-                    if review and not self._artifact_allowed(review['artifact_id'], 'read'):
+                    if review and (not self._artifact_allowed(review['artifact_id'], 'read')
+                                   or not self._registry_read_ok(review['artifact_id'])):
                         return self._json({'error': 'not found'}, 404)
                     return self._json(review) if review else self._json({"error": "not found"}, 404)
             if resource == "publications" and server.publication_controller is not None:
                 if len(parts) == 4:
                     publications = [p for p in server.publication_controller.list()
-                                    if self._artifact_allowed(p['resource_id'], 'read')]
+                                    if self._artifact_allowed(p['resource_id'], 'read')
+                                    and self._registry_read_ok(p['resource_id'])]
                     return self._json({"publications": publications})
                 if len(parts) == 5:
                     publication = server.publication_controller.get(parts[4])
-                    if publication and not self._artifact_allowed(publication['resource_id'], 'read'):
+                    if publication and (not self._artifact_allowed(publication['resource_id'], 'read')
+                                        or not self._registry_read_ok(publication['resource_id'])):
                         return self._json({'error': 'not found'}, 404)
                     return self._json(publication) if publication else self._json({"error": "not found"}, 404)
             if resource == "leases":
