@@ -288,15 +288,19 @@ def collect_status(host_id: str, *, binary: str | None = None, home: Path | None
 
 
 class AiSyncFeed:
-    def __init__(self, client, *, host_id, binary=None, home=None, clock=time.monotonic):
+    def __init__(self, client, *, host_id, binary=None, home=None, timeout: float = _TOOL_TIMEOUT,
+                 clock=time.monotonic):
         if not isinstance(host_id, str) or not host_id or len(host_id) > 200:
             raise ValueError("invalid host identity")
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 5 <= timeout <= 3600:
+            raise ValueError("timeout must be 5-3600 seconds")
         self.client, self.host_id, self.binary, self.home, self.clock = client, host_id, binary, home, clock
+        self.timeout = float(timeout)
         self.last_fingerprint: str | None = None
         self.last_post = 0.0
 
     def run_once(self, *, dry_run=False):
-        payload = collect_status(self.host_id, binary=self.binary, home=self.home)
+        payload = collect_status(self.host_id, binary=self.binary, home=self.home, timeout=self.timeout)
         summary = dict(posted=0, unchanged=0, errors=0, dry_run=dry_run, drifted=payload["drifted_files_count"],
                        last_error=payload["last_error"])
         if dry_run:
@@ -327,6 +331,9 @@ def main(argv=None):
     parser.add_argument("--host-id", default=None, help="host id (default: host.json host_id)")
     parser.add_argument("--api-key-file", default=None, help="read the ingest key from this file (default: ingest.api_key)")
     parser.add_argument("--ai-sync-bin", default=None, help="path to the ai-sync executable (default: search PATH)")
+    parser.add_argument("--timeout", type=float, default=_TOOL_TIMEOUT,
+                        help="per ai-sync command timeout in seconds (default 20; raise it on hosts "
+                             "where `ai-sync status` is slow, e.g. large local repos)")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--loop", type=float)
     parser.add_argument("--dry-run", action="store_true")
@@ -348,7 +355,7 @@ def main(argv=None):
         if key and len(key) > 8192:
             raise ValueError("invalid API key file")
         agent = AiSyncFeed(MetadataClient(resolve_control_plane(args.control_plane), key),
-                           host_id=args.host_id or cfg.host_id, binary=args.ai_sync_bin)
+                           host_id=args.host_id or cfg.host_id, binary=args.ai_sync_bin, timeout=args.timeout)
     except (OSError, ValueError):
         parser.exit(1, "ai-sync status reporter configuration is unavailable or invalid.\n")
     refresher = None

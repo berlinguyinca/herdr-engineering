@@ -5,6 +5,14 @@ it exclusively for discovery, validation and removal. Linux process inspection
 also protects workspaces used by visible commands outside the build gate.
 Inaccessible Herdr descendants or unknown ancestry always preserve files. Only current-user Cargo ``target``
 directories inside explicit roots are eligible; no symlinks are followed.
+
+When ``build-registry.db`` exists in the state directory (spec 05), a target whose
+project directory is related (equal, inside or containing, by path prefix) to the
+scope of an unexpired build lease is preserved (``active_lease``). The lease is
+re-read right before deletion. A registry that exists but cannot be read makes the
+whole pass fail closed (``registry_unreadable``). Leases only ever ADD protection:
+the flock and /proc defences above are unchanged, and no registry file means
+exactly the legacy behaviour.
 """
 from __future__ import annotations
 
@@ -157,6 +165,32 @@ def _untracked(target: Path) -> bool:
     return result.returncode == 0 and not result.stdout
 
 
+def _recognized(target: Path) -> bool:
+    """Same recognition rule as discovery: a Cargo ``target`` with build markers."""
+    return (target.name == "target" and (target.parent / "Cargo.toml").is_file()
+            and any((target / m).exists() for m in
+                    (".rustc_info.json", "debug/.fingerprint", "release/.fingerprint")))
+
+
+def _lease_block(state_dir: Path, target: Path) -> str | None:
+    """Skip reason from the build registry, or None. Fresh read on every call."""
+    from .build_registry import RegistryError, active_scopes, db_path
+    if not db_path(state_dir).exists() and not db_path(state_dir).is_symlink():
+        return None
+    try:
+        scopes = active_scopes(state_dir)
+    except RegistryError:
+        return "registry_unreadable"
+    project = target.parent
+    for raw in scopes:
+        if not raw.startswith("/"):
+            continue  # named scopes do not describe a path
+        scope = Path(raw)
+        if project.is_relative_to(scope) or scope.is_relative_to(project):
+            return "active_lease"
+    return None
+
+
 def _usage(path: Path) -> float:
     usage = shutil.disk_usage(path)
     if usage.total <= 0:
@@ -197,7 +231,7 @@ def run_once(
     result = {
         "timestamp": datetime.now(UTC).isoformat(), "status": "ok", "dry_run": dry_run,
         "roots": [], "removed_count": 0, "removed_bytes": 0, "reclaimed_bytes": 0,
-        "removed": [], "would_remove": [], "skipped": [], "errors": [],
+        "removed": [], "would_remove": [], "skipped": [], "errors": [], "warnings": [],
     }
     lock_fd = os.open(state_dir / "build-maintenance.lock",
                       os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -208,12 +242,26 @@ def run_once(
             result["status"] = "busy"
             return result
         _sweep(roots, state_dir, result, high_water, low_water, min_age_hours)
+        if result["warnings"]:
+            result["status"] = "warning"
         if result["errors"]:
             result["status"] = "error"
         _write_status(state_dir, result)
         return result
     finally:
         os.close(lock_fd)
+
+
+def _skip_for_registry(state_dir: Path, target: Path, name: str, result: dict) -> bool:
+    reason = _lease_block(state_dir, target)
+    if reason is None:
+        return False
+    result["skipped"].append({"path": name, "reason": reason})
+    if reason == "registry_unreadable":
+        note = "build registry exists but is unreadable; skipping all candidates this pass"
+        if note not in result["warnings"]:
+            result["warnings"].append(note)
+    return True
 
 
 def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours):
@@ -265,6 +313,8 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours):
             if any(path.is_relative_to(target.parent) for path in active):
                 result["skipped"].append({"path": name, "reason": "active project"})
                 continue
+            if _skip_for_registry(state_dir, target, name, result):
+                continue
             if not _untracked(target):
                 result["skipped"].append({"path": name, "reason": "tracked or unverifiable output"})
                 continue
@@ -277,6 +327,10 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours):
             if any(path.is_relative_to(target.parent) for path in active):
                 result["skipped"].append({"path": name, "reason": "active project"})
                 continue
+            if _skip_for_registry(state_dir, target, name, result):
+                continue  # lease re-read after the last scan, before any removal
+            if not _recognized(target):
+                raise OSError(f"Target no longer recognized as a Cargo output: {name}")
             if result["dry_run"]:
                 result["would_remove"].append(name)
                 continue

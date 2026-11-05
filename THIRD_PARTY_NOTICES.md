@@ -13,3 +13,15 @@
 
 Copyright (c) 2025 CodeBoarding. Permission is granted under the MIT License
 text in the vendored file header.
+
+## pdf.js (Apache-2.0)
+
+- Upstream: https://github.com/mozilla/pdf.js, npm package pdfjs-dist 4.10.38 (tarball sha512 checked against the
+  registry's `dist.integrity` by `scripts/vendor-pdfjs.sh`).
+- Vendored, unmodified: `herdr_engineering/control_plane/share_static/vendor/pdfjs/pdf.min.mjs`,
+  `pdf.worker.min.mjs`, the upstream `LICENSE`, and `SHA256SUMS` (checked by `tests/control_plane/test_pdfjs_vendor.py`).
+  Both the dashboard and the share-public viewer serve these files.
+- Not vendored: `cmaps/`, `standard_fonts/` and `wasm/`, which pdf.js fetches on demand (CJK and non-embedded-font PDFs,
+  JPEG2000 and some image decoders may render poorly or not at all).
+
+Copyright Mozilla Foundation and contributors; licensed under the Apache License, Version 2.0 (see `LICENSE` there).

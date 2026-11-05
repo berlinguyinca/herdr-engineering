@@ -39,8 +39,17 @@ class Store:
     def sync_call(self, method, *args, **kwargs):
         return asyncio.run(getattr(self, method)(*args, **kwargs))
 
-    async def report_permission(self, aid, principal, permission):
+    async def tombstoned_ids(self):
+        return []
+
+    async def lifecycle_of(self, aid):
+        return "active"
+
+    async def report_permission(self, aid, principal, permission, **_):
         return aid == "artifact_report" and hashlib.sha256(b"owner-key").hexdigest()[:16] in principal
+
+    async def operator_member_access(self, aid, principal, permission):
+        return False
 
     async def get_report(self, aid, vid):
         if aid != "artifact_report" or vid not in {"v1", "v2"}:

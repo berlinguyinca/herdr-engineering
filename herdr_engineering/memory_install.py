@@ -35,9 +35,9 @@ from typing import Any
 MARKER = "herdr-memory:managed"
 ADAPTER_VERSION = 3
 # Pinned herdr-memory revision; must match lock/upstreams.yaml (tested).
-PINNED_REVISION = "cc20ad4d46845b8257e54596e152846e3ce4a3c2"
+PINNED_REVISION = "7d8499af11d3ef825ecf7fd3bba3189b0f56e5f7"
 #: Client release the fleet is expected to run (`herdr-memory --version`).
-PINNED_CLIENT_VERSION = "0.1.6"
+PINNED_CLIENT_VERSION = "0.1.7"
 #: An unattended controller update older than this looks like a timer that stopped landing.
 FRESH_UPDATE_HOURS = 26
 SERVER_NAME = "herdr-memory"
@@ -61,10 +61,23 @@ def _default_command() -> list[str]:
     return [exe] if exe else [sys.executable, "-m", "herdr_engineering.cli"]
 
 
+def _dq(arg: str) -> str:
+    """Double-quote one word for POSIX sh (escape the characters special inside "")."""
+    return '"' + "".join("\\" + c if c in '\\"$`' else c for c in arg) + '"'
+
+
 def _hook_command(command: list[str] | None, harness: str, event: str) -> str:
-    import shlex
+    """Guarded hook line: does nothing (exit 0) on a host without the executable.
+
+    ``[ -x EXE ] && EXE memory hook ... || true`` -- absolute path, no PATH
+    dependence, valid in /bin/sh.  Entries written by older versions lack the
+    guard but carry the same marker, so they are still recognised as ours and
+    upgraded in place.
+    """
     base = command or _default_command()
-    return f"{shlex.join([*base, 'memory', 'hook', harness, event])} # {MARKER}"
+    words = " ".join(_dq(w) if i == 0 else _dq(w) if any(c in w for c in ' \t"$`\\') else w
+                     for i, w in enumerate([*base, "memory", "hook", harness, event]))
+    return f"[ -x {_dq(base[0])} ] && {words} || true # {MARKER}"
 
 
 def _atomic_write(path: Path, text: str) -> None:
