@@ -228,3 +228,22 @@ def test_bidi_controls_are_refused_in_comments_and_anchors(ch):
 
 def test_ordinary_bidi_text_and_marks_are_still_accepted():
     assert clean_comment("שלום עולם مرحبا ‏‎ ok") == "שלום עולם مرحبا ‏‎ ok"
+
+
+INVISIBLE = [chr(c) for c in (0x80, 0x85, 0x9F, 0xAD, 0x2028, 0x2029, 0x2060, 0x2064, 0x206A, 0x206F, 0xFEFF, 0xFFF9, 0xFFFB,
+                              0xE0001, 0xE0041, 0xE007F, 0xE000, 0x0378)]
+
+
+@pytest.mark.parametrize("ch", INVISIBLE, ids=lambda c: f"U+{ord(c):04X}")
+def test_invisible_characters_are_refused_by_unicode_category(ch):
+    """Plan 4 C4: Cc, Cf, Cs, Co and Cn are refused (C1 controls, tag characters, invisible operators, BOM, annotation
+    anchors, private use, unassigned) apart from an explicit allow-list."""
+    assert code(clean_comment, f"hello {ch} world") == "bad_chars"
+    assert code(clean_anchor, {"kind": "text_quote", "file": "a", "exact": f"a{ch}b"}) == "bad_chars"
+    assert code(clean_anchor, {"kind": "text_quote", "file": "a", "exact": "x", "prefix": ch}) == "bad_chars"
+
+
+def test_joiners_and_directional_marks_are_still_accepted():
+    for ok in ("‍", "‌", "‎", "‏", "؜"):
+        assert clean_comment(f"a{ok}b") == f"a{ok}b"
+    assert clean_comment("👨‍👩‍👧 family\n\tindented") == "👨‍👩‍👧 family\n\tindented"

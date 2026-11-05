@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import unicodedata
 from typing import Final
 
 from .share_bundle import ShareBundleError, normalise_name
@@ -98,19 +99,25 @@ def annotation_settings(raw: dict[str, object] | None) -> dict[str, bool | int]:
     return out
 
 
-_BIDI_CONTROLS: Final = frozenset(chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)))
+# Format and control characters that are still wanted: the joiners emoji and Indic/Arabic text need, and the directional
+# marks (U+200E/F, U+061C ALM), which do not reorder surrounding text the way embeddings, overrides and isolates do.
+_ALLOWED_FORMAT: Final = frozenset("\u200c\u200d\u200e\u200f\u061c")
+_BAD_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
 
 
 def _bad_chars(text: str, *, allow_whitespace: bool) -> bool:
-    """Control characters, surrogates, NUL and the explicit bidi embedding/override/isolate controls (U+202A-202E,
-    U+2066-2069), which can make the owner read a note or quote in a different order than it was typed."""
+    """True when ``text`` has a character in the Unicode categories Cc, Cf, Cs, Co or Cn that is not explicitly allowed.
+
+    That covers C0/C1 controls, surrogates, private use and unassigned code points, and every invisible format character:
+    the bidi embeddings/overrides/isolates (U+202A-202E, U+2066-2069), tag characters (U+E0000-E007F), invisible operators
+    (U+2060-2064, U+206A-206F), U+FEFF, interlinear annotation (U+FFF9-FFFB), soft hyphen. U+2028/2029 are categories
+    Zl/Zp and are refused as well. Allowed: ZWJ, ZWNJ, the directional marks and, with ``allow_whitespace``, ``\\n`` and ``\\t``."""
     for ch in text:
-        o = ord(ch)
-        if ch in _BIDI_CONTROLS:
-            return True
-        if 0xD800 <= o <= 0xDFFF or o == 0 or o == 0x7F:
-            return True
-        if o < 0x20 and not (allow_whitespace and ch in "\n\t"):
+        if ch in _ALLOWED_FORMAT:
+            continue
+        if allow_whitespace and ch in "\n\t":
+            continue
+        if ch in "\u2028\u2029" or unicodedata.category(ch) in _BAD_CATEGORIES:
             return True
     return False
 
