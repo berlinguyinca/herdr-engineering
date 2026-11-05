@@ -297,7 +297,7 @@ def test_viewer_page_and_callback_served_with_strict_csp(lab):
         assert body == (STATIC_DIR / "viewer.html").read_bytes()
         assert h["content-length"] == str(len(body))
     html = (STATIC_DIR / "viewer.html").read_text()
-    assert '<script src="/s/static/share.js"' in html
+    assert '<script type="module" src="/s/static/share.js"' in html
     assert not re.search(r"<script(?![^>]*\bsrc=)", html), "inline script"
     assert not re.search(r"\son\w+\s*=", html, re.I), "inline handler"
     assert not re.search(r"\sstyle\s*=|<style", html, re.I), "inline style"
@@ -618,7 +618,8 @@ def test_share_js_parses():
 
 
 def test_share_js_hygiene():
-    js = (STATIC_DIR / "share.js").read_text()
+    # the PKCE helpers live in lab-signin.js (shared with the member page); the pair is checked as one
+    js = (STATIC_DIR / "share.js").read_text() + (STATIC_DIR / "lab-signin.js").read_text()
     assert "innerHTML" not in js and "outerHTML" not in js and "insertAdjacentHTML" not in js
     assert "document.write" not in js and "eval(" not in js
     assert "console." not in js and "localStorage" not in js

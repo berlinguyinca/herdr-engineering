@@ -70,7 +70,7 @@ class Reply:
 def stack(tmp_path):
     web = tmp_path / "web"
     web.mkdir()
-    (web / "member.html").write_text("<!doctype html><title>member</title>")
+    (web / "member-artifacts.html").write_text("<!doctype html><title>member</title>")
     svc = CollabService(authenticator(), sink=FileEventLog(str(tmp_path / "log")), now=Clock(),
                         approval=ApprovalPolicy(auto_groups=[GROUP, "Users"], approver_groups=["Administrators"]),
                         public_config={"client_id": "web-client", "hosted_ui_domain": "auth.lab.example"})
@@ -311,8 +311,14 @@ def test_the_page_csp_names_exact_files_and_never_a_bare_self_for_scripts(stack)
     for path in ("/", "/my/callback"):
         csp = req(stack, "GET", path, member=None).headers["content-security-policy"]
         parts = {d.split()[0]: d.split()[1:] for d in csp.split("; ")}
-        assert parts["script-src"] == [f"{ORIGIN}/my/member.js"]
-        assert parts["style-src"] == [f"{ORIGIN}/my/member.css"]
+        # the exact set of files the page loads (Task 12 ruling: its modules sit under /my/, each named, none inline)
+        assert sorted(parts["script-src"]) == sorted(f"{ORIGIN}/my/{n}" for n in (
+            "member-artifacts-app.js", "member-artifacts-view.js", "member-api.js", "member-upload.js", "sha256-stream.js",
+            "herdr-web-components/util.js", "lab-signin.js"))
+        assert sorted(parts["style-src"]) == sorted(f"{ORIGIN}/my/{n}" for n in (
+            "theme.css", "base.css", "member-artifacts.css"))
+        assert parts["frame-src"] == ["'none'"] and parts["object-src"] == ["'none'"]
+        assert "'unsafe-inline'" not in csp and "'unsafe-eval'" not in csp
         assert parts["connect-src"] == [f"{ORIGIN}/api/member/", "https://auth.lab.example"]
         assert parts["default-src"] == ["'none'"] and parts["base-uri"] == ["'none'"]
         for name in ("script-src", "style-src", "connect-src"):
@@ -323,7 +329,26 @@ def test_config_exposes_only_the_public_sign_in_facts(stack):
     got = req(stack, "GET", "/api/member/config", member=None)
     assert got.status == 200
     assert got.json == {"cognito_domain": "https://auth.lab.example", "client_id": "web-client",
-                        "redirect_uri": f"{ORIGIN}/my/callback", "logout_uri": f"{ORIGIN}/"}
+                        "redirect_uri": f"{ORIGIN}/my/callback", "logout_uri": f"{ORIGIN}/",
+                        "http_chunks_per_request": stack.s.member_service.config.http_chunks_per_request}
+
+
+def test_every_page_file_is_served_with_its_type_and_the_same_csp(stack):
+    for name in ("member-artifacts-app.js", "member-artifacts-view.js", "member-api.js", "member-upload.js", "sha256-stream.js",
+                 "member-artifacts.css", "herdr-web-components/util.js", "herdr-design-system/theme.css",
+                 "herdr-design-system/base.css"):
+        target = stack.web / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"/* {name} */")
+    for path, kind in (("member-artifacts-app.js", "text/javascript"), ("member-artifacts.css", "text/css"),
+                       ("herdr-web-components/util.js", "text/javascript"), ("theme.css", "text/css"),
+                       ("lab-signin.js", "text/javascript")):
+        got = req(stack, "GET", f"/my/{path}", member=None)
+        assert got.status == 200 and got.headers["content-type"].startswith(kind), path
+        assert got.headers["x-content-type-options"] == "nosniff"
+    assert b"PKCE" in req(stack, "GET", "/my/lab-signin.js", member=None).raw      # served from share_static
+    assert req(stack, "GET", "/my/member.js", member=None).status == 404           # the old names are gone
+    assert req(stack, "GET", "/my/../member-api.js", member=None).status == 404
 
 
 # ------------------------------------------------------------------------------ parity with the MCP tools
@@ -730,7 +755,7 @@ def test_cli_gives_the_member_service_the_configured_limits(stack, tmp_path):
 
 def test_an_unexpected_failure_is_a_fixed_500_that_names_no_path(stack):
     import os
-    page = stack.web / "member.html"
+    page = stack.web / "member-artifacts.html"
     page.chmod(0)                                    # a real PermissionError inside the handler
     try:
         if os.access(page, os.R_OK):
@@ -739,4 +764,4 @@ def test_an_unexpected_failure_is_a_fixed_500_that_names_no_path(stack):
     finally:
         page.chmod(0o644)
     assert got.status == 500 and got.json == {"error": "internal", "message": "internal error"}
-    assert b"member.html" not in got.raw and b"Permission" not in got.raw
+    assert b"member-artifacts.html" not in got.raw and b"Permission" not in got.raw

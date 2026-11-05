@@ -149,7 +149,7 @@ VENDOR_MAX_BYTES = 4 * 1024 * 1024   # the vendored pdf.js worker is ~1.4 MB
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parent / "share_static"
 SHARED_BY_MAX = 120      # ``state.json`` ``shared_by``: the creator's display name on a member-created link (artifact_share_api)
 VIEWER_FILE = "viewer.html"
-STATIC_FILES = {"share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8",
+STATIC_FILES = {"lab-signin.js": "text/javascript; charset=utf-8", "share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8",
                 "annotate.js": "text/javascript; charset=utf-8", "anchor.js": "text/javascript; charset=utf-8",
                 "annotate.css": "text/css; charset=utf-8"}
 VIEW_FILE = "view.html"

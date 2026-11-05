@@ -47,10 +47,25 @@ _ID = re.compile(r"[A-Za-z0-9_.~-]{1,200}\Z")
 _UPLOAD = re.compile(UPLOAD_RE)
 _SHA = re.compile(SHA_RE)
 _DIGITS = re.compile(r"[0-9]{1,15}\Z")
-_STATIC: Final = {"/": ("member.html", "text/html; charset=utf-8"),
-                  "/my/callback": ("member.html", "text/html; charset=utf-8"),
-                  "/my/member.js": ("member.js", "text/javascript; charset=utf-8"),
-                  "/my/member.css": ("member.css", "text/css; charset=utf-8")}
+_HTML: Final = "text/html; charset=utf-8"
+_JS: Final = "text/javascript; charset=utf-8"
+_CSS: Final = "text/css; charset=utf-8"
+# Every file the page loads, by EXACT path (url -> (source, content type)).  A source is relative to ``web_root``, or
+# ("share_static", name) for the sign-in helpers shared with the share viewer.  The page CSP names exactly these paths
+# (never 'self'), so adding a file here is the one place a new script or style is admitted.
+_STATIC: Final = {"/": ("member-artifacts.html", _HTML),
+                  "/my/callback": ("member-artifacts.html", _HTML),
+                  "/my/member-artifacts-app.js": ("member-artifacts-app.js", _JS),
+                  "/my/member-artifacts-view.js": ("member-artifacts-view.js", _JS),
+                  "/my/member-api.js": ("member-api.js", _JS),
+                  "/my/member-upload.js": ("member-upload.js", _JS),
+                  "/my/sha256-stream.js": ("sha256-stream.js", _JS),
+                  "/my/herdr-web-components/util.js": ("herdr-web-components/util.js", _JS),
+                  "/my/lab-signin.js": (("share_static", "lab-signin.js"), _JS),
+                  "/my/theme.css": ("herdr-design-system/theme.css", _CSS),
+                  "/my/base.css": ("herdr-design-system/base.css", _CSS),
+                  "/my/member-artifacts.css": ("member-artifacts.css", _CSS)}
+_SHARE_STATIC: Final = Path(__file__).resolve().parent / "share_static"
 _RETRY_AFTER: Final = "10"
 
 _BODY_KEYS = {
@@ -228,15 +243,21 @@ class MemberWeb:
     # ----------------------------------------------------------------------------------------------- public routes
     def _static(self, h, path: str) -> None:
         name, ctype = _STATIC[path]
-        target = (self.web_root / name) if self.web_root else None
+        if isinstance(name, tuple):
+            target: Path | None = _SHARE_STATIC / name[1]
+        else:
+            target = (self.web_root / name) if self.web_root else None
         if target is None or not target.is_file():
             raise _Reply(404, "not_found", "not found")
         cognito = self._cognito_origin()
         # Exact files, never 'self': the same origin serves member-uploaded bundles (/s/<token>/f/x.js), which a bare
         # 'self' would let an HTML-injection bug load as a script and drive this API.
         connect = f"{self.origin}/api/member/" + (f" {cognito}" if cognito else "")
-        csp = (f"default-src 'none'; script-src {self.origin}/my/member.js; style-src {self.origin}/my/member.css; "
-               f"img-src 'self' data:; connect-src {connect}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        scripts = " ".join(f"{self.origin}{u}" for u in _STATIC if u.endswith(".js"))
+        styles = " ".join(f"{self.origin}{u}" for u in _STATIC if u.endswith(".css"))
+        csp = (f"default-src 'none'; script-src {scripts}; style-src {styles}; "
+               f"img-src 'self' data:; connect-src {connect}; frame-src 'none'; object-src 'none'; "
+               "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
         self._send(h, 200, target.read_bytes(), ctype, {"Content-Security-Policy": csp, "X-Frame-Options": "DENY"})
 
     def _cognito_origin(self) -> str | None:
@@ -251,7 +272,8 @@ class MemberWeb:
         if not isinstance(client_id, str) or not client_id or domain is None:
             raise _Reply(503, "unavailable", "sign-in is not configured")
         self._json(h, {"cognito_domain": domain, "client_id": client_id,
-                       "redirect_uri": f"{self.origin}/my/callback", "logout_uri": f"{self.origin}/"})
+                       "redirect_uri": f"{self.origin}/my/callback", "logout_uri": f"{self.origin}/",
+                       "http_chunks_per_request": self.service.member_service.config.http_chunks_per_request})
 
     def _single(self, h, name: str, *, limit: int = MAX_TOKEN_CHARS) -> str:
         values = h.headers.get_all(name) or []
