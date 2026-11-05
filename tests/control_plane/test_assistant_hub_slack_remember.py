@@ -2,6 +2,7 @@
 
 No gate is relaxed: when a gate refuses, the approval stays recorded, the owner is told why in the thread, and the
 remember intent is kept for the next qualifying approval.  Real listener, real judge runtime over a real socket."""
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -61,6 +62,18 @@ class RWorld(AskWorld):
         self.tap(ask, action)
         if consume:
             self.consume(session, task)
+        return ask
+
+    def foreign_approval(self, *, worker_id="w1", tenant=T, user=U, cmd=PUSH):
+        """An owner_slack approval for some other worker, key, tenant or user."""
+        worker = replace(self.worker, worker_id=worker_id, tenant_id=tenant, user_id=user)
+        d = decide(self.store, self.service.config["grants"], worker,
+                   RawAction(tool="Bash", command=cmd, repo="acme/repo-a"), "sf", "tf", self.clock.now, judge=self.judge)
+        assert d.outcome == "pending", d
+        ask = self.ask(d.request_id, tenant_id=tenant, user_id=user, created_at=self.clock.now,
+                       expires_at=self.clock.now + timedelta(minutes=15))
+        self.tap(ask)
+        assert self.store.get_action_request(d.request_id, tenant_id=tenant, user_id=user).status == "approved"
         return ask
 
     def thread(self, ask):
@@ -175,3 +188,26 @@ def test_every_refusal_code_has_a_plain_sentence(code):
     from herdr_engineering.control_plane.assistant_hub.slack import refusal_sentence
     sentence = refusal_sentence(ActivationRefused(code, "x"))
     assert sentence and code not in sentence and "_" not in sentence
+
+
+@pytest.mark.parametrize("other", [{"worker_id": "w2"}, {"cmd": "git push origin dev"}, {"tenant": "globex"},
+                                   {"user": "someone-else"}])
+def test_a_kept_wish_does_not_fire_on_an_approval_for_another_worker_key_tenant_or_user(tmp_path, other):
+    w = RWorld(tmp_path, shadow_days=14)
+    try:
+        satisfy_gate(w.store, w.judge, RISK, T, U)
+        w.approve()
+        w.approve()
+        wish = w.approve("ask_remember", consume=False)                    # refused in shadow: the wish is kept
+        assert w.stored(wish).activation == "pending"
+        w.clock.now = T0 + timedelta(days=15)                              # now it WOULD activate if it fired
+        w.foreign_approval(**other)
+        assert w.stored(wish).activation == "pending"
+        assert w.grants() == [] and w.audits("assistant.grant.activated") == []
+        assert len(w.thread(wish)) == 1                                    # nothing new said in its thread
+        w.approve()                                                        # the right worker and key does fire it
+        assert w.grants()[0].state.value == "active" and w.stored(wish).activation == "done"
+    finally:
+        w.runtime.stop()
+        w.listener.close()
+        w.judge_listener._stop.set()

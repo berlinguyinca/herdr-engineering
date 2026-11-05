@@ -106,22 +106,49 @@ def test_question_text_is_inert_in_slack(qw):
     assert "&lt;!channel&gt;" in text
 
 
-@pytest.mark.parametrize("over,reason", [
-    ({"user": "U0EVIL001"}, "not_owner"),
-    ({"thread_ts": None}, "not_thread"),
-    ({"thread_ts": "1.1"}, "no_ask"),
-    ({"channel": "D0ELSEWHERE"}, "no_ask"),
-])
-def test_replies_that_do_not_qualify_are_ignored_and_audited(qw, over, reason):
-    ask_id, ask = qw.posted_question()
+def _state(store):
+    snap = store.snapshot()
+    return json.dumps([snap["slack_asks"], snap["action_requests"], snap["action_evidence"]], default=str)
+
+
+def _event(ask, **over):
     event = {"type": "message", "user": OWNER, "channel": ask.channel, "thread_ts": ask.ts, "ts": "9.9", "text": "x",
              **over}
-    if event["thread_ts"] is None:
-        del event["thread_ts"]
-    qw.runtime.handle_event({"type": "event_callback", "event": event})
+    return {k: v for k, v in event.items() if v is not None}
+
+
+def test_a_non_owner_reply_in_the_questions_thread_is_audited(qw):
+    ask_id, ask = qw.posted_question()
+    qw.runtime.handle_event({"type": "event_callback", "event": _event(ask, user="U0EVIL001")})
     assert qw.poll("a", ask_id)[0] == {"status": "pending"}
     (refused,) = qw.audits("assistant.slack.refused")
-    assert f"reason={reason}" in refused["detail"] and "x" != refused["detail"]
+    assert "reason=not_owner" in refused["detail"] and ask_id in refused["detail"]
+
+
+@pytest.mark.parametrize("over", [{"thread_ts": None}, {"thread_ts": "1.1"}, {"channel": "D0ELSEWHERE"},
+                                  {"user": "U0EVIL001", "thread_ts": "1.1"}, {"user": "U0EVIL001", "thread_ts": None}])
+def test_events_that_target_no_stored_ask_are_silently_ignored(qw, over):
+    ask_id, ask = qw.posted_question()
+    audits, snap = len(qw.store.audit), _state(qw.store)
+    qw.runtime.handle_event({"type": "event_callback", "event": _event(ask, **over)})
+    assert qw.poll("a", ask_id)[0] == {"status": "pending"}
+    assert len(qw.store.audit) == audits and _state(qw.store) == snap
+
+
+def test_unrelated_channel_traffic_writes_nothing(qw):
+    ask_id, ask = qw.posted_question()
+    audits, snap = len(qw.store.audit), _state(qw.store)
+    for n in range(200):
+        qw.runtime.handle_event({"type": "event_callback", "event": {
+            "type": "message", "user": f"U0X{n:05d}", "channel": "C0GENERAL", "ts": f"{n}.1", "text": "hi"}})
+    assert len(qw.store.audit) == audits and _state(qw.store) == snap
+    assert qw.audits("assistant.slack.refused") == []
+
+
+def test_a_thread_broadcast_reply_is_still_the_owners_answer(qw):
+    ask_id, ask = qw.posted_question()
+    qw.reply(ask, "broadcast answer", subtype="thread_broadcast")
+    assert qw.poll("a", ask_id)[0] == {"status": "answered", "answer": "broadcast answer"}
 
 
 def test_bot_and_subtyped_messages_are_ignored(qw):
@@ -225,23 +252,63 @@ def test_without_a_runtime_or_when_disabled_the_ask_is_still_no_decision(qw):
     assert qw.store.list_slack_asks(T, U) == []
 
 
-def test_questions_are_batched_per_task_over_the_limit(tmp_path):
-    w = QWorld(tmp_path, max_asks_per_task_per_hour=1)
+@pytest.fixture
+def limited(tmp_path):
+    w = QWorld(tmp_path, max_asks_per_task_per_hour=1, ask_ttl_minutes=120)
     w.enroll("a")
     w.runtime.start()
     try:
-        first = w.question()
-        assert w.listener.wait_for(lambda: len(w.posts()) == 1)
-        second = w.question(text="another?")
-        third = w.question(text="and another?")
-        assert w.listener.wait_for(lambda: len(w.listener.calls_to("chat.update")) == 1, timeout=5)
-        assert len(w.posts()) == 2                                           # the ask and one batch line
-        assert w.poll("a", first["ask_id"])[0]["status"] == "pending"
-        for out in (second, third):
-            assert w.poll("a", out["ask_id"])[0] == {"status": "expired"}    # never shown, so never answerable
+        yield w
     finally:
         w.runtime.stop()
         w.listener.close()
+
+
+def test_over_limit_questions_stay_open_and_the_sweep_posts_them_when_the_window_frees(limited):
+    w = limited
+    first = w.question()
+    assert w.listener.wait_for(lambda: len(w.posts()) == 1)
+    second, third = w.question(text="another?"), w.question(text="and another?")
+    assert w.listener.wait_for(lambda: len(w.listener.calls_to("chat.update")) == 1, timeout=5)
+    assert len(w.posts()) == 2                                               # the ask and one batch line
+    for out in (second, third):
+        assert w.poll("a", out["ask_id"])[0] == {"status": "pending"}        # not expired: still waiting its turn
+        assert w.stored(out["ask_id"]).ts == "" and w.stored(out["ask_id"]).status == "open"
+    w.runtime.sweep()                                                        # window still full: nothing new is shown
+    time.sleep(0.4)
+    assert len(w.posts()) == 2 and len(w.listener.calls_to("chat.update")) == 1
+    w.clock.now = w.clock.now + timedelta(minutes=61)
+    w.runtime.sweep()
+    assert w.listener.wait_for(lambda: w.stored(second["ask_id"]).ts != "", timeout=5)
+    assert w.poll("a", second["ask_id"])[0] == {"status": "pending"}
+    assert w.stored(first["ask_id"]).ts
+
+
+def test_a_question_burst_does_not_delay_an_action_ask_on_the_same_task(limited):
+    w = limited
+    for n in range(4):
+        w.call("a", "assistant_ask", {"question": f"q{n}?", "session_id": "t1"})
+    assert w.listener.wait_for(lambda: len(w.listener.calls_to("chat.update")) >= 1, timeout=5)
+    before = len(w.posts())
+    out, err = w.call("a", "action_request", {"tool": "Bash", "command": "frobnicate --burst", "session_id": "t1",
+                                             "task_id": "t1"})
+    assert not err and out["outcome"] == "pending"
+    assert w.listener.wait_for(lambda: len(w.posts()) == before + 1, timeout=5)
+    (action,) = [a for a in w.store.list_slack_asks(T, U) if a.kind == "action"]
+    assert action.ts and any(b["type"] == "actions" for b in w.posts()[-1]["blocks"])
+
+
+def test_never_posted_lapsed_question_reports_not_asked_but_a_posted_one_does_not(limited):
+    w = limited
+    posted = w.question()
+    assert w.listener.wait_for(lambda: len(w.posts()) == 1)
+    waiting = w.question(text="never shown?")
+    assert w.listener.wait_for(lambda: len(w.posts()) >= 2, timeout=5)
+    w.clock.now = w.clock.now + timedelta(minutes=121)
+    assert w.poll("a", waiting["ask_id"])[0] == {"status": "expired", "reason": "not_asked"}
+    assert w.poll("a", posted["ask_id"])[0] == {"status": "expired"}
+    w.runtime.sweep()                                                        # the lapsed one is retired, same answer
+    assert w.poll("a", waiting["ask_id"])[0] == {"status": "expired", "reason": "not_asked"}
 
 
 def test_events_api_reply_over_socket_mode_is_acked_and_answers(qw):

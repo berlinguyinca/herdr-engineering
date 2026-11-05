@@ -257,8 +257,8 @@ class SlackRuntime:
         self._qcond = threading.Condition()
         self._drain_thread: threading.Thread | None = None
         self.dropped = 0
-        self._posted: dict[tuple[str, str, str, str], deque[datetime]] = {}    # per (worker, task) post times
-        self._batches: dict[tuple[str, str, str, str], _Batch] = {}
+        self._posted: dict[tuple[str, str, str, str, str], deque[datetime]] = {}    # per (worker, task) post times
+        self._batches: dict[tuple[str, str, str, str, str], _Batch] = {}
         self._dm: dict[str, str] = {}
         self._connected = False
         self._last_event: datetime | None = None
@@ -418,7 +418,7 @@ class SlackRuntime:
         if ask.status == "decided" and ask.answer is not None:
             return {"status": "answered", "answer": ask.answer}
         if ask.status == "expired" or (ask.status == "open" and as_utc(self._now()) >= as_utc(ask.expires_at)):
-            return {"status": "expired"}
+            return {"status": "expired"} if ask.ts else {"status": "expired", "reason": "not_asked"}
         return {"status": "pending"}
 
     def queued(self) -> int:
@@ -600,13 +600,17 @@ class SlackRuntime:
             if any(a.ts and a.ask_id != own and a.status in ("open", "decided")
                    for a in self.store.slack_asks_for_request(item.request_id)):
                 return True                  # a duplicate queue entry (sweep vs notify): one ask per request
-        key = (item.tenant_id, item.user_id, item.worker_id, item.task_id)
+        key = (item.tenant_id, item.user_id, item.worker_id, item.task_id, item.kind)   # questions count apart
         stamps = self._posted.pop(key, None) or deque()
         self._posted[key] = stamps                           # most recently used last, so the cap drops the idlest
         while stamps and now - stamps[0] >= _HOUR:
             stamps.popleft()
         if len(stamps) >= int(cfg.get("max_asks_per_task_per_hour") or 6):
+            if question and item.ask is not None and item.ask.ask_id in self._batched:
+                return True                  # already counted in the batch line; the sweep offers it again later
             return self._batch(item, key, cfg, now)
+        if question and item.ask is not None:
+            self._batched.pop(item.ask.ask_id, None)
         channel = self._target(cfg)
         ttl = timedelta(minutes=int(cfg.get("ask_ttl_minutes") or 15))
         ask = item.ask
@@ -662,7 +666,7 @@ class SlackRuntime:
                                                  button("Deny", "ask_deny", "danger"),
                                                  button("Approve and remember", "ask_remember")]}]
 
-    def _batch(self, item: _Queued, key: tuple[str, str, str, str], cfg: dict[str, Any], now: datetime) -> bool:
+    def _batch(self, item: _Queued, key: tuple[str, str, str, str, str], cfg: dict[str, Any], now: datetime) -> bool:
         """Over the per-task limit: one line per hour, edited to say how many more are waiting."""
         batch = self._batches.get(key)
         if batch is not None and now - batch.since >= _HOUR:
@@ -670,7 +674,7 @@ class SlackRuntime:
         count = (batch.count if batch else 0) + 1
         if item.kind == "question":
             text = (f"{count} more questions from worker {slack_text(item.worker_id)}, session {slack_text(item.task_id)}"
-                    " not shown (limit reached)")
+                    " waiting (limit reached; they are posted as the hour allows)")
         else:
             text = (f"{count} more waiting from worker {slack_text(item.worker_id)}, task {slack_text(item.task_id)}"
                     " (limit reached; decide them in the dashboard)")
@@ -683,12 +687,11 @@ class SlackRuntime:
             batch.count = count
         subject = item.request_id
         if item.kind == "question" and item.ask is not None:
-            subject = item.ask.ask_id
-            item.ask.status = "expired"              # never shown, so it can never be answered: tell the worker so
-            self.store.put_slack_ask(item.ask)
+            subject = item.ask.ask_id                # stays open and unposted: the sweep posts it when the window frees
+            self._batched[subject] = None
         else:
             self._batched[item.request_id] = None
-            self._cap(self._batched)
+        self._cap(self._batched)
         self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
                                 action="assistant.slack.ask_batched", subject_id=subject,
                                 detail=f"{'ask' if item.kind == 'question' else 'request'}={subject} waiting={count}")
@@ -838,18 +841,18 @@ class SlackRuntime:
         event = payload.get("event") if payload.get("type") == "event_callback" else None
         if not isinstance(event, dict) or event.get("type") != "message":
             return
-        if event.get("bot_id") or event.get("subtype"):
+        if event.get("bot_id") or event.get("subtype") not in (None, "thread_broadcast"):
             return                      # our own posts echo back as bot messages; edits and joins carry a subtype
+        parent, channel = event.get("thread_ts"), event.get("channel")
+        if not isinstance(parent, str) or not parent or parent == event.get("ts") or not isinstance(channel, str):
+            return                      # not a thread reply: channel traffic is none of our business, not even audited
+        ask = self.store.find_slack_ask_by_message(channel, parent)
+        if ask is None:
+            return                      # not in the thread of a message we posted: silent, nothing written
         uid = event.get("user")
         owner = self._cfg().get("owner_user_id") or ""
         if not owner or not isinstance(uid, str) or not hmac.compare_digest(uid.encode(), owner.encode()):
-            return self._refuse("not_owner", None, uid)
-        parent, channel = event.get("thread_ts"), event.get("channel")
-        if not isinstance(parent, str) or not parent or parent == event.get("ts"):
-            return self._refuse("not_thread", None, uid)
-        ask = self.store.find_slack_ask_by_message(channel, parent) if isinstance(channel, str) else None
-        if ask is None:
-            return self._refuse("no_ask", None, uid)
+            return self._refuse("not_owner", ask, uid)
         if ask.kind != "question":
             return self._refuse("not_question", ask, uid)
         if ask.status != "open":

@@ -442,7 +442,7 @@ def test_task_bookkeeping_is_pruned_and_capped(aw):
     aw.clock.now = NOW + timedelta(hours=3)                              # everything is older than an hour
     aw.decide(task="later")
     assert aw.listener.wait_for(lambda: aw.runtime.queued() == 0)
-    assert aw.listener.wait_for(lambda: set(aw.runtime._posted) == {(T, U, "w1", "later")}
+    assert aw.listener.wait_for(lambda: set(aw.runtime._posted) == {(T, U, "w1", "later", "action")}
                                 and aw.runtime._batches == {})
 
 
