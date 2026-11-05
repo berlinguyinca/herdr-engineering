@@ -134,10 +134,11 @@ test('Disable sharing confirms, says live links are revoked, and removes the liv
 test('declining the Disable sharing confirmation changes nothing', async () => {
   await withMembers(async ({ page, requests }) => {
     page.removeAllListeners('dialog');
-    page.on('dialog', dialog => dialog.dismiss());
+    let dismissed = false;
+    page.on('dialog', dialog => { dismissed = true; return dialog.dismiss(); });
     await row(page, 'Alice').getByRole('button', { name: 'Alice' }).click();
     await page.getByRole('button', { name: 'Disable sharing' }).click();
-    await page.waitForTimeout(300);
+    await until(() => assert.ok(dismissed, 'the confirm dialog was shown and dismissed'));
     assert.equal(requests.filter(r => r.method === 'POST').length, 0);
     await count(linkRows(page), 2);
   });
@@ -166,7 +167,7 @@ test('a viewer key sees no Members section', async () => {
   await withMembers(async ({ page, requests }) => {
     await page.locator('[data-artifact-registry]').waitFor();
     await until(() => assert.ok(requests.some(r => /\/api\/v1\/artifact-members$/.test(r.url))));
-    await page.waitForTimeout(300);
+    await page.waitForLoadState('networkidle');
     assert.equal(await members(page).isHidden(), true);
     assert.equal(await members(page).locator('[data-member-row]').count(), 0);
   }, { key: 'view-key' });

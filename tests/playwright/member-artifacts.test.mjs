@@ -250,7 +250,7 @@ test('a double-clicked Approve sends one approval and the one-time URL stays on 
     await approve.dblclick();
     assert.equal(await page.locator('[data-action="cancel-share"]').isDisabled().catch(() => true), true, 'Cancel is off while approving');
     const url = await page.locator('[data-secret-url]').inputValue({ timeout: 15000 });
-    await page.waitForTimeout(1200);
+    await page.waitForLoadState('networkidle');
     assert.equal(await page.locator('[data-secret-url]').inputValue(), url, 'the URL was not replaced');
     const s = await stats(srv);
     assert.equal(s.approve_calls, 1);

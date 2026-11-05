@@ -374,11 +374,19 @@ def test_run_upload_raw_path_shapes_on_a_real_nginx(tmp_path, path, status):
                         "-v", f"{tmp_path}/acme:/etc/acme:ro", _docker_nginx()], check=True, capture_output=True)
         port = int(subprocess.run(["docker", "port", name, "8443"], capture_output=True, text=True,
                                   check=True).stdout.split(":")[-1])
-        time.sleep(1.5)
         import socket
         import ssl
         ctx = ssl.create_default_context()
         ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+        deadline = time.monotonic() + 15           # wait for nginx to answer a TLS handshake rather than sleeping a fixed time
+        while True:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=2) as probe, \
+                        ctx.wrap_socket(probe, server_hostname=HOST):
+                    break
+            except OSError:
+                assert time.monotonic() < deadline, "nginx never started listening"
+                time.sleep(0.1)
         raw = (f"PUT {path} HTTP/1.1\r\nHost: {HOST}\r\nContent-Length: 2097152\r\nConnection: close\r\n\r\nx").encode()
         with socket.create_connection(("127.0.0.1", port), timeout=5) as sock, \
                 ctx.wrap_socket(sock, server_hostname=HOST) as tls:
