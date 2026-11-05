@@ -44,6 +44,8 @@ MAX_TOKEN_CHARS: Final = 8192
 READ_BLOCK: Final = 64 * 1024
 _PATH = re.compile(r"[A-Za-z0-9_.~/-]{1,512}")
 _ID = re.compile(r"[A-Za-z0-9_.~-]{1,200}\Z")
+_FOLDER = re.compile(r"fld_[0-9a-f]{24}\Z")
+_ARTIFACT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")      # the mirror's artifact id rule
 _UPLOAD = re.compile(UPLOAD_RE)
 _SHA = re.compile(SHA_RE)
 _DIGITS = re.compile(r"[0-9]{1,15}\Z")
@@ -75,6 +77,8 @@ _BODY_KEYS = {
     "publish": ({"base_version_id", "files", "message", "entry", "idempotency_key"}, {"files", "message"}),
     "share_create": ({"version_id", "audience", "allow_groups", "allow_emails", "expires_in_days", "entry", "title",
                       "idempotency_key"}, {"version_id", "audience"}),
+    "folder": ({"name"}, {"name"}),
+    "folder_item": ({"artifact_id"}, {"artifact_id"}),
     "approve": ({"confirm", "idempotency_key"}, {"confirm"}),
 }
 
@@ -217,7 +221,7 @@ class MemberWeb:
             h.close_connection = True
             return
         method = h.command
-        if method not in ("GET", "POST", "PUT"):
+        if method not in ("GET", "POST", "PUT", "DELETE"):
             raise _Reply(405, "method_not_allowed", "method not allowed")
         if method != "GET":
             origins = h.headers.get_all("Origin") or []
@@ -336,6 +340,8 @@ class MemberWeb:
                 return self._r_me
             if rest == ["links"]:
                 return self._r_links
+            if rest == ["library"]:
+                return self._r_library
             if n == 2 and rest[0] == "results":
                 return self._r_result
             if n == 2 and rest[0] == "artifacts":
@@ -343,9 +349,23 @@ class MemberWeb:
             if n == 3 and rest[0] == "artifacts" and rest[2] in ("history", "shares"):
                 return self._r_history if rest[2] == "history" else self._r_shares
             return None
+        if method == "DELETE":
+            if n == 2 and rest[0] == "folders":
+                return self._r_folder_delete
+            if n == 4 and rest[0] == "folders" and rest[2] == "items":
+                return self._r_unfile
+            return None
+        if method == "PUT" and n == 2 and rest[0] == "folders":
+            return self._r_folder_rename
         if method == "POST":
             if rest == ["artifacts"]:
                 return self._r_create
+            if rest == ["folders"]:
+                return self._r_folder_create
+            if n == 3 and rest[0] == "folders" and rest[2] == "items":
+                return self._r_file
+            if n == 3 and rest[0] == "pending" and rest[2] in ("accept", "discard"):
+                return self._r_accept if rest[2] == "accept" else self._r_discard
             if n == 3 and rest[0] == "artifacts":
                 return {"delete": self._r_delete, "publish": self._r_publish,
                         "shares": self._r_share_create}.get(rest[2])
@@ -515,6 +535,55 @@ class MemberWeb:
     def _r_abort(self, h, ms, pr, actor, rest, query):
         self._body(h, None)
         self._json(h, ms.upload_abort(actor, self._live(ms, actor, self._ident(rest[1])), rest[3]))
+
+    # ----------------------------------------------------------------------------------------------- the library
+    @staticmethod
+    def _folder_id(value: str) -> str:
+        if not _FOLDER.match(value):
+            raise _Reply(404, "not_found", "not found")
+        return value
+
+    @staticmethod
+    def _artifact_id(value: Any) -> str:
+        if not isinstance(value, str) or not _ARTIFACT.match(value):
+            raise _bad("bad artifact id")
+        return value
+
+    def _r_library(self, h, ms, pr, actor, rest, query):
+        self._query(query, set())
+        self._json(h, ms.library(actor))
+
+    def _r_folder_create(self, h, ms, pr, actor, rest, query):
+        self._json(h, ms.library_folder_create(actor, self._body(h, "folder")["name"]))
+
+    def _r_folder_rename(self, h, ms, pr, actor, rest, query):
+        folder = self._folder_id(rest[1])
+        self._json(h, ms.library_folder_rename(actor, folder, self._body(h, "folder")["name"]))
+
+    def _r_folder_delete(self, h, ms, pr, actor, rest, query):
+        folder = self._folder_id(rest[1])
+        self._body(h, None)
+        self._json(h, ms.library_folder_delete(actor, folder))
+
+    def _r_file(self, h, ms, pr, actor, rest, query):
+        folder = self._folder_id(rest[1])
+        self._json(h, ms.library_file(actor, folder, self._artifact_id(self._body(h, "folder_item")["artifact_id"])))
+
+    def _r_unfile(self, h, ms, pr, actor, rest, query):
+        folder = self._folder_id(rest[1])
+        artifact = self._artifact_id(rest[3])
+        self._body(h, None)
+        self._json(h, ms.library_unfile(actor, folder, artifact))
+
+    def _r_accept(self, h, ms, pr, actor, rest, query):
+        artifact = self._artifact_id(rest[1])
+        self._body(h, None)
+        self._json(h, ms.library_accept(actor, artifact))
+
+    def _r_discard(self, h, ms, pr, actor, rest, query):
+        artifact = self._artifact_id(rest[1])
+        self._body(h, None)
+        self._json(h, ms.library_discard(actor, artifact))
 
     # ----------------------------------------------------------------------------------------------- the run PUT
     def _header_once(self, h, name: str) -> str:

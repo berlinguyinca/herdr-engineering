@@ -25,6 +25,13 @@ from typing import Any, Final
 from .artifact_member_intents import (
     KIND_CREATE,
     KIND_DELETE,
+    KIND_LIBRARY_ACCEPT,
+    KIND_LIBRARY_DISCARD,
+    KIND_LIBRARY_FILE,
+    KIND_LIBRARY_FOLDER_CREATE,
+    KIND_LIBRARY_FOLDER_DELETE,
+    KIND_LIBRARY_FOLDER_RENAME,
+    KIND_LIBRARY_UNFILE,
     KIND_PUBLISH,
     KIND_SHARE_APPROVE,
     KIND_SHARE_CREATE,
@@ -326,6 +333,33 @@ class MemberService:
             return {"items": [], "folders": []}
         return {"items": library.get("items") if isinstance(library.get("items"), list) else [],
                 "folders": library.get("folders") if isinstance(library.get("folders"), list) else []}
+
+    def library_write(self, actor: Mapping[str, Any], kind: str, payload: dict, artifact_id: str | None = None) -> dict[str, Any]:
+        """Enqueue one library intent (folders, filing, accept or discard of a push) and return the ticket result.  The
+        worker validates the payload and re-checks ownership; this only gates on group membership."""
+        who = self._caller(actor, "library")
+        return self._submit(who, kind, payload, artifact_id, "library")
+
+    def library_folder_create(self, actor, name):
+        return self.library_write(actor, KIND_LIBRARY_FOLDER_CREATE, {"name": name})
+
+    def library_folder_rename(self, actor, folder_id, name):
+        return self.library_write(actor, KIND_LIBRARY_FOLDER_RENAME, {"folder_id": folder_id, "name": name})
+
+    def library_folder_delete(self, actor, folder_id):
+        return self.library_write(actor, KIND_LIBRARY_FOLDER_DELETE, {"folder_id": folder_id})
+
+    def library_file(self, actor, folder_id, artifact_id):
+        return self.library_write(actor, KIND_LIBRARY_FILE, {"folder_id": folder_id}, artifact_id)
+
+    def library_unfile(self, actor, folder_id, artifact_id):
+        return self.library_write(actor, KIND_LIBRARY_UNFILE, {"folder_id": folder_id}, artifact_id)
+
+    def library_accept(self, actor, artifact_id):
+        return self.library_write(actor, KIND_LIBRARY_ACCEPT, {}, artifact_id)
+
+    def library_discard(self, actor, artifact_id):
+        return self.library_write(actor, KIND_LIBRARY_DISCARD, {}, artifact_id)
 
     @staticmethod
     def _grants(entry: Mapping[str, Any] | None, need: str) -> bool:
