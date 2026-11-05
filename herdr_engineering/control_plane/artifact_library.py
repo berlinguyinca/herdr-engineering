@@ -89,6 +89,9 @@ class FeedPage:
     next_offset: int | None
 
 
+MAX_QUERY = 200
+
+
 def _like(text: str) -> str:
     escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
@@ -284,8 +287,20 @@ class LibraryStore:
 
         outer = []
         if q:
+            if len(q) > MAX_QUERY:
+                raise LibraryError(400, "query_too_long")
             p = arg(_like(q))
-            outer.append(f"(d.title ILIKE {p} ESCAPE '\\' OR d.sharer ILIKE {p} ESCAPE '\\')")
+            esc = f"ILIKE {p} ESCAPE '\\'"
+            # Filename only for rows whose artifact is still readable (revoked/expired rows blank the type too);
+            # folder names only from the caller's own folders ($1), never another member's.
+            outer.append(
+                f"(d.title {esc} OR d.sharer {esc} OR d.artifact_type {esc}"
+                f" OR (d.status IN ('active','pending') AND EXISTS (SELECT 1 FROM artifacts qa"
+                f" WHERE qa.artifact_id=d.artifact_id AND qa.original_filename {esc}))"
+                " OR EXISTS (SELECT 1 FROM artifact_library_items qi JOIN artifact_library_folders qf"
+                " ON qf.folder_id=qi.folder_id WHERE qi.artifact_id=d.artifact_id AND qf.owner=$1"
+                f" AND qf.name {esc}))"
+            )
         if artifact_type:
             outer.append(f"d.artifact_type = {arg(artifact_type)}")
         if since:
