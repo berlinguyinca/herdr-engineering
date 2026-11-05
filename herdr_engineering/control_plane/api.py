@@ -3765,6 +3765,8 @@ def _make_handler(server, public=False, operator=False):
                     if not etype or not eid:
                         return self._json(
                             {"error": "entity_type and entity_id required"}, 400)
+                    if etype == "artifact" and not self._registry_read_ok(eid):
+                        eid = "\x00unreadable"      # answers exactly as an id that does not exist
                     query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
                     if "limit" in query or "before" in query:
                         try:

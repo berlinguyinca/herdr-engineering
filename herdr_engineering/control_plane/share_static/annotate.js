@@ -722,7 +722,7 @@ function buildPanel(aside, data, hooks) {
   const expires = data.expires_at ? new Date(data.expires_at * 1000).toLocaleString() : null;
   const note = h('p', { class: 'note', text: `You are commenting on the copy of the file as it was shared; the live page may differ.${expires ? ` Your link works until ${expires}.` : ''}` });
   const anchorTitle = h('p', { class: 'anchor-title', id: 'anchor-title' });
-  const anchorQuote = h('blockquote', { class: 'anchor-quote', tabindex: '0', 'aria-labelledby': 'anchor-title' });
+  const anchorQuote = h('blockquote', { class: 'anchor-quote', dir: 'auto', tabindex: '0', 'aria-labelledby': 'anchor-title' });
   const reset = h('button', { type: 'button', text: 'Whole file instead' });
   const regionButton = data.kind === 'pdf' ? h('button', { type: 'button', 'aria-pressed': 'false', text: 'Mark region' }) : null;
   const comment = h('textarea', { id: 'comment', rows: '4', maxlength: String(data.max_comment_chars || 4000), 'aria-describedby': 'count' });
@@ -795,8 +795,8 @@ function buildPanel(aside, data, hooks) {
     const head = h('div', { class: 'row-head' }, h('span', { class: 'badge', 'data-status': row.status, text: statusLabel(row) }),
       current ? null : h('span', { class: 'file', text: `in ${row.file}` }));
     li.append(head, h('p', { class: 'row-anchor', text: t }));
-    if (quote) li.append(h('blockquote', { text: quote }));
-    const body = h('p', { class: 'row-body', text: row.body });
+    if (quote) li.append(h('blockquote', { dir: 'auto', text: quote }));
+    const body = h('p', { class: 'row-body', dir: 'auto', text: row.body });
     li.append(body);
     if (['open', 'submitted', 'edited'].includes(row.status)) {
       const editButton = h('button', { type: 'button', text: 'Edit', 'aria-label': 'Edit this annotation', disabled: busy.has(row.annotation_id) });

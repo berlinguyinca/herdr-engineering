@@ -238,8 +238,12 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   from `f/` to `a/` still works, and the `a/` page's own requests carry the cookie). Verified in Chromium, Firefox
   and WebKit (`tests/playwright/share-annotations.test.mjs`). What remains: the stolen URL still opens the share's
   files (`f/`, `v/`, `a/` page including its CSRF meta) until the session expires, because the author already holds
-  those files; the viewer's email is no longer readable from the URL (the session segment carries it encrypted under a key derived
-  from the signing secret; sessions minted before this change stop working and the viewer signs in again); and a cookie is bound to the session, not to a device, so it protects
+  those files; neither the viewer's email nor their user name is readable from the URL any more: the session segment is
+  `<basis>.<exp>.<ChaCha20-Poly1305 blob>`, with identity and email padded inside the encrypted block (key derived from
+  the signing secret under its own label; the tag is checked before anything is parsed, and the basis, expiry and share id
+  are authenticated). Sessions minted before this change stop working and the viewer signs in again. The image needs the
+  `cryptography` package (declared in the `share`, `collab` and `review-gate` extras; the fabric image installs `share`);
+  and a cookie is bound to the session, not to a device, so it protects
   against URL leaks, not against malware in the viewer's browser. Lab PDFs on `f/` are now served under the sandbox
   policy as well; where a browser refuses to show a sandboxed PDF inline, use the `v/` view.
 - **Stored media types.** Responses never carry a stored media type's parameters: `/live`, `/download`, report asset
@@ -251,13 +255,17 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   does not move. The worker logs a warning with a consecutive-failure counter so an operator sees it; clearing it
   means fixing or removing that line. Only a compromised edge can write such lines.
 - The worker re-checks the author against the share's CURRENT allow-list when it ingests a line (`not_on_list`, a
-  `denied` event): an email-basis author must still be on `allow_emails`, a group-basis author needs the share to still
-  have `allow_groups` (the worker holds no group names, like the edge), and an edit needs the stored author to be listed
-  (withdrawing one's own note stays allowed). A compromised edge, which holds the signing secret, can still claim any
-  listed email or the owner role.
-- Explicit bidirectional embedding, override and isolate controls (U+202A-202E, U+2066-2069) are refused in comments and
-  anchor text (`bad_chars`). Directional marks (U+200E/F) and zero-width characters are still accepted; they render as
-  text.
+  `denied` event), with the same rule as the edge (`still_admitted`, no owner exception) and ONLY on the basis the line
+  names: `e` needs the email on `allow_emails`, `g` needs the share to still have `allow_groups` (the worker holds no group
+  names, like the edge). Every line (create, edit, delete) must carry `basis` `e` or `g`; a missing or other value is
+  refused (`invalid`). A member removed from the list can neither create, edit nor withdraw: the edge refuses their POST,
+  and a line the edge accepted just before the removal is acknowledged (202 "pending") and then dropped by the worker.
+  A compromised edge, which holds the signing secret, can still claim any listed email.
+- Comments and anchor text are refused (`bad_chars`) when they contain a character of Unicode category Cc, Cf, Cs, Co or Cn
+  (C0/C1 controls, bidi embeddings/overrides/isolates, tag characters, invisible operators, BOM, private use, unassigned)
+  or U+2028/2029, except ZWJ, ZWNJ and the directional marks U+200E/200F/061C and `\n`, `\t`. Rows stored earlier are
+  cleaned again in the MCP `artifact_annotations` view (`clean_text`), and viewer text is rendered with `dir="auto"` / `<bdi>`.
+  Unassigned means "unassigned in this Python's Unicode tables", so a brand-new emoji can be refused until the runtime updates.
 - PDF pages are keyboard-operable (Tab to a page, Enter or Space for the whole page; after "Mark region" the arrows move
   a region, Shift+arrows resize it, Enter uses it, Escape drops it), like the image view.
 - Purged or tombstoned artifacts keep their annotation rows and author emails; there is no retention rule yet.

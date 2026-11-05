@@ -179,3 +179,9 @@ test('without confirm() nothing is dismissed', async () => {
   assert.equal(calls, 0);
   h.dispose();
 });
+
+test('viewer text is isolated for bidi: the body is dir=auto and the author is wrapped in bdi', () => {
+  const html = renderAnnotationRow(base, { artifactId: 'art1' });
+  assert.match(html, /<p dir="auto" style="[^"]*unicode-bidi:plaintext">/);
+  assert.match(html, /<strong><bdi>[^<]*<\/bdi><\/strong>/);
+});

@@ -74,3 +74,16 @@ def test_reviews_list_of_an_event_projection_only_upload_works_when_the_acl_auth
         got, body = status_of(env, f"{ROOT}/{aid}/reviews")
         assert got == 200 and len(json.loads(body)["reviews"]) == 1
         assert status_of(env, f"{ROOT}/{aid}/reviews", key="member-key")[0] == 404
+
+
+def test_the_artifact_event_stream_needs_the_same_principal_check(registry_pg):
+    ctx, *_ = wired(registry_pg)
+    with ctx as env:
+        aid = upload(env)
+        mine = status_of(env, f"/api/v1/events?entity_type=artifact&entity_id={aid}")
+        assert mine[0] == 200 and "ArtifactRegistered" in mine[1].decode()
+        for suffix in ("", "&limit=10"):
+            theirs = status_of(env, f"/api/v1/events?entity_type=artifact&entity_id={aid}{suffix}", key="member-key")
+            absent = status_of(env, f"/api/v1/events?entity_type=artifact&entity_id=art-nope{suffix}", key="member-key")
+            assert theirs[0] == absent[0] == 200 and "ArtifactRegistered" not in theirs[1].decode()
+            assert json.loads(theirs[1])["events"] == json.loads(absent[1])["events"] == []
