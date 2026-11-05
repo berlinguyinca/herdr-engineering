@@ -444,3 +444,28 @@ def test_task_bookkeeping_is_pruned_and_capped(aw):
     assert aw.listener.wait_for(lambda: aw.runtime.queued() == 0)
     assert aw.listener.wait_for(lambda: set(aw.runtime._posted) == {(T, U, "w1", "later")}
                                 and aw.runtime._batches == {})
+
+
+def test_the_same_request_queued_twice_is_posted_once(aw):
+    """The sweep can race notify_pending and queue one request twice: only one ask may ever reach Slack."""
+    req = aw.request()
+    row = aw.store.get_action_request(req, tenant_id=T, user_id=U)
+    aw.runtime.notify_pending(row, row.display, row.reason)
+    aw.runtime.notify_pending(row, row.display, row.reason)
+    assert aw.runtime.queued() == 2
+    aw.runtime.start()
+    assert aw.listener.wait_for(lambda: aw.runtime.queued() == 0)
+    time.sleep(0.3)
+    assert len(aw.posts()) == 1
+    assert len([a for a in aw.store.slack_asks_for_request(req) if a.ts]) == 1
+
+
+def test_tap_on_an_orphan_retired_ask_is_refused_as_not_open(aw):
+    req = aw.request()
+    orphan = aw.ask(req, ts="", channel="")          # an unposted ask left behind by a crash
+    assert aw.runtime.sweep() == 1                    # the sweep retires it and queues a fresh one
+    assert aw.store.get_slack_ask(orphan.ask_id, tenant_id=T, user_id=U).status == "expired"
+    aw.tap(orphan, channel="", ts="")
+    assert aw.status(req) == "pending"
+    (refused,) = aw.audits("assistant.slack.refused")
+    assert "reason=not_open" in refused["detail"]

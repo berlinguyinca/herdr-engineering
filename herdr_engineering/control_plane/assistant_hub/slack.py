@@ -493,6 +493,10 @@ class SlackRuntime:
         row = self.store.get_action_request(item.request_id, tenant_id=item.tenant_id, user_id=item.user_id)
         if row is None or row.status != "pending":
             return True                                  # decided meanwhile (REST) or gone: nothing to ask
+        own = item.ask.ask_id if item.ask is not None else ""
+        if any(a.ts and a.ask_id != own and a.status in ("open", "decided")
+               for a in self.store.slack_asks_for_request(item.request_id)):
+            return True                      # a duplicate queue entry (sweep vs notify): one ask per request
         now = as_utc(self._now())
         key = (item.tenant_id, item.user_id, item.worker_id, item.task_id)
         stamps = self._posted.pop(key, None) or deque()
