@@ -14,7 +14,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA = re.compile(r"[0-9a-f]{40}")
 GIT_TIMEOUT_S = 120
 
 #: Why a SHA was refused; each becomes a `source.refused` reason in the event phase.
@@ -61,11 +61,18 @@ def fetch_main(cache: Path, url: str) -> Verdict:
     return Verdict(True)
 
 
-def verify_published(sha: str, *, api_head: str | None, cache: Path, url: str) -> Verdict:
-    """Accept `sha` only if it is the API-reported head and an ancestor of fetched origin/main."""
-    if not _SHA.match(sha or ""):
+def verify_published(sha: str, *, api_head: str | None, cache: Path, url: str,
+                     require_tip: bool = False) -> Verdict:
+    """Accept `sha` only if it is the API-reported head and an ancestor of fetched origin/main.
+
+    `api_head` is required (None is refused). With `require_tip` the fetched origin/main tip must
+    also equal `sha`, which makes the API-head check non-circular: the head the poll saw is compared
+    with what git independently reports now, and a main that moved in between is refused (the next
+    pass picks up the newer head).
+    """
+    if not _SHA.fullmatch(sha or ""):
         return Verdict(False, "malformed_sha")
-    if api_head is not None and sha != api_head:
+    if api_head is None or sha != api_head:
         return Verdict(False, "not_api_head", f"api head is {api_head}")
     fetched = fetch_main(cache, url)
     if not fetched.ok:
@@ -74,4 +81,8 @@ def verify_published(sha: str, *, api_head: str | None, cache: Path, url: str) -
         return Verdict(False, "unknown_commit")
     if _git(cache, "merge-base", "--is-ancestor", sha, "refs/remotes/origin/main").returncode:
         return Verdict(False, "not_on_origin_main")
+    if require_tip:
+        tip = _git(cache, "rev-parse", "refs/remotes/origin/main").stdout.strip()
+        if tip != sha:
+            return Verdict(False, "not_api_head", f"origin/main is {tip}")
     return Verdict(True)

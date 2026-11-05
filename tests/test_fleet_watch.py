@@ -150,7 +150,7 @@ def test_backoff_prefers_retry_after_then_reset_then_exponential_with_cap():
     assert poll.backoff_seconds(failures=1, headers={"retry-after": "42"}, now=1000) == 42
     assert poll.backoff_seconds(failures=1, headers={"retry-after": "99999"}, now=1000) == 900
     assert poll.backoff_seconds(failures=1, headers={"x-ratelimit-reset": "1300"}, now=1000) == 300
-    assert poll.backoff_seconds(failures=1, headers={"x-ratelimit-reset": "50"}, now=1000) == 0
+    assert poll.backoff_seconds(failures=1, headers={"x-ratelimit-reset": "50"}, now=1000) == 5
     assert poll.backoff_seconds(failures=1, now=0) == 120
     assert poll.backoff_seconds(failures=2, now=0) == 240
     assert poll.backoff_seconds(failures=3, now=0) == 480
@@ -290,13 +290,13 @@ def test_d3_accepts_ancestor_but_refuses_non_api_head_and_malformed(forge, sdir)
     url = str(forge.root / f"{REPO}.git")
     first = forge.head(REPO)
     newer = forge.commit(REPO, "two")
-    assert verify.verify_published(first, api_head=None, cache=cache_for(sdir), url=url).ok
+    assert verify.verify_published(first, api_head=first, cache=cache_for(sdir), url=url).ok
     assert verify.verify_published(first, api_head=newer, cache=cache_for(sdir), url=url).reason == "not_api_head"
     assert verify.verify_published("abc", api_head=None, cache=cache_for(sdir), url=url).reason == "malformed_sha"
 
 
 def test_d3_fetch_failure_is_a_refusal_not_an_exception(sdir, tmp_path):
-    v = verify.verify_published("a" * 40, api_head=None, cache=cache_for(sdir), url=str(tmp_path / "nope.git"))
+    v = verify.verify_published("a" * 40, api_head="a" * 40, cache=cache_for(sdir), url=str(tmp_path / "nope.git"))
     assert not v.ok and v.reason == "fetch_failed"
 
 
@@ -374,3 +374,103 @@ def test_cli_without_dry_run_refuses_and_touches_nothing(gh, forge, tmp_path):
     out = cli(tmp_path, gh, forge, "once", "--repo", REPO)
     assert out.returncode == 2 and "--dry-run" in out.stderr
     assert gh.requests == [] and not (tmp_path / "home/state").exists()
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+@pytest.mark.parametrize("bad", [
+    {"schema_version": 1, "repos": [], "converged": {}, "rollouts": {}},
+    {"schema_version": 1, "repos": {}, "converged": [], "rollouts": {}},
+    {"schema_version": 1, "repos": {}, "converged": {}, "rollouts": 3},
+    {"schema_version": 1, "repos": {"o/x": 5}, "converged": {}, "rollouts": {}},
+    {"schema_version": 1, "repos": {"o/x": {"failures": "a"}}, "converged": {}, "rollouts": {}},
+    {"schema_version": 1, "repos": {"o/x": {"next_poll_at": "soon"}}, "converged": {}, "rollouts": {}},
+    {"schema_version": 1, "repos": {}, "converged": {"o/x": 7}, "rollouts": {}},
+    {"schema_version": 1, "repos": {}, "converged": {}, "rollouts": {"id": "x"}},
+    [1, 2],
+])
+def test_state_load_sets_aside_any_wrong_shape(sdir, bad):
+    sdir.mkdir(parents=True)
+    (sdir / "state.json").write_text(json.dumps(bad))
+    assert state.load(sdir) == state.empty_state()
+    assert list(sdir.glob("state.json.corrupt-*"))
+
+
+def test_run_once_survives_a_wrong_shaped_state_file(gh, sdir, tmp_path):
+    sdir.mkdir(parents=True)
+    (sdir / "state.json").write_text('{"schema_version":1,"repos":{"acme/widget":{"failures":"a"}}}')
+    assert core.run_once([REPO], directory=sdir, lock_path=tmp_path / "n")["repos"][REPO]["outcome"] == "new"
+
+
+def test_http_protocol_errors_are_degraded_polls_not_crashes():
+    import http.client
+
+    def short_read(url, headers):
+        raise http.client.IncompleteRead(b"x")
+
+    r = poll.poll_repo(REPO, {}, now=0, fetch=short_read)
+    assert r.outcome == "error" and r.detail.startswith("network")
+
+
+def test_permissions_are_enforced_on_pre_existing_paths(sdir):
+    sdir.mkdir(parents=True, mode=0o755)
+    os.chmod(sdir, 0o755)
+    (sdir / "state.json.tmp").write_text("x")
+    os.chmod(sdir / "state.json.tmp", 0o644)
+    state.save(state.empty_state(), sdir)
+    with state.single_instance(sdir):
+        pass
+    assert (sdir.stat().st_mode & 0o777) == 0o700
+    assert ((sdir / "state.json").stat().st_mode & 0o777) == 0o600
+    assert ((sdir / "lock").stat().st_mode & 0o777) == 0o600
+
+
+def test_new_parents_are_private_whatever_the_umask(tmp_path):
+    old = os.umask(0)
+    try:
+        d = tmp_path / "a" / "b" / "fleet-watch"
+        state.save(state.empty_state(), d)
+        assert (d.stat().st_mode & 0o777) == 0o700
+        assert ((tmp_path / "a" / "b").stat().st_mode & 0o777) == 0o700
+    finally:
+        os.umask(old)
+
+
+def test_d3_requires_an_api_head(forge, sdir):
+    url = str(forge.root / f"{REPO}.git")
+    v = verify.verify_published(forge.head(REPO), api_head=None, cache=cache_for(sdir), url=url)
+    assert not v.ok and v.reason == "not_api_head"
+
+
+def test_d3_refuses_when_main_moved_since_the_poll(forge, sdir):
+    url = str(forge.root / f"{REPO}.git")
+    polled = forge.head(REPO)
+    forge.commit(REPO, "raced")
+    v = verify.verify_published(polled, api_head=polled, cache=cache_for(sdir), url=url,
+                                require_tip=True)
+    assert not v.ok and v.reason == "not_api_head"
+
+
+def test_retry_after_zero_cannot_hot_loop():
+    assert poll.backoff_seconds(failures=1, headers={"retry-after": "0"}, now=0) >= 5
+    assert poll.backoff_seconds(failures=1, headers={"x-ratelimit-reset": "10"}, now=1000) >= 5
+
+
+def test_sha_with_trailing_newline_is_malformed(forge, sdir):
+    v = verify.verify_published(forge.head(REPO) + "\n", api_head=forge.head(REPO) + "\n",
+                                cache=cache_for(sdir), url=str(forge.root / f"{REPO}.git"))
+    assert v.reason == "malformed_sha"
+    bad = json.dumps({"commit": {"sha": "a" * 40 + "\n"}}).encode()
+    r = poll.poll_repo(REPO, {}, now=0, fetch=lambda u, h: poll.Response(200, {}, bad))
+    assert r.outcome == "error"
+
+
+def test_no_partial_rollout_when_any_watched_repo_is_unverified(gh, forge, sdir, tmp_path):
+    forge.create("acme/gadget")
+    repos = [REPO, "acme/gadget", "acme/missing"]       # the third 404s: no verified head
+    rep = core.run_once(repos, directory=sdir, lock_path=tmp_path / "n")
+    assert rep["rollout"] is None
+    assert rep["held"] == {"acme/missing": "error"}
+    ok = core.run_once(repos[:2], directory=sdir, lock_path=tmp_path / "n")
+    assert set(ok["rollout"]["targets"]) == set(repos[:2]) and ok["held"] == {}

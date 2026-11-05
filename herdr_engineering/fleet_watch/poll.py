@@ -6,6 +6,7 @@ pure function so it is unit-testable without sleeping. Read-only: only GET, neve
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import random
@@ -26,7 +27,8 @@ LOW_REMAINING_INTERVAL_S = 600
 BACKOFF_MIN_S = 120
 BACKOFF_CAP_S = 900
 HTTP_TIMEOUT_S = 15
-_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA = re.compile(r"[0-9a-f]{40}")
+BACKOFF_FLOOR_S = 5
 
 Outcome = Literal["new", "changed", "unchanged", "rate_limited", "error"]
 
@@ -77,10 +79,10 @@ def backoff_seconds(*, failures: int, headers: Mapping[str, str] | None = None, 
     headers = headers or {}
     retry_after = headers.get("retry-after", "")
     if retry_after.isdigit():
-        return min(int(retry_after), BACKOFF_CAP_S)
+        return min(max(int(retry_after), BACKOFF_FLOOR_S), BACKOFF_CAP_S)
     reset = headers.get("x-ratelimit-reset", "")
     if reset.isdigit():
-        return min(max(int(reset) - int(now), 0), BACKOFF_CAP_S)
+        return min(max(int(reset) - int(now), BACKOFF_FLOOR_S), BACKOFF_CAP_S)
     base = min(BACKOFF_MIN_S * (2 ** max(failures - 1, 0)), BACKOFF_CAP_S)
     return min(int(base * (1 + 0.25 * jitter)), BACKOFF_CAP_S)
 
@@ -116,7 +118,7 @@ def poll_repo(repo: str, entry: Mapping[str, object], *, now: float, fetch: Fetc
         headers["If-None-Match"] = str(etag)
     try:
         resp = fetch(f"{api_base()}/repos/{repo}/branches/main", headers)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, http.client.HTTPException) as exc:
         wait = backoff_seconds(failures=failures + 1, now=now, jitter=rng.random())
         return PollResult(repo, "error", prior_head, etag, wait, f"network: {exc}"[:200])
     if resp.status == 304:
@@ -132,7 +134,7 @@ def poll_repo(repo: str, entry: Mapping[str, object], *, now: float, fetch: Fetc
         head = json.loads(resp.body)["commit"]["sha"]
     except (ValueError, KeyError, TypeError):
         head = None
-    if not isinstance(head, str) or not _SHA.match(head):
+    if not isinstance(head, str) or not _SHA.fullmatch(head):
         wait = backoff_seconds(failures=failures + 1, now=now, jitter=rng.random())
         return PollResult(repo, "error", prior_head, etag, wait, "malformed branch response")
     outcome: Outcome = "new" if prior_head is None else ("changed" if head != prior_head else "unchanged")
