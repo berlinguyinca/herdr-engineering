@@ -97,3 +97,13 @@ def match_deploy(raw: RawAction, deploy_cfg: Any) -> DeployMatch | None:
             return None                                   # a hint can only make the match stricter
         return DeployMatch(pid, sid, repo, argv[2], argv_digest(argv))
     return None
+
+
+def scope_mode(deploy_cfg: Any, project: str, scope: str, repo: str) -> str:
+    """The CURRENT yaml mode of a configured scope ("ask" or "auto"), or "" when the scope (or that repo) is gone.
+    ``auto`` is a switch the owner can flip back at any time: only the exact string "auto" lets a standing grant act."""
+    for pid, sid, rrepo, _command in _scopes(deploy_cfg):
+        if (pid, sid) == (project, scope) and rrepo.casefold() == repo.casefold():
+            mode = deploy_cfg["projects"][pid]["scopes"][sid].get("mode")
+            return mode if isinstance(mode, str) else ""
+    return ""

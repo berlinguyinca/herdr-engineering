@@ -19,7 +19,7 @@ from ..assistant import AssistantStore
 from .actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, GrantState, as_utc, revoke
 from .calibration import build_report, gate_satisfied
 from .canonical import Derived, RawAction, derive
-from .deploy import DeployMatch, scope_key
+from .deploy import DeployMatch, scope_key, scope_mode
 from .events import scrub_payload
 from .evidence import OWNER_PROVENANCE, _shadow_elapsed, propose_if_ready
 from .jev import JudgeUnavailable
@@ -33,7 +33,8 @@ from .workers import Worker
 POLICY_ACTOR = "hub:policy"
 Outcome = Literal["authorized", "denied", "pending"]
 Notify = Callable[..., None]      # (row, display, reason, *, project="") -> None; must only enqueue
-Source = Literal["veto", "grant", "owner", "shadow", "unknown", "judge", "judge_unavailable", "deploy_preconditions"]
+Source = Literal["veto", "grant", "owner", "shadow", "unknown", "judge", "judge_unavailable", "deploy_preconditions",
+                "deploy_mode"]
 
 
 @dataclass(frozen=True)
@@ -296,7 +297,7 @@ def decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, ses
            deploy_cfg: dict | None = None) -> Decision:
     derived = derive(raw, deploy_cfg)
     key = derived.key
-    return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now, judge, notify),
+    return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now, judge, notify, deploy_cfg),
                    verb=key.verb.value if key else Verb.UNKNOWN.value, key_id=key.key_id() if key else "")
 
 
@@ -319,7 +320,8 @@ def _consume_approval(store: AssistantStore, cfg: dict, worker: Worker, key_id: 
 
 
 def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
-            task_id: str, now: datetime, judge: JudgeRuntime | None, notify: Notify | None = None) -> Decision:
+            task_id: str, now: datetime, judge: JudgeRuntime | None, notify: Notify | None = None,
+            deploy_cfg: dict | None = None) -> Decision:
     veto = check_vetoes(derived, _extra_rules(cfg))
     if veto is not None:
         return _deny(store, worker, raw, derived, veto, session_id, task_id, now)
@@ -332,6 +334,11 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
         return _pending(store, worker, raw, derived, session_id, task_id, now, "unknown",
                         "The action could not be classified with certainty, so the owner decides.", judge, notify=notify)
     grant = _live_grant(store, cfg, worker, derived.key, now, current_judge_version(judge), derived.deploy)
+    if grant is not None and derived.deploy is not None and scope_mode(
+            deploy_cfg, derived.deploy.project, derived.deploy.scope, derived.deploy.repo) != "auto":
+        # mode is the owner's kill switch: the standing grant stays stored but is ignored until mode is auto again
+        return _pending(store, worker, raw, derived, session_id, task_id, now, "deploy_mode",
+                        "Auto-deploy is not switched on for this scope, so the owner decides.", judge, notify=notify)
     if grant is not None and in_shadow(store, cfg, now):
         return _pending(store, worker, raw, derived, session_id, task_id, now, "shadow",
                         "The shadow period is still running, so the owner decides.", judge, notify=notify)

@@ -4887,6 +4887,9 @@ def _make_handler(server, public=False, operator=False):
                 if proj is None or parts[5] not in proj["scopes"]:
                     return self._json({"error": "not found"}, 404)
                 project, scope = parts[4], parts[5]
+                if self.command == "POST" and proj["scopes"][scope]["mode"] != "auto":
+                    return self._json({"error": "this scope is not set to mode: auto in the config, so auto-deploy "
+                                                "cannot be confirmed", "code": "mode_not_auto"}, 409)
 
                 def active_worker(worker_id):
                     w = svc.store.workers.get(worker_id) if isinstance(worker_id, str) else None

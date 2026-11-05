@@ -48,7 +48,8 @@ def call(base, path, key=None, method="GET", body=None):
         with urllib.request.urlopen(req) as r:
             return r.status, json.loads(r.read() or b"null")
     except urllib.error.HTTPError as e:
-        raw = e.read()
+        with e:                       # an HTTPError owns the response socket: close it or it leaks at GC time
+            raw = e.read()
         try:
             return e.code, json.loads(raw or b"null")
         except ValueError:
@@ -207,8 +208,36 @@ def test_auth_is_operator_only_and_origin_checked(dw):
                                           "Origin": "https://evil.example"})
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(req)
-    assert exc.value.code == 403
+    with exc.value:
+        assert exc.value.code == 403
     assert dw.posts() == [] and dw.grants() == []
+
+
+def set_mode(dw, mode):
+    cfg = json.loads(json.dumps(DEPLOY))
+    cfg["projects"]["herdr-engineering"]["scopes"]["control-plane"]["mode"] = mode
+    dw.svc.config["deploy"] = assistant_config({"personal_assistant": {"deploy": cfg}})["deploy"]
+
+
+def test_a_scope_whose_mode_is_ask_cannot_be_asked_about(dw):
+    dw.gate()
+    set_mode(dw, "ask")
+    status, body = dw.ask_auto()
+    assert status == 409 and body["code"] == "mode_not_auto"
+    assert dw.posts() == [] and dw.deploy_asks() == [] and dw.grants() == []
+    status, body = dw.ask_auto(path="/api/v1/assistant-deploys/herdr-engineering/other/auto")
+    assert status == 409 and dw.posts() == []                      # "other" is mode ask in the shipped fixture
+
+
+def test_mode_changed_to_ask_between_ask_and_tap_creates_nothing_and_says_why(dw):
+    dw.gate()
+    ask = dw.request_ask()
+    set_mode(dw, "ask")
+    dw.tap(ask, "deploy_confirm")
+    assert dw.grants() == []
+    (said,) = [c for c in dw.posts() if c.get("thread_ts") == ask.ts]
+    assert "auto" in said["text"] and "mode" in said["text"].lower()
+    assert dw.audits("assistant.grant.activated") == []
 
 
 def test_slack_off_or_unreachable_creates_nothing(dw):

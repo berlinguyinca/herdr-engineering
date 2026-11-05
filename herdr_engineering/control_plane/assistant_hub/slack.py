@@ -26,7 +26,7 @@ from typing import Any
 
 from ..assistant import AssistantStore
 from .actiongrants import ActionRequestRow, GrantState, as_utc
-from .deploy import DeployMatch, scope_key
+from .deploy import DeployMatch, scope_key, scope_mode
 from .evidence import propose_if_ready
 from .policy import (
     ActivationRefused,
@@ -190,6 +190,7 @@ _SENTENCES = {
     "not_rememberable": "this kind of action can never be remembered, so it will always ask you",
     "grant_cap": "this account already holds the maximum number of permissions",
     "not_configured": "that deploy scope is no longer configured the way you were asked about, so nothing was turned on",
+    "mode_not_auto": "auto-deploy is no longer switched on (mode: auto) for that scope, so nothing was turned on",
     "no_worker": "that worker is no longer active, so nothing was turned on",
 }
 
@@ -1024,6 +1025,8 @@ class SlackRuntime:
         worker = self.store.workers.get(ask.worker_id)
         if found is None or found != (ask.repo, ask.command):
             return "not_configured"
+        if scope_mode(self.service.config.get("deploy"), ask.project, ask.scope, ask.repo) != "auto":
+            return "mode_not_auto"
         if worker is None or worker.status != "active" or (worker.tenant_id, worker.user_id) != (ask.tenant_id,
                                                                                                ask.user_id):
             return "no_worker"

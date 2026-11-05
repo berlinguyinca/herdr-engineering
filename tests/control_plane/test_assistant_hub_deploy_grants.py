@@ -412,3 +412,40 @@ def test_old_snapshots_without_a_source_restore(dw):
 
 def test_default_grant_has_no_source():
     assert ActionGrant().source == "" and replace(ActionGrant(), source="x").source == "x"
+
+
+# ------------------------------------------------------------------------------------- mode is a kill switch at use
+def with_mode(mode, scope="control-plane"):
+    import json
+    cfg = json.loads(json.dumps(DEPLOY))
+    cfg["projects"]["herdr-engineering"]["scopes"][scope]["mode"] = mode
+    return cfg
+
+
+def test_a_mode_flipped_to_ask_ignores_the_standing_grant_without_touching_it(dw):
+    dw.gate()
+    g = dw.stand()
+    assert dw.deploy().source == "deploy_preconditions"
+    d = dw.deploy(deploy_cfg=with_mode("ask"))
+    assert (d.outcome, d.source) == ("pending", "deploy_mode") and d.grant_id is None
+    assert dw.store.get_action_grant(g.grant_id, tenant_id=T, user_id=U).state is GrantState.ACTIVE
+    assert dw.audits("assistant.grant.revoked") == []
+    d = dw.deploy(deploy_cfg=with_mode("auto"))                      # flipped back: the normal path again
+    assert (d.outcome, d.source) == ("pending", "deploy_preconditions")
+
+
+def test_a_scope_or_config_removed_never_authorizes(dw):
+    dw.gate()
+    g = dw.stand()
+    for cfg in ({"projects": {}}, None, {}):
+        d = dw.deploy(deploy_cfg=cfg)
+        assert d.outcome == "pending" and d.source in ("unknown", "deploy_mode")
+    moved = with_mode("auto")
+    moved["projects"]["herdr-engineering"]["scopes"]["control-plane"]["command"] = "deploy/moved.sh"
+    assert dw.deploy(deploy_cfg=moved).source in ("unknown", "deploy_mode")
+    assert dw.store.get_action_grant(g.grant_id, tenant_id=T, user_id=U).state is GrantState.ACTIVE
+
+
+def test_without_a_grant_a_mode_ask_scope_is_an_ordinary_owner_ask(dw):
+    dw.gate()
+    assert dw.deploy(deploy_cfg=with_mode("ask")).source == "owner"
