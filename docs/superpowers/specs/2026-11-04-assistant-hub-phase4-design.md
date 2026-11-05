@@ -168,9 +168,9 @@ Slack app manifest and library, message layout, exact config key names, the dead
 post-deploy check, how a worker learns a pending ask was decided (re-asking the same request is the expected shape),
 and test layout.
 
-## Open items for the owner
+## Decisions confirmed by the owner (2026-11-04)
 
-- **Deploy trust model (my default, please confirm):** deploying is "outward" risk, which today needs 30 approvals of the
-  exact action before a grant can be proposed. A project that deploys weekly would take most of a year. My default:
-  for the deploy scope only, an explicit owner opt-in (`mode: auto` plus Slack confirmation) replaces the approval
-  count, and every other gate (veto, judge, shadow period, hub-verified preconditions) still applies.
+- **Deploy trust model:** for the deploy scope only, an explicit owner opt-in (`mode: auto` plus a Slack confirmation tap)
+  replaces the approval count. Vetoes, the judge, the shadow period and the hub-verified preconditions still apply.
+- **Advisory enforcement is acceptable** for the first auto-deploy: the hub never says `authorized` for an unmatched command
+  and verifies the outcome afterwards; harness-level enforcement is deferred.
