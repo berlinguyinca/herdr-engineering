@@ -288,6 +288,45 @@ export class HerdrClient {
     return this.request(`${this.artifactSharesPath(id, shareId)}/events`, { signal });
   }
 
+  // Operator controls for member-owned artifacts (/api/v1/artifact-members); a viewer key answers 403.
+  artifactMemberPath(member, ...rest) {
+    return ['/api/v1/artifact-members', encodeURIComponent(member), ...rest.map(encodeURIComponent)].join('/');
+  }
+
+  listArtifactMembers({ signal } = {}) {
+    return this.request('/api/v1/artifact-members', { signal });
+  }
+
+  getArtifactMember(member, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member), { signal });
+  }
+
+  listArtifactMemberLinks({ audience, state, signal } = {}) {
+    const query = new URLSearchParams();
+    if (audience) query.set('audience', audience);
+    if (state) query.set('state', state);
+    const text = query.toString();
+    return this.request(`/api/v1/artifact-members/links${text ? `?${text}` : ''}`, { signal });
+  }
+
+  /** `limits` holds any of max_artifact_bytes / max_member_bytes / max_artifacts; null clears an override. */
+  setArtifactMemberLimits(member, limits, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'limits'), { method: 'POST', body: limits, signal });
+  }
+
+  setArtifactMemberSharing(member, enabled, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'sharing'), { method: 'POST', body: { enabled }, signal });
+  }
+
+  revokeArtifactMemberShare(member, shareId, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'shares', shareId, 'revoke'), { method: 'POST', body: {}, signal });
+  }
+
+  /** Permanent: `confirm` must repeat the artifact id exactly. */
+  purgeArtifactMemberArtifact(member, artifactId, confirm, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'artifacts', artifactId, 'purge'), { method: 'POST', body: { confirm }, signal });
+  }
+
   /** Annotations on an artifact's shares (owner view): one page, newest first; pass the returned `next` as `before`. */
   listArtifactAnnotations(id, { status = 'open', limit, before, signal } = {}) {
     const query = new URLSearchParams({ status });

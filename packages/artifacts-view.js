@@ -3,6 +3,7 @@ import { skeleton } from './motion.js';
 import { morph } from './patch.js';
 import { pollWhileVisible } from './refresh-bus.js';
 import { mountSharePanel } from './artifact-share-panel.js';
+import { mountMembersPanel } from './artifact-members-panel.js';
 import { mountHistory } from './artifact-history.js';
 import { liveLink, mountPdf, mountStaticHtml } from './artifact-static-preview.js';
 
@@ -15,7 +16,7 @@ const humanSize = value => {
 
 export function mountArtifacts(container, client, { freshness = () => null } = {}) {
   let disposed = false, timer, controller, generation = 0, loaded = false;
-  container.innerHTML = '<div class="hd-card" data-artifact-registry><div class="hd-card__title">Artifact registry</div><div class="hd-inline"><input class="hd-input" data-artifact-query placeholder="Search artifacts" aria-label="Search artifacts"><select class="hd-input" data-artifact-type aria-label="Filter artifact type"><option value="">All types</option><option value="other">Other</option><option value="web">Web</option><option value="report">Report</option><option value="document">Document</option></select><select class="hd-input" data-artifact-status aria-label="Filter artifact status"><option value="">All statuses</option><option value="available">Available</option><option value="draft">Draft</option></select><select class="hd-input" data-artifact-context-kind aria-label="Linked to"><option value="">Any work</option><option value="project">Project</option><option value="issue">Issue</option><option value="task">Task</option><option value="room">Room</option></select><input class="hd-input" data-artifact-context-ref placeholder="Project, issue, task or room id" aria-label="Linked work id"></div><p data-artifact-state role="status"></p><div data-artifact-results></div><button type="button" data-artifact-retry hidden>Retry</button></div>';
+  container.innerHTML = '<div class="hd-card" data-artifact-registry><div class="hd-card__title">Artifact registry</div><div class="hd-inline"><input class="hd-input" data-artifact-query placeholder="Search artifacts" aria-label="Search artifacts"><select class="hd-input" data-artifact-type aria-label="Filter artifact type"><option value="">All types</option><option value="other">Other</option><option value="web">Web</option><option value="report">Report</option><option value="document">Document</option></select><select class="hd-input" data-artifact-status aria-label="Filter artifact status"><option value="">All statuses</option><option value="available">Available</option><option value="draft">Draft</option></select><select class="hd-input" data-artifact-context-kind aria-label="Linked to"><option value="">Any work</option><option value="project">Project</option><option value="issue">Issue</option><option value="task">Task</option><option value="room">Room</option></select><input class="hd-input" data-artifact-context-ref placeholder="Project, issue, task or room id" aria-label="Linked work id"></div><p data-artifact-state role="status"></p><div data-artifact-results></div><button type="button" data-artifact-retry hidden>Retry</button></div><div data-artifact-members hidden></div>';
   const results = container.querySelector('[data-artifact-results]');
   const state = container.querySelector('[data-artifact-state]');
   const retry = container.querySelector('[data-artifact-retry]');
@@ -59,7 +60,10 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
   retry.addEventListener('click', render);
   const stop = pollWhileVisible(render, 30000);
   void render();
-  return { refresh: render, dispose() { disposed = true; clearTimeout(timer); stop(); controller?.abort(); } };
+  // The operator Members section shows itself only when the members list loads; a 403 leaves it hidden.
+  const membersAbort = new AbortController();
+  const members = mountMembersPanel(container.querySelector('[data-artifact-members]'), client, { signal: membersAbort.signal });
+  return { refresh: render, dispose() { disposed = true; clearTimeout(timer); stop(); controller?.abort(); membersAbort.abort(); members.dispose(); } };
 }
 
 const STAGES = { rendered: 'Rendered', evidence_checked: 'Evidence checked', reviewed: 'Reviewed' };
