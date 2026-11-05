@@ -612,7 +612,7 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
         " LEFT JOIN artifact_versions v ON v.version_id=a.current_version_id"
         " WHERE acl.principal_id=$1 AND (acl.expires_at IS NULL OR acl.expires_at > now())"
         " AND a.created_by IS DISTINCT FROM $1 AND a.lifecycle='active'"
-        " AND (acl.permissions ? 'read' OR acl.permissions ? 'admin')"
+        " AND (acl.permissions ? 'read' OR acl.permissions ? 'admin' OR acl.permissions ? 'share')"
         " ORDER BY a.artifact_id LIMIT $2", principal, VIEW_MAX_SHARED)
     links = await conn.fetch(      # the member's own links, and every link on an artifact it owns (it may revoke those)
         "SELECT s.share_id, s.artifact_id, s.version_id, s.audience, s.state, s.expires_at, s.allow_emails,"

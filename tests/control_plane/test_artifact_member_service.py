@@ -50,14 +50,14 @@ class World(Net):
         doc = {"generated_at": self.s._now(), "agents": {}, "limits": BridgeLimits(**limits).to_dict()}
         atomic_write_json(self.bridge.mirror, GRANTS_NAME, doc)
 
-    def view(self, name, artifacts=(), shared=(), principal=None):
+    def view(self, name, artifacts=(), shared=(), principal=None, perms="read"):
         key = member_owner_key(f"member:{name}")
         arts = [{"artifact_id": a, "title": f"title {a}", "lifecycle": "active", "head_version_id": "v_1",
                  "head_version_number": 1, "bytes": 3,
                  "versions": [{"version_id": "v_1", "version_number": 1, "created_at": "2026-10-30T12:00:00+00:00",
                                "message": "first", "parent_version_ids": []}]} for a in artifacts]
         sh = [{"artifact_id": a, "title": "shared", "head_version_id": "v_9", "head_version_number": 9,
-               "permissions": "read"} for a in shared]
+               "permissions": perms} for a in shared]
         doc = {"principal": principal or f"member:{name}", "updated": "2026-10-30T12:00:00+00:00", "usage": {},
                "artifacts": arts, "shared_with_me": sh, "links": []}
         atomic_write_json(self.bridge.mirror / "member-views", f"{key}.json", doc)
@@ -494,6 +494,19 @@ def test_share_create_is_429_after_the_hourly_cap_and_the_window_slides(approval
         assert w.ms.share_create(w.user("op"), ART, "v_1", "public")["status"] == "pending"
     finally:
         w.bridge.stop()
+
+
+def test_a_share_only_grant_may_create_links_but_not_read_and_a_read_only_grant_may_not_share(world):
+    """D3: ``share`` is the gate for links; it does not open the bytes, and ``read`` alone does not open links."""
+    world.view("op", [ART], shared=["art_sh_only"], perms=["share"])
+    assert world.ms.share_create(world.user("op"), "art_sh_only", "v_9", "public")["status"] == "pending"
+    assert refuse(world.ms.history, world.user("op"), "art_sh_only").status == 404
+    assert refuse(world.ms.head, world.user("op"), "art_sh_only").status == 404
+    assert world.ms.can_read(world.user("op"), "art_sh_only") is False
+    world.view("op", [ART], shared=["art_ro"], perms=["read"])
+    assert refuse(world.ms.share_create, world.user("op"), "art_ro", "v_9", "public").status == 404
+    assert world.ms.head(world.user("op"), "art_ro")["permission"] == ["read"]
+    assert world.ms.can_read(world.user("op"), "art_ro") is True
 
 
 def test_share_create_on_an_artifact_outside_the_view_is_the_same_404_as_a_ghost(world):

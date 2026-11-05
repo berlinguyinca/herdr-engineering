@@ -744,6 +744,19 @@ def test_a_pending_member_publish_protects_its_uploads_from_the_sweep(registry_p
 
 # ----------------------------------------------------------------------------- the member view
 
+def test_a_share_only_grant_appears_in_shared_with_me(registry_pg, tmp_path):
+    async def body(env, rt):
+        bob_aid = await create(env, user("bob"), title="Bobs")
+        await publish(env, bob_aid, {"index.html": b"<html>b</html>"}, actor=user("bob"), owner=BOB)
+        await sql(env, "INSERT INTO artifact_acl (artifact_id, principal_id, permissions, granted_by) "
+                       "VALUES ($1,$2,'[\"share\"]'::jsonb,$3)", bob_aid, ALICE, BOB)
+        async with env.pool.acquire() as conn:
+            await write_member_view(conn, ALICE, env.mirror_root)
+        (shared,) = view_of(env, ALICE)["shared_with_me"]
+        assert shared["artifact_id"] == bob_aid and shared["permissions"] == ["share"]
+    mrun(registry_pg, tmp_path, body)
+
+
 def test_the_view_lists_artifacts_versions_links_usage_and_shared_with_me(registry_pg, tmp_path):
     async def body(env, rt):
         aid = await create(env, title="Mine")

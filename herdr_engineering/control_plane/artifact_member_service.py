@@ -177,7 +177,7 @@ class MemberService:
         who = _Caller(pr, Actor(pr.kind, pr.id), check.principal, member_owner_key(check.principal))
         view = self._view(who)
         return self._entry(view.get("artifacts"), artifact_id) is not None \
-            or self._entry(view.get("shared_with_me"), artifact_id) is not None
+            or self._grants(self._entry(view.get("shared_with_me"), artifact_id), "read")
 
     # ------------------------------------------------------------------------------------------ throttles
     def _throttle(self, who: _Caller, kind: str, limit: int, n: int = 1, window: float = 60.0) -> None:
@@ -267,7 +267,7 @@ class MemberService:
     def _shareable(self, who: _Caller, tool: str, artifact_id: Any) -> None:
         """Owned and active, or shared with the caller; the worker re-checks the ``share`` grant and the lifecycle, this
         only spares a ticket and a write-rate slot."""
-        row, own = self._readable(who, tool, artifact_id)
+        row, own = self._readable(who, tool, artifact_id, need="share")
         if own and row.get("lifecycle") != "active":
             raise self._fail(who.pr, tool, "not_owner", 404, "not_found", NOT_FOUND, artifact_id)
 
@@ -319,13 +319,24 @@ class MemberService:
         view = self._view(who)
         return {k: view.get(k) for k in ("available", "updated", "usage", "artifacts", "shared_with_me", "links")}
 
-    def _readable(self, who: _Caller, tool: str, artifact_id: Any) -> tuple[Mapping[str, Any], bool]:
+    @staticmethod
+    def _grants(entry: Mapping[str, Any] | None, need: str) -> bool:
+        """Whether a ``shared_with_me`` entry carries ``need`` (``read`` or ``share``); ``admin`` carries both. The view
+        lists a grant that holds any of read, share or admin: ``share`` alone is the gate for links (D3), not for bytes."""
+        if entry is None:
+            return False
+        perms = entry.get("permissions")
+        perms = [perms] if isinstance(perms, str) else perms if isinstance(perms, list) else []
+        return "admin" in perms or need in perms
+
+    def _readable(self, who: _Caller, tool: str, artifact_id: Any,
+                  need: str = "read") -> tuple[Mapping[str, Any], bool]:
         view = self._view(who)
         own = self._entry(view.get("artifacts"), artifact_id)
         if own is not None:
             return own, True
         shared = self._entry(view.get("shared_with_me"), artifact_id)
-        if shared is None:
+        if shared is None or not self._grants(shared, need):
             raise self._fail(who.pr, tool, "not_visible", 404, "not_found", NOT_FOUND, artifact_id)
         return shared, False
 
