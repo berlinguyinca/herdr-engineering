@@ -172,16 +172,33 @@ const WEEK_SOURCES = ['projections', 'missions', 'sessions'];
 const LIFECYCLE_LABEL = {running:'running', blocked:'blocked', review:'in review', paused_quota:'paused (quota)', finished:'finished', failed:'failed', unconfirmed:'unconfirmed'};
 const NEEDS_ATTENTION = new Set(['blocked', 'review', 'failed']);
 const WEEK_ROW_LIMIT = 5;
+const browserZone = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; } };
+const validZone = zone => { if (typeof zone !== 'string' || !zone) return false; try { new Intl.DateTimeFormat('en-US', {timeZone: zone}); return true; } catch { return false; } };
+// G4: unknown zones are rejected and the browser zone is used; UTC only if the browser zone itself is unusable.
 export function userTimeZone(data = {}) {
-  const zone = typeof data.timeZone === 'string' && data.timeZone ? data.timeZone : Intl.DateTimeFormat().resolvedOptions().timeZone;
-  try { new Intl.DateTimeFormat('en-US', {timeZone: zone}); return zone; } catch { return 'UTC'; }
+  if (validZone(data.timeZone)) return data.timeZone;
+  const zone = browserZone();
+  return validZone(zone) ? zone : 'UTC';
 }
+const WEEK_STARTS = {monday: 1, sunday: 0, saturday: 6};
+const WEEK_PREFS_KEY = 'herdr.overview.week.v1';
+export const sanitizeWeekPreferences = value => {
+  const v = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return {timeZone: validZone(v.timeZone) ? v.timeZone : null, weekStart: typeof v.weekStart === 'string' && Object.hasOwn(WEEK_STARTS, v.weekStart) ? v.weekStart : 'monday'};
+};
+export function loadWeekPreferences(storage) {
+  try { return sanitizeWeekPreferences(JSON.parse(storage.getItem(WEEK_PREFS_KEY) || 'null')); } catch { return sanitizeWeekPreferences(undefined); }
+}
+export function saveWeekPreferences(storage, prefs) {
+  try { storage.setItem(WEEK_PREFS_KEY, JSON.stringify(sanitizeWeekPreferences(prefs))); } catch { /* The choice then lasts for this page only. */ }
+}
+export const userWeekStart = (data = {}) => sanitizeWeekPreferences({weekStart: data.weekStart}).weekStart;
 const weekGroup = item => item.lifecycle === 'paused_quota' ? 'paused' : item.lifecycle === 'finished' || item.lifecycle === 'failed' ? 'completed' : item.lifecycle === 'unconfirmed' ? 'unconfirmed' : 'active';
 export function weekCardModel(data = {}, states = {}, received = Date.now(), now = Date.now()) {
-  const timeZone = userTimeZone(data);
+  const timeZone = userTimeZone(data), weekStart = userWeekStart(data);
   const loaded = WEEK_SOURCES.filter(key => states[key]?.loaded), missing = WEEK_SOURCES.filter(key => !states[key]?.loaded);
   const items = workSummaries({projections: records(data.projections), recorded: records(data.missions), sessions: records(data.sessions), received, now});
-  const week = weeklyActivity({items, now, timeZone, historyComplete: false, serverHistory: data.weeklyHistory ?? null});
+  const week = weeklyActivity({items, now, timeZone, weekStartsOn: WEEK_STARTS[weekStart], historyComplete: false, serverHistory: data.weeklyHistory ?? null});
   const start = Date.parse(week.window.start), end = Date.parse(week.window.end);
   const inWindow = value => { const ms = Date.parse(text(value)); return ms >= start && ms < end; };
   const visible = items.filter(item => {
@@ -193,7 +210,7 @@ export function weekCardModel(data = {}, states = {}, received = Date.now(), now
   const sorted = [...visible].sort((a, b) => rank(a) - rank(b) || (Date.parse(b.updated_at || '') || 0) - (Date.parse(a.updated_at || '') || 0));
   const groups = ['active', 'paused', 'completed', 'unconfirmed'].map(key => ({key, items: sorted.filter(item => weekGroup(item) === key)})).filter(group => group.items.length);
   const partial = missing.length > 0 || ['started', 'finished', 'open', 'paused_quota', 'attention_needed'].some(key => week[key].coverage !== 'complete');
-  return {week, groups, timeZone, loaded, missing, partial, total: items.length, history: Boolean(data.weeklyHistory), historyFailed: Boolean(states.weekly?.error)};
+  return {week, groups, timeZone, weekStart, loaded, missing, partial, total: items.length, history: Boolean(data.weeklyHistory), historyFailed: Boolean(states.weekly?.error)};
 }
 const dayIn = (iso, timeZone) => { try { return new Intl.DateTimeFormat('en-CA', {timeZone, year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date(iso)); } catch { return String(iso).slice(0, 10); } };
 function weekMetric(label, m, timeZone = 'UTC') {
@@ -215,6 +232,13 @@ function weekRow(item) {
     ${progress === null ? '' : `<progress class="wk-progress" max="100" value="${progress}" aria-label="${esc(`Measured progress for ${title}: ${item.progress.label || `${progress}%`}`)}">${progress}%</progress><p>${esc(short(text(item.progress.label), 80))}</p>`}</div>
     <span class="ov-tag ${attention ? 'ov-alert' : ''}">${esc(LIFECYCLE_LABEL[item.lifecycle] || item.lifecycle)}</span></li>`;
 }
+const cap = word => word[0].toUpperCase() + word.slice(1);
+function weekControls(zone, weekStart) {
+  let zones = [];
+  try { zones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : []; } catch { zones = []; }
+  if (!zones.includes(zone)) zones = [zone, ...zones];
+  return `<div class="wk-controls"><label>Time zone <select data-week-zone>${zones.map(z => `<option value="${esc(z)}"${z === zone ? ' selected' : ''}>${esc(z)}</option>`).join('')}</select></label> <label>Week starts <select data-week-start>${Object.keys(WEEK_STARTS).map(k => `<option value="${k}"${k === weekStart ? ' selected' : ''}>${cap(k)}</option>`).join('')}</select></label></div>`;
+}
 const GROUP_LABEL = {active:'Active', paused:'Paused', completed:'Completed this week', unconfirmed:'Unconfirmed'};
 export function renderWeekCard(data = {}, states = {}, received = Date.now(), now = Date.now()) {
   const heading = '<div class="ov-heading"><h2 tabindex="-1">This week</h2></div>';
@@ -233,7 +257,8 @@ export function renderWeekCard(data = {}, states = {}, received = Date.now(), no
   return `${heading}${errors}
     <div class="ov-metrics wk-metrics">${weekMetric('Started', w.started, m.timeZone)}${weekMetric('Finished', w.finished, m.timeZone)}${weekMetric('Open', w.open)}${weekMetric('Quota-paused', w.paused_quota)}${weekMetric('Needs attention', w.attention_needed)}</div>
     ${banner}${rows || empty('No work items are reported yet.')}
-    <p class="ov-note">Week of ${esc(w.window.start.slice(0, 10))} (${esc(m.timeZone)}), counted from recorded timestamps. Progress is shown only where a mission reports measured evidence.</p>`;
+    ${weekControls(m.timeZone, m.weekStart)}
+    <p class="ov-note">Week of ${esc(dayIn(w.window.start, m.timeZone))} (${esc(m.timeZone)}), week starts ${esc(cap(m.weekStart))}, counted from recorded timestamps. Progress is shown only where a mission reports measured evidence.</p>`;
 }
 
 export function renderOverviewSection(section, data = {}, states = {}, received = Date.now(), now = Date.now(), { workCenter = true } = {}) {
@@ -348,6 +373,11 @@ export function mountOverview(container, client, { freshness = () => null, workC
   const CARDS=overviewCards(workCenter);
   let disposed=false, clock=null, received=Date.now();
   const data={snoozed:loadSnoozed()}, states={}, signatures=new Map();
+  // G4: the week's time zone and first day live beside the layout preference (same localStorage pattern, own key).
+  let weekStore=null;
+  try { weekStore=window.localStorage; } catch { /* Choices then last for this page only. */ }
+  const applyWeekPrefs=prefs=>{data.timeZone=prefs.timeZone||undefined;data.weekStart=prefs.weekStart;};
+  applyWeekPrefs(loadWeekPreferences(weekStore));
   const chip=freshnessSources(freshness);
   const panels=['attention',...CARDS,'health'];
   let preferences;
@@ -498,6 +528,13 @@ export function mountOverview(container, client, { freshness = () => null, workC
     if(document.hidden){polling.pause();return;}
     draw();polling.resume();clock=setInterval(draw,1000);
   }
+  container.addEventListener('change',event=>{
+    const zone=event.target.closest?.('[data-week-zone]'), start=event.target.closest?.('[data-week-start]');
+    if(!zone && !start)return;
+    const next=sanitizeWeekPreferences({timeZone:zone?zone.value:data.timeZone,weekStart:start?start.value:data.weekStart});
+    applyWeekPrefs(next);saveWeekPreferences(weekStore,next);
+    delete data.weeklyHistory;loadWeekly();draw();
+  });
   container.addEventListener('click',event=>{
     if(event.target.closest?.('[data-attention-toggle]')){data.attentionExpanded=!data.attentionExpanded;draw();return;}
     const control=event.target.closest?.('[data-overview-action], [data-overview-reset]');
@@ -519,21 +556,25 @@ export function mountOverview(container, client, { freshness = () => null, workC
   });
   // G1: one read of the server's stored lifecycle events for the current week per overview load (no polling). A failed or
   // malformed read leaves the card on its snapshot-only partial counts; coverage comes only from the server's answer.
-  const weeklyAbort=new AbortController();
-  if(workCenter && typeof client.weeklyEvents==='function') {
+  let weeklyAbort=new AbortController(), weeklySeq=0;
+  function loadWeekly() {
+    if(!workCenter || typeof client.weeklyEvents!=='function')return;
+    weeklyAbort.abort();weeklyAbort=new AbortController();
+    const signal=weeklyAbort.signal, seq=++weeklySeq;
     states.weekly={loaded:false,error:false};
     let window_;
-    try { const win=weekWindow({now:Date.now(),timeZone:userTimeZone(data)}); window_={since:new Date(win.start).toISOString(),until:new Date(win.end).toISOString()}; } catch { window_=null; }
-    Promise.resolve(window_ && client.weeklyEvents({...window_,limit:500,signal:weeklyAbort.signal})).then(body=>{
-      if(disposed || !window_)return;
+    try { const win=weekWindow({now:Date.now(),timeZone:userTimeZone(data),weekStartsOn:WEEK_STARTS[userWeekStart(data)]}); window_={since:new Date(win.start).toISOString(),until:new Date(win.end).toISOString()}; } catch { window_=null; }
+    Promise.resolve(window_ && client.weeklyEvents({...window_,limit:500,signal})).then(body=>{
+      if(disposed || seq!==weeklySeq || !window_)return;
       if(!Array.isArray(body?.events) || !body.coverage || typeof body.coverage!=='object')throw new Error('Invalid response');
       data.weeklyHistory={events:body.events,coverage:body.coverage};
       states.weekly={loaded:true,error:false};draw();
     }).catch(error=>{
-      if(disposed || weeklyAbort.signal.aborted)return;
+      if(disposed || signal.aborted || seq!==weeklySeq)return;
       states.weekly={loaded:false,error:`Could not read weekly history: ${requestErrorDetail(error)}`};draw();
     });
   }
+  loadWeekly();
   document.addEventListener('visibilitychange',visibility);visibility();
   return {refresh,dispose(){disposed=true;weeklyAbort.abort();clearInterval(clock);polling.dispose();document.removeEventListener('visibilitychange',visibility);}};
 }

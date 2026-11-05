@@ -126,3 +126,37 @@ test('G1: failed weekly read falls back to the snapshot and says so',async()=>wi
  assert.doesNotMatch(await page.locator(card).innerText(),/history from/);
  assert.match(await page.locator(`${card} .wk-metric`,{hasText:'Started'}).getAttribute('aria-label'),/partial|unknown/);
 }));
+
+// ---- G4: time zone and week start controls ----
+const weekQuery=[];
+const g4Handler=withFlag((p,url)=>{if(p===WEEKLY){weekQuery.push(url.searchParams.get('since'));return {events:[],coverage:{complete:false,horizon:'2025-12-01T00:00:00Z',truncated:false,reasons:['x']}};}return rawHandler(p);});
+test('G4: zone and week start controls persist, re-render the card, re-read the window and survive reload',async()=>withPage(async(page,base)=>{
+ weekQuery.length=0;
+ await boot(page,base,'/overview',g4Handler);
+ await page.locator(`${card} .wk-row`).first().waitFor({timeout:8000});
+ assert.match(await page.locator(card).innerText(),/week starts Monday/i,'default unchanged');
+ const before=weekQuery.length;
+ await page.locator(`${card} [data-week-zone]`).selectOption('Pacific/Auckland');
+ await page.locator(`${card} [data-week-start]`).selectOption('sunday');
+ await until(async()=>/Pacific\/Auckland/.test(await page.locator(`${card} .ov-note`).last().innerText()),'zone shown');
+ assert.match(await page.locator(card).innerText(),/week starts Sunday/i);
+ assert.ok(weekQuery.length>before,'weekly window re-read after a change');
+ assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('herdr.overview.week.v1')).timeZone),'Pacific/Auckland');
+ await page.reload();
+ await page.locator(`${card} [data-week-zone]`).waitFor({timeout:8000});
+ assert.equal(await page.locator(`${card} [data-week-zone]`).inputValue(),'Pacific/Auckland');
+ assert.equal(await page.locator(`${card} [data-week-start]`).inputValue(),'sunday');
+}));
+test('G4: an invalid stored zone is ignored and a blocked localStorage still renders the card',async()=>withPage(async(page,base)=>{
+ await page.addInitScript(()=>{localStorage.setItem('herdr.overview.week.v1',JSON.stringify({timeZone:'Mars/Base',weekStart:'friday'}));});
+ const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await boot(page,base,'/overview',g4Handler);
+ await page.locator(`${card} .wk-row`).first().waitFor({timeout:8000});
+ assert.match(await page.locator(card).innerText(),/week starts Monday/i);
+ assert.notEqual(await page.locator(`${card} [data-week-zone]`).inputValue(),'Mars/Base');
+ // Storage that throws on every call: choice still applies for this page.
+ await page.evaluate(()=>{Storage.prototype.setItem=()=>{throw new Error('full');};});
+ await page.locator(`${card} [data-week-start]`).selectOption('saturday');
+ await until(async()=>/week starts Saturday/i.test(await page.locator(card).innerText()),'saturday applied without storage');
+ assert.deepEqual(errors,[]);
+}));
