@@ -131,3 +131,66 @@ for (const [status, red] of [[403, false], [404, false], [503, false], [500, tru
     assert.deepEqual(reports, [!red]);
   });
 }
+
+// Real client URL construction driven by actual result-row clicks, not filter guesses.
+for (const row of [
+  mem({ kind: 'summary', bank_id: 'other-summaries', project: 'other', scope: 'project' }),
+  mem({ kind: 'decision', bank_id: 'other-facts', project: 'other', scope: 'project' }),
+  mem({ kind: 'summary', bank_id: 'other-mission-release', project: 'other', scope: 'mission:release' }),
+  mem({ kind: 'decision', bank_id: 'herdr-global', project: 'origin-metadata', scope: 'global' }),
+  mem({ kind: 'fact', bank_id: 'herdr-infra', project: 'origin-metadata', scope: 'infra' }),
+]) {
+  test(`row click forwards collection and actual ${row.scope}/${row.kind} context`, async () => {
+    const { HerdrClient } = await import('./herdr-web-client/client.js');
+    const requests = [];
+    const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+      requests.push({ url, opts });
+      const body = url.includes('/search?') ? { results: [row] } : url.endsWith('/status') ? {} : { memory: row };
+      return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+    } });
+    const { root, handlers, nodes } = fakeRoot();
+    const view = mountMemory(root, client, { query: new URLSearchParams('q=synthetic&kind=fact&project=wrong-filter') });
+    await tick();
+    handlers.click({ target: { closest: s => s === '[data-memory]' ? { dataset: { memory: row.memory_id }, focus() {} } : null } });
+    await tick();
+    const request = requests.find(r => new URL(r.url, 'http://fixture.test').pathname === '/api/v1/memory/m1');
+    const params = new URL(request.url, 'http://fixture.test').searchParams;
+    assert.equal(params.get('kind'), row.kind === 'summary' ? 'summary' : 'fact');
+    assert.equal(params.get('scope'), row.scope);
+    if (row.scope === 'project' || row.scope.startsWith('mission:')) assert.equal(params.get('project'), 'other');
+    else assert.equal(params.has('project'), false);
+    assert.match(nodes['[data-mem-drawer]'].innerHTML, /Linked work/);
+    view.dispose();
+  });
+}
+
+test('detail cancellation, close and disposal prevent stale responses repainting drawers', async () => {
+  const pending = [];
+  const client = {
+    async exploreMemory() { return { results: [mem({ memory_id: 'first' }), mem({ memory_id: 'second' })] }; },
+    async getMemoryServiceStatus() { return {}; },
+    getMemoryRecord(id, opts) { return new Promise(resolve => pending.push({ id, opts, resolve })); },
+  };
+  const { root, nodes, handlers } = fakeRoot();
+  const view = mountMemory(root, client, { query: new URLSearchParams('q=synthetic') });
+  const click = id => handlers.click({ target: { closest: s => s === '[data-memory]' ? { dataset: { memory: id }, focus() {} } : null } });
+  await tick();
+  click('first'); click('second');
+  assert.equal(pending[0].opts.signal.aborted, true);
+  pending[1].resolve({ memory: mem({ text: 'newest result' }) }); await tick();
+  pending[0].resolve({ memory: mem({ text: 'stale result' }) }); await tick();
+  assert.match(nodes['[data-mem-drawer]'].innerHTML, /newest result/);
+  assert.doesNotMatch(nodes['[data-mem-drawer]'].innerHTML, /stale result/);
+  click('first');
+  handlers.click({ target: { closest: s => s === '[data-mem-close]' ? {} : null } });
+  assert.equal(pending[2].opts.signal.aborted, true);
+  pending[2].resolve({ memory: mem() }); await tick();
+  assert.equal(nodes['[data-mem-drawer]'].hidden, true);
+  click('second'); view.dispose();
+  assert.equal(pending[3].opts.signal.aborted, true);
+  const frozen = nodes['[data-mem-drawer]'].innerHTML;
+  pending[3].resolve({ memory: mem({ text: 'after disposal' }) }); await tick();
+  assert.equal(nodes['[data-mem-drawer]'].innerHTML, frozen);
+  click('first');
+  assert.equal(pending.length, 4);
+});

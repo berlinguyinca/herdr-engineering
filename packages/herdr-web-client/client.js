@@ -132,8 +132,13 @@ export class HerdrClient {
     return this.request(`/api/v1/memory/search?${params}`, { signal });
   }
 
-  getMemoryRecord(id, { signal } = {}) {
-    return this.request(`/api/v1/memory/${encodeURIComponent(id)}`, { signal });
+  getMemoryRecord(id, { signal, kind, scope, project } = {}) {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries({ kind, scope, project })) {
+      if (value != null && value !== '') params.set(key, value);
+    }
+    const query = params.toString();
+    return this.request(`/api/v1/memory/${encodeURIComponent(id)}${query ? `?${query}` : ''}`, { signal });
   }
 
   getMemoryServiceStatus({ signal } = {}) {
