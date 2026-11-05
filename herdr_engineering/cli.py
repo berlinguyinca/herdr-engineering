@@ -3754,7 +3754,8 @@ def _share_wiring(cp: dict, dsn: str | None):
         return None, None, None
     from .control_plane.artifact_share_api import share_settings_config
     try:
-        settings = share_settings_config(share, public_url=share.get("public_url"))
+        settings = share_settings_config(share, public_url=share.get("public_url"),
+                                          public_host=share.get("public_host"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     from .control_plane import artifact_adapter
@@ -4230,7 +4231,7 @@ def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host
         pool_id=collab.get("cognito_pool"),
         client_ids=tuple(c for c in clients if isinstance(c, str)) if isinstance(clients, list) else (),
         web_client_id=collab.get("cognito_web_client"), cognito_domain=collab.get("cognito_domain"),
-        public_url=share.get("public_url"),
+        public_url=share.get("public_url"), public_host=share.get("public_host"),
         signing_secret=secret.encode("utf-8") if isinstance(secret, str) else b"",
         session_seconds=share.get("session_seconds", 14400), annotations=annotation_settings(share.get("annotations")),
         annotations_path=Path(events_dir) / "annotations.jsonl")
@@ -4326,7 +4327,7 @@ def _apply_collab_config(args, cp) -> None:
             continue
         value = collab[key]
         if key == "members":
-            _members_settings({"collab": {"members": value}})       # validated here, read again where it is used
+            _members_settings({"collab": {"members": value}, "share": cp.get("share")})   # validated here, read again where used
             setattr(args, dest, dict(value))
             continue
         if kind is dict and key == "summary_fix":
@@ -4451,55 +4452,19 @@ def _task_lease_value(value) -> float:
     return float(value)
 
 
-_MEMBER_KEYS = frozenset({"enabled", "group", "groups_ttl", "removed_grace", "max_artifact_bytes", "max_member_bytes",
-                          "max_artifacts", "share_limits", "share_creates_per_hour"})
-
-
 def _members_settings(cp) -> dict | None:
     """``control_plane.collab.members`` (YAML only): None unless ``enabled`` is exactly true. An enabled section needs
-    a ``group`` and may set ``groups_ttl`` (seconds a sign-in's group claims stay valid, default 24 h) and the optional
-    limit defaults (null or a positive integer = unlimited). A bad section stops the start."""
+    a ``group``, a ``session_secret`` and ``control_plane.share.public_host``; see ``members_config``. A bad section
+    stops the start."""
+    from .control_plane.members_config import parse_members
     collab = cp.get("collab") if isinstance(cp, dict) else None
     raw = collab.get("members") if isinstance(collab, dict) else None
-    if raw is None:
-        return None
-    where = "fleet config control_plane.collab.members"
-    if not isinstance(raw, dict):
-        raise SystemExit(f"{where} must be a mapping")
-    if "enabled" in raw and not isinstance(raw["enabled"], bool):
-        raise SystemExit(f"{where}.enabled must be true or false")
-    if raw.get("enabled") is not True:
-        return None
-    if unknown := sorted(set(raw) - _MEMBER_KEYS):
-        raise SystemExit(f"{where}: unknown keys: " + ", ".join(unknown))
-    group = raw.get("group")
-    if not isinstance(group, str) or not group.strip():
-        raise SystemExit(f"{where}.group must be a non-empty string")
-    ttl = raw.get("groups_ttl", 24 * 3600.0)
-    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not ttl > 0:
-        raise SystemExit(f"{where}.groups_ttl must be a positive number")
-    grace = raw.get("removed_grace", 3600.0)
-    if isinstance(grace, bool) or not isinstance(grace, (int, float)) or not 0 <= grace <= 30 * 86400:
-        raise SystemExit(f"{where}.removed_grace must be a number of seconds, 0 to 2592000")
-    defaults = {}
-    for key in ("max_artifact_bytes", "max_member_bytes", "max_artifacts"):
-        value = raw.get(key)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
-            raise SystemExit(f"{where}.{key} must be a positive integer or null")
-        defaults[key] = value
-    share_limits = raw.get("share_limits", {})
-    share_limits = {} if share_limits is None else share_limits
-    if not isinstance(share_limits, dict) or (bad := sorted(set(share_limits) - {"max_share_bytes", "max_total_bytes"})):
-        raise SystemExit(f"{where}.share_limits must be a mapping with max_share_bytes and max_total_bytes"
-                         + (": unknown keys: " + ", ".join(bad) if isinstance(share_limits, dict) else ""))
-    for key, value in share_limits.items():
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
-            raise SystemExit(f"{where}.share_limits.{key} must be a positive integer or null")
-    per_hour = raw.get("share_creates_per_hour", 20)
-    if isinstance(per_hour, bool) or not isinstance(per_hour, int) or per_hour < 1:
-        raise SystemExit(f"{where}.share_creates_per_hour must be a positive integer")
-    return {"group": group, "groups_ttl": float(ttl), "removed_grace": float(grace), "defaults": defaults,
-            "share_limits": dict(share_limits), "share_creates_per_hour": per_hour}
+    share = cp.get("share") if isinstance(cp, dict) else None
+    host = share.get("public_host") if isinstance(share, dict) else None
+    try:
+        return parse_members(raw, public_host=host)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
 
 
 def _collab_member_kwargs(cp, *, state_dir=None) -> dict:
@@ -4529,7 +4494,8 @@ def _members_runtime(cp, settings: CollabArtifactsSettings):
         from .control_plane.artifact_share_api import share_settings_config
         raw = (cp or {}).get("share") or {}
         try:
-            share_settings = {**share_settings_config(raw, public_url=raw.get("public_url")),
+            share_settings = {**share_settings_config(raw, public_url=raw.get("public_url"),
+                                                     public_host=raw.get("public_host")),
                               "member_share_limits": got["share_limits"]}
         except ValueError as exc:
             raise SystemExit(f"fleet config {exc}") from None

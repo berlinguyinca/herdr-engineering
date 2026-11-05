@@ -247,8 +247,13 @@ class ShareConfig:
     static_dir: Path | None = None
     annotations: dict = field(default_factory=lambda: annotation_settings(None))   # control_plane.share.annotations
     annotations_path: Path | None = None        # default: ``annotations.jsonl`` beside the events file
+    public_host: str | None = None              # control_plane.share.public_host: /s/ is served on this Host only (D9)
 
     def __post_init__(self) -> None:
+        if self.public_host is not None:
+            from .members_config import valid_public_host
+            if not valid_public_host(self.public_host):
+                raise ValueError("public_host must be a lowercase DNS name (no scheme, port or path)")
         if self.annotations_path is None:
             self.annotations_path = Path(self.events_path).with_name("annotations.jsonl")
 
@@ -1198,7 +1203,20 @@ class ShareHandler(BaseHTTPRequestHandler):
             else:
                 self.close_connection = True
 
+    def _host_ok(self) -> bool:
+        """With a configured ``public_host`` the request must carry exactly one Host naming it (D9)."""
+        wanted = self.server.config.public_host
+        if wanted is None:
+            return True
+        hosts = self.headers.get_all("Host") or []
+        if len(hosts) != 1:
+            return False
+        host = hosts[0].strip().lower()
+        return host == wanted or host == wanted + ":443"
+
     def _route(self):
+        if not self._host_ok():
+            return deny(self, None, "wrong_host")
         raw = self.path
         if len(raw) > MAX_RAW_PATH or not raw.startswith("/s/"):
             return deny(self, None, "unknown_route")

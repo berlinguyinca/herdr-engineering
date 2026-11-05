@@ -17,7 +17,6 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -56,6 +55,7 @@ from .collab_bridge_files import (
     upload_id_for,
     validate_chunk,
 )
+from .members_config import MembersConfig
 
 NOT_A_MEMBER: Final = "artifact tools are for group members"
 NOT_FOUND: Final = "not found"
@@ -75,45 +75,6 @@ class MemberServiceError(CollabError):
 
     def __init__(self, status: int, code: str, message: str):
         super().__init__(status, message, code=code)
-
-
-def _positive(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-@dataclass(frozen=True)
-class MembersConfig:
-    """The sanity, rate and staging limits of the member channel (plan 5, Global Constraints).  ``max_upload_bytes`` is the
-    per-file limit handed to ``validate_chunk``; ``staging_bytes_per_member`` is the member's staging cap (reserved by
-    declared size), on top of the whole-volume ``staging_bytes_total`` of the bridge limits."""
-    max_upload_bytes: int = _TIB
-    http_chunks_per_request: int = 32
-    max_publish_files: int = 200
-    max_message_chars: int = 500
-    chunks_per_minute: int = 1200
-    writes_per_minute: int = 30
-    share_creates_per_hour: int = 20
-    staging_bytes_per_member: int = _TIB
-    result_wait_seconds: float = 5.0
-
-    def __post_init__(self) -> None:
-        for f in dataclasses.fields(self):
-            if f.name == "result_wait_seconds":
-                v = self.result_wait_seconds
-                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 20:
-                    raise ValueError("result_wait_seconds must be 0 to 20")
-            else:
-                _positive(f.name, getattr(self, f.name))
-
-    @classmethod
-    def from_mapping(cls, raw: Mapping[str, Any] | None) -> MembersConfig:
-        raw = dict(raw or {})
-        known = {f.name for f in dataclasses.fields(cls)}
-        if unknown := sorted(set(raw) - known):
-            raise ValueError("unknown member limit(s): " + ", ".join(unknown))
-        return cls(**raw)
 
 
 def member_actor(pr: Principal) -> dict[str, Any]:

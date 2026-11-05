@@ -390,6 +390,8 @@ def test_the_member_admission_is_in_the_baseline_so_a_reset_keeps_it(edge, net, 
 
 # ------------------------------------------------------------------------------ config and worker wiring
 def collab(**members):
+    if members.get("enabled") is True:        # an enabled section needs the signing secret and the member host (slice form)
+        members = {"session_secret": "k" * 40, "public_host": "artifacts.example.org", **members}
     return {"collab": {"members": members}}
 
 
@@ -404,9 +406,10 @@ def test_enabled_members_read_group_ttl_and_optional_limits():
     from herdr_engineering import cli
     got = cli._members_settings(collab(enabled=True, group="staff", groups_ttl=60, max_member_bytes=10,
                                        max_artifact_bytes=None))
-    assert got == {"group": "staff", "groups_ttl": 60.0, "removed_grace": 3600.0,
-                   "defaults": {"max_artifact_bytes": None, "max_member_bytes": 10, "max_artifacts": None},
-                   "share_limits": {}, "share_creates_per_hour": 20}
+    assert {k: v for k, v in got.items() if k not in ("session_secret", "public_host", "limits")} == {
+        "group": "staff", "groups_ttl": 60.0, "removed_grace": 3600.0,
+        "defaults": {"max_artifact_bytes": None, "max_member_bytes": 10, "max_artifacts": None},
+        "share_limits": {}, "share_creates_per_hour": 20}
     shares = cli._members_settings(collab(enabled=True, group="staff", share_creates_per_hour=5,
                                           share_limits={"max_share_bytes": 9, "max_total_bytes": None}))
     assert shares["share_creates_per_hour"] == 5

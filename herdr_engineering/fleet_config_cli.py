@@ -198,6 +198,7 @@ COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "co
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled",
+                         "members",       # plan 5 member web: carries session_secret (the slice is 0600, collab-public only)
                          "task_lease_seconds"})   # a number of seconds, no secret
 
 
@@ -260,7 +261,33 @@ def collab_values(cfg: FleetConfig) -> dict:
         summary_fix_config(collab.get("summary_fix"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    _check_members(collab, _share_mapping(cfg)[0])
     return dict(collab)
+
+
+def _check_members(collab: dict, share: dict) -> None:
+    """Validate ``control_plane.collab.members`` (the member web host comes from ``control_plane.share.public_host``).
+
+    Messages name keys, never values: the section carries ``session_secret``."""
+    members = collab.get("members")
+    if members is None:
+        return
+    from .control_plane.members_config import parse_members
+    if isinstance(members, dict) and "public_host" in members:
+        raise FleetConfigError("control_plane.collab.members.public_host is not authored here: set "
+                               "control_plane.share.public_host (the deploy tooling copies it into the slice)")
+    try:
+        parse_members(members, public_host=share.get("public_host"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+
+
+def _members_with_host(values: dict, share: dict) -> dict:
+    """``values`` with the share host copied into an ENABLED members section (collab-public reads it there)."""
+    members = values.get("members")
+    if isinstance(members, dict) and members.get("enabled") is True:
+        return {**values, "members": {**members, "public_host": share.get("public_host")}}
+    return values
 
 
 def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
@@ -280,7 +307,8 @@ def render_collab(cfg: FleetConfig, out: Path) -> None:
     ``collab_artifacts: {enabled: <bool>}`` switch."""
     data = {"version": SCHEMA_VERSION,
             "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
-                                                 "values": {"collab": collab_values(cfg), **_collab_artifacts_slice(cfg)}}},
+                                                 "values": {"collab": _members_with_host(collab_values(cfg), _share_mapping(cfg)[0]),
+                                                        **_collab_artifacts_slice(cfg)}}},
             "hosts": {}}
     _parse(data)
     write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -294,10 +322,10 @@ SHARE_SECTION_KEY = "share"
 # control_plane.share as authored; an unknown key (which could be a secret meant elsewhere) is refused.
 SHARE_KEYS = frozenset({"enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
                         "session_seconds", "signing_secret", "shares_dir", "events_dir", "marker_dir",
-                        "annotations", "owner_emails", "public_url"})
+                        "annotations", "owner_emails", "public_url", "public_host"})
 # What share-public gets: no directories (its mounts are fixed), nothing else from the central file.
 SHARE_SLICE_KEYS = ("enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
-                    "session_seconds", "signing_secret", "annotations", "public_url")
+                    "session_seconds", "signing_secret", "annotations", "public_url", "public_host")
 # Cognito identifiers share-public needs for lab sign-in (public values; no group, no operator).
 SHARE_COLLAB_KEYS = ("cognito_pool", "cognito_clients", "cognito_web_client", "cognito_domain", "public_url")
 SHARE_FIXED_DIRS = {"shares_dir": "/shares", "events_dir": "/share-events",
@@ -359,6 +387,16 @@ def share_values(cfg: FleetConfig) -> dict:
         clean_owner_emails(share.get("owner_emails"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    if share.get("public_host") is not None:
+        from .control_plane.members_config import valid_public_host
+        host = share["public_host"]
+        if not valid_public_host(host):
+            raise FleetConfigError("control_plane.share.public_host must be a lowercase DNS name (no scheme, port or "
+                                   "path): share links and the member web live there")
+        if share.get("public_url") is not None and https_origin(share["public_url"]) != f"https://{host}":
+            raise FleetConfigError("control_plane.share.public_url disagrees with control_plane.share.public_host: "
+                                   "set only public_host")
+        share = {**share, "public_url": f"https://{host}"}
     if share.get("enabled") is not True:
         return {"share": {"enabled": False}}
     from .control_plane.share_session import MIN_SECRET_BYTES

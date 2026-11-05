@@ -830,3 +830,17 @@ def test_a_public_share_ignores_the_owner_emails(tmp_path):
     with share_server(tmp_path, owner_emails=["owner@lab.test"]) as (base, *_):
         status, body = create(base, audience="public")
         assert status == 201 and not body["share"].get("allow_emails")
+
+
+def test_share_settings_public_host_derives_the_link_base():
+    from herdr_engineering.control_plane.artifact_share_api import share_settings_config
+    only_host = share_settings_config({}, public_url=None, public_host="artifacts.example.org")
+    assert only_host["public_url"] == "https://artifacts.example.org"
+    same = share_settings_config({}, public_url="https://artifacts.example.org/", public_host="artifacts.example.org")
+    assert same["public_url"] == "https://artifacts.example.org"
+    with pytest.raises(ValueError, match="disagree"):
+        share_settings_config({}, public_url="https://old.example.org", public_host="artifacts.example.org")
+    for bad in ("Artifacts.example.org", "https://a.example.org", "a.example.org:443", "", "localhost"):
+        with pytest.raises(ValueError, match="public_host"):
+            share_settings_config({}, public_url=None, public_host=bad)
+    assert share_settings_config({}, public_url="https://x.example/")["public_url"] == "https://x.example/"

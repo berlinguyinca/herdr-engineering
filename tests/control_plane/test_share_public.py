@@ -1128,3 +1128,33 @@ def test_differential_a_served_bar_is_a_real_top_level_element_for_html5ever():
     assert accepted_shaped > 500, accepted_shaped
     for data in BYPASSES:
         assert share_public.labelled_html(data, "text/html", bar) is None
+
+
+# ----------------------------------------------------------------------- D9: /s/ is served on the share host only
+
+
+def _get_with_host(env, path, *host_lines):
+    lines = "".join(f"Host: {h}\r\n" for h in host_lines)
+    out = env.raw(f"GET {path} HTTP/1.1\r\n{lines}Connection: close\r\n\r\n".encode())
+    return int(out.split(b" ", 2)[1])
+
+
+def test_with_a_public_host_links_are_served_on_that_host_only(tmp_path):
+    e = Env(tmp_path, config_extra={"public_host": "artifacts.example.org"})
+    try:
+        link = "/s/%s/" % TOKEN
+        assert _get_with_host(e, link, "artifacts.example.org") == 302
+        assert _get_with_host(e, link, "ARTIFACTS.example.org") == 302            # Host is case-insensitive
+        assert _get_with_host(e, link, "artifacts.example.org:443") == 302
+        assert _get_with_host(e, f("index.html"), "artifacts.example.org") == 200
+        assert _get_with_host(e, link, "old.example.org") == 404                 # the old host: no new links
+        assert _get_with_host(e, link, "artifacts.example.org.evil.test") == 404
+        assert _get_with_host(e, link, "artifacts.example.org", "artifacts.example.org") == 404   # duplicate Host
+        assert _get_with_host(e, link, "127.0.0.1") == 404
+        assert _get_with_host(e, "/s/static/x", "old.example.org") == 404
+    finally:
+        e.close()
+
+
+def test_without_a_public_host_any_host_is_served(env):
+    assert _get_with_host(env, "/s/%s/" % TOKEN, "whatever.example") == 302

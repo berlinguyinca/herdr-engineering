@@ -63,8 +63,11 @@ class ShareHTTPError(Exception):
         self.message = message
 
 
-def share_settings_config(raw: dict | None, *, public_url: str | None) -> dict:
-    """Validated share caps (YAML ``control_plane.share``) plus the public base URL links are issued under."""
+def share_settings_config(raw: dict | None, *, public_url: str | None, public_host: str | None = None) -> dict:
+    """Validated share caps (YAML ``control_plane.share``) plus the public base URL links are issued under.
+
+    With ``public_host`` (``control_plane.share.public_host``) links are issued under ``https://<public_host>``; a
+    ``public_url`` that says something else is refused (one host, no silent winner), else ``public_url`` as before."""
     raw = raw or {}
     if not isinstance(raw, dict):
         raise ValueError("control_plane.share must be a mapping")
@@ -76,6 +79,13 @@ def share_settings_config(raw: dict | None, *, public_url: str | None) -> dict:
         settings[name] = value
     if settings["default_public_days"] > 90:
         raise ValueError("control_plane.share.default_public_days must be 1-90")
+    if public_host is not None:
+        from .members_config import valid_public_host
+        if not valid_public_host(public_host):
+            raise ValueError("control_plane.share.public_host must be a lowercase DNS name (no scheme, port or path)")
+        if public_url is not None and public_url.rstrip("/") != f"https://{public_host}":
+            raise ValueError("control_plane.share.public_url and public_host disagree: set only public_host")
+        public_url = f"https://{public_host}"
     if not isinstance(public_url, str) or not public_url.startswith("https://") or not urlsplit(public_url).netloc:
         raise ValueError("share links need an https:// control_plane.share.public_url")
     from .annotation_anchor import annotation_settings, clean_owner_emails
