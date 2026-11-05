@@ -3765,8 +3765,10 @@ def _make_handler(server, public=False, operator=False):
                     if not etype or not eid:
                         return self._json(
                             {"error": "entity_type and entity_id required"}, 400)
-                    if etype == "artifact" and not self._registry_read_ok(eid):
-                        eid = "\x00unreadable"      # answers exactly as an id that does not exist
+                    if etype == "artifact" and not (self._artifact_allowed(eid, "read") and self._registry_read_ok(eid)):
+                        # An id the caller may not read answers exactly as one that does not exist: the lookup runs
+                        # against an id no artifact can have (never NUL: Postgres text cannot hold it).
+                        eid = "artifact_unreadable_by_caller"
                     query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
                     if "limit" in query or "before" in query:
                         try:
@@ -5788,6 +5790,16 @@ def _make_handler(server, public=False, operator=False):
             return self._json(r.get_artifact(aid))
 
         # ------------------------------------------------------------ SSE
+        def _sse_readable(self, event) -> bool:
+            """Artifact events reach only subscribers who may read that artifact (same rule as the per-entity stream)."""
+            if not isinstance(event, dict) or event.get("entity_type") != "artifact":
+                return True
+            try:
+                artifact_id = event.get("entity_id")
+                return bool(self._artifact_allowed(artifact_id, "read") and self._registry_read_ok(artifact_id))
+            except Exception:       # noqa: BLE001 - fail closed: an unanswerable check shows nothing
+                return False
+
         def _sse(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -5808,6 +5820,8 @@ def _make_handler(server, public=False, operator=False):
                 self.wfile.flush()
                 # replay recent history so a fresh client catches up (Spec §52)
                 for ev in reversed(server.repo.recent_events(limit=100)):
+                    if not self._sse_readable(ev):
+                        continue
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
                 started = time.monotonic()
@@ -5828,6 +5842,8 @@ def _make_handler(server, public=False, operator=False):
                             "sequence": 0, "payload": {},
                         }))
                         self.wfile.flush()
+                        continue
+                    if not self._sse_readable(ev):
                         continue
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()

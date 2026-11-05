@@ -87,3 +87,54 @@ def test_the_artifact_event_stream_needs_the_same_principal_check(registry_pg):
             absent = status_of(env, f"/api/v1/events?entity_type=artifact&entity_id=art-nope{suffix}", key="member-key")
             assert theirs[0] == absent[0] == 200 and "ArtifactRegistered" not in theirs[1].decode()
             assert json.loads(theirs[1])["events"] == json.loads(absent[1])["events"] == []
+
+
+def acl_env(pg):
+    from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+    return api(pg, extra={"artifact_acl": ArtifactAcl()})
+
+
+def test_the_event_stream_is_closed_in_production_wiring_with_a_real_acl(registry_pg):
+    """The production CLI always builds an ArtifactAcl, where ``_registry_read_ok`` is a no-op: the ACL decides."""
+    with acl_env(registry_pg) as env:
+        aid = upload(env)
+        mine = status_of(env, f"/api/v1/events?entity_type=artifact&entity_id={aid}")
+        assert mine[0] == 200 and "ArtifactRegistered" in mine[1].decode()
+        for suffix in ("", "&limit=10"):
+            theirs = status_of(env, f"/api/v1/events?entity_type=artifact&entity_id={aid}{suffix}", key="member-key")
+            absent = status_of(env, f"/api/v1/events?entity_type=artifact&entity_id=art-nope{suffix}", key="member-key")
+            assert theirs == absent and theirs[0] == 200
+            assert json.loads(theirs[1])["events"] == [] and aid not in theirs[1].decode()
+        # a stale cursor made for the readable stream answers the same way for both
+        cursor = json.loads(status_of(env, f"/api/v1/events?entity_type=artifact&entity_id={aid}&limit=1")[1])
+        before = "&before=" + str(cursor["next_cursor"]) if cursor.get("next_cursor") else "&before=AAAA"
+        t = status_of(env, f"/api/v1/events?entity_type=artifact&entity_id={aid}&limit=1{before}", key="member-key")
+        a = status_of(env, f"/api/v1/events?entity_type=artifact&entity_id=art-nope&limit=1{before}", key="member-key")
+        assert t == a
+
+
+def sse_text(env, key):
+    import http.client
+    conn = http.client.HTTPConnection(env.base.split("//")[1], timeout=2)
+    conn.request("GET", "/api/v1/events/stream", headers={"X-API-Key": key})
+    resp = conn.getresponse()
+    out = b""
+    try:
+        while True:
+            chunk = resp.fp.readline()
+            if not chunk:
+                break
+            out += chunk
+    except (TimeoutError, OSError):
+        pass
+    conn.close()
+    return out.decode()
+
+
+def test_the_global_event_stream_drops_artifact_events_the_subscriber_may_not_read(registry_pg):
+    with acl_env(registry_pg) as env:
+        aid = upload(env)
+        mine, theirs = sse_text(env, "creator-key"), sse_text(env, "member-key")
+        assert "StreamConnected" in theirs and "StreamConnected" in mine
+        assert aid in mine and "ArtifactRegistered" in mine
+        assert aid not in theirs
