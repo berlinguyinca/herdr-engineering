@@ -206,6 +206,9 @@ edge (nginx, server_name <public_host>): /s/ -> share-public:8083
   therefore sets that directory to group `control_plane.collab.members.secrets_gid` (default: the worker's
   `HERDR_COLLAB_CERT_UID`, which compose passes with collab-public's default), mode 0770, files 0640; others get
   nothing. With no gid the worker refuses to start members rather than issue links nobody can receive.
+- A `share` grant is not read-protected: a grantee holding only `share` can create and approve a link, receives the
+  read-once URL, and so can open it and read the bytes. The member API (head, history, view tools) stays gated on
+  `read`; do not hand out `share` expecting it to hide content.
 - Public links by members (D3): members can create public links to their artifacts. The operator sees them in the
   Members panel and with `herdr-eng artifacts members links --audience public`; revoke there.
 - Limits and behaviours to know:
@@ -232,6 +235,8 @@ edge (nginx, server_name <public_host>): /s/ -> share-public:8083
     `artifact_shares.entry` (migrations 0048, 0049 and 0050; renumber at merge if another branch took the number).
     Storage keys and hashes are kept. The append-only jsonl event files on disk are written by a separate process and
     are NOT rewritten by purge; they keep the old names until the retention window of that log removes them.
+  - Purge also blanks the message and conflict file names of collaborator merge attempts. Lifecycle event reasons are
+    server-fixed strings (`member delete`, `member purge`), so nothing member-written remains there.
   - A shared blob survives the deletion of one owner while another artifact (including a held or restorable
     tombstone) still references it.
   - `share_creates_per_hour` (default 20) is counted per process in memory.

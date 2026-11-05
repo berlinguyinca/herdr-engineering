@@ -411,3 +411,15 @@ def test_enabled_members_need_the_share_the_bridge_and_api_keys_with_the_keys_na
     with pytest.raises(FleetConfigError, match=r"control_plane\.api_keys"):
         fcc.collab_values(load("d", share=share(), extra={**BRIDGE, "api_keys": {}}))
     assert fcc.collab_values(load("ok", share=share()))["members"]["enabled"] is True
+
+
+def test_startup_refuses_members_without_any_api_key_but_accepts_keys_from_the_command_line():
+    from herdr_engineering.cli import _refuse_keyless_members
+    cp = {"collab": {"members": members()}, "share": share()}
+    with pytest.raises(SystemExit, match="API key"):
+        _refuse_keyless_members(cp, None)
+    with pytest.raises(SystemExit, match="API key"):
+        _refuse_keyless_members(cp, {})
+    _refuse_keyless_members(cp, {"k" * 20: "operator"})              # e.g. --api-keys only: the merged set is what counts
+    _refuse_keyless_members({"collab": {"members": {"enabled": False}}}, None)    # members off: nothing to refuse
+    _refuse_keyless_members({}, None)

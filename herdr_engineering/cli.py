@@ -4019,6 +4019,7 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
+        _refuse_keyless_members(cp, api_keys)
         from .control_plane.federation import PEER_KINDS, FederationConfigError, parse_federation
         if any(str(v).strip() in PEER_KINDS for v in (api_keys or {}).values()):
             raise SystemExit("api_keys: role 'peer'/'peer-user' is not an API key role; a federated peer is configured "
@@ -4654,6 +4655,14 @@ def _members_settings(cp) -> dict | None:
         return parse_members(raw, public_host=host, session_seconds=seconds)
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+
+
+def _refuse_keyless_members(cp, api_keys) -> None:
+    """Members need API keys (from the fleet config, --api-key or --api-keys, already merged): with none, every caller on
+    the listener is the operator and could read and share member artifacts (D4). Stops the start."""
+    if _members_settings(cp) is not None and not api_keys:
+        raise SystemExit("fleet config control_plane.collab.members.enabled needs at least one API key "
+                         "(control_plane.api_keys, --api-key or --api-keys): without keys every caller is the operator")
 
 
 def _member_web(cp, collab, args):

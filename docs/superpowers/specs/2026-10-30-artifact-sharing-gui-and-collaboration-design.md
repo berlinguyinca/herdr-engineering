@@ -258,7 +258,8 @@ Today's control plane was single-operator. This section makes it multi-user for 
   progress, version history, share (lab or public), list and revoke own links, delete, usage. The member web API is
   mounted only for the configured host; on any other host it is a plain 404.
 * **Sharing (D3, D8).** A member may create a lab or public link on any artifact where their principal holds the `share`
-  permission (their own, or granted with `share` or `admin`; `read`/`edit`/`review` alone do not include it). The rules
+  permission (their own, or granted with `share` or `admin`; `read`/`edit`/`review` alone do not include it). A `share` holder can create and open a link, so `share` effectively
+  lets them read the bytes even though the member API stays gated on `read`. The rules
   are the operator's: a pinned immutable version, an expiry, revocable, and a two-step create then approve with
   `confirm: true` by a `share` holder (the creator). Public links default to 30 days and cap at 90; lab links likewise
   default to 30 days and cap at 90. A member's **lab** audience is exactly the lab group (`collab.cognito_group`); the
