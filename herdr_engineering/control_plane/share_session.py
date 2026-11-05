@@ -1,6 +1,9 @@
 """Stateless lab-share sessions: an HMAC path segment binding (share id, verified identity, expiry).
 
-A session is ``<b64url(identity)>.<b64url(email)>.<basis>.<exp>.<b64url(mac)>`` where ``mac = HMAC-SHA256(secret, domain
+A session is ``<b64url(identity)>.<b64url(iv || encrypted email)>.<basis>.<exp>.<b64url(mac)>``: the signed-in email is
+ENCRYPTED in the URL (HMAC-SHA256 counter-mode keystream under a key derived from the signing secret, synthetic IV), so a
+URL that leaks (history, Referer, a pasted link) discloses no address; the server decrypts after the MAC verifies. ``mac`` is
+the HMAC over the plaintext fields, where ``mac = HMAC-SHA256(secret, domain
 tag || len-prefixed share_id || identity || email || basis || exp)``. ``basis`` is how the viewer was admitted: ``e`` (their
 email is on the share's allow-list) or ``g`` (a group claim); it is MAC'd, so a viewer cannot upgrade it. It is a bearer secret for one verified identity (and the verified
 email it signed in with) on one share until ``exp`` (exclusive); the
@@ -16,7 +19,10 @@ import hmac
 import math
 import re
 
-_DOMAIN = b"herdr-share-session-v3"
+_DOMAIN = b"herdr-share-session-v4"
+_ENC_DOMAIN = b"herdr-share-session-email-enc-v1"
+_IV_DOMAIN = b"herdr-share-session-email-iv-v1"
+_IV_BYTES = 16
 BASES = ("e", "g")
 _CSRF_DOMAIN = b"herdr-annotate-csrf-v1"
 MIN_SECRET_BYTES = 32
@@ -26,7 +32,7 @@ MAX_SESSION = 768
 _IDENTITY_RE = re.compile(rf"[\x21-\x7e]{{1,{MAX_IDENTITY}}}")       # printable ASCII, no space
 _EMAIL_RE = re.compile(rf"[\x21-\x7e]{{3,{MAX_EMAIL}}}")             # printable ASCII, no space
 _ID_B64_MAX = 4 * MAX_IDENTITY // 3 + 4
-_EMAIL_B64_MAX = 4 * MAX_EMAIL // 3 + 4
+_EMAIL_B64_MAX = 4 * (MAX_EMAIL + _IV_BYTES) // 3 + 4
 _SESSION_RE = re.compile(rf"([A-Za-z0-9_-]{{2,{_ID_B64_MAX}}})\.([A-Za-z0-9_-]{{4,{_EMAIL_B64_MAX}}})\."
                          rf"([eg])\.([1-9][0-9]{{0,11}})\.([A-Za-z0-9_-]{{43}})")
 
@@ -50,6 +56,26 @@ def _mac(secret: bytes, share_id: str, identity: str, email: str, basis: str, ex
     return hmac.new(secret, msg, hashlib.sha256).digest()
 
 
+def _keystream_xor(secret: bytes, iv: bytes, data: bytes) -> bytes:
+    key = hmac.new(secret, _ENC_DOMAIN, hashlib.sha256).digest()
+    out = bytearray()
+    for counter in range(0, (len(data) + 31) // 32):
+        block = hmac.new(key, iv + counter.to_bytes(4, "big"), hashlib.sha256).digest()
+        out += block
+    return bytes(a ^ b for a, b in zip(data, out))
+
+
+def _seal_email(secret: bytes, mac: bytes, email: str) -> bytes:
+    """``iv || ciphertext``: the IV is derived from the session MAC (unique per distinct session fields)."""
+    iv = hmac.new(secret, _IV_DOMAIN + mac, hashlib.sha256).digest()[:_IV_BYTES]
+    return iv + _keystream_xor(secret, iv, email.encode("ascii"))
+
+
+def _open_email(secret: bytes, sealed: bytes) -> str:
+    iv, body = sealed[:_IV_BYTES], sealed[_IV_BYTES:]
+    return _keystream_xor(secret, iv, body).decode("ascii")
+
+
 def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, email: str, basis: str) -> str:
     """The session for ``identity`` on ``share_id`` valid until ``exp`` (epoch seconds, floored). Raises ValueError."""
     if not isinstance(secret, bytes) or len(secret) < MIN_SECRET_BYTES:
@@ -68,7 +94,7 @@ def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, ema
     if exp_int < 1 or exp_int >= 10 ** 12:
         raise ValueError("bad expiry")
     mac = _mac(secret, share_id, identity, email, basis, exp_int)
-    return f"{_b64(identity.encode('ascii'))}.{_b64(email.encode('ascii'))}.{basis}.{exp_int}.{_b64(mac)}"
+    return f"{_b64(identity.encode('ascii'))}.{_b64(_seal_email(secret, mac, email))}.{basis}.{exp_int}.{_b64(mac)}"
 
 
 def check_session(secret: bytes, share_id: str, session: str, now: float) -> dict | None:
@@ -86,13 +112,16 @@ def check_session(secret: bytes, share_id: str, session: str, now: float) -> dic
         id_part, email_part, basis, exp_part, mac_part = match.groups()
         try:
             identity = _unb64(id_part).decode("ascii")
-            email = _unb64(email_part).decode("ascii")
+            sealed = _unb64(email_part)
+            if len(sealed) < _IV_BYTES + 3:
+                return None
+            email = _open_email(secret, sealed)
             given = _unb64(mac_part)
         except (binascii.Error, ValueError):
             return None
         if not _IDENTITY_RE.fullmatch(identity) or _b64(identity.encode("ascii")) != id_part:
             return None      # one canonical encoding only
-        if not _EMAIL_RE.fullmatch(email) or _b64(email.encode("ascii")) != email_part:
+        if not _EMAIL_RE.fullmatch(email) or _b64(sealed) != email_part:
             return None
         if _b64(given) != mac_part:
             return None

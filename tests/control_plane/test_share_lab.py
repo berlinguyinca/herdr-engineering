@@ -647,7 +647,7 @@ def test_landing_route_follows_the_entry_type(tmp_path, entry, kind):
 
 
 def test_email_part_must_be_canonical_base64():
-    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
+    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice2@lab.example", basis="e")
     a_id, a_mail, a_basis, a_exp, a_mac = s.split(".")
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     assert len(a_mail) % 4 != 0                       # the last char carries unused low bits
@@ -699,3 +699,24 @@ def test_v1_session_and_bad_sessions_are_the_uniform_404_over_http(lab):
     remove_state(lab.root, lab.token_hash)             # revoked share: the same bytes as a bad session
     status, _, body = lab.request("GET", f"/s/{TOKEN}/k/{good}/f/index.html")
     assert status == 404 and body == ref
+
+
+def test_session_url_does_not_disclose_the_signed_in_email():
+    """Plan 4 C2: the session is a URL path segment, so the email must not be readable from it (plain, base64, hex, or
+    after splitting the segments); the server still recovers it, and a flipped ciphertext byte is refused."""
+    import base64
+    import binascii
+    email = "alice@lab.example"
+    s = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email=email, basis="e")
+    pad = lambda t: t + "=" * (-len(t) % 4)           # noqa: E731
+    blob = base64.urlsafe_b64decode(pad(s.split(".")[1]))     # the identity segment ("alice") is a separate, opaque id
+    for needle in (email, "@lab", "lab.example", "alice@"):
+        assert needle not in s and needle.encode() not in blob and binascii.hexlify(needle.encode()).decode() not in s
+        assert base64.urlsafe_b64encode(needle.encode()).rstrip(b"=").decode() not in s
+    assert b"alice" not in blob
+    assert check_session(SECRET, "shr-1", s, NOW0)["email"] == email
+    other = mint_session(b"B" * 32, "shr-1", "alice", NOW0 + 100, email=email, basis="e")
+    assert s.split(".")[1] != other.split(".")[1] and check_session(b"B" * 32, "shr-1", s, NOW0) is None
+    # same email, different session fields: the encrypted part differs too (no equality oracle across sessions)
+    bob = mint_session(SECRET, "shr-1", "bob", NOW0 + 100, email=email, basis="e")
+    assert bob.split(".")[1] != s.split(".")[1]
