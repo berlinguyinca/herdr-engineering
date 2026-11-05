@@ -434,6 +434,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--out", default=None, help="output .html path (default: <graph_json>.html)")
     p2.set_defaults(func=_cmd_graph_artifact_render)
 
+    # handoff --------------------------------------------------------------
+    p = sub.add_parser("handoff", help="/handoff skill helpers (the envelope and launch live in herdr-handoff)")
+    hsub = p.add_subparsers(dest="handoff_command", required=True)
+    p2 = hsub.add_parser("harness", help="print the harness running this session (exit 2 when undetectable)")
+    p2.add_argument("--harness", default=None, help="skip detection and validate this name")
+    p2.add_argument("--proc-root", default="/proc", help=argparse.SUPPRESS)
+    p2.set_defaults(func=_cmd_handoff_harness)
+
     # summary --------------------------------------------------------------
     p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
     smsub = p.add_subparsers(dest="summary_command", required=True)
@@ -446,6 +454,8 @@ def _build_parser() -> argparse.ArgumentParser:
         p2.add_argument("--project-dir", default=None, help="project root for --scope project (default: cwd)")
         if name != "verify":
             p2.add_argument("--dry-run", action="store_true")
+        p2.add_argument("--skill", choices=("summary", "handoff", "all"), default="all",
+                        help="which skill to manage (default: both /summary and /handoff)")
         p2.add_argument("--json", action="store_true")
         p2.set_defaults(func=_cmd_summary_manage)
     p2 = smsub.add_parser("history", help="read-only normalized history of the current agent session")
@@ -1298,16 +1308,31 @@ def _cmd_doctor(args) -> int:
     return doctor_main(args)
 
 
+def _cmd_handoff_harness(args) -> int:
+    from . import handoff_harness as hh
+    try:
+        found = hh.detect(explicit=args.harness, proc=Path(args.proc_root))
+    except hh.Undetectable as exc:
+        _print_json({"ok": False, "error": str(exc), "options": list(hh.HARNESSES)})
+        return 2
+    _print_json(found.to_dict())
+    return 0
+
+
 def _cmd_summary_manage(args) -> int:
     from . import session_summary as ss
     kw = dict(scope=args.scope, home=Path(args.home) if args.home else None,
               project=Path(args.project_dir) if args.project_dir else None)
     ok = True
-    if args.summary_command == "verify":
-        ok, results = ss.verify(**kw)
-    else:
-        fn = ss.install if args.summary_command == "install" else ss.uninstall
-        results = fn(dry_run=args.dry_run, **kw)
+    results = []
+    for skill in (ss.SKILLS if args.skill == "all" else (args.skill,)):
+        if args.summary_command == "verify":
+            good, part = ss.verify(skill=skill, **kw)
+            ok = ok and good
+        else:
+            fn = ss.install if args.summary_command == "install" else ss.uninstall
+            part = fn(dry_run=args.dry_run, skill=skill, **kw)
+        results += part
     if args.json:
         _print_json({"ok": ok, "results": [r.to_dict() for r in results]})
     else:

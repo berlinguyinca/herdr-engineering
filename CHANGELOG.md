@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### `/handoff` skill and `/summary` visibility
+- New `handoff` skill (`/handoff [pi|claude|codex|opencode]`), installed by `herdr-eng summary install` (`--skill summary|handoff|all`) with the same manifest and never-overwrite contract; no Pi prompt template (Pi's built-in `/handoff` keeps its name). Default target is the current harness, from the new `herdr-eng handoff harness` (explicit, ancestor process, pane agent, marker env; exit 2 when undetectable). Needs herdr-handoff 0.2.0 (envelope v2, `--from-json`, pane-less `launch`). Opt-in trigger ideas: `docs/operations/handoff-auto-triggers.md`.
+- `summary publish` now returns a `digest`, reuses a still-open report viewer pane (refreshed with SIGWINCH) instead of closing and re-splitting, and focuses the report pane.
+
 
 ### Fleet rollout watcher, phase 3: event model, read endpoints and outbox emitter (off by default)
 - Implements step 3 of `docs/specs/herdr-fleet-rollout-watcher-20261104/spec.md`. `POST /api/v1/ingest` accepts `entity_type=fleet_rollout` (`rollout_id` = `entity_id`) through `validate_fleet_rollout`, a strict allow-list per event type. **No free text anywhere** (deviation from spec section 8, decision 2026-11-05, recorded in the spec): every value is a closed enum, a fleet host, lowercase hex, an integer or a UTC timestamp, and unknown fields are rejected, so a secret cannot be stored by construction. `log_tail`, `pr_title` and free-form check names are gone; `checks[]` is `{name (closed enum), status (ok|failed|skipped), duration_ms}` and a log is a host-side reference `{host, path_id (updater|installer|healthcheck), sha256, bytes, lines}`. Regex redaction was built and withdrawn: reviewers kept finding readable secret shapes. Replays are idempotent on `<rollout_id>:<seq>`; a different payload for a stored `seq` is a 409.
