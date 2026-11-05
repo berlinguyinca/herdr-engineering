@@ -135,6 +135,17 @@ def test_expired_group_knowledge_is_published_as_unknown_never_removed(net):
     assert "op" not in directory(net.outbox)["users"]             # forgotten after a month: absence, still no evidence
 
 
+def test_a_disabled_member_reports_disabled_even_when_idle_past_the_ttl(net):
+    net.person("op")
+    net.person("lab")
+    net.s._now.t += net.s.member_groups_ttl + 1                  # lab never signs in again
+    call(net.s, "POST", ["admin", "users", "lab", "disable"], None, operator="op")
+    net.bridge.write_agents_feed()
+    users = directory(net.outbox)["users"]
+    assert users["lab"]["status"] == "disabled"                  # account state is positive evidence at any age
+    assert users["op"]["status"] == "unknown"                    # group membership alone still goes stale
+
+
 def test_a_token_without_a_groups_claim_refreshes_nothing(net):
     net.person("op")
     TOKENS["t-op"] = ("op", [])

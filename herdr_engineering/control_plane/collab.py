@@ -1485,13 +1485,22 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         """``(status, groups)`` for a user whose claims were ever seen, else None. Caller holds the lock.
 
         approved/disabled: fresh claims include the member group.  removed: fresh claims do not (positive evidence).
-        unknown: the claims are older than the TTL (or from the future): they prove nothing either way."""
+        unknown: the claims are older than the TTL (or from the future): they prove nothing about group membership.
+
+        The account record is positive evidence whatever the claim age: a disabled account (last seen in the member
+        group) reports ``disabled`` even when idle past the TTL. Only the group part goes stale, so group REMOVAL
+        still needs a fresh sign-in claim (there is no synced directory to consult)."""
         seen = self._user_groups.get(uid)
         if seen is None or self.member_group is None:
             return None
         age = self._now() - seen.at
         if not 0 <= age <= self.member_groups_ttl:
-            return ("unknown", list(seen.groups)) if 0 <= age <= self.MEMBER_FORGET_AFTER else None
+            if not 0 <= age <= self.MEMBER_FORGET_AFTER:
+                return None
+            if (self.member_group in seen.groups and self.approval is not None and uid in self._users
+                    and not self._ok(uid)):
+                return "disabled", list(seen.groups)
+            return "unknown", list(seen.groups)
         groups = list(seen.groups)
         if self.member_group not in groups:
             return "removed", groups

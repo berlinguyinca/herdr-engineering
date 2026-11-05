@@ -256,6 +256,30 @@ def test_i6_bytes_staged_by_a_collaborator_or_held_in_a_fabric_blob_row_are_shar
     run(with_store(registry_pg["dsn"], blobs, body))
 
 
+def test_i6b_bytes_shared_with_a_held_or_restorable_tombstoned_artifact_are_kept(registry_pg):
+    """Alice and Bob publish the same bytes; Bob's artifact is tombstoned (legal hold, then a plain hold window)."""
+    blobs = FakeBlobs()
+
+    async def body(store, conn):
+        data = b"shared " + uid("t").encode()
+        alice, va = await publish(store, blobs, owner="alice", name="a.md", media="text/markdown", data=data)
+        bob, vb = await publish(store, blobs, owner="bob", name="b.md", media="text/markdown", data=data)
+        assert key_of(va) == key_of(vb)
+        await store.tombstone_artifact(bob, actor="o", reason="hold", legal_hold=True)
+        out = await store.purge_now(alice, actor=OWNER, reason="r")
+        assert out["deleted"] == [] and out["retained_shared"] == [key_of(va)]
+        assert blobs.head(key_of(vb))
+        assert (await store.get_version(vb["version_id"]))["purged_at"] is None
+        await store.restore_artifact(bob, actor=OWNER, reason="r", override_legal_hold=True)
+        assert blobs.head(key_of(vb))
+        # once Bob is purged too, nothing references the bytes and they go
+        await store.tombstone_artifact(bob, actor="o", reason="again")
+        out = await store.purge_now(bob, actor=OWNER, reason="r")
+        assert out["deleted"] == [key_of(vb)] and not blobs.head(key_of(vb))
+
+    run(with_store(registry_pg["dsn"], blobs, body))
+
+
 # ---------------------------------------------------------------- I7
 def test_i7_a_tombstoned_or_purged_retracted_artifact_stays_retracted_after_a_reload(registry_pg):
     blobs = FakeBlobs()
