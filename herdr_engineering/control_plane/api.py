@@ -28,9 +28,9 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from ..version import __version__
 from .artifact_acl import is_agent_collaborator
@@ -42,6 +42,7 @@ from .graph import read_graph
 from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_delivery, redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
+from .share_public import etag_matches, vendor_etag
 from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
@@ -137,6 +138,10 @@ def _is_loopback(host: str) -> bool:
         return False
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
+# pdf.js is vendored once, under share_static (the share-public viewer serves the same files); the dashboard maps the
+# two modules into its web root's /vendor/pdfjs/. Nothing else of that directory (LICENSE, SHA256SUMS) is served.
+_PDFJS_VENDOR_DIR = Path(__file__).resolve().parent / "share_static" / "vendor" / "pdfjs"
+_VENDORED_PDFJS = frozenset({"vendor/pdfjs/pdf.min.mjs", "vendor/pdfjs/pdf.worker.min.mjs"})
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
 _MAX_ATTACHMENT_JSON = 36 * 1024 * 1024        # a 25 MiB attachment is ~33.4 MiB of base64 plus its mail envelope
@@ -306,9 +311,10 @@ class ControlPlaneServer:
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
+                 artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None):
+                 assistant_workers=None, assistant_judge=None, member_web=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -445,6 +451,16 @@ class ControlPlaneServer:
         self.share_store = share_store
         self.shares_root = shares_root
         self.share_settings = share_settings
+        # Operator controls for member-owned artifacts (a SyncArtifactAdapter over MemberAdmin): absent -> 503.
+        self.member_admin = member_admin
+        # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
+        self.annotation_store = annotation_store
+        # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
+        self.artifact_delete_owners = frozenset(artifact_delete_owners)
+        self.artifact_delete_allow_keyless_owner = bool(artifact_delete_allow_keyless_owner)
+        # ids the registry holds tombstoned: the legacy read path (ACL + repo projection) must treat them as nonexistent
+        from .artifact_delete_api import TombstoneCache
+        self.tombstone_cache = TombstoneCache()
         # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
         self.collab_grant_store = collab_grant_store
         self.collab_artifacts_enabled = collab_artifacts_enabled
@@ -499,6 +515,7 @@ class ControlPlaneServer:
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
         # The owner routes /api/v1/assistant-workers read it at request time, so it may be attached after startup.
         self.assistant_workers = assistant_workers
+        self.assistant_judge = assistant_judge       # JudgeRuntime | None; None: the activation gate refuses
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
         from .rakazo_artifacts import RegistryBackend
@@ -594,6 +611,7 @@ class ControlPlaneServer:
             self.assistant.host_candidates = lambda: (
                 self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
         self.collab_require_https = collab_require_https
+        self.member_web = member_web          # member_web.MemberWeb or None: the member host's web API (Task 11)
         # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
         # `control_plane.federation` on; the gateway is rebuilt if `collab` is swapped (tests do).
         self.federation_source = federation_source
@@ -696,6 +714,7 @@ class ControlPlaneServer:
         self.intelligence.single_operator_fn = lambda: self.single_operator
         if self.rakazo is not None:
             self.rakazo.agents.repo = self.repo
+            self.rakazo.apps_fn = lambda: self.apps
             self.rakazo.terminal.repo = self.repo
             self.rakazo.desk.routes = self.intelligence      # board proposals as phone cards (scope: assistant_viewers)
             self.intelligence.board.on_new = self.rakazo.notify_proposal      # and as push notifications
@@ -1637,6 +1656,8 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        if getattr(self.source, 'recovery_info', None):
+            h['recovery'] = dict(self.source.recovery_info)
         if self.repo.agent_identities.conflict_count:
             h["agent_identity_degraded"] = True
             h["agent_identity_conflicts"] = self.repo.agent_identities.conflict_count
@@ -1994,6 +2015,8 @@ def _make_handler(server, public=False, operator=False):
                             supplied[0].encode(), server.ci_fix_config["agent_api_key"].encode()):
                         return "agent"
                     return None
+                # With no api keys EVERY caller on this listener is the operator, including for member-owned
+                # artifacts (D4); members therefore require api keys (fleet-config check refuses otherwise).
                 # open — only reachable via loopback or an explicit --allow-open
                 # (Tailnet trust boundary); the fail-closed guard enforces this
                 return "operator"
@@ -2058,9 +2081,10 @@ def _make_handler(server, public=False, operator=False):
             digest = hashlib.sha256(supplied.encode()).hexdigest()[:16]
             return f"api-key:{digest}:{self._role() or 'local'}"
 
-        def _artifact_version_allowed(self, artifact_id, version_id, permission):
-            """Permission on the artifact AND the version must belong to it (registry-backed only)."""
-            if not self._artifact_allowed(artifact_id, permission):
+        def _artifact_version_allowed(self, artifact_id, version_id, permission, *, operator_member=True):
+            """Permission on the artifact AND the version must belong to it (registry-backed only).
+            ``operator_member=False`` withholds the plan 5 D4 operator grant (publications never reach member content)."""
+            if not self._artifact_allowed(artifact_id, permission, operator_member=operator_member):
                 return False
             if server.artifact_store is None:
                 return True
@@ -2072,17 +2096,37 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             return self._deny(403, "forbidden")
 
-        def _artifact_allowed(self, artifact_id, permission):
+        def _artifact_is_deleted(self, artifact_id, permission="read"):
+            """True when the registry holds the artifact tombstoned. Deleted means nonexistent for everyone, on the legacy
+            read path too (the in-memory ACL and the repo projection never see the registry lifecycle). Reads use the
+            short-lived cache of tombstoned ids (refreshed on every local delete/restore); writes ask the database."""
+            if server.artifact_store is None or not artifact_id:
+                return False
+            if permission == "read":
+                return server.tombstone_cache.contains(
+                    artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+            return self._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
+
+        def _artifact_allowed(self, artifact_id, permission, *, operator_member=True):
             if server.artifact_acl is None:
-                return True
+                return not self._artifact_is_deleted(artifact_id, permission)
             if self._artifact_acl_allows(artifact_id, permission):
+                # only an ACL-authorized caller reaches the store: an unauthorized read must never touch it
+                return not self._artifact_is_deleted(artifact_id, permission)
+            # Plan 5 D4: an operator key reads and shares (never edits) member-owned artifacts. Gated on the operator
+            # principal first, so any other unauthorized read still never reaches the store.
+            if (operator_member and permission in ("read", "share") and server.artifact_store is not None and artifact_id
+                    and self._resource_principal().endswith(":operator")
+                    and self._artifact_call("operator_member_access", artifact_id, self._resource_principal(),
+                                            permission)):
                 return True
             # Versioned-registry artifacts (native reports) are also private to their
             # durable owner and grants, which the registry itself records. Reads stay
             # ACL-only: an unauthorized read must never reach the store.
+            extra = {} if operator_member else {"operator_member": False}
             return bool(permission != "read" and server.artifact_store is not None
                         and artifact_id and self._artifact_call(
-                "report_permission", artifact_id, self._resource_principal(), permission))
+                "report_permission", artifact_id, self._resource_principal(), permission, **extra))
 
         def _artifact_acl_allows(self, artifact_id, permission):
             principal = self._resource_principal()
@@ -2163,6 +2207,18 @@ def _make_handler(server, public=False, operator=False):
             """Everything not on the allow-list is a plain 404: the legacy API, the
             dashboard and its static files do not exist on this listener."""
             path = self.path.split("?")[0]
+            mw = server.member_web
+            if mw is not None:
+                # The member host (exactly one Host header naming it) is served by the member web API alone; on any
+                # other Host its API paths do not exist.
+                if mw.owns(self):
+                    cl = self.headers.get_all("Content-Length") or []
+                    if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                            or (self.command == "GET" and cl and cl[0].strip() not in ("", "0"))):
+                        return self._deny(400, "ambiguous request framing")
+                    return mw.handle(self)
+                if path.startswith("/api/member/") or self.command == "PUT":
+                    return self._deny(404, "not found")
             # Request framing must be unambiguous: the edge and this server must agree where a
             # request ends, or a pipelined second request could be smuggled behind the first.
             cl = self.headers.get_all("Content-Length") or []
@@ -2249,7 +2305,8 @@ def _make_handler(server, public=False, operator=False):
         def handle_expect_100(self):
             """``Expect: 100-continue`` on POST /mcp is answered only after the large-body gate has decided (see
             ``_continue_100``); inviting the body first would defeat the pre-authentication gate."""
-            if self.command == "POST" and self.path.split("?")[0] == "/mcp":
+            if (self.command == "POST" and self.path.split("?")[0] == "/mcp") or (
+                    self.command == "PUT" and public and self.path.startswith("/api/member/")):
                 self._expect_100_pending = True
                 return True
             return super().handle_expect_100()
@@ -2367,7 +2424,10 @@ def _make_handler(server, public=False, operator=False):
             try:
                 return dispatch()
             except Exception as exc:
-                self._request_cause = type(exc).__name__
+                # A client closing while we write a dependency error must not
+                # replace the already-recorded reason that the request failed.
+                if self._request_cause is None:
+                    self._request_cause = type(exc).__name__
                 raise
             finally:
                 elapsed_ms = (time.monotonic() - self._request_started) * 1000
@@ -2474,8 +2534,8 @@ def _make_handler(server, public=False, operator=False):
             dpath = "/".join(seg.replace("/", "\x00") for seg in segs)
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
-                                    "assistant-action-requests", "assistant-grants", "assistant-team-briefs",
-                                    "assistant-external-actions"}
+                                    "assistant-action-requests", "assistant-grants", "assistant-judges",
+                                    "assistant-team-briefs", "assistant-external-actions"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
@@ -2574,6 +2634,8 @@ def _make_handler(server, public=False, operator=False):
         def do_PUT(self):
             # PUT exists only for assistant-apps (client credentials, blocked calendars); everything else keeps its flat
             # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
+            if public and server.member_web is not None and self.path.startswith("/api/member/"):
+                return self._timed_request(self._public)      # the member run upload (only on the member host)
             if operator or public or not self.path.startswith("/api/v1/assistant-apps/"):
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
@@ -2584,7 +2646,7 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
                                         "assistant-reminders", "assistant-workers",
-                                        "assistant-action-requests", "assistant-grants"}
+                                        "assistant-action-requests", "assistant-grants", "assistant-judges"}
 
         def _mutate_verb(self):
             if operator:
@@ -2615,7 +2677,7 @@ def _make_handler(server, public=False, operator=False):
             if err:
                 return err
             if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
-                            "assistant-action-requests", "assistant-grants"):
+                            "assistant-action-requests", "assistant-grants", "assistant-judges"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3070,14 +3132,27 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_members_api import route_members
+                if route_members(self, server, parts, resource):
+                    return None
+                from .artifact_delete_api import route_delete
+                if route_delete(self, server, parts, resource):
+                    return None
                 from .artifact_collab_api import route_collab
                 if route_collab(self, server, parts, resource):
+                    return None
+                # route_render FIRST: route_report claims every versioned preview/outputs path of any depth.
+                from .artifact_render_api import route_render
+                if route_render(self, server, parts, resource):
                     return None
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
                     return None
                 from .artifact_share_api import route_share
                 if route_share(self, server, parts, resource):
+                    return None
+                from .artifact_annotation_api import route_annotations
+                if route_annotations(self, server, parts, resource):
                     return None
                 from .artifact_registry_api import route_registry
                 if route_registry(self, server, parts, resource):
@@ -3118,6 +3193,10 @@ def _make_handler(server, public=False, operator=False):
                                        {"error": str(exc)})
             except RuntimeError as exc:
                 self._request_cause = type(exc).__name__
+                if resource == 'events':
+                    from .projection_history import DurableHistoryUnavailable
+                    if isinstance(exc, DurableHistoryUnavailable):
+                        self._request_cause = exc.cause_name
                 if resource == "github":
                     from ..github import GitHubError
                     if isinstance(exc, GitHubError):
@@ -3552,6 +3631,32 @@ def _make_handler(server, public=False, operator=False):
                     s = r.get_service(parts[4])
                     return self._etag_json(s) if s else self._json(
                         {"error": "not found"}, 404)
+                view = _q(self.path, 'view')
+                if view is not None:
+                    from .service_catalog_query import CatalogSnapshotExpired
+                    try:
+                        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                        allowed = {'view','scope','status','include_archived','search','host_id','group_by','limit','cursor'}
+                        if set(query)-allowed or any(len(values)!=1 for values in query.values()):
+                            raise ValueError('Unknown or repeated catalog parameter')
+                        if view != 'catalog':
+                            raise ValueError('Unknown services view')
+                        archived = query.get('include_archived', ['false'])[0]
+                        if archived not in ('true','false'):
+                            raise ValueError('include_archived must be true or false')
+                        raw_limit = query.get('limit', ['100'])[0]
+                        if not re.fullmatch(r'[0-9]{1,3}', raw_limit):
+                            raise ValueError('limit must be an integer between 1 and 500')
+                        page = r.service_catalog_page(scope=query.get('scope',['herdr'])[0],
+                            status=query.get('status',['current'])[0], include_archived=archived=='true',
+                            search=query.get('search',[''])[0], host_id=query.get('host_id',[''])[0],
+                            group_by=query.get('group_by',['project'])[0], limit=int(raw_limit),
+                            cursor=query.get('cursor',[None])[0])
+                        return self._etag_json(page)
+                    except CatalogSnapshotExpired as exc:
+                        return self._json({'error':'staleCatalogCursor','message':str(exc)},409)
+                    except ValueError as exc:
+                        return self._json({'error':str(exc)},400)
                 services = r.list_services()
                 host_filter = _q(self.path, "host_id")
                 if host_filter:
@@ -3624,6 +3729,9 @@ def _make_handler(server, public=False, operator=False):
                     # per-entity stream: /api/v1/events?entity_type=mission&entity_id=m1
                     etype = _q(self.path, "entity_type")
                     eid = _q(self.path, "entity_id")
+                    from .projection_history import hidden_history
+                    if etype and hidden_history(etype):
+                        return self._json({'error':'not found'},404)
                     if etype == "lineage":
                         return self._json({"error": "not found"}, 404)  # read via the scope-checked /api/v1/graph
                     if etype == "review_request":
@@ -3650,20 +3758,15 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({**page, "events": [_redact_event(event) for event in page["events"]]})
                     return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
-                data = r.get_artifact_data(parts[4])
-                a = r.get_artifact(parts[4])
-                if a is None and server.artifact_store is not None:
-                    a = self._artifact_call('get_record', parts[4], principal_id=self._resource_principal())
-                # payload lives in the object store, not the in-memory blob
-                if data is None and a is not None and server.rustfs is not None \
-                        and a.get("storage_key") and a.get("sha256"):
-                    try:
-                        data = server.rustfs.get(a["storage_key"], a["sha256"])
-                    except Exception:
-                        data = None
+                a, data = self._artifact_current_file(parts[4])
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
-                return self._bytes(data, a.get("mime_type", "application/octet-stream"))
+                # No artifact byte may execute on the dashboard origin: download as an attachment under a sandbox.
+                name = PurePosixPath(a.get("original_filename") or "artifact").name or "artifact"
+                from .artifact_render_api import safe_mime
+                return self._bytes(data, safe_mime(a.get("mime_type", "application/octet-stream")), headers=[
+                    ("Content-Disposition", "attachment; filename*=UTF-8''" + quote(name, safe="")),
+                    ("Content-Security-Policy", "default-src 'none'; sandbox")])
             if resource == "artifacts" and len(parts) == 4:
                 if server.artifact_store is not None:
                     artifacts = self._artifact_call(
@@ -3684,6 +3787,8 @@ def _make_handler(server, public=False, operator=False):
                         query=_q(self.path, "q"), artifact_type=_q(self.path, "type"),
                         status=_q(self.path, "status"), created_by=_q(self.path, "created_by"),
                         limit=_qint(self.path, "limit", 200), offset=_qint(self.path, "offset", 0))
+                if server.artifact_store is not None:
+                    artifacts = [a for a in artifacts if not self._artifact_is_deleted(a["artifact_id"])]
                 if server.artifact_acl is not None:
                     artifacts = [a for a in artifacts if self._artifact_allowed(a['artifact_id'], 'read')]
                 return self._json({"artifacts": artifacts})
@@ -3694,7 +3799,8 @@ def _make_handler(server, public=False, operator=False):
                     legacy = r.get_artifact(parts[4])
                     if legacy and not legacy.get('created_by'):
                         artifact = legacy
-                if artifact and not self._artifact_allowed(parts[4], "read"):
+                if artifact and (self._artifact_is_deleted(parts[4])
+                                 or not self._artifact_allowed(parts[4], "read")):
                     artifact = None
                 return self._json(artifact) if artifact else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_store is not None:
@@ -3896,6 +4002,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts)
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource)
+            if resource == "assistant-judges":
+                return self._assistant_judges(parts)
             if resource in ("assistant-team-briefs", "assistant-references"):
                 return self._assistant_briefs(parts, resource, None)
             if resource == "assistant-external-actions":
@@ -4066,7 +4174,8 @@ def _make_handler(server, public=False, operator=False):
             if resource == "publications" and server.publication_controller is not None:
                 if len(parts) == 5 and parts[4] == "requests":
                     body = self._read_json() or {}
-                    if not self._artifact_version_allowed(body.get('resource_id', ''), body.get('version_id'), 'share'):
+                    if not self._artifact_version_allowed(body.get('resource_id', ''), body.get('version_id'), 'share',
+                                                       operator_member=False):
                         return self._artifact_forbidden()
                     return self._json(server.publication_controller.request(
                         resource_id=body.get("resource_id"), version_id=body.get("version_id"),
@@ -4078,7 +4187,8 @@ def _make_handler(server, public=False, operator=False):
                     if publication is None:
                         return self._json({'error': 'not found'}, 404)
                     if not self._artifact_version_allowed(
-                            publication['resource_id'], publication['pinned_version_id'], 'share'):
+                            publication['resource_id'], publication['pinned_version_id'], 'share',
+                            operator_member=parts[5] == "revoke"):
                         return self._artifact_forbidden()
                     if parts[5] == "approve":
                         result = server.publication_controller.approve(parts[4], approver=self._resource_principal())
@@ -4372,6 +4482,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts, body)     # body was read above; never read it twice
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource, body)
+            if resource == "assistant-judges":
+                return self._assistant_judges(parts, body)
             if resource == "assistant-team-briefs":
                 return self._assistant_briefs(parts, resource, body)
             if resource == "assistant-external-actions":
@@ -4659,6 +4771,7 @@ def _make_handler(server, public=False, operator=False):
             from .assistant_hub.policy import (
                 ActivationRefused,
                 activate_grant,
+                current_judge_version,
                 record_owner_decision,
                 revoke_action_grant,
             )
@@ -4672,6 +4785,7 @@ def _make_handler(server, public=False, operator=False):
                 tenant_id, user_id = self._assistant_scope()
                 svc, store = server.assistant, server.assistant.store
                 cfg = svc.config["grants"]
+                version = current_judge_version(server.assistant_judge)
 
                 def request_view(r):
                     return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
@@ -4682,8 +4796,8 @@ def _make_handler(server, public=False, operator=False):
                 def grant_view(g):
                     return {"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb,
                             "resource_scope": g.resource_scope, "key_id": g.key_id,
-                            "state": g.effective_state(svc.now(), int(cfg["policy_version"])).value,
-                            "policy_version": g.policy_version, "created_at": iso(g.created_at),
+                            "state": g.effective_state(svc.now(), int(cfg["policy_version"]), version).value,
+                            "policy_version": g.policy_version, "judge_version": g.judge_version, "created_at": iso(g.created_at),
                             "proposed_at": iso(g.proposed_at), "activated_at": iso(g.activated_at),
                             "expires_at": iso(g.expires_at), "revoked_at": iso(g.revoked_at),
                             "confirmed_by": g.confirmed_by}
@@ -4703,7 +4817,8 @@ def _make_handler(server, public=False, operator=False):
                             return self._json({"error": 'body must be exactly {"approve": true|false}'}, 400)
                         try:
                             row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
-                                                        body["approve"], decided_by=user_id)
+                                                        body["approve"], decided_by=user_id,
+                                                        judge_version=version)
                         except ValueError as exc:       # already decided, or vetoed (a veto is final)
                             return self._json({"error": str(exc), "code": "conflict"}, 409)
                         return self._json(request_view(row))
@@ -4712,14 +4827,16 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"grants": [grant_view(g) for g in store.list_action_grants(tenant_id, user_id)]})
                     if len(parts) == 5 and self.command == "DELETE":
                         return self._json(grant_view(revoke_action_grant(store, svc.now(), tenant_id, user_id,
-                                                                          parts[4], revoked_by=user_id)))
+                                                                          parts[4], revoked_by=user_id,
+                                                                          policy_version=int(cfg["policy_version"]),
+                                                                          judge_version=version)))
                     if len(parts) == 6 and parts[5] == "activate" and self.command == "POST":
                         if not exact({"confirm"}) or body["confirm"] is not True:
                             return self._json({"error": 'body must be exactly {"confirm": true}'}, 400)
                         try:
-                            # The judge gate is hard-coded unsatisfied this phase: Phase 3 wires the real judge gate.
+                            # The real gate: calibration report from the store, owner flag, false-negative bound.
                             grant = activate_grant(store, cfg, svc.now(), tenant_id, user_id, parts[4],
-                                                   confirmed_by=user_id, judge_gate_satisfied=False)
+                                                   confirmed_by=user_id, judge=server.assistant_judge)
                         except ActivationRefused as exc:
                             if exc.code == "not_found":
                                 return self._json({"error": "not found"}, 404)
@@ -4732,6 +4849,34 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "not found"}, 404)
             except ValueError as exc:
                 return self._json({"error": str(exc)}, 400)
+
+        def _assistant_judges(self, parts, body=None):
+            """Owner-only judge status and a one-shot connectivity check. Same tenant/user scope as the grants routes;
+            the endpoint is shown as a host only and no key material or key path ever leaves here."""
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant_hub.judge_admin import check_view, status_view
+            if self._require("operator"):
+                return None
+            try:
+                server.assistant._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                judge = server.assistant_judge
+                fallback = svc.config.get("judge") or {}
+                if len(parts) == 4 and self.command == "GET":
+                    return self._json(status_view(svc.store, judge, fallback, tenant_id, user_id, svc.now()))
+                if len(parts) == 5 and parts[4] == "check" and self.command == "POST":
+                    if body not in (None, {}):
+                        return self._json({"error": "body must be empty"}, 400)
+                    return self._json(check_view(judge, fallback))
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
 
         def _assistant_briefs(self, parts, resource, body):
             """Team collaboration slice 4 (assistant_briefs.py): the operator's assistant offers a team a derived brief.
@@ -4857,7 +5002,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": mapped.message}, mapped.status)
 
         def _assistant_get(self, parts, resource):
-            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant import (
+                AssistantError,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant
@@ -5621,6 +5771,10 @@ def _make_handler(server, public=False, operator=False):
             filename = _q(self.path, "filename") or "upload"
             mime = _q(self.path, "mime") or \
                 self.headers.get("Content-Type", "application/octet-stream")
+            from ..media_type import canonical_upload_media_type
+            mime = canonical_upload_media_type(mime)
+            if mime is None:
+                return self._json({"error": "invalid mime"}, 400)
             session_id = _q(self.path, "session_id")
             mission_id = _q(self.path, "mission_id")
             owner = self._resource_principal()
@@ -5720,18 +5874,30 @@ def _make_handler(server, public=False, operator=False):
             rel = self.path.lstrip("/") or _INDEX
             if ".." in rel:
                 return self._send_json(403, {"error": "forbidden"})
-            target = (server.web_root / rel).resolve()
-            if not target.is_relative_to(server.web_root.resolve()) or \
+            vendored = rel in _VENDORED_PDFJS
+            target = ((_PDFJS_VENDOR_DIR / rel.rsplit("/", 1)[1]) if vendored else server.web_root / rel).resolve()
+            if not vendored and not target.is_relative_to(server.web_root.resolve()) or \
                     not target.exists() or target.is_dir():
                 return self._send_json(404, {"error": "not found"})
             ctype = {
-                ".html": "text/html", ".css": "text/css",
+                ".html": "text/html", ".css": "text/css", ".mjs": "text/javascript",
                 ".js": "text/javascript", ".svg": "image/svg+xml",
             }.get(target.suffix, "application/octet-stream")
             data = target.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Cache-Control", "no-store")
+            etag = vendor_etag(data) if vendored else None
+            not_modified = vendored and etag_matches(self.headers.get("If-None-Match"), etag)
+            self.send_response(304 if not_modified else 200)
+            if not not_modified:
+                self.send_header("Content-Type", ctype)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # The vendored path carries no version: revalidate (no-cache) against a sha256 ETag; the rest is the
+            # dashboard's own, edited code.
+            self.send_header("Cache-Control", "no-cache" if vendored else "no-store")
+            if etag:
+                self.send_header("ETag", etag)
+            if not_modified:
+                self.end_headers()
+                return None
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -5860,6 +6026,8 @@ def _make_handler(server, public=False, operator=False):
             if version_id is not None and (not isinstance(version_id, str) or not version_id):
                 return self._json({"error": "version_id must be a non-empty string"}, 400)
             if server.artifact_store is not None:
+                if self._artifact_call("lifecycle_of", artifact_id) == "tombstoned":
+                    return self._deny(404, "not found")             # deleted: nothing may write to it
                 known = (self._artifact_call("get_version", version_id, artifact_id) if version_id
                          else self._artifact_call("get_record", artifact_id, principal_id=self._resource_principal()))
                 if known is None:
@@ -6090,12 +6258,34 @@ def _make_handler(server, public=False, operator=False):
                 return self._etag_json(body)
             return self._json(body, etag=etag)
 
-        def _bytes(self, data, mime):
+        def _artifact_current_file(self, artifact_id, want=None):
+            """``(record, bytes)`` of the artifact's current file (either may be None), as ``/download`` serves it.
+
+            ``want(record) -> bool`` may veto reading the bytes (they are then None) for callers that need only the record."""
+            r = server.repo
+            if self._artifact_is_deleted(artifact_id):
+                return None, None
+            data = r.get_artifact_data(artifact_id)
+            a = r.get_artifact(artifact_id)
+            if a is None and server.artifact_store is not None:
+                a = self._artifact_call('get_record', artifact_id, principal_id=self._resource_principal())
+            # payload lives in the object store, not the in-memory blob
+            if data is None and a is not None and (want is None or want(a)) and server.rustfs is not None \
+                    and a.get("storage_key") and a.get("sha256"):
+                try:
+                    data = server.rustfs.get(a["storage_key"], a["sha256"])
+                except Exception:
+                    data = None
+            return a, data
+
+        def _bytes(self, data, mime, headers=()):
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
+            for name, value in headers:
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
             return None

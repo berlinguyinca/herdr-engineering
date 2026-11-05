@@ -64,23 +64,27 @@ These were applied by hand on bender; reapply them on a new host.
 ## Share links (`/s/`)
 
 Artifact share links are served by `herdr-share-public` behind the same edge, under
-`control_plane.collab.public_url` (`https://localdev.mcp.metabolomics.us/s/<token>/`). Off unless
+`control_plane.share.public_url`, a host of its own (`https://<share host>/s/<token>/`); MCP stays on
+`control_plane.collab.public_url`. Off unless
 `control_plane.share.enabled: true` in the central fleet config; enabling them needs the collab marker.
 
 ```
-edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, internal; no DB, RustFS,
+edge (nginx, the share host's own server: /s/ only) -> herdr-share-public:8083 (network `share`, internal; no DB, RustFS,
                                        control plane or outbound route)
 ```
 
 - Config: `deploy.sh` renders `herdr-eng fleet config render-share` to
   `~/.config/herdr-engineering/share/share-config.json` (0600): only `control_plane.share`'s serving keys
-  and collab's `cognito_pool`, `cognito_clients`, `cognito_web_client`, `cognito_domain`, `public_url`.
+  and collab's `cognito_pool`, `cognito_clients`, `cognito_web_client`, `cognito_domain`, `public_url`
+  (the collab URL is carried but share links no longer use it).
   share-public refuses any file carrying more.
 - Signing secret: `enabled: true` without `control_plane.share.signing_secret` (at least 32 bytes) is refused
   before anything is built. Generate it on the control-plane host and paste it into the fleet YAML yourself:
   `openssl rand -hex 32`. Never commit it, print it, or pass it as a flag or environment variable. Rotating it
   ends every open lab session.
-- `public_url` must be a bare origin (empty path or `/`): the viewer's sign-in redirect is fixed at `/s/callback`.
+- `control_plane.share.public_url` must be a bare lowercase https origin (empty path or `/`; no userinfo, query,
+  fragment, non-ASCII or trailing-dot host) on a host other than `control_plane.collab.public_url`'s: the viewer's
+  sign-in redirect is fixed at `/s/callback` at its root. `deploy.sh` refuses anything else.
 - Lab session lifetime: `control_plane.share.session_seconds` (default 14400 = 4 h) is only a cap. A session
   also ends at the share's expiry and at the Cognito access token's `exp` (about 1 h with the pool's default
   token validity), so recipients sign in again after ~1 h unless the app client's access-token validity is raised.
@@ -107,17 +111,28 @@ edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, 
 - Edge resilience: share-public is resolved at run time (`resolver 127.0.0.11`, `server ... resolve` in a
   zoned upstream, `max_conns=100` under share-public's 128-connection cap), so the edge starts and reloads
   (certificate renewals included) while share-public is down; `/s/` then answers 502.
-- Edge: with shares enabled the edge's `nginx.conf` gains exactly one location, `^~ /s/` (snippets
-  `collab-edge/share-http.conf` and `share-location.conf`): GET/HEAD/OPTIONS, plus POST only on
-  `/s/<token>/session` (the body-less lab sign-in exchange); any request with a body is refused; its own
-  `limit_req`/`limit_conn` zones; `proxy_buffering off`; `proxy_read_timeout 600s`; no access log (tokens and
-  session HMACs are in the path). Disabled, the edge conf is the repo file unchanged and a running
-  share-public is stopped (its bundles stay on disk).
+- Edge: with shares enabled the edge's `nginx.conf` gains the zones, upstream and a `server` for the share host
+  (snippet `collab-edge/share-http.conf`; `@share_host@` is the host of `control_plane.share.public_url`, rendered by
+  `herdr-eng fleet config render-edge`). The MCP host serves no `/s/` at all (404). The share server proxies only
+  `/s/`; everything else is a 404. `location /s/`: GET/HEAD/OPTIONS, plus POST only on `/s/<token>/session` (the
+  body-less lab sign-in exchange); any request with a body is refused. The annotation endpoints
+  (`/s/<token>/k/<session>/annotations[/ann_<id>/edit|delete]`) are a separate location: GET and POST only, a 32k
+  body cap, their own `share_annotate` zone (5 r/s, burst 30). Both have `limit_conn share_conn 16`,
+  `proxy_buffering off`, and no access log (tokens and session HMACs are in the path). The edge adds no caching and
+  no response headers beyond HSTS, so share-public's CSP and `Cache-Control: no-store` reach the browser unchanged;
+  `Origin`, `Sec-Fetch-Dest`, `Range` and `Content-Length` are passed on, `X-Forwarded-Host` is dropped. Disabled, the
+  edge conf is the repo file unchanged and a running share-public is stopped (its bundles stay on disk).
+- Certificate: the edge presents ONE certificate for both hosts (`/etc/acme`); `collab-sync.sh` is unchanged and
+  still manages one lineage. Before enabling shares, add the share host to the existing lineage once, on the
+  certbot host, with the same DNS-01 plugin and flags the lineage was created with:
+  `certbot certonly --cert-name localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d <share host>`
+  (every name the lineage already has must be repeated). Renewals then cover both names. The router and SNI front
+  must also send the share host's name to the edge's port.
 - Edge limits (trade-off): `/s/` allows 100 requests/s per client address with a burst of 300 (parquet range
   reads come in bursts, and campus NAT puts many people behind one address) and 16 concurrent connections per
   address. The total is capped only by the upstream's `max_conns=100` (share-public refuses past 128): a
   handful of heavy clients can take most of it and other viewers then wait or get 502, without a log line
-  per refusal. Lower the rate in `collab-edge/share-http.conf` / `share-location.conf` if abuse shows up.
+  per refusal. Lower the rate in `collab-edge/share-http.conf` if abuse shows up.
 - Edge logging: `/s/` has no access log, but a request nginx refuses before it reaches the `/s/` location
   (malformed request line, oversized headers, TLS or PROXY-protocol errors) can appear in the edge's access or
   error log with its request line, which may contain a token.
@@ -130,10 +145,104 @@ real share server over the bundles in `tests/share-fixtures/` (see its README) a
 reads, the sandbox, CSP blocking, PDF display, revoke and lab sign-in against a fake Cognito.
 
 Operator step, once, before sending lab links (not done by `deploy.sh`): add
-`https://localdev.mcp.metabolomics.us/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
+`<control_plane.share.public_url>/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
 `herdr-collab-web` app client (`aws cognito-idp update-user-pool-client` replaces the whole client: read it
 first with `describe-user-pool-client` and send every existing attribute back with the new URL added). Public
-links need no Cognito change.
+links need no Cognito change. Keep the previous host's `/s/callback` registered until the deploy is verified: a
+rollback to the previous release signs in there. Existing links on the old host stop working at the cutover
+(re-issue them); see docs/operations/collaboration-network.md.
+
+## Member artifacts (`artifacts.metabolomics.us`)
+
+Members (the Cognito group `control_plane.collab.members.group`) own artifacts, upload and publish them in the
+browser, and can create public or lab share links for them. One host, `control_plane.share.public_host`, serves it all:
+`/s/` (share-public, as above), `/api/member/` and the member page `/` and `/my/` (collab-public). Off unless
+`share.public_host` is set; the member locations also need `control_plane.collab.members.enabled: true`.
+
+```
+edge (nginx, server_name <public_host>): /s/ -> share-public:8083
+                                         /api/member/, /, /my/ -> collab-public:8081 (own zones member_req / member_conn)
+```
+
+- Edge: `collab-edge/member-http.conf` is spliced into the host's server only when members are enabled, and its two
+  zones (`member_req` 10 r/s, `member_conn`) into the http block. `PUT /api/member/artifacts/<id>/uploads/<id>/runs/<n>`
+  alone gets `client_max_body_size 17m` and `proxy_request_buffering off` (32 chunks x 512 KiB + slack); everything
+  else under `/api/member/` is 1 MiB. No access log on `/s/` and `/api/member/` (tokens and the session exchange).
+  `X-Frame-Options: DENY` and HSTS are set by the edge (the app's copy is hidden so it is sent once); the page's CSP is
+  the app's. The MCP host serves no `/s/` and the new host serves no `/mcp`.
+- Operator steps, **not done by `deploy.sh`**:
+  1. DNS: `artifacts.metabolomics.us` to the public edge.
+  2. Add the hostname to cubert's SNI stream edge (`networking/cubert-ansible`, stream map to the collab edge backend)
+     and run its playbook.
+  3. Certificate: the collab edge's ACME lineage must name the new host (`certbot certonly --cert-name ... --expand
+     -d <existing names> -d artifacts.metabolomics.us`); `deploy.sh` refuses a certificate that does not.
+  4. Cognito: add `https://artifacts.metabolomics.us/s/callback` AND `https://artifacts.metabolomics.us/my/callback` to
+     both CallbackURLs and LogoutURLs of the `herdr-collab-web` app client. `update-user-pool-client` replaces the
+     whole client, so read it first with `describe-user-pool-client` and send every existing attribute back with the
+     new URLs added. Careful: that output may contain `ClientSecret` (never paste or log it; redirect the JSON to a
+     0600 file) and read-only fields (`ClientId`, `UserPoolId`, `CreationDate`, `LastModifiedDate`, `ClientSecret`)
+     that `update-user-pool-client` rejects: strip them (for example `jq 'del(.UserPoolClient.CreationDate,
+     .UserPoolClient.LastModifiedDate, .UserPoolClient.ClientSecret)'`) and pass `ClientId`/`UserPoolId` as options.
+     Changing `public_host` later means registering both callbacks on the new host first; keep the old host's until
+     verified.
+  5. Fleet YAML: set `control_plane.share.public_host`, `control_plane.collab.members.enabled: true`,
+     `control_plane.collab.members.group`, `control_plane.collab.members.session_secret` (`openssl rand -hex 32`,
+     pasted in; never committed, printed or passed as a flag) and, if collab-public does not run as the default uid,
+     `control_plane.collab.members.secrets_gid` (the gid collab-public runs as). The worker gets
+     `HERDR_COLLAB_CERT_UID` (default 1000, as collab-public) from compose; if neither is available the worker REFUSES
+     to start members (fail closed) with a message naming `control_plane.collab.members.secrets_gid`.
+  6. Verify: `curl -s https://artifacts.metabolomics.us/api/member/config` returns 200, then a sign-in round-trip at
+     `/`. Run `WORKER_CONTAINER=<worker> deploy/control-plane/member-secret-smoke.sh /tmp <collab-public-uid>` as root on the worker
+     host once (it checks the worker's own gid against the uid, refuses uid 0/65534; PYTHON/PYTHONPATH must give a
+     checkout both users can import).
+  7. Rollback: remove `public_host` / `members.enabled` and redeploy (the edge returns to the share-only server or
+     the previous conf; rows, blobs and bundles stay). Members' public links stop with the host.
+- Group-readability caveat: any process whose gid is the secrets gid can read a pending share URL for up to 60 s
+  (until collab-public takes it or the worker's sweep deletes it) and can delete it (denial only). The default gid is
+  collab-public's uid, usually the deploying operator's own login group; prefer a dedicated group (set
+  `control_plane.collab.members.secrets_gid` and run collab-public as it) over the operator's login group.
+- Secret hand-off between uids (important): the worker (root) writes the read-once share URL to
+  `<outbox>/secrets/<ticket>.json` and collab-public (uid `HERDR_COLLAB_CERT_UID`) reads and deletes it. The worker
+  therefore sets that directory to group `control_plane.collab.members.secrets_gid` (default: the worker's
+  `HERDR_COLLAB_CERT_UID`, which compose passes with collab-public's default), mode 0770, files 0640; others get
+  nothing. With no gid the worker refuses to start members rather than issue links nobody can receive.
+- A `share` grant is not read-protected: a grantee holding only `share` can create and approve a link, receives the
+  read-once URL, and so can open it and read the bytes. The member API (head, history, view tools) stays gated on
+  `read`; do not hand out `share` expecting it to hide content.
+- Public links by members (D3): members can create public links to their artifacts. The operator sees them in the
+  Members panel and with `herdr-eng artifacts members links --audience public`; revoke there.
+- Limits and behaviours to know:
+  - The provenance banner on member links is best-effort: the page's own CSS/JS can hide it; the containment is the
+    sandbox CSP, opaque origin, group/expiry and revoke. Public links get the bar on HTML only.
+  - Member HTML is capped at 2 MiB; svg, pdf, xhtml and xml are refused for member links, and HTML whose markup
+    cannot be proven to render the bar (for example scripts containing `a <!b`, or content before `<body>` beyond
+    head elements) is refused rather than labelled.
+  - The operator-API approve path shows the user id, not the display name; the member web path shows the name.
+  - Removing a member from the group takes effect after the claim TTL (`members.groups_ttl`, 24 h) and then a grace
+    (`members.removed_grace`, default 3600 s of continuous removed observation) before their shares are revoked.
+    Group REMOVAL is only observed at a sign-in: a member who never signs in again keeps the last seen groups. A
+    DISABLED account is different: it reports `disabled` at any claim age (the TTL only ages group membership), and
+    the sweep revokes their links.
+  - Effective upload limits are the smaller of the member setting and the collab_artifacts bridge limit
+    (`max_upload_bytes` vs `max_file_bytes`; `staging_bytes_per_member` vs the bridge staging caps). `null` for
+    `max_upload_bytes` or `staging_bytes_per_member` means "only the 1 TiB structural bound".
+  - `members.enabled` needs `share.enabled`, `collab_artifacts.enabled: true` and at least one `api_keys` entry;
+    `herdr-eng fleet-config check` names the missing key. With no API keys the open listener makes every caller an
+    operator, so the member routes would be reachable by anyone on that listener.
+  - Orphan blobs left by conflicting publishes stay counted against the member's quota until an operator purge.
+  - Purge refuses held tombstones and tombstones without a purge date; it anonymises annotations, share events and
+    feedback of third parties, and blanks file names in `output_manifest`, `provenance.message`/`entry` and
+    `artifact_shares.entry` (migrations 0048, 0049 and 0050; renumber at merge if another branch took the number).
+    Storage keys and hashes are kept. The append-only jsonl event files on disk are written by a separate process and
+    are NOT rewritten by purge; they keep the old names until the retention window of that log removes them.
+  - Purge also blanks the message and conflict file names of collaborator merge attempts. Lifecycle event reasons are
+    server-fixed strings (`member delete`, `member purge`), so nothing member-written remains there.
+  - A shared blob survives the deletion of one owner while another artifact (including a held or restorable
+    tombstone) still references it.
+  - `share_creates_per_hour` (default 20) is counted per process in memory.
+- Verifying the rendered edge: `docker run --rm --add-host collab-public:127.0.0.1 --add-host share-public:127.0.0.1
+  -v <conf>:/etc/nginx/nginx.conf:ro -v <certdir>:/etc/acme:ro nginx:1.29-alpine nginx -t` (a test does this when
+  Docker is available).
 
 ## Artifact collaborator bridge (`control_plane.collab_artifacts`)
 
@@ -296,5 +405,5 @@ curl -s https://localdev.mcp.metabolomics.us/api/v1/collab/config        # 200
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/collab/rooms   # 401
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/hosts          # 404
 curl -s http://<tailnet-ip>:9482/api/v1/collab/config                    # operator block present
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (shares on or off)
+curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (the MCP host serves no /s/)
 ```

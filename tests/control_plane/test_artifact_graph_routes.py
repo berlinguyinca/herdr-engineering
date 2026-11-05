@@ -58,6 +58,12 @@ class FakeStore:
     def sync_call(self, method, *args, **kwargs):
         return asyncio.run(getattr(self, method)(*args, **kwargs))
 
+    async def tombstoned_ids(self):
+        return []
+
+    async def lifecycle_of(self, aid):
+        return "active"
+
     async def report_permission(self, aid, principal, permission):
         return principal == acl_id("owner-key")          # the registry's own durable owner
 

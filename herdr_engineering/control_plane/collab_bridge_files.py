@@ -82,6 +82,7 @@ _SHA = re.compile(SHA_RE)
 _PART = re.compile(r"[0-9]{7}\Z")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")  # owner keys, actor / artifact / version ids
 _KIND = re.compile(r"[a-z][a-z0-9_.]{0,47}\Z")
+_USER_ACTOR_ID = re.compile(r"[A-Za-z0-9_.:@+-]{1,128}\Z")   # a Cognito username (collab_cognito._USER_RE)
 _IDEMPOTENCY = re.compile(r"[\x21-\x7e]{1,128}\Z")
 _TEXT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _MAX_B64 = 4 * math.ceil(CHUNK_BYTES / 3)
@@ -398,13 +399,15 @@ def ensure_dir(path: Path, *, mode: int = DIR_MODE, public_mode: bool = False) -
     os.close(_ensure_dir(path, mode, public_mode=public_mode))
 
 
-def _create_tmp(dfd: int, data: bytes, mode: int) -> str:
+def _create_tmp(dfd: int, data: bytes, mode: int, gid: int | None = None) -> str:
     """Write ``data`` into a fresh ``.tmp-<rand>`` in ``dfd`` (fsynced, ``mode`` regardless of umask); its name."""
     tmp = _tmp_name()
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
     try:
         try:
             _write_all(fd, data)
+            if gid is not None:
+                os.fchown(fd, -1, gid)
             os.fchmod(fd, mode)
             os.fsync(fd)
         finally:
@@ -455,7 +458,7 @@ def _open_tmpfile(dfd: int) -> int:
     return os.open(".", flag | os.O_RDWR | os.O_CLOEXEC, 0o600, dir_fd=dfd)   # RDWR: the no-/proc fallback re-reads it
 
 
-def _link_tmpfile(dfd: int, name: str, data: bytes, mode: int) -> bool | None:
+def _link_tmpfile(dfd: int, name: str, data: bytes, mode: int, gid: int | None = None) -> bool | None:
     """The ``O_TMPFILE`` path of ``link_new_bytes``: True/False as it returns, or None when unsupported (fall back).
 
     The file has no name until ``linkat`` gives it its final one, so there is never a ``.tmp-*`` leftover and never an
@@ -469,6 +472,8 @@ def _link_tmpfile(dfd: int, name: str, data: bytes, mode: int) -> bool | None:
         raise
     try:
         _write_all(fd, data)
+        if gid is not None:
+            os.fchown(fd, -1, gid)
         os.fchmod(fd, mode)
         os.fsync(fd)
         try:
@@ -499,12 +504,12 @@ def link_new_bytes(dir: Path, name: str, data: bytes, *, mode: int = 0o600) -> b
         os.close(dfd)
 
 
-def _link_new_at(dfd: int, name: str, data: bytes, mode: int) -> bool:
-    """The body of ``link_new_bytes`` on an already opened directory fd."""
-    linked = _link_tmpfile(dfd, name, data, mode)
+def _link_new_at(dfd: int, name: str, data: bytes, mode: int, gid: int | None = None) -> bool:
+    """The body of ``link_new_bytes`` on an already opened directory fd (``gid``: the file's group, when set)."""
+    linked = _link_tmpfile(dfd, name, data, mode, gid)
     if linked is not None:
         return linked
-    tmp = _create_tmp(dfd, data, mode)
+    tmp = _create_tmp(dfd, data, mode, gid)
     try:
         os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
     except FileExistsError:
@@ -516,13 +521,15 @@ def _link_new_at(dfd: int, name: str, data: bytes, mode: int) -> bool:
 
 
 def link_new_beneath(root: Path, parts: list[str], name: str, data: bytes, *, mode: int = 0o600,
-                     create_dirs: bool = False, dir_mode: int = 0o700) -> bool:
+                     create_dirs: bool = False, dir_mode: int = 0o700, gid: int | None = None) -> bool:
     """``link_new_bytes`` at ``root/parts.../name`` with every component opened no-follow from the trusted ``root``.
 
     With ``create_dirs`` missing directories are created (``mkdirat``, ``dir_mode``) as ``make_dirs_beneath`` does;
     without it a missing directory is refused, so a write never resurrects a directory someone else removed.
     ``BridgeError`` for an unsafe name or a missing, symlinked or non-directory component (``OSError`` from the
-    creating walk). True when written now, False when ``name`` already exists (never replaced, never partial).
+    creating walk). With ``gid`` the file and the last directory component get that group (the directory is also
+    repaired to ``dir_mode`` when it already exists), so another uid in the group can read and unlink the file.
+    True when written now, False when ``name`` already exists (never replaced, never partial).
     """
     if not _safe_part(name) or name.startswith(".tmp-"):
         raise BridgeError("unsafe file name")
@@ -533,7 +540,10 @@ def link_new_beneath(root: Path, parts: list[str], name: str, data: bytes, *, mo
         if dfd is None:
             raise BridgeError("directory is missing or unsafe")
     try:
-        return _link_new_at(dfd, name, bytes(data), mode)
+        if gid is not None:
+            os.fchown(dfd, -1, gid)
+            os.fchmod(dfd, dir_mode)
+        return _link_new_at(dfd, name, bytes(data), mode, gid)
     finally:
         os.close(dfd)
 
@@ -1267,7 +1277,12 @@ def _validate_actor(raw) -> Actor:
     if not isinstance(raw, dict) or set(raw) != {"kind", "id"} or raw["kind"] not in _ACTOR_KINDS:
         raise IntentError("invalid actor")
     try:
-        actor_id = agent_owner_key(raw["id"]) if raw["kind"] == "agent" else _check_id(raw["id"], "actor id")
+        if raw["kind"] == "agent":
+            actor_id = agent_owner_key(raw["id"])
+        elif isinstance(raw["id"], str) and _USER_ACTOR_ID.match(raw["id"]):
+            actor_id = raw["id"]
+        else:
+            raise BridgeError("invalid actor id")
     except BridgeError:
         raise IntentError("invalid actor") from None
     return Actor(raw["kind"], actor_id)

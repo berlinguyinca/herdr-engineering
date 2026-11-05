@@ -169,10 +169,31 @@ It publishes the report and prints one line:
   identity; zero or several matching dashboard sessions are refused (`no_session`, `ambiguous_session`) rather
   than guessed, and a running dashboard job is not cancelled.
 - It opens a side pane to the right of the agent (`--no-focus`) that runs `herdr-eng summary view FILE
-  --close-pane ID`: the report rendered as styled terminal text (`md_render.py`, no dependencies; `NO_COLOR` turns
-  colour off), paged with `less`, and the pane closes itself when the pager exits. A pane from an earlier run
-  that is still open is replaced, because keystrokes sent to a running pager would be pager commands. The pane id
-  is kept in a sidecar file. `--no-pane` and `--no-dashboard` turn either half off.
+  --close-pane ID --peer ID`: the report rendered as styled terminal text (`md_render.py`, no dependencies;
+  `NO_COLOR` turns colour off), shown by the built-in full-screen viewer (`pane_viewer.py`; it replaced `less`, which
+  cannot reflow). Keys: `q` or Ctrl-C closes, space/`f` and `b` page, arrows/`j`/`k` scroll, `g`/`G` jump. When the
+  pane is resized the report is wrapped again at the new width and the reader stays at the same relative place.
+  A pane from an earlier run that is still open is replaced, because keystrokes sent to a running viewer would be
+  viewer commands. The pane id is kept in a sidecar file. `--no-pane` and `--no-dashboard` turn either half off.
+- **Drift graph.** The skill may end the report with an optional `drift-graph` block (labelled segments of
+  consecutive prompts and, if the topic changed into something that deserved its own session, where). `publish`
+  strips the block before the report is stored, posted or shown, checks it against the real prompts of the session
+  (`session_history.py`, the same for Claude, Pi, Codex and OpenCode) and computes every number itself: start time
+  and prompt count per segment, and an agent count where the history reports child agents. A block that does not
+  check out (gaps, wrong totals, fewer than 5 prompts, more than 8 segments) is dropped and the report is published
+  as before. Each segment also shows **time worked** (the gaps between consecutive events, leaving out any pause over
+  30 minutes) next to its wall-clock time (`wall`, always shown), and **tokens** as fresh (new input + output) over cached re-reads, summed
+  from the harness's own usage records (Claude `message.usage`, Pi `usage`, Codex `token_count`, OpenCode `tokens`).
+  A total line closes the graph and the drift marker carries the cost of everything after the topic change. A figure
+  that was not recorded is left out, never shown as 0 or estimated; child-agent usage in separate records is not
+  counted and the total says "main session only". A valid graph is saved beside the report as `<report>.graph.json` (0600) and drawn in a second pane
+  split below the summary (`herdr-eng summary graph FILE --close-pane ID --peer ID`): boxes joined by arrows in a
+  row when they fit, a column when they do not, a numbered list below 30 columns, ASCII when the terminal is not
+  UTF-8. The marker `◆ Looks like a new task from prompt N` is a judgement, not a fact. The graph reflows on
+  resize and has the same scroll keys. The result of `publish` carries `graph` (`ok`, `pane_id`, `error`,
+  `skipped`); a failure there never affects the summary. The two viewers are peers: closing either closes both, and
+  a re-publish closes any live pair first. `scripts/check_summary_panes.sh` checks the resize behaviour in a real
+  Herdr pane.
 - If publishing fails, the skill prints the complete report so nothing is lost. Target mode and prepared
   evidence runs never publish.
 

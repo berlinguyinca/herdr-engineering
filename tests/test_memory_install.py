@@ -202,6 +202,21 @@ def test_codex_hooks_trust_never_written(home):
     assert "hooks.state" not in (home / ".codex/config.toml").read_text()
 
 
+def test_codex_approves_only_memory_recall_and_preserves_other_tool_policies(home):
+    path = home / '.codex/config.toml'
+    path.parent.mkdir()
+    path.write_text('[mcp_servers.other]\ncommand = "other"\ndefault_tools_approval_mode = "prompt"\n')
+    result = inst(home, which_only('codex')).install()
+    assert result.ok
+    config = tomllib.loads(path.read_text())
+    memory = config['mcp_servers']['herdr-memory']
+    assert memory['tools']['memory_recall']['approval_mode'] == 'approve'
+    assert memory['tools']['memory_retain']['approval_mode'] == 'prompt'
+    assert 'default_tools_approval_mode' not in memory
+    assert config['mcp_servers']['other']['default_tools_approval_mode'] == 'prompt'
+    assert 'approval_policy' not in config and 'hooks' not in config
+
+
 # ---- credentials / doctor -------------------------------------------------
 def write_cfg(home, cred, extra=None):
     cfg = home / ".config/herdr-memory/config.json"
@@ -367,6 +382,23 @@ def test_wheel_install_without_provenance_is_reported_unknown_with_its_version(h
     assert i.installed_revision() is None and i.installed_version() == "0.1.3"
     check = _check(i.doctor(["claude"]), "package_revision")
     assert check["status"] == "unknown" and "0.1.3" in check["detail"]
+
+
+def test_cli_provenance_never_comes_from_another_interpreter(home, monkeypatch):
+    from importlib import metadata
+    from types import SimpleNamespace
+
+    stale = home / 'wrapper' / 'herdr_memory-0.0.1.dist-info'
+    stale.mkdir(parents=True)
+    (stale / 'direct_url.json').write_text(json.dumps({'vcs_info': {'commit_id': 'old-wrapper'}}))
+    monkeypatch.setattr(metadata, 'distribution', lambda _: SimpleNamespace(_path=stale))
+    exe = _client_install(home)
+    installer = mi.MemoryInstaller(home, command=CMD,
+        which=lambda name: exe if name == 'herdr-memory' else None, run=fake_run)
+    assert installer.installed_version() == mi.PINNED_CLIENT_VERSION
+    assert installer.installed_revision() == mi.PINNED_REVISION + '0' * (40 - len(mi.PINNED_REVISION))
+    missing = mi.MemoryInstaller(home, command=CMD, which=lambda _: None, run=fake_run)
+    assert missing.installed_version() is None and missing.installed_revision() is None
 
 
 def test_doctor_reports_the_client_version_the_cli_advertises(home):
@@ -560,6 +592,37 @@ def test_mcp_serve_roundtrip():
     assert replies[3]["result"]["isError"] is True
 
 
+@pytest.mark.parametrize('explicit', ['false', 'true', 1, 0, [], {}, None])
+@pytest.mark.parametrize('evidence', [[], ['git:revision:file']])
+def test_mcp_serve_rejects_non_boolean_save_intent_before_running_cli(explicit, evidence):
+    import io
+    calls = []
+
+    def run(argv, timeout):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout='{"outcome":"persisted"}', stderr='')
+
+    message = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
+        'name': 'memory_retain', 'arguments': {'text': 'Save only with real intent',
+                                             'explicit': explicit, 'evidence': evidence}}}
+    output = io.StringIO()
+    mcp.serve(io.StringIO(json.dumps(message) + '\n'), output, 'claude',
+              run=run, which=lambda _: '/x/herdr-memory')
+    response = json.loads(output.getvalue())
+    assert response['result']['isError'] is True
+    assert calls == []
+
+
+def test_mcp_boolean_false_needs_evidence_and_true_is_forwarded():
+    with pytest.raises(ValueError, match='explicit=true or evidence'):
+        mcp.build_argv('memory_retain', {'text': 'note', 'explicit': False}, 'pi', '/cli')
+    argv = mcp.build_argv('memory_retain', {'text': 'note', 'explicit': True}, 'pi', '/cli')
+    assert '--explicit' in argv
+    argv = mcp.build_argv('memory_retain', {'text': 'note', 'explicit': False,
+        'evidence': ['git:revision:file']}, 'pi', '/cli')
+    assert '--explicit' not in argv and '--evidence' in argv
+
+
 def test_hook_labels_untrusted_and_fails_silent():
     import io
     out = io.StringIO()
@@ -575,3 +638,69 @@ def test_hook_labels_untrusted_and_fails_silent():
     assert mcp.run_hook("claude", "SessionStart", io.StringIO("{}"), out, run=boom, which=lambda n: "/x") == 0
     assert out.getvalue() == ""
     assert mcp.run_hook("claude", "SessionStart", io.StringIO("{}"), out, which=lambda n: None) == 0
+
+
+# ---- guarded Claude lifecycle hooks -----------------------------------------
+
+GUARDED = {
+    ev: f'[ -x "/opt/herdr-eng" ] && "/opt/herdr-eng" memory hook claude {ev} || true # {mi.MARKER}'
+    for ev in ("SessionStart", "UserPromptSubmit")
+}
+OLD_UNGUARDED = {ev: f"/opt/herdr-eng memory hook claude {ev} # {mi.MARKER}" for ev in GUARDED}
+
+
+def _hook_cmds(home):
+    s = json.loads((home / ".claude/settings.json").read_text())
+    return {ev: [h["command"] for e in s["hooks"][ev] for h in e["hooks"] if mi.MARKER in h["command"]]
+            for ev in GUARDED}
+
+
+def _write_old_hooks(home):
+    (home / ".claude").mkdir(exist_ok=True)
+    hooks = {ev: [{"hooks": [{"type": "command", "command": "user-" + ev}]},
+                  {"hooks": [{"type": "command", "command": c, "timeout": 3}]}]
+             for ev, c in OLD_UNGUARDED.items()}
+    (home / ".claude/settings.json").write_text(json.dumps({"hooks": hooks}, indent=2) + "\n")
+
+
+def test_install_writes_guarded_hook_form(home):
+    inst(home).install()
+    assert _hook_cmds(home) == {ev: [c] for ev, c in GUARDED.items()}
+
+
+def test_repair_upgrades_old_unguarded_hooks_in_place_without_duplicates(home):
+    _write_old_hooks(home)
+    assert inst(home).verify(["claude"]).ok is False
+    res = inst(home).repair(["claude"])
+    assert res.ok
+    assert _hook_cmds(home) == {ev: [c] for ev, c in GUARDED.items()}
+    s = json.loads((home / ".claude/settings.json").read_text())
+    assert [e["hooks"][0]["command"] for e in s["hooks"]["SessionStart"]][0] == "user-SessionStart"
+
+
+def test_repair_on_guarded_hooks_is_a_noop(home):
+    inst(home).install()
+    before = snapshot(home)
+    res = inst(home).repair(["claude"])
+    assert all(r.action == "noop" for r in res.reports if r.unit == "hooks")
+    assert snapshot(home) == before
+
+
+def test_status_treats_guarded_hooks_as_healthy(home):
+    inst(home).install()
+    res = inst(home).status(["claude"])
+    assert res.ok
+    assert [r.state for r in res.reports if r.unit == "hooks"] == [mi.CURRENT]
+
+
+@pytest.mark.parametrize("with_binary", [False, True])
+def test_guarded_hook_command_runs_under_bin_sh(tmp_path, with_binary):
+    exe = tmp_path / "bin" / "herdr-eng"
+    exe.parent.mkdir()
+    if with_binary:
+        exe.write_text('#!/bin/sh\necho RAN "$@"\n')
+        exe.chmod(0o755)
+    cmd = mi._hook_command([str(exe)], "claude", "SessionStart")
+    out = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+    assert out.returncode == 0
+    assert out.stdout == ("RAN memory hook claude SessionStart\n" if with_binary else "")

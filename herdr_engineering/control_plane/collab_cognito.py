@@ -102,14 +102,17 @@ class CognitoAuthenticator:
         if claims.get("token_use") != "access" or not isinstance(client, str) or client not in self.client_ids:
             return None
         user = claims.get("username") or claims.get("sub")
-        if not isinstance(user, str) or not user or not isinstance(groups, list) or not _USER_RE.match(user):
+        if not isinstance(user, str) or not user or not isinstance(groups, list) or not _USER_RE.fullmatch(user):
             return None
+        capped = len(groups) > 64             # a list past the cap may hide the group a caller looks for
         groups = [g for g in groups if isinstance(g, str)][:64]
         if not self.open_signup:
             if self.required_group not in groups or not self._still_in_group(user):
                 return None
         self._seen.add(user)
-        return {"user": user, "exp": float(claims["exp"]), "groups": groups}
+        iat = claims.get("iat")
+        return {"user": user, "exp": float(claims["exp"]), "groups": groups, "groups_capped": capped,
+                "iat": float(iat) if isinstance(iat, (int, float)) and not isinstance(iat, bool) else None}
 
     def verify_id_token(self, token: str, *, user: str) -> str | None:
         """Verified, lower-cased, ASCII-only email from an ID token that belongs to ``user``.
@@ -150,7 +153,7 @@ class CognitoAuthenticator:
 
     def exists(self, user_id: str) -> bool:
         """Known and still in the group (stream/agent re-checks come through here)."""
-        if not isinstance(user_id, str) or not _USER_RE.match(user_id):
+        if not isinstance(user_id, str) or not _USER_RE.fullmatch(user_id):
             return False
         if self.open_signup:
             return True            # the service's approval state decides, not group membership
