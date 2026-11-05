@@ -809,12 +809,12 @@ def _anchor_index(data: bytes) -> int | None:
 # The scanner above and Python's HTMLParser read comments and CDATA differently from a browser, so they cannot be
 # trusted to say where the bar lands. Instead of reconciling them, pages containing any construct whose tokenization is
 # a browser-specific corner are refused (a uniform 404 at serve time, ``unsupported_html`` at approve).
-_AMBIGUOUS = re.compile(rb"<!\[|<!-->|<!--->|--!>|<\?|\x00|</(?![A-Za-z])")        # CDATA, abrupt comments, PI, bogus end tags
+_AMBIGUOUS = re.compile(rb"<!\[|<!-->|<!--->|--!>|<\?|\x00|</(?![A-Za-z])|<frame(?:set)?(?=[\s/>])", re.I)        # CDATA, abrupt comments, PI, bogus end tags, frames (a frameset page ignores <body>, so it cannot carry the bar)
 _BANG = re.compile(rb"<!")
 _BANG_OK = re.compile(rb"<!(?:--(?:[^-]|-(?!-))*-->|doctype(?=[\s>]))", re.I)     # a clean comment (no "--" inside) or a doctype
 _COMMENT = re.compile(rb"<!--(?:[^-]|-(?!-))*-->")
 _RAW_TEXT = frozenset({b"script", b"style", b"title", b"textarea", b"xmp", b"iframe", b"noembed", b"noframes", b"noscript"})
-_NESTING = frozenset({b"template", b"select", b"svg", b"math"})
+_NO_ANCESTOR = frozenset({b"template", b"select", b"svg", b"math", b"plaintext"})   # never open before the anchor
 _INERT_TAG = re.compile(rb"<(/?)(script|style|title|textarea|xmp|iframe|noembed|noframes|noscript|plaintext|template|select"
                         rb"|svg|math)(?=[\s/>])", re.I)
 
@@ -828,28 +828,26 @@ def _well_formed_markup(data: bytes) -> bool:
 
 
 def _inert_context_closed(prefix: bytes) -> bool:
-    """True when every raw-text / inert element opened in ``prefix`` (the bytes before the anchor) is closed again in it
-    by a plain closer; ``plaintext`` never closes. A comment is dropped first when its own inert tags balance (a commented-out
-    ``<script src=...></script>``); otherwise it stays (it could hide a closer or an opener) and the ``<!--`` check below
-    refuses the page."""
+    """True when ``prefix`` (the bytes before the anchor) opens no element that could swallow the bar: ``svg``, ``math``,
+    ``template``, ``select`` and ``plaintext`` may not open there at all (no balancing: an HTML child inside an svg/math
+    integration point makes the parser ignore their closers), and each raw-text element (script, style, title, textarea,
+    xmp, iframe, noembed, noframes, noscript) must be closed again by a plain closer. A comment is dropped first when its
+    own inert tags pass this check; otherwise it stays (it could hide a closer or an opener) and the ``<!--`` check
+    below refuses the page."""
     prefix = _COMMENT.sub(lambda m: b"" if _inert_context_closed(m.group()[4:-3]) else m.group(), prefix)
     if b"<!--" in prefix:
         return False
     inside: bytes | None = None
-    depth = {name: 0 for name in _NESTING}
     for match in _INERT_TAG.finditer(prefix):
         closing, name = bool(match.group(1)), match.group(2).lower()
         if inside is not None:
             inside = None if closing and name == inside else inside
-        elif name == b"plaintext":
-            return False
-        elif name in _RAW_TEXT:
-            inside = None if closing else name
-        elif closing:
-            depth[name] = max(0, depth[name] - 1)
-        else:
-            depth[name] += 1
-    return inside is None and not any(depth.values())
+        elif name in _NO_ANCESTOR:
+            if not closing:
+                return False
+        elif not closing:
+            inside = name
+    return inside is None
 
 
 def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:

@@ -872,6 +872,12 @@ DECOYS = {
     "cdata-html": b"<!doctype html><html><![CDATA[ x><template><body\n]]></template><h1>visible page</h1>",
     "bogus-end-tag": b"<!doctype html></ x><template><body></template><h1>visible page</h1>",
     "bang-comment-close": b"<!doctype html><!-- x --!><template><body></template><h1>visible page</h1>",
+    "svg-desc-html": b"<h1>visible page</h1><svg><desc><p></svg><body>",
+    "svg-foreignobject-html": b"<svg><foreignObject><p></svg><body><h1>x</h1>",
+    "math-annotation-html": b'<h1>visible page</h1><math><annotation-xml encoding="text/html"><p></math><body>',
+    "math-mtext-html": b"<math><mtext><b></math><body>",
+    "frameset-then-body": b"<frameset></frameset><body>x",
+    "frameset-frame": b'<html><head></head><frameset cols="*"><frame src=a></frameset><body>',
     "dashdash-in-comment": b"<!doctype html><!-- a -- b --><template><body></template><h1>visible page</h1>",
 }
 
@@ -968,6 +974,12 @@ GATE_REFUSED = {
     "script-comment": b"<script><!-- </script><body><p>x</p>",
     "commented-opener": b"<!-- <template> --><body><p>x</p>",
     "commented-closer": b"<script><!-- </script> --><body><p>x</p>",
+    "balanced-svg-before-anchor": b"<svg></svg><body><p>x</p>",
+    "balanced-math-before-anchor": b"<math></math><body><p>x</p>",
+    "balanced-template-before-anchor": b"<template></template><body><p>x</p>",
+    "balanced-select-before-anchor": b"<select></select><body><p>x</p>",
+    "frameset-after-body": b"<body><p>x</p><frameset></frameset>",
+    "frame-alone": b"<body><frame src=a>",
     "unclosed-template": b"<template><body><p>x</p>",
     "unclosed-xmp": b"<xmp><body><p>x</p>",
     "unclosed-iframe": b"<iframe><body><p>x</p>",
@@ -985,7 +997,8 @@ GATE_ACCEPTED = {
     "comment": b"<!doctype html><!-- fine --><html><body><!-- also fine --><p>x</p>",
     "style-script": b"<head><style>p{}</style><script>var a = 1 < 2;</script></head><body>",
     "commented-pair": b"<head><!-- <script src=a.js></script> --></head><body><p>x</p>",
-    "closed-template": b"<template><p>t</p></template><body><p>x</p>",
+    "svg-after-anchor": b"<body><svg><desc><p></svg><math><mtext><b></math><template></template><select></select>",
+    "framework-word": b"<body><p>a frame of reference, framed</p>",
     "closed-noscript": b"<head><noscript><style>p{}</style></noscript></head><body>",
     "raw-after-anchor": b"<body><template><body><textarea>",
     # an unclosed raw-text element swallows the would-be anchor, so the bar goes first (offset 0) and is top-level
@@ -1017,8 +1030,8 @@ GRAMMAR = [b"<!doctype html>", b"<html>", b"<head>", b"</head>", b"<body>", b"<b
            b"<?pi ", b"?>", b"<!x>", b"</ x>", b"</>", b"<template>", b"</template>", b"<textarea>", b"</textarea>",
            b"<title>", b"</title>", b"<xmp>", b"</xmp>", b"<iframe>", b"</iframe>", b"<noembed>", b"<noframes>",
            b"<noscript>", b"</noscript>", b"<plaintext>", b"<select>", b"</select>", b"<svg>", b"</svg>", b"<math>",
-           b"</math>", b"<script>", b"</script>", b"<style>", b"</style>", b'<a title="', b'">', b"'", b'"', b"<",
-           b">", b"\n", b"<frameset>", b"<object>", b"<!doctype html", b"&lt;"]
+           b"</math>", b"<desc>", b"<foreignObject>", b"<mtext>", b'<annotation-xml encoding="text/html">', b"</frameset>", b"<frame src=a>", b"<script>", b"</script>", b"<style>", b"</style>", b'<a title="', b'">', b"'", b'"', b"<",
+           b">", b"\n", b"<frameset>", b"<frameset cols=\"*\">", b"<object>", b"<!doctype html", b"&lt;"]
 BYPASSES = [b"<!doctype html><!---><template><!--><body></template><h1>visible page</h1>",
             b"<!doctype html><!--><template><!--><body></template><h1>visible page</h1>",
             b"<!doctype html><html><![CDATA[ x><template><body\n]]></template><h1>visible page</h1>"]
