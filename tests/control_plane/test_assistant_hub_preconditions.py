@@ -360,15 +360,19 @@ def _force(stack: Stack, where: str, kind: str, answer) -> GitHubAppClient | Non
         stack.r.fail[frag] = answer
 
 
-@pytest.mark.parametrize("where,names", [
+BROKEN_WHERE = [
     ("gh_tip", {"on_main", "ci_green"}),       # default_branch_head is also used to find the CI branch
     ("gh_status", {"ci_green"}), ("gh_runs", {"ci_green"}), ("gh_compare", {"descends_from_deployed"}),
     ("wp", {"ci_green"}), ("health", {"descends_from_deployed"}),
-])
-@pytest.mark.parametrize("kind,answer", FORCED, ids=[k for k, _ in FORCED])
+]
+# One GitHub path cannot be "down" alone: that case is test_github_down_makes_every_github_name_unchecked.
+BROKEN_CASES = [(where, names, kind, answer) for where, names in BROKEN_WHERE for kind, answer in FORCED
+                if not (answer is None and where.startswith("gh"))]
+
+
+@pytest.mark.parametrize("where,names,kind,answer", BROKEN_CASES,
+                         ids=[f"{w}-{k}" for w, _, k, _ in BROKEN_CASES])
 def test_a_broken_endpoint_is_unchecked_never_ok(tmp_path, where, names, kind, answer):
-    if answer is None and where.startswith("gh"):
-        pytest.skip("one GitHub path cannot be 'down' alone; test_github_down_makes_every_github_name_unchecked")
     stack = Stack(tmp_path)
     try:
         if kind == "slow":

@@ -336,7 +336,8 @@ def test_unposted_ask_survives_a_restart_and_is_posted_exactly_once(aw):
     again = aw.new_runtime(restored)
     try:
         again.start()
-        assert aw.listener.wait_for(lambda: len(aw.posts()) == 1)
+        # the post reaches the wire before its ts is stored: wait on the stored state
+        assert aw.listener.wait_for(lambda: any(a.ts for a in restored.list_slack_asks(T, U)), timeout=10)
         (ask,) = [a for a in restored.list_slack_asks(T, U) if a.ts]
         assert ask.request_id == d.request_id
         assert again.sweep() == 0                                        # a later sweep offers nothing again
@@ -413,12 +414,16 @@ def test_a_permanent_error_does_not_block_the_next_ask_and_is_reoffered_later(aw
     aw.runtime.start()
     first = aw.decide()
     second = aw.decide()
-    assert aw.listener.wait_for(lambda: len(aw.posts()) == 1, timeout=3)     # no wait for ask_ttl
-    assert aw.store.get_slack_ask(next(a.ask_id for a in aw.store.list_slack_asks(T, U, "open") if a.ts),
-                                  tenant_id=T, user_id=U).request_id == second.request_id
-    assert len(aw.audits("assistant.slack.ask_failed")) == 1
-    assert aw.listener.wait_for(lambda: len(aw.posts()) == 2, timeout=5)     # the sweep re-offers the first
-    assert {a.request_id for a in aw.store.list_slack_asks(T, U, "open") if a.ts} == {first.request_id, second.request_id}
+    def posted() -> list:
+        return [a for a in aw.store.list_slack_asks(T, U, "open") if a.ts]
+
+    # the post reaches the wire before its ts and the failure audit are stored: wait on the stored state
+    assert aw.listener.wait_for(lambda: len(posted()) == 1 and len(aw.audits("assistant.slack.ask_failed")) == 1,
+                                timeout=10)                                  # no wait for ask_ttl
+    assert posted()[0].request_id == second.request_id
+    assert len(aw.posts()) == 1
+    assert aw.listener.wait_for(lambda: len(posted()) == 2, timeout=10)      # the sweep re-offers the first
+    assert {a.request_id for a in posted()} == {first.request_id, second.request_id}
 
 
 def test_ratelimited_waits_for_retry_after(aw):

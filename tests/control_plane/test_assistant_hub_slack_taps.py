@@ -374,8 +374,8 @@ def test_socket_mode_link_ignores_environment_proxies(world, monkeypatch):
         world.runtime.start()
         assert world.listener.wait_for(lambda: world.listener.ws_alive == 1)
         env = world.listener.push_interactive(_socket_payload(ask))
-        assert world.listener.wait_for(lambda: world.status(ask.request_id) == "approved")
-        assert env in world.listener.acks
+        assert world.listener.wait_for(lambda: world.status(ask.request_id) == "approved", timeout=10)
+        assert world.listener.wait_for(lambda: env in world.listener.acks, timeout=10)     # the ack may trail the tap
         assert proxy.requests == [] and proxy.ws_connections == 0 and proxy.calls == []
     finally:
         proxy.close()

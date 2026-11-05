@@ -206,9 +206,10 @@ state computed now.
   listed in Phase 3. Every refusal except `not_found` (an unknown id has no grant to attach it to) writes
   `assistant.grant.activate_refused`. With no judge configured the answer is
   `judge_disabled`, so a default install can never reach an active grant.
-- **Phase 4** adds hook-attested evidence (so tool outcomes the harness saw can count) and the in-session first-grant
-  confirmation. The Phase 1 known limit above (a model with shell access can post `harness_attested` events) must be
-  closed before attested evidence counts.
+- **Phase 4** (below) adds the Slack front door: the owner's verified tap is owner evidence (`owner_slack`), and a
+  per-project, per-scope deploy permission replaces the approval count for a deploy the owner confirmed. Hook-attested
+  evidence is still deferred, and until it exists the Phase 1 known limit above (a model with shell access can post
+  `harness_attested` events) stays open, so attested evidence does not count.
 - Even an active grant is ignored during the global shadow period (`pending`, source `shadow`).
 
 ### Scopes
@@ -439,8 +440,8 @@ labels exists under the new version and the owner activates again. Key file and 
 - **The integration tier has not been run against a real System One.** The documented response shape used in tests is
   the documented sample, not a recorded real response.
 - **Determinism of real Laya** across calls is unmeasured; calibration assumes it is stable enough.
-- **Deferred:** the canary prompt (a known-bad probe to catch a mock or degraded judge), and **Phase 4**: dynamic
-  activation UX, in-session confirmation, hook-attested evidence, the owner digest, and Codex/OpenCode/Pi adapters.
+- **Deferred:** the canary prompt (a known-bad probe to catch a mock or degraded judge). The other Phase 3 deferrals
+  (hook-attested evidence, harness adapters, the owner digest) are still deferred; see Phase 4, "Not verified".
 
 ### Integration-test environment variables
 
@@ -450,9 +451,202 @@ labels exists under the new version and the owner activates again. Key file and 
 New audit action names: none beyond those above; consults and authorizations carry the judge version and the four answers
 as percentages, never text.
 
+## Phase 4: Slack front door, deploy permission and outcome check
+
+Phase 4 puts the owner's decisions in Slack and lets the owner switch on automatic deploys for one project and one scope.
+Everything in this section is **off by default**: with `personal_assistant.slack.enabled: false` (the default) and no
+`personal_assistant.deploy` block, the hub behaves as in Phase 3. Design: `docs/superpowers/specs/2026-11-04-assistant-hub-phase4-design.md`.
+
+### Slack app setup and manifest
+
+Create one Slack app in your workspace (Socket Mode, so the tailnet-only hub needs no public endpoint). A manifest that
+matches what the code calls (`auth.test`, `apps.connections.open`, `conversations.open`, `chat.postMessage`, `chat.update`):
+
+```yaml
+display_information:
+  name: herdr assistant
+features:
+  bot_user:
+    display_name: herdr assistant
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write        # chat.postMessage / chat.update
+      - im:write          # conversations.open: the owner's DM
+      - im:history        # the owner's threaded replies in the DM (answers to questions)
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.im        # thread replies in the DM; add message.channels / message.groups plus channels:history /
+                          # groups:history only if you set personal_assistant.slack.channel to a channel id
+  interactivity:
+    is_enabled: true      # the Approve / Deny / Approve and remember / Confirm / Cancel buttons
+  socket_mode_enabled: true
+```
+
+Then generate an **app-level token** with the `connections:write` scope (it starts with `xapp-`) and install the app to
+get the **bot token** (`xoxb-`). Find your own Slack member id (profile, "Copy member ID", like `U01ABC23DEF`).
+
+### Registering the tokens (CLI only)
+
+```
+herdr-eng control-plane assistant-slack register --bot-token-file /etc/herdr/slack-bot.token \
+  --app-token-file /etc/herdr/slack-app.token --key-stdin
+```
+
+- The bot token then the app token are read from **stdin** (one per line, or two hidden prompts on a terminal); there is no
+  argv or environment path, and nothing prints a token. The command proves the bot token with `auth.test` and the app token
+  with `apps.connections.open`, writes both files with mode 0600 (`PATH.new` then rename), and prints fingerprints, team
+  and bot user id only. `--base-url` defaults to `https://slack.com/api` (`http` only for loopback).
+- `assistant-slack status --bot-token-file ... --app-token-file ...` is local only: it reads file metadata and calls nobody.
+- Failures print `assistant-slack register failed: <code>`; exit codes 0 ok, 1 refused, 2 usage.
+- The command does **not** edit the YAML. Add the block below yourself, including your `owner_user_id`.
+
+```yaml
+personal_assistant:
+  slack:
+    enabled: true
+    base_url: https://slack.com/api
+    bot_token_file: /etc/herdr/slack-bot.token
+    app_token_file: /etc/herdr/slack-app.token
+    owner_user_id: U01ABC23DEF        # required when enabled; the ONLY Slack account whose taps and replies count
+    channel: ""                       # a channel id (C/G/D...), or empty for the owner's DM
+    ask_ttl_minutes: 15               # 1..120; an unanswered ask then stays pending
+    max_asks_per_task_per_hour: 6     # 1..1000; further asks are batched into one line
+    summary_idle_minutes: 30          # 1..1440; a task with no final report gets a summary after this much quiet
+```
+
+Inline tokens (`bot_token`, `app_token`, `token`, `secret`) are rejected at load, and the two files must differ.
+
+### The widened trust boundary (read this)
+
+A verified Slack tap is **owner evidence of provenance `owner_slack`, counted exactly like `owner_api`**. This widens the owner
+trust boundary from "the operator API key" to "the operator API key **or** the Slack account named in `owner_user_id`,
+authenticated by your Slack workspace". Anyone who controls that Slack account (or your Slack app tokens) can approve actions. Protect
+both like the operator key, and use 2FA on the account. Accepted by the owner on 2026-11-04.
+
+A tap counts only when all of these hold: it arrives over the authenticated Socket Mode connection; it comes from
+`owner_user_id`; it is on the very message the hub posted (same channel and `ts`); it carries the ask id plus its one-time
+nonce; the ask is still open and unexpired; and the request is still pending. Re-posting, editing or forwarding a message
+approves nothing, a second tap is refused, and a tap on a request decided elsewhere closes the ask and removes the buttons.
+Refused taps write `assistant.slack.refused` with a reason. A worker is never told about the Slack channel.
+
+### One-shot approvals, approve-and-remember, questions, summaries
+
+- **Ask.** A new pending `action_request` (and only that; vetoes post nothing) posts one message with **Approve**, **Deny**
+  and **Approve and remember**. The worker's text is made inert (mentions, links and markup neutralized) and never carries
+  secrets. The worker learns the answer by **asking again**: an approved request returns `authorized` once (source `owner`)
+  and the approval is spent; the next identical request is a new pending one.
+- **Approve and remember.** The tap approves, records the evidence and then tries to activate the resulting grant through the
+  *unchanged* gates (global shadow period, evidence thresholds and diversity, the judge gate). If a gate refuses, the approval
+  stays recorded, the thread says in plain words what is still missing, and the wish is kept and retried at the next
+  qualifying `owner_slack` approval for the same worker, key, tenant and user. Nothing is relaxed for ordinary actions.
+- **Questions.** `assistant_ask` with a `question` posts a message and returns `{"status": "pending", "ask_id": ...}`; the worker
+  polls with `assistant_ask {"ask_id": ...}`. Only a text reply **in that message's thread from `owner_user_id`** answers it
+  (`answered` plus the text, returned as untrusted data). A reply is never an approval: a reply on an action ask is refused
+  with `reason=not_question`. A question the hub could not post yet reports `pending` and is posted when Slack is back;
+  past its ttl it is `expired` (`reason: not_asked` if it was never shown). Another worker, tenant or user sees `ask not found`.
+- **Rate limit.** `max_asks_per_task_per_hour` bounds posts per worker and task; the rest are folded into one batched line and
+  posted as the window frees. A burst of questions does not delay an action ask on the same task.
+- **Per-task summaries.** When a worker's `report` for a `task_id` is marked `final: true` (or the task has been quiet for
+  `summary_idle_minutes`), the hub posts **one** summary per worker and task: counts (authorized under grants, one-shot
+  approvals used, denied, vetoed, each worded "at least N"), any deploy outcomes of that task, and the worker's inert report text.
+  Quiet work sends nothing else.
+
+### Deploy permission per project and scope
+
+```yaml
+personal_assistant:
+  deploy:
+    precondition_timeout_seconds: 10    # 1..60: the overall deadline for the hub's checks per request
+    deploy_check_minutes: 20            # 1..240: how long the hub watches for the new version after authorizing
+    deploy_window_minutes: 10           # 1..240, not above deploy_check_minutes: before this a different version only
+                                        # means "not deployed yet"; after it, a different version is "NOT live"
+    projects:
+      herdr-engineering:                # project id: [a-z0-9][a-z0-9_-]{0,63}
+        repo: berlinguyinca/herdr-engineering
+        scopes:
+          control-plane:                # scope id, same pattern
+            mode: ask                   # ask (default) | auto
+            command: deploy/control-plane/deploy.sh      # relative path: no leading / or ./, no .., no spaces
+            require: [on_main, ci_green, descends_from_deployed]   # non-empty subset; default all three
+            health_url: http://127.0.0.1:8080/api/v1/health         # required if require is explicit and names descends_from_deployed
+```
+
+(`deploy.projects.<p>.scopes.<s>` takes only `mode`, `command`, `require`, `health_url`; unknown or secret-looking keys are
+rejected at load. `health_url` is `https`, or `http` for loopback only, with no userinfo, query or fragment.)
+
+- **Matching is the hub's call, never the worker's.** A request maps to a project and scope only when it is exactly
+  `<command> --ref <40 lowercase hex chars>` and the worker's `repo` hint agrees with `repo`. Anything else is an ordinary
+  unknown action, and the hub never says `authorized` for it on the strength of the deploy config.
+- **`mode: auto` is only a candidate until you confirm it.** `POST /api/v1/assistant-deploys/<project>/<scope>/auto`
+  (operator key, body `{"worker_id": ..., "confirm": true}`) *asks*: it posts a Slack message with **Confirm** and **Cancel**
+  and returns 202 `awaiting_confirmation`. Only the verified Confirm tap creates the standing grant (source `owner_standing`,
+  confirmed by `slack:<owner>`), through the same judge gate and shadow period; if a gate refuses, the thread says what is missing and
+  nothing is created. `DELETE` the same path with `?worker_id=...` revokes it. `GET /api/v1/assistant-deploys` lists configured
+  scopes and live standing grants.
+- **`mode` is the owner's kill switch, read live on every request.** Setting `mode: ask` (and reloading the config) makes every
+  deploy for that scope `pending` with source `deploy_mode` at once; the standing grant stays stored but is ignored until
+  `mode` is `auto` again. Removing the scope from the config has the same effect.
+- **Standing permission is not a bypass.** It replaces only the approval count and session/task diversity for the deploy
+  scope. Vetoes, the global shadow period, `effective_state` (judge version, policy version, expiry) and the judge all still apply, and the
+  judge can still escalate a deploy to you.
+- **Hub-verified preconditions.** Each name in `require` is checked by the hub itself, with the worker's claims ignored
+  (`hint` and `environment` text change nothing): `on_main` (the sha is the tip of the default branch, via the `github.app` GitHub
+  App), `ci_green` (GitHub status and check runs for the commit **and** the latest Woodpecker push pipeline for that commit on
+  the default branch, via Woodpecker's unauthenticated read endpoints), and `descends_from_deployed` (the sha is strictly ahead
+  of the commit `health_url` reports as deployed; the same sha, a prefix or non-hex data is not a new deploy). A failed check
+  is `pending` with `failed <name>`; a check that could not be completed (timeout, error, odd data, no client, no
+  `health_url`) is `pending` with `unchecked <name>`; both source `deploy_preconditions`, and the owner is asked. Nothing
+  defaults to allow. A one-shot owner approval of the exact request skips the preconditions, because you decided it.
+
+### After a deploy: the hub's own outcome check
+
+When a deploy is authorized the hub stores a **deploy check** (it survives a hub restart, which a control-plane redeploy causes) and
+polls `<health_url>?probe=1` itself; the worker's word is never used for "healthy". Statuses and the exact Slack wording:
+
+| Status | Meaning | Slack |
+|---|---|---|
+| `awaiting` | still polling; an unreachable endpoint is expected while the container is replaced | nothing yet; summaries say "still being checked" |
+| `healthy` | health reports the target commit (a prefix of at least 12 characters), or a newer commit that contains it | `Deploy healthy` (with a note if main moved or could not be re-checked) |
+| `rolled_back` | after `deploy_window_minutes` a different version is serving | `Deploy not live ... a different version is serving ... the new version is not live; cause unknown`. The hub does **not** claim a rollback happened or that the old version "is back" |
+| `unconfirmed` | `deploy_check_minutes` ran out without a confirmed result, or there is no `health_url` | `Deploy unconfirmed ... Do not assume it worked` |
+| `failed_rollback` | the worker reported `{"deploy_exit": 3}` in an `outcome` report | `URGENT: the deploy ... failed to roll back`, never batched or rate-limited |
+
+A deploy whose lineage cannot be verified is never reported healthy; a check that could not even be opened is posted as
+`Deploy NOT verified by the hub`. The `rolled_back` status name is historical: it means "a different version is serving", nothing more.
+
+### Limits you must know
+
+- **The hub is advisory, as in Phase 2.** A worker asks voluntarily. The hub cannot stop a harness from running a command it
+  was not authorized for; it guarantees only that it never answers `authorized` for it and that it checks the outcome
+  afterwards. Enforcement at the harness (hooks) is deferred.
+- **Worker working directory and repository are not attested.** The `repo` in a request is the worker's own hint, and the
+  hub cannot see which checkout or working directory the worker then runs `deploy.sh` from. A hint can only make matching
+  stricter (a mismatch leaves the request unmatched); it cannot widen it. What the hub does bind is the exact argv and the 40-character
+  sha, which it verifies against GitHub, Woodpecker and the health endpoint. Run deploy workers only from the intended checkout.
+- Slack taps widen the owner boundary as described above; the Socket Mode link has no per-request signing secret, so the
+  app-level token plus the user id and nonce checks are the whole authentication.
+
+### Not verified yet (Phase 4; read before relying on this)
+
+- **Nothing has been run against a real Slack workspace, real GitHub, real Woodpecker or a real herdr-engineering deploy.**
+  The tests use real sockets and real HTTP servers on 127.0.0.1 that speak the documented Slack Web API, Socket Mode and
+  GitHub / Woodpecker / health shapes; they are not recordings of the real services, and Slack's real payloads, rate limits
+  and reconnect behaviour may differ.
+- **`default_clients()` wiring is untested against real services.** The production construction of the GitHub App client,
+  the Woodpecker provider and the health client from host config has not been exercised against GitHub, Woodpecker or a real
+  health endpoint; the tests build equivalent clients pointed at local listeners.
+- **Socket Mode against production Slack** (reconnects, `disconnect` envelopes, app-level token rotation) is unexercised.
+- The `rolled_back` / `unconfirmed` / `failed_rollback` paths are tested against local listeners that change their answers, not
+  against a deploy that really rolls back.
+- **Deferred:** blue/green deploys, hook-attested evidence, Codex/OpenCode/Pi harness adapters, the canary prompt, the owner
+  digest, and harness-level enforcement.
+
 ## Testing notes
 
-The end-to-end flows are `tests/control_plane/test_assistant_hub_e2e.py` (Phase 1), `test_assistant_hub_phase2_e2e.py` (Phase 2) and `test_assistant_hub_phase3_e2e.py` (Phase 3, judge via a raw-socket listener serving the documented shape), each with a real control plane and hub on 127.0.0.1, port 0.
+The end-to-end flows are `tests/control_plane/test_assistant_hub_e2e.py` (Phase 1), `test_assistant_hub_phase2_e2e.py` (Phase 2), `test_assistant_hub_phase3_e2e.py` (Phase 3, judge via a raw-socket listener serving the documented shape) and `test_assistant_hub_phase4_e2e.py` (Phase 4: a real Socket Mode WebSocket listener plus real GitHub, Woodpecker and health listeners; run it with `-W error`), each with a real control plane and hub on 127.0.0.1, port 0.
 Tests use a throwaway `HOME`; never point a test at your real `~/.claude`, `~/.codex` or `~/.config/herdr`.
 `@pytest.mark.integration` smoke runs the real `claude mcp add` line (skipped when `claude` is not on PATH):
 `python3 -m pytest tests/control_plane/test_assistant_hub_e2e.py -m integration`.

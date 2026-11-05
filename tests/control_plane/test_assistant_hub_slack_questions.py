@@ -331,8 +331,9 @@ def test_an_unposted_question_is_posted_after_a_restart(tmp_path):
     w.runtime = fresh
     fresh.start()
     try:
-        assert w.listener.wait_for(lambda: len(w.posts()) == 1, timeout=5)
-        assert w.stored(out["ask_id"]).ts
+        # the post reaches the wire before the runtime stores its ts: wait on the stored state, not the wire
+        assert w.listener.wait_for(lambda: w.stored(out["ask_id"]).ts != "", timeout=10)
+        assert len(w.posts()) == 1
     finally:
         fresh.stop()
         w.listener.close()
