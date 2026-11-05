@@ -177,21 +177,35 @@ edge (nginx, server_name <public_host>): /s/ -> share-public:8083
   3. Certificate: the collab edge's ACME lineage must name the new host (`certbot certonly --cert-name ... --expand
      -d <existing names> -d artifacts.metabolomics.us`); `deploy.sh` refuses a certificate that does not.
   4. Cognito: add `https://artifacts.metabolomics.us/s/callback` AND `https://artifacts.metabolomics.us/my/callback` to
-     both CallbackURLs and LogoutURLs of the `herdr-collab-web` app client (`describe-user-pool-client`, send every
-     existing attribute back with the new URLs added: `update-user-pool-client` replaces the whole client). Changing
-     `public_host` later means registering both callbacks on the new host first; keep the old host's until verified.
-  5. Fleet YAML: set `share.public_host`, `collab.members.enabled: true`, `collab.members.group` and
-     `collab.members.session_secret` (`openssl rand -hex 32`, pasted in; never committed, printed or passed as a flag).
+     both CallbackURLs and LogoutURLs of the `herdr-collab-web` app client. `update-user-pool-client` replaces the
+     whole client, so read it first with `describe-user-pool-client` and send every existing attribute back with the
+     new URLs added. Careful: that output may contain `ClientSecret` (never paste or log it; redirect the JSON to a
+     0600 file) and read-only fields (`ClientId`, `UserPoolId`, `CreationDate`, `LastModifiedDate`, `ClientSecret`)
+     that `update-user-pool-client` rejects: strip them (for example `jq 'del(.UserPoolClient.CreationDate,
+     .UserPoolClient.LastModifiedDate, .UserPoolClient.ClientSecret)'`) and pass `ClientId`/`UserPoolId` as options.
+     Changing `public_host` later means registering both callbacks on the new host first; keep the old host's until
+     verified.
+  5. Fleet YAML: set `control_plane.share.public_host`, `control_plane.collab.members.enabled: true`,
+     `control_plane.collab.members.group`, `control_plane.collab.members.session_secret` (`openssl rand -hex 32`,
+     pasted in; never committed, printed or passed as a flag) and, if collab-public does not run as the default uid,
+     `control_plane.collab.members.secrets_gid` (the gid collab-public runs as). The worker gets
+     `HERDR_COLLAB_CERT_UID` (default 1000, as collab-public) from compose; if neither is available the worker REFUSES
+     to start members (fail closed) with a message naming `control_plane.collab.members.secrets_gid`.
   6. Verify: `curl -s https://artifacts.metabolomics.us/api/member/config` returns 200, then a sign-in round-trip at
-     `/`. Run `deploy/control-plane/member-secret-smoke.sh /tmp <collab-public-uid>` as root on the worker host once.
+     `/`. Run `WORKER_CONTAINER=<worker> deploy/control-plane/member-secret-smoke.sh /tmp <collab-public-uid>` as root on the worker
+     host once (it checks the worker's own gid against the uid, refuses uid 0/65534; PYTHON/PYTHONPATH must give a
+     checkout both users can import).
   7. Rollback: remove `public_host` / `members.enabled` and redeploy (the edge returns to the share-only server or
      the previous conf; rows, blobs and bundles stay). Members' public links stop with the host.
+- Group-readability caveat: any process whose gid is the secrets gid can read a pending share URL for up to 60 s
+  (until collab-public takes it or the worker's sweep deletes it) and can delete it (denial only). The default gid is
+  collab-public's uid, usually the deploying operator's own login group; prefer a dedicated group (set
+  `control_plane.collab.members.secrets_gid` and run collab-public as it) over the operator's login group.
 - Secret hand-off between uids (important): the worker (root) writes the read-once share URL to
   `<outbox>/secrets/<ticket>.json` and collab-public (uid `HERDR_COLLAB_CERT_UID`) reads and deletes it. The worker
-  therefore sets that directory to group `members.secrets_gid` (default: `HERDR_COLLAB_CERT_UID` of the worker's
-  environment, compose runs collab-public as `uid:uid`), mode 0770, files 0640; others get nothing. Without a gid it
-  stays root-only 0700/0600 and approving a share goes live but the member sees `already_read`. Set
-  `secrets_gid` explicitly if the worker's environment does not carry the uid, and run the smoke script after a deploy.
+  therefore sets that directory to group `control_plane.collab.members.secrets_gid` (default: the worker's
+  `HERDR_COLLAB_CERT_UID`, which compose passes with collab-public's default), mode 0770, files 0640; others get
+  nothing. With no gid the worker refuses to start members rather than issue links nobody can receive.
 - Public links by members (D3): members can create public links to their artifacts. The operator sees them in the
   Members panel and with `herdr-eng artifacts members links --audience public`; revoke there.
 - Limits and behaviours to know:

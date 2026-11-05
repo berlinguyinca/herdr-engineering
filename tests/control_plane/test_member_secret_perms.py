@@ -99,11 +99,59 @@ def test_runtime_defaults_keep_the_secret_private():
 @pytest.mark.skipif(os.geteuid() != 0, reason="the cross-uid check needs root (run the deploy smoke script on the host)")
 def test_smoke_script_crosses_two_uids(tmp_path):
     os.chmod(tmp_path, 0o755)
-    out = subprocess.run(["bash", str(ROOT / "deploy/control-plane/member-secret-smoke.sh"), str(tmp_path), "65534"],
+    out = subprocess.run(["bash", str(ROOT / "deploy/control-plane/member-secret-smoke.sh"), str(tmp_path), "65533"],
                          capture_output=True, text=True, env={**os.environ, "PYTHON": sys.executable,
-                                                              "PYTHONPATH": str(ROOT)})
+                                                              "PYTHONPATH": str(ROOT),
+                                                              "WORKER_GID": "65533"})
     assert out.returncode == 0, out.stdout + out.stderr
 
 
 def test_smoke_script_is_shell_valid():
     assert subprocess.run(["bash", "-n", str(ROOT / "deploy/control-plane/member-secret-smoke.sh")]).returncode == 0
+
+
+# ----------------------------------------------------------------------------- the worker resolves the gid or refuses
+
+def _worker_env():
+    import yaml
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    return doc["services"]["control-plane-worker"]["environment"]
+
+
+def test_the_worker_compose_environment_carries_the_collab_public_uid_with_its_default():
+    import yaml
+    env = _worker_env()
+    assert env["HERDR_COLLAB_CERT_UID"] == "${HERDR_COLLAB_CERT_UID:-1000}"
+    pub = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())["services"]["collab-public"]
+    assert pub["user"].startswith("${HERDR_COLLAB_CERT_UID:-1000}:")      # the same default as the container it serves
+
+
+def _cp(**members):
+    return {"collab": {"members": {"enabled": True, "group": "staff", "session_secret": "a" * 40, **members}},
+            "share": {"public_host": "a.example.org", "enabled": False}}
+
+
+def test_members_without_a_resolvable_gid_refuse_to_start(tmp_path, monkeypatch, caplog):
+    from herdr_engineering import cli
+    monkeypatch.delenv("HERDR_COLLAB_CERT_UID", raising=False)
+    settings = type("S", (), {"outbox_dir": tmp_path / "o", "mirror_dir": tmp_path / "m"})()
+    with pytest.raises(SystemExit, match="secrets_gid"):
+        cli._members_runtime(_cp(), settings)
+    monkeypatch.setenv("HERDR_COLLAB_CERT_UID", "١٢٣")                   # non-ASCII digits are not a uid
+    with pytest.raises(SystemExit, match="secrets_gid"):
+        cli._members_runtime(_cp(), settings)
+    monkeypatch.setenv("HERDR_COLLAB_CERT_UID", "1000")
+    assert cli._members_runtime(_cp(), settings).secret_gid == 1000
+    monkeypatch.delenv("HERDR_COLLAB_CERT_UID")
+    assert cli._members_runtime(_cp(secrets_gid=4321), settings).secret_gid == 4321
+
+
+def test_smoke_script_rejects_meaningless_uids_and_checks_the_workers_gid():
+    text = (ROOT / "deploy/control-plane/member-secret-smoke.sh").read_text()
+    out = subprocess.run(["bash", str(ROOT / "deploy/control-plane/member-secret-smoke.sh"), str(ROOT), "0"],
+                         capture_output=True, text=True)
+    assert out.returncode == 2 and "uid" in out.stderr
+    out = subprocess.run(["bash", str(ROOT / "deploy/control-plane/member-secret-smoke.sh"), str(ROOT), "65534"],
+                         capture_output=True, text=True)
+    assert out.returncode == 2
+    assert "WORKER_GID" in text and "docker" in text

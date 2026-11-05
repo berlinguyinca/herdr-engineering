@@ -3,6 +3,13 @@
 #
 #   member-secret-smoke.sh <scratch-dir> <collab-public-uid>
 #
+# The gid is verified against the WORKER, not just the argument: set WORKER_CONTAINER to the running worker container
+# (its HERDR_COLLAB_CERT_UID is read with `docker exec`), or WORKER_GID to the value you configured as
+# control_plane.collab.members.secrets_gid. The script fails when that is not exactly <collab-public-uid>.
+# Python must import herdr_engineering for root and for <collab-public-uid>: on the host that means PYTHON and
+# PYTHONPATH of a checkout (or venv) readable by both; the worker image's python is not reachable from the host
+# without a mount, so for a pure-image setup mount the repo's herdr_engineering read-only and set PYTHONPATH.
+#
 # Writes a secret exactly as the worker does (root, group = the collab-public uid, dir 0770, file 0640), then reads
 # and deletes it as <collab-public-uid>:<collab-public-uid> and checks that an unrelated uid (65534) can do neither.
 # Uses only the scratch dir; touches no live outbox, database or service.
@@ -10,6 +17,15 @@ set -euo pipefail
 DIR="${1:?usage: $0 <scratch-dir> <collab-public-uid>}"
 UID_PUB="${2:?usage: $0 <scratch-dir> <collab-public-uid>}"
 PYTHON="${PYTHON:-python3}"
+case "$UID_PUB" in ''|*[!0-9]*) echo "collab-public uid must be a number" >&2; exit 2;; esac
+if [ "$UID_PUB" = 0 ] || [ "$UID_PUB" = 65534 ]; then
+  echo "uid $UID_PUB is root/nobody: the test would prove nothing; pass the HERDR_COLLAB_CERT_UID of collab-public" >&2; exit 2
+fi
+if [ -n "${WORKER_CONTAINER:-}" ]; then
+  WORKER_GID="$(docker exec "$WORKER_CONTAINER" printenv HERDR_COLLAB_CERT_UID)" || { echo "cannot read the worker's environment" >&2; exit 2; }
+fi
+[ -n "${WORKER_GID:-}" ] || { echo "set WORKER_CONTAINER or WORKER_GID: the worker's resolved secrets gid must be checked" >&2; exit 2; }
+[ "$WORKER_GID" = "$UID_PUB" ] || { echo "FAIL: the worker resolves gid '$WORKER_GID', collab-public runs as $UID_PUB" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "run as root (the worker is root)" >&2; exit 2; }
 command -v setpriv >/dev/null || { echo "setpriv (util-linux) is required" >&2; exit 2; }
 OUT="$(mktemp -d "$DIR/outbox.XXXXXX")"; chmod 0755 "$OUT"

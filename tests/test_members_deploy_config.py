@@ -332,3 +332,53 @@ def test_the_rendered_edge_passes_nginx_t(tmp_path, members):
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert "test is successful" in out.stderr
+
+
+def test_the_run_upload_location_has_the_raw_path_guard_and_a_strict_anchor():
+    run = _block(_block(_server(_edge(share=True, share_host=HOST, members=True), HOST), "    location /api/member/ {"),
+                 '      location ~ "^/api/member/artifacts/')
+    assert "if ($share_raw_path_ok = 0) { return 404; }" in run
+    assert '\\z"' in run.splitlines()[0] and "$\"" not in run.splitlines()[0]
+
+
+@pytest.mark.skipif(_docker_nginx() is None, reason="no docker nginx image")
+@pytest.mark.parametrize("path,status", [
+    ("/api/member/x/../artifacts/a/uploads/b/runs/1", 404),
+    ("/api/member//artifacts/a/uploads/b/runs/1", 404),
+    ("/api/member/artifacts/a/uploads/b/runs/1%0A", 413),       # not the run location: the 1 MiB parent limit applies
+    ("/api/member/artifacts/a/uploads/b/runs/1", 200)])         # a declared 2 MiB body passes only on the run location
+def test_run_upload_raw_path_shapes_on_a_real_nginx(tmp_path, path, status):
+    import subprocess
+    import time
+    (tmp_path / "acme").mkdir()
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(tmp_path / "acme/privkey.pem"),
+                    "-out", str(tmp_path / "acme/fullchain.pem"), "-days", "1", "-subj", "/CN=t"],
+                   check=True, capture_output=True)
+    conf = _edge(share=True, share_host=HOST, members=True)
+    # a plain listener standing in for the edge's proxy_protocol/SNI front, and a stub upstream that answers 200
+    conf = conf.replace("ssl proxy_protocol", "ssl").replace(
+        "if ($hcn_from_edge = 0) { return 444; }", "")
+    conf = conf.replace("server collab-public:8081;", "server 127.0.0.1:9;")
+    conf = conf.replace("proxy_pass http://collab;", "return 200;")
+    (tmp_path / "nginx.conf").write_text(conf)
+    name = f"nginx-t13-{tmp_path.name[-8:]}"
+    try:
+        subprocess.run(["docker", "run", "-d", "--rm", "--name", name, "-p", "127.0.0.1::8443", "--add-host",
+                        "collab-public:127.0.0.1", "--add-host", "share-public:127.0.0.1",
+                        "-v", f"{tmp_path}/nginx.conf:/etc/nginx/nginx.conf:ro",
+                        "-v", f"{tmp_path}/acme:/etc/acme:ro", _docker_nginx()], check=True, capture_output=True)
+        port = int(subprocess.run(["docker", "port", name, "8443"], capture_output=True, text=True,
+                                  check=True).stdout.split(":")[-1])
+        time.sleep(1.5)
+        import socket
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+        raw = (f"PUT {path} HTTP/1.1\r\nHost: {HOST}\r\nContent-Length: 2097152\r\nConnection: close\r\n\r\nx").encode()
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock, \
+                ctx.wrap_socket(sock, server_hostname=HOST) as tls:
+            tls.sendall(raw)
+            got = tls.recv(200).decode("latin-1")
+        assert got.startswith(f"HTTP/1.1 {status} "), got
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)

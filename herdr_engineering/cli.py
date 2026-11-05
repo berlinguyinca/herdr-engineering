@@ -4500,7 +4500,7 @@ def _secrets_gid(got) -> int | None:
     if got["secrets_gid"] is not None:
         return got["secrets_gid"]
     raw = os.environ.get("HERDR_COLLAB_CERT_UID", "").strip()
-    return int(raw) if raw.isdigit() else None
+    return int(raw) if re.fullmatch(r"[0-9]+", raw) else None
 
 
 def _members_runtime(cp, settings: CollabArtifactsSettings):
@@ -4512,6 +4512,11 @@ def _members_runtime(cp, settings: CollabArtifactsSettings):
     got = _members_settings(cp)
     if got is None:
         return None
+    secret_gid = _secrets_gid(got)
+    if secret_gid is None:      # fail closed: an approve would go live with a URL collab-public can never read
+        raise SystemExit("fleet config control_plane.collab.members.secrets_gid is not set and HERDR_COLLAB_CERT_UID is "
+                         "not in the worker's environment: members cannot start (the share URL could not reach "
+                         "collab-public)")
     share = _share_worker_settings(cp)
     share_settings = None
     if share["enabled"]:
@@ -4526,7 +4531,7 @@ def _members_runtime(cp, settings: CollabArtifactsSettings):
     return MemberRuntime(outbox=settings.outbox_dir, mirror_root=settings.mirror_dir, group=got["group"], enabled=True,
                          defaults=got["defaults"], removed_grace=got["removed_grace"],
                          shares_root=Path(share["shares_dir"]) if share["enabled"] else None,
-                         share_settings=share_settings, clock=time.time, secret_gid=_secrets_gid(got))
+                         share_settings=share_settings, clock=time.time, secret_gid=secret_gid)
 
 
 def _task_lease(args, cp):
