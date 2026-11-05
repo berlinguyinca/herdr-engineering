@@ -4378,10 +4378,14 @@ def _cmd_cp_web(args) -> int:
     finally:
         if hub_server is not None:
             try:
-                hub_server.shutdown()
+                try:
+                    hub_server.shutdown()
+                finally:
+                    if hub_server.hub.judge is not None:
+                        hub_server.hub.judge.recorder.stop()
             finally:
-                if hub_server.hub.judge is not None:
-                    hub_server.hub.judge.recorder.stop()
+                if hub_server.hub.slack is not None:
+                    hub_server.hub.slack.stop()
         svr.shutdown()
         if artifact_bridge is not None:
             artifact_bridge.stop()
@@ -4866,8 +4870,11 @@ def _start_assistant_hub(service):
     from .control_plane.assistant_hub.workers import WorkerRegistry
     registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
                               worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
+    from .control_plane.assistant_hub.slack import SlackRuntime
+    slack = SlackRuntime(service.store, service, lambda: service.config.get("slack") or {}, service.now)
     try:
-        server = HubServer(Hub(registry=registry, service=service, store=service.store, judge=_build_judge_runtime(service)),
+        server = HubServer(Hub(registry=registry, service=service, store=service.store,
+                               judge=_build_judge_runtime(service), slack=slack),
                            host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
@@ -4875,6 +4882,8 @@ def _start_assistant_hub(service):
         raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
     server.start()
     server.hub.judge.recorder.start()          # a thread exists only when the judge is enabled
+    if (service.config.get("slack") or {}).get("enabled") is True:
+        slack.start()                          # Socket Mode link and the ask poster; stopped by the caller
     return server, registry
 
 
@@ -4886,6 +4895,7 @@ def _wire_assistant_hub(svr):
     hub_server, registry = _start_assistant_hub(service)
     svr.assistant_workers = registry
     svr.assistant_judge = hub_server.hub.judge if hub_server is not None else None   # same runtime as the hub
+    svr.assistant_slack = hub_server.hub.slack if hub_server is not None else None
     return hub_server
 
 

@@ -17,14 +17,16 @@ import re
 import threading
 import urllib.error
 import urllib.request
+from collections import deque
 from collections.abc import Callable
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from ..assistant import AssistantStore
-from .actiongrants import as_utc
+from .actiongrants import ActionRequestRow, as_utc
 from .policy import record_owner_decision
-from .slack_asks import SlackAsk
+from .slack_asks import SlackAsk, button_value, new_ask_id, new_nonce
 
 __all__ = ["SlackClient", "SlackError", "SlackRuntime", "ASK_ACTIONS", "slack_text", "slack_api_call"]
 
@@ -146,12 +148,39 @@ def _short_id(value: object) -> str:
     return value if isinstance(value, str) and _ID.fullmatch(value) else "-"
 
 
+@dataclass
+class _Queued:
+    """One pending request waiting to be posted.  ``ask`` is created on the first attempt and reused by every retry."""
+    tenant_id: str
+    user_id: str
+    request_id: str
+    worker_id: str
+    task_id: str
+    display: str
+    why: str
+    project: str
+    queued_at: datetime
+    ask: SlackAsk | None = None
+
+
+@dataclass
+class _Batch:
+    channel: str
+    ts: str
+    count: int
+    since: datetime
+
+
+_HOUR = timedelta(hours=1)
+
+
 class SlackRuntime:
     """Owns the Socket Mode connection and the tap handler.  ``start``/``stop`` are idempotent."""
 
     def __init__(self, store: AssistantStore, service: Any, cfg_getter: Callable[[], dict[str, Any]],
                  now_fn: Callable[[], datetime], *, min_backoff: float = 0.5, max_backoff: float = 30.0,
-                 ping_interval: float = 2.0, stop_timeout: float = 15.0) -> None:
+                 ping_interval: float = 2.0, stop_timeout: float = 15.0,
+                 queue_size: int = 200) -> None:
         self.store = store
         self.service = service
         self._cfg = cfg_getter
@@ -163,32 +192,50 @@ class SlackRuntime:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._state = threading.Lock()
+        self._qsize = max(1, int(queue_size))
+        self._queue: deque[_Queued] = deque()
+        self._qcond = threading.Condition()
+        self._drain_thread: threading.Thread | None = None
+        self.dropped = 0
+        self._posted: dict[tuple[str, str, str, str], deque[datetime]] = {}    # per (worker, task) post times
+        self._batches: dict[tuple[str, str, str, str], _Batch] = {}
+        self._dm: dict[str, str] = {}
+        self._connected = False
+        self._last_event: datetime | None = None
         self._tap = threading.Lock()           # one tap at a time: a double tap decides once
         self.client = SlackClient(cfg_getter)
 
     # -- lifecycle ---------------------------------------------------------------------------------
     def start(self) -> None:
         with self._state:
-            if self._thread is not None and self._thread.is_alive():
-                return          # running, or a stop() that timed out and has not finished: never two supervisors
-            self._stop.clear()
-            self._thread = threading.Thread(target=self._run, name="slack-socket-mode", daemon=True)
-            self._thread.start()
+            if self._thread is None or not self._thread.is_alive():
+                self._stop.clear()
+                self._thread = threading.Thread(target=self._run, name="slack-socket-mode", daemon=True)
+                self._thread.start()
+            elif self._stop.is_set():
+                return          # a stop() that timed out has not finished: never two supervisors
+            if self._drain_thread is None or not self._drain_thread.is_alive():
+                self._drain_thread = threading.Thread(target=self._drain, name="slack-asks", daemon=True)
+                self._drain_thread.start()
 
     def stop(self) -> bool:
-        """Stop the supervisor.  True when it has ended; False when it did not end within ``stop_timeout`` (it is
-        still winding down, ``start`` refuses until it has, and a later ``stop`` can confirm)."""
+        """Stop the runtime.  True when both threads have ended; False when one did not end within ``stop_timeout``
+        (it is still winding down, ``start`` refuses until it has, and a later ``stop`` can confirm).  Queued asks
+        are kept in memory, so a restart posts them."""
         with self._state:
-            thread = self._thread
+            threads = [self._thread, self._drain_thread]
             self._stop.set()
-        if thread is not None:
-            thread.join(timeout=self._stop_timeout)
-            if thread.is_alive():
-                return False
+        with self._qcond:
+            self._qcond.notify_all()
+        alive = False
+        for thread in threads:
+            if thread is not None:
+                thread.join(timeout=self._stop_timeout)
+                alive = alive or thread.is_alive()
+        if not alive:
             with self._state:
-                if self._thread is thread:
-                    self._thread = None
-        return True
+                self._thread = self._drain_thread = None
+        return not alive
 
     def _run(self) -> None:
         delay = self._min_backoff
@@ -231,14 +278,18 @@ class SlackRuntime:
         try:
             client.connect()
             connected = client.is_connected()
+            self._connected = connected
+            self._last_event = as_utc(self._now())
             while connected and not self._stop.is_set() and client.is_connected():
                 self._stop.wait(0.1)
         finally:
+            self._connected = False
             client.close()
         return connected
 
     def _on_request(self, client: Any, req: Any) -> None:
         from slack_sdk.socket_mode.response import SocketModeResponse
+        self._last_event = as_utc(self._now())
         try:
             client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))   # ack first
         except Exception as exc:
@@ -249,6 +300,157 @@ class SlackRuntime:
             self.handle_interaction(req.payload)
         except Exception as exc:            # a bad payload must never take the connection down
             _log.warning("slack interaction failed: %s", type(exc).__name__)
+
+    # -- owner asks --------------------------------------------------------------------------------
+    def notify_pending(self, row: ActionRequestRow, display: str, why: str, *, project: str = "") -> None:
+        """Queue a NEW pending request for the owner.  Never blocks and never raises: the caller is a request thread.
+
+        The queue is bounded (oldest dropped); the runtime's own thread posts, retrying while Slack is unreachable."""
+        try:
+            if not self._cfg().get("enabled"):
+                return
+            item = _Queued(row.tenant_id, row.user_id, row.request_id, row.worker_id, row.task_id, display, why,
+                           project, as_utc(self._now()))
+            with self._qcond:
+                if len(self._queue) >= self._qsize:
+                    self._queue.popleft()
+                    self.dropped += 1
+                self._queue.append(item)
+                self._qcond.notify()
+        except Exception as exc:
+            _log.warning("slack notify failed: %s", type(exc).__name__)
+
+    def queued(self) -> int:
+        with self._qcond:
+            return len(self._queue)
+
+    def status(self, tenant_id: str, user_id: str) -> dict[str, Any]:
+        """What the owner API shows: no token, path or channel text."""
+        last = self._last_event
+        return {"enabled": bool(self._cfg().get("enabled")), "connected": self._connected,
+                "last_event_at": last.isoformat() if last is not None else None,
+                "open_asks": sum(1 for a in self.store.list_slack_asks(tenant_id, user_id, "open") if a.ts)}
+
+    def _drain(self) -> None:
+        delay = self._min_backoff
+        while not self._stop.is_set():
+            with self._qcond:
+                while not self._queue and not self._stop.is_set():
+                    self._qcond.wait(1.0)
+                if self._stop.is_set():
+                    return
+                item = self._queue[0]
+            try:
+                done = self._post_ask(item)
+            except SlackError as exc:
+                done = self._expired(item) or False
+                if done:
+                    self._audit_failed(item, exc.code)
+                else:
+                    self._stop.wait(delay)
+                    delay = min(delay * 2, self._max_backoff)
+            except Exception as exc:                  # never kill the loop; the ask stays with the owner's REST view
+                _log.warning("slack ask failed: %s", type(exc).__name__)
+                done = True
+            if done:
+                delay = self._min_backoff
+                with self._qcond:
+                    if self._queue and self._queue[0] is item:
+                        self._queue.popleft()
+
+    def _expired(self, item: _Queued) -> bool:
+        ttl = timedelta(minutes=int(self._cfg().get("ask_ttl_minutes") or 15))
+        return as_utc(self._now()) - item.queued_at >= ttl
+
+    def _audit_failed(self, item: _Queued, code: str) -> None:
+        if item.ask is not None:
+            item.ask.status = "expired"
+            self.store.put_slack_ask(item.ask)
+        self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
+                                action="assistant.slack.ask_failed", subject_id=item.request_id,
+                                detail=f"request={item.request_id} code={code}")
+
+    def _target(self, cfg: dict[str, Any]) -> str:
+        if cfg.get("channel"):
+            return str(cfg["channel"])
+        owner = str(cfg["owner_user_id"])
+        if owner not in self._dm:
+            self._dm[owner] = self.client.open_dm(owner)
+        return self._dm[owner]
+
+    def _post_ask(self, item: _Queued) -> bool:
+        """True when the item is finished (posted, batched, or no longer needed); SlackError means retry later."""
+        cfg = self._cfg()
+        if not cfg.get("enabled"):
+            return True
+        row = self.store.get_action_request(item.request_id, tenant_id=item.tenant_id, user_id=item.user_id)
+        if row is None or row.status != "pending":
+            return True                                  # decided meanwhile (REST) or gone: nothing to ask
+        now = as_utc(self._now())
+        key = (item.tenant_id, item.user_id, item.worker_id, item.task_id)
+        stamps = self._posted.setdefault(key, deque())
+        while stamps and now - stamps[0] >= _HOUR:
+            stamps.popleft()
+        if len(stamps) >= int(cfg.get("max_asks_per_task_per_hour") or 6):
+            return self._batch(item, key, cfg, now)
+        channel = self._target(cfg)
+        ttl = timedelta(minutes=int(cfg.get("ask_ttl_minutes") or 15))
+        ask = item.ask
+        if ask is None:                  # stored before it is posted: a tap needs the ts, which only a post yields
+            ask = item.ask = SlackAsk(ask_id=new_ask_id(), tenant_id=item.tenant_id, user_id=item.user_id,
+                                      request_id=item.request_id, task_id=item.task_id, nonce=new_nonce(),
+                                      channel=channel, created_at=now, expires_at=now + ttl)
+            self.store.put_slack_ask(ask)
+        text = f"Approval needed from worker {slack_text(item.worker_id)}"
+        ts = self.client.post_message(channel, self._ask_blocks(ask, item), text)
+        ask.ts, ask.channel, ask.created_at, ask.expires_at = ts, channel, now, now + ttl
+        self.store.put_slack_ask(ask)
+        stamps.append(now)
+        self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
+                                action="assistant.slack.ask_posted", subject_id=ask.ask_id,
+                                detail=f"ask={ask.ask_id} request={item.request_id} worker={_short_id(item.worker_id)}")
+        return True
+
+    @staticmethod
+    def _ask_blocks(ask: SlackAsk, item: _Queued) -> list[dict[str, Any]]:
+        lines = [f"*Approval needed* from worker `{slack_text(item.worker_id)}`"]
+        if item.project:
+            lines.append(f"Project: {slack_text(item.project)}")
+        lines.append("```" + slack_text(item.display) + "```")
+        lines.append(f"Why: {slack_text(item.why)}")
+        value = button_value(ask)
+
+        def button(label: str, action_id: str, style: str = "") -> dict[str, Any]:
+            out: dict[str, Any] = {"type": "button", "text": {"type": "plain_text", "text": label},
+                                   "action_id": action_id, "value": value}
+            if style:
+                out["style"] = style
+            return out
+
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
+                {"type": "actions", "elements": [button("Approve", "ask_approve", "primary"),
+                                                 button("Deny", "ask_deny", "danger"),
+                                                 button("Approve and remember", "ask_remember")]}]
+
+    def _batch(self, item: _Queued, key: tuple[str, str, str, str], cfg: dict[str, Any], now: datetime) -> bool:
+        """Over the per-task limit: one line per hour, edited to say how many more are waiting."""
+        batch = self._batches.get(key)
+        if batch is not None and now - batch.since >= _HOUR:
+            batch = None
+        count = (batch.count if batch else 0) + 1
+        text = (f"{count} more waiting from worker {slack_text(item.worker_id)}, task {slack_text(item.task_id)}"
+                " (limit reached; decide them in the dashboard)")
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+        if batch is None:
+            channel = self._target(cfg)
+            self._batches[key] = _Batch(channel, self.client.post_message(channel, blocks, text), count, now)
+        else:
+            self.client.update_message(batch.channel, batch.ts, blocks, text)
+            batch.count = count
+        self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
+                                action="assistant.slack.ask_batched", subject_id=item.request_id,
+                                detail=f"request={item.request_id} waiting={count}")
+        return True
 
     # -- taps --------------------------------------------------------------------------------------
     def _scope(self) -> tuple[str, str]:

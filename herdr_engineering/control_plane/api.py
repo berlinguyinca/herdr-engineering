@@ -314,7 +314,7 @@ class ControlPlaneServer:
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None, assistant_judge=None):
+                 assistant_workers=None, assistant_judge=None, assistant_slack=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -513,6 +513,7 @@ class ControlPlaneServer:
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
         # The owner routes /api/v1/assistant-workers read it at request time, so it may be attached after startup.
         self.assistant_workers = assistant_workers
+        self.assistant_slack = assistant_slack       # SlackRuntime | None; None: the status route reports it off
         self.assistant_judge = assistant_judge       # JudgeRuntime | None; None: the activation gate refuses
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
@@ -2498,7 +2499,7 @@ def _make_handler(server, public=False, operator=False):
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
                                     "assistant-action-requests", "assistant-grants", "assistant-judges",
-                                    "assistant-team-briefs"}
+                                    "assistant-slack", "assistant-team-briefs"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
@@ -2607,7 +2608,8 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
                                         "assistant-reminders", "assistant-workers",
-                                        "assistant-action-requests", "assistant-grants", "assistant-judges"}
+                                        "assistant-action-requests", "assistant-grants", "assistant-judges",
+                                        "assistant-slack"}
 
         def _mutate_verb(self):
             if operator:
@@ -2638,7 +2640,8 @@ def _make_handler(server, public=False, operator=False):
             if err:
                 return err
             if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
-                            "assistant-action-requests", "assistant-grants", "assistant-judges"):
+                            "assistant-action-requests", "assistant-grants", "assistant-judges",
+                            "assistant-slack"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3962,6 +3965,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource)
             if resource == "assistant-judges":
                 return self._assistant_judges(parts)
+            if resource == "assistant-slack":
+                return self._assistant_slack(parts)
             if resource in ("assistant-team-briefs", "assistant-references"):
                 return self._assistant_briefs(parts, resource, None)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
@@ -4823,6 +4828,29 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"error": "body must be empty"}, 400)
                     return self._json(check_view(judge, fallback))
                 return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+
+        def _assistant_slack(self, parts):
+            """Owner-only Slack front door status: whether it is on and connected, when it last heard from Slack and
+            how many asks are open.  Read-only; no token, token path or message text ever leaves here."""
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            if self._require("operator"):
+                return None
+            try:
+                server.assistant._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                server.assistant.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                if len(parts) != 4 or self.command != "GET":
+                    return self._json({"error": "not found"}, 404)
+                runtime = server.assistant_slack
+                if runtime is None:
+                    return self._json({"enabled": False, "connected": False, "last_event_at": None, "open_asks": 0})
+                return self._json(runtime.status(tenant_id, user_id))
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)
             except RateLimited as exc:

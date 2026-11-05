@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Literal
@@ -30,6 +31,7 @@ from .workers import Worker
 
 POLICY_ACTOR = "hub:policy"
 Outcome = Literal["authorized", "denied", "pending"]
+Notify = Callable[..., None]      # (row, display, reason, *, project="") -> None; must only enqueue
 Source = Literal["veto", "grant", "owner", "shadow", "unknown", "judge", "judge_unavailable"]
 
 
@@ -191,15 +193,26 @@ def _submit_to_recorder(judge: JudgeRuntime | None, worker: Worker, derived: Der
         pass
 
 
+def _notify_owner(notify: Notify | None, row: ActionRequestRow, raw: RawAction) -> None:
+    """A NEW pending row is offered to the owner's Slack once.  The notifier only enqueues; a failure changes nothing."""
+    if notify is None:
+        return
+    try:
+        notify(row, row.display, row.reason, project=raw.repo or "")
+    except Exception:
+        pass
+
+
 def _pending(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
              task_id: str, now: datetime, source: Source, reason: str, judge: JudgeRuntime | None = None,
-             extra: str = "") -> Decision:
+             extra: str = "", notify: Notify | None = None) -> Decision:
     row = _new_row(worker, raw, derived, session_id, task_id, "pending", reason, now)
     row, created = _find_or_put(store, worker, row)
     if created:
         _audit(store, worker, POLICY_ACTOR, "assistant.action.requested", row.request_id,
                f"source={source} key_id={row.key_id}{extra}")
         _submit_to_recorder(judge, worker, derived, row.request_id, session_id, task_id)
+        _notify_owner(notify, row, raw)
     return Decision("pending", reason, row.request_id, None, None, source)
 
 
@@ -246,10 +259,10 @@ def _consult(judge: JudgeRuntime | None, key: ActionKey) -> Verdict | str:
 
 
 def decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, session_id: str, task_id: str,
-           now: datetime, *, judge: JudgeRuntime | None = None) -> Decision:
+           now: datetime, *, judge: JudgeRuntime | None = None, notify: Notify | None = None) -> Decision:
     derived = derive(raw)
     key = derived.key
-    return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now, judge),
+    return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now, judge, notify),
                    verb=key.verb.value if key else Verb.UNKNOWN.value, key_id=key.key_id() if key else "")
 
 
@@ -272,7 +285,7 @@ def _consume_approval(store: AssistantStore, cfg: dict, worker: Worker, key_id: 
 
 
 def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
-            task_id: str, now: datetime, judge: JudgeRuntime | None) -> Decision:
+            task_id: str, now: datetime, judge: JudgeRuntime | None, notify: Notify | None = None) -> Decision:
     veto = check_vetoes(derived, _extra_rules(cfg))
     if veto is not None:
         return _deny(store, worker, raw, derived, veto, session_id, task_id, now)
@@ -283,33 +296,33 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
                             consumed.request_id, None, None, "owner")
     if derived.owner_decides or derived.key is None:
         return _pending(store, worker, raw, derived, session_id, task_id, now, "unknown",
-                        "The action could not be classified with certainty, so the owner decides.", judge)
+                        "The action could not be classified with certainty, so the owner decides.", judge, notify=notify)
     grant = _live_grant(store, cfg, worker, derived.key, now, current_judge_version(judge))
     if grant is not None and in_shadow(store, cfg, now):
         return _pending(store, worker, raw, derived, session_id, task_id, now, "shadow",
-                        "The shadow period is still running, so the owner decides.", judge)
+                        "The shadow period is still running, so the owner decides.", judge, notify=notify)
     if grant is not None:
         # The only path that would authorize: the judge is consulted here and nowhere else (no lock is held).
         result = _consult(judge, derived.key)
         if isinstance(result, str):
             return _pending(store, worker, raw, derived, session_id, task_id, now, "judge_unavailable",
-                            _JUDGE_UNAVAILABLE_REASON, judge, extra=f" code={result}")
+                            _JUDGE_UNAVAILABLE_REASON, judge, extra=f" code={result}", notify=notify)
         outcome, source = _apply_verdict(result)
         if outcome == "authorized":
             # The consult can be slow: re-check that the grant is still live (revoked/expired/judge changed meanwhile).
             grant = _live_grant(store, cfg, worker, derived.key, _fresh_now(judge, now), current_judge_version(judge))
             if grant is None:
                 return _pending(store, worker, raw, derived, session_id, task_id, now, "owner",
-                                "No active grant covers this exact action, so the owner decides.", judge)
+                                "No active grant covers this exact action, so the owner decides.", judge, notify=notify)
         if outcome == "pending":
             return _pending(store, worker, raw, derived, session_id, task_id, now, source, _JUDGE_REASON, judge,
-                            extra=_verdict_detail(result))
+                            extra=_verdict_detail(result), notify=notify)
         _audit(store, worker, POLICY_ACTOR, "assistant.action.authorized", grant.grant_id,
                f"grant={grant.grant_id} key_id={grant.key_id} worker={worker.worker_id}{_verdict_detail(result)}")
         return Decision("authorized", "Authorized by the owner's active grant for this exact action.", None,
                         grant.grant_id, None, source)
     return _pending(store, worker, raw, derived, session_id, task_id, now, "owner",
-                    "No active grant covers this exact action, so the owner decides.", judge)
+                    "No active grant covers this exact action, so the owner decides.", judge, notify=notify)
 
 
 def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str,

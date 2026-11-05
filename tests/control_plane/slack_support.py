@@ -34,6 +34,8 @@ class SlackListener:
         self.team = team
         self.bot_user_id = bot_user_id
         self.requests: list[dict[str, str]] = []
+        self.bodies: list[tuple[str, bytes]] = []     # (method, raw request body) of every POST
+        self.fail_posts: list[str] = []               # next chat.postMessage answers: '500' or 'reject' (consumed in order)
         self.calls: list[dict[str, object]] = []      # parsed bodies of chat.postMessage / chat.update / conversations.open
         self.acks: list[str] = []                     # envelope ids the client acknowledged over the socket
         self.ws_connections = 0
@@ -62,10 +64,19 @@ class SlackListener:
                 method = self.path.rsplit("/", 1)[-1]
                 with outer._lock:
                     outer.requests.append({"path": self.path, "authorization": auth})
+                    outer.bodies.append((method, raw))
+                    failure = outer.fail_posts.pop(0) if method == "chat.postMessage" and outer.fail_posts else ""
                 if outer.on_request is not None:
                     outer.on_request(method)
+                if failure == "500":
+                    self.send_response(500)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 doc: dict[str, object] = {"ok": False, "error": "invalid_auth"}
-                if method == "auth.test" and auth == f"Bearer {outer.bot_token}":
+                if failure == "reject":
+                    doc = {"ok": False, "error": "channel_not_found"}
+                elif method == "auth.test" and auth == f"Bearer {outer.bot_token}":
                     doc = {"ok": True, "url": "https://acme.slack.com/", "team": outer.team, "user": "herdr",
                            "team_id": "T0TEAM001", "user_id": outer.bot_user_id, "bot_id": "B0BOT0001"}
                 elif method == "apps.connections.open" and auth == f"Bearer {outer.app_token}":

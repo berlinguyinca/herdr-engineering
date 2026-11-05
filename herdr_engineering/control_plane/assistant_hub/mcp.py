@@ -19,6 +19,7 @@ from ..assistant import AssistantError
 from .canonical import RawAction
 from .events import EVENTS_PER_WORKER_PER_MINUTE, RateLimiter, record_event
 from .policy import current_judge_version, decide
+from .slack import SlackRuntime
 from .workers import Worker, WorkerAuthError
 
 if TYPE_CHECKING:
@@ -58,6 +59,7 @@ class Hub:
     event_limiter: RateLimiter = field(default_factory=RateLimiter)
     event_rate_limit: int = EVENTS_PER_WORKER_PER_MINUTE
     judge: JudgeRuntime | None = None      # None: no judge, so an otherwise-authorized action is left to the owner
+    slack: SlackRuntime | None = None      # None: no owner asks in Slack; a new pending request is only queued for it
 
 
 class _ToolError(Exception):
@@ -196,7 +198,7 @@ def _action_request(hub: Hub, worker: Worker, args: dict) -> dict:
     if not hub.event_limiter.allow(worker.worker_id, hub.event_rate_limit):      # one slot per call, taken here
         raise _ToolError("rate limited")
     d = decide(hub.store, hub.service.config["grants"], worker, raw, session_id, task_id, hub.service.now(),
-               judge=hub.judge)
+               judge=hub.judge, notify=hub.slack.notify_pending if hub.slack is not None else None)
     try:
         record_event(hub.store, worker, kind="action_request", provenance="worker_reported", session_id=session_id,
                      payload={"outcome": d.outcome, "source": d.source,
