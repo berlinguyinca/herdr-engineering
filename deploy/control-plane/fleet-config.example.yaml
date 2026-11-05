@@ -288,6 +288,9 @@ sections:
       #             mode: ask              # ask (default) | auto (candidate only)
       #             command: deploy/control-plane/deploy.sh   # relative path: no leading / or ./, no .., no spaces
       #             require: [on_main, ci_green, descends_from_deployed]   # a non-empty subset; default all three
+      #             health_url: http://127.0.0.1:8080/api/v1/health   # REQUIRED with an explicit descends_from_deployed: the hub
+      #                                         # reads the deployed commit from `<health_url>?probe=1` (loopback http or https)
+      #     precondition_timeout_seconds: 10   # overall deadline for the hub's checks per request, 1..60
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)

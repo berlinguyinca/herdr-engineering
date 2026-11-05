@@ -725,7 +725,7 @@ def _deploy_scope(raw: Any, where: str) -> dict[str, Any]:
     inline = sorted(k for k in raw if isinstance(k, str) and any(w in k.lower() for w in _DEPLOY_SECRET_WORDS))
     if inline:
         raise ValueError(f"{where} must not hold secrets inline ({inline}); a deploy scope has no secret settings")
-    unknown = set(raw) - {"mode", "command", "require"}
+    unknown = set(raw) - {"mode", "command", "require", "health_url"}
     if unknown:
         raise ValueError(f"{where} has unknown keys: {sorted(map(str, unknown))}")
     mode = raw.get("mode", "ask")
@@ -741,7 +741,17 @@ def _deploy_scope(raw: Any, where: str) -> dict[str, Any]:
         raise ValueError(f"{where}.require has a duplicate entry")
     if not set(require) <= set(DEPLOY_REQUIRE):
         raise ValueError(f"{where}.require may only hold {list(DEPLOY_REQUIRE)}")
-    return {"mode": mode, "command": command, "require": [r for r in DEPLOY_REQUIRE if r in require]}
+    out: dict[str, Any] = {"mode": mode, "command": command, "require": [r for r in DEPLOY_REQUIRE if r in require]}
+    if "health_url" in raw:
+        health = _judge_endpoint(raw["health_url"], f"{where}.health_url")
+        if not health:
+            raise ValueError(f"{where}.health_url must not be empty")
+        out["health_url"] = health
+    elif "require" in raw and "descends_from_deployed" in require:
+        # an explicit list naming the check needs the URL the hub reads the deployed commit from; with the default list
+        # a missing URL is not a config error, the check just stays unverified (pending) at run time
+        raise ValueError(f"{where}.health_url is required when require includes descends_from_deployed")
+    return out
 
 
 def _deploy_config(raw: Any) -> dict[str, Any]:
@@ -754,9 +764,12 @@ def _deploy_config(raw: Any) -> dict[str, Any]:
         return {"projects": {}}
     if not isinstance(raw, dict):
         raise ValueError(f"{where} must be a mapping")
-    unknown = set(raw) - {"projects"}
+    unknown = set(raw) - {"projects", "precondition_timeout_seconds"}
     if unknown:
         raise ValueError(f"{where} has unknown keys: {sorted(map(str, unknown))}")
+    timeout = raw.get("precondition_timeout_seconds")
+    if "precondition_timeout_seconds" in raw and (type(timeout) is not int or not 1 <= timeout <= 60):
+        raise ValueError(f"{where}.precondition_timeout_seconds must be an integer from 1 to 60")
     projects = raw.get("projects", {})
     if not isinstance(projects, dict):
         raise ValueError(f"{where}.projects must be a mapping")
@@ -793,7 +806,7 @@ def _deploy_config(raw: Any) -> dict[str, Any]:
                 raise ValueError(f"{pwhere}.scopes.{sid}: duplicate repo and command (another scope already runs it)")
             seen.add(ident)
         out[pid] = {"repo": repo, "scopes": norm}
-    return {"projects": out}
+    return {"projects": out, **({"precondition_timeout_seconds": timeout} if timeout is not None else {})}
 
 
 def apps_config(raw: Any) -> dict[str, Any]:

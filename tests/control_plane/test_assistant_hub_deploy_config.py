@@ -13,7 +13,8 @@ REQUIRE_ALL = ["on_main", "ci_green", "descends_from_deployed"]
 GOOD = {"projects": {"herdr-engineering": {
     "repo": "berlinguyinca/herdr-engineering",
     "scopes": {"control-plane": {"mode": "ask", "command": "deploy/control-plane/deploy.sh",
-                                 "require": list(REQUIRE_ALL)}}}}}
+                                 "require": list(REQUIRE_ALL),
+                                 "health_url": "http://127.0.0.1:8080/api/v1/health"}}}}}
 
 
 def _deploy(deploy: Any = None) -> dict[str, Any]:
@@ -39,7 +40,7 @@ def test_a_good_block_normalizes() -> None:
 def test_mode_defaults_to_ask_and_require_to_all_three() -> None:
     cfg = {"projects": {"p": {"repo": "o/r", "scopes": {"s": {"command": "deploy.sh"}}}}}
     scope = _deploy(cfg)["projects"]["p"]["scopes"]["s"]
-    assert scope == {"mode": "ask", "command": "deploy.sh", "require": REQUIRE_ALL}
+    assert scope == {"mode": "ask", "command": "deploy.sh", "require": REQUIRE_ALL}   # default list: no health_url needed
 
 
 def test_require_subset_is_kept_in_canonical_order_and_deduplicated_input_is_refused() -> None:
