@@ -257,6 +257,37 @@ def test_n12_a_link_is_not_issued_for_an_artifact_deleted_meanwhile(registry_pg)
     run(with_store(registry_pg["dsn"], blobs, body))
 
 
+def test_approving_a_link_and_the_purge_rewrite_of_its_share_row_share_one_lock_order(registry_pg):
+    """The purge holds the artifact row and then rewrites the artifact's share rows; an approve used to lock the share row
+    and then wait for the artifact row, a deadlock. Both sides must now take the artifact row first (two real connections)."""
+    blobs = FakeBlobs()
+
+    async def body(store, conn):
+        a, va = await publish(store, blobs, owner="o", name="a.md", media="text/markdown", data=data_for("lockorder"))
+        shares = ShareStore(conn)
+        share = await shares.create(artifact_id=a, version_id=va["version_id"], audience="lab",
+                                    allow_emails=["x@example.org"])
+        purge = await asyncpg.connect(registry_pg["dsn"])
+        approve = await asyncpg.connect(registry_pg["dsn"])
+        try:
+            tx = purge.transaction()
+            await tx.start()
+            await purge.fetchval("SELECT 1 FROM artifacts WHERE artifact_id=$1 FOR UPDATE", a)   # what purge_now holds
+            index = BundleIndex("a.md", [BundleFile("a.md", "a" * 64, 1, "text/markdown")], 1, [])
+            approving = asyncio.ensure_future(ShareStore(approve).mark_live(
+                share["share_id"], token_hash="b" * 64, index=index, approved_by="op"))
+            await asyncio.sleep(0.6)                                       # the approve is now waiting on a lock
+            await purge.execute("UPDATE artifact_shares SET title=NULL WHERE artifact_id=$1", a)  # anonymisation
+            await tx.commit()
+            live = await asyncio.wait_for(approving, 10)                   # neither side was aborted as a deadlock victim
+            assert live["state"] == "live"
+        finally:
+            await purge.close()
+            await approve.close()
+
+    run(with_store(registry_pg["dsn"], blobs, body))
+
+
 # ------------------------------------------------------------------------------------------------ N4
 def test_n4_a_version_retract_cannot_touch_a_deleted_artifact(registry_pg):
     with api(registry_pg) as env:

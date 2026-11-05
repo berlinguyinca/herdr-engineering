@@ -360,6 +360,10 @@ class ArtifactLifecycleMixin:
             " WHERE artifact_id=$1", artifact_id)
         await self._conn.execute("SET LOCAL herdr.purge_redaction = 'off'")
         await self._conn.execute("UPDATE artifact_collab_uploads SET name='[removed]' WHERE artifact_id=$1", artifact_id)
+        # collaborator merge attempts carry the file names of their conflicts and a free-text message
+        await self._conn.execute(
+            "UPDATE artifact_collab_attempts SET message=CASE WHEN message IS NULL THEN NULL ELSE '[removed]' END,"
+            " conflict_names='[]'::jsonb WHERE artifact_id=$1", artifact_id)
         await self._conn.execute(
             "UPDATE artifacts SET display_name=NULL, original_filename='[removed]' WHERE artifact_id=$1", artifact_id)
 

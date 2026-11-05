@@ -481,6 +481,17 @@ def test_purge_blanks_names_and_messages_in_manifests_provenance_and_share_entri
     assert "jane" not in json.dumps([dict(r) for r in env.sql("SELECT * FROM artifact_versions")], default=str)
 
 
+def test_purge_blanks_collaborator_attempt_messages_and_conflict_names(env):
+    aid, vid = env.artifact()
+    env.sql("INSERT INTO artifact_collab_attempts (attempt_id, artifact_id, collaborator_agent_id, conflict_names, message)"
+            " VALUES ('att_1', $1, 'agent-x', '[\"jane-doe.md\"]'::jsonb, 'merge of jane-doe notes')", aid)
+    retract(env, aid)
+    assert env.req(purge_path(aid), body={"confirm": aid})[0] == 200
+    row = env.sql("SELECT conflict_names::text, message, collaborator_agent_id FROM artifact_collab_attempts WHERE attempt_id='att_1'")[0]
+    assert "jane" not in json.dumps([row[0], row[1]])
+    assert row[2] == "agent-x", "the audit row stays"
+
+
 def test_the_version_freeze_still_refuses_edits_outside_a_purge(env):
     aid, vid = env.artifact()
     import pytest

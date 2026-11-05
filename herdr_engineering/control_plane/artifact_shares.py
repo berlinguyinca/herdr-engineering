@@ -330,6 +330,15 @@ class ShareStore:
     async def _mark_live(self, share_id: str, token_hash: str, index: BundleIndex, approved_by: str,
                          member: bool) -> dict:
         async with _transaction(self._conn) as conn:
+            # Lock order: the artifact row first (FOR SHARE), then the share row. Purge holds the artifact row FOR UPDATE
+            # and then rewrites the artifact's share rows, so taking them the other way round could deadlock.
+            # FOR SHARE: a concurrent delete (which locks the artifact row FOR UPDATE) either finished first, so the link
+            # is refused here, or waits for this commit and then revokes the link it finds live
+            owner_artifact = await conn.fetchval("SELECT artifact_id FROM artifact_shares WHERE share_id=$1", share_id)
+            lifecycle = None
+            if owner_artifact is not None:
+                lifecycle = await conn.fetchval("SELECT lifecycle FROM artifacts WHERE artifact_id=$1 FOR SHARE",
+                                                owner_artifact)
             current = await conn.fetchrow("SELECT state, expires_at, created_by, artifact_id, audience FROM "
                                           "artifact_shares WHERE share_id=$1 FOR UPDATE", share_id)
             if current is None:
@@ -338,11 +347,6 @@ class ShareStore:
                 raise ShareError("not found", code="not_found")
             if current["state"] != "pending":
                 raise ShareError(f"share is {current['state']}, not pending")
-            # FOR SHARE: a concurrent delete (which locks the artifact row FOR UPDATE) either finished first, so the link
-            # is refused here, or waits for this commit and then revokes the link it finds live
-            lifecycle = await conn.fetchval(
-                "SELECT lifecycle FROM artifacts WHERE artifact_id = (SELECT artifact_id FROM artifact_shares "
-                "WHERE share_id=$1) FOR SHARE", share_id)
             if lifecycle is not None and lifecycle != "active":
                 raise ShareError("artifact is not active")
             if current["expires_at"] is not None and current["expires_at"] <= datetime.now(UTC):
