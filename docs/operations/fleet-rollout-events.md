@@ -18,10 +18,15 @@ Strict by construction (the validator is the last line of defence against a bugg
   `reason` (spec 8.1), `repo` (`autospec pi-engineering herdr-engineering ai-sync claude-config`);
 - `host` is `[a-z0-9-]{1,40}`; SHAs are 40 lowercase hex; `checks` <= 32 x (`name` <= 40, `ok`); `counts` only
   `dirty_paths|unpublished_commits|behind`; `log_tail` <= 2048 chars and <= 40 lines; `pr_title` <= 120 chars;
-- **no secrets**: a `log_tail` or `pr_title` containing credentials in a URL, an `Authorization:` header, `token=`,
-  `password=`, `secret=`, `api_key=`, private-key armour, a 24+ character token-like run, a control character or a
-  `/home/<user>`, `/Users/<user>`, `/root` path is **rejected** (never truncated or repaired). The general ingest door
-  also redacts credential-looking strings before the validator sees them, so such a field is stored as `[REDACTED]`.
+- **no secrets**: `log_tail`, `pr_title` and every `checks[].name` go through the same `unsafe_text` check and are
+  **rejected** (never truncated or repaired) when they contain credentials in a URL, an `Authorization:` or `Cookie:`
+  header, `token=`/`password=`/`passwd=`/`pwd=`/`secret=`/`api_key=`, a `Basic`/`Bearer` scheme followed by a value,
+  private-key armour (with or without dashes), AWS (`AKIA`/`ASIA`), `sk-`, Slack, GitHub and JWT token shapes, an
+  ssh key path (`.ssh/`, `id_rsa`...), netrc `machine ... login ... password`, a 24+ character token-like run, a control
+  character, a `/home/<user>`, `/Users/<user>` or `/root` path, or the literal `[REDACTED]`. The general ingest door
+  runs first and overwrites credential-looking strings (sometimes only the header name) with `[REDACTED]`; the validator
+  treats that marker as a rejection, so a half-redacted value is a `400`, never stored. A PR title that trips the check
+  is dropped by the emitter (so a long hyphenated or token-like title is dropped too).
 - `source.*` events are not tied to one rollout; they use `control_plane.fleet_rollout.source_stream_id(repo)` as stream id.
 
 Idempotent: the envelope identity is `<rollout_id>:<seq>` (`event_id()`). The same `seq` with identical content is a
@@ -53,7 +58,16 @@ secret), validates with the server's own validator, assigns the next `seq`, appe
 `$XDG_STATE_HOME/herdr-engineering/fleet-watch/outbox.jsonl` (0600, fsynced) and then tries to deliver. A control plane
 that is down never raises: the event stays queued and goes out, oldest first, on the next `flush()`. The queue stops at
 the first transient failure (network, 5xx, 401/403/429) to keep the stream ordered; events the server will never accept
-(400/409/413/422, torn lines, > 16 KiB) are parked with the reason in `outbox.rejected.jsonl` so they cannot block the rest.
+(400/409/413/422, a 200 that is not `ok`, torn lines, > 16 KiB) are parked with the reason in `outbox.rejected.jsonl` so
+they cannot block the rest. `flush` holds its file lock only to read and to trim, never across a network call.
+
+`seq` is never reused: the next value is the maximum of `seq.json`, its backup `seq.json.bak`, and every seq still in
+the outbox or the parked files, and it is persisted **before** the event is appended (a crash burns a number, a gap is
+harmless). Only if both counter files are gone and every event was already delivered and trimmed can a counter restart.
+
+Bounded growth: at most 2000 unflushed events (older ones are parked as `outbox full` and counted in `outbox.dropped`,
+shown by `outbox status` as `dropped`); `outbox.rejected.jsonl` rotates to `.1` above 1 MB (one generation kept);
+`seq.json` entries idle for 30 days are pruned.
 
 ```
 herdr-eng fleet-watch outbox status [--json]

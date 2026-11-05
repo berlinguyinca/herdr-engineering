@@ -71,9 +71,11 @@ def cmd_outbox(args) -> int:
         emitter = events.Emitter()
         pending = emitter.pending()
         rejected = emitter.rejected.read_text().count("\n") if emitter.rejected.exists() else 0
-        report = {"pending": len(pending), "rejected": rejected, "directory": str(emitter.directory)}
+        report = {"pending": len(pending), "rejected": rejected, "dropped": emitter.dropped(),
+                  "directory": str(emitter.directory)}
         print(json.dumps(report) if args.json else
-              f"outbox: {report['pending']} pending, {report['rejected']} parked ({report['directory']})")
+              f"outbox: {report['pending']} pending, {report['rejected']} parked, {report['dropped']} dropped "
+              f"({report['directory']})")
         return 0
     try:
         emitter = events.Emitter(client=_outbox_client(args))

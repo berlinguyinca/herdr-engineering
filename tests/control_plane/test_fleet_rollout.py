@@ -356,3 +356,85 @@ def test_events_survive_reload(server, acknowledged_sink):
         fresh.record_event(event["entity_type"], event["entity_id"], event["event_type"], event["payload"])
     assert [r["rollout_id"] for r in fresh.list_fleet_rollouts()] == [RID]
     assert fresh.list_fleet_rollouts()[0]["status"] == "succeeded"
+
+
+# --------------------------------------------------------------------------- review round 1: secret shapes everywhere
+
+#: (text, fragment that must never be readable back)
+SECRET_SHAPES = [
+    ("https://user:pw@example.com/x", "user:pw"),
+    ("/home/alice/.aws", "alice"),
+    ("/root/.ssh/id_rsa", "id_rsa"),
+    ("/root/.config", "/root"),
+    ("/Users/bob", "bob"),
+    ("Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+    ("Bearer abcdef123456", "abcdef123456"),
+    ("ssh -i ~/.ssh/id_ed25519 host", "id_ed25519"),
+    ("/var/lib/x/.ssh/id_rsa", "id_rsa"),
+    ("pwd=hunter2", "hunter2"),
+    ("passwd=hunter2", "hunter2"),
+    ("Cookie: session=abc12345", "abc12345"),
+    ("machine x login u password p", "login u"),
+    ("ghp_" + "a" * 36, "ghp_"),
+    ("sk-abcdef123456", "sk-abc"),
+    ("AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7"),
+    ("ASIAIOSFODNN7EXAMPLE", "ASIAIOSFODNN7"),
+    ("xoxb-123-456-abc", "xoxb"),
+    ("eyJhbGciOi.eyJzdWIi.sig", "eyJhbGciOi"),
+    ("tok " + "x" * 30, "xxxxxxxx"),
+    ("-----BEGIN RSA PRIVATE KEY-----", "PRIVATE KEY"),
+    ("BEGIN OPENSSH PRIVATE KEY", "PRIVATE KEY"),
+    ("authorization: basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+    ("[REDACTED] dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+]
+SHAPE_IDS = [s[:24] for s, _ in SECRET_SHAPES]
+
+
+@pytest.mark.parametrize("text,_needle", SECRET_SHAPES, ids=SHAPE_IDS)
+def test_check_names_reject_secret_shapes(text, _needle):
+    with pytest.raises(ValueError, match="check name"):
+        validate_fleet_rollout(RID, "host.finished", host_finished(checks=[{"name": text, "ok": True}]))
+
+
+@pytest.mark.parametrize("text,_needle", SECRET_SHAPES, ids=SHAPE_IDS)
+def test_pr_titles_reject_secret_shapes(text, _needle):
+    with pytest.raises(ValueError, match="pr_title"):
+        validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, "pr_title": text}))
+
+
+@pytest.mark.parametrize("text,_needle", SECRET_SHAPES, ids=SHAPE_IDS)
+def test_log_tails_reject_secret_shapes(text, _needle):
+    with pytest.raises(ValueError, match="log_tail"):
+        validate_fleet_rollout(RID, "host.finished", host_finished(log_tail=f"before\n{text}\nafter"))
+
+
+def test_ordinary_text_is_still_accepted():
+    ok = host_finished(checks=[{"name": "installed revision matches", "ok": True}], log_tail="Basic checks ok\nunit active")
+    validate_fleet_rollout(RID, "host.finished", ok)
+    validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, "pr_title": "Fix authorization bug in pwd handling"}))
+
+
+@pytest.mark.parametrize("field", ["log_tail", "pr_title", "check"])
+def test_the_ingest_doors_redaction_marker_is_a_rejection_not_a_stored_value(field):
+    marked = "[REDACTED] trailing"
+    if field == "log_tail":
+        call = ("host.finished", host_finished(log_tail=marked))
+    elif field == "pr_title":
+        call = ("rollout.observed", observed(trigger={**TRIGGER, "pr_title": marked}))
+    else:
+        call = ("host.finished", host_finished(checks=[{"name": marked, "ok": True}]))
+    with pytest.raises(ValueError, match="redact"):
+        validate_fleet_rollout(RID, *call)
+
+
+@pytest.mark.parametrize("text,needle", SECRET_SHAPES, ids=SHAPE_IDS)
+def test_nothing_credential_shaped_is_readable_back_through_http(server, text, needle):
+    post, get, repo, _ = server
+    status, _body = post(envelope("host.finished", host_finished(log_tail=text)))
+    assert status == 400
+    assert post(envelope("host.finished", host_finished(1, checks=[{"name": text[:40], "ok": True}]))
+                if False else envelope("rollout.observed", observed(trigger={**TRIGGER, "pr_title": text})))[0] == 400
+    for path in ("/api/v1/fleet-rollouts", f"/api/v1/fleet-rollouts/{RID}", "/api/v1/fleet-rollouts/versions"):
+        body = json.dumps(get(path)[1])
+        assert needle not in body
+    assert needle not in json.dumps(repo.stream("fleet_rollout", RID))

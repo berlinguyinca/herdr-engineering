@@ -33,10 +33,19 @@ _HOST = re.compile(r"[a-z0-9-]{1,40}")
 _LINK = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 _USERINFO = re.compile(r"://[^/@\s]+@")
 TOKENISH = re.compile(r"[A-Za-z0-9_\-]{24,}")
-_ASSIGNED_SECRET = re.compile(r"(?i)(?:token|password|passwd|secret|api[_-]?key)\w*\s*[=:]")
+_ASSIGNED_SECRET = re.compile(r"(?i)(?:token|password|passwd|pwd|secret|api[_-]?key)\w*\s*[=:]")
 _AUTH_HEADER = re.compile(r"(?i)authorization\s*[:=]")
-_PRIVATE_KEY = re.compile(r"-----BEGIN")
+_COOKIE = re.compile(r"(?i)\b(?:set-)?cookie\s*[:=]")
+_SCHEME_VALUE = re.compile(r"(?i)\b(?:basic|bearer)\s+[A-Za-z0-9+/=._~-]{8,}")
+_PRIVATE_KEY = re.compile(r"-----BEGIN|BEGIN [A-Z ]*PRIVATE KEY")
+_KNOWN_TOKEN = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}|\bsk-[A-Za-z0-9_-]{6,}|\bxox[abeprs]-|\beyJ[A-Za-z0-9_-]{6,}\."
+                          r"|\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{6,}")
+_SSH_KEY_PATH = re.compile(r"\.ssh/|\bid_(?:rsa|dsa|ecdsa|ed25519)\b")
+_NETRC = re.compile(r"(?i)\bmachine\s+\S+\s+login\b|\blogin\s+\S+\s+password\b")
 HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s]+|/root\b")
+#: What the general ingest door writes over a credential-looking string; a value that still carries it was
+#: partly redacted upstream, so whatever else it holds cannot be trusted.
+DOOR_MARKER = "[REDACTED]"
 
 #: event type -> (required fields, optional fields), beyond the common rollout_id / ts / seq.
 EVENT_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
@@ -129,16 +138,27 @@ def _keys(name: str, value: dict, required: set[str], optional: set[str] = froze
 
 
 def leaks(text: str) -> str | None:
-    """Why ``text`` must not be stored, or None. Markers of credentials and of the operator's home directory."""
-    if _USERINFO.search(text):
-        return "credentials in a URL"
-    if _AUTH_HEADER.search(text):
-        return "an Authorization header"
-    if _ASSIGNED_SECRET.search(text):
-        return "a secret assignment"
-    if _PRIVATE_KEY.search(text):
-        return "private key material"
+    """Why ``text`` must not be stored, or None. Markers of credentials, key material and key files."""
+    for pattern, why in ((_USERINFO, "credentials in a URL"), (_AUTH_HEADER, "an Authorization header"),
+                         (_COOKIE, "a cookie header"), (_ASSIGNED_SECRET, "a secret assignment"),
+                         (_SCHEME_VALUE, "an authentication scheme and value"), (_PRIVATE_KEY, "private key material"),
+                         (_KNOWN_TOKEN, "a known token format"), (_SSH_KEY_PATH, "an ssh key path"),
+                         (_NETRC, "netrc credentials")):
+        if pattern.search(text):
+            return why
     return None
+
+
+def unsafe_text(text: str) -> str | None:
+    """`leaks` plus a token-like run, a home-directory path or the ingest door's redaction marker."""
+    reason = leaks(text)
+    if reason is None and DOOR_MARKER in text:
+        reason = "a value already redacted upstream"
+    if reason is None and TOKENISH.search(text):
+        reason = "a token-like string"
+    if reason is None and HOME_PATH.search(text):
+        reason = "a home-directory path"
+    return reason
 
 
 def _title(value) -> str | None:
@@ -146,8 +166,9 @@ def _title(value) -> str | None:
         return None
     if not isinstance(value, str) or len(value) > PR_TITLE_CHARS or not value.isprintable():
         raise _bad(f"pr_title must be printable text of at most {PR_TITLE_CHARS} characters")
-    if leaks(value):
-        raise _bad(f"pr_title contains {leaks(value)}")
+    reason = unsafe_text(value)
+    if reason:
+        raise _bad(f"pr_title contains {reason}")
     return value
 
 
@@ -185,6 +206,8 @@ def _checks(value) -> list:
         name = item["name"]
         if not isinstance(name, str) or not 0 < len(name) <= 40 or not name.isprintable():
             raise _bad("check name must be printable text of 1 to 40 characters")
+        if unsafe_text(name):
+            raise _bad(f"check name contains {unsafe_text(name)}")
         if type(item["ok"]) is not bool:
             raise _bad("check ok must be a boolean")
         out.append({"name": name, "ok": item["ok"]})
@@ -198,11 +221,7 @@ def _log_tail(value) -> str:
         raise _bad(f"log_tail must be at most {LOG_TAIL_LINES} lines")
     if not value.replace("\n", "").isprintable():
         raise _bad("log_tail contains non-printable characters")
-    reason = leaks(value)
-    if reason is None and TOKENISH.search(value):
-        reason = "a token-like string"
-    if reason is None and HOME_PATH.search(value):
-        reason = "a home-directory path"
+    reason = unsafe_text(value)
     if reason:
         raise _bad(f"log_tail contains {reason}")
     return value

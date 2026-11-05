@@ -16,8 +16,8 @@ import json
 import os
 import re
 import urllib.error
-from collections.abc import Iterator
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ..ai_sync_feed import redact as redact_line
@@ -26,10 +26,10 @@ from ..control_plane.fleet_rollout import (
     LOG_TAIL_CHARS,
     LOG_TAIL_LINES,
     PR_TITLE_CHARS,
-    TOKENISH,
     event_id,
     leaks,
     source_stream_id,
+    unsafe_text,
     validate_fleet_rollout,
 )
 from . import state
@@ -41,6 +41,9 @@ PERMANENT_STATUSES = frozenset({400, 409, 413, 422})
 #: Optional payload fields whose value may legitimately be null; any other None is dropped before validation.
 NULLABLE = frozenset({"before_sha", "after_sha", "halted_at_host"})
 LINE_CHARS = 200
+MAX_PENDING = 2000
+MAX_REJECTED_BYTES = 1_000_000
+SEQ_RETENTION_DAYS = 30
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _BASE64ISH = re.compile(r"[A-Za-z0-9+/=]{32,}")
 
@@ -50,7 +53,7 @@ def clean_pr_title(title: str | None) -> str | None:
     if not isinstance(title, str):
         return None
     text = " ".join("".join(c if c.isprintable() else " " for c in title).split())[:PR_TITLE_CHARS]
-    return None if not text or leaks(text) else text
+    return None if not text or unsafe_text(text) else text
 
 
 def _redact_one(line: str, home: str) -> str:
@@ -62,7 +65,7 @@ def _redact_one(line: str, home: str) -> str:
         return REDACTED_LINE
     line = _BASE64ISH.sub("[redacted]", redact_line(line, LINE_CHARS))
     # Belt and braces: nothing the control plane would refuse may leave this host.
-    if leaks(line) or TOKENISH.search(line) or HOME_PATH.search(line) or not line.isprintable():
+    if unsafe_text(line) or not line.isprintable():
         return REDACTED_LINE
     return line
 
@@ -78,20 +81,27 @@ def redact_log_tail(text: str, home: str | os.PathLike | None = None) -> str:
     return "\n".join(lines)
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+class NotAccepted(Exception):
+    """The control plane answered 200 but did not accept the event; retrying cannot help."""
 
 
 class Emitter:
     """Queue-then-deliver emitter. `client` is anything with `request(route, body) -> dict` (MetadataClient)."""
 
-    def __init__(self, directory: Path | str | None = None, client=None, *, home: str | os.PathLike | None = None):
+    def __init__(self, directory: Path | str | None = None, client=None, *, home: str | os.PathLike | None = None,
+                 max_pending: int = MAX_PENDING, max_rejected_bytes: int = MAX_REJECTED_BYTES,
+                 clock: Callable[[], datetime] | None = None):
         self.directory = Path(directory) if directory else state.state_dir()
         self.client = client
         self.home = home
+        self.max_pending = max_pending
+        self.max_rejected_bytes = max_rejected_bytes
+        self.clock = clock or (lambda: datetime.now(UTC))
         self.outbox = self.directory / "outbox.jsonl"
         self.rejected = self.directory / "outbox.rejected.jsonl"
         self.seq_file = self.directory / "seq.json"
+        self.seq_backup = self.directory / "seq.json.bak"
+        self.dropped_file = self.directory / "outbox.dropped"
 
     # -- storage -----------------------------------------------------------------------------------------
 
@@ -127,12 +137,55 @@ class Emitter:
             handle.flush()
             os.fsync(handle.fileno())
 
-    def _seqs(self) -> dict[str, int]:
+    def _read_seqs(self, path: Path) -> dict[str, dict]:
         try:
-            data = json.loads(self.seq_file.read_text())
+            data = json.loads(path.read_text())
         except (OSError, ValueError):
             return {}
-        return {k: v for k, v in data.items() if isinstance(v, int)} if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: v for k, v in data.items() if isinstance(v, dict) and type(v.get("next")) is int
+                and isinstance(v.get("at"), str)}
+
+    def _scan_max_seq(self, rollout_id: str) -> int:
+        """Highest seq already used for `rollout_id` in the outbox and the parked files, or -1."""
+        top = -1
+        for path, wrapped in ((self.outbox, False), (self.rejected, True), (Path(f"{self.rejected}.1"), True)):
+            try:
+                text = path.read_text()
+            except OSError:
+                continue
+            for line in text.split("\n"):
+                try:
+                    item = json.loads(line)
+                    if wrapped:
+                        item = json.loads(item["line"])
+                    if item["entity_id"] == rollout_id and type(item["payload"]["seq"]) is int:
+                        top = max(top, item["payload"]["seq"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+        return top
+
+    def _next_seq(self, rollout_id: str) -> int:
+        """Never lower than any copy of the counter or any event still on disk, so a lost or corrupt seq.json
+        cannot make a new event reuse the seq of one the server already holds."""
+        recorded = (self._read_seqs(p).get(rollout_id, {}).get("next", 0) for p in (self.seq_file, self.seq_backup))
+        return max(*recorded, self._scan_max_seq(rollout_id) + 1)
+
+    def _reserve_seq(self, rollout_id: str, seq: int) -> None:
+        """Persist `seq + 1` (both copies) BEFORE the event is appended; prune rollouts idle for 30 days."""
+        now = self.clock()
+        merged: dict[str, dict] = {}
+        for path in (self.seq_backup, self.seq_file):
+            for key, entry in self._read_seqs(path).items():
+                if key not in merged or entry["next"] >= merged[key]["next"]:
+                    merged[key] = entry
+        horizon = (now - timedelta(days=SEQ_RETENTION_DAYS)).isoformat()
+        merged = {k: v for k, v in merged.items() if v["at"] >= horizon}
+        merged[rollout_id] = {"next": seq + 1, "at": now.isoformat()}
+        text = json.dumps(merged, sort_keys=True)
+        self._write_atomic(self.seq_file, text)
+        self._write_atomic(self.seq_backup, text)
 
     def _raw_lines(self) -> list[str]:
         try:
@@ -152,6 +205,13 @@ class Emitter:
                 out.append(item)
         return out
 
+    def dropped(self) -> int:
+        """How many unflushed events were parked because the outbox was full (visible in `outbox status`)."""
+        try:
+            return int(self.dropped_file.read_text().strip() or 0)
+        except (OSError, ValueError):
+            return 0
+
     # -- emitting ----------------------------------------------------------------------------------------
 
     def emit(self, rollout_id: str, event_type: str, *, flush: bool = True, **fields) -> dict:
@@ -166,15 +226,15 @@ class Emitter:
         if isinstance(payload.get("trigger"), dict) and "pr_title" in payload["trigger"]:
             payload["trigger"]["pr_title"] = clean_pr_title(payload["trigger"]["pr_title"])
         with self._locked():
-            seqs = self._seqs()
-            seq = seqs.get(rollout_id, 0)
+            seq = self._next_seq(rollout_id)
             clean = validate_fleet_rollout(rollout_id, event_type,
-                                           {"rollout_id": rollout_id, "ts": _now(), "seq": seq, **payload})
+                                           {"rollout_id": rollout_id, "ts": self.clock().isoformat(), "seq": seq,
+                                            **payload})
             envelope = {"source": "fleet-watch", "entity_type": "fleet_rollout", "entity_id": rollout_id,
                         "event_type": event_type, "event_id": event_id(rollout_id, seq), "payload": clean}
+            self._reserve_seq(rollout_id, seq)               # before the append: a crash burns a seq, never reuses one
             self._append(self.outbox, json.dumps(envelope, sort_keys=True))
-            seqs[rollout_id] = seq + 1
-            self._write_atomic(self.seq_file, json.dumps(seqs, sort_keys=True))
+            self._enforce_cap()
         if flush and self.client is not None:
             self.flush()
         return envelope
@@ -183,54 +243,79 @@ class Emitter:
         """A `source.*` event, filed on the watched repo's own stream (not tied to one rollout)."""
         return self.emit(source_stream_id(repo), event_type, repo=repo, **fields)
 
+    def _enforce_cap(self) -> None:
+        lines = self._raw_lines()
+        overflow = len(lines) - self.max_pending
+        if overflow <= 0:
+            return
+        for line in lines[:overflow]:
+            self._park(line, "outbox full: oldest unflushed event parked")
+        self._write_atomic(self.dropped_file, str(self.dropped() + overflow))
+        self._write_atomic(self.outbox, "".join(f"{line}\n" for line in lines[overflow:]))
+
     # -- delivery ----------------------------------------------------------------------------------------
 
     def _post(self, envelope: dict) -> None:
         result = self.client.request("/api/v1/ingest", envelope)
         entity = result.get("entity")
         if result.get("ok") is not True or not isinstance(entity, dict) or entity.get("entity_id") != envelope["entity_id"]:
-            raise ValueError("fleet_rollout event rejected")
+            raise NotAccepted("fleet_rollout event not accepted by the control plane")
 
     def flush(self) -> dict:
         """Deliver the queue oldest-first. Stops at the first transient failure (order matters); parks events the
-        server will never accept. Returns `{"sent", "pending", "rejected", "error"}`."""
-        sent = rejected = 0
-        error = None
+        server will never accept. The lock is held only to read and to trim, never across a network call.
+        Returns `{"sent", "pending", "rejected", "error"}`."""
         with self._locked():
             lines = self._raw_lines()
-            keep: list[str] = []
-            for index, line in enumerate(lines):
-                try:
-                    envelope = json.loads(line)
-                    if not isinstance(envelope, dict) or "payload" not in envelope:
-                        raise ValueError("not an event envelope")
-                except ValueError:
-                    self._park(line, "unparseable")
-                    rejected += 1
+        if self.client is None:
+            return {"sent": 0, "pending": len(lines), "rejected": 0, "error": "no control plane client"}
+        done: set[str] = set()
+        parks: list[tuple[str, str]] = []
+        sent = 0
+        error = None
+        for line in lines:
+            try:
+                envelope = json.loads(line)
+                if not isinstance(envelope, dict) or "payload" not in envelope:
+                    raise ValueError("not an event envelope")
+            except ValueError:
+                parks.append((line, "unparseable"))
+                done.add(line)
+                continue
+            try:
+                self._post(envelope)
+                sent += 1
+                done.add(line)
+            except NotAccepted as exc:
+                parks.append((line, f"not accepted: {exc}"))
+                done.add(line)
+            except urllib.error.HTTPError as exc:
+                if exc.code in PERMANENT_STATUSES:
+                    parks.append((line, f"http {exc.code}: {exc.read(200).decode('utf-8', 'replace')}"))
+                    done.add(line)
                     continue
-                if self.client is None:
-                    error, keep = "no control plane client", lines[index:]
-                    break
-                try:
-                    self._post(envelope)
-                    sent += 1
-                except urllib.error.HTTPError as exc:
-                    if exc.code in PERMANENT_STATUSES:
-                        self._park(line, f"http {exc.code}: {exc.read(200).decode('utf-8', 'replace')}")
-                        rejected += 1
-                        continue
-                    error, keep = f"http {exc.code}", lines[index:]
-                    break
-                except (OSError, ValueError) as exc:
-                    if isinstance(exc, ValueError) and "too large" in str(exc):
-                        self._park(line, str(exc))
-                        rejected += 1
-                        continue
-                    error, keep = f"{type(exc).__name__}: {exc}"[:200], lines[index:]
-                    break
-            if sent or rejected:
+                error = f"http {exc.code}"
+                break
+            except (OSError, ValueError) as exc:
+                if isinstance(exc, ValueError) and "too large" in str(exc):
+                    parks.append((line, str(exc)))
+                    done.add(line)
+                    continue
+                error = f"{type(exc).__name__}: {exc}"[:200]
+                break
+        with self._locked():
+            current = self._raw_lines()                      # includes anything emitted while we were on the network
+            keep = [line for line in current if line not in done]
+            for line, reason in parks:
+                self._park(line, reason)
+            if done:
                 self._write_atomic(self.outbox, "".join(f"{line}\n" for line in keep))
-        return {"sent": sent, "pending": len(keep), "rejected": rejected, "error": error}
+        return {"sent": sent, "pending": len(keep), "rejected": len(parks), "error": error}
 
     def _park(self, line: str, reason: str) -> None:
+        try:
+            if self.rejected.stat().st_size > self.max_rejected_bytes:
+                os.replace(self.rejected, f"{self.rejected}.1")      # one generation of history, then forgotten
+        except FileNotFoundError:
+            pass
         self._append(self.rejected, json.dumps({"reason": reason, "line": line}))

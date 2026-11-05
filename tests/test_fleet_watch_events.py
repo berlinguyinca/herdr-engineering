@@ -115,7 +115,7 @@ def test_random_junk_never_produces_something_the_server_would_reject():
 
 def test_pr_title_is_collapsed_capped_and_dropped_when_it_carries_a_secret():
     assert events.clean_pr_title("  Add \n thing\t ") == "Add thing"
-    assert len(events.clean_pr_title("x" * 500)) == 120
+    assert len(events.clean_pr_title("word " * 100)) == 120
     assert events.clean_pr_title("rotate token=abc123") is None
     assert events.clean_pr_title(None) is None
 
@@ -214,7 +214,8 @@ def test_a_server_side_rejection_is_parked_and_does_not_block_later_events(tmp_p
     em.emit(RID, "rollout.succeeded", flush=False)
     result = em.flush()
     assert (result["sent"], result["rejected"], result["pending"]) == (2, 1, 0)
-    assert [e["payload"]["seq"] for e in repo.stream("fleet_rollout", RID)] == [0, 1]
+    # the poisoned line used seq 9, so the next event continues after it: no seq is ever reused
+    assert [e["payload"]["seq"] for e in repo.stream("fleet_rollout", RID)] == [0, 10]
     parked = (tmp_path / "outbox.rejected.jsonl").read_text()
     assert "env" in parked and "400" in parked
 
@@ -327,3 +328,232 @@ def test_cli_outbox_status_and_flush(tmp_path, live):
     assert up.returncode == 0, up.stderr
     assert json.loads(up.stdout) == {"sent": 1, "pending": 0, "rejected": 0, "error": None}
     assert len(repo.stream("fleet_rollout", RID)) == 1
+
+
+# --------------------------------------------------------------------------- review round 1
+
+from tests.control_plane.test_fleet_rollout import SECRET_SHAPES, SHAPE_IDS  # noqa: E402
+
+
+@pytest.mark.parametrize("text,needle", SECRET_SHAPES, ids=SHAPE_IDS)
+def test_emitter_redacts_every_secret_shape_from_log_tails_whole_line(text, needle):
+    out = events.redact_log_tail(f"before\n{text}\nafter", home="/home/me")
+    assert needle not in out and out.startswith("before") and out.endswith("after")
+    validate_fleet_rollout(RID, "host.step", {"rollout_id": RID, "ts": "2026-11-04T10:00:00+00:00", "seq": 0,
+                                              "host": "beast", "repo": "autospec", "status": "applying",
+                                              "log_tail": out})
+
+
+def test_a_matching_header_name_redacts_the_value_too():
+    assert events.redact_log_tail("authorization: basic dXNlcjpwYXNz", home="/h") == "[redacted line]"
+    assert "dXNl" not in events.redact_log_tail("Authorization: Basic dXNlcjpwYXNz", home="/h")
+
+
+@pytest.mark.parametrize("text,_needle", SECRET_SHAPES, ids=SHAPE_IDS)
+def test_emitter_drops_pr_titles_with_secret_shapes(text, _needle):
+    assert events.clean_pr_title(text) is None
+    assert events.clean_pr_title(f"fix {text} now") is None
+
+
+def test_emitter_refuses_check_names_with_secret_shapes(tmp_path):
+    em = events.Emitter(tmp_path, client=None)
+    with pytest.raises(ValueError, match="check name"):
+        em.emit(RID, "host.finished", host="beast", repo="autospec", status="ok",
+                checks=[{"name": "https://user:pw@example.com/x", "ok": True}])
+    assert em.pending() == []
+
+
+def test_through_a_real_post_no_credential_shape_is_readable_back(tmp_path, live):
+    repo, base = live
+    em = events.Emitter(tmp_path, client=MetadataClient(base), home="/home/me")
+    em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS)
+    em.emit(RID, "host.finished", host="beast", repo="autospec", status="failed", reason="apply_failed",
+            log_tail="\n".join(t for t, _ in SECRET_SHAPES))
+    assert em.pending() == []
+    body = json.dumps(get(base, f"/api/v1/fleet-rollouts/{RID}"))
+    for _, needle in SECRET_SHAPES:
+        assert needle not in body, needle
+
+
+# --------------------------------------------------------------------------- seq never reused
+
+def seqs_of(em):
+    return [e["payload"]["seq"] for e in em.pending()]
+
+
+def test_seq_continues_after_seq_json_is_deleted(tmp_path):
+    em = events.Emitter(tmp_path, client=None)
+    for _ in range(3):
+        em.emit(RID, "rollout.started", targets=TARGETS)
+    for name in ("seq.json", "seq.json.bak"):
+        (tmp_path / name).unlink(missing_ok=True)
+    events.Emitter(tmp_path, client=None).emit(RID, "rollout.halted", halted_at_host="bender", reason="health_failed")
+    assert seqs_of(em) == [0, 1, 2, 3]
+
+
+def test_seq_continues_after_seq_json_is_corrupted(tmp_path):
+    em = events.Emitter(tmp_path, client=None)
+    for _ in range(2):
+        em.emit(RID, "rollout.started", targets=TARGETS)
+    for name in ("seq.json", "seq.json.bak"):
+        (tmp_path / name).write_text("{not json")
+    em.emit(RID, "rollout.succeeded")
+    assert seqs_of(em) == [0, 1, 2]
+
+
+def test_seq_accounts_for_parked_events_and_the_backup(tmp_path, live):
+    repo, base = live
+    em = events.Emitter(tmp_path, client=MetadataClient(base))
+    em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS)
+    em.emit(RID, "rollout.planned", trigger=TRIGGER, targets=TARGETS)
+    assert em.pending() == []                                        # everything delivered and trimmed
+    (tmp_path / "seq.json").unlink()                                 # the backup still knows
+    em.emit(RID, "rollout.started", targets=TARGETS)
+    assert [e["payload"]["seq"] for e in repo.stream("fleet_rollout", RID)] == [0, 1, 2]
+    # parked events count too
+    with (tmp_path / "outbox.rejected.jsonl").open("a") as f:
+        f.write(json.dumps({"reason": "x", "line": json.dumps({"entity_id": RID, "payload": {"seq": 40}})}) + "\n")
+    for name in ("seq.json", "seq.json.bak"):
+        (tmp_path / name).unlink(missing_ok=True)
+    assert events.Emitter(tmp_path, client=None).emit(RID, "rollout.succeeded")["payload"]["seq"] == 41
+
+
+def test_a_failed_seq_write_queues_nothing_and_reuses_no_seq(tmp_path):
+    em = events.Emitter(tmp_path, client=None)
+    em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS)
+    blocker = tmp_path / "seq.json.tmp"
+    blocker.mkdir()                                                  # the atomic write cannot open its temp file
+    with pytest.raises(OSError):
+        em.emit(RID, "rollout.halted", halted_at_host="bender", reason="health_failed")
+    assert seqs_of(em) == [0]                                        # nothing half-queued
+    blocker.rmdir()
+    em.emit(RID, "rollout.halted", halted_at_host="bender", reason="health_failed")
+    assert seqs_of(em) == [0, 1]
+
+
+def test_a_failed_outbox_append_burns_the_seq_but_never_reuses_it(tmp_path):
+    em = events.Emitter(tmp_path, client=None)
+    em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS)
+    saved = (tmp_path / "outbox.jsonl").read_bytes()
+    (tmp_path / "outbox.jsonl").unlink()
+    (tmp_path / "outbox.jsonl").mkdir()                              # the append fails after seq was reserved
+    with pytest.raises(OSError):
+        em.emit(RID, "rollout.started", targets=TARGETS)
+    (tmp_path / "outbox.jsonl").rmdir()
+    (tmp_path / "outbox.jsonl").write_bytes(saved)
+    em.emit(RID, "rollout.halted", halted_at_host="bender", reason="health_failed")
+    assert seqs_of(em) == [0, 2]                                     # a gap is harmless, a duplicate would lose events
+
+
+# --------------------------------------------------------------------------- bounded growth
+
+def test_a_full_outbox_parks_the_oldest_and_counts_the_drop(tmp_path):
+    em = events.Emitter(tmp_path, client=None, max_pending=3)
+    for _ in range(5):
+        em.emit(RID, "rollout.started", targets=TARGETS)
+    assert seqs_of(em) == [2, 3, 4]
+    assert em.dropped() == 2
+    parked = (tmp_path / "outbox.rejected.jsonl").read_text()
+    assert parked.count("outbox full") == 2                          # visible, not silent
+    assert events.Emitter(tmp_path, client=None).dropped() == 2      # persisted
+
+
+def test_the_rejected_file_rotates(tmp_path):
+    em = events.Emitter(tmp_path, client=None, max_pending=1, max_rejected_bytes=2000)
+    for _ in range(40):
+        em.emit(RID, "rollout.started", targets=TARGETS)
+    assert (tmp_path / "outbox.rejected.jsonl").stat().st_size <= 2000 + 1500
+    assert (tmp_path / "outbox.rejected.jsonl.1").exists()
+    assert not (tmp_path / "outbox.rejected.jsonl.2").exists()
+
+
+def test_old_idle_seq_entries_are_pruned_but_active_ones_stay(tmp_path):
+    from datetime import UTC, datetime, timedelta
+    clock = {"now": datetime(2026, 11, 4, tzinfo=UTC)}
+    em = events.Emitter(tmp_path, client=None, clock=lambda: clock["now"])
+    old = plan.rollout_id({"autospec": "d" * 40})
+    em.emit(old, "rollout.started", targets=TARGETS)
+    clock["now"] += timedelta(days=29)
+    em.emit(RID, "rollout.started", targets=TARGETS)
+    assert set(json.loads((tmp_path / "seq.json").read_text())) == {old, RID}
+    clock["now"] += timedelta(days=2)                                # `old` is now 31 days idle
+    em.emit(RID, "rollout.succeeded")
+    assert set(json.loads((tmp_path / "seq.json").read_text())) == {RID}
+
+
+def test_status_reports_dropped(tmp_path):
+    state_dir = tmp_path / "state" / "herdr-engineering" / "fleet-watch"
+    em = events.Emitter(state_dir, client=None, max_pending=1)
+    em.emit(RID, "rollout.started", targets=TARGETS)
+    em.emit(RID, "rollout.succeeded")
+    out = run_cli(tmp_path, "outbox", "status", "--json")
+    assert json.loads(out.stdout)["dropped"] == 1
+
+
+# --------------------------------------------------------------------------- flush does not block emitters; 200 not ok parks
+
+def test_emit_is_not_blocked_while_a_flush_is_waiting_on_the_network(tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    started, release = threading.Event(), threading.Event()
+
+    class Slow(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            started.set()
+            release.wait(20)
+            body = json.dumps({"ok": True, "entity": {"entity_id": RID}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        em = events.Emitter(tmp_path, client=MetadataClient(f"http://127.0.0.1:{httpd.server_address[1]}"))
+        em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS, flush=False)
+        flusher = threading.Thread(target=em.flush, daemon=True)
+        flusher.start()
+        assert started.wait(10)
+        done = threading.Event()
+        late = threading.Thread(target=lambda: (em.emit(RID, "rollout.started", targets=TARGETS, flush=False), done.set()),
+                                daemon=True)
+        late.start()
+        assert done.wait(5), "emit blocked behind a flush that is waiting on the network"
+        release.set()
+        flusher.join(10)
+        assert seqs_of(em) == [1]                                    # the late event survived the flush's trim
+    finally:
+        release.set()
+        httpd.shutdown()
+
+
+def test_a_200_that_is_not_ok_is_parked_and_does_not_block_the_queue(tmp_path, live):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    repo, base = live
+
+    class NotOk(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = b'{"ok": false}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), NotOk)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        em = events.Emitter(tmp_path, client=MetadataClient(f"http://127.0.0.1:{httpd.server_address[1]}"))
+        em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS, flush=False)
+        result = em.flush()
+        assert (result["sent"], result["rejected"], result["pending"], result["error"]) == (0, 1, 0, None)
+        assert "not accepted" in (tmp_path / "outbox.rejected.jsonl").read_text()
+    finally:
+        httpd.shutdown()
