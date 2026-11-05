@@ -160,3 +160,84 @@ test('G4: an invalid stored zone is ignored and a blocked localStorage still ren
  await until(async()=>/week starts Saturday/i.test(await page.locator(card).innerText()),'saturday applied without storage');
  assert.deepEqual(errors,[]);
 }));
+
+// ---- G5: expansion, filter chips, row details ----
+const manyApi={...API,'/api/v1/mission-activity':{activities:[
+ ...Array.from({length:8},(_,i)=>projection(`G${i}`,`Calm ${i}`)),
+ projection('STUCK','Stuck one',{activity:{health:'blocked'}}),
+ projection('OLD','Old report',{freshness:{state:'stale',age_seconds:9000},activity_snapshot_at:'2025-12-31T20:00:00Z'})]}};
+const g5=withFlag(p=>manyApi[p]??rawHandler(p));
+const rowsIn=(page,group)=>page.locator(`${card} ul[aria-label="${group} work"] .wk-row`);
+test('G5: Show all / Show fewer expands one group past the cap, by keyboard, and keeps focus',async()=>withPage(async(page,base)=>{
+ await boot(page,base,'/overview',g5);
+ await rowsIn(page,'Active').first().waitFor({timeout:8000});
+ assert.equal(await rowsIn(page,'Active').count(),5);
+ const more=page.locator(`${card} [data-week-more="active"]`);
+ assert.equal(await more.getAttribute('aria-expanded'),'false');
+ const headline=await page.locator(`${card} .wk-metrics`).innerText();
+ await more.focus();await page.keyboard.press('Enter');
+ await until(async()=>(await rowsIn(page,'Active').count())>5,'expanded');
+ assert.equal(await rowsIn(page,'Active').count(),11,'8 calm + 1 stuck + 2 sessions');
+ const again=page.locator(`${card} [data-week-more="active"]`);
+ assert.equal(await again.getAttribute('aria-expanded'),'true');
+ assert.equal(await again.innerText(),'Show fewer');
+ assert.equal(await again.evaluate(el=>el===document.activeElement),true,'focus stays on the toggle');
+ assert.equal(await page.locator(`${card} .wk-metrics`).innerText(),headline,'headline counts unchanged');
+ await page.keyboard.press('Space');
+ await until(async()=>(await rowsIn(page,'Active').count())===5,'collapsed');
+}));
+test('G5: filter chips narrow rows, are aria-pressed, never change the counts, and keep Unconfirmed rows',async()=>withPage(async(page,base)=>{
+ await boot(page,base,'/overview',g5);
+ await rowsIn(page,'Active').first().waitFor({timeout:8000});
+ const headline=await page.locator(`${card} .wk-metrics`).innerText();
+ const chip=page.locator(`${card} [data-week-filter="attention"]`);
+ assert.equal(await chip.getAttribute('aria-pressed'),'false');
+ await chip.focus();await page.keyboard.press('Enter');
+ await until(async()=>(await rowsIn(page,'Active').count())===1,'filtered to attention');
+ assert.match(await rowsIn(page,'Active').first().innerText(),/Stuck one/);
+ assert.equal(await page.locator(`${card} [data-week-filter="attention"]`).getAttribute('aria-pressed'),'true');
+ assert.equal(await page.locator(`${card} [data-week-filter="attention"]`).evaluate(el=>el===document.activeElement),true,'focus kept');
+ assert.equal(await page.locator(`${card} .wk-metrics`).innerText(),headline);
+ assert.equal(await rowsIn(page,'Unconfirmed').count(),2,'both unconfirmed rows (stale report + recorded-only mission) still listed');
+ assert.match(await page.locator(`${card} .wk-filter-note`).innerText(),/Unconfirmed work is always listed/);
+ assert.equal(await page.locator(`${card} [data-week-more]`).count(),0,'no expand button for a short filtered list');
+ await page.keyboard.press('Space');
+ await until(async()=>(await rowsIn(page,'Active').count())===5,'filter cleared');
+ await page.locator(`${card} [data-week-filter="paused"]`).click();
+ await until(async()=>/No listed work matches this filter/.test(await page.locator(card).innerText()),'empty filter message');
+ assert.equal(await page.locator(`${card} .wk-metrics`).innerText(),headline);
+}));
+test('G5: row details open by button with only existing fields and verified links',async()=>withPage(async(page,base)=>{
+ await boot(page,base,'/overview',g5);
+ await rowsIn(page,'Active').first().waitFor({timeout:8000});
+ const row=page.locator(`${card} .wk-row`,{hasText:'Stuck one'});
+ const btn=row.locator('[data-week-detail]');
+ assert.equal(await btn.getAttribute('aria-expanded'),'false');
+ await btn.focus();await page.keyboard.press('Enter');
+ const d=row.locator('dl.wk-details');
+ await d.waitFor({timeout:4000});
+ assert.equal(await row.locator('[data-week-detail]').getAttribute('aria-expanded'),'true');
+ const t=await d.innerText();
+ assert.match(t,/Status\s+blocked/);assert.match(t,/Coverage\s+complete/);assert.match(t,/Evidence/);
+ assert.doesNotMatch(t,/Next action|Repository|Owner/i);
+ assert.equal(await d.locator('a[href^="#/missions/"]').count(),1);
+ assert.equal(await row.locator('[data-week-detail]').evaluate(el=>el===document.activeElement),true);
+ await page.keyboard.press('Enter');
+ await until(async()=>(await row.locator('dl.wk-details').count())===0,'details closed');
+}));
+test('G5: narrow viewport has no horizontal scroll with chips, expansion and details open',async()=>withPage(async(page,base)=>{
+ await boot(page,base,'/overview',g5);
+ await rowsIn(page,'Active').first().waitFor({timeout:8000});
+ await page.setViewportSize({width:360,height:800});
+ await page.locator(`${card} [data-week-more="active"]`).click();
+ await page.locator(`${card} [data-week-detail]`).first().click();
+ await sleep(100);
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,'no horizontal scroll at 360px');
+ await page.locator(card).screenshot({path:path.join(shots,'wc-g5-overview-week-expanded-mobile.png')});
+}));
+test('G5: flag off shows no card, chips or details',async()=>withPage(async(page,base)=>{
+ await boot(page,base,'/overview',withFlag(p=>manyApi[p]??rawHandler(p),false));
+ await sleep(500);
+ assert.equal(await page.locator('[data-week-filter],[data-week-more],[data-week-detail]').count(),0);
+ assert.equal(await page.locator(card).count(),0);
+}));

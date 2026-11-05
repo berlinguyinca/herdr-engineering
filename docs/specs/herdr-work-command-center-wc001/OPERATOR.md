@@ -26,7 +26,10 @@ Status: code complete on branch `feat/wc001-s6-validation-rollout`; **nothing is
 - **Unconfirmed** group: the report is stale, disconnected or only recorded, so the state may have changed.
 - **Progress bar**: only appears when the mission reports measured evidence (acceptance criteria, else weighted DAG), through the existing `measuredProgress`. An agent finishing never completes its mission and never produces a bar or a 100%.
 - A mission with many agents is one row; an agent without a provable mission is its own row marked as not linked.
-- The card shows at most 5 rows per group ("Showing 5 of N").
+- The card lists at most 5 rows per group; a **Show all N** button (aria-expanded) lists the rest and **Show fewer** restores the cap (G5, per group, kept only until the page is reloaded).
+- **Filter chips (G5)**: Started, Finished, Open, Paused, Needs attention (aria-pressed buttons; press again to clear). A chip only chooses which rows are listed, using the same rules as the matching headline count. It never changes the five headline counts, the coverage badges or the partial banner. The **Unconfirmed** group is never filtered out (its state is unknown, so no metric can exclude it) and the card says so while a filter is on. Started/Finished chips list only rows that carry their own recorded timestamp in the week, so they can list fewer rows than the headline when that count comes from stored history.
+- **Row details (G5)**: each row has a Details button (aria-expanded) showing only fields the work summary already has: status, coverage, started/finished/updated times in the chosen zone (only those that exist), evidence entries with their times, and links to the Herdr mission detail and session pages. If a verified pane is recorded it points to the session page's copy-command Terminal button; the browser never opens a terminal.
+- No repository filter: work summaries carry no repository field and Herdr does not infer one.
 
 ## Known gaps
 - Weekly history (G1): `GET /api/v1/work/weekly-events?since=&until=&limit=&after=` reads the in-memory event streams (same source and auth as `/api/v1/events`; 404 when the flag is off; max 31-day span, limit max 500). It cannot prove completeness: start events are written when the control plane first sees the work (not the true start), the durable Postgres sink is best-effort and not retried, and work that never ends has no finish event. So `coverage.complete` is always false here, Started/Finished stay "at least N (partial)", and the banner stays visible. Quota-paused history is not emitted by any Python code, so no paused_quota events exist yet.
@@ -37,7 +40,7 @@ Status: code complete on branch `feat/wc001-s6-validation-rollout`; **nothing is
 - Saved Overview layouts place This week last (new cards append to a saved order) until the user moves it.
 - Two recorded missions that share one id and no source are keyed together by the existing mission catalog; a Work context link to such a mission is labelled "not fully confirmed" rather than hidden.
 - No next-action field and no issue/PR link inside the Work context header (no verified source exists).
-- Filter chips and expanded row details from the UX reference are not built.
+- Expansion, filter and details state (G5) is in memory per page only; a reload resets it. No repository filter until the work summary carries a repository (see handoffs/G5.md).
 
 ## Observed production coverage
 None. Nothing has run against production data. After enabling, check the card on the real Overview: the Unconfirmed group and the partial banner show how much of the fleet reports current data, and the count of rows vs `Agents`/`Current missions` shows how many agents are not linked to a mission.

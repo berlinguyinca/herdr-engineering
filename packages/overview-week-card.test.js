@@ -246,3 +246,9 @@ test('G5: hostile ids and titles stay escaped in details', () => {
   const html = render({projections: [projection('pi:X', '<b onmouseover=1>t</b>')], weekDetails: ['mission:pi:X']});
   assert.doesNotMatch(html, /<b onmouseover/);
 });
+test('G5: the no-match message also shows when only Unconfirmed rows remain', () => {
+  const stale = projection('pi:S', 'Old report', {freshness: {state: 'stale', age_seconds: 9000}, activity_snapshot_at: iso(now - 9000e3)});
+  const html = render({projections: [projection('pi:A', 'Calm'), stale], weekFilter: 'paused'});
+  assert.match(html, /No listed work matches this filter/);
+  assert.match(html, /Old report/);
+});
