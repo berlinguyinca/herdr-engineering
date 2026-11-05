@@ -57,12 +57,12 @@ def share_settings(**limits):
     return {**share_settings_config(None, public_url=PUBLIC_URL), "member_share_limits": limits}
 
 
-def srun(pg, tmp_path, body, *, settings=None, defaults=None, shares=True, clock=None):
+def srun(pg, tmp_path, body, *, settings=None, defaults=None, shares=True, clock=None, **runtime_kw):
     clock = clock or Clock()
     runtime = MemberRuntime(
         outbox=tmp_path / "outbox", mirror_root=tmp_path / "mirror", group="lab", enabled=True,
         defaults=defaults or {}, shares_root=tmp_path / "shares" if shares else None, clock=clock,
-        share_settings=(settings or share_settings()) if shares else None)
+        share_settings=(settings or share_settings()) if shares else None, **runtime_kw)
 
     async def go(env):
         await sql(env, "TRUNCATE artifacts, artifact_acl, artifact_shares, artifact_member_usage, artifact_member_events,"

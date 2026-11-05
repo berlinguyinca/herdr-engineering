@@ -44,6 +44,8 @@ log = logging.getLogger(__name__)
 
 SUMMARY_FILES = 50
 SECRET_DIR_MODE = 0o700
+SECRET_DIR_MODE_SHARED = 0o770   # group write: the reader unlinks the file it has read
+SECRET_FILE_MODE_SHARED = 0o640
 
 
 class _LoopCall:
@@ -228,8 +230,11 @@ async def handle_share_approve(ctx: IntentContext, intent: Intent) -> dict:
     secret = json.dumps({"ticket": intent.ticket, "principal": who.principal, "url": url,
                          "at": rt.clock()}).encode("utf-8")
     try:
+        shared = rt.secret_gid is not None      # collab-public (another uid) reads and unlinks it through the group
         written = await asyncio.to_thread(link_new_beneath, rt.outbox, [SECRETS_DIR], intent.ticket + ".json", secret,
-                                          mode=rt.secret_mode, create_dirs=True, dir_mode=SECRET_DIR_MODE)
+                                          mode=SECRET_FILE_MODE_SHARED if shared else rt.secret_mode, create_dirs=True,
+                                          dir_mode=SECRET_DIR_MODE_SHARED if shared else SECRET_DIR_MODE,
+                                          gid=rt.secret_gid)
         if not written:
             raise OSError("the secret result already exists")
     except (BridgeError, OSError):      # a live link nobody can receive is worse than none

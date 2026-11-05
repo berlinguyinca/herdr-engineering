@@ -211,3 +211,124 @@ def test_the_member_host_may_not_be_the_mcp_host_even_with_share_disabled(tmp_pa
 def test_an_ip_literal_is_not_a_public_host(tmp_path, bad):
     with pytest.raises(FleetConfigError, match="public_host"):
         fcc.share_values(cfg_of(tmp_path, sh=share(public_host=bad)))
+
+
+# ---------------------------------------------------------------------------- Task 13: the artifacts host on the edge
+
+EDGE_DIR = ROOT / "deploy" / "control-plane" / "collab-edge"
+
+
+def _edge(**kw):
+    return fcc.render_edge_conf((EDGE_DIR / "nginx.conf").read_text(), snippets_dir=EDGE_DIR, **kw)
+
+
+def _block(text, header):
+    """The brace-balanced block that starts at ``header`` (a line prefix, or an index), as text."""
+    start = header if isinstance(header, int) else text.index(header)
+    depth, i = 0, text.index("{", start)
+    while True:
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        if depth == 0:
+            return text[start:i + 1]
+        i += 1
+
+
+def _server(text, name):
+    at = text.index(f"server_name {name};")
+    return _block(text, text.rfind("  server {", 0, at))
+
+
+def test_without_a_public_host_the_edge_is_the_template_byte_for_byte():
+    template = (EDGE_DIR / "nginx.conf").read_text()
+    assert _edge(share=False) == template
+
+
+def test_with_a_public_host_exactly_one_server_name_is_added():
+    off = _edge(share=False)
+    on = _edge(share=True, share_host=HOST, members=True)
+    assert on.count("server_name ") == off.count("server_name ") + 1
+    assert on.count(f"server_name {HOST};") == 1
+
+
+def test_the_old_host_has_no_share_location_and_the_mcp_host_keeps_mcp():
+    on = _edge(share=True, share_host=HOST, members=True)
+    mcp_servers = [s for s in (_server(on, n) for n in _server_names(on) if n != HOST)]
+    assert mcp_servers
+    for s in mcp_servers:
+        assert "/s/" not in s
+    assert any("location = /mcp" in s for s in mcp_servers)
+    artifacts = _server(on, HOST)
+    assert "/mcp" not in artifacts and "/a2a" not in artifacts and "/api/v1/collab" not in artifacts
+
+
+def _server_names(text):
+    import re
+    return re.findall(r"^\s+server_name ([^;]+);", text, re.M)
+
+
+def test_the_artifacts_host_locations_limits_and_logs():
+    on = _edge(share=True, share_host=HOST, members=True)
+    s = _server(on, HOST)
+    for loc in ("location /s/ {", "location /api/member/ {", "location = / {", "location /my/ {",
+                "location / { return 404; }"):
+        assert loc in s
+    api = _block(s, "    location /api/member/ {")
+    run = _block(api, '      location ~ "^/api/member/artifacts/')
+    # only the run upload is large and streamed; everything else under the API is 1 MiB and buffered
+    assert "client_max_body_size 17m;" in run and "proxy_request_buffering off;" in run
+    assert "client_max_body_size 1m;" in api.replace(run, "") and "17m" not in api.replace(run, "")
+    assert "proxy_request_buffering off" not in api.replace(run, "")
+    assert "PUT" in run
+    # no access log where the token or the session travels
+    for block in (_block(s, "    location /s/ {"), api.replace(run, ""), run, _block(s, "    location /my/ {"),
+                  _block(s, "    location = / {")):
+        assert "access_log off;" in block
+    # its own request and connection zones, not the share ones
+    assert "zone=member_req" in api and "limit_conn member_conn" in api
+    assert "zone=member_req" in run and "limit_conn member_conn" in run
+    assert "limit_req_zone $remote_addr zone=member_req:" in on and "limit_conn_zone $remote_addr zone=member_conn:" in on
+    # framing and HSTS reach the browser from the API and the page
+    for block in (api, _block(s, "    location /my/ {"), _block(s, "    location = / {")):
+        assert "proxy_hide_header X-Frame-Options;" in block and 'add_header X-Frame-Options "DENY" always;' in block
+        assert 'add_header Strict-Transport-Security "max-age=31536000" always;' in block
+
+
+def test_member_zones_exist_only_with_members_and_the_share_listener_deny_is_unchanged():
+    off = _edge(share=True, share_host=HOST, members=False)
+    on = _edge(share=True, share_host=HOST, members=True)
+    assert "member_req" not in off and "member_conn" not in off and "/api/member/" not in off
+    # the operator listener (the share network is refused there) is identical in every rendering
+    deny = [line for line in (EDGE_DIR / "nginx.conf").read_text().splitlines() if "deny" in line]
+    assert deny
+    for text in (off, on):
+        for line in deny:
+            assert line in text.splitlines()
+    assert on.count("deny ") == off.count("deny ") == (EDGE_DIR / "nginx.conf").read_text().count("deny ")
+
+
+def _docker_nginx():
+    import shutil
+    import subprocess
+    if not shutil.which("docker"):
+        return None
+    for image in ("nginx:1.29-alpine", "nginx:alpine"):
+        if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode == 0:
+            return image
+    return None
+
+
+@pytest.mark.skipif(_docker_nginx() is None, reason="no docker nginx image: nginx -t not run")
+@pytest.mark.parametrize("members", [False, True])
+def test_the_rendered_edge_passes_nginx_t(tmp_path, members):
+    import subprocess
+    (tmp_path / "acme").mkdir()
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(tmp_path / "acme/privkey.pem"),
+                    "-out", str(tmp_path / "acme/fullchain.pem"), "-days", "1", "-subj", "/CN=t"],
+                   check=True, capture_output=True)
+    (tmp_path / "nginx.conf").write_text(_edge(share=True, share_host=HOST, members=members))
+    out = subprocess.run(["docker", "run", "--rm", "--add-host", "collab-public:127.0.0.1", "--add-host",
+                          "share-public:127.0.0.1", "-v", f"{tmp_path}/nginx.conf:/etc/nginx/nginx.conf:ro",
+                          "-v", f"{tmp_path}/acme:/etc/acme:ro", _docker_nginx(), "nginx", "-t"],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "test is successful" in out.stderr

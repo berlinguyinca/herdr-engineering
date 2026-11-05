@@ -39,7 +39,7 @@ HOST_RE: Final = re.compile(r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?
 
 TOP_KEYS: Final = frozenset({"enabled", "group", "session_secret", "groups_ttl", "removed_grace", "max_artifact_bytes",
                              "max_member_bytes", "max_artifacts", "share_limits", "share_creates_per_hour",
-                             "request_limits", "rate_limits", "staging", "public_host", "session_seconds"})
+                             "request_limits", "rate_limits", "staging", "public_host", "session_seconds", "secrets_gid"})
 REQUEST_KEYS: Final = frozenset({"http_chunks_per_request", "max_publish_files", "max_message_chars",
                                  "max_upload_bytes", "result_wait_seconds"})
 RATE_KEYS: Final = frozenset({"chunks_per_minute", "writes_per_minute", "session_exchanges_per_minute"})
@@ -182,6 +182,9 @@ def parse_members(raw: object, *, public_host: object = None, session_seconds: o
     limits = _limits(raw, per_hour)
     if not on:
         return None
-    return {"group": group, "groups_ttl": float(ttl), "removed_grace": float(grace), "defaults": defaults,
+    gid = raw.get("secrets_gid")
+    if gid is not None and (isinstance(gid, bool) or not isinstance(gid, int) or gid < 0):
+        raise ValueError(f"{WHERE}.secrets_gid must be a non-negative integer (the collab-public group id) or null")
+    return {"secrets_gid": gid, "group": group, "groups_ttl": float(ttl), "removed_grace": float(grace), "defaults": defaults,
             "share_limits": dict(share_limits), "share_creates_per_hour": per_hour, "session_seconds": seconds,
             "session_secret": secret, "public_host": host, "limits": limits}

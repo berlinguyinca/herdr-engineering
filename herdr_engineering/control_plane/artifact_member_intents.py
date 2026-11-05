@@ -115,7 +115,8 @@ class MemberRuntime:
     clock: Callable[[], float]
     removed_grace: float = 3600.0      # seconds a member must be continuously listed ``removed`` before anything is revoked
     share_settings: Mapping[str, Any] | None = None   # ``share_settings_config`` plus ``member_share_limits``; None = off
-    secret_mode: int = 0o600           # file mode of a secret result (the deployment may need a group-readable one)
+    secret_mode: int = 0o600           # file mode of a secret result when ``secret_gid`` is None
+    secret_gid: int | None = None      # group of collab-public: the secret dir becomes 0770 and the file 0640 in it
 
 
 # ----------------------------------------------------------------------------- payloads

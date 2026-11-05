@@ -4494,6 +4494,15 @@ def _collab_member_kwargs(cp, *, state_dir=None) -> dict:
     return out
 
 
+def _secrets_gid(got) -> int | None:
+    """The group that may read and delete member share secrets: ``members.secrets_gid``, else the group of the
+    collab-public container (compose runs it as ``HERDR_COLLAB_CERT_UID:HERDR_COLLAB_CERT_UID``); None = root-private."""
+    if got["secrets_gid"] is not None:
+        return got["secrets_gid"]
+    raw = os.environ.get("HERDR_COLLAB_CERT_UID", "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
 def _members_runtime(cp, settings: CollabArtifactsSettings):
     """The worker's ``MemberRuntime`` (None when members are off). ``shares_root`` is the share bundle directory only
     when ``control_plane.share`` is enabled; without it only share rows are revoked."""
@@ -4517,7 +4526,7 @@ def _members_runtime(cp, settings: CollabArtifactsSettings):
     return MemberRuntime(outbox=settings.outbox_dir, mirror_root=settings.mirror_dir, group=got["group"], enabled=True,
                          defaults=got["defaults"], removed_grace=got["removed_grace"],
                          shares_root=Path(share["shares_dir"]) if share["enabled"] else None,
-                         share_settings=share_settings, clock=time.time)
+                         share_settings=share_settings, clock=time.time, secret_gid=_secrets_gid(got))
 
 
 def _task_lease(args, cp):

@@ -473,6 +473,11 @@ EDGE_SHARE_HOST_MARKER = "@share_host@"
 
 EDGE_MEMBER_MARKER = "    # @member-locations@\n"
 EDGE_MEMBER_SNIPPET = "member-http.conf"
+EDGE_MEMBER_ZONES_MARKER = "  # @member-zones@\n"
+EDGE_MEMBER_ZONES = (
+    "  # The member web UI and API: their own zones (the share zones are for /s/).\n"
+    "  limit_req_zone $remote_addr zone=member_req:10m rate=10r/s;\n"
+    "  limit_conn_zone $remote_addr zone=member_conn:10m;\n")
 
 
 def render_edge_conf(template: str, *, share: bool, share_host: str | None = None,
@@ -497,6 +502,9 @@ def render_edge_conf(template: str, *, share: bool, share_host: str | None = Non
     if snippet.count(EDGE_MEMBER_MARKER) != 1:
         raise FleetConfigError(f"{EDGE_SHARE_SNIPPET} must hold the marker line {EDGE_MEMBER_MARKER.strip()!r} once")
     member = (base / EDGE_MEMBER_SNIPPET).read_text(encoding="utf-8") if members else ""
+    if snippet.count(EDGE_MEMBER_ZONES_MARKER) != 1:
+        raise FleetConfigError(f"{EDGE_SHARE_SNIPPET} must hold the marker line {EDGE_MEMBER_ZONES_MARKER.strip()!r} once")
+    snippet = snippet.replace(EDGE_MEMBER_ZONES_MARKER, EDGE_MEMBER_ZONES if members else "")
     snippet = snippet.replace(EDGE_MEMBER_MARKER, member)      # members off: the share host serves /s/ and nothing else
     return template.replace(EDGE_SHARE_MARKER, snippet)
 

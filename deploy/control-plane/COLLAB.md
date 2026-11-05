@@ -152,6 +152,65 @@ links need no Cognito change. Keep the previous host's `/s/callback` registered 
 rollback to the previous release signs in there. Existing links on the old host stop working at the cutover
 (re-issue them); see docs/operations/collaboration-network.md.
 
+## Member artifacts (`artifacts.metabolomics.us`)
+
+Members (the Cognito group `control_plane.collab.members.group`) own artifacts, upload and publish them in the
+browser, and can create public or lab share links for them. One host, `control_plane.share.public_host`, serves it all:
+`/s/` (share-public, as above), `/api/member/` and the member page `/` and `/my/` (collab-public). Off unless
+`share.public_host` is set; the member locations also need `control_plane.collab.members.enabled: true`.
+
+```
+edge (nginx, server_name <public_host>): /s/ -> share-public:8083
+                                         /api/member/, /, /my/ -> collab-public:8081 (own zones member_req / member_conn)
+```
+
+- Edge: `collab-edge/member-http.conf` is spliced into the host's server only when members are enabled, and its two
+  zones (`member_req` 10 r/s, `member_conn`) into the http block. `PUT /api/member/artifacts/<id>/uploads/<id>/runs/<n>`
+  alone gets `client_max_body_size 17m` and `proxy_request_buffering off` (32 chunks x 512 KiB + slack); everything
+  else under `/api/member/` is 1 MiB. No access log on `/s/` and `/api/member/` (tokens and the session exchange).
+  `X-Frame-Options: DENY` and HSTS are set by the edge (the app's copy is hidden so it is sent once); the page's CSP is
+  the app's. The MCP host serves no `/s/` and the new host serves no `/mcp`.
+- Operator steps, **not done by `deploy.sh`**:
+  1. DNS: `artifacts.metabolomics.us` to the public edge.
+  2. Add the hostname to cubert's SNI stream edge (`networking/cubert-ansible`, stream map to the collab edge backend)
+     and run its playbook.
+  3. Certificate: the collab edge's ACME lineage must name the new host (`certbot certonly --cert-name ... --expand
+     -d <existing names> -d artifacts.metabolomics.us`); `deploy.sh` refuses a certificate that does not.
+  4. Cognito: add `https://artifacts.metabolomics.us/s/callback` AND `https://artifacts.metabolomics.us/my/callback` to
+     both CallbackURLs and LogoutURLs of the `herdr-collab-web` app client (`describe-user-pool-client`, send every
+     existing attribute back with the new URLs added: `update-user-pool-client` replaces the whole client). Changing
+     `public_host` later means registering both callbacks on the new host first; keep the old host's until verified.
+  5. Fleet YAML: set `share.public_host`, `collab.members.enabled: true`, `collab.members.group` and
+     `collab.members.session_secret` (`openssl rand -hex 32`, pasted in; never committed, printed or passed as a flag).
+  6. Verify: `curl -s https://artifacts.metabolomics.us/api/member/config` returns 200, then a sign-in round-trip at
+     `/`. Run `deploy/control-plane/member-secret-smoke.sh /tmp <collab-public-uid>` as root on the worker host once.
+  7. Rollback: remove `public_host` / `members.enabled` and redeploy (the edge returns to the share-only server or
+     the previous conf; rows, blobs and bundles stay). Members' public links stop with the host.
+- Secret hand-off between uids (important): the worker (root) writes the read-once share URL to
+  `<outbox>/secrets/<ticket>.json` and collab-public (uid `HERDR_COLLAB_CERT_UID`) reads and deletes it. The worker
+  therefore sets that directory to group `members.secrets_gid` (default: `HERDR_COLLAB_CERT_UID` of the worker's
+  environment, compose runs collab-public as `uid:uid`), mode 0770, files 0640; others get nothing. Without a gid it
+  stays root-only 0700/0600 and approving a share goes live but the member sees `already_read`. Set
+  `secrets_gid` explicitly if the worker's environment does not carry the uid, and run the smoke script after a deploy.
+- Public links by members (D3): members can create public links to their artifacts. The operator sees them in the
+  Members panel and with `herdr-eng artifacts members links --audience public`; revoke there.
+- Limits and behaviours to know:
+  - The provenance banner on member links is best-effort: the page's own CSS/JS can hide it; the containment is the
+    sandbox CSP, opaque origin, group/expiry and revoke. Public links get the bar on HTML only.
+  - Member HTML is capped at 2 MiB; svg, pdf, xhtml and xml are refused for member links, and HTML whose markup
+    cannot be proven to render the bar (for example scripts containing `a <!b`, or content before `<body>` beyond
+    head elements) is refused rather than labelled.
+  - The operator-API approve path shows the user id, not the display name; the member web path shows the name.
+  - Removing a member from the group takes effect after the claim TTL (`members.groups_ttl`, 24 h) and then a grace
+    (`members.removed_grace`, default 3600 s of continuous removed observation) before their shares are revoked.
+  - Orphan blobs left by conflicting publishes stay counted against the member's quota until an operator purge.
+  - Purge refuses held tombstones and tombstones without a purge date; it anonymises annotations, share events and
+    feedback of third parties (migrations 0048 and 0049; renumber at merge if another branch took the number).
+  - `share_creates_per_hour` (default 20) is counted per process in memory.
+- Verifying the rendered edge: `docker run --rm --add-host collab-public:127.0.0.1 --add-host share-public:127.0.0.1
+  -v <conf>:/etc/nginx/nginx.conf:ro -v <certdir>:/etc/acme:ro nginx:1.29-alpine nginx -t` (a test does this when
+  Docker is available).
+
 ## Artifact collaborator bridge (`control_plane.collab_artifacts`)
 
 External agents can read and commit to an artifact whose owner granted them access. Off unless
