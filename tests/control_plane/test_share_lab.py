@@ -707,3 +707,30 @@ def test_longest_values_fit_the_segment_and_regex():
     s = mint_session(SECRET, "shr-1", "a" * 128, NOW0 + 100, email="e" * 250 + "@b.c", basis="g")
     assert _SESSION_SEGMENT.fullmatch(s) and len(s) <= 768
     assert check_session(SECRET, "shr-1", s, NOW0)["identity"] == "a" * 128
+
+def test_modules_import_and_fail_clearly_without_cryptography():
+    """deploy.sh runs render-share on a host python and ``api`` imports share_public: neither may need the package at
+    import time; minting a session says what is missing and checking one fails closed."""
+    import subprocess
+    import sys
+    code = (
+        "import sys\n"
+        "class Block:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'cryptography' or name.startswith('cryptography.'):\n"
+        "            raise ImportError('blocked')\n"
+        "sys.meta_path.insert(0, Block())\n"
+        "import herdr_engineering.control_plane.api\n"
+        "from herdr_engineering.control_plane import share_session as ss\n"
+        "assert ss.MIN_SECRET_BYTES == 32\n"
+        "try:\n"
+        "    ss.mint_session(b'x' * 32, 'shr-1', 'alice', 2_000_000_000, email='a@b.co', basis='e')\n"
+        "except RuntimeError as e:\n"
+        "    assert 'cryptography' in str(e)\n"
+        "else:\n"
+        "    raise SystemExit('mint did not fail')\n"
+        "assert ss.check_session(b'x' * 32, 'shr-1', 'e.2000000000.' + 'A' * 550, 1.0) is None\n"
+        "print('ok')\n")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                         env={"PYTHONPATH": str(__import__("pathlib").Path(__file__).resolve().parents[2])})
+    assert out.returncode == 0 and out.stdout.strip() == "ok", out.stderr[-800:]

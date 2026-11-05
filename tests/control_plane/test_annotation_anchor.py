@@ -231,7 +231,8 @@ def test_ordinary_bidi_text_and_marks_are_still_accepted():
 
 
 INVISIBLE = [chr(c) for c in (0x80, 0x85, 0x9F, 0xAD, 0x2028, 0x2029, 0x2060, 0x2064, 0x206A, 0x206F, 0xFEFF, 0xFFF9, 0xFFFB,
-                              0xE0001, 0xE0041, 0xE007F, 0xE000, 0x0378)]
+                              0xE0001, 0xE0041, 0xE007F, 0xE000, 0x0378,
+                              0xE0100, 0xE01EF, 0x034F, 0x115F, 0x1160, 0x17B4, 0x3164, 0xFFA0, 0x2800)]
 
 
 @pytest.mark.parametrize("ch", INVISIBLE, ids=lambda c: f"U+{ord(c):04X}")
@@ -247,3 +248,7 @@ def test_joiners_and_directional_marks_are_still_accepted():
     for ok in ("‍", "‌", "‎", "‏", "؜"):
         assert clean_comment(f"a{ok}b") == f"a{ok}b"
     assert clean_comment("👨‍👩‍👧 family\n\tindented") == "👨‍👩‍👧 family\n\tindented"
+
+
+def test_emoji_variation_selector_is_still_accepted():
+    assert clean_comment("\u2764\ufe0f ok") == "\u2764\ufe0f ok"

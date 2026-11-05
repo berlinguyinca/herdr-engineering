@@ -103,6 +103,10 @@ def annotation_settings(raw: dict[str, object] | None) -> dict[str, bool | int]:
 # marks (U+200E/F, U+061C ALM), which do not reorder surrounding text the way embeddings, overrides and isolates do.
 _ALLOWED_FORMAT: Final = frozenset("\u200c\u200d\u200e\u200f\u061c")
 _BAD_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+# Invisible or blank-looking characters outside those categories: combining grapheme joiner, Hangul and Halfwidth fillers,
+# Khmer inherent vowels, braille blank, and the variation selectors supplement (the plain FE00-FE0F selectors stay: emoji).
+_BLANK: Final = frozenset("\u034f\u115f\u1160\u17b4\u17b5\u3164\uffa0\u2800")
+_BLANK_RANGES: Final = ((0xE0100, 0xE01EF),)
 
 
 def _bad_chars(text: str, *, allow_whitespace: bool) -> bool:
@@ -117,7 +121,9 @@ def _bad_chars(text: str, *, allow_whitespace: bool) -> bool:
             continue
         if allow_whitespace and ch in "\n\t":
             continue
-        if ch in "\u2028\u2029" or unicodedata.category(ch) in _BAD_CATEGORIES:
+        if ch in "\u2028\u2029" or ch in _BLANK or unicodedata.category(ch) in _BAD_CATEGORIES:
+            return True
+        if any(low <= ord(ch) <= high for low, high in _BLANK_RANGES):
             return True
     return False
 

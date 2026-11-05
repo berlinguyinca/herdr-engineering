@@ -20,9 +20,6 @@ import math
 import os
 import re
 
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-
 _VERSION = b"herdr-share-session-v5"
 _KEY_LABEL = b"herdr-share-session-aead-key-v5"
 BASES = ("e", "g")
@@ -52,7 +49,13 @@ def _field(value: str) -> bytes:
     return len(raw).to_bytes(4, "big") + raw
 
 
-def _aead(secret: bytes) -> ChaCha20Poly1305:
+def _aead(secret: bytes):
+    """The session cipher. ``cryptography`` is imported here, not at module level, so this module (``MIN_SECRET_BYTES``,
+    the CSRF and cookie helpers) and everything that imports it load on a host without the package."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    except ImportError as exc:
+        raise RuntimeError("lab-share sessions need the 'cryptography' package (pip install 'herdr-engineering[share]')") from exc
     return ChaCha20Poly1305(hmac.new(secret, _KEY_LABEL, hashlib.sha256).digest())
 
 
@@ -105,9 +108,10 @@ def check_session(secret: bytes, share_id: str, session: str, now: float) -> dic
         if _b64(blob) != blob_part:
             return None      # one canonical encoding only
         exp = int(exp_part)
+        cipher = _aead(secret)          # a missing package raises RuntimeError: caught below, so every check fails closed
         try:
-            plain = _aead(secret).decrypt(blob[:_NONCE], blob[_NONCE:], _ad(share_id, basis, exp))
-        except InvalidTag:
+            plain = cipher.decrypt(blob[:_NONCE], blob[_NONCE:], _ad(share_id, basis, exp))
+        except Exception:               # noqa: BLE001 - InvalidTag, or any malformed input: one uniform answer
             return None
         n = plain[0]
         m = plain[1 + MAX_IDENTITY]

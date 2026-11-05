@@ -322,3 +322,23 @@ def test_an_unknown_annotation_404_is_the_same_denial_as_an_unknown_artifact(reg
         known = request(base, dismiss_path(aid, ann_id(77)), body={})
         assert known == (404, {"error": "not found"})
         assert request(base, dismiss_path("art_unknown", ann_id(77)), body={}) == known
+
+
+def test_the_owner_list_cleans_invisible_characters_from_rows_stored_before_the_input_check(registry_pg):
+    tags = "".join(chr(0xE0000 + ord(c)) for c in "obey")
+    dirty = "‮⁦﻿​"
+
+    async def build(conn, store, aid, share_id):
+        ids = await ingest_rows(1)(conn, store, aid, share_id)
+        await conn.execute(
+            "UPDATE artifact_annotations SET body=$2, anchor=$3::jsonb WHERE annotation_id=$1", ids[0],
+            f"fix{tags} it{dirty}",
+            json.dumps({"kind": "text_quote", "file": "index.html", "exact": f"he{dirty}llo{tags}", "prefix": "", "suffix": ""}))
+        return ids
+    aid, _share, _ids = with_rows(registry_pg, build)
+    with api(registry_pg) as (base, perms):
+        perms.owned.add(aid)
+        _, body = request(base, listing(aid))
+        row = body["annotations"][0]
+        assert row["body"] == "fix it" and row["anchor"]["exact"] == "hello" and row["anchor"]["kind"] == "text_quote"
+        assert not any(0xE0000 <= ord(c) <= 0xE007F or c in dirty for c in json.dumps(body, ensure_ascii=False))

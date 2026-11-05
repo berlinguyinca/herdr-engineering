@@ -200,6 +200,14 @@ them is run by the build. Do them in this order, and do not deploy a partial set
 
 ### Before you deploy: what changes for existing links
 
+- **Drain the annotation spool first.** The previous edge wrote no `basis` (and no `author_email` on edits and
+  deletes); the worker now refuses such lines as `invalid`. Lines spooled but not yet ingested at the cutover would be
+  lost: wait until the worker has ingested the spool, or stop share-public before deploying and start it after the
+  worker runs the new code. Existing lab sessions are invalidated (the session format changed), so viewers sign in again.
+- **Version skew.** The edge and the worker should run the same Python version: the character check refuses
+  unassigned code points (category Cn), and two runtimes with different Unicode tables disagree about a very new
+  character (the edge accepts, the worker drops the line).
+
 - **Every outstanding share link stops working.** Links issued so far point at the MCP host
   (`localdev.mcp.metabolomics.us/s/<token>/`); that host no longer serves `/s/` and a temporary redirect was
   deliberately not added. Tokens are shown once and cannot be re-derived: list the live shares first

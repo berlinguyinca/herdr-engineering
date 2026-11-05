@@ -27,7 +27,7 @@ Lab shares (``audience: lab``) add, only when the lab settings are complete (els
   generated ``/s/static/config.json`` -- a fixed allow-list read from ``static_dir`` with ``O_NOFOLLOW``, served with
   the strict ``VIEWER_CSP`` (no inline script or style) and no CORS.
 * ``POST /s/<token>/session`` (body-less; ``Authorization: Bearer <access>`` and ``X-Id-Token``, exactly one each) ->
-  ``share_lab.authorise`` against the share's allow-list, then a ``share_session`` HMAC session capped at the earliest of
+  ``share_lab.authorise`` against the share's allow-list, then a ``share_session`` AEAD session (identity and email encrypted inside) capped at the earliest of
   ``session_seconds``, the share's expiry and the access token's ``exp``. Rate-limited per share and globally. OPTIONS
   on it is the 404, so a cross-origin page cannot get a preflight for the ``Authorization`` header.
 * ``GET/HEAD/OPTIONS /s/<token>/k/<session>/f/<path>`` -> the session is checked against the share's CURRENT state on
@@ -1539,7 +1539,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             else:
                 verb = parts[7]
                 record = {"v": 1, "op": verb, "annotation_id": annotation_id, "share_id": share_id,
-                          "author_identity": identity, "basis": got["basis"], "at": at}
+                          "author_identity": identity, "author_email": got["email"], "basis": got["basis"], "at": at}
                 if verb == "edit":
                     record["body"] = parse_edit_request(raw, max_chars=max_chars)
                 else:

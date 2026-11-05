@@ -210,7 +210,7 @@ def test_edit_and_delete(registry_pg):
     async def body(store, conn):
         _, _, sid = await seed(conn)
         assert await store.ingest(conn, create(sid, 1), "c1", **KW) == "inserted"
-        edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "basis": "e", "body": "new",
+        edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "author_email": "A@x.org", "basis": "e", "body": "new",
                 "at": datetime.now(UTC).isoformat()}
         assert await store.ingest(conn, edit, "e1", **KW) == "edited"
         assert await store.ingest(conn, edit, "e1", **KW) == "duplicate"
@@ -225,7 +225,7 @@ def test_edit_and_delete(registry_pg):
         # own_rows / agents / list see it, then a delete withdraws it
         assert len((await store.own_rows(sid))["u1"]) == 1
         aid = await conn.fetchval("SELECT artifact_id FROM artifact_annotations")
-        delete = {"op": "delete", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "basis": "e",
+        delete = {"op": "delete", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "author_email": "A@x.org", "basis": "e",
                   "at": datetime.now(UTC).isoformat()}
         assert await store.ingest(conn, delete, "d1", **KW) == "withdrawn"
         assert await store.ingest(conn, delete, "d1", **KW) == "duplicate"
@@ -245,7 +245,7 @@ def test_edit_refused_when_not_open_or_not_live(registry_pg):
         await store.ingest(conn, create(sid, 1), "c1", **KW)
         aid = await conn.fetchval("SELECT artifact_id FROM artifact_annotations")
         await store.dismiss(aid, ann_id(1), actor="owner")
-        edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "basis": "e", "body": "x",
+        edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "author_email": "A@x.org", "basis": "e", "body": "x",
                 "at": datetime.now(UTC).isoformat()}
         assert await store.ingest(conn, edit, "e1", **KW) == "not_open"
         _, _, sid2 = await seed(conn)
@@ -289,7 +289,7 @@ def test_dismiss_and_resolve(registry_pg):
         assert out["skipped"] == [{"annotation_id": ann_id(2), "reason": "version_not_newer"}]
         out = await store.resolve(aid, [ann_id(1)], version_id=v2, actor="agent")
         assert out["skipped"][0]["reason"] == "not_open"
-        await store.ingest(conn, {"op": "delete", "share_id": sid, "annotation_id": ann_id(3), "author_identity": "u1", "basis": "e",
+        await store.ingest(conn, {"op": "delete", "share_id": sid, "annotation_id": ann_id(3), "author_identity": "u1", "author_email": "A@x.org", "basis": "e",
                                   "at": datetime.now(UTC).isoformat()}, "d3", **KW)
         out = await store.resolve(aid, [ann_id(3)], version_id=v2, actor="agent")
         assert out["skipped"][0]["reason"] == "not_open"
@@ -420,7 +420,7 @@ def test_concurrent_change_waits_for_the_row_lock(registry_pg):
             await store.ingest(a, create(sid, 1), "c1", **KW)
             await store.ingest(a, create(sid, 2), "c2", **KW)
             for n, op in ((1, "edit"), (2, "delete")):
-                line = {"op": op, "share_id": sid, "annotation_id": ann_id(n), "author_identity": "u1", "basis": "e", "body": "x",
+                line = {"op": op, "share_id": sid, "annotation_id": ann_id(n), "author_identity": "u1", "author_email": "A@x.org", "basis": "e", "body": "x",
                         "at": datetime.now(UTC).isoformat()}
                 tx = a.transaction()
                 await tx.start()
@@ -444,7 +444,7 @@ def test_transient_database_error_aborts_the_pass_and_the_line_is_retried(regist
         _, _, sid = await seed(conn)
         assert await store.ingest(conn, create(sid, 1), "c1", **KW) == "inserted"
         path, marker = tmp_path / "annotations.jsonl", tmp_path / "m"
-        edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "basis": "e", "body": "later",
+        edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "author_email": "A@x.org", "basis": "e", "body": "later",
                 "at": datetime.now(UTC).isoformat()}
         path.write_text(json.dumps(edit) + "\n")
 
@@ -493,7 +493,7 @@ def test_a_removed_email_member_does_not_pass_through_the_groups_of_a_share_that
         assert await store.ingest(conn, create(sid, 3, basis="g"), "g3", **KW) == "not_on_list"
         assert await store.ingest(conn, create(sid, 4, basis="e"), "g4", **KW) == "inserted"
         edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(2), "author_identity": "u1", "body": "rewritten",
-                "basis": "g", "at": datetime.now(UTC).isoformat()}
+                "author_email": "A@x.org", "basis": "g", "at": datetime.now(UTC).isoformat()}
         assert await store.ingest(conn, edit, "g5", **KW) == "not_on_list"       # the author was admitted by group, now gone
     run(registry_pg, body)
 
@@ -524,11 +524,25 @@ def test_a_removed_member_can_neither_edit_nor_withdraw(registry_pg):
         assert await store.ingest(conn, create(sid, 1), "c1", **KW) == "inserted"
         await conn.execute("UPDATE artifact_shares SET allow_emails='{}' WHERE share_id=$1", sid)
         edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "body": "rewritten",
-                "basis": "e", "at": datetime.now(UTC).isoformat()}
+                "author_email": "A@x.org", "basis": "e", "at": datetime.now(UTC).isoformat()}
         assert await store.ingest(conn, edit, "e1", **KW) == "not_on_list"
         assert await conn.fetchval("SELECT body FROM artifact_annotations") == "note"
         gone = {**edit, "op": "delete"}
         gone.pop("body")
         assert await store.ingest(conn, gone, "d1", **KW) == "not_on_list"
         assert await conn.fetchval("SELECT status FROM artifact_annotations") == "open"
+    run(registry_pg, body)
+
+
+def test_edit_and_delete_are_checked_against_the_email_the_edge_sent(registry_pg):
+    """M1: the line's own author_email decides, not the stored row's; a line without one is refused."""
+    async def body(store, conn):
+        _, _, sid = await seed(conn)
+        assert await store.ingest(conn, create(sid, 1), "c1", **KW) == "inserted"      # the row says A@x.org (listed)
+        line = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "basis": "e",
+                "body": "new", "at": datetime.now(UTC).isoformat()}
+        assert await store.ingest(conn, line, "m1", **KW) == "invalid"                 # no author_email
+        assert await store.ingest(conn, {**line, "author_email": "evil@x.org"}, "m2", **KW) == "not_on_list"
+        assert await store.ingest(conn, {**line, "author_email": 5}, "m3", **KW) == "invalid"
+        assert await store.ingest(conn, {**line, "author_email": "A@x.org"}, "m4", **KW) == "edited"
     run(registry_pg, body)

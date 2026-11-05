@@ -223,9 +223,10 @@ class AnnotationStore:
             return "not_open"
         if not _live_at(share, at):
             return "not_live"
-        if record.get("basis") not in ("e", "g"):
+        email = _text(record.get("author_email"), MAX_IDENTITY_CHARS)
+        if record.get("basis") not in ("e", "g") or email is None or not _EMAIL.match(email):
             return "invalid"
-        if not _admitted(share, row["author_email"], record.get("basis")):
+        if not _admitted(share, email.lower(), record.get("basis")):
             return "not_on_list"            # removed since the POST: neither an edit nor a withdrawal is applied
         if op == "edit":
             await conn.execute("UPDATE artifact_annotations SET body = $2, edited_at = $3, updated_at = now() "

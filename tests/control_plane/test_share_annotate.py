@@ -710,6 +710,7 @@ def test_edit_and_delete_an_open_own_row(lab):
     assert edit["author_identity"] == "alice" and edit["share_id"] == "shr-1" and edit["v"] == 1 and edit["at"]
     assert delete["op"] == "delete" and delete["annotation_id"] == CID and "body" not in delete
     assert delete["author_identity"] == "alice"
+    assert edit["author_email"] == delete["author_email"] == EMAIL
     assert edit["basis"] == delete["basis"] == "e"          # the worker re-checks admission by this basis (plan 4 C3)
 
 
