@@ -97,6 +97,7 @@ class FakeCognito:
     def __init__(self, redirect_uri: str, logout_uri: str):
         self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self.redirect_uri, self.logout_uri = redirect_uri, logout_uri
+        self.redirect_uris = {redirect_uri}        # more than one when a second origin (the share site) signs in here too
         self.user = "alice"
         self.codes: dict[str, dict] = {}
         self.logouts = 0
@@ -146,13 +147,13 @@ class FakeCognito:
                     cognito.logouts += 1
                     return self._send(302, headers=(("Location", cognito.logout_uri),))
                 if (parts.path != "/oauth2/authorize" or q.get("response_type") != "code"
-                        or q.get("client_id") != WEB_CLIENT or q.get("redirect_uri") != cognito.redirect_uri
+                        or q.get("client_id") != WEB_CLIENT or q.get("redirect_uri") not in cognito.redirect_uris
                         or q.get("code_challenge_method") != "S256" or not q.get("code_challenge") or not q.get("state")):
                     return self._send(400, b"bad authorize request")
                 code = secrets.token_urlsafe(24)
                 with cognito.lock:
-                    cognito.codes[code] = {"challenge": q["code_challenge"], "user": cognito.user}
-                location = cognito.redirect_uri + "?" + urlencode({"code": code, "state": q["state"]})
+                    cognito.codes[code] = {"challenge": q["code_challenge"], "user": cognito.user, "redirect_uri": q["redirect_uri"]}
+                location = q["redirect_uri"] + "?" + urlencode({"code": code, "state": q["state"]})
                 return self._send(302, headers=(("Location", location), ("Cache-Control", "no-store")))
 
             def do_POST(self):
@@ -164,7 +165,7 @@ class FakeCognito:
                 verifier = form.get("code_verifier", "")
                 if (urlsplit(self.path).path != "/oauth2/token" or grant is None
                         or form.get("grant_type") != "authorization_code" or form.get("client_id") != WEB_CLIENT
-                        or form.get("redirect_uri") != cognito.redirect_uri
+                        or form.get("redirect_uri") != grant["redirect_uri"]
                         or _b64url(hashlib.sha256(verifier.encode("ascii")).digest()) != grant["challenge"]):
                     return self._send(400, b'{"error":"invalid_grant"}', cors)
                 return self._send(200, json.dumps(cognito.tokens(grant["user"])).encode("ascii"), cors)
