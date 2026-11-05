@@ -455,7 +455,7 @@ def _switch_values(svc):
 
 FEATURES = {"steering": {"enabled": True}, "contextual": {"enabled": True}, "insights": {"enabled": True},
             "team_rooms": {"enabled": True}, "team_roles": {"enabled": True}, "coordinators": {"enabled": True},
-            "fabric_trust": {"enabled": True, "machines": ["bender"]},
+            "fabric_trust": {"enabled": True, "machines": ["bender"], "tailnet_suffix": "tail1234.ts.net"},
             "delegation_enabled": True,
             "replay_history": "full"}
 OFF = {"steering": False, "contextual": False, "insights": False, "team_rooms": False, "team_roles": False,

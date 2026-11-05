@@ -3017,6 +3017,8 @@ def _make_handler(server, public=False, operator=False):
             machine header, nothing else. A request that carries any forwarding header was relayed by something, so the socket
             peer is that relay and not the caller: no peer is offered and Fabric fails closed. (Behind `tailscale serve` the
             peer is 127.0.0.1, which the service refuses on its own.) X-Forwarded-For is never read as an address."""
+            if public or operator:      # Fabric is for the main collab listener only: never the internet-facing or operator ones
+                return {}
             relayed = any(h in self.headers for h in _FORWARDING_HEADERS)
             return {"peer_ip": None if relayed else self.client_address[0],
                     "machine": self.headers.get("X-Herdr-Machine")}

@@ -905,6 +905,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             a = self._agents.get(p["agent_id"])
             if a is not None:
                 a["fabric"] = bool(p["fabric"])
+                a["fabric_expires_at"] = p.get("fabric_expires_at") if a["fabric"] else None   # absent = expired (fail closed)
                 if p.get("machine"):
                     a["machine"] = p["machine"]
         elif t == "agent_renamed":
@@ -2869,6 +2870,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                             "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
                             "machine": a.get("machine"), "fabric": bool(a.get("fabric")),
+                            "fabric_expires_at": a.get("fabric_expires_at"),
                             "online": any(self._online(r["room_id"], "agent", aid) for r in rooms),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})
@@ -2938,13 +2940,16 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             bound = machine or agent.get("machine")
             if fabric and not bound:
                 raise CollabError(400, "the agent has no machine; give one with machine")
-            if bool(agent.get("fabric")) == fabric and bound == agent.get("machine"):
-                return {"agent_id": agent_id, "fabric": fabric, "machine": bound, "changed": False}
-            self._commit("agent_fabric_set", self._actor(
-                pr, agent_id=agent_id, fabric=fabric, machine=bound,
+            changed = bool(agent.get("fabric")) != fabric or bound != agent.get("machine")
+            if not fabric and not changed:
+                return {"agent_id": agent_id, "fabric": False, "machine": bound, "changed": False}
+            expires = self._now() + self.fabric_trust_cfg()["agent_ttl_seconds"] if fabric else None
+            self._commit("agent_fabric_set", self._actor(            # setting the bit again renews the expiry
+                pr, agent_id=agent_id, fabric=fabric, machine=bound, fabric_expires_at=expires,
                 action="agent.fabric.set" if fabric else "agent.fabric.clear", outcome="allowed",
                 project_ids=[], resource_id=agent_id))
-        return {"agent_id": agent_id, "fabric": fabric, "machine": bound, "changed": True}
+        return {"agent_id": agent_id, "fabric": fabric, "machine": bound, "changed": changed,
+                **({"fabric_expires_at": expires} if fabric else {})}
 
     # ------------------------------------------------------- room profile
     def _profile(self, room_id: str) -> dict:
@@ -3251,9 +3256,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             model = choice.model if isinstance(choice.model, str) else None
             hid = ids.new_id("collab")
             # The text rides in its own event with no "action": the audit log and the room feed never show it.
-            self._commit("helper_task", {"actor_user_id": pr.owner, "actor_agent_id": pr.id, "helper_id": hid,
-                                         "task": task, "tier": str(choice.tier)[:40],
-                                         "model_reason": str(choice.reason)[:200]})
+            self._commit("helper_task", self._actor(pr, helper_id=hid, task=task, tier=str(choice.tier)[:40],
+                                                    model_reason=str(choice.reason)[:200]))
             try:
                 self._commit("helper_requested", self._actor(
                     pr, project_id=room["project_id"], room_id=room_id, helper_id=hid, requester_agent_id=pr.id,

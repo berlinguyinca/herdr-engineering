@@ -6,12 +6,14 @@ it is given the real socket peer address (``peer_ip``) and the informational ``X
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import socket
 import threading
 
 import pytest
 
+from herdr_engineering.control_plane import collab_fabric_trust as fabric_trust_module
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
 from herdr_engineering.control_plane.collab_fabric_trust import (
@@ -25,26 +27,42 @@ from tests.control_plane.test_collab_fabric_trust import localapi  # noqa: F401
 from tests.control_plane.test_collab_tasks import USERS, W, _digest, code, svc  # noqa: F401
 
 BENDER, BEAST, STRANGER = "100.64.0.1", "100.64.0.2", "100.64.0.9"
+SUFFIX = "tail1234.ts.net"
+
+
+def _local_ips() -> list[str]:
+    """Every non-loopback IPv4 address of this host, tailnet (100.64.0.0/10) addresses first."""
+    found: set[str] = set()
+    for probe in ("10.255.255.254", "100.100.100.100"):          # a UDP connect sends nothing
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((probe, 9))
+            found.add(s.getsockname()[0])
+        except OSError:
+            pass
+        finally:
+            s.close()
+    try:
+        found.update(i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET))
+    except OSError:
+        pass
+    ips = [ip for ip in found if not ip.startswith("127.")]
+    return sorted(ips, key=lambda ip: (ipaddress.ip_address(ip) not in TAILNET, ip))
+
+
+TAILNET = ipaddress.ip_network("100.64.0.0/10")
 
 
 def lan_ip() -> str | None:
-    """A non-loopback address of this host (a UDP connect sends nothing), or None."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.255.254", 9))
-        ip = s.getsockname()[0]
-        return None if ip.startswith("127.") else ip
-    except OSError:
-        return None
-    finally:
-        s.close()
+    ips = _local_ips()
+    return ips[0] if ips else None
 
 
 @pytest.fixture
 def fw(svc, localapi):
     """A room world with fabric trust ON for bender and beast, resolved through the real LocalAPI socket fixture."""
     w = W(svc)
-    svc.fabric_trust = normalize_fabric_trust({"enabled": True, "machines": ["bender", "beast"], "whois_cache_seconds": 0})
+    svc.fabric_trust = normalize_fabric_trust({"enabled": True, "tailnet_suffix": SUFFIX, "machines": ["bender", "beast"], "whois_cache_seconds": 0})
     svc.fabric_resolver = FabricPeerResolver(svc.fabric_trust_cfg, whois=TailscaleWhois(sockets=(localapi["sock"],), timeout=2.0))
     w.localapi = localapi
     return w
@@ -169,11 +187,11 @@ def test_missing_peer_loopback_and_mapped_loopback_are_never_fabric(fw):
 def test_flag_off_kill_switch_and_degraded_service_are_401(fw):
     info = fabric_agent(fw)
     assert fabric(fw, info)
-    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "kill_switch": True, "machines": ["bender"]})
+    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "tailnet_suffix": SUFFIX, "kill_switch": True, "machines": ["bender"]})
     denied(fw, info)
     fw.s.fabric_trust = normalize_fabric_trust(None)
     denied(fw, info)
-    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "machines": ["bender"], "whois_cache_seconds": 0})
+    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "tailnet_suffix": SUFFIX, "machines": ["bender"], "whois_cache_seconds": 0})
     assert fabric(fw, info)
     fw.s.degraded = True
     denied(fw, info)
@@ -197,13 +215,15 @@ def test_only_the_owner_sets_or_clears_the_bit(fw):
     assert code(fw.s.set_agent_fabric, fw.alice, aid, {"fabric": "yes"}) == 400
     assert code(fw.s.set_agent_fabric, fw.alice, aid, {}) == 400
     denied(fw, info)
-    assert fw.s.set_agent_fabric(fw.alice, aid, {"fabric": True}) == {"agent_id": aid, "fabric": True, "machine": "bender", "changed": True}
+    first = fw.s.set_agent_fabric(fw.alice, aid, {"fabric": True})
+    assert first == {"agent_id": aid, "fabric": True, "machine": "bender", "changed": True,
+                     "fabric_expires_at": first["fabric_expires_at"]}
     assert fabric(fw, info)
-    assert fw.s.set_agent_fabric(fw.alice, aid, {"fabric": True})["changed"] is False       # no second event
+    assert fw.s.set_agent_fabric(fw.alice, aid, {"fabric": True})["changed"] is False       # a renewal, not a state change
     assert fw.s.set_agent_fabric(fw.alice, aid, {"fabric": False})["changed"] is True
     denied(fw, info)
     kinds = [e["event_type"] for e in fw.s._log if e["event_type"] == "agent_fabric_set"]
-    assert len(kinds) == 2
+    assert len(kinds) == 3                                               # set, renew, clear
 
 
 def test_a_fabric_principal_cannot_set_the_bit_or_rotate_a_credential(fw):
@@ -276,11 +296,11 @@ def test_still_valid_rechecks_every_fabric_condition(fw):
     assert not fw.s.still_valid(pr)
     fw.s.set_agent_fabric(fw.alice, info["agent_id"], {"fabric": True})
     assert fw.s.still_valid(pr)
-    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "machines": ["beast"], "whois_cache_seconds": 0})
+    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "tailnet_suffix": SUFFIX, "machines": ["beast"], "whois_cache_seconds": 0})
     assert not fw.s.still_valid(pr)                                      # bender removed from the list
-    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "kill_switch": True, "machines": ["bender"]})
+    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "tailnet_suffix": SUFFIX, "kill_switch": True, "machines": ["bender"]})
     assert not fw.s.still_valid(pr)
-    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "machines": ["bender"], "whois_cache_seconds": 0})
+    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "tailnet_suffix": SUFFIX, "machines": ["bender"], "whois_cache_seconds": 0})
     fw.s.revoke_agent(fw.alice, info["agent_id"])
     assert not fw.s.still_valid(pr)
 
@@ -296,11 +316,18 @@ def test_a_credential_principal_is_judged_exactly_as_before(fw):
 
 # ------------------------------------------------------------------ real HTTP
 @pytest.fixture
-def http_world(fw):
+def http_world(fw, request, monkeypatch):
     """The real server bound on every interface, so a request to the host's own LAN address has a non-loopback peer."""
     ip = lan_ip()
     if ip is None:
-        pytest.skip("no non-loopback address on this host")
+        # These tests are the only proof the HTTP layer hands the real socket peer to Fabric auth, so a host with no
+        # non-loopback address is a failure, not a skip. Pass --allow-fabric-http-skip to accept that explicitly.
+        if request.config.getoption("--allow-fabric-http-skip"):
+            pytest.skip("no non-loopback address on this host (--allow-fabric-http-skip)")
+        pytest.fail("no non-loopback address: the Fabric HTTP tests cannot run (use --allow-fabric-http-skip to skip)")
+    if ipaddress.ip_address(ip) not in TAILNET:
+        # No tailnet address here: widen the tailnet check to this one address for the test, exactly as a tailnet peer would pass.
+        monkeypatch.setattr(fabric_trust_module, "FABRIC_PEER_NETS", (*fabric_trust_module.FABRIC_PEER_NETS, ipaddress.ip_network(ip + "/32")))
     srv = ControlPlaneServer(ControlPlaneRepo(), host="0.0.0.0", port=0, collab=fw.s, collab_tls_terminated=True, public_port=0,
                              api_keys={"op": "operator"})
     t = threading.Thread(target=srv.serve, daemon=True)
@@ -388,13 +415,13 @@ def test_http_flag_off_and_kill_switch_are_401(http_world):
     w.localapi["nodes"][w.lan] = "bender.tail1234.ts.net."
     path = f"{BASE}/rooms/{w.room}/events?cursor=0"
     assert req(w, "GET", path, headers=auth(info))[0] == 200
-    w.s.fabric_trust = normalize_fabric_trust({"enabled": True, "kill_switch": True, "machines": ["bender"]})
+    w.s.fabric_trust = normalize_fabric_trust({"enabled": True, "tailnet_suffix": SUFFIX, "kill_switch": True, "machines": ["bender"]})
     assert req(w, "GET", path, headers=auth(info))[0] == 401
     w.s.fabric_trust = normalize_fabric_trust(None)
     assert req(w, "GET", path, headers=auth(info))[0] == 401
 
 
-def test_http_mcp_and_a2a_accept_fabric_from_a_real_peer_only(http_world):
+def test_http_public_handler_never_accepts_fabric(http_world):
     w = http_world
     info = fabric_agent(w)
     msg = {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
@@ -402,10 +429,12 @@ def test_http_mcp_and_a2a_accept_fabric_from_a_real_peer_only(http_world):
     assert req(w, "POST", "/mcp", public=True, headers=auth(info), body=msg)[0] == 401
     assert req(w, "POST", "/a2a", public=True, headers=auth(info), body=a2a)[0] == 401
     w.localapi["nodes"][w.lan] = "bender.tail1234.ts.net."
-    assert req(w, "POST", "/mcp", public=True, headers=auth(info), body=msg)[0] == 200
-    assert req(w, "POST", "/a2a", public=True, headers=auth(info), body=a2a)[0] != 401
-    w.localapi["nodes"]["127.0.0.1"] = "bender.tail1234.ts.net."
-    assert req(w, "POST", "/mcp", public=True, host="127.0.0.1", headers=auth(info), body=msg)[0] == 401
+    # the public (internet-facing) handler NEVER accepts Fabric, even from a perfectly valid tailnet peer
+    assert req(w, "POST", "/mcp", public=True, headers=auth(info), body=msg)[0] == 401
+    assert req(w, "POST", "/a2a", public=True, headers=auth(info), body=a2a)[0] == 401
+    assert req(w, "GET", f"{BASE}/rooms/{w.room}/events?cursor=0", public=True, headers=auth(info))[0] == 401
+    # ...while the same request on the main collab listener is fine
+    assert req(w, "GET", f"{BASE}/rooms/{w.room}/events?cursor=0", headers=auth(info))[0] == 200
 
 
 def test_http_set_bit_route_is_owner_only(http_world):
@@ -434,3 +463,81 @@ def test_http_stream_opened_via_fabric_ends_when_the_agent_is_revoked(http_world
     w.s.revoke_agent(w.alice, info["agent_id"])
     assert read_frame(r) == {"type": "closed", "reason": "access_revoked"}
     c.close()
+
+
+# ------------------------------------------------------------------ peer must be a tailnet address
+def test_peer_outside_the_tailnet_ranges_is_never_fabric(fw):
+    info = fabric_agent(fw)
+    for ip in ("192.168.1.5", "10.0.0.1", "172.16.0.1", "8.8.8.8", "100.128.0.1", "100.63.255.255", "fd00::1", "2001:db8::1"):
+        fw.localapi["nodes"][ip] = "bender.tail1234.ts.net."
+        denied(fw, info, peer=ip)
+    for ip in ("100.127.255.254", "fd7a:115c:a1e0::5"):
+        fw.localapi["nodes"][ip] = "bender.tail1234.ts.net."
+        assert fabric(fw, info, peer=ip).machine == "bender"
+
+
+# ------------------------------------------------------------------ full-name identity
+def test_machine_is_the_full_fqdn_not_the_first_label(fw):
+    info = fabric_agent(fw)
+    fw.localapi["nodes"]["100.64.0.30"] = "bender.attacker.example."
+    denied(fw, info, peer="100.64.0.30")
+    fw.localapi["nodes"]["100.64.0.31"] = "BENDER.TAIL1234.ts.net"
+    assert fabric(fw, info, peer="100.64.0.31").machine == "bender"
+    assert code(fw.s.authenticate, f"Fabric {info['agent_id']}", None, peer_ip="100.64.0.30") == 401
+
+
+# ------------------------------------------------------------------ expiry
+def test_fabric_bit_expires_and_setting_it_again_renews(fw):
+    s = fw.s
+    clock = {"t": 1000.0}
+    s._now = lambda: clock["t"]
+    info = fabric_agent(fw)
+    aid = info["agent_id"]
+    ttl = s.fabric_trust_cfg()["agent_ttl_seconds"]
+    assert ttl == 2592000
+    row = [a for a in s.list_my_agents(fw.alice)["agents"] if a["agent_id"] == aid][0]
+    assert row["fabric_expires_at"] == 1000.0 + ttl
+    pr = fabric(fw, info)
+    clock["t"] = 1000.0 + ttl - 1
+    assert s.still_valid(pr) and fabric(fw, info)
+    clock["t"] = 1000.0 + ttl
+    assert not s.still_valid(pr)
+    denied(fw, info)
+    assert "fabric_expired" in [e["payload"]["reason"] for e in s._log if e["event_type"] == "audit_denied"]
+    out = s.set_agent_fabric(fw.alice, aid, {"fabric": True})                  # renew
+    assert out["fabric_expires_at"] == clock["t"] + ttl and fabric(fw, info)
+    s.set_agent_fabric(fw.alice, aid, {"fabric": False})
+    assert [a for a in s.list_my_agents(fw.alice)["agents"] if a["agent_id"] == aid][0]["fabric_expires_at"] is None
+
+
+def test_ttl_comes_from_config_and_old_events_without_expiry_fail_closed(fw):
+    fw.s.fabric_trust = normalize_fabric_trust({"enabled": True, "machines": ["bender"], "tailnet_suffix": SUFFIX,
+                                                "agent_ttl_seconds": 300, "whois_cache_seconds": 0})
+    info = fabric_agent(fw)
+    assert fw.s._agents[info["agent_id"]]["fabric_expires_at"] == fw.s._now() + 300
+    old = fabric_agent(fw, bit=False)                   # an event from before this field existed
+    fw.s._commit("agent_fabric_set", {"actor_user_id": "alice", "actor_agent_id": None, "agent_id": old["agent_id"],
+                                      "fabric": True, "machine": "bender", "action": "agent.fabric.set", "outcome": "allowed",
+                                      "project_ids": [], "resource_id": old["agent_id"]})
+    assert fw.s._agents[old["agent_id"]]["fabric"] is True
+    denied(fw, old)
+
+
+# ------------------------------------------------------------------ audit flood + actor routing
+def test_a_flood_of_refusals_writes_one_audit_row_per_agent_and_reason(fw):
+    info = fabric_agent(fw, bit=False)
+    before = len(fw.s._log)
+    for _ in range(50):
+        denied(fw, info)
+    rows = [e for e in list(fw.s._log)[before:] if e["event_type"] == "audit_denied"]
+    assert len(rows) == 1 and rows[0]["payload"]["reason"] == "fabric_not_enabled"
+    assert rows[0]["payload"]["via"] == "fabric" and rows[0]["payload"]["machine"] == "bender"
+
+
+def test_helper_task_event_carries_the_actor_via_fields(fw):
+    info = fabric_agent(fw, actions=("read", "post", "spawn_helpers"))
+    fw.s.set_room_profile(fw.alice, fw.room, {"allowed_families": ["claude-code"]})
+    pr = fabric(fw, info)
+    fw.s.request_helper(pr, {"room_id": fw.room, "role": "worker", "task": "look at this"})
+    row = [e for e in fw.s._log if e["event_type"] == "helper_task"][-1]["payload"]
+    assert row["via"] == "fabric" and row["machine"] == "bender" and row["actor_agent_id"] == info["agent_id"]

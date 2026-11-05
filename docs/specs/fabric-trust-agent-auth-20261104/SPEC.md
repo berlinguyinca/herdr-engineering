@@ -67,8 +67,29 @@ control_plane:
       enabled: false           # absent = off
       kill_switch: false
       machines: [bender, beast, zapp]   # tailscale MagicDNS short names
+      tailnet_suffix: tail0c50da.ts.net # REQUIRED when enabled: a node is a machine only if its FULL name is <machine>.<suffix>
+      agent_ttl_seconds: 2592000        # how long the owner's "fabric" bit stays valid (default 30 d, 300..7776000)
       whois_cache_seconds: 30
 ```
+
+Security rules (review of 75689743):
+- **Listener.** `Authorization: Fabric` is honoured on the MAIN collab handler only. The `public` (internet-facing, `/mcp`,
+  `/a2a`) and `operator` handlers never pass a peer, so Fabric is always 401 there. The peer must also be inside
+  `100.64.0.0/10` or `fd7a:115c:a1e0::/48`; loopback, LAN and public addresses are never fabric. Any forwarding header
+  (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `Via`, ...) also refuses Fabric (defence in depth).
+- **Never put an L4/SNI proxy, a subnet router or an exit node in `machines`.** Such a node presents its own tailnet address for
+  traffic that originates elsewhere, so whois would vouch for the wrong party. `machines` must be ordinary end hosts only.
+- **Real fix (operator decision pending):** a dedicated listener bound to the tailnet interface that serves the collab API and
+  nothing else. Until then the main listener plus the checks above is the accepted boundary.
+- **Machine identity** is the FULL MagicDNS name (trailing dot stripped, case-insensitive) equal to `<machine>.<tailnet_suffix>`;
+  the first DNS label alone is never enough.
+- **Expiry.** When the owner sets the bit the `agent_fabric_set` event records `fabric_expires_at` (now + `agent_ttl_seconds`).
+  `authenticate` and `still_valid` refuse after it (`fabric_expired`); setting the bit again renews it; clearing it removes it.
+  Events without the field (older logs) count as expired: fail closed. The agent list view shows `fabric_expires_at`.
+- **Audit.** Refusals of an otherwise-recognised agent are audited at most once per (agent, reason) per 60 s
+  (`_audit_denied` throttle); the `auth_failures` counter still counts every attempt. Every event an agent principal commits goes
+  through `_actor`, so `via`/`machine` are always present for fabric callers (including `helper_task`).
+- **whois for IPv6** brackets the address (`[addr]:1`).
 
 ## 4. Slices (each: failing test first, real server, no mocks)
 1. Peer identity: whois resolver against real tailscaled in test via a local socket fixture; allow-list; unit + integration.

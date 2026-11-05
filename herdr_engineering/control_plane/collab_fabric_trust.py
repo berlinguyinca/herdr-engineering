@@ -19,7 +19,10 @@ from typing import Any
 
 from ..fabric_access import TailscaleWhois
 
-FABRIC_TRUST_KEYS = frozenset({"enabled", "kill_switch", "machines", "whois_cache_seconds"})
+FABRIC_TRUST_KEYS = frozenset({"enabled", "kill_switch", "machines", "whois_cache_seconds", "tailnet_suffix", "agent_ttl_seconds"})
+AGENT_TTL_DEFAULT, AGENT_TTL_MIN, AGENT_TTL_MAX = 2592000, 300, 7776000      # 30 days; 5 minutes..90 days
+FABRIC_PEER_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))   # tailnet addresses only
+_SUFFIX = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+\Z")
 _SHORT_NAME = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z")
 _NAME = "control_plane.collab.fabric_trust"
 _MAX_CACHE = 1024
@@ -27,7 +30,9 @@ _MAX_CACHE = 1024
 
 def normalize_fabric_trust(raw: Any) -> dict:
     """Validate ``control_plane.collab.fabric_trust`` (YAML only). Unknown keys and wrong types raise ValueError. Absent means
-    OFF. ``machines`` are MagicDNS short names (no dots), lower-cased; enabling with no machines is an error."""
+    OFF. ``machines`` are MagicDNS short names (no dots), lower-cased; enabling with no machines, or without ``tailnet_suffix``
+    (the tailnet's MagicDNS domain, e.g. ``tail0c50da.ts.net``), is an error. A node is a machine only when its FULL name equals
+    ``<machine>.<tailnet_suffix>``. ``agent_ttl_seconds`` is how long one owner "set the bit" stays valid."""
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -35,7 +40,8 @@ def normalize_fabric_trust(raw: Any) -> dict:
     unknown = sorted(str(k) for k in set(raw) - FABRIC_TRUST_KEYS)
     if unknown:
         raise ValueError(f"{_NAME}: unknown keys: " + ", ".join(unknown))
-    cfg: dict[str, Any] = {"enabled": False, "kill_switch": False, "machines": [], "whois_cache_seconds": 30}
+    cfg: dict[str, Any] = {"enabled": False, "kill_switch": False, "machines": [], "whois_cache_seconds": 30,
+                   "tailnet_suffix": None, "agent_ttl_seconds": AGENT_TTL_DEFAULT}
     for key, value in raw.items():
         name = f"{_NAME}.{key}"
         if key in ("enabled", "kill_switch"):
@@ -47,12 +53,21 @@ def normalize_fabric_trust(raw: Any) -> dict:
             value = [v.strip().lower() for v in value]
             if not all(_SHORT_NAME.match(v) for v in value):
                 raise ValueError(f"{name} entries must be MagicDNS short names (letters, digits, hyphens; no dots)")
+        elif key == "tailnet_suffix":
+            if not isinstance(value, str) or not _SUFFIX.match(value.strip().strip(".").lower()):
+                raise ValueError(f"{name} must be the tailnet MagicDNS domain, e.g. tail0c50da.ts.net")
+            value = value.strip().strip(".").lower()
+        elif key == "agent_ttl_seconds":
+            if isinstance(value, bool) or not isinstance(value, int) or not AGENT_TTL_MIN <= value <= AGENT_TTL_MAX:
+                raise ValueError(f"{name} must be an integer {AGENT_TTL_MIN}-{AGENT_TTL_MAX}")
         else:
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 3600:
                 raise ValueError(f"{name} must be an integer 0-3600")
         cfg[key] = value
     if cfg["enabled"] and not cfg["machines"]:
         raise ValueError(f"{_NAME}.machines must list at least one machine when enabled")
+    if cfg["enabled"] and not cfg["tailnet_suffix"]:
+        raise ValueError(f"{_NAME}.tailnet_suffix is required when enabled")
     return cfg
 
 
@@ -79,24 +94,30 @@ class FabricPeerResolver:
             if not peer_ip:
                 return None
             ip = str(ipaddress.ip_address(peer_ip.split("%")[0]))
-            short = self._short_name(ip, float(cfg["whois_cache_seconds"]))
+            fqdn = self._node_name(ip, float(cfg["whois_cache_seconds"]))
+            suffix = cfg["tailnet_suffix"]
+            if not fqdn or not suffix:
+                return None
+            for machine in cfg["machines"]:                    # the FULL name must match: a first-label match is spoofable
+                if fqdn == f"{machine}.{suffix}":
+                    return machine
         except Exception:                                      # noqa: BLE001 - any failure is "not the fabric"
             return None
-        return short if short in cfg["machines"] else None
+        return None
 
-    def _short_name(self, ip: str, ttl: float) -> str | None:
+    def _node_name(self, ip: str, ttl: float) -> str | None:
         t = self.now()
         with self._lock:
             hit = self._cache.get(ip)
         if hit and t - hit[0] < ttl:
             return hit[1]
         ident = self.whois.lookup(ip)                          # OSError / bad JSON propagates: not cached, caller fails closed
-        short = ident.node.split(".")[0].lower() if ident and ident.node else None
+        fqdn = ident.node.rstrip(".").lower() if ident and ident.node else None
         with self._lock:
             if len(self._cache) >= _MAX_CACHE:
                 self._cache.clear()
-            self._cache[ip] = (t, short)
-        return short
+            self._cache[ip] = (t, fqdn)
+        return fqdn
 
 
 class FabricTrustMixin:
@@ -131,6 +152,8 @@ def _real_peer(peer_ip: str | None) -> str | None:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
     if ip.is_loopback or ip.is_unspecified or ip.is_multicast:
+        return None
+    if not any(ip in net for net in FABRIC_PEER_NETS):        # only a tailnet address (100.64.0.0/10, fd7a:115c:a1e0::/48)
         return None
     return str(ip)
 
@@ -173,6 +196,9 @@ class FabricAuthMixin:
             return "fabric_machine_unbound"
         if not agent.get("fabric"):
             return "fabric_not_enabled"
+        expires = agent.get("fabric_expires_at")                     # absent (older log) = expired: fail closed
+        if not isinstance(expires, (int, float)) or self._now() >= expires:
+            return "fabric_expired"
         return None
 
     def _fabric_authenticate(self, aid: str, peer_ip: str | None, claimed: str | None):

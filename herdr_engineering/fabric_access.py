@@ -39,6 +39,12 @@ class _UnixHTTP(http.client.HTTPConnection):
         self.sock.connect(self._path)
 
 
+def whois_path(ip: str) -> str:
+    """The LocalAPI whois request path for an address; tailscaled wants ``host:port``, so an IPv6 literal is bracketed."""
+    host = f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
+    return f"/localapi/v0/whois?addr={quote(host + ':1')}"
+
+
 class TailscaleWhois:
     """Identify a tailnet peer through tailscaled's LocalAPI (works from a host-network container with the socket mounted)."""
 
@@ -52,7 +58,7 @@ class TailscaleWhois:
         for path in self.sockets:
             try:
                 conn = _UnixHTTP(path, self.timeout)
-                conn.request("GET", f"/localapi/v0/whois?addr={quote(ip + ':1')}", headers={"Host": "local-tailscaled.sock"})
+                conn.request("GET", whois_path(ip), headers={"Host": "local-tailscaled.sock"})
                 resp = conn.getresponse()
                 body = resp.read()
                 conn.close()

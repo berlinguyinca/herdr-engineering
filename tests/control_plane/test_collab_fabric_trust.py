@@ -18,7 +18,7 @@ from herdr_engineering.control_plane.collab_fabric_trust import (
 from herdr_engineering.fabric_access import TailscaleWhois
 
 NODES = {"100.64.0.1": "bender.tail1234.ts.net.", "100.64.0.2": "beast.tail1234.ts.net.",
-         "100.64.0.9": "stranger.tail1234.ts.net."}
+         "100.64.0.9": "stranger.tail1234.ts.net.", "fd7a:115c:a1e0::1": "bender.tail1234.ts.net."}
 
 
 class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -33,7 +33,10 @@ def localapi(tmp_path):
     class H(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             state["hits"] += 1
-            ip = self.path.split("addr=")[1].split("%3A")[0].split(":")[0]
+            from urllib.parse import unquote
+            addr = unquote(self.path.split("addr=")[1])
+            state.setdefault("queries", []).append(addr)
+            ip = addr.rsplit(":", 1)[0].strip("[]")
             name = state["nodes"].get(ip)
             if name is None:
                 self.send_response(404); self.end_headers(); return
@@ -54,7 +57,7 @@ def localapi(tmp_path):
 
 
 def cfg(**kw):
-    return normalize_fabric_trust({"enabled": True, "machines": ["bender", "beast"], **kw})
+    return normalize_fabric_trust({"enabled": True, "machines": ["bender", "beast"], "tailnet_suffix": "tail1234.ts.net", **kw})
 
 
 def resolver(localapi, config, now=time.monotonic):
@@ -150,11 +153,13 @@ def test_spoofed_forwarded_for_cannot_even_be_passed(localapi):
 
 # ---------------------------------------------------------------- config
 def test_absent_config_is_off():
-    assert normalize_fabric_trust(None) == {"enabled": False, "kill_switch": False, "machines": [], "whois_cache_seconds": 30}
+    assert normalize_fabric_trust(None) == {"enabled": False, "kill_switch": False, "machines": [], "whois_cache_seconds": 30,
+                                            "tailnet_suffix": None, "agent_ttl_seconds": 2592000}
 
 
 def test_valid_config_is_normalized():
-    c = normalize_fabric_trust({"enabled": True, "machines": ["Bender", "beast"], "whois_cache_seconds": 5})
+    c = normalize_fabric_trust({"enabled": True, "machines": ["Bender", "beast"], "whois_cache_seconds": 5,
+                               "tailnet_suffix": "Tail1234.TS.net."})
     assert c["machines"] == ["bender", "beast"] and c["whois_cache_seconds"] == 5 and c["enabled"] is True
 
 
@@ -177,10 +182,10 @@ def test_enabled_without_machines_is_rejected():
 def test_collab_service_reads_fabric_trust_per_request():
     svc = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
     assert svc.fabric_trust_active() is False
-    box = {"v": {"enabled": True, "machines": ["bender"]}}
+    box = {"v": {"enabled": True, "machines": ["bender"], "tailnet_suffix": "tail1234.ts.net"}}
     svc.fabric_trust_source = lambda: box["v"]
     assert svc.fabric_trust_active() is True
-    box["v"] = {"enabled": True, "machines": ["bender"], "kill_switch": True}
+    box["v"] = {"enabled": True, "machines": ["bender"], "kill_switch": True, "tailnet_suffix": "tail1234.ts.net"}
     assert svc.fabric_trust_active() is False
     box["v"] = {"enabled": True, "kill_switch": "yes"}
     assert svc.fabric_trust_active() is False
@@ -189,3 +194,33 @@ def test_collab_service_reads_fabric_trust_per_request():
 def test_unix_socket_env_is_not_consulted(monkeypatch, localapi):
     monkeypatch.setenv("TS_SOCKET", "/nonexistent")
     assert os.environ["TS_SOCKET"] and resolver(localapi, cfg()).resolve("100.64.0.1") == "bender"
+
+
+# ---------------------------------------------------------------- review fixes
+def test_full_fqdn_must_match_machine_dot_suffix(localapi):
+    r = resolver(localapi, cfg())
+    localapi["nodes"]["100.64.0.20"] = "bender.evil.example."          # right first label, wrong domain
+    localapi["nodes"]["100.64.0.21"] = "bender.sub.tail1234.ts.net."   # extra label
+    localapi["nodes"]["100.64.0.22"] = "BENDER.Tail1234.TS.net"        # case and missing trailing dot are fine
+    assert r.resolve("100.64.0.20") is None and r.resolve("100.64.0.21") is None
+    assert r.resolve("100.64.0.22") == "bender" and r.resolve("100.64.0.1") == "bender"
+    assert resolver(localapi, cfg(tailnet_suffix="other.ts.net")).resolve("100.64.0.1") is None
+
+
+def test_ipv6_peer_is_bracketed_in_the_whois_query(localapi):
+    assert resolver(localapi, cfg()).resolve("fd7a:115c:a1e0::1") == "bender"
+    assert localapi["queries"][-1] == "[fd7a:115c:a1e0::1]:1"
+    from herdr_engineering.fabric_access import whois_path
+    assert whois_path("100.64.0.1").endswith("100.64.0.1%3A1") and "%5Bfd7a" in whois_path("fd7a::1")
+
+
+def test_tailnet_suffix_is_required_when_enabled_and_validated():
+    with pytest.raises(ValueError, match="tailnet_suffix"):
+        normalize_fabric_trust({"enabled": True, "machines": ["bender"]})
+    for bad in ("", "ts", "a b.net", 5, "x..net"):
+        with pytest.raises(ValueError):
+            normalize_fabric_trust({"tailnet_suffix": bad})
+    for bad in (299, 7776001, True, "30"):
+        with pytest.raises(ValueError):
+            normalize_fabric_trust({"agent_ttl_seconds": bad})
+    assert normalize_fabric_trust({"agent_ttl_seconds": 300})["agent_ttl_seconds"] == 300
