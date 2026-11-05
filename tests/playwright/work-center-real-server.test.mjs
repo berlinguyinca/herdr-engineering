@@ -98,3 +98,48 @@ test('real server, flag OFF (the default): no capability, no This week card, no 
   assert.equal(await page.locator('[data-herdr-link], [data-herdr-partial]').count(),0);
  });
 });
+
+test('G1 real server: Started/Finished come from real stored lifecycle events, coverage stays partial with a horizon',async()=>{
+ await withServer({WORK_CENTER:'1',MISSION_STORY_SEED:'1'},async(page,base)=>{
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  const cardSel='[data-overview="week"]';
+  const calls=[];
+  page.on('request',r=>{if(r.url().includes('/api/v1/work/weekly-events'))calls.push(r.url());});
+  await page.goto(`${base}/index.html#/overview`);
+  await page.locator(`${cardSel} .wk-row`).first().waitFor({timeout:15000});
+  await until(async()=>/history from/.test(await page.locator(cardSel).innerText()),'server history badge',15000);
+  assert.equal(calls.length,1,'one weekly read for this load');
+  // Read the same window the page asked for, straight from the real endpoint.
+  const q=new URL(calls[0]).searchParams;
+  const body=await json(base,`/api/v1/work/weekly-events?since=${encodeURIComponent(q.get('since'))}&until=${encodeURIComponent(q.get('until'))}&limit=500`);
+  assert.equal(body.coverage.complete,false,'the server cannot prove emission, so never complete');
+  assert.ok(body.coverage.horizon,'a horizon is reported');
+  assert.equal(body.coverage.truncated,false);
+  const distinct=kind=>new Set(body.events.filter(e=>e.kind===kind&&!(e.source==='session'&&e.mission_key)).map(e=>e.work_id));
+  const startedIds=distinct('started'),finishedIds=distinct('finished');
+  assert.ok(startedIds.size>=4,`seed has several started works: ${[...startedIds]}`);
+  assert.equal(finishedIds.size,2,'Alpha and Delta finished; Gamma failed is not a finish');
+  const metric=async label=>Number((await page.locator(`${cardSel} .wk-metric`,{hasText:label}).locator('strong').innerText()).trim());
+  assert.equal(await metric('Finished'),2);
+  assert.equal(await metric('Started'),startedIds.size);
+  const badge=await page.locator(`${cardSel} .wk-metric`,{hasText:'Started'}).innerText();
+  assert.match(badge,/at least \d+ \(partial\) · history from \d{4}-\d{2}-\d{2}/);
+  assert.doesNotMatch(badge,/complete/);
+  await page.setViewportSize({width:1200,height:900});
+  await page.locator(cardSel).screenshot({path:path.join(REPO,'docs/specs/herdr-work-command-center-wc001/screenshots/wc-g1-real-server-overview.png')});
+  assert.deepEqual(errors.filter(m=>!/Failed to load resource/.test(m)),[]);
+ });
+});
+
+test('G1 real server, flag OFF: the weekly endpoint is 404 and the page never asks for it',async()=>{
+ await withServer({},async(page,base)=>{
+  const calls=[];
+  page.on('request',r=>{if(r.url().includes('/api/v1/work/'))calls.push(r.url());});
+  const res=await fetch(`${base}/api/v1/work/weekly-events?since=2026-01-01T00:00:00Z&until=2026-01-08T00:00:00Z`);
+  assert.equal(res.status,404);
+  await page.goto(`${base}/index.html#/overview`);
+  await page.locator('[data-overview="sessions"]').waitFor({timeout:15000});
+  await sleep(500);
+  assert.deepEqual(calls,[]);
+ });
+});
