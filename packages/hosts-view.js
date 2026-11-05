@@ -7,6 +7,10 @@ import { liveRefresher, pollWhileVisible } from './refresh-bus.js';
 import { renderFleetMatrix } from './fleet-view.js';
 import { renderHostCard, HOST_CARD_STYLE, staleFor } from './host-view.js';
 import { configNotice, indexConfigStatus } from './fleet-config-badge.js';
+import { loadDiagnostics, SECTIONS } from './diagnostics-source.js';
+import { renderIssueList } from './diagnostics-view.js';
+import { renderSessionTimeline } from './diagnostics-timeline.js';
+import { renderDriftComparison } from './task-drift-view.js';
 
 // Motion keys: a meter by host and kind, a fleet cell by component row and host. Matrix rows are
 // paired by position in morph, so the key is the row's component name, never the DOM node.
@@ -83,4 +87,19 @@ export function mountHosts(container, client, { data = null, driftedOnly = false
   if (data) live.applied(data); else live.refresh();
   const stopPoll = pollWhileVisible(() => live.refresh(), HOST_POLL_MS);
   return { refresh: (hint) => live.refresh(hint), dispose: () => { stopPoll(); live.dispose(); clearInterval(tick); } };
+}
+
+// Host diagnostics is the one page here that is NOT live: H03 reads each feed once and the plan forbids polling it, so this mount starts no
+// refresh bus, no poll, no timer and no control, writes what that single read could see, and returns nothing. What H03 could not read travels
+// through as `unavailable`, so a section that failed renders its unavailable banner instead of an empty list that would read as "nothing is wrong".
+// The events feed carries events, not incidents, and mapping one onto the other would mean inventing a severity, so H04 shows what it cannot use
+// as a rejected record. The same feeds carry no drift report, so H06 prints unknown for every field rather than a value supplied here.
+export async function mountDiagnostics(container, { source } = {}) {
+  const read = await loadDiagnostics(source).catch(() => null);   // loadDiagnostics already swallows every feed failure; this covers a source that is not a source at all
+  const diagnostics = read || { events: { timeline: [] }, unavailable: [...SECTIONS], partial: true };
+  const events = diagnostics.events?.timeline || [];
+  container.innerHTML = `<h1>Diagnostics</h1>
+    <section data-diagnostics-issues><h2>Error issues</h2>${renderIssueList(events, { state: diagnostics })}</section>
+    <section data-diagnostics-timeline><h2>Session timeline</h2>${renderSessionTimeline(events, { unavailable: diagnostics.unavailable })}</section>
+    <section data-diagnostics-drift><h2>Task drift</h2>${renderDriftComparison(diagnostics.drift)}</section>`;
 }
