@@ -209,7 +209,8 @@ def _action_request(hub: Hub, worker: Worker, args: dict) -> dict:
     if not hub.event_limiter.allow(worker.worker_id, hub.event_rate_limit):      # one slot per call, taken here
         raise _ToolError("rate limited")
     d = decide(hub.store, hub.service.config["grants"], worker, raw, session_id, task_id, hub.service.now(),
-               judge=hub.judge, notify=hub.slack.notify_pending if hub.slack is not None else None)
+               judge=hub.judge, notify=hub.slack.notify_pending if hub.slack is not None else None,
+               deploy_cfg=hub.service.config.get("deploy"))
     try:
         record_event(hub.store, worker, kind="action_request", provenance="worker_reported", session_id=session_id,
                      payload={"outcome": d.outcome, "source": d.source,

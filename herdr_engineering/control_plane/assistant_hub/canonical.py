@@ -1050,7 +1050,11 @@ def _with_deploy(raw: RawAction, derived: Derived, deploy_cfg: Any) -> Derived:
     if match is None:
         return derived
     key = request_key(match)
-    return replace(derived, key=key, elements=(key,), owner_decides=False, reason="", one_shot_safe=True, deploy=match)
+    argv = (raw.command or "").split(" ")
+    # The vetoes (fixed and the owner's extra verb rules) read the element keys: the deploy element is deploy.prod too.
+    details = tuple(replace(e, key=key, owner_decides=False) if list(e.argv) == argv else e for e in derived.details)
+    return replace(derived, key=key, elements=(key,), owner_decides=False, reason="", one_shot_safe=True, deploy=match,
+                   details=details)
 
 
 def derive(raw: RawAction, deploy_cfg: Any = None) -> Derived:

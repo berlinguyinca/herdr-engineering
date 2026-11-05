@@ -46,6 +46,7 @@ class ActionGrant:
     policy_version: int = 1
     judge_version: str = ""
     confirmed_by: str = ""
+    source: str = ""                 # "" = earned by evidence; "owner_standing" = a deploy scope the owner confirmed
 
     def __post_init__(self) -> None:
         self.state = GrantState(self.state)      # a restored snapshot carries the plain string

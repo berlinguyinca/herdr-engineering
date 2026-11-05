@@ -19,6 +19,7 @@ from ..assistant import AssistantStore
 from .actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, GrantState, as_utc, revoke
 from .calibration import build_report, gate_satisfied
 from .canonical import Derived, RawAction, derive
+from .deploy import DeployMatch, scope_key
 from .events import scrub_payload
 from .evidence import OWNER_PROVENANCE, _shadow_elapsed, propose_if_ready
 from .jev import JudgeUnavailable
@@ -32,7 +33,7 @@ from .workers import Worker
 POLICY_ACTOR = "hub:policy"
 Outcome = Literal["authorized", "denied", "pending"]
 Notify = Callable[..., None]      # (row, display, reason, *, project="") -> None; must only enqueue
-Source = Literal["veto", "grant", "owner", "shadow", "unknown", "judge", "judge_unavailable"]
+Source = Literal["veto", "grant", "owner", "shadow", "unknown", "judge", "judge_unavailable", "deploy_preconditions"]
 
 
 @dataclass(frozen=True)
@@ -151,12 +152,26 @@ def _deny(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derive
     return Decision("denied", f"Denied by the {veto.code} rule: {veto.reason}.", row.request_id, None, veto.code, "veto")
 
 
+STANDING = "owner_standing"      # ActionGrant.source of a deploy scope the owner confirmed in Slack
+
+
 def _live_grant(store: AssistantStore, cfg: dict, worker: Worker, key: ActionKey, now: datetime,
-                judge_version: str = "") -> ActionGrant | None:
-    key_id, policy = key.key_id(), int(cfg["policy_version"])
+                judge_version: str = "", deploy: DeployMatch | None = None) -> ActionGrant | None:
+    """The ACTIVE grant that covers ``key`` for this worker.
+
+    A configured deploy (``deploy`` set) is covered ONLY by a standing grant for its scope (tenant, user, worker, verb,
+    repo, scope; never the sha, which each request binds on its own key and Task 8 checks).  Every other action is
+    matched on the exact key id, and a standing grant never covers it."""
+    policy = int(cfg["policy_version"])
+    if deploy is not None:
+        key_id, standing = scope_key(deploy).key_id(), True
+    else:
+        key_id, standing = key.key_id(), False
     for g in store.list_action_grants(worker.tenant_id, worker.user_id):
         if (g.worker_id == worker.worker_id and g.key_id == key_id and g.tenant_id == worker.tenant_id
-                and g.user_id == worker.user_id
+                and g.user_id == worker.user_id and (g.source == STANDING) is standing
+                and (not standing or (g.verb == Verb.DEPLOY_PROD.value
+                                      and g.resource_scope.casefold() == deploy.repo.casefold()))
                 and g.effective_state(now, policy, judge_version) is GrantState.ACTIVE):
             return g
     return None
@@ -258,9 +273,28 @@ def _consult(judge: JudgeRuntime | None, key: ActionKey) -> Verdict | str:
         return "internal"
 
 
+_PRECONDITIONS_REASON = "The deploy preconditions could not be verified, so the owner decides."
+
+
+@dataclass(frozen=True)
+class PreconditionResult:
+    """Outcome of the hub's own deploy checks.  Only ``passed`` lets a standing-grant deploy through."""
+    status: Literal["passed", "failed", "not_checked"]
+    detail: str = ""
+
+
+def _deploy_preconditions(store: AssistantStore, match: DeployMatch, grant: ActionGrant, worker: Worker,
+                          now: datetime) -> PreconditionResult:
+    """The hub-verified checks (on main, CI green, descends from the deployed commit) belong to Task 8.
+
+    Until they exist this FAILS CLOSED: nothing is checked, so a standing-grant deploy is never authorized."""
+    return PreconditionResult("not_checked")
+
+
 def decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, session_id: str, task_id: str,
-           now: datetime, *, judge: JudgeRuntime | None = None, notify: Notify | None = None) -> Decision:
-    derived = derive(raw)
+           now: datetime, *, judge: JudgeRuntime | None = None, notify: Notify | None = None,
+           deploy_cfg: dict | None = None) -> Decision:
+    derived = derive(raw, deploy_cfg)
     key = derived.key
     return replace(_decide(store, cfg, worker, raw, derived, session_id, task_id, now, judge, notify),
                    verb=key.verb.value if key else Verb.UNKNOWN.value, key_id=key.key_id() if key else "")
@@ -297,7 +331,7 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
     if derived.owner_decides or derived.key is None:
         return _pending(store, worker, raw, derived, session_id, task_id, now, "unknown",
                         "The action could not be classified with certainty, so the owner decides.", judge, notify=notify)
-    grant = _live_grant(store, cfg, worker, derived.key, now, current_judge_version(judge))
+    grant = _live_grant(store, cfg, worker, derived.key, now, current_judge_version(judge), derived.deploy)
     if grant is not None and in_shadow(store, cfg, now):
         return _pending(store, worker, raw, derived, session_id, task_id, now, "shadow",
                         "The shadow period is still running, so the owner decides.", judge, notify=notify)
@@ -310,10 +344,17 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
         outcome, source = _apply_verdict(result)
         if outcome == "authorized":
             # The consult can be slow: re-check that the grant is still live (revoked/expired/judge changed meanwhile).
-            grant = _live_grant(store, cfg, worker, derived.key, _fresh_now(judge, now), current_judge_version(judge))
+            grant = _live_grant(store, cfg, worker, derived.key, _fresh_now(judge, now), current_judge_version(judge),
+                                derived.deploy)
             if grant is None:
                 return _pending(store, worker, raw, derived, session_id, task_id, now, "owner",
                                 "No active grant covers this exact action, so the owner decides.", judge, notify=notify)
+            if derived.deploy is not None:
+                checked = _deploy_preconditions(store, derived.deploy, grant, worker, _fresh_now(judge, now))
+                if checked.status != "passed":
+                    return _pending(store, worker, raw, derived, session_id, task_id, now, "deploy_preconditions",
+                                    _PRECONDITIONS_REASON, judge, extra=f" preconditions={checked.status}",
+                                    notify=notify)
         if outcome == "pending":
             return _pending(store, worker, raw, derived, session_id, task_id, now, source, _JUDGE_REASON, judge,
                             extra=_verdict_detail(result), notify=notify)
@@ -420,6 +461,61 @@ def _activate_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: 
         store.put_action_grant(active)
     store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=confirmed_by, action="assistant.grant.activated",
                        subject_id=grant_id, detail=f"key_id={active.key_id} worker={active.worker_id}")
+    return active
+
+
+def create_standing_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str,
+                          worker_id: str, key: ActionKey, confirmed_by: str, judge_version: str,
+                          judge: JudgeRuntime | None) -> ActionGrant:
+    """An ACTIVE standing grant for one deploy scope, created at the owner's verified Slack confirmation.
+
+    It skips ONLY the approval-count and session/task diversity rules.  The shadow period and the judge gate (every
+    code of ``_check_judge_gate``) must hold now, exactly as for ``activate_grant``; at use the grant still obeys
+    ``effective_state``, the shadow period, the judge consult and the vetoes.  ``judge_version`` is the version the caller
+    saw; when given and no longer current the creation is refused as ``stale_report``.  An existing live standing grant
+    for the same worker and scope is returned unchanged."""
+    if (key.tool != "deploy" or key.verb is not Verb.DEPLOY_PROD or not key.resource_scope
+            or not key.target.startswith("scope:")):
+        raise ValueError("a standing grant needs a deploy scope key")
+    try:
+        return _create_standing_grant(store, cfg, now, tenant_id, user_id, worker_id, key, confirmed_by, judge_version,
+                                      judge)
+    except ActivationRefused as exc:
+        store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=confirmed_by.strip() or "unknown",
+                           action="assistant.grant.activate_refused", subject_id=key.key_id(),
+                           detail=f"{exc.code} key_id={key.key_id()} worker={worker_id}")
+        raise
+
+
+def _create_standing_grant(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str,
+                           worker_id: str, key: ActionKey, confirmed_by: str, judge_version: str,
+                           judge: JudgeRuntime | None) -> ActionGrant:
+    if not confirmed_by.strip():
+        raise ActivationRefused("confirmation_missing", "the owner's confirmation is required")
+    now, key_id, policy = as_utc(now), key.key_id(), int(cfg["policy_version"])
+    grant = ActionGrant(
+        grant_id="ag_" + secrets.token_urlsafe(16), tenant_id=tenant_id, user_id=user_id, worker_id=worker_id,
+        resource_scope=key.resource_scope, key_id=key_id, verb=key.verb.value, key_canonical=key.canonical(),
+        state=GrantState.PROPOSED, created_at=now, proposed_at=now, policy_version=policy, source=STANDING)
+    with store._lock:
+        current = current_judge_version(judge)
+        for g in store.list_action_grants(tenant_id, user_id):
+            if (g.worker_id, g.key_id, g.source) == (worker_id, key_id, STANDING) \
+                    and g.effective_state(now, policy, current) is GrantState.ACTIVE:
+                return g                                  # a second confirmation creates nothing more
+        if in_shadow(store, cfg, now):
+            raise ActivationRefused("still_in_shadow", "the shadow period has not elapsed")
+        version = _check_judge_gate(store, now, tenant_id, user_id, grant, judge)
+        if judge_version and judge_version != version:
+            raise ActivationRefused("stale_report", _GATE_MESSAGES["stale_report"])
+        active = replace(grant, state=GrantState.ACTIVE, activated_at=now, confirmed_by=confirmed_by,
+                         judge_version=version, expires_at=now + timedelta(days=int(cfg["grant_ttl_days"])))
+        try:
+            store.put_action_grant(active)
+        except ValueError:                                # per-tenant grant cap
+            raise ActivationRefused("grant_cap", "the tenant already holds the maximum number of grants") from None
+    store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=confirmed_by, action="assistant.grant.activated",
+                       subject_id=active.grant_id, detail=f"key_id={key_id} worker={worker_id} source={STANDING}")
     return active
 
 
