@@ -57,6 +57,7 @@ ISSUER = f"https://cognito-idp.us-west-2.amazonaws.com/{POOL}"
 WEB_CLIENT = "member-ui-web"
 GROUP = "local.dev"
 USERS = {"alice": ("alice@lab.example", [GROUP]), "mal": ("mal@lab.example", ["Users"])}
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==")
 HOSTILE = '"><img src=x onerror=window.__x=1>'
 _LOCK = threading.RLock()
 
@@ -207,16 +208,16 @@ class FakeMemberService:
         with _LOCK:
             if "lib" not in u:
                 def item(aid, title, sharer, day, source, status="active", expires=None, body=b"", ctype="text/html"):
-                    path = "index.html" if ctype == "text/html" else "data.bin"
+                    path = {"text/html": "index.html", "text/plain": "notes.txt", "image/png": "fig.png", "application/pdf": "doc.pdf"}.get(ctype, "data.bin")
                     return {"artifact_id": aid, "title": title, "sharer": sharer, "shared_at": f"2026-10-{day:02d}T10:00:00+00:00",
                             "source": source, "status": status, "expires_at": expires, "share_id": None if source != "opened" else "shr_hidden",
-                            "folder_ids": [], "artifact_type": "html" if ctype == "text/html" else "bin", "size_bytes": len(body),
+                            "folder_ids": [], "artifact_type": path.rsplit(".", 1)[-1], "size_bytes": len(body),
                             "files": [{"path": path, "sha256": hashlib.sha256(body).hexdigest(), "size": len(body), "content_type": ctype}]
                             if status in ("active", "pending") else [], "_body": body}
                 u["lib"] = {"folders": [], "items": [
                     item("lib_mine", "Plate map", "alice@lab.example", 1, "mine", body=b"<h1>mine content</h1>"),
-                    item("lib_assigned", f"QC report {HOSTILE}", "bob@lab.example", 5, "assigned", body=b"<h1>assigned content</h1>"),
-                    item("lib_opened", "Opened by link", "cy@lab.example", 3, "opened", expires="2026-12-01T00:00:00+00:00", body=b"<h1>opened content</h1>"),
+                    item("lib_assigned", f"QC report {HOSTILE}", "bob@lab.example", 5, "assigned", body=b"assigned plain text", ctype="text/plain"),
+                    item("lib_opened", "Opened by link", "cy@lab.example", 3, "opened", expires="2026-12-01T00:00:00+00:00", body=PNG, ctype="image/png"),
                     item("lib_expired", "Old link", "dee@lab.example", 2, "opened", status="expired", expires="2026-09-30T00:00:00+00:00"),
                     item("lib_pending", "Agent push", "agent", 7, "pending", status="pending", body=b"<h1>pending content</h1>"),
                     item("lib_pending2", "Second push", "agent", 8, "pending", status="pending", body=b"x", ctype="application/octet-stream"),
@@ -246,6 +247,8 @@ class FakeMemberService:
         return self._submit(u, doc)
 
     def library_folder_create(self, actor, name):
+        if name.strip().lower() == "full":
+            return self._submit(self._u(actor), {"result": "rejected", "reason": "folder_limit"})
         fid = "fld_" + secrets.token_hex(12)
         return self._folder_write(actor, lambda lib: lib["folders"].append({"folder_id": fid, "name": name}),
                                   {"result": "created", "folder_id": fid})
@@ -286,6 +289,9 @@ class FakeMemberService:
         return self._folder_write(actor, change, {"result": "accepted"})
 
     def library_discard(self, actor, artifact_id):
+        if artifact_id == "lib_pending2" and not self._lib(actor).get("_refused_once"):
+            self._lib(actor)["_refused_once"] = True      # the first discard is refused, the retry succeeds
+            return self._submit(self._u(actor), {"result": "rejected", "reason": "not_found"})
         def change(lib):
             lib["items"] = [i for i in lib["items"] if not (i["artifact_id"] == artifact_id and i["source"] == "pending")]
         return self._folder_write(actor, change, {"result": "discarded"})

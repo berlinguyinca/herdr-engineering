@@ -193,6 +193,7 @@ async function reloadLibrary() {
 const CHIP_SOURCES = { all: undefined, assigned: ['assigned'], opened: ['opened'], mine: ['mine'], pending: ['pending'] };
 
 function paintFeed() {
+  if (!$('[data-chips-region]') || !$('[data-feed-region]')) return;      // the member left the library while a search was pending
   const folderId = current.route === 'folder' ? current.id : null;
   const scope = V.filterFeed(lib.items, { folderId, sources: ['mine', 'assigned', 'opened', 'pending'] });
   const count = (src) => scope.filter((r) => r.source === src).length;
@@ -213,7 +214,23 @@ function viewLibrary() {
   paintFeed();
 }
 
-const wait = async (work, done) => { await work(); await route(); if (done) say(done); };
+/** Run one library write, refresh the view, then say what happened. A refusal (HTTP 200 result "rejected") or a failure is
+ *  an error message, never the success text; the view is refreshed either way so it shows the server's truth. */
+async function wait(work, done) {
+  let message = done;
+  let kind = 'info';
+  let ok = true;
+  try {
+    const refusal = V.rejectionText(await work());
+    if (refusal) { message = refusal; kind = 'error'; ok = false; }
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) throw e;
+    message = describe(e); kind = 'error'; ok = false;
+  }
+  await route();
+  if (message) say(message, kind);
+  return ok;
+}
 
 async function folderCreate(form) {
   const name = String(new FormData(form).get('name') || '').trim();
@@ -228,23 +245,34 @@ async function folderRename(el) {
 async function folderDelete(el) {
   const folder = lib.folders.find((f) => f.folder_id === el.dataset.folder);
   if (!folder || !window.confirm(`Delete the folder "${folder.name}"? Its items stay in your library.`)) return;
-  await api.deleteFolder(folder.folder_id);
+  const wasHere = current.route === 'folder' && current.id === folder.folder_id;
+  if (!wasHere) { await wait(() => api.deleteFolder(folder.folder_id), 'Folder deleted.'); return; }
+  let refusal = null;
+  try { refusal = V.rejectionText(await api.deleteFolder(folder.folder_id)); } catch (e) { refusal = describe(e); }
+  if (refusal) { await route(); say(refusal, 'error'); return; }
+  location.hash = '#/';
   say('Folder deleted.');
-  if (location.hash === '#/') await route(); else location.hash = '#/';
 }
 
-const VIEWABLE = /^(text\/|application\/pdf$|image\/(png|jpe?g|gif|webp)$)/;
-/** Fetch with the member session, then show the blob in its own window (the strict page CSP carries over to it) or save it. */
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.hidden = true;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+/** Fetch with the member session. Only the server's inline types (plain text, pdf, png, jpeg, gif, webp) are shown, in their own
+ *  window; HTML and every other type is saved as a file and never rendered in the member origin. */
 async function openContent(el) {
   const { artifact, path } = el.dataset;
   const { blob, type } = await api.fetchContent(artifact, path);
-  const url = URL.createObjectURL(blob);
-  if (VIEWABLE.test(type)) window.open(url, '_blank', 'noopener');
-  else {
-    const a = document.createElement('a');
-    a.href = url; a.download = path.split('/').pop(); a.hidden = true;
-    document.body.append(a); a.click(); a.remove();
-  }
+  const name = path.split('/').pop();
+  if (V.contentMode(type) !== 'inline') { saveBlob(blob, name); return; }
+  const shown = type.startsWith('text/') ? new Blob([blob], { type: 'text/plain;charset=utf-8' }) : blob;
+  const url = URL.createObjectURL(shown);
+  const win = window.open(url, '_blank', 'noopener');
+  if (win === null) { URL.revokeObjectURL(url); saveBlob(blob, name); say('Your browser blocked the new window, so the file was saved instead.'); return; }
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
@@ -309,6 +337,7 @@ async function viewArtifact(id) {
 }
 
 async function route() {
+  clearTimeout(searchTimer);
   shownShare = null;
   const abandoned = draft;
   draft = null;
@@ -620,7 +649,10 @@ document.addEventListener('change', (ev) => {
     else startUploads(current.id, chosen);
   } else if (t.matches('select[data-action="file"]')) {
     const folder = t.value;
-    if (folder) wait(() => api.fileItem(folder, t.dataset.artifact), 'Filed.').catch((e) => say(describe(e), 'error'));
+    if (folder) {
+      wait(() => api.fileItem(folder, t.dataset.artifact), 'Filed.').then((ok) => { if (!ok && t.isConnected) t.value = ''; })
+        .catch((e) => say(describe(e), 'error'));
+    }
   } else if (t.matches('input[name="audience"]')) {
     const form = t.closest('form');
     const pub = form.elements.audience.value === 'public';

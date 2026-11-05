@@ -68,3 +68,17 @@ test('contentUrl percent-encodes the path segments and fetchContent sends the me
     assert.equal(seen[0].headers.authorization, 'Member S');
   });
 });
+
+test('fetchContent turns 401 (signed out), 404, 429 and 503 into ApiErrors without leaking a body', async () => {
+  for (const status of [401, 404, 429, 503]) {
+    let signedOut = 0;
+    const srv = await serve((req, res) => reply(res, status, { error: 'x', message: `m${status}` }));
+    const sessions = createSessionStore({ getItem: () => null, setItem() {}, removeItem() {} });
+    sessions.set({ session: 'S', expires_at: future() });
+    const api = createMemberApi({ sessions, refresh: async () => {}, onSignedOut() { signedOut += 1; }, base: srv.base, sleep: async () => {} });
+    try {
+      await assert.rejects(api.fetchContent('art-1', 'index.html'), (e) => e.name === 'ApiError' && e.status === status);
+      assert.equal(signedOut, status === 401 ? 1 : 0);
+    } finally { await srv.close(); }
+  }
+});

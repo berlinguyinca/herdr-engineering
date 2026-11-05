@@ -57,6 +57,8 @@ input[type="radio"] { padding: 0; }
 .folder-list { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 2px; }
 .folder-list .tab { display: block; overflow-wrap: anywhere; }
 .folder-manage { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.row-open { font: inherit; font-weight: 600; text-align: left; background: none; border: 0; padding: 0; color: var(--text); cursor: pointer; text-decoration: underline; overflow-wrap: anywhere; }
+.row-open:hover { color: var(--btn-accent); }
 .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .row-muted { background: #f0f0f3; color: #5a5a6c; }
 .row-muted .row-title { color: #5a5a6c; font-weight: 400; }

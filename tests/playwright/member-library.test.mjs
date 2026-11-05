@@ -112,15 +112,22 @@ test('library feed: render, chips, search, expired row, pending, folders, openin
     assert.equal(await expired.locator('a, button, select').count(), 0);
     assert.equal(await expired.getAttribute('href'), null);
 
-    // opening content goes through the content route with the member session and opens the file
-    const link = page.locator('[data-feed-row="lib_mine"] a[data-action="open"]');
-    assert.equal(await link.getAttribute('href'), '/api/member/artifacts/lib_mine/content/index.html');
-    const [popup] = await Promise.all([context.waitForEvent('page'), link.click()]);
+    // opening content: only the server's inline types are shown (plain text, png, pdf); HTML is saved, never rendered
+    assert.equal(await page.locator('[data-feed-row="lib_mine"] [data-action="open"]').getAttribute('href'), null, 'no content href to middle-click');
+    const [saved] = await Promise.all([page.waitForEvent('download'), page.locator('[data-feed-row="lib_mine"] [data-action="open"]').click()]);
+    assert.equal(saved.suggestedFilename(), 'index.html');
+    assert.equal(context.pages().length, 1, 'HTML did not open a window');
+    const [popup] = await Promise.all([context.waitForEvent('page'), page.locator('[data-feed-row="lib_assigned"] [data-action="open"]').click()]);
     await popup.waitForLoadState();
-    assert.match(await popup.locator('body').innerText(), /mine content/);
     assert.match(popup.url(), /^blob:/);
     assert.ok(!popup.url().includes('shr_hidden'));
+    assert.equal(await popup.evaluate(() => document.contentType), 'text/plain');
+    assert.match(await popup.locator('body').innerText(), /assigned plain text/);
     await popup.close();
+    const [img] = await Promise.all([context.waitForEvent('page'), page.locator('[data-feed-row="lib_opened"] [data-action="open"]').click()]);
+    await img.waitForLoadState();
+    assert.equal(await img.evaluate(() => document.contentType), 'image/png');
+    await img.close();
 
     // Pending: Accept moves a row into the library, Discard removes one
     await page.locator('[data-chip="pending"]').click();
@@ -128,6 +135,11 @@ test('library feed: render, chips, search, expired row, pending, folders, openin
     await page.locator('[data-feed-row="lib_pending"] [data-action="accept"]').click();
     await page.locator('[data-feed-row="lib_pending"] [data-action="accept"]').waitFor({ state: 'detached', timeout: 15000 });
     assert.equal(await rows(page).count(), 1);
+    // a refused intent (HTTP 200 result "rejected") is an error message with the reason, not a success
+    await page.locator('[data-feed-row="lib_pending2"] [data-action="discard"]').click();
+    await page.waitForFunction(() => /Refused: not_found/.test(document.querySelector('#status').textContent), null, { timeout: 15000 });
+    assert.equal(await page.locator('#status').getAttribute('data-kind'), 'error');
+    assert.equal(await page.locator('[data-feed-row="lib_pending2"]').count(), 1, 'the refused row is still there');
     await page.locator('[data-feed-row="lib_pending2"] [data-action="discard"]').click();
     await page.waitForFunction(() => !document.querySelector('[data-chip="pending"]'), null, { timeout: 15000 });
     await page.locator('[data-chip="all"]').click();
@@ -136,6 +148,10 @@ test('library feed: render, chips, search, expired row, pending, folders, openin
     assert.equal(await page.locator('[data-feed-row="lib_pending"] .badge-mine').count(), 1);
 
     // folders: create, file an item, open the folder view, remove from the folder
+    await page.locator('[data-folder-form] input[name="name"]').fill('full');
+    await page.locator('[data-folder-form] button[type="submit"]').click();
+    await page.waitForFunction(() => /Refused: folder_limit/.test(document.querySelector('#status').textContent), null, { timeout: 15000 });
+    assert.equal(await page.locator('.folder-list a[href^="#/f/"]').count(), 0);
     await page.locator('[data-folder-form] input[name="name"]').fill('Topic <b>A</b>');
     await page.locator('[data-folder-form] button[type="submit"]').click();
     const folderLink = page.locator('.folder-list a[href^="#/f/"]');

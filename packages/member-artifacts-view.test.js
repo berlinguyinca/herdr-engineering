@@ -193,7 +193,7 @@ test('renderFeedRow: badge per source, escaped text, content link on the content
   assert.match(badge('pending'), /badge-pending">Pending</);
   const html = renderFeedRow(item({ title: HOSTILE, sharer: HOSTILE, share_id: 'shr_secret', source: 'opened', expires_at: '2026-12-01T00:00:00Z' }));
   inert(html);
-  assert.match(html, /href="\/api\/member\/artifacts\/art-1\/content\/index\.html"/);
+  assert.match(html, /data-artifact="art-1" data-path="index\.html"/);
   assert.doesNotMatch(html, /shr_secret/);
   assert.match(html, /Expires 2026-12-01/);
   assert.match(html, /2026-10-01/);
@@ -269,4 +269,34 @@ test('renderNav keeps My artifacts reachable at #/mine next to the Library tab',
   const html = renderNav('library', true);
   assert.match(html, /href="#\/"[^>]*aria-current="page">Library/);
   assert.match(html, /href="#\/mine"[^>]*>My artifacts/);
+});
+
+// ---------------------------------------------------------------------------------------------- fix round 1
+import { contentMode, rejectionText } from './member-artifacts-view.js';
+
+test('contentMode shows only the server inline types; html, css, js, xml, svg and the rest are downloaded', () => {
+  for (const t of ['text/plain', 'text/plain; charset=utf-8', 'application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp']) {
+    assert.equal(contentMode(t), 'inline', t);
+  }
+  for (const t of ['text/html', 'text/html; charset=utf-8', 'text/css', 'text/javascript', 'text/xml', 'application/xhtml+xml',
+    'image/svg+xml', 'application/json', 'text/csv', 'application/octet-stream', '', undefined, 'TEXT/HTML']) {
+    assert.equal(contentMode(t), 'download', String(t));
+  }
+});
+
+test('rejectionText reads the worker refusal (HTTP 200 result rejected) and nothing else', () => {
+  assert.match(rejectionText({ result: 'rejected', reason: 'pending_cap' }), /pending_cap/);
+  assert.match(rejectionText({ result: 'rejected' }), /refused/i);
+  assert.equal(rejectionText({ result: 'created' }), null);
+  assert.equal(rejectionText(null), null);
+  assert.equal(rejectionText(undefined), null);
+});
+
+test('the open action is a button without an href; expired rows hide the source badge', () => {
+  const open = renderFeedRow(item());
+  assert.match(open, /<button[^>]*data-action="open"[^>]*data-path="index\.html"/);
+  assert.doesNotMatch(open, /href=/);
+  const gone = renderFeedRow(item({ status: 'expired', source: 'opened' }));
+  assert.doesNotMatch(gone, /badge-opened|Opened via link/);
+  assert.match(gone, />Expired</);
 });

@@ -286,7 +286,18 @@ export function chooseEntry(row) {
   return files.find((f) => f.path === 'index.html') || files[0] || null;
 }
 
-const contentHref = (id, path) => `/api/member/artifacts/${encodeURIComponent(id)}/content/${String(path).split('/').map(encodeURIComponent).join('/')}`;
+const INLINE_TYPES = new Set(['text/plain', 'application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+/** 'inline' only for the types the server itself serves inline (member_web _INLINE_TYPES); everything else is saved, never rendered. */
+export function contentMode(type) {
+  const base = String(type || '').split(';', 1)[0].trim().toLowerCase();
+  return INLINE_TYPES.has(base) ? 'inline' : 'download';
+}
+
+/** The worker answers a refusal with HTTP 200 {result: 'rejected', reason}; this is the message, or null when it was not refused. */
+export function rejectionText(out) {
+  if (!out || out.result !== 'rejected') return null;
+  return out.reason ? `Refused: ${out.reason}` : 'Refused.';
+}
 
 export function renderFeedRow(row, { folders = [], activeFolder = null } = {}) {
   const [badgeKey, badgeText] = SOURCE_BADGE[row.source] || ['opened', row.source || 'Unknown'];
@@ -297,13 +308,13 @@ export function renderFeedRow(row, { folders = [], activeFolder = null } = {}) {
   if (gone) {
     return `<li class="row row-muted row-expired" data-feed-row="${esc(row.artifact_id)}" data-status="${esc(row.status)}">
 <span class="row-title">${esc(row.title || row.artifact_id)}</span>
-<span class="row-meta">${badge} <span class="badge badge-${row.status === 'expired' ? 'expired' : 'revoked'}">${esc(gone)}</span> ${sharer} <span data-date>${esc(when)}</span></span>
+<span class="row-meta"><span class="badge badge-${row.status === 'expired' ? 'expired' : 'revoked'}">${esc(gone)}</span> ${sharer} <span data-date>${esc(when)}</span></span>
 </li>`;
   }
   const entry = chooseEntry(row);
   const title = esc(row.title || row.artifact_id);
   const open = entry
-    ? `<a class="row-title" data-action="open" data-artifact="${esc(row.artifact_id)}" data-path="${esc(entry.path)}" href="${esc(contentHref(row.artifact_id, entry.path))}" rel="noopener">${title}</a>`
+    ? `<button type="button" class="row-title row-open" data-action="open" data-artifact="${esc(row.artifact_id)}" data-path="${esc(entry.path)}">${title}</button>`
     : `<span class="row-title">${title}</span>`;
   const expiry = row.source === 'opened' && row.expires_at ? ` <span data-expiry>Expires ${esc(formatDate(row.expires_at))}</span>` : '';
   const id = esc(row.artifact_id);
