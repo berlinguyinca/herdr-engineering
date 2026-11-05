@@ -6,6 +6,7 @@ not worker health: a missing collector never manufactures a stalled mission.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -62,6 +63,8 @@ MAX_LINKS = 20
 ENTITY_TYPE = 'mission_activity_store'
 STORED_EVENT = 'MissionActivityStored'
 PERSIST_INTERVAL_SECONDS = 30
+PERSIST_HEARTBEAT_SECONDS = 600     # an unchanged projection is still re-written this often so restart freshness holds
+WARN_INTERVAL_SECONDS = 300         # persist-failure warnings (with traceback) at most this often; the rest are counted
 log = logging.getLogger(__name__)
 LINK_KINDS = frozenset(('issue', 'pull_request'))
 _REPOSITORY = re.compile(r'^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$')
@@ -171,6 +174,20 @@ def _sanitize(value: Any, *, depth=0, budget=None) -> Any:
     return None
 
 
+_VOLATILE = frozenset(('observed_at', 'snapshot_at', 'received_at', 'activity_snapshot_at', 'lastHeartbeatAt'))
+
+
+def _content_digest(value: dict) -> str:
+    """Hash of what a mirror row would say, ignoring timestamps that move on every snapshot."""
+    def strip(item):
+        if isinstance(item, dict):
+            return {k: strip(v) for k, v in item.items() if k not in _VOLATILE}
+        if isinstance(item, list):
+            return [strip(v) for v in item]
+        return item
+    return hashlib.sha256(json.dumps(strip(value), sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 def _only_valid_v4(mission: dict, now: float) -> bool:
     """A saved mission may carry the contract-v4 fields only in the exact shape clean_pi_fields would have stored."""
     saved = {name: mission[name] for name in PI_V4_FIELDS if name in mission}
@@ -183,7 +200,10 @@ class MissionActivityStore:
     def __init__(self, *, now=None, max_missions=MAX_MISSIONS, persist=None):
         self._now = now or time.time
         self._persist = persist           # callable(event dict) or None; best-effort, never breaks ingest
-        self._persisted: dict[str, tuple[float, str]] = {}   # key -> (epoch, connection) of the last mirrored row
+        self._persisted: dict[str, tuple[float, str, str]] = {}   # key -> (epoch, connection, content digest) of the last mirrored row
+        self.persist_failures = 0
+        self._warned_at: float | None = None
+        self._warned_failures = 0
         self._max_missions = max(1, min(MAX_MISSIONS, max_missions))
         self._entries: OrderedDict[str, dict] = OrderedDict()
         self._lock = threading.RLock()
@@ -341,18 +361,34 @@ class MissionActivityStore:
             try:
                 self._persist(row)
             except Exception:  # noqa: BLE001 - the mirror is best-effort; the in-memory projection already holds the snapshot
-                log.warning('mission activity persistence failed for %s', mission_key, exc_info=True)
+                self._note_persist_failure(mission_key, now)
         return {'accepted': True, 'mission_key': mission_key}
 
+    def _note_persist_failure(self, key, now):
+        """Warn with a traceback at most once per WARN_INTERVAL_SECONDS; every failure is counted."""
+        with self._lock:
+            self.persist_failures += 1
+            if self._warned_at is not None and now - self._warned_at < WARN_INTERVAL_SECONDS:
+                return
+            earlier = self.persist_failures - self._warned_failures - 1
+            self._warned_at, self._warned_failures = now, self.persist_failures
+        log.warning('mission activity persistence failed for %s%s', key,
+                    f' ({earlier} earlier failure(s) not logged)' if earlier else '', exc_info=True)
+
     def _storable(self, key, entry, now):
-        """The event to mirror for this accepted snapshot, or None (no sink, or throttled). Caller holds the lock."""
+        """The event to mirror for this accepted snapshot, or None (no sink, throttled, or unchanged). Caller holds the
+        lock. A connection change is always written; otherwise at most once per PERSIST_INTERVAL_SECONDS, and an
+        unchanged projection only once per PERSIST_HEARTBEAT_SECONDS."""
         if self._persist is None:
             return None
         connection = entry['value']['connection']
+        digest = _content_digest(entry['value'])
         last = self._persisted.get(key)
-        if last is not None and last[1] == connection and now - last[0] < PERSIST_INTERVAL_SECONDS:
-            return None
-        self._persisted[key] = (now, connection)
+        if last is not None and last[1] == connection:
+            age = now - last[0]
+            if age < PERSIST_INTERVAL_SECONDS or (last[2] == digest and age < PERSIST_HEARTBEAT_SECONDS):
+                return None
+        self._persisted[key] = (now, connection, digest)
         while len(self._persisted) > 4 * self._max_missions:
             self._persisted.pop(next(iter(self._persisted)))
         return {'entity_type': ENTITY_TYPE, 'entity_id': key, 'event_type': STORED_EVENT,
@@ -378,7 +414,8 @@ class MissionActivityStore:
             self._persisted.clear()
             for key, (_, entry) in sorted(best.items(), key=lambda item: item[1][0])[-self._max_missions:]:
                 self._entries[key] = entry
-                self._persisted[key] = (entry['received_epoch'], entry['value']['connection'])
+                self._persisted[key] = (entry['received_epoch'], entry['value']['connection'],
+                                        _content_digest(entry['value']))
         return {'loaded': len(self._entries), 'skipped': skipped}
 
     @staticmethod

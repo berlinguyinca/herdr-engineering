@@ -79,7 +79,7 @@ def test_restored_store_keeps_ordering_rules_and_keeps_persisting():
     assert again.mission_activity.get('pi:MSN-1')['observed_at'] == stamp(NOW)
     assert old['accepted'] is False    # out-of-order rules survive the restart
     clock[0] += PERSIST_INTERVAL_SECONDS + 1
-    IngestService(again).ingest(snapshot('MSN-1', clock[0]))
+    IngestService(again).ingest(snapshot('MSN-1', clock[0], title='Changed'))
     assert [r['entity_type'] for r in again._sink.rows] == [ENTITY_TYPE]
 
 
@@ -97,7 +97,7 @@ def test_writes_are_throttled_per_mission_but_a_connection_change_is_written():
     service.ingest(changed)
     assert len(sink.rows) == 2
     clock[0] += PERSIST_INTERVAL_SECONDS
-    service.ingest(snapshot('MSN-1', clock[0]))
+    service.ingest(snapshot('MSN-1', clock[0], title='Changed again'))
     assert len(sink.rows) == 3
     service.ingest(snapshot('MSN-2', clock[0]))
     assert len(sink.rows) == 4
