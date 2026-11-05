@@ -28,11 +28,11 @@ dependencies:
     note: "Build pin for `deploy/control-plane/deploy.sh --with-memory` (amd64 only): deploy.sh exports exactly this revision from the clone at `checkout` (override: --memory-checkout / HERDR_MEMORY_CHECKOUT) and runs its deploy/build.sh. Distinct from the client pin of `herdr-memory` (herdr_engineering.memory_install.PINNED_REVISION); bump both deliberately."
   herdr-handoff:
     source: "berlinguyinca/herdr-handoff"
-    revision: "2bbae4db4da0569241a8d377baea108157efd0f8"
+    revision: "c425453958df28c14a77fd3f61794aaa678fa47a"
     decision: ADOPT
     license: "MIT"
     maintenance: "active; standalone cross-harness handoff contract"
-    note: "Required operational dependency. Includes memory-context handoffs and the engineering-memory namespace routes (herdr-handoff#1, #3). Install the pinned CLI and all four harness skills before strict validation."
+    note: "Required operational dependency. Includes memory-context handoffs and the engineering-memory namespace routes (herdr-handoff#1, #3), and the v2 handoff envelope with pane-less launch fallback (herdr-handoff#4, v0.2.0). Install the pinned CLI and all four harness skills before strict validation."
   herdr:
     source: "official (local binary)"
     revision: "0.9.1"
