@@ -492,6 +492,38 @@ def test_the_version_freeze_still_refuses_edits_outside_a_purge(env):
                 "WHERE version_id=$1 AND set_config('herdr.purge_redaction','on',false)='on'", vid)
 
 
+def test_the_redaction_window_only_allows_blanking_on_a_purged_version(env):
+    """Migration 0050: even with the GUC on, a live version cannot be rewritten, and a purged one only to '[removed]'."""
+    aid, vid = env.artifact()
+    import pytest
+    on = "set_config('herdr.purge_redaction','on',false)='on'"
+    with pytest.raises(Exception, match="immutable"):                       # live version, forged name
+        env.sql("UPDATE artifact_versions SET output_manifest=jsonb_set(output_manifest, '{0,name}', '\"forged.md\"') "
+                f"WHERE version_id=$1 AND {on}", vid)
+    with pytest.raises(Exception, match="immutable"):                       # live version, forged commit message
+        env.sql("UPDATE artifact_versions SET provenance=provenance || '{\"message\": \"forged commit\"}'::jsonb "
+                f"WHERE version_id=$1 AND {on}", vid)
+    with pytest.raises(Exception, match="immutable"):                       # purged, but not blanked
+        env.sql("UPDATE artifact_versions SET purged_at=now(), "
+                "output_manifest=jsonb_set(output_manifest, '{0,name}', '\"forged.md\"') "
+                f"WHERE version_id=$1 AND {on}", vid)
+    with pytest.raises(Exception, match="immutable"):
+        env.sql("UPDATE artifact_versions SET purged_at=now(), "
+                "provenance=provenance || '{\"entry\": \"forged.html\"}'::jsonb "
+                f"WHERE version_id=$1 AND {on}", vid)
+    with pytest.raises(Exception, match="immutable"):                       # a right value on a live version is still refused
+        env.sql("UPDATE artifact_versions SET output_manifest=jsonb_set(output_manifest, '{0,name}', '\"[removed]\"') "
+                f"WHERE version_id=$1 AND {on}", vid)
+    with pytest.raises(Exception, match="immutable"):
+        env.sql("UPDATE artifact_versions SET purged_at=now(), "
+                "provenance=provenance || '{\"message\": \"forged commit\"}'::jsonb "
+                f"WHERE version_id=$1 AND {on}", vid)
+    env.sql("UPDATE artifact_versions SET purged_at=now(), "
+            "output_manifest=jsonb_set(output_manifest, '{0,name}', '\"[removed]\"') "
+            f"WHERE version_id=$1 AND {on}", vid)                           # the allowed blanking
+    assert env.sql("SELECT output_manifest->0->>'name' FROM artifact_versions WHERE version_id=$1", vid)[0][0] == "[removed]"
+
+
 def test_purge_clears_every_viewer_identity_quoted_anchor_text_and_feedback(env):
     from herdr_engineering.control_plane.artifact_shares import EVENT_KINDS
     aid, vid = env.artifact()
