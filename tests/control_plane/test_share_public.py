@@ -878,6 +878,11 @@ DECOYS = {
     "math-mtext-html": b"<math><mtext><b></math><body>",
     "frameset-then-body": b"<frameset></frameset><body>x",
     "frameset-frame": b'<html><head></head><frameset cols="*"><frame src=a></frameset><body>',
+    "form-dialog": b"<form><dialog></form><body></dialog><h1>visible</h1>",
+    "form-details": b"<form><details></form><body></details><h1>visible</h1>",
+    "form-object": b"<form><object data=x></form><body></object><h1>visible</h1>",
+    "div-hidden": b"<div hidden><body><h1>visible</h1>",
+    "text-before-body": b"hello<body><h1>visible</h1>",
     "dashdash-in-comment": b"<!doctype html><!-- a -- b --><template><body></template><h1>visible page</h1>",
 }
 
@@ -972,7 +977,6 @@ GATE_REFUSED = {
     "nul": b"<body><p>" + b"x" * 2000 + b"\x00</p>",             # past the first 1 KiB the encoding check does not look
     "comment-hides-tag": b"<template><!-- </template> --><body><p>x</p>",
     "script-comment": b"<script><!-- </script><body><p>x</p>",
-    "commented-opener": b"<!-- <template> --><body><p>x</p>",
     "commented-closer": b"<script><!-- </script> --><body><p>x</p>",
     "balanced-svg-before-anchor": b"<svg></svg><body><p>x</p>",
     "balanced-math-before-anchor": b"<math></math><body><p>x</p>",
@@ -980,6 +984,21 @@ GATE_REFUSED = {
     "balanced-select-before-anchor": b"<select></select><body><p>x</p>",
     "frameset-after-body": b"<body><p>x</p><frameset></frameset>",
     "frame-alone": b"<body><frame src=a>",
+    "form-dialog": b"<form><dialog></form><body></dialog><h1>x</h1>",
+    "form-details": b"<form><details></form><body></details><h1>x</h1>",
+    "form-object": b"<form><object data=x></form><body></object><h1>x</h1>",
+    "unknown-element": b"<custom-el><body><p>x</p>",
+    "div-before-body": b"<div></div><body><p>x</p>",
+    "text-before-html": b"hi<html><body><p>x</p>",
+    "bom-prefix": b"\xef\xbb\xbf<html><body><p>x</p>",
+    "two-doctypes": b"<!doctype html><!doctype html><body><p>x</p>",
+    "doctype-after-html": b"<html><!doctype html><body><p>x</p>",
+    "script-tag-not-closer": b"<script></script foo><body><p>x</p>",
+    "angle-in-attr": b'<meta content="<b>"><body><p>x</p>',
+    "noscript-with-div": b"<head><noscript><div></div></noscript></head><body><p>x</p>",
+    "selfclosing-html": b"<html/><body><p>x</p>",
+    "stray-head-end": b"</head><body><p>x</p>",
+    "meta-after-head": b"<head></head><meta><body><p>x</p>",
     "unclosed-template": b"<template><body><p>x</p>",
     "unclosed-xmp": b"<xmp><body><p>x</p>",
     "unclosed-iframe": b"<iframe><body><p>x</p>",
@@ -998,6 +1017,14 @@ GATE_ACCEPTED = {
     "style-script": b"<head><style>p{}</style><script>var a = 1 < 2;</script></head><body>",
     "commented-pair": b"<head><!-- <script src=a.js></script> --></head><body><p>x</p>",
     "svg-after-anchor": b"<body><svg><desc><p></svg><math><mtext><b></math><template></template><select></select>",
+    "commented-opener": b"<!-- <template> --><body><p>x</p>",
+    "full-head": (b"<!DOCTYPE html>\n<!-- c --><html lang=en><head><meta charset=utf-8><base href=/><link rel=x href=y>"
+                  b"<title>a <b> title</title><style>p{}</style><script src=a.js></script>"
+                  b"<noscript><style>p{}</style><meta name=a></noscript></head>\n<body class=a>"),
+    "selfclosing-script-swallows-anchor": b"<script/><body><p>x</p>",   # no anchor is found, so the bar goes first
+    "double-body": b"<body><body>",
+    "html-only": b"<html lang=en><p>x</p>",
+    "doctype-only": b"<!doctype html><p>x</p>",
     "framework-word": b"<body><p>a frame of reference, framed</p>",
     "closed-noscript": b"<head><noscript><style>p{}</style></noscript></head><body>",
     "raw-after-anchor": b"<body><template><body><textarea>",
@@ -1014,7 +1041,7 @@ def test_the_gate_refuses_every_ambiguous_construct(name):
     data = GATE_REFUSED[name]
     cut = share_public._anchor_index(data) or 0
     # the gate alone, not the HTMLParser check behind it: each refusal class is pinned by its own page
-    assert not (share_public._well_formed_markup(data) and share_public._inert_context_closed(data[:cut]))
+    assert not (share_public._well_formed_markup(data) and share_public._prefix_allowed(data[:cut]))
     assert share_public.labelled_html(data, "text/html", share_public.shared_by_bar("Al")) is None
 
 
@@ -1024,13 +1051,14 @@ def test_the_gate_still_labels_ordinary_pages(name):
     assert out is not None and out.count(b"data-herdr-shared-by") == 1
 
 
-GRAMMAR = [b"<!doctype html>", b"<html>", b"<head>", b"</head>", b"<body>", b"<body class=a>", b"</body>", b"</html>",
+GRAMMAR = [b"<meta charset=utf-8>", b"<link rel=a href=b>", b"<base href=/>", b"<div>", b"<span hidden>", b"\n", b"<!doctype html>", b"<html>", b"<head>", b"</head>", b"<body>", b"<body class=a>", b"</body>", b"</html>",
            b"<p>", b"</p>", b"text", b"<h1>x</h1>", b"<title>t</title>", b"<style>p{}</style>", b"<script>1</script>",
            b"<!-- ok -->", b"<!--", b"-->", b"<!-->", b"<!--->", b"--!>", b"<!-- a -- b -->", b"<![CDATA[", b"]]>",
            b"<?pi ", b"?>", b"<!x>", b"</ x>", b"</>", b"<template>", b"</template>", b"<textarea>", b"</textarea>",
            b"<title>", b"</title>", b"<xmp>", b"</xmp>", b"<iframe>", b"</iframe>", b"<noembed>", b"<noframes>",
            b"<noscript>", b"</noscript>", b"<plaintext>", b"<select>", b"</select>", b"<svg>", b"</svg>", b"<math>",
-           b"</math>", b"<desc>", b"<foreignObject>", b"<mtext>", b'<annotation-xml encoding="text/html">', b"</frameset>", b"<frame src=a>", b"<script>", b"</script>", b"<style>", b"</style>", b'<a title="', b'">', b"'", b'"', b"<",
+           b"</math>", b"<form>", b"</form>", b"<dialog>", b"</dialog>", b"<details>", b"</details>", b"<object data=x>", b"</object>",
+           b"<div hidden>", b"</div>", b"<desc>", b"<foreignObject>", b"<mtext>", b'<annotation-xml encoding="text/html">', b"</frameset>", b"<frame src=a>", b"<script>", b"</script>", b"<style>", b"</style>", b'<a title="', b'">', b"'", b'"', b"<",
            b">", b"\n", b"<frameset>", b"<frameset cols=\"*\">", b"<object>", b"<!doctype html", b"&lt;"]
 BYPASSES = [b"<!doctype html><!---><template><!--><body></template><h1>visible page</h1>",
             b"<!doctype html><!--><template><!--><body></template><h1>visible page</h1>",
@@ -1083,5 +1111,20 @@ def test_differential_a_served_bar_is_a_real_top_level_element_for_html5ever():
         accepted += 1
         assert _oracle_bar_is_top_level(out.decode()), (data, out)
     assert accepted > 300 and rejected > 3000, (accepted, rejected)
+    # head-shaped prefixes followed by a body/html anchor and a random tail: the allowlist's own territory
+    head = [b"<!doctype html>", b"<html>", b"<head>", b"</head>", b"<meta charset=a>", b"<title>t</title>",
+            b"<style>p{}</style>", b"<script>1</script>", b"<noscript><style>a{}</style></noscript>", b"<!-- c -->",
+            b"\n", b" ", b"<link rel=a>", b"<base href=/>", b"<div>", b"<form>", b"<dialog>", b"x", b"<template>",
+            b"</form>", b"<svg>", b"<p>", b"<script>", b"<title>", b"<noscript>"]
+    shaped = accepted_shaped = 0
+    for _ in range(4000):
+        data = (b"".join(rng.choice(head) for _ in range(rng.randint(0, 8))) + rng.choice([b"<body>", b"<BODY a=1>", b"<html>"])
+                + b"".join(rng.choice(GRAMMAR) for _ in range(rng.randint(0, 6))))
+        out = share_public.labelled_html(data, "text/html; charset=utf-8", bar)
+        shaped += 1
+        if out is not None:
+            accepted_shaped += 1
+            assert _oracle_bar_is_top_level(out.decode()), (data, out)
+    assert accepted_shaped > 500, accepted_shaped
     for data in BYPASSES:
         assert share_public.labelled_html(data, "text/html", bar) is None

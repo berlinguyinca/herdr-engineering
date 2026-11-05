@@ -88,7 +88,6 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote_to_bytes, urlsplit
@@ -806,17 +805,23 @@ def _anchor_index(data: bytes) -> int | None:
 
 
 # ---- the strict gate: member-link HTML is labelled only when its markup is unambiguous for every HTML5 tokenizer.
-# The scanner above and Python's HTMLParser read comments and CDATA differently from a browser, so they cannot be
+# The scanner above reads comments and CDATA differently from a browser, so it cannot be
 # trusted to say where the bar lands. Instead of reconciling them, pages containing any construct whose tokenization is
 # a browser-specific corner are refused (a uniform 404 at serve time, ``unsupported_html`` at approve).
 _AMBIGUOUS = re.compile(rb"<!\[|<!-->|<!--->|--!>|<\?|\x00|</(?![A-Za-z])|<frame(?:set)?(?=[\s/>])", re.I)        # CDATA, abrupt comments, PI, bogus end tags, frames (a frameset page ignores <body>, so it cannot carry the bar)
 _BANG = re.compile(rb"<!")
 _BANG_OK = re.compile(rb"<!(?:--(?:[^-]|-(?!-))*-->|doctype(?=[\s>]))", re.I)     # a clean comment (no "--" inside) or a doctype
 _COMMENT = re.compile(rb"<!--(?:[^-]|-(?!-))*-->")
-_RAW_TEXT = frozenset({b"script", b"style", b"title", b"textarea", b"xmp", b"iframe", b"noembed", b"noframes", b"noscript"})
-_NO_ANCESTOR = frozenset({b"template", b"select", b"svg", b"math", b"plaintext"})   # never open before the anchor
-_INERT_TAG = re.compile(rb"<(/?)(script|style|title|textarea|xmp|iframe|noembed|noframes|noscript|plaintext|template|select"
-                        rb"|svg|math)(?=[\s/>])", re.I)
+_WS = re.compile(rb"[ \t\r\n\f]+")
+_DOCTYPE = re.compile(rb"<!doctype[^>]*>", re.I)
+_ATTRS = (rb"(?:[ \t\r\n\f]+[^\s\"'<>/=`]+(?:[ \t\r\n\f]*=[ \t\r\n\f]*(?:\"[^\"<>]*\"|'[^'<>]*'|[^\s\"'<>=`]+))?)*"
+          rb"[ \t\r\n\f]*")
+_START = re.compile(rb"<([A-Za-z][A-Za-z0-9]*)" + _ATTRS + rb"(/?)>")
+_HEAD_END = re.compile(rb"</head[ \t\r\n\f]*>", re.I)
+_VOID_HEAD = frozenset({b"meta", b"link", b"base"})
+_RAW_HEAD = frozenset({b"title", b"style", b"script", b"noscript"})
+_NOSCRIPT_BODY = re.compile(rb"(?:[ \t\r\n\f]+|<(?:meta|link)" + _ATTRS + rb"/?>|<style" + _ATTRS + rb">[^<]*</style[ \t\r\n\f]*>)*",
+                            re.I)
 
 
 def _well_formed_markup(data: bytes) -> bool:
@@ -827,27 +832,65 @@ def _well_formed_markup(data: bytes) -> bool:
     return all(_BANG_OK.match(data, m.start()) for m in _BANG.finditer(data))
 
 
-def _inert_context_closed(prefix: bytes) -> bool:
-    """True when ``prefix`` (the bytes before the anchor) opens no element that could swallow the bar: ``svg``, ``math``,
-    ``template``, ``select`` and ``plaintext`` may not open there at all (no balancing: an HTML child inside an svg/math
-    integration point makes the parser ignore their closers), and each raw-text element (script, style, title, textarea,
-    xmp, iframe, noembed, noframes, noscript) must be closed again by a plain closer. A comment is dropped first when its
-    own inert tags pass this check; otherwise it stays (it could hide a closer or an opener) and the ``<!--`` check
-    below refuses the page."""
-    prefix = _COMMENT.sub(lambda m: b"" if _inert_context_closed(m.group()[4:-3]) else m.group(), prefix)
-    if b"<!--" in prefix:
-        return False
-    inside: bytes | None = None
-    for match in _INERT_TAG.finditer(prefix):
-        closing, name = bool(match.group(1)), match.group(2).lower()
-        if inside is not None:
-            inside = None if closing and name == inside else inside
-        elif name in _NO_ANCESTOR:
-            if not closing:
+def _raw_element_end(prefix: bytes, pos: int, name: bytes) -> int | None:
+    """Offset after the plain closer of the raw-text element whose start tag ends at ``pos``, or None when there is no
+    closer, the first ``</name`` is not a plain ``</name>``, or the body holds markup that changes how it ends."""
+    closer = re.compile(rb"</" + name + rb"(?=[\s/>])", re.I).search(prefix, pos)
+    if closer is None:
+        return None
+    plain = re.compile(rb"</" + name + rb"[ \t\r\n\f]*>", re.I).match(prefix, closer.start())
+    body = prefix[pos:closer.start()]
+    if plain is None or (name in (b"script", b"style") and re.search(rb"<!--|<script", body, re.I)):
+        return None
+    if name == b"noscript" and not _NOSCRIPT_BODY.fullmatch(body):
+        return None
+    return plain.end()
+
+
+def _prefix_allowed(prefix: bytes) -> bool:
+    """Structural allowlist for the bytes before the injection anchor (``prefix`` ends with the anchor tag itself). Only
+    these may appear: whitespace, one doctype (first), well-formed comments, the start tags html and head (once, in
+    order) with plain attributes, meta / link / base, and title / style / script / noscript elements with a plain
+    closer (noscript only holding meta, link and style), ``</head>``, and finally ``<body ...>`` as the last token.
+    Any other element, any text, a stray closer, or a ``/>`` on a non-void element refuses the page, so nothing
+    before the anchor can open an element the parser would still have open (or a mode it would stay in) at the bar."""
+    pos, size, stage = 0, len(prefix), 0       # stage: 0 nothing yet, 1 after html, 2 in head, 3 after </head>
+    seen_doctype = False
+    while pos < size:
+        if match := _WS.match(prefix, pos) or _COMMENT.match(prefix, pos):
+            pos = match.end()
+        elif match := _DOCTYPE.match(prefix, pos):
+            if seen_doctype or stage:
                 return False
-        elif not closing:
-            inside = name
-    return inside is None
+            seen_doctype, pos = True, match.end()
+        elif match := _HEAD_END.match(prefix, pos):
+            if stage != 2:
+                return False
+            stage, pos = 3, match.end()
+        elif match := _START.match(prefix, pos):
+            name, slash = match.group(1).lower(), match.group(2)
+            pos = match.end()
+            if name == b"body":
+                return pos == size and not slash
+            if name in _VOID_HEAD and stage < 3:
+                stage = 2 if stage < 2 else stage
+            elif slash:
+                return False
+            elif name == b"html" and stage == 0:
+                stage = 1
+            elif name == b"head" and stage < 2:
+                stage = 2
+            elif name in _RAW_HEAD and stage < 3:
+                stage = 2
+                end = _raw_element_end(prefix, pos, name)
+                if end is None:
+                    return False
+                pos = end
+            else:
+                return False
+        else:
+            return False
+    return True
 
 
 def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
@@ -857,74 +900,18 @@ def inject_mode_switch(data: bytes, link: bytes) -> bytes | None:
     return None if cut is None else data[:cut] + link + data[cut:]
 
 
-_VOID = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track",
-                   "wbr", "basefont", "bgsound", "frame", "keygen"})
-_BAR_ANCESTORS = frozenset({"html", "head", "body"})
-
-
-class _BarProbe(HTMLParser):
-    """Tokenises the page up to the end of the bar and records how deep in the element tree the bar's start tag sits."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=False)
-        self.stack: list[str] = []
-        self.bars = 0
-        self.bar_stack: list[str] = []
-        self.escaped_script = False
-
-    def handle_starttag(self, tag, attrs):
-        if tag == "div" and any(name == "data-herdr-shared-by" for name, _ in attrs):
-            self.bars += 1
-            self.bar_stack = list(self.stack)
-        if tag not in _VOID:
-            self.stack.append(tag)
-
-    def handle_startendtag(self, tag, attrs):
-        if tag == "div" and any(name == "data-herdr-shared-by" for name, _ in attrs):
-            self.bars += 1
-            self.bar_stack = list(self.stack)
-
-    def handle_endtag(self, tag):
-        if tag in self.stack:
-            while self.stack.pop() != tag:
-                pass
-
-    def handle_data(self, data):
-        if self.stack and self.stack[-1] in ("script", "style") and "<!--" in data.lower():
-            self.escaped_script = True      # "<!--<script>" double-escapes: browsers and this tokenizer may disagree
-
-
-def bar_is_effective(prefix: str) -> bool:
-    """True when the one ``data-herdr-shared-by`` start tag in ``prefix`` (the page up to the end of the bar) is a normal
-    element whose only open ancestors are html / head / body: not inside an attribute value, a comment, CDATA, a script,
-    a template, noscript, xmp, iframe, select, svg ... (every element still open at that point other than html, head
-    and body fails the check). Fail closed on any parser trouble."""
-    probe = _BarProbe()
-    try:
-        probe.feed(prefix)
-        probe.close()
-    except Exception:
-        return False
-    return probe.bars == 1 and not probe.escaped_script and set(probe.bar_stack) <= _BAR_ANCESTORS
-
-
 def labelled_html(data: bytes, content_type: str, bar: bytes, link: bytes = b"") -> bytes | None:
     """``data`` with ``bar`` (and then ``link``) inserted where a browser will render the bar as a top-level element, or
     None when that cannot be shown: non-ASCII-compatible bytes, markup the strict gate calls ambiguous
-    (``_well_formed_markup``, ``_inert_context_closed``), or a page whose markup puts the anchor in an inert context
-    (the HTMLParser check, a secondary assertion). A page with no html, head or body anchor at all gets the bar first. Never returns an unlabelled page."""
+    (``_well_formed_markup``) or anything but the allowlisted head constructs before the anchor (``_prefix_allowed``).
+    A page with no html, head or body anchor at all gets the bar first. Never returns an unlabelled page."""
     if not _ascii_compatible(content_type, data):
         return None
     cut = _anchor_index(data)
     cut = 0 if cut is None else cut
-    if not _well_formed_markup(data) or not _inert_context_closed(data[:cut]):
+    if not _well_formed_markup(data) or not _prefix_allowed(data[:cut]):
         return None
-    out = data[:cut] + bar + link + data[cut:]
-    try:
-        prefix = out[:cut + len(bar)].decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    return out if bar_is_effective(prefix) else None
+    return data[:cut] + bar + link + data[cut:]
 
 
 def shared_by_bar(name: str) -> bytes:
