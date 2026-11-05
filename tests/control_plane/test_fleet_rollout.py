@@ -3,6 +3,7 @@
 No mocks: a real ControlPlaneServer on a loopback port, real HTTP requests, a real event sink.
 """
 import json
+import random
 import threading
 import urllib.error
 import urllib.request
@@ -23,11 +24,14 @@ TS = "2026-11-04T10:00:00+00:00"
 TS2 = "2026-11-04T11:00:00+00:00"
 
 
+LOG_REF = {"host": "beast", "path_id": "updater", "sha256": "ab" * 32, "bytes": 1234, "lines": 12}
+
+
 def ev(rid=RID, seq=0, **fields):
     return {"rollout_id": rid, "ts": TS, "seq": seq, **fields}
 
 
-TRIGGER = {"repo": "autospec", "sha": SHA_A, "pr": 7, "pr_title": "Add thing", "merged_at": TS}
+TRIGGER = {"repo": "autospec", "sha": SHA_A, "pr": 7, "merged_at": TS}
 TARGETS = [{"repo": "autospec", "sha": SHA_A, "before": SHA_C}]
 
 
@@ -38,8 +42,9 @@ def observed(rid=RID, seq=0, **over):
 def host_finished(rid=RID, seq=5, host="beast", status="ok", **over):
     return ev(rid, seq, **{"host": host, "repo": "autospec", "status": status,
                            "before_sha": SHA_C, "after_sha": SHA_A, "started_at": TS, "finished_at": TS,
-                           "duration_ms": 1200, "checks": [{"name": "parity", "ok": True}],
-                           "log_tail": "installed\nok", **over})
+                           "duration_ms": 1200,
+                           "checks": [{"name": "parity_ok", "status": "ok", "duration_ms": 40}],
+                           **({} if "log" in over else {"log": {**LOG_REF, "host": host}}), **over})
 
 
 def envelope(event_type, payload, rid=None):
@@ -72,7 +77,6 @@ def _without(payload, key):
 @pytest.mark.parametrize("event_type,payload", [
     ("rollout.nonsense", observed()),                                   # unknown event type
     ("rollout.observed", {**observed(), "env": {"HOME": "/home/x"}}),    # unknown field
-    ("rollout.observed", {**observed(), "log_tail": "x"}),               # known field, wrong event type
     ("rollout.observed", _without(observed(), "trigger")),
     ("rollout.observed", {**observed(), "rollout_id": "f" * 16}),        # must equal entity_id
     ("rollout.observed", {**observed(), "seq": -1}),
@@ -85,8 +89,6 @@ def _without(payload, key):
     ("rollout.observed", observed(trigger={**TRIGGER, "sha": "abc"})),
     ("rollout.observed", observed(trigger={**TRIGGER, "extra": 1})),
     ("rollout.observed", observed(trigger={**TRIGGER, "pr": -1})),
-    ("rollout.observed", observed(trigger={**TRIGGER, "pr_title": "t" * 121})),
-    ("rollout.observed", observed(trigger={**TRIGGER, "pr_title": "bad\x00title"})),
     ("rollout.observed", observed(targets=[{"repo": "autospec", "sha": SHA_A, "before": "short"}])),
     ("rollout.observed", observed(targets=[{"repo": "autospec", "sha": SHA_A, "before": None, "x": 1}])),
     ("rollout.observed", observed(targets=[TARGETS[0]] * 6)),
@@ -102,7 +104,6 @@ def _without(payload, key):
     ("host.finished", host_finished(checks=[{"name": "n", "ok": True}] * 33)),
     ("host.finished", host_finished(counts={"dirty_paths": 1, "secret": 2})),
     ("host.finished", host_finished(counts={"dirty_paths": -1})),
-    ("host.finished", host_finished(links={"pi_session_rollout": "x" * 100})),
     ("host.finished", host_finished(links={"other": "x"})),
     ("host.finished", _without(host_finished(), "host")),
     ("rollout.halted", ev(halted_at_host="bender; x", reason="health_failed")),
@@ -110,42 +111,6 @@ def _without(payload, key):
 def test_malformed_events_are_rejected(event_type, payload):
     with pytest.raises(ValueError):
         validate_fleet_rollout(RID, event_type, payload)
-
-
-def test_oversize_log_tail_is_rejected_not_truncated():
-    with pytest.raises(ValueError, match="log_tail"):
-        validate_fleet_rollout(RID, "host.finished", host_finished(log_tail="x" * 2049))
-    with pytest.raises(ValueError, match="log_tail"):
-        validate_fleet_rollout(RID, "host.finished", host_finished(log_tail="\n".join("l" for _ in range(41))))
-    ok = validate_fleet_rollout(RID, "host.finished", host_finished(log_tail="\n".join("l" for _ in range(40))))
-    assert ok["log_tail"].count("\n") == 39
-
-
-@pytest.mark.parametrize("tail", [
-    "Authorization: Bearer abc",
-    "authorization: token xyz",
-    "curl https://user:hunter2@github.com/x.git",
-    "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-    "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-    "export TOKEN=abc",
-    "token=abc",
-    "PASSWORD=hunter2",
-    "password: hunter2",
-    "-----BEGIN OPENSSH PRIVATE KEY-----",
-    "key AKIAIOSFODNN7EXAMPLEAKIAIOSFODNN",
-    "reading /home/wohlgemuth/.ssh/id_ed25519",
-    "reading /Users/alice/Library/x",
-    "bell \x07 char",
-], ids=lambda t: t[:30])
-def test_secret_and_home_path_log_tails_are_rejected_by_the_server(tail):
-    with pytest.raises(ValueError, match="log_tail"):
-        validate_fleet_rollout(RID, "host.finished", host_finished(log_tail=tail))
-
-
-def test_pr_title_rejects_secret_markers():
-    for bad in ("fix password=hunter2", "see https://u:p@h/x", "Authorization: Bearer x"):
-        with pytest.raises(ValueError, match="pr_title"):
-            validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, "pr_title": bad}))
 
 
 def test_rollout_id_shape_is_enforced():
@@ -222,7 +187,6 @@ def test_ingest_then_list_summary_and_detail(server):
     assert [e["seq"] for e in detail["events"]] == [0, 1, 2, 3, 4]
     [row] = detail["hosts"]
     assert (row["host"], row["repo"], row["status"], row["after_sha"]) == ("beast", "autospec", "ok", SHA_A)
-    assert row["log_tail"] == "installed\nok"
 
 
 def test_halted_rollout_reports_where_and_why(server):
@@ -274,21 +238,6 @@ def test_a_mismatched_entity_id_is_a_400(server):
     post, get, *_ = server
     assert post(envelope("rollout.observed", observed(), rid=RID2))[0] == 400
     assert get() == (200, {"rollouts": []})
-
-
-def test_home_path_in_log_tail_is_a_400_and_stores_nothing(server):
-    post, get, repo, _ = server
-    status, body = post(envelope("host.finished", host_finished(log_tail="cd /home/wohlgemuth/work")))
-    assert status == 400 and "log_tail" in json.dumps(body), (status, body)
-    assert repo.stream("fleet_rollout", RID) == []
-
-
-def test_a_token_in_log_tail_never_reaches_storage_even_through_the_http_door(server):
-    # The ingest door's blanket redactor and the validator are independent layers; whichever fires, the token is gone.
-    post, get, repo, _ = server
-    status, _ = post(envelope("host.finished", host_finished(log_tail="GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789")))
-    stored = json.dumps(repo.stream("fleet_rollout", RID))
-    assert "ghp_" not in stored and "abcdefghijklmnopqrstuvwxyz" not in stored
 
 
 def test_unknown_field_is_a_400_and_stores_nothing(server):
@@ -358,159 +307,6 @@ def test_events_survive_reload(server, acknowledged_sink):
     assert fresh.list_fleet_rollouts()[0]["status"] == "succeeded"
 
 
-# --------------------------------------------------------------------------- review round 1: secret shapes everywhere
-
-#: (text, fragment that must never be readable back)
-SECRET_SHAPES = [
-    ("https://user:pw@example.com/x", "user:pw"),
-    ("/home/alice/.aws", "alice"),
-    ("/root/.ssh/id_rsa", "id_rsa"),
-    ("/root/.config", "/root"),
-    ("/Users/bob", "bob"),
-    ("Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
-    ("Bearer abcdef123456", "abcdef123456"),
-    ("ssh -i ~/.ssh/id_ed25519 host", "id_ed25519"),
-    ("/var/lib/x/.ssh/id_rsa", "id_rsa"),
-    ("pwd=hunter2", "hunter2"),
-    ("passwd=hunter2", "hunter2"),
-    ("Cookie: session=abc12345", "abc12345"),
-    ("machine x login u password p", "login u"),
-    ("ghp_" + "a" * 36, "ghp_"),
-    ("sk-abcdef123456", "sk-abc"),
-    ("AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7"),
-    ("ASIAIOSFODNN7EXAMPLE", "ASIAIOSFODNN7"),
-    ("xoxb-123-456-abc", "xoxb"),
-    ("eyJhbGciOi.eyJzdWIi.sig", "eyJhbGciOi"),
-    ("tok " + "x" * 30, "xxxxxxxx"),
-    ("-----BEGIN RSA PRIVATE KEY-----", "PRIVATE KEY"),
-    ("BEGIN OPENSSH PRIVATE KEY", "PRIVATE KEY"),
-    ("authorization: basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
-    ("[REDACTED] dXNlcjpwYXNz", "dXNlcjpwYXNz"),
-]
-SHAPE_IDS = [s[:24] for s, _ in SECRET_SHAPES]
-
-
-@pytest.mark.parametrize("text,_needle", SECRET_SHAPES, ids=SHAPE_IDS)
-def test_check_names_reject_secret_shapes(text, _needle):
-    with pytest.raises(ValueError, match="check name"):
-        validate_fleet_rollout(RID, "host.finished", host_finished(checks=[{"name": text, "ok": True}]))
-
-
-@pytest.mark.parametrize("text,_needle", SECRET_SHAPES, ids=SHAPE_IDS)
-def test_pr_titles_reject_secret_shapes(text, _needle):
-    with pytest.raises(ValueError, match="pr_title"):
-        validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, "pr_title": text}))
-
-
-@pytest.mark.parametrize("text,_needle", SECRET_SHAPES, ids=SHAPE_IDS)
-def test_log_tails_reject_secret_shapes(text, _needle):
-    with pytest.raises(ValueError, match="log_tail"):
-        validate_fleet_rollout(RID, "host.finished", host_finished(log_tail=f"before\n{text}\nafter"))
-
-
-def test_ordinary_text_is_still_accepted():
-    ok = host_finished(checks=[{"name": "installed revision matches", "ok": True}], log_tail="Basic checks ok\nunit active")
-    validate_fleet_rollout(RID, "host.finished", ok)
-    validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, "pr_title": "Fix authorization bug in pwd handling"}))
-
-
-@pytest.mark.parametrize("field", ["log_tail", "pr_title", "check"])
-def test_the_ingest_doors_redaction_marker_is_a_rejection_not_a_stored_value(field):
-    marked = "[REDACTED] trailing"
-    if field == "log_tail":
-        call = ("host.finished", host_finished(log_tail=marked))
-    elif field == "pr_title":
-        call = ("rollout.observed", observed(trigger={**TRIGGER, "pr_title": marked}))
-    else:
-        call = ("host.finished", host_finished(checks=[{"name": marked, "ok": True}]))
-    with pytest.raises(ValueError, match="redact"):
-        validate_fleet_rollout(RID, *call)
-
-
-@pytest.mark.parametrize("text,needle", SECRET_SHAPES, ids=SHAPE_IDS)
-def test_nothing_credential_shaped_is_readable_back_through_http(server, text, needle):
-    post, get, repo, _ = server
-    status, _body = post(envelope("host.finished", host_finished(log_tail=text)))
-    assert status == 400
-    assert post(envelope("host.finished", host_finished(1, checks=[{"name": text[:40], "ok": True}]))
-                if False else envelope("rollout.observed", observed(trigger={**TRIGGER, "pr_title": text})))[0] == 400
-    for path in ("/api/v1/fleet-rollouts", f"/api/v1/fleet-rollouts/{RID}", "/api/v1/fleet-rollouts/versions"):
-        body = json.dumps(get(path)[1])
-        assert needle not in body
-    assert needle not in json.dumps(repo.stream("fleet_rollout", RID))
-
-
-# --------------------------------------------------------------------------- review round 2: default-deny, hosts, links
-
-RESIDUAL = [
-    ("sig=Zm9vYmFyYmF6cXV4", "Zm9vYmFy"),
-    ("https://x.blob/y?sv=2022-11-02&ss=b&sig=abcDEF123%2Bxyz", "abcDEF123"),
-    ('"auth": "dXNlcjpwYXNzd29yZA=="', "dXNlcjpwYXNzd29yZA"),
-    ('{"auths":{"ghcr.io":{"auth":"dXNlcjpwYXNz"}}}', "dXNlcjpwYXNz"),
-    ("docker login -u u -p hunter2 ghcr.io", "hunter2"),
-    ("--password hunter2", "hunter2"),
-    ("-p hunter2 login", "hunter2"),
-    ("mysql -uroot -phunter2", "hunter2"),
-    ("curl -u admin:hunter2 http://x", "hunter2"),
-    ("DB_PASS=hunter2", "hunter2"),
-    ("localhost:5432:db:user:s3cretpw", "s3cretpw"),
-    ('{"password":"x"}', '"password"'),
-    ("ya29.a0AfH6SMBx1234567890", "ya29"),
-    ("SG.abcdefghijklmnop.qrstuvwxyz012345", "abcdefghijklmnop"),
-    ("https://hooks.slack.com/services/T0/B0/xxx", "hooks.slack"),
-    ("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalrXUtnFEMI"),
-    ("c2VjcmV0cGFzcw==", "c2VjcmV0"),
-    ("deadbeefdeadbeefdead", "deadbeefdead"),
-    ("private_key_id: abc", "private_key_id"),
-    ("~/.config/gh/hosts.yml", "hosts.yml"),
-    ("9e7f0435" * 5, "9e7f0435"),                       # a full 40-hex SHA is only allowed in sha fields
-    ("glpat-abcdefghij1234567890", "glpat"),
-    ("hf_abcdefghijklmnopqrstuvwxyz", "hf_abc"),
-    ("sk_live_abcdefghijklmnop", "sk_live"),
-]
-RESIDUAL_IDS = [t[:24] for t, _ in RESIDUAL]
-FINE_TEXT = [
-    "feat(fleet): merge-triggered fleet rollout watcher core (#628)",
-    "updated autospec e535daa1 -> 9e7f0435",
-    "health ok after 12s",
-    "make-the-ingest-door-redact-secrets-consistently-for-all-streams",
-    "installed into /var/lib/herdr-engineering/pi/releases/current",
-    "12 tests passed: all good",
-]
-
-
-@pytest.mark.parametrize("text,_n", RESIDUAL, ids=RESIDUAL_IDS)
-def test_residual_secret_shapes_are_rejected_in_every_free_text_field(text, _n):
-    with pytest.raises(ValueError, match="log_tail"):
-        validate_fleet_rollout(RID, "host.finished", host_finished(log_tail=f"ok\n{text}\nok"))
-    with pytest.raises(ValueError, match="pr_title"):
-        validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, "pr_title": text}))
-    with pytest.raises(ValueError, match="check name"):
-        validate_fleet_rollout(RID, "host.finished", host_finished(checks=[{"name": text, "ok": True}]))
-
-
-@pytest.mark.parametrize("text", FINE_TEXT)
-def test_ordinary_titles_and_log_lines_are_accepted(text):
-    validate_fleet_rollout(RID, "host.finished", host_finished(log_tail=f"ok\n{text}"))
-    if len(text) <= 120:
-        validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, "pr_title": text}))
-    if len(text) <= 40:
-        validate_fleet_rollout(RID, "host.finished", host_finished(checks=[{"name": text, "ok": True}]))
-
-
-@pytest.mark.parametrize("text,needle", RESIDUAL, ids=RESIDUAL_IDS)
-def test_residual_shapes_are_never_readable_back_through_http(server, text, needle):
-    post, get, repo, _ = server
-    assert post(envelope("rollout.observed", observed()))[0] == 200
-    assert post(envelope("host.finished", host_finished(log_tail=text)))[0] == 400
-    assert post(envelope("host.finished", host_finished(1, checks=[{"name": text[:40], "ok": True}]) if False else
-                         host_finished(log_tail=f"line one\n{text}")))[0] == 400
-    assert post(envelope("rollout.observed", observed(1, trigger={**TRIGGER, "pr_title": text})))[0] == 400
-    for path in ("/api/v1/fleet-rollouts", f"/api/v1/fleet-rollouts/{RID}", "/api/v1/fleet-rollouts/versions"):
-        assert needle not in json.dumps(get(path)[1])
-    assert needle not in json.dumps(repo.stream("fleet_rollout", RID))
-
-
 @pytest.mark.parametrize("host", ["glpat-abcdefghij1234567890", "hf_abcdefghij", "sk_live_abcdef", "deadbeefdeadbeef",
                                   "evilhost", "beast2"])
 def test_hosts_are_a_closed_enum_of_the_fleet(host):
@@ -528,3 +324,237 @@ def test_links_must_be_a_rollout_id_not_free_text(link):
     ok = validate_fleet_rollout(RID, "host.finished", host_finished(links={"pi_session_rollout": "a1" * 16}))
     assert ok["links"] == {"pi_session_rollout": "a1" * 16}
     validate_fleet_rollout(RID, "host.finished", host_finished(links={"pi_session_rollout": None}))
+
+
+# --------------------------------------------------------------------------- decision 2026-11-05: no free text at all
+
+
+from herdr_engineering.control_plane import fleet_rollout as fr  # noqa: E402
+
+
+def make_secret_corpus(seed: int = 20261105, per_shape: int = 14) -> list[str]:
+    """Synthesize secret-SHAPED strings at test time (nothing credential-like is committed): per format a prefix plus
+    random characters, plus structural shapes (key=value lines, headers, DSNs, flags, JSON, PEM headers, passphrases)."""
+    import base64
+    import string
+    rng = random.Random(seed)
+    alnum, lower, hexd = string.ascii_letters + string.digits, string.ascii_lowercase + string.digits, "0123456789abcdef"
+
+    def rand(chars, n):
+        return "".join(rng.choice(chars) for _ in range(n))
+
+    def b64(n):
+        return base64.b64encode(rng.randbytes(n)).decode()
+
+    makers = [
+        lambda: "gh" + rng.choice("pousr") + "_" + rand(alnum, 36),
+        lambda: "github_pat_" + rand(alnum + "_", 40),
+        lambda: rng.choice(["AKI", "ASI"]) + "A" + rand(string.ascii_uppercase + string.digits, 16),
+        lambda: "sk-" + rand(alnum, rng.randint(8, 40)),
+        lambda: "sk_" + rng.choice(["live", "test"]) + "_" + rand(alnum, 24),
+        lambda: "xox" + rng.choice("abprs") + "-" + rand(string.digits, 10) + "-" + rand(alnum, 24),
+        lambda: "eyJ" + rand(alnum, 12) + "." + "eyJ" + rand(alnum, 12) + "." + rand(alnum + "_-", 20),
+        lambda: "-----BEGIN " + rng.choice(["RSA ", "OPENSSH ", "EC ", ""]) + "PRIVATE KEY-----",
+        lambda: "BEGIN PRIVATE KEY " + rand(alnum, 10),
+        lambda: rng.choice(["postgres", "mysql", "mongodb", "redis", "amqp", "smtp", "ftp"]) + "://" + rand(lower, 6)
+        + ":" + rand(alnum, 10) + "@" + rand(lower, 6) + ".example/db",
+        lambda: "https://" + rand(lower, 6) + ":" + rand(alnum, 12) + "@git.example/o/r.git",
+        lambda: "Authorization: " + rng.choice(["Basic ", "Bearer ", "token "]) + b64(rng.randint(9, 24)),
+        lambda: rng.choice(["Basic ", "Bearer "]) + b64(rng.randint(9, 24)),
+        lambda: rng.choice(["Cookie", "Set-Cookie", "X-Api-Key"]) + ": " + rand(alnum, 12),
+        lambda: rand(hexd, rng.randint(16, 64)),
+        lambda: rand(alnum, rng.randint(20, 48)),
+        lambda: b64(rng.randint(12, 33)),
+        lambda: rng.choice(["password", "passwd", "pwd", "secret", "token", "api_key", "apikey", "auth", "sig", "credential"])
+        + rng.choice(["=", ": ", " = ", '": "']) + rand(alnum, rng.randint(6, 18)),
+        lambda: rng.choice(["DB_PASS", "MY_APP_PW", "STRIPE_KEY", "ANSIBLE_BECOME_PASS", "SECRET_TOKEN"]) + "=" + rand(alnum, 10),
+        lambda: '{"' + rng.choice(["password", "auth", "token", "key", "pw"]) + '":"' + rand(alnum, 10) + '"}',
+        lambda: '{"auths":{"registry.example":{"auth":"' + b64(12) + '"}}}',
+        lambda: rng.choice(["--password ", "--token ", "-p ", "-u user:", "--api-key "]) + rand(alnum, 10),
+        lambda: rng.choice(["mysql -uroot -p", "docker login -u u -p ", "curl -u admin:", "sshpass -p "]) + rand(alnum, 10),
+        lambda: "https://svc.example/x?" + rng.choice(["sig", "key", "token", "code", "auth"]) + "=" + rand(alnum, 14),
+        lambda: "localhost:5432:db:user:" + rand(alnum, 10),
+        lambda: "machine " + rand(lower, 5) + " login " + rand(lower, 4) + " password " + rand(alnum, 8),
+        lambda: "ssh -i ~/.ssh/id_" + rng.choice(["rsa", "ed25519", "ecdsa"]) + " " + rand(lower, 5),
+        lambda: "/home/" + rand(lower, 6) + "/." + rng.choice(["aws", "ssh", "config/gh", "netrc"]),
+        lambda: "/Users/" + rand(lower, 6) + "/Library",
+        lambda: " ".join(rng.choice(["correct", "horse", "battery", "staple", "mango", "orbit", "lamp", "river"]) for _ in range(4)),
+        lambda: "the password is " + rand(alnum, 8),
+        lambda: "[REDACTED] " + b64(12),
+        lambda: "ya29." + rand(alnum + "_-", 24),
+        lambda: "SG." + rand(alnum, 16) + "." + rand(alnum, 16),
+        lambda: "https://hooks.slack.com/services/T" + rand(string.digits, 8) + "/B" + rand(string.digits, 8) + "/" + rand(alnum, 12),
+        lambda: rng.choice(["glpat-", "hf_", "npm_"]) + rand(alnum, 24),
+        lambda: "token " + rand(string.ascii_lowercase, 30),
+        lambda: "x" * rng.randint(24, 60),
+        lambda: "line one\n" + rng.choice(["password", "token"]) + "\n" + rand(alnum, 12),
+        lambda: "\x1b[31m" + rand(alnum, 20) + "\x1b[0m",
+        lambda: "ok" + "\x00" + rand(alnum, 6),
+    ]
+    out = {make() for make in makers for _ in range(per_shape)}
+    return sorted(out)
+
+
+CORPUS = make_secret_corpus()
+SOURCE_ID = fr.source_stream_id("autospec")
+
+
+def _legitimate(value: str) -> bool:
+    """Strings that are valid for SOME structured field (enum, host, hex id/sha, UTC timestamp): not secrets."""
+    import re
+    from datetime import UTC, datetime
+    enums = set(fr.STATUSES) | set(fr.REASONS) | set(fr.HOST_ORDER) | set(fr.WATCHED_REPOS) | set(fr.CHECK_NAMES) \
+        | set(fr.CHECK_STATUSES) | set(fr.LOG_KINDS) | set(fr.COUNT_KEYS)
+    if value in enums or re.fullmatch(r"[0-9a-f]{16,64}", value):
+        return True
+    try:
+        return datetime.fromisoformat(value).utcoffset() == UTC.utcoffset(None)
+    except ValueError:
+        return False
+
+
+CORPUS = [c for c in CORPUS if not _legitimate(c)]
+LOG = LOG_REF
+EXAMPLES = {
+    "rollout.observed": observed(),
+    "rollout.planned": ev(trigger=TRIGGER, targets=TARGETS),
+    "rollout.started": ev(targets=TARGETS),
+    "rollout.resumed": ev(reason="operator"),
+    "host.started": ev(host="beast", repo="autospec", status="precheck"),
+    "host.step": ev(host="beast", repo="autospec", status="applying", checks=[{"name": "parity_ok", "status": "ok"}], log=LOG),
+    "host.finished": host_finished(links={"pi_session_rollout": "a1" * 16}, counts={"dirty_paths": 0}),
+    "rollout.succeeded": ev(),
+    "rollout.halted": ev(halted_at_host="bender", reason="health_failed"),
+    "rollout.superseded": ev(reason="operator"),
+    "rollout.abandoned": ev(reason="operator"),
+    "lock.pinned": ev(targets=TARGETS),
+    "lock.refused": ev(targets=TARGETS, reason="not_on_main"),
+    "source.refused": ev(SOURCE_ID, repo="autospec", reason="not_on_main"),
+    "source.degraded": ev(SOURCE_ID, repo="autospec", reason="rate_limited"),
+    "source.recovered": ev(SOURCE_ID, repo="autospec"),
+}
+
+
+def _paths(node, path=()):
+    """Every leaf (and every dict/list slot) of a payload as a path of keys/indexes."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _paths(value, (*path, key))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _paths(value, (*path, index))
+    else:
+        yield path
+
+
+def _set(node, path, value):
+    import copy
+    node = copy.deepcopy(node)
+    cursor = node
+    for step in path[:-1]:
+        cursor = cursor[step]
+    cursor[path[-1]] = value
+    return node
+
+
+def _stream_of(payload):
+    return payload["rollout_id"]
+
+
+def test_every_example_event_is_valid():
+    assert set(EXAMPLES) == fr.EVENT_TYPES
+    for event_type, payload in EXAMPLES.items():
+        validate_fleet_rollout(_stream_of(payload), event_type, payload)
+
+
+def test_no_field_of_any_event_accepts_an_arbitrary_string():
+    """Secret-free by construction: replace every leaf of every event with every corpus string -> always refused."""
+    assert len(CORPUS) > 400
+    checked = 0
+    for event_type, payload in EXAMPLES.items():
+        for path in _paths(payload):
+            for text in CORPUS:
+                mutated = _set(payload, path, text)
+                with pytest.raises(ValueError):
+                    validate_fleet_rollout(_stream_of(payload), event_type, mutated)
+                checked += 1
+    assert checked > 20000
+
+
+def test_no_object_accepts_an_arbitrary_key():
+    for event_type, payload in EXAMPLES.items():
+        for text in CORPUS[:60]:
+            with pytest.raises(ValueError):
+                validate_fleet_rollout(_stream_of(payload), event_type, {**payload, text: "x"})
+        for path in _paths(payload):
+            if len(path) > 1 and isinstance(path[-1], str):
+                parent = path[:-1]
+                node = payload
+                for step in parent:
+                    node = node[step]
+                if isinstance(node, dict):
+                    mutated = _set(payload, (*parent, "free_text"), "anything") if parent else payload
+                    with pytest.raises(ValueError):
+                        validate_fleet_rollout(_stream_of(payload), event_type, mutated)
+
+
+@pytest.mark.parametrize("old", ["log_tail", "pr_title"])
+def test_the_removed_free_text_fields_are_unknown_fields(old):
+    with pytest.raises(ValueError, match="unknown"):
+        validate_fleet_rollout(RID, "host.finished", host_finished(**{old: "installed ok"}))
+    with pytest.raises(ValueError, match="unknown"):
+        validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, old: "x"}))
+
+
+def test_checks_are_a_closed_enum_with_status_and_numeric_duration():
+    ok = host_finished(checks=[{"name": n, "status": "failed" if i % 2 else "ok", "duration_ms": i}
+                               for i, n in enumerate(fr.CHECK_NAMES)])
+    assert validate_fleet_rollout(RID, "host.finished", ok)["checks"][0] == {"name": fr.CHECK_NAMES[0], "status": "ok", "duration_ms": 0}
+    validate_fleet_rollout(RID, "host.finished", host_finished(checks=[{"name": "parity_ok", "status": "skipped"}]))
+    for bad in ({"name": "parity", "status": "ok"}, {"name": "parity_ok", "status": "maybe"},
+                {"name": "parity_ok", "ok": True}, {"name": "parity_ok", "status": "ok", "duration_ms": -1},
+                {"name": "parity_ok", "status": "ok", "duration_ms": "5"}, {"name": "parity_ok", "status": "ok", "x": 1},
+                {"status": "ok"}):
+        with pytest.raises(ValueError):
+            validate_fleet_rollout(RID, "host.finished", host_finished(checks=[bad]))
+
+
+def test_a_log_reference_is_host_kind_hash_and_sizes_only():
+    assert validate_fleet_rollout(RID, "host.finished", host_finished())["log"] == LOG_REF
+    for bad in ({**LOG_REF, "path_id": "/etc/passwd"}, {**LOG_REF, "path_id": "other"}, {**LOG_REF, "sha256": "ab" * 31},
+                {**LOG_REF, "sha256": "AB" * 32}, {**LOG_REF, "bytes": -1}, {**LOG_REF, "lines": "3"},
+                {**LOG_REF, "host": "evil"}, {**LOG_REF, "host": "bender"},        # must equal the event's host
+                {**LOG_REF, "content": "installed"}, {k: v for k, v in LOG_REF.items() if k != "sha256"}, "text", None):
+        with pytest.raises(ValueError):
+            validate_fleet_rollout(RID, "host.finished", host_finished(log=bad))
+
+
+def test_random_sha256_survives_the_ingest_door_and_reads_back(server):
+    import hashlib
+    post, get, *_ = server
+    ref = {**LOG_REF, "sha256": hashlib.sha256(b"some log").hexdigest()}
+    assert post(envelope("rollout.observed", observed()))[0] == 200
+    assert post(envelope("host.finished", host_finished(log=ref)))[0] == 200
+    [row] = get(f"/api/v1/fleet-rollouts/{RID}")[1]["hosts"]
+    assert row["log"] == ref
+
+
+def test_corpus_strings_in_any_field_are_a_400_or_never_stored_through_http(server):
+    post, get, repo, _ = server
+    assert post(envelope("rollout.observed", observed()))[0] == 200
+    targets = [(t, p) for t, p in EXAMPLES.items() if t in ("host.finished", "rollout.observed", "host.step")]
+    leaves = [(t, p, path) for t, p in targets for path in _paths(p)]
+    stored = 0
+    for index, text in enumerate(CORPUS):
+        event_type, payload, path = leaves[index % len(leaves)]
+        mutated = _set(payload, path, text)
+        mutated["seq"] = 1000 + index if path != ("seq",) else mutated["seq"]
+        status, _ = post(envelope(event_type, mutated, rid=RID))
+        assert status == 400, (event_type, path, text)
+        stored += status == 200
+    assert stored == 0
+    blob = json.dumps([e["payload"] for e in repo.stream("fleet_rollout", RID)]) \
+        + json.dumps(get(f"/api/v1/fleet-rollouts/{RID}")[1]["hosts"])
+    vocabulary = json.dumps(EXAMPLES) + json.dumps(sorted(fr.EVENT_FIELDS))      # field names and values legitimately stored
+    for text in CORPUS:
+        assert text in vocabulary or text not in blob, text

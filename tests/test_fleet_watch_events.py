@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import socket
 import stat
 import subprocess
@@ -19,14 +18,14 @@ from pathlib import Path
 import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
-from herdr_engineering.control_plane.fleet_rollout import source_stream_id, validate_fleet_rollout
+from herdr_engineering.control_plane.fleet_rollout import source_stream_id
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.fleet_watch import events, plan
 from herdr_engineering.service_metadata_feed import MetadataClient
 
 SHA_A, SHA_C = "a" * 40, "c" * 40
 RID = plan.rollout_id({"autospec": SHA_A})
-TRIGGER = {"repo": "autospec", "sha": SHA_A, "pr": 7, "pr_title": "Add thing", "merged_at": "2026-11-04T09:00:00+00:00"}
+TRIGGER = {"repo": "autospec", "sha": SHA_A, "pr": 7, "merged_at": "2026-11-04T09:00:00+00:00"}
 TARGETS = [{"repo": "autospec", "sha": SHA_A, "before": SHA_C}]
 
 
@@ -51,75 +50,6 @@ def get(base: str, path: str):
         return json.loads(r.read())
 
 
-# --------------------------------------------------------------------------- unit: redaction
-
-ADVERSARIAL = [
-    "Authorization: Bearer abcdef0123456789",
-    "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-    "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-    "github_pat_11AAAAAAA0abcdefghijklmnopqrstuvwxyz_0123456789ABCDEFGHIJ",
-    "git clone https://user:hunter2@github.com/acme/x.git",
-    "password=hunter2 passwd: abc secret=zzz api_key=qqq",
-    "-----BEGIN OPENSSH PRIVATE KEY-----",
-    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW",
-    "AKIAIOSFODNN7EXAMPLEAKIAIOSFODNN7EXAMPLE",
-    "scp /home/wohlgemuth/.ssh/id_ed25519 host:",
-    "open /Users/alice/Library/Keychains/login.keychain-db",
-    "ls /root/.aws/credentials",
-    "bell \x07 and escape \x1b[31mred\x1b[0m and nul \x00 end",
-    "tab\tseparated\rcarriage",
-]
-
-
-def test_redaction_strips_every_adversarial_secret_and_the_result_validates():
-    text = "\n".join(["ok installed"] + ADVERSARIAL + ["done"])
-    out = events.redact_log_tail(text, home="/home/wohlgemuth")
-    for needle in ("ghp_", "github_pat_", "hunter2", "Bearer", "BEGIN", "b3BlbnNz", "AKIAIOSFODNN7",
-                   "/home/wohlgemuth", "/Users/alice", "/root", "\x07", "\x1b", "\x00"):
-        assert needle not in out, needle
-    assert out.startswith("ok installed") and out.endswith("done")
-    # whatever the redactor emits, the server-side allow-list accepts
-    validate_fleet_rollout(RID, "host.step", {"rollout_id": RID, "ts": "2026-11-04T10:00:00+00:00", "seq": 0,
-                                              "host": "beast", "repo": "autospec", "status": "applying",
-                                              "log_tail": out})
-
-
-def test_home_directory_becomes_a_tilde_and_keeps_the_rest_of_the_path():
-    out = events.redact_log_tail("wrote /home/wohlgemuth/.local/share/herdr/x and /tmp/other", home="/home/wohlgemuth")
-    assert out == "wrote ~/.local/share/herdr/x and /tmp/other"
-
-
-def test_the_real_home_of_a_non_standard_user_is_redacted_too():
-    out = events.redact_log_tail("wrote /srv/people/zed/.cache/x", home="/srv/people/zed")
-    assert "/srv/people/zed" not in out and "~/.cache/x" in out
-
-
-def test_log_tail_keeps_the_last_40_lines_and_at_most_2048_chars():
-    out = events.redact_log_tail("\n".join(f"line {n}" for n in range(500)), home="/h")
-    assert out.splitlines()[-1] == "line 499" and len(out.splitlines()) <= 40
-    out = events.redact_log_tail("\n".join((" ".join(["word"] * 25) + f" {n}") for n in range(40)), home="/h")
-    assert len(out) <= 2048 and out.splitlines()[-1].endswith(" 39")
-    assert events.redact_log_tail("", home="/h") == ""
-
-
-def test_random_junk_never_produces_something_the_server_would_reject():
-    rng = random.Random(7)
-    alphabet = list("abcXYZ019_-=:/. \n\t\r\x00\x1b@") + ["token=", "Authorization: ", "/home/u/", "://u:p@", "-----BEGIN ", "ghp_"]
-    for _ in range(300):
-        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 400)))
-        out = events.redact_log_tail(text, home="/home/u")
-        validate_fleet_rollout(RID, "host.step", {"rollout_id": RID, "ts": "2026-11-04T10:00:00+00:00", "seq": 0,
-                                                  "host": "beast", "repo": "autospec", "status": "applying",
-                                                  "log_tail": out})
-
-
-def test_pr_title_is_collapsed_capped_and_dropped_when_it_carries_a_secret():
-    assert events.clean_pr_title("  Add \n thing\t ") == "Add thing"
-    assert len(events.clean_pr_title("word " * 100)) == 120
-    assert events.clean_pr_title("rotate token=abc123") is None
-    assert events.clean_pr_title(None) is None
-
-
 # --------------------------------------------------------------------------- unit: emitter queueing
 
 def test_emit_validates_before_queueing(tmp_path):
@@ -130,16 +60,6 @@ def test_emit_validates_before_queueing(tmp_path):
         em.emit(RID, "host.finished", host="beast", repo="autospec", status="exploded")
     assert em.pending() == []
     assert not (tmp_path / "seq.json").exists() or json.loads((tmp_path / "seq.json").read_text()) == {}
-
-
-def test_emit_redacts_log_tail_and_title_itself(tmp_path):
-    em = events.Emitter(tmp_path, client=None, home="/home/wohlgemuth")
-    em.emit(RID, "host.finished", host="beast", repo="autospec", status="failed", reason="apply_failed",
-            log_tail="pip: /home/wohlgemuth/venv failed\nAuthorization: Bearer zzzzzzzz")
-    em.emit(RID, "rollout.observed", trigger={**TRIGGER, "pr_title": "set password=abc"}, targets=TARGETS)
-    stored = json.dumps(em.pending())
-    assert "wohlgemuth" not in stored and "Bearer" not in stored and "password" not in stored
-    assert em.pending()[1]["payload"]["trigger"]["pr_title"] is None
 
 
 def test_seq_is_per_stream_monotonic_and_survives_a_restart(tmp_path):
@@ -284,7 +204,7 @@ def test_an_oversize_envelope_is_parked_and_a_client_less_emitter_just_queues(tm
 
 def test_a_whole_rollout_round_trips_through_the_read_endpoints(tmp_path, live):
     _, base = live
-    em = events.Emitter(tmp_path, client=MetadataClient(base), home="/home/wohlgemuth")
+    em = events.Emitter(tmp_path, client=MetadataClient(base))
     em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS)
     em.emit(RID, "rollout.planned", trigger=TRIGGER, targets=TARGETS)
     em.emit(RID, "rollout.started", targets=TARGETS)
@@ -294,15 +214,17 @@ def test_a_whole_rollout_round_trips_through_the_read_endpoints(tmp_path, live):
                 reason=None if status == "ok" else "health_failed", before_sha=SHA_C,
                 after_sha=SHA_A if status == "ok" else None,
                 started_at="2026-11-04T10:00:00+00:00", finished_at="2026-11-04T10:01:00+00:00", duration_ms=60000,
-                checks=[{"name": "parity", "ok": status == "ok"}],
-                log_tail="installed into /home/wohlgemuth/venv\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz012345")
+                checks=[{"name": "parity_ok", "status": "ok" if status == "ok" else "failed"}],
+                log=em.record_log(RID, host, "updater", "installed into /home/wohlgemuth/venv\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz012345\n"))
     em.emit(RID, "rollout.halted", halted_at_host="bender", reason="health_failed")
     assert em.pending() == []
     [summary] = get(base, "/api/v1/fleet-rollouts")["rollouts"]
     assert (summary["status"], summary["halted_at_host"]) == ("halted", "bender")
     detail = get(base, f"/api/v1/fleet-rollouts/{RID}")
     assert [(h["host"], h["status"]) for h in detail["hosts"]] == [("beast", "ok"), ("bender", "failed")]
-    assert all("wohlgemuth" not in h["log_tail"] and "ghp_" not in h["log_tail"] for h in detail["hosts"])
+    blob = json.dumps(detail)
+    assert "wohlgemuth" not in blob and "ghp_" not in blob                 # the log text never left the host
+    assert all(h["log"]["bytes"] > 0 and len(h["log"]["sha256"]) == 64 for h in detail["hosts"])
     assert get(base, "/api/v1/fleet-rollouts/versions")["hosts"][0]["repos"]["autospec"]["sha"] == SHA_A
 
 
@@ -328,51 +250,6 @@ def test_cli_outbox_status_and_flush(tmp_path, live):
     assert up.returncode == 0, up.stderr
     assert json.loads(up.stdout) == {"sent": 1, "pending": 0, "rejected": 0, "error": None}
     assert len(repo.stream("fleet_rollout", RID)) == 1
-
-
-# --------------------------------------------------------------------------- review round 1
-
-from tests.control_plane.test_fleet_rollout import SECRET_SHAPES, SHAPE_IDS  # noqa: E402
-
-
-@pytest.mark.parametrize("text,needle", SECRET_SHAPES, ids=SHAPE_IDS)
-def test_emitter_redacts_every_secret_shape_from_log_tails_whole_line(text, needle):
-    out = events.redact_log_tail(f"before\n{text}\nafter", home="/home/me")
-    assert needle not in out and out.startswith("before") and out.endswith("after")
-    validate_fleet_rollout(RID, "host.step", {"rollout_id": RID, "ts": "2026-11-04T10:00:00+00:00", "seq": 0,
-                                              "host": "beast", "repo": "autospec", "status": "applying",
-                                              "log_tail": out})
-
-
-def test_a_matching_header_name_redacts_the_value_too():
-    assert events.redact_log_tail("authorization: basic dXNlcjpwYXNz", home="/h") == "[redacted line]"
-    assert "dXNl" not in events.redact_log_tail("Authorization: Basic dXNlcjpwYXNz", home="/h")
-
-
-@pytest.mark.parametrize("text,_needle", SECRET_SHAPES, ids=SHAPE_IDS)
-def test_emitter_drops_pr_titles_with_secret_shapes(text, _needle):
-    assert events.clean_pr_title(text) is None
-    assert events.clean_pr_title(f"fix {text} now") is None
-
-
-def test_emitter_refuses_check_names_with_secret_shapes(tmp_path):
-    em = events.Emitter(tmp_path, client=None)
-    with pytest.raises(ValueError, match="check name"):
-        em.emit(RID, "host.finished", host="beast", repo="autospec", status="ok",
-                checks=[{"name": "https://user:pw@example.com/x", "ok": True}])
-    assert em.pending() == []
-
-
-def test_through_a_real_post_no_credential_shape_is_readable_back(tmp_path, live):
-    repo, base = live
-    em = events.Emitter(tmp_path, client=MetadataClient(base), home="/home/me")
-    em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS)
-    em.emit(RID, "host.finished", host="beast", repo="autospec", status="failed", reason="apply_failed",
-            log_tail="\n".join(t for t, _ in SECRET_SHAPES))
-    assert em.pending() == []
-    body = json.dumps(get(base, f"/api/v1/fleet-rollouts/{RID}"))
-    for _, needle in SECRET_SHAPES:
-        assert needle not in body, needle
 
 
 # --------------------------------------------------------------------------- seq never reused
@@ -467,20 +344,6 @@ def test_the_rejected_file_rotates(tmp_path):
     assert not (tmp_path / "outbox.rejected.jsonl.2").exists()
 
 
-def test_old_idle_seq_entries_are_pruned_but_active_ones_stay(tmp_path):
-    from datetime import UTC, datetime, timedelta
-    clock = {"now": datetime(2026, 11, 4, tzinfo=UTC)}
-    em = events.Emitter(tmp_path, client=None, clock=lambda: clock["now"])
-    old = plan.rollout_id({"autospec": "d" * 40})
-    em.emit(old, "rollout.started", targets=TARGETS)
-    clock["now"] += timedelta(days=29)
-    em.emit(RID, "rollout.started", targets=TARGETS)
-    assert set(json.loads((tmp_path / "seq.json").read_text())) == {old, RID}
-    clock["now"] += timedelta(days=2)                                # `old` is now 31 days idle
-    em.emit(RID, "rollout.succeeded")
-    assert set(json.loads((tmp_path / "seq.json").read_text())) == {RID}
-
-
 def test_status_reports_dropped(tmp_path):
     state_dir = tmp_path / "state" / "herdr-engineering" / "fleet-watch"
     em = events.Emitter(state_dir, client=None, max_pending=1)
@@ -559,29 +422,6 @@ def test_a_200_that_is_not_ok_is_parked_and_does_not_block_the_queue(tmp_path, l
         httpd.shutdown()
 
 
-# --------------------------------------------------------------------------- review round 2
-
-from tests.control_plane.test_fleet_rollout import FINE_TEXT, RESIDUAL, RESIDUAL_IDS  # noqa: E402
-
-
-@pytest.mark.parametrize("text,needle", RESIDUAL, ids=RESIDUAL_IDS)
-def test_emitter_withholds_residual_shapes_line_by_line(text, needle):
-    out = events.redact_log_tail(f"before\n{text}\nafter", home="/home/me")
-    assert needle not in out and out.startswith("before") and out.endswith("after")
-    assert events.clean_pr_title(text) is None
-
-
-@pytest.mark.parametrize("text", FINE_TEXT)
-def test_emitter_keeps_ordinary_lines_and_titles(text):
-    assert events.redact_log_tail(f"ok\n{text}", home="/home/me") == f"ok\n{text}"
-    if len(text) <= 120:
-        assert events.clean_pr_title(text) == text
-
-
-def test_withheld_lines_are_marked():
-    assert "[line withheld]" in events.redact_log_tail("sig=Zm9vYmFyYmF6cXV4", home="/h")
-
-
 # --------------------------------------------------------------------------- source-stream counters are permanent
 
 def test_source_stream_counters_survive_the_idle_prune(tmp_path):
@@ -615,3 +455,95 @@ def test_losing_every_counter_after_a_full_delivery_still_cannot_collide(tmp_pat
     seqs = [e["payload"]["seq"] for e in repo.stream("fleet_rollout", RID)]
     assert len(seqs) == 3 and seqs[:2] == [0, 1] and 2 <= seqs[2] < 2**31
     assert em.pending() == [] and not (tmp_path / "outbox.rejected.jsonl").exists()
+
+
+# --------------------------------------------------------------------------- decision 2026-11-05: logs stay on the host
+
+from tests.control_plane.test_fleet_rollout import CORPUS  # noqa: E402  (strings legitimate for no structured field)
+
+
+def test_the_emitter_cannot_carry_free_text_in_any_field(tmp_path):
+    em = events.Emitter(tmp_path, client=None)
+    for text in CORPUS:
+        for fields in ({"log_tail": text}, {"pr_title": text}, {"note": text}, {"host": text}, {"reason": text},
+                       {"log": {"host": "beast", "path_id": text, "sha256": "ab" * 32, "bytes": 1, "lines": 1}},
+                       {"checks": [{"name": text, "status": "ok"}]}, {"links": {"pi_session_rollout": text}}):
+            with pytest.raises(ValueError):
+                em.emit(RID, "host.finished", **{"host": "beast", "repo": "autospec", "status": "ok", **fields})
+    assert em.pending() == []
+
+
+def test_log_text_is_stored_locally_privately_and_only_a_reference_is_emitted(tmp_path, live):
+    import hashlib
+    repo, base = live
+    em = events.Emitter(tmp_path, client=MetadataClient(base))
+    secret_log = "pip install failed\nTOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n/home/wohlgemuth/venv\n"
+    ref = em.record_log(RID, "beast", "installer", secret_log)
+    assert ref == {"host": "beast", "path_id": "installer", "sha256": hashlib.sha256(secret_log.encode()).hexdigest(),
+                   "bytes": len(secret_log.encode()), "lines": 3}
+    stored = tmp_path / "logs" / RID / "beast-installer.log"
+    assert stored.read_text() == secret_log and stat.S_IMODE(stored.stat().st_mode) == 0o600
+    assert stat.S_IMODE(stored.parent.stat().st_mode) == 0o700
+    em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS)
+    em.emit(RID, "host.finished", host="beast", repo="autospec", status="failed", reason="apply_failed", log=ref)
+    wire = json.dumps(get(base, f"/api/v1/fleet-rollouts/{RID}")) + json.dumps([e["payload"] for e in repo.stream("fleet_rollout", RID)])
+    assert "ghp_" not in wire and "wohlgemuth" not in wire and "pip install" not in wire
+    assert ref["sha256"] in wire
+
+
+def test_the_log_store_keeps_only_the_tail_and_prunes_old_logs(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from herdr_engineering.fleet_watch import logs
+    store = logs.LogStore(tmp_path)
+    big = "x" * 1_500_000
+    ref = store.write(RID, "bender", "updater", big)
+    assert ref["bytes"] == logs.MAX_BYTES == len(store.read(RID, "bender", "updater"))
+    old = tmp_path / RID / "bender-updater.log"
+    os.utime(old, (0, 0))
+    other = plan.rollout_id({"autospec": "d" * 40})
+    store.write(other, "beast", "healthcheck", "ok\n", now=datetime.now(UTC) + timedelta(days=1))
+    assert not old.exists() and (tmp_path / other / "beast-healthcheck.log").exists()
+    for bad in (("../x", "beast", "updater"), (RID, "evil", "updater"), (RID, "beast", "../../etc")):
+        with pytest.raises(ValueError):
+            store.write(*bad, "x")
+
+
+def test_cli_log_show_prints_this_hosts_log_and_refuses_bad_input(tmp_path):
+    import hashlib
+    state_dir = tmp_path / "state" / "herdr-engineering" / "fleet-watch"
+    em = events.Emitter(state_dir, client=None)
+    ref = em.record_log(RID, "bender", "healthcheck", "line one\nline two\n")
+    shown = run_cli(tmp_path, "log", "show", RID, "--host", "bender")
+    assert shown.returncode == 0 and "line two" in shown.stdout and f"sha256={ref['sha256']}" in shown.stdout
+    assert hashlib.sha256(b"line one\nline two\n").hexdigest() == ref["sha256"]
+    assert run_cli(tmp_path, "log", "show", RID, "--host", "bender", "--path-id", "installer").returncode == 1
+    assert run_cli(tmp_path, "log", "show", RID, "--host", "beast").returncode == 1
+    assert run_cli(tmp_path, "log", "show", "../etc", "--host", "bender").returncode == 2
+    assert run_cli(tmp_path, "log", "show", RID, "--host", "evil").returncode == 2
+
+
+def test_per_rollout_counters_are_never_pruned_so_a_resumed_rollout_never_reuses_a_seq(tmp_path):
+    from datetime import UTC, datetime, timedelta
+    clock = {"now": datetime(2026, 11, 4, tzinfo=UTC)}
+    sent = []
+
+    class Recorder:
+        def request(self, route, body):
+            sent.append((body["entity_id"], body["payload"]["seq"]))
+            return {"ok": True, "entity": {"entity_id": body["entity_id"]}}
+
+    em = events.Emitter(tmp_path, client=Recorder(), clock=lambda: clock["now"])
+    em.emit(RID, "rollout.started", targets=TARGETS)
+    clock["now"] += timedelta(days=31)
+    em.emit(plan.rollout_id({"autospec": "d" * 40}), "rollout.resumed")
+    em.emit(RID, "rollout.resumed")                                  # a halted rollout resumed after 31 idle days
+    assert [seq for entity, seq in sent if entity == RID] == [0, 1]
+    clock["now"] = datetime(2038, 1, 1, tzinfo=UTC)                  # the clock floor stays below the 2**31 cap
+    for name in ("seq.json", "seq.json.bak"):
+        (tmp_path / name).unlink()
+    em2 = events.Emitter(tmp_path / "other", client=None, clock=lambda: clock["now"])
+    em2.emit(RID, "rollout.resumed")
+    for name in ("seq.json", "seq.json.bak"):
+        (tmp_path / "other" / name).unlink()
+    assert em2.emit(RID, "rollout.resumed")["payload"]["seq"] < 2**31

@@ -1,10 +1,12 @@
 """Rollout event emitter with a durable outbox (spec sections 5 and 8). Off unless something calls it.
 
-`Emitter.emit` redacts, validates with the SAME allow-list the control plane applies, assigns the next `seq` of
-the rollout's stream and appends the envelope to `outbox.jsonl` (fsynced) before it tries `POST /api/v1/ingest`.
-A control plane that is down costs nothing: the event stays queued and `flush()` delivers it later, oldest first,
-stopping at the first transient failure so the stream order is kept. Delivery is idempotent on the server
-(`<rollout_id>:<seq>`), so a crash between "delivered" and "trimmed" just replays harmlessly.
+The event model has no free text (decision 2026-11-05): every field is an enum, a host name, hex, a number or a UTC
+timestamp, so nothing secret can ride along. Log text stays on the host (`logs.LogStore`) and events carry only a
+reference to it (`Emitter.record_log`). `Emitter.emit` validates with the SAME allow-list the control plane applies,
+assigns the next `seq` of the rollout's stream and appends the envelope to `outbox.jsonl` (fsynced) before it tries
+`POST /api/v1/ingest`. A control plane that is down costs nothing: the event stays queued and `flush()` delivers it
+later, oldest first, stopping at the first transient failure so the stream order is kept. Delivery is idempotent on
+the server (`<rollout_id>:<seq>`), so a crash between "delivered" and "trimmed" just replays harmlessly.
 """
 
 from __future__ import annotations
@@ -14,74 +16,20 @@ import copy
 import fcntl
 import json
 import os
-import re
 import urllib.error
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
-from ..control_plane.fleet_rollout import (
-    HOME_PATH,
-    LOG_TAIL_CHARS,
-    LOG_TAIL_LINES,
-    PR_TITLE_CHARS,
-    WATCHED_REPOS,
-    event_id,
-    leaks,
-    source_stream_id,
-    unsafe_text,
-    validate_fleet_rollout,
-    withheld_reason,
-)
-from . import state
+from ..control_plane.fleet_rollout import event_id, source_stream_id, validate_fleet_rollout
+from . import logs, state
 
-#: Sent in place of a whole line that carries a credential marker.
-REDACTED_LINE = "[redacted line]"
-#: Sent in place of a line that merely LOOKS like it carries a secret (default-deny).
-WITHHELD_LINE = "[line withheld]"
 #: HTTP statuses that mean "this event will never be accepted": parked, the queue moves on.
 PERMANENT_STATUSES = frozenset({400, 409, 413, 422})
 #: Optional payload fields whose value may legitimately be null; any other None is dropped before validation.
 NULLABLE = frozenset({"before_sha", "after_sha", "halted_at_host"})
-LINE_CHARS = 200
 MAX_PENDING = 2000
 MAX_REJECTED_BYTES = 1_000_000
-SEQ_RETENTION_DAYS = 30
-SOURCE_STREAM_IDS = frozenset(source_stream_id(repo) for repo in WATCHED_REPOS)
-_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-
-
-def clean_pr_title(title: str | None) -> str | None:
-    """A one-line printable title of at most 120 characters, or None when it is empty or carries a secret."""
-    if not isinstance(title, str):
-        return None
-    text = " ".join("".join(c if c.isprintable() else " " for c in title).split())[:PR_TITLE_CHARS]
-    return None if not text or unsafe_text(text) else text
-
-
-def _redact_one(line: str, home: str) -> str:
-    line = _ANSI.sub("", line)
-    if home and home != "/":
-        line = line.replace(home, "~")
-    line = HOME_PATH.sub("~", line)
-    if leaks(line):
-        return REDACTED_LINE
-    if withheld_reason(line):
-        return WITHHELD_LINE
-    line = " ".join("".join(c if c.isprintable() else " " for c in line).split())[:LINE_CHARS]
-    # Belt and braces: nothing the control plane would refuse may leave this host.
-    return WITHHELD_LINE if unsafe_text(line) else line
-
-
-def redact_log_tail(text: str, home: str | os.PathLike | None = None) -> str:
-    """The last <=40 non-empty lines (<=2048 chars) of `text`, with credentials, token-like runs, control
-    characters and the operator's home directory removed. Never raises; the result always validates."""
-    home_text = str(home if home is not None else Path.home()).rstrip("/")
-    lines = [_redact_one(line, home_text) for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")[-200:]]
-    lines = [line for line in lines if line.strip()][-LOG_TAIL_LINES:]
-    while lines and len("\n".join(lines)) > LOG_TAIL_CHARS:
-        lines.pop(0)
-    return "\n".join(lines)
 
 
 class NotAccepted(Exception):
@@ -91,12 +39,11 @@ class NotAccepted(Exception):
 class Emitter:
     """Queue-then-deliver emitter. `client` is anything with `request(route, body) -> dict` (MetadataClient)."""
 
-    def __init__(self, directory: Path | str | None = None, client=None, *, home: str | os.PathLike | None = None,
+    def __init__(self, directory: Path | str | None = None, client=None, *,
                  max_pending: int = MAX_PENDING, max_rejected_bytes: int = MAX_REJECTED_BYTES,
                  clock: Callable[[], datetime] | None = None):
         self.directory = Path(directory) if directory else state.state_dir()
         self.client = client
-        self.home = home
         self.max_pending = max_pending
         self.max_rejected_bytes = max_rejected_bytes
         self.clock = clock or (lambda: datetime.now(UTC))
@@ -190,16 +137,14 @@ class Emitter:
             return False
 
     def _reserve_seq(self, rollout_id: str, seq: int) -> None:
-        """Persist `seq + 1` (both copies) BEFORE the event is appended; prune rollouts idle for 30 days."""
+        """Persist `seq + 1` (both copies) BEFORE the event is appended. Counters are never pruned: they are a few
+        bytes each, and a dropped counter would restart at seq 0 and collide with what the server already holds."""
         now = self.clock()
         merged: dict[str, dict] = {}
         for path in (self.seq_backup, self.seq_file):
             for key, entry in self._read_seqs(path).items():
                 if key not in merged or entry["next"] >= merged[key]["next"]:
                     merged[key] = entry
-        horizon = (now - timedelta(days=SEQ_RETENTION_DAYS)).isoformat()
-        # `source.*` streams are one constant id per repo for ever: a pruned counter would restart at seq 0 and collide.
-        merged = {k: v for k, v in merged.items() if v["at"] >= horizon or k in SOURCE_STREAM_IDS}
         merged[rollout_id] = {"next": seq + 1, "at": now.isoformat()}
         text = json.dumps(merged, sort_keys=True)
         self._write_atomic(self.seq_file, text)
@@ -241,10 +186,6 @@ class Emitter:
         Delivery problems never raise: the event simply stays in the outbox.
         """
         payload = {k: copy.deepcopy(v) for k, v in fields.items() if v is not None or k in NULLABLE}
-        if isinstance(payload.get("log_tail"), str):
-            payload["log_tail"] = redact_log_tail(payload["log_tail"], self.home)
-        if isinstance(payload.get("trigger"), dict) and "pr_title" in payload["trigger"]:
-            payload["trigger"]["pr_title"] = clean_pr_title(payload["trigger"]["pr_title"])
         with self._locked():
             seq = self._next_seq(rollout_id)
             clean = validate_fleet_rollout(rollout_id, event_type,
@@ -258,6 +199,10 @@ class Emitter:
         if flush and self.client is not None:
             self.flush()
         return envelope
+
+    def record_log(self, rollout_id: str, host: str, path_id: str, text: str) -> dict:
+        """Keep `text` in this host's private log store and return the reference to put in `log=` of an event."""
+        return logs.LogStore(self.directory / "logs").write(rollout_id, host, path_id, text, now=self.clock())
 
     def source_event(self, repo: str, event_type: str, **fields) -> dict:
         """A `source.*` event, filed on the watched repo's own stream (not tied to one rollout)."""

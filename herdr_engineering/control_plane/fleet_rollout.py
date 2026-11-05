@@ -1,14 +1,14 @@
 """``fleet_rollout`` event model (spec docs/specs/herdr-fleet-rollout-watcher-20261104, section 8).
 
-One append-only stream per rollout (``entity_id`` = ``rollout_id``). The validator is a strict allow-list with
-closed enums and hard length caps: it is the last line of defence when a buggy emitter would leak a token, a
-secret environment or a home directory, so it rejects (never silently truncates) anything suspicious. The read
-model is derived in memory from the streams, like ``repo.list_ai_sync``; no SQL table exists.
+One append-only stream per rollout (``entity_id`` = ``rollout_id``). The model contains NO free text: every value is
+a closed enum, an inventory host, a lowercase-hex id or digest, an integer, or a UTC timestamp, and unknown fields
+are rejected. Secret-free is therefore by construction, not by redaction (decision 2026-11-05: regex redaction of log
+text cannot be made safe). Logs stay on the host and are referenced by SHA-256 (``log``). The read model is derived
+in memory from the streams, like ``repo.list_ai_sync``; no SQL table exists.
 """
 from __future__ import annotations
 
 import hashlib
-import math
 import re
 import threading
 from datetime import UTC, datetime
@@ -22,51 +22,18 @@ REASONS = ("dirty_checkout", "not_on_main", "unpublished_commits", "busy", "time
            "apply_failed", "ssh_failed", "halted", "optional_unreachable", "not_published", "rate_limited",
            "operator")
 HOST_ORDER = ("beast", "bender", "macbook-pro")
-LOG_TAIL_CHARS = 2048
-LOG_TAIL_LINES = 40
-PR_TITLE_CHARS = 120
-MAX_CHECKS = 32
+#: Health checks the host-apply step runs (spec section 5): the only names a check may carry.
+CHECK_NAMES = ("version_matches", "service_active", "gateway_registered", "parity_ok", "release_complete",
+               "current_symlink", "version_smoke", "generation_receipt", "verify_ok", "feed_in_sync")
+CHECK_STATUSES = ("ok", "failed", "skipped")
+#: Which host-side log a reference points at; the content itself never leaves the host.
+LOG_KINDS = ("updater", "installer", "healthcheck")
+MAX_CHECKS = len(CHECK_NAMES)
 COUNT_KEYS = ("dirty_paths", "unpublished_commits", "behind")
 
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _ID = re.compile(r"[0-9a-f]{16}")
 _LINK = re.compile(r"[0-9a-f]{16,32}")
-_USERINFO = re.compile(r"://[^/@\s]+@")
-_ASSIGNED_SECRET = re.compile(r"(?i)(?:token|password|passwd|pwd|secret|api[_-]?key)\w*[ \t]*[=:]")
-_AUTH_HEADER = re.compile(r"(?i)authorization[ \t]*[:=]")
-_COOKIE = re.compile(r"(?i)\b(?:set-)?cookie[ \t]*[:=]")
-_SCHEME_VALUE = re.compile(r"(?i)\b(?:basic|bearer)[ \t]+[A-Za-z0-9+/=._~-]{8,}")
-_PRIVATE_KEY = re.compile(r"-----BEGIN|BEGIN [A-Z ]*PRIVATE KEY")
-_KNOWN_TOKEN = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}|\bsk-[A-Za-z0-9_-]{6,}|\bxox[abeprs]-|\beyJ[A-Za-z0-9_-]{6,}\."
-                          r"|\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{6,}|\bya29\.|\bSG\.[\w-]{10,}|\bglpat-[\w-]{10,}"
-                          r"|\bhf_[A-Za-z0-9]{10,}|\b[sr]k_(?:live|test)_|\bnpm_[A-Za-z0-9]{20,}"
-                          r"|hooks\.slack\.com/services/")
-_SSH_KEY_PATH = re.compile(r"\.ssh/|\bid_(?:rsa|dsa|ecdsa|ed25519)\b")
-_SECRET_FILE = re.compile(r"(?i)\.(?:netrc|npmrc|pgpass|git-credentials)\b|\.config/gh\b|\.docker/config|\.aws\b"
-                          r"|\.kube/config|\bhosts\.yml\b")
-_NETRC = re.compile(r"(?i)\bmachine[ \t]+\S+[ \t]+login\b|\blogin[ \t]+\S+[ \t]+password\b")
-HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s]+|/root\b")
-#: What the general ingest door writes over a credential-looking string; a value that still carries it was
-#: partly redacted upstream, so whatever else it holds cannot be trusted.
-DOOR_MARKER = "[REDACTED]"
-
-# Default-deny by shape (round 2): free text is refused when it LOOKS like it carries a secret, not only when it
-# matches a known secret format.
-_KEY_NAME_VALUE = re.compile(
-    r"(?i)[A-Za-z0-9_.-]*(?:pass|password|passwd|pwd|secret|token|key|auth|auths|creds?|credentials?|cookie|sig|signature)"
-    r"(?:_id)?[\"']?[ \t]*[=:][ \t]*[\"'\[{]?\S")
-_PGPASS = re.compile(r"(?m)^[^:\s]+:\d{1,5}:[^:\s]+:[^:\s]+:\S+$")
-_SECRET_FLAG = re.compile(r"(?i)(?<![\w-])--(?:pass(?:word|wd)?|pwd|token|secret|api-?key|access-?key|auth\w*)(?:=|[ \t]+)\S")
-_USER_PW_FLAG = re.compile(r"(?<![\w-])-u[ \t]*[^\s:]+:\S+")
-_CRED_COMMAND = re.compile(r"(?i)\b(?:mysql\w*|psql|docker|podman|login|sshpass|curl|wget|redis-cli|mongo\w*|htpasswd|ldap\w+"
-                           r"|smbclient|twine|mosquitto\w*)\b")
-_P_FLAG = re.compile(r"(?<![\w-])-p[ \t]*[^\s-]\S*")
-_QUERY_SECRET = re.compile(r"(?i)[?&](?:sig|signature|key|token|code|auth|apikey|api_key|access_token|password|pwd)=")
-_BASE64_PADDED = re.compile(r"[A-Za-z0-9+/]{12,}={1,2}(?![\w=])")
-_RUN = re.compile(r"[A-Za-z0-9+/_=.-]{20,}")
-_PROSE_RUN = re.compile(r"[a-z]{1,12}(?:-[a-z]{1,12})+")
-_PATH_RUN = re.compile(r"/{1,2}[A-Za-z0-9._-]{1,40}(?:/[A-Za-z0-9._-]{1,40})*/?")
-ENTROPY_BITS = 3.5
 
 #: event type -> (required fields, optional fields), beyond the common rollout_id / ts / seq.
 EVENT_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
@@ -75,10 +42,10 @@ EVENT_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "rollout.started": (frozenset({"targets"}), frozenset()),
     "rollout.resumed": (frozenset(), frozenset({"reason"})),
     "host.started": (frozenset({"host", "repo"}), frozenset({"status"})),
-    "host.step": (frozenset({"host", "repo", "status"}), frozenset({"checks", "log_tail"})),
+    "host.step": (frozenset({"host", "repo", "status"}), frozenset({"checks", "log"})),
     "host.finished": (frozenset({"host", "repo", "status"}),
                       frozenset({"reason", "before_sha", "after_sha", "started_at", "finished_at",
-                                 "duration_ms", "checks", "log_tail", "counts", "links"})),
+                                 "duration_ms", "checks", "log", "counts", "links"})),
     "rollout.succeeded": (frozenset(), frozenset()),
     "rollout.halted": (frozenset({"halted_at_host"}), frozenset({"reason"})),
     "rollout.superseded": (frozenset(), frozenset({"reason"})),
@@ -158,78 +125,11 @@ def _keys(name: str, value: dict, required: set[str], optional: set[str] = froze
         raise _bad(f"{name} requires {missing[0]}")
 
 
-def leaks(text: str) -> str | None:
-    """Why ``text`` must not be stored, or None. Markers of credentials, key material and key files."""
-    for pattern, why in ((_USERINFO, "credentials in a URL"), (_AUTH_HEADER, "an Authorization header"),
-                         (_COOKIE, "a cookie header"), (_ASSIGNED_SECRET, "a secret assignment"),
-                         (_SCHEME_VALUE, "an authentication scheme and value"), (_PRIVATE_KEY, "private key material"),
-                         (_KNOWN_TOKEN, "a known token format"), (_SSH_KEY_PATH, "an ssh key path"),
-                         (_SECRET_FILE, "a credential file path"),
-                         (_NETRC, "netrc credentials")):
-        if pattern.search(text):
-            return why
-    return None
-
-
-def _entropy(text: str) -> float:
-    return -sum(n / len(text) * math.log2(n / len(text)) for n in (text.count(c) for c in set(text)))
-
-
-def _suspicious_run(run: str) -> bool:
-    run = run.rstrip(".")
-    if len(run) < 20 or _PROSE_RUN.fullmatch(run) or _PATH_RUN.fullmatch(run):
-        return False
-    if re.fullmatch(r"[0-9a-fA-F]+", run) or len(run) >= 24:
-        return True
-    mixed = any(c.isupper() for c in run) and any(c.islower() for c in run) and any(c.isdigit() for c in run)
-    return mixed or _entropy(run) > ENTROPY_BITS
-
-
-def withheld_reason(text: str) -> str | None:
-    """Default-deny: why free text LOOKS like it carries a secret even though no known pattern matched."""
-    if _KEY_NAME_VALUE.search(text):
-        return "a key-like name with a value"
-    if _SECRET_FLAG.search(text) or _USER_PW_FLAG.search(text) or (_CRED_COMMAND.search(text) and _P_FLAG.search(text)):
-        return "a credential command-line flag"
-    if _QUERY_SECRET.search(text):
-        return "a secret URL query parameter"
-    if _PGPASS.search(text):
-        return "a pgpass-style entry"
-    if _BASE64_PADDED.search(text) or any(_suspicious_run(r) for r in _RUN.findall(text)):
-        return "a token-like string"
-    return None
-
-
-def unsafe_text(text: str) -> str | None:
-    """`leaks` plus the default-deny shapes, a home-directory path and the ingest door's redaction marker."""
-    reason = leaks(text)
-    if reason is None and DOOR_MARKER in text:
-        reason = "a value already redacted upstream"
-    if reason is None:
-        reason = withheld_reason(text)
-    if reason is None and HOME_PATH.search(text):
-        reason = "a home-directory path"
-    return reason
-
-
-def _title(value) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str) or len(value) > PR_TITLE_CHARS or not value.isprintable():
-        raise _bad(f"pr_title must be printable text of at most {PR_TITLE_CHARS} characters")
-    reason = unsafe_text(value)
-    if reason:
-        raise _bad(f"pr_title contains {reason}")
-    return value
-
-
 def _trigger(value) -> dict:
-    _keys("trigger", value, {"repo", "sha"}, {"pr", "pr_title", "merged_at"})
+    _keys("trigger", value, {"repo", "sha"}, {"pr", "merged_at"})
     clean = {"repo": _enum("trigger.repo", value["repo"], WATCHED_REPOS), "sha": _sha("trigger.sha", value["sha"])}
     if "pr" in value:
         clean["pr"] = None if value["pr"] is None else _count("trigger.pr", value["pr"])
-    if "pr_title" in value:
-        clean["pr_title"] = _title(value["pr_title"])
     if "merged_at" in value:
         clean["merged_at"] = None if value["merged_at"] is None else _utc("trigger.merged_at", value["merged_at"])
     return clean
@@ -253,29 +153,26 @@ def _checks(value) -> list:
         raise _bad(f"checks must be a list of at most {MAX_CHECKS} objects")
     out = []
     for item in value:
-        _keys("check", item, {"name", "ok"})
-        name = item["name"]
-        if not isinstance(name, str) or not 0 < len(name) <= 40 or not name.isprintable():
-            raise _bad("check name must be printable text of 1 to 40 characters")
-        if unsafe_text(name):
-            raise _bad(f"check name contains {unsafe_text(name)}")
-        if type(item["ok"]) is not bool:
-            raise _bad("check ok must be a boolean")
-        out.append({"name": name, "ok": item["ok"]})
+        _keys("check", item, {"name", "status"}, {"duration_ms"})
+        clean = {"name": _enum("check name", item["name"], CHECK_NAMES),
+                 "status": _enum("check status", item["status"], CHECK_STATUSES)}
+        if "duration_ms" in item:
+            clean["duration_ms"] = _count("check duration_ms", item["duration_ms"])
+        out.append(clean)
     return out
 
 
-def _log_tail(value) -> str:
-    if not isinstance(value, str) or len(value) > LOG_TAIL_CHARS:
-        raise _bad(f"log_tail must be a string of at most {LOG_TAIL_CHARS} characters")
-    if value.count("\n") + 1 > LOG_TAIL_LINES:
-        raise _bad(f"log_tail must be at most {LOG_TAIL_LINES} lines")
-    if not value.replace("\n", "").isprintable():
-        raise _bad("log_tail contains non-printable characters")
-    reason = unsafe_text(value)
-    if reason:
-        raise _bad(f"log_tail contains {reason}")
-    return value
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _log_ref(value) -> dict:
+    """A pointer to a log kept on the host: which host and kind, a SHA-256 of the content, its size. No text."""
+    _keys("log", value, {"host", "path_id", "sha256", "bytes", "lines"})
+    if not isinstance(value["sha256"], str) or not _SHA256.fullmatch(value["sha256"]):
+        raise _bad("log.sha256 must be 64 lowercase hex characters")
+    return {"host": _host("log.host", value["host"]), "path_id": _enum("log.path_id", value["path_id"], LOG_KINDS),
+            "sha256": value["sha256"], "bytes": _count("log.bytes", value["bytes"]),
+            "lines": _count("log.lines", value["lines"])}
 
 
 def validate_fleet_rollout(entity_id, event_type, payload) -> dict:
@@ -313,8 +210,8 @@ def validate_fleet_rollout(entity_id, event_type, payload) -> dict:
             clean[key] = _count(key, value)
         elif key == "checks":
             clean[key] = _checks(value)
-        elif key == "log_tail":
-            clean[key] = _log_tail(value)
+        elif key == "log":
+            clean[key] = _log_ref(value)
         elif key == "counts":
             _keys("counts", value, set(), set(COUNT_KEYS))
             clean[key] = {k: _count(f"counts.{k}", v) for k, v in value.items()}
@@ -326,6 +223,8 @@ def validate_fleet_rollout(entity_id, event_type, payload) -> dict:
             clean[key] = dict(value)
         elif key == "halted_at_host":
             clean[key] = _host(key, value, nullable=True)
+    if "log" in clean and clean["log"]["host"] != clean.get("host"):
+        raise _bad("log.host must equal host")
     if event_type.startswith("source.") and rid != source_stream_id(clean["repo"]):
         raise _bad("source events must use the stream id of their repo")
     return clean

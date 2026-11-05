@@ -403,3 +403,21 @@ dependency"); client-rendered diagrams from untrusted strings.
    existing operator-principal rules in `ingest.py` are sufficient or defer buttons to CLI-only in v1.
 8. Should `herdr-eng` on non-controller hosts own a checkout at all, or move to release-directory installs
    (atomic switch like Pi) so the dirty-checkout hazard disappears instead of being detected?
+
+## 14. Decision record: no free text in rollout events (2026-11-05)
+
+Section 8.1 specified a redacted `log_tail` (and a `pr_title`, free-form check names) with a denylist plus the existing
+`redact()`. Step 3 implemented that and it was reviewed three times; each round found secret shapes that survived or
+were stored (25 of 70 new shapes readable back in round 3, with 17.5% of ordinary lines wrongly withheld). Pattern
+redaction of arbitrary command output cannot be made safe, and the event store is readable by everyone with dashboard
+access. **The user chose option 1: remove all free text from the event model.**
+
+- `log_tail`, `pr_title` and `checks[].name` as free text are deleted. `checks[]` becomes `{name (closed enum), status
+  (ok|failed|skipped), duration_ms}`; the PR is identified by `trigger.pr` (int) and `trigger.sha`.
+- A log is a reference `log = {host, path_id (updater|installer|healthcheck), sha256 (64 hex), bytes, lines}`. The text
+  stays in a 0600 store on the host that captured it and is read with `herdr-eng fleet-watch log show <rollout_id> --host H`.
+- Every remaining string is an enum, a fleet host (`beast|bender|macbook-pro`), lowercase hex, or a UTC timestamp;
+  unknown fields are rejected. Secret-free is a property of the schema, proven by tests that put hundreds of
+  secret-shaped strings into every field and expect refusal.
+- The dashboard (step 6) shows the log reference and the host-side command, not the text.
+- Related fix: `seq` counters are never pruned (a resumed or recovered stream must not restart at 0).

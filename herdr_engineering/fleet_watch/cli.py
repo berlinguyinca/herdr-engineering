@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 
-from . import core, events, poll, state
+from . import core, events, logs, poll, state
 
 
 def render(report: dict) -> str:
@@ -89,6 +89,29 @@ def cmd_outbox(args) -> int:
     return 1 if report["error"] else 0
 
 
+def cmd_log(args) -> int:
+    """Print a rollout log from THIS host's private store (events carry only its SHA-256, never the text)."""
+    import hashlib
+
+    store = logs.LogStore()
+    try:
+        kinds = [args.path_id] if args.path_id else store.kinds(args.rollout_id, args.host)
+        if not kinds:
+            raise logs.LogNotFound(f"no log for {args.host} in rollout {args.rollout_id}")
+        for kind in kinds:
+            text = store.read(args.rollout_id, args.host, kind)
+            digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+            print(f"== {args.host} {kind} sha256={digest}")
+            print(text, end="" if text.endswith("\n") else "\n")
+    except logs.LogNotFound as exc:
+        print(f"fleet-watch log show: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"fleet-watch log show: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def register(sub) -> None:
     p = sub.add_parser("fleet-watch", help="merge-triggered fleet rollout watcher (read-only core)")
     wsub = p.add_subparsers(dest="fleet_watch_command", required=True)
@@ -110,3 +133,12 @@ def register(sub) -> None:
     fl.add_argument("--json", action="store_true")
     for sp in (st, fl):
         sp.set_defaults(func=cmd_outbox)
+    lg = wsub.add_parser("log", help="show a rollout log kept on this host (never sent to the control plane)")
+    lsub = lg.add_subparsers(dest="log_command", required=True)
+    sh = lsub.add_parser("show", help="print the stored log(s) of one rollout and host")
+    sh.add_argument("rollout_id", help="16-hex rollout id")
+    sh.add_argument("--host", required=True, help="fleet host the log belongs to (beast, bender, macbook-pro)")
+    sh.add_argument("--path-id", choices=sorted(__import__("herdr_engineering.control_plane.fleet_rollout",
+                                                           fromlist=["LOG_KINDS"]).LOG_KINDS),
+                    help="one log kind (default: all stored for that host)")
+    sh.set_defaults(func=cmd_log)

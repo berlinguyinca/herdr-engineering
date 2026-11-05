@@ -1,8 +1,16 @@
 # Fleet rollout events (spec step 3, off by default)
 
-Implements section 8 of `docs/specs/herdr-fleet-rollout-watcher-20261104/spec.md`: the event model the fleet rollout
-watcher reports into. Nothing emits these events yet (the runner is step 4); this release adds the ingest type, the
-read endpoints and the emitter/outbox, so they can be exercised with `curl`.
+Implements section 8 of `docs/specs/herdr-fleet-rollout-watcher-20261104/spec.md` (with the decision recorded in its
+appendix): the event model the fleet rollout watcher reports into. Nothing emits these events yet (the runner is step 4);
+this release adds the ingest type, the read endpoints, the emitter/outbox and the host-side log store, so they can be
+exercised with `curl`.
+
+## No free text
+
+The model carries **no free text**. Every value is a closed enum, an inventory host, a lowercase-hex id or digest, an
+integer, or a UTC timestamp, and unknown fields are rejected, so a secret cannot ride along by construction (regex
+redaction of log text was tried and could not be made safe). The spec's redacted `log_tail`, `pr_title` and free-form
+check names do not exist; see "Logs" below.
 
 ## Ingest: `entity_type = "fleet_rollout"`
 
@@ -12,33 +20,39 @@ event types `rollout.observed|planned|started|resumed|succeeded|halted|supersede
 `entity_id`), `ts` (ISO-8601 **UTC**) and `seq` (int >= 0, per stream); the other fields allowed depend on the event type
 (`control_plane/fleet_rollout.py::EVENT_FIELDS`). Anything outside that table is a `400` and nothing is stored.
 
-Strict by construction (the validator is the last line of defence against a buggy emitter):
+| field | allowed values |
+|---|---|
+| `repo`, `trigger.repo`, `targets[].repo` | `autospec pi-engineering herdr-engineering ai-sync claude-config` |
+| `host`, `halted_at_host`, `log.host` | `beast bender macbook-pro` (a new fleet member needs a code change) |
+| `status` | `pending precheck applying checking ok blocked failed unreachable skipped rolled_back` |
+| `reason` | `dirty_checkout not_on_main unpublished_commits busy timeout health_failed apply_failed ssh_failed halted optional_unreachable not_published rate_limited operator` |
+| `trigger` | `repo`, `sha` (40 hex), optional `pr` (int), `merged_at` (UTC) - no title |
+| `targets[]` | `repo`, `sha`, optional `before` (40 hex or null), at most 5 |
+| `checks[]` (at most 10) | `name` in `version_matches service_active gateway_registered parity_ok release_complete current_symlink version_smoke generation_receipt verify_ok feed_in_sync`, `status` in `ok failed skipped`, optional `duration_ms` |
+| `log` | `host`, `path_id` in `updater installer healthcheck`, `sha256` (64 hex), `bytes`, `lines`; `log.host` must equal `host` |
+| `counts` | `dirty_paths unpublished_commits behind` (non-negative ints) |
+| `links.pi_session_rollout` | 16 to 32 lowercase hex, or null |
+| `before_sha`, `after_sha` | 40 hex or null |
+| `started_at`, `finished_at` | UTC timestamp; `duration_ms` non-negative int |
 
-- closed enums: `status` (`pending precheck applying checking ok blocked failed unreachable skipped rolled_back`),
-  `reason` (spec 8.1), `repo` (`autospec pi-engineering herdr-engineering ai-sync claude-config`);
-- `host` and `halted_at_host` are the closed fleet enum `beast|bender|macbook-pro` (a new member needs a code change);
-  `links.pi_session_rollout` is a 16 to 32 character lowercase-hex rollout id; SHAs are 40 lowercase hex; `checks` <= 32 x (`name` <= 40, `ok`); `counts` only
-  `dirty_paths|unpublished_commits|behind`; `log_tail` <= 2048 chars and <= 40 lines; `pr_title` <= 120 chars;
-- **no secrets**: `log_tail`, `pr_title` and every `checks[].name` go through the same `unsafe_text` check and are
-  **rejected** (never truncated or repaired) when they contain credentials in a URL, an `Authorization:` or `Cookie:`
-  header, `token=`/`password=`/`passwd=`/`pwd=`/`secret=`/`api_key=`, a `Basic`/`Bearer` scheme followed by a value,
-  private-key armour (with or without dashes), AWS (`AKIA`/`ASIA`), `sk-`, Slack, GitHub and JWT token shapes, an
-  ssh key path (`.ssh/`, `id_rsa`...), netrc `machine ... login ... password`, a 24+ character token-like run, a control
-  character, a `/home/<user>`, `/Users/<user>` or `/root` path, or the literal `[REDACTED]`. The general ingest door
-  runs first and overwrites credential-looking strings (sometimes only the header name) with `[REDACTED]`; the validator
-  treats that marker as a rejection, so a half-redacted value is a `400`, never stored. A PR title that trips the check
-  is dropped by the emitter.
-- **default-deny by shape** (not only known formats): free text is also refused when it has a key-like name followed by a
-  value (`pass|pwd|secret|token|key|auth|cred|cookie|sig` then `=`/`:`/JSON colon), a credential CLI flag (`--password x`,
-  `-u user:pw`, `-pX` next to mysql/docker/curl/login...), a secret URL query parameter (`sig|key|token|code|auth`), a
-  pgpass line, a padded base64 value, a credential file (`hosts.yml`, `.netrc`...), or a run of 20+ characters that is hex,
-  mixed upper/lower/digit or high-entropy (24+ characters always, unless it is a path or lowercase hyphenated prose such as
-  `make-the-ingest-door-redact-secrets-consistently`). Cost: a log line with a long file name such as a wheel name is
-  withheld; the emitter replaces such a line with `[line withheld]`. 40-hex commit SHAs are accepted only in the sha fields.
-- `source.*` events are not tied to one rollout; they use `control_plane.fleet_rollout.source_stream_id(repo)` as stream id.
+`source.*` events are not tied to one rollout; they use `control_plane.fleet_rollout.source_stream_id(repo)` as stream id.
 
 Idempotent: the envelope identity is `<rollout_id>:<seq>` (`event_id()`). The same `seq` with identical content is a
 no-op (`"duplicate": true` in the reply); different content for a stored `seq` is `409`.
+
+## Logs stay on the host
+
+Log text (updater, installer, health-check output) never leaves the host that produced it. The emitter keeps it in a
+private store (`$XDG_STATE_HOME/herdr-engineering/fleet-watch/logs/<rollout_id>/<host>-<kind>.log`, dirs 0700, files 0600,
+last 1 MB kept, files older than 30 days deleted when a new one is written) and the event carries only the reference
+`{host, path_id, sha256, bytes, lines}`. The operator reads it where it was written:
+
+```
+herdr-eng fleet-watch log show <rollout_id> --host bender [--path-id updater|installer|healthcheck]
+```
+
+The command prints each stored log with its SHA-256, which should equal the `log.sha256` in the event. (The watcher
+that drives `ssh` runs on the controller, so for remote hosts the logs it captured are in the controller's store.)
 
 ## Read API (ETag, like ai-sync)
 
@@ -60,28 +74,27 @@ curl -s http://127.0.0.1:8765/api/v1/fleet-rollouts/versions | jq
 
 ## Emitter and outbox (`herdr_engineering/fleet_watch/events.py`)
 
-`Emitter.emit(rollout_id, event_type, **fields)` redacts `log_tail` (last 40 non-empty lines, <= 2048 chars; credential
-lines become `[redacted line]`, token-like runs `[redacted]`, home paths `~`) and `pr_title` (dropped if it carries a
-secret), validates with the server's own validator, assigns the next `seq`, appends to
-`$XDG_STATE_HOME/herdr-engineering/fleet-watch/outbox.jsonl` (0600, fsynced) and then tries to deliver. A control plane
-that is down never raises: the event stays queued and goes out, oldest first, on the next `flush()`. The queue stops at
-the first transient failure (network, 5xx, 401/403/429) to keep the stream ordered; events the server will never accept
-(400/409/413/422, a 200 that is not `ok`, torn lines, > 16 KiB) are parked with the reason in `outbox.rejected.jsonl` so
-they cannot block the rest. `flush` holds its file lock only to read and to trim, never across a network call.
+`Emitter.emit(rollout_id, event_type, **fields)` validates with the server's own validator, assigns the next `seq`,
+appends to `$XDG_STATE_HOME/herdr-engineering/fleet-watch/outbox.jsonl` (0600, fsynced) and then tries to deliver. A
+control plane that is down never raises: the event stays queued and goes out, oldest first, on the next `flush()`. The
+queue stops at the first transient failure (network, 5xx, 401/403/429) to keep the stream ordered; events the server will
+never accept (400/409/413/422, a 200 that is not `ok`, torn lines, > 16 KiB) are parked with the reason in
+`outbox.rejected.jsonl` so they cannot block the rest. `flush` holds its file lock only to read and to trim, never across a
+network call.
 
-`seq` is never reused: the next value is the maximum of `seq.json`, its backup `seq.json.bak`, and every seq still in
-the outbox or the parked files, and it is persisted **before** the event is appended (a crash burns a number, a gap is
-harmless). If both counter files are gone while every event was already delivered and trimmed, the next seq starts from the clock
-(seconds since the epoch, kept below 2^31) instead of 0, so it cannot collide with what the server holds. `source.*`
-counters are never pruned.
+`seq` is never reused: the next value is the maximum of `seq.json`, its backup `seq.json.bak`, and every seq still in the
+outbox or the parked files, and it is persisted **before** the event is appended (a crash burns a number, a gap is
+harmless). **Counters are never pruned** (a few bytes per rollout; a dropped counter would restart at 0 and collide with
+the server, e.g. a halted rollout resumed weeks later, or a `source.*` stream). If both counter files are gone while every
+event was already delivered and trimmed, the next seq starts from the clock (seconds since the epoch, below 2^31).
 
 Bounded growth: at most 2000 unflushed events (older ones are parked as `outbox full` and counted in `outbox.dropped`,
-shown by `outbox status` as `dropped`); `outbox.rejected.jsonl` rotates to `.1` above 1 MB (one generation kept);
-`seq.json` entries idle for 30 days are pruned.
+shown by `outbox status` as `dropped`); `outbox.rejected.jsonl` rotates to `.1` above 1 MB; logs expire after 30 days.
 
 ```
 herdr-eng fleet-watch outbox status [--json]
 herdr-eng fleet-watch outbox flush [--control-plane URL] [--api-key-file F] [--json]   # exit 1 if events stay queued
+herdr-eng fleet-watch log show <rollout_id> --host H [--path-id K]
 ```
 
 Rollback: nothing calls the emitter in this release; removing the ingest type is the only server-side change to undo.
