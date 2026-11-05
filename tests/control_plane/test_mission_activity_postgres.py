@@ -12,7 +12,10 @@ import pytest
 from herdr_engineering.control_plane.bridge import PostgresSource, load_into
 from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.mission_activity import ENTITY_TYPE, RETENTION_SECONDS
-from herdr_engineering.control_plane.mission_outcome import issue_refs_by_mission, pr_refs_by_mission
+from herdr_engineering.control_plane.mission_outcome import (
+    issue_refs_by_mission,
+    pr_refs_by_mission,
+)
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.control_plane.sink import DurableEventSink
 from tests.e2e.pg import ThrowawayPostgres, find_bins
