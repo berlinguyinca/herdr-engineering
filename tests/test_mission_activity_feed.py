@@ -549,3 +549,32 @@ def test_next_action_crosses_feed_and_store_summaries_unchanged_and_bounded():
     store.ingest('pi:MSN-1', payload, source='pi')
     summary = store.list_summaries()[0]['activity']
     assert summary['nextAction'] == 'No further action is scheduled' and summary['nextActionAt'] == STAMP
+
+
+def _rewrite_snapshot(project, snapshot, **top):
+    path = project / '.pi-eng/orchestration-snapshot.json'
+    path.write_text(json.dumps(dict(snapshot, **top)))
+    path.chmod(0o600)
+
+
+def test_contract_v4_fields_cross_the_feed_and_v3_still_works(tmp_path):
+    with native_session(tmp_path) as (root, project, _, snapshot, _), api() as (url, posts):
+        snapshot['missions'][0].update(created_at='2026-11-01T10:00:00Z', completed_at='nope', secret='x',
+                                       links=[dict(kind='issue', repository='acme/app', number=3, title='no'), 'junk'])
+        _rewrite_snapshot(project, snapshot, contractVersion=4)
+        assert feed.MissionActivityFeed(url, host_id='host', control_dir=root).run_once()['posted'] == 1
+        mission = posts[0]['payload']['mission']
+        assert mission['created_at'] == '2026-11-01T10:00:00Z' and mission['completed_at'] == 'nope'
+        assert mission['links'] == [dict(kind='issue', repository='acme/app', number=3)]
+        assert 'secret' not in mission
+    (tmp_path / 'v3').mkdir()
+    with native_session(tmp_path / 'v3') as (root, _, _, _, _), api() as (url, posts):
+        feed.MissionActivityFeed(url, host_id='host', control_dir=root).run_once()
+        assert not {'created_at', 'completed_at', 'links'} & set(posts[0]['payload']['mission'])
+
+
+def test_unknown_contract_version_is_not_published(tmp_path):
+    with native_session(tmp_path) as (root, project, _, snapshot, _), api() as (url, posts):
+        _rewrite_snapshot(project, snapshot, contractVersion=5)
+        feed.MissionActivityFeed(url, host_id='host', control_dir=root).run_once()
+        assert all(p['payload']['connection'] != 'connected' for p in posts)

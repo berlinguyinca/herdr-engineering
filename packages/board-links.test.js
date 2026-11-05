@@ -129,3 +129,29 @@ test('G3: an old server without pr_refs, or a malformed pr_refs, still works fro
     assert.deepEqual(refs, [{kind: 'mission', id: 'pi:MSN-1', type: 'pr', repository: 'acme/app', number: 7}]);
   }
 });
+
+test('G8: issue_refs verify an ISSUE card only when exactly one mission carries it; a PR with the same number is separate', () => {
+  const body = {
+    outcomes: {},
+    pr_refs: {'pi:A': [{repository: 'acme/app', number: 3}]},
+    issue_refs: {'pi:A': [{repository: 'acme/app', number: 3}, {repository: 'acme/app', number: 4}], 'pi:B': [{repository: 'acme/app', number: 4}]},
+  };
+  const {refs, failed} = refsFromMissionOutcomes(body);
+  assert.equal(failed, false);
+  const one = resolveBoardLink(issue({number: 3}), {refs});
+  assert.equal(one.state, 'verified');
+  assert.equal(one.target.id, 'pi:A');
+  assert.equal(resolveBoardLink(issue({number: 4}), {refs}).state, 'ambiguous');
+  assert.equal(resolveBoardLink(issue({number: 5}), {refs}).state, 'none');
+  assert.equal(resolveBoardLink(pr({number: 4}), {refs}).state, 'none', 'an issue link never verifies a PR card');
+  assert.equal(resolveBoardLink(pr({number: 3}), {refs}).state, 'verified');
+  assert.equal(refsFromMissionOutcomes({outcomes: {}, issue_refs: {'pi:A': [{repository: 'acme/app', number: 3}, {repository: 'acme/app', number: 3}]}}).refs.length, 1);
+});
+
+test('G8: absent or malformed issue_refs change nothing', () => {
+  for (const extra of [{}, {issue_refs: null}, {issue_refs: []}, {issue_refs: 'x'}, {issue_refs: {'pi:A': 5, 'pi:B': [null, {repository: 1, number: 1}, {repository: 'a/b', number: '2'}]}}]) {
+    const {refs, failed} = refsFromMissionOutcomes({outcomes: {}, ...extra});
+    assert.equal(failed, false);
+    assert.deepEqual(refs, []);
+  }
+});

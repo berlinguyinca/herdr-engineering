@@ -44,6 +44,13 @@ MISSION_FIELDS = frozenset((
     'id', 'title', 'status', 'goal', 'revision', 'workflowClass', 'canonicalState',
     'tasks', 'acceptanceCriteria', 'stop',
 ))
+# Snapshot contract v4 (additive): validated separately by clean_pi_fields, never by the generic sanitizer.
+PI_V4_FIELDS = ('created_at', 'completed_at', 'links')
+SUMMARY_MISSION_FIELDS = ('id', 'title', 'status', 'goal', 'canonicalState', 'created_at', 'completed_at')
+MAX_LINKS = 20
+LINK_KINDS = frozenset(('issue', 'pull_request'))
+_REPOSITORY = re.compile(r'^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$')
+MAX_LINK_NUMBER = 2 ** 31 - 1
 WORKER_SUMMARY_FIELDS = frozenset((
     'workerId', 'taskId', 'health', 'state', 'model', 'route', 'currentActivity',
     'lastOutputAt', 'lastMeaningfulProgressAt', 'lastHeartbeatAt',
@@ -65,6 +72,52 @@ def _timestamp(value: Any, name: str, now: float) -> float:
         return epoch
     except (ValueError, OverflowError, OSError) as exc:
         raise ValueError(f'{name} must be a timezone-qualified timestamp, not in the future') from exc
+
+
+def _pi_time(value: Any, now: float) -> str | None:
+    try:
+        return iso(_timestamp(value, 'time', now))
+    except ValueError:
+        return None
+
+
+def _pi_link(raw: Any) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    kind, repository, number = raw.get('kind'), raw.get('repository'), raw.get('number')
+    if (kind not in LINK_KINDS or not isinstance(repository, str) or not _REPOSITORY.fullmatch(repository)
+            or repository.split('/')[0] in ('.', '..') or repository.split('/')[1] in ('.', '..')
+            or type(number) is not int or not 1 <= number <= MAX_LINK_NUMBER):
+        return None
+    return {'kind': kind, 'repository': repository, 'number': number}
+
+
+def clean_pi_fields(mission: Any, *, now: float) -> dict:
+    """Validate the contract-v4 mission fields. Malformed or absent entries are dropped, never repaired or inferred."""
+    if not isinstance(mission, dict):
+        return {}
+    out: dict = {}
+    for name in ('created_at', 'completed_at'):
+        value = _pi_time(mission.get(name), now)
+        if value is not None:
+            out[name] = value
+    raw = mission.get('links')
+    if isinstance(raw, list):
+        links, seen = [], set()
+        for item in raw[:MAX_LINKS * 4]:
+            link = _pi_link(item)
+            if link is None:
+                continue
+            identity = (link['kind'], link['repository'].lower(), link['number'])
+            if identity in seen:
+                continue
+            seen.add(identity)
+            links.append(link)
+            if len(links) >= MAX_LINKS:
+                break
+        if links:
+            out['links'] = links
+    return out
 
 
 def _identifier(value: Any, name: str) -> str:
@@ -157,7 +210,8 @@ class MissionActivityStore:
             'received_at': iso(now), 'mission_revision': revision, 'connection': connection,
             'activity_revision': revision if connection == 'connected' else None,
             'activity_snapshot_at': iso(snapshot) if connection == 'connected' else None,
-            'mission': _sanitize({k: v for k, v in mission.items() if k in MISSION_FIELDS}),
+            'mission': {**_sanitize({k: v for k, v in mission.items() if k in MISSION_FIELDS}),
+                        **clean_pi_fields(mission, now=now)},
             'activity': (_sanitize({k: v for k, v in activity.items() if k in ACTIVITY_FIELDS})
                          if connection == 'connected' else {}),
         }
@@ -211,8 +265,7 @@ class MissionActivityStore:
                 {k: v for k, v in worker.items() if k in WORKER_SUMMARY_FIELDS}
                 for worker in activity.get('workerDetails', []) if isinstance(worker, dict)
             ]
-            value['mission'] = {k: v for k, v in value['mission'].items()
-                                if k in ('id', 'title', 'status', 'goal', 'canonicalState')}
+            value['mission'] = {k: v for k, v in value['mission'].items() if k in SUMMARY_MISSION_FIELDS}
         return value
 
     def get(self, mission_key: str) -> dict | None:
@@ -221,6 +274,13 @@ class MissionActivityStore:
             self._prune(now)
             entry = self._entries.get(mission_key)
             return self._view(entry, now) if entry else None
+
+    def links_by_mission(self) -> dict[str, list[dict]]:
+        """{mission key: Pi-reported links} for retained snapshots that carry any; copies, newest data only."""
+        with self._lock:
+            self._prune(self._now())
+            return {key: copy.deepcopy(entry['value']['mission']['links'])
+                    for key, entry in self._entries.items() if entry['value']['mission'].get('links')}
 
     def list_summaries(self) -> list[dict]:
         with self._lock:

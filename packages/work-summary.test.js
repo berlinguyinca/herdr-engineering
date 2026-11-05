@@ -112,3 +112,20 @@ test('G8 sessions without a mission never get a next action', () => {
   const recordedOnly = run({recorded: [{mission_id: 'M9', title: 'Plain', next_action: 'Not from Pi'}]});
   assert.equal(recordedOnly[0].nextAction, undefined);
 });
+
+test('G8 Pi v4 created/completed are evidence only: they never become started_at/completed_at or change lifecycle', () => {
+  const p = projection();
+  p.mission = {...p.mission, created_at: '2026-11-01T10:00:00+00:00', completed_at: '2026-11-03T10:00:00+00:00'};
+  const [item] = run({projections: [p]});
+  const kinds = item.evidence.filter(e => e.kind.startsWith('pi_reported_'));
+  assert.deepEqual(kinds.map(e => [e.kind, e.timestamp]), [['pi_reported_created', '2026-11-01T10:00:00+00:00'], ['pi_reported_completed', '2026-11-03T10:00:00+00:00']]);
+  assert.equal(item.started_at, undefined);
+  assert.equal(item.completed_at, undefined);
+  assert.equal(item.lifecycle, 'running');
+});
+test('G8 absent or malformed Pi times add no evidence', () => {
+  for (const mission of [{}, {created_at: 'soon', completed_at: 5}, {created_at: '  '}]) {
+    const p = projection(); p.mission = {...p.mission, ...mission};
+    assert.equal(run({projections: [p]})[0].evidence.some(e => e.kind.startsWith('pi_reported_')), false);
+  }
+});
