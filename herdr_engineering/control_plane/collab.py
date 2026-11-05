@@ -1478,7 +1478,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     if clean:
                         loaded[uid] = _GroupClaim(at, clean, iat, since)
             self._user_groups.update(loaded)
-        except Exception:                                              # noqa: BLE001 - incl. RecursionError, MemoryError
+        except Exception:  # incl. RecursionError, MemoryError
             return
 
     def _member_status(self, uid: str) -> tuple[str, list[str]] | None:

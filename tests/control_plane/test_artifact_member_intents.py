@@ -161,12 +161,14 @@ def v(kind, payload, actor=None, aid="artifact_x"):
 
 def test_validators_accept_the_documented_payloads_for_agents_and_users():
     for actor in (user("alice"), agent("ag1")):
-        v("member.artifact_create", {"title": "T", "filename": "a.html", "profile": "document"}, actor)
-        v("member.publish", {"base_version_id": None, "files": [{"name": "a.html", "upload_id": "upl_" + "0" * 24}],
-                             "message": "m"}, actor)
-        v("member.publish", {"base_version_id": "version_1", "entry": "a.html", "message": "",
-                             "files": [{"name": "a.html", "upload_id": "upl_" + "0" * 24}]}, actor)
-        v("member.artifact_delete", {"confirm": True}, actor)
+        made = v("member.artifact_create", {"title": "T", "filename": "a.html", "profile": "document"}, actor)
+        first = v("member.publish", {"base_version_id": None,
+                                     "files": [{"name": "a.html", "upload_id": "upl_" + "0" * 24}],
+                                     "message": "m"}, actor)
+        second = v("member.publish", {"base_version_id": "version_1", "entry": "a.html", "message": "",
+                                      "files": [{"name": "a.html", "upload_id": "upl_" + "0" * 24}]}, actor)
+        gone = v("member.artifact_delete", {"confirm": True}, actor)
+        assert all(r is not None for r in (made, first, second, gone))
 
 
 @pytest.mark.parametrize("kind,payload", [

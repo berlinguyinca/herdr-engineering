@@ -166,7 +166,7 @@ class MemberWeb:
             self._error(h, _Reply(status, "unavailable" if status == 503 else "error", "request failed"))
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             h.close_connection = True
-        except Exception as exc:  # noqa: BLE001 - one fixed line: the type only, it could hold a path or a token
+        except Exception as exc:  # one fixed line: the type only, it could hold a path or a token
             _LOG.warning("member web: internal error (%s)", type(exc).__name__)
             self._error(h, _Reply(500, "internal", "internal error"))
 
@@ -305,7 +305,7 @@ class MemberWeb:
                 raise _unauthorized()
         except _Reply:
             raise
-        except Exception:  # noqa: BLE001 - every authentication failure is the same 401
+        except Exception:  # every authentication failure is the same 401
             raise _unauthorized() from None
         now = self.clock()
         exp = now + self.session_seconds

@@ -262,7 +262,7 @@ def _purge(handler, server, admin, principal: str, artifact_id: str, body: dict,
         _call(admin, "record_purge", principal, artifact_id, actor,
               {"deleted": len(result["deleted"]), "retained_shared": len(result["retained_shared"]),
                "revoked_shares": revoked})
-    except Exception as exc:    # noqa: BLE001 - the purge is done and logged on the artifact; the member row is secondary
+    except Exception as exc:  # the purge is done and logged on the artifact; the member row is secondary
         log.error("purge of %s done, member audit row not written (%s)", artifact_id, type(exc).__name__)
     handler._json({"artifact_id": artifact_id, "purged": True, "deleted": len(result["deleted"]),
                    "retained_shared": len(result["retained_shared"]), "revoked_shares": revoked})

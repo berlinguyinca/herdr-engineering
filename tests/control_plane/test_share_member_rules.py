@@ -546,8 +546,10 @@ def test_member_plan_and_approve_refuse_active_documents_with_unsupported_type(a
 @pytest.mark.parametrize("vid", ["v_svg", "v_xhtml", "v_pdf"])
 def test_operator_links_may_still_share_svg_xhtml_and_pdf(aenv, vid):
     env = aenv()
-    _plan(env.server, AID, vid, None, OPERATOR)
-    env.approve(env.create(OPERATOR, version_id=vid), OPERATOR)
+    assert _plan(env.server, AID, vid, None, OPERATOR) is not None          # planning an operator link does not raise
+    row = env.create(OPERATOR, version_id=vid)
+    url, _summary = env.approve(row, OPERATOR)
+    assert url and env.adapter("get", row["share_id"])["state"] == "live"
 
 
 def test_member_html_over_the_cap_is_refused_at_plan_and_approve(aenv):

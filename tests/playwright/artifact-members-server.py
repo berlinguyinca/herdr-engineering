@@ -26,7 +26,6 @@ sys.path.insert(0, str(ROOT))
 
 from herdr_engineering.control_plane.api import ControlPlaneServer  # noqa: E402
 from herdr_engineering.control_plane.artifact_shares import ShareError  # noqa: E402
-from herdr_engineering.control_plane.artifacts import ArtifactError  # noqa: E402
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
 
 HOSTILE = '"><img src=x onerror=window.__x=1>'
@@ -131,7 +130,7 @@ class MemberAdminFixture:
 
     def _purgeable(self, principal, artifact_id):
         a = self.state.artifacts.get(artifact_id)
-        return {"artifact_id": artifact_id, "lifecycle": a["lifecycle"], "purge_after": _now().isoformat()} if a and a["created_by"] == principal else None
+        return {"artifact_id": artifact_id, "lifecycle": a["lifecycle"], "legal_hold": False, "purge_after": _now().isoformat()} if a and a["created_by"] == principal else None
 
     def _record_purge(self, *args):
         return None

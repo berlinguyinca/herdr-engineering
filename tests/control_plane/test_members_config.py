@@ -110,10 +110,11 @@ def test_slice_form_carries_public_host_inside_the_section():
 
 def _uncommented_example(tmp_path):
     """The example fleet config with its commented member blocks switched on (real YAML, real loader)."""
+    from pathlib import Path
+
     import yaml
 
     from herdr_engineering.fleet_config import load_fleet_config
-    from pathlib import Path
     src = Path(__file__).resolve().parents[2] / "deploy" / "control-plane" / "fleet-config.example.yaml"
     lines, out, mode = src.read_text().splitlines(), [], None
     for line in lines:
