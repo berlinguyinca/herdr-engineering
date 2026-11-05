@@ -715,7 +715,8 @@ def _folder_json(folder: Any) -> dict:
 
 
 async def _folder_create(store: Any, principal: str, intent: Intent) -> dict:
-    """Create-or-get by name, so a replayed intent (or a double click) yields the same folder.  The member's lane is
+    """Create-or-get by name, so a replayed intent (or a double click) yields the same folder.  This deliberately
+    differs from ``LibraryStore.create_folder`` (409 ``duplicate_name``): replays must be idempotent.  The member's lane is
     serial, so looking first cannot race; an insert that failed would abort the transaction."""
     name = intent.payload["name"]
     if not any(f.name.lower() == name.strip().lower() for f in await store.list_folders(principal)):
@@ -797,7 +798,7 @@ async def _library_view(conn: Any, principal: str, rt: MemberRuntime | None) -> 
     """``{items, folders}``: the feed (own pending included) newest first, at most ``LIBRARY_VIEW_MAX`` items."""
     from .artifact_library import DEFAULT_SOURCES, MAX_PAGE, LibraryStore
     store = LibraryStore(_OneConn(conn))
-    email, groups = await _member_identity(principal, rt)
+    email, groups = await _member_identity(principal, rt)   # an empty/stale directory fails closed: fewer items
     member_id = principal.removeprefix("member:")
     sources = frozenset({*DEFAULT_SOURCES, "pending"})
     items: list[dict] = []

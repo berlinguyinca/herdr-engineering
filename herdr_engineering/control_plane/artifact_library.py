@@ -130,14 +130,14 @@ SELECT a.artifact_id, {_TITLE}, acl.granted_by, acl.created_at, 'assigned', 2, '
   FROM artifact_acl acl JOIN artifacts a ON a.artifact_id=acl.artifact_id
  WHERE acl.principal_id=$1 AND (acl.expires_at IS NULL OR acl.expires_at > now())
    AND (acl.permissions ? 'read' OR acl.permissions ? 'admin')
-   AND a.intake='accepted' AND a.lifecycle<>'tombstoned'
+   AND a.intake='accepted' AND a.lifecycle NOT IN ('retracted','tombstoned')
 UNION ALL
 SELECT a.artifact_id, coalesce(nullif(s.title,''), {_TITLE}), coalesce(s.created_by,''), coalesce(s.approved_at, s.created_at),
        'assigned', 2, 'active', s.expires_at, s.share_id, a.artifact_type, coalesce(a.size_bytes,0)
   FROM artifact_shares s JOIN artifacts a ON a.artifact_id=s.artifact_id
  WHERE s.state='live' AND s.audience='lab' AND (s.expires_at IS NULL OR s.expires_at > now())
    AND (EXISTS (SELECT 1 FROM unnest(s.allow_emails) e WHERE lower(e)=$3) OR s.allow_groups && $4::text[])
-   AND a.intake='accepted' AND a.lifecycle<>'tombstoned'
+   AND a.intake='accepted' AND a.lifecycle NOT IN ('retracted','tombstoned')
 UNION ALL
 SELECT a.artifact_id, coalesce(nullif(c.title,''), nullif(s.title,''), {_TITLE}), coalesce(c.sharer, s.created_by, ''),
        c.claimed_at, 'opened', 3,
@@ -150,7 +150,7 @@ SELECT a.artifact_id, coalesce(nullif(c.title,''), nullif(s.title,''), {_TITLE})
             THEN 0 ELSE coalesce(a.size_bytes,0) END
   FROM artifact_share_claims c JOIN artifact_shares s ON s.share_id=c.share_id
   JOIN artifacts a ON a.artifact_id=s.artifact_id
- WHERE c.member_id=$2 AND a.lifecycle<>'tombstoned' AND a.intake='accepted'
+ WHERE c.member_id=$2 AND a.lifecycle NOT IN ('retracted','tombstoned') AND a.intake='accepted'
 """
 
 
@@ -296,7 +296,7 @@ class LibraryStore:
         live = await self._pool.fetchval(
             "SELECT 1 FROM artifact_shares s JOIN artifacts a ON a.artifact_id=s.artifact_id "
             "WHERE s.share_id=$1 AND s.state='live' AND (s.expires_at IS NULL OR s.expires_at > now()) "
-            "AND a.lifecycle<>'tombstoned' AND a.intake='accepted'",
+            "AND a.lifecycle NOT IN ('retracted','tombstoned') AND a.intake='accepted'",
             share_id,
         )
         if live is None:

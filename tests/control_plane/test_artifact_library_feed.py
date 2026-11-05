@@ -245,6 +245,29 @@ def test_pending_only_visible_to_owner(dsn):
     run(dsn, body)
 
 
+def test_retracted_artifact_vanishes_for_grantee_lab_recipient_and_claimant(dsn):
+    async def body(store, pool):
+        a = await artifact(pool, YOU_P, name="Gone")
+        await pool.execute(
+            "INSERT INTO artifact_acl (artifact_id,principal_id,granted_by) VALUES ($1,$2,$3)",
+            a,
+            ME_P,
+            YOU_P,
+        )
+        sid = await share(pool, a, groups=[G1])
+        await store.record_claim(ME, sid)
+        everything = frozenset({"mine", "assigned", "opened"})
+        assert (await feed(store, groups=frozenset({G1}), sources=everything)).total == 1
+        await pool.execute("UPDATE artifacts SET lifecycle='retracted' WHERE artifact_id=$1", a)
+        for who, kw in ((ME, {"groups": frozenset({G1})}), (YOU, {})):
+            page = await feed(store, member=who, sources=everything, **kw)
+            assert page.items == [], who
+        with pytest.raises(LibraryError):
+            await store.record_claim(YOU, sid)
+
+    run(dsn, body)
+
+
 def test_pending_excluded_unless_source_includes_pending(dsn):
     async def body(store, pool):
         await artifact(pool, ME_P, name="Pushed", intake="pending")
