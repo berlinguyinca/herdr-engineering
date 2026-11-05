@@ -1,4 +1,4 @@
-"""Fabric trust, slice 1: peer identity.
+"""Fabric trust, slice 1: peer identity; slice 2: the ``Fabric`` auth scheme (``FabricTrustMixin`` below).
 
 Design: ``docs/specs/fabric-trust-agent-auth-20261104/SPEC.md`` (sections 3.1, 3.5, 4 slice 1). A request is "from the fabric"
 only if the real TCP peer address resolves, through the local tailscaled LocalAPI ``whois`` (``fabric_access.TailscaleWhois``),
@@ -118,3 +118,90 @@ class FabricTrustMixin:
     def fabric_trust_active(self) -> bool:
         cfg = self.fabric_trust_cfg()
         return bool(cfg["enabled"] and not cfg["kill_switch"])
+
+
+def _real_peer(peer_ip: str | None) -> str | None:
+    """The normalized peer address, or None for anything that can never be a tailnet node: absent, malformed, loopback
+    (every peer behind ``tailscale serve`` or a local proxy), unspecified, multicast. IPv4-mapped IPv6 is unwrapped first so
+    ``::ffff:127.0.0.1`` cannot slip past."""
+    try:
+        ip = ipaddress.ip_address((peer_ip or "").split("%")[0])
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback or ip.is_unspecified or ip.is_multicast:
+        return None
+    return str(ip)
+
+
+class FabricAuthMixin:
+    """``Authorization: Fabric <agent_id>`` for ``CollabService`` (spec section 3.2). Every refusal is the same generic 401 and
+    counts as an auth failure; a refusal for a peer that the transport check already accepted (an allow-listed machine) is also
+    audited under its own reason code. Unauthenticated callers are never written to the log."""
+
+    fabric_resolver: FabricPeerResolver
+
+    def _init_fabric_auth(self) -> None:
+        self.fabric_resolver = FabricPeerResolver(self.fabric_trust_cfg)
+
+    def _fabric_fail(self, reason: str | None = None, agent: dict | None = None, aid: str | None = None,
+                     machine: str | None = None) -> None:
+        self.stats["auth_failures"] += 1
+        if reason and agent is not None and aid:
+            self._audit_denied(self._fabric_actor(aid, agent["owner"], machine), "auth.agent", reason,
+                               resource_id=aid, agent_id=aid)
+        from .collab import CollabError  # lazy: collab imports this module
+        raise CollabError(401, "unauthorized")
+
+    @staticmethod
+    def _fabric_actor(aid: str, owner: str, machine: str | None = None):
+        from .collab import Principal
+        pr = Principal("agent", aid, owner)
+        pr.via, pr.machine = "fabric", machine
+        return pr
+
+    def _fabric_agent_problem(self, aid: str, agent: dict, machine: str) -> str | None:
+        """Why this agent may not use Fabric auth from ``machine`` right now (None = it may). Caller holds the lock."""
+        if agent["status"] != "active":
+            return "fabric_agent_inactive"
+        if agent.get("external") or aid in self._helper_minted or aid in self._helper_by_agent:
+            return "fabric_agent_kind"
+        if not self._ok(agent["owner"]):
+            return "fabric_owner_disabled"
+        if agent.get("machine") != machine:
+            return "fabric_machine_unbound"
+        if not agent.get("fabric"):
+            return "fabric_not_enabled"
+        return None
+
+    def _fabric_authenticate(self, aid: str, peer_ip: str | None, claimed: str | None):
+        if self.degraded or not self.fabric_trust_active() or not aid:
+            self._fabric_fail()
+        peer = _real_peer(peer_ip)
+        machine = self.fabric_resolver.resolve(peer) if peer else None     # fails closed on every error
+        if machine is None:
+            self._fabric_fail()
+        with self._lock:
+            agent = self._agents.get(aid)
+            if agent is None:
+                self._fabric_fail()
+            if claimed is not None and claimed.strip().lower() != machine:  # the header is informational; whois decides
+                self._fabric_fail("fabric_header_mismatch", agent, aid, machine)
+            reason = self._fabric_agent_problem(aid, agent, machine)
+            if reason:
+                self._fabric_fail(reason, agent, aid, machine)
+            pr = self._fabric_actor(aid, agent["owner"], machine)
+        pr.peer = peer
+        return pr
+
+    def _fabric_still_valid(self, pr) -> bool:
+        """Everything ``_fabric_authenticate`` checked, again, for a stream that is still open. tailscaled is asked outside the
+        service lock (it is cached by ``whois_cache_seconds``)."""
+        if self.degraded or not self.fabric_trust_active() or not pr.peer:
+            return False
+        if self.fabric_resolver.resolve(pr.peer) != pr.machine:
+            return False
+        with self._lock:
+            agent = self._agents.get(pr.id)
+            return agent is not None and self._fabric_agent_problem(pr.id, agent, pr.machine) is None

@@ -1959,6 +1959,10 @@ _PUBLIC_CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
+_FORWARDING_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Real-IP", "X-Forwarded-Host", "X-Forwarded-Server",
+                       "Tailscale-User-Login", "Tailscale-User-Name", "Via")
+
+
 def _make_handler(server, public=False, operator=False):
     class _Handler(BaseHTTPRequestHandler):
         server_version = "HerdrControlPlane/0.1"
@@ -2284,7 +2288,7 @@ def _make_handler(server, public=False, operator=False):
                     return self._deny(400, "ambiguous request framing")
                 try:
                     principal = server.collab.authenticate(
-                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"))
+                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"), **self._fabric_args())
                     big_tools = collab_mcp.admitted_tools(server.collab, principal) if principal.is_agent else frozenset()
                 except Exception:
                     big_tools = frozenset()
@@ -2305,7 +2309,7 @@ def _make_handler(server, public=False, operator=False):
                 extra = {} if principal is None else {"principal": principal}
                 status, payload = handle(
                     server.collab, message, self.headers.get("Authorization", ""),
-                    self.headers.get("X-Herdr-Device"), **extra)
+                    self.headers.get("X-Herdr-Device"), **extra, **self._fabric_args())
             except Exception:
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32603, "message": "internal error"}}, 500)
@@ -2971,7 +2975,7 @@ def _make_handler(server, public=False, operator=False):
                                           self.headers.get("Authorization", ""),
                                           self.headers.get("X-Herdr-Device"),
                                           operator=server.operator_user if operator else None,
-                                          client=self._proxied_client())
+                                          client=self._proxied_client(), **self._fabric_args())
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
             if isinstance(result, tuple):
@@ -3007,6 +3011,15 @@ def _make_handler(server, public=False, operator=False):
             finally:
                 frames.close()
             return None
+
+        def _fabric_args(self):
+            """What ``Authorization: Fabric`` may use to identify the caller: the REAL socket peer and the informational
+            machine header, nothing else. A request that carries any forwarding header was relayed by something, so the socket
+            peer is that relay and not the caller: no peer is offered and Fabric fails closed. (Behind `tailscale serve` the
+            peer is 127.0.0.1, which the service refuses on its own.) X-Forwarded-For is never read as an address."""
+            relayed = any(h in self.headers for h in _FORWARDING_HEADERS)
+            return {"peer_ip": None if relayed else self.client_address[0],
+                    "machine": self.headers.get("X-Herdr-Machine")}
 
         def _proxied_client(self):
             """Behind `tailscale serve` every peer is 127.0.0.1; key the limiter on the
@@ -4780,7 +4793,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):
-            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant import (
+                AssistantError,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant

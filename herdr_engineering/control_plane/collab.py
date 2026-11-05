@@ -39,7 +39,7 @@ from . import collab_models, ids, logfile_lock, placement
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_coordinators import CoordinatorsMixin
-from .collab_fabric_trust import FabricTrustMixin
+from .collab_fabric_trust import FabricAuthMixin, FabricTrustMixin
 from .collab_federation import FederationMixin
 from .collab_team_briefs import BRIEF_NOTE as _TR_BRIEF_NOTE
 from .collab_team_briefs import TeamBriefsMixin
@@ -309,7 +309,8 @@ class StaticTokenAuthenticator:
 
 
 class Principal:
-    __slots__ = ("kind", "id", "owner", "digest", "exp", "status", "approver", "admin", "external")
+    __slots__ = ("kind", "id", "owner", "digest", "exp", "status", "approver", "admin", "external",
+                 "via", "machine", "peer")
 
     def __init__(self, kind: str, id: str, owner: str, digest: str | None = None,
                  exp: float | None = None):
@@ -318,6 +319,9 @@ class Principal:
         self.approver = False          # may approve or deny people waiting
         self.admin = False             # the operator on the tailnet-only listener: may also disable and remove
         self.external = False          # an agent a coworker enrolled by invite (T10): bound to one room, never a person
+        self.via: str | None = None    # "fabric" when the caller was identified by its tailnet machine, not a secret
+        self.machine: str | None = None   # the allow-listed machine that vouched for it (fabric only)
+        self.peer: str | None = None   # the real socket peer address it was resolved from (fabric only), re-checked on streams
 
     @property
     def key(self) -> str:
@@ -398,7 +402,7 @@ class FileEventLog:
 
 
 class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin,
-                    CoordinatorsMixin, TeamBriefsMixin, FabricTrustMixin):
+                    CoordinatorsMixin, TeamBriefsMixin, FabricTrustMixin, FabricAuthMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -548,6 +552,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._init_team_roles()
         self._init_coordinators()
         self._init_fabric_trust()
+        self._init_fabric_auth()
         self._init_team_briefs()
 
     # ------------------------------------------------------------ plumbing
@@ -643,6 +648,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             return payload.get("paused") is True          # resuming helpers is an ordinary write
         if event_type == "team_external_coordination_set" and payload is not None:
             return payload.get("enabled") is False        # turning the opt-in OFF is a revocation; ON is an ordinary write
+        if event_type == "agent_fabric_set" and payload is not None:
+            return payload.get("fabric") is False         # clearing the fabric bit is a revocation; setting it is not
         return event_type in SAFETY_EVENTS
 
     def _creation_cost(self, event_type: str, payload: dict | None) -> int:
@@ -866,6 +873,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "slot": slot, "_legacy_slot": taken, "aliases": [], "skills": list(p.get("skills") or []),
                 "owner": p["owner_user_id"], "device_id": p["device_id"], "harness_type": p["harness_type"],
                 "instance_id": p.get("instance_id"), "status": "active",
+                "machine": p.get("machine"), "fabric": False,    # additive (older logs have neither); the bit starts OFF
                 "name": p.get("name") or _default_handle(p["harness_type"], p["agent_id"]),
                 "parent": p.get("parent_agent_id"), "join": p.get("join_digest"),
                 "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"],
@@ -893,6 +901,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._joins[self._joins_by_id[p["join_id"]]]["revoked"] = True
         elif t == "agent_linked":
             self._agents[p["agent_id"]]["instance_id"] = p.get("instance_id")
+        elif t == "agent_fabric_set":
+            a = self._agents.get(p["agent_id"])
+            if a is not None:
+                a["fabric"] = bool(p["fabric"])
+                if p.get("machine"):
+                    a["machine"] = p["machine"]
         elif t == "agent_renamed":
             a = self._agents[p["agent_id"]]
             if a["name"] not in a["aliases"]:                  # an old name keeps working as an alias
@@ -1296,9 +1310,14 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     lk["grants"] = [g for g in lk["grants"] if g != "terminal"]
 
     # ------------------------------------------------------ authentication
-    def authenticate(self, authorization: str, device: str | None) -> Principal:
+    def authenticate(self, authorization: str, device: str | None, *, peer_ip: str | None = None,
+                     machine: str | None = None) -> Principal:
+        """``peer_ip`` is the REAL socket peer address (never X-Forwarded-For) and ``machine`` the informational
+        ``X-Herdr-Machine`` header; both matter only to the ``Fabric`` scheme."""
         scheme, _, token = (authorization or "").partition(" ")
         token = token.strip()
+        if scheme == "Fabric":
+            return self._fabric_authenticate(token, peer_ip, machine)
         if self.degraded and scheme != "Bearer":
             self.stats["auth_failures"] += 1       # agents cannot be verified without the log: same 401 as any bad token
             raise CollabError(401, "unauthorized")
@@ -1391,6 +1410,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def still_valid(self, pr: Principal) -> bool:
         """Re-check a long-lived stream's principal (revocation / expiry / owner loss)."""
+        if pr.via == "fabric":
+            return self._fabric_still_valid(pr)
         with self._lock:
             if pr.kind == "user":
                 # An open stream ends when its token expires (the client re-opens
@@ -1540,8 +1561,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     @staticmethod
     def _actor(pr: Principal, **extra) -> dict:
-        return {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None,
-                "actor_kind": "external" if pr.external else pr.kind, **extra}
+        out = {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None,
+               "actor_kind": "external" if pr.external else pr.kind}
+        if pr.via:                                    # additive audit fields: how the caller was identified
+            out.update(via=pr.via, machine=pr.machine)
+        return {**out, **extra}
 
     def _require_user(self, pr: Principal) -> None:
         if pr.is_agent:
@@ -1929,6 +1953,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
             skills = _skills(body.get("skills"))
+            machine = _machine(body.get("machine"))
             aid, cred = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32)
             expires = self._now() + self.credential_ttl
             instance = body.get("instance_id")
@@ -1938,7 +1963,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "harness_type": rec["harness_type"],
                 "instance_id": instance if isinstance(instance, str) and len(instance) <= 120
                 and not _NAME_BAD.search(instance) else None,
-                **({"skills": skills} if skills else {}),
+                **({"skills": skills} if skills else {}), **({"machine": machine} if machine else {}),
                 "secret_digest": _digest(cred), "expires_at_epoch": expires,
                 "action": "agent.enroll", "outcome": "allowed",
                 "project_ids": [], "resource_id": aid})
@@ -1964,6 +1989,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         label = _name(body.get("harness_type", "claude-code"), "harness_type")
         handle = _handle(body["name"]) if body.get("name") is not None else None
         skills = _skills(body.get("skills"))
+        machine = _machine(body.get("machine"))
         cred = "hca_" + secrets.token_urlsafe(32)
         device = "remote-" + secrets.token_hex(8)
         expires = self._now() + self.remote_credential_ttl
@@ -1975,7 +2001,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "actor_user_id": pr.id, "actor_agent_id": None, "agent_id": aid,
                 "owner_user_id": pr.id, "code_digest": None, "device_id": device,
                 "harness_type": label, "instance_id": None, "name": handle, "parent_agent_id": parent,
-                **({"skills": skills} if skills else {}),
+                **({"skills": skills} if skills else {}), **({"machine": machine} if machine else {}),
                 "secret_digest": _digest(cred),
                 "expires_at_epoch": expires, "action": "agent.connect", "outcome": "allowed",
                 "project_ids": [], "resource_id": aid})
@@ -2094,6 +2120,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 return self._redeem_external(rec, digest, body, client)
             owner = rec["owner"]
             skills = _skills(body.get("skills"))
+            machine = _machine(body.get("machine"))
             self._agent_slots(owner)
             name = self._agent_names(owner, rec["prefix"], 1)[0]
             aid, cred = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32)
@@ -2106,7 +2133,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "parent_agent_id": rec.get("parent") if (self._agents.get(rec.get("parent")) or {}).get("status") == "active" else None,
                 "instance_id": instance if isinstance(instance, str) and len(instance) <= 120
                 and instance and not _NAME_BAD.search(instance) else None,
-                **({"skills": skills} if skills else {}),
+                **({"skills": skills} if skills else {}), **({"machine": machine} if machine else {}),
                 "secret_digest": _digest(cred), "expires_at_epoch": expires,
                 "action": "agent.join", "outcome": "allowed", "project_ids": [], "resource_id": aid})
             request_id = self._file_request(owner, rec["room_id"], aid, rec["actions"]) if rec["room_id"] else None
@@ -2841,6 +2868,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                            and self._now() - r["created_epoch"] < REQUEST_TTL]
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                             "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
+                            "machine": a.get("machine"), "fabric": bool(a.get("fabric")),
                             "online": any(self._online(r["room_id"], "agent", aid) for r in rooms),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})
@@ -2859,7 +2887,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         return {"rooms": out}
 
     def rotate_credential(self, pr: Principal) -> dict:
-        if not pr.is_agent:
+        if not pr.is_agent or pr.via == "fabric":     # a machine identity must never be turned into a secret
             raise CollabError(403, "forbidden")
         cred = "hca_" + secrets.token_urlsafe(32)
         expires = self._now() + self.credential_ttl
@@ -2893,6 +2921,30 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             self._end_agent(self._actor(pr), agent_id, "revoked", set())      # and every helper under it
         self._refresh_agent_feed()
         return {"ok": True}
+
+    def set_agent_fabric(self, pr: Principal, agent_id: str, body: dict) -> dict:
+        """Owner only: switch the ``fabric`` bit of one of the owner's own agents, optionally (re)recording the machine it is
+        bound to. Agents (fabric ones included) can never call this, and an external or helper agent can never carry the bit."""
+        self._require_user(pr)
+        fabric = body.get("fabric")
+        if not isinstance(fabric, bool):
+            raise CollabError(400, "fabric must be true or false")
+        machine = _machine(body.get("machine"))
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if (not agent or agent["status"] != "active" or agent["owner"] != pr.id
+                    or agent.get("external") or agent_id in self._helper_minted or agent_id in self._helper_by_agent):
+                raise CollabError(404, "not found")
+            bound = machine or agent.get("machine")
+            if fabric and not bound:
+                raise CollabError(400, "the agent has no machine; give one with machine")
+            if bool(agent.get("fabric")) == fabric and bound == agent.get("machine"):
+                return {"agent_id": agent_id, "fabric": fabric, "machine": bound, "changed": False}
+            self._commit("agent_fabric_set", self._actor(
+                pr, agent_id=agent_id, fabric=fabric, machine=bound,
+                action="agent.fabric.set" if fabric else "agent.fabric.clear", outcome="allowed",
+                project_ids=[], resource_id=agent_id))
+        return {"agent_id": agent_id, "fabric": fabric, "machine": bound, "changed": True}
 
     # ------------------------------------------------------- room profile
     def _profile(self, room_id: str) -> dict:
@@ -6485,7 +6537,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     # --------------------------------------------------------------- routing
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
                  authorization: str, device: str | None, operator: str | None = None,
-                 client: str | None = None):
+                 client: str | None = None, peer_ip: str | None = None, machine: str | None = None):
         """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream."""
         try:
             if parts == ["agents", "enrollment", "complete"] and method == "POST":
@@ -6509,7 +6561,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 pr = Principal("user", operator, operator)
                 pr.admin = pr.approver = True
             else:
-                pr = self.authenticate(authorization, device)
+                pr = self.authenticate(authorization, device, peer_ip=peer_ip, machine=machine)
             n = len(parts)
             if pr.status != "approved" and parts != ["me"]:
                 self.stats["policy_denied"] += 1
@@ -6773,6 +6825,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     return 200, self.rename_agent(pr, parts[1], body)
                 if n == 3 and parts[0] == "agents" and parts[2] == "revoke":
                     return 200, self.revoke_agent(pr, parts[1])
+                if n == 3 and parts[0] == "agents" and parts[2] == "fabric":
+                    return 200, self.set_agent_fabric(pr, parts[1], body)
                 if n >= 3 and parts[0] == "rooms":
                     rid = parts[1]
                     if parts[2:] == ["members"]:
@@ -7087,6 +7141,18 @@ def _handle(value: Any) -> str:
 
 _SKILL = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/-]{0,63}\Z")
 MAX_SKILLS = 100
+
+
+_MACHINE_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z")
+
+
+def _machine(value: Any) -> str | None:
+    """The MagicDNS short name an agent says it runs on (absent = none). It is a claim: Fabric auth still needs the owner's bit."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _MACHINE_RE.match(value.strip().lower()):
+        raise CollabError(400, "machine must be a MagicDNS short name (letters, digits, hyphens)")
+    return value.strip().lower()
 
 
 def _skills(value: Any) -> list[str] | None:

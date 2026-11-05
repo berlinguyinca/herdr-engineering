@@ -519,7 +519,8 @@ def oversize_refusal(message: Any, tools: frozenset[str]):
     return None if isinstance(name, str) and name in tools else refusal
 
 
-def handle(service: CollabService, message: Any, authorization: str, device: str | None, principal: Any = None):
+def handle(service: CollabService, message: Any, authorization: str, device: str | None, principal: Any = None,
+           *, peer_ip: str | None = None, machine: str | None = None):
     """One JSON-RPC message in, (HTTP status, JSON or None) out. ``principal`` is a caller the HTTP layer already
     authenticated (the large-body gate); it is not authenticated a second, so failures are counted once."""
     if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
@@ -531,7 +532,7 @@ def handle(service: CollabService, message: Any, authorization: str, device: str
         pr = principal
     else:
         try:
-            pr = service.authenticate(authorization, device)
+            pr = service.authenticate(authorization, device, peer_ip=peer_ip, machine=machine)
         except CollabError:
             return 401, _error(rid, -32001, "unauthorized")
     if not pr.is_agent:
