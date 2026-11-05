@@ -338,6 +338,13 @@ class ShareStore:
                 raise ShareError("not found", code="not_found")
             if current["state"] != "pending":
                 raise ShareError(f"share is {current['state']}, not pending")
+            # FOR SHARE: a concurrent delete (which locks the artifact row FOR UPDATE) either finished first, so the link
+            # is refused here, or waits for this commit and then revokes the link it finds live
+            lifecycle = await conn.fetchval(
+                "SELECT lifecycle FROM artifacts WHERE artifact_id = (SELECT artifact_id FROM artifact_shares "
+                "WHERE share_id=$1) FOR SHARE", share_id)
+            if lifecycle is not None and lifecycle != "active":
+                raise ShareError("artifact is not active")
             if current["expires_at"] is not None and current["expires_at"] <= datetime.now(UTC):
                 raise ShareError("share has already expired", code="expired")
             if await conn.fetchval("SELECT 1 FROM artifact_shares WHERE token_hash=$1", token_hash) is not None:

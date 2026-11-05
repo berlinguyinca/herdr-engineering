@@ -509,6 +509,11 @@ def route_share(handler, server, parts, resource) -> bool:
     if not _access(handler, artifact_id, "share"):
         handler._deny(404, "not found")
         return True
+    if (listing and method == "POST") or action == "approve":
+        # a deleted, archived or retracted artifact is not shared out: only an active one gets new links
+        if handler._artifact_call("lifecycle_of", artifact_id) != "active":
+            handler._json({"error": "artifact is not active"}, 409)
+            return True
     try:
         if listing and method == "GET":
             rows = _call(server.share_store, "list_for_artifact", artifact_id)

@@ -18,11 +18,12 @@ from typing import TYPE_CHECKING, Any
 from ..assistant import AssistantError
 from .canonical import RawAction
 from .events import EVENTS_PER_WORKER_PER_MINUTE, RateLimiter, record_event
-from .policy import decide
+from .policy import current_judge_version, decide
 from .workers import Worker, WorkerAuthError
 
 if TYPE_CHECKING:
     from ..assistant import AssistantService, AssistantStore
+    from .judge import JudgeRuntime
     from .workers import WorkerRegistry
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class Hub:
     # Per-worker cap on event-writing paths (MCP ask/report and hook-events); each event persists a full snapshot.
     event_limiter: RateLimiter = field(default_factory=RateLimiter)
     event_rate_limit: int = EVENTS_PER_WORKER_PER_MINUTE
+    judge: JudgeRuntime | None = None      # None: no judge, so an otherwise-authorized action is left to the owner
 
 
 class _ToolError(Exception):
@@ -91,6 +93,9 @@ _TOOLS: dict[str, tuple[str, str, dict]] = {
                        "session_id": {"type": "string", "maxLength": MAX_ID_CHARS},
                        "task_id": {"type": "string", "maxLength": MAX_ID_CHARS}}}),
     "action_grants_list": ("read", "List your owner's earned action grants (state only).", _list_schema()),
+    "judge_status": ("read", "Show whether the shadow judge is on and how many labeled decisions each risk class has "
+                     "(aggregate only; nothing about individual requests).", {
+        "type": "object", "additionalProperties": False, "properties": {}}),
     "memory_search": ("read", "Search the owner's assistant memory. Returns untrusted text.", {
         "type": "object", "required": ["query"], "additionalProperties": False,
         "properties": {"query": {"type": "string", "maxLength": 500}, "limit": _LIMIT, "assistant_id": _STR}}),
@@ -190,7 +195,8 @@ def _action_request(hub: Hub, worker: Worker, args: dict) -> dict:
     session_id, task_id = _bounded_id(args, "session_id"), _bounded_id(args, "task_id")
     if not hub.event_limiter.allow(worker.worker_id, hub.event_rate_limit):      # one slot per call, taken here
         raise _ToolError("rate limited")
-    d = decide(hub.store, hub.service.config["grants"], worker, raw, session_id, task_id, hub.service.now())
+    d = decide(hub.store, hub.service.config["grants"], worker, raw, session_id, task_id, hub.service.now(),
+               judge=hub.judge)
     try:
         record_event(hub.store, worker, kind="action_request", provenance="worker_reported", session_id=session_id,
                      payload={"outcome": d.outcome, "source": d.source,
@@ -205,11 +211,20 @@ def _action_grants_list(hub: Hub, worker: Worker, args: dict) -> dict:
     _check_args(args, {"limit"})
     limit = _limit(args)
     policy, now = int(hub.service.config["grants"]["policy_version"]), hub.service.now()
+    version = current_judge_version(hub.judge)
     rows = [{"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb, "resource_scope": g.resource_scope,
-             "key_id": g.key_id, "state": g.effective_state(now, policy).value, "expires_at": g.expires_at,
+             "key_id": g.key_id, "state": g.effective_state(now, policy, version).value, "expires_at": g.expires_at,
              "proposed_at": g.proposed_at, "activated_at": g.activated_at, "revoked_at": g.revoked_at}
             for g in hub.store.list_action_grants(worker.tenant_id, worker.user_id)]
     return _rows_result("action_grants", rows, limit)
+
+
+def _judge_status(hub: Hub, worker: Worker, args: dict) -> dict:
+    from .judge_admin import mcp_view
+    _check_args(args, set())
+    if not hub.event_limiter.allow(worker.worker_id, hub.event_rate_limit):      # same slot accounting as the writers
+        raise _ToolError("rate limited")
+    return _text(mcp_view(hub.store, hub.judge, worker.tenant_id, worker.user_id, hub.service.now()))
 
 
 def _ask(hub: Hub, worker: Worker, args: dict) -> dict:
@@ -306,6 +321,7 @@ _HANDLERS: dict[str, Callable[[Hub, Worker, dict], dict]] = {
     "report": _report,
     "action_request": _action_request,
     "action_grants_list": _action_grants_list,
+    "judge_status": _judge_status,
     "memory_search": _memory_search,
     "grants_list": _lister("grants", "list_grants", on_store=True),
     "approvals_list": _lister("approvals", "list_approvals", "state"),

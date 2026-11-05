@@ -214,6 +214,9 @@ class ArtifactFixture:
             item["diff"] = ArtifactBundle.diff(left, right, media_type=media)
         return {"version_id": version_id, "against": parents[0] if parents else None, "files": out}
 
+    async def lifecycle_of(self, artifact_id):
+        return "active"
+
     async def report_permission(self, artifact_id, principal_id, permission):
         return artifact_id in self.records
 

@@ -87,7 +87,7 @@ class MemberAdmin:
     async def purgeable(self, principal: str, artifact_id: str) -> dict | None:
         """The member's artifact for purge: any lifecycle (the caller decides), tombstoned included."""
         row = await self.conn.fetchrow(
-            "SELECT artifact_id, lifecycle, purge_after FROM artifacts WHERE artifact_id=$1 AND created_by=$2",
+            "SELECT artifact_id, lifecycle, purge_after, legal_hold FROM artifacts WHERE artifact_id=$1 AND created_by=$2",
             artifact_id, principal)
         return dict(row) if row else None
 
@@ -243,10 +243,21 @@ def _purge(handler, server, admin, principal: str, artifact_id: str, body: dict,
         raise ShareHTTPError(404, "not found")
     if artifact["lifecycle"] not in ("retracted", "tombstoned"):
         raise ShareHTTPError(409, f"cannot purge an artifact that is {artifact['lifecycle']}; it must be deleted first")
-    if artifact["lifecycle"] == "tombstoned" and artifact["purge_after"] is None:    # a hold: refuse before revoking
+    if artifact["legal_hold"] or (artifact["lifecycle"] == "tombstoned" and artifact["purge_after"] is None):
+        # a hold (the flag, or a tombstone with no purge date): refuse before revoking
         raise ShareHTTPError(409, "cannot purge an artifact under legal hold; lift the hold first")
     revoked = _revoke_all(server, _call(admin, "open_shares", artifact_id=artifact_id), actor)
-    result = _call(server.artifact_store, "purge_artifact", artifact_id, actor=actor)
+    # the shared deferred-delete path: the purge record commits first, objects are deleted after; never the hold override
+    result = _call(server.artifact_store, "purge_now", artifact_id, actor=actor, reason="member purge")
+    if result["result"] == "refused":
+        raise ShareHTTPError(409, "cannot purge an artifact under legal hold; lift the hold first"
+                             if result["reason"] == "legal_hold" else f"cannot purge: {result['reason']}")
+    if result["result"] == "not_found":
+        raise ShareHTTPError(404, "not found")
+    if result["result"] == "already_purged":
+        handler._json({"artifact_id": artifact_id, "purged": True, "already_purged": True, "deleted": 0,
+                       "retained_shared": 0, "revoked_shares": revoked})
+        return
     try:
         _call(admin, "record_purge", principal, artifact_id, actor,
               {"deleted": len(result["deleted"]), "retained_shared": len(result["retained_shared"]),

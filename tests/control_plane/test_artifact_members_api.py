@@ -394,6 +394,38 @@ def test_purge_refuses_an_artifact_under_legal_hold(env):
     assert env.req(purge_path(aid), body={"confirm": aid})[0] == 200
 
 
+def test_purge_refuses_the_legal_hold_flag_even_when_a_purge_date_is_set(env):
+    aid, _ = env.artifact()
+    retract(env, aid)
+    env.sql("UPDATE artifacts SET lifecycle='tombstoned', tombstoned_at=now(), purge_after=now(), legal_hold=true "
+            "WHERE artifact_id=$1", aid)
+    status, body = env.req(purge_path(aid), body={"confirm": aid})
+    assert status == 409 and "legal hold" in body["error"]
+    assert env.blobs.deleted == []
+    assert env.sql("SELECT count(*) FROM artifact_versions WHERE artifact_id=$1 AND purged_at IS NULL", aid)[0][0] == 1
+    assert not env.sql("SELECT 1 FROM artifact_lifecycle_events WHERE artifact_id=$1 AND action='purge'", aid)
+
+
+def test_member_purge_commits_first_and_defers_the_object_delete_to_the_shared_queue(env, monkeypatch):
+    aid, _ = env.artifact()
+    retract(env, aid)
+
+    def down(key):
+        raise OSError("object store down")
+    monkeypatch.setattr(env.blobs, "delete", down)
+    status, body = env.req(purge_path(aid), body={"confirm": aid})
+    assert status == 200, body                       # the purge record is committed even though the delete failed
+    assert body["purged"] is True and body["deleted"] == 0
+    assert env.sql("SELECT count(*) FROM artifact_versions WHERE artifact_id=$1 AND purged_at IS NULL", aid)[0][0] == 0
+    assert env.sql("SELECT count(*) FROM artifact_pending_deletes")[0][0] >= 1
+    event = env.sql("SELECT detail FROM artifact_lifecycle_events WHERE artifact_id=$1 AND action='purge'", aid)
+    assert event and "queued_delete" in str(event[0]["detail"])
+    # anonymisation and usage settle happened in the same committed transaction
+    assert env.sql("SELECT original_filename FROM artifacts WHERE artifact_id=$1", aid)[0][0] == "[removed]"
+    usage = env.sql("SELECT bytes_used, bytes_retracted FROM artifact_member_usage WHERE member_principal=$1", ALICE)[0]
+    assert (usage["bytes_used"], usage["bytes_retracted"]) == (0, 0)
+
+
 def test_purge_anonymises_annotations_viewer_events_uploads_and_the_filename(env):
     aid, vid = env.artifact()
     share = env.share(aid, vid)

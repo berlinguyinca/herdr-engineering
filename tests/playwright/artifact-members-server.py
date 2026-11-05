@@ -4,7 +4,7 @@ The browser talks to the production HTTP handlers (``ControlPlaneServer`` + ``ar
 ``artifact_share_api.revoke_share``), so routing, the operator-only role check, the same-origin check, body validation and
 the 404/409 mapping are the real ones. Only persistence is in memory: ``MemberAdminFixture`` mirrors ``MemberAdmin``
 (usage rows with effective limits, member-created links, sharing switch, purge answers), ``LinkStore`` the two
-``ShareStore`` calls revoke uses, and ``PurgeStore`` ``purge_artifact``.
+``ShareStore`` calls revoke uses, and ``PurgeStore`` ``purge_now``.
 
 API keys: ``op-key`` is an operator, ``view-key`` a viewer (the page sends whichever key the browser context sets in
 ``X-API-Key``). Stdout carries ``PORT=n``.
@@ -168,14 +168,14 @@ class PurgeStore:
     def _list_records(self, **_kwargs):      # the registry list above the Members section: nothing to show
         return []
 
-    def _purge_artifact(self, artifact_id, *, actor, reason="operator purge"):
+    def _purge_now(self, artifact_id, *, actor, reason, request_key=None, override_legal_hold=False):
         a = self.state.artifacts[artifact_id]
         if a["lifecycle"] == "tombstoned":
-            raise ArtifactError("artifact bytes were already purged")
+            return {"artifact_id": artifact_id, "result": "already_purged", "deleted": [], "retained_shared": []}
         a["lifecycle"] = "tombstoned"
         self.state.members[a["created_by"]]["bytes_retracted"] = 0
         self.state.purged.append(artifact_id)
-        return {"deleted": ["blob"], "retained_shared": []}
+        return {"artifact_id": artifact_id, "result": "deleted", "deleted": ["blob"], "retained_shared": []}
 
 
 if __name__ == "__main__":

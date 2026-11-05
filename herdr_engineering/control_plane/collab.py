@@ -40,6 +40,8 @@ from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_coordinators import CoordinatorsMixin
 from .collab_federation import FederationMixin
+from .collab_team_briefs import BRIEF_NOTE as _TR_BRIEF_NOTE
+from .collab_team_briefs import TeamBriefsMixin
 from .collab_team_roles import ROLE_FIELDS, TeamRolesMixin
 from .collab_team_rooms import TeamRoomsMixin
 from .collab_workbench import WorkbenchMixin
@@ -404,7 +406,7 @@ class _GroupClaim(NamedTuple):
 
 
 class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin,
-                    CoordinatorsMixin):
+                    CoordinatorsMixin, TeamBriefsMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -573,6 +575,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._init_team_rooms()
         self._init_team_roles()
         self._init_coordinators()
+        self._init_team_briefs()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -5680,7 +5683,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             extra["taint"] = list(t.get("taint") or [])
             if quoted and t.get("quoted"):
                 extra["quoted_source"] = {**t["quoted"], "taint": list(t.get("taint") or []), "untrusted": True,
-                                          "note": _TR_QUOTE_NOTE}
+                                          "note": _TR_BRIEF_NOTE if t["quoted"].get("source") == "assistant_brief"
+                                          else _TR_QUOTE_NOTE}
         return {**extra, "task_id": tid, "room_id": t["room_id"], "target_agent_id": t["target"],
                 "target_name": a.get("name"), "target_address": self._address(t["target"]),
                 "target_aliases": list(a.get("aliases", ())), "text": t["text"], "status": self._task_status(t),

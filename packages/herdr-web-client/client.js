@@ -178,6 +178,33 @@ export class HerdrClient {
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
   }
 
+  // Owner-only delete (tombstone / purge now) and restore. The server answers a non-owner with a plain 404.
+  artifactDeleteAccess({ signal } = {}) {
+    return this.request('/api/v1/artifacts/delete-access', { signal });
+  }
+
+  listTombstonedArtifacts({ signal } = {}) {
+    return this.request('/api/v1/artifacts/tombstoned', { signal });
+  }
+
+  // A permanent delete must carry the typed count as a string: it is refused here, before any request, if it does not.
+  async deleteArtifacts(ids, { mode = 'tombstone', reason, holdDays, confirm, requestKey, signal } = {}) {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('Select at least one artifact');
+    if (ids.length > 200) throw new Error('At most 200 artifacts per request');
+    if (mode === 'purge_now' && confirm !== String(new Set(ids).size)) throw new Error('A permanent delete needs its typed confirm count');
+    const body = { ids, mode, reason };
+    if (holdDays !== undefined) body.hold_days = holdDays;
+    if (mode === 'purge_now') body.confirm = confirm;
+    if (requestKey) body.request_key = requestKey;
+    return this.request('/api/v1/artifacts/delete', { method: 'POST', body, signal });
+  }
+
+  async restoreArtifacts(ids, { requestKey, signal } = {}) {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('Select at least one artifact');
+    if (ids.length > 200) throw new Error('At most 200 artifacts per request');
+    return this.request('/api/v1/artifacts/restore', { method: 'POST', body: requestKey ? { ids, request_key: requestKey } : { ids }, signal });
+  }
+
   // Artifacts bound to a project, issue, task or room (P03). The server filters by what the caller may read.
   artifactsForContext(kind, ref, { q, mediaType, limit, cursor, signal } = {}) {
     const query = new URLSearchParams();
@@ -579,6 +606,19 @@ export class HerdrClient {
     return this.request('/api/v1/services', { signal });
   }
 
+  listServiceCatalog({scope='herdr', status='current', includeArchived=false,
+    search='', hostId='', groupBy='project', limit=100, cursor, signal} = {}) {
+    const query = new URLSearchParams({view:'catalog', scope:scope==='local'?'unassigned':scope,
+      status, include_archived:String(includeArchived), search, host_id:hostId,
+      group_by:groupBy, limit:String(limit)});
+    if(cursor != null)query.set('cursor',cursor);
+    return this.request(`/api/v1/services?${query}`, {signal});
+  }
+
+  getService(serviceId, {signal} = {}) {
+    return this.request(`/api/v1/services/${encodeURIComponent(serviceId)}`, {signal});
+  }
+
   /** Canonical fabric URLs for URLs in agent output (read-only; originals are never changed). */
   resolveFabricUrls(urls, sourceMachine = null, { signal } = {}) {
     return this.request('/api/v1/fabric/resolve-urls', { method: 'POST', body: { urls, source_machine: sourceMachine }, signal });
@@ -871,6 +911,11 @@ export class HerdrClient {
 
   listReviews({ signal } = {}) {
     return this.request('/api/v1/reviews', { signal });
+  }
+
+  // Every open review, not limited to the newest page: a long-waiting review is the one that page drops.
+  listWaitingReviews({ signal } = {}) {
+    return this.request('/api/v1/reviews?needs_decision=1', { signal });
   }
 
   getTests() {

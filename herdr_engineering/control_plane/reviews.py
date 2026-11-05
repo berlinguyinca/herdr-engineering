@@ -106,6 +106,19 @@ class ReviewService:
             key=lambda r: (r["updated_at"], r["review_id"]), reverse=True,
         )
 
+    def list_waiting(self, *, limit=200):
+        """Every review still open (starting or awaiting a decision), longest-waiting first, bounded by `limit`.
+
+        list_reviews() orders by updated_at and the API returns only the newest page, but a heartbeat does not bump
+        updated_at, so a review that has waited longest is exactly the one that page drops. This list is not windowed.
+        """
+        limit = max(1, int(limit))
+        with self.repo._event_lock:
+            ids = [key for kind, key in self.repo._events if kind == ENTITY]
+            records = [self.get(key) for key in ids]
+        waiting = sorted((r for r in records if r["status"] not in TERMINAL), key=lambda r: (r["created_at"], r["review_id"]))
+        return {"reviews": waiting[:limit], "total": len(waiting), "has_more": len(waiting) > limit}
+
     def register(self, payload):
         if not isinstance(payload, dict):
             raise ValueError("review must be an object")

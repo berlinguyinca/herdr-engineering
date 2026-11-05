@@ -312,8 +312,9 @@ class ControlPlaneServer:
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
+                 artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None, member_web=None):
+                 assistant_workers=None, assistant_judge=None, member_web=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -454,6 +455,12 @@ class ControlPlaneServer:
         self.member_admin = member_admin
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
+        # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
+        self.artifact_delete_owners = frozenset(artifact_delete_owners)
+        self.artifact_delete_allow_keyless_owner = bool(artifact_delete_allow_keyless_owner)
+        # ids the registry holds tombstoned: the legacy read path (ACL + repo projection) must treat them as nonexistent
+        from .artifact_delete_api import TombstoneCache
+        self.tombstone_cache = TombstoneCache()
         # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
         self.collab_grant_store = collab_grant_store
         self.collab_artifacts_enabled = collab_artifacts_enabled
@@ -508,6 +515,7 @@ class ControlPlaneServer:
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
         # The owner routes /api/v1/assistant-workers read it at request time, so it may be attached after startup.
         self.assistant_workers = assistant_workers
+        self.assistant_judge = assistant_judge       # JudgeRuntime | None; None: the activation gate refuses
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
         from .rakazo_artifacts import RegistryBackend
@@ -721,6 +729,7 @@ class ControlPlaneServer:
                 from .google_workspace import GoogleWorkspace
                 _gw = GoogleWorkspace(apps=self.apps)
                 self.apps.on_change = _gw.invalidate
+                self.apps.on_client_change = _gw.invalidate_all
                 # Single-operator rule: map the data key (never the approval actor) through the bridge when there is one.
                 self.assistant.google_read = lambda t, u, tool, payload: _gw.run(*self._canonical_person(t, u), tool, payload)
                 self.assistant.google_write = lambda t, u, tool, payload: _gw.write(*self._canonical_person(t, u), tool, payload)
@@ -732,6 +741,14 @@ class ControlPlaneServer:
             self.assistant.lineage_emit = ActionLineageEmitter(self.ingest, principal_resolver(self._keys)).emit
             self.assistant.review_rereview = rereview_hook(self)
             self.assistant.comment_poster = comment_hook(self)
+            if self.assistant.config["team_briefs"]["enabled"]:
+                # team collaboration slice 4: wired ONLY when the flag is on, so a deployment that never sets it has no hook at all
+                from .assistant_adapters import brief_hook
+                self.assistant.brief_submitter = brief_hook(self)
+                if self.collab is not None:
+                    self.collab.assistant_briefs_source = lambda: self.assistant.config["team_briefs"]
+                if getattr(self, "google", None) is not None and self.assistant.mail_source is None:
+                    self.assistant.mail_source = lambda t, u, mid: self.google.get_raw_message(*self._canonical_person(t, u), mid)
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
             self.assistant.ci_rerun_request = self.intelligence.assistant_ci_rerun
@@ -1584,6 +1601,8 @@ class ControlPlaneServer:
             caps.append("collab_v1")
         if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
             caps.append("assistant_v1")
+            if self.assistant.team_briefs.enabled():
+                caps.append("assistant_team_briefs")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             caps.append("project_intelligence_v1")
         if getattr(self, "memory", None) is not None and self.memory.enabled():
@@ -1627,6 +1646,8 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        if getattr(self.source, 'recovery_info', None):
+            h['recovery'] = dict(self.source.recovery_info)
         if self.repo.agent_identities.conflict_count:
             h["agent_identity_degraded"] = True
             h["agent_identity_conflicts"] = self.repo.agent_identities.conflict_count
@@ -1937,6 +1958,7 @@ _PUBLIC_STATIC = {
     "/collab-context.js": ("collab-context.js", "text/javascript"),
     "/collab-helpers.js": ("collab-helpers.js", "text/javascript"),
     "/collab-workbench.js": ("collab-workbench.js", "text/javascript"),
+    "/collab-team-rooms.js": ("collab-team-rooms.js", "text/javascript"),
     "/motion.js": ("motion.js", "text/javascript"),
     "/patch.js": ("patch.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
@@ -2062,11 +2084,23 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             return self._deny(403, "forbidden")
 
+        def _artifact_is_deleted(self, artifact_id, permission="read"):
+            """True when the registry holds the artifact tombstoned. Deleted means nonexistent for everyone, on the legacy
+            read path too (the in-memory ACL and the repo projection never see the registry lifecycle). Reads use the
+            short-lived cache of tombstoned ids (refreshed on every local delete/restore); writes ask the database."""
+            if server.artifact_store is None or not artifact_id:
+                return False
+            if permission == "read":
+                return server.tombstone_cache.contains(
+                    artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+            return self._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
+
         def _artifact_allowed(self, artifact_id, permission, *, operator_member=True):
             if server.artifact_acl is None:
-                return True
+                return not self._artifact_is_deleted(artifact_id, permission)
             if self._artifact_acl_allows(artifact_id, permission):
-                return True
+                # only an ACL-authorized caller reaches the store: an unauthorized read must never touch it
+                return not self._artifact_is_deleted(artifact_id, permission)
             # Plan 5 D4: an operator key reads and shares (never edits) member-owned artifacts. Gated on the operator
             # principal first, so any other unauthorized read still never reaches the store.
             if (operator_member and permission in ("read", "share") and server.artifact_store is not None and artifact_id
@@ -2378,7 +2412,10 @@ def _make_handler(server, public=False, operator=False):
             try:
                 return dispatch()
             except Exception as exc:
-                self._request_cause = type(exc).__name__
+                # A client closing while we write a dependency error must not
+                # replace the already-recorded reason that the request failed.
+                if self._request_cause is None:
+                    self._request_cause = type(exc).__name__
                 raise
             finally:
                 elapsed_ms = (time.monotonic() - self._request_started) * 1000
@@ -2485,7 +2522,8 @@ def _make_handler(server, public=False, operator=False):
             dpath = "/".join(seg.replace("/", "\x00") for seg in segs)
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
-                                    "assistant-action-requests", "assistant-grants"}
+                                    "assistant-action-requests", "assistant-grants", "assistant-judges",
+                                    "assistant-team-briefs"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
@@ -2596,7 +2634,7 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
                                         "assistant-reminders", "assistant-workers",
-                                        "assistant-action-requests", "assistant-grants"}
+                                        "assistant-action-requests", "assistant-grants", "assistant-judges"}
 
         def _mutate_verb(self):
             if operator:
@@ -2627,7 +2665,7 @@ def _make_handler(server, public=False, operator=False):
             if err:
                 return err
             if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
-                            "assistant-action-requests", "assistant-grants"):
+                            "assistant-action-requests", "assistant-grants", "assistant-judges"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3085,6 +3123,9 @@ def _make_handler(server, public=False, operator=False):
                 from .artifact_members_api import route_members
                 if route_members(self, server, parts, resource):
                     return None
+                from .artifact_delete_api import route_delete
+                if route_delete(self, server, parts, resource):
+                    return None
                 from .artifact_collab_api import route_collab
                 if route_collab(self, server, parts, resource):
                     return None
@@ -3140,6 +3181,10 @@ def _make_handler(server, public=False, operator=False):
                                        {"error": str(exc)})
             except RuntimeError as exc:
                 self._request_cause = type(exc).__name__
+                if resource == 'events':
+                    from .projection_history import DurableHistoryUnavailable
+                    if isinstance(exc, DurableHistoryUnavailable):
+                        self._request_cause = exc.cause_name
                 if resource == "github":
                     from ..github import GitHubError
                     if isinstance(exc, GitHubError):
@@ -3574,6 +3619,32 @@ def _make_handler(server, public=False, operator=False):
                     s = r.get_service(parts[4])
                     return self._etag_json(s) if s else self._json(
                         {"error": "not found"}, 404)
+                view = _q(self.path, 'view')
+                if view is not None:
+                    from .service_catalog_query import CatalogSnapshotExpired
+                    try:
+                        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                        allowed = {'view','scope','status','include_archived','search','host_id','group_by','limit','cursor'}
+                        if set(query)-allowed or any(len(values)!=1 for values in query.values()):
+                            raise ValueError('Unknown or repeated catalog parameter')
+                        if view != 'catalog':
+                            raise ValueError('Unknown services view')
+                        archived = query.get('include_archived', ['false'])[0]
+                        if archived not in ('true','false'):
+                            raise ValueError('include_archived must be true or false')
+                        raw_limit = query.get('limit', ['100'])[0]
+                        if not re.fullmatch(r'[0-9]{1,3}', raw_limit):
+                            raise ValueError('limit must be an integer between 1 and 500')
+                        page = r.service_catalog_page(scope=query.get('scope',['herdr'])[0],
+                            status=query.get('status',['current'])[0], include_archived=archived=='true',
+                            search=query.get('search',[''])[0], host_id=query.get('host_id',[''])[0],
+                            group_by=query.get('group_by',['project'])[0], limit=int(raw_limit),
+                            cursor=query.get('cursor',[None])[0])
+                        return self._etag_json(page)
+                    except CatalogSnapshotExpired as exc:
+                        return self._json({'error':'staleCatalogCursor','message':str(exc)},409)
+                    except ValueError as exc:
+                        return self._json({'error':str(exc)},400)
                 services = r.list_services()
                 host_filter = _q(self.path, "host_id")
                 if host_filter:
@@ -3646,6 +3717,9 @@ def _make_handler(server, public=False, operator=False):
                     # per-entity stream: /api/v1/events?entity_type=mission&entity_id=m1
                     etype = _q(self.path, "entity_type")
                     eid = _q(self.path, "entity_id")
+                    from .projection_history import hidden_history
+                    if etype and hidden_history(etype):
+                        return self._json({'error':'not found'},404)
                     if etype == "lineage":
                         return self._json({"error": "not found"}, 404)  # read via the scope-checked /api/v1/graph
                     if etype == "review_request":
@@ -3701,6 +3775,8 @@ def _make_handler(server, public=False, operator=False):
                         query=_q(self.path, "q"), artifact_type=_q(self.path, "type"),
                         status=_q(self.path, "status"), created_by=_q(self.path, "created_by"),
                         limit=_qint(self.path, "limit", 200), offset=_qint(self.path, "offset", 0))
+                if server.artifact_store is not None:
+                    artifacts = [a for a in artifacts if not self._artifact_is_deleted(a["artifact_id"])]
                 if server.artifact_acl is not None:
                     artifacts = [a for a in artifacts if self._artifact_allowed(a['artifact_id'], 'read')]
                 return self._json({"artifacts": artifacts})
@@ -3711,7 +3787,8 @@ def _make_handler(server, public=False, operator=False):
                     legacy = r.get_artifact(parts[4])
                     if legacy and not legacy.get('created_by'):
                         artifact = legacy
-                if artifact and not self._artifact_allowed(parts[4], "read"):
+                if artifact and (self._artifact_is_deleted(parts[4])
+                                 or not self._artifact_allowed(parts[4], "read")):
                     artifact = None
                 return self._json(artifact) if artifact else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_store is not None:
@@ -3888,6 +3965,12 @@ def _make_handler(server, public=False, operator=False):
                 if len(parts) > 4:
                     record = reviews.get(parts[4])
                     return self._json(record) if record else self._json({"error": "not found"}, 404)
+                hidden = {"plan", "feedback", "receipt", "instance_id"}
+                if _q(self.path, "needs_decision") == "1":
+                    page = reviews.list_waiting(limit=min(200, max(1, _qint(self.path, "limit", 200))))
+                    return self._json({"available": True, "needs_decision": True, "total": page["total"], "has_more": page["has_more"],
+                                       "reviews": [{k: v for k, v in row.items() if k not in hidden} for row in page["reviews"]],
+                                       "checked_at": r._stamp()})
                 rows = reviews.list_reviews()
                 offset = max(0, _qint(self.path, "offset", 0))
                 limit = min(500, max(1, _qint(self.path, "limit", 500)))
@@ -3907,6 +3990,10 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts)
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource)
+            if resource == "assistant-judges":
+                return self._assistant_judges(parts)
+            if resource in ("assistant-team-briefs", "assistant-references"):
+                return self._assistant_briefs(parts, resource, None)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -4381,6 +4468,10 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_workers(parts, body)     # body was read above; never read it twice
             if resource in ("assistant-action-requests", "assistant-grants"):
                 return self._assistant_hub_owner(parts, resource, body)
+            if resource == "assistant-judges":
+                return self._assistant_judges(parts, body)
+            if resource == "assistant-team-briefs":
+                return self._assistant_briefs(parts, resource, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4664,6 +4755,7 @@ def _make_handler(server, public=False, operator=False):
             from .assistant_hub.policy import (
                 ActivationRefused,
                 activate_grant,
+                current_judge_version,
                 record_owner_decision,
                 revoke_action_grant,
             )
@@ -4677,6 +4769,7 @@ def _make_handler(server, public=False, operator=False):
                 tenant_id, user_id = self._assistant_scope()
                 svc, store = server.assistant, server.assistant.store
                 cfg = svc.config["grants"]
+                version = current_judge_version(server.assistant_judge)
 
                 def request_view(r):
                     return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
@@ -4687,8 +4780,8 @@ def _make_handler(server, public=False, operator=False):
                 def grant_view(g):
                     return {"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb,
                             "resource_scope": g.resource_scope, "key_id": g.key_id,
-                            "state": g.effective_state(svc.now(), int(cfg["policy_version"])).value,
-                            "policy_version": g.policy_version, "created_at": iso(g.created_at),
+                            "state": g.effective_state(svc.now(), int(cfg["policy_version"]), version).value,
+                            "policy_version": g.policy_version, "judge_version": g.judge_version, "created_at": iso(g.created_at),
                             "proposed_at": iso(g.proposed_at), "activated_at": iso(g.activated_at),
                             "expires_at": iso(g.expires_at), "revoked_at": iso(g.revoked_at),
                             "confirmed_by": g.confirmed_by}
@@ -4708,7 +4801,8 @@ def _make_handler(server, public=False, operator=False):
                             return self._json({"error": 'body must be exactly {"approve": true|false}'}, 400)
                         try:
                             row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
-                                                        body["approve"], decided_by=user_id)
+                                                        body["approve"], decided_by=user_id,
+                                                        judge_version=version)
                         except ValueError as exc:       # already decided, or vetoed (a veto is final)
                             return self._json({"error": str(exc), "code": "conflict"}, 409)
                         return self._json(request_view(row))
@@ -4717,14 +4811,16 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"grants": [grant_view(g) for g in store.list_action_grants(tenant_id, user_id)]})
                     if len(parts) == 5 and self.command == "DELETE":
                         return self._json(grant_view(revoke_action_grant(store, svc.now(), tenant_id, user_id,
-                                                                          parts[4], revoked_by=user_id)))
+                                                                          parts[4], revoked_by=user_id,
+                                                                          policy_version=int(cfg["policy_version"]),
+                                                                          judge_version=version)))
                     if len(parts) == 6 and parts[5] == "activate" and self.command == "POST":
                         if not exact({"confirm"}) or body["confirm"] is not True:
                             return self._json({"error": 'body must be exactly {"confirm": true}'}, 400)
                         try:
-                            # The judge gate is hard-coded unsatisfied this phase: Phase 3 wires the real judge gate.
+                            # The real gate: calibration report from the store, owner flag, false-negative bound.
                             grant = activate_grant(store, cfg, svc.now(), tenant_id, user_id, parts[4],
-                                                   confirmed_by=user_id, judge_gate_satisfied=False)
+                                                   confirmed_by=user_id, judge=server.assistant_judge)
                         except ActivationRefused as exc:
                             if exc.code == "not_found":
                                 return self._json({"error": "not found"}, 404)
@@ -4736,6 +4832,94 @@ def _make_handler(server, public=False, operator=False):
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
             except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+
+        def _assistant_judges(self, parts, body=None):
+            """Owner-only judge status and a one-shot connectivity check. Same tenant/user scope as the grants routes;
+            the endpoint is shown as a host only and no key material or key path ever leaves here."""
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant_hub.judge_admin import check_view, status_view
+            if self._require("operator"):
+                return None
+            try:
+                server.assistant._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                judge = server.assistant_judge
+                fallback = svc.config.get("judge") or {}
+                if len(parts) == 4 and self.command == "GET":
+                    return self._json(status_view(svc.store, judge, fallback, tenant_id, user_id, svc.now()))
+                if len(parts) == 5 and parts[4] == "check" and self.command == "POST":
+                    if body not in (None, {}):
+                        return self._json({"error": "body must be empty"}, 400)
+                    return self._json(check_view(judge, fallback))
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+
+        def _assistant_briefs(self, parts, resource, body):
+            """Team collaboration slice 4 (assistant_briefs.py): the operator's assistant offers a team a derived brief.
+
+            POST /api/v1/assistant-team-briefs  {room_id, team_id, message_ref[, assistant_id, target_agent_id]}
+            GET  /api/v1/assistant-team-briefs  the caller's own briefs (no mail pointers)
+            GET  /api/v1/assistant-references/<id>  the caller's own reference, resolved. Anyone else, or a wrong id, is one 404.
+
+            The scope is the authenticated API-key principal's own ``(tenant, user)``; collaboration credentials do not
+            authenticate here. Off (the flag, or the assistant) answers like a route that does not exist."""
+            from .assistant import (
+                AssistantError,
+                AssistantForbidden,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
+            from .assistant_briefs import TeamBriefError
+            try:
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                svc._require_enabled()
+                briefs = svc.team_briefs
+                briefs._require_enabled()
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                if resource == "assistant-references" and len(parts) == 5 and self.command == "GET":
+                    return self._json(briefs.reference(parts[4], tenant_id=tenant_id, user_id=user_id))
+                if resource == "assistant-team-briefs" and len(parts) == 4 and self.command == "GET":
+                    return self._json({"briefs": briefs.list(tenant_id=tenant_id, user_id=user_id)})
+                if resource == "assistant-team-briefs" and len(parts) == 4 and self.command == "POST":
+                    body = body if isinstance(body, dict) else {}
+                    if set(body) - {"room_id", "team_id", "message_ref", "assistant_id", "target_agent_id"}:
+                        return self._json({"error": "unknown field"}, 400)
+                    for key in ("room_id", "team_id", "message_ref"):
+                        if not isinstance(body.get(key), str) or not body[key]:
+                            return self._json({"error": f"{key} is required"}, 400)
+                    for key in ("assistant_id", "target_agent_id"):
+                        if body.get(key) is not None and not isinstance(body[key], str):
+                            return self._json({"error": f"{key} must be a string"}, 400)
+                    assistant_id = body.get("assistant_id") or next(
+                        (a.assistant_id for a in svc.store.list_assistants(tenant_id=tenant_id, user_id=user_id) if a.enabled), "")
+                    brief = briefs.process_message(
+                        tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id, message_ref=body["message_ref"],
+                        room_id=body["room_id"], team_id=body["team_id"], target_agent_id=body.get("target_agent_id"))
+                    if brief is None:
+                        return self._json({"brief": None, "result": "no_topic"})
+                    return self._json({"brief": brief}, 200 if brief["replayed"] else 201)
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except AssistantForbidden:
+                return self._json({"error": "forbidden"}, 403)
+            except TeamBriefError as exc:
+                return self._json({"error": str(exc)}, exc.status)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except (AssistantError, ValueError) as exc:
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):
@@ -5763,6 +5947,8 @@ def _make_handler(server, public=False, operator=False):
             if version_id is not None and (not isinstance(version_id, str) or not version_id):
                 return self._json({"error": "version_id must be a non-empty string"}, 400)
             if server.artifact_store is not None:
+                if self._artifact_call("lifecycle_of", artifact_id) == "tombstoned":
+                    return self._deny(404, "not found")             # deleted: nothing may write to it
                 known = (self._artifact_call("get_version", version_id, artifact_id) if version_id
                          else self._artifact_call("get_record", artifact_id, principal_id=self._resource_principal()))
                 if known is None:
@@ -5998,6 +6184,8 @@ def _make_handler(server, public=False, operator=False):
 
             ``want(record) -> bool`` may veto reading the bytes (they are then None) for callers that need only the record."""
             r = server.repo
+            if self._artifact_is_deleted(artifact_id):
+                return None, None
             data = r.get_artifact_data(artifact_id)
             a = r.get_artifact(artifact_id)
             if a is None and server.artifact_store is not None:

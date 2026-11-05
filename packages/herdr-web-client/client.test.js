@@ -308,11 +308,12 @@ test('CI detail, logs and review reads encode identities and forward cancellatio
   const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{calls.push({url,opts});return {ok:true,status:200,text:async()=>'{}'};}});
   const signal=new AbortController().signal;
   await client.getCi({signal});await client.getCiPipeline('owner/repo & other',12,{signal});
-  await client.getCiLog('owner/repo',12,'step/9',{signal});await client.listReviews({signal});
+  await client.getCiLog('owner/repo',12,'step/9',{signal});await client.listReviews({signal});await client.listWaitingReviews({signal});
   assert.equal(calls[0].url,'/api/v1/ci');
   assert.equal(new URL(calls[1].url,'http://test').searchParams.get('repository'),'owner/repo & other');
   assert.equal(new URL(calls[2].url,'http://test').searchParams.get('step'),'step/9');
   assert.equal(calls[3].url,'/api/v1/reviews');
+  assert.equal(calls[4].url,'/api/v1/reviews?needs_decision=1');
   for(const call of calls)assert.equal(call.opts.signal,signal);
 });
 test('CI mutation uses explicit action POST with the provider run number',async()=>{
@@ -580,6 +581,20 @@ test('getGithubProjects reads the projects list or one project, conditionally', 
   assert.equal(server.calls[0].url, '/api/v1/github/projects');
   assert.equal(again.notModified, true);
   assert.equal(server.calls[2].url, '/api/v1/github/projects?project=PVT_1&since=2');
+});
+
+test('catalog paging is opt in, encoded and abortable; detail reads only one service', async()=>{
+  const calls=[]; const controller=new AbortController();
+  const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{calls.push({url,signal:opts.signal});return {ok:true,status:200,text:async()=>'{}'};}});
+  await client.listServices();
+  await client.listServiceCatalog({scope:'unassigned',status:'all',includeArchived:true,search:'a & b',hostId:'h/x',groupBy:'type',limit:2,cursor:'opaque',signal:controller.signal});
+  await client.getService('a/b?#',{signal:controller.signal});
+  assert.equal(calls[0].url,'/api/v1/services');
+  const params=new URL(calls[1].url,'http://x').searchParams;
+  assert.deepEqual(Object.fromEntries(params),{view:'catalog',scope:'unassigned',status:'all',include_archived:'true',search:'a & b',host_id:'h/x',group_by:'type',limit:'2',cursor:'opaque'});
+  assert.equal(calls[1].signal,controller.signal);
+  assert.equal(calls[2].url,'/api/v1/services/a%2Fb%3F%23');
+  assert.equal(calls[2].signal,controller.signal);
 });
 
 test('the log slice request names the step, the line range and the test it expects there',async()=>{

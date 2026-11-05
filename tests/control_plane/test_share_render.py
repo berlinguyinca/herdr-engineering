@@ -756,6 +756,8 @@ def test_two_hundred_timeouts_leak_no_fds_or_processes(monkeypatch: pytest.Monke
     sr.clear_sanitize_caches()
     assert sr.sanitize_html(b"<p>warm</p>", resolve=keep_all) == "<p>warm</p>"
     fds_before = len(os.listdir("/proc/self/fd"))
+    # Other fixtures in a full run (a session Postgres, say) own children of this process; count only ours.
+    children_before = set(_children_of_self())
     for i in range(200):
         with pytest.raises(sr.RenderFailed):
             sr.sanitize_html(b"<div>" * 9_000 + str(i).encode(), resolve=keep_all)
@@ -765,7 +767,7 @@ def test_two_hundred_timeouts_leak_no_fds_or_processes(monkeypatch: pytest.Monke
     assert not zombies
     monkeypatch.setattr(sr, "SANITIZE_DEADLINE_SECONDS", 3.0)
     assert sr.sanitize_html(b"<p>again</p>", resolve=keep_all) == "<p>again</p>"
-    assert len(_children_of_self()) <= 1
+    assert len(set(_children_of_self()) - children_before) <= 1
     sr.clear_sanitize_caches()
 
 

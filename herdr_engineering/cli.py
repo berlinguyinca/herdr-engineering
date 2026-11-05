@@ -195,6 +195,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # google ---------------------------------------------------------------
     from .google_setup_cli import register as _register_google
     _register_google(sub)
+    from .fleet_watch.cli import register as _register_fleet_watch
+    _register_fleet_watch(sub)
 
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
@@ -367,6 +369,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_collab_subparser(asub)
     from .artifact_members_client import add_members_subparser
     add_members_subparser(asub)
+    from .artifact_delete_client import add_delete_subparsers
+    add_delete_subparsers(asub)
     from .artifact_browse_client import add_browse_subparsers
     add_browse_subparsers(asub)
     from .teams_client import add_teams_subparser
@@ -415,6 +419,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--no-pane", action="store_true")
     p2.add_argument("--no-dashboard", action="store_true")
     p2.set_defaults(func=_cmd_summary_publish)
+    p2 = smsub.add_parser("view", help="render a published /summary report and page it (what the side pane runs)")
+    p2.add_argument("file", help="the report's Markdown file")
+    p2.add_argument("--close-pane", default=None, metavar="PANE_ID",
+                    help="close this Herdr pane when the reader quits")
+    p2.add_argument("--peer", default=None, metavar="PANE_ID", help="also close this pane (the graph) afterwards")
+    p2.set_defaults(func=_cmd_summary_view)
+    p2 = smsub.add_parser("graph", help="draw a published report's drift graph (what the graph pane runs)")
+    p2.add_argument("file", help="the report's Markdown file; the graph is read from its .graph.json sidecar")
+    p2.add_argument("--close-pane", default=None, metavar="PANE_ID",
+                    help="close this Herdr pane when the reader quits")
+    p2.add_argument("--peer", default=None, metavar="PANE_ID", help="also close this pane (the summary) afterwards")
+    p2.set_defaults(func=_cmd_summary_graph)
 
     # memory ---------------------------------------------------------------
     p = sub.add_parser("memory", help="herdr-memory harness adapters: plan/install/status/doctor/repair/upgrade/uninstall")
@@ -734,6 +750,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
+    p2 = csub.add_parser("checkpoint", help="prewarm durable projection checkpoints")
+    p2.add_argument("--fleet-config", required=True)
+    p2.add_argument("--migrations", default=None)
+    p2.set_defaults(func=_cmd_cp_checkpoint)
     p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
                          "never deletes: rows move to a quarantine file/table)")
     p2.add_argument("--log-file", default=None, help="a collab-only JSON-lines log; without it the Postgres "
@@ -792,6 +812,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
     p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
     p2.set_defaults(func=_cmd_cp_assistant_hub_owner, command_group_kind="grant")
+    p2 = csub.add_parser("assistant-judge", help="register the judge API key, show judge status, or check connectivity")
+    p2.add_argument("action", choices=["register", "status", "check"])
+    p2.add_argument("--endpoint", default=None, help="register: the judge base URL (https; http only for loopback)")
+    p2.add_argument("--key-file", default=None, help="register: absolute PATH the 0600 key file is written to (rotated via PATH.new)")
+    p2.add_argument("--key-stdin", action="store_true", help="register: read the key from stdin (the only way; never argv)")
+    p2.add_argument("--model", default="laya-auto", help="register: the model id that must appear in GET /v1/models")
+    p2.add_argument("--control-plane", default=None, help="status|check: control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", default=None, help="status|check: PATH to a file holding an operator API key")
+    p2.set_defaults(func=_cmd_cp_assistant_judge)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -1320,6 +1349,16 @@ def _cmd_summary_publish(args) -> int:
         return 1
     _print_json(out)
     return 0 if out["ok"] else 1
+
+
+def _cmd_summary_view(args) -> int:
+    from . import summary_report as sr
+    return sr.view_report(args.file, close_pane=args.close_pane, peer_pane=args.peer)
+
+
+def _cmd_summary_graph(args) -> int:
+    from . import summary_report as sr
+    return sr.view_graph(args.file, close_pane=args.close_pane, peer_pane=args.peer)
 
 
 def _cmd_agent_mine(args) -> int:
@@ -3429,6 +3468,99 @@ def _tty_safe(value) -> str:
     return "".join(c for c in str(value) if c == " " or not (ord(c) < 32 or 0x7F <= ord(c) <= 0x9F))
 
 
+def _assistant_judge_register(args) -> int:
+    """``assistant-judge register``: the key comes from stdin only and is never printed. 0 ok, 1 refused, 2 usage."""
+    from .control_plane.assistant_hub.judge_register import (
+        MAX_KEY_CHARS,
+        RegisterError,
+        register_key,
+    )
+
+    if not (args.endpoint and args.key_file and args.key_stdin):
+        print("assistant-judge register needs --endpoint, --key-file and --key-stdin (the key is never taken from argv)",
+              file=sys.stderr)
+        return 2
+    if sys.stdin.isatty():
+        import getpass
+        raw = getpass.getpass("judge API key: ")
+    else:
+        raw = sys.stdin.read(MAX_KEY_CHARS + 2)
+    key = raw.strip()
+    if not key or any(c.isspace() for c in key):
+        print("assistant-judge register failed: empty or malformed key on stdin", file=sys.stderr)
+        return 2
+    try:
+        done = register_key(args.endpoint, args.key_file, key, args.model)
+    except RegisterError as exc:
+        print(f"assistant-judge register failed: {exc.code}", file=sys.stderr)
+        if exc.seen:
+            print("models seen (first 10): " + ", ".join(_tty_safe(m) for m in exc.seen), file=sys.stderr)
+        return 1
+    print(f"registered: fingerprint={done.fingerprint} model={_tty_safe(done.model)} models_seen={done.models_seen}")
+    print("next: add api_key_file, endpoint and model to control_plane.personal_assistant.judge in your fleet YAML (this "
+          "command does not edit it); set backend_confirmed: true only after verifying a real model is serving.")
+    return 0
+
+
+def _cmd_cp_assistant_judge(args) -> int:
+    """``control-plane assistant-judge register|status|check``: 0 ok, 1 failure (one stderr line), 2 usage."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    if args.action == "register":
+        return _assistant_judge_register(args)
+    if not args.api_key_file:
+        print(f"assistant-judge {args.action} needs --api-key-file", file=sys.stderr)
+        return 2
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+    except ValueError:
+        print("cannot read --api-key-file: not a text file", file=sys.stderr)
+        return 2
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(f"{base}{path}", method=method, headers={
+            "X-API-Key": key, "Content-Type": "application/json"},
+            data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=90) as response:
+            return json.loads(response.read(1024 * 1024))
+    try:
+        if args.action == "check":
+            out = call("POST", "/api/v1/assistant-judges/check", {})
+            if out["ok"]:
+                print(_tty_safe(f"ok latency_ms={out['latency_ms']} model={out['model']}"))
+                return 0
+            print(_tty_safe(f"check failed: {out['code']}"))
+            return 1
+        out = call("GET", "/api/v1/assistant-judges")
+        print(_tty_safe(f"enabled={out['enabled']} model={out['model']} judge_version={out['judge_version']} "
+                        f"backend_confirmed={out['backend_confirmed']}"))
+        print(_tty_safe(f"endpoint_host={out['endpoint_host'] or '-'} key_fingerprint={out['key_fingerprint'] or '-'} "
+                        f"recorder_queue={out['recorder']['queue']} recorder_dropped={out['recorder']['dropped']}"))
+        print(f"{'RISK_CLASS':<18} {'LABELED':>7} {'FN':>4} {'FN_BOUND':>9}  GATE")
+        classes = out["calibration"]["classes"]
+        for name, gate in out["gate"].items():
+            row = classes.get(name)
+            labeled, fn, bound = (row["labeled"], row["false_negatives"], f"{row['fn_upper_bound']:.3f}") if row else (0, 0, "-")
+            verdict = "satisfied" if gate["satisfied"] else f"closed ({gate['code']})"
+            print(_tty_safe(f"{name:<18} {labeled:>7} {fn:>4} {bound:>9}  {verdict}"))
+        return 0
+    except urllib.error.HTTPError as exc:
+        print(f"assistant-judge {args.action} failed: HTTP {exc.code}", file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"assistant-judge {args.action} failed: {type(exc).__name__}", file=sys.stderr)
+    return 1
+
+
 def _cmd_cp_assistant_hub_owner(args) -> int:
     """``control-plane assistant-action list|approve|deny`` and ``assistant-grant list|revoke|activate``.
 
@@ -3630,6 +3762,49 @@ def _assistant_worker_install_hooks(args) -> int:
     else:
         print("no changes written", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_cp_checkpoint(args) -> int:
+    import asyncio
+
+    from .control_plane.db import Migrator
+    from .control_plane.projection_refresh import refresh_checkpoint
+    from .control_plane.projection_store import CheckpointInvalid, ProjectionStore
+
+    stage = 'configuration'
+    try:
+        _, cp = _load_cp_fleet_config(args.fleet_config)
+        dsn = cp.get("pg_dsn")
+        if not dsn:
+            _print_json({"ok": False, "error": "checkpoint requires control_plane.pg_dsn"})
+            return 1
+
+        async def migrate():
+            nonlocal stage
+            stage = 'database_connection'
+            conn = await _cp_connect(dsn)
+            try:
+                stage = 'migration'
+                await Migrator(conn).apply(args.migrations or _cp_migrations_dir())
+                # Migrator has committed: concurrent indexes must run outside its transaction.
+                stage = 'index_preparation'
+                await ProjectionStore(conn).ensure_indexes()
+            finally:
+                await conn.close()
+
+        asyncio.run(migrate())
+        stage = 'materialization'
+        result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
+                                    inspector_limits=cp.get("inspector_limits") or {})
+    except (Exception, SystemExit) as exc:
+        error = {"ok": False, "error": type(exc).__name__, "stage": stage}
+        if isinstance(exc, CheckpointInvalid):
+            # Only our own static validation messages are safe to surface.
+            error['reason'] = str(exc)
+        _print_json(error)
+        return 1
+    _print_json({"ok": True, **result})
     return 0
 
 
@@ -3978,6 +4153,11 @@ def _cmd_cp_web(args) -> int:
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
     member_admin = _member_admin_wiring(cp, dsn)
+    try:
+        from .control_plane.artifact_delete_api import owner_digests_config
+        artifact_delete = owner_digests_config(cp.get("artifact_delete"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     collab_grant_store, collab_artifacts_enabled = _collab_grant_wiring(cp, dsn)
     collab = None
     artifact_bridge = None
@@ -4111,6 +4291,8 @@ def _cmd_cp_web(args) -> int:
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
                              annotation_store=annotation_store, member_admin=member_admin,
+                             artifact_delete_owners=artifact_delete.digests,
+                             artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
                              member_web=member_web)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
@@ -4140,7 +4322,11 @@ def _cmd_cp_web(args) -> int:
         pass
     finally:
         if hub_server is not None:
-            hub_server.shutdown()
+            try:
+                hub_server.shutdown()
+            finally:
+                if hub_server.hub.judge is not None:
+                    hub_server.hub.judge.recorder.stop()
         svr.shutdown()
         if artifact_bridge is not None:
             artifact_bridge.stop()
@@ -4676,6 +4862,26 @@ def _cmd_bridge_hash_password(args):
     return 0
 
 
+def _build_judge_runtime(service):
+    """The one ``JudgeRuntime`` of this process: live ``judge`` config, a client built per call (so key rotation and
+    config edits apply), and the single-thread shadow recorder. A disabled judge yields no client and records nothing."""
+    from .control_plane.assistant_hub.jev import JevClient
+    from .control_plane.assistant_hub.judge import JudgeRuntime
+    from .control_plane.assistant_hub.shadow import ShadowRecorder
+
+    def cfg_getter():
+        return service.config.get("judge") or {}
+
+    def client_factory():
+        cfg = cfg_getter()
+        if cfg.get("enabled") is not True:
+            return None
+        return JevClient(cfg["endpoint"], cfg["api_key_file"], cfg["model"], float(cfg["timeout_seconds"]))
+
+    recorder = ShadowRecorder(service.store, cfg_getter, client_factory, service.now)
+    return JudgeRuntime(cfg_getter=cfg_getter, client_factory=client_factory, recorder=recorder, now=service.now)
+
+
 def _start_assistant_hub(service):
     """Start the tailnet-only assistant hub when both the assistant and ``personal_assistant.hub`` are enabled.
 
@@ -4693,12 +4899,14 @@ def _start_assistant_hub(service):
     registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
                               worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
     try:
-        server = HubServer(Hub(registry=registry, service=service, store=service.store), host=hub_cfg["host"],
+        server = HubServer(Hub(registry=registry, service=service, store=service.store, judge=_build_judge_runtime(service)),
+                           host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
     except (ValueError, OSError) as exc:
         raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
     server.start()
+    server.hub.judge.recorder.start()          # a thread exists only when the judge is enabled
     return server, registry
 
 
@@ -4709,6 +4917,7 @@ def _wire_assistant_hub(svr):
         return None
     hub_server, registry = _start_assistant_hub(service)
     svr.assistant_workers = registry
+    svr.assistant_judge = hub_server.hub.judge if hub_server is not None else None   # same runtime as the hub
     return hub_server
 
 
@@ -5124,7 +5333,18 @@ def _cmd_cp_worker(args) -> int:
                 raise
             if bridge_loop is not None:
                 bridge_task = asyncio.create_task(bridge_loop.run(stop), name="collab-bridge-loop")
+            from .control_plane.projection_refresh import ProjectionRefresh
+
+            # --once stays bounded. A dedicated thread/source leaves lease and
+            # artifact work on its existing connection and event loop.
+            fleet_cp = _worker_control_plane_section(getattr(args, "fleet_config", None))
+            refresh = None
             try:
+                if fleet_cp.get("pg_dsn"):
+                    refresh = ProjectionRefresh(
+                        fleet_cp["pg_dsn"], host_aliases=_host_aliases_from(fleet_cp),
+                        inspector_limits=fleet_cp.get("inspector_limits") or {})
+                    refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                  fabric_compactor=compactor, share_housekeeper=share_hk,
@@ -5132,6 +5352,8 @@ def _cmd_cp_worker(args) -> int:
                                  artifact_reconciler=reconciler)
             finally:
                 stop.set()
+                if refresh is not None:
+                    await asyncio.to_thread(refresh.stop)
                 if bridge_task is not None:
                     try:
                         await asyncio.wait_for(bridge_task, 60)    # applier.aclose / mirror.close run in its teardown

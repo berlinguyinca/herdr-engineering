@@ -22,8 +22,9 @@ const RUNS = [
 ];
 
 // What the audit counted when the floors were set (sum over STATES / over VIEWER_STATES). The totals may not fall below 90% of it.
-// focused was 480 until the Usage page put its tables and charts behind tabs: a hidden panel's links are not tab stops, so one tab stop fewer is expected there.
-const FLOOR = { owner: { controls: 540, focused: 470 }, viewer: { controls: 37, focused: 30 } };
+// focused is 480 again. It was lowered to 470 on the reasoning that the Usage tabs hide tab stops, but the Usage page is not among these states
+// (every scope is a workbench panel, #hcn-p-*); the real drift was the phone's closed Filters disclosure, fixed in 8cbeff9b. Never lower it: name the state that drifted.
+const FLOOR = { owner: { controls: 540, focused: 480 }, viewer: { controls: 37, focused: 30 } };
 
 for (const [label, opts] of RUNS) {
   test(`every control in every state is accessible: ${label}`, async () => {

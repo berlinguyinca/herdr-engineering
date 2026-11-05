@@ -118,6 +118,99 @@ def test_missing_repository_setting_fails_closed(monkeypatch, capsys):
     update.assert_not_called()
 
 
+def test_run_update_refuses_the_sentinel_form_python_m_actually_produces(checkout, monkeypatch,
+                                                                        capsys):
+    """`python -m` leaves `sys.path[0] == ""`; that sentinel is the working directory.
+
+    This is the shape bender's unit produced (`WorkingDirectory=<checkout>` + `-m`). The first version
+    of `shadowed()` returned False for an empty entry, so the real invocation went past the guard -
+    caught by running the new code in a clean main checkout on bender, not by the unit tests.
+    """
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    monkeypatch.setattr(fleet_autoupdate, "package_root", lambda: checkout)
+    monkeypatch.setattr(fleet_autoupdate, "ENTRY_PATH_ZERO", "")
+    monkeypatch.chdir(checkout)
+    with patch.object(fleet_autoupdate, "fleet_update") as update:
+        assert fleet_autoupdate.main() == 1
+    assert "checkout it would update" in json.loads(capsys.readouterr().out)["error"]
+    update.assert_not_called()
+
+
+def test_entry_captures_the_path_before_fleet_rewrites_it():
+    """`herdr_engineering.fleet` inserts `<checkout>/scripts` at `sys.path[0]` when it imports.
+
+    A guard reading `sys.path[0]` at call time therefore never sees the cwd sentinel - the mistake
+    that let bender's `python -m` invocation through (#584). `_entry` is imported before `.fleet`, so
+    its value is what the interpreter started with. Proven in a fresh interpreter: in-process the
+    order depends on which test imported the package first.
+    """
+    from pathlib import Path
+
+    from herdr_engineering import fleet_autoupdate
+
+    checkout = Path(fleet_autoupdate.__file__).resolve().parent.parent
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import herdr_engineering._entry as e, herdr_engineering.fleet, sys;"
+         "print(e.PATH_ZERO or '<cwd-sentinel>'); print(sys.path[0])"],
+        cwd=str(checkout), capture_output=True, text=True, check=True)
+    captured, after = probe.stdout.split()
+    assert captured != after
+    assert after.endswith("scripts")
+
+
+def test_every_run_records_which_code_executed_it(checkout, capsys, monkeypatch):
+    """The state file says which code performed the update, and whether that was the checkout."""
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True}):
+        assert fleet_autoupdate.main() == 0
+    capsys.readouterr()
+
+    runner = fleet_autoupdate.read_state()["detail"]
+    assert runner["runner_module"] == str(fleet_autoupdate.package_root())
+    assert runner["runner_is_checkout"] is False
+
+
+def test_a_skip_records_the_runner_too(checkout, capsys, monkeypatch):
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    subprocess.run(["git", "-C", str(checkout), "checkout", "-b", "feature"],
+                   check=True, capture_output=True)
+    with patch.object(fleet_autoupdate, "fleet_update") as update:
+        assert fleet_autoupdate.main() == 0
+    capsys.readouterr()
+    update.assert_not_called()
+
+    detail = fleet_autoupdate.read_state()["detail"]
+    assert detail["branch"] == "feature"
+    assert detail["runner_is_checkout"] is False
+
+
+def test_editable_controller_runs_and_says_so(checkout, capsys, monkeypatch):
+    """An editable install of the checkout is the other route to running its own code (bender).
+
+    Not refused - for a clean checkout the fast-forward updates the code the next run uses - but it
+    must be visible in the record, because it is why a dirty checkout stays permanently self-blocking.
+    """
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    monkeypatch.setattr(fleet_autoupdate, "package_root", lambda: checkout)
+    with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True}) as update:
+        assert fleet_autoupdate.main() == 0
+    capsys.readouterr()
+    update.assert_called_once_with()
+
+    runner = fleet_autoupdate.read_state()["detail"]
+    assert runner["runner_is_checkout"] is True
+    assert runner["runner_module"] == str(checkout)
+
+
 def test_installer_renders_explicit_checkout_and_interpreter_without_enabling(tmp_path):
     source = Path(__file__).resolve().parents[1]
     root = tmp_path / 'checkout space %n $here "quote"'
@@ -155,3 +248,111 @@ def test_installer_renders_explicit_checkout_and_interpreter_without_enabling(tm
         if "Failed to initialize manager" in stderr or "Failed to lookup RuntimeDirectory" in stderr:
             pytest.skip("user systemd manager unavailable for systemd-analyze verify")
         assert validation.returncode == 0, stderr
+
+
+def test_service_working_directory_stays_outside_the_checkout():
+    """Issue #584: `python -m` puts the working directory first on sys.path.
+
+    The repository is flat-layout, so `WorkingDirectory=<checkout>` makes the timer import the
+    checkout instead of the installed build - and then the updater a host needs is the code the
+    checkout is too far behind (or too dirty) to receive.
+    """
+    source = Path(__file__).resolve().parents[1]
+    text = (source / "scripts/herdr-eng-fleet-update.service").read_text()
+    assert "WorkingDirectory=%h" in text
+    # Nothing may re-inject the checkout as the working directory.
+    assert "__REPO__" not in text
+    assert "WorkingDirectory=__" not in text
+
+
+def test_shadowing_is_only_cwd_shadowing():
+    from herdr_engineering.fleet_autoupdate import shadowed
+
+    target = Path("/srv/controller")
+    assert shadowed(target, "/srv/controller", target) is True
+    # An editable install of the same checkout reached through the console script keeps its own
+    # interpreter directory first on sys.path; that is the operator's choice, not shadowing.
+    assert shadowed(target, "/home/operator/.local/bin", target) is False
+    # Running the installed build from inside the checkout is also fine.
+    assert shadowed(Path("/opt/herdr-engineering"), "/srv/controller", target) is False
+    # A sentinel sys.path[0] means the current directory; under pytest that is not /srv/controller.
+    # (Its cwd-dependence is pinned in the next test - the first predicate excused the sentinel
+    # altogether, and the sentinel is the shape `python -m` actually produces.)
+    assert shadowed(target, "", target) is False
+
+
+def test_the_sentinel_sys_path_entry_is_the_working_directory(tmp_path, monkeypatch):
+    """`python -m` puts the sentinel `""` at `sys.path[0]`, and that sentinel means the cwd.
+
+    Read back on bender with the new code in a clean main checkout: `-m herdr_engineering.fleet_autoupdate`
+    ran with `sys.path[0] == ''` and the package inside the checkout, and the first version of
+    `shadowed()` answered "not shadowing" - so the guard existed while the production shape walked past
+    it. The predicate must resolve the sentinel against the process working directory.
+    """
+    from herdr_engineering.fleet_autoupdate import shadowed
+
+    target = (tmp_path / "controller").resolve()
+    target.mkdir()
+
+    monkeypatch.chdir(target)
+    assert shadowed(target, "", target) is True                    # -m from inside the checkout
+    monkeypatch.chdir(tmp_path)
+    assert shadowed(target, "", target) is False                   # -m from a neutral directory
+    assert shadowed(target, str(target), target) is True           # cwd spelled absolutely
+    assert shadowed(target, str(tmp_path / "bin"), target) is False  # console script
+
+
+def test_run_update_refuses_to_update_the_checkout_it_imported(checkout, monkeypatch, tmp_path,
+                                                               capsys):
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    monkeypatch.setattr(fleet_autoupdate, "package_root", lambda: checkout)
+    monkeypatch.setattr(fleet_autoupdate, "ENTRY_PATH_ZERO", str(checkout))
+    with patch.object(fleet_autoupdate, "fleet_update") as update:
+        assert fleet_autoupdate.main() == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "checkout it would update" in error
+    assert "herdr-eng fleet update" in error
+    update.assert_not_called()
+    # Refused before any work: no lock file, no state recorded as a fleet change.
+    assert not (tmp_path / "state" / "herdr-engineering" / "fleet-auto-update.lock").exists()
+
+
+def test_a_parity_failure_records_which_host_failed(checkout, capsys, monkeypatch):
+    """`unattended update failed: None` told the operator nothing.
+
+    The 2026-11-04 run on bender deployed to all three hosts (`fleet_sync` rc 0, status rc 0) and
+    failed only the parity check on one host's agent state. That report has no `error` key, so the
+    recorded reason was null and `herdr-eng memory doctor` printed `unattended update failed: None`.
+    """
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    report = {
+        "ok": False,
+        "revision": "3c1946abd8b6c6a89390257fe88d88d23520992b",
+        "steps": {
+            "fleet_sync": {"ok": True, "rc": 0},
+            "revision_parity": {"ok": False, "invalid_hosts": ["mac"], "mismatched_hosts": []},
+        },
+    }
+    with patch.object(fleet_autoupdate, "fleet_update", return_value=report):
+        assert fleet_autoupdate.main() == 1
+    capsys.readouterr()
+
+    state = fleet_autoupdate.read_state()
+    assert state["outcome"] == "failed"
+    assert state["reason"] is not None, "a failure must never record a null reason"
+    assert "mac" in state["reason"]
+    assert state["revision"] == report["revision"]
+
+
+def test_a_failure_with_no_detail_at_all_still_says_so(checkout, capsys, monkeypatch):
+    from herdr_engineering import fleet_autoupdate
+
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(checkout))
+    with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": False}):
+        assert fleet_autoupdate.main() == 1
+    capsys.readouterr()
+    assert fleet_autoupdate.read_state()["reason"] == "fleet update failed without reporting a reason"

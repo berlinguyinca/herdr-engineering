@@ -390,7 +390,7 @@ const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" sty
 function routeSkeleton(match, parts) {
   const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' || match.startsWith('/analytics') || match.startsWith('/pr/') ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
   const piMission = match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:');
-  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' || match === '/deployments' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match === '/fabric-services' || match.startsWith('/pr/') ? 2 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' || match === '/deployments' || match === '/ai-sync' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match === '/fabric-services' || match.startsWith('/pr/') ? 2 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
   return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
@@ -1008,9 +1008,13 @@ async function copyText(text, btn) {
 }
 
 async function viewServices(_parts, revision) {
-  const { services } = await client.listServices();
+  const scope=({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr';
+  const showAll=route().query.get('all')==='1';
+  const requested=route().query.get('status');
+  const status=['current','unavailable','unknown','all','archived'].includes(requested)?requested:showAll?'all':'current';
+  const body=await client.listServiceCatalog({scope,status,includeArchived:status==='archived',groupBy:scope==='herdr'?'project':'type'});
   if (revision !== renderRevision) return;
-  return mountServices(root, client, services, { scope: ({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
+  return mountServices(root, client, body.page ? body : body.services, {scope,showAll,status});
 }
 
 async function viewFabricServices(_parts, revision) {
@@ -1024,7 +1028,7 @@ async function viewFabricServices(_parts, revision) {
 async function viewAiSync(_parts, revision) {
   const data = await client.listAiSync();
   if (revision !== renderRevision) return;
-  const stop = mountAiSync(root, client, data);
+  const stop = mountAiSync(root, client, data, { freshness: (ok, message) => root.querySelector('herdr-freshness')?.touch?.(ok, message) });
   root.querySelector('herdr-freshness')?.touch?.(true);
   return { refresh() {}, dispose: stop };
 }

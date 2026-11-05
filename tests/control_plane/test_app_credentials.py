@@ -230,3 +230,19 @@ def test_no_tombstone_without_persistence(box):
     s.put_connection("t", "u", "gmail", account="a", scopes=[], refresh_token="r")
     s.delete_connection("t", "u", "gmail")
     assert s._tombstones == set()
+
+
+def test_one_corrupt_blocked_row_fails_only_that_person_closed(box):
+    p = _Fake()
+    p.blocked[("t", "ann", "calendar")] = ["work"]
+    p.blocked[("t", "bob", "calendar")] = ["kids"]
+    real = p.load_blocked
+    p.load_blocked = lambda: [*real(), ("t", "bad", "calendar", "{not json")]
+    s = CredentialStore(box, p)
+    assert s.blocked_loaded
+    assert s.get_blocked("t", "ann", "calendar") == ["work"]
+    assert s.get_blocked("t", "bob", "calendar") == ["kids"]
+    with pytest.raises(AppsError):
+        s.get_blocked("t", "bad", "calendar")        # unknown stays closed for that person only
+    s.set_blocked("t", "bad", "calendar", ["x"])      # saving a fresh list heals the row
+    assert s.get_blocked("t", "bad", "calendar") == ["x"]

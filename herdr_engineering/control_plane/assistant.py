@@ -43,10 +43,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from . import placement, slurm_placement
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.events import WorkerEvent, event_size
+from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
+from .assistant_hub.shadow import JudgeRecord
 from .assistant_hub.verbs import Verb
 from .assistant_hub.vetoes import FIXED_VETOES
 from .assistant_hub.workers import Enrollment, Worker
@@ -192,6 +195,17 @@ def _delegation_pi_bindings(value: Any) -> list[dict[str, str]]:
 
 
 _TENANT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}\Z")
+
+
+def _context_rejection(exc: Exception) -> bool:
+    """The gateway's 400 for a prompt larger than one model's window ("request exceeds available context windows"): a model with
+    a bigger window can still answer it. Any other 400 is a bad request and fails fast."""
+    if getattr(exc, "code", None) != 400 or not callable(getattr(exc, "read", None)):
+        return False
+    try:
+        return b"context window" in exc.read(2000).lower()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _model_preferences(value: Any) -> list[str]:
@@ -349,6 +363,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "ci_watch": ci_watch_config(section.get("ci_watch")),
         # Scheduled inbox watch (inbox_watch.py): new mail goes to the assistant as one triage turn; off unless enabled.
         "inbox_watch": inbox_watch_config(section.get("inbox_watch")),
+        # Team collaboration slice 4 (assistant_briefs.py): derived briefs to a team; off unless enabled; no key skips approval.
+        "team_briefs": team_briefs_config(section.get("team_briefs")),
         # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
         "apps": apps_config(section.get("apps")),
         # Tailnet-only MCP hub: off unless enabled; the tenant defaults to the section's default tenant.
@@ -362,6 +378,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             ((section.get("placement") or {}).get("slurm") or {}).get("clusters"))},
         # Earned per-user action grants for hub workers (shadow period, approval thresholds, extra vetoes).
         "grants": _grants_config(section.get("grants")),
+        # Action judge (jev): off unless enabled; the API key is read from api_key_file, never inline.
+        "judge": _judge_config(section.get("judge")),
     }
 
 
@@ -493,6 +511,121 @@ def _grants_config(raw: Any) -> dict[str, Any]:
         "grant_ttl_days": _hub_pos_int(raw.get("grant_ttl_days", 30), f"{where}.grant_ttl_days"),
         "extra_vetoes": _grants_extra_vetoes(raw.get("extra_vetoes", []), f"{where}.extra_vetoes"),
         "policy_version": _hub_pos_int(raw.get("policy_version", 1), f"{where}.policy_version"),
+    }
+
+
+_JUDGE_KEYS = {"enabled", "provider", "endpoint", "model", "api_key_file", "timeout_seconds", "fail_mode",
+               "backend_confirmed", "thresholds", "calibration"}
+_JUDGE_INLINE_SECRETS = {"api_key", "key", "token", "secret"}
+_JUDGE_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+_JUDGE_THRESHOLDS = {"destructive": 0.30, "irreversible": 0.30, "severity_score": 2.0}
+
+
+def _judge_number(value: Any, where: str, low: float, high: float, *, low_open: bool) -> float:
+    ok = not isinstance(value, bool) and isinstance(value, (int, float)) and (
+        (value > low if low_open else value >= low) and value <= high)
+    if not ok:
+        bound = f"above {low:g}" if low_open else f"at least {low:g}"
+        raise ValueError(f"{where} must be a number {bound} and at most {high:g}")
+    return float(value) + 0.0
+
+
+def _judge_sub(raw: Any, where: str, allowed: set[str]) -> dict[str, Any]:
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    return raw
+
+
+def _judge_endpoint(value: Any, where: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{where} must be a string")
+    value = value.strip()
+    if not value:
+        return ""
+    if any(ch.isspace() or ord(ch) < 32 for ch in value):
+        raise ValueError(f"{where} must not contain whitespace or control characters")
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError as exc:
+        raise ValueError(f"{where} is not a valid URL: {exc}") from exc
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ValueError(f"{where} must not contain user info")
+    if "?" in value or "#" in value:
+        raise ValueError(f"{where} must not contain a query or fragment")
+    if not host:
+        raise ValueError(f"{where} needs a host")
+    if parts.scheme == "http" and host not in _JUDGE_LOOPBACK:
+        raise ValueError(f"{where} must use https:// (http:// is allowed only for loopback hosts)")
+    if parts.scheme not in ("http", "https"):
+        raise ValueError(f"{where} must be an https:// URL")
+    return parts.scheme + value[len(parts.scheme):]
+
+
+def _judge_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.judge``. Off by default; secrets only via ``api_key_file``."""
+    where = "control_plane.personal_assistant.judge"
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    inline = sorted(set(raw) & _JUDGE_INLINE_SECRETS)
+    if inline:
+        raise ValueError(f"{where} must not hold secrets inline ({inline}); put the key in a file and set api_key_file")
+    unknown = set(raw) - _JUDGE_KEYS
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    flags: dict[str, bool] = {}
+    for name in ("enabled", "backend_confirmed"):
+        flags[name] = raw.get(name, False)
+        if not isinstance(flags[name], bool):
+            raise ValueError(f"{where}.{name} must be true or false (not a string)")
+    if raw.get("provider", "jev") != "jev":
+        raise ValueError(f"{where}.provider must be 'jev'")
+    if raw.get("fail_mode", "closed") != "closed":
+        raise ValueError(f"{where}.fail_mode must be 'closed'")
+    model = raw.get("model", "laya-auto")
+    if not isinstance(model, str) or not model.strip() or len(model) > 200:
+        raise ValueError(f"{where}.model must be a non-empty string of at most 200 characters")
+    timeout = raw.get("timeout_seconds", 5)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 60:
+        raise ValueError(f"{where}.timeout_seconds must be an integer between 1 and 60")
+    endpoint = _judge_endpoint(raw.get("endpoint", ""), f"{where}.endpoint")
+    key_file = raw.get("api_key_file", "")
+    if not isinstance(key_file, str):
+        raise ValueError(f"{where}.api_key_file must be a path string")
+    key_file = key_file.strip()
+    if key_file and not key_file.startswith("/"):
+        raise ValueError(f"{where}.api_key_file must be an absolute path")
+    if flags["enabled"] and not endpoint:
+        raise ValueError(f"{where}.endpoint is required when the judge is enabled")
+    if flags["enabled"] and not key_file:
+        raise ValueError(f"{where}.api_key_file is required when the judge is enabled")
+    th = _judge_sub(raw.get("thresholds"), f"{where}.thresholds", set(_JUDGE_THRESHOLDS))
+    thresholds = {k: _judge_number(th.get(k, d), f"{where}.thresholds.{k}", 0.0, 3.0 if k == "severity_score" else 1.0,
+                                   low_open=k != "severity_score") for k, d in _JUDGE_THRESHOLDS.items()}
+    cal = _judge_sub(raw.get("calibration"), f"{where}.calibration", {"min_labeled_decisions", "max_false_negative_bound"})
+    labeled = cal.get("min_labeled_decisions", 200)
+    if isinstance(labeled, bool) or not isinstance(labeled, int) or labeled < 20:
+        raise ValueError(f"{where}.calibration.min_labeled_decisions must be an integer of at least 20")
+    return {
+        "enabled": flags["enabled"],
+        "provider": "jev",
+        "endpoint": endpoint,
+        "model": model.strip(),
+        "api_key_file": key_file,
+        "timeout_seconds": timeout,
+        "fail_mode": "closed",
+        "backend_confirmed": flags["backend_confirmed"],
+        "thresholds": thresholds,
+        "calibration": {"min_labeled_decisions": labeled,
+                        "max_false_negative_bound": _judge_number(cal.get("max_false_negative_bound", 0.05),
+                                                                  f"{where}.calibration.max_false_negative_bound",
+                                                                  0.0, 0.5, low_open=True)},
     }
 
 
@@ -1628,7 +1761,7 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
                 code = getattr(exc, "code", None)
                 if code is None and not isinstance(exc, OSError):      # timeouts and resets are OSErrors; a bug is not
                     raise
-                if code is not None and code not in RETRY_CODES:
+                if code is not None and code not in RETRY_CODES and not _context_rejection(exc):
                     raise
                 _log.warning("assistant model %r failed (%s); trying the next", model,
                              code if code is not None else type(exc).__name__)
@@ -1936,6 +2069,7 @@ class AssistantStore:
         self.connectors: dict[str, Connector] = {}
         self.delegations: dict[str, DelegationRequest] = {}
         self.proposals: dict[str, AssistantProposal] = {}
+        self.team_briefs: dict[str, TeamBriefRecord] = {}          # reference -> the private record of one offered brief
         self.notifications: dict[str, AssistantNotification] = {}
         self.workers: dict[str, Worker] = {}
         self.enrollments: dict[str, Enrollment] = {}
@@ -1943,6 +2077,8 @@ class AssistantStore:
         self.action_grants: dict[str, ActionGrant] = {}
         self.action_requests: dict[str, ActionRequestRow] = {}      # insertion order == oldest first
         self.action_evidence: dict[str, ActionEvidence] = {}        # insertion order == oldest first
+        self.judge_records: dict[str, JudgeRecord] = {}             # insertion order == oldest first
+        self._judge_index: dict[str, dict[str, None]] = {}
         self.max_action_rows_per_tenant = 5000
         self.max_action_grants_per_tenant = 2000
         self._request_index: dict[str, dict[str, None]] = {}        # tenant -> request ids, oldest first
@@ -2011,6 +2147,7 @@ class AssistantStore:
                 "connectors": [self._e_to_dict(c) for c in self.connectors.values()],
                 "delegations": [self._e_to_dict(d) for d in self.delegations.values()],
                 "proposals": [self._e_to_dict(x) for x in self.proposals.values()],
+                "team_briefs": [self._e_to_dict(x) for x in self.team_briefs.values()],
                 "notifications": [self._e_to_dict(x) for x in self.notifications.values()],
                 "workers": [self._e_to_dict(x) for x in self.workers.values()],
                 "enrollments": [self._e_to_dict(x) for x in self.enrollments.values()],
@@ -2018,6 +2155,7 @@ class AssistantStore:
                 "action_grants": [self._e_to_dict(x) for x in self.action_grants.values()],
                 "action_requests": [self._e_to_dict(x) for x in self.action_requests.values()],
                 "action_evidence": [self._e_to_dict(x) for x in self.action_evidence.values()],
+                "judge_records": [self._e_to_dict(x) for x in self.judge_records.values()],
                 "policy_state": dict(self.policy_state),
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
@@ -2049,6 +2187,8 @@ class AssistantStore:
                                 (self._e_from_dict(DelegationRequest, d) for d in snap.get("delegations", []))}
             self.proposals = {x.proposal_id: x for x in
                               (self._e_from_dict(AssistantProposal, d) for d in snap.get("proposals", []))}
+            self.team_briefs = {x.reference: x for x in
+                                (self._e_from_dict(TeamBriefRecord, d) for d in snap.get("team_briefs", []))}
             self.notifications = {x.notification_id: x for x in
                                   (self._e_from_dict(AssistantNotification, d)
                                    for d in snap.get("notifications", []))}
@@ -2072,14 +2212,19 @@ class AssistantStore:
                                     (self._e_from_dict(ActionRequestRow, d) for d in snap.get("action_requests", []))}
             self.action_evidence = {x.evidence_id: x for x in
                                     (self._e_from_dict(ActionEvidence, d) for d in snap.get("action_evidence", []))}
-            self._request_index, self._evidence_index = {}, {}
+            self.judge_records = {x.record_id: x for x in
+                                  (self._e_from_dict(JudgeRecord, d) for d in snap.get("judge_records", []))}
+            self._request_index, self._evidence_index, self._judge_index = {}, {}, {}
+            for j in self.judge_records.values():
+                self._judge_index.setdefault(j.tenant_id, {})[j.record_id] = None
             for r in self.action_requests.values():
                 self._request_index.setdefault(r.tenant_id, {})[r.request_id] = None
             for ev in self.action_evidence.values():
                 self._evidence_index.setdefault(ev.tenant_id, {})[ev.evidence_id] = None
             self.policy_state = dict(snap.get("policy_state", {}))
             for rows, index in ((self.action_requests, self._request_index),
-                                (self.action_evidence, self._evidence_index)):
+                                (self.action_evidence, self._evidence_index),
+                                (self.judge_records, self._judge_index)):
                 for idx in index.values():           # an oversized snapshot must not stay over the cap
                     while len(idx) > self.max_action_rows_per_tenant:
                         rows.pop(next(iter(idx)), None)
@@ -2176,6 +2321,70 @@ class AssistantStore:
             return self._sorted_copies([e for e in self.action_evidence.values()
                                         if e.tenant_id == tenant_id and e.user_id == user_id
                                         and (key_id is None or e.key_id == key_id)])
+
+    # -- shadow judge records ----------------------------------------------------
+    def add_judge_record(self, record: JudgeRecord) -> bool:
+        """Store a record; exactly one per (tenant, request). False when the request already has one."""
+        with self._lock:
+            if record.record_id in self.judge_records:
+                return False                      # never overwrite, whichever user wrote it
+            if self._judge_by_request(record.tenant_id, record.user_id, record.request_id) is not None:
+                return False
+            self._bounded_put(self.judge_records, self._judge_index, record.tenant_id, record.record_id,
+                              replace(record))
+            self._after_mutation()
+            return True
+
+    def _judge_by_request(self, tenant_id: str, user_id: str, request_id: str) -> JudgeRecord | None:
+        for rid in self._judge_index.get(tenant_id, {}):
+            r = self.judge_records.get(rid)
+            if r is not None and r.request_id == request_id and r.user_id == user_id:
+                return r
+        return None
+
+    def get_judge_record_by_request(self, tenant_id: str, user_id: str, request_id: str) -> JudgeRecord | None:
+        with self._lock:
+            r = self._judge_by_request(tenant_id, user_id, request_id)
+            return replace(r) if r else None
+
+    _JUDGE_LABEL_FIELDS = frozenset({"owner_decision", "decided_at", "regret", "label_note"})
+
+    def update_judge_label(self, tenant_id: str, user_id: str, request_id: str, /, **changes: Any) -> bool:
+        """Set owner-label fields on the request's record; False (and no change) when there is none."""
+        bad = set(changes) - self._JUDGE_LABEL_FIELDS
+        if bad:
+            raise ValueError(f"not a judge label field: {sorted(bad)}")
+        if changes.get("owner_decision", "") not in ("", "approved", "denied"):
+            raise ValueError("owner_decision must be '', 'approved' or 'denied'")
+        with self._lock:
+            r = self._judge_by_request(tenant_id, user_id, request_id)
+            if r is None:
+                return False
+            if changes.get("owner_decision") and r.owner_decision:
+                return False                      # the first owner label wins
+            for name, value in changes.items():
+                setattr(r, name, value)
+            self._after_mutation()
+            return True
+
+    def mark_judge_regret(self, tenant_id: str, key_id: str, worker_id: str, *, user_id: str | None = None) -> int:
+        with self._lock:
+            hit = [self.judge_records[rid] for rid in self._judge_index.get(tenant_id, {})
+                   if rid in self.judge_records and self.judge_records[rid].key_id == key_id
+                   and self.judge_records[rid].worker_id == worker_id
+                   and self.judge_records[rid].owner_decision == "approved"
+                   and (user_id is None or self.judge_records[rid].user_id == user_id)]
+            for r in hit:
+                r.regret = True
+            if hit:
+                self._after_mutation()
+            return len(hit)
+
+    def list_judge_records(self, tenant_id: str, user_id: str, judge_version: str | None = None) -> list[JudgeRecord]:
+        with self._lock:
+            return self._sorted_copies([r for r in self.judge_records.values()
+                                        if r.tenant_id == tenant_id and r.user_id == user_id
+                                        and (judge_version is None or r.judge_version == judge_version)])
 
     def ensure_shadow_started(self, now: datetime, configured: datetime | None = None) -> datetime:
         """The shadow period's start: the configured time if set, else the first time seen (persisted)."""
@@ -2539,6 +2748,21 @@ class AssistantStore:
             key=lambda c: c.created_at)
 
     # -- delegations ---------------------------------------------------------------
+    def put_team_brief_required(self, rec: TeamBriefRecord) -> None:
+        """Store one brief record and acknowledge durable persistence, or raise (and leave the store as it was). The collab log
+        is only written after this returns, so a crash can lose the log entry but never the reference."""
+        with self._lock:
+            previous = self.team_briefs.get(rec.reference)
+            self.team_briefs[rec.reference] = rec
+            try:
+                self._persist_required()
+            except Exception:
+                if previous is None:
+                    self.team_briefs.pop(rec.reference, None)
+                else:
+                    self.team_briefs[rec.reference] = previous
+                raise
+
     def put_delegation(self, d: DelegationRequest) -> None:
         with self._lock:
             d.updated_at = _now()
@@ -2747,6 +2971,13 @@ class AssistantService:
         self.ci_rerun_request = None   # same signature; queues a ci_rerun (restart that CI run) proposal beside the repair
         self.ci_repo_scope = None      # (tenant, user, "owner/name") -> bool: is the repo in this user's board scope (pre-filter)
         self.ci_snapshot = None        # callable -> CI monitor snapshot (cache read); a second source of failed runs for watch_ci
+        # Team collaboration slice 4 (assistant_briefs.py). Both hooks are wired by the control plane and absent means "not available".
+        self.mail_source = None        # (tenant, user, message id) -> a Gmail users.messages.get dict (raises LookupError when absent)
+        self.brief_submitter = None    # (collab_user, room_id, brief dict) -> dict: the collab service's in-process submit_brief
+        self.team_briefs = TeamBriefService(self)
+        if self.config["team_briefs"]["enabled"] and not self.store.supports_required_persistence:
+            raise ValueError("control_plane.personal_assistant.team_briefs requires acknowledged assistant persistence "
+                             "(personal_assistant.persistence.dsn): the brief reference must survive a restart")
         if runner is not None:
             self.runner = runner
         else:
@@ -2761,6 +2992,10 @@ class AssistantService:
                                            list(inf.get("preferred_models") or [])),
                     context_provider=self.fleet_context,
                     context_gate=lambda run: self.fleet_allowed(run.user_id))
+                resolver = self.runner.resolver
+                if resolver is not None:      # off-thread: a slow gateway must never delay startup
+                    threading.Thread(target=resolver.check_configured, args=(str(inf.get("model", "")),),
+                                     name="assistant-model-check", daemon=True).start()
             else:
                 self.runner = LocalRunnerAdapter(self.store)
         self._shell_runner = None  # injected in tests; default uses subprocess

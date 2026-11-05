@@ -23,7 +23,13 @@ import os
 import subprocess
 from pathlib import Path
 
+# Imported before `.fleet`, which rewrites sys.path at import time (see herdr_engineering/_entry.py).
+from . import _entry
 from .fleet import fleet_update
+
+#: The interpreter's own `sys.path[0]`, captured before `.fleet` could replace it with the checkout's
+#: `scripts/` directory. This is what `shadowed()` is allowed to reason about.
+ENTRY_PATH_ZERO = _entry.PATH_ZERO
 
 #: How many dirty paths to name in a skip report (the count is always exact).
 SKIP_PREVIEW_FILES = 8
@@ -110,12 +116,75 @@ def _divergence(root: Path) -> dict:
     return detail
 
 
-def run_update() -> dict:
-    """Run the normal updater only for an explicitly configured clean main checkout."""
+def package_root() -> Path:
+    """The directory holding the `herdr_engineering` package this process imported."""
+    return Path(__file__).resolve().parent.parent
+
+
+def shadowed(module_root: Path, entry: str, target: Path) -> bool:
+    """Whether the code running this update came from the checkout it is about to update.
+
+    For `python -m`, `sys.path[0]` is the working directory. This project is flat-layout
+    (`herdr_engineering/` at the repository root), so a unit with `WorkingDirectory=<checkout>`
+    imports the checkout rather than the installed build, and the updater that is meant to
+    fast-forward a checkout becomes whatever revision that checkout happens to hold. A checkout
+    behind then runs an outdated updater, and a fix shipped inside the updater can only arrive by
+    fast-forwarding the very checkout it exists to unblock - observed on bender (exit 1 reporting
+    the pre-#572 message while the installed build already reported a skip) and on the Mac before
+    #583 gave the launchd counterpart a neutral working directory (#584).
+
+    Only cwd shadowing is refused: an editable install reached through the `herdr-eng` console
+    script (or `python -m` from a neutral directory) is the operator's own checkout by choice.
+
+    `sys.path[0]` is the sentinel `""` for `python -m` and `python -c` on CPython 3.12 - read back on
+    bender, the host this defect was found on - and the sentinel *means* the working directory. So an
+    empty entry is resolved against `Path.cwd()` rather than excused: the first version of this
+    predicate returned False for it, which let the exact production shape (`-m`, a unit whose working
+    directory is inside the checkout) walk past the guard on a real host.
+    """
+    try:
+        # Not strict: the working directory can be a path that no longer exists, and a checkout
+        # that has vanished cannot be updated by anyone.
+        origin = Path(entry).resolve() if entry else Path.cwd().resolve()
+        return origin == target and module_root.resolve() == target
+    except OSError:
+        return False
+
+
+def runner_identity(root: Path) -> dict:
+    """Which code is performing this update, and whether it is the checkout being updated.
+
+    Two independent routes make the nightly job run a checkout's own code. One is `python -m` with
+    the checkout as the process working directory: `sys.path[0]` then wins over every install, and
+    that is what the unit used to do (fixed by `WorkingDirectory=%h`, and refused by `shadowed()`).
+    The other is an **editable install of the controller checkout** - bender's controller `.venv`
+    carries `__editable__.herdr_engineering-0.1.0.pth` - so its runner is the checkout whatever the
+    working directory is. That route is not refused: for a clean checkout the fast-forward simply
+    updates the code the next run uses. But it is why a dirty checkout is permanently self-blocking
+    (the runner cannot be refreshed from a checkout the updater will not touch), so every run records
+    it instead of leaving the condition invisible - the mistake D23 warns against is asserting a
+    mechanism from how installs *should* be laid out rather than from what actually ran.
+    """
+    module = package_root().resolve()
+    return {"runner_module": str(module), "runner_is_checkout": module == root.resolve()}
+
+
+def controller_root() -> Path:
+    """The controller checkout the unattended updater is configured to update."""
     configured_root = os.environ.get("HERDR_ENGINEERING_REPO")
     if not configured_root:
         raise RuntimeError("HERDR_ENGINEERING_REPO must name the controller checkout")
-    root = Path(configured_root).resolve(strict=True)
+    return Path(configured_root).resolve(strict=True)
+
+
+def run_update() -> dict:
+    """Run the normal updater only for an explicitly configured clean main checkout."""
+    root = controller_root()
+    if shadowed(package_root(), ENTRY_PATH_ZERO, root):
+        raise RuntimeError(
+            f"the fleet updater is running from {package_root()}, the checkout it would update; "
+            "run the installed `herdr-eng fleet update`, or give the unit a working directory "
+            "outside the checkout (see scripts/herdr-eng-fleet-update.service)")
     state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
     lock_path = state / "herdr-engineering" / "fleet-auto-update.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -152,20 +221,53 @@ def run_update() -> dict:
         return fleet_update()
 
 
+def failure_reason(report: dict) -> str | None:
+    """Why `fleet_update()` said no, in the one line the doctor prints.
+
+    `fleet_update()` fails two ways: it raises nothing and sets `error` (a precondition it refused),
+    or it completes the deploy and returns `ok: false` because the post-deploy parity check found a
+    host that does not match. The second kind carries no `error` at all - the reason lives in
+    `steps.revision_parity` - so recording `report.get("error")` wrote `reason: null`, and
+    `herdr-eng memory doctor` printed `unattended update failed: None` for a fleet whose deploy had
+    succeeded everywhere and whose only complaint was one host's agent state.
+    """
+    error = report.get("error")
+    if error:
+        return str(error)
+    if not report.get("ok"):
+        parity = (report.get("steps") or {}).get("revision_parity") or {}
+        for key in ("missing_hosts", "mismatched_hosts", "invalid_hosts",
+                    "unexpected_hosts", "duplicate_hosts"):
+            hosts = parity.get(key)
+            if hosts:
+                return f"revision parity failed: {key[:-1]} {', '.join(str(h) for h in hosts)}"
+        if parity:
+            return "revision parity failed (no host detail recorded)"
+        return "fleet update failed without reporting a reason"
+    return None
+
+
 def main() -> int:
+    runner: dict = {}
+    try:
+        runner = runner_identity(controller_root())
+    except (OSError, RuntimeError):
+        pass  # no controller configured (or unreachable): nothing to attribute this run to
     try:
         report = run_update()
     except SkipUpdate as exc:
         report = {"ok": True, "skipped": True, "reason": str(exc)}
-        if exc.detail:
-            report["detail"] = exc.detail
-        record_run("skipped", reason=str(exc), detail=exc.detail or None)
+        detail = {**runner, **(exc.detail or {})}
+        if detail:
+            report["detail"] = detail
+        record_run("skipped", reason=str(exc), detail=detail or None)
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         report = {"ok": False, "error": str(exc)}
-        record_run("failed", reason=str(exc))
+        record_run("failed", reason=str(exc), detail=runner or None)
     else:
         record_run("updated" if report.get("ok") else "failed",
-                   reason=report.get("error"), revision=report.get("revision"))
+                   reason=failure_reason(report), revision=report.get("revision"),
+                   detail=runner or None)
     print(json.dumps(report, sort_keys=True))
     return 0 if report.get("ok") else 1
 

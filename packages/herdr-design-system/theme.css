@@ -92,6 +92,7 @@
   --error-bg: #fef2f2;
   --info-bg: var(--accent-weak);
   --warn-text: #9b5d00;
+  --ok-text: #0a7a55;
   --drift-bg: #fff4e5;
   --drift-text: #8a4b00;
   --missing-bg: #f6f6f6;
@@ -155,6 +156,7 @@
     --freshness-warn: #fbbf24;
     --error-bg: #3a1a1a;
     --warn-text: #fbbf24;
+    --ok-text: #34d399;
     --drift-bg: #3a2a10;
     --drift-text: #ffc46b;
     --missing-bg: #1f2227;
@@ -217,6 +219,7 @@
   --freshness-warn: #fbbf24;
   --error-bg: #3a1a1a;
   --warn-text: #fbbf24;
+  --ok-text: #34d399;
   --drift-bg: #3a2a10;
   --drift-text: #ffc46b;
   --missing-bg: #1f2227;
@@ -250,6 +253,7 @@
 /* Shared data table */
 .hd-table-wrap { max-width: 100%; overflow-x: auto; }
 [data-artifact-registry] .hd-inline { flex-wrap: wrap; }
+[data-artifact-registry] [hidden] { display: none !important; }
 [data-artifact-registry] .hd-input { min-width: 0; max-width: 100%; padding: 8px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font: inherit; }
 .hd-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; background: var(--surface); }
 .hd-table th, .hd-table td { padding: var(--density-row-padding, 8px) 12px; text-align: left; border-bottom: 1px solid var(--border-subtle); }
