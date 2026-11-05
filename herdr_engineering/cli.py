@@ -5236,7 +5236,11 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rust
     applier.register_commit()
     register_annotation_resolve(applier)
     register_member_intents(applier)
-    publisher = None if members is None else (lambda conn: publish_member_views(conn, members))
+    publisher = None
+    if members is not None:
+        import dataclasses
+        pooled = dataclasses.replace(members, rustfs=rustfs)     # the view tick fills the library content pool
+        publisher = lambda conn: publish_member_views(conn, pooled)  # noqa: E731
     return cp_worker.CollabBridgeLoop(connect, mirror, applier, members_publisher=publisher)
 
 

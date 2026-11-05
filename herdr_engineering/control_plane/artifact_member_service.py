@@ -37,8 +37,12 @@ from .artifact_member_intents import (
     KIND_SHARE_CREATE,
     KIND_SHARE_EVENTS,
     KIND_SHARE_REVOKE,
+    LIBRARY_CONTENT_DIR,
     MEMBER_VIEWS_DIR,
     take_secret,
+)
+from .artifact_member_intents import (
+    LIB_MAX_FILE_BYTES as LIBRARY_FILE_MAX,
 )
 from .artifact_members import member_owner_key
 from .collab import CollabError, CollabService, Principal
@@ -53,6 +57,7 @@ from .collab_bridge_files import (
     BridgeLimits,
     file_exists_beneath,
     list_parts,
+    open_beneath,
     read_json_beneath,
     read_staged_meta,
     remove_tree_beneath,
@@ -333,6 +338,39 @@ class MemberService:
             return {"items": [], "folders": []}
         return {"items": library.get("items") if isinstance(library.get("items"), list) else [],
                 "folders": library.get("folders") if isinstance(library.get("folders"), list) else []}
+
+    def library_content(self, actor: Mapping[str, Any], artifact_id: Any, path: Any) -> tuple[dict[str, Any], bytes]:
+        """``(file entry, bytes)`` of ``path`` in the head version of a library item of the caller.  The item must be in
+        the caller's own view (active or pending) with a ``files`` entry for exactly this path; the bytes come from the
+        worker's gated pool by their digest.  Everything else (stranger, missing, revoked, expired, unknown path, pool
+        blob gone or changed) is one 404; an owner whose item is over the size caps is told ``too_large``."""
+        who = self._caller(actor, "content")
+        view = self._view(who)
+        item = self._entry((view.get("library") or {}).get("items") if isinstance(view.get("library"), dict) else None,
+                           artifact_id)
+        if item is None or item.get("status") not in ("active", "pending") or not isinstance(path, str):
+            raise self._fail(who.pr, "content", "not_visible", 404, "not_found", NOT_FOUND, artifact_id)
+        files = item.get("files") if isinstance(item.get("files"), list) else []
+        entry = next((f for f in files if isinstance(f, dict) and f.get("path") == path), None)
+        if entry is None:
+            if item.get("too_large") is True and self._entry(view.get("artifacts"), artifact_id) is not None:
+                raise MemberServiceError(404, "too_large", "this artifact is too large to open here")
+            raise self._fail(who.pr, "content", "no_file", 404, "not_found", NOT_FOUND, artifact_id)
+        sha, size = entry.get("sha256"), entry.get("size")
+        if (not isinstance(sha, str) or not _SHA.match(sha) or isinstance(size, bool) or not isinstance(size, int)
+                or not 0 <= size <= LIBRARY_FILE_MAX):
+            raise self._fail(who.pr, "content", "bad_entry", 404, "not_found", NOT_FOUND, artifact_id)
+        fh = open_beneath(self.bridge.mirror, [LIBRARY_CONTENT_DIR, sha], max_bytes=size)
+        if fh is None:
+            raise self._fail(who.pr, "content", "no_blob", 404, "not_found", NOT_FOUND, artifact_id)
+        try:
+            with fh:
+                data = fh.read(size + 1)
+        except (OSError, BridgeError):
+            raise self._fail(who.pr, "content", "no_blob", 404, "not_found", NOT_FOUND, artifact_id) from None
+        if len(data) != size or hashlib.sha256(data).hexdigest() != sha:
+            raise self._fail(who.pr, "content", "bad_blob", 404, "not_found", NOT_FOUND, artifact_id)
+        return entry, data
 
     def library_write(self, actor: Mapping[str, Any], kind: str, payload: dict, artifact_id: str | None = None) -> dict[str, Any]:
         """Enqueue one library intent (folders, filing, accept or discard of a push) and return the ticket result.  The

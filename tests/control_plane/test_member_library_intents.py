@@ -1,15 +1,22 @@
 # ruff: noqa: F811  (pytest fixtures are imported by name)
 """Library worker intents and the ``library`` key of the member view (Task 6), on real Postgres and the real worker."""
 
+import dataclasses
+import hashlib
+import os
+
 from herdr_engineering.control_plane.artifact_library import LibraryStore
+from herdr_engineering.control_plane.artifact_member_intents import publish_member_views
 from tests.control_plane.registry_pg import registry_pg  # noqa: F401 - imported fixture
 from tests.control_plane.test_artifact_member_intents import (
     ALICE,
     BOB,
+    HTML,
     USERS,
     agent,
     create,
     mrun,
+    publish,
     send,
     sql,
     user,
@@ -246,5 +253,116 @@ def test_view_uses_directory_email_and_groups(registry_pg, tmp_path):
         await new_folder(env, "bob")
         ids = {i["artifact_id"]: i for i in view_of(env, BOB)["library"]["items"]}
         assert ids[mine]["share_id"] == sid and ids[mine]["source"] == "assigned"
+
+    lrun(registry_pg, tmp_path, body)
+
+
+POOL = "library-content"
+
+
+def pool_files(env):
+    root = env.mirror_root / POOL
+    return {p.name: p.read_bytes() for p in root.iterdir()} if root.exists() else {}
+
+
+async def tick(env, rt):
+    async with env.pool.acquire() as conn:
+        await publish_member_views(conn, dataclasses.replace(rt, rustfs=env.applier.rustfs))
+
+
+def files_of(env, who, aid):
+    items = [i for i in view_of(env, who)["library"]["items"] if i["artifact_id"] == aid]
+    return items[0]["files"] if items else None
+
+
+def test_view_files_pooled_for_owner_assigned_and_claimed(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, title="Doc")
+        await publish(env, aid, {"index.html": HTML, "style.css": b"a{}"})
+        await sql(
+            env,
+            "INSERT INTO artifact_acl (artifact_id,principal_id,permissions,granted_by) "
+            "VALUES ($1,$2,'[\"read\"]'::jsonb,$3)",
+            aid,
+            BOB,
+            ALICE,
+        )
+        await tick(env, rt)
+        want = {"index.html": HTML, "style.css": b"a{}"}
+        for who in (ALICE, BOB):
+            files = files_of(env, who, aid)
+            assert {f["path"] for f in files} == set(want)
+            for f in files:
+                assert f["size"] == len(want[f["path"]]) and f["content_type"]
+                assert pool_files(env)[f["sha256"]] == want[f["path"]]
+                assert hashlib.sha256(want[f["path"]]).hexdigest() == f["sha256"]
+        mode = (
+            env.mirror_root / POOL / files_of(env, ALICE, aid)[0]["sha256"]
+        ).stat().st_mode & 0o777
+        assert mode in (0o644, 0o640, 0o600)
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_view_files_end_when_access_ends(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, title="Doc")
+        await publish(env, aid)
+        sid = await live_share(env, aid, groups=("nobody",))
+        assert (await send(env, user("bob"), CLAIM, {"share_id": sid}))["result"] == "claimed"
+        await tick(env, rt)
+        assert files_of(env, BOB, aid)
+        await sql(env, "UPDATE artifact_shares SET state='revoked' WHERE share_id=$1", sid)
+        await tick(env, rt)
+        assert not files_of(env, BOB, aid)  # revoked: no files (or no item at all)
+        await sql(
+            env,
+            "INSERT INTO artifact_acl (artifact_id,principal_id,permissions,granted_by,expires_at) "
+            "VALUES ($1,$2,'[\"read\"]'::jsonb,$3, now() - interval '1 hour')",
+            aid,
+            BOB,
+            ALICE,
+        )
+        await tick(env, rt)
+        assert not files_of(env, BOB, aid)  # expired grant
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_oversized_item_has_no_files_and_is_marked_too_large(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, title="Big")
+        await publish(env, aid)
+        await sql(
+            env, "ALTER TABLE artifact_versions DISABLE TRIGGER USER"
+        )  # immutable by trigger; fake a big file
+        await sql(
+            env,
+            "UPDATE artifact_versions SET output_manifest = (SELECT jsonb_agg(jsonb_set(e, '{size_bytes}', "
+            "to_jsonb(30000000))) FROM jsonb_array_elements(output_manifest) e) WHERE artifact_id=$1",
+            aid,
+        )
+        await sql(env, "ALTER TABLE artifact_versions ENABLE TRIGGER USER")
+        await tick(env, rt)
+        (item,) = [i for i in view_of(env, ALICE)["library"]["items"] if i["artifact_id"] == aid]
+        assert item["files"] == [] and item["too_large"] is True
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_pool_gc_removes_unreferenced_old_blobs_only(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid = await create(env, title="Doc")
+        await publish(env, aid)
+        await tick(env, rt)
+        kept = {f["sha256"] for f in files_of(env, ALICE, aid)}
+        pool = env.mirror_root / POOL
+        old, young = "a" * 64, "b" * 64
+        for name in (old, young):
+            (pool / name).write_bytes(b"orphan")
+        os.utime(pool / old, (1, 1))
+        await tick(env, rt)
+        names = set(pool_files(env))
+        assert old not in names and young in names and kept <= names
 
     lrun(registry_pg, tmp_path, body)

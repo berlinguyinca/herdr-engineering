@@ -46,6 +46,10 @@ _PATH = re.compile(r"[A-Za-z0-9_.~/-]{1,512}")
 _ID = re.compile(r"[A-Za-z0-9_.~-]{1,200}\Z")
 _FOLDER = re.compile(r"fld_[0-9a-f]{24}\Z")
 _ARTIFACT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")      # the mirror's artifact id rule
+_CTYPE = re.compile(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(; ?charset=[A-Za-z0-9_-]+)?")
+# inline only where the browser cannot run script from it (html and svg are attachments)
+_INLINE_TYPES: Final = frozenset({"text/plain", "image/png", "image/jpeg", "image/gif", "image/webp",
+                                  "application/pdf"})
 _UPLOAD = re.compile(UPLOAD_RE)
 _SHA = re.compile(SHA_RE)
 _DIGITS = re.compile(r"[0-9]{1,15}\Z")
@@ -346,6 +350,8 @@ class MemberWeb:
                 return self._r_result
             if n == 2 and rest[0] == "artifacts":
                 return self._r_head
+            if n >= 4 and rest[0] == "artifacts" and rest[2] == "content":
+                return self._r_content
             if n == 3 and rest[0] == "artifacts" and rest[2] in ("history", "shares"):
                 return self._r_history if rest[2] == "history" else self._r_shares
             return None
@@ -537,6 +543,21 @@ class MemberWeb:
         self._json(h, ms.upload_abort(actor, self._live(ms, actor, self._ident(rest[1])), rest[3]))
 
     # ----------------------------------------------------------------------------------------------- the library
+    def _r_content(self, h, ms, pr, actor, rest, query):
+        """``GET /api/member/artifacts/{id}/content/{path}``: one file of a library item, gated by the caller's own view."""
+        self._query(query, set())
+        if not _ARTIFACT.match(rest[1]) or h.path.partition("?")[0].endswith("/"):
+            raise _Reply(404, "not_found", "not found")
+        entry, data = ms.library_content(actor, rest[1], "/".join(rest[3:]))
+        ctype = entry.get("content_type") if isinstance(entry.get("content_type"), str) else "application/octet-stream"
+        base = ctype.split(";", 1)[0].strip().lower()
+        inline = base in _INLINE_TYPES
+        name = rest[-1]
+        disposition = "inline" if inline else f'attachment; filename="{name}"'
+        self._send(h, 200, data, ctype if _CTYPE.fullmatch(ctype) else "application/octet-stream",
+                   {"Content-Security-Policy": "default-src 'none'; sandbox", "Content-Disposition": disposition,
+                    "X-Frame-Options": "DENY"})
+
     @staticmethod
     def _folder_id(value: str) -> str:
         if not _FOLDER.match(value):

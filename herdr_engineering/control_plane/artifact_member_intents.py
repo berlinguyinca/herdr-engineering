@@ -26,9 +26,11 @@ import hashlib
 import json
 import logging
 import math
+import mimetypes
 import os
 import re
 import stat
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +56,7 @@ from .collab_bridge_files import (
     read_staged_meta,
     register_intent_kind,
     remove_tree_beneath,
+    stream_new_beneath,
     tree_entry_cap,
     unlink_beneath,
 )
@@ -126,6 +129,7 @@ class MemberRuntime:
     share_settings: Mapping[str, Any] | None = None   # ``share_settings_config`` plus ``member_share_limits``; None = off
     secret_mode: int = 0o600           # file mode of a secret result when ``secret_gid`` is None
     secret_gid: int | None = None      # group of collab-public: the secret dir becomes 0770 and the file 0640 in it
+    rustfs: Any = None                 # blob client the library content pool is filled from (None: no content is mirrored)
 
 
 # ----------------------------------------------------------------------------- payloads
@@ -794,8 +798,96 @@ def _item_json(item: Any) -> dict:
             "artifact_type": item.artifact_type, "size_bytes": item.size_bytes}
 
 
-async def _library_view(conn: Any, principal: str, rt: MemberRuntime | None) -> dict:
-    """``{items, folders}``: the feed (own pending included) newest first, at most ``LIBRARY_VIEW_MAX`` items."""
+LIBRARY_CONTENT_DIR = "library-content"          # <mirror>/library-content/<sha256>: the shared, gated blob pool
+LIB_MAX_FILES = 200
+LIB_MAX_FILE_BYTES = 25 * 1024 * 1024
+LIB_MAX_ITEM_BYTES = 100 * 1024 * 1024
+POOL_GC_MIN_AGE = 600.0
+_SHA_HEX = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def safe_content_path(path: object) -> bool:
+    """A relative, normalised path: no empty, dot or dotdot component, no NUL, no backslash, not absolute."""
+    return (isinstance(path, str) and 0 < len(path) <= 512 and "\0" not in path and "\\" not in path
+            and all(part not in ("", ".", "..") for part in path.split("/")))
+
+
+def _fetch_into_pool(rustfs: Any, root: Path, entry: dict) -> bool:
+    """Blocking: put one blob into the pool unless it is there (digest verified while streaming; never replaced)."""
+    sha, size = entry["sha256"], entry["size"]
+    key = entry["storage_key"]
+    if isinstance(key, str) and _SHA_HEX.match(key):
+        key = f"sha256/{key[:2]}/{key[2:4]}/{key}"
+    try:
+        return stream_new_beneath(root, [LIBRARY_CONTENT_DIR], sha, rustfs.iter_get(key, sha), max_bytes=size)
+    except Exception as exc:                                   # noqa: BLE001 - one blob never stops the view
+        log.warning("library content blob not pooled (%s)", type(exc).__name__)
+        return False
+
+
+async def _attach_files(conn: Any, items: list[dict], rustfs: Any, root: Path) -> set[str]:
+    """Give every active or pending item the files of its head version and pool their bytes; the pooled shas.
+
+    Anything else (revoked, expired, no head, over a cap, bytes unavailable) gets ``files: []``; an item over a cap is
+    also marked ``too_large`` (the owner is told, nobody else).  Access ends when the view is rewritten."""
+    for item in items:
+        item["files"] = []
+    wanted = [i["artifact_id"] for i in items if i["status"] in ("active", "pending")]
+    if not wanted or rustfs is None:
+        return set()
+    rows = await conn.fetch(
+        "SELECT a.artifact_id, v.output_manifest FROM artifacts a JOIN artifact_versions v"
+        " ON v.version_id=a.current_version_id WHERE a.artifact_id = ANY($1::text[])"
+        " AND a.lifecycle NOT IN ('retracted','tombstoned') AND v.state <> 'retracted'", wanted)
+    heads = {r["artifact_id"]: _json(r["output_manifest"]) for r in rows}
+    pooled: set[str] = set()
+    for item in items:
+        manifest = heads.get(item["artifact_id"])
+        if item["status"] not in ("active", "pending") or not isinstance(manifest, list):
+            continue
+        entries: list[dict] = []
+        for m in manifest:
+            if not isinstance(m, dict):
+                continue
+            sha = m.get("sha256") or m.get("blob_sha256")
+            size = m.get("size_bytes")
+            if (safe_content_path(m.get("name")) and isinstance(sha, str) and _SHA_HEX.match(sha)
+                    and isinstance(size, int) and not isinstance(size, bool) and size >= 0):
+                entries.append({"path": m["name"], "sha256": sha, "size": size,
+                                "content_type": m.get("media_type") if isinstance(m.get("media_type"), str) else None,
+                                "storage_key": m.get("storage_key") or m.get("blob_sha256") or sha})
+        if (len(entries) > LIB_MAX_FILES or any(e["size"] > LIB_MAX_FILE_BYTES for e in entries)
+                or sum(e["size"] for e in entries) > LIB_MAX_ITEM_BYTES):
+            item["too_large"] = True
+            continue
+        ok = True
+        for e in entries:
+            ok = ok and await asyncio.to_thread(_fetch_into_pool, rustfs, root, e)
+        if not ok:
+            continue
+        item["files"] = [{"path": e["path"], "sha256": e["sha256"], "size": e["size"],
+                          "content_type": e["content_type"] or mimetypes.guess_type(e["path"])[0]
+                          or "application/octet-stream"} for e in entries]
+        pooled.update(e["sha256"] for e in entries)
+    return pooled
+
+
+def sweep_pool(root: Path, referenced: set[str], now: float) -> int:
+    """Blocking: delete pool blobs no view references, skipping files younger than ``POOL_GC_MIN_AGE``."""
+    try:
+        listing = list_beneath(root, [LIBRARY_CONTENT_DIR], max_entries=1_000_000)
+    except BridgeError:
+        return 0
+    removed = 0
+    for name, st in listing or []:
+        if stat.S_ISREG(st.st_mode) and name not in referenced and now - st.st_mtime >= POOL_GC_MIN_AGE:
+            removed += bool(unlink_beneath(root, [LIBRARY_CONTENT_DIR], name))
+    return removed
+
+
+async def _library_view(conn: Any, principal: str, rt: MemberRuntime | None, rustfs: Any = None,
+                        root: Path | None = None) -> tuple[dict, set[str]]:
+    """``({items, folders}, pooled shas)``: the feed (own pending included) newest first, at most ``LIBRARY_VIEW_MAX``."""
     from .artifact_library import DEFAULT_SOURCES, MAX_PAGE, LibraryStore
     store = LibraryStore(_OneConn(conn))
     email, groups = await _member_identity(principal, rt)   # an empty/stale directory fails closed: fewer items
@@ -808,11 +900,12 @@ async def _library_view(conn: Any, principal: str, rt: MemberRuntime | None) -> 
         items.extend(_item_json(i) for i in page.items)
         if page.next_offset is None or not page.items:
             break
-    return {"items": items, "folders": [_folder_json(f) for f in await store.list_folders(principal)]}
+    pooled = await _attach_files(conn, items, rustfs, root) if root is not None else set()
+    return {"items": items, "folders": [_folder_json(f) for f in await store.list_folders(principal)]}, pooled
 
 
 async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: Mapping[str, Any] | None = None,
-                            rt: MemberRuntime | None = None) -> None:
+                            rt: MemberRuntime | None = None, rustfs: Any = None) -> set[str]:
     """Write ``<root>/member-views/<member_owner_key>.json``: the member's usage, artifacts, shared-with-me and links."""
     from .artifact_member_quota import _NOT_PURGED
     from .artifact_members import MemberStore, member_owner_key
@@ -852,7 +945,10 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
         " AND NOT EXISTS (SELECT 1 FROM artifacts t WHERE t.artifact_id=s.artifact_id AND t.lifecycle='tombstoned')"
         " ORDER BY s.created_at DESC, s.share_id LIMIT $2",
         principal, VIEW_MAX_LINKS, [a["artifact_id"] for a in artifacts])
-    library = await _library_view(conn, principal, rt)
+    root = Path(root)
+    from .collab_bridge_files import DIR_MODE
+    ensure_dir(root, mode=DIR_MODE, public_mode=True)
+    library, pooled = await _library_view(conn, principal, rt, rustfs if rustfs is not None else getattr(rt, "rustfs", None), root)
     doc = {
         "principal": principal, "updated": __import__("time").time(),
         "usage": {"bytes_used": usage["bytes_used"], "bytes_retracted": usage["bytes_retracted"],
@@ -870,20 +966,19 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
                    "created_at": _iso(s["created_at"]), "mine": s["mine"]} for s in links],
         "library": library,
     }
-    root = Path(root)
-    from .collab_bridge_files import DIR_MODE
 
     def write() -> None:
-        ensure_dir(root, mode=DIR_MODE, public_mode=True)
         atomic_write_json(root / MEMBER_VIEWS_DIR, member_owner_key(principal) + ".json", doc)
     await asyncio.to_thread(write)
+    return pooled
 
 
 async def _after(ctx: IntentContext, intent: Intent, out: dict, private: dict) -> None:
     """Rewrite the acting member's view once the outcome is durable."""
     principal, rt = private.get("_principal"), ctx.extras.get("members")
     if isinstance(principal, str) and isinstance(rt, MemberRuntime):
-        await write_member_view(ctx.conn, principal, rt.mirror_root, defaults=rt.defaults, rt=rt)
+        await write_member_view(ctx.conn, principal, rt.mirror_root, defaults=rt.defaults, rt=rt,
+                                rustfs=getattr(ctx.store, "rustfs", None))
 
 
 # ----------------------------------------------------------------------------- secret results
@@ -973,13 +1068,17 @@ async def publish_member_views(conn: Any, rt: MemberRuntime) -> int:
         "SELECT created_by AS p FROM artifacts WHERE created_by LIKE 'member:%'"
         " UNION SELECT member_principal FROM artifact_member_usage"
         " UNION SELECT principal_id FROM artifact_acl WHERE principal_id LIKE 'member:%'")
-    written = 0
+    written, failed = 0, False
+    referenced: set[str] = set()
     for r in rows:
         try:
-            await write_member_view(conn, r["p"], rt.mirror_root, defaults=rt.defaults, rt=rt)
+            referenced |= await write_member_view(conn, r["p"], rt.mirror_root, defaults=rt.defaults, rt=rt)
             written += 1
         except Exception as exc:
+            failed = True
             log.error("member view not written (%s)", type(exc).__name__)
+    if not failed and rt.rustfs is not None:        # a view that failed still lists its blobs: collect nothing then
+        await asyncio.to_thread(sweep_pool, rt.mirror_root, referenced, time.time())
     await sweep_disabled_members(conn, rt)
     await asyncio.to_thread(sweep_secrets, rt)
     return written

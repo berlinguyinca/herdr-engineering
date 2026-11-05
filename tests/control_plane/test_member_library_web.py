@@ -6,6 +6,7 @@ would read it) and returns the ticket result.  Claims are not a member-web route
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -163,3 +164,133 @@ def test_a_non_member_cannot_write_the_library(stack):
         403,
     )
     assert intents(stack) == []
+
+
+# ------------------------------------------------------------------------------ content by id
+def pool(stack, data: bytes) -> str:
+    sha = hashlib.sha256(data).hexdigest()
+    root = stack.w.bridge.mirror / "library-content"
+    root.mkdir(exist_ok=True)
+    (root / sha).write_bytes(data)
+    return sha
+
+
+def item(aid, files, status="active", source="mine", **extra):
+    return {"artifact_id": aid, "status": status, "source": source, "files": files, **extra}
+
+
+def entry(data: bytes, path="index.html", ctype="text/html"):
+    return {
+        "path": path,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "content_type": ctype,
+    }
+
+
+def content(stack, aid, path, **kw):
+    return req(stack, "GET", f"{BASE}/artifacts/{aid}/content/{path}", **kw)
+
+
+@pytest.mark.parametrize(
+    "status,source",
+    [("active", "mine"), ("active", "assigned"), ("active", "opened"), ("pending", "pending")],
+)
+def test_content_by_id_for_owner_assigned_and_claimed(stack, status, source):
+    data = b"<p>hi</p>"
+    pool(stack, data)
+    put_library(stack, {"items": [item("art_x1", [entry(data)], status, source)], "folders": []})
+    got = content(stack, "art_x1", "index.html")
+    assert got.status == 200 and got.raw == data
+
+
+@pytest.mark.parametrize("status", ["revoked", "expired"])
+def test_content_by_id_refused_after_revoke_and_expiry(stack, status):
+    data = b"x"
+    pool(stack, data)
+    put_library(stack, {"items": [item("art_x1", [entry(data)], status, "opened")], "folders": []})
+    gone = content(stack, "art_x1", "index.html")
+    put_library(
+        stack, {"items": [item("art_x1", [entry(data)], "active", "opened")], "folders": []}
+    )
+    assert content(stack, "art_x1", "index.html").status == 200
+    assert gone.status == 404 and gone.json == content(stack, "art_missing", "index.html").json
+
+
+def test_content_by_id_for_stranger_404_same_as_missing(stack):
+    data = b"secret"
+    pool(stack, data)
+    put_library(stack, {"items": [item("art_x1", [entry(data)])], "folders": []})
+    stranger = content(stack, "art_x1", "index.html", member="lab")
+    missing = content(stack, "art_zzz", "index.html")
+    other_path = content(stack, "art_x1", "nope.html")
+    assert stranger.status == missing.status == other_path.status == 404
+    assert stranger.raw == missing.raw == other_path.raw
+    assert content(stack, "art_x1", "index.html", member=None).status == 401
+
+
+@pytest.mark.parametrize(
+    "data,ctype,inline",
+    [
+        (b"<script>alert(1)</script>", "text/html", False),
+        (b"plain", "text/plain", True),
+        (b"\x89PNG", "image/png", True),
+        (b"<svg onload=1/>", "image/svg+xml", False),
+        (b"%PDF-", "application/pdf", True),
+        (b"zz", "application/x-weird", False),
+    ],
+)
+def test_content_has_sandbox_csp_and_nosniff(stack, data, ctype, inline):
+    pool(stack, data)
+    put_library(stack, {"items": [item("art_x1", [entry(data, "f.bin", ctype)])], "folders": []})
+    got = content(stack, "art_x1", "f.bin")
+    assert got.status == 200
+    assert got.headers["content-security-policy"] == "default-src 'none'; sandbox"
+    assert got.headers["x-content-type-options"] == "nosniff"
+    assert got.headers["content-disposition"].startswith("inline" if inline else "attachment")
+
+
+def test_content_path_traversal_and_globbing_rejected(stack):
+    data = b"ok"
+    pool(stack, data)
+    put_library(
+        stack, {"items": [item("art_x1", [entry(data, "a/b.txt", "text/plain")])], "folders": []}
+    )
+    assert content(stack, "art_x1", "a/b.txt").status == 200
+    for bad in (
+        "../a/b.txt",
+        "a/../a/b.txt",
+        "%2e%2e/a/b.txt",
+        "a//b.txt",
+        "./a/b.txt",
+        "a/*",
+        "a/b.tx",
+        "a%2Fb.txt",
+        "a\\b.txt",
+        "a/b.txt/",
+    ):
+        assert content(stack, "art_x1", bad).status == 404, bad
+    assert content(stack, "art_x1", "a/b.txt?x=1").status == 400
+
+
+def test_content_is_refused_when_the_pooled_blob_changed_or_is_gone(stack):
+    data = b"original"
+    sha = pool(stack, data)
+    put_library(stack, {"items": [item("art_x1", [entry(data)])], "folders": []})
+    (stack.w.bridge.mirror / "library-content" / sha).write_bytes(b"tampered")
+    assert content(stack, "art_x1", "index.html").status == 404
+    (stack.w.bridge.mirror / "library-content" / sha).unlink()
+    assert content(stack, "art_x1", "index.html").status == 404
+
+
+def test_too_large_is_told_to_the_owner_only(stack):
+    put_library(stack, {"items": [item("art_x1", [], too_large=True)], "folders": []})
+    stack.w.view("op", ["art_x1"])
+    put_library(stack, {"items": [item("art_x1", [], too_large=True)], "folders": []})
+    assert content(stack, "art_x1", "index.html").json["error"] == "too_large"
+    put_library(
+        stack,
+        {"items": [item("art_x1", [], source="assigned", too_large=True)], "folders": []},
+        "lab",
+    )
+    assert content(stack, "art_x1", "index.html", member="lab").json["error"] == "not_found"
