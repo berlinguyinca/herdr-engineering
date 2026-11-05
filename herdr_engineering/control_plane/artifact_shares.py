@@ -33,6 +33,7 @@ import json
 import re
 import secrets
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -49,7 +50,7 @@ __all__ = ["ShareStore", "ShareError", "new_token"]
 
 AUDIENCES = ("lab", "public")
 EVENT_KINDS = ("created", "approved", "opened", "denied", "revoked", "expired", "annotated", "annotation_edited",
-               "annotation_withdrawn", "annotation_dismissed", "annotation_addressed")
+               "annotation_withdrawn", "annotation_dismissed", "annotation_addressed", "claimed")
 PUBLIC_MIN_DAYS, PUBLIC_MAX_DAYS = 1, 90
 # Callers compute "now + N days" slightly before create() reads the clock; tolerate that skew on the lower bound.
 _SKEW = timedelta(minutes=5)
@@ -68,7 +69,10 @@ EVENTS_ROTATE_BYTES = 4 * 1024 * 1024
 ROTATED_GRACE_SECONDS = 30.0
 # The share container writes the events file, so it may only report what it observed; the lifecycle kinds
 # (created/approved/revoked/expired) are written by this store alone.
-INGESTIBLE_KINDS = ("opened", "denied")
+INGESTIBLE_KINDS = ("opened", "denied", "claimed")
+# ``claimed`` is the container's report that a visitor with a verified session opened the share.  It is only kept for an
+# actor the ``members`` resolver of ``ingest_events_file`` maps to an approved member (the same rules as
+# ``member_for_actor``); any other claim is dropped without a trace.
 
 _COLUMNS = ("share_id, artifact_id, version_id, audience, allow_emails, allow_groups, state, entry, file_count, "
             "total_bytes, title, expires_at, created_by, created_at, approved_by, approved_at, revoked_at")
@@ -142,6 +146,22 @@ async def _may_share(conn: Any, artifact_id: str, principal: str) -> bool:
 
 
 _SPEND_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('artifact_share_live_bytes'))"
+
+
+class _Held:
+    """Lets ``LibraryStore`` run on the connection the ingest transaction already holds."""
+
+    def __init__(self, conn: Any):
+        self._conn = conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def acquire(self):
+        @asynccontextmanager
+        async def held():
+            yield self._conn
+        return held()
 
 
 class ShareStore:
@@ -437,7 +457,8 @@ class ShareStore:
             "WHERE share_id=$1 ORDER BY at, event_id LIMIT $2", share_id, max(1, int(limit)))
         return [{**dict(r), "detail": json.loads(r["detail"])} for r in records]
 
-    async def ingest_events_file(self, path: Path, *, marker_path: Path | None = None) -> int:
+    async def ingest_events_file(self, path: Path, *, marker_path: Path | None = None,
+                                 members: Callable[[str], str | None] | None = None) -> int:
         """Ingest complete JSON lines appended to ``path`` since the last run; returns rows inserted.
 
         See the module docstring for the offset/fingerprint/idempotency design and why ``marker_path`` exists.
@@ -447,11 +468,12 @@ class ShareStore:
         """
         path = Path(path)
         marker = Path(marker_path) if marker_path is not None else path.with_name(path.name + ".offset")
-        return await self._ingestor().ingest_file(path, marker)
+        return await self._ingestor(members).ingest_file(path, marker)
 
     async def ingest_and_rotate_events(self, path: Path, *, marker_path: Path | None = None,
                                        rotate_bytes: int | None = None, now: float | None = None,
-                                       grace: float | None = None) -> int:
+                                       grace: float | None = None,
+                                       members: Callable[[str], str | None] | None = None) -> int:
         """Ingest ``path`` (and a pending ``path.1``) and rotate ``path`` once ``rotate_bytes`` of it are consumed.
 
         The mechanics (leftover ``.1`` drain, rename, marker move, crash safety) live in
@@ -459,19 +481,40 @@ class ShareStore:
         """
         path = Path(path)
         marker = Path(marker_path) if marker_path is not None else path.with_name(path.name + ".offset")
-        return await self._ingestor().ingest_and_rotate(
+        return await self._ingestor(members).ingest_and_rotate(
             path, marker,
             rotate_bytes=EVENTS_ROTATE_BYTES if rotate_bytes is None else rotate_bytes,
             now=time.time() if now is None else now,
             grace=ROTATED_GRACE_SECONDS if grace is None else grace)
 
-    def _ingestor(self) -> JsonlIngestor:
+    def _ingestor(self, members: Callable[[str], str | None] | None = None) -> JsonlIngestor:
         async def store(conn: Any, parsed: tuple, key: str) -> bool:
             share_id, kind, actor, at, detail = parsed
+            if kind == "claimed":
+                return await self._claim(conn, members, share_id, actor, at, key)
             return await self._event(conn, share_id, kind, actor, detail, at, key)
         # built per call so the module limit and ``_open_regular`` are read at call time
         return JsonlIngestor(self._conn, parse_line=self._parse_line, store=store, max_line_bytes=_MAX_LINE_BYTES,
                              max_ingest_bytes=_MAX_INGEST_BYTES, opener=self._open_regular)
+
+    async def _claim(self, conn: Any, members: Callable[[str], str | None] | None, share_id: str, actor: str,
+                     at: datetime, key: str) -> bool:
+        """Store a ``claimed`` event and keep the share in the member's library.
+
+        ``members`` maps the verified actor to a member id (None: not an approved member, or no resolver).  Such a claim
+        is dropped (False), never an error; so is a claim on a share that is not live (the event is still kept as an
+        audit row, the library is not touched).  Replays are idempotent: ``ingest_key`` and the claims primary key."""
+        member = members(actor) if members is not None else None
+        if not isinstance(member, str) or not member:
+            return False
+        stored = await self._event(conn, share_id, "claimed", actor, {"share_id": share_id}, at, key)
+        if stored:
+            from .artifact_library import LibraryError, LibraryStore
+            try:
+                await LibraryStore(_Held(conn)).record_claim(member, share_id)
+            except LibraryError:
+                pass
+        return stored
 
     @staticmethod
     def _open_regular(path: Path):

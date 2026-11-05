@@ -151,7 +151,8 @@ SHARED_BY_MAX = 120      # ``state.json`` ``shared_by``: the creator's display n
 VIEWER_FILE = "viewer.html"
 STATIC_FILES = {"lab-signin.js": "text/javascript; charset=utf-8", "share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8",
                 "annotate.js": "text/javascript; charset=utf-8", "anchor.js": "text/javascript; charset=utf-8",
-                "annotate.css": "text/css; charset=utf-8"}
+                "annotate.css": "text/css; charset=utf-8", "landing.js": "text/javascript; charset=utf-8",
+                "landing.css": "text/css; charset=utf-8"}
 VIEW_FILE = "view.html"
 ANNOTATIONS_MAX_BYTES = 32 * 1024 * 1024     # the annotations file cap (the worker rotates it long before)
 ANNOTATION_LINE_MAX = 65536                  # the worker's max_line_bytes: a longer line would be dropped at ingest
@@ -182,7 +183,7 @@ _CSP_TEMPLATE = ("sandbox allow-scripts allow-downloads; default-src {self}; scr
 CSP = _CSP_TEMPLATE.format(self="'self'")   # without a configured public origin
 PDF_CSP = "frame-ancestors 'none'"
 VIEWER_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' {origin}; img-src 'self' data:; "
-              "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+              "font-src {public}/s/static/; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 VIEW_CSP = ("default-src 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; style-src-elem {origin}/s/static/ "
             "{origin}/s/{token}/ 'unsafe-inline'; style-src-attr 'unsafe-inline'; img-src {origin}/s/{token}/ data: blob:; "
             "font-src {origin}/s/{token}/ {origin}/s/static/ data:; connect-src {origin}/s/{token}/; "
@@ -210,6 +211,25 @@ SHARED_BY_BAR = (
     'color:#4a3b00!important;background:#fff3cd!important;border-bottom:1px solid #b8a04a!important;'
     'text-align:center!important;transform:none!important;clip:auto!important;height:auto!important">{text}</div>')
 SHARED_BY_ETAG_SUFFIX = "-b1"
+# The recipient landing bar: "Shared by NAME . title . expires in N days", and for a visitor whose session the server has
+# not verified, the sign-in notice and a link to the sign-in step. Plain markup with inline light styles (the page is
+# the author's, in a sandbox: no script and no stylesheet of ours runs there). It sits in the flow, so the notice never
+# covers the content; ``margin_top`` clears the fixed shared-by label bar when the page has one.
+LANDING_FALLBACK_SHARER = "a lab member"
+LANDING_NOTICE = ("Sign in with your lab account to add this to your library. Signing in does not change who can "
+                  "see it.")
+LANDING_BUTTON = "Sign in to keep this"
+LANDING_TITLE_MAX = 120
+LANDING_ETAG_SUFFIX = "-l1"
+CLAIM_COOKIE = "herdr_claim"      # a public link's verified-visitor session (HttpOnly, Path=/s/<token>/): never in a URL
+CLAIM_SEEN_MAX = 50000            # (share, session) pairs remembered so one session records a claim once
+_LANDING_STYLE = ("display:block!important;visibility:visible!important;opacity:1!important;margin:{margin}px 0 0 0!important;"
+                  "padding:8px 16px!important;font:500 14px/1.4 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif!important;"
+                  "color:#353740!important;background:#fff!important;border-bottom:1px solid #d9d9e3!important;"
+                  "text-align:left!important")
+_LANDING_LINK_STYLE = ("display:inline-block!important;margin:0 0 0 12px!important;padding:4px 12px!important;"
+                       "background:#10a37f!important;color:#fff!important;border-radius:8px!important;"
+                       "font:600 14px/1.4 system-ui,sans-serif!important;text-decoration:none!important")
 UNAVAILABLE_BODY = b"Unavailable\n"
 JSON_HEADERS = (("Content-Type", "application/json"), ("X-Content-Type-Options", "nosniff"),
                 ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),
@@ -317,7 +337,7 @@ def lab_settings(config: ShareConfig) -> LabSettings | None:
                              sort_keys=True, ensure_ascii=True).encode("ascii")
     return LabSettings(authenticator=authenticator, secret=secret, session_seconds=seconds,
                        static_dir=Path(config.static_dir) if config.static_dir else DEFAULT_STATIC_DIR,
-                       viewer_csp=VIEWER_CSP.format(origin=origin), config_json=config_json)
+                       viewer_csp=VIEWER_CSP.format(origin=origin, public=f"https://{public_parts.netloc.lower()}"), config_json=config_json)
 
 
 class ShareState(dict):
@@ -371,6 +391,10 @@ class EventLog:
     def opened(self, share_id: str, actor: str, detail: dict) -> None:
         if self._opened.allow(share_id):
             self.append(share_id, "opened", actor, detail)
+
+    def claimed(self, share_id: str, actor: str, detail: dict) -> None:
+        """A verified visitor opened this share: the worker keeps it in that member's library (once per session upstream)."""
+        self.append(share_id, "claimed", actor, detail)
 
     def denied(self, share_id: str, actor: str, reason: str) -> None:
         if self._denied.allow(f"{share_id}\x00{reason}"):   # per share: one link cannot silence the others
@@ -472,6 +496,17 @@ def _record_event(append, *args) -> None:
         append(*args)
     except Exception:
         _log("event append failed")
+
+
+def _record_claim(handler, share_id: str, claim: tuple[str, str] | None) -> None:
+    """Append one ``claimed`` event for a visitor whose session this server verified, at most once per (session, share).
+    ``claim`` is (verified identity, session string); nothing is ever recorded for a signed-out visitor."""
+    if claim is None:
+        return
+    identity, session = claim
+    if not handler.server.claim_first(share_id, session):
+        return
+    _record_event(handler.server.events.claimed, share_id, identity, {"share_id": share_id})
 
 
 def _write_body(handler, body: bytes) -> None:
@@ -941,6 +976,35 @@ def shared_by_bar(name: str) -> bytes:
     return SHARED_BY_BAR.format(text=text).encode("utf-8")
 
 
+def expires_text(expires_at: float | None, now: float) -> str:
+    """``expires in N days`` (whole days), ``expires in 1 day``, ``expires today``; empty when the share has no expiry."""
+    if expires_at is None:
+        return ""
+    days = int((expires_at - now) // 86400)
+    if days < 1:
+        return "expires today"
+    return "expires in 1 day" if days == 1 else f"expires in {days} days"
+
+
+def landing_bar(sharer: str | None, title: str | None, expires_at: float | None, now: float, *, token: str,
+                signed_in: bool, can_sign_in: bool, margin_top: int = 0) -> bytes:
+    """The landing bar markup. Every dynamic part is HTML-escaped; the sign-in link carries no query and no return path."""
+    parts = [f"Shared by {sharer if isinstance(sharer, str) and sharer.strip() else LANDING_FALLBACK_SHARER}"]
+    if isinstance(title, str) and title.strip():
+        parts.append(title.strip()[:LANDING_TITLE_MAX])
+    left = expires_text(expires_at, now)
+    if left:
+        parts.append(left)
+    text = html.escape(" \u00b7 ".join(parts))
+    extra = ""
+    if not signed_in and can_sign_in:
+        extra = (f'<a data-herdr-signin href="/s/{token}/signin" rel="noopener" style="{_LANDING_LINK_STYLE}">'
+                 f'{html.escape(LANDING_BUTTON)}</a><div data-herdr-notice style="margin:6px 0 0 0!important;'
+                 f'font-weight:400!important">{html.escape(LANDING_NOTICE)}</div>')
+    return (f'<div data-herdr-landing role="note" style="{_LANDING_STYLE.format(margin=int(margin_top))}">{text}{extra}'
+            "</div>").encode()
+
+
 def _read_all(fd: int, size: int) -> bytes | None:
     """Exactly ``size`` bytes of ``fd`` (``pread``), or None when the file is shorter than promised."""
     chunks, offset = [], 0
@@ -954,7 +1018,8 @@ def _read_all(fd: int, size: int) -> bytes | None:
 
 
 def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True, actor: str = "public",
-                      token: str | None = None, mode_switch: str | None = None, sandbox_pdf: bool = False) -> bool:
+                      token: str | None = None, mode_switch: str | None = None, sandbox_pdf: bool = False,
+                      landing: bytes | None = None, claim: tuple[str, str] | None = None) -> bool:
     """Serve ``rel_path`` (raw, still percent-encoded) from ``state``'s bundle; True when served, False after a 404.
 
     ``state`` is what ``load_state`` returned. Handles HEAD, If-Match (412), If-None-Match (304), If-Range and a single
@@ -1000,7 +1065,7 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         is_html = content_type_for(name).split(";")[0].strip() == "text/html"
         shared_by = state.get("shared_by") if is_html else None
         bar = shared_by_bar(shared_by) if isinstance(shared_by, str) else b""
-        if is_html and (bar or mode_switch is not None):
+        if is_html and (bar or mode_switch is not None or landing):
             if size > MODE_SWITCH_MAX_BYTES:
                 if bar:      # a labelled page is never served unlabelled
                     deny(handler, state, "banner_unavailable", actor)
@@ -1010,7 +1075,7 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
                 if data is None:
                     deny(handler, state, "size_mismatch", actor)
                     return False
-                link = mode_switch.encode("ascii") if mode_switch is not None else b""
+                link = (mode_switch.encode("ascii") if mode_switch is not None else b"") + (landing or b"")
                 if bar:
                     injected = labelled_html(data, content_type_for(name), bar, link)
                     if injected is None:      # fail closed: a labelled page is never served unlabelled or with a hidden bar
@@ -1019,9 +1084,10 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
                 elif _ascii_compatible(content_type_for(name), data):
                     injected = inject_mode_switch(data, link)
                 if injected is not None:
-                    suffix = (SHARED_BY_ETAG_SUFFIX if bar else "") + (MODE_SWITCH_ETAG_SUFFIX if mode_switch is not None else "")
+                    suffix = ((SHARED_BY_ETAG_SUFFIX if bar else "") + (MODE_SWITCH_ETAG_SUFFIX if mode_switch is not None else "")
+                              + (_landing_tag(landing) if landing else ""))
                     return _serve_with_link(handler, state, name, item, injected, csp, cors=cors, actor=actor,
-                                            etag_suffix=suffix)
+                                            etag_suffix=suffix, claim=claim)
         headers = _content_headers(name, etag, csp, sandbox_pdf=sandbox_pdf)
         if _announces_body(handler):
             handler.close_connection = True
@@ -1057,6 +1123,7 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         _send_headers(handler, status, headers, cors=cors)
         if handler.command == "GET" and status == 200 and name == state.get("entry"):
             _record_event(handler.server.events.opened, share_id, actor, {"file": name[:200]})
+            _record_claim(handler, share_id, claim)
         if handler.command == "HEAD":
             return True
         offset, remaining = start, length
@@ -1078,8 +1145,14 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         os.close(fd)
 
 
+def _landing_tag(landing: bytes) -> str:
+    """An ETag part for the landing bar: its bytes change with the viewer's state and the days left."""
+    return LANDING_ETAG_SUFFIX + hashlib.sha256(landing).hexdigest()[:10]
+
+
 def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, csp: str, *, cors: bool,
-                     actor: str, etag_suffix: str = MODE_SWITCH_ETAG_SUFFIX) -> bool:
+                     actor: str, etag_suffix: str = MODE_SWITCH_ETAG_SUFFIX,
+                     claim: tuple[str, str] | None = None) -> bool:
     """The full 200 of ``body`` (an HTML file with the mode-switch link injected; see ``serve_bundle_file``). The ETag is
     the index sha256 plus ``-m1``, as for the raw file (the same size-only integrity check as the raw route)."""
     etag = f'"{item["sha256"]}{etag_suffix}"'
@@ -1102,6 +1175,7 @@ def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, c
     _send_headers(handler, 200, headers + [("Content-Length", str(len(body)))], cors=cors)
     if handler.command == "GET" and name == state.get("entry"):
         _record_event(handler.server.events.opened, state["share_id"], actor, {"file": name[:200]})
+        _record_claim(handler, state["share_id"], claim)
     if handler.command != "HEAD":
         _write_body(handler, body)
     return True
@@ -1111,7 +1185,7 @@ def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, c
 
 _ROUTE_METHODS: dict[str, tuple[str, ...]] = {
     "link": ("GET", "HEAD"), "file": ("GET", "HEAD"), "session": ("POST",), "lab_file": ("GET", "HEAD"),
-    "lab_view": ("GET", "HEAD"), "annotations": ("GET", "POST"), "annotation_item": ("POST",)}
+    "lab_view": ("GET", "HEAD"), "annotations": ("GET", "POST"), "annotation_item": ("POST",), "signin": ("GET", "HEAD")}
 _NO_PREFLIGHT = frozenset({"session", "lab_view", "annotations", "annotation_item"})   # OPTIONS is the uniform 404
 
 
@@ -1122,6 +1196,8 @@ def _classify(parts: list[str]) -> str | None:
         return "link"
     if n == 4 and parts[3] == "session":
         return "session"
+    if n == 4 and parts[3] == "signin":
+        return "signin"
     if n >= 5 and parts[3] == "f":
         return "file"
     if n >= 6 and parts[3] == "k":
@@ -1257,16 +1333,23 @@ class ShareHandler(BaseHTTPRequestHandler):
         if state is None:
             return deny(self, prepared.raw, reason)
         audience = state.get("audience")
-        if audience == "public" and route in ("link", "file"):
+        if audience == "public" and route in ("link", "file", "signin", "session"):
+            if route == "signin":
+                return self._signin_page(state, parts[2])
+            if route == "session":
+                return self._claim_session(state, parts[2])
             if route == "link":
                 location = "f/" + quote(state["entry"], safe="/")
                 _send_headers(self, 302, [("Location", location), ("Content-Length", "0"),
                                           ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"),
                                           ("X-Robots-Tag", "noindex"), ("X-Content-Type-Options", "nosniff")])
                 return None
-            serve_bundle_file(self, state, "/".join(parts[4:]), token=parts[2])
+            claim = self._claim_identity(state)
+            serve_bundle_file(self, state, "/".join(parts[4:]), token=parts[2],
+                              landing=self._landing(state, "/".join(parts[4:]), parts[2], signed_in=claim is not None),
+                              claim=claim)
             return None
-        if audience != "lab" or route == "file":
+        if audience != "lab" or route in ("file", "signin"):
             return deny(self, state, "audience")    # lab files only under a session; sessions only for lab shares
         lab = self.server.lab
         if lab is None:
@@ -1284,7 +1367,9 @@ class ShareHandler(BaseHTTPRequestHandler):
         if route == "lab_file":
             link = self._mode_switch(parts) if enabled else None
             serve_bundle_file(self, state, "/".join(parts[6:]), actor=got["identity"], token=parts[2],
-                              mode_switch=link, sandbox_pdf=True)
+                              mode_switch=link, sandbox_pdf=True,
+                              landing=self._landing(state, "/".join(parts[6:]), parts[2], signed_in=True),
+                              claim=(got["identity"], session))
             return None
         if route == "lab_view":
             if parts[5] == "v":
@@ -1299,6 +1384,124 @@ class ShareHandler(BaseHTTPRequestHandler):
                 return deny(self, state, "no_write_cookie", got["identity"])   # the URL alone is not a credential
             return self._annotations_get(state, got)
         return self._annotation_post(state, parts, got, lab)
+
+    # -- the recipient landing bar and the claim session of a public link
+
+    def _landing_bar(self, state: ShareState, token: str, *, signed_in: bool, margin_top: int) -> bytes:
+        try:
+            expires = _expiry(state.get("expires_at"))
+        except (ValueError, TypeError, OverflowError):
+            expires = None
+        return landing_bar(state.get("shared_by"), state.get("title"), expires, self.server.now(), token=token,
+                           signed_in=signed_in, can_sign_in=state.get("audience") == "public", margin_top=margin_top)
+
+    def _landing(self, state: ShareState, rel: str, token: str, *, signed_in: bool) -> bytes | None:
+        """The bar for an HTML document navigation (never a subresource), or None; needs the lab sign-in to be configured."""
+        if self.server.lab is None or self.headers.get_all("Sec-Fetch-Dest") != ["document"]:
+            return None
+        name = decode_rel_path(rel)
+        if name is None or content_type_for(name).split(";")[0].strip() != "text/html":
+            return None
+        shared_by = state.get("shared_by")
+        if state.get("audience") == "lab" and not isinstance(shared_by, str):
+            return None                     # operator-made lab links keep their no-banner pages
+        return self._landing_bar(state, token, signed_in=signed_in, margin_top=38 if isinstance(shared_by, str) else 0)
+
+    def _claim_identity(self, state: ShareState) -> tuple[str, str] | None:
+        """(verified identity, session) from this public link's claim cookie, or None (signed out, forged, expired)."""
+        lab = self.server.lab
+        if lab is None:
+            return None
+        values = []
+        for header in self.headers.get_all("Cookie") or []:
+            for piece in header.split(";"):
+                name, _, value = piece.strip().partition("=")
+                if name == CLAIM_COOKIE:
+                    values.append(value)
+        if len(values) != 1 or not _SESSION_SEGMENT.fullmatch(values[0]):
+            return None
+        got = check_session(lab.secret, state["share_id"], values[0], self.server.now())
+        return None if got is None else (got["identity"], values[0])
+
+    def _signin_page(self, state: ShareState, token: str):
+        """The sign-in step of a public link: the static viewer page with this share's bar data (no token, no return path)."""
+        lab = self.server.lab
+        if lab is None:
+            return deny(self, state, "lab_unconfigured")
+        opened = _open_beneath(lab.static_dir, [VIEWER_FILE], max_size=STATIC_MAX_BYTES)
+        if opened is None:
+            return deny(self, None, "static_missing")
+        fd, st = opened
+        try:
+            page = _read_all(fd, st.st_size)
+        finally:
+            os.close(fd)
+        if page is None:
+            return deny(self, None, "static_missing")
+        try:
+            expires = _expiry(state.get("expires_at"))
+        except (ValueError, TypeError, OverflowError):
+            expires = None
+        data = json.dumps({"sharer": state.get("shared_by"), "title": state.get("title"), "expiresAt": expires},
+                          sort_keys=True, ensure_ascii=True)
+        for ch, esc in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026")):
+            data = data.replace(ch, esc)
+        block = f'<script type="application/json" id="herdr-landing">{data}</script>'.encode("ascii")
+        self._send_viewer_bytes(lab, page.replace(b"<!--herdr-landing-->", block, 1), "text/html; charset=utf-8")
+        return None
+
+    def _claim_session(self, state: ShareState, token: str):
+        """Exchange verified Cognito tokens for the claim cookie of a public link. No allow-list applies (the link is
+        public); the cookie only says who the verified visitor is. Never echoes a token; every failure is the 404."""
+        lab = self.server.lab
+        share_id = state["share_id"]
+        if lab is None:
+            return deny(self, state, "lab_unconfigured")
+        if _announces_body(self):
+            return deny(self, state, "body")
+        if not self.server.session_per_share.allow(share_id) or not self.server.session_global.allow("*"):
+            return deny(self, state, "rate_limited")
+        authorization, id_token = self._single_header("Authorization"), self._single_header("X-Id-Token")
+        if authorization is None or id_token is None:
+            return deny(self, state, "bad_headers")
+        scheme, _, access_token = authorization.strip().partition(" ")
+        if scheme.lower() != "bearer":
+            return deny(self, state, "bad_headers")
+        try:
+            claims = lab.authenticator.verify_claims(access_token.strip()) if access_token.strip().isascii() else None
+            user = claims.get("user") if claims else None
+            exp = claims.get("exp") if claims else None
+            email = lab.authenticator.verify_id_token(id_token.strip(), user=user) \
+                if isinstance(user, str) and id_token.strip().isascii() else None
+        except Exception:
+            claims, user, exp, email = None, None, None, None
+        if not isinstance(user, str) or not isinstance(exp, float) or not isinstance(email, str) or not email:
+            return deny(self, state, "bad_access_token" if not isinstance(user, str) else "bad_id_token")
+        now = self.server.now()
+        until = min(now + lab.session_seconds, exp)
+        try:
+            share_expiry = _expiry(state.get("expires_at"))
+        except (ValueError, TypeError, OverflowError):
+            return deny(self, state, "invalid_state", user)
+        if share_expiry is not None:
+            until = min(until, share_expiry)
+        until_int = int(until // 1)
+        if until_int <= now:
+            return deny(self, state, "token_expired", user)
+        try:
+            session = mint_session(lab.secret, share_id, user, until_int, email=email, basis="g")
+        except ValueError:
+            return deny(self, state, "bad_identity", user)
+        cookie = (f"{CLAIM_COOKIE}={session}; Max-Age={until_int - int(now)}; Path=/s/{token}/; HttpOnly; Secure; "
+                  "SameSite=Lax")
+        body = json.dumps({"landing": f"/s/{token}/", "expires_at": until_int}, sort_keys=True).encode("ascii")
+        _send_headers(self, 200, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
+                                  ("Set-Cookie", cookie), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
+                                  ("Referrer-Policy", "no-referrer"), ("X-Robots-Tag", "noindex"),
+                                  ("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")],
+                      cors=False)
+        self.wfile.write(body)
+        return None
 
     def _mode_switch(self, parts) -> str | None:
         """The link to inject into this lab ``f/`` response, or None: only HTML, only a document navigation."""
@@ -1384,6 +1587,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         _send_headers(self, 200, headers, cors=False)
         if self.command == "GET" and name == state.get("entry"):
             _record_event(server.events.opened, share_id, actor, {"file": name[:200], "mode": mode})
+            _record_claim(self, share_id, (got["identity"], parts[4]))
         if self.command != "HEAD":
             _write_body(self, body)
         return None
@@ -1440,6 +1644,8 @@ class ShareHandler(BaseHTTPRequestHandler):
         shared_by = state.get("shared_by")
         banner = (f'<aside class="herdr-shared-by" role="note">Shared by {html.escape(shared_by)} \u2014 content was not '
                   'reviewed by the operator</aside>') if isinstance(shared_by, str) else ""
+        if isinstance(shared_by, str):      # operator-made lab links keep their no-banner page
+            banner += self._landing_bar(state, parts[2], signed_in=True, margin_top=0).decode("utf-8")
         values = {
             "BANNER": banner, "NONCE": nonce, "MODE": mode, "CSRF_META": csrf, "PANEL": panel,
             "SWITCH": '<nav data-mode-switch aria-label="View mode">' + "".join(links) + "</nav>",
@@ -1692,9 +1898,22 @@ class ShareServer(ThreadingHTTPServer):
         self.annotate_global = RateLimiter(limits["global_per_minute"], now, max_keys=1)
         self.annotation_log = AnnotationLog(config.annotations_path)
         self.render_cache = RenderCache()
+        self._claims_seen: set[tuple[str, str]] = set()
+        self._claims_lock = threading.Lock()
         self.view_template = self._load_view_template()
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         super().__init__(address, ShareHandler)
+
+    def claim_first(self, share_id: str, session: str) -> bool:
+        """True the first time this (share, session) is seen; the table is bounded (cleared when full)."""
+        key = (share_id, hashlib.sha256(session.encode("ascii", "replace")).hexdigest())
+        with self._claims_lock:
+            if key in self._claims_seen:
+                return False
+            if len(self._claims_seen) >= CLAIM_SEEN_MAX:
+                self._claims_seen.clear()
+            self._claims_seen.add(key)
+            return True
 
     def _load_view_template(self) -> str:
         """``view.html`` once at start-up; every placeholder must occur exactly once (else the server does not start)."""

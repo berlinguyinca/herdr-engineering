@@ -4984,7 +4984,7 @@ def _share_worker_settings(cp):
     return out
 
 
-def _worker_share_housekeeper(fleet_config_path):
+def _worker_share_housekeeper(fleet_config_path, member_runtime=None):
     """The share housekeeper when the fleet file enables shares, else None."""
     from pathlib import Path
 
@@ -4999,7 +4999,8 @@ def _worker_share_housekeeper(fleet_config_path):
     settings = _share_worker_settings(cp)
     if not settings["enabled"]:
         return None
-    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"])
+    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"],
+                            member_runtime=member_runtime)
 
 
 def _worker_annotation_housekeeper(fleet_config_path, mirror=None):
@@ -5316,7 +5317,7 @@ def _cmd_cp_worker(args) -> int:
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
-            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None))
+            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None), member_runtime)
             reconciler = _worker_artifact_reconciler(getattr(args, "fleet_config", None), rustfs)
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,

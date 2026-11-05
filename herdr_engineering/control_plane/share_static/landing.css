@@ -1,0 +1,56 @@
+/* Public landing: the sign-in card and the bar on the share pages. Light only; tokens match the dashboard theme. */
+:root {
+  --herdr-bg: #f7f7f8;
+  --herdr-surface: #fff;
+  --herdr-border: #d9d9e3;
+  --herdr-text: #353740;
+  --herdr-accent: #10a37f;
+  --herdr-radius: 8px;
+  color-scheme: light;
+}
+
+html, body {
+  background: var(--herdr-bg);
+  color: var(--herdr-text);
+}
+
+.herdr-landing {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 16px;
+  background: var(--herdr-surface);
+  color: var(--herdr-text);
+  border-bottom: 1px solid var(--herdr-border);
+  font: 500 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.herdr-landing-notice {
+  flex-basis: 100%;
+  margin: 0;
+  font-weight: 400;
+}
+
+.herdr-landing-signin,
+.herdr-signin-button {
+  padding: 6px 14px;
+  background: var(--herdr-accent);
+  color: #fff;
+  border: 0;
+  border-radius: var(--herdr-radius);
+  font: 600 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  cursor: pointer;
+}
+
+.herdr-signin-card {
+  background: var(--herdr-surface);
+  color: var(--herdr-text);
+  border: 1px solid var(--herdr-border);
+  border-radius: var(--herdr-radius);
+  text-align: center;
+}
+
+.herdr-signin-card p {
+  margin: 0 0 1rem;
+}
