@@ -2417,6 +2417,22 @@ class AssistantStore:
             a = self.slack_asks.get(ask_id)
             return replace(a) if a else None
 
+    def find_slack_ask_by_message(self, channel: str, ts: str) -> SlackAsk | None:
+        """The ask the hub posted as message ``ts`` in ``channel`` (a thread reply names its parent this way)."""
+        if not channel or not ts:
+            return None
+        with self._lock:
+            for a in self.slack_asks.values():
+                if a.ts == ts and a.channel == channel:
+                    return replace(a)
+            return None
+
+    def list_unposted_slack_questions(self) -> list[SlackAsk]:
+        """Open questions that never reached Slack (a restart or an outage), oldest first, across tenants."""
+        with self._lock:
+            return [replace(a) for a in self.slack_asks.values()
+                    if a.kind == "question" and a.status == "open" and not a.ts]
+
     def list_slack_asks(self, tenant_id: str, user_id: str, status: str | None = None) -> list[SlackAsk]:
         with self._lock:
             return self._sorted_copies([a for a in self.slack_asks.values()

@@ -25,11 +25,20 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ..assistant import AssistantStore
-from .actiongrants import ActionRequestRow, as_utc
-from .policy import record_owner_decision
+from .actiongrants import ActionRequestRow, GrantState, as_utc
+from .evidence import propose_if_ready
+from .policy import (
+    ActivationRefused,
+    activate_grant,
+    current_judge_version,
+    in_shadow,
+    record_owner_decision,
+)
 from .slack_asks import SlackAsk, button_value, new_ask_id, new_nonce
+from .verbs import ActionKey, Verb
 
-__all__ = ["SlackClient", "SlackError", "SlackRuntime", "ASK_ACTIONS", "slack_text", "slack_api_call", "PERMANENT_ERRORS"]
+__all__ = ["SlackClient", "SlackError", "SlackRuntime", "ASK_ACTIONS", "slack_text", "slack_api_call", "PERMANENT_ERRORS",
+           "refusal_sentence"]
 
 _log = logging.getLogger("herdr_engineering.assistant_hub.slack")
 _MAX_REPLY = 1024 * 1024
@@ -142,21 +151,46 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
 _TEXT_MAX = 300
 
 
-def slack_text(value: str) -> str:
+def slack_text(value: str, limit: int = _TEXT_MAX) -> str:
     """Worker-controlled text made inert for Slack mrkdwn: control characters are dropped, ``& < >`` are escaped
     (so ``<!channel>``, ``<@U123>`` and ``<url|label>`` print literally), ``@`` gets a zero-width space so a bare
     ``@here`` cannot notify, backticks become the look-alike modifier grave accent, and the result is at most 300
-    characters (never cut inside an entity)."""
+    characters (``limit``; never cut inside an entity)."""
     out = _CONTROL.sub(" ", str(value))
     out = out.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     out = out.replace("@", "@\u200b").replace("`", "\u02cb")
-    if len(out) > _TEXT_MAX:
-        out = out[:_TEXT_MAX - 1]
+    if len(out) > limit:
+        out = out[:limit - 1]
         amp = out.rfind("&")
         if amp > out.rfind(";"):
             out = out[:amp]
         out += "\u2026"
     return out
+
+
+_QUESTION_TEXT = 1500
+_ANSWER_BYTES = 4096
+_ANSWER_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]+")
+_SENTENCES = {
+    "still_in_shadow": "the learning period (shadow mode) has not ended yet",
+    "insufficient_labels": "not enough of your decisions have been labeled yet for this kind of action",
+    "judge_disabled": "the safety judge is not switched on",
+    "backend_unconfirmed": "you have not yet confirmed that a real model is serving the safety judge",
+    "insufficient_diversity": "your labeled decisions come from too few different actions",
+    "no_discrimination": "there are too few denied or regretted decisions to show the judge can tell good from bad",
+    "fn_bound_exceeded": "the judge still misses too many risky actions to be trusted with this",
+    "stale_report": "the judge's calibration report is out of date for the current judge",
+    "judge_error": "the safety judge could not be checked just now",
+    "not_proposed": "there is no proposed permission for this action to turn on",
+    "confirmation_missing": "your confirmation was missing",
+    "not_enough_approvals": "this action has not been approved enough times yet, across enough sessions and tasks",
+    "not_rememberable": "this kind of action can never be remembered, so it will always ask you",
+}
+
+
+def refusal_sentence(exc: ActivationRefused) -> str:
+    """A refusal code in plain words (what is missing), never the code or the raw message."""
+    return _SENTENCES.get(exc.code, "one of the safety checks has not passed yet")
 
 
 def _short_id(value: object) -> str:
@@ -176,6 +210,7 @@ class _Queued:
     project: str
     queued_at: datetime
     ask: SlackAsk | None = None
+    kind: str = "action"             # action | question (a question's ask is created up front)
 
 
 @dataclass
@@ -196,9 +231,10 @@ class SlackRuntime:
                  now_fn: Callable[[], datetime], *, min_backoff: float = 0.5, max_backoff: float = 30.0,
                  ping_interval: float = 2.0, stop_timeout: float = 15.0,
                  queue_size: int = 200, sweep_interval: float = 300.0, reoffer_backoff: float = 300.0,
-                 max_task_keys: int = 1000) -> None:
+                 max_task_keys: int = 1000, judge: Any = None) -> None:
         self.store = store
         self.service = service
+        self.judge = judge                 # the policy's judge runtime: activating a remembered grant uses its gate
         self._cfg = cfg_getter
         self._now = now_fn
         self._min_backoff = min_backoff
@@ -322,12 +358,15 @@ class SlackRuntime:
             client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))   # ack first
         except Exception as exc:
             _log.warning("slack ack failed: %s", type(exc).__name__)
-        if req.type != "interactive" or not isinstance(req.payload, dict):
+        if req.type not in ("interactive", "events_api") or not isinstance(req.payload, dict):
             return
         try:
-            self.handle_interaction(req.payload)
+            if req.type == "interactive":
+                self.handle_interaction(req.payload)
+            else:
+                self.handle_event(req.payload)
         except Exception as exc:            # a bad payload must never take the connection down
-            _log.warning("slack interaction failed: %s", type(exc).__name__)
+            _log.warning("slack %s failed: %s", req.type, type(exc).__name__)
 
     # -- owner asks --------------------------------------------------------------------------------
     def notify_pending(self, row: ActionRequestRow, display: str, why: str, *, project: str = "") -> None:
@@ -337,16 +376,50 @@ class SlackRuntime:
         try:
             if not self._cfg().get("enabled"):
                 return
-            item = _Queued(row.tenant_id, row.user_id, row.request_id, row.worker_id, row.task_id, display, why,
-                           project, as_utc(self._now()))
-            with self._qcond:
-                if len(self._queue) >= self._qsize:
-                    self._queue.popleft()
-                    self.dropped += 1
-                self._queue.append(item)
-                self._qcond.notify()
+            self._enqueue(_Queued(row.tenant_id, row.user_id, row.request_id, row.worker_id, row.task_id, display,
+                                  why, project, as_utc(self._now())))
         except Exception as exc:
             _log.warning("slack notify failed: %s", type(exc).__name__)
+
+    def _enqueue(self, item: _Queued) -> None:
+        with self._qcond:
+            if len(self._queue) >= self._qsize:
+                self._queue.popleft()
+                self.dropped += 1
+            self._queue.append(item)
+            self._qcond.notify()
+
+    def is_enabled(self) -> bool:
+        return bool(self._cfg().get("enabled"))
+
+    # -- worker questions --------------------------------------------------------------------------
+    def ask_question(self, tenant_id: str, user_id: str, worker_id: str, session_id: str, question: str,
+                     options: list[str], context: str) -> str:
+        """Store an open question ask for the worker and queue it for posting; returns its id.  Never blocks."""
+        now = as_utc(self._now())
+        ttl = timedelta(minutes=int(self._cfg().get("ask_ttl_minutes") or 15))
+        ask = SlackAsk(ask_id=new_ask_id(), tenant_id=tenant_id, user_id=user_id, kind="question", task_id=session_id,
+                       nonce=new_nonce(), created_at=now, expires_at=now + ttl, worker_id=worker_id,
+                       question=question[:2000], options=[o[:500] for o in options[:20]], context=context[:2000])
+        self.store.put_slack_ask(ask)
+        self._enqueue(self._question_item(ask, now))
+        return ask.ask_id
+
+    @staticmethod
+    def _question_item(ask: SlackAsk, now: datetime) -> _Queued:
+        return _Queued(ask.tenant_id, ask.user_id, "", ask.worker_id, ask.task_id, ask.question, ask.context, "", now,
+                       ask=ask, kind="question")
+
+    def question_status(self, tenant_id: str, user_id: str, worker_id: str, ask_id: str) -> dict[str, Any] | None:
+        """What the asking worker may see of its own question, or None when it is not that worker's question."""
+        ask = self.store.get_slack_ask(ask_id, tenant_id=tenant_id, user_id=user_id)
+        if ask is None or ask.kind != "question" or ask.worker_id != worker_id:
+            return None
+        if ask.status == "decided" and ask.answer is not None:
+            return {"status": "answered", "answer": ask.answer}
+        if ask.status == "expired" or (ask.status == "open" and as_utc(self._now()) >= as_utc(ask.expires_at)):
+            return {"status": "expired"}
+        return {"status": "pending"}
 
     def queued(self) -> int:
         with self._qcond:
@@ -372,7 +445,7 @@ class SlackRuntime:
                 item = self._queue[0] if self._queue else None
             if item is None:
                 continue
-            self._current = item.request_id
+            self._current = item.request_id or (item.ask.ask_id if item.ask is not None else "")
             wait = 0.0
             try:
                 done = self._post_ask(item)
@@ -399,8 +472,9 @@ class SlackRuntime:
 
     def _failed(self, item: _Queued, code: str) -> None:
         self._audit_failed(item, code)
-        self._failed_at[item.request_id] = time.monotonic()
-        self._cap(self._failed_at)
+        if item.kind == "action":
+            self._failed_at[item.request_id] = time.monotonic()
+            self._cap(self._failed_at)
 
     def _cap(self, mapping: dict[Any, Any]) -> None:
         while len(mapping) > self._max_keys:
@@ -463,6 +537,25 @@ class SlackRuntime:
                                            row.reason, "", now))
                 self._qcond.notify()
             queued += 1
+        return queued + self._sweep_questions(now)
+
+    def _sweep_questions(self, now: datetime) -> int:
+        """Questions stored but never posted (a restart, or the queue dropped them) are queued again until they expire."""
+        queued = 0
+        for ask in self.store.list_unposted_slack_questions():
+            if now >= as_utc(ask.expires_at):
+                ask.status = "expired"
+                self.store.put_slack_ask(ask)
+                continue
+            with self._qcond:
+                if len(self._queue) >= self._qsize:
+                    break
+                if ask.ask_id == self._current or any(i.ask is not None and i.ask.ask_id == ask.ask_id
+                                                      for i in self._queue):
+                    continue
+                self._queue.append(self._question_item(ask, now))
+                self._qcond.notify()
+            queued += 1
         return queued
 
     def _expired(self, item: _Queued) -> bool:
@@ -473,9 +566,10 @@ class SlackRuntime:
         if item.ask is not None:
             item.ask.status = "expired"
             self.store.put_slack_ask(item.ask)
+        subject = item.request_id or (item.ask.ask_id if item.ask is not None else "-")
         self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
-                                action="assistant.slack.ask_failed", subject_id=item.request_id,
-                                detail=f"request={item.request_id} code={code}")
+                                action="assistant.slack.ask_failed", subject_id=subject,
+                                detail=f"{'request' if item.request_id else 'ask'}={subject} code={code}")
 
     def _target(self, cfg: dict[str, Any]) -> str:
         if cfg.get("channel"):
@@ -490,14 +584,22 @@ class SlackRuntime:
         cfg = self._cfg()
         if not cfg.get("enabled"):
             return True
-        row = self.store.get_action_request(item.request_id, tenant_id=item.tenant_id, user_id=item.user_id)
-        if row is None or row.status != "pending":
-            return True                                  # decided meanwhile (REST) or gone: nothing to ask
-        own = item.ask.ask_id if item.ask is not None else ""
-        if any(a.ts and a.ask_id != own and a.status in ("open", "decided")
-               for a in self.store.slack_asks_for_request(item.request_id)):
-            return True                      # a duplicate queue entry (sweep vs notify): one ask per request
         now = as_utc(self._now())
+        question = item.kind == "question"
+        if question:
+            current = self.store.get_slack_ask(item.ask.ask_id, tenant_id=item.tenant_id,
+                                               user_id=item.user_id) if item.ask is not None else None
+            if current is None or current.status != "open" or current.ts or now >= as_utc(current.expires_at):
+                return True                  # answered, expired, already posted (a duplicate entry) or gone
+            item.ask = current
+        else:
+            row = self.store.get_action_request(item.request_id, tenant_id=item.tenant_id, user_id=item.user_id)
+            if row is None or row.status != "pending":
+                return True                              # decided meanwhile (REST) or gone: nothing to ask
+            own = item.ask.ask_id if item.ask is not None else ""
+            if any(a.ts and a.ask_id != own and a.status in ("open", "decided")
+                   for a in self.store.slack_asks_for_request(item.request_id)):
+                return True                  # a duplicate queue entry (sweep vs notify): one ask per request
         key = (item.tenant_id, item.user_id, item.worker_id, item.task_id)
         stamps = self._posted.pop(key, None) or deque()
         self._posted[key] = stamps                           # most recently used last, so the cap drops the idlest
@@ -513,15 +615,31 @@ class SlackRuntime:
                                       request_id=item.request_id, task_id=item.task_id, nonce=new_nonce(),
                                       channel=channel, created_at=now, expires_at=now + ttl)
             self.store.put_slack_ask(ask)
-        text = f"Approval needed from worker {slack_text(item.worker_id)}"
-        ts = self.client.post_message(channel, self._ask_blocks(ask, item), text)
+        if question:
+            text = f"Question from worker {slack_text(item.worker_id)}"
+            blocks = self._question_blocks(ask)
+        else:
+            text = f"Approval needed from worker {slack_text(item.worker_id)}"
+            blocks = self._ask_blocks(ask, item)
+        ts = self.client.post_message(channel, blocks, text)
         ask.ts, ask.channel, ask.created_at, ask.expires_at = ts, channel, now, now + ttl
         self.store.put_slack_ask(ask)
         stamps.append(now)
         self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
                                 action="assistant.slack.ask_posted", subject_id=ask.ask_id,
-                                detail=f"ask={ask.ask_id} request={item.request_id} worker={_short_id(item.worker_id)}")
+                                detail=f"ask={ask.ask_id} request={item.request_id} worker={_short_id(item.worker_id)}"
+                                       f"{' kind=question' if question else ''}")
         return True
+
+    @staticmethod
+    def _question_blocks(ask: SlackAsk) -> list[dict[str, Any]]:
+        lines = [f"*Question* from worker `{slack_text(ask.worker_id)}`", slack_text(ask.question, _QUESTION_TEXT)]
+        if ask.options:
+            lines.append("Options: " + " | ".join(slack_text(o, 120) for o in ask.options))
+        if ask.context:
+            lines.append("Context: " + slack_text(ask.context, _QUESTION_TEXT))
+        lines.append("_Reply in this thread to answer._")
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}}]
 
     @staticmethod
     def _ask_blocks(ask: SlackAsk, item: _Queued) -> list[dict[str, Any]]:
@@ -550,8 +668,12 @@ class SlackRuntime:
         if batch is not None and now - batch.since >= _HOUR:
             batch = None
         count = (batch.count if batch else 0) + 1
-        text = (f"{count} more waiting from worker {slack_text(item.worker_id)}, task {slack_text(item.task_id)}"
-                " (limit reached; decide them in the dashboard)")
+        if item.kind == "question":
+            text = (f"{count} more questions from worker {slack_text(item.worker_id)}, session {slack_text(item.task_id)}"
+                    " not shown (limit reached)")
+        else:
+            text = (f"{count} more waiting from worker {slack_text(item.worker_id)}, task {slack_text(item.task_id)}"
+                    " (limit reached; decide them in the dashboard)")
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
         if batch is None:
             channel = self._target(cfg)
@@ -559,11 +681,17 @@ class SlackRuntime:
         else:
             self.client.update_message(batch.channel, batch.ts, blocks, text)
             batch.count = count
-        self._batched[item.request_id] = None
-        self._cap(self._batched)
+        subject = item.request_id
+        if item.kind == "question" and item.ask is not None:
+            subject = item.ask.ask_id
+            item.ask.status = "expired"              # never shown, so it can never be answered: tell the worker so
+            self.store.put_slack_ask(item.ask)
+        else:
+            self._batched[item.request_id] = None
+            self._cap(self._batched)
         self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
-                                action="assistant.slack.ask_batched", subject_id=item.request_id,
-                                detail=f"request={item.request_id} waiting={count}")
+                                action="assistant.slack.ask_batched", subject_id=subject,
+                                detail=f"{'ask' if item.kind == 'question' else 'request'}={subject} waiting={count}")
         return True
 
     # -- taps --------------------------------------------------------------------------------------
@@ -619,11 +747,15 @@ class SlackRuntime:
         approve, remember = ASK_ACTIONS[action_id]
         try:
             record_owner_decision(self.store, self.service.config["grants"], now, ask.tenant_id, ask.user_id,
-                                  ask.request_id, approve, f"slack:{uid}", provenance="owner_slack")
+                                  ask.request_id, approve, f"slack:{uid}", provenance="owner_slack",
+                                  judge_version=current_judge_version(self.judge))
         except (ValueError, KeyError):          # decided or vetoed by another path between the check and the call
             current = self.store.get_action_request(ask.request_id, tenant_id=ask.tenant_id, user_id=ask.user_id)
             return self._close_stale(ask, row.display, current.status if current is not None else "gone", uid)
         ask.status, ask.remember = "decided", remember
+        ask.worker_id, ask.key_id = row.worker_id, row.key_id
+        if approve and remember:
+            ask.activation = "pending"              # kept until a grant is active: a refusal does not forget the wish
         self.store.put_slack_ask(ask)
         outcome = "approve" if approve else "deny"
         self.store.audit_record(tenant_id=ask.tenant_id, user_id=ask.user_id, actor=f"slack:{uid}",
@@ -631,6 +763,112 @@ class SlackRuntime:
                                 detail=f"{outcome} ask={ask.ask_id} request={ask.request_id}"
                                        f"{' remember' if remember else ''}")
         self._show_outcome(ask, row.display, approve, uid)
+        if approve:
+            self._remember(ask, row, uid, now)
+
+    # -- approve and remember ----------------------------------------------------------------------
+    def _remember(self, ask: SlackAsk, row: ActionRequestRow, uid: str, now: datetime) -> None:
+        """After an owner_slack approval: try to turn every kept "remember" wish for this worker and key into an active
+        grant through the real gates.  No gate is relaxed and nothing polls; the next approval is the next attempt."""
+        wishes = [a for a in self.store.list_slack_asks(ask.tenant_id, ask.user_id)
+                  if a.activation == "pending" and a.worker_id == row.worker_id and a.key_id == row.key_id]
+        if not wishes:
+            return
+        try:
+            refusal = self._activate(ask, row, uid, now)
+        except Exception as exc:                  # the approval stands; the wish is kept for the next one
+            _log.warning("slack remember failed: %s", type(exc).__name__)
+            refusal = "judge_error"
+        if refusal is None:
+            for wish in wishes:
+                wish.activation = "done"
+                self.store.put_slack_ask(wish)
+                self._say(wish, "Remembered. This worker may now run this exact action without asking you, until the "
+                                "permission expires or you revoke it in the dashboard.")
+        elif refusal == "not_rememberable":
+            for wish in wishes:
+                wish.activation = ""
+                self.store.put_slack_ask(wish)
+        if refusal is not None and ask.activation == "pending":
+            tail = "" if refusal == "not_rememberable" else " I will try again after your next approval of this action."
+            self._say(ask, f"Approved, but not remembered yet: {_SENTENCES.get(refusal, _SENTENCES['judge_error'])}."
+                           f"{tail}")
+
+    def _activate(self, ask: SlackAsk, row: ActionRequestRow, uid: str, now: datetime) -> str | None:
+        """None when the grant is active (now or already), otherwise the refusal code."""
+        cfg = self.service.config["grants"]
+        if row.verb == Verb.UNKNOWN.value or not row.key_canonical:
+            return "not_rememberable"
+        key = ActionKey.from_canonical(row.key_canonical)
+        if key.key_id() != row.key_id:
+            return "not_rememberable"
+        if in_shadow(self.store, cfg, now):
+            return "still_in_shadow"
+        version = current_judge_version(self.judge)
+        grant = propose_if_ready(self.store, cfg, now, ask.tenant_id, ask.user_id, row.worker_id, key, vetoed=False,
+                                 judge_version=version)
+        if grant is None:
+            return "not_enough_approvals"
+        if grant.effective_state(now, int(cfg["policy_version"]), version) is GrantState.ACTIVE:
+            return None
+        try:
+            activate_grant(self.store, cfg, now, ask.tenant_id, ask.user_id, grant.grant_id,
+                           confirmed_by=f"slack:{uid}", judge=self.judge)
+        except ActivationRefused as exc:
+            return exc.code
+        return None
+
+    def _say(self, ask: SlackAsk, text: str) -> None:
+        """A plain message in the ask's thread.  Our own fixed text only; a failure never undoes a decision."""
+        try:
+            self.client.post_message(ask.channel, [{"type": "section", "text": {"type": "mrkdwn", "text": text}}], text,
+                                     thread_ts=ask.ts)
+        except SlackError as exc:
+            self.store.audit_record(tenant_id=ask.tenant_id, user_id=ask.user_id, actor=SLACK_ACTOR,
+                                    action="assistant.slack.update_failed", subject_id=ask.ask_id,
+                                    detail=f"ask={ask.ask_id} code={exc.code}")
+
+    # -- owner replies -----------------------------------------------------------------------------
+    def handle_event(self, payload: dict[str, Any]) -> None:
+        with self._tap:
+            self._handle_event(payload)
+
+    def _handle_event(self, payload: dict[str, Any]) -> None:
+        """The owner's threaded text reply to a question.  The text is data for the worker, never an approval."""
+        event = payload.get("event") if payload.get("type") == "event_callback" else None
+        if not isinstance(event, dict) or event.get("type") != "message":
+            return
+        if event.get("bot_id") or event.get("subtype"):
+            return                      # our own posts echo back as bot messages; edits and joins carry a subtype
+        uid = event.get("user")
+        owner = self._cfg().get("owner_user_id") or ""
+        if not owner or not isinstance(uid, str) or not hmac.compare_digest(uid.encode(), owner.encode()):
+            return self._refuse("not_owner", None, uid)
+        parent, channel = event.get("thread_ts"), event.get("channel")
+        if not isinstance(parent, str) or not parent or parent == event.get("ts"):
+            return self._refuse("not_thread", None, uid)
+        ask = self.store.find_slack_ask_by_message(channel, parent) if isinstance(channel, str) else None
+        if ask is None:
+            return self._refuse("no_ask", None, uid)
+        if ask.kind != "question":
+            return self._refuse("not_question", ask, uid)
+        if ask.status != "open":
+            return self._refuse("not_open", ask, uid)
+        if as_utc(self._now()) >= as_utc(ask.expires_at):
+            ask.status = "expired"
+            self.store.put_slack_ask(ask)
+            return self._refuse("expired", ask, uid)
+        text = event.get("text")
+        answer = _ANSWER_CONTROL.sub("", text).strip() if isinstance(text, str) else ""
+        answer = answer.encode("utf-8")[:_ANSWER_BYTES].decode("utf-8", "ignore")
+        if not answer:
+            return self._refuse("empty", ask, uid)
+        ask.answer, ask.status = answer, "decided"
+        self.store.put_slack_ask(ask)
+        self.store.audit_record(tenant_id=ask.tenant_id, user_id=ask.user_id, actor=f"slack:{uid}",
+                                action="assistant.slack.answer", subject_id=ask.ask_id,
+                                detail=f"ask={ask.ask_id} worker={_short_id(ask.worker_id)} bytes={len(answer.encode())}")
+        self._say(ask, "Recorded. The worker will see your answer.")
 
     def _close_stale(self, ask: SlackAsk, display: str, status: str, uid: object) -> None:
         """The request was decided another way: refuse the tap, close the ask and take the buttons off the message.

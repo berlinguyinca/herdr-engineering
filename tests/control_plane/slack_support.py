@@ -6,8 +6,8 @@ token, each answering ``{"ok": true, ...}``; anything else gets ``{"ok": false, 
 are recorded so tests can assert on what crossed the wire.
 
 It also serves the rest of what the runtime needs: ``chat.postMessage``, ``chat.update`` and ``conversations.open`` (bot
-token) and a real RFC 6455 WebSocket endpoint that speaks Socket Mode (``hello``, then ``interactive`` envelopes pushed by
-``push_interactive`` and acknowledged by the client).  ``apps.connections.open`` returns a ``ws://`` URL pointing back at
+token) and a real RFC 6455 WebSocket endpoint that speaks Socket Mode (``hello``, then ``interactive`` and ``events_api`` envelopes pushed by
+``push_interactive`` / ``push_event`` and acknowledged by the client).  ``apps.connections.open`` returns a ``ws://`` URL pointing back at
 this listener; slack_sdk's built-in client connects in plain text to any port other than 443, so no TLS is needed here.
 """
 from __future__ import annotations
@@ -132,6 +132,14 @@ class SlackListener:
     def push_interactive(self, payload: dict[str, object], envelope_id: str | None = None) -> str:
         envelope_id = envelope_id or f"env-{time.time_ns()}"
         self._outbox.put(json.dumps({"envelope_id": envelope_id, "type": "interactive", "payload": payload,
+                                     "accepts_response_payload": False}))
+        return envelope_id
+
+    def push_event(self, event: dict[str, object], envelope_id: str | None = None) -> str:
+        """An ``events_api`` envelope carrying a Slack event (a message the owner typed)."""
+        envelope_id = envelope_id or f"env-{time.time_ns()}"
+        self._outbox.put(json.dumps({"envelope_id": envelope_id, "type": "events_api",
+                                     "payload": {"type": "event_callback", "event": event},
                                      "accepts_response_payload": False}))
         return envelope_id
 

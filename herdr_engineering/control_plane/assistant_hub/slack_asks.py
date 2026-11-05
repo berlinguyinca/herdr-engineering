@@ -6,7 +6,7 @@ and message timestamp the hub posted, and an expiry; a tap that does not match a
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -39,6 +39,12 @@ class SlackAsk:
     answer: str | None = None
     created_at: datetime = _EPOCH
     expires_at: datetime = _EPOCH
+    worker_id: str = ""              # the worker that asked (a question) or whose request this is (an action)
+    key_id: str = ""                 # action asks: the key a remembered approval would earn a grant for
+    activation: str = ""             # action asks tapped "Approve and remember": "" | "pending" (kept intent) | "done"
+    question: str = ""               # question asks: what the worker asked (kept so a restart can still post it)
+    options: list[str] = field(default_factory=list)
+    context: str = ""
 
 
 def button_value(ask: SlackAsk) -> str:
