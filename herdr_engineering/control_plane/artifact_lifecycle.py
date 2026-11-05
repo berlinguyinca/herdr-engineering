@@ -228,6 +228,12 @@ class ArtifactLifecycleMixin:
         """Serialise purge decisions on one content digest for the rest of the transaction."""
         await self._conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", self._digest_of(key))
 
+    async def _lock_digests(self, keys: list[str]) -> None:
+        """Exclusive digest locks for several keys, always in sorted digest order (the order every shared taker uses):
+        two transactions over overlapping digest sets then queue instead of deadlocking."""
+        for digest in sorted({self._digest_of(k) for k in keys if k}):
+            await self._conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", digest)
+
     async def _lock_digests_shared(self, keys: list[str]) -> None:
         """Writers of a reference to content-addressed bytes call this inside their committing transaction, then
         re-check the object exists. It excludes a concurrent purge sweep (exclusive lock on the same digest) until the
@@ -287,8 +293,8 @@ class ArtifactLifecycleMixin:
         normalised = {canonical for canonical in map(self._canonical_key, keys) if canonical}
         # the purge event comes first: _key_shared must already see this artifact as purged only after commit, so the
         # decision below excludes it explicitly
+        await self._lock_digests(sorted(normalised))
         for key in sorted(normalised):
-            await self._lock_digest(key)
             if await self._key_shared(artifact_id, key):
                 retained.append(key)
             else:

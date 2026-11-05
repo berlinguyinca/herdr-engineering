@@ -64,8 +64,9 @@ operator is an owner only with `allow_keyless_owner: true`. Its actions are audi
   reports, links, shares and annotations, and refuses every write (new versions, merges, uploads, retracts,
   collaborator writes). That holds for registry artifacts and for older uploads served from the in-memory ACL and the
   event projection: those reads consult a cache of tombstoned ids that this process updates at once on every
-  delete/restore, and that another control-plane process sees within 5 seconds (a store that cannot be asked keeps the
-  last answer; before the first answer a dead store gives the fixed 503). Writes ask the database. The collaborator
+  delete/restore, and that another control-plane process sees within 5 seconds (the cache fails closed: when the store cannot be
+  asked, the last answer is used only inside that 5-second window; past it, and before the first answer, a dead store
+  gives the fixed 503). Writes ask the database. The collaborator
   mirror drops the artifact from `grants.json` and removes its folder (head, blobs, annotations) on the worker's next
   pass, which is also what makes MCP read/head/history/annotations stop; collaborator actions queued for it are
   refused. Until that pass (seconds) a collaborator agent can still read the mirrored copy.
@@ -89,6 +90,10 @@ does not apply migrations; new web code against a database without migration `00
 lifecycle route with 503/500 (reads and other routes are unaffected). While old web processes still run next to the
 migrated database, a hold they place is a tombstone without a purge date; the new code treats it as a legal hold.
 Rolling back the migration drops queued deletes (their bytes stay orphaned, none is lost).
+
+Digest locks (purge, merge, publish) are always taken in sorted digest order, so concurrent operations over
+overlapping digests queue instead of deadlocking. The reviews list of an artifact needs the same read permission as
+its versions (otherwise the plain 404).
 
 Parked (not done): route names `tombstoned` and `delete-access` shadow artifacts with those literal ids; the tombstone
 listing is capped at 200 and has no pagination; bulk purges run synchronously and `_key_shared` scans have no GIN index
