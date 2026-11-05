@@ -366,3 +366,37 @@ def test_archive_check_is_read_only_and_never_returns_credentials(profile, tmp_p
     assert 'fixture-credential' not in json.dumps(receipt)
     assert len(receipt['sha256']) == 64
     assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob('*')) == before
+
+
+def test_managed_sdk_connectivity_uses_canonical_status_with_bounded_timeout():
+    from herdr_engineering.memory_client_profile import verify_connectivity
+    calls=[]
+    def runner(argv,**kwargs):
+        calls.append((argv,kwargs))
+        return subprocess.CompletedProcess(argv,0,stdout='{"healthy":true}',stderr='private-unused-stderr')
+    verify_connectivity('owned-test-container',runner=runner)
+    assert calls[0][0]==['docker','exec','owned-test-container','herdr-memory','--harness','codex','status']
+    assert calls[0][1]['timeout']==20
+    assert calls[0][1]['capture_output'] is True
+
+
+@pytest.mark.parametrize('body', ['{"healthy":false}', '{"healthy":"true"}', '{}', '[]', 'null', 'private-malformed-response'])
+def test_unhealthy_or_malformed_sdk_status_is_rejected_without_echo(body):
+    from herdr_engineering.memory_client_profile import verify_connectivity
+    def runner(argv,**kwargs):
+        return subprocess.CompletedProcess(argv,0,stdout=body,stderr='private-secret-error')
+    with pytest.raises(ProfileError) as failure:
+        verify_connectivity('owned-test-container',runner=runner)
+    assert str(failure.value)=='Private memory client connectivity check failed'
+    assert 'private-secret-error' not in str(failure.value)
+
+
+def test_sdk_status_timeout_and_failed_exit_are_sanitized():
+    from herdr_engineering.memory_client_profile import verify_connectivity
+    def timeout(argv,**kwargs):
+        raise subprocess.TimeoutExpired(argv,20,output='private-timeout-body',stderr='private-key')
+    def failed(argv,**kwargs):
+        return subprocess.CompletedProcess(argv,1,stdout='{"healthy":true}',stderr='private-key')
+    for runner in (timeout,failed):
+        with pytest.raises(ProfileError,match='^Private memory client connectivity check failed$'):
+            verify_connectivity('owned-test-container',runner=runner)

@@ -232,3 +232,16 @@ cleanup() {{ return 0; }}
     assert archive.read_bytes() == b'OLD-PRIVATE-PROFILE'
     assert calls.index(installs[0]) < next(i for i, e in enumerate(calls)
                                          if e['action'] == 'verify-rollback')
+
+
+@pytest.mark.parametrize(('opt_in','enabled','supported','mode'),[
+    (0,1,1,'install'),(1,0,1,'install'),(1,1,0,'install'),(1,1,1,'unmanaged'),(1,0,1,'clear'),
+])
+def test_forward_connectivity_noop_without_optin_managed_sdk(harness,opt_in,enabled,supported,mode):
+    result=run(harness,f'''
+MEMORY_PRIVATE_EGRESS={opt_in}; MEMORY_CLIENT_ENABLED={enabled}
+MEMORY_CLIENT_SUPPORTED={supported}; MEMORY_CLIENT_MODE={mode}
+memory_client_forward_connectivity "$WORK"
+''')
+    assert result.returncode==0,result.stderr
+    assert not harness['log'].exists()

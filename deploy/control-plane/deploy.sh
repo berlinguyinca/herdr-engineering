@@ -996,6 +996,7 @@ forward() {
   fi
   memory_client_apply forward "$WORK" || return 1
   web_egress_after forward || return 1
+  memory_client_forward_connectivity "$WORK" || return 1
   # The edge resolves collab-public once, at (re)load: a recreated collab-public has a
   # new address, so reload the edge after every collab up, not only on a new conf.
   if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi

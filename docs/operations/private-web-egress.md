@@ -183,6 +183,13 @@ rule by ordinal.
 - The matching runtime profile is installed before `after` validates the new web
   endpoint/network identity and priority, checks active UFW, and adds exactly the
   recorded rule. Post-add validation failure attempts restrictive revocation.
+- For an opted-in forward rollout with a managed SDK profile, the installed
+  canonical `herdr-memory --harness codex status` must complete within a 20-second
+  caller deadline and report Boolean `healthy: true`. This runs after profile
+  installation and the egress grant, before profile promotion or policy commit.
+  Unhealthy/malformed status, nonzero exit and timeout enter the existing rollback;
+  response bodies and stderr are withheld. Disabled, unmanaged and clear modes
+  skip the gate. Restoring an old known state never depends on backend health.
 - Rollback restores the saved selector/CIDR/generation with the previous commit's
   Compose, pinned image/config and **previous** memory profile before regranting.
   Invalid callback directions and wrong/missing pending attempts fail before
@@ -268,6 +275,11 @@ proxy, not a UFW/Compose transaction. No parallel proxy, daemon or canonical SDK
 Unix transport is added here.
 
 ## Newton review checkpoint
+
+Parent reconciliation base for the forward connectivity fix is
+`a6f0168e79a1e706879a9654d6508a3055a465f1`, including main `8cebbe17`
+with PR620 merged and the newer artifact changes preserved. The original
+implementation history below is retained for provenance.
 
 Implementation worktree: `herdr-private-web-egress-20261105`, branch
 `feat/private-web-egress-20261105`. Base is PR620 `ff87b581` plus main `49a22333`;

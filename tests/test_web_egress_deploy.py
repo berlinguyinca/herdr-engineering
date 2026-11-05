@@ -15,11 +15,11 @@ def function(name):
 
 
 @pytest.mark.parametrize(
-    ("direction", "interrupted"), [("forward", False), ("rollback", False), ("rollback", True)]
+    ("direction", "interrupted", "health_result"), [("forward", False, "healthy"), ("forward", False, "unhealthy"), ("forward", False, "malformed"), ("rollback", False, "healthy"), ("rollback", True, "healthy")]
 )
 @pytest.mark.parametrize("delete_fails", [False, True])
 def test_real_coordinator_restores_matching_policy_and_profile_before_grant(
-    tmp_path, direction, delete_fails, interrupted
+    tmp_path, direction, delete_fails, interrupted, health_result
 ):
     log = tmp_path / "events"
     state = tmp_path / "state.py"
@@ -60,7 +60,7 @@ WEB_EGRESS_COMPOSE_ENABLED=0; MEMORY_PRIVATE_EGRESS_CIDR=unused; WEB_EGRESS_GENE
 HERDR_SHARES_DIR="{tmp_path}/shares"; HERDR_SHARE_EVENTS_DIR="{tmp_path}/share-events"
 HERDR_COLLAB_MIRROR_DIR="{tmp_path}/mirror"; HERDR_COLLAB_OUTBOX_DIR="{tmp_path}/outbox"; HERDR_COLLAB_SPOOL_DIR="{tmp_path}/spool"
 PIPELINES_SYNC=missing; SYNC_STABLE=missing; APP_SERVICES=(control-plane-web); EDGE_SERVICE=(); SHARE_SERVICE=()
-MEMORY_CLIENT_SUPPORTED=1; MEMORY_CLIENT_MODE=install
+MEMORY_PRIVATE_EGRESS=1; MEMORY_CLIENT_ENABLED=1; MEMORY_CLIENT_SUPPORTED=1; MEMORY_CLIENT_MODE=install
 MEMORY_CLIENT_PREVIOUS="{old}"; MEMORY_CLIENT_CANDIDATE="{new}"; MEMORY_CLIENT_CURRENT="{tmp_path}/promoted-profile"
 . "{ROOT}/deploy/control-plane/web-egress-deploy.sh"
 . "{ROOT}/deploy/control-plane/memory-client-deploy.sh"
@@ -73,7 +73,10 @@ web_egress_cmd() {{
     if [ "$action" = before ] && [ "{int(delete_fails)}" = 1 ]; then return 1; fi
   fi
 }}
-memory_client_cmd() {{ echo "profile:$*" >> "{log}"; }}
+memory_client_cmd() {{
+  echo "profile:$*" >> "{log}"
+  if [ "$2" = connectivity ] && [ "{health_result}" != healthy ]; then return 1; fi
+}}
 container_of() {{ echo private-web; }}
 install_private() {{ echo "host-install:$1" >> "{log}"; }}
 restore_host_state() {{ echo restore-host-state >> "{log}"; }}
@@ -102,6 +105,16 @@ status=0
             for line in events
         )
         return
+    if direction == "forward" and health_result != "healthy":
+        assert result.returncode == 1, result.stderr
+        assert sum(" connectivity " in line for line in events) == 1
+        failed_check = next(i for i,line in enumerate(events) if " connectivity " in line)
+        rollback_before = next(i for i,line in enumerate(events) if line.startswith("egress:before") and "rollback" in line)
+        rollback_profile = next(i for i,line in enumerate(events) if " install " in line and str(old) in line)
+        assert failed_check < rollback_before < rollback_profile
+        assert not any(line == "host-install:" + str(new) for line in events)
+        assert not any(line.startswith("egress:commit") and "forward" in line for line in events)
+        return
     assert result.returncode == (143 if interrupted else (0 if direction == "forward" else 1)), (
         result.stderr
     )
@@ -112,6 +125,11 @@ status=0
     )
     grant = next(i for i, line in enumerate(events) if line.startswith("egress:after"))
     assert before < compose < profile < grant
+    connectivity = [i for i,line in enumerate(events) if " connectivity " in line]
+    if direction == "forward":
+        assert len(connectivity) == 1 and grant < connectivity[0]
+    else:
+        assert connectivity == []
     assert str(old if direction == "rollback" else new) in events[profile]
     assert "selector=1 cidr=172.31.252.0/29" in events[compose]
     commit = next(i for i, line in enumerate(events) if line.startswith("egress:commit"))
