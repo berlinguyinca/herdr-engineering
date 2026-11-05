@@ -498,7 +498,7 @@ def test_the_log_store_keeps_only_the_tail_and_prunes_old_logs(tmp_path):
     store = logs.LogStore(tmp_path)
     big = "x" * 1_500_000
     ref = store.write(RID, "bender", "updater", big)
-    assert ref["bytes"] == logs.MAX_BYTES == len(store.read(RID, "bender", "updater"))
+    assert ref["bytes"] == logs.MAX_BYTES == len(store.read_bytes(RID, "bender", "updater"))
     old = tmp_path / RID / "bender-updater.log"
     os.utime(old, (0, 0))
     other = plan.rollout_id({"autospec": "d" * 40})
