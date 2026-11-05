@@ -30,7 +30,7 @@ Status: code complete on branch `feat/wc001-s6-validation-rollout`; **nothing is
 
 ## Known gaps
 - Weekly history (G1): `GET /api/v1/work/weekly-events?since=&until=&limit=&after=` reads the in-memory event streams (same source and auth as `/api/v1/events`; 404 when the flag is off; max 31-day span, limit max 500). It cannot prove completeness: start events are written when the control plane first sees the work (not the true start), the durable Postgres sink is best-effort and not retried, and work that never ends has no finish event. So `coverage.complete` is always false here, Started/Finished stay "at least N (partial)", and the banner stays visible. Quota-paused history is not emitted by any Python code, so no paused_quota events exist yet.
-- Issue cards never link to Herdr: no issue-to-mission relationship is recorded anywhere.
+- Issue cards never link to Herdr (G2 audit, see handoffs/G2.md): no structured issue-to-mission field is recorded anywhere, and Herdr will not guess from titles or `Closes #N` text. Issue cards link only after missions or PR records carry an explicit machine field (see the handoff for the minimal field).
 - A PR links only for missions that have a stored outcome (ended missions); a PR recorded by a still-running mission verifies after it ends. The board reads refs once per page load.
 - The week uses the browser time zone (no user setting) and starts on Monday.
 - Terminal attach is copy-command only.

@@ -75,3 +75,15 @@ def test_http_returns_prs_and_keeps_auth_behaviour(served):
     assert _get(served, None)[0] == 401
     assert _get(served, "wrong")[0] == 401
     assert _get(served, "ing")[0] == 200
+
+
+def test_g2_summaries_carry_no_issue_relationship_and_text_is_never_parsed():
+    """G2: no structured mission->issue source exists. Free text naming an issue must not create one."""
+    repo = ControlPlaneRepo()
+    ControlPlaneServer(repo, host="127.0.0.1", port=0, api_keys={"v1": "viewer"})
+    for stage in ("implementation", "complete"):
+        repo.upsert_mission("MSN-9", title="Closes #5", purpose="Fixes org/app#5", stage=stage, source="pi")
+    repo.upsert_pull_request("p", mission_id="pi:MSN-9", repository="org/app", number=6, url="https://github.com/org/app/pull/6", status="open")
+    summary = outcome_summaries(repo)["pi:MSN-9"]
+    assert "issues" not in summary and "issue" not in summary
+    assert summary["prs"] == [{"repository": "org/app", "number": 6}]
