@@ -10,6 +10,8 @@ import { freshnessSources } from './freshness.js';
 import { createResourcePoller } from './refresh-bus.js';
 import { requestErrorDetail } from './dashboard-load-state.js';
 import { morph, handOff } from './patch.js';
+import { workSummaries } from './work-summary.js';
+import { weeklyActivity } from './work-week.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -55,8 +57,8 @@ export function unresolvedCiFailures(entries) {
   const pr=r=>/^refs\/pull\/(\d+)\//.exec(r.ref || '')?.[1] || (String(r.event || '')==='pull_request' ? /^(\d+)$/.exec(String(r.pull_request ?? ''))?.[1] : null);
   return entries.filter(e=>e.tab==='failed' && !((passedAt.get(key(e.record)) || 0) > when(e.record)) && !e.record.pr_merged && !merged.has(`${e.record.repository || ''}#${pr(e.record)}`));
 }
-const OVERVIEW_CARDS = ['sessions','missions','fleet','ci','reviews','services','hosts','activity'];
-const CARD_LABELS = {missions:'Current missions',fleet:'Fleet health',sessions:'Agents',ci:'CI builds',reviews:'Reviews',services:'HerdR services',hosts:'Hosts',activity:'Recent changes'};
+const OVERVIEW_CARDS = ['week','sessions','missions','fleet','ci','reviews','services','hosts','activity'];
+const CARD_LABELS = {week:'This week',missions:'Current missions',fleet:'Fleet health',sessions:'Agents',ci:'CI builds',reviews:'Reviews',services:'HerdR services',hosts:'Hosts',activity:'Recent changes'};
 const PREFERENCES_KEY = 'herdr.overview.layout.v1';
 export function sanitizeOverviewPreferences(value) {
   const valid = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -163,6 +165,69 @@ function missionRow(entry, canSnooze = false) {
   return `<li class="ov-row"><div>${link(`#/missions/${encodeURIComponent(entry.key)}`,short(entry.title))}<p>${esc(short(detail || (entry.group === 'attention' ? entry.health : 'Activity not reported')))}</p></div><span class="ov-tag ${entry.group === 'attention' ? 'ov-alert' : ''}">${esc(human(entry.health))}${entry.host ? ` · ${esc(entry.host)}` : ''}${canSnooze ? `<br><button type="button" class="hd-btn hd-btn--quiet hd-btn--sm ov-snooze" data-snooze="${esc(entry.key)}" title="Hide from this list for 24 hours">Snooze 24h</button>` : ''}</span></li>`;
 }
 
+// WC-003: "This week" card. Pure projection of workSummaries + weeklyActivity; it reads the data the overview already loads.
+const WEEK_SOURCES = ['projections', 'missions', 'sessions'];
+const LIFECYCLE_LABEL = {running:'running', blocked:'blocked', review:'in review', paused_quota:'paused (quota)', finished:'finished', failed:'failed', unconfirmed:'unconfirmed'};
+const NEEDS_ATTENTION = new Set(['blocked', 'review', 'failed']);
+const WEEK_ROW_LIMIT = 5;
+export function userTimeZone(data = {}) {
+  const zone = typeof data.timeZone === 'string' && data.timeZone ? data.timeZone : Intl.DateTimeFormat().resolvedOptions().timeZone;
+  try { new Intl.DateTimeFormat('en-US', {timeZone: zone}); return zone; } catch { return 'UTC'; }
+}
+const weekGroup = item => item.lifecycle === 'paused_quota' ? 'paused' : item.lifecycle === 'finished' || item.lifecycle === 'failed' ? 'completed' : item.lifecycle === 'unconfirmed' ? 'unconfirmed' : 'active';
+export function weekCardModel(data = {}, states = {}, received = Date.now(), now = Date.now()) {
+  const timeZone = userTimeZone(data);
+  const loaded = WEEK_SOURCES.filter(key => states[key]?.loaded), missing = WEEK_SOURCES.filter(key => !states[key]?.loaded);
+  const items = workSummaries({projections: records(data.projections), recorded: records(data.missions), sessions: records(data.sessions), received, now});
+  const week = weeklyActivity({items, now, timeZone, historyComplete: false});
+  const start = Date.parse(week.window.start), end = Date.parse(week.window.end);
+  const inWindow = value => { const ms = Date.parse(text(value)); return ms >= start && ms < end; };
+  const visible = items.filter(item => {
+    const group = weekGroup(item);
+    if (group === 'completed') return inWindow(item.completed_at) || (item.lifecycle === 'failed' && inWindow(item.updated_at));
+    return true;
+  });
+  const rank = item => NEEDS_ATTENTION.has(item.lifecycle) ? 0 : 1;
+  const sorted = [...visible].sort((a, b) => rank(a) - rank(b) || (Date.parse(b.updated_at || '') || 0) - (Date.parse(a.updated_at || '') || 0));
+  const groups = ['active', 'paused', 'completed', 'unconfirmed'].map(key => ({key, items: sorted.filter(item => weekGroup(item) === key)})).filter(group => group.items.length);
+  const partial = missing.length > 0 || ['started', 'finished', 'open', 'paused_quota', 'attention_needed'].some(key => week[key].coverage !== 'complete');
+  return {week, groups, timeZone, loaded, missing, partial, total: items.length};
+}
+function weekMetric(label, m) {
+  const unknown = m.count === null, partial = m.coverage === 'partial';
+  const value = unknown ? '—' : String(m.count);
+  const badge = unknown ? 'unknown' : partial ? `at least ${m.count} (partial)` : 'complete';
+  const full = `${label}: ${unknown ? 'unknown' : partial ? `at least ${m.count}, partial data` : m.count}${m.basis === 'snapshot' ? ', current snapshot' : ''}`;
+  return `<div class="ov-metric wk-metric" role="group" aria-label="${esc(full)}"><strong>${esc(value)}</strong><span>${esc(label)}</span><small class="wk-badge" data-coverage="${esc(m.coverage)}">${esc(badge)}${m.basis === 'snapshot' ? ' · snapshot' : ''}</small></div>`;
+}
+function weekRow(item) {
+  const href = item.links?.[0]?.href;
+  const title = short(text(item.title) || text(item.source_ref) || 'Untitled work', 90);
+  const sessions = item.session_ids?.length || 0;
+  const progress = item.progress && Number.isFinite(item.progress.percent) ? Math.max(0, Math.min(100, Math.round(item.progress.percent))) : null;
+  const attention = NEEDS_ATTENTION.has(item.lifecycle);
+  return `<li class="ov-row wk-row" data-work-id="${esc(item.work_id)}"><div>${href ? `<a href="${esc(href)}">${esc(title)}</a>` : `<span class="wk-title">${esc(title)}</span>`}
+    <p>${esc(item.source === 'session' ? 'Agent without a mission' : 'Mission')} · ${sessions} ${sessions === 1 ? 'session' : 'sessions'}</p>
+    ${progress === null ? '' : `<progress class="wk-progress" max="100" value="${progress}" aria-label="${esc(`Measured progress for ${title}: ${item.progress.label || `${progress}%`}`)}">${progress}%</progress><p>${esc(short(text(item.progress.label), 80))}</p>`}</div>
+    <span class="ov-tag ${attention ? 'ov-alert' : ''}">${esc(LIFECYCLE_LABEL[item.lifecycle] || item.lifecycle)}</span></li>`;
+}
+const GROUP_LABEL = {active:'Active', paused:'Paused', completed:'Completed this week', unconfirmed:'Unconfirmed'};
+export function renderWeekCard(data = {}, states = {}, received = Date.now(), now = Date.now()) {
+  const heading = '<div class="ov-heading"><h2 tabindex="-1">This week</h2></div>';
+  const failed = WEEK_SOURCES.filter(key => states[key]?.error);
+  const errors = failed.length ? `<p class="ov-warning ov-stale" role="status" title="${esc(failed.map(key => `${SOURCE_LABELS[key]}: ${states[key].error}`).join('; '))}">↻ Could not refresh ${esc(failed.map(key => SOURCE_LABELS[key].toLowerCase()).join(', '))} · ${WEEK_SOURCES.some(key => states[key]?.loaded) ? 'showing last data' : 'retrying'}</p>` : '';
+  if (!WEEK_SOURCES.some(key => states[key]?.loaded)) {
+    return `${heading}${errors}${failed.length ? '' : `<div data-skeleton aria-busy="true" role="status" aria-label="Loading this week"><div class="hd-skeleton ov-skeleton" aria-hidden="true"></div>${loadingProgress('this week')}</div>`}`;
+  }
+  const m = weekCardModel(data, states, received, now), w = m.week;
+  const banner = m.partial ? `<p class="ov-warning wk-banner" role="status">Partial data: ${m.missing.length ? `still waiting for ${esc(m.missing.map(key => SOURCE_LABELS[key].toLowerCase()).join(', '))}. ` : ''}Started and Finished only count work with recorded timestamps in the current snapshot, so they are lower bounds. Open, Paused and Needs attention are snapshots of right now.</p>` : '';
+  const rows = m.groups.map(group => `<h3 class="ov-sub">${GROUP_LABEL[group.key]} <span class="wk-count">(${group.items.length})</span></h3><ul class="ov-list" aria-label="${esc(GROUP_LABEL[group.key])} work">${group.items.slice(0, WEEK_ROW_LIMIT).map(weekRow).join('')}</ul>${group.items.length > WEEK_ROW_LIMIT ? empty(`Showing ${WEEK_ROW_LIMIT} of ${group.items.length}.`) : ''}`).join('');
+  return `${heading}${errors}
+    <div class="ov-metrics wk-metrics">${weekMetric('Started', w.started)}${weekMetric('Finished', w.finished)}${weekMetric('Open', w.open)}${weekMetric('Quota-paused', w.paused_quota)}${weekMetric('Needs attention', w.attention_needed)}</div>
+    ${banner}${rows || empty('No work items are reported yet.')}
+    <p class="ov-note">Week of ${esc(w.window.start.slice(0, 10))} (${esc(m.timeZone)}), counted from recorded timestamps. Progress is shown only where a mission reports measured evidence.</p>`;
+}
+
 export function renderOverviewSection(section, data = {}, states = {}, received = Date.now(), now = Date.now()) {
   const model = overviewModel(data,received,now);
   if (section === 'attention') {
@@ -177,6 +242,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
       ${attention.items.length>limit ? `<div class="ov-attention-controls"><span class="ov-note">Showing ${visible.length} of ${attention.items.length} observed items</span><button type="button" class="hd-btn hd-btn--secondary" data-attention-toggle aria-expanded="${expanded}" aria-controls="ov-attention-items">${expanded?'Show fewer':`Show all ${attention.items.length}`}</button></div>` : ''}
       ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"${attention.server?' data-attention-origin="server"':''}><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
   }
+  if (section === 'week') return renderWeekCard(data, states, received, now);
   if (section === 'missions') {
     const m = model.missions;
     const ready = states.projections?.loaded || states.missions?.loaded;
@@ -252,6 +318,9 @@ const styles = `<style>
 @media(max-width:960px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel[data-overview=sessions]{grid-column:auto}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
 .ov-attention{margin-bottom:16px}.ov-attention-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:0 24px}.ov-attention-list.is-expanded{max-height:min(60vh,560px);overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.ov-attention-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}.ov-attention-controls button:focus-visible,.ov-attention-list:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-panel[hidden]{display:none}.ov-customize{margin:0 0 16px;font-size:13px}.ov-customize>summary{cursor:pointer;width:fit-content;padding:8px 0}.ov-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}.ov-control-row strong{min-width:145px}.ov-customize button:focus-visible,.ov-customize summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-layout:has(>[hidden]){grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr))}.ov-layout:has(>[hidden])>.ov-panel{grid-column:auto}
 @media(max-width:960px){.ov-layout:has(>[hidden]){grid-template-columns:minmax(0,1fr)}.ov-control-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding-bottom:8px;border-bottom:1px solid var(--border)}.ov-control-row strong{grid-column:1/-1}}
+.wk-metrics{align-items:stretch}.wk-badge{font-size:11px;color:var(--text-secondary);line-height:1.3}.wk-badge[data-coverage=partial],.wk-badge[data-coverage=unknown]{color:var(--status-attention)}.wk-count{color:var(--text-muted);font-weight:400}.wk-progress{display:block;width:100%;max-width:260px;height:8px;margin-top:6px;accent-color:var(--accent)}.wk-row a:focus-visible,.wk-row .wk-title{outline-offset:2px}.ov-panel[data-overview=week]{grid-column:1/-1}
+@media(max-width:960px){.wk-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.wk-progress{max-width:none}}
+@media(prefers-reduced-motion:reduce){.wk-progress{transition:none}}
 </style>`;
 
 const SNOOZE_KEY = 'herdr.snoozedMissions';
@@ -289,7 +358,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     attention:signal=>client.attention({state:'open'},{signal}).catch(error=>{if(error?.status===404)return {disabled:true};throw error;}),
   };
   states.attention={loaded:false,error:false};
-  container.innerHTML=`${styles}<details class="ov-customize"><summary>Customize Overview</summary><p class="ov-note">Attention is always visible. Health stays in the footer.</p><div data-overview-controls></div><button type="button" class="hd-btn hd-btn--secondary hd-btn--sm" data-overview-reset>Reset layout</button></details><section class="ov-panel ov-attention" data-overview="attention" aria-label="Attention"></section><div class="ov-layout">${OVERVIEW_CARDS.map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
+  container.innerHTML=`${styles}<details class="ov-customize"><summary>Customize Overview</summary><p class="ov-note">Attention is always visible. Health stays in the footer.</p><div data-overview-controls></div><button type="button" class="hd-btn hd-btn--secondary hd-btn--sm" data-overview-reset>Reset layout</button></details><section class="ov-panel ov-attention" data-overview="attention" aria-label="Attention"></section><div class="ov-layout">${OVERVIEW_CARDS.map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key==='week'?'This week':key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
   function applyPreferences() {
     const focused=document.activeElement;
     const action=focused?.dataset.overviewAction, card=focused?.dataset.card;
