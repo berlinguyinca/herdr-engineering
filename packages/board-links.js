@@ -43,19 +43,28 @@ export function resolveBoardLink(item, {refs = null, refsFailed = false} = {}) {
 }
 
 /**
- * WC-005b: map `/api/v1/mission-outcomes` summaries ({[missionKey]: {prs:[{repository,number}]}}) to resolver refs.
- * The key is kept exactly as served (namespace included). Entries without a usable prs list contribute nothing.
- * @returns {{refs: object[], failed: boolean}} failed is true when the payload is not the expected shape
+ * WC-005b/G3: map `/api/v1/mission-outcomes` to resolver refs. Two additive sources of recorded PRs, both keyed by the
+ * mission key exactly as served (namespace included): per-outcome `outcomes[key].prs` (ended missions) and the top-level
+ * `pr_refs[key]` (every listed mission, running included; absent on older servers). The same mission+PR is emitted once.
+ * @returns {{refs: object[], failed: boolean}} failed is true when `outcomes` is not the expected shape
  */
 export function refsFromMissionOutcomes(body) {
   const outcomes = body && typeof body === 'object' ? body.outcomes : null;
   if (!outcomes || typeof outcomes !== 'object' || Array.isArray(outcomes)) return { refs: [], failed: true };
-  const refs = [];
+  const refs = [], seen = new Set();
+  const add = (id, pr) => {
+    if (!pr || typeof pr.repository !== 'string' || !Number.isInteger(pr.number)) return;
+    const k = `${id}\u0000${pr.repository}\u0000${pr.number}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    refs.push({ kind: 'mission', id, type: 'pr', repository: pr.repository, number: pr.number });
+  };
   for (const [id, summary] of Object.entries(outcomes)) {
-    if (!summary || !Array.isArray(summary.prs)) continue;
-    for (const pr of summary.prs) {
-      if (pr && typeof pr.repository === 'string' && Number.isInteger(pr.number)) refs.push({ kind: 'mission', id, type: 'pr', repository: pr.repository, number: pr.number });
-    }
+    if (summary && Array.isArray(summary.prs)) for (const pr of summary.prs) add(id, pr);
+  }
+  const prRefs = body.pr_refs;
+  if (prRefs && typeof prRefs === 'object' && !Array.isArray(prRefs)) {
+    for (const [id, list] of Object.entries(prRefs)) if (Array.isArray(list)) for (const pr of list) add(id, pr);
   }
   return { refs, failed: false };
 }

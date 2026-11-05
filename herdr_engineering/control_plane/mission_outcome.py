@@ -246,6 +246,19 @@ def outcome_summaries(repo):
     return out
 
 
+def pr_refs_by_mission(repo):
+    """G3: {mission key: [{repository, number}]} for every listed mission (running included), bounded by MAX_SUMMARIES.
+    Only missions with a recorded PR appear. Same single bulk read and grouping as the per-outcome ``prs``; a failing read is empty."""
+    refs = _pr_refs_by_mission(repo)
+    if not refs:
+        return {}
+    try:
+        keys = {mission_key(m) for m in repo.list_missions()[:MAX_SUMMARIES]}
+    except Exception:  # noqa: BLE001
+        return {}
+    return {k: v for k, v in sorted(refs.items()) if k in keys}
+
+
 def _pr_refs_by_mission(repo):
     """One bulk read of the PR records, grouped by the exact mission key (namespaces never mix): {key: [{repository, number}]},
     sorted by (repository, number) so the order is deterministic. A failing read yields no refs, never a failed list."""
