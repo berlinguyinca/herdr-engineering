@@ -182,7 +182,7 @@ It publishes the report and prints one line:
   and prompt count per segment, and an agent count where the history reports child agents. A block that does not
   check out (gaps, wrong totals, fewer than 5 prompts, more than 8 segments) is dropped and the report is published
   as before. Each segment also shows **time worked** (the gaps between consecutive events, leaving out any pause over
-  30 minutes) next to its wall-clock span, and **tokens** as fresh (new input + output) over cached re-reads, summed
+  30 minutes) next to its wall-clock time (`wall`, always shown), and **tokens** as fresh (new input + output) over cached re-reads, summed
   from the harness's own usage records (Claude `message.usage`, Pi `usage`, Codex `token_count`, OpenCode `tokens`).
   A total line closes the graph and the drift marker carries the cost of everything after the topic change. A figure
   that was not recorded is left out, never shown as 0 or estimated; child-agent usage in separate records is not

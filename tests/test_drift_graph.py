@@ -83,7 +83,7 @@ def test_start_is_none_when_the_prompt_has_no_time():
 
 def test_drift_is_kept_on_a_later_segment_start():
     g = dg.build_graph(block(GOOD, drift_at=6, drift_note="this is a web page task"), prompts(12), 12)
-    assert g["drift"] == {"at": 6, "note": "this is a web page task", "worked_s": None, "fresh": None, "cached": None}
+    assert g["drift"] == {"at": 6, "note": "this is a web page task", "worked_s": None, "span_s": None, "fresh": None, "cached": None}
 
 
 @pytest.mark.parametrize("at", [1, 3, 99, "x", None])
@@ -236,7 +236,7 @@ def test_the_drift_carries_the_cost_of_everything_after_it():
     activity = ["2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z", "2026-01-01T09:55:00Z"]
     usage = [{"ts": "2026-01-01T09:05:00Z", "fresh": 100, "cached": 1}, {"ts": "2026-01-01T09:40:00Z", "fresh": 40, "cached": 4}]
     g = dg.build_graph(block(GOOD, drift_at=6, drift_note="n"), ps, 12, activity_ts=activity, usage=usage)
-    assert g["drift"]["worked_s"] == 25 * 60 and g["drift"]["fresh"] == 40 and g["drift"]["cached"] == 4
+    assert g["drift"]["worked_s"] == 25 * 60 and g["drift"]["span_s"] == 25 * 60 and g["drift"]["fresh"] == 40 and g["drift"]["cached"] == 4
     assert dg.build_graph(block(GOOD), ps, 12, activity_ts=activity, usage=usage)["drift"] is None
 
 
