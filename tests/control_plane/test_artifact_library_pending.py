@@ -17,6 +17,7 @@ from tests.control_plane.test_artifact_member_intents import (
     mrun,
     publish_payload,
     send,
+    settle,
     sql,
     user,
 )
@@ -57,6 +58,7 @@ def test_26th_pending_refused_with_clear_message(registry_pg, tmp_path):
             assert (await push(env, i))["result"] == "created"
         out = await push(env, 99)
         assert out["result"] == "rejected" and out["reason"] == "pending_cap"
+        assert str(PENDING_CAP) in out["message"]  # the clear text reaches the agent-facing result
         exc = PendingCapExceeded()  # the result carries the stable code; the error carries the text
         assert (exc.status, exc.code) == (429, "pending_cap") and str(PENDING_CAP) in exc.message
         assert (await create(env)) and await LibraryStore(env.pool).count_pending(
@@ -78,6 +80,29 @@ def test_same_idempotency_key_does_not_double_count(registry_pg, tmp_path):
             env, key="same-key-1"
         )  # at the cap, a retry is still a replay, not a refusal
         assert replay["result"] == "created" and replay["artifact_id"] == first["artifact_id"]
+        assert await LibraryStore(env.pool).count_pending(ALICE) == PENDING_CAP
+
+    mrun(registry_pg, tmp_path, body)
+
+
+def test_concurrent_creates_at_24_pending_admit_exactly_one(registry_pg, tmp_path):
+    async def body(env, rt):
+        for i in range(PENDING_CAP - 1):
+            assert (await push(env, i))["result"] == "created"
+        raws = [
+            env.intent(
+                agent("ag1"),
+                kind="member.artifact_create",
+                payload={"title": f"race{i}", "filename": "a.html", "profile": "web"},
+                artifact_id=None,
+                key=f"race-key-{i}",
+            )
+            for i in range(2)
+        ]
+        await settle(env)
+        outs = [env.result(r["ticket"]) for r in raws]
+        assert sorted(o["result"] for o in outs) == ["created", "rejected"]
+        assert [o["reason"] for o in outs if o["result"] == "rejected"] == ["pending_cap"]
         assert await LibraryStore(env.pool).count_pending(ALICE) == PENDING_CAP
 
     mrun(registry_pg, tmp_path, body)

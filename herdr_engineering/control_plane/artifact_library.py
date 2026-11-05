@@ -50,13 +50,14 @@ class LibraryError(Exception):
 PENDING_CAP = 25
 
 
+PENDING_CAP_STATUS = 429
+PENDING_CAP_CODE = "pending_cap"
+PENDING_CAP_MESSAGE = f"You have {PENDING_CAP} pending artifacts; accept or discard some in your library before pushing more."
+
+
 class PendingCapExceeded(LibraryError):
     def __init__(self) -> None:
-        super().__init__(
-            429,
-            "pending_cap",
-            f"at most {PENDING_CAP} agent-pushed artifacts may await review; accept or discard some",
-        )
+        super().__init__(PENDING_CAP_STATUS, PENDING_CAP_CODE, PENDING_CAP_MESSAGE)
 
 
 NOT_FOUND = (404, "not_found")

@@ -96,7 +96,7 @@ def _present(ticket: str, doc: Mapping[str, Any]) -> dict[str, Any]:
     if doc.get("status") == "pending" or "result" not in doc:
         return {"ticket": ticket, "status": "pending"}
     keep = ("result", "artifact_id", "version_id", "version_number", "head_version_id", "reason", "share_id", "audience",
-            "summary", "events")
+            "summary", "events", "message")
     return {"ticket": ticket, "status": "done", **{k: doc[k] for k in keep if doc.get(k) is not None}}
 
 

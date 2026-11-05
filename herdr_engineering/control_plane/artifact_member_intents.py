@@ -413,7 +413,12 @@ async def _conclude(ctx: IntentContext, who: _Who, action: str, out: dict, *, ar
 # ----------------------------------------------------------------------------- create
 
 async def handle_create(ctx: IntentContext, intent: Intent) -> dict:
-    from .artifact_library import PENDING_CAP, PendingCapExceeded, count_pending_on
+    from .artifact_library import (
+        PENDING_CAP,
+        PENDING_CAP_CODE,
+        PENDING_CAP_MESSAGE,
+        count_pending_on,
+    )
     from .artifact_member_quota import QuotaExceeded, check_new_artifact
     who, refusal = await _member(ctx, "artifact_create")
     if refusal is not None:
@@ -437,8 +442,7 @@ async def handle_create(ctx: IntentContext, intent: Intent) -> dict:
             agent_push = who.actor.kind == "agent"
             if agent_push:             # the usage row is already locked by the quota check: counting here is race-free
                 if await count_pending_on(ctx.conn, who.principal) >= PENDING_CAP:
-                    # the applier keeps only the stable ``reason`` code; PendingCapExceeded carries the clear text
-                    out = _rejected(PendingCapExceeded().code)
+                    out = {**_rejected(PENDING_CAP_CODE), "message": PENDING_CAP_MESSAGE}
                     return await _conclude(ctx, who, "artifact_create", out, artifact_id=None)
             made = await ctx.store.register_logical(original_filename=payload.filename, artifact_type="other",
                                                     created_by=who.principal)
