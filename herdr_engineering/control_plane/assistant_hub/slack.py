@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections import deque
@@ -28,10 +29,13 @@ from .actiongrants import ActionRequestRow, as_utc
 from .policy import record_owner_decision
 from .slack_asks import SlackAsk, button_value, new_ask_id, new_nonce
 
-__all__ = ["SlackClient", "SlackError", "SlackRuntime", "ASK_ACTIONS", "slack_text", "slack_api_call"]
+__all__ = ["SlackClient", "SlackError", "SlackRuntime", "ASK_ACTIONS", "slack_text", "slack_api_call", "PERMANENT_ERRORS"]
 
 _log = logging.getLogger("herdr_engineering.assistant_hub.slack")
 _MAX_REPLY = 1024 * 1024
+# Errors that retrying cannot fix: the ask fails at once, the queue moves on, and the sweep offers it again later.
+PERMANENT_ERRORS = frozenset({"channel_not_found", "invalid_auth", "not_in_channel", "account_inactive",
+                              "token_revoked", "is_archived", "token_expired", "missing_scope", "disabled", "token"})
 ASK_ACTIONS = {"ask_approve": (True, False), "ask_deny": (False, False), "ask_remember": (True, True)}
 _ID = re.compile(r"[A-Za-z0-9_.\-]{1,64}")
 SLACK_ACTOR = "hub:slack"
@@ -40,9 +44,10 @@ SLACK_ACTOR = "hub:slack"
 class SlackError(Exception):
     """A Slack call failed.  ``code`` is a short word (Slack's own error code or ``io``/``token``); never a body or token."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, retry_after: float = 0.0) -> None:
         super().__init__(code)
         self.code = code
+        self.retry_after = retry_after       # seconds Slack asked us to wait (Retry-After), 0 when absent
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -61,6 +66,13 @@ def _read_token(path: str) -> str:
     return token
 
 
+def _retry_after(value: object) -> float:
+    try:
+        return min(max(float(str(value)), 0.0), 3600.0) if value is not None else 0.0
+    except ValueError:
+        return 0.0
+
+
 def slack_api_call(base_url: str, method: str, token: str, body: dict[str, Any] | None, timeout: float,
                    ) -> dict[str, Any]:
     """One Web API call that never uses an environment proxy and never follows a redirect (a token rides on it).
@@ -73,11 +85,14 @@ def slack_api_call(base_url: str, method: str, token: str, body: dict[str, Any] 
         data, headers["Content-Type"] = json.dumps(body).encode(), "application/json; charset=utf-8"
     req = urllib.request.Request(base_url.rstrip("/") + "/" + method, method="POST", data=data, headers=headers)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)    # never via a proxy
+    retry_after = 0.0
     try:
         with opener.open(req, timeout=timeout) as response:
             raw = response.read(_MAX_REPLY)
+            retry_after = _retry_after(response.headers.get("Retry-After"))
     except urllib.error.HTTPError as exc:
         raw = exc.read(_MAX_REPLY)
+        retry_after = _retry_after(exc.headers.get("Retry-After") if exc.headers else None)
     except (OSError, ValueError):
         raise SlackError("io") from None
     try:
@@ -86,7 +101,7 @@ def slack_api_call(base_url: str, method: str, token: str, body: dict[str, Any] 
         raise SlackError("bad_reply") from None
     if not isinstance(doc, dict) or doc.get("ok") is not True:
         error = doc.get("error") if isinstance(doc, dict) else None
-        raise SlackError(error if isinstance(error, str) and _ID.fullmatch(error) else "bad_reply")
+        raise SlackError(error if isinstance(error, str) and _ID.fullmatch(error) else "bad_reply", retry_after)
     return doc
 
 
@@ -180,7 +195,8 @@ class SlackRuntime:
     def __init__(self, store: AssistantStore, service: Any, cfg_getter: Callable[[], dict[str, Any]],
                  now_fn: Callable[[], datetime], *, min_backoff: float = 0.5, max_backoff: float = 30.0,
                  ping_interval: float = 2.0, stop_timeout: float = 15.0,
-                 queue_size: int = 200) -> None:
+                 queue_size: int = 200, sweep_interval: float = 300.0, reoffer_backoff: float = 300.0,
+                 max_task_keys: int = 1000) -> None:
         self.store = store
         self.service = service
         self._cfg = cfg_getter
@@ -193,6 +209,14 @@ class SlackRuntime:
         self._thread: threading.Thread | None = None
         self._state = threading.Lock()
         self._qsize = max(1, int(queue_size))
+        self._sweep_interval = sweep_interval
+        self._reoffer_backoff = reoffer_backoff      # a request that failed is not offered again sooner (monotonic s)
+        self._max_keys = max(1, int(max_task_keys))
+        self._failed_at: dict[str, float] = {}
+        self._batched: dict[str, None] = {}          # request ids folded into a batched line: the sweep skips them
+        self._current: str = ""                      # request id being posted right now
+        self._sweep_due = True
+        self._next_sweep = 0.0
         self._queue: deque[_Queued] = deque()
         self._qcond = threading.Condition()
         self._drain_thread: threading.Thread | None = None
@@ -215,6 +239,7 @@ class SlackRuntime:
             elif self._stop.is_set():
                 return          # a stop() that timed out has not finished: never two supervisors
             if self._drain_thread is None or not self._drain_thread.is_alive():
+                self._sweep_due = True           # first thing: offer every pending request that has no ask yet
                 self._drain_thread = threading.Thread(target=self._drain, name="slack-asks", daemon=True)
                 self._drain_thread.start()
 
@@ -280,6 +305,9 @@ class SlackRuntime:
             connected = client.is_connected()
             self._connected = connected
             self._last_event = as_utc(self._now())
+            with self._qcond:
+                self._sweep_due = True               # Slack is reachable again: offer whatever is still unasked
+                self._qcond.notify()
             while connected and not self._stop.is_set() and client.is_connected():
                 self._stop.wait(0.1)
         finally:
@@ -334,29 +362,108 @@ class SlackRuntime:
     def _drain(self) -> None:
         delay = self._min_backoff
         while not self._stop.is_set():
+            self._maybe_sweep()
+            self._prune()
             with self._qcond:
-                while not self._queue and not self._stop.is_set():
+                if not self._queue and not self._stop.is_set() and not self._sweep_due:
                     self._qcond.wait(1.0)
                 if self._stop.is_set():
                     return
-                item = self._queue[0]
+                item = self._queue[0] if self._queue else None
+            if item is None:
+                continue
+            self._current = item.request_id
+            wait = 0.0
             try:
                 done = self._post_ask(item)
             except SlackError as exc:
-                done = self._expired(item) or False
-                if done:
-                    self._audit_failed(item, exc.code)
-                else:
-                    self._stop.wait(delay)
+                if exc.code in PERMANENT_ERRORS or self._expired(item):
+                    self._failed(item, exc.code)         # the queue moves on; the sweep offers it again later
+                    done = True
+                else:                                    # transient: retry, honouring Slack's Retry-After
+                    done = False
+                    wait = max(delay, exc.retry_after)
                     delay = min(delay * 2, self._max_backoff)
             except Exception as exc:                  # never kill the loop; the ask stays with the owner's REST view
                 _log.warning("slack ask failed: %s", type(exc).__name__)
                 done = True
+            finally:
+                self._current = ""
             if done:
                 delay = self._min_backoff
                 with self._qcond:
                     if self._queue and self._queue[0] is item:
                         self._queue.popleft()
+            elif wait:
+                self._stop.wait(wait)
+
+    def _failed(self, item: _Queued, code: str) -> None:
+        self._audit_failed(item, code)
+        self._failed_at[item.request_id] = time.monotonic()
+        self._cap(self._failed_at)
+
+    def _cap(self, mapping: dict[Any, Any]) -> None:
+        while len(mapping) > self._max_keys:
+            del mapping[next(iter(mapping))]            # oldest first
+
+    def _prune(self) -> None:
+        """Task keys are worker-controlled: forget the ones idle for an hour and cap what is left."""
+        now = as_utc(self._now())
+        for key in [k for k, stamps in self._posted.items() if not stamps or now - stamps[-1] >= _HOUR]:
+            del self._posted[key]
+        for key in [k for k, batch in self._batches.items() if now - batch.since >= _HOUR]:
+            del self._batches[key]
+        self._cap(self._posted)
+        self._cap(self._batches)
+
+    def _maybe_sweep(self) -> None:
+        with self._qcond:
+            due = self._sweep_due or time.monotonic() >= self._next_sweep
+            self._sweep_due = False
+        if due:
+            self._next_sweep = time.monotonic() + self._sweep_interval
+            try:
+                self.sweep()
+            except Exception as exc:
+                _log.warning("slack sweep failed: %s", type(exc).__name__)
+
+    def sweep(self) -> int:
+        """Queue every pending request that still deserves an ask and has none; returns how many were queued.
+
+        This is what makes a restart or a long Slack outage lossless: the pending rows are the source of truth.
+        Skipped: requests older than ``approval_ttl_minutes`` (a stale approval would be useless), ones with a posted
+        ask, ones already queued or being posted, ones folded into a batched line, and ones that failed recently."""
+        cfg = self._cfg()
+        if not cfg.get("enabled"):
+            return 0
+        now = as_utc(self._now())
+        ttl = timedelta(minutes=int((self.service.config.get("grants") or {}).get("approval_ttl_minutes", 15)))
+        mono = time.monotonic()
+        queued = 0
+        for row in self.store.list_pending_action_requests_any():       # oldest first
+            if now - as_utc(row.created_at) > ttl:
+                continue
+            rid = row.request_id
+            if rid in self._batched or mono - self._failed_at.get(rid, -1e9) < self._reoffer_backoff:
+                continue
+            with self._qcond:
+                if len(self._queue) >= self._qsize:
+                    break                                          # full: the next sweep picks up the rest
+                if rid == self._current or any(i.request_id == rid for i in self._queue):
+                    continue
+            asks = self.store.slack_asks_for_request(rid)
+            if any(a.ts and a.status in ("open", "decided") for a in asks):
+                continue
+            for orphan in asks:                    # an unposted ask left by a crash or a drop: retire it, post afresh
+                if not orphan.ts and orphan.status == "open":
+                    orphan.status = "expired"
+                    self.store.put_slack_ask(orphan)
+            with self._qcond:
+                self._queue.append(_Queued(row.tenant_id, row.user_id, rid, row.worker_id, row.task_id, row.display,
+                                           row.reason, "", now))
+                self._qcond.notify()
+            queued += 1
+        return queued
 
     def _expired(self, item: _Queued) -> bool:
         ttl = timedelta(minutes=int(self._cfg().get("ask_ttl_minutes") or 15))
@@ -388,7 +495,8 @@ class SlackRuntime:
             return True                                  # decided meanwhile (REST) or gone: nothing to ask
         now = as_utc(self._now())
         key = (item.tenant_id, item.user_id, item.worker_id, item.task_id)
-        stamps = self._posted.setdefault(key, deque())
+        stamps = self._posted.pop(key, None) or deque()
+        self._posted[key] = stamps                           # most recently used last, so the cap drops the idlest
         while stamps and now - stamps[0] >= _HOUR:
             stamps.popleft()
         if len(stamps) >= int(cfg.get("max_asks_per_task_per_hour") or 6):
@@ -447,6 +555,8 @@ class SlackRuntime:
         else:
             self.client.update_message(batch.channel, batch.ts, blocks, text)
             batch.count = count
+        self._batched[item.request_id] = None
+        self._cap(self._batched)
         self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
                                 action="assistant.slack.ask_batched", subject_id=item.request_id,
                                 detail=f"request={item.request_id} waiting={count}")

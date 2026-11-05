@@ -2389,6 +2389,15 @@ class AssistantStore:
                                         if r.tenant_id == tenant_id and r.user_id == user_id
                                         and (status is None or r.status == status)])
 
+    def list_pending_action_requests_any(self) -> list[ActionRequestRow]:
+        """Every tenant's pending requests, oldest first, as copies (the Slack sweep's one cross-tenant read)."""
+        with self._lock:
+            return self._sorted_copies([r for r in self.action_requests.values() if r.status == "pending"])
+
+    def slack_asks_for_request(self, request_id: str) -> list[SlackAsk]:
+        with self._lock:
+            return [replace(a) for a in self.slack_asks.values() if a.request_id == request_id]
+
     # -- Slack asks (assistant hub) ---------------------------------------------
     def put_slack_ask(self, ask: SlackAsk) -> None:
         with self._lock:

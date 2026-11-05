@@ -35,7 +35,7 @@ class SlackListener:
         self.bot_user_id = bot_user_id
         self.requests: list[dict[str, str]] = []
         self.bodies: list[tuple[str, bytes]] = []     # (method, raw request body) of every POST
-        self.fail_posts: list[str] = []               # next chat.postMessage answers: '500' or 'reject' (consumed in order)
+        self.fail_posts: list[str] = []               # next chat.postMessage answers: '500', 'reject' or '429:<seconds>' (consumed in order)
         self.calls: list[dict[str, object]] = []      # parsed bodies of chat.postMessage / chat.update / conversations.open
         self.acks: list[str] = []                     # envelope ids the client acknowledged over the socket
         self.ws_connections = 0
@@ -68,6 +68,15 @@ class SlackListener:
                     failure = outer.fail_posts.pop(0) if method == "chat.postMessage" and outer.fail_posts else ""
                 if outer.on_request is not None:
                     outer.on_request(method)
+                if failure.startswith("429"):          # '429:<seconds>': Slack's rate limit with Retry-After
+                    body = json.dumps({"ok": False, "error": "ratelimited"}).encode()
+                    self.send_response(429)
+                    self.send_header("Retry-After", failure.partition(":")[2] or "1")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if failure == "500":
                     self.send_response(500)
                     self.send_header("Content-Length", "0")
