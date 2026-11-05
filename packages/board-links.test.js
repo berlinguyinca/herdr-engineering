@@ -103,3 +103,29 @@ test('G2: issue cards stay unlinked; free text and unrecorded issue fields are n
   assert.ok(refs.every(r => r.type === 'pr'), 'only recorded PRs become refs');
   assert.equal(resolveBoardLink(issue(), {refs}).state, 'none');
 });
+
+test('G3: pr_refs makes a running mission PR verify; duplicates across fields collapse; ambiguity rules hold', () => {
+  const body = {
+    outcomes: {'pi:MSN-1': {prs: [{repository: 'acme/app', number: 7}]}},
+    pr_refs: {'pi:MSN-1': [{repository: 'acme/app', number: 7}], 'pi:RUN-1': [{repository: 'acme/app', number: 8}], 'pi:RUN-2': [{repository: 'acme/app', number: 9}], 'pi:RUN-3': [{repository: 'acme/app', number: 9}]},
+  };
+  const {refs, failed} = refsFromMissionOutcomes(body);
+  assert.equal(failed, false);
+  assert.equal(refs.filter(r => r.id === 'pi:MSN-1').length, 1, 'same mission in both fields is one ref');
+  const verified = resolveBoardLink(pr({number: 8}), {refs});
+  assert.equal(verified.state, 'verified');
+  assert.equal(verified.target.id, 'pi:RUN-1');
+  assert.equal(resolveBoardLink(pr({number: 7}), {refs}).state, 'verified');
+  assert.equal(resolveBoardLink(pr({number: 9}), {refs}).state, 'ambiguous');
+  assert.equal(resolveBoardLink(pr({number: 8, repository: 'acme/other'}), {refs}).state, 'none');
+  assert.equal(resolveBoardLink(issue({number: 8}), {refs}).state, 'none');
+});
+
+test('G3: an old server without pr_refs, or a malformed pr_refs, still works from outcomes', () => {
+  const outcomes = {'pi:MSN-1': {prs: [{repository: 'acme/app', number: 7}]}};
+  for (const extra of [{}, {pr_refs: null}, {pr_refs: []}, {pr_refs: 'x'}, {pr_refs: {'pi:A': 5, 'pi:B': [null, {repository: 1, number: 1}, {repository: 'a/b', number: '2'}]}}]) {
+    const {refs, failed} = refsFromMissionOutcomes({outcomes, ...extra});
+    assert.equal(failed, false);
+    assert.deepEqual(refs, [{kind: 'mission', id: 'pi:MSN-1', type: 'pr', repository: 'acme/app', number: 7}]);
+  }
+});

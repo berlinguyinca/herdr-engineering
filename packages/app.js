@@ -529,7 +529,9 @@ async function viewGithubProjects() {
   } catch {
     herdrRefsFailed = true;
   }
-  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board', herdrRefs, herdrRefsFailed });
+  // G3: the board re-reads the refs on its own refresh cycle (throttled in the view); flag off: no loader at all.
+  const loadHerdrRefs = workCenter ? signal => client.missionOutcomes({ signal }).then(refsFromMissionOutcomes) : null;
+  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board', herdrRefs, herdrRefsFailed, loadHerdrRefs });
 }
 
 async function viewReviewGate() {

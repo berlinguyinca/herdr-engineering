@@ -24,7 +24,11 @@ const ITEMS=[
  item('P-ambiguous',7,{type:'PULL_REQUEST',number:9,url:'https://github.com/acme/app/pull/9'}),      // two missions record it
  item('P-other-repo',8,{type:'PULL_REQUEST',number:7,repository:'acme/other',url:'https://github.com/acme/other/pull/7'}), // same number, other repo
 ];
-const OUTCOMES={outcomes:{
+const OUTCOMES={pr_refs:{
+ 'pi:RUN-1':[{repository:'acme/app',number:8}],                       // G3: a still-running mission recorded PR 8
+ 'MSN-9':[{repository:'acme/app',number:9}],'pi:MSN-9':[{repository:'acme/app',number:9}],
+ 'pi:MSN-7':[{repository:'acme/app',number:7}],
+},outcomes:{
  'pi:MSN-7':{result:'succeeded',prs:[{repository:'acme/app',number:7}]},
  'MSN-9':{result:'succeeded',prs:[{repository:'acme/app',number:9}]},
  'pi:MSN-9':{result:'succeeded',prs:[{repository:'acme/app',number:9}]},
@@ -62,7 +66,8 @@ test('real app: a PR card recorded by exactly one mission offers Open in Herdr; 
  assert.equal(await page.locator('[data-ghp-item="P-verified"] [data-herdr-link]').count(),1);
  assert.equal(await page.locator('[data-ghp-item="P-verified"] [data-herdr-link]').getAttribute('href'),'#/missions/pi%3AMSN-7');
  assert.equal(await page.locator('[data-ghp-item="P-verified"] a:not([data-herdr-link])').getAttribute('href'),'https://github.com/acme/app/pull/7');
- for(const id of ['P-none','P-ambiguous','P-other-repo','I-verified','I-none','I-hostile'])assert.equal(await page.locator(`[data-ghp-item="${id}"] [data-herdr-link]`).count(),0,id);
+ assert.equal(await page.locator('[data-ghp-item="P-none"] [data-herdr-link]').getAttribute('href'),'#/missions/pi%3ARUN-1','G3: running-mission PR verifies');
+ for(const id of ['P-ambiguous','P-other-repo','I-verified','I-none','I-hostile'])assert.equal(await page.locator(`[data-ghp-item="${id}"] [data-herdr-link]`).count(),0,id);
  assert.equal(await page.locator('[data-herdr-partial]').count(),0);
  assert.equal(reads['/api/v1/mission-outcomes'],1,'one read on mount, no polling of the refs');
  assert.deepEqual(net.writes,[]);
@@ -117,4 +122,38 @@ test('a failed relationship source shows the quiet partial note and no link',asy
  await page.locator('#wc005-host [data-ghp-item="I-none"]').waitFor({timeout:8000});
  assert.equal(await page.locator('#wc005-host [data-herdr-link]').count(),0);
  assert.match(await page.locator('#wc005-host [data-ghp-item="I-none"]').innerText(),/Herdr data partial/);
+}));
+
+test('G3: the board re-reads refs on its refresh cycle (throttled), a later-recorded PR gains Open in Herdr; a failed re-read goes partial; GET only',async()=>withPage(async(page,base)=>{
+ const net=await withProjects(page);
+ await boot(page,base,'/overview',handler);
+ await page.evaluate(async()=>{
+  const {mountGithubProjects}=await import('/github-projects-view.js');
+  const get=async({project,signal}={})=>({body:await (await fetch(`/api/v1/github/projects${project?`?project=${project}`:''}`,{signal})).json()});
+  window.__loads=0;window.__mode='ok';
+  const load=async()=>{window.__loads++;if(window.__mode==='fail')throw new Error('x');return {refs:[{kind:'mission',id:'pi:RUN-1',type:'pr',repository:'acme/app',number:8}],failed:false};};
+  const host=document.createElement('div');host.id='wc005-host';document.body.prepend(host);
+  window.__board=mountGithubProjects(host,{getGithubProjects:get},{project:'PVT_1',herdrRefs:[],loadHerdrRefs:load,herdrRefsMs:300});
+ });
+ const card=page.locator('#wc005-host [data-ghp-item="P-none"]');
+ await card.waitFor({timeout:8000});
+ assert.equal(await page.evaluate(()=>window.__loads),0,'throttled: the mount-time refresh does not re-read');
+ assert.equal(await card.locator('[data-herdr-link]').count(),0);
+ await sleep(400);
+ await page.evaluate(()=>window.__board.refresh());
+ await until(async()=>await card.locator('[data-herdr-link]').count()===1,'link after refs re-read');
+ assert.equal(await card.locator('[data-herdr-link]').getAttribute('href'),'#/missions/pi%3ARUN-1');
+ await sleep(400);
+ await page.evaluate(()=>{window.__mode='fail';window.__board.refresh();});
+ await until(async()=>/Herdr data partial/.test(await card.innerText()),'partial after failed re-read');
+ assert.equal(await card.locator('[data-herdr-link]').count(),0);
+ assert.deepEqual(net.writes,[]);
+}));
+
+test('G3: flag off, the real app never reads mission-outcomes and shows no Herdr links',async()=>withPage(async(page,base)=>{
+ await withProjects(page);
+ const reads=await boot(page,base,'/github/projects?project=PVT_1',rawHandler);
+ await page.locator('[data-ghp-item="P-verified"]').waitFor({timeout:8000});
+ assert.equal(await page.locator('[data-herdr-link]').count(),0);
+ assert.equal(reads['/api/v1/mission-outcomes']||0,0);
 }));

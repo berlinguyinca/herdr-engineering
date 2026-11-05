@@ -80,8 +80,10 @@ const styles=`<style>
 @media(max-width:700px){.ghp-row .ghp-herdr{grid-column:1}.ghp-board{grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}.ghp-row{grid-template-columns:minmax(0,1fr)}.ghp-row .ghp-meta{grid-column:1}}
 </style>`;
 
-export function mountGithubProjects(container,client,{project='',layout='board',herdrRefs=null,herdrRefsFailed=false}={}) {
- let disposed=false,projects=null,items=null,projectsError='',itemsError='',selected=text(project),flat=layout==='list',timer=null;
+// G3: Herdr refs are re-read on the board's existing refresh cycle (poll / live event / tab return), at most once per REFS_MS.
+const REFS_MS=30000;
+export function mountGithubProjects(container,client,{project='',layout='board',herdrRefs=null,herdrRefsFailed=false,loadHerdrRefs=null,herdrRefsMs=REFS_MS}={}) {
+ let refsAt=Date.now(),disposed=false,projects=null,items=null,projectsError='',itemsError='',selected=text(project),flat=layout==='list',timer=null;
  const held={projects:{query:null,polls:0,full:false},items:{query:null,polls:0,full:false}};
  const syncSignature=body=>JSON.stringify(body?.projects_sync||null);
  const requests=new Map(),listeners=new AbortController();
@@ -203,7 +205,15 @@ export function mountGithubProjects(container,client,{project='',layout='board',
   // The URL names the shown project and layout without re-rendering the route.
   try{const q=new URLSearchParams();if(selected)q.set('project',selected);if(flat)q.set('layout','list');history.replaceState(null,'',`#/github/projects${q.size?`?${q}`:''}`);}catch{}
  }
- function refresh(){readProjects();readItems();}
+ function readRefs(){
+  if(typeof loadHerdrRefs!=='function'||Date.now()-refsAt<herdrRefsMs)return;
+  refsAt=Date.now();
+  request('refs',signal=>loadHerdrRefs(signal),mapped=>{
+   if(!mapped||!Array.isArray(mapped.refs))throw new Error('Invalid Herdr refs');
+   herdrRefs=mapped.refs;herdrRefsFailed=!!mapped.failed;
+  },()=>{herdrRefsFailed=true;});
+ }
+ function refresh(){readProjects();readItems();readRefs();}
  el('[data-ghp-project]').addEventListener('change',event=>{
   selected=event.target.value;requests.get('items')?.abort();requests.delete('items');items=null;itemsError='';held.items.query=null;remember();draw();readItems();
  },{signal:listeners.signal});

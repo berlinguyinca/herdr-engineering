@@ -7,7 +7,7 @@ import urllib.request
 import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
-from herdr_engineering.control_plane.mission_outcome import outcome_summaries
+from herdr_engineering.control_plane.mission_outcome import outcome_summaries, pr_refs_by_mission
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 
@@ -87,3 +87,55 @@ def test_g2_summaries_carry_no_issue_relationship_and_text_is_never_parsed():
     summary = outcome_summaries(repo)["pi:MSN-9"]
     assert "issues" not in summary and "issue" not in summary
     assert summary["prs"] == [{"repository": "org/app", "number": 6}]
+
+
+# ---- G3: top-level `pr_refs` covers running missions too; `outcomes` membership/meaning is unchanged ----
+
+
+def _running(repo, key):
+    source, _, raw = key.rpartition(":")
+    kw = {"source": source} if source else {}
+    repo.upsert_mission(raw, title=key, stage="implementation", **kw)
+
+
+def test_g3_a_running_mission_pr_is_in_pr_refs_but_not_in_outcomes():
+    repo, _ = _world()
+    _running(repo, "pi:RUN-1")
+    repo.upsert_pull_request("r", mission_id="pi:RUN-1", repository="org/app", number=31, status="open")
+    assert "pi:RUN-1" not in outcome_summaries(repo)   # presence in outcomes still means "ended"
+    assert pr_refs_by_mission(repo)["pi:RUN-1"] == [{"repository": "org/app", "number": 31}]
+
+
+def test_g3_ended_missions_keep_their_refs_and_namespaces_stay_separate():
+    repo, _ = _world()
+    refs = pr_refs_by_mission(repo)
+    assert refs["pi:MSN-1"] == [{"repository": "org/app", "number": 10}, {"repository": "org/app", "number": 20}]
+    assert refs["MSN-1"] == [{"repository": "org/app", "number": 99}]
+    assert "pi:MSN-3" not in refs   # no PR => no key
+    assert pr_refs_by_mission(repo) == refs
+
+
+def test_g3_a_pr_of_another_or_unknown_mission_never_leaks_in():
+    repo, _ = _world()
+    _running(repo, "pi:RUN-2")
+    repo.upsert_pull_request("x", mission_id="pi:GONE", repository="org/app", number=77, status="open")   # mission not listed
+    repo.upsert_pull_request("y", mission_id=None, repository="org/app", number=78, status="open")
+    refs = pr_refs_by_mission(repo)
+    assert "pi:RUN-2" not in refs and "pi:GONE" not in refs
+    assert all(r["number"] not in (77, 78) for v in refs.values() for r in v)
+
+
+def test_g3_failing_read_yields_empty_and_the_list_still_answers():
+    repo, _ = _world()
+    def boom():
+        raise RuntimeError("db down")
+    repo.list_pull_requests = boom
+    assert pr_refs_by_mission(repo) == {}
+    assert "pi:MSN-1" in outcome_summaries(repo)
+
+
+def test_g3_http_envelope_adds_pr_refs_and_keeps_outcomes(served):
+    status, body = _get(served, "v1")
+    assert status == 200 and set(body) == {"outcomes", "pr_refs"}
+    assert body["pr_refs"]["pi:MSN-1"] == [{"repository": "org/app", "number": 10}, {"repository": "org/app", "number": 20}]
+    assert _get(served, None)[0] == 401
