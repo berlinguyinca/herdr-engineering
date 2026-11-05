@@ -593,3 +593,23 @@ def test_panes_inherit_the_publishers_pythonpath_so_the_viewer_matches_the_publi
     calls.clear()
     _publish(tmp_path, calls)                                  # environ without PYTHONPATH: no --env at all
     assert not any("--env" in c for c in calls)
+
+
+def test_sidecar_carries_time_and_token_metrics_from_the_history(tmp_path):
+    def history(agent, session_id):
+        data = _history()(agent, session_id)
+        data.update(activity_ts=[f"2026-01-01T09:0{i}:00Z" for i in range(1, 7)], child_records=2,
+                    usage=[{"ts": "2026-01-01T09:01:30Z", "fresh": 100, "cached": 900},
+                           {"ts": "2026-01-01T09:05:30Z", "fresh": 40, "cached": 10}])
+        return data
+    out = _publish(tmp_path, [], history=history)
+    graph = json.loads(Path(out["file"] + ".graph.json").read_text())
+    assert [s["fresh"] for s in graph["segments"]] == [100, 40]
+    assert graph["segments"][0]["worked_s"] == 180 and graph["drift"]["fresh"] == 40
+    assert graph["totals"]["fresh"] == 140 and graph["totals"]["main_only"] is True
+
+
+def test_a_history_without_metrics_still_publishes_the_graph(tmp_path):
+    out = _publish(tmp_path, [])
+    graph = json.loads(Path(out["file"] + ".graph.json").read_text())
+    assert out["graph"]["ok"] is True and graph["segments"][0]["fresh"] is None and graph["totals"]["worked_s"] is None

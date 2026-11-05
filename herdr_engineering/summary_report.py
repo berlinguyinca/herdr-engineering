@@ -267,7 +267,9 @@ def _build_graph(file, raw, agent, session_id, history):
     try:
         if raw:
             data = history(agent, session_id)
-            graph = build_graph(raw, data.get("prompts") or [], data.get("prompts_total") or 0, data.get("dispatch_ts"))
+            graph = build_graph(raw, data.get("prompts") or [], data.get("prompts_total") or 0, data.get("dispatch_ts"),
+                                activity_ts=data.get("activity_ts"), usage=data.get("usage"),
+                                main_only=bool(data.get("child_records")))
     finally:
         if graph:
             side.write_text(json.dumps(graph))

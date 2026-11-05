@@ -50,6 +50,45 @@ def _pad(text: str, width: int) -> str:
     return text + " " * max(width - visible_width(text), 0)
 
 
+def format_duration(seconds: int | float) -> str:
+    """``<1m``, ``42m``, ``1h05m``, ``3h``."""
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "<1m"
+    hours, minutes = divmod(minutes, 60)
+    if not hours:
+        return f"{minutes}m"
+    return f"{hours}h" if not minutes else f"{hours}h{minutes:02d}m"
+
+
+def format_tokens(n: int | float) -> str:
+    """``999``, ``1.5k``, ``180k``, ``3.1M``, ``250M``: two or three significant digits."""
+    n = max(int(n), 0)
+    if n < 1000:
+        return str(n)
+    for unit, size in (("k", 1e3), ("M", 1e6)):
+        value = n / size
+        text = f"{value:.0f}" if value >= 10 else f"{value:.1f}".removesuffix(".0")
+        if unit == "M" or float(text) < 1000:
+            return text + unit
+    return str(n)                                   # unreachable: the M branch always returns
+
+
+def _worked(seconds, span=None, dot=" - ") -> str | None:
+    if seconds is None:
+        return None
+    text = f"{format_duration(seconds)} worked"
+    if span is not None and span - seconds >= 60:   # a span equal to the time worked says nothing more
+        text += f"{dot}{format_duration(span)} span"
+    return text
+
+
+def _fresh(fresh, cached, dot=" - ") -> str | None:
+    if fresh is None:
+        return None
+    return f"{format_tokens(fresh)} fresh" + (f"{dot}{format_tokens(cached)} cached" if cached else "")
+
+
 def _local(start: str | None, tz: tzinfo | None) -> datetime | None:
     try:
         return datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(tz) if start else None
@@ -62,6 +101,9 @@ def _meta(seg: dict, g: dict, tz, multi_day: bool) -> list[str]:
     count = f"{seg['count']} prompt{'' if seg['count'] == 1 else 's'}"
     stamp = when.strftime("%m-%d %H:%M" if multi_day else "%H:%M") if when else ""
     lines = [f"{stamp} {g['dot']} {count}" if stamp else count]
+    dot = f" {g['dot']} "
+    lines += [x for x in (_worked(seg.get("worked_s"), seg.get("span_s"), dot),
+                          _fresh(seg.get("fresh"), seg.get("cached"), dot)) if x]
     if seg.get("agents"):
         lines.append(f"{seg['agents']} agent{'' if seg['agents'] == 1 else 's'}")
     return lines
@@ -89,7 +131,24 @@ def _drift_text(graph: dict, g: dict, width: int) -> list[str]:
         return []
     text = f"Looks like a new task from prompt {drift['at']}" + (f": {drift['note']}" if drift.get("note") else "")
     wrapped = _wrap(text, width - 2)
-    return [g["mark"] + " " + wrapped[0]] + ["  " + line for line in wrapped[1:]]
+    out = [g["mark"] + " " + wrapped[0]] + ["  " + line for line in wrapped[1:]]
+    dot = f" {g['dot']} "
+    cost = dot.join(x for x in (_worked(drift.get("worked_s"), None, dot), _fresh(drift.get("fresh"), None, dot)) if x)
+    if cost:
+        out += ["  " + line for line in _wrap(f"From there on: {cost}", width - 2)]
+    return out
+
+
+def _total_text(graph: dict, g: dict, width: int) -> list[str]:
+    totals = graph.get("totals") or {}
+    dot = f" {g['dot']} "
+    parts = [x for x in (_worked(totals.get("worked_s"), totals.get("span_s"), dot),
+                         _fresh(totals.get("fresh"), totals.get("cached"), dot)) if x]
+    if not parts:
+        return []
+    if totals.get("main_only") and totals.get("fresh") is not None:
+        parts.append("main session only")
+    return _wrap("Total: " + dot.join(parts), width)
 
 
 def render_graph(graph: dict, width: int, *, unicode: bool = True, color: bool = True,
@@ -129,6 +188,7 @@ def render_graph(graph: dict, width: int, *, unicode: bool = True, color: bool =
             out += [fix(line) for line in _drift_text(graph, g, width)]
     if not graph.get("drift"):
         out.append("No drift found.")
+    out += [fix(line) for line in _total_text(graph, g, width)]
     out = [line if visible_width(line) <= width else _chop(line, width)[0] for line in out]
     return [_colour(line) for line in out] if color and unicode else out
 
