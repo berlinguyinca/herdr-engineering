@@ -156,7 +156,7 @@ def build_graph(raw: str | None, prompts: list[dict], total: int,
         drift = {"at": at, "note": _clip(note, MAX_NOTE) if isinstance(note, str) else ""}
         after = next(s for s in out if s["from_prompt"] == at)["start"]
         cost = _metrics(after, None, activity_ts, usage)
-        drift.update({k: cost[k] for k in ("worked_s", "fresh", "cached")})
+        drift.update({k: cost[k] for k in ("worked_s", "span_s", "fresh", "cached")})
     fresh, cached = _tokens(usage, "0001-01-01T00:00:00Z", None) if usage else (None, None)
     if usage and any(u.get("ts") is None for u in usage):        # untimed rows still belong in the session total
         fresh = sum(u.get("fresh", 0) for u in usage)

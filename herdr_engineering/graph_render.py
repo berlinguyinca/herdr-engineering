@@ -78,8 +78,8 @@ def _worked(seconds, span=None, dot=" - ") -> str | None:
     if seconds is None:
         return None
     text = f"{format_duration(seconds)} worked"
-    if span is not None and span - seconds >= 60:   # a span equal to the time worked says nothing more
-        text += f"{dot}{format_duration(span)} span"
+    if span is not None:                            # wall-clock time is always shown beside the time worked
+        text += f"{dot}{format_duration(span)} wall"
     return text
 
 
@@ -133,7 +133,7 @@ def _drift_text(graph: dict, g: dict, width: int) -> list[str]:
     wrapped = _wrap(text, width - 2)
     out = [g["mark"] + " " + wrapped[0]] + ["  " + line for line in wrapped[1:]]
     dot = f" {g['dot']} "
-    cost = dot.join(x for x in (_worked(drift.get("worked_s"), None, dot), _fresh(drift.get("fresh"), None, dot)) if x)
+    cost = dot.join(x for x in (_worked(drift.get("worked_s"), drift.get("span_s"), dot), _fresh(drift.get("fresh"), None, dot)) if x)
     if cost:
         out += ["  " + line for line in _wrap(f"From there on: {cost}", width - 2)]
     return out
