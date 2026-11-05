@@ -27,6 +27,7 @@ from typing import Any
 from ..assistant import AssistantStore
 from .actiongrants import ActionRequestRow, GrantState, as_utc
 from .deploy import DeployMatch, scope_key, scope_mode
+from .deploycheck import FINAL, DeployCheck, describe_status, verify_deploy
 from .evidence import propose_if_ready
 from .policy import (
     ActivationRefused,
@@ -36,6 +37,7 @@ from .policy import (
     in_shadow,
     record_owner_decision,
 )
+from .preconditions import HealthClient, PreconditionClients
 from .slack_asks import SlackAsk, button_value, new_ask_id, new_nonce
 from .verbs import ActionKey, Verb
 
@@ -217,7 +219,8 @@ class _Queued:
     project: str
     queued_at: datetime
     ask: SlackAsk | None = None
-    kind: str = "action"             # action | question | summary (their asks are created up front)
+    kind: str = "action"             # action | question | summary (their asks are created up front) | outcome (a deploy
+                                     # check id in ``request_id``)
 
 
 @dataclass
@@ -243,7 +246,8 @@ class SlackRuntime:
                  ping_interval: float = 2.0, stop_timeout: float = 15.0,
                  queue_size: int = 200, sweep_interval: float = 300.0, reoffer_backoff: float = 300.0,
                  max_task_keys: int = 1000, judge: Any = None,
-                 summary_interval: float = 5.0) -> None:
+                 summary_interval: float = 5.0, health: Any = None, preconditions: PreconditionClients | None = None,
+                 check_interval: float = 15.0) -> None:
         self.store = store
         self.service = service
         self.judge = judge                 # the policy's judge runtime: activating a remembered grant uses its gate
@@ -280,6 +284,10 @@ class SlackRuntime:
         self._last_event: datetime | None = None
         self._tap = threading.Lock()           # one tap at a time: a double tap decides once
         self.client = SlackClient(cfg_getter)
+        self.health = health if health is not None else HealthClient()     # the deploy outcome check's reader
+        self.preconditions = preconditions                                 # GitHub access for the after-deploy main look
+        self._check_interval = check_interval
+        self._check_thread: threading.Thread | None = None
 
     # -- lifecycle ---------------------------------------------------------------------------------
     def start(self) -> None:
@@ -294,13 +302,28 @@ class SlackRuntime:
                 self._sweep_due = True           # first thing: offer every pending request that has no ask yet
                 self._drain_thread = threading.Thread(target=self._drain, name="slack-asks", daemon=True)
                 self._drain_thread.start()
+            self._start_checks_locked()
+
+    def start_checks(self) -> None:
+        """Only the deploy outcome checker (Slack off): open checks still resolve and are stored."""
+        with self._state:
+            busy = any(t is not None and t.is_alive() for t in (self._thread, self._drain_thread))
+            if self._stop.is_set() and busy:
+                return                       # a stop() that timed out has not finished
+            self._stop.clear()
+            self._start_checks_locked()
+
+    def _start_checks_locked(self) -> None:
+        if self._check_thread is None or not self._check_thread.is_alive():
+            self._check_thread = threading.Thread(target=self._check_loop, name="deploy-checks", daemon=True)
+            self._check_thread.start()
 
     def stop(self) -> bool:
         """Stop the runtime.  True when both threads have ended; False when one did not end within ``stop_timeout``
         (it is still winding down, ``start`` refuses until it has, and a later ``stop`` can confirm).  Queued asks
         are kept in memory, so a restart posts them."""
         with self._state:
-            threads = [self._thread, self._drain_thread]
+            threads = [self._thread, self._drain_thread, self._check_thread]
             self._stop.set()
         with self._qcond:
             self._qcond.notify_all()
@@ -311,7 +334,7 @@ class SlackRuntime:
                 alive = alive or thread.is_alive()
         if not alive:
             with self._state:
-                self._thread = self._drain_thread = None
+                self._thread = self._drain_thread = self._check_thread = None
         return not alive
 
     def _run(self) -> None:
@@ -495,6 +518,9 @@ class SlackRuntime:
         elif item.kind == "summary" and item.ask is not None:      # stays open: the timer offers it again later
             self._failed_at[item.ask.ask_id] = time.monotonic()
             self._cap(self._failed_at)
+        elif item.kind == "outcome":                               # stays unnotified: the sweep offers it again
+            self._failed_at[item.request_id] = time.monotonic()
+            self._cap(self._failed_at)
 
     def _cap(self, mapping: dict[Any, Any]) -> None:
         while len(mapping) > self._max_keys:
@@ -557,7 +583,7 @@ class SlackRuntime:
                                            row.reason, "", now))
                 self._qcond.notify()
             queued += 1
-        return queued + self._sweep_questions(now)
+        return queued + self._sweep_questions(now) + self._sweep_outcomes(now)
 
     # -- task summaries ----------------------------------------------------------------------------
     def note_task(self, tenant_id: str, user_id: str, worker_id: str, task_id: str, *, final: bool = False,
@@ -663,25 +689,139 @@ class SlackRuntime:
                                        f" final={'yes' if current.final else 'no'}")
         return True
 
-    @classmethod
-    def _summary_text(cls, ask: SlackAsk, counts: dict[str, int], idle_minutes: int) -> str:
+    def _summary_text(self, ask: SlackAsk, counts: dict[str, int], idle_minutes: int) -> str:
         """Counts and the worker's inert report text only: never a command, a display string, a secret or a token."""
         lines = [f"*Task summary* from worker `{slack_text(ask.worker_id)}`, task `{slack_text(ask.task_id, 128)}`"]
         if not ask.final:
             lines.append(f"_No final report; the task has been quiet for {idle_minutes} minutes._")
-        lines += [f"Authorized under grants: {counts['grant']}",
-                  f"One-shot approvals used: {counts['one_shot']}",
-                  f"Denied by you: {counts['denied']}",
-                  f"Vetoed: {counts['vetoed']}"]
-        lines += cls._summary_deploy_lines(ask)
+        lines += [f"Authorized under grants: at least {counts['grant']}",
+                  f"One-shot approvals used: at least {counts['one_shot']}",
+                  f"Denied by you: at least {counts['denied']}",
+                  f"Vetoed: at least {counts['vetoed']}"]
+        lines += self._summary_deploy_lines(ask)
         if ask.context:
             lines.append("Worker's report: " + slack_text(ask.context, _SUMMARY_REPORT_SHOWN))
         return "\n".join(lines)
 
+    def _summary_deploy_lines(self, ask: SlackAsk) -> list[str]:
+        """Deploy outcomes of this task, worded from the hub's own check.  A deploy without a confirmed result says
+        "unconfirmed" or "still being checked", never success."""
+        checks = self.store.list_deploy_checks(ask.tenant_id, ask.user_id, worker_id=ask.worker_id, task_id=ask.task_id)
+        return [f"Deploy {slack_text(c.project, 64)}/{slack_text(c.scope, 64)} {slack_text(c.sha[:12], 12)}: "
+                f"{describe_status(c)}" for c in checks[-5:]]
+
+    # -- deploy outcomes ---------------------------------------------------------------------------
+    def _check_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.run_deploy_checks()
+            except Exception as exc:                  # never ends the checker
+                _log.warning("deploy check pass failed: %s", type(exc).__name__)
+            self._stop.wait(self._check_interval)
+
+    def run_deploy_checks(self) -> int:
+        """One pass over every open deploy check (resumes whatever a restart left ``awaiting``).  A check that reached
+        a final status is queued for its Slack message.  Returns how many reached a final status."""
+        finished = 0
+        now = as_utc(self._now())
+        for check in self.store.list_deploy_checks_any(status="awaiting"):
+            if self._stop.is_set():
+                break
+            done = verify_deploy(self.store, check, self.health, now, reverify=self._reverify)
+            if done.status in FINAL:
+                finished += 1
+                self.notify_deploy_outcome(done)
+        return finished
+
+    def _reverify(self, check: DeployCheck) -> str:
+        """After a healthy result: is the deployed commit still on main's history?  (The preconditions were verified
+        before the worker ran the deploy; main may have moved in between.)"""
+        clients = self.preconditions
+        if clients is None or clients.gh is None or not check.repo:
+            return "unverified"
+        repo = f"github.com/{check.repo}"
+        _, tip = clients.gh.default_branch_head(repo)
+        if not isinstance(tip, str) or not tip:
+            return "unverified"
+        if tip == check.sha:
+            return "on_main"
+        span = clients.gh.commits_between(repo, check.sha, tip)
+        if span.status in ("ahead", "identical"):
+            return "on_main"
+        return "off_main" if span.status in ("behind", "diverged") else "unverified"
+
+    def notify_deploy_outcome(self, check: DeployCheck) -> None:
+        """Queue the Slack message for a finished check.  Never blocks and never raises."""
+        try:
+            if not self._cfg().get("enabled") or check.status not in FINAL or check.notified:
+                return
+            self._enqueue(_Queued(check.tenant_id, check.user_id, check.check_id, check.worker_id, check.task_id, "",
+                                  "", check.project, as_utc(self._now()), kind="outcome"))
+        except Exception as exc:
+            _log.warning("slack outcome notify failed: %s", type(exc).__name__)
+
+    def _sweep_outcomes(self, now: datetime) -> int:
+        queued = 0
+        mono = time.monotonic()
+        for check in self.store.list_deploy_checks_any(unnotified=True):
+            if mono - self._failed_at.get(check.check_id, -1e9) < self._reoffer_backoff:
+                continue
+            with self._qcond:
+                if len(self._queue) >= self._qsize:
+                    break
+                if check.check_id == self._current or any(i.kind == "outcome" and i.request_id == check.check_id
+                                                          for i in self._queue):
+                    continue
+                self._queue.append(_Queued(check.tenant_id, check.user_id, check.check_id, check.worker_id,
+                                           check.task_id, "", "", check.project, now, kind="outcome"))
+                self._qcond.notify()
+            queued += 1
+        return queued
+
+    def _post_outcome(self, item: _Queued, cfg: dict[str, Any]) -> bool:
+        """Post one deploy outcome.  Never rate-limited or batched: it does not count against the task's asks, and
+        ``failed_rollback`` is an urgent message of its own."""
+        check = self.store.get_deploy_check(item.request_id, tenant_id=item.tenant_id, user_id=item.user_id)
+        if check is None or check.notified or check.status not in FINAL:
+            return True
+        urgent = check.status == "failed_rollback"
+        text = ("URGENT: a deploy failed to roll back" if urgent else
+                f"Deploy {describe_status(check).split(' (')[0]}")
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": self._outcome_text(check)}}]
+        channel = self._target(cfg)
+        self.client.post_message(channel, blocks, text)
+        with self.store._lock:
+            current = self.store.get_deploy_check(check.check_id, tenant_id=check.tenant_id, user_id=check.user_id)
+            if current is not None:
+                current.notified = True
+                self.store.put_deploy_check(current)
+        self.store.audit_record(tenant_id=check.tenant_id, user_id=check.user_id, actor=SLACK_ACTOR,
+                                action="assistant.slack.deploy_outcome_posted", subject_id=check.check_id,
+                                detail=f"check={check.check_id} status={check.status}"
+                                       f"{' urgent=yes' if urgent else ''}")
+        return True
+
     @staticmethod
-    def _summary_deploy_lines(ask: SlackAsk) -> list[str]:
-        """Deploy outcomes of this task.  Empty until deploys exist (Task 9 fills it in)."""
-        return []
+    def _outcome_text(check: DeployCheck) -> str:
+        """Ids, the short sha and fixed words only: no command, no remote text."""
+        head = f"`{slack_text(check.project, 64)}/{slack_text(check.scope, 64)}` at `{slack_text(check.sha[:12], 12)}`"
+        if check.status == "failed_rollback":
+            return (f":rotating_light: *URGENT: the deploy of {head} failed to roll back.* The control plane may be "
+                    f"broken or half-updated. Worker `{slack_text(check.worker_id)}` reported deploy.sh exit 3. "
+                    "This needs you now.")
+        if check.status == "healthy":
+            line = f"*Deploy healthy:* {head} is serving."
+            if check.reverified == "off_main":
+                line += " Warning: that commit is no longer on main's history."
+            elif check.reverified != "on_main":
+                line += " Main could not be re-checked after the deploy."
+            return line
+        if check.status == "rolled_back":
+            return (f"*Deploy rolled back:* {head} is not serving; the previous version is back "
+                    f"(health reports `{slack_text(check.seen_commit, 12)}`).")
+        return (f"*Deploy unconfirmed:* the hub could not confirm {head} within the check window"
+                f"{' (health ' + 'reported ' + slack_text(check.seen_commit, 12) + ')' if check.seen_commit else ''}."
+                " Do not assume it worked.")
 
     def _sweep_questions(self, now: datetime) -> int:
         """Questions stored but never posted (a restart, or the queue dropped them) are queued again until they expire."""
@@ -731,6 +871,8 @@ class SlackRuntime:
         now = as_utc(self._now())
         if item.kind == "summary":
             return self._post_summary(item, cfg, now)
+        if item.kind == "outcome":
+            return self._post_outcome(item, cfg)
         question = item.kind == "question"
         if question:
             current = self.store.get_slack_ask(item.ask.ask_id, tenant_id=item.tenant_id,

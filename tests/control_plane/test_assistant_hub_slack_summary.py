@@ -134,10 +134,10 @@ def test_final_report_posts_exactly_one_summary_with_correct_counts(sw):
     time.sleep(0.4)
     body = sw.summary_body()
     assert len(sw.summaries()) == 1
-    assert "Authorized under grants: 2" in body
-    assert "One-shot approvals used: 1" in body
-    assert "Denied by you: 1" in body
-    assert "Vetoed: 1" in body
+    assert "Authorized under grants: at least 2" in body
+    assert "One-shot approvals used: at least 1" in body
+    assert "Denied by you: at least 1" in body
+    assert "Vetoed: at least 1" in body
     assert "all shipped" in body
     raw = sw.summary_raw()
     assert "git push" not in raw and "origin" not in raw          # counts and the report text only, never commands
@@ -188,7 +188,7 @@ def test_idle_task_gets_one_summary_and_a_later_final_report_adds_none(sw):
     assert sw.summaries() == []
     sw.clock.now = NOW + timedelta(minutes=31)
     assert sw.listener.wait_for(lambda: len(sw.summaries()) == 1)
-    assert "Vetoed: 1" in sw.summary_body() and "halfway" in sw.summary_body()
+    assert "Vetoed: at least 1" in sw.summary_body() and "halfway" in sw.summary_body()
     sw.report("a", text="late", final=True)
     sw.clock.now = NOW + timedelta(hours=3)
     time.sleep(0.8)

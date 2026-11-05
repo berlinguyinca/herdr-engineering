@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..assistant import AssistantError
 from .canonical import RawAction
+from .deploycheck import record_exit
 from .events import EVENTS_PER_WORKER_PER_MINUTE, RateLimiter, record_event
 from .policy import current_judge_version, decide
 from .preconditions import PreconditionClients
@@ -281,6 +282,22 @@ def _ask(hub: Hub, worker: Worker, args: dict) -> dict:
     return _text({"status": "pending", "ask_id": new_id, "event_id": event.event_id})
 
 
+def _note_deploy_exit(hub: Hub, worker: Worker, kind: Any, extra: Any, task_id: str | None) -> None:
+    """An ``outcome`` report carrying ``{"deploy_exit": <int>}`` is the worker saying what deploy.sh exited with.  Exit 3
+    (failed to roll back) raises the worker's deploy check to ``failed_rollback`` and posts the urgent Slack message;
+    anything else is only stored.  The worker's word can only make the owner look sooner, never mark a deploy healthy."""
+    code = extra.get("deploy_exit") if kind == "outcome" and isinstance(extra, dict) else None
+    if type(code) is not int:
+        return
+    try:
+        changed = record_exit(hub.store, worker, task_id, code, hub.service.now())
+        if changed is not None and hub.slack is not None:
+            hub.slack.notify_deploy_outcome(changed)
+    except Exception as exc:                                    # noqa: BLE001 - the report itself is already stored
+        logging.getLogger("herdr_engineering.assistant_hub.mcp").warning("deploy exit not recorded: %s",
+                                                                          type(exc).__name__)
+
+
 def _report(hub: Hub, worker: Worker, args: dict) -> dict:
     _check_args(args, {"kind", "text", "payload", "session_id", "task_id", "final"})
     kind = args.get("kind")
@@ -309,6 +326,7 @@ def _report(hub: Hub, worker: Worker, args: dict) -> dict:
                          session_id=_req_str(args, "session_id"), payload=payload)
     if task_id is not None:         # the recorded (scrubbed) text, never the raw argument
         _note_task(hub, worker, task_id, final=final is True, text=event.payload.get("text"))
+    _note_deploy_exit(hub, worker, kind, extra, task_id)
     return _text({"status": "recorded", "event_id": event.event_id})
 
 

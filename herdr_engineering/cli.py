@@ -4872,11 +4872,13 @@ def _start_assistant_hub(service):
                               worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
     from .control_plane.assistant_hub.slack import SlackRuntime
     judge = _build_judge_runtime(service)
-    slack = SlackRuntime(service.store, service, lambda: service.config.get("slack") or {}, service.now, judge=judge)
+    from .control_plane.assistant_hub.preconditions import default_clients
+    clients = default_clients()
+    slack = SlackRuntime(service.store, service, lambda: service.config.get("slack") or {}, service.now, judge=judge,
+                         health=clients.health, preconditions=clients)
     try:
-        from .control_plane.assistant_hub.preconditions import default_clients
         server = HubServer(Hub(registry=registry, service=service, store=service.store,
-                               judge=judge, slack=slack, preconditions=default_clients()),
+                               judge=judge, slack=slack, preconditions=clients),
                            host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
@@ -4886,6 +4888,8 @@ def _start_assistant_hub(service):
     server.hub.judge.recorder.start()          # a thread exists only when the judge is enabled
     if (service.config.get("slack") or {}).get("enabled") is True:
         slack.start()                          # Socket Mode link and the ask poster; stopped by the caller
+    else:
+        slack.start_checks()                   # deploy outcome checks do not need Slack; open ones resume here
     return server, registry
 
 

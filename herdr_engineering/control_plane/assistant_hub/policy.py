@@ -8,6 +8,7 @@ rows and audit entries carry the canonical key and key id only, never the raw co
 
 from __future__ import annotations
 
+import logging
 import re
 import secrets
 from collections.abc import Callable
@@ -20,6 +21,7 @@ from .actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, GrantSt
 from .calibration import build_report, gate_satisfied
 from .canonical import Derived, RawAction, derive
 from .deploy import DeployMatch, scope_config, scope_key, scope_mode
+from .deploycheck import open_check
 from .events import scrub_payload
 from .evidence import OWNER_PROVENANCE, _shadow_elapsed, propose_if_ready
 from .jev import JudgeUnavailable
@@ -367,6 +369,16 @@ def _consume_approval(store: AssistantStore, cfg: dict, worker: Worker, key_id: 
     return None
 
 
+def _open_deploy_check(store: AssistantStore, deploy_cfg: dict | Callable[[], dict | None] | None, worker: Worker,
+                       match: DeployMatch, task_id: str, request_id: str, now: datetime) -> None:
+    """Every authorized deploy is verified afterwards by the hub itself.  Never raises: the decision is already made."""
+    try:
+        open_check(store, _live_deploy_cfg(deploy_cfg), worker, match, task_id, request_id, now)
+    except Exception as exc:                                    # noqa: BLE001
+        logging.getLogger("herdr_engineering.assistant_hub.policy").warning(
+            "deploy check not opened: %s", type(exc).__name__)
+
+
 def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, derived: Derived, session_id: str,
             task_id: str, now: datetime, judge: JudgeRuntime | None, notify: Notify | None = None,
             deploy_cfg: dict | Callable[[], dict | None] | None = None,
@@ -377,6 +389,8 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
     if derived.key is not None and derived.one_shot_safe:     # fail closed: only keys that digest the whole action
         consumed = _consume_approval(store, cfg, worker, derived.key.key_id(), now)
         if consumed is not None:
+            if derived.deploy is not None:
+                _open_deploy_check(store, deploy_cfg, worker, derived.deploy, task_id, consumed.request_id, now)
             return Decision("authorized", "Authorized once by the owner's approval of this exact action.",
                             consumed.request_id, None, None, "owner")
     if derived.owner_decides or derived.key is None:
@@ -417,6 +431,7 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
             _audit(store, worker, POLICY_ACTOR, "assistant.deploy.authorized", grant.grant_id,
                    f"project={m.project} scope={m.scope} sha12={m.sha[:12]} grant={grant.grant_id} "
                    f"worker={worker.worker_id}")
+            _open_deploy_check(store, deploy_cfg, worker, m, task_id, "", now)
         _audit(store, worker, POLICY_ACTOR, "assistant.action.authorized", grant.grant_id,
                f"grant={grant.grant_id} key_id={grant.key_id} worker={worker.worker_id}{_verdict_detail(result)}")
         return Decision("authorized", "Authorized by the owner's active grant for this exact action.", None,

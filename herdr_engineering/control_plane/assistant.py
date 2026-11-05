@@ -48,6 +48,7 @@ from urllib.parse import urlsplit
 from . import placement, slurm_placement
 from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
+from .assistant_hub.deploycheck import DeployCheck
 from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_hub.shadow import JudgeRecord
 from .assistant_hub.slack_asks import SlackAsk
@@ -764,9 +765,17 @@ def _deploy_config(raw: Any) -> dict[str, Any]:
         return {"projects": {}}
     if not isinstance(raw, dict):
         raise ValueError(f"{where} must be a mapping")
-    unknown = set(raw) - {"projects", "precondition_timeout_seconds"}
+    unknown = set(raw) - {"projects", "precondition_timeout_seconds", "deploy_check_minutes", "deploy_window_minutes"}
     if unknown:
         raise ValueError(f"{where} has unknown keys: {sorted(map(str, unknown))}")
+    minutes: dict[str, int] = {}
+    for name in ("deploy_check_minutes", "deploy_window_minutes"):
+        if name in raw:
+            if type(raw[name]) is not int or not 1 <= raw[name] <= 240:
+                raise ValueError(f"{where}.{name} must be an integer from 1 to 240")
+            minutes[name] = raw[name]
+    if minutes.get("deploy_window_minutes", 1) > minutes.get("deploy_check_minutes", 20):
+        raise ValueError(f"{where}.deploy_window_minutes must not exceed deploy_check_minutes")
     timeout = raw.get("precondition_timeout_seconds")
     if "precondition_timeout_seconds" in raw and (type(timeout) is not int or not 1 <= timeout <= 60):
         raise ValueError(f"{where}.precondition_timeout_seconds must be an integer from 1 to 60")
@@ -806,7 +815,8 @@ def _deploy_config(raw: Any) -> dict[str, Any]:
                 raise ValueError(f"{pwhere}.scopes.{sid}: duplicate repo and command (another scope already runs it)")
             seen.add(ident)
         out[pid] = {"repo": repo, "scopes": norm}
-    return {"projects": out, **({"precondition_timeout_seconds": timeout} if timeout is not None else {})}
+    return {"projects": out, **minutes,
+            **({"precondition_timeout_seconds": timeout} if timeout is not None else {})}
 
 
 def apps_config(raw: Any) -> dict[str, Any]:
@@ -2264,6 +2274,9 @@ class AssistantStore:
         self.slack_asks: dict[str, SlackAsk] = {}                   # insertion order == oldest first
         self.max_slack_asks_per_tenant = 2000
         self._slack_index: dict[str, dict[str, None]] = {}
+        self.deploy_checks: dict[str, DeployCheck] = {}             # insertion order == oldest first
+        self.max_deploy_checks_per_tenant = 500
+        self._deploy_index: dict[str, dict[str, None]] = {}
         self._request_index: dict[str, dict[str, None]] = {}        # tenant -> request ids, oldest first
         self._evidence_index: dict[str, dict[str, None]] = {}
         self.policy_state: dict[str, Any] = {}                      # small durable policy facts (shadow start)
@@ -2340,6 +2353,7 @@ class AssistantStore:
                 "action_evidence": [self._e_to_dict(x) for x in self.action_evidence.values()],
                 "judge_records": [self._e_to_dict(x) for x in self.judge_records.values()],
                 "slack_asks": [self._e_to_dict(x) for x in self.slack_asks.values()],
+                "deploy_checks": [self._e_to_dict(x) for x in self.deploy_checks.values()],
                 "policy_state": dict(self.policy_state),
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
@@ -2400,8 +2414,13 @@ class AssistantStore:
                                   (self._e_from_dict(JudgeRecord, d) for d in snap.get("judge_records", []))}
             self.slack_asks = {x.ask_id: x for x in
                                (self._e_from_dict(SlackAsk, d) for d in snap.get("slack_asks", []))}
+            self.deploy_checks = {x.check_id: x for x in
+                                  (self._e_from_dict(DeployCheck, d) for d in snap.get("deploy_checks", []))}
             self._request_index, self._evidence_index, self._judge_index = {}, {}, {}
             self._slack_index = {}
+            self._deploy_index = {}
+            for dc in self.deploy_checks.values():
+                self._deploy_index.setdefault(dc.tenant_id, {})[dc.check_id] = None
             for sa in self.slack_asks.values():
                 self._slack_index.setdefault(sa.tenant_id, {})[sa.ask_id] = None
             for j in self.judge_records.values():
@@ -2414,7 +2433,8 @@ class AssistantStore:
             for rows, index, cap in ((self.action_requests, self._request_index, self.max_action_rows_per_tenant),
                                      (self.action_evidence, self._evidence_index, self.max_action_rows_per_tenant),
                                      (self.judge_records, self._judge_index, self.max_action_rows_per_tenant),
-                                     (self.slack_asks, self._slack_index, self.max_slack_asks_per_tenant)):
+                                     (self.slack_asks, self._slack_index, self.max_slack_asks_per_tenant),
+                                     (self.deploy_checks, self._deploy_index, self.max_deploy_checks_per_tenant)):
                 for idx in index.values():           # an oversized snapshot must not stay over the cap
                     while len(idx) > cap:
                         rows.pop(next(iter(idx)), None)
@@ -2579,6 +2599,35 @@ class AssistantStore:
                 "one_shot": sum(1 for e in events if e.payload.get("source") == "owner"),
                 "denied": sum(1 for r in rows if r.status == "denied"),
                 "vetoed": sum(1 for r in rows if r.status == "vetoed")}
+
+    # -- deploy outcome checks (assistant hub) ----------------------------------
+    def put_deploy_check(self, check: DeployCheck) -> None:
+        with self._lock:
+            self._bounded_put(self.deploy_checks, self._deploy_index, check.tenant_id, check.check_id, replace(check),
+                              cap=self.max_deploy_checks_per_tenant)
+            self._after_mutation()
+
+    def get_deploy_check(self, check_id: str, *, tenant_id: str, user_id: str) -> DeployCheck | None:
+        with self._lock:
+            c = self.deploy_checks.get(check_id)
+            return replace(c) if c and c.tenant_id == tenant_id and c.user_id == user_id else None
+
+    def list_deploy_checks(self, tenant_id: str, user_id: str, *, worker_id: str | None = None,
+                           task_id: str | None = None) -> list[DeployCheck]:
+        """This tenant's and user's checks, oldest first (by start), optionally of one worker and task."""
+        with self._lock:
+            rows = [c for c in self.deploy_checks.values() if c.tenant_id == tenant_id and c.user_id == user_id
+                    and (worker_id is None or c.worker_id == worker_id) and (task_id is None or c.task_id == task_id)]
+            return [replace(c) for c in sorted(rows, key=lambda c: c.started_at)]
+
+    def list_deploy_checks_any(self, *, status: str | None = None, unnotified: bool = False) -> list[DeployCheck]:
+        """Every tenant's checks of one status (or the finished ones whose Slack message is not posted), oldest first:
+        the checker's and the Slack sweep's one cross-tenant read."""
+        with self._lock:
+            rows = [c for c in self.deploy_checks.values()
+                    if (status is None or c.status == status) and (not unnotified or (c.status != "awaiting"
+                                                                                       and not c.notified))]
+            return [replace(c) for c in sorted(rows, key=lambda c: c.started_at)]
 
     def list_slack_asks(self, tenant_id: str, user_id: str, status: str | None = None) -> list[SlackAsk]:
         with self._lock:
