@@ -160,7 +160,13 @@ def route_registry(handler, server, parts, resource):
             kwargs["legal_hold"] = bool(body.get("legal_hold", False))
         if action in {"tombstone", "restore"}:
             kwargs["override_legal_hold"] = bool(body.get("override_legal_hold", False))
+        if action == "restore" and not owner:
+            kwargs["allowed_from"] = ["archived"]            # decided under the row lock, not from the read above
         result = handler._artifact_call(f"{action}_artifact", artifact_id, **kwargs)
+        cache = getattr(server, "tombstone_cache", None)
+        if cache is not None and action in {"tombstone", "restore"}:
+            cache.add([artifact_id] if action == "tombstone" else [])
+            cache.invalidate()
         if action == "tombstone":
             from .artifact_delete_api import revoke_shares
             result["shares_revoked"] = revoke_shares(handler, server, artifact_id, principal)

@@ -69,6 +69,12 @@ class Store:
     async def get_record(self, aid, **_):
         return self.records.get(aid)
 
+    async def tombstoned_ids(self):
+        return []
+
+    async def lifecycle_of(self, aid):
+        return "active"
+
     async def report_permission(self, aid, principal, permission):
         return aid in self.records and OWNER in principal
 

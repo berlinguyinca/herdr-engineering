@@ -257,8 +257,15 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             )
             if artifact is None:
                 raise ArtifactError(f"no artifact {artifact_id}")
-            if artifact["lifecycle"] == "tombstoned":
+            if artifact.get("lifecycle") == "tombstoned":
                 raise ArtifactError("artifact is deleted: restore it before committing a new version")
+            # a purge sweep may delete a queued object that no committed reference protects yet: hold the shared digest
+            # lock until this commit (the sweep then sees the reference) and re-check the bytes are still there
+            references = [ref for ref in [source_manifest_blob, *[
+                output.get("storage_key") or output.get("blob_sha256") for output in output_manifest]] if ref]
+            await self._lock_digests_shared(references)
+            for reference in references:
+                await self._validate_blob_reference(reference)
             if artifact.get("artifact_type") == "report" and report_descriptor is None:
                 raise ArtifactError("report artifact versions require a report descriptor")
             if idempotency_key:
@@ -621,7 +628,7 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             return False
         artifact = await self._conn.fetchrow(
             "SELECT created_by, lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id)
-        if artifact is None or artifact["lifecycle"] == "tombstoned":
+        if artifact is None or artifact.get("lifecycle") == "tombstoned":
             return False            # a deleted artifact is invisible and read-only to everyone; the owner restores it first
         if artifact.get("created_by") == principal_id:
             return True
@@ -700,17 +707,21 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         expected = f"sha256/{sha256[:2]}/{sha256[2:4]}/{sha256}"
         if storage_key != expected:
             raise ArtifactError("report blob key must match its content digest")
-        await self._validate_blob_reference(storage_key)
-        previous = await self._conn.fetchrow(
-            "SELECT storage_key, size_bytes, media_type FROM artifact_blobs "
-            "WHERE scope=$1 AND blob_sha256=$2", artifact_id, sha256)
-        if previous and (previous["storage_key"] != storage_key or previous["size_bytes"] != size_bytes
-                         or previous["media_type"] != media_type):
-            raise ArtifactError("immutable scoped blob metadata conflict")
-        await self._conn.execute(
-            "INSERT INTO artifact_blobs (scope, blob_sha256, storage_key, size_bytes, media_type, verified_at) "
-            "VALUES ($1,$2,$3,$4,$5,now()) ON CONFLICT (scope, blob_sha256) DO NOTHING",
-            artifact_id, sha256, storage_key, size_bytes, media_type)
+        async with _transaction(self._conn):
+            # shared digest lock until the row commits, then the existence check: a purge sweep cannot delete the object
+            # between "it exists" and "a reference to it is committed"
+            await self._lock_digests_shared([storage_key])
+            await self._validate_blob_reference(storage_key)
+            previous = await self._conn.fetchrow(
+                "SELECT storage_key, size_bytes, media_type FROM artifact_blobs "
+                "WHERE scope=$1 AND blob_sha256=$2", artifact_id, sha256)
+            if previous and (previous["storage_key"] != storage_key or previous["size_bytes"] != size_bytes
+                             or previous["media_type"] != media_type):
+                raise ArtifactError("immutable scoped blob metadata conflict")
+            await self._conn.execute(
+                "INSERT INTO artifact_blobs (scope, blob_sha256, storage_key, size_bytes, media_type, verified_at) "
+                "VALUES ($1,$2,$3,$4,$5,now()) ON CONFLICT (scope, blob_sha256) DO NOTHING",
+                artifact_id, sha256, storage_key, size_bytes, media_type)
         return {"storage_key": storage_key, "sha256": sha256, "size_bytes": size_bytes,
                 "media_type": media_type}
 
@@ -1155,13 +1166,18 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
     async def record_retraction(self, artifact_id: str, version_id: str | None = None, reason: str = "") -> None:
         """Durable half of the lineage retraction (``artifact_scope.ArtifactGraphGate``): an artifact becomes
         ``lifecycle='retracted'``, a version ``state='retracted'``. Nothing is deleted; both columns are free text."""
+        if await self._conn.fetchval(
+                "SELECT 1 FROM artifacts WHERE artifact_id=$1 AND lifecycle='tombstoned'", artifact_id):
+            raise ArtifactError("artifact is deleted: restore it before retracting")
         if version_id is None:
             changed = await self._conn.execute(
-                "UPDATE artifacts SET lifecycle='retracted' WHERE artifact_id=$1", artifact_id)
+                "UPDATE artifacts SET lifecycle='retracted' WHERE artifact_id=$1 AND lifecycle<>'tombstoned'",
+                artifact_id)
         else:
             changed = await self._conn.execute(
-                "UPDATE artifact_versions SET state='retracted' WHERE version_id=$1 AND artifact_id=$2",
-                version_id, artifact_id)
+                "UPDATE artifact_versions v SET state='retracted' WHERE v.version_id=$1 AND v.artifact_id=$2 "
+                "AND v.purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.artifact_id=v.artifact_id "
+                "AND a.lifecycle='tombstoned')", version_id, artifact_id)
         if changed != "UPDATE 1":
             raise ArtifactError("no such artifact or version to retract")
 
@@ -1258,15 +1274,19 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                        retention_class: str = "temporary") -> str:
         digest = hashlib.sha256(data).hexdigest()
         key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
-        self._rf.put(data)
         aid = ids.new_id("artifact")
-        await self._conn.execute(
-            "INSERT INTO artifacts (artifact_id, original_filename, mime_type, "
-            " artifact_type, created_by, size_bytes, sha256, storage_backend, "
-            " storage_key, status, retention_class) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,'rustfs',$8,'available',$9)",
-            aid, original_filename, mime_type, artifact_type, created_by,
-            len(data), digest, key, retention_class)
+        async with _transaction(self._conn):
+            # put UNDER the shared digest lock: a purge sweep that already decided to delete this object finishes first
+            # (the put then restores it), and one that starts later waits for the row below and keeps the bytes
+            await self._lock_digests_shared([key])
+            self._rf.put(data)
+            await self._conn.execute(
+                "INSERT INTO artifacts (artifact_id, original_filename, mime_type, "
+                " artifact_type, created_by, size_bytes, sha256, storage_backend, "
+                " storage_key, status, retention_class) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,'rustfs',$8,'available',$9)",
+                aid, original_filename, mime_type, artifact_type, created_by,
+                len(data), digest, key, retention_class)
         if mission_id or session_id:
             await self.attach(aid, mission_id=mission_id,
                               session_id=session_id, created_by=created_by)

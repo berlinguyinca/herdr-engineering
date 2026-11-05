@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -28,6 +29,7 @@ DELETE_MODES = ("tombstone", "purge_now")
 ANONYMIZED = "purged"
 _NOT_PURGED = ("NOT EXISTS (SELECT 1 FROM artifact_lifecycle_events pe WHERE pe.artifact_id=a.artifact_id "
                "AND pe.action='purge')")
+_DIGEST = re.compile(r"[0-9a-f]{64}")
 _TRANSITIONS = {
     "archive": ({"active"}, "archived"),
     "restore": ({"archived", "tombstoned"}, "active"),
@@ -42,6 +44,12 @@ def _error(message: str, code: str | None = None):
     return exc
 
 
+def _is_held(row: Any) -> bool:
+    """A legal hold: the durable flag, or (rows written by code from before the flag existed, rolling deploys) a
+    tombstone with no purge date."""
+    return bool(row["legal_hold"]) or (row["lifecycle"] == "tombstoned" and row["purge_after"] is None)
+
+
 def _code(exc: BaseException) -> str | None:
     return getattr(exc, "code", None)
 
@@ -52,17 +60,23 @@ class ArtifactLifecycleMixin:
 
     async def _lifecycle(self, action: str, artifact_id: str, *, actor: str, reason: str = "",
                          request_key: str | None = None, hold_days: float | None = DEFAULT_HOLD_DAYS,
-                         legal_hold: bool = False, override_legal_hold: bool = False) -> dict:
+                         legal_hold: bool = False, override_legal_hold: bool = False,
+                         allowed_from: set[str] | None = None) -> dict:
+        """``allowed_from`` narrows the permitted current states; it is checked under the row lock (a caller that
+        decided from an earlier unlocked read cannot act on a state that changed in between)."""
         from .artifacts import ArtifactError, _transaction
         if not actor:
             raise ArtifactError("actor is required")
         reason = (reason or "").strip()[:1000]
         if action == "tombstone" and not reason:
             raise ArtifactError("a tombstone needs a reason")
-        allowed_from, to_state = _TRANSITIONS[action]
+        permitted, to_state = _TRANSITIONS[action]
+        if allowed_from is not None:
+            permitted = permitted & set(allowed_from)
         async with _transaction(self._conn):
             row = await self._conn.fetchrow(
-                "SELECT artifact_id, lifecycle, legal_hold FROM artifacts WHERE artifact_id=$1 FOR UPDATE", artifact_id)
+                "SELECT artifact_id, lifecycle, legal_hold, purge_after FROM artifacts WHERE artifact_id=$1 FOR UPDATE",
+                artifact_id)
             if row is None:
                 raise ArtifactError(f"no artifact {artifact_id}")
             if request_key:
@@ -72,11 +86,15 @@ class ArtifactLifecycleMixin:
                 if prior:
                     if prior["action"] != action:
                         raise _error("request key was reused for a different lifecycle action", "request_key_reused")
+                    if row["lifecycle"] != prior["to_state"]:
+                        # a stale key: the recorded action no longer describes the artifact's state
+                        raise _error("request key belongs to an earlier action that has since been undone",
+                                     "request_key_reused")
                     return {"artifact_id": artifact_id, "lifecycle": prior["to_state"], "replayed": True}
             current = row["lifecycle"]
-            if current not in allowed_from:
+            if current not in permitted:
                 raise ArtifactError(f"cannot {action} an artifact that is {current}")
-            held = bool(row["legal_hold"])
+            held = _is_held(row)
             detail: dict = {}
             if action == "restore" and current == "tombstoned":
                 if await self._conn.fetchval(
@@ -119,9 +137,10 @@ class ArtifactLifecycleMixin:
         return await self._lifecycle("archive", artifact_id, actor=actor, reason=reason, request_key=request_key)
 
     async def restore_artifact(self, artifact_id: str, *, actor: str, reason: str = "",
-                               request_key: str | None = None, override_legal_hold: bool = False) -> dict:
+                               request_key: str | None = None, override_legal_hold: bool = False,
+                               allowed_from: set[str] | None = None) -> dict:
         return await self._lifecycle("restore", artifact_id, actor=actor, reason=reason, request_key=request_key,
-                                     override_legal_hold=override_legal_hold)
+                                     override_legal_hold=override_legal_hold, allowed_from=allowed_from)
 
     async def tombstone_artifact(self, artifact_id: str, *, actor: str, reason: str,
                                  request_key: str | None = None, legal_hold: bool = False,
@@ -134,6 +153,10 @@ class ArtifactLifecycleMixin:
 
     async def lifecycle_of(self, artifact_id: str) -> str | None:
         return await self._conn.fetchval("SELECT lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id)
+
+    async def tombstoned_ids(self) -> list[str]:
+        return [r["artifact_id"] for r in await self._conn.fetch(
+            "SELECT artifact_id FROM artifacts WHERE lifecycle='tombstoned'")]
 
     async def list_lifecycle_events(self, artifact_id: str) -> list[dict]:
         rows = await self._conn.fetch(
@@ -161,6 +184,13 @@ class ArtifactLifecycleMixin:
     def _digest_of(key: str) -> str:
         return key.rsplit("/", 1)[-1]
 
+    @classmethod
+    def _canonical_key(cls, key: str) -> str | None:
+        """The one object key a content digest lives at (``sha256/xx/yy/<digest>``), or None when ``key`` does not end
+        in a digest. Only canonical keys are ever queued or deleted: an alias spelling is never trusted."""
+        digest = cls._digest_of(key)
+        return f"sha256/{digest[:2]}/{digest[2:4]}/{digest}" if _DIGEST.fullmatch(digest) else None
+
     async def _key_shared(self, artifact_id: str, key: str) -> bool:
         """True when anything other than ``artifact_id`` still references the content-addressed key: a version of a
         not-yet-purged artifact (live OR tombstoned), a registered blob (any scope, ``fabric`` included), a staged
@@ -177,22 +207,31 @@ class ArtifactLifecycleMixin:
             return True
         row = await self._conn.fetchrow(
             "SELECT 1 AS x FROM artifact_blobs b LEFT JOIN artifacts a ON a.artifact_id=b.scope "
-            f"WHERE b.scope<>$1 AND b.storage_key=$2 AND {_NOT_PURGED} LIMIT 1", artifact_id, key)
+            f"WHERE b.scope<>$1 AND (b.storage_key=$2 OR b.blob_sha256=$3) AND {_NOT_PURGED} LIMIT 1",
+            artifact_id, key, digest)
         if row:
             return True
         row = await self._conn.fetchrow(
-            "SELECT 1 AS x FROM artifact_collab_uploads u WHERE u.artifact_id<>$1 AND "
-            "(u.storage_key=$2 OR u.sha256=$3) LIMIT 1", artifact_id, key, digest)
+            "SELECT 1 AS x FROM artifact_collab_uploads u LEFT JOIN artifacts a ON a.artifact_id=u.artifact_id "
+            f"WHERE u.artifact_id<>$1 AND (u.storage_key=$2 OR u.sha256=$3) AND {_NOT_PURGED} LIMIT 1",
+            artifact_id, key, digest)
         if row:
             return True
         row = await self._conn.fetchrow(
-            f"SELECT 1 AS x FROM artifacts a WHERE a.artifact_id<>$1 AND a.storage_key=$2 AND {_NOT_PURGED} LIMIT 1",
-            artifact_id, key)
+            f"SELECT 1 AS x FROM artifacts a WHERE a.artifact_id<>$1 AND (a.storage_key=$2 OR a.sha256=$3) "
+            f"AND {_NOT_PURGED} LIMIT 1", artifact_id, key, digest)
         return row is not None
 
     async def _lock_digest(self, key: str) -> None:
         """Serialise purge decisions on one content digest for the rest of the transaction."""
         await self._conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", self._digest_of(key))
+
+    async def _lock_digests_shared(self, keys: list[str]) -> None:
+        """Writers of a reference to content-addressed bytes call this inside their committing transaction, then
+        re-check the object exists. It excludes a concurrent purge sweep (exclusive lock on the same digest) until the
+        reference commits, after which the sweep sees the reference and keeps the bytes."""
+        for digest in sorted({self._digest_of(k) for k in keys if k}):
+            await self._conn.execute("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))", digest)
 
     async def purge_due(self, *, limit: int = 20) -> list[dict]:
         """Purge tombstoned artifacts whose hold has expired (never a legal hold). Idempotent; one record per artifact."""
@@ -209,11 +248,12 @@ class ArtifactLifecycleMixin:
             artifact_id = row["artifact_id"]
             async with _transaction(self._conn):
                 locked = await self._conn.fetchrow(
-                    "SELECT lifecycle, legal_hold FROM artifacts WHERE artifact_id=$1 FOR UPDATE", artifact_id)
-                if locked is None or locked["lifecycle"] != "tombstoned" or locked["legal_hold"]:
+                    "SELECT lifecycle, legal_hold, purge_after FROM artifacts WHERE artifact_id=$1 FOR UPDATE",
+                    artifact_id)
+                if locked is None or locked["lifecycle"] != "tombstoned" or _is_held(locked):
                     continue
                 purged = await self._purge_locked(artifact_id, actor="system", reason="hold window elapsed")
-            purged["deleted"] = await self.drain_pending_deletes(purged["queued"])
+            purged["deleted"], purged["warning"] = await self._drain_after_commit(purged["queued"])
             results.append({k: v for k, v in purged.items() if k != "queued"})
         return results
 
@@ -233,13 +273,7 @@ class ArtifactLifecycleMixin:
         if legacy and legacy["storage_key"]:
             keys.add(legacy["storage_key"])
         queued, retained = [], []
-        normalised = set()
-        for key in keys:
-            if not key.startswith("sha256/"):
-                digest = self._digest_of(key)
-                key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}" if len(digest) == 64 else key
-            if key.startswith("sha256/"):
-                normalised.add(key)
+        normalised = {canonical for canonical in map(self._canonical_key, keys) if canonical}
         # the purge event comes first: _key_shared must already see this artifact as purged only after commit, so the
         # decision below excludes it explicitly
         for key in sorted(normalised):
@@ -269,14 +303,22 @@ class ArtifactLifecycleMixin:
     async def drain_pending_deletes(self, keys: list[str] | None = None, *, limit: int = 100) -> list[str]:
         """Delete queued objects (all, or just ``keys``), re-checking at delete time that nothing references them any
         more. A key that cannot be deleted stays queued for the next sweep. Returns the keys actually deleted."""
+        return (await self._drain(keys, limit=limit))[0]
+
+    async def _drain(self, keys: list[str] | None = None, *, limit: int = 100) -> tuple[list[str], list[str]]:
+        """``(deleted, failed)``: a failed key stays queued; recording the failure is best effort and never raises."""
         from .artifacts import _transaction
         if keys is None:
             keys = [r["storage_key"] for r in await self._conn.fetch(
                 "SELECT storage_key FROM artifact_pending_deletes ORDER BY queued_at LIMIT $1", int(limit))]
-        deleted = []
+        deleted, failed = [], []
         for key in keys:
             try:
                 async with _transaction(self._conn):
+                    canonical = self._canonical_key(key)
+                    if canonical is None or canonical != key:         # never act on an alias spelling
+                        await self._conn.execute("DELETE FROM artifact_pending_deletes WHERE storage_key=$1", key)
+                        continue
                     await self._lock_digest(key)
                     if await self._key_shared("", key):
                         await self._conn.execute("DELETE FROM artifact_pending_deletes WHERE storage_key=$1", key)
@@ -285,9 +327,22 @@ class ArtifactLifecycleMixin:
                     await self._conn.execute("DELETE FROM artifact_pending_deletes WHERE storage_key=$1", key)
                     deleted.append(key)
             except Exception:                           # noqa: BLE001 - stays queued, retried next sweep
-                await self._conn.execute(
-                    "UPDATE artifact_pending_deletes SET attempts=attempts+1 WHERE storage_key=$1", key)
-        return deleted
+                failed.append(key)
+                try:
+                    await self._conn.execute(
+                        "UPDATE artifact_pending_deletes SET attempts=attempts+1 WHERE storage_key=$1", key)
+                except Exception:                       # noqa: BLE001 - bookkeeping only; the key is still queued
+                    pass
+        return deleted, failed
+
+    async def _drain_after_commit(self, keys: list[str]) -> tuple[list[str], str | None]:
+        """The post-commit half of a purge. The purge is already committed, so nothing here may fail the call: a
+        problem becomes the fixed warning ``cleanup_pending`` (the next sweep finishes the job)."""
+        try:
+            deleted, failed = await self._drain(keys)
+        except Exception:                               # noqa: BLE001
+            return [], "cleanup_pending"
+        return deleted, "cleanup_pending" if failed else None
 
     # ------------------------------------------------------- owner delete / restore
     @staticmethod
@@ -328,11 +383,12 @@ class ArtifactLifecycleMixin:
         from .artifacts import ArtifactError, _transaction
         reason = self._delete_args(actor, reason)
         out = {"artifact_id": artifact_id, "result": "not_found", "reason": None, "replayed": False,
-               "deleted": [], "retained_shared": []}
+               "deleted": [], "retained_shared": [], "warning": None}
         refusal = None
         async with _transaction(self._conn):
             row = await self._conn.fetchrow(
-                "SELECT lifecycle, legal_hold FROM artifacts WHERE artifact_id=$1 FOR UPDATE", artifact_id)
+                "SELECT lifecycle, legal_hold, purge_after FROM artifacts WHERE artifact_id=$1 FOR UPDATE",
+                artifact_id)
             if row is None:
                 return out
             prior = await self._conn.fetchrow(
@@ -343,7 +399,7 @@ class ArtifactLifecycleMixin:
                         "replayed": bool(request_key) and prior["request_key"] == request_key}
             if await self._key_conflict(artifact_id, request_key, "purge"):
                 refusal = "request_key_reused"
-            elif row["legal_hold"] and not override_legal_hold:
+            elif _is_held(row) and not override_legal_hold:
                 refusal = "legal_hold"
             else:
                 try:
@@ -355,12 +411,13 @@ class ArtifactLifecycleMixin:
                 else:
                     purged = await self._purge_locked(
                         artifact_id, actor=actor, reason=reason, request_key=request_key,
-                        extra={"legal_hold_overridden": True} if row["legal_hold"] else None)
+                        extra={"legal_hold_overridden": True} if _is_held(row) else None)
         if refusal:
             await self._audit_refused(artifact_id, actor, reason, refusal, "purge_now")
             return {**out, "result": "refused", "reason": refusal}
-        deleted = await self.drain_pending_deletes(purged["queued"])
-        return {**out, "result": "deleted", "deleted": deleted, "retained_shared": purged["retained_shared"]}
+        deleted, warning = await self._drain_after_commit(purged["queued"])
+        return {**out, "result": "deleted", "deleted": deleted, "retained_shared": purged["retained_shared"],
+                "warning": warning}
 
     async def delete_many(self, artifact_ids: list[str], *, mode: str, actor: str, reason: str,
                           request_key: str | None = None, hold_days: float = DEFAULT_HOLD_DAYS,
@@ -435,10 +492,12 @@ class ArtifactLifecycleMixin:
             try:
                 row = await self._conn.fetchrow("SELECT lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id)
                 prior = row is not None and request_key and await self._conn.fetchrow(
-                    "SELECT 1 AS x FROM artifact_lifecycle_events WHERE artifact_id=$1 AND request_key=$2 "
+                    "SELECT to_state FROM artifact_lifecycle_events WHERE artifact_id=$1 AND request_key=$2 "
                     "AND action='restore'", artifact_id, request_key)
                 if row is None:
                     out["result"] = "not_found"
+                elif prior and row["lifecycle"] != prior["to_state"]:
+                    out.update(result="refused", reason="request_key_reused")      # stale key, state moved on
                 elif prior:
                     out["replayed"] = True
                 elif await self._key_conflict(artifact_id, request_key, "restore"):
@@ -460,7 +519,8 @@ class ArtifactLifecycleMixin:
     async def list_tombstoned(self, *, limit: int = MAX_BULK) -> list[dict]:
         """Tombstoned artifacts (newest first) with their hold, for the owner's restore view."""
         rows = await self._conn.fetch(
-            "SELECT a.artifact_id, a.original_filename, a.artifact_type, a.tombstoned_at, a.purge_after, a.legal_hold, "
+            "SELECT a.artifact_id, a.original_filename, a.artifact_type, a.tombstoned_at, a.purge_after, "
+            "(a.legal_hold OR a.purge_after IS NULL) AS legal_hold, "
             f"NOT ({_NOT_PURGED}) AS purged, (SELECT e.reason FROM artifact_lifecycle_events e "
             "WHERE e.artifact_id=a.artifact_id AND e.action='tombstone' ORDER BY e.event_id DESC LIMIT 1) AS reason "
             "FROM artifacts a WHERE a.lifecycle='tombstoned' ORDER BY a.tombstoned_at DESC LIMIT $1",
@@ -519,6 +579,9 @@ class ArtifactLifecycleMixin:
             f"UPDATE artifact_blobs b SET orphan_marked_at=NULL WHERE b.orphan_marked_at IS NOT NULL AND {referenced} "
             "RETURNING b.scope")
         report["orphans_cleared"] = len(cleared)
+        report["legacy_holds_normalised"] = len(await self._conn.fetch(
+            "UPDATE artifacts a SET legal_hold=true WHERE a.lifecycle='tombstoned' AND a.purge_after IS NULL "
+            f"AND NOT a.legal_hold AND {_NOT_PURGED} RETURNING a.artifact_id"))
         report["uploads_expired"] = await self.expire_uploads()
         report["purged"] = len(await self.purge_due())
         return report

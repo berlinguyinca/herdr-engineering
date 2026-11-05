@@ -22,6 +22,8 @@ import hashlib
 import logging
 import re
 import secrets
+import threading
+import time
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlsplit
@@ -39,6 +41,43 @@ _MAX_HOLD_DAYS = 3650
 _KEYLESS_ACTOR = "keyless:operator"
 _BAD = {"error": "invalid request"}
 _UNAVAILABLE = {"error": "artifact store unavailable"}
+
+
+class TombstoneCache:
+    """The registry's tombstoned artifact ids, for request paths that must not query the store per row.
+
+    Refreshed at most every ``ttl`` seconds and immediately on every delete/restore this process performs (``add`` /
+    ``invalidate``); another process's delete is visible within ``ttl``. If the store cannot be asked, the last known
+    set stays in force, and before the first successful load the failure propagates (the caller answers the fixed 503,
+    so nothing is served unchecked)."""
+
+    def __init__(self, ttl: float = 5.0, clock=time.monotonic) -> None:
+        self._ttl, self._clock = ttl, clock
+        self._lock = threading.Lock()
+        self._ids: frozenset[str] | None = None
+        self._loaded = 0.0
+        self._dirty = True
+
+    def contains(self, artifact_id: str, load) -> bool:
+        with self._lock:
+            now = self._clock()
+            if self._ids is None or self._dirty or now - self._loaded > self._ttl:
+                try:
+                    self._ids, self._loaded, self._dirty = frozenset(load()), now, False
+                except Exception:                       # noqa: BLE001 - keep the last answer, try again next call
+                    _LOG.exception("tombstone cache refresh failed")
+                    if self._ids is None:
+                        raise
+            return artifact_id in self._ids
+
+    def add(self, ids) -> None:
+        with self._lock:
+            if self._ids is not None:
+                self._ids = self._ids | frozenset(ids)
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._dirty = True
 
 
 class DeleteOwners(NamedTuple):
@@ -167,6 +206,8 @@ def _public(result: dict) -> dict:
         row["objects_kept_shared"] = len(result["retained_shared"])
     if result.get("unchanged"):
         row["unchanged"] = True
+    if result.get("warning"):
+        row["warning"] = result["warning"]
     return row
 
 
@@ -238,6 +279,10 @@ def route_delete(handler, server, parts, resource) -> bool:
         _LOG.error("artifact delete: every id failed in the store")
         handler._json(_UNAVAILABLE, 503)
         return True
+    cache = getattr(server, "tombstone_cache", None)
+    if cache is not None:                                   # the legacy read path sees the change at once
+        cache.add([r["artifact_id"] for r in raw if r["result"] in ("tombstoned", "deleted", "already_purged")])
+        cache.invalidate()
     if name == "delete":
         for row in raw:
             if row["result"] in ("tombstoned", "deleted", "already_purged"):
