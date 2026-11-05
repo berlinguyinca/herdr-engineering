@@ -305,7 +305,7 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
-                 memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 memory_adapter=None, memory_config=None, unified_workspace_config=None, work_center_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None):
@@ -422,6 +422,9 @@ class ControlPlaneServer:
         self.summary_report = None
         # unified_workspace_v1 (P01): capability advertisement only; no route consumes it yet. YAML-only, default off.
         self.unified_workspace_enabled = isinstance(unified_workspace_config, dict) and unified_workspace_config.get("enabled") is True
+        # work_center_v1 (WC-006): gates every Work Command Center UI surface in the dashboard (This week card, session Work Context
+        # header, board "Open in Herdr" links). Advertisement only; no route consumes it. YAML-only, strict True, default off.
+        self.work_center_enabled = isinstance(work_center_config, dict) and work_center_config.get("enabled") is True
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -1591,6 +1594,8 @@ class ControlPlaneServer:
             caps.append("memory_v1")
         if getattr(self, "unified_workspace_enabled", False):
             caps.append("unified_workspace_v1")
+        if getattr(self, "work_center_enabled", False):
+            caps.append("work_center_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
         try:

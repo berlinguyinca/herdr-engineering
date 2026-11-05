@@ -3,6 +3,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import {withPage} from './helpers/fixture.mjs';
+import {withFlag} from './helpers/work-center.mjs';
 import {boot,until,sleep,T0} from './helpers/live.mjs';
 
 const shots=path.resolve(import.meta.dirname,'../../docs/specs/herdr-work-command-center-wc001/screenshots');
@@ -16,9 +17,10 @@ const API={
  '/api/v1/missions':{missions:[{mission_id:'MSN-9',title:'Archived survey',created_at:'2025-12-30T10:00:00Z',updated_at:'2025-12-31T10:00:00Z'}]},
  '/api/v1/sessions':{sessions:[{session_id:'s-1',host_id:'beast',status:'running',updated_at:snap,mission_key:'pi:MSN-1'},{session_id:'s-solo',host_id:'beast',status:'running',updated_at:snap,display_name:'Solo agent'}]},
 };
-const handler=p=>API[p]??{services:[],hosts:[],activities:[],events:[],items:[],reviews:[],available:true,components:[],summary:{},status:'ok',repositories:[],pipelines:[]};
+const rawHandler=p=>API[p]??{services:[],hosts:[],activities:[],events:[],items:[],reviews:[],available:true,components:[],summary:{},status:'ok',repositories:[],pipelines:[]};
 const card='[data-overview="week"]';
 
+const handler=withFlag(rawHandler);
 test('overview shows the This week card with honest coverage and measured progress only',async()=>withPage(async(page,base)=>{
  const errors=[];page.on('pageerror',e=>errors.push(e.message));
  await boot(page,base,'/overview',handler);

@@ -3,6 +3,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import {withPage} from './helpers/fixture.mjs';
+import {withFlag} from './helpers/work-center.mjs';
 import {boot,until,sleep} from './helpers/live.mjs';
 
 const shots=path.resolve(import.meta.dirname,'../../docs/specs/herdr-work-command-center-wc001/screenshots');
@@ -21,13 +22,14 @@ const API={
  '/api/v1/sessions':{sessions:SESSIONS},
  '/api/v1/sessions/s-1/terminal':{recommended:'local',commands:[{form:'local',label:'Local',command:'herdr attach s-1'}]},
 };
-const handler=p=>{
+const rawHandler=p=>{
  const m=/^\/api\/v1\/sessions\/([^/]+)$/.exec(p);
  if(m){const s=SESSIONS.find(x=>x.session_id===m[1]);return s??{__status:404,json:{error:'not found'}};}
  return API[p]??{services:[],hosts:[],activities:[],events:[],items:[],reviews:[],available:true,components:[],summary:{},status:'ok',repositories:[],pipelines:[]};
 };
 const ctx='[data-work-context]';
 
+const handler=withFlag(rawHandler);
 test('overview row -> session shows Work Context with the parent mission link -> mission route',async()=>withPage(async(page,base)=>{
  const errors=[];page.on('pageerror',e=>errors.push(e.message));
  await boot(page,base,'/overview?keep=1',handler);

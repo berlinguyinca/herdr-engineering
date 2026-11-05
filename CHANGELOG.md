@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Work Command Center: rollout gate `work_center_v1` (off by default)
+- New capability `work_center_v1` in `/api/v1/health`, only when `control_plane.work_center.enabled: true` (YAML, strict `true`, default off). It gates the Overview "This week" card, the session "Work context" header and the GitHub board "Open in Herdr" links; with it off the dashboard is unchanged (the board no longer reads `/api/v1/mission-outcomes`). Rollback is turning the flag off. Nothing is deployed or enabled by merging. See `docs/specs/herdr-work-command-center-wc001/OPERATOR.md`.
+
 ### Fleet status: the macOS fabric-agent probe asked launchd for the wrong service
 - `herdr-eng fleet status` and every `herdr-eng fleet update` reported `agent=inactive` for mac, `_parity()` put the host in `invalid_hosts`, and the unattended nightly run exited 1 on a fleet that was healthy. The probe in `ansible/tasks/fleet-fingerprint.yml` asks `launchctl print gui/<uid>/herdr-eng-fabric-agent` — the *systemd* unit name — while `scripts/fabric-agent-macos.sh` has registered the LaunchAgent as `com.herdr-engineering.fabric-agent` since the installer was written (4bc6b541). `launchctl` finds nothing, the probe answers `inactive`, and no mac has ever passed the check since the probe landed (57615222). The probe now asks for the label the installer writes; `test_fleet_fingerprint_probes_the_service_names_the_installers_actually_use` reads the label out of the installer and the unit name out of the Linux installer, so neither platform's name can drift from the probe again. Verified on the host that was failing: the probe snippet returns `active` for the running agent (pid 26639).
 
