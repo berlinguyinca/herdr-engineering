@@ -239,9 +239,57 @@ cleanup() {{ return 0; }}
 ])
 def test_forward_connectivity_noop_without_optin_managed_sdk(harness,opt_in,enabled,supported,mode):
     result=run(harness,f'''
-MEMORY_PRIVATE_EGRESS={opt_in}; MEMORY_CLIENT_ENABLED={enabled}
+MEMORY_PRIVATE_EGRESS_CHANGED=1; MEMORY_PRIVATE_EGRESS={opt_in}; MEMORY_CLIENT_ENABLED={enabled}
 MEMORY_CLIENT_SUPPORTED={supported}; MEMORY_CLIENT_MODE={mode}
 memory_client_forward_connectivity "$WORK"
 ''')
+    assert result.returncode==0,result.stderr
+    assert not harness['log'].exists()
+
+
+def test_ordinary_redeploy_preserves_approved_policy_without_remote_health_gate(harness):
+    from herdr_engineering.web_egress_runtime import make_record, private_json
+    approved=make_record('172.30.254.0/29','100.71.1.7/32','e'*32)
+    approved.update(network_id='c'*64,rule_may_exist=True)
+    current=harness['root']/'state/web-egress/current.json'
+    private_json(current,approved)
+    before=current.read_bytes()
+    body=f'''
+REPO="{ROOT}"; HERE="{ROOT}/deploy/control-plane"; PROJECT=herdr-control-plane
+MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_CIDR=172.31.252.0/29; MEMORY_PRIVATE_EGRESS_GATEWAY=""
+. "{ROOT}/deploy/control-plane/web-egress-deploy.sh"
+web_egress_cmd() {{
+  if [ "$1" = approved ]; then
+    (cd "$REPO" && PYTHONPATH="$REPO" python3 -m herdr_engineering.web_egress_runtime "$@")
+  elif [ "$1" = preview ]; then
+    echo "preview:$*" >> "{harness['log']}"
+    echo '{{"enabled":true,"managed":true}}'
+  else return 99; fi
+}}
+web_egress_preflight
+[ "$MEMORY_PRIVATE_EGRESS" = 1 ] && [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]
+[ "$MEMORY_PRIVATE_EGRESS_CIDR" = 172.30.254.0/29 ]
+[ "$MEMORY_PRIVATE_EGRESS_GATEWAY" = 100.71.1.7/32 ]
+[ "$WEB_EGRESS_GENERATION" = {'e'*32} ]
+MEMORY_CLIENT_ENABLED=1; MEMORY_CLIENT_SUPPORTED=1; MEMORY_CLIENT_MODE=install
+memory_client_forward_connectivity "$WORK"
+'''
+    result=run(harness,body)
+    assert result.returncode==0,result.stderr
+    assert current.read_bytes()==before
+    assert events(harness)==[]
+    assert '--enabled --cidr 172.30.254.0/29 --gateway-ip 100.71.1.7/32' in harness['log'].read_text()
+
+
+def test_auto_without_any_owned_state_never_inspects_or_calls_root(harness):
+    body=f'''
+REPO="{ROOT}"; HERE="{ROOT}/deploy/control-plane"; PROJECT=herdr-control-plane
+MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_CIDR=172.31.252.0/29; MEMORY_PRIVATE_EGRESS_GATEWAY=""
+. "{ROOT}/deploy/control-plane/web-egress-deploy.sh"
+web_egress_cmd() {{ echo unexpected-egress-command >> "{harness['log']}"; return 99; }}
+web_egress_preflight
+[ "$MEMORY_PRIVATE_EGRESS" = 0 ] && [ "$WEB_EGRESS_COMPOSE_ENABLED" = 0 ]
+'''
+    result=run(harness,body)
     assert result.returncode==0,result.stderr
     assert not harness['log'].exists()

@@ -11,13 +11,29 @@ web_egress_cmd() {
 
 web_egress_preflight() {
   WEB_EGRESS_MANAGED=0
-  WEB_EGRESS_COMPOSE_ENABLED="$MEMORY_PRIVATE_EGRESS"
+  WEB_EGRESS_COMPOSE_ENABLED=0
+  MEMORY_PRIVATE_EGRESS_CHANGED=0
   WEB_EGRESS_CURRENT="$STATE_DIR/web-egress/current.json"
   WEB_EGRESS_OVERLAY="$HERE/compose.web-egress.yaml"
   WEB_EGRESS_GENERATION=00000000000000000000000000000000
-  # With no opt-in and no owned state this feature does absolutely nothing.
-  if [ "$MEMORY_PRIVATE_EGRESS" = 0 ] && [ ! -e "$WEB_EGRESS_CURRENT" ] \
-      && [ ! -e "$STATE_DIR/web-egress/pending.json" ]; then return 0; fi
+  case "$MEMORY_PRIVATE_EGRESS" in auto|0|1) ;; *) return 1 ;; esac
+  # Omitted flags preserve an approved policy; untouched hosts still do nothing.
+  if [ "$MEMORY_PRIVATE_EGRESS" != 1 ] && [ ! -e "$WEB_EGRESS_CURRENT" ] && [ ! -L "$WEB_EGRESS_CURRENT" ] \
+      && [ ! -e "$STATE_DIR/web-egress/pending.json" ] && [ ! -L "$STATE_DIR/web-egress/pending.json" ]; then
+    MEMORY_PRIVATE_EGRESS=0; return 0
+  fi
+  if [ "$MEMORY_PRIVATE_EGRESS" = auto ]; then
+    local approved="$ENV_DIR/web-egress-approved.json" values
+    web_egress_cmd approved --current "$WEB_EGRESS_CURRENT" >"$approved" || return 1
+    values="$(python3 - "$approved" <<'PYAPPROVED'
+import json,sys
+v=json.load(open(sys.argv[1]))
+print(int(v['enabled']),v.get('cidr','disabled'),v.get('destination','disabled'),v.get('generation','disabled'))
+PYAPPROVED
+)" || return 1
+    read -r MEMORY_PRIVATE_EGRESS MEMORY_PRIVATE_EGRESS_CIDR MEMORY_PRIVATE_EGRESS_GATEWAY WEB_EGRESS_GENERATION <<<"$values"
+  fi
+  WEB_EGRESS_COMPOSE_ENABLED="$MEMORY_PRIVATE_EGRESS"
   [ "$PROJECT" = herdr-control-plane ] || {
     echo "private egress supports only the canonical private control-plane project" >&2; return 1;
   }
@@ -59,10 +75,11 @@ web_egress_select() {
   values="$(python3 - "$selected" <<'PY'
 import json,sys
 v=json.load(open(sys.argv[1]))
-print(int(v['enabled']), v.get('cidr','disabled'), v.get('generation','disabled'))
+assert type(v['activation_changed']) is bool
+print(int(v['enabled']), v.get('cidr','disabled'), v.get('generation','disabled'), int(v['activation_changed']))
 PY
 )" || return 1
-  read -r WEB_EGRESS_COMPOSE_ENABLED MEMORY_PRIVATE_EGRESS_CIDR WEB_EGRESS_GENERATION <<<"$values"
+  read -r WEB_EGRESS_COMPOSE_ENABLED MEMORY_PRIVATE_EGRESS_CIDR WEB_EGRESS_GENERATION MEMORY_PRIVATE_EGRESS_CHANGED <<<"$values"
 }
 
 web_egress_before() {

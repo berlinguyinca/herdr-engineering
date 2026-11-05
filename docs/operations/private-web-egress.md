@@ -154,10 +154,16 @@ can select `--memory-private-egress` with
 also come from the trusted host environment
 `HERDR_CP_MEMORY_PRIVATE_EGRESS_GATEWAY`. `--memory-private-egress-cidr CIDR`
 selects an explicit small candidate; no overlap is automatically worked around.
-The override is absent on an ordinary deploy. Omitting the opt-in on a later
-deploy with an owned active receipt performs a transactional disable; this is
-not a silent persistent opt-in. With no opt-in and no owned state there are zero
-network inspections and zero root calls.
+On an untouched host, omitted flags add no override and cause zero network
+inspections or root calls. Once a policy is approved, an ordinary deploy with
+flags omitted preserves its verified owned `current.json` policy: destination,
+CIDR and ownership generation come from that same existing receipt, not host
+defaults or container IDs. Incomplete receipts and pending transitions refuse
+auto-selection. Explicit `--no-memory-private-egress` performs transactional
+disable; omission never withdraws a previously approved route. Explicit initial
+enablement still requires the assigned gateway. To propose changed parameters,
+use the explicit enable flag and parameters; ordinary redeploys retain the saved
+selection rather than silently adopting new defaults.
 
 Enabled preflight is Linux-only. Before any runtime profile, network membership
 or firewall mutation, it performs **read-only** noninteractive `sudo -n --
@@ -183,13 +189,20 @@ rule by ordinal.
 - The matching runtime profile is installed before `after` validates the new web
   endpoint/network identity and priority, checks active UFW, and adds exactly the
   recorded rule. Post-add validation failure attempts restrictive revocation.
-- For an opted-in forward rollout with a managed SDK profile, the installed
+- For a **new or changed egress activation** with a managed SDK profile, the
   canonical `herdr-memory --harness codex status` must complete within a 20-second
   caller deadline and report Boolean `healthy: true`. This runs after profile
   installation and the egress grant, before profile promotion or policy commit.
   Unhealthy/malformed status, nonzero exit and timeout enter the existing rollback;
   response bodies and stderr are withheld. Disabled, unmanaged and clear modes
-  skip the gate. Restoring an old known state never depends on backend health.
+  skip the gate. An unchanged approved policy also skips remote SDK health,
+  even during routine web recreation: comparison uses only destination, CIDR and
+  ownership-generation values, not container/network IDs or revocation bookkeeping.
+  Structural ownership, route, gateway-assignment and firewall checks still apply.
+  Thus a backend outage does not block ordinary CP rollout or the existing
+  `--with-memory` repair step that runs after forward success. New/changed unhealthy
+  activation still rolls back before promotion; restoring an old known state
+  never depends on backend health.
 - Rollback restores the saved selector/CIDR/generation with the previous commit's
   Compose, pinned image/config and **previous** memory profile before regranting.
   Invalid callback directions and wrong/missing pending attempts fail before
@@ -296,3 +309,10 @@ Ruff, shell syntax and diff-whitespace checks passed. Root effects in these test
 were stubs only. The entire engineering test suite was not rerun for this bounded
 slice. The earlier temporary canaries were cleaned up and were not replaced by a
 production activation. The remaining live grant/route canary belongs to the parent.
+
+Lifecycle review correction: omitted egress flags preserve the approved owned
+policy; explicit `--no-memory-private-egress` disables it. Remote SDK acceptance
+is required only for new/changed policy, allowing unchanged backend outages to
+reach the existing repair phase. This correction passed 169 related tests and
+nine actual deploy-script checks, with root effects stubbed and no production
+failure injection. Lint, shell syntax and diff checks passed.

@@ -475,3 +475,71 @@ def test_preexisting_unowned_rule_refuses_before_snapshot_or_compose(runtime):
         tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
     assert not tx.attempt.exists()
     assert not any("delete" in command or "allow" in command for command in events)
+
+
+def test_approved_policy_for_repeat_deploy_preserves_full_committed_selection(runtime):
+    from herdr_engineering.web_egress_runtime import approved_policy
+
+    tx, events, rules, networks, web, attach = runtime
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.before("forward")
+    attach()
+    tx.after("forward")
+    tx.commit("forward")
+    previous = json.loads(tx.current.read_text())
+    selected = approved_policy(tx.current)
+    assert selected == previous
+    later = Transaction(
+        tx.current,
+        tx.attempt.parent.parent / "attempt-repeat/web-egress",
+        lock_fd=tx.lock_fd,
+        lock_path=tx.lock_path,
+        execute=tx.execute,
+        inspect=tx.inspect,
+    )
+    later.snapshot(
+        enabled=selected["enabled"], cidr=selected["cidr"], destination=selected["destination"]
+    )
+    later.before("forward")
+    later.after("forward")
+    later.commit("forward")
+    assert rules
+    assert json.loads(tx.current.read_text()) == previous
+
+
+def test_activation_change_compares_policy_not_container_or_network_ids():
+    from copy import deepcopy
+
+    from herdr_engineering.web_egress_runtime import activation_changed, make_record
+
+    record = make_record("172.31.252.0/29", "100.104.39.6/32", "a" * 32)
+    record.update(network_id="c" * 64, rule_may_exist=True)
+    recreated = deepcopy(record)
+    recreated.update(network_id="d" * 64, rule_may_exist=False)
+    assert activation_changed(record, recreated) is False
+    assert activation_changed({"enabled": False}, record) is True
+    assert activation_changed(record, {"enabled": False}) is False
+    changed = make_record("172.31.252.0/29", "100.71.1.7/32", "a" * 32)
+    assert activation_changed(record, changed) is True
+    changed = make_record("172.30.254.0/29", "100.104.39.6/32", "a" * 32)
+    assert activation_changed(record, changed) is True
+
+
+@pytest.mark.parametrize("fault", ["missing-id", "not-committed", "nonboolean", "pending"])
+def test_auto_policy_refuses_partial_or_interrupted_approval(runtime, fault):
+    from herdr_engineering.web_egress_runtime import approved_policy, make_record
+
+    tx, *_ = runtime
+    record = make_record("172.31.252.0/29", "100.104.39.6/32", "a" * 32)
+    record.update(network_id="c" * 64, rule_may_exist=True)
+    if fault == "missing-id":
+        record["network_id"] = None
+    elif fault == "not-committed":
+        record["rule_may_exist"] = False
+    elif fault == "nonboolean":
+        record = {"enabled": 0}
+    private_json(tx.current, record)
+    if fault == "pending":
+        private_json(tx.pending, {"attempt": str(tx.attempt), "direction": "forward"})
+    with pytest.raises(ValueError):
+        approved_policy(tx.current)

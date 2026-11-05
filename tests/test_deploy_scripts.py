@@ -2167,3 +2167,63 @@ exit 99
     assert 'compose ' not in calls and 'docker build' not in calls
     assert (state/'web-egress/pending.json').exists()
     assert (state/'rollout.lock').exists()
+
+
+def _approved_private_egress(env):
+    """Existing approved network and receipt, with no real Docker/UFW calls."""
+    from herdr_engineering import web_egress as policy
+    from herdr_engineering.web_egress_runtime import make_record, private_json
+    _egress_inspection_stubs(env)
+    record=make_record('172.30.254.0/29','100.71.1.7/32','e'*32)
+    record.update(network_id='c'*64,rule_may_exist=True)
+    current=env['home']/'.local/state/herdr-engineering/deploys/web-egress/current.json'
+    private_json(current,record)
+    web={'Id':'a'*64,'Config':{'Labels':{'com.docker.compose.project':policy.PROJECT,
+          'com.docker.compose.service':'control-plane-web'}},'NetworkSettings':{'Networks':{
+          policy.DEFAULT:{'GwPriority':0},policy.NETWORK:{'NetworkID':'c'*64,'IPAddress':'172.30.254.2',
+          'IPPrefixLen':29,'Gateway':'172.30.254.1','GwPriority':100}}}}
+    network={'Id':'c'*64,'Name':policy.NETWORK,'Driver':'bridge','Internal':False,'EnableIPv6':False,
+         'Labels':{**policy.LABELS,'io.herdr.web-egress.generation':'e'*32},
+         'Options':{'com.docker.network.bridge.name':policy.BRIDGE},
+         'IPAM':{'Config':[{'Subnet':record['cidr'],'Gateway':'172.30.254.1'}]},
+         'Containers':{'a'*64:{'Name':'herdr-cp-web','IPv4Address':'172.30.254.2/29'}}}
+    bindir=Path(env['env']['PATH'].split(os.pathsep)[0])
+    docker=bindir/'docker'
+    prefix=f'''if [ "$1 ${{2:-}}" = "network ls" ]; then echo owned-network; exit 0; fi
+if [ "$1 ${{2:-}}" = "network inspect" ]; then printf '%s\\n' '{json.dumps([network])}'; exit 0; fi
+if [ "$1" = inspect ] && [[ "$*" == *NetworkSettings.Networks* ]]; then
+  printf '%s\\n' '{json.dumps(web)}'; exit 0
+fi
+if [ "$1" = compose ]; then echo "egress-env:$HERDR_CP_WEB_EGRESS_CIDR:$HERDR_CP_WEB_EGRESS_GENERATION" >> "{env['log']}"; fi
+'''
+    docker.write_text(docker.read_text().replace('\n','\n'+prefix,1))
+    ip=bindir/'ip'
+    ip.write_text('''#!/bin/bash
+case "$*" in *address*) echo '[{"addr_info":[{"family":"inet","local":"100.71.1.7"}]}]' ;; *) echo '[]' ;; esac
+''')
+    return current
+
+
+def test_ordinary_deploy_preserves_last_owned_egress_selection_without_flags(env):
+    current=_approved_private_egress(env)
+    before=current.read_bytes()
+    result=deploy(env,'--dry-run')
+    assert result.returncode==0,result.stderr
+    calls=env['log'].read_text()
+    assert 'compose.web-egress.yaml' in calls
+    assert 'egress-env:172.30.254.0/29:'+('e'*32) in calls
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert current.read_bytes()==before
+
+
+def test_explicit_no_egress_removes_selector_and_accepts_inactive_cleanup(env):
+    current=_approved_private_egress(env)
+    before=current.read_bytes()
+    env['env']['STUB_UFW_PREFLIGHT']='inactive'
+    result=deploy(env,'--dry-run','--no-memory-private-egress')
+    assert result.returncode==0,result.stderr
+    calls=env['log'].read_text()
+    assert 'compose.web-egress.yaml' not in calls
+    assert 'root-read-status' in calls
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert current.read_bytes()==before  # dry-run never revokes or rewrites policy

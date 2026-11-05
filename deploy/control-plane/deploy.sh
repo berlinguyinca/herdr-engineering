@@ -7,6 +7,7 @@
 #                                  [--with-memory [--memory-checkout PATH]]
 #                                  [--memory-client-config PATH]
 #                                  [--memory-private-egress --memory-private-egress-gateway IPV4/32]
+#                                  [--no-memory-private-egress]
 #                                  [--memory-private-egress-cidr CIDR]
 #                                  [--memory-private-egress-recover SAVED_ATTEMPT]
 #                                  [--allow-divergent]
@@ -111,7 +112,7 @@
 set -euo pipefail
 
 REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
-MEMORY_PRIVATE_EGRESS=0; MEMORY_PRIVATE_EGRESS_RECOVER=""
+MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_RECOVER=""
 MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.0/29"
 MEMORY_PRIVATE_EGRESS_GATEWAY="${HERDR_CP_MEMORY_PRIVATE_EGRESS_GATEWAY:-}"
 MEMORY=0; MEMORY_CHECKOUT="${HERDR_MEMORY_CHECKOUT:-}"
@@ -128,6 +129,7 @@ while [ $# -gt 0 ]; do
     --deploy-lock-wait) DEPLOY_LOCK_WAIT="${2:?--deploy-lock-wait needs a value}"; shift 2 ;;
     --memory-private-egress-recover) MEMORY_PRIVATE_EGRESS_RECOVER="${2:?needs the saved deploy attempt}"; shift 2 ;;
     --memory-private-egress) MEMORY_PRIVATE_EGRESS=1; shift ;;
+    --no-memory-private-egress) MEMORY_PRIVATE_EGRESS=0; shift ;;
     --memory-private-egress-cidr) MEMORY_PRIVATE_EGRESS_CIDR="${2:?needs a CIDR}"; shift 2 ;;
     --memory-private-egress-gateway) MEMORY_PRIVATE_EGRESS_GATEWAY="${2:?needs an explicit IPv4/32}"; shift 2 ;;
     --with-memory) MEMORY=1; shift ;;

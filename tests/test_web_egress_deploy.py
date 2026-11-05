@@ -15,7 +15,15 @@ def function(name):
 
 
 @pytest.mark.parametrize(
-    ("direction", "interrupted", "health_result"), [("forward", False, "healthy"), ("forward", False, "unhealthy"), ("forward", False, "malformed"), ("rollback", False, "healthy"), ("rollback", True, "healthy")]
+    ("direction", "interrupted", "health_result"),
+    [
+        ("forward", False, "healthy"),
+        ("forward", False, "unhealthy"),
+        ("forward", False, "malformed"),
+        ("forward", False, "outage-unchanged"),
+        ("rollback", False, "healthy"),
+        ("rollback", True, "healthy"),
+    ],
 )
 @pytest.mark.parametrize("delete_fails", [False, True])
 def test_real_coordinator_restores_matching_policy_and_profile_before_grant(
@@ -51,7 +59,7 @@ set -euo pipefail
 WORK="{current.parent}"; PREV_WORK="{previous.parent}"; ENV_DIR="{tmp_path}/env"
 ATTEMPT="{tmp_path}/attempt"; STATE_DIR="{tmp_path}"; STATE_HELPER="{state}"
 REPO="$WORK"; HERE="{ROOT}/deploy/control-plane"; DEPLOY_LOCK_FD=7
-SHA=new; TAG=new; REF=candidate; MEMORY=0; PREV_COMMIT=old; PREV_SHA=old; PREV_TAG=old; PREVIOUS_IMAGE=old
+SHA=new; TAG=new; REF=candidate; MEMORY={int(health_result == "outage-unchanged")}; PREV_COMMIT=old; PREV_SHA=old; PREV_TAG=old; PREVIOUS_IMAGE=old
 COLLAB=0; SHARE=0; NEW_SHARE=""; COLLAB_HASH=""; PREV_COLLAB_HASH=""
 ENV_FILE=unused; FLEET_DIR=unused; LLM_DIR=unused; NEW_LLM=unused
 HOST_MUTATED=0; DEPLOY_FINISHED=0; WEB_EGRESS_MANAGED=1
@@ -67,7 +75,7 @@ MEMORY_CLIENT_PREVIOUS="{old}"; MEMORY_CLIENT_CANDIDATE="{new}"; MEMORY_CLIENT_C
 web_egress_cmd() {{
   local action="$1"; shift
   if [ "$action" = selector ]; then
-    printf '%s\\n' '{{"enabled":true,"cidr":"172.31.252.0/29","generation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    printf '%s\\n' '{{"enabled":true,"cidr":"172.31.252.0/29","generation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","activation_changed":{str(health_result != "outage-unchanged").lower()}}}'
   else
     echo "egress:$action $*" >> "{log}"
     if [ "$action" = before ] && [ "{int(delete_fails)}" = 1 ]; then return 1; fi
@@ -85,6 +93,7 @@ compose_up() {{
   echo "compose:$3 selector=$WEB_EGRESS_COMPOSE_ENABLED cidr=$MEMORY_PRIVATE_EGRESS_CIDR" >> "{log}"
   [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]
 }}
+memory_phase() {{ echo backend-repair >> "{log}"; }}
 rollback_share() {{ return 0; }}
 verify() {{ echo "verify:$1" >> "{log}"; }}
 git() {{ return 0; }}
@@ -105,12 +114,18 @@ status=0
             for line in events
         )
         return
-    if direction == "forward" and health_result != "healthy":
+    if direction == "forward" and health_result in ("unhealthy", "malformed"):
         assert result.returncode == 1, result.stderr
         assert sum(" connectivity " in line for line in events) == 1
-        failed_check = next(i for i,line in enumerate(events) if " connectivity " in line)
-        rollback_before = next(i for i,line in enumerate(events) if line.startswith("egress:before") and "rollback" in line)
-        rollback_profile = next(i for i,line in enumerate(events) if " install " in line and str(old) in line)
+        failed_check = next(i for i, line in enumerate(events) if " connectivity " in line)
+        rollback_before = next(
+            i
+            for i, line in enumerate(events)
+            if line.startswith("egress:before") and "rollback" in line
+        )
+        rollback_profile = next(
+            i for i, line in enumerate(events) if " install " in line and str(old) in line
+        )
         assert failed_check < rollback_before < rollback_profile
         assert not any(line == "host-install:" + str(new) for line in events)
         assert not any(line.startswith("egress:commit") and "forward" in line for line in events)
@@ -125,9 +140,12 @@ status=0
     )
     grant = next(i for i, line in enumerate(events) if line.startswith("egress:after"))
     assert before < compose < profile < grant
-    connectivity = [i for i,line in enumerate(events) if " connectivity " in line]
-    if direction == "forward":
+    connectivity = [i for i, line in enumerate(events) if " connectivity " in line]
+    if direction == "forward" and health_result != "outage-unchanged":
         assert len(connectivity) == 1 and grant < connectivity[0]
+    elif health_result == "outage-unchanged":
+        assert connectivity == []
+        assert "backend-repair" in events
     else:
         assert connectivity == []
     assert str(old if direction == "rollback" else new) in events[profile]

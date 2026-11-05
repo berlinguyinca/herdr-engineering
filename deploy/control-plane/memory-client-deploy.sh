@@ -112,6 +112,7 @@ memory_client_apply() {  # forward|rollback <the matching source tree>
 
 memory_client_forward_connectivity() {
   [ "${MEMORY_PRIVATE_EGRESS:-0}" = 1 ] || return 0
+  [ "${MEMORY_PRIVATE_EGRESS_CHANGED:-0}" = 1 ] || return 0
   [ "${MEMORY_CLIENT_SUPPORTED:-0}" = 1 ] || return 0
   [ "${MEMORY_CLIENT_ENABLED:-0}" = 1 ] || return 0
   [ "${MEMORY_CLIENT_MODE:-unmanaged}" = install ] || return 0

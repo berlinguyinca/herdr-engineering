@@ -110,7 +110,7 @@ def make_record(cidr, destination, generation=None):
 
 
 def validate(record):
-    if record == {"enabled": False}:
+    if isinstance(record, dict) and set(record) == {"enabled"} and record["enabled"] is False:
         return record
     if not isinstance(record, dict) or record.get("enabled") is not True:
         raise ValueError("invalid receipt")
@@ -128,6 +128,27 @@ def validate(record):
     ):
         raise ValueError("invalid receipt")
     return record
+
+
+def approved_policy(current):
+    """Read the last committed owned policy, never an unresolved write-ahead state."""
+    path = Path(current)
+    pending = path.with_name("pending.json")
+    if pending.exists() or pending.is_symlink():
+        raise ValueError("pending recovery")
+    record = validate(read_json(path, {"enabled": False}))
+    if record["enabled"] and (record["network_id"] is None or not record["rule_may_exist"]):
+        raise ValueError("incomplete approved policy")
+    return record
+
+
+def activation_changed(previous, candidate):
+    """Endpoint/CIDR/ownership policy change; container/network IDs are not policy."""
+    previous, candidate = validate(previous), validate(candidate)
+    return candidate["enabled"] and (
+        not previous["enabled"]
+        or any(candidate[key] != previous[key] for key in ("cidr", "destination", "generation"))
+    )
 
 
 def execute(command):
@@ -441,6 +462,7 @@ def main(argv=None):
     parser.add_argument(
         "action",
         choices=[
+            "approved",
             "preview",
             "snapshot",
             "before",
@@ -462,6 +484,9 @@ def main(argv=None):
     parser.add_argument("--lock-path")
     args = parser.parse_args(argv)
     try:
+        if args.action == "approved":
+            print(json.dumps(approved_policy(args.current)))
+            return 0
         if args.action == "preview":
             previous = validate(read_json(args.current, {"enabled": False}))
             if Path(args.current).with_name("pending.json").exists():
@@ -505,6 +530,9 @@ def main(argv=None):
         if args.action == "selector":
             selected = transaction.record(
                 "candidate" if args.direction == "forward" else "previous"
+            )
+            selected["activation_changed"] = args.direction == "forward" and activation_changed(
+                transaction.record("previous"), transaction.record("candidate")
             )
             print(json.dumps(selected))
             return 0
