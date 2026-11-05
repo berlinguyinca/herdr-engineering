@@ -31,7 +31,8 @@ import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
-import { mountHosts, loadHosts } from './hosts-view.js';
+import { mountHosts, loadHosts, mountDiagnostics } from './hosts-view.js';
+import { createDiagnosticsSource } from './diagnostics-source.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics, usageStrip } from './analytics-view.js';
@@ -99,6 +100,7 @@ const NAV = [
   { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/settings', label: 'Settings' },
+  { group: 'Fabric', path: '/diagnostics', label: 'Diagnostics' },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
   { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
   { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
@@ -254,6 +256,7 @@ const ROUTES = {
   '/team-map': viewTeamMap,
   '/services/:id': viewService,
   '/hosts': viewHosts,
+  '/diagnostics': viewDiagnostics,
   '/personal-assistant': viewPersonalAssistant,
   '/intelligence': viewIntelligence,
   '/hosts/:id': viewHost,
@@ -1117,6 +1120,18 @@ async function viewHosts(_parts, revision) {
   const data = await loadHosts(client);
   if (revision !== renderRevision) return;
   return mountHosts(root, client, { data, driftedOnly: route().query.get('drift') === '1' });
+}
+
+// Diagnostics is a snapshot the way the LLM pages are (addSnapshotChip): one read per navigation, never refreshed by a live event, because H03 reads
+// each feed once. The two calls below are feeds that already exist — the event stream and the host list — so no endpoint is invented here, and the
+// mount writes into this route's own node, so a read that finishes after the operator navigated away cannot write over the page they moved to.
+async function viewDiagnostics(_parts, revision) {
+  root.innerHTML = '<div data-diagnostics></div>';
+  const source = createDiagnosticsSource({ fetchEvents: () => client.request('/api/v1/events').catch(() => null), fetchHosts: () => client.listHosts().catch(() => null), now: Date.now() });
+  await mountDiagnostics(root.querySelector('[data-diagnostics]'), { source });
+  if (revision !== renderRevision) return NO_REFRESH;
+  addSnapshotChip();
+  return NO_REFRESH;
 }
 
 async function viewHost(parts, revision) {
