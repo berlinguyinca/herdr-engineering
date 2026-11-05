@@ -8,6 +8,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { CollabApi } from './herdr-web-client/collab.js';
 import { mountCollaborators } from './artifact-collaborators.js';
 import { mountActivity } from './artifact-activity.js';
+import { mountFeedbackPanel } from './artifact-feedback-panel.js';
 
 export const AUDIENCES = [['private', 'Private'], ['lab', 'Group (lab)'], ['public', 'Public']];
 const AUDIENCE_LABEL = Object.fromEntries(AUDIENCES);
@@ -115,11 +116,13 @@ export function eventCounts(events) {
   return counts;
 }
 
+const EVENT_LABELS = { annotated: 'annotated', annotation_edited: 'annotation edited', annotation_withdrawn: 'annotation deleted by its author', annotation_dismissed: 'annotation dismissed', annotation_addressed: 'annotation addressed' };
+
 export function renderEvents(events) {
   if (!events?.length) return '<p>No events recorded.</p>';
   return `<ul data-share-events-list style="${wrap}">${events.map(event => {
     const detail = typeof event.detail === 'string' ? event.detail : event.detail ? JSON.stringify(event.detail) : '';
-    return `<li>${esc(event.at || '')} · <strong>${esc(event.kind || 'event')}</strong>${event.actor ? ` · ${esc(event.actor)}` : ''}${detail && detail !== '{}' ? ` · <code>${esc(detail)}</code>` : ''}</li>`;
+    return `<li>${esc(event.at || '')} · <strong>${esc(EVENT_LABELS[event.kind] || event.kind || 'event')}</strong>${event.actor ? ` · ${esc(event.actor)}` : ''}${detail && detail !== '{}' ? ` · <code>${esc(detail)}</code>` : ''}</li>`;
   }).join('')}</ul>`;
 }
 
@@ -355,12 +358,12 @@ export function createShareController(client, artifactId, { versions = [], headV
 
 // ------------------------------------------------------------------------------------------------ mount
 
-const TABS = [['links', 'Links'], ['collaborators', 'Collaborators'], ['activity', 'Activity']];
+const TABS = [['links', 'Links'], ['collaborators', 'Collaborators'], ['activity', 'Activity'], ['feedback', 'Feedback']];
 const TAB_BAR = `<div role="tablist" aria-label="Sharing" data-panel-tabs>${TABS.map(([key, label], i) => `<button type="button" role="tab" class="hd-btn" data-panel-tab="${key}" aria-selected="${i === 0}">${label}</button>`).join('')}</div>`;
 
 // `collabApi` defaults to the same-origin, token-less mode: the dashboard proxy authenticates the call.
 export function mountSharePanel(container, client, artifactId, { versions = [], headVersionId, signal, allowEntry = true, collabApi = new CollabApi(null) } = {}) {
-  container.innerHTML = TAB_BAR + '<div role="tabpanel" data-panel-pane="links"><section data-share-panel><p class="hd-note">Viewer links give people outside this dashboard read-only access to one pinned version.</p><div data-share-form-region></div><div role="status" data-share-status></div><div data-share-review-region></div><div data-share-link-region></div><h3>Links</h3><div data-share-list-region></div></section></div><div role="tabpanel" data-panel-pane="collaborators" hidden></div><div role="tabpanel" data-panel-pane="activity" hidden></div>';
+  container.innerHTML = TAB_BAR + '<div role="tabpanel" data-panel-pane="links"><section data-share-panel><p class="hd-note">Viewer links give people outside this dashboard read-only access to one pinned version.</p><div data-share-form-region></div><div role="status" data-share-status></div><div data-share-review-region></div><div data-share-link-region></div><h3>Links</h3><div data-share-list-region></div></section></div><div role="tabpanel" data-panel-pane="collaborators" hidden></div><div role="tabpanel" data-panel-pane="activity" hidden></div><div role="tabpanel" data-panel-pane="feedback" hidden></div>';
   const region = name => container.querySelector(`[data-share-${name}-region]`);
   const status = container.querySelector('[data-share-status]');
   let formKey = null, shownLink = null;
@@ -408,6 +411,7 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
     currentTab = key;
     if (key === 'collaborators' && !mounted.collaborators) mounted.collaborators = mountCollaborators(pane(key), client, collabApi, artifactId, { signal });
     if (key === 'activity' && !mounted.activity) mounted.activity = activityHandle = mountActivity(pane(key), client, artifactId, { versions: ctrl.state.versions, signal });
+    if (key === 'feedback' && !mounted.feedback) mounted.feedback = mountFeedbackPanel(pane(key), client, artifactId, { signal });
     for (const [name] of TABS) {
       const shown = name === key;
       const element = pane(name);

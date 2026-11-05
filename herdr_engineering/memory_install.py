@@ -33,11 +33,11 @@ from pathlib import Path
 from typing import Any
 
 MARKER = "herdr-memory:managed"
-ADAPTER_VERSION = 2
+ADAPTER_VERSION = 3
 # Pinned herdr-memory revision; must match lock/upstreams.yaml (tested).
-PINNED_REVISION = "e483bda"
+PINNED_REVISION = "cc20ad4d46845b8257e54596e152846e3ce4a3c2"
 #: Client release the fleet is expected to run (`herdr-memory --version`).
-PINNED_CLIENT_VERSION = "0.1.5"
+PINNED_CLIENT_VERSION = "0.1.6"
 #: An unattended controller update older than this looks like a timer that stopped landing.
 FRESH_UPDATE_HOURS = 26
 SERVER_NAME = "herdr-memory"
@@ -61,10 +61,23 @@ def _default_command() -> list[str]:
     return [exe] if exe else [sys.executable, "-m", "herdr_engineering.cli"]
 
 
+def _dq(arg: str) -> str:
+    """Double-quote one word for POSIX sh (escape the characters special inside "")."""
+    return '"' + "".join("\\" + c if c in '\\"$`' else c for c in arg) + '"'
+
+
 def _hook_command(command: list[str] | None, harness: str, event: str) -> str:
-    import shlex
+    """Guarded hook line: does nothing (exit 0) on a host without the executable.
+
+    ``[ -x EXE ] && EXE memory hook ... || true`` -- absolute path, no PATH
+    dependence, valid in /bin/sh.  Entries written by older versions lack the
+    guard but carry the same marker, so they are still recognised as ours and
+    upgraded in place.
+    """
     base = command or _default_command()
-    return f"{shlex.join([*base, 'memory', 'hook', harness, event])} # {MARKER}"
+    words = " ".join(_dq(w) if i == 0 else _dq(w) if any(c in w for c in ' \t"$`\\') else w
+                     for i, w in enumerate([*base, "memory", "hook", harness, event]))
+    return f"[ -x {_dq(base[0])} ] && {words} || true # {MARKER}"
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -486,7 +499,9 @@ class CodexAdapter(Adapter):
     def units(self):
         argv = _server_command(self.command, "codex")
         body = f"command = {json.dumps(argv[0])}\nargs = {json.dumps(argv[1:])}\n" \
-               f"env = {{ HERDR_MEMORY_MANAGED = \"{MARKER}\" }}"
+               f"env = {{ HERDR_MEMORY_MANAGED = \"{MARKER}\" }}\n" \
+               'tools = { memory_recall = { approval_mode = "approve" }, ' \
+               'memory_retain = { approval_mode = "prompt" } }'
         return [
             TomlBlockUnit("mcp", self.home / ".codex" / "config.toml", f"mcp_servers.{SERVER_NAME}", body),
             FileUnit("skill", self.home / ".codex" / "skills" / "herdr-memory" / "SKILL.md",
@@ -760,19 +775,9 @@ class MemoryInstaller:
         return None
 
     def _client_dist_infos(self) -> list[Path]:
-        """Candidate `herdr_memory-*.dist-info` directories, this interpreter first."""
-        infos: list[Path] = []
-        try:
-            from importlib import metadata
-            own = getattr(metadata.distribution("herdr-memory"), "_path", None)
-            if own:
-                infos.append(Path(own))
-        except Exception:
-            pass
+        """Metadata belonging to the CLI, never an unrelated wrapper interpreter."""
         site = self._client_site_packages()
-        if site:
-            infos.extend(sorted(site.glob("herdr_memory-*.dist-info")))
-        return infos
+        return sorted(site.glob("herdr_memory-*.dist-info")) if site else []
 
     def installed_revision(self) -> str | None:
         """Revision of the installed ``herdr-memory`` package, or None if unknowable."""

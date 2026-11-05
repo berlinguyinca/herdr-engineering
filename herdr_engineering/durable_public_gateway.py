@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+from .media_type import safe_media_type
 from .public_gateway import GatewayResponse
 
 
@@ -36,7 +37,7 @@ class DurablePublicGateway:
         if result.get("status") == 410:
             return GatewayResponse(410)
         body = result["body"]
-        headers = {"Content-Type": result["media_type"],
+        headers = {"Content-Type": safe_media_type(result["media_type"]),
                    "Cache-Control": "no-store",
                    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
                    "X-Content-Type-Options": "nosniff",

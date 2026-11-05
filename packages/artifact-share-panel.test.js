@@ -718,13 +718,29 @@ function withPanes(container) {
   return container;
 }
 
-test('the panel offers Links, Collaborators and Activity tabs with the Links content untouched', async () => {
+test('the panel offers Links, Collaborators, Activity and Feedback tabs with the Links content untouched', async () => {
   const container = withPanes(fakeContainer());
   const panel = mountSharePanel(container, fakeClient(), 'art1', { versions, headVersionId: 'v2' });
   await tick();
-  for (const label of ['Links', 'Collaborators', 'Activity']) assert.match(container.innerHTML, new RegExp(`data-panel-tab="${label.toLowerCase()}"[^>]*>${label}<`));
+  for (const label of ['Links', 'Collaborators', 'Activity', 'Feedback']) assert.match(container.innerHTML, new RegExp(`data-panel-tab="${label.toLowerCase()}"[^>]*>${label}<`));
+  assert.equal((container.innerHTML.match(/data-panel-tab=/g) || []).length, 4);
+  assert.match(container.innerHTML, /data-panel-pane="feedback" hidden/);
   assert.match(container.innerHTML, /data-share-action="review"/);
   assert.doesNotMatch(container.innerHTML, /<(iframe|frame|object|embed)/i);
+  panel.dispose();
+});
+
+test('the Feedback tab mounts its panel once, lazily', async () => {
+  const container = withPanes(fakeContainer());
+  let lists = 0;
+  const client = { ...fakeClient(), listArtifactAnnotations: async () => { lists++; return { annotations: [], next: null }; } };
+  const panel = mountSharePanel(container, client, 'art1', { versions, headVersionId: 'v2' });
+  await tick();
+  assert.equal(lists, 0);
+  container.tabClick('feedback'); await tick();
+  container.tabClick('links'); container.tabClick('feedback'); await tick();
+  assert.equal(lists, 1);
+  assert.match(container.panes.feedback.html, /No annotations yet/);
   panel.dispose();
 });
 

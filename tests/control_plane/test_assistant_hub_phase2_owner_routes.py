@@ -20,10 +20,18 @@ from herdr_engineering.control_plane.assistant import AssistantService, assistan
 from herdr_engineering.control_plane.assistant_hub.actiongrants import ActionGrant, GrantState
 from herdr_engineering.control_plane.assistant_hub.canonical import RawAction, derive
 from herdr_engineering.control_plane.assistant_hub.mcp import Hub
-from herdr_engineering.control_plane.assistant_hub.policy import activate_grant
 from herdr_engineering.control_plane.assistant_hub.server import HubServer
 from herdr_engineering.control_plane.assistant_hub.workers import WorkerRegistry
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
+from tests.control_plane.judge_support import (
+    SAFE,
+    WireListener,
+    force_active_grant_for_tests,
+    judge_cfg,
+    make_runtime,
+    success_body,
+    write_key,
+)
 
 KEYS = {"alice": "p2-route-alice-key", "bea": "p2-route-bea-key", "viewer": "p2-route-viewer-key",
         "carol": "p2-route-carol-key"}
@@ -57,24 +65,29 @@ def owner(base, method, path, body=None, who="alice", raw=None):
 
 
 @pytest.fixture()
-def world(acknowledged_sink):
+def world(acknowledged_sink, tmp_path):
     long_ago = (datetime.now(UTC) - timedelta(days=60)).isoformat()
     section = {"enabled": True, "tenancy": {"principals": {pid("alice"): "acme", pid("bea"): "globex", pid("carol"): "acme"}},
                "grants": {"shadow_started_at": long_ago},
                "hub": {"enabled": True, "host": "100.64.0.9", "port": 9483, "allowed_networks": ["127.0.0.0/8"]}}
     svc = AssistantService(config=assistant_config({"personal_assistant": section}))
     registry = WorkerRegistry(svc.store, enrollment_ttl=timedelta(minutes=10), worker_ttl=timedelta(days=30))
-    hub = HubServer(Hub(registry=registry, service=svc, store=svc.store), host="127.0.0.1", port=0,
+    li = WireListener(success_body(SAFE))        # documented-shape System One answer: the judge finds nothing to flag
+    rt = make_runtime(svc.store, judge_cfg(f"http://127.0.0.1:{li.port}", write_key(tmp_path)), svc.now)
+    svc._test_judge = rt
+    hub = HubServer(Hub(registry=registry, service=svc, store=svc.store, judge=rt), host="127.0.0.1", port=0,
                     allowed_networks=["127.0.0.0/8"], allowed_hosts=[])
     hub.start()
     hub.wait_until_ready()
     svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), assistant_service=svc, api_keys=ROLES,
-                             assistant_workers=registry)
+                             assistant_workers=registry, assistant_judge=rt)
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     yield f"http://127.0.0.1:{svr.port}", f"http://127.0.0.1:{hub.port}", svc, registry
     svr.shutdown()
     hub.shutdown()
+    rt.recorder.stop()
+    li.close()
 
 
 def new_worker(base, hub_base, scopes=None, who="alice", device="dev1"):
@@ -116,7 +129,7 @@ def put_grant(svc, worker_id, tenant="acme", user=None, state=GrantState.PROPOSE
         key_id=key.key_id(), verb=key.verb.value, key_canonical=key.canonical(), state=state, created_at=now,
         proposed_at=now, expires_at=now + timedelta(days=30), policy_version=cfg["policy_version"]))
     if activate:
-        activate_grant(svc.store, cfg, now, tenant, user, gid, confirmed_by="owner", judge_gate_satisfied=True)
+        force_active_grant_for_tests(svc.store, cfg, gid, now, svc._test_judge.cfg_getter())
     return gid
 
 
@@ -277,17 +290,18 @@ def test_grants_list_effective_state_and_tenant_scoping(world):
     assert rows[gid]["state"] == "active" and rows[gid]["confirmed_by"] == "owner"
     assert rows[expired]["state"] == "expired"                       # effective state, not the stored one
     assert set(rows[gid]) == {"grant_id", "worker_id", "verb", "resource_scope", "key_id", "state", "policy_version",
-                              "created_at", "proposed_at", "activated_at", "expires_at", "revoked_at", "confirmed_by"}
+                              "created_at", "proposed_at", "activated_at", "expires_at", "revoked_at", "confirmed_by",
+                                  "judge_version"}
     assert "key_canonical" not in json.dumps(out)
     assert owner(base, "GET", "/api/v1/assistant-grants", who="bea")[1] == {"grants": []}
 
 
-def test_activate_refused_judge_gate_not_satisfied(world):
+def test_activate_refused_insufficient_labels(world):
     base, hub_base, svc, _ = world
     worker = new_worker(base, hub_base, scopes=ACT)
     gid = put_grant(svc, worker[0])
     status, body = owner(base, "POST", f"/api/v1/assistant-grants/{gid}/activate", {"confirm": True})
-    assert status == 409 and body["code"] == "judge_gate_not_satisfied" and body["error"]
+    assert status == 409 and body["code"] == "insufficient_labels" and body["error"]
     assert owner(base, "GET", "/api/v1/assistant-grants")[1]["grants"][0]["state"] == "proposed"
 
 
@@ -429,7 +443,7 @@ def test_cli_grant_list_revoke_activate(world, keyfile, capsys):
     rc, out, _ = run_cli(capsys, base, keyfile, "assistant-grant", "list")
     assert rc == 0 and active in out and proposed in out and "active" in out and "proposed" in out
     rc, out, err = run_cli(capsys, base, keyfile, "assistant-grant", "activate", proposed)
-    assert rc == 1 and "judge_gate_not_satisfied" in out + err and len((out + err).strip().splitlines()) == 1
+    assert rc == 1 and "insufficient_labels" in out + err and len((out + err).strip().splitlines()) == 1
     rc, out, _ = run_cli(capsys, base, keyfile, "assistant-grant", "revoke", active)
     assert rc == 0 and "revoked" in out
     assert action_request(hub_base, worker, PUSH)["outcome"] == "pending"
@@ -504,7 +518,7 @@ def test_refused_activation_is_audited_and_chain_verifies(world):
     worker = new_worker(base, hub_base, scopes=ACT)
     gate = put_grant(svc, worker[0])
     shadow = put_grant(svc, worker[0], cmd="git push origin dev", state=GrantState.SHADOW)
-    for gid, code in ((gate, "judge_gate_not_satisfied"), (shadow, "not_proposed")):
+    for gid, code in ((gate, "insufficient_labels"), (shadow, "not_proposed")):
         assert owner(base, "POST", f"/api/v1/assistant-grants/{gid}/activate", {"confirm": True})[0] == 409
         entries = [e for e in svc.store.audit if e["action"] == "assistant.grant.activate_refused"
                    and e["subject_id"] == gid]

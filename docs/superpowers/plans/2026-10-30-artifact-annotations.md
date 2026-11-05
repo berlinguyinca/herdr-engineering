@@ -2,6 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Pre-flight rulings (operator-delegated; `.superpowers/sdd/2026-10-30-artifact-annotations/preflight.md`, rows = section 1, C = section 3)
+
+- Plan 3 as built wins over this plan's older assumptions; named anchors replace stale line numbers (rows 5, 10, 11).
+- `annotation_resolve` result fields: extend `collab_intents._RESULT_KEYS` and `_check_outcome`, 50-id cap (row 1, C1).
+- MCP dispatch: explicit `_artifact_call` branches, `_TOOL_ACTIONS` entries, per-artifact write check via `_open_with_limits` under `svc._lock` (rows 2-4, 9, C4).
+- Registration: `requires_artifact=True`; `IntentContext` under `TYPE_CHECKING` (rows 6, 7).
+- One shared `CollabMirror`, built in `_cmd_cp_worker`; `publish_annotations` locks per artifact and never creates directories (rows 5, 8, C5).
+- The dashboard has no CSP and gets none here; pdf.js is served by `_serve_static` with `.mjs` MIME and nosniff, not `_PUBLIC_STATIC` (rows 10, C2).
+- `route_render` runs before `route_report`, with a regression test; `_bytes` gains a `headers` param used by `/download` only (rows 11, 12, C3).
+- nh3: `link_rel=None`, `rel`/`target` via `set_tag_attribute_values`, explicit `clean_content_tags` without `style` (row 13).
+- The Feedback tab is unconditional in the Share card (row 14).
+- One SAN certificate for both hosts; no `HERDR_SHARE_CERT_DIR`; `render_edge` passes `share_host`; operator docs updated in Task 10 (rows 15, 16, C7, C8).
+- Migration 0046 is free; widen `artifact_share_events_kind_check` and `artifact_shares.EVENT_KINDS` together; `shared_file_names(version_row)`; forged `annotated` lines stay ignored (rows 17, 18, C11).
+- Settings: `annotation_settings` raises `ValueError`, `share_values` wraps it in `FleetConfigError` (row 20); one `share_settings_config` call site (row 19).
+- `share.js` validates `landing`; `scripts/share-browser-check.mjs` is rerun (rows 21, 28, C6).
+- New share-public route table (row 22); pdf.js limitation accepted (row 23); `test_no_frames` excludes `/vendor/` and new code writes frame elements in prose without angle brackets (rows 24, 25, C9).
+- Crash-retry of `annotation_resolve` is accepted and tested (C10).
+
 **Goal:** Ship plan 4 of the artifact sharing / collaboration design.
 - Signed-in lab viewers and the owner can annotate a lab-shared artifact.
 - Each annotation is bound to the share's pinned version plus an anchor.
@@ -65,7 +83,7 @@
   - `share_static/`
   - `packages/artifacts-view.js`
   - `herdr_engineering/fleet_config_cli.py` (`SHARE_KEYS`, `SHARE_SLICE_KEYS`, `share_values`, `render_edge_conf`, the `@share-location@` splice)
-  - `herdr_engineering/cli.py` (`_share_public_server`, `share_settings_config` call sites, `_cmd_cp_worker`)
+  - `herdr_engineering/cli.py` (`_share_public_server`, the one `share_settings_config` call site in `_share_wiring`, `_cmd_cp_worker`, `_build_collab_bridge_loop`)
 
 ## Decisions (operator, 2026-10-30; binding)
 
@@ -73,15 +91,16 @@ The project is in **alpha**. Nothing has been issued, so everything is replaceab
 
 1. **No frames, anywhere, ever.**
    - No `<iframe>`, `<frame>`, `<frameset>`, `<object>`, `<embed>` or `srcdoc` in any HTML or JS we serve, and no cross-document `postMessage`. pdf.js's internal messages to its own worker are not cross-document and are allowed.
-   - This applies to the owner dashboard too. Its three preview sites in `packages/artifacts-view.js` are replaced in Task 13:
-     - `showPreview` (~line 152), which serves both the report preview and the legacy HTML outputs
-     - the PDF and HTML iframes at ~line 419
+   - This applies to the owner dashboard too. Its preview sites in `packages/artifacts-view.js` are replaced in Task 13:
+     - `showPreview` (the `createElement` + `srcdoc` site), which serves both the report preview and the legacy HTML outputs
+     - the ternary with the PDF and HTML iframes in the artifact detail renderer
    - **Tradeoff, accepted:**
      - Annotations apply to the static render, not to the running app.
      - Interactive content (JS-built charts, apps) cannot be annotated in place. Its viewer leaves a whole-file comment or annotates whatever static text survives sanitizing.
      - Text quotes refer to the sanitized text, so text that a script adds at run time is not quotable.
      - Inline `<svg>`/`<math>`, `<canvas>`, `<video>`, `<audio>` and every frame or plugin element are removed with their content. The library cannot leave a placeholder in their place. Instead, every static render carries the fixed note "Scripts, frames and embedded media are not shown in this static copy".
      - Relative `url(...)` references inside a `<style>` element are not rewritten, because nh3 does not filter style text, so such background images do not load in the static copy. References in `style` attributes and in linked stylesheets do resolve.
+     - pdf.js loads `cmaps/`, `standard_fonts/` and `wasm/` on demand and only the two build files are vendored, so PDFs with non-embedded or CJK fonts may show missing glyphs. Accepted; `useSystemFonts: false` and `isEvalSupported: false` are passed. Vendoring `standard_fonts` + `cmaps` (about 3 MB) is the later fix.
      - `.md` files are `application/octet-stream` today (`share_bundle._CONTENT_TYPES`), so they get a whole-file comment only. A markdown renderer is out of scope.
 2. **Share host, with no legacy links.**
    - The share host comes from the new YAML key `control_plane.share.public_url`. MCP stays on `control_plane.collab.public_url`.
@@ -147,26 +166,27 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 
 - **Bridge files** (`collab_bridge_files.py`):
   - `read_json_beneath`, `atomic_write_json`, `new_ticket`, `TICKET_RE`, `BridgeLimits`, `Actor(kind, id)`.
-  - `register_intent_kind(kind, validate_payload, *, actors)`.
-  - `validate_intent(raw, *, filename, limits) -> Intent(ticket, kind, actor, artifact_id, idempotency_key, submitted_at, payload)`.
+  - `register_intent_kind(kind, validate_payload, *, actors, requires_artifact=False)`.
+  - `validate_intent(raw, *, filename, limits) -> Intent(ticket, kind, actor, artifact_id, idempotency_key, submitted_at, payload, request_sha256)`.
   - An unregistered kind gives `IntentError("unknown intent kind")`. `share_create` stays rejected.
 - **Mirror** (`collab_mirror.py`, `CollabMirror`):
   - The worker owns the mirror, and it is read-only in `collab-public`.
   - The layout is `grants.json`, `artifacts/<id>/head.json`, `blobs/`, `results/<ticket>.json`.
   - `sync()` removes the directory of an artifact that is ungranted or retracted.
 - **Applier** (`collab_intents.py`, `CollabIntentApplier`):
-  - `register(kind, handler, *, lane_key=None, replay_outcomes)`.
+  - `register(kind, handler, *, lane_key=None, replay_outcomes, after=None, early_replay=False)`.
   - `handler(ctx: IntentContext, intent) -> dict`, where `IntentContext` holds `actor, agent, conn, store, grants, limits, assemble, extras`.
   - The generic steps are the ledger replay, validation, `decided_for_key` replay, the 60 s age check and the `agents.json` freshness check for agent actors. The grant check (`grant_for`) is **not** generic: each handler runs it.
-  - The result file is `results/<ticket>.json = {ticket, kind, actor: {kind, id}, artifact_id, result, reason?, decided_at, …handler fields}`.
+  - The result file is `results/<ticket>.json = {ticket, kind, actor: {kind, id}, artifact_id, result, reason?, decided_at, …}`. Handler fields reach it only through `_RESULT_KEYS` (`version_id, version_number, head_version_id, merged_names, conflicts, reason`), which `_finish`, `_replayed`, `_result_of_row` and `_check_outcome` all use. Task 15 extends it.
 - **collab-public** (`collab_artifacts.py`, `CollabArtifactBridge`):
   - `has_grants(pr)` and `has_write_grant(pr)`.
   - `append_intent(actor, kind, payload, *, artifact_id, idempotency_key) -> ticket`.
   - `read_result(actor, ticket, *, wait, still_valid)` and `result(pr, ticket, *, wait)`.
   - The pending-per-agent and outbox caps.
-  - Denials go through `service._audit_denied(pr, "artifact.<tool>", reason, resource_id=...)`. Allowed reads are audited as `artifact_tool_used`.
-- **MCP** (`collab_mcp.py`): `_ARTIFACT_TOOLS`, `ARTIFACT_TOOL_NAMES`, `tools_for` (offers the tools only when `has_grants`), `_call`, `artifact_commit_result`. Throttling uses `CollabService._throttle(key, limit, window, what)`.
-- **Worker wiring:** `_cmd_cp_worker` builds the applier and registers `commit`. Plan 4 adds its registration there.
+  - Denials go through `self._deny(pr, tool, id)` / `self._refuse(...)`, which build `artifact.<tool>` and count `policy_denied`. Allowed reads go through `self._used(pr, artifact_id, tool)`, which indexes `_TOOL_ACTIONS[tool]` and audits `artifact_tool_used`.
+  - Write checks are per artifact: `_open_with_limits(pr, op, artifact_id)` returns `(permission, doc, limits)`. `has_write_grant(pr)` means a write grant on ANY artifact and is not an authorisation.
+- **MCP** (`collab_mcp.py`): `_ARTIFACT_TOOLS`, `ARTIFACT_TOOL_NAMES`, `tools_for` (offers the tools only when `has_grants`), `_call`, `_artifact_call` (a hard-coded if-chain whose tail is `artifact_commit`), `artifact_commit_result`. Throttling uses `CollabService._throttle(key, limit, window, what)`, called under `with svc._lock:` as `commit` does.
+- **Worker wiring:** `_cmd_cp_worker` builds the applier and registers `commit`. Plan 4 adds its registration there. The `CollabMirror` is currently built inside `cli._build_collab_bridge_loop` and owned by `CollabBridgeLoop`; Task 4 moves its construction into `_cmd_cp_worker`.
 
 ## Global Constraints
 
@@ -176,6 +196,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - Pinned by `tests/control_plane/test_no_frames.py` (Task 16) across `packages/`, `share_static/` (excluding `vendor/`), the Python sources that emit HTML, and the server-rendered responses.
   - The match is tag-aware, `<\s*(iframe|frame|frameset|object|embed|portal|fencedframe)(?=[\s/>])`, case-insensitive. It does not flag `length<Object.keys` (`packages/topology-view.js:147`) or the detector byte strings `b"<iframe"` in `intel_attachments.py`.
   - Hostile-input test strings (`*.test.js`, `tests/`) are not scanned.
+  - In new code, docstrings and comments name frame elements in prose without angle brackets (for example "the frame element"), or the guard matches them.
 - **Who may annotate.**
   - Only a lab-share viewer with a v2 session, minted from verified Cognito tokens that passed `share_lab.authorise`.
   - The owner annotates the same way, through the lab link.
@@ -230,13 +251,14 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 - **Owner live route** (`GET /api/v1/artifacts/{id}/live`, Task 13):
   - `Content-Security-Policy: sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`. A PDF gets `frame-ancestors 'none'` only, as `share_public.PDF_CSP` does.
   - Also sent: `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, `no-store`, and no ACAO.
-  - The existing `/download` gains `Content-Disposition: attachment` and `Content-Security-Policy: default-src 'none'; sandbox`, so no artifact byte ever executes on the dashboard origin.
+  - The existing `/download` gains `Content-Disposition: attachment` and `Content-Security-Policy: default-src 'none'; sandbox`, so no artifact byte ever executes on the dashboard origin. They are passed through a new optional `headers` parameter of `api._bytes`, used by `/download` only; other `_bytes` callers are unchanged (tested).
+  - **The dashboard has no CSP and this plan adds none** (a dashboard-wide CSP is separate hardening that could break the SPA). Dashboard protection is nh3, the open shadow root, the sandboxed `live` route and the `/download` headers.
 - **Configuration is YAML only** (no environment variables):
   - `control_plane.share.public_url`: an https origin with an empty path. It is required when `share.enabled` and must not equal `control_plane.collab.public_url`. Added to `SHARE_KEYS` and `SHARE_SLICE_KEYS`.
   - `control_plane.share.annotations`: `enabled` (bool, default `true`) plus the Decision 6 limits. Added to `SHARE_KEYS` and `SHARE_SLICE_KEYS`.
   - `control_plane.share.owner_emails`: a list, default `[]`. Added to `SHARE_KEYS` only, NOT `SHARE_SLICE_KEYS`.
-  - The edge certificate directory follows the compose pattern `control_plane.compose.HERDR_SHARE_CERT_DIR`.
-- **Migration.** Number `0046`: 0043 is taken by `feat/artifact-collab-gui`, 0045 is plan 3's and 0047 is plan 5's. Re-check `origin/main` and open branches before committing, and take the next free number. The migration must be additive and idempotent, with a `DOWN:` comment like 0043.
+  - There is no new certificate key. The share host is a second SAN on the existing collab certificate (`HERDR_COLLAB_CERT_DIR`, `collab-sync.sh`'s single lineage and renewal timer).
+- **Migration.** Number `0046`, verified free on main and every branch (0043 x2, 0044 and 0045 are on main; 0048 is plan 5's (renumbered; 0047 is feat/artifact-delete's)). Re-check before committing and take the next free number if that changed. The migration must be additive and idempotent, with a `DOWN:` comment like 0043.
 - **Never logged, and never stored outside the response that needs them:** tokens, sessions, CSRF tokens, nonces, `Authorization` and `X-Id-Token` values. Author emails reach only the owner API and the author's own projection, never the MCP mirror or an agent.
 - **Code style.**
   - Python: `from __future__ import annotations`, type hints, and the surrounding module's style.
@@ -349,7 +371,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 
 ### Task 3: Migration 0046 and `AnnotationStore`
 
-**Files:** Create `deploy/control-plane/migrations/0046_artifact_annotations.sql` and `herdr_engineering/control_plane/artifact_annotations.py`; Test `tests/control_plane/test_artifact_annotations_store.py` (Postgres fixtures as in `test_share_store.py`)
+**Files:** Create `deploy/control-plane/migrations/0046_artifact_annotations.sql` and `herdr_engineering/control_plane/artifact_annotations.py`; Modify `herdr_engineering/control_plane/artifact_shares.py` (`EVENT_KINDS`) and `herdr_engineering/control_plane/artifact_share_api.py` (`shared_file_names`); Test `tests/control_plane/test_artifact_annotations_store.py` (Postgres fixtures as in `test_share_store.py`)
 
 **Interfaces:**
 - **Migration** (additive and idempotent):
@@ -375,12 +397,13 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - Table CHECK `(status = 'addressed') = (addressed_in_version_id IS NOT NULL)`.
   - Indexes `(artifact_id, status, created_at DESC, annotation_id)`, `(share_id, author_identity, created_at DESC)` and `(updated_at)`.
   - Table `artifact_annotation_ops(ingest_key text PRIMARY KEY, annotation_id text NOT NULL, op text NOT NULL CHECK (op IN ('edit','delete')), at timestamptz NOT NULL)`, the idempotency ledger for edit and delete lines.
-  - The `artifact_share_events.kind` CHECK is widened to add `'annotated'`, `'annotation_edited'`, `'annotation_withdrawn'`, `'annotation_dismissed'` and `'annotation_addressed'`. The constraint is dropped and re-added by name inside a `DO` block that is a no-op once widened.
+  - The `artifact_share_events.kind` CHECK is widened to add `'annotated'`, `'annotation_edited'`, `'annotation_withdrawn'`, `'annotation_dismissed'` and `'annotation_addressed'` (11 kinds in all). The 0041 constraint is unnamed, so its name is Postgres' default `artifact_share_events_kind_check`. A `DO $$ … $$` block runs `DROP CONSTRAINT IF EXISTS artifact_share_events_kind_check` then `ADD CONSTRAINT … CHECK (kind IN (…))`, guarded by a `pg_get_constraintdef(...) LIKE '%annotated%'` check so it is a no-op once widened.
+  - Python `artifact_shares.EVENT_KINDS` (which gates `ShareStore.add_event`) is widened with the same five kinds in the same commit. `INGESTIBLE_KINDS` stays `opened, denied`. `AnnotationStore` writes its events through `ShareStore._event(conn, …)`.
 - **Store** `AnnotationStore(conn)`:
   - `async def ingest(self, conn, record: dict, ingest_key: str, *, owner_emails: frozenset[str], per_user_per_day: int, max_per_share: int, max_comment_chars: int) -> str` dispatches on `record.get("op", "create")`.
     - **`create`** returns `"inserted"`, `"duplicate"` or a refusal: `unknown_share`, `not_lab`, `not_live`, `file_not_in_version`, `quota_user_day`, `quota_share` or `invalid`.
       - `artifact_id` and `version_id` come from the share row. Fields of that name in `record` are ignored.
-      - `file` must be one of the names the share exposes, from `shared_file_names(artifact_row, version_row) -> frozenset[str]`. This new helper in `artifact_share_api.py` is factored out of `_plan`, which then uses it.
+      - `file` must be one of the names the share exposes, from `shared_file_names(version_row) -> frozenset[str]`. This new helper in `artifact_share_api.py` is factored out of `_plan(server, artifact_id, version_id, entry)`, which then uses it. The file set depends only on the version row: `{PREVIEW_NAME}` when it has a `report_descriptor`, else the normalised `output_manifest` names. The worker has only a connection, so it selects `output_manifest, report_descriptor` from `artifact_versions` itself. (`_plan` also requires an `.html`/`.pdf` output, so PNG/parquet-only shares in tests are seeded as state files, not created through the API.)
       - The share must have been live at `record["at"]`, and `at` is clamped to at most now + 5 min.
       - `author_role` is `owner` when the email is in `owner_emails`.
     - **`edit` / `delete`** return `"edited"` / `"withdrawn"`, `"duplicate"`, or a refusal: `not_found`, `not_author`, `not_open`, `not_live` or `invalid`.
@@ -408,6 +431,8 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
     - The 2001st create of one author in one day → `quota_user_day`. With `max_per_share=3`, the 4th create on a share → `quota_share`.
     - A line timed after `revoked_at` → `not_live`. A line timed before it → inserted.
     - An owner email → `author_role = 'owner'`.
+    - A forged `{"kind": "annotated"}` line in `events.jsonl` is ignored by `ShareStore` ingest.
+    - `EVENT_KINDS` and the CHECK accept the same 11 kinds.
   - Edit and delete:
     - An edit by the author → `edited`, with one event.
     - An edit by another identity → `not_author`.
@@ -429,16 +454,16 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 
 **Files:**
 - Modify:
-  - `herdr_engineering/control_plane/worker.py`: a new `AnnotationHousekeeper`, next to `ShareHousekeeper`
-  - `herdr_engineering/cli.py`: construct the housekeeper near line 4007
-  - `herdr_engineering/fleet_config_cli.py`: `SHARE_KEYS` gains `"annotations"` and `"owner_emails"`, and `SHARE_SLICE_KEYS` gains `"annotations"`
+  - `herdr_engineering/control_plane/worker.py`: a new `AnnotationHousekeeper`, next to `ShareHousekeeper`; the run-pass function (which takes `share_housekeeper=`) gains an `annotation_housekeeper=` parameter
+  - `herdr_engineering/cli.py`: in `_cmd_cp_worker`, build ONE `CollabMirror` (when `collab_artifacts` is enabled) and pass it both to `_build_collab_bridge_loop(mirror=...)` and to `AnnotationHousekeeper(mirror=...)`; update every `_cmd_cp_worker` call site of the run pass, next to `_worker_share_housekeeper`
+  - `herdr_engineering/fleet_config_cli.py`: `SHARE_KEYS` gains `"annotations"` and `"owner_emails"`, and `SHARE_SLICE_KEYS` gains `"annotations"`; `share_values` wraps the `ValueError` of `annotation_settings` in `FleetConfigError`
   - `herdr_engineering/control_plane/artifact_share_api.py`: `share_settings_config` reads both keys; `_create` appends `owner_emails` to a lab share's `allow_emails`
   - `herdr_engineering/control_plane/share_bundle.py`: the projection writer
 - Test: `tests/control_plane/test_annotation_worker.py`, and extend `tests/control_plane/test_artifact_share_api.py` and the fleet-config tests
 
 **Interfaces:**
 - `ANNOTATION_DEFAULTS = {"enabled": True, "per_user_per_minute": 60, "per_share_per_minute": 600, "global_per_minute": 3000, "per_user_per_day": 2000, "max_per_share": 20000, "max_comment_chars": 4000}`, defined in `annotation_anchor.py`.
-- `def annotation_settings(raw: dict | None) -> dict` merges `raw` over the defaults. Loading refuses with `FleetConfigError`:
+- `def annotation_settings(raw: dict | None) -> dict` merges `raw` over the defaults. It raises `ValueError` (the module stays import-light and imports no `fleet_config`; `fleet_config_cli.share_values` wraps it in `FleetConfigError`, as `share_settings_config` does at its call site). It refuses:
   - unknown keys
   - a non-bool `enabled`
   - a non-int or ≤ 0 limit
@@ -447,10 +472,10 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - The write is atomic, mode 0644.
   - It is capped at 2 MiB: newest rows first, and a cut file carries `"truncated": true`.
   - It is skipped when `<root>/<share_id>` is missing, and it never follows a symlink.
-- `class AnnotationHousekeeper(shares_root, events_dir, marker_dir, settings, *, owner_emails, mirror=None, interval=15.0, clock=time.time)` with `async tick(conn) -> dict | str`. Each tick:
+- `class AnnotationHousekeeper(shares_root, events_dir, marker_dir, settings, *, owner_emails, mirror=None, interval=15.0, clock=time.time)`, where `mirror` is the single shared `CollabMirror` (a second instance would have separate per-artifact locks and could race `remove`/`sync`) with `async tick(conn) -> dict | str`. Each tick:
   1. ingests and rotates `annotations.jsonl` (marker `annotation.marker.json`, `max_line_bytes=65536`);
   2. rewrites the projections of the touched shares;
-  3. if `mirror` is set, writes `annotations.json` for the touched artifacts (Task 15);
+  3. if `mirror` is set, calls `mirror.publish_annotations` for the touched artifacts (Task 15); with no mirror this step is skipped;
   4. on the first tick after start, treats everything as touched.
 
   It never raises out of the worker pass.
@@ -465,6 +490,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
     - The `annotation_settings` defaults equal `ANNOTATION_DEFAULTS`.
     - `annotation_settings` refuses a non-bool `enabled`, `per_user_per_minute: 0`, `max_comment_chars: 4001` and an unknown key.
     - `owner_emails` with an invalid email → `FleetConfigError`.
+    - A bad `annotations` block through `share_values` surfaces as `FleetConfigError`, not `ValueError`.
     - `share_values` accepts both new keys. A rendered slice contains `annotations` but never `owner_emails`.
   - Lab shares:
     - A lab share created with `owner_emails: ["owner@lab.test"]` lists it in `allow_emails`, de-duplicated and lower-cased.
@@ -479,7 +505,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 **Files:**
 - Modify:
   - `herdr_engineering/fleet_config_cli.py`: `SHARE_KEYS` and `SHARE_SLICE_KEYS` gain `"public_url"`
-  - `herdr_engineering/cli.py`: every `share_settings_config` call site passes `public_url=share["public_url"]`; `_share_public_server` sets `ShareConfig.public_url`; `_share_lab_problems` names the new key
+  - `herdr_engineering/cli.py`: the one production `share_settings_config` call site (`_share_wiring`) passes `public_url=share["public_url"]`; `_share_public_server` sets `ShareConfig.public_url` (its source changes; the field exists already); `_share_lab_problems` names the new key
   - `herdr_engineering/control_plane/artifact_share_api.py`: the error text
 - Test: the fleet-config tests, `tests/control_plane/test_artifact_share_api.py` and `tests/control_plane/test_share_lab.py`
 
@@ -490,11 +516,12 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - on a netloc different from `control_plane.collab.public_url`'s
 
   Otherwise it raises `FleetConfigError` naming the key: "share links and the lab sign-in callback /s/callback live at the root of the share host; MCP stays on control_plane.collab.public_url".
-- `ShareConfig.public_url` is the share host. It is the source of:
+- `ShareConfig.public_url` (already present) is the share host. It is the source of:
   - `lab_settings`, with redirect_uri `<share>/s/callback`
   - `ShareServer.public_origin`, which feeds the sandbox CSP and our views' CSP
   - the link base in `artifact_share_api`
-- `SHARE_COLLAB_KEYS` is unchanged.
+- `SHARE_COLLAB_KEYS` is unchanged: the collab `public_url` still reaches the slice for MCP (harmless).
+- The existing tests that call `share_settings_config` (`test_artifact_share_api.py`, which pass `https://x.example/`) are updated to the new key.
 
 - [ ] **Step 1: Write failing tests**
   - Refused:
@@ -518,7 +545,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 - Modify:
   - `herdr_engineering/control_plane/share_session.py`
   - `herdr_engineering/control_plane/share_public.py`: `_session` mints v2 and returns `landing`; `_SESSION_SEGMENT` max 768
-  - `herdr_engineering/control_plane/share_static/share.js`: `BASE_PATH` `{1,768}`; navigates to `landing`
+  - `herdr_engineering/control_plane/share_static/share.js`: validates and navigates to `landing`
 - Test: extend `tests/control_plane/test_share_lab.py` and `tests/control_plane/test_share_public.py`
 
 **Interfaces:**
@@ -531,7 +558,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 - `def csrf_token(secret: bytes, share_id: str, session: str) -> str` is b64url(HMAC-SHA256(secret, b"herdr-annotate-csrf-v1\x00" + len-prefixed share_id + len-prefixed session)), 43 characters.
 - `def check_csrf(secret, share_id, session, value) -> bool` compares with `hmac.compare_digest`.
 - The session response is `{"base": ".../k/<session>/f/", "entry", "landing", "expires_at"}`. `landing` is `.../k/<session>/f/<entry>` when `content_type_for(entry)` is `text/html`, else `.../k/<session>/v/<entry>`.
-- `share.js` replaces the location to `landing`. It has no hash handling, and no other behaviour changes.
+- `share.js` validates `landing` before `location.replace`, as it validated `base`: it must match `/^\/s\/[A-Za-z0-9_-]{43}\/k\/[A-Za-z0-9_.-]{1,768}\/[fv]\//` and satisfy `landing.indexOf(sharePath) === 0`. The old `base`/`entry` checks and fields are dropped if nothing else uses them (alpha, no shims). It has no hash handling.
 
 - [ ] **Step 1: Write failing tests**
   - Round trip:
@@ -549,7 +576,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - `mint_session` without `email` is a `TypeError`.
 - [ ] **Step 2: Run** `python3 -m pytest tests/control_plane/test_share_public.py tests/control_plane/test_share_lab.py -q` → FAIL.
 - [ ] **Step 3: Implement.** `_session` passes `grant["email"]` to `mint_session`. Update the existing tests that minted v1 sessions to pass an email; do not keep v1 fixtures.
-- [ ] **Step 4: Run** → PASS.
+- [ ] **Step 4: Run** → PASS. Update every fixture that minted v1 (`tests/control_plane/test_share_lab.py`, `test_share_public.py`, `scripts/share-browser-check.mjs`), then run `node scripts/share-browser-check.mjs` and fix it if it asserts `base` or v1 sessions.
 - [ ] **Step 5: Commit** `feat(share): email-bound v2 sessions, annotate CSRF token, live landing`.
 
 ### Task 7: Static render: an adapter around `nh3` (pure)
@@ -578,7 +605,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 - `def sanitize_html(data: bytes, *, resolve: Resolver) -> str` returns a fragment.
   - It decodes the bytes with `errors="replace"`, then calls `nh3.clean` once:
     - `tags`: the element allow-list `a abbr address article aside b bdi bdo blockquote br caption cite code col colgroup data dd del details dfn div dl dt em figcaption figure footer h1 h2 h3 h4 h5 h6 header hr i img ins kbd li link main mark nav ol p pre q rp rt ruby s samp section small span strong style sub summary sup table tbody td tfoot th thead time tr u ul var wbr`
-    - `clean_content_tags`: `script template iframe frame frameset noframes object embed applet portal fencedframe svg math canvas video audio textarea select title noembed xmp plaintext`
+    - `clean_content_tags` is ALWAYS passed explicitly and never overlaps `tags` (an overlap is a Rust panic, `pyo3_runtime.PanicException`, a BaseException; omitting it makes `style` collide with the default `{"script","style"}`): `script template iframe frame frameset noframes object embed applet portal fencedframe svg math canvas video audio textarea select title noembed xmp plaintext`
     - `attributes`:
       - global: `class id title lang dir role style`
       - `a`: `href`
@@ -591,8 +618,8 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
       - `link`: `rel href`
     - `generic_attribute_prefixes={"aria-"}`
     - `url_schemes={"http", "https", "mailto", "data"}`
-    - `link_rel="noopener noreferrer"`
-    - `set_tag_attribute_values={"a": {"target": "_blank"}}`
+    - `link_rel=None` (setting `link_rel` while `rel` is allowed raises `ValueError` in nh3 0.3.7)
+    - `set_tag_attribute_values={"a": {"target": "_blank", "rel": "noopener noreferrer"}}`
     - `strip_comments=True`
     - `attribute_filter`: a function that routes `a[href]`, `img[src]` and `link[href]` through `resolve`. It keeps `link` only with `rel="stylesheet"`, and rewrites `url(...)` in `style` values through `resolve("css", …)` with one bounded, non-backtracking regex.
   - Everything the library does not allow is dropped. That includes `form`, `meta`, `base`, `noscript` and every `on*` attribute.
@@ -601,13 +628,12 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 - `def wrap_content(kind: str, inner: str) -> str` returns `<p class="herdr-static-note">STATIC_NOTE</p><div id="herdr-content" data-kind="<kind>"><template shadowrootmode="open">` + inner + `</template></div>`.
 - `class RenderCache(max_entries=32, max_bytes=64 * 1024 * 1024)` is a thread-safe LRU keyed by `(sha256, name, RENDER_VERSION)`.
 
-- [ ] **Step 0: Verify the library before writing the adapter** (a throwaway script in the scratch dir, not committed). Record the results in the module docstring.
-  - `pip download nh3` gives an abi3 manylinux wheel that installs on Python 3.12 and 3.13 x86_64.
-  - `nh3.clean('<style>a{}</style><p>x</p>', tags={'style', 'p'}, clean_content_tags={'script'})` keeps the `<style>` element.
-    - **If it does not**, remove `style` from `tags`, add it to `clean_content_tags`, and widen the Decision 1 tradeoff to "author `<style>` blocks are not kept". Do not write a pre-pass.
-  - `<link rel=stylesheet href=x>` survives with `link` in `tags`. **If it does not**, drop `link` the same way.
-  - Find out whether `attribute_filter` runs before or after the URL-scheme check. The adapter must not depend on the order. Relative URLs it returns must survive, and so must the absolute URLs it keeps.
-  - Overlapping `tags` and `clean_content_tags` raises. The adapter never passes an overlap.
+- [ ] **Step 0: Re-confirm the library facts** (a throwaway script in the scratch dir, not committed). The pre-flight verified them with nh3 0.3.7 (ammonia 4.1.4); record them in the module docstring (name frame elements in prose, no angle brackets).
+  - A wheel `nh3-0.3.7-cp38-abi3-manylinux_2_17_x86_64` exists and installs on Python 3.12 and 3.13.
+  - `<style>` is kept, with `clean_content_tags` explicit and without `style`. `<link rel=stylesheet>` is kept with `link` in `tags`.
+  - `attribute_filter` runs AFTER the scheme check for absolute URLs (a `javascript:` href never reaches it; relative URLs do). `data:` reaches it because `"data"` is in `url_schemes`. The adapter must not depend on the order.
+  - `@import url(http://…)` inside `<style>` text is kept: the view CSP's `style-src-elem` is the only barrier.
+  - `link_rel` together with an allowed `rel` raises `ValueError`; overlapping `tags` and `clean_content_tags` panics. Neither is ever passed.
 - [ ] **Step 1: Write failing tests** (one assertion group per line)
   - None of these payloads leaves a `script` element, an `on*` attribute, a `javascript:` URL, `<base` or `<meta` in the output, checked by re-parsing it:
     - `<script>alert(1)</script>`
@@ -621,6 +647,8 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
     - `<math><mtext><table><mglyph><style><img src=x onerror=1>`
     - `<noscript><p title="</noscript><img src=x onerror=1>">`
     - `<style></style><img src=x onerror=1>`
+  - A unit test calls `sanitize_html` once on trivial input (the import-time-equivalent smoke), so a bad option combination fails loudly rather than at first request.
+  - A `<style>@import url(http://evil/x.css)</style>` stays in the output, and the view CSP (Task 9 test) blocks the load.
   - `<iframe src=a.html>`, `<frame>`, `<frameset><frame>`, `<object data=x>`, `<embed src=x>` and `<svg><foreignObject><iframe>` give output that matches no frame or plugin tag (the Global Constraints regex).
   - Unterminated markup gives a balanced fragment, and `wrap_content` output ends with `</template></div>`.
   - Links through `share_resolver(...)`:
@@ -649,7 +677,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 - Modify:
   - `pyproject.toml`: package-data gains `"control_plane/share_static/vendor/pdfjs/*"`, because the existing `*.js` globs miss `vendor/` and `.mjs`
   - `THIRD_PARTY_NOTICES.md`: a pdf.js (Apache-2.0) entry
-  - `herdr_engineering/control_plane/api.py`: `_PUBLIC_STATIC` gains `/vendor/pdfjs/pdf.min.mjs` and `/vendor/pdfjs/pdf.worker.min.mjs` as `text/javascript`, read from the same package dir
+  - `herdr_engineering/control_plane/api.py`: the DASHBOARD's `_serve_static` (web root `packages/`) serves `/vendor/pdfjs/{pdf.min.mjs,pdf.worker.min.mjs}` from `share_static/vendor/pdfjs` (outside the web root, so a dedicated source dir is mapped); `.mjs` maps to `text/javascript` (today it is `application/octet-stream`, which module scripts reject) and the response carries `X-Content-Type-Options: nosniff`. `_PUBLIC_STATIC` is the collab public listener and is NOT touched.
   - `herdr_engineering/control_plane/share_public.py`: `STATIC_FILES` / `_viewer_asset` gain the one-level `vendor/pdfjs/<name>` allow-list, with `VENDOR_MAX_BYTES = 4 MiB`; `STATIC_MAX_BYTES` stays 1 MiB
 
 **Interfaces:**
@@ -658,15 +686,16 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - It compares the tarball's sha512 with `npm view pdfjs-dist@$PDFJS dist.integrity`.
   - It copies only `build/pdf.min.mjs`, `build/pdf.worker.min.mjs` and `LICENSE`, and writes `SHA256SUMS`.
 - Both servers serve the files with `nosniff` and a long `Cache-Control`.
-  - The dashboard CSP's `script-src 'self'` covers both the module and the worker.
+  - The dashboard has no CSP, so nothing is added there (Task 13, Global Constraints).
   - The share views' CSP names `worker-src <origin>/s/static/vendor/pdfjs/`.
+- Known limitation (Decision 1): `cmaps/`, `standard_fonts/` and `wasm/` are not vendored.
 - `annotate.css` and the dashboard preview CSS carry the `.textLayer` rules from `pdfjs-dist/web/pdf_viewer.css`, with attribution.
 
 - [ ] **Step 1: Write failing tests**
   - Every file under `vendor/pdfjs/` matches `SHA256SUMS`.
   - `LICENSE` is Apache-2.0, and no other file is present.
   - Both files are listed by `importlib.resources` in an installed wheel (build it with `pip wheel . --no-deps` into a temp dir).
-  - `GET /vendor/pdfjs/pdf.min.mjs` on the dashboard test server, and `/s/static/vendor/pdfjs/pdf.min.mjs` on share-public, return 200 with `text/javascript`.
+  - `GET /vendor/pdfjs/pdf.min.mjs` on the dashboard test server (served by `_serve_static`, with `text/javascript` and `nosniff`; `/vendor/pdfjs/../x` → 404), and `/s/static/vendor/pdfjs/pdf.min.mjs` on share-public, return 200 with `text/javascript`.
   - `/s/static/vendor/pdfjs/../share.js` → 404.
 - [ ] **Step 2: Run** → FAIL.
 - [ ] **Step 3: Run the script, then implement** the static map entries.
@@ -741,7 +770,17 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
     5. A failed append gives 503 `{"error": "unavailable"}`.
   - Every POST response is sent with `cors=False`.
 - **`OPTIONS`** on any `v/`, `a/` or annotations path gives the uniform 404.
-- **`_route`:** POST is accepted only for `session` and the three annotation paths. `_route` recognises `v/` and `a/`, and leaves `f/` on `serve_bundle_file`, unchanged.
+- **`_route` table.** Today `_route` computes `is_lab_file = len(parts) >= 7 and parts[3] == "k" and parts[5] == "f"`, rejects everything else as `unknown_route`, and ties POST to `is_session` via `(self.command == "POST") != is_session`. Rewrite it as:
+
+  | Path (after `/s/<token>/`) | Methods | Match |
+  |---|---|---|
+  | `session` | POST | as today |
+  | `k/<session>/f/<path>` | GET, HEAD | `len >= 7`, `parts[5] == "f"`; `serve_bundle_file`, unchanged apart from the mode switch |
+  | `k/<session>/v/<path>`, `k/<session>/a/<path>` | GET, HEAD | `len >= 7`, `parts[5] in ("v", "a")` |
+  | `k/<session>/annotations` | GET, POST | `len == 6` |
+  | `k/<session>/annotations/<aid>/edit`, `.../delete` | POST | `len == 8`, `parts[6] == "annotations"`, `parts[7] in ("edit", "delete")` |
+
+  Everything else, and OPTIONS, stays the uniform 404. POST is accepted only for `session` and the three annotation paths.
 - `STATIC_FILES` gains `annotate.js` and `annotate.css`.
 
 - [ ] **Step 1: Write failing tests** (raw `http.client`, as in the existing file)
@@ -755,6 +794,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - **HTML content:**
     - A bundle `index.html` containing `<script>window.x=1</script><iframe src=a></iframe>` is served with neither.
     - A 2 MiB + 1 file gets the too-large message.
+    - The view CSP's `style-src-elem` has no remote origin, so an `@import url(http://…)` kept inside a `<style>` element cannot load (asserted on the header).
   - **The 404 cases:** a v1-format session, a public share, an expired session, a revoked share, and a path not in the index.
   - **The mode-switch link:**
     - A lab `f/index.html` GET with `Sec-Fetch-Dest: document` returns the original bytes with exactly `mode_switch_link(...)` inserted before the last `</body>`. The response has the `-m1` ETag, the correct `Content-Length`, `Vary: Sec-Fetch-Dest`, no `Accept-Ranges`, and the unchanged sandbox CSP.
@@ -798,8 +838,8 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 - Modify:
   - `deploy/control-plane/collab-edge/share-http.conf`, which holds the share `server {}` block
   - `deploy/control-plane/collab-edge/nginx.conf`: remove the `@share-location@` splice line
-  - `deploy/control-plane/compose.collab.yaml`: mount `${HERDR_SHARE_CERT_DIR}` at `/etc/acme-share:ro`
-  - `herdr_engineering/fleet_config_cli.py`: drop the `share-location.conf` splice entry (~line 382); `render_edge_conf` substitutes `@share_host@`
+  - `herdr_engineering/fleet_config_cli.py`: drop the `share-location.conf` splice entry (the `@share-location@` marker in `EDGE_SHARE_MARKERS`); `render_edge_conf` substitutes `@share_host@`; `render_edge(cfg, template, out)` reads `share_values(cfg)["share"]["public_url"]` and passes `share_host` (`deploy.sh`'s `render-edge` call needs no change)
+  - Docs that still describe `share-location.conf`: `deploy/control-plane/COLLAB.md` (the share section), `docs/operations/collaboration-network*.md`, `docs/specs/herdr-unified-workspace-20261028/security/THREAT_MODEL.md` (the two share mentions)
 - Delete `deploy/control-plane/collab-edge/share-location.conf`
 - Test: extend `tests/test_share_deploy_config.py`
 
@@ -811,7 +851,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - `limit_req_zone $remote_addr zone=share_annotate:10m rate=5r/s;`
   - the `$share_method_ok` entry `"~^POST:/s/[A-Za-z0-9_-]{43}/k/[A-Za-z0-9_.-]{1,768}/annotations(/ann_[A-Za-z0-9_-]{22}/(edit|delete))?\z" 1;`
   - **`server { listen 8443 ssl proxy_protocol; server_name @share_host@; … }`**, with:
-    - `ssl_certificate /etc/acme-share/fullchain.pem` and its key
+    - `ssl_certificate /etc/acme/fullchain.pem` and `ssl_certificate_key /etc/acme/privkey.pem`, the same mount as the MCP block. **One certificate with both names (SANs) serves both hosts**; there is no `HERDR_SHARE_CERT_DIR`, no second `collab-sync.sh install` and no compose change. Reason: `collab-sync.sh` manages one lineage (fixed `herdr-collab-cert-renew.{service,timer}` units, one `CERT_NAME`/`CERT_DIR`, one container reload), so a second install would overwrite the MCP host's renewal timer. The operator expands the existing lineage (Task 16 step 5); a separate lineage would be its own `collab-sync.sh` change.
     - HSTS, the `$hcn_from_edge` guard, and `proxy_set_header Host`, `X-Forwarded-*` and `Origin` as in the MCP block
     - `proxy_set_header Sec-Fetch-Dest $http_sec_fetch_dest;`, so the Decision 9 gate sees the browser's value. No `proxy_hide_header Vary`.
     - **flat** locations:
@@ -837,15 +877,17 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - Rendering:
     - With sharing disabled, the output is byte-identical to the template.
     - `share=True` without `share_host` raises.
+  - `render_edge(cfg, …)` on a config with `share.public_url` writes a conf whose share `server_name` is that host; a config with sharing disabled writes the template unchanged.
+  - The share block's certificate paths equal the MCP block's.
   - `nginx -t` passes with dummy certs when `nginx` is on PATH; skip otherwise.
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement.**
+- [ ] **Step 3: Implement**, including the doc edits above (no remaining mention of `share-location.conf` outside git history).
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat(edge): share host server block; drop /s/ from the MCP host`.
 
 ### Task 11: `annotate.js`: mode pages, the annotation panel, capture per kind
 
-**Files:** Create `herdr_engineering/control_plane/share_static/annotate.js`, `annotate.css`, `tests/playwright/share-annotations-server.py`, `tests/playwright/share-annotations.test.mjs`
+**Files:** Create `herdr_engineering/control_plane/share_static/annotate.js`, `annotate.css`, `tests/playwright/share-annotations-server.py`, `tests/playwright/share-annotations.test.mjs`; Modify `scripts/share-browser-check.mjs` if v2 sessions or `landing` change its expectations (it drives a real lab session, checks `f/` range reads and the raw route's CSP). Comments in the new files name frame elements in prose without angle brackets.
 
 **Interfaces:**
 - `annotate.js` is an ES module loaded by `<script type="module" nonce>`.
@@ -920,7 +962,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - **Narrow viewport:** at 320px there is no horizontal scroll, and the panel is below the content.
 - [ ] **Step 2: Run** `node --test tests/playwright/share-annotations.test.mjs` → FAIL.
 - [ ] **Step 3: Implement** `annotate.js` and `annotate.css`.
-- [ ] **Step 4: Run** the test plus `python3 -m pytest tests/control_plane/test_share_public.py -q` → PASS.
+- [ ] **Step 4: Run** the test plus `python3 -m pytest tests/control_plane/test_share_public.py -q` and `node scripts/share-browser-check.mjs` → PASS.
 - [ ] **Step 5: Commit** `feat(share): live/annotate views and the annotation panel`.
 
 ### Task 12: Owner annotation API and web-client methods
@@ -960,11 +1002,11 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - `packages/artifact-static-preview.js` and `packages/artifact-static-preview.test.js`
   - `tests/control_plane/test_artifact_render_api.py`
 - Modify:
-  - `herdr_engineering/control_plane/api.py`: call `route_render` before the `download` branch (~line 3435); `/download` gains `Content-Disposition: attachment` and `Content-Security-Policy: default-src 'none'; sandbox`
+  - `herdr_engineering/control_plane/api.py`: in the route chain (`route_collab, route_report, route_share, route_registry`), call `route_render` BEFORE `route_report`, because `route_report` claims versioned paths with `len(parts) >= 8` and `parts[7] in {preview, outputs, …}`, so it would serve `.../preview/render` as raw preview HTML and 404 `.../outputs/{i}/render`; `_bytes` gains an optional `headers=` parameter and only the `/download` branch passes `Content-Disposition: attachment` and `Content-Security-Policy: default-src 'none'; sandbox`
   - `herdr_engineering/control_plane/artifact_report_api.py`: `_text` gets `frame-ancestors 'none'` (Decision 8)
   - `packages/herdr-web-client/client.js`
   - `packages/artifacts-view.js`
-  - `tests/playwright/artifact-reports.test.mjs`: the `frameLocator` assertions at ~lines 52–57, 217 and 237
+  - `tests/playwright/artifact-reports.test.mjs`: the `frameLocator` assertions, the `about:srcdoc` `page.frames()` assertion, and the two legacy-output sites (rows currently at lines 54, 58, 217, 237)
   - the Playwright stub server that backs it
 
 **Interfaces:**
@@ -992,8 +1034,8 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
     - shows "This PDF could not be drawn" on error
   - `liveLink(url)` returns `<a class="hd-btn" target="_blank" rel="noopener noreferrer" href=esc(url) data-open-live>Open live view in a new tab</a>`.
 - **`artifacts-view.js`:**
-  - `showPreview(output, content)` is replaced by `showPreview(output, render)`, which takes a render-route response and calls `mountStaticHtml`. The report preview (~line 324) calls `artifactReportPreviewRender`, and the legacy outputs (~line 186) call `artifactOutputRender`.
-  - The ~line 419 ternary becomes:
+  - `showPreview(output, content)` is replaced by `showPreview(output, render)`, which takes a render-route response and calls `mountStaticHtml`. The report reader's preview call site uses `artifactReportPreviewRender`, and the legacy-output call site uses `artifactOutputRender`.
+  - The PDF/HTML ternary in the artifact detail renderer becomes:
     - PDF → `mountPdf(await artifactBytes)` + `liveLink`
     - image → native `<img>` (unchanged)
     - HTML → `mountStaticHtml(artifactRender)` + `liveLink`
@@ -1004,6 +1046,8 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - **Python:**
     - Each render route on an HTML artifact holding `<script>`, `<iframe>`, `onerror` and `<a href="#/settings">` returns HTML with none of them.
     - The legacy-output resolver rewrites a sibling image to the outputs route.
+    - **Regression:** `.../versions/{vid}/preview/render` returns the JSON envelope (not the raw preview HTML) and `.../outputs/{i}/render` returns 200 JSON (not 404), because `route_render` runs before `route_report`.
+    - Other `_bytes` users send the same headers as before (only `/download` gains `attachment` and `sandbox`).
     - The `live` route sends the sandbox CSP, `X-Frame-Options: DENY` and no ACAO, and sends a PDF with `frame-ancestors 'none'`.
     - `/download` now sends `attachment` and `sandbox`.
     - `_text` sends `frame-ancestors 'none'`.
@@ -1021,13 +1065,13 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
     - An HTML artifact with `<script>window.__x=1</script>` leaves `window.__x` undefined.
     - The live link opens a popup whose `document.domain` access throws, or whose `origin` is `"null"`: it is the sandbox.
 - [ ] **Step 2: Run** `python3 -m pytest tests/control_plane/test_artifact_render_api.py -q`, `node --test packages/artifact-static-preview.test.js` and `node --test tests/playwright/artifact-reports.test.mjs` → FAIL.
-- [ ] **Step 3: Implement.** If the dashboard CSP blocks pdf.js font loading in the Playwright run, add the narrowest needed source (`font-src 'self' data:`) to `_PUBLIC_CSP`, with a test. Never add `frame-src`.
+- [ ] **Step 3: Implement.** The dashboard has no CSP and none is added (`_PUBLIC_CSP` is the collab listener's and is not touched). pdf.js is served from `/vendor/pdfjs/` by `_serve_static` (Task 8). Comments in the new JS name frame elements in prose without angle brackets.
 - [ ] **Step 4: Run** those, plus `npm run test:client` and `python3 -m pytest tests/control_plane/test_artifact_report_render.py -q` → PASS.
 - [ ] **Step 5: Commit** `feat(web): replace dashboard preview iframes with static render and pdf.js`.
 
 ### Task 14: Feedback panel in the artifact detail view
 
-**Files:** Create `packages/artifact-feedback-panel.js` and `packages/artifact-feedback-panel.test.js`; Modify `packages/artifacts-view.js` (mount it in `renderArtifactDetail` and `renderReportReader` next to `mountSharePanel`) and `packages/artifact-share-panel.js` (`renderEvents` labels the five new kinds)
+**Files:** Create `packages/artifact-feedback-panel.js` and `packages/artifact-feedback-panel.test.js`; Modify `packages/artifacts-view.js` (mount it in `renderArtifactDetail` and `renderReportReader` next to `mountSharePanel`), `packages/artifact-share-panel.js` (the Feedback tab and `renderEvents` labels for the five new kinds) and `packages/artifact-share-panel.test.js` (tab-count assertions)
 
 **Interfaces:**
 - Consumes the Task 12 client methods.
@@ -1048,7 +1092,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - a status filter (Open by default) and "Load more"
   - a per-section `<herdr-error>` with Retry
   - Dismiss asks `confirm()`, disables the button in flight, and refreshes
-- If plan 3's Share card has a tab bar, the panel mounts into a "Feedback" tab panel. Otherwise it mounts as a `<section data-artifact-feedback>` after the Share card.
+- **The Feedback tab is unconditional** (spec section D: "A Feedback tab in the Share panel"). In `artifact-share-panel.js`: add `['feedback', 'Feedback']` to `TABS` (currently links, collaborators, activity), add an empty `data-panel-pane="feedback"` pane to the panel template, and add a lazy `mountFeedbackPanel` branch to `showTab` (the existing `mounted.<key>` pattern).
 
 - [ ] **Step 1: Write failing tests**
   - Hostile emails, bodies, quotes and file names are escaped.
@@ -1056,6 +1100,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - The owner badge and the edited marker are shown.
   - A 4000-character unbroken body gets the wrap style.
   - The empty state reads "No annotations yet. Lab viewers can annotate a shared version by switching a lab link to Annotate; public links cannot."
+  - The tab bar has four tabs; clicking Feedback mounts the panel once (lazily).
   - `renderEvents` shows `annotated` as "annotated" and `annotation_withdrawn` as "annotation deleted by its author".
 - [ ] **Step 2: Run** `node --test packages/artifact-feedback-panel.test.js` → FAIL.
 - [ ] **Step 3: Implement** and mount.
@@ -1070,38 +1115,41 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - `tests/control_plane/test_collab_mcp_annotations.py`
   - `tests/control_plane/test_annotation_resolve_intent.py`
 - Modify:
-  - `herdr_engineering/control_plane/collab_mcp.py`: two tools
-  - `collab_artifacts.py`: `CollabArtifactBridge.annotations` / `.resolve_annotations`; it imports `annotation_intents` so that the kind is registered in collab-public
+  - `herdr_engineering/control_plane/collab_mcp.py`: two tools in `_ARTIFACT_TOOLS`, plus explicit `if name == …` branches in `_artifact_call` before the commit tail
+  - `collab_artifacts.py`: `CollabArtifactBridge.annotations` / `.resolve_annotations`, `_TOOL_ACTIONS` entry; it imports `annotation_intents` so that the kind is registered in collab-public
+  - `collab_intents.py`: `_RESULT_KEYS` and `_check_outcome` gain `resolved` and `skipped`
   - `collab_mirror.py`: `publish_annotations`
-  - `herdr_engineering/control_plane/worker.py`: `AnnotationHousekeeper` publishes for touched artifacts
-  - `herdr_engineering/cli.py`: in `_cmd_cp_worker`, `register_annotation_resolve(applier)` next to plan 3's `commit` registration
+  - `herdr_engineering/control_plane/worker.py`: `AnnotationHousekeeper` publishes for touched artifacts through the shared mirror (Task 4)
+  - `herdr_engineering/cli.py`: in `_cmd_cp_worker`, `register_annotation_resolve(applier)` next to plan 3's `commit` registration; the worker wiring imports `annotation_intents` too, so both processes register (a second registration raises)
+  - `tests/control_plane/test_collab_mcp_artifacts.py` (pins the exact tool-name set and counts) and `tests/e2e/test_artifact_collab_bridge.py`
   - `packages/collab-guide.md`, `docs/operations/collaboration-network-guide.md`, and `skills/herdr-artifact/SKILL.md` (the tool list only)
 
 **Interfaces:**
-- **`annotation_intents.py`.** It is light: its import pulls in no asyncpg-heavy modules, because collab-public imports it.
+- **`annotation_intents.py`.** It is light, because collab-public imports it. It uses `from __future__ import annotations` and `if TYPE_CHECKING:` for `IntentContext` (it lives in `collab_intents.py`, which imports asyncpg, `artifacts` and `rustfs`), and imports `Intent`, `Actor`, `BridgeLimits`, `IntentError` and `register_intent_kind` from the light `collab_bridge_files`.
   - `@dataclass(frozen=True) class AnnotationResolvePayload: version_id: str; annotation_ids: tuple[str, ...]`.
   - `def validate_annotation_resolve_payload(raw: dict, limits: BridgeLimits) -> AnnotationResolvePayload`. It accepts exactly the keys `{version_id, annotation_ids}`, with 1–50 unique ids that each match `ANNOTATION_ID_RE`. Anything else raises `IntentError`.
-  - At import it calls `register_intent_kind("annotation_resolve", validate_annotation_resolve_payload, actors=frozenset({"agent"}))`. `artifact_id` and `idempotency_key` travel in plan 3's envelope, not in the payload.
+  - At import it calls `register_intent_kind("annotation_resolve", validate_annotation_resolve_payload, actors=frozenset({"agent"}), requires_artifact=True)`, so the registry rejects a missing artifact id. `artifact_id` and `idempotency_key` travel in plan 3's envelope, not in the payload. The registry cannot enforce the idempotency key, so the handler does.
   - `async def handle_annotation_resolve(ctx: IntentContext, intent: Intent) -> dict`:
     1. If `intent.artifact_id` or `intent.idempotency_key` is None → `{"result": "rejected", "reason": "bad_envelope"}`.
     2. `await ctx.grants.grant_for(intent.artifact_id, ctx.actor.id)` must give `write`, unexpired, else `rejected` with "no write grant". The registry's generic steps do not check grants.
     3. The version must belong to the artifact (`ctx.store.get_version`), else `bad_version`. It must have been committed by this agent (`created_via = 'collaborator' AND collaborator_agent_id = ctx.actor.id`), else `not_own_version`.
     4. It calls `AnnotationStore(ctx.conn).resolve(..., actor=f"collab:{ctx.actor.id}")`. `artifact_annotations` is imported lazily inside the handler.
-    5. It returns `{"result": "resolved", "resolved": [...], "skipped": [...]}`. The applier writes plan 3's result file (`ticket, kind, actor: {kind, id}, artifact_id, result, reason?, decided_at`, plus these fields) and records the ledger outcome, `resolved` or `rejected`.
+    5. It returns `{"result": "resolved", "resolved": [...], "skipped": [...]}` (at most 50 ids, so the result stays far below `max_conflict_text_bytes + 1 MiB`). `collab_intents._RESULT_KEYS` and `_check_outcome` are extended with `resolved` (list of str) and `skipped` (list of `{annotation_id, reason}`, bounded); without that, `_finish`, `_replayed` and `_result_of_row` silently drop both fields. The applier then writes plan 3's result file and records the ledger outcome, `resolved` or `rejected`.
+    6. Crash-retry (accepted): if the process dies between the handler's return and `record_outcome`, the re-run reports `skipped: not_open` for rows the first run resolved. The agent sees the result file written by the FIRST run (`_settle_from_row` keeps an existing result file). Say so in the handler docstring.
   - `def register_annotation_resolve(applier: CollabIntentApplier) -> None` calls `applier.register("annotation_resolve", handle_annotation_resolve, replay_outcomes=frozenset({"resolved"}))`, with the default lane.
 - **Mirror file** `<mirror>/artifacts/<artifact_id>/annotations.json` = `{"artifact_id", "generated_at", "annotations": open_for_agents(...)}`.
   - It is at most 1 MiB, newest first, with `"truncated": true` when cut.
-  - `CollabMirror.publish_annotations(artifact_id, rows)` writes it with `atomic_write_json`, only for artifacts that hold a live grant.
+  - `CollabMirror.publish_annotations(artifact_id, rows)` takes `async with self._lock(artifact_id)` (the per-artifact lock `remove`/`sync` use) and writes only when `file_exists_beneath(root, [ARTIFACTS_DIR, artifact_id], HEAD_NAME)` is true; otherwise it is a no-op. `atomic_write_json` creates missing parent dirs, so without this check a publish racing `remove()` would resurrect `artifacts/<id>/` holding only `annotations.json`. `grants.json` liveness is not the test.
   - The `AnnotationHousekeeper` tick calls it for touched artifacts. `resolve` advances `updated_at`, so a resolve is republished on the next tick (≤ 15 s), and the handler does not touch the mirror.
   - `sync()` removing an artifact's directory also removes this file.
   - The anchors refer to the static render.
 - **Bridge** (`CollabArtifactBridge`):
-  - `annotations(pr, artifact_id, *, limit=200) -> dict` needs a read or write grant, under plan 3's "not found" rules, and projects each row to the allowed keys.
-  - `resolve_annotations(pr, args) -> {ticket, status: "pending"}`:
-    - needs `has_write_grant`
-    - throttles with `_throttle("artresolve:" + pr.id, 30, 60.0, "annotation resolve")`
+  - `annotations(pr, artifact_id, *, limit=200) -> dict` needs a read or write grant, under plan 3's "not found" rules, projects each row to the allowed keys, and audits via `self._used(pr, artifact_id, "artifact_annotations")`. `_TOOL_ACTIONS` gains `"artifact_annotations": "artifact.annotations"` (an unknown name raises `KeyError` in `_used`). Denials use `self._deny(pr, "annotations", id)` / `self._refuse(...)`.
+  - `resolve_annotations(pr, args) -> {ticket, status: "pending"}`, mirroring `commit`:
+    - `permission, doc, limits = self._open_with_limits(pr, "annotation_resolve", artifact_id)`; `permission != "write"` → `self._refuse(..., "read_only", 403, READ_ONLY)`. This is a per-artifact check; `has_write_grant` is not used for authorisation.
+    - throttles inside `with svc._lock:` with `_throttle("artresolve:" + pr.id, 30, 60.0, "annotation resolve")`
     - then calls `append_intent(Actor("agent", pr.id), "annotation_resolve", {"version_id", "annotation_ids"}, artifact_id=args["artifact_id"], idempotency_key=args["idempotency_key"])`
-- **Tools**, appended to `_ARTIFACT_TOOLS`, both with `additionalProperties: False`:
+- **Tools**, appended to `_ARTIFACT_TOOLS`, both with `additionalProperties: False`. `_artifact_call` falls through to the `artifact_commit` tail for any name it does not know (it needs `base_version_id`), so each tool gets an explicit `if name == "artifact_annotations"` / `"artifact_annotation_resolve"` branch before that tail. The branches validate arguments with `_need_str`/`_need_int`, check the 1..50 count and uniqueness by hand (the schema's `uniqueItems` is not enforced server-side), and wrap output with `_text(..., untrusted=True)` where noted:
   - `artifact_annotations {artifact_id (required), limit: 1..200}` returns `untrusted=True`. With no mirror file: `{"annotations": [], "note": "no annotations mirrored"}`.
   - `artifact_annotation_resolve {artifact_id, version_id, annotation_ids (1..50, uniqueItems), idempotency_key}`, all required. It submits, waits up to 10 s through `result`, and returns the result or `{ticket, status: "pending"}`; the agent polls with `artifact_commit_result`.
   - The descriptions say:
@@ -1109,7 +1157,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
     - the anchors quote a static, script-free copy of the file
     - integrate the feedback with `artifact_commit`, then resolve with that commit's version id
     - nothing goes live automatically
-- **Audit:** denials go through `_audit_denied(pr, "artifact.annotations" | "artifact.annotation_resolve", reason, resource_id=artifact_id)`, and allowed reads are logged as `artifact_tool_used`.
+- **Audit:** denials go through `_deny` / `_refuse` (they build `artifact.annotations` / `artifact.annotation_resolve` and count `policy_denied`), and allowed reads through `_used` as `artifact_tool_used`.
 
 - [ ] **Step 1: Write failing tests**
   - **Registry:**
@@ -1119,6 +1167,8 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
     - A second `register_intent_kind("annotation_resolve", …)` raises.
     - Plan 3's subprocess test (only plan 3's registrations) still rejects `annotation_resolve` as an unknown kind.
   - **Tools:**
+    - The updated `test_collab_mcp_artifacts.py` pins the new exact tool-name set and count.
+    - A write-grant on artifact A does not authorise a resolve on artifact B (read-only there → refused).
     - Without a grant, `tools_for` lists neither tool.
     - With a read grant both are listed, and a resolve is refused with "not found" and an audited denial.
     - `artifact_annotations` output starts with `UNTRUSTED` and has no email or identity, even when the mirror file was tampered with.
@@ -1131,9 +1181,12 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
     - A grant revoked after the intent was written → "no write grant".
     - A missing `idempotency_key` → `bad_envelope`.
     - Replaying the same key → the same result through `replay_outcomes`, with no second update.
+    - The result file and a replay carry `resolved` and `skipped` (through the extended `_RESULT_KEYS`); an oversized list (51 ids) is refused by `_check_outcome`.
+    - Crash-retry: calling the handler twice reports `skipped: not_open` the second time while the first run's result file is what the agent reads.
   - **Mirror:**
     - After a resolve and one housekeeper tick, the mirror no longer lists the resolved ids.
     - After an author's delete is ingested, it no longer lists that id.
+    - `publish_annotations` for an artifact with no `head.json` (removed) writes nothing and creates no directory.
 - [ ] **Step 2: Run** → FAIL.
 - [ ] **Step 3: Implement.** Document both tools in `packages/collab-guide.md` and its `docs/operations` mirror.
 - [ ] **Step 4: Run** the new tests, `tests/control_plane/test_collab_intents.py`, `tests/control_plane/test_collab_public.py` and the other `collab_mcp` importers (`grep -rln collab_mcp tests`) → PASS.
@@ -1146,10 +1199,11 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - `tests/playwright/artifact-shares-server.py`: in-memory annotation routes with the Task 12 shapes
   - `tests/playwright/artifact-shares.test.mjs`, or a new `artifact-feedback.test.mjs`
   - `docs/superpowers/specs/2026-10-30-artifact-sharing-gui-and-collaboration-design.md` (section D)
-  - the share deploy doc under `docs/operations/` (`grep -rl "control_plane.share" docs/operations`)
+  - the share deploy doc under `docs/operations/` (`grep -rl "control_plane.share" docs/operations`); the `share-location.conf` mentions were already removed in Task 10
 - Create `tests/control_plane/test_no_frames.py`
 
 - [ ] **Step 1: Write the Playwright test**
+  - Rows 54, 58 (the `page.frames()` / `about:srcdoc` assertion), 217 and 237 of `artifact-reports.test.mjs` are covered by Task 13; confirm none remains.
   - The artifact detail page shows the Feedback section with three seeded annotations: one open with a hostile body, one addressed in v3, and one open with `edited_at`.
   - The hostile body is literal, and `window.__x` stays undefined.
   - The addressed row links to v3, and the edited row shows "edited".
@@ -1157,13 +1211,13 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - A 500 shows the error with Retry, and Retry recovers.
   - At 320px there is no horizontal scroll.
 - [ ] **Step 2: Write** `test_no_frames.py`, with `TAG = re.compile(r"<\s*(iframe|frame|frameset|object|embed|portal|fencedframe)(?=[\s/>])", re.I)` and `API = re.compile(r"createElement\(\s*['\"`](iframe|frame|object|embed)|\.srcdoc\b|\bsrcdoc=|postMessage\(", re.I)`:
-  - **(a) Source scan.** Every `.js`, `.mjs`, `.html` and `.css` file under `packages/` is scanned, along with `herdr_engineering/control_plane/share_static/` and every `.py` under `herdr_engineering/`. Excluded are `node_modules`, `*.test.js` and `share_static/vendor/`. No file matches `TAG` or `API`.
+  - **(a) Source scan.** Every `.js`, `.mjs`, `.html` and `.css` file under `packages/` is scanned, along with `herdr_engineering/control_plane/share_static/` and every `.py` under `herdr_engineering/`. Excluded are `node_modules`, `*.test.js` and `share_static/vendor/`. The new modules' docstrings and comments name frame elements in prose without angle brackets, or this scan matches them. No file matches `TAG` or `API`.
     - The detector byte strings in `intel_attachments.py` (`b"<iframe"`) are not tags and do not match.
     - Any new exception must be a named entry in an `ALLOWED` dict with its reason. The dict starts empty.
   - **(b) Rendered responses.** None of these response bodies matches `TAG` once lower-cased. The `MODE_SWITCH_TEMPLATE` constant must also match neither `TAG` nor `API`:
     - the dashboard `index.html` and every `_PUBLIC_STATIC` HTML page
     - the share viewer page and `/s/callback`
-    - the static assets
+    - the static assets, except `/vendor/` paths (the served `pdf.min.mjs`/`pdf.worker.min.mjs` contain `postMessage(` for pdf.js's own worker, which Decision 1 allows); (b) excludes `/vendor/` exactly as (a) excludes `share_static/vendor/`, and the test documents it
     - `v/` and `a/` for every kind, including a bundle full of frames
     - the annotations JSON
     - the owner render routes and the report preview
@@ -1177,7 +1231,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 - [ ] **Step 5: Write the deploy notes.** These are operator steps; the implementer does not run them:
   1. DNS: point `artifacts.metabolomics.us` at the public edge.
   2. Add the hostname to the cubert SNI stream edge in `networking/cubert-ansible`, routed to the collab edge like `localdev.mcp.metabolomics.us`.
-  3. Certificate: run `deploy/control-plane/collab-sync.sh install --cert-name artifacts.metabolomics.us --cert-dir <dir>`, and set `control_plane.compose.HERDR_SHARE_CERT_DIR: <dir>`.
+  3. Certificate: expand the existing collab lineage to a SAN certificate covering `localdev.mcp.metabolomics.us` and `artifacts.metabolomics.us` (certbot `--expand`, the same `--cert-name`). The existing `HERDR_COLLAB_CERT_DIR` mount and renewal timer serve both hosts; no new compose key and no second timer.
   4. In Cognito app client `cognito_web_client`, set the callback URL `https://artifacts.metabolomics.us/s/callback` and the sign-out URL `https://artifacts.metabolomics.us/`. Remove the MCP host's `/s/callback` entry.
   5. In YAML, set `control_plane.share.public_url: https://artifacts.metabolomics.us`, plus optional `owner_emails` and `annotations` overrides.
   6. Rebuild the image (new `nh3` dependency and vendored pdf.js). Redeploy collab-edge, share-public and the control plane, then apply migration 0046.
