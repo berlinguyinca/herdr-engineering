@@ -97,7 +97,7 @@ def test_the_real_home_of_a_non_standard_user_is_redacted_too():
 def test_log_tail_keeps_the_last_40_lines_and_at_most_2048_chars():
     out = events.redact_log_tail("\n".join(f"line {n}" for n in range(500)), home="/h")
     assert out.splitlines()[-1] == "line 499" and len(out.splitlines()) <= 40
-    out = events.redact_log_tail("\n".join(("w" * 100 + f" {n}") for n in range(40)), home="/h")
+    out = events.redact_log_tail("\n".join((" ".join(["word"] * 25) + f" {n}") for n in range(40)), home="/h")
     assert len(out) <= 2048 and out.splitlines()[-1].endswith(" 39")
     assert events.redact_log_tail("", home="/h") == ""
 
@@ -557,3 +557,61 @@ def test_a_200_that_is_not_ok_is_parked_and_does_not_block_the_queue(tmp_path, l
         assert "not accepted" in (tmp_path / "outbox.rejected.jsonl").read_text()
     finally:
         httpd.shutdown()
+
+
+# --------------------------------------------------------------------------- review round 2
+
+from tests.control_plane.test_fleet_rollout import FINE_TEXT, RESIDUAL, RESIDUAL_IDS  # noqa: E402
+
+
+@pytest.mark.parametrize("text,needle", RESIDUAL, ids=RESIDUAL_IDS)
+def test_emitter_withholds_residual_shapes_line_by_line(text, needle):
+    out = events.redact_log_tail(f"before\n{text}\nafter", home="/home/me")
+    assert needle not in out and out.startswith("before") and out.endswith("after")
+    assert events.clean_pr_title(text) is None
+
+
+@pytest.mark.parametrize("text", FINE_TEXT)
+def test_emitter_keeps_ordinary_lines_and_titles(text):
+    assert events.redact_log_tail(f"ok\n{text}", home="/home/me") == f"ok\n{text}"
+    if len(text) <= 120:
+        assert events.clean_pr_title(text) == text
+
+
+def test_withheld_lines_are_marked():
+    assert "[line withheld]" in events.redact_log_tail("sig=Zm9vYmFyYmF6cXV4", home="/h")
+
+
+# --------------------------------------------------------------------------- source-stream counters are permanent
+
+def test_source_stream_counters_survive_the_idle_prune(tmp_path):
+    from datetime import UTC, datetime, timedelta
+    clock = {"now": datetime(2026, 11, 4, tzinfo=UTC)}
+    sent = []
+
+    class Recorder:
+        def request(self, route, body):
+            sent.append((body["entity_id"], body["payload"]["seq"]))
+            return {"ok": True, "entity": {"entity_id": body["entity_id"]}}
+
+    em = events.Emitter(tmp_path, client=Recorder(), clock=lambda: clock["now"])
+    em.source_event("autospec", "source.degraded", reason="timeout")
+    clock["now"] += timedelta(days=31)
+    em.emit(RID, "rollout.resumed")
+    em.source_event("autospec", "source.recovered")
+    sid = source_stream_id("autospec")
+    assert [seq for entity, seq in sent if entity == sid] == [0, 1]
+
+
+def test_losing_every_counter_after_a_full_delivery_still_cannot_collide(tmp_path, live):
+    repo, base = live
+    em = events.Emitter(tmp_path, client=MetadataClient(base))
+    em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS)
+    em.emit(RID, "rollout.planned", trigger=TRIGGER, targets=TARGETS)
+    assert em.pending() == []
+    for name in ("seq.json", "seq.json.bak"):
+        (tmp_path / name).unlink()
+    em.emit(RID, "rollout.started", targets=TARGETS)                 # a counter restart would be a 409 and a lost event
+    seqs = [e["payload"]["seq"] for e in repo.stream("fleet_rollout", RID)]
+    assert len(seqs) == 3 and seqs[:2] == [0, 1] and 2 <= seqs[2] < 2**31
+    assert em.pending() == [] and not (tmp_path / "outbox.rejected.jsonl").exists()

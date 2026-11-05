@@ -20,22 +20,25 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from ..ai_sync_feed import redact as redact_line
 from ..control_plane.fleet_rollout import (
     HOME_PATH,
     LOG_TAIL_CHARS,
     LOG_TAIL_LINES,
     PR_TITLE_CHARS,
+    WATCHED_REPOS,
     event_id,
     leaks,
     source_stream_id,
     unsafe_text,
     validate_fleet_rollout,
+    withheld_reason,
 )
 from . import state
 
 #: Sent in place of a whole line that carries a credential marker.
 REDACTED_LINE = "[redacted line]"
+#: Sent in place of a line that merely LOOKS like it carries a secret (default-deny).
+WITHHELD_LINE = "[line withheld]"
 #: HTTP statuses that mean "this event will never be accepted": parked, the queue moves on.
 PERMANENT_STATUSES = frozenset({400, 409, 413, 422})
 #: Optional payload fields whose value may legitimately be null; any other None is dropped before validation.
@@ -44,8 +47,8 @@ LINE_CHARS = 200
 MAX_PENDING = 2000
 MAX_REJECTED_BYTES = 1_000_000
 SEQ_RETENTION_DAYS = 30
+SOURCE_STREAM_IDS = frozenset(source_stream_id(repo) for repo in WATCHED_REPOS)
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-_BASE64ISH = re.compile(r"[A-Za-z0-9+/=]{32,}")
 
 
 def clean_pr_title(title: str | None) -> str | None:
@@ -63,11 +66,11 @@ def _redact_one(line: str, home: str) -> str:
     line = HOME_PATH.sub("~", line)
     if leaks(line):
         return REDACTED_LINE
-    line = _BASE64ISH.sub("[redacted]", redact_line(line, LINE_CHARS))
+    if withheld_reason(line):
+        return WITHHELD_LINE
+    line = " ".join("".join(c if c.isprintable() else " " for c in line).split())[:LINE_CHARS]
     # Belt and braces: nothing the control plane would refuse may leave this host.
-    if unsafe_text(line) or not line.isprintable():
-        return REDACTED_LINE
-    return line
+    return WITHHELD_LINE if unsafe_text(line) else line
 
 
 def redact_log_tail(text: str, home: str | os.PathLike | None = None) -> str:
@@ -101,6 +104,7 @@ class Emitter:
         self.rejected = self.directory / "outbox.rejected.jsonl"
         self.seq_file = self.directory / "seq.json"
         self.seq_backup = self.directory / "seq.json.bak"
+        self.seq_marker = self.directory / "seq.init"
         self.dropped_file = self.directory / "outbox.dropped"
 
     # -- storage -----------------------------------------------------------------------------------------
@@ -169,8 +173,21 @@ class Emitter:
     def _next_seq(self, rollout_id: str) -> int:
         """Never lower than any copy of the counter or any event still on disk, so a lost or corrupt seq.json
         cannot make a new event reuse the seq of one the server already holds."""
-        recorded = (self._read_seqs(p).get(rollout_id, {}).get("next", 0) for p in (self.seq_file, self.seq_backup))
-        return max(*recorded, self._scan_max_seq(rollout_id) + 1)
+        recorded = [self._read_seqs(p).get(rollout_id, {}).get("next", 0) for p in (self.seq_file, self.seq_backup)]
+        floor = max(*recorded, self._scan_max_seq(rollout_id) + 1)
+        if floor == 0 and self.seq_marker.exists() and not any(self._readable(p) for p in (self.seq_file, self.seq_backup)):
+            # Both counters are gone although this emitter has run before, and nothing on disk remembers the
+            # stream: start from the clock (seconds, so it stays below the validator's 2**31) rather than at 0,
+            # which could collide with seqs the server already holds.
+            floor = min(int(self.clock().timestamp()), 2**31 - 10_000)
+        return floor
+
+    @staticmethod
+    def _readable(path: Path) -> bool:
+        try:
+            return isinstance(json.loads(path.read_text()), dict)
+        except (OSError, ValueError):
+            return False
 
     def _reserve_seq(self, rollout_id: str, seq: int) -> None:
         """Persist `seq + 1` (both copies) BEFORE the event is appended; prune rollouts idle for 30 days."""
@@ -181,11 +198,14 @@ class Emitter:
                 if key not in merged or entry["next"] >= merged[key]["next"]:
                     merged[key] = entry
         horizon = (now - timedelta(days=SEQ_RETENTION_DAYS)).isoformat()
-        merged = {k: v for k, v in merged.items() if v["at"] >= horizon}
+        # `source.*` streams are one constant id per repo for ever: a pruned counter would restart at seq 0 and collide.
+        merged = {k: v for k, v in merged.items() if v["at"] >= horizon or k in SOURCE_STREAM_IDS}
         merged[rollout_id] = {"next": seq + 1, "at": now.isoformat()}
         text = json.dumps(merged, sort_keys=True)
         self._write_atomic(self.seq_file, text)
         self._write_atomic(self.seq_backup, text)
+        if not self.seq_marker.exists():
+            self._write_atomic(self.seq_marker, now.isoformat())
 
     def _raw_lines(self) -> list[str]:
         try:

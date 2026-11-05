@@ -8,6 +8,7 @@ model is derived in memory from the streams, like ``repo.list_ai_sync``; no SQL 
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import threading
 from datetime import UTC, datetime
@@ -29,23 +30,43 @@ COUNT_KEYS = ("dirty_paths", "unpublished_commits", "behind")
 
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _ID = re.compile(r"[0-9a-f]{16}")
-_HOST = re.compile(r"[a-z0-9-]{1,40}")
-_LINK = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_LINK = re.compile(r"[0-9a-f]{16,32}")
 _USERINFO = re.compile(r"://[^/@\s]+@")
-TOKENISH = re.compile(r"[A-Za-z0-9_\-]{24,}")
-_ASSIGNED_SECRET = re.compile(r"(?i)(?:token|password|passwd|pwd|secret|api[_-]?key)\w*\s*[=:]")
-_AUTH_HEADER = re.compile(r"(?i)authorization\s*[:=]")
-_COOKIE = re.compile(r"(?i)\b(?:set-)?cookie\s*[:=]")
-_SCHEME_VALUE = re.compile(r"(?i)\b(?:basic|bearer)\s+[A-Za-z0-9+/=._~-]{8,}")
+_ASSIGNED_SECRET = re.compile(r"(?i)(?:token|password|passwd|pwd|secret|api[_-]?key)\w*[ \t]*[=:]")
+_AUTH_HEADER = re.compile(r"(?i)authorization[ \t]*[:=]")
+_COOKIE = re.compile(r"(?i)\b(?:set-)?cookie[ \t]*[:=]")
+_SCHEME_VALUE = re.compile(r"(?i)\b(?:basic|bearer)[ \t]+[A-Za-z0-9+/=._~-]{8,}")
 _PRIVATE_KEY = re.compile(r"-----BEGIN|BEGIN [A-Z ]*PRIVATE KEY")
 _KNOWN_TOKEN = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}|\bsk-[A-Za-z0-9_-]{6,}|\bxox[abeprs]-|\beyJ[A-Za-z0-9_-]{6,}\."
-                          r"|\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{6,}")
+                          r"|\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{6,}|\bya29\.|\bSG\.[\w-]{10,}|\bglpat-[\w-]{10,}"
+                          r"|\bhf_[A-Za-z0-9]{10,}|\b[sr]k_(?:live|test)_|\bnpm_[A-Za-z0-9]{20,}"
+                          r"|hooks\.slack\.com/services/")
 _SSH_KEY_PATH = re.compile(r"\.ssh/|\bid_(?:rsa|dsa|ecdsa|ed25519)\b")
-_NETRC = re.compile(r"(?i)\bmachine\s+\S+\s+login\b|\blogin\s+\S+\s+password\b")
+_SECRET_FILE = re.compile(r"(?i)\.(?:netrc|npmrc|pgpass|git-credentials)\b|\.config/gh\b|\.docker/config|\.aws\b"
+                          r"|\.kube/config|\bhosts\.yml\b")
+_NETRC = re.compile(r"(?i)\bmachine[ \t]+\S+[ \t]+login\b|\blogin[ \t]+\S+[ \t]+password\b")
 HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s]+|/root\b")
 #: What the general ingest door writes over a credential-looking string; a value that still carries it was
 #: partly redacted upstream, so whatever else it holds cannot be trusted.
 DOOR_MARKER = "[REDACTED]"
+
+# Default-deny by shape (round 2): free text is refused when it LOOKS like it carries a secret, not only when it
+# matches a known secret format.
+_KEY_NAME_VALUE = re.compile(
+    r"(?i)[A-Za-z0-9_.-]*(?:pass|password|passwd|pwd|secret|token|key|auth|auths|creds?|credentials?|cookie|sig|signature)"
+    r"(?:_id)?[\"']?[ \t]*[=:][ \t]*[\"'\[{]?\S")
+_PGPASS = re.compile(r"(?m)^[^:\s]+:\d{1,5}:[^:\s]+:[^:\s]+:\S+$")
+_SECRET_FLAG = re.compile(r"(?i)(?<![\w-])--(?:pass(?:word|wd)?|pwd|token|secret|api-?key|access-?key|auth\w*)(?:=|[ \t]+)\S")
+_USER_PW_FLAG = re.compile(r"(?<![\w-])-u[ \t]*[^\s:]+:\S+")
+_CRED_COMMAND = re.compile(r"(?i)\b(?:mysql\w*|psql|docker|podman|login|sshpass|curl|wget|redis-cli|mongo\w*|htpasswd|ldap\w+"
+                           r"|smbclient|twine|mosquitto\w*)\b")
+_P_FLAG = re.compile(r"(?<![\w-])-p[ \t]*[^\s-]\S*")
+_QUERY_SECRET = re.compile(r"(?i)[?&](?:sig|signature|key|token|code|auth|apikey|api_key|access_token|password|pwd)=")
+_BASE64_PADDED = re.compile(r"[A-Za-z0-9+/]{12,}={1,2}(?![\w=])")
+_RUN = re.compile(r"[A-Za-z0-9+/_=.-]{20,}")
+_PROSE_RUN = re.compile(r"[a-z]{1,12}(?:-[a-z]{1,12})+")
+_PATH_RUN = re.compile(r"/{1,2}[A-Za-z0-9._-]{1,40}(?:/[A-Za-z0-9._-]{1,40})*/?")
+ENTROPY_BITS = 3.5
 
 #: event type -> (required fields, optional fields), beyond the common rollout_id / ts / seq.
 EVENT_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
@@ -121,8 +142,8 @@ def _sha(name: str, value, nullable=False):
 def _host(name: str, value, nullable=False):
     if value is None and nullable:
         return None
-    if not isinstance(value, str) or not _HOST.fullmatch(value):
-        raise _bad(f"{name} must match [a-z0-9-]{{1,40}}")
+    if value not in HOST_ORDER:
+        raise _bad(f"{name} must be one of {', '.join(HOST_ORDER)}")
     return value
 
 
@@ -143,19 +164,49 @@ def leaks(text: str) -> str | None:
                          (_COOKIE, "a cookie header"), (_ASSIGNED_SECRET, "a secret assignment"),
                          (_SCHEME_VALUE, "an authentication scheme and value"), (_PRIVATE_KEY, "private key material"),
                          (_KNOWN_TOKEN, "a known token format"), (_SSH_KEY_PATH, "an ssh key path"),
+                         (_SECRET_FILE, "a credential file path"),
                          (_NETRC, "netrc credentials")):
         if pattern.search(text):
             return why
     return None
 
 
+def _entropy(text: str) -> float:
+    return -sum(n / len(text) * math.log2(n / len(text)) for n in (text.count(c) for c in set(text)))
+
+
+def _suspicious_run(run: str) -> bool:
+    run = run.rstrip(".")
+    if len(run) < 20 or _PROSE_RUN.fullmatch(run) or _PATH_RUN.fullmatch(run):
+        return False
+    if re.fullmatch(r"[0-9a-fA-F]+", run) or len(run) >= 24:
+        return True
+    mixed = any(c.isupper() for c in run) and any(c.islower() for c in run) and any(c.isdigit() for c in run)
+    return mixed or _entropy(run) > ENTROPY_BITS
+
+
+def withheld_reason(text: str) -> str | None:
+    """Default-deny: why free text LOOKS like it carries a secret even though no known pattern matched."""
+    if _KEY_NAME_VALUE.search(text):
+        return "a key-like name with a value"
+    if _SECRET_FLAG.search(text) or _USER_PW_FLAG.search(text) or (_CRED_COMMAND.search(text) and _P_FLAG.search(text)):
+        return "a credential command-line flag"
+    if _QUERY_SECRET.search(text):
+        return "a secret URL query parameter"
+    if _PGPASS.search(text):
+        return "a pgpass-style entry"
+    if _BASE64_PADDED.search(text) or any(_suspicious_run(r) for r in _RUN.findall(text)):
+        return "a token-like string"
+    return None
+
+
 def unsafe_text(text: str) -> str | None:
-    """`leaks` plus a token-like run, a home-directory path or the ingest door's redaction marker."""
+    """`leaks` plus the default-deny shapes, a home-directory path and the ingest door's redaction marker."""
     reason = leaks(text)
     if reason is None and DOOR_MARKER in text:
         reason = "a value already redacted upstream"
-    if reason is None and TOKENISH.search(text):
-        reason = "a token-like string"
+    if reason is None:
+        reason = withheld_reason(text)
     if reason is None and HOME_PATH.search(text):
         reason = "a home-directory path"
     return reason
@@ -271,7 +322,7 @@ def validate_fleet_rollout(entity_id, event_type, payload) -> dict:
             _keys("links", value, set(), {"pi_session_rollout"})
             link = value.get("pi_session_rollout")
             if link is not None and (not isinstance(link, str) or not _LINK.fullmatch(link)):
-                raise _bad("links.pi_session_rollout must match [A-Za-z0-9_.:-]{1,64}")
+                raise _bad("links.pi_session_rollout must be a rollout id (16 to 32 lowercase hex characters)")
             clean[key] = dict(value)
         elif key == "halted_at_host":
             clean[key] = _host(key, value, nullable=True)

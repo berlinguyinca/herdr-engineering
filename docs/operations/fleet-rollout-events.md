@@ -16,7 +16,8 @@ Strict by construction (the validator is the last line of defence against a bugg
 
 - closed enums: `status` (`pending precheck applying checking ok blocked failed unreachable skipped rolled_back`),
   `reason` (spec 8.1), `repo` (`autospec pi-engineering herdr-engineering ai-sync claude-config`);
-- `host` is `[a-z0-9-]{1,40}`; SHAs are 40 lowercase hex; `checks` <= 32 x (`name` <= 40, `ok`); `counts` only
+- `host` and `halted_at_host` are the closed fleet enum `beast|bender|macbook-pro` (a new member needs a code change);
+  `links.pi_session_rollout` is a 16 to 32 character lowercase-hex rollout id; SHAs are 40 lowercase hex; `checks` <= 32 x (`name` <= 40, `ok`); `counts` only
   `dirty_paths|unpublished_commits|behind`; `log_tail` <= 2048 chars and <= 40 lines; `pr_title` <= 120 chars;
 - **no secrets**: `log_tail`, `pr_title` and every `checks[].name` go through the same `unsafe_text` check and are
   **rejected** (never truncated or repaired) when they contain credentials in a URL, an `Authorization:` or `Cookie:`
@@ -26,7 +27,14 @@ Strict by construction (the validator is the last line of defence against a bugg
   character, a `/home/<user>`, `/Users/<user>` or `/root` path, or the literal `[REDACTED]`. The general ingest door
   runs first and overwrites credential-looking strings (sometimes only the header name) with `[REDACTED]`; the validator
   treats that marker as a rejection, so a half-redacted value is a `400`, never stored. A PR title that trips the check
-  is dropped by the emitter (so a long hyphenated or token-like title is dropped too).
+  is dropped by the emitter.
+- **default-deny by shape** (not only known formats): free text is also refused when it has a key-like name followed by a
+  value (`pass|pwd|secret|token|key|auth|cred|cookie|sig` then `=`/`:`/JSON colon), a credential CLI flag (`--password x`,
+  `-u user:pw`, `-pX` next to mysql/docker/curl/login...), a secret URL query parameter (`sig|key|token|code|auth`), a
+  pgpass line, a padded base64 value, a credential file (`hosts.yml`, `.netrc`...), or a run of 20+ characters that is hex,
+  mixed upper/lower/digit or high-entropy (24+ characters always, unless it is a path or lowercase hyphenated prose such as
+  `make-the-ingest-door-redact-secrets-consistently`). Cost: a log line with a long file name such as a wheel name is
+  withheld; the emitter replaces such a line with `[line withheld]`. 40-hex commit SHAs are accepted only in the sha fields.
 - `source.*` events are not tied to one rollout; they use `control_plane.fleet_rollout.source_stream_id(repo)` as stream id.
 
 Idempotent: the envelope identity is `<rollout_id>:<seq>` (`event_id()`). The same `seq` with identical content is a
@@ -63,7 +71,9 @@ they cannot block the rest. `flush` holds its file lock only to read and to trim
 
 `seq` is never reused: the next value is the maximum of `seq.json`, its backup `seq.json.bak`, and every seq still in
 the outbox or the parked files, and it is persisted **before** the event is appended (a crash burns a number, a gap is
-harmless). Only if both counter files are gone and every event was already delivered and trimmed can a counter restart.
+harmless). If both counter files are gone while every event was already delivered and trimmed, the next seq starts from the clock
+(seconds since the epoch, kept below 2^31) instead of 0, so it cannot collide with what the server holds. `source.*`
+counters are never pruned.
 
 Bounded growth: at most 2000 unflushed events (older ones are parked as `outbox full` and counted in `outbox.dropped`,
 shown by `outbox status` as `dropped`); `outbox.rejected.jsonl` rotates to `.1` above 1 MB (one generation kept);

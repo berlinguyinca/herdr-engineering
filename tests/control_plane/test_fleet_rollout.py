@@ -438,3 +438,93 @@ def test_nothing_credential_shaped_is_readable_back_through_http(server, text, n
         body = json.dumps(get(path)[1])
         assert needle not in body
     assert needle not in json.dumps(repo.stream("fleet_rollout", RID))
+
+
+# --------------------------------------------------------------------------- review round 2: default-deny, hosts, links
+
+RESIDUAL = [
+    ("sig=Zm9vYmFyYmF6cXV4", "Zm9vYmFy"),
+    ("https://x.blob/y?sv=2022-11-02&ss=b&sig=abcDEF123%2Bxyz", "abcDEF123"),
+    ('"auth": "dXNlcjpwYXNzd29yZA=="', "dXNlcjpwYXNzd29yZA"),
+    ('{"auths":{"ghcr.io":{"auth":"dXNlcjpwYXNz"}}}', "dXNlcjpwYXNz"),
+    ("docker login -u u -p hunter2 ghcr.io", "hunter2"),
+    ("--password hunter2", "hunter2"),
+    ("-p hunter2 login", "hunter2"),
+    ("mysql -uroot -phunter2", "hunter2"),
+    ("curl -u admin:hunter2 http://x", "hunter2"),
+    ("DB_PASS=hunter2", "hunter2"),
+    ("localhost:5432:db:user:s3cretpw", "s3cretpw"),
+    ('{"password":"x"}', '"password"'),
+    ("ya29.a0AfH6SMBx1234567890", "ya29"),
+    ("SG.abcdefghijklmnop.qrstuvwxyz012345", "abcdefghijklmnop"),
+    ("https://hooks.slack.com/services/T0/B0/xxx", "hooks.slack"),
+    ("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalrXUtnFEMI"),
+    ("c2VjcmV0cGFzcw==", "c2VjcmV0"),
+    ("deadbeefdeadbeefdead", "deadbeefdead"),
+    ("private_key_id: abc", "private_key_id"),
+    ("~/.config/gh/hosts.yml", "hosts.yml"),
+    ("9e7f0435" * 5, "9e7f0435"),                       # a full 40-hex SHA is only allowed in sha fields
+    ("glpat-abcdefghij1234567890", "glpat"),
+    ("hf_abcdefghijklmnopqrstuvwxyz", "hf_abc"),
+    ("sk_live_abcdefghijklmnop", "sk_live"),
+]
+RESIDUAL_IDS = [t[:24] for t, _ in RESIDUAL]
+FINE_TEXT = [
+    "feat(fleet): merge-triggered fleet rollout watcher core (#628)",
+    "updated autospec e535daa1 -> 9e7f0435",
+    "health ok after 12s",
+    "make-the-ingest-door-redact-secrets-consistently-for-all-streams",
+    "installed into /var/lib/herdr-engineering/pi/releases/current",
+    "12 tests passed: all good",
+]
+
+
+@pytest.mark.parametrize("text,_n", RESIDUAL, ids=RESIDUAL_IDS)
+def test_residual_secret_shapes_are_rejected_in_every_free_text_field(text, _n):
+    with pytest.raises(ValueError, match="log_tail"):
+        validate_fleet_rollout(RID, "host.finished", host_finished(log_tail=f"ok\n{text}\nok"))
+    with pytest.raises(ValueError, match="pr_title"):
+        validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, "pr_title": text}))
+    with pytest.raises(ValueError, match="check name"):
+        validate_fleet_rollout(RID, "host.finished", host_finished(checks=[{"name": text, "ok": True}]))
+
+
+@pytest.mark.parametrize("text", FINE_TEXT)
+def test_ordinary_titles_and_log_lines_are_accepted(text):
+    validate_fleet_rollout(RID, "host.finished", host_finished(log_tail=f"ok\n{text}"))
+    if len(text) <= 120:
+        validate_fleet_rollout(RID, "rollout.observed", observed(trigger={**TRIGGER, "pr_title": text}))
+    if len(text) <= 40:
+        validate_fleet_rollout(RID, "host.finished", host_finished(checks=[{"name": text, "ok": True}]))
+
+
+@pytest.mark.parametrize("text,needle", RESIDUAL, ids=RESIDUAL_IDS)
+def test_residual_shapes_are_never_readable_back_through_http(server, text, needle):
+    post, get, repo, _ = server
+    assert post(envelope("rollout.observed", observed()))[0] == 200
+    assert post(envelope("host.finished", host_finished(log_tail=text)))[0] == 400
+    assert post(envelope("host.finished", host_finished(1, checks=[{"name": text[:40], "ok": True}]) if False else
+                         host_finished(log_tail=f"line one\n{text}")))[0] == 400
+    assert post(envelope("rollout.observed", observed(1, trigger={**TRIGGER, "pr_title": text})))[0] == 400
+    for path in ("/api/v1/fleet-rollouts", f"/api/v1/fleet-rollouts/{RID}", "/api/v1/fleet-rollouts/versions"):
+        assert needle not in json.dumps(get(path)[1])
+    assert needle not in json.dumps(repo.stream("fleet_rollout", RID))
+
+
+@pytest.mark.parametrize("host", ["glpat-abcdefghij1234567890", "hf_abcdefghij", "sk_live_abcdef", "deadbeefdeadbeef",
+                                  "evilhost", "beast2"])
+def test_hosts_are_a_closed_enum_of_the_fleet(host):
+    with pytest.raises(ValueError, match="host"):
+        validate_fleet_rollout(RID, "host.finished", host_finished(host=host))
+    with pytest.raises(ValueError, match="halted_at_host"):
+        validate_fleet_rollout(RID, "rollout.halted", ev(halted_at_host=host, reason="health_failed"))
+
+
+@pytest.mark.parametrize("link", ["glpat-abcdefghij1234567890", "hf_abcdefghij", "sk_live_abcdef", "ghp_" + "a" * 36,
+                                  "deadbeefdead", "x" * 33, "AKIAIOSFODNN7EXAMPLE", "../../etc/passwd"])
+def test_links_must_be_a_rollout_id_not_free_text(link):
+    with pytest.raises(ValueError, match="pi_session_rollout"):
+        validate_fleet_rollout(RID, "host.finished", host_finished(links={"pi_session_rollout": link}))
+    ok = validate_fleet_rollout(RID, "host.finished", host_finished(links={"pi_session_rollout": "a1" * 16}))
+    assert ok["links"] == {"pi_session_rollout": "a1" * 16}
+    validate_fleet_rollout(RID, "host.finished", host_finished(links={"pi_session_rollout": None}))
