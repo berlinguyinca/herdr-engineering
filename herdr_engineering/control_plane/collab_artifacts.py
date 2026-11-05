@@ -81,7 +81,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import collab_waiters
+from . import annotation_intents, artifact_member_intents, collab_waiters  # noqa: F401 - registers the member kinds
 from .collab import CollabError, Principal
 from .collab_bridge_files import (
     AUDITED_MARKER,
@@ -118,10 +118,11 @@ from .collab_bridge_files import (
     validate_chunk,
     validate_intent,
 )
-from .collab_mirror import ARTIFACTS_DIR, BLOBS_DIR, GRANTS_NAME, HEAD_NAME
+from .collab_mirror import ANNOTATIONS_NAME, ARTIFACTS_DIR, BLOBS_DIR, GRANTS_NAME, HEAD_NAME
 
 log = logging.getLogger(__name__)
 
+MEMBER_DIRECTORY_FEED = "member-directory.json"   # artifact_member_intents.MEMBER_DIRECTORY (worker side)
 AGENTS_FEED = "agents.json"                 # the worker reads it as collab_intents.AGENTS_FEED
 UNAVAILABLE = "collaboration bridge unavailable"
 NOT_FOUND = "not found"
@@ -142,7 +143,8 @@ _VERSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")
 _SHA = re.compile(SHA_RE)
 _GRANT_PERMISSIONS = frozenset({"read", "write"})
 _TOOL_ACTIONS = {"artifacts_list": "artifact.list", "artifact_head": "artifact.head",
-                 "artifact_read": "artifact.read", "artifact_history": "artifact.history"}
+                 "artifact_read": "artifact.read", "artifact_history": "artifact.history",
+                 "artifact_annotations": "artifact.annotations"}
 
 READ_ONLY = "read-only grant"
 NOT_WRITABLE = "artifact is not writable through collaboration"
@@ -763,6 +765,12 @@ class CollabArtifactBridge:
                 self._tickets.popitem(last=False)
                 self.stats["tickets_evicted"] += 1
 
+    def release_owner_usage(self, owner_key: str) -> None:
+        """Forget the cached staging usage of ``owner_key`` (after its upload dir was removed), so the freed
+        reservation counts at once instead of after the cache ages out."""
+        with self._staging_lock:
+            self._owner_usage.pop(owner_key, None)
+
     def append_intent(self, actor: Actor, kind: str, payload: dict, *, artifact_id: str | None,
                       idempotency_key: str | None, ticket: str | None = None) -> str:
         """Write one intent for ``actor`` and return its ticket. The CALLER authorizes (``commit`` does for agents).
@@ -922,6 +930,64 @@ class CollabArtifactBridge:
             seen[upload_id] = meta.size_bytes
         return sum(seen.values())
 
+    # -- annotations -------------------------------------------------------------------------------------------
+    _ANNOTATION_KEYS = ("annotation_id", "version_id", "version_number", "file", "anchor", "body", "author_role",
+                        "created_at", "edited_at")
+    _ANCHOR_KEYS = ("kind", "file", "exact", "prefix", "suffix", "page", "region", "x", "y", "w", "h")
+    ANNOTATIONS_MAX_BYTES = 2 * 1024 * 1024
+    _RESOLVE_KEYS = frozenset({"artifact_id", "version_id", "annotation_ids", "idempotency_key"})
+
+    @classmethod
+    def _annotation_view(cls, row) -> dict | None:
+        """One mirrored annotation projected to the allowed keys; whatever else the file carries (an author's email
+        or identity included) is dropped.  The text is people's feedback: untrusted data, never instructions."""
+        if not isinstance(row, dict):
+            return None
+        out = {k: row[k] for k in cls._ANNOTATION_KEYS if isinstance(row.get(k), (str, int, float, dict, type(None)))
+               and not isinstance(row.get(k), bool)}
+        if isinstance(out.get("anchor"), dict):
+            anchor = {k: v for k, v in out["anchor"].items() if k in cls._ANCHOR_KEYS
+                      and isinstance(v, (str, int, float, dict)) and not isinstance(v, bool)}
+            if isinstance(anchor.get("region"), dict):
+                anchor["region"] = {k: v for k, v in anchor["region"].items() if k in ("x", "y", "w", "h")
+                                    and isinstance(v, (int, float)) and not isinstance(v, bool)}
+            out["anchor"] = anchor
+        return out
+
+    def annotations(self, pr: Principal, artifact_id, *, limit: int = 200) -> dict:
+        """The ``artifact_annotations`` tool: the open annotations the worker mirrored for a granted artifact."""
+        _permission, _doc = self._open(pr, "annotations", artifact_id)
+        if not _int(limit) or not 1 <= limit <= MAX_HISTORY:
+            raise CollabError(400, f"limit must be an integer from 1 to {MAX_HISTORY}")
+        doc = read_json_cached(self.mirror, [ARTIFACTS_DIR, artifact_id, ANNOTATIONS_NAME],
+                               max_bytes=self.ANNOTATIONS_MAX_BYTES)
+        rows = doc.get("annotations") if isinstance(doc, dict) else None
+        if not isinstance(rows, list):
+            self._used(pr, artifact_id, "artifact_annotations")
+            return {"annotations": [], "note": "no annotations mirrored"}
+        views = [v for v in (self._annotation_view(r) for r in rows[:limit]) if v is not None]
+        out = {"artifact_id": artifact_id, "annotations": views,
+               "truncated": doc.get("truncated") is True or len(rows) > limit}
+        self._used(pr, artifact_id, "artifact_annotations")
+        return out
+
+    def resolve_annotations(self, pr: Principal, args) -> dict:
+        """The ``artifact_annotation_resolve`` tool: ``{ticket, status: "pending"}``; the worker decides later."""
+        if not isinstance(args, dict) or set(args) != self._RESOLVE_KEYS:
+            raise CollabError(400, "annotation resolve arguments are missing or unknown")
+        artifact_id = args["artifact_id"]
+        permission, _doc, _limits = self._open_with_limits(pr, "annotation_resolve", artifact_id)
+        if permission != "write":      # per artifact: a write grant on another artifact authorises nothing here
+            raise self._refuse(pr, "annotation_resolve", artifact_id, "read_only", 403, READ_ONLY)
+        svc = self.service
+        with svc._lock:
+            svc._throttle("artresolve:" + pr.id, 30, 60.0, "annotation resolve")
+        ticket = self.append_intent(
+            Actor("agent", pr.id), annotation_intents.KIND,
+            {"version_id": args["version_id"], "annotation_ids": args["annotation_ids"]},
+            artifact_id=artifact_id, idempotency_key=args["idempotency_key"])
+        return {"ticket": ticket, "status": "pending"}
+
     def result(self, pr: Principal, ticket: str, *, wait: float) -> dict:
         """The ``artifact_commit_result`` tool: ``read_result`` for the calling agent's own tickets."""
         if not isinstance(pr, Principal) or not pr.is_agent:
@@ -1002,6 +1068,7 @@ class CollabArtifactBridge:
                 agents[agent_id] = {
                     "owner": a["owner"], "status": "active" if svc._ok(a["owner"]) else "disabled",
                     "expires_at": a.get("expires_at"), "external": bool(x),
+                    "groups": svc._groups_of(a["owner"]), "harness_type": a.get("harness_type"),
                     "join_id": join_ids.get(a.get("join")) if a.get("join") else None,
                     "hard_expiry": x.get("hard_expiry") if isinstance(x, dict) else None}
         return {"generated_at": self.clock(), "agents": agents}
@@ -1011,6 +1078,13 @@ class CollabArtifactBridge:
         try:
             with self._feed_lock:
                 body = self._feed()
+                directory = self.service.member_directory()
+                # Directory first (private, 0600: it carries e-mail addresses), then the agents feed. Two files cannot
+                # be swapped together; both carry the same generated_at/updated, and a reader pairing the new agents
+                # feed with the previous directory only lags one pass (the worker fails closed on a stale one).
+                if directory is not None:
+                    atomic_write_json(self.outbox, MEMBER_DIRECTORY_FEED,
+                                      {**directory, "updated": body["generated_at"]}, mode=0o600)
                 atomic_write_json(self.outbox, AGENTS_FEED, body)
                 self._feed_at = body["generated_at"]
             self.stats["feed_writes"] += 1

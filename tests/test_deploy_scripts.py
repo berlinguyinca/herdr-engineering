@@ -772,7 +772,7 @@ exit 0
         (bindir / name).write_text(f"#!/usr/bin/env bash\necho {name} \"$*\" >> {env['tmp']}/ssh.log\nexit 0\n")
         (bindir / name).chmod(0o755)
     env["env"]["HERDR_FLEET_HOSTS"] = str(hosts)
-    r = run(AGENTS, env, "--no-fetch", "--ref", "HEAD")
+    r = run(AGENTS, env, "--no-fetch", "--ref", env["ref"])
     assert "herdr-eng fleet join alpha" in r.stdout + r.stderr
     calls = (env["tmp"] / "ssh.log").read_text()
     assert "test -s" in calls and "host.json" in calls
@@ -1578,7 +1578,9 @@ def test_collab_lock_is_released_when_the_deploy_is_terminated(env):
     import time
     _with_collab(env)
     _seed_previous(env, _layout_commit())
-    env["env"].update(STUB_READY_AFTER="100000", HERDR_CP_HEALTH_TRIES="100000",
+    # Keep only the candidate unready: SIGTERM now performs protected rollback,
+    # whose previous release must be allowed to become healthy before locks drop.
+    env["env"].update(STUB_UNHEALTHY_TAGS=env["ref"][:12], HERDR_CP_HEALTH_TRIES="100000",
                       HERDR_CP_HEALTH_INTERVAL="0.05")
     p = subprocess.Popen(["bash", str(DEPLOY), "--no-fetch", "--ref", env["ref"],
                           "--fleet-config", str(env["central"])], env=env["env"], cwd=ROOT,
@@ -1590,7 +1592,8 @@ def test_collab_lock_is_released_when_the_deploy_is_terminated(env):
             time.sleep(0.05)
         assert not _lock_is_free(env, wait=0)                   # held mid-deploy
         p.send_signal(signal.SIGTERM)
-        p.communicate(timeout=30)
+        _, err = p.communicate(timeout=90)
+        assert "and healthy" in err
     finally:
         if p.poll() is None:
             p.kill()
@@ -1780,7 +1783,7 @@ def test_second_concurrent_deploy_fails_cleanly_while_the_first_runs(env):
             time.sleep(0.05)
         before = env["log"].read_text()
         second = deploy(env, "--deploy-lock-wait", "1")
-        assert second.returncode == 1 and "another deploy.sh is still running" in second.stderr
+        assert second.returncode == 75 and "deployment busy" in second.stderr
         assert "docker build" not in env["log"].read_text()[len(before):]
     finally:
         first.kill()
@@ -1802,7 +1805,7 @@ def test_web_absent_at_capture_aborts_preparation(env):
 
 
 def test_candidate_without_lock_held_support_warns_and_leaves_refresh_to_the_timer(env):
-    added = _git("log", "--format=%H", "-S", "--lock-held", "--",
+    added = _git("log", env["ref"], "--format=%H", "-S", "--lock-held", "--",
                  "deploy/control-plane/collab-sync.sh").splitlines()[-1]
     old = _git("rev-parse", f"{added}^")
     _with_collab(env)

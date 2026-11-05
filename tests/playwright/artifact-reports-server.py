@@ -20,8 +20,46 @@ from herdr_engineering.control_plane.artifact_renderers import RendererRegistry 
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
 
 
+def tiny_pdf(text, height=200):
+    """A valid one-page PDF that draws ``text`` in black Helvetica (real xref offsets)."""
+    stream = f"BT /F1 36 Tf 40 100 Td ({text}) Tj ET".encode()
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+               (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 %d] /Contents 4 0 R "
+                b"/Resources << /Font << /F1 5 0 R >> >> >>") % height,
+               b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    return bytes(out)
+
+
 class ReportFixture:
     def __init__(self):
+        # Plain (non-report) artifacts for the preview tests; bytes live in the same content-addressed store.
+        self.plain = {}
+        for artifact_id, name, mime, data in (
+            ("html_1", "page.html", "text/html", b"<h1>Plain page heading</h1><script>window.__x=1</script>"
+             b"<a href=\"#/settings\">settings</a><p>Body text</p>"),
+            ("pdf_1", "doc.pdf", "application/pdf", tiny_pdf("Hello PDF")),
+            ("pdf_tall", "tall.pdf", "application/pdf", tiny_pdf("Tall", height=14400)),
+            ("host_1", "host.html", "text/html",
+             b"<style>:host{position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;"
+             b"z-index:2147483647!important;display:block!important;background:red!important}"
+             b"#cover{position:fixed;inset:0;z-index:2147483647;background:blue}</style>"
+             b"<div id=cover>cover</div><p>Hostile host page</p>"),
+        ):
+            digest = hashlib.sha256(data).hexdigest()
+            key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+            self.plain[artifact_id] = ({"artifact_id": artifact_id, "artifact_type": "other", "original_filename": name,
+                "mime_type": mime, "current_version_id": f"{artifact_id}_v1", "status": "available",
+                "storage_key": key, "sha256": digest, "size_bytes": len(data)}, key, data)
         self.data = b"measurement,value\n" + b"sample,1\n" * 250_000
         self.digest = hashlib.sha256(self.data).hexdigest()
         self.key = f"sha256/{self.digest[:2]}/{self.digest[2:4]}/{self.digest}"
@@ -57,6 +95,7 @@ class ReportFixture:
             }
         self.outputs = {version: [] for version in self.descriptors}
         self.blobs = {self.key: self.data}
+        self.blobs.update({key: data for _record, key, data in self.plain.values()})
         legacy_versions = ("version_1", "version_2") if os.environ.get("REPORT_ALL_LEGACY") else (
             ("version_1",) if os.environ.get("REPORT_MIXED_HISTORY") else ())
         for version in legacy_versions:
@@ -74,6 +113,8 @@ class ReportFixture:
         return asyncio.run(getattr(self, method)(*args, **kwargs))
 
     async def get_record(self, artifact_id, **_kwargs):
+        if artifact_id in self.plain:
+            return dict(self.plain[artifact_id][0])
         if artifact_id != "report_1":
             return None
         return {"artifact_id": artifact_id, "artifact_type": "other" if os.environ.get("ARTIFACT_REPORT_LEGACY_TYPE") else "report", "original_filename": "Investigation report",
@@ -90,9 +131,13 @@ class ReportFixture:
                 "output_manifest": copy.deepcopy(self.outputs[version_id]), "validation": {"status": "passed"}}
 
     async def list_versions(self, artifact_id):
+        if artifact_id != "report_1":
+            return []
         return [await self.get_version(version, artifact_id) for version in ("version_2", "version_1")]
 
     async def list_version_summaries(self, artifact_id):
+        if artifact_id != "report_1":
+            return []
         return [{**{key: value for key, value in row.items() if key in
                  {"version_id", "artifact_id", "version_number", "state"}}, "is_report": bool(row["report_descriptor"])}
                 for row in await self.list_versions(artifact_id)]
@@ -102,7 +147,7 @@ class ReportFixture:
         return version["report_descriptor"] if version else None
 
     async def report_permission(self, artifact_id, principal_id, permission):
-        return artifact_id == "report_1"
+        return artifact_id == "report_1" or artifact_id in self.plain
 
     async def get_report(self, artifact_id, version_id):
         if not await self.get_version(version_id, artifact_id):
@@ -155,6 +200,11 @@ class ReportFixture:
         if not await self.get_version(version_id, artifact_id) or asset_id != "observations":
             return None
         return {**self.descriptors[version_id]["assets"][0], "storage_key": self.key}
+
+    def get(self, key, digest):
+        data = self.blobs[key]
+        assert hashlib.sha256(data).hexdigest() == digest
+        return data
 
     def head(self, key):
         return key in self.blobs

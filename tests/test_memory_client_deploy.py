@@ -182,3 +182,53 @@ memory_client_build
 ''', STUB_CLIENT_MODE='install', STUB_CLIENT_PREPARE_FAIL='1')
     assert result.returncode != 0
     assert [e['action'] for e in events(harness)] == ['policy-info', 'prepare']
+
+
+@pytest.mark.parametrize('interrupted', [False, True], ids=['failed-forward', 'signal-exit'])
+def test_coordinator_rollback_restores_previous_profile_before_verification(harness, interrupted):
+    """Exercise the coordinator's real rollback/EXIT functions with isolated host callbacks."""
+    source = (ROOT / 'deploy/control-plane/deploy.sh').read_text()
+    rollback = source[source.index('rollback() {'):].split('\n}\n', 1)[0] + '\n}\n'
+    finish = source[source.index('finish() {'):].split('\n}\n', 1)[0] + '\n}\n'
+    previous = harness['root'] / 'env/rollback-worktree/herdr_engineering'
+    previous.mkdir(parents=True)
+    (previous / 'memory_client_profile.py').write_text('# previous runtime capability')
+    (previous / '__init__.py').write_text('')
+    (previous / 'cli.py').write_text('# isolated previous render callback')
+    state = harness['root'] / 'state-helper.py'
+    state.write_text('# isolated state receipt callback')
+    current = harness['root'] / 'state/memory-client/profile.tar'
+    current.parent.mkdir(parents=True, mode=0o700)
+    current.write_bytes(b'OLD-PRIVATE-PROFILE')
+    current.chmod(0o600)
+    body = f'''
+memory_client_preflight
+memory_client_snapshot
+PREV_COMMIT=old; PREV_SHA=old; PREV_TAG=old; PREVIOUS_IMAGE=old
+SHA=new; REPO="$WORK"; STATE_HELPER="{state}"; COLLAB=0
+APP_SERVICES=(control-plane-web); EDGE_SERVICE=(); SHARE_SERVICE=()
+HOST_MUTATED=1; DEPLOY_FINISHED=0
+DEPLOY_LOCK_PHASES=()
+deploy_lock_phase() {{ DEPLOY_LOCK_PHASES+=("$1"); }}
+restore_host_state() {{ return 0; }}
+git() {{ return 0; }}
+compose_up() {{ return 0; }}
+rollback_share() {{ return 0; }}
+verify() {{ printf '%s\\n' '{{"action":"verify-rollback","args":[]}}' >> "{harness['log']}"; }}
+cleanup() {{ return 0; }}
+{rollback}
+{finish}
+'''
+    if interrupted:
+        body += 'trap finish EXIT\ntrap \'exit 143\' TERM\nkill -TERM $$\n'
+    else:
+        body += 'status=0; rollback || status=$?; exit "$status"\n'
+    result = run(harness, body, STUB_CLIENT_MODE='install')
+    assert result.returncode == (143 if interrupted else 1), result.stderr
+    calls = events(harness)
+    installs = [e for e in calls if e['action'] == 'install']
+    assert len(installs) == 1
+    archive = Path(installs[0]['args'][installs[0]['args'].index('--archive') + 1])
+    assert archive.read_bytes() == b'OLD-PRIVATE-PROFILE'
+    assert calls.index(installs[0]) < next(i for i, e in enumerate(calls)
+                                         if e['action'] == 'verify-rollback')

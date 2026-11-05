@@ -16,6 +16,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import secrets
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -23,8 +24,11 @@ import asyncpg
 import pytest
 
 from herdr_engineering.control_plane import collab_mcp
+from herdr_engineering.control_plane.annotation_intents import register_annotation_resolve
+from herdr_engineering.control_plane.artifact_annotations import AnnotationStore
 from herdr_engineering.control_plane.artifact_collab_store import CollabGrantStore
 from herdr_engineering.control_plane.artifact_scope import ArtifactGraphGate
+from herdr_engineering.control_plane.artifact_shares import ShareStore, new_token
 from herdr_engineering.control_plane.artifacts import ArtifactStore
 from herdr_engineering.control_plane.collab import CollabError
 from herdr_engineering.control_plane.collab_artifacts import CollabArtifactBridge
@@ -35,6 +39,7 @@ from herdr_engineering.control_plane.collab_bridge_files import (
 )
 from herdr_engineering.control_plane.collab_intents import CollabIntentApplier
 from herdr_engineering.control_plane.collab_mirror import CollabMirror
+from herdr_engineering.control_plane.share_bundle import BundleFile, BundleIndex
 from tests.control_plane.registry_pg import FakeBlobs, registry_pg  # noqa: F401 - imported fixture
 from tests.control_plane.test_collab_tasks import W, svc  # noqa: F401 - imported fixture
 
@@ -72,6 +77,7 @@ class Rig:
             self.outbox, self.mirror, rustfs=self.blobs, limits=self.limits, spool_dir=tmp_path / "spool",
             lineage=lambda version: self.lineage.append(version) or {}, clock=self.clock, gate=self.gate)
         self.applier.register_commit()
+        register_annotation_resolve(self.applier)
         self.bridge = CollabArtifactBridge(svc, self.mirror_root, self.outbox, clock=self.clock, feed_interval=3600.0)
         svc.artifact_bridge = self.bridge
         self.aid = ""
@@ -278,6 +284,56 @@ def test_artifact_collaboration_end_to_end(registry_pg, svc, tmp_path):
         rig = Rig(svc, tmp_path, pool)
         try:
             await asyncio.wait_for(scenario(rig, pool), 120)
+        finally:
+            await rig.applier.aclose(timeout=10)
+            rig.bridge.stop()
+            rig.mirror.close()
+            await asyncio.wait_for(pool.close(), 10)
+    asyncio.run(go())
+
+
+async def annotation_scenario(rig: Rig, pool, tmp_path) -> None:
+    from tests.control_plane.test_annotation_worker import housekeeper
+    from tests.control_plane.test_artifact_annotations_store import KW, create
+    v1 = await rig.owner_commit(None, BASE_DOC)
+    await rig.grant("write")
+    await rig.heartbeat()
+    async with pool.acquire() as conn:
+        shares = ShareStore(conn)
+        share = await shares.create(artifact_id=rig.aid, version_id=v1, audience="lab", created_by="owner",
+                                    allow_emails=["a@x.org"])
+        await shares.mark_live(share["share_id"], token_hash=new_token()[1],
+                               index=BundleIndex("doc.md", [BundleFile("doc.md", "a" * 64, 1, "text/markdown")], 1, []),
+                               approved_by="op")
+        ident = "ann_" + secrets.token_hex(11)
+        rec = create(share["share_id"], 1, annotation_id=ident, author_email="Person@X.org",
+                     anchor={"kind": "text_quote", "file": "doc.md", "exact": "line 3"}, body="reword line 3")
+        assert await AnnotationStore(conn).ingest(conn, rec, "e2e" + ident, **KW) == "inserted"
+        hk = housekeeper(tmp_path / "hk", mirror=rig.mirror)
+        await hk.tick(conn)                                     # the worker publishes through the shared mirror
+    listed = rig.ok("artifact_annotations", artifact_id=rig.aid)
+    assert [(a["annotation_id"], a["body"]) for a in listed["annotations"]] == [(ident, "reword line 3")]
+    assert "x.org" not in json.dumps(listed).lower()
+    ticket = rig.commit(v1, [{"name": "doc.md", "op": "put", "text": edit(BASE_DOC, 3, "reworded")}])
+    await rig.cycle()
+    mine = rig.result(ticket)["version_id"]
+    await rig.heartbeat(advance=61)
+    pending = rig.bridge.resolve_annotations(rig.agent, {"artifact_id": rig.aid, "version_id": mine,
+                                                         "annotation_ids": [ident], "idempotency_key": "e2e-1"})
+    await rig.cycle()
+    done = rig.result(pending["ticket"])
+    assert done["result"] == "resolved" and done["resolved"] == [ident] and done["skipped"] == []
+    async with pool.acquire() as conn:
+        await hk.tick(conn)
+    assert rig.ok("artifact_annotations", artifact_id=rig.aid)["annotations"] == []
+
+
+def test_annotations_end_to_end(registry_pg, svc, tmp_path):
+    async def go():
+        pool = await asyncpg.create_pool(registry_pg["dsn"], min_size=1, max_size=10)
+        rig = Rig(svc, tmp_path, pool)
+        try:
+            await asyncio.wait_for(annotation_scenario(rig, pool, tmp_path), 120)
         finally:
             await rig.applier.aclose(timeout=10)
             rig.bridge.stop()
