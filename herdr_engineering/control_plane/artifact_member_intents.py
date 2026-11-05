@@ -69,6 +69,12 @@ KIND_PUBLISH = "member.publish"
 KIND_DELETE = "member.artifact_delete"
 KIND_LIBRARY_ACCEPT = "library_accept"
 KIND_LIBRARY_DISCARD = "library_discard"
+KIND_LIBRARY_FOLDER_CREATE = "library_folder_create"
+KIND_LIBRARY_FOLDER_RENAME = "library_folder_rename"
+KIND_LIBRARY_FOLDER_DELETE = "library_folder_delete"
+KIND_LIBRARY_FILE = "library_file"
+KIND_LIBRARY_UNFILE = "library_unfile"
+KIND_LIBRARY_CLAIM = "library_claim"
 KIND_SHARE_CREATE = "member.share_create"
 KIND_SHARE_APPROVE = "member.share_approve"
 KIND_SHARE_REVOKE = "member.share_revoke"
@@ -85,6 +91,7 @@ VIEW_MAX_ARTIFACTS = 500
 VIEW_MAX_VERSIONS = 50
 VIEW_MAX_LINKS = 200
 VIEW_MAX_SHARED = 500
+LIBRARY_VIEW_MAX = 2000
 VIEW_INTERVAL = 60.0
 MEDIA_TYPES = {
     ".html": "text/html", ".pdf": "application/pdf", ".parquet": "application/vnd.apache.parquet",
@@ -294,6 +301,36 @@ register_intent_kind(KIND_LIBRARY_DISCARD, _validate_empty(KIND_LIBRARY_DISCARD)
                      requires_artifact=True)
 
 
+_FOLDER_ID = re.compile(r"fld_[0-9a-f]{24}\Z")
+
+
+def _folder_payload(kind: str, keys: frozenset[str]):
+    """A payload of exactly ``keys`` (``folder_id``, ``name``, ``share_id``), checked; the plain dict."""
+    def validate(raw: dict, limits: BridgeLimits) -> dict:
+        if not isinstance(raw, dict) or set(raw) != keys:
+            raise _bad(kind)
+        if "folder_id" in keys and (not isinstance(raw["folder_id"], str) or not _FOLDER_ID.match(raw["folder_id"])):
+            raise _bad(kind)
+        if "name" in keys and (not isinstance(raw["name"], str) or not 1 <= len(raw["name"]) <= 400):
+            raise _bad(kind)
+        if "share_id" in keys and (not isinstance(raw["share_id"], str) or not _SHARE_ID.match(raw["share_id"])):
+            raise _bad(kind)
+        return dict(raw)
+    return validate
+
+
+# The library is a person's own filing: users only, never on the agent tool menu.
+_USER = frozenset({"user"})
+for _kind, _keys, _needs_artifact in (
+        (KIND_LIBRARY_FOLDER_CREATE, frozenset({"name"}), False),
+        (KIND_LIBRARY_FOLDER_RENAME, frozenset({"folder_id", "name"}), False),
+        (KIND_LIBRARY_FOLDER_DELETE, frozenset({"folder_id"}), False),
+        (KIND_LIBRARY_FILE, frozenset({"folder_id"}), True),
+        (KIND_LIBRARY_UNFILE, frozenset({"folder_id"}), True),
+        (KIND_LIBRARY_CLAIM, frozenset({"share_id"}), False)):
+    register_intent_kind(_kind, _folder_payload(_kind, _keys), actors=_USER, requires_artifact=_needs_artifact)
+
+
 # ----------------------------------------------------------------------------- the member directory
 
 def _finite(value: object) -> bool:
@@ -401,7 +438,7 @@ async def _own(conn: Any, artifact_id: str | None, principal: str) -> Mapping[st
 async def _conclude(ctx: IntentContext, who: _Who, action: str, out: dict, *, artifact_id: str | None) -> dict:
     """Audit the outcome, stamp ``last_used_at`` and hand the principal to the after-hook."""
     from .artifact_members import MemberStore
-    ok = out.get("result") in ("created", "deleted", "accepted")
+    ok = out.get("result") in ("created", "deleted", "accepted", "renamed", "filed", "unfiled", "claimed")
     await MemberStore(ctx.conn).record(
         who.principal, action, actor=_actor_json(who.actor), artifact_id=artifact_id,
         outcome="ok" if ok else "refused", code=None if ok else str(out.get("reason") or out.get("result")))
@@ -634,6 +671,93 @@ async def handle_library_discard(ctx: IntentContext, intent: Intent) -> dict:
     return await _delete_own(ctx, who, intent.artifact_id, "library_discard")
 
 
+# ----------------------------------------------------------------------------- library: folders, filing, claims
+
+class _OneConn:
+    """Lets ``LibraryStore`` run on the worker's own connection: ``acquire()`` hands that connection back."""
+    def __init__(self, conn: Any):
+        self._conn = conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def acquire(self):
+        import contextlib
+
+        @contextlib.asynccontextmanager
+        async def held():
+            yield self._conn
+        return held()
+
+
+def _library_handler(action: str, run: Callable[..., Any], result: str):
+    """A user-only library intent: ``run(store, member_id, principal, intent)`` returns extra result fields.
+    Results carry no ids (the view has them). A ``LibraryError`` becomes a rejection with its code (``not_found`` for another member's folder, as for a missing one)."""
+    async def handle(ctx: IntentContext, intent: Intent) -> dict:
+        from .artifact_library import LibraryError, LibraryStore
+        who, refusal = await _member(ctx, action)
+        if refusal is not None:
+            return refusal
+        store = LibraryStore(_OneConn(ctx.conn))
+        try:
+            async with ctx.conn.transaction():
+                extra = await run(store, who.principal, intent)
+        except LibraryError as exc:
+            out = _rejected(exc.code)
+        else:
+            out = {"result": result, **extra}
+        return await _conclude(ctx, who, action, out, artifact_id=intent.artifact_id)
+    return handle
+
+
+def _folder_json(folder: Any) -> dict:
+    return {"folder_id": folder.folder_id, "name": folder.name, "item_count": folder.item_count}
+
+
+async def _folder_create(store: Any, principal: str, intent: Intent) -> dict:
+    """Create-or-get by name, so a replayed intent (or a double click) yields the same folder.  The member's lane is
+    serial, so looking first cannot race; an insert that failed would abort the transaction."""
+    name = intent.payload["name"]
+    if not any(f.name.lower() == name.strip().lower() for f in await store.list_folders(principal)):
+        await store.create_folder(principal, name)
+    return {}
+
+
+async def _folder_rename(store: Any, principal: str, intent: Intent) -> dict:
+    await store.rename_folder(principal, intent.payload["folder_id"], intent.payload["name"])
+    return {}
+
+
+async def _folder_delete(store: Any, principal: str, intent: Intent) -> dict:
+    await store.delete_folder(principal, intent.payload["folder_id"])
+    return {}
+
+
+async def _file(store: Any, principal: str, intent: Intent) -> dict:
+    await store.file_artifact(principal, intent.payload["folder_id"], intent.artifact_id)
+    return {}
+
+
+async def _unfile(store: Any, principal: str, intent: Intent) -> dict:
+    await store.unfile_artifact(principal, intent.payload["folder_id"], intent.artifact_id)
+    return {}
+
+
+async def _claim(store: Any, principal: str, intent: Intent) -> dict:
+    await store.record_claim(principal.removeprefix("member:"), intent.payload["share_id"])
+    return {}
+
+
+LIBRARY_HANDLERS = (
+    (KIND_LIBRARY_FOLDER_CREATE, _library_handler("library_folder_create", _folder_create, "created")),
+    (KIND_LIBRARY_FOLDER_RENAME, _library_handler("library_folder_rename", _folder_rename, "renamed")),
+    (KIND_LIBRARY_FOLDER_DELETE, _library_handler("library_folder_delete", _folder_delete, "deleted")),
+    (KIND_LIBRARY_FILE, _library_handler("library_file", _file, "filed")),
+    (KIND_LIBRARY_UNFILE, _library_handler("library_unfile", _unfile, "unfiled")),
+    (KIND_LIBRARY_CLAIM, _library_handler("library_claim", _claim, "claimed")),
+)
+
+
 # ----------------------------------------------------------------------------- the member view
 
 def _iso(value: object) -> str | None:
@@ -644,7 +768,50 @@ def _json(value: object) -> Any:
     return json.loads(value) if isinstance(value, str) else value
 
 
-async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: Mapping[str, Any] | None = None) -> None:
+async def _member_identity(principal: str, rt: MemberRuntime | None) -> tuple[str, frozenset[str]]:
+    """The member's (email, groups) from the worker's member directory; empty when it cannot be known (no runtime,
+    stale or missing directory, unknown member). Nothing is guessed."""
+    from .artifact_members import member_principal
+    if rt is None:
+        return "", frozenset()
+    directory = await asyncio.to_thread(load_directory, rt)
+    for user_id, entry in (directory or {}).items():
+        try:
+            if member_principal(user_id) != principal:
+                continue
+        except ValueError:
+            continue
+        email, groups = entry.get("email"), entry.get("groups")
+        return (email if isinstance(email, str) else ""), frozenset(g for g in groups or [] if isinstance(g, str))
+    return "", frozenset()
+
+
+def _item_json(item: Any) -> dict:
+    return {"artifact_id": item.artifact_id, "title": item.title, "sharer": item.sharer,
+            "shared_at": _iso(item.shared_at), "source": item.source, "status": item.status,
+            "expires_at": _iso(item.expires_at), "share_id": item.share_id, "folder_ids": list(item.folder_ids),
+            "artifact_type": item.artifact_type, "size_bytes": item.size_bytes}
+
+
+async def _library_view(conn: Any, principal: str, rt: MemberRuntime | None) -> dict:
+    """``{items, folders}``: the feed (own pending included) newest first, at most ``LIBRARY_VIEW_MAX`` items."""
+    from .artifact_library import DEFAULT_SOURCES, MAX_PAGE, LibraryStore
+    store = LibraryStore(_OneConn(conn))
+    email, groups = await _member_identity(principal, rt)
+    member_id = principal.removeprefix("member:")
+    sources = frozenset({*DEFAULT_SOURCES, "pending"})
+    items: list[dict] = []
+    while len(items) < LIBRARY_VIEW_MAX:
+        page = await store.feed(member_id, email, groups, sources=sources,
+                                limit=min(MAX_PAGE, LIBRARY_VIEW_MAX - len(items)), offset=len(items))
+        items.extend(_item_json(i) for i in page.items)
+        if page.next_offset is None or not page.items:
+            break
+    return {"items": items, "folders": [_folder_json(f) for f in await store.list_folders(principal)]}
+
+
+async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: Mapping[str, Any] | None = None,
+                            rt: MemberRuntime | None = None) -> None:
     """Write ``<root>/member-views/<member_owner_key>.json``: the member's usage, artifacts, shared-with-me and links."""
     from .artifact_member_quota import _NOT_PURGED
     from .artifact_members import MemberStore, member_owner_key
@@ -684,6 +851,7 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
         " AND NOT EXISTS (SELECT 1 FROM artifacts t WHERE t.artifact_id=s.artifact_id AND t.lifecycle='tombstoned')"
         " ORDER BY s.created_at DESC, s.share_id LIMIT $2",
         principal, VIEW_MAX_LINKS, [a["artifact_id"] for a in artifacts])
+    library = await _library_view(conn, principal, rt)
     doc = {
         "principal": principal, "updated": __import__("time").time(),
         "usage": {"bytes_used": usage["bytes_used"], "bytes_retracted": usage["bytes_retracted"],
@@ -699,6 +867,7 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
                    "audience": s["audience"], "state": s["state"], "expires_at": _iso(s["expires_at"]),
                    "recipients": [*(s["allow_emails"] or []), *(s["allow_groups"] or [])],
                    "created_at": _iso(s["created_at"]), "mine": s["mine"]} for s in links],
+        "library": library,
     }
     root = Path(root)
     from .collab_bridge_files import DIR_MODE
@@ -713,7 +882,7 @@ async def _after(ctx: IntentContext, intent: Intent, out: dict, private: dict) -
     """Rewrite the acting member's view once the outcome is durable."""
     principal, rt = private.get("_principal"), ctx.extras.get("members")
     if isinstance(principal, str) and isinstance(rt, MemberRuntime):
-        await write_member_view(ctx.conn, principal, rt.mirror_root, defaults=rt.defaults)
+        await write_member_view(ctx.conn, principal, rt.mirror_root, defaults=rt.defaults, rt=rt)
 
 
 # ----------------------------------------------------------------------------- secret results
@@ -806,7 +975,7 @@ async def publish_member_views(conn: Any, rt: MemberRuntime) -> int:
     written = 0
     for r in rows:
         try:
-            await write_member_view(conn, r["p"], rt.mirror_root, defaults=rt.defaults)
+            await write_member_view(conn, r["p"], rt.mirror_root, defaults=rt.defaults, rt=rt)
             written += 1
         except Exception as exc:
             log.error("member view not written (%s)", type(exc).__name__)
@@ -872,6 +1041,8 @@ def register_member_intents(applier: CollabIntentApplier) -> None:
     from . import (
         artifact_member_shares as shares,  # the worker only: collab-public never imports the handlers
     )
+    for kind, handler in LIBRARY_HANDLERS:
+        applier.register(kind, handler, lane_key=_lane, after=_after)
     for kind, handler in ((KIND_SHARE_CREATE, shares.handle_share_create), (KIND_SHARE_APPROVE, shares.handle_share_approve),
                           (KIND_SHARE_REVOKE, shares.handle_share_revoke), (KIND_SHARE_EVENTS, shares.handle_share_events)):
         applier.register(kind, handler, lane_key=_lane, after=_after)

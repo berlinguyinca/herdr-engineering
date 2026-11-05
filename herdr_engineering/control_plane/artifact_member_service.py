@@ -319,6 +319,14 @@ class MemberService:
         view = self._view(who)
         return {k: view.get(k) for k in ("available", "updated", "usage", "artifacts", "shared_with_me", "links")}
 
+    def library(self, actor: Mapping[str, Any]) -> dict[str, Any]:
+        """The caller's library (feed items and folders) from their view file; empty when there is none yet."""
+        library = self._view(self._caller(actor, "library")).get("library")
+        if not isinstance(library, dict):
+            return {"items": [], "folders": []}
+        return {"items": library.get("items") if isinstance(library.get("items"), list) else [],
+                "folders": library.get("folders") if isinstance(library.get("folders"), list) else []}
+
     @staticmethod
     def _grants(entry: Mapping[str, Any] | None, need: str) -> bool:
         """Whether a ``shared_with_me`` entry carries ``need`` (``read`` or ``share``); ``admin`` carries both. The view

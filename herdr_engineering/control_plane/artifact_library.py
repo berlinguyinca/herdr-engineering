@@ -119,11 +119,11 @@ _CANDIDATES_SQL = f"""
 SELECT a.artifact_id, {_TITLE} AS title, a.created_by AS sharer, a.created_at AS shared_at, 'pending' AS source,
        0 AS prio, 'pending' AS status, NULL::timestamptz AS expires_at, NULL::text AS share_id,
        a.artifact_type, coalesce(a.size_bytes,0) AS size_bytes
-  FROM artifacts a WHERE a.created_by=$1 AND a.intake='pending' AND a.lifecycle<>'tombstoned'
+  FROM artifacts a WHERE a.created_by=$1 AND a.intake='pending' AND a.lifecycle NOT IN ('retracted','tombstoned')
 UNION ALL
 SELECT a.artifact_id, {_TITLE}, a.created_by, a.created_at, 'mine', 1, 'active', NULL, NULL,
        a.artifact_type, coalesce(a.size_bytes,0)
-  FROM artifacts a WHERE a.created_by=$1 AND a.intake='accepted' AND a.lifecycle<>'tombstoned'
+  FROM artifacts a WHERE a.created_by=$1 AND a.intake='accepted' AND a.lifecycle NOT IN ('retracted','tombstoned')
 UNION ALL
 SELECT a.artifact_id, {_TITLE}, acl.granted_by, acl.created_at, 'assigned', 2, 'active', acl.expires_at, NULL,
        a.artifact_type, coalesce(a.size_bytes,0)

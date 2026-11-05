@@ -566,3 +566,7 @@ def test_share_list_drops_links_the_caller_neither_created_nor_owns(world):
     atomic_write_json(world.bridge.mirror / "member-views", f"{key}.json", doc)
     got = [r["share_id"][6] for r in world.ms.share_list(world.user("op"))["links"]]
     assert got == ["a", "b"]
+
+
+def test_library_defaults_to_empty_without_a_view(world):
+    assert world.ms.library(world.user("op")) == {"items": [], "folders": []}

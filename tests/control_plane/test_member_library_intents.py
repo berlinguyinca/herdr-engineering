@@ -1,0 +1,250 @@
+# ruff: noqa: F811  (pytest fixtures are imported by name)
+"""Library worker intents and the ``library`` key of the member view (Task 6), on real Postgres and the real worker."""
+
+from herdr_engineering.control_plane.artifact_library import LibraryStore
+from tests.control_plane.registry_pg import registry_pg  # noqa: F401 - imported fixture
+from tests.control_plane.test_artifact_member_intents import (
+    ALICE,
+    BOB,
+    USERS,
+    agent,
+    create,
+    mrun,
+    send,
+    sql,
+    user,
+    view_of,
+    write_feeds,
+)
+from tests.control_plane.test_collab_approval import s as approval_svc  # noqa: F401 - imported fixture
+
+FOLDER_CREATE, FOLDER_RENAME, FOLDER_DELETE = (
+    "library_folder_create",
+    "library_folder_rename",
+    "library_folder_delete",
+)
+FILE, UNFILE, CLAIM, ACCEPT, DISCARD = (
+    "library_file",
+    "library_unfile",
+    "library_claim",
+    "library_accept",
+    "library_discard",
+)
+
+
+def lrun(pg, tmp_path, body):
+    async def clean(env, rt):
+        await sql(env, "TRUNCATE artifact_library_folders, artifact_share_claims CASCADE")
+        return await body(env, rt)
+
+    return mrun(pg, tmp_path, clean)
+
+
+async def new_folder(env, who="alice", name="Papers"):
+    out = await send(env, user(who), FOLDER_CREATE, {"name": name})
+    assert out["result"] == "created", out
+    return (
+        await sql(
+            env,
+            "SELECT folder_id FROM artifact_library_folders WHERE owner=$1 AND name=$2",
+            f"member:{who}",
+            name,
+        )
+    )[0][0]
+
+
+async def live_share(env, aid, *, groups=("lab",)):
+    vid = (await sql(env, "SELECT current_version_id FROM artifacts WHERE artifact_id=$1", aid))[0][
+        0
+    ]
+    if vid is None:
+        vid = "version_" + "f" * 32
+        await sql(
+            env,
+            "INSERT INTO artifact_versions (version_id,artifact_id,version_number,state) VALUES ($1,$2,1,'ready')",
+            vid,
+            aid,
+        )
+    sid = "share_" + "ab" * 12
+    await sql(
+        env,
+        "INSERT INTO artifact_shares (share_id,artifact_id,version_id,audience,allow_groups,state,title,created_by) "
+        "VALUES ($1,$2,$3,'lab',$4,'live','Shared',$5)",
+        sid,
+        aid,
+        vid,
+        list(groups),
+        ALICE,
+    )
+    return sid
+
+
+def test_each_intent_updates_db_and_view_file(registry_pg, tmp_path):
+    async def body(env, rt):
+        mine = await create(env, title="Mine")
+        pushed = (
+            await send(
+                env,
+                agent("ag1"),
+                "member.artifact_create",
+                {"title": "Pushed", "filename": "a.html", "profile": "web"},
+            )
+        )["artifact_id"]
+        fid = await new_folder(env)
+        lib = view_of(env, ALICE)["library"]
+        assert [(f["folder_id"], f["name"], f["item_count"]) for f in lib["folders"]] == [
+            (fid, "Papers", 0)
+        ]
+        assert {i["artifact_id"] for i in lib["items"]} == {mine, pushed}
+
+        out = await send(env, user("alice"), FOLDER_RENAME, {"folder_id": fid, "name": "Reads"})
+        assert out["result"] == "renamed"
+        assert view_of(env, ALICE)["library"]["folders"][0]["name"] == "Reads"
+
+        assert (await send(env, user("alice"), FILE, {"folder_id": fid}, aid=mine))[
+            "result"
+        ] == "filed"
+        lib = view_of(env, ALICE)["library"]
+        assert lib["folders"][0]["item_count"] == 1
+        (item,) = [i for i in lib["items"] if i["artifact_id"] == mine]
+        assert item["folder_ids"] == [fid]
+        assert (await sql(env, "SELECT count(*) FROM artifact_library_items"))[0][0] == 1
+
+        assert (await send(env, user("alice"), UNFILE, {"folder_id": fid}, aid=mine))[
+            "result"
+        ] == "unfiled"
+        assert (await sql(env, "SELECT count(*) FROM artifact_library_items"))[0][0] == 0
+        assert view_of(env, ALICE)["library"]["folders"][0]["item_count"] == 0
+
+        sid = await live_share(env, mine, groups=("nobody",))
+        assert (await send(env, user("bob"), CLAIM, {"share_id": sid}))["result"] == "claimed"
+        assert (await sql(env, "SELECT member_id FROM artifact_share_claims"))[0][0] == "bob"
+        (opened,) = [i for i in view_of(env, BOB)["library"]["items"] if i["artifact_id"] == mine]
+        assert opened["source"] == "opened" and opened["share_id"] == sid
+
+        assert (await send(env, user("alice"), ACCEPT, {}, aid=pushed))["result"] == "accepted"
+        (acc,) = [i for i in view_of(env, ALICE)["library"]["items"] if i["artifact_id"] == pushed]
+        assert acc["source"] == "mine"
+
+        pushed2 = (
+            await send(
+                env,
+                agent("ag1"),
+                "member.artifact_create",
+                {"title": "P2", "filename": "a.html", "profile": "web"},
+            )
+        )["artifact_id"]
+        assert (await send(env, user("alice"), DISCARD, {}, aid=pushed2))["result"] == "deleted"
+        assert pushed2 not in {i["artifact_id"] for i in view_of(env, ALICE)["library"]["items"]}
+
+        assert (await send(env, user("alice"), FOLDER_DELETE, {"folder_id": fid}))[
+            "result"
+        ] == "deleted"
+        assert view_of(env, ALICE)["library"]["folders"] == []
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_view_file_contains_pending_only_for_owner(registry_pg, tmp_path):
+    async def body(env, rt):
+        pushed = (
+            await send(
+                env,
+                agent("ag1"),
+                "member.artifact_create",
+                {"title": "Pushed", "filename": "a.html", "profile": "web"},
+            )
+        )["artifact_id"]
+        await sql(
+            env,
+            "INSERT INTO artifact_acl (artifact_id,principal_id,permissions,granted_by) "
+            "VALUES ($1,$2,'[\"read\"]'::jsonb,$3)",
+            pushed,
+            BOB,
+            ALICE,
+        )
+        await new_folder(env, "alice")
+        await new_folder(env, "bob")
+        (mine,) = [i for i in view_of(env, ALICE)["library"]["items"] if i["artifact_id"] == pushed]
+        assert mine["status"] == "pending" and mine["source"] == "pending"
+        assert pushed not in {i["artifact_id"] for i in view_of(env, BOB)["library"]["items"]}
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_view_capped_at_2000_newest_first(registry_pg, tmp_path):
+    async def body(env, rt):
+        await sql(
+            env,
+            "INSERT INTO artifacts (artifact_id,created_by,display_name,intake,created_at) "
+            "SELECT 'artifact_bulk' || lpad(g::text, 6, '0'), $1, 'bulk ' || g, 'accepted', "
+            "now() - make_interval(secs => g) FROM generate_series(1, 2100) g",
+            ALICE,
+        )
+        await new_folder(env)
+        items = view_of(env, ALICE)["library"]["items"]
+        assert len(items) == 2000
+        stamps = [i["shared_at"] for i in items]
+        assert stamps == sorted(stamps, reverse=True)
+        assert items[0]["artifact_id"] == "artifact_bulk000001"  # newest
+        assert "artifact_bulk002000" == items[-1]["artifact_id"]
+        assert isinstance(stamps[0], str)
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_replayed_intent_is_idempotent(registry_pg, tmp_path):
+    async def body(env, rt):
+        mine = await create(env)
+        first = await send(env, user("alice"), FOLDER_CREATE, {"name": "A"}, key="same-key-1")
+        again = await send(env, user("alice"), FOLDER_CREATE, {"name": "A"}, key="same-key-1")
+        assert first["result"] == again["result"] == "created"
+        assert (await sql(env, "SELECT count(*) FROM artifact_library_folders"))[0][0] == 1
+        fid = (await sql(env, "SELECT folder_id FROM artifact_library_folders"))[0][0]
+        for _ in range(2):
+            assert (await send(env, user("alice"), FILE, {"folder_id": fid}, aid=mine))[
+                "result"
+            ] == "filed"
+        assert (await sql(env, "SELECT count(*) FROM artifact_library_items"))[0][0] == 1
+        sid = await live_share(env, mine)
+        for _ in range(2):
+            assert (await send(env, user("bob"), CLAIM, {"share_id": sid}))["result"] == "claimed"
+        assert (await sql(env, "SELECT count(*) FROM artifact_share_claims"))[0][0] == 1
+        # create is create-or-get by name: a second, differently keyed request yields the same single folder
+        dup = await send(env, user("alice"), FOLDER_CREATE, {"name": "A"})
+        assert dup["result"] == "created"
+        assert (await sql(env, "SELECT count(*) FROM artifact_library_folders"))[0][0] == 1
+        assert len(await LibraryStore(env.pool).list_folders(ALICE)) == 1
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_intent_for_other_members_folder_fails_404(registry_pg, tmp_path):
+    async def body(env, rt):
+        mine = await create(env)
+        fid = await new_folder(env, "alice")
+        ghost = "fld_" + "0" * 24
+        for other in (fid, ghost):
+            for kind, payload, aid in (
+                (FOLDER_RENAME, {"folder_id": other, "name": "x"}, None),
+                (FOLDER_DELETE, {"folder_id": other}, None),
+                (FILE, {"folder_id": other}, mine),
+                (UNFILE, {"folder_id": other}, mine),
+            ):
+                out = await send(env, user("bob"), kind, payload, aid=aid)
+                assert out["result"] == "rejected" and out["reason"] == "not_found", (kind, out)
+        assert [f.name for f in await LibraryStore(env.pool).list_folders(ALICE)] == ["Papers"]
+
+    lrun(registry_pg, tmp_path, body)
+
+
+def test_view_uses_directory_email_and_groups(registry_pg, tmp_path):
+    async def body(env, rt):
+        mine = await create(env)
+        sid = await live_share(env, mine, groups=("lab",))
+        write_feeds(env, users={**USERS, "bob": {"status": "approved", "email": "bob@x.org"}})
+        await new_folder(env, "bob")
+        ids = {i["artifact_id"]: i for i in view_of(env, BOB)["library"]["items"]}
+        assert ids[mine]["share_id"] == sid and ids[mine]["source"] == "assigned"
+
+    lrun(registry_pg, tmp_path, body)
