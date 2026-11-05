@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderWeekCard, renderOverviewSection, weekCardModel, sanitizeOverviewPreferences, userTimeZone } from './overview-view.js';
+import { renderWeekCard, renderOverviewSection, weekCardModel, sanitizeOverviewPreferences, userTimeZone, sanitizeWeekPreferences, loadWeekPreferences, saveWeekPreferences } from './overview-view.js';
 
 const now = Date.parse('2026-11-04T12:00:00Z'), iso = ms => new Date(ms).toISOString();
 const loaded = {projections: {loaded: true}, missions: {loaded: true}, sessions: {loaded: true}};
@@ -60,7 +60,7 @@ test('loading, error and no-timezone states', () => {
   assert.match(renderWeekCard({}, {}, now, now), /data-skeleton/);
   assert.match(renderWeekCard({}, {projections: {error: 'boom'}}, now, now), /Could not refresh live mission reports · retrying/);
   assert.match(render({projections: [projection()]}, {...loaded, sessions: {loaded: true, error: 'x'}}), /showing last data/);
-  assert.equal(userTimeZone({timeZone: 'Not/AZone'}), 'UTC');
+  assert.equal(userTimeZone({timeZone: 'Not/AZone'}), Intl.DateTimeFormat().resolvedOptions().timeZone); // G4: unknown zone falls back to the browser zone
   assert.ok(userTimeZone({}).length > 0);
 });
 
@@ -94,4 +94,48 @@ test('G1: failed weekly read keeps the old partial card and says the history cou
 });
 test('G1: model never hardcodes complete without server coverage', () => {
   assert.equal(weekCardModel({timeZone: 'UTC'}, loaded, now, now).week.started.coverage === 'complete', false);
+});
+
+// ---- G4: user-chosen time zone and week start ----
+const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+test('G4: sanitizeWeekPreferences accepts only known zones and week starts, default unchanged', () => {
+  assert.deepEqual(sanitizeWeekPreferences(undefined), {timeZone: null, weekStart: 'monday'});
+  assert.deepEqual(sanitizeWeekPreferences({timeZone: 'America/Los_Angeles', weekStart: 'sunday'}), {timeZone: 'America/Los_Angeles', weekStart: 'sunday'});
+  assert.deepEqual(sanitizeWeekPreferences({timeZone: 'Mars/Base', weekStart: 'friday'}), {timeZone: null, weekStart: 'monday'});
+  assert.deepEqual(sanitizeWeekPreferences({timeZone: 42, weekStart: ['sunday']}), {timeZone: null, weekStart: 'monday'});
+  assert.deepEqual(sanitizeWeekPreferences('x'), {timeZone: null, weekStart: 'monday'});
+});
+test('G4: an unknown zone falls back to the browser zone, not silently to UTC', () => {
+  assert.equal(userTimeZone({timeZone: 'Mars/Base'}), browserZone);
+});
+test('G4: week start moves the window and is shown on the card', () => {
+  const at = {timeZone: 'America/Los_Angeles'}; // Wed 2026-11-04 04:00 PST
+  for (const [weekStart, first] of [['monday', '2026-11-02'], ['sunday', '2026-11-01'], ['saturday', '2026-10-31']]) {
+    const m = weekCardModel({...at, weekStart}, loaded, now, now);
+    assert.equal(m.weekStart, weekStart);
+    assert.equal(new Date(m.week.window.start).toLocaleDateString('en-CA', {timeZone: at.timeZone}), first, weekStart);
+    assert.match(renderWeekCard({...at, weekStart}, loaded, now, now), new RegExp(`week starts ${weekStart[0].toUpperCase()}${weekStart.slice(1)}`, 'i'));
+  }
+});
+test('G4: the card names the zone in use and offers zone and week-start controls with the current values selected', () => {
+  const html = render({timeZone: 'America/Los_Angeles', weekStart: 'sunday'});
+  assert.match(html, /<select[^>]*data-week-zone/);
+  assert.match(html, /<option value="America\/Los_Angeles" selected>/);
+  assert.match(html, /<select[^>]*data-week-start/);
+  assert.match(html, /<option value="sunday" selected>/);
+  assert.match(html, /America\/Los_Angeles/);
+});
+test('G4: storage round trip validates, and throwing storage still works', () => {
+  const mem = new Map(), ok = {getItem: k => mem.get(k) ?? null, setItem: (k, v) => mem.set(k, v)};
+  saveWeekPreferences(ok, {timeZone: 'Asia/Tokyo', weekStart: 'saturday'});
+  assert.deepEqual(loadWeekPreferences(ok), {timeZone: 'Asia/Tokyo', weekStart: 'saturday'});
+  mem.set('herdr.overview.week.v1', '{not json');
+  assert.deepEqual(loadWeekPreferences(ok), {timeZone: null, weekStart: 'monday'});
+  mem.set('herdr.overview.week.v1', JSON.stringify({timeZone: 'Nope/Zone', weekStart: 'sunday'}));
+  assert.deepEqual(loadWeekPreferences(ok), {timeZone: null, weekStart: 'sunday'});
+  const bad = {getItem() { throw new Error('blocked'); }, setItem() { throw new Error('full'); }};
+  assert.deepEqual(loadWeekPreferences(bad), {timeZone: null, weekStart: 'monday'});
+  assert.doesNotThrow(() => saveWeekPreferences(bad, {timeZone: 'UTC', weekStart: 'monday'}));
+  assert.deepEqual(loadWeekPreferences(undefined), {timeZone: null, weekStart: 'monday'});
+  assert.match(render({}), /This week/);
 });

@@ -227,3 +227,20 @@ test('G1: server quota-pause event supplies evidence for a snapshot paused item'
   assert.equal(out.paused_quota.count, 1);
   assert.equal(out.paused_quota.unevidenced, 0);
 });
+
+test('G4: Monday, Sunday and Saturday starts are half-open local-midnight windows in a non-UTC zone', () => {
+  const at = Date.parse('2026-11-04T12:00:00Z'); // Wed 04:00 PST
+  const local = ms => new Date(ms).toLocaleString('en-CA', {timeZone: LA, hour12: false});
+  for (const [ws, day] of [[1, '2026-11-02'], [0, '2026-11-01'], [6, '2026-10-31']]) {
+    const w = weekWindow({now: at, timeZone: LA, weekStartsOn: ws});
+    assert.match(local(w.start), new RegExp(`^${day}, 00:00:00`), `start ${ws}`);
+    assert.equal(weekWindow({now: w.start, timeZone: LA, weekStartsOn: ws}).start, w.start, 'start inclusive');
+    assert.equal(weekWindow({now: w.end - 1, timeZone: LA, weekStartsOn: ws}).start, w.start, 'last ms inside');
+    assert.equal(weekWindow({now: w.end, timeZone: LA, weekStartsOn: ws}).start, w.end, 'end exclusive');
+  }
+});
+test('G4: Saturday start across the fall-back change (Nov 1 2026, America/Los_Angeles) is 169h and DST-safe', () => {
+  const w = weekWindow({now: Date.parse('2026-11-02T20:00:00Z'), timeZone: LA, weekStartsOn: 6});
+  assert.equal(new Date(w.start).toISOString(), '2026-10-31T07:00:00.000Z');
+  assert.equal(new Date(w.end).toISOString(), '2026-11-07T08:00:00.000Z');
+});
