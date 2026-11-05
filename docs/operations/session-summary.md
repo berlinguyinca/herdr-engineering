@@ -21,7 +21,9 @@ herdr-eng summary install --scope project    # current repository only
 herdr-eng summary install --dry-run          # show what would change
 ```
 
-Rerun it to upgrade. Global layout:
+`herdr-eng summary install` also installs the sibling `/handoff` skill (see
+`handoff.md`); pass `--skill summary` to manage only this one (`--skill handoff|all` also exist on
+`uninstall` and `verify`). Rerun it to upgrade. Global layout:
 
 | What | Where |
 | --- | --- |
@@ -67,6 +69,22 @@ herdr-eng summary verify --json
 `# Session summary` and end with *Evidence coverage*.
 
 Tests: `pytest tests/test_session_summary.py tests/test_session_history.py`.
+
+## After publishing: digest, pane reuse, focus
+
+`herdr-eng summary publish` prints JSON. Besides the one-line `message` it now carries a `digest`
+(overall status line, the first lines of the report, `Report file: <absolute path>` and
+`Dashboard: ...`), and the skill shows both, so the result is visible without opening the pane.
+
+The report pane is no longer closed and re-split on every publish. While the viewer from an earlier
+publish is still running (its pid is in `<report>.viewer.pid`, checked against `/proc/<pid>/cmdline`),
+the publisher rewrites the report, sends the viewer `SIGWINCH` (it re-reads the file on redraw) and
+returns `{"pane": {"ok": true, "pane_id": ..., "reused": true}}`. If the viewer was quit, or a graph
+pane appeared or went away (the peers' ids would be stale), the old pair is closed and a new pair is
+opened as before. A new pane is split with `--focus`; a reused one is focused with
+`herdr pane focus --pane $HERDR_PANE_ID --direction right`, so the reader lands on the report.
+Tests: `tests/test_summary_report_herdr.py` runs a real isolated herdr server and viewer process
+(skipped when `herdr` is not installed).
 
 ## What it reads, and its limits
 
