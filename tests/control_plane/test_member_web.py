@@ -306,6 +306,19 @@ def test_the_page_is_served_on_the_member_host_with_a_strict_csp(stack):
     assert req(stack, "GET", "/", member=None, host="other.example").status == 404
 
 
+def test_the_page_csp_names_exact_files_and_never_a_bare_self_for_scripts(stack):
+    """The member host also serves member-uploaded bundles (/s/<token>/f/x.js): 'self' would let them run as the page."""
+    for path in ("/", "/my/callback"):
+        csp = req(stack, "GET", path, member=None).headers["content-security-policy"]
+        parts = {d.split()[0]: d.split()[1:] for d in csp.split("; ")}
+        assert parts["script-src"] == [f"{ORIGIN}/my/member.js"]
+        assert parts["style-src"] == [f"{ORIGIN}/my/member.css"]
+        assert parts["connect-src"] == [f"{ORIGIN}/api/member/", "https://auth.lab.example"]
+        assert parts["default-src"] == ["'none'"] and parts["base-uri"] == ["'none'"]
+        for name in ("script-src", "style-src", "connect-src"):
+            assert "'self'" not in parts[name] and "*" not in parts[name] and "https:" not in parts[name]
+
+
 def test_config_exposes_only_the_public_sign_in_facts(stack):
     got = req(stack, "GET", "/api/member/config", member=None)
     assert got.status == 200
@@ -359,6 +372,27 @@ def test_writes_return_what_the_mcp_tools_return(stack):
     web = req(stack, "POST", f"/api/member/artifacts/{ART}/shares/share_111111111111111111111111/approve", body={"confirm": True})
     assert strip(web.json) == strip(collab_member_tools.call(
         stack.s, pr, "artifact_share_approve", {"artifact_id": ART, "share_id": "share_111111111111111111111111", "confirm": True}))
+
+
+def test_a_public_share_matches_the_mcp_tool_too(stack):
+    pr = mcp_agent(stack)
+    args = {"version_id": "v_1", "audience": "public", "expires_in_days": 7, "idempotency_key": "idem-pub-share-1"}
+    web = req(stack, "POST", f"/api/member/artifacts/{ART}/shares", body=args)
+    mcp = collab_member_tools.call(stack.s, pr, "artifact_share_create", {"artifact_id": ART, **args})
+    assert web.status == 200 and strip(web.json) == strip(mcp) and web.json["status"] == "pending"
+    other = {**args, "idempotency_key": "idem-pub-share-2"}
+    web = req(stack, "POST", f"/api/member/artifacts/{ART}/shares", body=other)
+    mcp = collab_member_tools.call(stack.s, pr, "artifact_share_create", {"artifact_id": ART, **other})
+    assert strip(web.json) == strip(mcp)
+
+
+def test_the_head_route_returns_what_the_mcp_tool_returns(stack):
+    pr = mcp_agent(stack)
+    web = req(stack, "GET", f"/api/member/artifacts/{ART}")
+    assert web.status == 200 and web.json == collab_member_tools.call(stack.s, pr, "artifact_head", {"artifact_id": ART})
+    assert req(stack, "GET", f"/api/member/artifacts/{OTHER}").status == 404          # not in the caller's view
+    assert req(stack, "GET", f"/api/member/artifacts/{ART}?x=1").status == 400
+    assert req(stack, "GET", "/api/member/artifacts/not%20an%20id").status == 404
 
 
 def test_a_ticket_result_defaults_to_no_wait_and_matches_the_mcp_tool(stack):
@@ -439,6 +473,43 @@ def test_tombstoned_artifacts_do_not_exist_for_the_web_api(stack):
     assert got.status == 404
 
 
+def test_malformed_queries_and_names_are_400_not_500(stack):
+    base = f"/api/member/artifacts/{ART}/history"
+    for q in ("?a", "?limit", "?limit=1&limit=2", "?a=1&b=2&c=3&d=4&e=5", "?limit=x", "?nope=1", "?&&"):
+        got = req(stack, "GET", base + q)
+        assert got.status == 400 and got.json["error"] == "bad_request", q
+    assert req(stack, "GET", "/api/member/results/tkt_x?seconds").status in (400, 404)
+    assert req(stack, "GET", "/api/member/me?x").status == 400
+    for tail, body in (("delete", {"confirm": True}), ("shares", {"version_id": "v_1", "audience": "lab"})):
+        got = req(stack, "POST", f"/api/member/artifacts/{ART}/{tail}?x=1", body=body)
+        assert got.status == 400, tail                                 # no write route takes a query
+    heads = list(run_headers())
+    heads[0] = "X-Name: %ff%fe.bin"                                    # percent-decodes to invalid UTF-8
+    got = req(stack, "PUT", f"/api/member/artifacts/{ART}/uploads/{upload_id()}/runs/0", declared=len(DATA), send=False,
+              extra=heads)
+    assert got.status == 400 and got.json["error"] == "bad_request"
+
+
+def test_a_share_on_a_tombstoned_artifact_is_refused_before_it_costs_a_slot(stack):
+    import json as _json
+    from pathlib import Path
+
+    from herdr_engineering.control_plane.artifact_member_service import MemberServiceError
+    vf = Path(stack.w.bridge.mirror) / "member-views" / f"{member_owner_key('member:op')}.json"
+    doc = _json.loads(vf.read_text())
+    doc["artifacts"][0]["lifecycle"] = "tombstoned"
+    vf.write_text(_json.dumps(doc))
+    actor = member_actor(stack.w.people["op"])
+    ms = stack.s.member_service
+    for call in (lambda: ms.share_create(actor, ART, "v_1", "lab"),
+                 lambda: ms.share_approve(actor, ART, "share_111111111111111111111111", True)):
+        with pytest.raises(MemberServiceError) as err:
+            call()
+        assert (err.value.status, err.value.code) == (404, "not_found")
+    assert not [k for k, v in stack.s._hits.items() if k.startswith("memberwrite") and v]
+    assert not [k for k, v in stack.s._hits.items() if k.startswith("membershare_create") and v]
+
+
 # ------------------------------------------------------------------------------ uploads
 DATA = bytes(range(256)) * 2400            # 614400 bytes: chunk 0 is 512 KiB, chunk 1 the rest
 
@@ -488,6 +559,23 @@ def test_a_mismatched_upload_id_is_400_before_the_body_is_read(stack):
     got = req(stack, "PUT", f"/api/member/artifacts/{ART}/uploads/{forged}/runs/0", declared=len(DATA), send=False,
               extra=run_headers())
     assert got.status == 400
+
+
+def test_a_run_over_the_chunk_window_is_429_before_the_body_is_read(stack):
+    ms = stack.s.member_service
+    ms.config = type(ms.config)(**{**ms.config.__dict__, "chunks_per_minute": 1})
+    got = req(stack, "PUT", f"/api/member/artifacts/{ART}/uploads/{upload_id()}/runs/0", declared=len(DATA), send=False,
+              extra=run_headers())                      # two chunks, one allowed; the body is never sent
+    assert got.status == 429 and got.json["error"] == "rate_limited" and got.headers.get("retry-after")
+    assert stack.w.staged("op") == []
+    assert not stack.s._hits.get("memberchunk:member:op")                     # a refused pre-check records nothing
+    ms.config = type(ms.config)(**{**ms.config.__dict__, "chunks_per_minute": 2})
+    ok = req(stack, "PUT", f"/api/member/artifacts/{ART}/uploads/{upload_id()}/runs/0", raw=DATA,
+             extra=run_headers(), content_type="application/octet-stream")
+    assert ok.status == 200, ok.raw
+    again = req(stack, "PUT", f"/api/member/artifacts/{ART}/uploads/{upload_id()}/runs/0", declared=len(DATA),
+                send=False, extra=run_headers())
+    assert again.status == 429                                                # the real hits were counted
 
 
 def test_run_headers_are_required_exactly_once(stack):
@@ -609,6 +697,24 @@ def test_cli_builds_the_member_web_from_the_members_section(stack):
     assert cli._member_web({}, stack.s, args) is None                          # members off
     assert cli._member_web(members_cp(), stack.s, SimpleNamespace(collab_only=False)) is None
     assert cli._member_web(members_cp(enabled=False), stack.s, args) is None
+
+
+def test_the_session_lifetime_reaches_collab_public_through_the_rendered_slice(stack, tmp_path):
+    """collab-public loads only the rendered collab slice, never ``control_plane.share``: build exactly that file."""
+    from herdr_engineering import cli
+    from herdr_engineering import fleet_config_cli as fcc
+    from herdr_engineering.fleet_config import load_fleet_config
+    from tests.test_members_deploy_config import cfg_of, members, share
+    out = tmp_path / "collab-slice.json"
+    fcc.render_collab(cfg_of(tmp_path, sh=share(session_seconds=900), mem=members()), out)
+    cp = load_fleet_config(out).section("control_plane")
+    assert "share" not in cp
+    args = SimpleNamespace(collab_only=True, web_root=stack.web, collab_require_https=True)
+    mw = cli._member_web(cp, stack.s, args)
+    assert (mw.session_seconds, mw.public_host) == (900, "artifacts.example.test")
+    out2 = tmp_path / "default-slice.json"
+    fcc.render_collab(cfg_of(tmp_path / "d", sh=share(), mem=members()), out2)
+    assert cli._member_web(load_fleet_config(out2).section("control_plane"), stack.s, args).session_seconds == 14400
 
 
 def test_cli_gives_the_member_service_the_configured_limits(stack, tmp_path):

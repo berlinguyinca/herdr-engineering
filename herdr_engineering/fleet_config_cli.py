@@ -269,24 +269,33 @@ def _check_members(collab: dict, share: dict) -> None:
     """Validate ``control_plane.collab.members`` (the member web host comes from ``control_plane.share.public_host``).
 
     Messages name keys, never values: the section carries ``session_secret``."""
+    host = share.get("public_host")
+    if host is not None and host == _loose_hostname(collab.get("public_url")):
+        raise FleetConfigError("control_plane.share.public_host must be a host other than control_plane.collab."
+                               "public_url's: the member web and share links live there, MCP stays on the collab host")
     members = collab.get("members")
     if members is None:
         return
     from .control_plane.members_config import parse_members
-    if isinstance(members, dict) and "public_host" in members:
-        raise FleetConfigError("control_plane.collab.members.public_host is not authored here: set "
-                               "control_plane.share.public_host (the deploy tooling copies it into the slice)")
+    for key in ("public_host", "session_seconds"):
+        if isinstance(members, dict) and key in members:
+            raise FleetConfigError(f"control_plane.collab.members.{key} is not authored here: set "
+                                   f"control_plane.share.{key} (the deploy tooling copies it into the slice)")
     try:
-        parse_members(members, public_host=share.get("public_host"))
+        parse_members(members, public_host=host, session_seconds=share.get("session_seconds"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
 
 
 def _members_with_host(values: dict, share: dict) -> dict:
-    """``values`` with the share host copied into an ENABLED members section (collab-public reads it there)."""
+    """``values`` with the share host and session lifetime copied into an ENABLED members section (collab-public only
+    loads this slice, never ``control_plane.share``, so it reads both there)."""
     members = values.get("members")
     if isinstance(members, dict) and members.get("enabled") is True:
-        return {**values, "members": {**members, "public_host": share.get("public_host")}}
+        slice_ = {**members, "public_host": share.get("public_host")}
+        if share.get("session_seconds") is not None:
+            slice_["session_seconds"] = share["session_seconds"]
+        return {**values, "members": slice_}
     return values
 
 

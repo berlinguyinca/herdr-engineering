@@ -24,12 +24,23 @@ def test_there_is_one_members_config_type():
 
 def test_disabled_or_absent_is_off():
     assert parse_members(None) is None
-    assert parse_members({"enabled": False, "group": 5}) is None
+    assert parse_members({"enabled": False, "group": "g"}) is None
     assert parse_members({"group": "g"}) is None
+    assert parse_members({"enabled": False}) is None
+
+
+@pytest.mark.parametrize("bad", [{"group": 5}, {"nonsense": 1}, {"session_secret": "short"}, {"public_host": "A.b.c"},
+                                 {"groups_ttl": -1}, {"share_creates_per_hour": 0}, {"session_seconds": 5},
+                                 {"request_limits": {"http_chunks_per_request": 33}}, {"request_limits": []}])
+def test_a_disabled_section_is_validated_too(bad):
+    with pytest.raises(ValueError):
+        parse_members({"enabled": False, **bad})
 
 
 def test_defaults_and_limits_object():
     got = parse_members(section(), public_host=HOST)
+    assert got["session_seconds"] == 14400
+    assert parse_members(section(), public_host=HOST, session_seconds=900)["session_seconds"] == 900
     assert got["limits"] == MembersConfig()
     assert got["public_host"] == HOST and got["session_secret"] == SECRET
     assert got["share_limits"] == {} and got["share_creates_per_hour"] == 20

@@ -206,6 +206,8 @@ class MemberWeb:
             origins = h.headers.get_all("Origin") or []
             if len(origins) != 1 or origins[0] != self.origin:
                 raise _Reply(403, "forbidden", "forbidden")
+            if query:                                           # no write route takes one
+                raise _bad()
         if method == "GET" and path in _STATIC:
             return self._static(h, path)
         segs = path.strip("/").split("/")
@@ -230,9 +232,11 @@ class MemberWeb:
         if target is None or not target.is_file():
             raise _Reply(404, "not_found", "not found")
         cognito = self._cognito_origin()
-        connect = "'self'" + (f" {cognito}" if cognito else "")
-        csp = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-               f"connect-src {connect}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        # Exact files, never 'self': the same origin serves member-uploaded bundles (/s/<token>/f/x.js), which a bare
+        # 'self' would let an HTML-injection bug load as a script and drive this API.
+        connect = f"{self.origin}/api/member/" + (f" {cognito}" if cognito else "")
+        csp = (f"default-src 'none'; script-src {self.origin}/my/member.js; style-src {self.origin}/my/member.css; "
+               f"img-src 'self' data:; connect-src {connect}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
         self._send(h, 200, target.read_bytes(), ctype, {"Content-Security-Policy": csp, "X-Frame-Options": "DENY"})
 
     def _cognito_origin(self) -> str | None:
@@ -310,6 +314,8 @@ class MemberWeb:
                 return self._r_links
             if n == 2 and rest[0] == "results":
                 return self._r_result
+            if n == 2 and rest[0] == "artifacts":
+                return self._r_head
             if n == 3 and rest[0] == "artifacts" and rest[2] in ("history", "shares"):
                 return self._r_history if rest[2] == "history" else self._r_shares
             return None
@@ -348,7 +354,10 @@ class MemberWeb:
     def _query(self, query: str, allowed: set[str]) -> dict[str, str]:
         if not query:
             return {}
-        pairs = parse_qs(query, keep_blank_values=True, strict_parsing=True, max_num_fields=4)
+        try:
+            pairs = parse_qs(query, keep_blank_values=True, strict_parsing=True, max_num_fields=4)
+        except ValueError:
+            raise _bad() from None
         if set(pairs) - allowed or any(len(v) != 1 for v in pairs.values()):
             raise _bad()
         return {k: v[0] for k, v in pairs.items()}
@@ -427,6 +436,10 @@ class MemberWeb:
         self._query(query, set())
         self._json(h, ms.share_list(actor, self._live(ms, actor, self._ident(rest[1]))))
 
+    def _r_head(self, h, ms, pr, actor, rest, query):
+        self._query(query, set())
+        self._json(h, ms.head(actor, self._live(ms, actor, self._ident(rest[1]))))
+
     def _r_history(self, h, ms, pr, actor, rest, query):
         got = self._query(query, {"limit"})
         self._json(h, ms.history(actor, self._live(ms, actor, self._ident(rest[1])), self._int_param(got.get("limit"), 50)))
@@ -499,7 +512,10 @@ class MemberWeb:
         length = int(lengths[0])
         if length > ms.config.http_chunks_per_request * CHUNK_BYTES:
             raise _Reply(413, "too_large", "run is too large")
-        name = unquote(self._header_once(h, "X-Name"), errors="strict")
+        try:
+            name = unquote(self._header_once(h, "X-Name"), errors="strict")
+        except UnicodeDecodeError:
+            raise _bad("X-Name is not valid UTF-8") from None
         size = self._header_once(h, "X-Size-Bytes")
         file_sha, run_sha = self._header_once(h, "X-File-SHA256"), self._header_once(h, "X-Run-SHA256")
         if not _DIGITS.match(size) or not _SHA.match(file_sha) or not _SHA.match(run_sha):
@@ -513,6 +529,7 @@ class MemberWeb:
             raise _bad() from None
         if expected != upload_id:
             raise _bad("upload_id does not match the headers")
+        ms.precheck_run(actor, length)                               # the chunk window, before the body is read
         h._continue_100()
         data = self._read_exactly(h, length)
         self._json(h, ms.upload_run(actor, artifact_id, name, int(size), file_sha, int(first), data, run_sha))

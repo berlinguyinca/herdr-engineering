@@ -39,12 +39,21 @@ HOST_RE: Final = re.compile(r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?
 
 TOP_KEYS: Final = frozenset({"enabled", "group", "session_secret", "groups_ttl", "removed_grace", "max_artifact_bytes",
                              "max_member_bytes", "max_artifacts", "share_limits", "share_creates_per_hour",
-                             "request_limits", "rate_limits", "staging", "public_host"})
+                             "request_limits", "rate_limits", "staging", "public_host", "session_seconds"})
 REQUEST_KEYS: Final = frozenset({"http_chunks_per_request", "max_publish_files", "max_message_chars",
                                  "max_upload_bytes", "result_wait_seconds"})
 RATE_KEYS: Final = frozenset({"chunks_per_minute", "writes_per_minute", "session_exchanges_per_minute"})
 STAGING_KEYS: Final = frozenset({"staging_bytes_per_member"})
 SHARE_LIMIT_KEYS: Final = frozenset({"max_share_bytes", "max_total_bytes"})
+
+
+# Upper bounds (config load).  ``http_chunks_per_request`` x 512 KiB plus framing must fit the edge's 17m
+# ``client_max_body_size`` (member-http.conf), so 32 is a hard ceiling; the rest keep a typo from disabling a limit.
+MAX_HTTP_CHUNKS: Final = 32
+_BOUNDS: Final = {"http_chunks_per_request": MAX_HTTP_CHUNKS, "max_publish_files": 10_000, "max_message_chars": 10_000,
+                  "chunks_per_minute": 100_000, "writes_per_minute": 10_000, "share_creates_per_hour": 10_000,
+                  "session_exchanges_per_minute": 10_000, "max_upload_bytes": _TIB, "staging_bytes_per_member": _TIB}
+MAX_SESSION_SECONDS: Final = 7 * 86400
 
 
 def _positive(name: str, value: Any) -> int:
@@ -76,7 +85,9 @@ class MembersConfig:
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 20:
                     raise ValueError("result_wait_seconds must be 0 to 20")
             else:
-                _positive(f.name, getattr(self, f.name))
+                value = _positive(f.name, getattr(self, f.name))
+                if value > _BOUNDS[f.name]:
+                    raise ValueError(f"{f.name} must be at most {_BOUNDS[f.name]}")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> MembersConfig:
@@ -89,7 +100,8 @@ class MembersConfig:
 
 def valid_public_host(value: object) -> bool:
     """A lowercase DNS name: no scheme, port, path, userinfo, uppercase, trailing dot or non-ASCII."""
-    return isinstance(value, str) and value.isascii() and HOST_RE.fullmatch(value) is not None
+    return (isinstance(value, str) and value.isascii() and HOST_RE.fullmatch(value) is not None
+            and not value.rsplit(".", 1)[-1].isdigit())                    # an IPv4 literal is not a DNS name
 
 
 def _section(raw: Mapping[str, Any], key: str, allowed: frozenset[str]) -> dict[str, Any]:
@@ -114,31 +126,36 @@ def _limits(raw: Mapping[str, Any], per_hour: int) -> MembersConfig:
     return MembersConfig.from_mapping(merged)
 
 
-def parse_members(raw: object, *, public_host: object = None) -> dict[str, Any] | None:
+def parse_members(raw: object, *, public_host: object = None, session_seconds: object = None) -> dict[str, Any] | None:
     """The validated section, or None unless ``enabled`` is exactly true.  Raises ``ValueError``.
 
-    ``public_host`` (the share host) is required when enabled; an authored ``public_host`` key is the slice form."""
+    A disabled section is validated too (types, unknown keys, bounds), so a mistake shows now and not when someone
+    flips it on; only ``group``, ``session_secret`` and the host are required just when enabled.  ``public_host`` and
+    ``session_seconds`` (the share's) win over the authored keys, which are the slice form."""
     if raw is None:
         return None
     if not isinstance(raw, Mapping):
         raise ValueError(f"{WHERE} must be a mapping")
     if "enabled" in raw and not isinstance(raw["enabled"], bool):
         raise ValueError(f"{WHERE}.enabled must be true or false")
-    if raw.get("enabled") is not True:
-        return None
+    on = raw.get("enabled") is True
     if unknown := sorted(set(raw) - TOP_KEYS):
         raise ValueError(f"{WHERE}: unknown keys: " + ", ".join(unknown))
     group = raw.get("group")
-    if not isinstance(group, str) or not group.strip():
+    if (on or group is not None) and (not isinstance(group, str) or not group.strip()):
         raise ValueError(f"{WHERE}.group must be a non-empty string")
     secret = raw.get("session_secret")
-    if not isinstance(secret, str) or not secret.isascii() or len(secret.encode()) < MIN_SECRET_BYTES:
+    if (on or secret is not None) and (not isinstance(secret, str) or not secret.isascii()
+                                       or len(secret.encode()) < MIN_SECRET_BYTES):
         raise ValueError(f"{WHERE}.session_secret must be a string of at least {MIN_SECRET_BYTES} bytes")
     host = public_host if public_host is not None else raw.get("public_host")
-    if host is None:
+    if host is None and on:
         raise ValueError(f"{WHERE} needs control_plane.share.public_host (the member web host)")
-    if not valid_public_host(host):
+    if host is not None and not valid_public_host(host):
         raise ValueError("control_plane.share.public_host must be a lowercase DNS name (no scheme, port or path)")
+    seconds = session_seconds if session_seconds is not None else raw.get("session_seconds", 14400)
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or not 60 <= seconds <= MAX_SESSION_SECONDS:
+        raise ValueError("control_plane.share.session_seconds must be an integer, 60 to 604800")
     ttl = raw.get("groups_ttl", 24 * 3600.0)
     if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not ttl > 0:
         raise ValueError(f"{WHERE}.groups_ttl must be a positive number")
@@ -162,6 +179,9 @@ def parse_members(raw: object, *, public_host: object = None) -> dict[str, Any] 
     per_hour = raw.get("share_creates_per_hour", 20)
     if isinstance(per_hour, bool) or not isinstance(per_hour, int) or per_hour < 1:
         raise ValueError(f"{WHERE}.share_creates_per_hour must be a positive integer")
+    limits = _limits(raw, per_hour)
+    if not on:
+        return None
     return {"group": group, "groups_ttl": float(ttl), "removed_grace": float(grace), "defaults": defaults,
-            "share_limits": dict(share_limits), "share_creates_per_hour": per_hour,
-            "session_secret": secret, "public_host": host, "limits": _limits(raw, per_hour)}
+            "share_limits": dict(share_limits), "share_creates_per_hour": per_hour, "session_seconds": seconds,
+            "session_secret": secret, "public_host": host, "limits": limits}

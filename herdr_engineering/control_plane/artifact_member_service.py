@@ -263,8 +263,11 @@ class MemberService:
 
     # ------------------------------------------------------------------------------------------ shares
     def _shareable(self, who: _Caller, tool: str, artifact_id: Any) -> None:
-        """Owned, or shared with the caller; the worker re-checks the ``share`` grant, this only spares a ticket."""
-        self._readable(who, tool, artifact_id)
+        """Owned and active, or shared with the caller; the worker re-checks the ``share`` grant and the lifecycle, this
+        only spares a ticket and a write-rate slot."""
+        row, own = self._readable(who, tool, artifact_id)
+        if own and row.get("lifecycle") != "active":
+            raise self._fail(who.pr, tool, "not_owner", 404, "not_found", NOT_FOUND, artifact_id)
 
     def share_create(self, actor: Mapping[str, Any], artifact_id: Any, version_id: Any, audience: Any,
                      allow_groups: Any = None, allow_emails: Any = None, expires_in_days: Any = None,
@@ -411,6 +414,19 @@ class MemberService:
             last = self._stage_validated(who, chunk, limits)
             replayed = replayed and last["replayed"]
         return {**last, "replayed": replayed, "chunks": len(chunks)}
+
+    def precheck_run(self, actor: Mapping[str, Any], content_length: int) -> None:
+        """Refuse a run the chunk window cannot take, from its ``Content-Length`` alone and without recording a hit, so
+        the web layer can answer 429 before it reads a byte of the body.  ``upload_run`` still counts the real hits."""
+        who = self._caller(actor, "upload_run")
+        n = -(-content_length // CHUNK_BYTES)
+        svc = self.service
+        with svc._lock:
+            now = svc._now()
+            hits = [t for t in svc._hits.get(f"memberchunk:{who.principal}", ()) if now - t < 60.0]
+            if len(hits) + n > self._chunk_rate(self._limits()):
+                svc.stats["rate_limited"] += 1
+                raise MemberServiceError(429, "rate_limited", "chunk rate limit exceeded")
 
     def _upload_key(self, artifact_id: Any, name: Any, size_bytes: Any, file_sha256: Any, who: _Caller,
                     limits: BridgeLimits) -> str:

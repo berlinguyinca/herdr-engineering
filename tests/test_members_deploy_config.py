@@ -145,3 +145,69 @@ def test_member_locations_are_in_the_edge_only_when_members_are_enabled():
     assert "location /api/member/ {" in on and "location = / {" in on and "location /my/ {" in on
     assert "proxy_request_buffering off;" in on and "client_max_body_size 17m;" in on
     assert on.count("location / { return 404; }") == off.count("location / { return 404; }")
+
+
+# ---------------------------------------------------------------------------- fix round 1: config validation
+
+
+def test_the_slice_carries_the_session_lifetime_only_when_the_share_sets_it(tmp_path):
+    out = tmp_path / "a.json"
+    fcc.render_collab(cfg_of(tmp_path / "a", sh=share(session_seconds=900), mem=members()), out)
+    assert json.loads(out.read_text())["sections"]["control_plane"]["values"]["collab"]["members"]["session_seconds"] == 900
+    out2 = tmp_path / "b.json"
+    fcc.render_collab(cfg_of(tmp_path / "b", sh=share(), mem=members()), out2)
+    assert "session_seconds" not in json.loads(out2.read_text())["sections"]["control_plane"]["values"]["collab"]["members"]
+
+
+@pytest.mark.parametrize("bad", [{"session_seconds": 900}, {"public_host": HOST}])
+def test_the_slice_only_keys_are_not_authored_under_members(tmp_path, bad):
+    with pytest.raises(FleetConfigError, match="not authored here"):
+        fcc.collab_values(cfg_of(tmp_path, sh=share(), mem=members(**bad)))
+
+
+@pytest.mark.parametrize("bad", [59, True, "900", 10**9])
+def test_a_bad_session_lifetime_is_refused_for_members(tmp_path, bad):
+    with pytest.raises(FleetConfigError, match="session_seconds"):
+        fcc.collab_values(cfg_of(tmp_path, sh=share(session_seconds=bad), mem=members()))
+
+
+def test_a_disabled_members_section_is_validated_too(tmp_path):
+    for bad in ({"enabled": False, "nonsense": 1}, {"enabled": False, "session_secret": "short"},
+                {"enabled": False, "group": 5}, {"enabled": False, "rate_limits": {"writes_per_minute": 0}},
+                {"enabled": False, "request_limits": {"http_chunks_per_request": 33}}):
+        with pytest.raises(FleetConfigError, match="collab.members"):
+            fcc.collab_values(cfg_of(tmp_path / str(len(str(bad))), sh=share(), mem=bad))
+    ok = {"enabled": False, "group": "g", "request_limits": {"http_chunks_per_request": 32}}
+    assert fcc.collab_values(cfg_of(tmp_path / "ok", mem=ok))["members"] == ok
+
+
+@pytest.mark.parametrize("key,sect,value", [("http_chunks_per_request", "request_limits", 33),
+                                            ("max_publish_files", "request_limits", 10**6),
+                                            ("max_message_chars", "request_limits", 10**6),
+                                            ("chunks_per_minute", "rate_limits", 10**7),
+                                            ("writes_per_minute", "rate_limits", 10**6),
+                                            ("session_exchanges_per_minute", "rate_limits", 10**6),
+                                            ("max_upload_bytes", "request_limits", 1 << 41),
+                                            ("staging_bytes_per_member", "staging", 1 << 41)])
+def test_member_limits_have_upper_bounds_at_config_load(tmp_path, key, sect, value):
+    with pytest.raises(FleetConfigError, match=key):
+        fcc.collab_values(cfg_of(tmp_path, sh=share(), mem=members(**{sect: {key: value}})))
+
+
+def test_share_creates_per_hour_has_an_upper_bound(tmp_path):
+    with pytest.raises(FleetConfigError, match="share_creates_per_hour"):
+        fcc.collab_values(cfg_of(tmp_path, sh=share(), mem=members(share_creates_per_hour=10**6)))
+
+
+def test_the_member_host_may_not_be_the_mcp_host_even_with_share_disabled(tmp_path):
+    for sh in ({"enabled": False, "public_host": "mcp.example.test"}, share(public_host="mcp.example.test")):
+        with pytest.raises(FleetConfigError, match="other than"):
+            fcc.collab_values(cfg_of(tmp_path / str(len(sh)), sh=sh, mem=members()))
+    with pytest.raises(FleetConfigError, match="other than"):                  # members off, host still set
+        fcc.collab_values(cfg_of(tmp_path / "off", sh={"enabled": False, "public_host": "mcp.example.test"}))
+
+
+@pytest.mark.parametrize("bad", ["10.0.0.1", "127.0.0.1", "a.b.7"])
+def test_an_ip_literal_is_not_a_public_host(tmp_path, bad):
+    with pytest.raises(FleetConfigError, match="public_host"):
+        fcc.share_values(cfg_of(tmp_path, sh=share(public_host=bad)))
