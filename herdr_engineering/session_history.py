@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -407,6 +408,63 @@ def _record_cwds(res: Resolution, limit: int = 8) -> list[str]:
 
 # --- public entry -----------------------------------------------------------
 
+# --- real user prompts: the same rules for every harness ---------------------------------------------
+# None of the four readers marks injected content (task notifications, system reminders, hook output, pasted
+# context); all emit it as ordinary ``user`` events, so one classifier decides what a person actually typed.
+_INJECTED_PREFIXES = ("<task-notification", "<system-reminder", "<environment_context", "<command-",
+                      "<local-command", "<pasted_content")
+PROMPT_TEXT_CLIP = 120
+PROMPT_TEXT_HEAD = PROMPT_TEXT_TAIL = 50
+
+
+def is_human_prompt(text: str) -> bool:
+    """True for text a person typed; false for empty text and wrapper-tagged injected content."""
+    stripped = (text or "").lstrip()
+    return bool(stripped) and not stripped.startswith(_INJECTED_PREFIXES)
+
+
+def normalize_ts(value: Any) -> str | None:
+    """Any recorded timestamp (ISO text, epoch seconds or milliseconds) as UTC ``YYYY-MM-DDTHH:MM:SSZ``, else None."""
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            when = datetime.fromtimestamp(value / 1000 if value > 1e11 else value, tz=timezone.utc)
+        elif isinstance(value, str) and value.strip():
+            when = datetime.fromisoformat(value.strip())
+            when = when.replace(tzinfo=timezone.utc) if when.tzinfo is None else when.astimezone(timezone.utc)
+        else:
+            return None
+    except (ValueError, OverflowError, OSError):
+        return None
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_prompts(events: list[dict], *, text_limit: int = 400) -> tuple[list[dict], int]:
+    """Every real user prompt as ``{n, ts, text}`` (n counts from 1), plus the true total.
+
+    Past ``text_limit`` prompts only some keep their text: the first and last 50 and evenly spaced ones between.
+    Every prompt keeps ``n`` and ``ts`` so counts and times are exact whatever was sampled.
+    """
+    real = [e for e in events if e.get("kind") == "user" and is_human_prompt(e.get("text", ""))]
+    total = len(real)
+    if total <= text_limit:
+        keep = set(range(total))
+    else:
+        head, tail = PROMPT_TEXT_HEAD, PROMPT_TEXT_TAIL
+        middle = total - head - tail
+        want = max(text_limit - head - tail, 0)
+        keep = set(range(head)) | set(range(total - tail, total))
+        keep |= {head + (i * middle) // want for i in range(want)} if want else set()
+    prompts = []
+    for i, e in enumerate(real):
+        prompt = {"n": i + 1, "ts": normalize_ts(e.get("ts"))}
+        if i in keep:
+            prompt["text"] = e["text"][:PROMPT_TEXT_CLIP]
+        prompts.append(prompt)
+    return prompts, total
+
+
 def read_history(res: Resolution, *, home: Path | None = None, max_events: int = 400) -> dict:
     home = home or Path.home()
     gaps: list[str] = []
@@ -438,6 +496,8 @@ def read_history(res: Resolution, *, home: Path | None = None, max_events: int =
     verdict = "limited" if (not events or res.method.startswith(("newest", "none"))) else (
         "partial" if gaps else "complete")
     cwds = _record_cwds(res) if res.path and res.agent else []
+    prompts, prompts_total = build_prompts(events)
+    dispatch_ts = [normalize_ts(e.get("ts")) for e in events if e["kind"] == "child_dispatch"]
     omitted = max(0, len(events) - max_events)
     shown = events if not omitted else events[:60] + events[-(max_events - 60):]
     return {
@@ -445,6 +505,7 @@ def read_history(res: Resolution, *, home: Path | None = None, max_events: int =
         "cwd": (cwds[-1] if cwds else None), "cwds": cwds,
         "events_total": len(events), "events_omitted_from_middle": omitted, "events": shown,
         "compactions": len(compactions), "child_records": meta["child_records"],
+        "prompts": prompts, "prompts_total": prompts_total, "dispatch_ts": dispatch_ts,
         "coverage": {"verdict": verdict, "gaps": gaps},
         "read_only": True,
     }

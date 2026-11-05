@@ -419,7 +419,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("file", help="the report's Markdown file")
     p2.add_argument("--close-pane", default=None, metavar="PANE_ID",
                     help="close this Herdr pane when the reader quits")
+    p2.add_argument("--peer", default=None, metavar="PANE_ID", help="also close this pane (the graph) afterwards")
     p2.set_defaults(func=_cmd_summary_view)
+    p2 = smsub.add_parser("graph", help="draw a published report's drift graph (what the graph pane runs)")
+    p2.add_argument("file", help="the report's Markdown file; the graph is read from its .graph.json sidecar")
+    p2.add_argument("--close-pane", default=None, metavar="PANE_ID",
+                    help="close this Herdr pane when the reader quits")
+    p2.add_argument("--peer", default=None, metavar="PANE_ID", help="also close this pane (the summary) afterwards")
+    p2.set_defaults(func=_cmd_summary_graph)
 
     # memory ---------------------------------------------------------------
     p = sub.add_parser("memory", help="herdr-memory harness adapters: plan/install/status/doctor/repair/upgrade/uninstall")
@@ -1342,7 +1349,12 @@ def _cmd_summary_publish(args) -> int:
 
 def _cmd_summary_view(args) -> int:
     from . import summary_report as sr
-    return sr.view_report(args.file, close_pane=args.close_pane)
+    return sr.view_report(args.file, close_pane=args.close_pane, peer_pane=args.peer)
+
+
+def _cmd_summary_graph(args) -> int:
+    from . import summary_report as sr
+    return sr.view_graph(args.file, close_pane=args.close_pane, peer_pane=args.peer)
 
 
 def _cmd_agent_mine(args) -> int:
