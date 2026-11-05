@@ -320,7 +320,8 @@ class ArtifactLifecycleMixin:
         """Per-member data tied to a purged artifact: the recipients and titles of its links, the free-text detail of
         its member audit rows and its access grants. The rows (who did what, when) remain; nothing identifying does."""
         await self._conn.execute(
-            "UPDATE artifact_shares SET allow_emails='{}', allow_groups='{}', title=NULL WHERE artifact_id=$1",
+            "UPDATE artifact_shares SET allow_emails='{}', allow_groups='{}', title=NULL, entry=NULL"
+            " WHERE artifact_id=$1",
             artifact_id)
         await self._conn.execute(
             "UPDATE artifact_member_events SET detail='{}'::jsonb WHERE artifact_id=$1", artifact_id)
@@ -345,6 +346,18 @@ class ArtifactLifecycleMixin:
         await self._conn.execute(
             "UPDATE artifact_report_feedback SET body='[removed]', actor='[removed]' WHERE artifact_id=$1"
             " AND actor IS DISTINCT FROM (SELECT created_by FROM artifacts WHERE artifact_id=$1)", artifact_id)
+        # The file names in each version's manifest and the commit message / entry file in its provenance name the
+        # same things the columns above did. storage_key and sha256 stay: _key_shared and the audit trail need them.
+        await self._conn.execute(
+            "UPDATE artifact_versions SET"
+            " output_manifest=CASE WHEN jsonb_typeof(output_manifest)='array' THEN (SELECT coalesce(jsonb_agg("
+            "  CASE WHEN jsonb_typeof(e)='object' AND e ? 'name' THEN jsonb_set(e, '{name}', '\"[removed]\"') ELSE e END"
+            "  ORDER BY o), '[]'::jsonb) FROM jsonb_array_elements(output_manifest) WITH ORDINALITY AS t(e, o))"
+            "  ELSE output_manifest END,"
+            " provenance=(provenance - 'message' - 'entry')"
+            "   || CASE WHEN provenance ? 'message' THEN jsonb_build_object('message', '[removed]') ELSE '{}'::jsonb END"
+            "   || CASE WHEN provenance ? 'entry' THEN jsonb_build_object('entry', '[removed]') ELSE '{}'::jsonb END"
+            " WHERE artifact_id=$1", artifact_id)
         await self._conn.execute("SET LOCAL herdr.purge_redaction = 'off'")
         await self._conn.execute("UPDATE artifact_collab_uploads SET name='[removed]' WHERE artifact_id=$1", artifact_id)
         await self._conn.execute(

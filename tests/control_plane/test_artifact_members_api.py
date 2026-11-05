@@ -455,6 +455,43 @@ def test_purge_anonymises_annotations_viewer_events_uploads_and_the_filename(env
     assert "smith" not in json.dumps(dict(row)).lower()
 
 
+def test_purge_blanks_names_and_messages_in_manifests_provenance_and_share_entries(env):
+    aid, vid = env.artifact()
+    share = env.share(aid, vid)
+    before = env.sql("SELECT output_manifest FROM artifact_versions WHERE version_id=$1", vid)[0][0]
+    before = json.loads(before) if isinstance(before, str) else before
+    assert before and all("name" in o for o in before), before
+    env.sql("ALTER TABLE artifact_versions DISABLE TRIGGER artifact_versions_freeze")
+    try:
+        env.sql("UPDATE artifact_versions SET provenance=provenance || '{\"message\":\"jane-doe diagnosis\","
+                "\"entry\":\"jane-doe.html\",\"via\":\"member_web\"}'::jsonb WHERE version_id=$1", vid)
+    finally:
+        env.sql("ALTER TABLE artifact_versions ENABLE TRIGGER artifact_versions_freeze")
+    env.sql("UPDATE artifact_shares SET entry='jane-doe.html' WHERE share_id=$1", share["share_id"])
+    retract(env, aid)
+    assert env.req(purge_path(aid), body={"confirm": aid})[0] == 200
+    row = env.sql("SELECT output_manifest, provenance FROM artifact_versions WHERE version_id=$1", vid)[0]
+    manifest = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+    prov = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+    assert [o["name"] for o in manifest] == ["[removed]"] * len(before)
+    assert [o["storage_key"] for o in manifest] == [o["storage_key"] for o in before]          # bytes stay addressable
+    assert [o["sha256"] for o in manifest] == [o["sha256"] for o in before]
+    assert prov["message"] == "[removed]" and prov["entry"] == "[removed]" and prov["via"] == "member_web"
+    assert env.sql("SELECT entry FROM artifact_shares WHERE share_id=$1", share["share_id"])[0][0] is None
+    assert "jane" not in json.dumps([dict(r) for r in env.sql("SELECT * FROM artifact_versions")], default=str)
+
+
+def test_the_version_freeze_still_refuses_edits_outside_a_purge(env):
+    aid, vid = env.artifact()
+    import pytest
+    with pytest.raises(Exception, match="immutable"):
+        env.sql("UPDATE artifact_versions SET output_manifest=jsonb_set(output_manifest, '{0,name}', '\"x\"') "
+                "WHERE version_id=$1", vid)
+    with pytest.raises(Exception, match="immutable"):
+        env.sql("UPDATE artifact_versions SET output_manifest=jsonb_set(output_manifest, '{0,storage_key}', '\"x\"') "
+                "WHERE version_id=$1 AND set_config('herdr.purge_redaction','on',false)='on'", vid)
+
+
 def test_purge_clears_every_viewer_identity_quoted_anchor_text_and_feedback(env):
     from herdr_engineering.control_plane.artifact_shares import EVENT_KINDS
     aid, vid = env.artifact()
