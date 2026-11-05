@@ -26,7 +26,7 @@ from .actiongrants import as_utc
 from .policy import record_owner_decision
 from .slack_asks import SlackAsk
 
-__all__ = ["SlackClient", "SlackError", "SlackRuntime", "ASK_ACTIONS"]
+__all__ = ["SlackClient", "SlackError", "SlackRuntime", "ASK_ACTIONS", "slack_text", "slack_api_call"]
 
 _log = logging.getLogger("herdr_engineering.assistant_hub.slack")
 _MAX_REPLY = 1024 * 1024
@@ -59,6 +59,35 @@ def _read_token(path: str) -> str:
     return token
 
 
+def slack_api_call(base_url: str, method: str, token: str, body: dict[str, Any] | None, timeout: float,
+                   ) -> dict[str, Any]:
+    """One Web API call that never uses an environment proxy and never follows a redirect (a token rides on it).
+
+    ``body`` None sends an empty form (``apps.connections.open``); otherwise the body is JSON."""
+    headers = {"Authorization": f"Bearer {token}"}
+    if body is None:
+        data, headers["Content-Type"] = b"", "application/x-www-form-urlencoded"
+    else:
+        data, headers["Content-Type"] = json.dumps(body).encode(), "application/json; charset=utf-8"
+    req = urllib.request.Request(base_url.rstrip("/") + "/" + method, method="POST", data=data, headers=headers)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)    # never via a proxy
+    try:
+        with opener.open(req, timeout=timeout) as response:
+            raw = response.read(_MAX_REPLY)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(_MAX_REPLY)
+    except (OSError, ValueError):
+        raise SlackError("io") from None
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        raise SlackError("bad_reply") from None
+    if not isinstance(doc, dict) or doc.get("ok") is not True:
+        error = doc.get("error") if isinstance(doc, dict) else None
+        raise SlackError(error if isinstance(error, str) and _ID.fullmatch(error) else "bad_reply")
+    return doc
+
+
 class SlackClient:
     """Slack Web API calls with the bot token.  Built per call from the live config, so rotation applies."""
 
@@ -70,26 +99,7 @@ class SlackClient:
         cfg = self._cfg()
         if not cfg.get("enabled"):
             raise SlackError("disabled")
-        token = _read_token(cfg["bot_token_file"])
-        req = urllib.request.Request(
-            cfg["base_url"].rstrip("/") + "/" + method, method="POST", data=json.dumps(body).encode(),
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)    # never via a proxy
-        try:
-            with opener.open(req, timeout=self._timeout) as response:
-                raw = response.read(_MAX_REPLY)
-        except urllib.error.HTTPError as exc:
-            raw = exc.read(_MAX_REPLY)
-        except (OSError, ValueError):
-            raise SlackError("io") from None
-        try:
-            doc = json.loads(raw)
-        except ValueError:
-            raise SlackError("bad_reply") from None
-        if not isinstance(doc, dict) or doc.get("ok") is not True:
-            error = doc.get("error") if isinstance(doc, dict) else None
-            raise SlackError(error if isinstance(error, str) and _ID.fullmatch(error) else "bad_reply")
-        return doc
+        return slack_api_call(cfg["base_url"], method, _read_token(cfg["bot_token_file"]), body, self._timeout)
 
     def post_message(self, channel: str, blocks: list[dict[str, Any]], text: str, *, thread_ts: str = "") -> str:
         body: dict[str, Any] = {"channel": channel, "blocks": blocks, "text": text}
@@ -111,6 +121,27 @@ class SlackClient:
         return cid
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+_TEXT_MAX = 300
+
+
+def slack_text(value: str) -> str:
+    """Worker-controlled text made inert for Slack mrkdwn: control characters are dropped, ``& < >`` are escaped
+    (so ``<!channel>``, ``<@U123>`` and ``<url|label>`` print literally), ``@`` gets a zero-width space so a bare
+    ``@here`` cannot notify, backticks become the look-alike modifier grave accent, and the result is at most 300
+    characters (never cut inside an entity)."""
+    out = _CONTROL.sub(" ", str(value))
+    out = out.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    out = out.replace("@", "@\u200b").replace("`", "\u02cb")
+    if len(out) > _TEXT_MAX:
+        out = out[:_TEXT_MAX - 1]
+        amp = out.rfind("&")
+        if amp > out.rfind(";"):
+            out = out[:amp]
+        out += "\u2026"
+    return out
+
+
 def _short_id(value: object) -> str:
     return value if isinstance(value, str) and _ID.fullmatch(value) else "-"
 
@@ -120,13 +151,14 @@ class SlackRuntime:
 
     def __init__(self, store: AssistantStore, service: Any, cfg_getter: Callable[[], dict[str, Any]],
                  now_fn: Callable[[], datetime], *, min_backoff: float = 0.5, max_backoff: float = 30.0,
-                 ping_interval: float = 2.0) -> None:
+                 ping_interval: float = 2.0, stop_timeout: float = 15.0) -> None:
         self.store = store
         self.service = service
         self._cfg = cfg_getter
         self._now = now_fn
         self._min_backoff = min_backoff
         self._max_backoff = max_backoff
+        self._stop_timeout = stop_timeout
         self._ping_interval = ping_interval        # a dead link is noticed after about five missed pings
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -138,17 +170,25 @@ class SlackRuntime:
     def start(self) -> None:
         with self._state:
             if self._thread is not None and self._thread.is_alive():
-                return
+                return          # running, or a stop() that timed out and has not finished: never two supervisors
             self._stop.clear()
             self._thread = threading.Thread(target=self._run, name="slack-socket-mode", daemon=True)
             self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """Stop the supervisor.  True when it has ended; False when it did not end within ``stop_timeout`` (it is
+        still winding down, ``start`` refuses until it has, and a later ``stop`` can confirm)."""
         with self._state:
-            thread, self._thread = self._thread, None
+            thread = self._thread
             self._stop.set()
         if thread is not None:
-            thread.join(timeout=15)
+            thread.join(timeout=self._stop_timeout)
+            if thread.is_alive():
+                return False
+            with self._state:
+                if self._thread is thread:
+                    self._thread = None
+        return True
 
     def _run(self) -> None:
         delay = self._min_backoff
@@ -173,9 +213,19 @@ class SlackRuntime:
         app_token = _read_token(cfg["app_token_file"])
         sdk_log = logging.getLogger("herdr_engineering.assistant_hub.slack.sdk")
         sdk_log.setLevel(logging.ERROR)                     # the SDK's own logs may carry connection tickets
-        client = SocketModeClient(
+        base_url = cfg["base_url"]
+
+        class NoProxySocketModeClient(SocketModeClient):
+            def issue_new_wss_url(self) -> str:             # the SDK's WebClient would read HTTP(S)_PROXY from the env
+                url = slack_api_call(base_url, "apps.connections.open", app_token, None, 10).get("url")
+                if not isinstance(url, str) or not url:
+                    raise SlackError("bad_reply")
+                return url
+
+        client = NoProxySocketModeClient(
             app_token=app_token, logger=sdk_log, auto_reconnect_enabled=False, ping_interval=self._ping_interval,
-            web_client=WebClient(base_url=cfg["base_url"].rstrip("/") + "/", timeout=10))
+            web_client=WebClient(base_url=base_url.rstrip("/") + "/", timeout=10))
+        client.proxy = None                                 # the websocket honours only this attribute (set from the env)
         client.socket_mode_request_listeners.append(self._on_request)
         connected = False
         try:
@@ -249,13 +299,14 @@ class SlackRuntime:
         if row.status == "vetoed":
             return self._refuse("vetoed", ask, uid)
         if row.status != "pending":
-            return self._refuse("request_not_pending", ask, uid)
+            return self._close_stale(ask, row.display, row.status, uid)
         approve, remember = ASK_ACTIONS[action_id]
         try:
             record_owner_decision(self.store, self.service.config["grants"], now, ask.tenant_id, ask.user_id,
                                   ask.request_id, approve, f"slack:{uid}", provenance="owner_slack")
         except (ValueError, KeyError):          # decided or vetoed by another path between the check and the call
-            return self._refuse("request_not_pending", ask, uid)
+            current = self.store.get_action_request(ask.request_id, tenant_id=ask.tenant_id, user_id=ask.user_id)
+            return self._close_stale(ask, row.display, current.status if current is not None else "gone", uid)
         ask.status, ask.remember = "decided", remember
         self.store.put_slack_ask(ask)
         outcome = "approve" if approve else "deny"
@@ -265,10 +316,21 @@ class SlackRuntime:
                                        f"{' remember' if remember else ''}")
         self._show_outcome(ask, row.display, approve, uid)
 
+    def _close_stale(self, ask: SlackAsk, display: str, status: str, uid: object) -> None:
+        """The request was decided another way: refuse the tap, close the ask and take the buttons off the message.
+
+        Only a decided ask's message is edited: the runtime refuses taps on a message that carries ``edited``."""
+        self._refuse("request_not_pending", ask, uid)
+        ask.status = "decided"
+        self.store.put_slack_ask(ask)
+        self._edit_message(ask, display, f"Already {slack_text(status)} elsewhere")
+
     def _show_outcome(self, ask: SlackAsk, display: str, approve: bool, uid: str) -> None:
         verdict = "Approved" if approve else "Denied"
-        text = f"{verdict} by <@{uid}>"
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": (display or "Request")[:2800]}},
+        self._edit_message(ask, display, f"{verdict} by <@{uid}>")
+
+    def _edit_message(self, ask: SlackAsk, display: str, text: str) -> None:
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": slack_text(display or "Request")}},
                   {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}]
         try:
             self.client.update_message(ask.channel, ask.ts, blocks, text)

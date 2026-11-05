@@ -360,3 +360,52 @@ def test_disabled_config_connects_nothing(world):
     world.runtime.start()
     world.runtime.stop()
     assert world.listener.requests == [] and world.listener.ws_connections == 0
+
+
+def test_socket_mode_link_ignores_environment_proxies(world, monkeypatch):
+    """The link carries the app-level token: no env proxy may see the web call or the websocket."""
+    proxy = SlackListener(BOT, APP)
+    try:
+        for name in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            monkeypatch.setenv(name, f"http://127.0.0.1:{proxy.port}")
+        for name in ("no_proxy", "NO_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+        ask = world.ask()
+        world.runtime.start()
+        assert world.listener.wait_for(lambda: world.listener.ws_alive == 1)
+        env = world.listener.push_interactive(_socket_payload(ask))
+        assert world.listener.wait_for(lambda: world.status(ask.request_id) == "approved")
+        assert env in world.listener.acks
+        assert proxy.requests == [] and proxy.ws_connections == 0 and proxy.calls == []
+    finally:
+        proxy.close()
+
+
+def test_stop_timeout_keeps_the_handle_and_start_refuses_a_second_supervisor(world):
+    world.runtime = SlackRuntime(world.store, world.service, lambda: world.cfg, world.clock,
+                                 min_backoff=0.05, max_backoff=0.2, ping_interval=0.3, stop_timeout=0.2)
+    gate = threading.Event()
+    world.listener.on_request = lambda method: gate.wait(3) if method == "apps.connections.open" else None
+    world.runtime.start()
+    assert world.listener.wait_for(lambda: any(r["path"].endswith("apps.connections.open")
+                                               for r in world.listener.requests))
+    assert world.runtime.stop() is False                        # timed out: the supervisor is still running
+    world.runtime.start()                                       # refused while the old supervisor is alive
+    assert len([t for t in threading.enumerate() if t.name == "slack-socket-mode"]) == 1
+    gate.set()
+    assert world.listener.wait_for(
+        lambda: not any(t.name == "slack-socket-mode" for t in threading.enumerate()), timeout=5)
+    assert world.runtime.stop() is True
+    world.runtime.start()                                       # the old one is gone, so a new start works
+    assert world.listener.wait_for(lambda: world.listener.ws_alive == 1)
+
+
+def test_tap_on_request_decided_elsewhere_closes_the_ask_and_removes_buttons(world):
+    ask = world.ask()
+    record_owner_decision(world.store, world.service.config["grants"], NOW, T, U, ask.request_id, False, U)
+    world.tap(ask)
+    assert world.store.get_slack_ask(ask.ask_id, tenant_id=T, user_id=U).status == "decided"
+    (update,) = world.listener.calls_to("chat.update")
+    assert update["ts"] == ask.ts and not any(b.get("type") == "actions" for b in update["blocks"])
+    world.tap(ask)                                       # a second tap is refused as not_open, nothing more is sent
+    assert len(world.listener.calls_to("chat.update")) == 1
