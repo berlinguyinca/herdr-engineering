@@ -466,3 +466,36 @@ def test_transient_database_error_aborts_the_pass_and_the_line_is_retried(regist
         assert await ingestor.ingest_file(path, marker) == 1
         assert await conn.fetchval("SELECT body FROM artifact_annotations") == "later"
     run(registry_pg, body)
+
+
+def test_ingest_rechecks_the_allow_list_not_only_the_post(registry_pg):
+    """Plan 4 C3 (M1): a member removed from the allow-list after the POST but before the worker reads the line is refused."""
+    async def body(store, conn):
+        _, _, sid = await seed(conn)
+        assert await store.ingest(conn, create(sid, 1, basis="e"), "m1", **KW) == "inserted"
+        await conn.execute("UPDATE artifact_shares SET allow_emails='{}' WHERE share_id=$1", sid)   # removed since the POST
+        assert await store.ingest(conn, create(sid, 2, basis="e"), "m2", **KW) == "not_on_list"
+        assert await store.ingest(conn, create(sid, 3), "m3", **KW) == "not_on_list"              # a pre-field line
+        assert await store.ingest(conn, create(sid, 4, basis="g"), "m4", **KW) == "not_on_list"   # no groups either
+        assert await store.ingest(conn, create(sid, 5, author_email="boss@x.org"), "m5", **KW) == "inserted"
+        await conn.execute("UPDATE artifact_shares SET allow_groups='{lab}' WHERE share_id=$1", sid)
+        assert await store.ingest(conn, create(sid, 6, basis="g"), "m6", **KW) == "inserted"
+        assert await store.ingest(conn, create(sid, 7, basis="e"), "m7", **KW) == "not_on_list"   # email basis needs the email
+        assert await conn.fetchval("SELECT count(*) FROM artifact_annotations") == 3
+        assert "annotation_not_on_list" in await denied_reasons(conn, sid)
+    run(registry_pg, body)
+
+
+def test_a_removed_member_cannot_edit_but_can_withdraw_their_note(registry_pg):
+    async def body(store, conn):
+        _, _, sid = await seed(conn)
+        assert await store.ingest(conn, create(sid, 1), "c1", **KW) == "inserted"
+        await conn.execute("UPDATE artifact_shares SET allow_emails='{}' WHERE share_id=$1", sid)
+        edit = {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "body": "rewritten",
+                "at": datetime.now(UTC).isoformat()}
+        assert await store.ingest(conn, edit, "e1", **KW) == "not_on_list"
+        assert await conn.fetchval("SELECT body FROM artifact_annotations") == "note"
+        gone = {**edit, "op": "delete"}
+        gone.pop("body")
+        assert await store.ingest(conn, gone, "d1", **KW) == "withdrawn"
+    run(registry_pg, body)

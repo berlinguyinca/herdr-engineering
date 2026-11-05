@@ -1533,7 +1533,8 @@ class ShareHandler(BaseHTTPRequestHandler):
                     return self._annotate_error(state, got, 400, "bad_file")
                 annotation_id = "ann_" + secrets.token_urlsafe(16)
                 record = {"v": 1, "op": "create", "annotation_id": annotation_id, "share_id": share_id,
-                          "author_identity": identity, "author_email": got["email"], "at": at, "anchor": anchor,
+                          "author_identity": identity, "author_email": got["email"], "basis": got["basis"], "at": at,
+                          "anchor": anchor,
                           "body": comment}
             else:
                 verb = parts[7]

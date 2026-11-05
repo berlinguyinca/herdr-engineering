@@ -83,6 +83,20 @@ def _when(value: object, now: datetime) -> datetime | None:
     return min(at, now + MAX_FUTURE)
 
 
+def _admitted(share: Any, email: str, basis: object, owner_emails: frozenset[str]) -> bool:
+    """Whether ``email`` may still annotate ``share`` by its CURRENT allow-list (the ingest-time twin of the POST check).
+
+    ``basis`` is how the session was admitted (``e`` email / ``g`` group claim); a line without one (spooled before the
+    field existed) passes when either basis still holds. The share owner's emails stay admitted, as at POST time."""
+    from .share_lab import still_admitted
+    state = {"audience": share["audience"], "allow_emails": list(share["allow_emails"] or []),
+             "allow_groups": list(share["allow_groups"] or [])}
+    if email.lower() in owner_emails:
+        return True
+    bases = (basis,) if basis in ("e", "g") else ("e", "g")
+    return any(still_admitted(state, email, b) for b in bases)
+
+
 def _live_at(share: Any, at: datetime) -> bool:
     approved, revoked, expires = share["approved_at"], share["revoked_at"], share["expires_at"]
     return (approved is not None and at >= approved and (revoked is None or at <= revoked)
@@ -112,7 +126,8 @@ class AnnotationStore:
             return "invalid"
         async with _transaction(conn):
             share = await conn.fetchrow(
-                "SELECT s.share_id, s.artifact_id, s.version_id, s.audience, s.approved_at, s.revoked_at, "
+                "SELECT s.share_id, s.artifact_id, s.version_id, s.audience, s.allow_emails, s.allow_groups, "
+                "s.approved_at, s.revoked_at, "
                 "s.expires_at, v.output_manifest::text AS output_manifest, "
                 "v.report_descriptor::text AS report_descriptor "
                 "FROM artifact_shares s JOIN artifact_versions v ON v.version_id = s.version_id "
@@ -123,7 +138,7 @@ class AnnotationStore:
                 code = await self._create(conn, share, record, ingest_key, owner_emails, per_user_per_day,
                                           max_per_share, max_comment_chars)
             else:
-                code = await self._change(conn, share, record, ingest_key, op, max_comment_chars)
+                code = await self._change(conn, share, record, ingest_key, op, max_comment_chars, owner_emails)
             if code in ("inserted", "edited", "withdrawn", "duplicate"):
                 return code
             await ShareStore(conn)._event(conn, share_id, "denied", _text(record.get("author_identity"), 200) or "unknown",
@@ -153,6 +168,8 @@ class AnnotationStore:
             return "invalid"
         if not _live_at(share, at):
             return "not_live"
+        if not _admitted(share, email, record.get("basis"), owner_emails):
+            return "not_on_list"            # removed from the allow-list between the POST and this ingest
         version = {"output_manifest": json.loads(share["output_manifest"]),
                    "report_descriptor": json.loads(share["report_descriptor"]) if share["report_descriptor"] else None}
         if file not in shared_file_names(version):
@@ -178,7 +195,8 @@ class AnnotationStore:
                                       {"annotation_id": annotation_id, "file": file}, None, key)
         return "inserted"
 
-    async def _change(self, conn: Any, share: Any, record: dict, key: str, op: str, max_comment_chars: int) -> str:
+    async def _change(self, conn: Any, share: Any, record: dict, key: str, op: str, max_comment_chars: int,
+                      owner_emails: frozenset[str] = frozenset()) -> str:
         now = datetime.now(UTC)
         if await conn.fetchval("SELECT 1 FROM artifact_annotation_ops WHERE ingest_key = $1", key):
             return "duplicate"
@@ -193,7 +211,7 @@ class AnnotationStore:
                 body = clean_comment(record.get("body"), max_chars=max_comment_chars)
             except AnnotationInputError:
                 return "invalid"
-        row = await conn.fetchrow("SELECT author_identity, status, file_name FROM artifact_annotations "
+        row = await conn.fetchrow("SELECT author_identity, author_email, status, file_name FROM artifact_annotations "
                                   "WHERE annotation_id = $1 AND share_id = $2 FOR UPDATE",
                                   annotation_id, share["share_id"])
         if row is None:
@@ -204,6 +222,8 @@ class AnnotationStore:
             return "not_open"
         if not _live_at(share, at):
             return "not_live"
+        if op == "edit" and not _admitted(share, row["author_email"], None, owner_emails):
+            return "not_on_list"            # a removed member can still withdraw their note, never rewrite it
         if op == "edit":
             await conn.execute("UPDATE artifact_annotations SET body = $2, edited_at = $3, updated_at = now() "
                                "WHERE annotation_id = $1", annotation_id, body, at)
