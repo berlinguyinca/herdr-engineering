@@ -138,7 +138,21 @@ export class HerdrClient {
       if (value != null && value !== '') params.set(key, value);
     }
     const query = params.toString();
-    return this.request(`/api/v1/memory/${encodeURIComponent(id)}${query ? `?${query}` : ''}`, { signal });
+    // A caller's close/replace signal must not remove request()'s 15 s bound.
+    let bounded = signal;
+    if (signal) {
+      const deadline = AbortSignal.timeout(15000);
+      if (AbortSignal.any) bounded = AbortSignal.any([signal, deadline]);
+      else {
+        const controller = new AbortController();
+        for (const source of [signal, deadline]) {
+          if (source.aborted) controller.abort(source.reason);
+          else source.addEventListener('abort', () => controller.abort(source.reason), { once: true });
+        }
+        bounded = controller.signal;
+      }
+    }
+    return this.request(`/api/v1/memory/${encodeURIComponent(id)}${query ? `?${query}` : ''}`, { signal: bounded });
   }
 
   getMemoryServiceStatus({ signal } = {}) {

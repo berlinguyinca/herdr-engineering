@@ -618,5 +618,23 @@ test('memory detail encodes optional selectors and preserves id-only callers and
   assert.equal(calls[0].url, '/api/v1/memory/fixture%3Aa%2Fb');
   const selected = new URL(calls[1].url, 'http://fixture.test');
   assert.deepEqual(Object.fromEntries(selected.searchParams), { kind: 'summary', scope: 'mission:release', project: 'other&project' });
-  assert.equal(calls[1].signal, controller.signal);
+  assert.equal(calls[1].signal.aborted, false);
+  controller.abort();
+  assert.equal(calls[1].signal.aborted, true);
+});
+
+test('memory detail caller cancellation still aborts in-flight fetch without AbortSignal.any', async () => {
+  const nativeAny = AbortSignal.any;
+  AbortSignal.any = undefined;
+  const controller = new AbortController();
+  try {
+    const client = new HerdrClient('', { fetchImpl: (url, opts) => new Promise((resolve, reject) => {
+      opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true });
+    }) });
+    const pending = client.getMemoryRecord('fixture', { signal: controller.signal, kind: 'summary' });
+    controller.abort();
+    await assert.rejects(pending, { name: 'AbortError' });
+  } finally {
+    AbortSignal.any = nativeAny;
+  }
 });

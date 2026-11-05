@@ -194,3 +194,39 @@ test('detail cancellation, close and disposal prevent stale responses repainting
   click('first');
   assert.equal(pending.length, 4);
 });
+
+for (const fallback of [false, true]) {
+test(`actual row click with real client keeps its 15-second deadline (${fallback ? 'fallback' : 'native'} signal combination)`, async () => {
+  const { HerdrClient } = await import('./herdr-web-client/client.js');
+  let detailSignal;
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    if (new URL(url, 'http://fixture.test').pathname === '/api/v1/memory/m1') {
+      detailSignal = opts.signal;
+      return new Promise((resolve, reject) => {
+        if (opts.signal.aborted) reject(opts.signal.reason);
+        else opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true });
+      });
+    }
+    const body = url.includes('/search?') ? { results: [mem()] } : {};
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  } });
+  const { root, nodes, handlers } = fakeRoot();
+  const view = mountMemory(root, client, { query: new URLSearchParams('q=synthetic') });
+  await tick();
+  const nativeTimeout = AbortSignal.timeout, nativeAny = AbortSignal.any, deadlines = [];
+  if (fallback) AbortSignal.any = undefined;
+  AbortSignal.timeout = ms => { deadlines.push(ms); return nativeTimeout(20); };
+  try {
+    handlers.click({ target: { closest: s => s === '[data-memory]' ? { dataset: { memory: 'm1' }, focus() {} } : null } });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.ok(detailSignal, 'detail fetch must actually start');
+    assert.deepEqual(deadlines, [15000], 'caller cancellation must not remove the existing deadline');
+    assert.equal(detailSignal.aborted, true, 'stalled detail fetch must abort without manual disposal');
+    assert.doesNotMatch(nodes['[data-mem-drawer]'].innerHTML, /aria-busy="true"/);
+  } finally {
+    AbortSignal.timeout = nativeTimeout;
+    AbortSignal.any = nativeAny;
+    view.dispose();
+  }
+});
+}
