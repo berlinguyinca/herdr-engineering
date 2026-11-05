@@ -16,10 +16,14 @@ memory retention.
 
 ## Required boundary before enabling
 
-Automatic delivery stays disabled until an authenticated human can enroll an
-engineering session and its destination project. The current production shared
-`open-listener` identity cannot establish that consent. A repository path, harness
-name, agent-supplied source label, or default project is not personal-data consent.
+Automatic delivery stays disabled until the operator explicitly enrolls an
+engineering session and its destination project through the existing trusted
+private-location configuration or approval policy. The operator intentionally
+accepts the private dashboard's shared `open-listener` mode: dashboard login,
+Cognito enrollment and a per-person dashboard credential are not prerequisites.
+That trust policy does not authorize personal-data retention. A repository path,
+harness name, agent-supplied source label, or default project is not personal-data
+consent.
 Unknown, mixed, personal or changed conversation identities suppress delivery.
 Enrollment alone is insufficient: a personal MCP lookup can contaminate an
 otherwise engineering conversation without changing its identity. Require verified
@@ -31,7 +35,7 @@ Do not enable old archived capture hooks to bypass this requirement.
 ## Delivery slice
 
 1. Persist opt-in against exact conversation identity, project and policy revision
-   using existing authenticated configuration/approval facilities. Enrollment must
+   using existing trusted private-operator configuration/approval facilities. Enrollment must
    not grant global or infrastructure scope. Disabling it prevents new enqueue
    operations. Already accepted durable queue entries retain their original
    authorization and can replay: the current CLI has no policy-revocation check.
@@ -65,4 +69,5 @@ memory boundary. A REST loop with four harness labels is insufficient.
 
 Existing session-summary installer/history and agent-summary tests: 140 passed.
 This establishes the reusable baseline, not completion of retention adapters.
-Production authentication and per-session enrollment remain prerequisites.
+Per-session opt-in and trustworthy domain provenance remain prerequisites;
+additional dashboard authentication is not required by the operator policy.
