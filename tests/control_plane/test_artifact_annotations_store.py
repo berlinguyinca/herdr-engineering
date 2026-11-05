@@ -341,9 +341,11 @@ def test_paging_agents_view_and_touched(registry_pg):
 def test_hostile_body_round_trips(registry_pg):
     async def body(store, conn):
         aid, _, sid = await seed(conn)
-        hostile = "'); DROP TABLE artifact_annotations;-- <script>alert(1)</script> ‮ {{7*7}} \U0001f600 \\u0000 \t\n x"
+        hostile = "'); DROP TABLE artifact_annotations;-- <script>alert(1)</script> {{7*7}} \U0001f600 \\u0000 \t\n x"
         assert await store.ingest(conn, create(sid, 1, body=hostile), "h1", **KW) == "inserted"
         assert (await store.open_for_agents(aid))[0]["body"] == hostile
+        # an explicit bidi override is refused outright (plan 4 C4), never stored
+        assert await store.ingest(conn, create(sid, 2, body="safe \u202e txet"), "h2", **KW) == "invalid"
     run(registry_pg, body)
 
 
